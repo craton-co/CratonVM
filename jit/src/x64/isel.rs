@@ -97,6 +97,14 @@ pub enum Op {
     Sub,
     And,
     Or,
+    /// Bitwise exclusive-or.
+    ///
+    /// Distinct from the `XOR r,r` *zeroing idiom*, which is a
+    /// [`Op::Mov`] row (`mov_r64_imm0_xor`): a selector asking for
+    /// "put 0 in this register" and a selector asking for "exclusive-or these
+    /// two values" are different requests that happen to share an opcode, and
+    /// merging them would let the zeroing row answer a real `xor`.
+    Xor,
     Cmp,
     Test,
     /// Signed multiply, two-operand form.
@@ -743,6 +751,13 @@ pub enum SelError {
     NoPattern { op: Op, ty: Ty },
     /// [`pattern`] was asked for a name the table does not contain.
     UnknownPattern,
+    /// A memory operand named no base register.
+    ///
+    /// `[index*scale + disp32]` is a legal x86-64 operand, but [`Mem`] has no
+    /// way to express "no base" — its `base` is a `u8`, not an `Option<u8>` —
+    /// so an address with only an index has no representation here. Refusing
+    /// is the fail-closed direction; the caller falls back to a shift.
+    NoBaseRegister,
 }
 
 impl std::fmt::Display for SelError {
@@ -771,6 +786,9 @@ impl std::fmt::Display for SelError {
                 write!(f, "no instruction pattern for {op:?}/{ty:?}")
             }
             SelError::UnknownPattern => write!(f, "no such instruction pattern"),
+            SelError::NoBaseRegister => {
+                write!(f, "memory operand has no base register")
+            }
         }
     }
 }
@@ -1560,6 +1578,120 @@ pub static PATTERNS: &[Pattern] = &[
             ..Enc::BASE
         },
         flags: FlagEffect::W,
+        ..Pattern::BASE
+    },
+    // ── Register-to-register ALU (the `ir_lower` binary-op family) ───────
+    //
+    // Every row below reproduces one of the byte literals `ir_lower.rs`'s
+    // `lower_data_node` emits for a two-operand integer node. They follow
+    // `sub_r64_r64`'s shape exactly — the `xx /r` "store" direction, with the
+    // destination in the ModRM `r/m` field — because that is the direction
+    // those literals encode (`C8` is `mod=11, reg=RCX, r/m=RAX`, i.e.
+    // `OP RAX, RCX`).
+    Pattern {
+        name: "add_r64_r64",
+        emitter: "ir_lower.rs inline `[0x48, 0x01, 0xC8]` (Op::Add, Long/Ref)",
+        op: Op::Add,
+        enc: Enc {
+            rex_w: true,
+            rex: RexMode::Always,
+            opcode: Opcode::One(0x01),
+            reg: RegF::Src,
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        flags: FlagEffect::W,
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "add_r32_r32",
+        emitter: "ir_lower.rs inline `[0x01, 0xC8]` (Op::Add, Int)",
+        op: Op::Add,
+        ty: Ty::I32,
+        enc: Enc {
+            opcode: Opcode::One(0x01),
+            reg: RegF::Src,
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        flags: FlagEffect::W,
+        cost: Cost::new(2, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "sub_r32_r32",
+        emitter: "ir_lower.rs inline `[0x29, 0xC8]` (Op::Sub, Int)",
+        op: Op::Sub,
+        ty: Ty::I32,
+        enc: Enc {
+            opcode: Opcode::One(0x29),
+            reg: RegF::Src,
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        flags: FlagEffect::W,
+        cost: Cost::new(2, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "and_r64_r64",
+        emitter: "ir_lower.rs inline `[0x48, 0x21, 0xC8]` (Op::And)",
+        op: Op::And,
+        enc: Enc {
+            rex_w: true,
+            rex: RexMode::Always,
+            opcode: Opcode::One(0x21),
+            reg: RegF::Src,
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        flags: FlagEffect::W,
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "or_r64_r64",
+        emitter: "ir_lower.rs inline `[0x48, 0x09, 0xC8]` (Op::Or)",
+        op: Op::Or,
+        enc: Enc {
+            rex_w: true,
+            rex: RexMode::Always,
+            opcode: Opcode::One(0x09),
+            reg: RegF::Src,
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        flags: FlagEffect::W,
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "xor_r64_r64",
+        emitter: "ir_lower.rs inline `[0x48, 0x31, 0xC8]` (Op::Xor)",
+        op: Op::Xor,
+        enc: Enc {
+            rex_w: true,
+            rex: RexMode::Always,
+            opcode: Opcode::One(0x31),
+            reg: RegF::Src,
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        flags: FlagEffect::W,
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "imul_r64_r64",
+        emitter: "ir_lower.rs inline `[0x48, 0x0F, 0xAF, 0xC1]` (Op::Mul, Long)",
+        op: Op::Imul,
+        enc: Enc {
+            rex_w: true,
+            rex: RexMode::Always,
+            opcode: Opcode::Two(0xAF),
+            reg: RegF::Dst,
+            rm: RmF::RegSrc,
+            ..Enc::BASE
+        },
+        flags: FlagEffect::W,
+        cost: Cost::new(4, 1, 3),
         ..Pattern::BASE
     },
     Pattern {
@@ -2450,6 +2582,1734 @@ pub fn render(p: &Pattern, d: &Decoded) -> String {
         ops.push(format!("imm{:02X?}", d.imm));
     }
     format!("{:?}({}) {}", p.op, p.name, ops.join(", "))
+}
+
+// ---------------------------------------------------------------------------
+// IR-level instruction selection
+// ---------------------------------------------------------------------------
+//
+// Everything above this banner is about *encoding*: given operands already in
+// registers, which byte sequence expresses the operation. This section is
+// about **selection**: given a region of the sea-of-nodes IR, which machine
+// instructions should exist at all.
+//
+// `ir_lower::lower_data_node` answers that question one node at a time and
+// through the frame: every binary node emits `MOV RAX,[slot]; MOV RCX,[slot];
+// <op>; MOV [slot],RAX`. That shape leaves five families of x86-64 instruction
+// on the floor, and this section is a pattern matcher that finds them:
+//
+//   * **address-mode folding** — `a + (i << 2) + 16` is one `LEA`, not three
+//     ALU instructions and three frame round-trips ([`match_address`]);
+//   * **compare-and-branch fusion** — an `Op::Cmp` that only feeds an `Op::If`
+//     never needs its 0/1 value materialised through `SETcc`/`MOVZX`;
+//   * **test-versus-compare-against-zero** — `CMP r, 0` and `TEST r, r` leave
+//     CF, OF, SF and ZF identical, and the second is shorter;
+//   * **`LEA` for three-operand adds and small multiplies** — `LEA` is
+//     non-destructive, so a left-hand side that is still live afterwards does
+//     not have to be copied first, and `x*3` / `x*5` / `x*9` are one `LEA`;
+//   * **immediate and memory-operand folding** — a constant that fits the
+//     immediate field, and a load whose value has exactly one arithmetic
+//     consumer, both disappear into that consumer's operand.
+//
+// # What makes this safe
+//
+// Two gates, and neither of them is optional.
+//
+// **The immediate-width gate.** A constant only folds into an immediate field
+// when the *checked* conversion succeeds — [`imm_form_for`] is `i8::try_from` /
+// `i32::try_from`, never `as i8` / `as i32`. A displacement only folds when
+// [`Disp::encode32`] accepts it. Both are the helpers `disp.rs` exists to
+// concentrate; this module adds no narrowing of its own.
+//
+// **The load-folding gate.** Folding a load into a later arithmetic user moves
+// the load *down* the block, past everything between them. [`may_fold_load`]
+// refuses unless the load has exactly one value consumer, is not named by a
+// safepoint snapshot, is a plain (non-volatile, non-safepoint) read, and every
+// node it would cross answers [`Reorder::Allowed`] to [`Graph::may_reorder`].
+// Get that wrong and the load reads the value of a *later* store — the same
+// defect class this branch already found once in escape analysis.
+//
+// # Fail-closed
+//
+// There is no silent no-op anywhere in this section. A node no rule matches
+// becomes a [`Rule::Generic`] tile naming that node, which is an instruction to
+// the caller ("lower this the old way"), not an absence. A tile whose
+// instructions the pattern table cannot encode is *discarded* under the default
+// [`SelectOptions::require_encodable`], and the reason is recorded in
+// [`BlockSelection::notes`]. A block always comes back with every one of its
+// nodes covered exactly once — [`BlockSelection::covers`] is the check, and the
+// tests assert it.
+//
+// # Not wired
+//
+// Nothing calls [`select_block`] in the production pipeline. It is a component
+// with its own gate, exactly like the pattern table above it; see
+// `docs/jit/instruction-selection.md` for what the production wiring has to do
+// and what is still unvalidated.
+
+use crate::ir::{is_memory_token_slot, CmpOp, Graph, IrType, NodeId, Op as IrOp, Reorder,
+    ReorderBlock};
+
+/// Largest number of IR nodes [`match_address`] will walk before giving up.
+///
+/// An address expression that needs more than this many nodes is not an
+/// address expression; the bound keeps a pathological operand chain from
+/// turning into a pathological compile.
+pub const ADDR_MATCH_BUDGET: usize = 24;
+
+/// The cost of leaving a node to `ir_lower::lower_data_node`.
+///
+/// Read off that function's actual shape for a binary integer node:
+/// `load_to_rax` (a `MOV r64, [RBP+disp8]`, 4 bytes), `load_to_rcx` (4 bytes),
+/// the operation itself (2–4 bytes) and `store_rax` (4 bytes) — call it 15
+/// bytes and 4 micro-ops, with a latency of one load (≈4 cycles, the two loads
+/// issue in parallel) plus the operation plus the store.
+///
+/// It is deliberately the most expensive thing the cost model can name: a rule
+/// that covers *more* IR nodes must win, and this is what makes it win.
+pub const GENERIC_COST: Cost = Cost::new(15, 4, 9);
+
+// ── Cost accumulation ────────────────────────────────────────────────────
+
+/// The cost of a *sequence* of instructions.
+///
+/// Widened from [`Cost`]'s `u8` fields, which are per-row and would saturate
+/// after a handful of instructions. Saturating rather than wrapping: an
+/// overflowing cost must read as "very expensive", never as "free".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeqCost {
+    pub bytes: u32,
+    pub uops: u32,
+    pub latency: u32,
+}
+
+impl SeqCost {
+    /// Lift a single row's cost.
+    pub fn of(c: Cost) -> SeqCost {
+        SeqCost {
+            bytes: u32::from(c.bytes),
+            uops: u32::from(c.uops),
+            latency: u32::from(c.latency),
+        }
+    }
+
+    /// Sequence composition: bytes and micro-ops add, and so does latency —
+    /// the instructions a tile emits for one IR node are a dependence chain
+    /// (each consumes the previous one's result), not independent work.
+    pub fn then(self, o: SeqCost) -> SeqCost {
+        SeqCost {
+            bytes: self.bytes.saturating_add(o.bytes),
+            uops: self.uops.saturating_add(o.uops),
+            latency: self.latency.saturating_add(o.latency),
+        }
+    }
+
+    /// The ranking key, **micro-ops first**.
+    ///
+    /// Front-end throughput is what a tiling decision actually buys: the whole
+    /// point of folding a load into its consumer or collapsing an add tree into
+    /// one `LEA` is to issue fewer micro-ops. Bytes break the tie (instruction
+    /// cache), then latency. Ordering matters — ranking by bytes first would
+    /// prefer a two-byte `ADD r32, r32` plus a three-byte `MOV` over a
+    /// four-byte `LEA` that does both.
+    pub fn key(self) -> (u32, u32, u32) {
+        (self.uops, self.bytes, self.latency)
+    }
+}
+
+// ── Addressing modes over IR values ──────────────────────────────────────
+
+/// `base + index*scale + disp`, with IR nodes where [`Mem`] has registers.
+///
+/// The register allocator turns this into a [`Mem`]; until then the operands
+/// are values, so the two x86 rules that are about *register numbers* — an
+/// index may not be RSP, and an RSP/R12 base needs a SIB byte — cannot be
+/// checked here. They are [`Mem`]'s job and the table already states them
+/// ([`Constraint::IndexNotRsp`], [`base_requires_sib`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IrAddr {
+    /// The unscaled term.
+    pub base: Option<NodeId>,
+    /// The scaled term.
+    pub index: Option<NodeId>,
+    /// 1, 2, 4 or 8. Meaningless (and always 1) when there is no index.
+    pub scale: u8,
+    /// The constant term, in bytes.
+    pub disp: i64,
+}
+
+impl IrAddr {
+    /// An empty address — no terms at all.
+    pub fn empty() -> IrAddr {
+        IrAddr {
+            base: None,
+            index: None,
+            scale: 1,
+            disp: 0,
+        }
+    }
+
+    /// How many machine terms this address carries. One term is not worth an
+    /// `LEA`: `[x]` is a register copy and `[x + 8]` is an `ADD`.
+    pub fn terms(&self) -> usize {
+        usize::from(self.base.is_some())
+            + usize::from(self.index.is_some())
+            + usize::from(self.disp != 0)
+    }
+
+    /// Is this expressible as an x86-64 memory operand?
+    ///
+    /// Three questions, each asked of the code that owns it:
+    ///
+    /// * the scale goes to [`scale_bits`];
+    /// * the displacement goes to [`Disp::encode32`] — the checked helper, so a
+    ///   value past `i32` is an error and never a truncation;
+    /// * a base is **required**. `[index*scale + disp32]` is a legal x86
+    ///   operand (`mod=00`, SIB `base=101`) but [`Mem`] has no way to say "no
+    ///   base", so admitting one here would produce an [`IrAddr`] that cannot
+    ///   be lowered. Refusing is the fail-closed direction: the caller falls
+    ///   back to a shift or a multiply.
+    pub fn check(&self) -> Result<(), SelError> {
+        if self.index.is_some() {
+            scale_bits(self.scale)?;
+        } else if self.scale != 1 {
+            return Err(SelError::BadScale { scale: self.scale });
+        }
+        if self.base.is_none() {
+            return Err(SelError::NoBaseRegister);
+        }
+        Disp::encode32(self.disp)?;
+        Ok(())
+    }
+
+    /// Encoded length of the ModRM/SIB/displacement tail this address needs,
+    /// for the cost model: one ModRM byte, a SIB byte when there is an index or
+    /// an RSP-class base (unknowable here, so assumed absent), and the
+    /// displacement bytes [`Disp::encode`] would choose.
+    fn operand_bytes(&self) -> u32 {
+        let sib = u32::from(self.index.is_some());
+        let disp = match Disp::encode(self.disp) {
+            Ok(d) => u32::try_from(d.byte_len()).unwrap_or(4),
+            // Unencodable: `check` refuses it, so this arm only runs for a
+            // cost query on an address nobody will emit. Price it as the
+            // widest form rather than as free.
+            Err(_) => 4,
+        };
+        1 + sib + disp
+    }
+}
+
+/// Why [`match_address`] declined to build an [`IrAddr`].
+///
+/// Every arm names a node or a value: a refusal that cannot be attributed is a
+/// refusal nobody can act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddrRefusal {
+    /// The root is not an arithmetic node an address can be read out of.
+    NotAnAddress(NodeId),
+    /// A second scaled term appeared; x86 has one index.
+    TooManyIndices(NodeId),
+    /// A third unscaled term appeared; x86 has one base and one index.
+    TooManyTerms(NodeId),
+    /// The folded displacement overflowed `i64` before it could even be
+    /// range-checked against `i32`.
+    DispOverflow(i64),
+    /// The walk hit [`ADDR_MATCH_BUDGET`].
+    Budget,
+    /// The id does not name a node.
+    Unknown(NodeId),
+    /// The address is well-formed but has no x86-64 memory operand.
+    Unencodable(SelError),
+}
+
+/// An address expression and the interior nodes it absorbed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddrMatch {
+    /// The address itself.
+    pub addr: IrAddr,
+    /// The interior nodes (root included) whose computation the address
+    /// subsumes. Every one of them must be covered by the tile that uses this
+    /// match, and none of them may be emitted separately.
+    pub absorbed: Vec<NodeId>,
+}
+
+// ── Value uses ───────────────────────────────────────────────────────────
+
+/// How many consumers each value has, and which values a deopt frame names.
+///
+/// **Value** uses, not edge uses. `Graph::use_counts` counts every input slot,
+/// including the memory-token edges that `IrBuilder` threads through *loads*
+/// (`self.mem = load` after every `getfield`). Counting those would make every
+/// load look multiply-used and would refuse every fold — the token edge is an
+/// ordering edge, and ordering is what [`may_fold_load`] checks separately.
+///
+/// `pinned` is the other half of "exactly one use": a value a
+/// [`crate::ir::SafepointSnapshot`] names has to *exist* somewhere the deopt
+/// writer can point at, so it may not be folded away even when its only
+/// in-graph consumer is the folding user.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ValueUses {
+    counts: Vec<u32>,
+    pinned: Vec<bool>,
+}
+
+impl ValueUses {
+    /// Count every value edge in `graph`, once.
+    pub fn of(graph: &Graph) -> ValueUses {
+        let n = graph.nodes.len();
+        let mut counts = vec![0u32; n];
+        let mut pinned = vec![false; n];
+        for node in &graph.nodes {
+            for (i, &inp) in node.inputs.iter().enumerate() {
+                if is_memory_token_slot(node, i) {
+                    continue;
+                }
+                if let Some(slot) = counts.get_mut(inp as usize) {
+                    *slot = slot.saturating_add(1);
+                }
+            }
+        }
+        for sp in &graph.safepoints {
+            for &id in sp.locals.iter().chain(sp.stack.iter()) {
+                if let Some(slot) = pinned.get_mut(id as usize) {
+                    *slot = true;
+                }
+            }
+        }
+        ValueUses { counts, pinned }
+    }
+
+    /// Value consumers of `id`. An unknown id reads as heavily used, so an
+    /// out-of-range node is never folded.
+    pub fn count(&self, id: NodeId) -> u32 {
+        self.counts.get(id as usize).copied().unwrap_or(u32::MAX)
+    }
+
+    /// Does a safepoint snapshot name `id`?  Unknown ids read as pinned.
+    pub fn is_pinned(&self, id: NodeId) -> bool {
+        self.pinned.get(id as usize).copied().unwrap_or(true)
+    }
+
+    /// Exactly one value consumer, and no deopt frame needs it.
+    pub fn single_use(&self, id: NodeId) -> bool {
+        self.count(id) == 1 && !self.is_pinned(id)
+    }
+}
+
+// ── Selection context ────────────────────────────────────────────────────
+
+/// Everything the tiler needs about one scheduled basic block.
+pub struct SelCtx<'g> {
+    /// The graph being selected over.
+    pub graph: &'g Graph,
+    uses: ValueUses,
+    /// Position of each node in `order`, or `usize::MAX` when it is not in this
+    /// block.
+    pos: Vec<usize>,
+    /// The block's data nodes, in the order `ir_lower` will emit them.
+    order: Vec<NodeId>,
+}
+
+impl<'g> SelCtx<'g> {
+    /// Build a context for `block`, which must be the block's data nodes in
+    /// scheduled order (`ir_schedule::Block::nodes`).
+    pub fn new(graph: &'g Graph, block: &[NodeId]) -> SelCtx<'g> {
+        let mut pos = vec![usize::MAX; graph.nodes.len()];
+        for (i, &id) in block.iter().enumerate() {
+            if let Some(slot) = pos.get_mut(id as usize) {
+                // A duplicated entry keeps its FIRST position: the earlier one
+                // is the conservative answer for every "is this before that"
+                // question below.
+                if *slot == usize::MAX {
+                    *slot = i;
+                }
+            }
+        }
+        SelCtx {
+            graph,
+            uses: ValueUses::of(graph),
+            pos,
+            order: block.to_vec(),
+        }
+    }
+
+    /// The value-use table.
+    pub fn uses(&self) -> &ValueUses {
+        &self.uses
+    }
+
+    /// The block's nodes, in scheduled order.
+    pub fn order(&self) -> &[NodeId] {
+        &self.order
+    }
+
+    /// Position of `id` within the block, or `None` when it lives elsewhere.
+    pub fn position(&self, id: NodeId) -> Option<usize> {
+        match self.pos.get(id as usize).copied() {
+            Some(p) if p != usize::MAX => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Is `id` scheduled into this block?
+    pub fn in_block(&self, id: NodeId) -> bool {
+        self.position(id).is_some()
+    }
+
+    /// May `id` be absorbed into a bigger tile?
+    ///
+    /// It must be in *this* block — absorbing a node the scheduler placed
+    /// elsewhere (a loop-invariant expression hoisted out of the loop, say)
+    /// would recompute it on every iteration *and* leave the original standing.
+    /// And it must have exactly one consumer, or absorbing it deletes a
+    /// register something else reads.
+    pub fn absorbable(&self, id: NodeId) -> bool {
+        self.in_block(id) && self.uses.single_use(id)
+    }
+
+    /// The node's IR type mapped onto the selector's operand type, or `None`
+    /// for a type no integer rule applies to.
+    pub fn int_ty(&self, id: NodeId) -> Option<Ty> {
+        match self.graph.node_opt(id)?.ty {
+            IrType::Int => Some(Ty::I32),
+            IrType::Long | IrType::Ref => Some(Ty::I64),
+            _ => None,
+        }
+    }
+
+    /// The constant `id` names, when it names one.
+    pub fn const_of(&self, id: NodeId) -> Option<i64> {
+        match self.graph.node_opt(id)?.op {
+            IrOp::Const(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Input `idx` of `id`, `None` for a missing edge or an unknown node.
+    pub fn input(&self, id: NodeId, idx: usize) -> Option<NodeId> {
+        self.graph.node_opt(id)?.input_opt(idx)
+    }
+}
+
+// ── Address matching ─────────────────────────────────────────────────────
+
+/// Accumulator for [`match_address`]: at most one base, at most one index.
+struct AddrAcc {
+    addr: IrAddr,
+    absorbed: Vec<NodeId>,
+}
+
+impl AddrAcc {
+    fn new() -> AddrAcc {
+        AddrAcc {
+            addr: IrAddr::empty(),
+            absorbed: Vec::new(),
+        }
+    }
+
+    /// A scaled term `x * s`, `s` in 2/4/8.
+    fn scaled(&mut self, x: NodeId, s: u8) -> Result<(), AddrRefusal> {
+        if self.addr.index.is_some() {
+            return Err(AddrRefusal::TooManyIndices(x));
+        }
+        self.addr.index = Some(x);
+        self.addr.scale = s;
+        Ok(())
+    }
+
+    /// An unscaled term. Fills the base first; a second one becomes a
+    /// scale-1 index, which is exactly the three-operand `LEA r, [a + b]`.
+    fn plain(&mut self, x: NodeId) -> Result<(), AddrRefusal> {
+        if self.addr.base.is_none() {
+            self.addr.base = Some(x);
+            return Ok(());
+        }
+        if self.addr.index.is_none() {
+            self.addr.index = Some(x);
+            self.addr.scale = 1;
+            return Ok(());
+        }
+        Err(AddrRefusal::TooManyTerms(x))
+    }
+
+    /// A constant term. `checked_add`, so a folded displacement can never wrap
+    /// into a small-looking number.
+    fn disp(&mut self, c: i64) -> Result<(), AddrRefusal> {
+        self.addr.disp = self
+            .addr
+            .disp
+            .checked_add(c)
+            .ok_or(AddrRefusal::DispOverflow(c))?;
+        Ok(())
+    }
+}
+
+/// Absorb the shift count / multiplier constant of a folded `Shl` or `Mul`.
+///
+/// The constant becomes part of the SIB scale field, so its register is gone
+/// too — but only when nothing else reads it. Without this the tile would leave
+/// a dead `MOV r, 2` behind for every scaled index.
+///
+/// `a` and `b` are the node's two operands and `value` the one that is *not*
+/// the constant; whichever of `a`/`b` is not `value` is the constant.
+fn absorb_constant(ctx: &SelCtx, acc: &mut AddrAcc, a: NodeId, b: NodeId, value: NodeId) {
+    let k = if a == value { b } else { a };
+    if k != value && ctx.absorbable(k) && ctx.const_of(k).is_some() {
+        acc.absorbed.push(k);
+    }
+}
+
+/// Read a `base + index*scale + disp` address out of the pure integer
+/// arithmetic rooted at `root`.
+///
+/// The grammar, applied to the root and then recursively to every term whose
+/// node [`SelCtx::absorbable`] accepts:
+///
+/// ```text
+///   term := Add(term, term)          -- split
+///         | Shl(x, Const k), k<=3    -- index x, scale 1<<k
+///         | Mul(x, Const c)          -- c in 1/2/4/8 -> index x, scale c
+///         | Const(c)                 -- disp += c   (never at the root)
+///         | anything else            -- base, or a scale-1 index
+/// ```
+///
+/// The root additionally admits the *small multiply* forms `x*2`, `x*3`, `x*5`
+/// and `x*9`, which become `[x + x*1]`, `[x + x*2]`, `[x + x*4]` and
+/// `[x + x*8]`. `x*4` and `x*8` are deliberately **not** admitted: they need a
+/// base-less operand, which [`IrAddr::check`] refuses (see there), and a shift
+/// covers them anyway.
+///
+/// The `absorbable` gate is what makes this a *selection* rather than a
+/// rewrite: an interior node with a second consumer stays where it is and
+/// becomes the address's base, so nothing is ever computed twice.
+pub fn match_address(ctx: &SelCtx, root: NodeId) -> Result<AddrMatch, AddrRefusal> {
+    let rootn = ctx
+        .graph
+        .node_opt(root)
+        .ok_or(AddrRefusal::Unknown(root))?;
+    if !matches!(rootn.op, IrOp::Add | IrOp::Shl | IrOp::Mul) {
+        return Err(AddrRefusal::NotAnAddress(root));
+    }
+
+    let mut acc = AddrAcc::new();
+    let mut work: Vec<NodeId> = vec![root];
+    let mut steps = 0usize;
+
+    while let Some(id) = work.pop() {
+        steps += 1;
+        if steps > ADDR_MATCH_BUDGET {
+            return Err(AddrRefusal::Budget);
+        }
+        let is_root = id == root;
+        let node = ctx.graph.node_opt(id).ok_or(AddrRefusal::Unknown(id))?;
+        // The root is being *replaced* by the address, so it absorbs itself.
+        // Every other node has to earn it.
+        let may_absorb = is_root || ctx.absorbable(id);
+
+        // `x << k` and `x * c` at the root, where the whole node becomes the
+        // address. Handled before the generic arms so a root multiply can use
+        // the two-term small-multiply forms.
+        if is_root && matches!(node.op, IrOp::Mul) {
+            let x = node.input_opt(0).ok_or(AddrRefusal::Unknown(id))?;
+            let k = node.input_opt(1).ok_or(AddrRefusal::Unknown(id))?;
+            // Whichever side is the constant is the multiplier; the other is
+            // the value that becomes both the base and the index.
+            let (val, other) = match (ctx.const_of(x), ctx.const_of(k)) {
+                (_, Some(c)) => (c, x),
+                (Some(c), _) => (c, k),
+                _ => return Err(AddrRefusal::NotAnAddress(root)),
+            };
+            acc.absorbed.push(root);
+            absorb_constant(ctx, &mut acc, x, k, other);
+            // `x*4` and `x*8` are missing on purpose: they need `[x*4]` with
+            // no base, which `IrAddr::check` refuses. A shift covers them.
+            match val {
+                1 => acc.plain(other)?,
+                2 => {
+                    acc.plain(other)?;
+                    acc.plain(other)?;
+                }
+                3 => {
+                    acc.plain(other)?;
+                    acc.scaled(other, 2)?;
+                }
+                5 => {
+                    acc.plain(other)?;
+                    acc.scaled(other, 4)?;
+                }
+                9 => {
+                    acc.plain(other)?;
+                    acc.scaled(other, 8)?;
+                }
+                _ => return Err(AddrRefusal::NotAnAddress(root)),
+            }
+            continue;
+        }
+        if is_root && matches!(node.op, IrOp::Shl) {
+            let x = node.input_opt(0).ok_or(AddrRefusal::Unknown(id))?;
+            let k = node.input_opt(1).ok_or(AddrRefusal::Unknown(id))?;
+            // Only `x << 1` has a base-ful form (`[x + x]`); `<< 2` and `<< 3`
+            // would need a base-less operand.
+            if ctx.const_of(k) == Some(1) {
+                acc.absorbed.push(root);
+                absorb_constant(ctx, &mut acc, x, k, x);
+                acc.plain(x)?;
+                acc.plain(x)?;
+                continue;
+            }
+            return Err(AddrRefusal::NotAnAddress(root));
+        }
+
+        match &node.op {
+            IrOp::Add if may_absorb => {
+                let a = node.input_opt(0).ok_or(AddrRefusal::Unknown(id))?;
+                let b = node.input_opt(1).ok_or(AddrRefusal::Unknown(id))?;
+                acc.absorbed.push(id);
+                // Push the right operand first so the left is popped first and
+                // becomes the base — a deterministic, reproducible choice.
+                work.push(b);
+                work.push(a);
+            }
+            IrOp::Shl if may_absorb && !is_root => {
+                match (node.input_opt(0), node.input_opt(1)) {
+                    (Some(x), Some(k)) => match ctx.const_of(k) {
+                        Some(sh @ (0 | 1 | 2 | 3)) => {
+                            acc.absorbed.push(id);
+                            absorb_constant(ctx, &mut acc, x, k, x);
+                            match sh {
+                                0 => acc.plain(x)?,
+                                1 => acc.scaled(x, 2)?,
+                                2 => acc.scaled(x, 4)?,
+                                _ => acc.scaled(x, 8)?,
+                            }
+                        }
+                        _ => acc.plain(id)?,
+                    },
+                    _ => acc.plain(id)?,
+                }
+            }
+            IrOp::Mul if may_absorb && !is_root => {
+                let folded = match (node.input_opt(0), node.input_opt(1)) {
+                    (Some(x), Some(y)) => match (ctx.const_of(y), ctx.const_of(x)) {
+                        (Some(c), _) => Some((x, y, c)),
+                        (_, Some(c)) => Some((y, x, c)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match folded {
+                    Some((x, k, c @ (1 | 2 | 4 | 8))) => {
+                        acc.absorbed.push(id);
+                        absorb_constant(ctx, &mut acc, x, k, x);
+                        match c {
+                            1 => acc.plain(x)?,
+                            2 => acc.scaled(x, 2)?,
+                            4 => acc.scaled(x, 4)?,
+                            _ => acc.scaled(x, 8)?,
+                        }
+                    }
+                    _ => acc.plain(id)?,
+                }
+            }
+            IrOp::Const(c) if !is_root => {
+                // A constant only folds into the displacement when nothing
+                // else reads it; otherwise it keeps its register and becomes a
+                // term. (`absorbable` also refuses a constant from another
+                // block, which is the loop-invariant case.)
+                if ctx.absorbable(id) {
+                    acc.absorbed.push(id);
+                    let v = *c;
+                    acc.disp(v)?;
+                } else {
+                    acc.plain(id)?;
+                }
+            }
+            _ => {
+                if is_root {
+                    return Err(AddrRefusal::NotAnAddress(root));
+                }
+                acc.plain(id)?;
+            }
+        }
+    }
+
+    acc.addr.check().map_err(AddrRefusal::Unencodable)?;
+    Ok(AddrMatch {
+        addr: acc.addr,
+        absorbed: acc.absorbed,
+    })
+}
+
+// ── The load-folding gate ────────────────────────────────────────────────
+
+/// Why a load may not be folded into its consumer's memory operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldRefusal {
+    /// One of the two nodes is not in the block being selected.
+    NotInBlock(NodeId),
+    /// The load is not scheduled before its user, so there is nothing to fold
+    /// *forward*.
+    NotBefore { load: NodeId, user: NodeId },
+    /// The load's value has more than one consumer (or none), so folding would
+    /// duplicate the access or drop a live value.
+    MultipleUses { load: NodeId, uses: u32 },
+    /// A safepoint snapshot names the loaded value; it must exist in a place
+    /// the deopt writer can point at.
+    SafepointPinned(NodeId),
+    /// The node is not a plain read: it writes, allocates, is a safepoint, or
+    /// carries JMM ordering (a volatile read is an acquire and pins everything
+    /// after it).
+    NotAPlainRead(NodeId),
+    /// A node between the load and its user refuses to be crossed.
+    Intervening {
+        between: NodeId,
+        reason: ReorderBlock,
+    },
+}
+
+/// May the value `load` produces be folded into `user`'s memory operand?
+///
+/// Folding turns `MOV tmp, [addr]; ADD dst, tmp` into `ADD dst, [addr]`, which
+/// **moves the memory access forward** to the user's position. Every condition
+/// below is about that move:
+///
+/// 1. Both nodes are in this block, and the load is scheduled first — the fold
+///    is a forward motion or it is nothing.
+/// 2. The load has exactly one value consumer. Two consumers and the fold
+///    either performs the access twice (a second cache miss, and *two* reads of
+///    a location another thread may be writing) or leaves the second consumer
+///    without a register.
+/// 3. No safepoint snapshot names the loaded value. A deopt frame has to be
+///    able to name every live value; a value that only ever exists inside
+///    another instruction's operand cannot be named.
+/// 4. The load is a *plain* read. A volatile read is [`crate::ir::MemOrder`]
+///    `Acquire`, and moving anything across it — including itself — is exactly
+///    what an acquire forbids. Same for a safepointing or allocating node.
+/// 5. **Every node it crosses answers `Allowed`.** This is the one that
+///    matters. `Graph::may_reorder` is pairwise, so the check has to be run
+///    against each intervening node individually — asking only about the user
+///    would say nothing about the store in between, and folding across a store
+///    to the same location makes the load read the *later* value.
+///
+/// Total: never panics, and every refusal names the node responsible.
+pub fn may_fold_load(ctx: &SelCtx, load: NodeId, user: NodeId) -> Result<(), FoldRefusal> {
+    let lp = ctx
+        .position(load)
+        .ok_or(FoldRefusal::NotInBlock(load))?;
+    let up = ctx
+        .position(user)
+        .ok_or(FoldRefusal::NotInBlock(user))?;
+    if lp >= up {
+        return Err(FoldRefusal::NotBefore { load, user });
+    }
+    let n = ctx.uses.count(load);
+    if n != 1 {
+        return Err(FoldRefusal::MultipleUses { load, uses: n });
+    }
+    if ctx.uses.is_pinned(load) {
+        return Err(FoldRefusal::SafepointPinned(load));
+    }
+    let eff = ctx.graph.memory_effect(load);
+    if !eff.reads.is_some()
+        || eff.is_write()
+        || eff.safepoint
+        || eff.allocates
+        || !eff.order.is_plain()
+    {
+        return Err(FoldRefusal::NotAPlainRead(load));
+    }
+    // `lp + 1 <= up <= order.len()`, so the slice exists; `get` rather than
+    // indexing anyway, because a codegen path must not be able to panic.
+    let between = match ctx.order.get(lp + 1..up) {
+        Some(s) => s,
+        None => return Err(FoldRefusal::NotBefore { load, user }),
+    };
+    for &mid in between {
+        match ctx.graph.may_reorder(load, mid) {
+            Reorder::Allowed(_) => {}
+            Reorder::Blocked(reason) => {
+                return Err(FoldRefusal::Intervening {
+                    between: mid,
+                    reason,
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Machine instructions over virtual operands ───────────────────────────
+
+/// Where a folded memory operand's address comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddrSource {
+    /// A `base + index*scale + disp` expression this module matched out of
+    /// pure IR arithmetic.
+    Expr(IrAddr),
+    /// The address `ir_lower` already computes for this memory node.
+    ///
+    /// `Op::Load`'s edge layout is `[ctrl, mem, base, field_index]` — a *field
+    /// index*, not a byte offset — and turning one into an `[base + disp]`
+    /// operand needs the object layout, which is `ir_lower`'s knowledge and not
+    /// this module's. So the selector proves the **fold** legal (which is the
+    /// part that can be got wrong silently) and leaves the address shape to the
+    /// lowering. This is a named node, not an absence: the lowering is told
+    /// exactly which memory node's address to reuse.
+    Opaque(NodeId),
+}
+
+/// One machine instruction, with IR node ids where a register will go.
+///
+/// This is deliberately *not* [`Req`]: a `Req` names physical registers, and
+/// selection happens before allocation. [`MInst::probe`] is the bridge — it
+/// runs the chosen row through the table with placeholder registers to prove an
+/// encoding exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MInst {
+    /// `dst <- imm`.
+    Imm { dst: NodeId, ty: Ty, imm: i64 },
+    /// `dst <- src`. Emitted only as the two-address fixup: an x86 ALU
+    /// instruction overwrites its first operand, so a left-hand side that is
+    /// still live afterwards has to be copied first.
+    Move { dst: NodeId, ty: Ty, src: NodeId },
+    /// `dst <- LEA addr` — no memory access, no flags.
+    Lea { dst: NodeId, ty: Ty, addr: IrAddr },
+    /// `dst <- lhs op rhs`, two-address (`dst` and `lhs` are the same
+    /// register after allocation).
+    AluRR {
+        op: Op,
+        ty: Ty,
+        dst: NodeId,
+        lhs: NodeId,
+        rhs: NodeId,
+    },
+    /// `dst <- lhs op imm`. `form` is the field the immediate was *checked*
+    /// against, never a width somebody assumed.
+    AluRI {
+        op: Op,
+        ty: Ty,
+        dst: NodeId,
+        lhs: NodeId,
+        imm: i64,
+        form: ImmForm,
+    },
+    /// `dst <- lhs op [addr]` — a load folded into its single consumer.
+    /// `load` names the IR node whose access this is, so the lowering knows
+    /// which node it is no longer emitting separately.
+    AluRM {
+        op: Op,
+        ty: Ty,
+        dst: NodeId,
+        lhs: NodeId,
+        addr: AddrSource,
+        load: NodeId,
+    },
+    /// `CMP lhs, rhs` — flags only.
+    CmpRR { ty: Ty, lhs: NodeId, rhs: NodeId },
+    /// `CMP lhs, imm` — flags only, immediate width checked.
+    CmpRI {
+        ty: Ty,
+        lhs: NodeId,
+        imm: i64,
+        form: ImmForm,
+    },
+    /// `TEST reg, reg` — the compare-against-zero form. `CMP r, 0` and
+    /// `TEST r, r` leave CF, OF, SF and ZF identical (one is `SUB r, 0`, the
+    /// other `AND r, r`; both clear CF and OF and set SF/ZF from the value), so
+    /// this substitution is exact for **every** condition code, signed or
+    /// unsigned — not just the equality pair.
+    TestRR { ty: Ty, reg: NodeId },
+    /// `SETcc dst8; MOVZX dst, dst8` — a comparison whose 0/1 value is
+    /// actually read.
+    SetCc { dst: NodeId, cc: CmpOp },
+    /// `Jcc` on the flags the immediately preceding compare wrote. `at` is the
+    /// `Op::If` node, so the caller can find its successor edges.
+    Jcc { cc: CmpOp, at: NodeId },
+    /// No rule matched: `ir_lower`'s generic per-node lowering owns this node.
+    ///
+    /// **Not** a no-op. A selector that answered an unmatched node with
+    /// silence would drop the node's semantics entirely; this arm names the
+    /// node the caller must still lower.
+    Generic { node: NodeId },
+}
+
+impl MInst {
+    /// The [`PATTERNS`] row this instruction encodes through, when the table
+    /// has one.
+    ///
+    /// `None` is a statement about the *table*, not about the instruction: see
+    /// `docs/jit/instruction-selection.md` for the rows that are still missing
+    /// and what each needs.
+    pub fn pattern_name(&self) -> Option<&'static str> {
+        match *self {
+            MInst::Imm { ty: Ty::I64, imm, .. } => Some(match imm {
+                0 => "mov_r64_imm0_xor",
+                v if i32::try_from(v).is_ok() => "mov_r64_imm32",
+                _ => "mov_r64_imm64",
+            }),
+            MInst::Imm { .. } => None,
+            MInst::Move { ty: Ty::I64, .. } => Some("mov_r64_r64"),
+            MInst::Move { .. } => None,
+            MInst::Lea { ty: Ty::I64, .. } => Some("lea_r64_m"),
+            MInst::Lea { .. } => None,
+            MInst::AluRR { op, ty, .. } => match (op, ty) {
+                (Op::Add, Ty::I64) => Some("add_r64_r64"),
+                (Op::Add, Ty::I32) => Some("add_r32_r32"),
+                (Op::Sub, Ty::I64) => Some("sub_r64_r64"),
+                (Op::Sub, Ty::I32) => Some("sub_r32_r32"),
+                (Op::And, Ty::I64) => Some("and_r64_r64"),
+                (Op::Or, Ty::I64) => Some("or_r64_r64"),
+                (Op::Xor, Ty::I64) => Some("xor_r64_r64"),
+                (Op::Imul, Ty::I64) => Some("imul_r64_r64"),
+                (Op::Imul, Ty::I32) => Some("imul_r32_r32"),
+                _ => None,
+            },
+            MInst::AluRI { op, ty: Ty::I64, form, .. } => match (op, form) {
+                (Op::Add, ImmForm::Imm8) => Some("add_r64_imm8"),
+                (Op::Add, ImmForm::Imm32) => Some("add_r64_imm32"),
+                (Op::Sub, ImmForm::Imm8) => Some("sub_r64_imm8"),
+                (Op::Sub, ImmForm::Imm32) => Some("sub_r64_imm32"),
+                (Op::And, ImmForm::Imm8) => Some("and_r64_imm8"),
+                (Op::Or, ImmForm::Imm8) => Some("or_r64_imm8"),
+                _ => None,
+            },
+            MInst::AluRI { .. } => None,
+            MInst::AluRM { .. } => None,
+            MInst::CmpRR { ty: Ty::I64, .. } => Some("cmp_r64_r64"),
+            MInst::CmpRR { ty: Ty::I32, .. } => Some("cmp_r32_r32"),
+            MInst::CmpRR { .. } => None,
+            MInst::CmpRI { .. } => None,
+            MInst::TestRR { ty: Ty::I64, .. } => Some("test_r64_r64"),
+            MInst::TestRR { ty: Ty::I32, .. } => Some("test_r32_r32"),
+            MInst::TestRR { .. } => None,
+            MInst::SetCc { .. } => None,
+            MInst::Jcc { .. } => Some("jcc_rel32"),
+            MInst::Generic { .. } => None,
+        }
+    }
+
+    /// Prove an encoding exists, using placeholder registers.
+    ///
+    /// Register *numbers* change an encoding's length (REX, the RSP/RBP
+    /// addressing quirks) but not whether one exists for these rows, which is
+    /// the only question a selector can answer before allocation. The
+    /// displacement and the immediate are the operands that *can* make a row
+    /// inapplicable, and those are real here, so this catches the mistakes that
+    /// matter: an immediate that does not fit its field, a displacement past
+    /// `disp32`, a scale that is not 1/2/4/8.
+    pub fn probe(&self) -> Result<Encoded, SelError> {
+        let name = self.pattern_name().ok_or(SelError::UnknownPattern)?;
+        let mut a = Args {
+            dst: RAX,
+            src: RCX,
+            mem: Mem::base_disp(RAX, 0),
+            imm: 0,
+            op_byte: 0,
+        };
+        match *self {
+            MInst::Imm { imm, .. } => a.imm = imm,
+            MInst::Move { .. } => {}
+            MInst::Lea { addr, .. } | MInst::AluRM {
+                addr: AddrSource::Expr(addr),
+                ..
+            } => {
+                addr.check()?;
+                a.mem = Mem {
+                    base: RAX,
+                    index: addr.index.map(|_| Index {
+                        reg: RCX,
+                        scale: addr.scale,
+                    }),
+                    disp: addr.disp,
+                    force_disp32: false,
+                };
+            }
+            MInst::AluRI { imm, .. } | MInst::CmpRI { imm, .. } => a.imm = imm,
+            MInst::Jcc { cc, .. } => a.op_byte = cc.x64_cc(),
+            // The `TEST r, r` rows declare `Constraint::SameRegister`: the
+            // instruction *is* "compare this value with itself". Probing them
+            // with two different placeholder registers would fail the row's own
+            // constraint and report a missing encoding that is not missing.
+            MInst::TestRR { .. } => a.src = a.dst,
+            _ => {}
+        }
+        encode_named(name, &a)
+    }
+
+    /// This instruction's cost.
+    ///
+    /// Taken from the [`PATTERNS`] row whenever the table has one, so the cost
+    /// model and the encoder cannot drift; the literals below are only for the
+    /// instructions the table does not cover yet, and each states its own
+    /// arithmetic.
+    pub fn cost(&self) -> SeqCost {
+        if let Some(row) = self.pattern_name().and_then(|n| pattern(n)) {
+            // The table's `bytes` is the operand-independent floor. An address
+            // with an index or a displacement is longer than the floor, and
+            // the cost model has to see that or it will fold a disp32 into a
+            // memory operand as though it were free.
+            let extra = match *self {
+                MInst::Lea { addr, .. }
+                | MInst::AluRM {
+                    addr: AddrSource::Expr(addr),
+                    ..
+                } => addr.operand_bytes().saturating_sub(1),
+                _ => 0,
+            };
+            let mut seq = SeqCost::of(row.cost);
+            seq.bytes = seq.bytes.saturating_add(extra);
+            return seq;
+        }
+        match *self {
+            // `CMP r/m, imm8` is `83 /7 ib`, `imm32` is `81 /7 id`; add one
+            // REX byte for the 64-bit forms.
+            MInst::CmpRI { ty, form, .. } => {
+                let rex = u32::from(matches!(ty, Ty::I64));
+                let imm = u32::try_from(form.byte_len()).unwrap_or(8);
+                SeqCost {
+                    bytes: 2 + rex + imm,
+                    uops: 1,
+                    latency: 1,
+                }
+            }
+            // `OP r, [mem]` is one *fused* micro-op on every x86-64 core that
+            // matters, which is the whole reason to fold: the byte count barely
+            // moves, the micro-op count halves. Latency is a load (≈4) plus the
+            // ALU operation.
+            MInst::AluRM { ty, addr, .. } => {
+                let rex = u32::from(matches!(ty, Ty::I64));
+                let operand = match addr {
+                    AddrSource::Expr(a) => a.operand_bytes(),
+                    // Unknown address shape: price it as the widest common
+                    // form (ModRM + disp32) rather than as the cheapest.
+                    AddrSource::Opaque(_) => 5,
+                };
+                SeqCost {
+                    bytes: 1 + rex + operand,
+                    uops: 1,
+                    latency: 5,
+                }
+            }
+            // `0F 9x C0` then `0F B6 C0`.
+            MInst::SetCc { .. } => SeqCost {
+                bytes: 6,
+                uops: 2,
+                latency: 2,
+            },
+            // Everything else the table does not cover is priced as the
+            // generic lowering, which is the direction that never makes an
+            // unmodelled instruction look attractive.
+            _ => SeqCost::of(GENERIC_COST),
+        }
+    }
+}
+
+// ── Tiles ────────────────────────────────────────────────────────────────
+
+/// Which rule produced a tile. Diagnostic, and the handle the tests use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rule {
+    /// No rule matched; `ir_lower` lowers this node the usual way.
+    Generic,
+    /// An add / shift / multiply tree collapsed into one `LEA`.
+    Lea,
+    /// A binary op whose right operand is a constant that fits the immediate
+    /// field.
+    AluImm,
+    /// A binary op on two registers.
+    AluReg,
+    /// A load folded into its single arithmetic consumer.
+    AluFoldedLoad,
+    /// An `Op::Cmp` fused with the `Op::If` it feeds: `CMP; Jcc`.
+    CmpBranch,
+    /// The same, against a zero operand: `TEST; Jcc`.
+    TestZeroBranch,
+    /// An `Op::If` whose condition is not a fusable compare: `TEST; Jcc`,
+    /// which is what `ir_lower` already emits.
+    TestBranch,
+    /// An `Op::Cmp` whose 0/1 value is read: `CMP; SETcc; MOVZX`.
+    CmpSetCc,
+}
+
+/// One IR subtree and the machine instructions selected for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tile {
+    /// The node this tile computes.
+    pub root: NodeId,
+    /// Every IR node this tile subsumes, `root` included. No other tile may
+    /// cover any of them, and the caller must not lower them separately.
+    pub covered: Vec<NodeId>,
+    /// The instructions, in emission order.
+    pub insts: Vec<MInst>,
+    /// Sum of the instruction costs.
+    pub cost: SeqCost,
+    /// Which rule fired.
+    pub rule: Rule,
+}
+
+impl Tile {
+    fn new(root: NodeId, covered: Vec<NodeId>, insts: Vec<MInst>, rule: Rule) -> Tile {
+        let cost = insts
+            .iter()
+            .fold(SeqCost::default(), |acc, i| acc.then(i.cost()));
+        Tile {
+            root,
+            covered,
+            insts,
+            cost,
+            rule,
+        }
+    }
+
+    /// What the nodes this tile covers would have cost had each been left to
+    /// the generic lowering.
+    ///
+    /// One [`GENERIC_COST`] per covered node. That is the *alternative* to
+    /// covering them: a node a tile absorbs is a node the tiler never visits,
+    /// so it never gets a tile of its own.
+    pub fn baseline(&self) -> SeqCost {
+        let n = u32::try_from(self.covered.len()).unwrap_or(u32::MAX);
+        SeqCost {
+            bytes: u32::from(GENERIC_COST.bytes).saturating_mul(n),
+            uops: u32::from(GENERIC_COST.uops).saturating_mul(n),
+            latency: u32::from(GENERIC_COST.latency).saturating_mul(n),
+        }
+    }
+
+    /// The ranking key: this tile's cost **minus** what it displaces.
+    ///
+    /// Raw cost alone cannot rank a tiling. Folding a load into its consumer
+    /// makes the *consumer* more expensive — `ADD r, [m]` is longer and slower
+    /// than `ADD r, r` — and is still the right choice, because the load's own
+    /// four instructions disappear. Only the net figure sees that.
+    ///
+    /// Signed, not saturating: two tiles that cover the same nodes have the
+    /// same baseline, so the raw costs still separate them. A saturating
+    /// subtraction would clamp both to zero and make the choice arbitrary.
+    ///
+    /// Micro-ops first, then bytes, then latency — see [`SeqCost::key`].
+    pub fn net_key(&self) -> (i64, i64, i64) {
+        let b = self.baseline();
+        (
+            i64::from(self.cost.uops) - i64::from(b.uops),
+            i64::from(self.cost.bytes) - i64::from(b.bytes),
+            i64::from(self.cost.latency) - i64::from(b.latency),
+        )
+    }
+
+    /// The fall-back tile: one node, lowered the old way.
+    pub fn generic(root: NodeId) -> Tile {
+        Tile::new(
+            root,
+            vec![root],
+            vec![MInst::Generic { node: root }],
+            Rule::Generic,
+        )
+    }
+
+    /// Can the pattern table encode every instruction in this tile?
+    ///
+    /// `Rule::Generic` is encodable by definition — it delegates to the
+    /// hand-written lowering, which is not the table's business.
+    pub fn encodable(&self) -> Result<(), SelError> {
+        if matches!(self.rule, Rule::Generic) {
+            return Ok(());
+        }
+        for i in &self.insts {
+            i.probe()?;
+        }
+        Ok(())
+    }
+}
+
+/// Knobs for [`select_block`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectOptions {
+    /// Discard any tile whose instructions [`PATTERNS`] cannot encode.
+    ///
+    /// `true` — the default, and the only setting a production wiring may use
+    /// — makes the selector refuse to choose an instruction it cannot prove
+    /// exists. `false` reports the tiling the rules *would* pick, which is how
+    /// the tests enumerate the rows the table is still missing.
+    pub require_encodable: bool,
+    /// Fold a load into its single arithmetic consumer. Off by default: the
+    /// gate is sound (see [`may_fold_load`]) but the *address* half is still
+    /// [`AddrSource::Opaque`], so a lowering has to teach the memory operand to
+    /// `ir_lower` before this is worth turning on.
+    pub fold_loads: bool,
+}
+
+impl Default for SelectOptions {
+    fn default() -> SelectOptions {
+        SelectOptions {
+            require_encodable: true,
+            fold_loads: false,
+        }
+    }
+}
+
+/// Something a rule declined, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Note {
+    /// An address expression was rejected.
+    Address { root: NodeId, why: AddrRefusal },
+    /// A load fold was rejected.
+    Fold { user: NodeId, why: FoldRefusal },
+    /// A tile was rejected because the table cannot encode it.
+    Unencodable { root: NodeId, rule: Rule, why: SelError },
+    /// A constant did not fit any immediate field.
+    WideImmediate { root: NodeId, value: i64 },
+}
+
+/// The tiling of one basic block.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockSelection {
+    /// The tiles, in emission order: the block's data nodes first (in
+    /// scheduled order, skipping the ones a later tile absorbed), then the
+    /// terminator's tile.
+    pub tiles: Vec<Tile>,
+    /// Total cost.
+    pub cost: SeqCost,
+    /// Every rule refusal, for diagnostics and for the tests.
+    pub notes: Vec<Note>,
+}
+
+impl BlockSelection {
+    /// Does this selection cover `block` exactly once per node?
+    ///
+    /// The invariant the whole design rests on: a node covered twice is
+    /// computed twice, and a node covered zero times is a dropped instruction —
+    /// which is the failure mode a catch-all `_ => {}` produces and the reason
+    /// this check exists.
+    pub fn covers(&self, block: &[NodeId]) -> bool {
+        let mut seen: Vec<NodeId> = self
+            .tiles
+            .iter()
+            .flat_map(|t| t.covered.iter().copied())
+            .collect();
+        let mut want: Vec<NodeId> = block.to_vec();
+        seen.sort_unstable();
+        want.sort_unstable();
+        // The terminator's own id is allowed to appear in `seen` without being
+        // in `block`: it is a control node and never a member of `Block::nodes`.
+        seen.retain(|id| want.binary_search(id).is_ok());
+        seen == want
+    }
+
+    /// Tiles that fired a rule other than [`Rule::Generic`].
+    pub fn matched(&self) -> impl Iterator<Item = &Tile> + '_ {
+        self.tiles.iter().filter(|t| t.rule != Rule::Generic)
+    }
+}
+
+// ── Rules ────────────────────────────────────────────────────────────────
+
+/// The narrowest immediate field that can hold `value`.
+///
+/// `i8::try_from` / `i32::try_from`, never `as i8` / `as i32`. A raw narrowing
+/// here is a wrong-code bug of exactly the shape `disp.rs` was written to
+/// close: `128 as i8` is `-128`, and an `AND r64, -128` where `AND r64, 128`
+/// was meant clears the wrong bits.
+pub fn imm_form_for(value: i64) -> Option<ImmForm> {
+    if i8::try_from(value).is_ok() {
+        Some(ImmForm::Imm8)
+    } else if i32::try_from(value).is_ok() {
+        Some(ImmForm::Imm32)
+    } else {
+        None
+    }
+}
+
+/// The machine operation an IR binary node performs, and the operand type to
+/// perform it at.
+///
+/// `And` / `Or` / `Xor` come back as [`Ty::I64`] for an `Int` node too, which
+/// is what `ir_lower` already does (`[0x48, 0x21, 0xC8]` for every `Op::And`):
+/// the low 32 bits of a 64-bit bitwise operation are the 32-bit result, so the
+/// wide form is correct for both and there is only one row to keep honest.
+fn alu_op_of(op: &IrOp, ty: Ty) -> Option<(Op, Ty)> {
+    Some(match op {
+        IrOp::Add => (Op::Add, ty),
+        IrOp::Sub => (Op::Sub, ty),
+        IrOp::Mul => (Op::Imul, ty),
+        IrOp::And => (Op::And, Ty::I64),
+        IrOp::Or => (Op::Or, Ty::I64),
+        IrOp::Xor => (Op::Xor, Ty::I64),
+        _ => return None,
+    })
+}
+
+/// Is this operation commutative, i.e. may the selector fold either operand?
+fn commutative(op: &IrOp) -> bool {
+    matches!(op, IrOp::Add | IrOp::Mul | IrOp::And | IrOp::Or | IrOp::Xor)
+}
+
+/// Does the left-hand side need copying before a two-address ALU instruction
+/// overwrites it?
+///
+/// `dst <- lhs op rhs` compiles to `OP dst, rhs` with `dst` and `lhs` coalesced.
+/// That is only legal when `lhs` dies at this node — one consumer, and no deopt
+/// frame naming it. Otherwise the tile pays for a `MOV` first, and that cost is
+/// exactly what makes the non-destructive `LEA` win the comparison.
+fn needs_copy(ctx: &SelCtx, lhs: NodeId) -> bool {
+    !ctx.uses.single_use(lhs)
+}
+
+/// `LEA` for an add / shift / multiply tree.
+fn tile_lea(ctx: &SelCtx, root: NodeId, claimed: &[bool], notes: &mut Vec<Note>) -> Option<Tile> {
+    // 32-bit `LEA` (`8D /r` with REX.W clear) is correct for `int` arithmetic —
+    // it truncates to 32 bits, which is exactly Java's wrap — but the table has
+    // no row for it, and emitting the 64-bit form instead would leave garbage in
+    // the high half of a slot that `Op::Return` copies out whole. Refuse rather
+    // than guess; see the doc's "still unvalidated" section.
+    let ty = ctx.int_ty(root)?;
+    if ty != Ty::I64 {
+        return None;
+    }
+    let m = match match_address(ctx, root) {
+        Ok(m) => m,
+        // `NotAnAddress` only means "this rule does not apply to this node",
+        // which is true of most nodes and is not worth a note. Everything else
+        // is a rule that *wanted* to fire and could not, which is.
+        Err(AddrRefusal::NotAnAddress(_)) => return None,
+        Err(why) => {
+            notes.push(Note::Address { root, why });
+            return None;
+        }
+    };
+    // One term is a copy or an add, not an address.
+    if m.addr.terms() < 2 {
+        return None;
+    }
+    for &id in &m.absorbed {
+        if id != root && claimed.get(id as usize).copied().unwrap_or(true) {
+            return None;
+        }
+    }
+    Some(Tile::new(
+        root,
+        m.absorbed.clone(),
+        vec![MInst::Lea {
+            dst: root,
+            ty,
+            addr: m.addr,
+        }],
+        Rule::Lea,
+    ))
+}
+
+/// The register / immediate / folded-load forms of a binary integer node.
+fn tiles_alu(
+    ctx: &SelCtx,
+    root: NodeId,
+    claimed: &[bool],
+    opts: &SelectOptions,
+    notes: &mut Vec<Note>,
+) -> Vec<Tile> {
+    let mut out = Vec::new();
+    let node = match ctx.graph.node_opt(root) {
+        Some(n) => n,
+        None => return out,
+    };
+    let ty = match ctx.int_ty(root) {
+        Some(t) => t,
+        None => return out,
+    };
+    let (op, opty) = match alu_op_of(&node.op, ty) {
+        Some(p) => p,
+        None => return out,
+    };
+    let (lhs, rhs) = match (node.input_opt(0), node.input_opt(1)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return out,
+    };
+
+    // The two-address fixup copies the *whole* register: there is no such
+    // thing as copying half a value, and `ir_lower` stores every value in a
+    // 64-bit frame slot. Always `Ty::I64`, so the copy has a table row for
+    // both `int` and `long` operands.
+    let prefix = |lhs: NodeId| -> Vec<MInst> {
+        if needs_copy(ctx, lhs) {
+            vec![MInst::Move {
+                dst: root,
+                ty: Ty::I64,
+                src: lhs,
+            }]
+        } else {
+            Vec::new()
+        }
+    };
+
+    // ── constant into the immediate field ────────────────────────────────
+    //
+    // `Sub` is not commutative, so only its right operand may become an
+    // immediate; the others may take either.
+    let const_side = match (ctx.const_of(lhs), ctx.const_of(rhs)) {
+        (_, Some(c)) => Some((lhs, rhs, c)),
+        (Some(c), None) if commutative(&node.op) => Some((rhs, lhs, c)),
+        _ => None,
+    };
+    if let Some((reg, kn, c)) = const_side {
+        match imm_form_for(c) {
+            Some(form) => {
+                let mut covered = vec![root];
+                if ctx.absorbable(kn) && !claimed.get(kn as usize).copied().unwrap_or(true) {
+                    covered.push(kn);
+                }
+                let mut insts = prefix(reg);
+                insts.push(MInst::AluRI {
+                    op,
+                    ty: opty,
+                    dst: root,
+                    lhs: reg,
+                    imm: c,
+                    form,
+                });
+                out.push(Tile::new(root, covered, insts, Rule::AluImm));
+            }
+            None => notes.push(Note::WideImmediate { root, value: c }),
+        }
+    }
+
+    // ── a load folded into the memory operand ────────────────────────────
+    if opts.fold_loads {
+        // `Sub` may only fold its right operand: `SUB dst, [m]` is
+        // `dst - [m]`, and there is no `[m] - dst` form.
+        let mut candidates: Vec<(NodeId, NodeId)> = vec![(lhs, rhs)];
+        if commutative(&node.op) {
+            candidates.push((rhs, lhs));
+        }
+        for (keep, fold) in candidates {
+            match may_fold_load(ctx, fold, root) {
+                Ok(()) => {
+                    if claimed.get(fold as usize).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let mut insts = prefix(keep);
+                    insts.push(MInst::AluRM {
+                        op,
+                        ty: opty,
+                        dst: root,
+                        lhs: keep,
+                        addr: AddrSource::Opaque(fold),
+                        load: fold,
+                    });
+                    out.push(Tile::new(
+                        root,
+                        vec![root, fold],
+                        insts,
+                        Rule::AluFoldedLoad,
+                    ));
+                    break;
+                }
+                Err(why) => notes.push(Note::Fold { user: root, why }),
+            }
+        }
+    }
+
+    // ── plain register form ──────────────────────────────────────────────
+    let mut insts = prefix(lhs);
+    insts.push(MInst::AluRR {
+        op,
+        ty: opty,
+        dst: root,
+        lhs,
+        rhs,
+    });
+    out.push(Tile::new(root, vec![root], insts, Rule::AluReg));
+    out
+}
+
+/// The operand a compare absorbed into its immediate field or into `TEST`,
+/// as a (possibly empty) cover list.
+fn absorbed_operand(ctx: &SelCtx, id: NodeId, claimed: &[bool]) -> Vec<NodeId> {
+    if ctx.absorbable(id) && !claimed.get(id as usize).copied().unwrap_or(true) {
+        vec![id]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The flag-setting half of a comparison, shared by the fused-branch and the
+/// materialising forms.
+///
+/// Returns the instructions plus the extra node the compare absorbed (the zero
+/// constant, when `TEST` replaced `CMP r, 0`).
+fn compare_insts(
+    ctx: &SelCtx,
+    cmp: NodeId,
+    claimed: &[bool],
+) -> Option<(Vec<MInst>, Vec<NodeId>, bool)> {
+    let node = ctx.graph.node_opt(cmp)?;
+    let (a, b) = (node.input_opt(0)?, node.input_opt(1)?);
+    // A reference comparison must compare all 64 bits: two distinct objects
+    // 4 GiB apart agree in their low word, and so does a heap pointer whose low
+    // word happens to be zero and `null`. `int_ty` already maps `Ref` to
+    // `Ty::I64`; take the wider of the two operand types so a mixed pair
+    // (a `Ref` against an `Int`-typed null constant) still compares wide.
+    let ty = match (ctx.int_ty(a), ctx.int_ty(b)) {
+        (Some(Ty::I64), _) | (_, Some(Ty::I64)) => Ty::I64,
+        (Some(t), _) => t,
+        (_, Some(t)) => t,
+        _ => return None,
+    };
+    // `CMP r, 0` -> `TEST r, r`.
+    if ctx.const_of(b) == Some(0) {
+        let extra = absorbed_operand(ctx, b, claimed);
+        return Some((vec![MInst::TestRR { ty, reg: a }], extra, false));
+    }
+    if ctx.const_of(a) == Some(0) {
+        let extra = absorbed_operand(ctx, a, claimed);
+        // The operands swapped, so the condition has to be mirrored by the
+        // caller; report that rather than silently comparing backwards.
+        return Some((vec![MInst::TestRR { ty, reg: b }], extra, true));
+    }
+    // `CMP r, imm`.
+    if let Some(c) = ctx.const_of(b) {
+        if let Some(form) = imm_form_for(c) {
+            let extra = absorbed_operand(ctx, b, claimed);
+            return Some((
+                vec![MInst::CmpRI {
+                    ty,
+                    lhs: a,
+                    imm: c,
+                    form,
+                }],
+                extra,
+                false,
+            ));
+        }
+    }
+    Some((vec![MInst::CmpRR { ty, lhs: a, rhs: b }], Vec::new(), false))
+}
+
+/// Mirror a condition for swapped operands: `a < b` becomes `b > a`.
+///
+/// Not the same as [`CmpOp::negate`] — negation is for inverting a *branch*,
+/// this is for exchanging the operands, and confusing the two inverts the
+/// program.
+fn mirror(cc: CmpOp) -> CmpOp {
+    match cc {
+        CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Ne => CmpOp::Ne,
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Ge => CmpOp::Le,
+    }
+}
+
+/// `Op::Cmp` whose 0/1 value is actually read: `CMP; SETcc; MOVZX`.
+fn tile_cmp_setcc(ctx: &SelCtx, root: NodeId, claimed: &[bool]) -> Option<Tile> {
+    let cc = match ctx.graph.node_opt(root)?.op {
+        IrOp::Cmp(cc) => cc,
+        _ => return None,
+    };
+    let (mut insts, extra, swapped) = compare_insts(ctx, root, claimed)?;
+    let cc = if swapped { mirror(cc) } else { cc };
+    insts.push(MInst::SetCc { dst: root, cc });
+    let mut covered = vec![root];
+    covered.extend(extra);
+    Some(Tile::new(root, covered, insts, Rule::CmpSetCc))
+}
+
+/// The terminator's candidate tiles, **most preferred first**.
+///
+/// Two candidates at most: the fused `CMP; Jcc` (or `TEST; Jcc`) when the
+/// compare exists only to feed this branch, and the unfused `TEST cond, cond;
+/// JNE` that `ir_lower::lower_terminator` already emits. The list is ordered
+/// rather than costed because the second entry is a *fall-back*, not a rival:
+/// the caller takes the first one the encodability gate admits, so a fused
+/// form the table cannot encode degrades to the form it can instead of
+/// degrading to nothing.
+fn tile_terminator(ctx: &SelCtx, term: NodeId, claimed: &[bool]) -> Vec<Tile> {
+    let mut out = Vec::new();
+    let node = match ctx.graph.node_opt(term) {
+        Some(n) => n,
+        None => return out,
+    };
+    if !matches!(node.op, IrOp::If) {
+        return out;
+    }
+    let cond = match node.input_opt(1) {
+        Some(c) => c,
+        None => return out,
+    };
+    // Fuse only when the compare exists solely to feed this branch. A compare
+    // with a second consumer still has to materialise its 0/1 value, and
+    // fusing would delete it. It must also be in *this* block: a compare the
+    // scheduler placed in a dominator computes flags that any instruction in
+    // between would have destroyed.
+    let cmp_cc = match ctx.graph.node_opt(cond).map(|n| &n.op) {
+        Some(&IrOp::Cmp(cc)) if ctx.in_block(cond) && ctx.uses.single_use(cond) => Some(cc),
+        _ => None,
+    };
+    if let Some(cc) = cmp_cc {
+        if let Some((mut insts, extra, swapped)) = compare_insts(ctx, cond, claimed) {
+            let cc = if swapped { mirror(cc) } else { cc };
+            let is_test = insts.iter().any(|i| matches!(i, MInst::TestRR { .. }));
+            insts.push(MInst::Jcc { cc, at: term });
+            let mut covered = vec![term, cond];
+            covered.extend(extra);
+            let rule = if is_test {
+                Rule::TestZeroBranch
+            } else {
+                Rule::CmpBranch
+            };
+            out.push(Tile::new(term, covered, insts, rule));
+        }
+    }
+    // The fall-back: `TEST cond, cond; JNE`, which is byte-for-byte what
+    // `ir_lower::lower_terminator` already emits.
+    let ty = ctx.int_ty(cond).unwrap_or(Ty::I32);
+    out.push(Tile::new(
+        term,
+        vec![term],
+        vec![
+            MInst::TestRR { ty, reg: cond },
+            MInst::Jcc {
+                cc: CmpOp::Ne,
+                at: term,
+            },
+        ],
+        Rule::TestBranch,
+    ));
+    out
+}
+
+// ── The driver ───────────────────────────────────────────────────────────
+
+/// Select instructions for one scheduled basic block.
+///
+/// `block` is the block's data nodes in the order `ir_lower` will emit them
+/// (`ir_schedule::Block::nodes`), and `terminator` its `Op::If` / `Op::Return`
+/// (`ir_schedule::Block::terminator`).
+///
+/// # Algorithm
+///
+/// Maximal munch in two passes, because a tile that absorbs a node has to claim
+/// it *before* the node's own position is reached:
+///
+/// 1. **Claim, in reverse order.** The terminator goes first (it is the last
+///    thing in the block and it is the one that can fuse a compare), then each
+///    node from the end backwards. Each unclaimed node offers its candidate
+///    tiles; the cheapest by [`Tile::net_key`] — cost minus what it displaces
+///    — wins and claims its interior nodes. Reverse order is what gives the
+///    *consumer* first refusal on its operands, which is the direction folding
+///    moves in.
+/// 2. **Emit, in forward order.** Every node that is still a root emits its
+///    tile, in the block's own order, and the terminator's tile goes last.
+///
+/// # Guarantees
+///
+/// * Total — never panics, never fails. A malformed node becomes a
+///   [`Rule::Generic`] tile.
+/// * Every node in `block` is covered exactly once
+///   ([`BlockSelection::covers`]).
+/// * Under the default [`SelectOptions`], every non-generic tile has a proven
+///   encoding.
+pub fn select_block(
+    graph: &Graph,
+    block: &[NodeId],
+    terminator: Option<NodeId>,
+    opts: &SelectOptions,
+) -> BlockSelection {
+    let ctx = SelCtx::new(graph, block);
+    let n = graph.nodes.len();
+    let mut claimed = vec![false; n];
+    let mut chosen: Vec<Option<Tile>> = (0..n).map(|_| None).collect();
+    let mut notes: Vec<Note> = Vec::new();
+
+    // Pass 1a: the terminator.
+    //
+    // A terminator ALWAYS gets a tile. A branch that selection declined to
+    // cover is a branch nobody emits, which is the one failure this design
+    // must not have: when the fused form is refused, the fall-back is the
+    // unfused `TEST; Jcc`, and when that is refused too it is a
+    // `Rule::Generic` tile naming the `Op::If`.
+    let term_tile = terminator.map(|t| {
+        let tile = tile_terminator(&ctx, t, &claimed)
+            .into_iter()
+            .find_map(|tile| admit(tile, opts, &mut notes))
+            .unwrap_or_else(|| Tile::generic(t));
+        mark_claims(&tile, &mut claimed);
+        tile
+    });
+
+    // Pass 1b: the data nodes, back to front.
+    for &id in block.iter().rev() {
+        if claimed.get(id as usize).copied().unwrap_or(false) {
+            continue;
+        }
+        let mut cands: Vec<Tile> = Vec::new();
+        if let Some(t) = tile_lea(&ctx, id, &claimed, &mut notes) {
+            cands.push(t);
+        }
+        cands.extend(tiles_alu(&ctx, id, &claimed, opts, &mut notes));
+        if let Some(t) = tile_cmp_setcc(&ctx, id, &claimed) {
+            cands.push(t);
+        }
+        let best = cands
+            .into_iter()
+            .filter_map(|t| admit(t, opts, &mut notes))
+            .min_by_key(|t| t.net_key())
+            .unwrap_or_else(|| Tile::generic(id));
+        mark_claims(&best, &mut claimed);
+        if let Some(slot) = chosen.get_mut(id as usize) {
+            *slot = Some(best);
+        }
+    }
+
+    // Pass 2: emit in block order.
+    let mut tiles = Vec::with_capacity(block.len());
+    for &id in block {
+        let taken = chosen.get_mut(id as usize).and_then(|s| s.take());
+        if let Some(t) = taken {
+            tiles.push(t);
+        }
+    }
+    if let Some(t) = term_tile {
+        tiles.push(t);
+    }
+    let cost = tiles
+        .iter()
+        .fold(SeqCost::default(), |acc, t| acc.then(t.cost));
+    BlockSelection { tiles, cost, notes }
+}
+
+/// Mark every node a tile absorbed (its root excepted) as claimed.
+fn mark_claims(t: &Tile, claimed: &mut [bool]) {
+    for &c in &t.covered {
+        if c == t.root {
+            continue;
+        }
+        if let Some(slot) = claimed.get_mut(c as usize) {
+            *slot = true;
+        }
+    }
+}
+
+/// Admit a tile, or record why the table cannot encode it.
+///
+/// The fail-closed step: under [`SelectOptions::require_encodable`] a tile the
+/// pattern table cannot produce bytes for is **discarded**, so the node falls
+/// back to the generic lowering instead of being selected into an instruction
+/// nobody can emit.
+fn admit(t: Tile, opts: &SelectOptions, notes: &mut Vec<Note>) -> Option<Tile> {
+    if !opts.require_encodable {
+        return Some(t);
+    }
+    match t.encodable() {
+        Ok(()) => Some(t),
+        Err(why) => {
+            notes.push(Note::Unencodable {
+                root: t.root,
+                rule: t.rule,
+                why,
+            });
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3937,5 +5797,1037 @@ mod tests {
             decoded_rows += 1;
         }
         assert_eq!(decoded_rows, PATTERNS.len());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // IR-level instruction selection
+    // ══════════════════════════════════════════════════════════════════════
+
+    use crate::ir::{MemKind, SafepointSnapshot, NO_NODE};
+
+    /// A bare graph. `Graph`'s fields are public and `UseLists` derives
+    /// `Default`, which is how `ir_schedule`'s own tests build one.
+    fn g() -> Graph {
+        Graph {
+            nodes: Vec::new(),
+            entry: NO_NODE,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        }
+    }
+
+    fn konst(graph: &mut Graph, v: i64) -> NodeId {
+        graph.add(IrOp::Const(v), IrType::Long, vec![], None)
+    }
+
+    fn konst_i32(graph: &mut Graph, v: i64) -> NodeId {
+        graph.add(IrOp::Const(v), IrType::Int, vec![], None)
+    }
+
+    fn param(graph: &mut Graph, i: u16) -> NodeId {
+        graph.add(IrOp::Param(i), IrType::Long, vec![], None)
+    }
+
+    fn bin(graph: &mut Graph, op: IrOp, a: NodeId, b: NodeId) -> NodeId {
+        graph.add(op, IrType::Long, vec![a, b], None)
+    }
+
+    /// Give `id` a second consumer so it is no longer single-use. Returns the
+    /// consumer, which the caller can leave out of the block under test.
+    fn second_use(graph: &mut Graph, id: NodeId) -> NodeId {
+        graph.add(IrOp::Neg, IrType::Long, vec![id], None)
+    }
+
+    fn ctx_of<'a>(graph: &'a Graph, block: &[NodeId]) -> SelCtx<'a> {
+        SelCtx::new(graph, block)
+    }
+
+    // ── the new ALU rows are the byte literals they claim ─────────────────
+
+    /// Every row added for the IR selector names an `ir_lower.rs` byte
+    /// literal in its `emitter` field. This is that claim, checked: if a row
+    /// and the literal it cites ever disagree, the table is lying about what
+    /// the compiler emits and the selector's cost model is priced off a
+    /// fiction.
+    #[test]
+    fn the_new_alu_rows_reproduce_the_ir_lower_byte_literals() {
+        // `ir_lower::lower_data_node`, Op::Add / Sub / Mul / And / Or / Xor.
+        assert_eq!(sel(&gpr(Op::Add, Ty::I64, RAX, RCX)), vec![0x48, 0x01, 0xC8]);
+        assert_eq!(sel(&gpr(Op::Add, Ty::I32, RAX, RCX)), vec![0x01, 0xC8]);
+        assert_eq!(sel(&gpr(Op::Sub, Ty::I64, RAX, RCX)), vec![0x48, 0x29, 0xC8]);
+        assert_eq!(sel(&gpr(Op::Sub, Ty::I32, RAX, RCX)), vec![0x29, 0xC8]);
+        assert_eq!(sel(&gpr(Op::And, Ty::I64, RAX, RCX)), vec![0x48, 0x21, 0xC8]);
+        assert_eq!(sel(&gpr(Op::Or, Ty::I64, RAX, RCX)), vec![0x48, 0x09, 0xC8]);
+        assert_eq!(sel(&gpr(Op::Xor, Ty::I64, RAX, RCX)), vec![0x48, 0x31, 0xC8]);
+        assert_eq!(
+            sel(&gpr(Op::Imul, Ty::I64, RAX, RCX)),
+            vec![0x48, 0x0F, 0xAF, 0xC1]
+        );
+        assert_eq!(sel(&gpr(Op::Imul, Ty::I32, RAX, RCX)), vec![0x0F, 0xAF, 0xC1]);
+    }
+
+    /// The zeroing idiom and a real `XOR` share an opcode; they must not share
+    /// a row, or a request for `xor a, b` could be answered with `a ^ a`.
+    #[test]
+    fn the_xor_zeroing_idiom_and_a_real_xor_are_different_rows() {
+        let zeroing = select(&gpr_imm(Op::Mov, Ty::I64, RDX, 0)).expect("zeroing");
+        assert_eq!(zeroing.pattern.name, "mov_r64_imm0_xor");
+        let real = select(&gpr(Op::Xor, Ty::I64, RDX, RSI)).expect("xor");
+        assert_eq!(real.pattern.name, "xor_r64_r64");
+        assert_ne!(zeroing.encoded.bytes, real.encoded.bytes);
+    }
+
+    // ── immediate widths ──────────────────────────────────────────────────
+
+    /// The whole point of `imm_form_for`: 128 is NOT an `imm8`. A raw
+    /// `128 as i8` is `-128`, so `AND r, 128` written that way clears every
+    /// bit but the sign bit instead of setting one.
+    #[test]
+    fn immediate_widths_use_checked_conversions_not_casts() {
+        assert_eq!(imm_form_for(0), Some(ImmForm::Imm8));
+        assert_eq!(imm_form_for(127), Some(ImmForm::Imm8));
+        assert_eq!(imm_form_for(-128), Some(ImmForm::Imm8));
+        assert_eq!(imm_form_for(128), Some(ImmForm::Imm32));
+        assert_eq!(imm_form_for(-129), Some(ImmForm::Imm32));
+        assert_eq!(imm_form_for(i64::from(i32::MAX)), Some(ImmForm::Imm32));
+        assert_eq!(imm_form_for(i64::from(i32::MIN)), Some(ImmForm::Imm32));
+        assert_eq!(imm_form_for(i64::from(i32::MAX) + 1), None);
+        assert_eq!(imm_form_for(i64::from(i32::MIN) - 1), None);
+        assert_eq!(imm_form_for(i64::MAX), None);
+        // Restate the bug the checked form prevents.
+        assert_eq!(128u8 as i8, -128);
+    }
+
+    /// A constant too wide for any immediate field must fall back to the
+    /// register form, and say so — never be truncated into the field.
+    #[test]
+    fn a_constant_past_imm32_falls_back_to_the_register_form() {
+        let mut graph = g();
+        let p = param(&mut graph, 0);
+        let big = konst(&mut graph, i64::from(i32::MAX) + 1);
+        let add = bin(&mut graph, IrOp::Add, p, big);
+        let block = vec![big, add];
+        let s = select_block(&graph, &block, None, &SelectOptions::default());
+        assert!(s.covers(&block), "coverage: {s:?}");
+        let root = s
+            .tiles
+            .iter()
+            .find(|t| t.root == add)
+            .expect("the add is a tile root");
+        assert_eq!(
+            root.rule,
+            Rule::AluReg,
+            "a wide constant must not become an immediate"
+        );
+        assert!(
+            s.notes.iter().any(|n| matches!(
+                n,
+                Note::WideImmediate { value, .. } if *value == i64::from(i32::MAX) + 1
+            )),
+            "the refusal must be reported: {:?}",
+            s.notes
+        );
+    }
+
+    #[test]
+    fn a_constant_that_fits_imm8_becomes_an_immediate() {
+        let mut graph = g();
+        let p = param(&mut graph, 0);
+        let k = konst(&mut graph, 24);
+        let add = bin(&mut graph, IrOp::Add, p, k);
+        let block = vec![k, add];
+        let s = select_block(&graph, &block, None, &SelectOptions::default());
+        assert!(s.covers(&block));
+        let root = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(root.rule, Rule::AluImm);
+        assert!(
+            root.covered.contains(&k),
+            "the constant must be absorbed, not left to emit a dead MOV"
+        );
+        assert!(root.insts.iter().any(|i| matches!(
+            i,
+            MInst::AluRI {
+                op: Op::Add,
+                form: ImmForm::Imm8,
+                ..
+            }
+        )));
+    }
+
+    // ── address-mode folding ──────────────────────────────────────────────
+
+    #[test]
+    fn address_folds_base_index_scale_and_displacement() {
+        // p0 + (i << 2) + 16
+        let mut graph = g();
+        let p0 = param(&mut graph, 0);
+        let i = param(&mut graph, 1);
+        let two = konst(&mut graph, 2);
+        let shl = bin(&mut graph, IrOp::Shl, i, two);
+        let sixteen = konst(&mut graph, 16);
+        let a1 = bin(&mut graph, IrOp::Add, p0, shl);
+        let a2 = bin(&mut graph, IrOp::Add, a1, sixteen);
+        let block = vec![two, shl, sixteen, a1, a2];
+        let ctx = ctx_of(&graph, &block);
+        let m = match_address(&ctx, a2).expect("an address");
+        assert_eq!(m.addr.base, Some(p0));
+        assert_eq!(m.addr.index, Some(i));
+        assert_eq!(m.addr.scale, 4);
+        assert_eq!(m.addr.disp, 16);
+        assert_eq!(m.addr.terms(), 3);
+        for n in [a2, a1, shl, two, sixteen] {
+            assert!(m.absorbed.contains(&n), "node {n} must be absorbed");
+        }
+        assert!(m.addr.check().is_ok());
+    }
+
+    /// An interior node with a second consumer keeps its register and becomes
+    /// a plain term. Absorbing it would compute it twice.
+    #[test]
+    fn a_shared_interior_node_is_not_absorbed() {
+        let mut graph = g();
+        let p0 = param(&mut graph, 0);
+        let i = param(&mut graph, 1);
+        let two = konst(&mut graph, 2);
+        let shl = bin(&mut graph, IrOp::Shl, i, two);
+        let add = bin(&mut graph, IrOp::Add, p0, shl);
+        // A second consumer of the shift, outside the block under test.
+        let _other = second_use(&mut graph, shl);
+        let block = vec![two, shl, add];
+        let ctx = ctx_of(&graph, &block);
+        let m = match_address(&ctx, add).expect("an address");
+        assert_eq!(m.addr.base, Some(p0));
+        assert_eq!(
+            m.addr.index,
+            Some(shl),
+            "the shared shift stays a value and becomes the index itself"
+        );
+        assert_eq!(m.addr.scale, 1, "its scale is gone with it");
+        assert!(!m.absorbed.contains(&shl));
+    }
+
+    /// A node the scheduler put in another block must not be pulled in: it
+    /// would be recomputed here *and* still computed there.
+    #[test]
+    fn an_out_of_block_interior_node_is_not_absorbed() {
+        let mut graph = g();
+        let p0 = param(&mut graph, 0);
+        let i = param(&mut graph, 1);
+        let two = konst(&mut graph, 2);
+        let shl = bin(&mut graph, IrOp::Shl, i, two);
+        let add = bin(&mut graph, IrOp::Add, p0, shl);
+        // `shl` is single-use but lives elsewhere.
+        let block = vec![add];
+        let ctx = ctx_of(&graph, &block);
+        let m = match_address(&ctx, add).expect("an address");
+        assert_eq!(m.addr.index, Some(shl));
+        assert_eq!(m.addr.scale, 1);
+        assert!(!m.absorbed.contains(&shl));
+    }
+
+    /// The checked-displacement gate. `Disp::encode32` refuses, so the address
+    /// is refused — it is never truncated into a 32-bit field.
+    #[test]
+    fn a_displacement_past_disp32_is_refused_not_truncated() {
+        let mut graph = g();
+        let p0 = param(&mut graph, 0);
+        let far = konst(&mut graph, 1i64 << 40);
+        let add = bin(&mut graph, IrOp::Add, p0, far);
+        let block = vec![far, add];
+        let ctx = ctx_of(&graph, &block);
+        assert_eq!(
+            match_address(&ctx, add),
+            Err(AddrRefusal::Unencodable(SelError::Disp(DispOutOfRange {
+                value: 1i64 << 40
+            })))
+        );
+        // And the selector must not choose an LEA it cannot encode.
+        let s = select_block(&graph, &block, None, &SelectOptions::default());
+        assert!(s.covers(&block));
+        assert!(
+            !s.matched().any(|t| t.rule == Rule::Lea),
+            "no LEA may survive an unencodable displacement"
+        );
+    }
+
+    #[test]
+    fn a_folded_displacement_cannot_wrap() {
+        let mut graph = g();
+        let p0 = param(&mut graph, 0);
+        let a = konst(&mut graph, i64::MAX);
+        let b = konst(&mut graph, 1);
+        let s1 = bin(&mut graph, IrOp::Add, p0, a);
+        let s2 = bin(&mut graph, IrOp::Add, s1, b);
+        let block = vec![a, b, s1, s2];
+        let ctx = ctx_of(&graph, &block);
+        // `checked_add` refuses; a wrapping add would have produced
+        // `i64::MIN`, which is not "a small displacement" either but *is* a
+        // different, silently wrong answer.
+        assert!(matches!(
+            match_address(&ctx, s2),
+            Err(AddrRefusal::DispOverflow(_)) | Err(AddrRefusal::Unencodable(_))
+        ));
+    }
+
+    #[test]
+    fn small_multiplies_become_two_term_addresses() {
+        for (mult, want_scale) in [(3i64, 2u8), (5, 4), (9, 8)] {
+            let mut graph = g();
+            let x = param(&mut graph, 0);
+            let k = konst(&mut graph, mult);
+            let mul = bin(&mut graph, IrOp::Mul, x, k);
+            let block = vec![k, mul];
+            let ctx = ctx_of(&graph, &block);
+            let m = match_address(&ctx, mul)
+                .unwrap_or_else(|e| panic!("x*{mult} must be an address: {e:?}"));
+            assert_eq!(m.addr.base, Some(x));
+            assert_eq!(m.addr.index, Some(x));
+            assert_eq!(m.addr.scale, want_scale);
+            assert_eq!(m.addr.disp, 0);
+            assert!(m.addr.check().is_ok());
+        }
+    }
+
+    /// `x*4` needs `[x*4]` — no base — which `Mem` cannot express. Refuse
+    /// rather than emit an operand nobody can lower.
+    #[test]
+    fn a_base_less_address_is_refused() {
+        let mut graph = g();
+        let x = param(&mut graph, 0);
+        let k = konst(&mut graph, 4);
+        let mul = bin(&mut graph, IrOp::Mul, x, k);
+        let block = vec![k, mul];
+        let ctx = ctx_of(&graph, &block);
+        assert_eq!(match_address(&ctx, mul), Err(AddrRefusal::NotAnAddress(mul)));
+        // And the type itself refuses a base-less operand outright.
+        let bare = IrAddr {
+            base: None,
+            index: Some(x),
+            scale: 4,
+            disp: 0,
+        };
+        assert_eq!(bare.check(), Err(SelError::NoBaseRegister));
+    }
+
+    #[test]
+    fn an_illegal_scale_is_refused() {
+        let bad = IrAddr {
+            base: Some(0),
+            index: Some(1),
+            scale: 3,
+            disp: 0,
+        };
+        assert_eq!(bad.check(), Err(SelError::BadScale { scale: 3 }));
+    }
+
+    #[test]
+    fn the_address_walk_is_bounded() {
+        let mut graph = g();
+        let mut acc = param(&mut graph, 0);
+        let mut block = Vec::new();
+        for n in 0..(ADDR_MATCH_BUDGET as i64 + 8) {
+            let k = konst(&mut graph, n);
+            acc = bin(&mut graph, IrOp::Add, acc, k);
+            block.push(k);
+            block.push(acc);
+        }
+        let ctx = ctx_of(&graph, &block);
+        assert_eq!(match_address(&ctx, acc), Err(AddrRefusal::Budget));
+    }
+
+    // ── LEA versus the two-address ALU form ───────────────────────────────
+
+    /// `LEA` is non-destructive, so it wins exactly when the left operand is
+    /// still live and the ALU form would need a `MOV` first. This is the cost
+    /// model doing real work: neither instruction is unconditionally better.
+    #[test]
+    fn lea_wins_only_when_the_alu_form_would_need_a_copy() {
+        // (a) left operand dies here: plain ADD is cheaper.
+        let mut graph = g();
+        let p = param(&mut graph, 0);
+        let q = param(&mut graph, 1);
+        let add = bin(&mut graph, IrOp::Add, p, q);
+        let block = vec![add];
+        let s = select_block(&graph, &block, None, &SelectOptions::default());
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(t.rule, Rule::AluReg, "a dying operand needs no copy");
+
+        // (b) left operand is live afterwards: the copy makes LEA cheaper.
+        let mut graph = g();
+        let p = param(&mut graph, 0);
+        let q = param(&mut graph, 1);
+        let add = bin(&mut graph, IrOp::Add, p, q);
+        let _keep = second_use(&mut graph, p);
+        let block = vec![add];
+        let s = select_block(&graph, &block, None, &SelectOptions::default());
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(t.rule, Rule::Lea, "a live operand makes the copy real");
+        assert!(matches!(t.insts.as_slice(), [MInst::Lea { .. }]));
+    }
+
+    /// Ranking is micro-ops first. A three-byte `MOV` plus a three-byte `ADD`
+    /// is *more* bytes than a four-byte `LEA`, but the point of the ordering is
+    /// that it would still lose on micro-ops even if it were shorter.
+    #[test]
+    fn the_cost_key_ranks_micro_ops_before_bytes() {
+        let cheap = SeqCost {
+            bytes: 12,
+            uops: 1,
+            latency: 1,
+        };
+        let dear = SeqCost {
+            bytes: 2,
+            uops: 2,
+            latency: 1,
+        };
+        assert!(cheap.key() < dear.key());
+        assert_eq!(
+            SeqCost::of(Cost::new(3, 1, 1))
+                .then(SeqCost::of(Cost::new(3, 1, 1)))
+                .key(),
+            (2, 6, 2)
+        );
+    }
+
+    /// The generic lowering has to be the most expensive thing the model can
+    /// name, or a rule that covers more nodes would never be preferred.
+    #[test]
+    fn the_generic_lowering_is_the_most_expensive_option() {
+        let generic = SeqCost::of(GENERIC_COST);
+        for i in [
+            MInst::AluRR {
+                op: Op::Add,
+                ty: Ty::I64,
+                dst: 0,
+                lhs: 1,
+                rhs: 2,
+            },
+            MInst::Lea {
+                dst: 0,
+                ty: Ty::I64,
+                addr: IrAddr {
+                    base: Some(1),
+                    index: Some(2),
+                    scale: 8,
+                    disp: 64,
+                },
+            },
+            MInst::CmpRR {
+                ty: Ty::I64,
+                lhs: 0,
+                rhs: 1,
+            },
+        ] {
+            assert!(
+                i.cost().key() < generic.key(),
+                "{i:?} must be cheaper than the generic lowering"
+            );
+        }
+    }
+
+    // ── compare / branch fusion ───────────────────────────────────────────
+
+    /// Build `if (a <cc> b) …` with the compare feeding only the branch.
+    fn cmp_branch_graph(cc: CmpOp, rhs_zero: bool) -> (Graph, NodeId, NodeId, Vec<NodeId>) {
+        let mut graph = g();
+        let start = graph.add(IrOp::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(IrOp::Proj(0), IrType::Control, vec![start], None);
+        let a = graph.add(IrOp::Param(0), IrType::Int, vec![], None);
+        let b = if rhs_zero {
+            konst_i32(&mut graph, 0)
+        } else {
+            graph.add(IrOp::Param(1), IrType::Int, vec![], None)
+        };
+        let cmp = graph.add(IrOp::Cmp(cc), IrType::Int, vec![a, b], None);
+        let iff = graph.add(IrOp::If, IrType::Control, vec![ctrl, cmp], None);
+        let block = if rhs_zero { vec![b, cmp] } else { vec![cmp] };
+        (graph, cmp, iff, block)
+    }
+
+    #[test]
+    fn a_compare_that_only_feeds_a_branch_is_fused_into_it() {
+        let (graph, cmp, iff, block) = cmp_branch_graph(CmpOp::Lt, false);
+        let s = select_block(&graph, &block, Some(iff), &SelectOptions::default());
+        assert!(s.covers(&block), "coverage: {s:?}");
+        let t = s.tiles.last().expect("a terminator tile");
+        assert_eq!(t.rule, Rule::CmpBranch);
+        assert!(t.covered.contains(&cmp), "the compare is consumed");
+        assert!(matches!(
+            t.insts.as_slice(),
+            [MInst::CmpRR { .. }, MInst::Jcc { cc: CmpOp::Lt, .. }]
+        ));
+        // No SETcc/MOVZX anywhere: that is the whole saving.
+        assert!(!s
+            .tiles
+            .iter()
+            .flat_map(|t| t.insts.iter())
+            .any(|i| matches!(i, MInst::SetCc { .. })));
+    }
+
+    #[test]
+    fn a_compare_against_zero_becomes_test() {
+        let (graph, cmp, iff, block) = cmp_branch_graph(CmpOp::Ne, true);
+        let s = select_block(&graph, &block, Some(iff), &SelectOptions::default());
+        assert!(s.covers(&block), "coverage: {s:?}");
+        let t = s.tiles.last().expect("a terminator tile");
+        assert_eq!(t.rule, Rule::TestZeroBranch);
+        assert!(t.covered.contains(&cmp));
+        assert!(matches!(
+            t.insts.as_slice(),
+            [MInst::TestRR { ty: Ty::I32, .. }, MInst::Jcc { cc: CmpOp::Ne, .. }]
+        ));
+        // `TEST r32, r32` is two bytes where `CMP r32, imm8` is three.
+        assert_eq!(
+            MInst::TestRR {
+                ty: Ty::I32,
+                reg: 0
+            }
+            .cost()
+            .bytes,
+            2
+        );
+    }
+
+    /// A zero on the *left* means the operands swapped, so the condition has
+    /// to be mirrored — not negated. `0 < x` is `x > 0`, never `x >= 0`.
+    #[test]
+    fn a_zero_on_the_left_mirrors_the_condition() {
+        let mut graph = g();
+        let start = graph.add(IrOp::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(IrOp::Proj(0), IrType::Control, vec![start], None);
+        let zero = konst_i32(&mut graph, 0);
+        let x = graph.add(IrOp::Param(0), IrType::Int, vec![], None);
+        let cmp = graph.add(IrOp::Cmp(CmpOp::Lt), IrType::Int, vec![zero, x], None);
+        let iff = graph.add(IrOp::If, IrType::Control, vec![ctrl, cmp], None);
+        let block = vec![zero, cmp];
+        let s = select_block(&graph, &block, Some(iff), &SelectOptions::default());
+        let t = s.tiles.last().expect("terminator");
+        assert!(
+            matches!(
+                t.insts.as_slice(),
+                [MInst::TestRR { reg, .. }, MInst::Jcc { cc: CmpOp::Gt, .. }] if *reg == x
+            ),
+            "0 < x must become TEST x,x / JG, got {:?}",
+            t.insts
+        );
+        // Mirroring is not negation.
+        assert_eq!(mirror(CmpOp::Lt), CmpOp::Gt);
+        assert_eq!(CmpOp::Lt.negate(), CmpOp::Ge);
+    }
+
+    /// A compare with a second consumer still has to produce its 0/1 value, so
+    /// the branch may not consume it.
+    #[test]
+    fn a_compare_with_a_second_consumer_is_not_fused() {
+        let (mut graph, cmp, iff, block) = cmp_branch_graph(CmpOp::Eq, false);
+        let _other = graph.add(IrOp::Neg, IrType::Int, vec![cmp], None);
+
+        // Without the encodability gate, the rule that fires is `CMP; SETcc`.
+        let lax = select_block(
+            &graph,
+            &block,
+            Some(iff),
+            &SelectOptions {
+                require_encodable: false,
+                fold_loads: false,
+            },
+        );
+        let own = lax.tiles.iter().find(|t| t.root == cmp).expect("cmp tile");
+        assert_eq!(own.rule, Rule::CmpSetCc);
+        assert!(own.insts.iter().any(|i| matches!(i, MInst::SetCc { .. })));
+
+        // With it, `SETcc` has no row (its 8-bit destination needs a REX rule
+        // the table does not state), so the compare falls back to the generic
+        // lowering — which is byte-for-byte what `ir_lower` emits today.
+        let s = select_block(&graph, &block, Some(iff), &SelectOptions::default());
+        assert!(s.covers(&block));
+        let term = s.tiles.last().expect("terminator");
+        assert_eq!(term.rule, Rule::TestBranch);
+        assert!(!term.covered.contains(&cmp));
+        let own = s.tiles.iter().find(|t| t.root == cmp).expect("cmp tile");
+        assert_eq!(own.rule, Rule::Generic);
+        assert!(s.notes.iter().any(|n| matches!(
+            n,
+            Note::Unencodable {
+                rule: Rule::CmpSetCc,
+                ..
+            }
+        )));
+    }
+
+    /// A compare the scheduler put in another block cannot be fused: the
+    /// instructions in between would have destroyed the flags.
+    #[test]
+    fn an_out_of_block_compare_is_not_fused() {
+        let (graph, cmp, iff, _block) = cmp_branch_graph(CmpOp::Eq, false);
+        let block: Vec<NodeId> = Vec::new();
+        let s = select_block(&graph, &block, Some(iff), &SelectOptions::default());
+        let term = s.tiles.last().expect("terminator");
+        assert_eq!(term.rule, Rule::TestBranch);
+        assert!(!term.covered.contains(&cmp));
+    }
+
+    // ── the load-folding gate ─────────────────────────────────────────────
+
+    /// `[ctrl, mem, base, offset]` load / `[ctrl, mem, base, offset, value]`
+    /// store over one base, with constant offsets so the alias model can prove
+    /// (or refuse) disjointness.
+    struct MemFixture {
+        graph: Graph,
+        load: NodeId,
+        store: NodeId,
+        add: NodeId,
+        block: Vec<NodeId>,
+    }
+
+    fn mem_fixture(load_off: i64, store_off: i64) -> MemFixture {
+        let mut graph = g();
+        let start = graph.add(IrOp::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(IrOp::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(IrOp::Proj(1), IrType::Memory, vec![start], None);
+        let base = graph.add(IrOp::Param(0), IrType::Ref, vec![], None);
+        let lo = graph.add(IrOp::Const(load_off), IrType::Int, vec![], None);
+        let so = graph.add(IrOp::Const(store_off), IrType::Int, vec![], None);
+        let val = graph.add(IrOp::Param(1), IrType::Int, vec![], None);
+        let load = graph.add(
+            IrOp::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, mem, base, lo],
+            None,
+        );
+        // The builder threads the token through the load, so the store's
+        // slot-1 edge names it. That edge must NOT count as a value use.
+        let store = graph.add(
+            IrOp::Store(MemKind::Int),
+            IrType::Void,
+            vec![ctrl, load, base, so, val],
+            None,
+        );
+        let other = graph.add(IrOp::Param(2), IrType::Int, vec![], None);
+        let add = graph.add(IrOp::Add, IrType::Int, vec![other, load], None);
+        let block = vec![load, store, add];
+        MemFixture {
+            graph,
+            load,
+            store,
+            add,
+            block,
+        }
+    }
+
+    #[test]
+    fn the_memory_token_edge_is_not_a_value_use() {
+        let f = mem_fixture(1, 1);
+        let uses = ValueUses::of(&f.graph);
+        assert_eq!(
+            uses.count(f.load),
+            1,
+            "the store's token edge must not count; only the Add reads the value"
+        );
+        assert!(uses.single_use(f.load));
+    }
+
+    /// The defect this gate exists to prevent: folding the load into the Add
+    /// moves it past the store, so it would read the value the store *just
+    /// wrote* instead of the one that was there.
+    #[test]
+    fn a_load_is_not_folded_across_an_aliasing_store() {
+        let f = mem_fixture(1, 1);
+        let ctx = ctx_of(&f.graph, &f.block);
+        assert_eq!(
+            may_fold_load(&ctx, f.load, f.add),
+            Err(FoldRefusal::Intervening {
+                between: f.store,
+                reason: ReorderBlock::MayAlias
+            })
+        );
+        let opts = SelectOptions {
+            require_encodable: false,
+            fold_loads: true,
+        };
+        let s = select_block(&f.graph, &f.block, None, &opts);
+        assert!(
+            !s.matched().any(|t| t.rule == Rule::AluFoldedLoad),
+            "no fold may survive an aliasing store"
+        );
+        assert!(s.covers(&f.block));
+    }
+
+    /// A store the alias model proves disjoint does not block the fold.
+    #[test]
+    fn a_load_is_folded_across_a_provably_disjoint_store() {
+        let f = mem_fixture(1, 2);
+        let ctx = ctx_of(&f.graph, &f.block);
+        assert_eq!(may_fold_load(&ctx, f.load, f.add), Ok(()));
+        let opts = SelectOptions {
+            require_encodable: false,
+            fold_loads: true,
+        };
+        let s = select_block(&f.graph, &f.block, None, &opts);
+        let t = s.tiles.iter().find(|t| t.root == f.add).expect("add tile");
+        assert_eq!(t.rule, Rule::AluFoldedLoad);
+        assert!(t.covered.contains(&f.load));
+        assert!(s.covers(&f.block), "coverage: {s:?}");
+        // The folded load must not also be emitted on its own.
+        assert!(
+            !s.tiles.iter().any(|t| t.root == f.load),
+            "the load may not be a tile root as well as folded"
+        );
+    }
+
+    #[test]
+    fn a_multiply_used_load_is_not_folded() {
+        let mut f = mem_fixture(1, 2);
+        let _second = f.graph.add(IrOp::Neg, IrType::Int, vec![f.load], None);
+        let ctx = ctx_of(&f.graph, &f.block);
+        assert_eq!(
+            may_fold_load(&ctx, f.load, f.add),
+            Err(FoldRefusal::MultipleUses {
+                load: f.load,
+                uses: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_safepoint_pinned_load_is_not_folded() {
+        let mut f = mem_fixture(1, 2);
+        f.graph.safepoints.push(SafepointSnapshot {
+            bci: 0,
+            locals: vec![f.load],
+            stack: Vec::new(),
+        });
+        let ctx = ctx_of(&f.graph, &f.block);
+        assert_eq!(
+            may_fold_load(&ctx, f.load, f.add),
+            Err(FoldRefusal::SafepointPinned(f.load))
+        );
+    }
+
+    #[test]
+    fn a_load_after_its_user_is_not_folded() {
+        let f = mem_fixture(1, 2);
+        // Present the block in an order where the load comes last.
+        let block = vec![f.store, f.add, f.load];
+        let ctx = ctx_of(&f.graph, &block);
+        assert_eq!(
+            may_fold_load(&ctx, f.load, f.add),
+            Err(FoldRefusal::NotBefore {
+                load: f.load,
+                user: f.add
+            })
+        );
+    }
+
+    #[test]
+    fn a_load_outside_the_block_is_not_folded() {
+        let f = mem_fixture(1, 2);
+        let block = vec![f.add];
+        let ctx = ctx_of(&f.graph, &block);
+        assert_eq!(
+            may_fold_load(&ctx, f.load, f.add),
+            Err(FoldRefusal::NotInBlock(f.load))
+        );
+    }
+
+    /// A call between the load and its user is opaque: it may write anything.
+    #[test]
+    fn a_load_is_not_folded_across_a_call() {
+        let mut f = mem_fixture(1, 2);
+        let ctrl = f.graph.nodes[f.load as usize].inputs[0];
+        let call = f.graph.add(
+            IrOp::Call { info_ptr: 0 },
+            IrType::Int,
+            vec![ctrl, f.load],
+            None,
+        );
+        let block = vec![f.load, call, f.add];
+        let ctx = ctx_of(&f.graph, &block);
+        assert!(matches!(
+            may_fold_load(&ctx, f.load, f.add),
+            Err(FoldRefusal::Intervening { between, .. }) if between == call
+        ));
+    }
+
+    // ── coverage and fail-closed behaviour ────────────────────────────────
+
+    /// The invariant everything else rests on. A node covered twice is
+    /// computed twice; a node covered zero times is a *dropped instruction* —
+    /// the failure mode a catch-all `_ => {}` produces.
+    #[test]
+    fn every_block_node_is_covered_exactly_once() {
+        let mut graph = g();
+        let start = graph.add(IrOp::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(IrOp::Proj(0), IrType::Control, vec![start], None);
+        let p = param(&mut graph, 0);
+        let q = param(&mut graph, 1);
+        let k2 = konst(&mut graph, 2);
+        let shl = bin(&mut graph, IrOp::Shl, q, k2);
+        let k8 = konst(&mut graph, 8);
+        let a1 = bin(&mut graph, IrOp::Add, p, shl);
+        let a2 = bin(&mut graph, IrOp::Add, a1, k8);
+        let k5 = konst(&mut graph, 5);
+        let and = bin(&mut graph, IrOp::And, a2, k5);
+        let d = graph.add(IrOp::Div, IrType::Long, vec![and, p], None);
+        let zero = konst(&mut graph, 0);
+        let cmp = graph.add(IrOp::Cmp(CmpOp::Ne), IrType::Int, vec![d, zero], None);
+        let iff = graph.add(IrOp::If, IrType::Control, vec![ctrl, cmp], None);
+        let block = vec![k2, shl, k8, a1, a2, k5, and, d, zero, cmp];
+        let s = select_block(&graph, &block, Some(iff), &SelectOptions::default());
+        assert!(s.covers(&block), "coverage failed: {s:#?}");
+        // No node appears in two tiles.
+        let mut all: Vec<NodeId> = s
+            .tiles
+            .iter()
+            .flat_map(|t| t.covered.iter().copied())
+            .collect();
+        let before = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(before, all.len(), "a node was covered twice");
+    }
+
+    /// An op no rule matches must come back as a tile that *names* it.
+    #[test]
+    fn an_unmatched_node_becomes_a_generic_tile_naming_it() {
+        let mut graph = g();
+        let p = param(&mut graph, 0);
+        let q = param(&mut graph, 1);
+        let d = graph.add(IrOp::Div, IrType::Long, vec![p, q], None);
+        let block = vec![d];
+        let s = select_block(&graph, &block, None, &SelectOptions::default());
+        assert_eq!(s.tiles.len(), 1);
+        assert_eq!(s.tiles[0].rule, Rule::Generic);
+        assert_eq!(s.tiles[0].insts, vec![MInst::Generic { node: d }]);
+        assert!(s.covers(&block));
+    }
+
+    /// A `MonitorEnter` must never vanish. This is the shape of the bug the
+    /// brief names: `lower_data_node`'s catch-all meant an unguarded monitor
+    /// op compiled to nothing and a lock was dropped.
+    #[test]
+    fn an_unmatched_monitor_op_is_never_silently_dropped() {
+        let mut graph = g();
+        let start = graph.add(IrOp::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(IrOp::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(IrOp::Proj(1), IrType::Memory, vec![start], None);
+        let obj = graph.add(IrOp::Param(0), IrType::Ref, vec![], None);
+        let enter = graph.add(IrOp::MonitorEnter, IrType::Memory, vec![ctrl, mem, obj], None);
+        let exit = graph.add(
+            IrOp::MonitorExit,
+            IrType::Memory,
+            vec![ctrl, enter, obj],
+            None,
+        );
+        let block = vec![enter, exit];
+        let s = select_block(&graph, &block, None, &SelectOptions::default());
+        assert!(s.covers(&block), "both monitor ops must be covered");
+        for id in [enter, exit] {
+            let t = s.tiles.iter().find(|t| t.root == id).expect("a tile");
+            assert_eq!(t.rule, Rule::Generic);
+            assert_eq!(t.insts, vec![MInst::Generic { node: id }]);
+        }
+    }
+
+    /// A terminator always gets a tile. A branch selection declined to cover
+    /// is a branch nobody emits — the one failure this design must not have.
+    #[test]
+    fn a_terminator_always_gets_a_tile() {
+        // (a) an `If` whose compare is fusable.
+        let (graph, _cmp, iff, block) = cmp_branch_graph(CmpOp::Le, false);
+        let s = select_block(&graph, &block, Some(iff), &SelectOptions::default());
+        assert!(matches!(
+            s.tiles.last().map(|t| t.root),
+            Some(r) if r == iff
+        ));
+
+        // (b) a `Return`, which no rule matches: still a tile, and it NAMES
+        // the node so the caller knows it has to emit the epilogue.
+        let mut graph = g();
+        let start = graph.add(IrOp::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(IrOp::Proj(0), IrType::Control, vec![start], None);
+        let ret = graph.add(IrOp::Return, IrType::Control, vec![ctrl], None);
+        let s = select_block(&graph, &[], Some(ret), &SelectOptions::default());
+        assert_eq!(s.tiles.len(), 1);
+        assert_eq!(s.tiles[0].rule, Rule::Generic);
+        assert_eq!(s.tiles[0].insts, vec![MInst::Generic { node: ret }]);
+    }
+
+    /// A tile the pattern table cannot encode is discarded, not emitted.
+    #[test]
+    fn a_tile_the_table_cannot_encode_is_discarded_and_reported() {
+        let mut graph = g();
+        let p = param(&mut graph, 0);
+        let k = konst(&mut graph, 5);
+        // `XOR r64, imm8` has no row.
+        let x = bin(&mut graph, IrOp::Xor, p, k);
+        let block = vec![k, x];
+
+        let lax = select_block(
+            &graph,
+            &block,
+            None,
+            &SelectOptions {
+                require_encodable: false,
+                fold_loads: false,
+            },
+        );
+        assert_eq!(
+            lax.tiles.iter().find(|t| t.root == x).map(|t| t.rule),
+            Some(Rule::AluImm),
+            "without the gate the immediate form is what the rules pick"
+        );
+
+        let strict = select_block(&graph, &block, None, &SelectOptions::default());
+        let t = strict.tiles.iter().find(|t| t.root == x).expect("root");
+        assert_eq!(t.rule, Rule::AluReg, "the gate must fall back, not emit");
+        assert!(
+            strict.notes.iter().any(|n| matches!(
+                n,
+                Note::Unencodable {
+                    rule: Rule::AluImm,
+                    ..
+                }
+            )),
+            "the discard must be reported: {:?}",
+            strict.notes
+        );
+        assert!(strict.covers(&block));
+    }
+
+    /// Under the default options every non-generic instruction the selector
+    /// chooses has a proven encoding. This is what makes `require_encodable`
+    /// a gate rather than a comment.
+    #[test]
+    fn every_selected_instruction_encodes_under_the_default_options() {
+        let mut graph = g();
+        let start = graph.add(IrOp::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(IrOp::Proj(0), IrType::Control, vec![start], None);
+        let p = param(&mut graph, 0);
+        let q = param(&mut graph, 1);
+        let k2 = konst(&mut graph, 2);
+        let shl = bin(&mut graph, IrOp::Shl, q, k2);
+        let a1 = bin(&mut graph, IrOp::Add, p, shl);
+        let k = konst(&mut graph, 40);
+        let a2 = bin(&mut graph, IrOp::Add, a1, k);
+        let _live = second_use(&mut graph, a2);
+        let zero = konst(&mut graph, 0);
+        let cmp = graph.add(IrOp::Cmp(CmpOp::Gt), IrType::Int, vec![a2, zero], None);
+        let iff = graph.add(IrOp::If, IrType::Control, vec![ctrl, cmp], None);
+        let block = vec![k2, shl, a1, k, a2, zero, cmp];
+        let s = select_block(&graph, &block, Some(iff), &SelectOptions::default());
+        assert!(s.covers(&block), "coverage: {s:#?}");
+        for t in s.matched() {
+            for i in &t.insts {
+                let e = i
+                    .probe()
+                    .unwrap_or_else(|e| panic!("{i:?} in {:?} does not encode: {e}", t.rule));
+                assert!(!e.bytes.is_empty(), "{i:?} encoded to nothing");
+            }
+        }
+    }
+
+    /// Selection is a function of its input: the same graph and block must
+    /// produce the same tiling every time, or a regression cannot be bisected.
+    #[test]
+    fn selection_is_deterministic() {
+        let mut graph = g();
+        let p = param(&mut graph, 0);
+        let q = param(&mut graph, 1);
+        let k2 = konst(&mut graph, 2);
+        let shl = bin(&mut graph, IrOp::Shl, q, k2);
+        let a1 = bin(&mut graph, IrOp::Add, p, shl);
+        let block = vec![k2, shl, a1];
+        let a = select_block(&graph, &block, None, &SelectOptions::default());
+        let b = select_block(&graph, &block, None, &SelectOptions::default());
+        assert_eq!(a, b);
+    }
+
+    /// The instructions the table cannot encode yet, pinned so the gap is a
+    /// fact rather than a surprise. Shrinking this list is the next wave's
+    /// work; growing it silently is what this test prevents.
+    #[test]
+    fn the_rows_the_selector_still_lacks_are_exactly_these() {
+        let missing: Vec<&'static str> = [
+            MInst::AluRM {
+                op: Op::Add,
+                ty: Ty::I64,
+                dst: 0,
+                lhs: 1,
+                addr: AddrSource::Opaque(2),
+                load: 2,
+            },
+            MInst::CmpRI {
+                ty: Ty::I64,
+                lhs: 0,
+                imm: 1,
+                form: ImmForm::Imm8,
+            },
+            MInst::SetCc {
+                dst: 0,
+                cc: CmpOp::Eq,
+            },
+            MInst::Lea {
+                dst: 0,
+                ty: Ty::I32,
+                addr: IrAddr::empty(),
+            },
+            MInst::AluRI {
+                op: Op::Xor,
+                ty: Ty::I64,
+                dst: 0,
+                lhs: 1,
+                imm: 1,
+                form: ImmForm::Imm8,
+            },
+        ]
+        .iter()
+        .filter(|i| i.pattern_name().is_none())
+        .map(|_| "unencodable")
+        .collect();
+        assert_eq!(
+            missing.len(),
+            5,
+            "these five instruction shapes have no PATTERNS row; see \
+             docs/jit/instruction-selection.md"
+        );
+        // And the ones that DO have rows really resolve to a row.
+        for i in [
+            MInst::AluRR {
+                op: Op::Add,
+                ty: Ty::I64,
+                dst: 0,
+                lhs: 1,
+                rhs: 2,
+            },
+            MInst::Move {
+                dst: 0,
+                ty: Ty::I64,
+                src: 1,
+            },
+            MInst::Lea {
+                dst: 0,
+                ty: Ty::I64,
+                addr: IrAddr {
+                    base: Some(1),
+                    index: None,
+                    scale: 1,
+                    disp: 0,
+                },
+            },
+            MInst::TestRR {
+                ty: Ty::I32,
+                reg: 0,
+            },
+            MInst::Jcc {
+                cc: CmpOp::Ne,
+                at: 0,
+            },
+        ] {
+            let name = i.pattern_name().unwrap_or_else(|| panic!("{i:?}"));
+            assert!(pattern(name).is_some(), "`{name}` is not in PATTERNS");
+            assert!(i.probe().is_ok(), "{i:?} must encode");
+        }
     }
 }

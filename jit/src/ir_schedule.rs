@@ -68,7 +68,7 @@
 //! that change can be evaluated against a number rather than a hunch.
 
 use super::bailout::{Bailout, BailoutReason};
-use super::ir::{Graph, NodeId, Op, NO_NODE};
+use super::ir::{Graph, NodeId, Op, Reorder, ReorderBlock, NO_NODE};
 use std::collections::HashMap;
 
 // ── Tuning constants ─────────────────────────────────────────────────
@@ -992,9 +992,217 @@ fn priority_sort_block(graph: &Graph, nodes: &mut Vec<NodeId>) {
 
     // A cycle would leave nodes unscheduled. The plain topological order is
     // always valid, so keep it rather than emitting a partial block.
-    if out.len() == count {
+    if out.len() != count {
+        return;
+    }
+    // The memory-ordering rule has the last word. The side-effect chain above
+    // is *supposed* to make this vacuous — every impure node is wired into a
+    // total order — but "supposed to" is what a validator is for: this pass is
+    // the only thing between the memory model and the emitted instruction
+    // order, and a reordering it cannot justify must not leave the function.
+    if check_memory_order(graph, &baseline, &out).is_ok() {
         *nodes = out;
     }
+}
+
+// ── Memory-effect ordering ───────────────────────────────────────────
+//
+// The scheduler is the pass that decides what order instructions are emitted
+// in, so it is the pass that can silently break the memory model. This section
+// is the rule it obeys, stated once and checkable after the fact.
+//
+// # The rule
+//
+// Let *M* be the sub-sequence of a block's nodes that **order memory** — every
+// node whose `Op::memory_shape` gives it a non-inert `MemEffect`: it reads,
+// writes, allocates, safepoints, or carries a JMM fence half. Then for any two
+// candidate orderings of the same node set:
+//
+// 1. The candidate must be a **permutation** of the baseline. A schedule that
+//    drops or invents a node is refused outright, whatever else is true of it.
+// 2. Two members of *M* may swap **only** if `Graph::may_reorder` answers
+//    `Allowed` for the pair, in baseline order. That is the memory model's own
+//    answer: disjoint locations, a read/read pair, or an inert partner.
+// 3. A **barrier** — any member of *M* that is a safepoint or whose `MemOrder`
+//    is not `Plain` — may not swap with another member of *M* **at all**, even
+//    when rule 2 would allow it.
+// 4. Nodes outside *M* are unconstrained by this rule. They are pure values;
+//    dependence order already pins them, and that is `topo_sort_block`'s job.
+//
+// # Why rule 3 is stronger than the model
+//
+// `Graph::may_reorder` deliberately answers a *memory-side* question only. Its
+// own documentation lists what it does not cover, and one item on that list is
+// exactly what a scheduler needs: **implicit exception order**. `Op::Load`
+// faults on a null base and deopts; `Op::Guard` transfers control and carries
+// no memory edge at all. Moving a load below a safepoint is memory-neutral —
+// the model answers `Allowed(ReadOnly)` — and is still wrong, because the
+// deopt that a fault triggers would now rebuild a frame at a bci whose
+// safepoint has already run.
+//
+// So the rule refuses it. Refusing costs an optimisation the scheduler does not
+// currently attempt (the priority pass already chains every impure node); a
+// wrong answer here costs a wrong reconstruction, which is the failure mode
+// that does not announce itself.
+
+/// Why an ordering was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderRefusal {
+    /// The candidate is not a permutation of the baseline — a node was
+    /// dropped, invented or duplicated.
+    NotAPermutation,
+    /// Too many memory-ordering nodes moved to check the pairs within budget.
+    /// Refusing is the fail-closed answer: an unverified reordering is not an
+    /// accepted one.
+    Budget,
+    /// The memory model refuses this swap, for this reason.
+    Model(ReorderBlock),
+    /// One of the pair is a barrier — a safepoint or a JMM fence half — and a
+    /// barrier does not move relative to anything that orders memory.
+    Barrier,
+}
+
+/// A pair of memory-ordering nodes whose relative order changed illegally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderViolation {
+    /// The node that came first in the baseline.
+    pub earlier: NodeId,
+    /// The node that came second in the baseline.
+    pub later: NodeId,
+    /// Why the swap is refused.
+    pub refusal: OrderRefusal,
+}
+
+/// Largest number of ordered pairs [`check_memory_order`] will examine.
+///
+/// The check is quadratic in the number of memory-ordering nodes in one block,
+/// and a compiler must not turn a pathological graph into a pathological
+/// compile — the same rule `PRIORITY_BLOCK_BUDGET` states above. Over budget
+/// the answer is [`OrderRefusal::Budget`], i.e. "not verified, therefore not
+/// allowed".
+pub const MEMORY_ORDER_PAIR_BUDGET: usize = 16_384;
+
+/// Does `id` order memory at all?
+///
+/// True for every node with a non-inert `MemEffect`: it reads, writes,
+/// allocates, is a safepoint, or carries a JMM fence half. An id that names no
+/// node answers `true` — `Graph::memory_effect` degrades an unknown node to
+/// `MemEffect::OPAQUE`, and the failure direction has to be the one that
+/// refuses motion.
+pub fn orders_memory(graph: &Graph, id: NodeId) -> bool {
+    !graph.memory_effect(id).is_inert()
+}
+
+/// Is `id` a barrier — a node nothing memory-ordering may cross?
+///
+/// A safepoint (`Op::Call`, `Op::New`, `Op::NewArray`, `Op::Guard`, the
+/// monitors) or any node whose `MemOrder` is not `Plain` (a monitor operation,
+/// a volatile access). See the section header for why safepoints are barriers
+/// here even though the memory model lets a read cross one.
+pub fn is_memory_barrier(graph: &Graph, id: NodeId) -> bool {
+    let e = graph.memory_effect(id);
+    e.safepoint || !e.order.is_plain()
+}
+
+/// Does `candidate` preserve the memory-effect ordering of `baseline`?
+///
+/// The rule is stated in full in the section header above. In short: the
+/// candidate must be a permutation, two memory-ordering nodes may only swap
+/// when `Graph::may_reorder` licenses it, and a barrier may not swap with a
+/// memory-ordering node at all.
+///
+/// Cheap in the common case: when the memory-ordering nodes appear in the same
+/// relative order in both sequences — which is what every scheduler in this
+/// file currently produces — the answer is a single linear scan and no pairwise
+/// query at all.
+///
+/// Total: never panics. Every refusal names the pair responsible, except
+/// [`OrderRefusal::NotAPermutation`], where there is no pair to name and the
+/// node ids are [`NO_NODE`].
+pub fn check_memory_order(
+    graph: &Graph,
+    baseline: &[NodeId],
+    candidate: &[NodeId],
+) -> Result<(), OrderViolation> {
+    let not_a_permutation = OrderViolation {
+        earlier: NO_NODE,
+        later: NO_NODE,
+        refusal: OrderRefusal::NotAPermutation,
+    };
+    if baseline.len() != candidate.len() {
+        return Err(not_a_permutation);
+    }
+    {
+        let mut a = baseline.to_vec();
+        let mut b = candidate.to_vec();
+        a.sort_unstable();
+        b.sort_unstable();
+        if a != b {
+            return Err(not_a_permutation);
+        }
+    }
+
+    let base_mem: Vec<NodeId> = baseline
+        .iter()
+        .copied()
+        .filter(|&id| orders_memory(graph, id))
+        .collect();
+    let cand_mem: Vec<NodeId> = candidate
+        .iter()
+        .copied()
+        .filter(|&id| orders_memory(graph, id))
+        .collect();
+    // Nothing that orders memory moved relative to anything else that does.
+    if base_mem == cand_mem {
+        return Ok(());
+    }
+
+    let mut pos: HashMap<NodeId, usize> = HashMap::with_capacity(cand_mem.len());
+    for (i, &id) in cand_mem.iter().enumerate() {
+        pos.insert(id, i);
+    }
+    // A duplicated memory node makes "which one moved" unanswerable.
+    if pos.len() != cand_mem.len() {
+        return Err(not_a_permutation);
+    }
+    let pairs = base_mem.len().saturating_mul(base_mem.len().saturating_sub(1)) / 2;
+    if pairs > MEMORY_ORDER_PAIR_BUDGET {
+        return Err(OrderViolation {
+            earlier: base_mem.first().copied().unwrap_or(NO_NODE),
+            later: base_mem.last().copied().unwrap_or(NO_NODE),
+            refusal: OrderRefusal::Budget,
+        });
+    }
+
+    for (i, &x) in base_mem.iter().enumerate() {
+        for &y in base_mem.iter().skip(i + 1) {
+            let (px, py) = match (pos.get(&x), pos.get(&y)) {
+                (Some(&a), Some(&b)) => (a, b),
+                _ => return Err(not_a_permutation),
+            };
+            if px < py {
+                continue; // relative order preserved
+            }
+            if is_memory_barrier(graph, x) || is_memory_barrier(graph, y) {
+                return Err(OrderViolation {
+                    earlier: x,
+                    later: y,
+                    refusal: OrderRefusal::Barrier,
+                });
+            }
+            match graph.may_reorder(x, y) {
+                Reorder::Allowed(_) => {}
+                Reorder::Blocked(r) => {
+                    return Err(OrderViolation {
+                        earlier: x,
+                        later: y,
+                        refusal: OrderRefusal::Model(r),
+                    })
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Block frequency estimation ───────────────────────────────────────
@@ -2046,6 +2254,364 @@ mod tests {
         assert_eq!(nodes[0], base, "the no-input base must sort first");
         for w in nodes.windows(2) {
             assert!(w[0] < w[1], "chain must be in ascending dependency order");
+        }
+    }
+
+    // ── Memory-effect ordering ───────────────────────────────────────────
+
+    use crate::ir::{MemKind, NodeId as Id};
+
+    fn bare_graph() -> Graph {
+        Graph {
+            nodes: Vec::new(),
+            entry: NO_NODE,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        }
+    }
+
+    /// `ctrl`, `mem`, one base reference and two constant offsets, so the
+    /// alias model has everything it needs to prove (or refuse) disjointness.
+    struct MemGraph {
+        graph: Graph,
+        ctrl: Id,
+        mem: Id,
+        base: Id,
+        off_a: Id,
+        off_b: Id,
+        value: Id,
+    }
+
+    fn mem_graph() -> MemGraph {
+        let mut graph = bare_graph();
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let base = graph.add(Op::Param(0), IrType::Ref, vec![], None);
+        let off_a = graph.add(Op::Const(1), IrType::Int, vec![], None);
+        let off_b = graph.add(Op::Const(2), IrType::Int, vec![], None);
+        let value = graph.add(Op::Param(1), IrType::Int, vec![], None);
+        MemGraph {
+            graph,
+            ctrl,
+            mem,
+            base,
+            off_a,
+            off_b,
+            value,
+        }
+    }
+
+    impl MemGraph {
+        fn load(&mut self, tok: Id, off: Id) -> Id {
+            self.graph.add(
+                Op::Load(MemKind::Int),
+                IrType::Int,
+                vec![self.ctrl, tok, self.base, off],
+                None,
+            )
+        }
+        fn store(&mut self, tok: Id, off: Id) -> Id {
+            self.graph.add(
+                Op::Store(MemKind::Int),
+                IrType::Void,
+                vec![self.ctrl, tok, self.base, off, self.value],
+                None,
+            )
+        }
+    }
+
+    #[test]
+    fn orders_memory_classifies_the_op_families() {
+        let mut f = mem_graph();
+        let load = f.load(f.mem, f.off_a);
+        let store = f.store(load, f.off_b);
+        let enter = f
+            .graph
+            .add(Op::MonitorEnter, IrType::Memory, vec![f.ctrl, store, f.base], None);
+        let exit = f
+            .graph
+            .add(Op::MonitorExit, IrType::Memory, vec![f.ctrl, enter, f.base], None);
+        let call = f
+            .graph
+            .add(Op::Call { info_ptr: 0 }, IrType::Int, vec![f.ctrl, exit], None);
+        let guard = f
+            .graph
+            .add(Op::Guard { bci: 0 }, IrType::Void, vec![f.ctrl, f.value], None);
+        let add = f
+            .graph
+            .add(Op::Add, IrType::Int, vec![f.value, f.value], None);
+        let konst = f.graph.add(Op::Const(7), IrType::Int, vec![], None);
+
+        for (id, name) in [
+            (load, "load"),
+            (store, "store"),
+            (enter, "monitorenter"),
+            (exit, "monitorexit"),
+            (call, "call"),
+            (guard, "guard"),
+        ] {
+            assert!(orders_memory(&f.graph, id), "{name} must order memory");
+        }
+        for (id, name) in [(add, "add"), (konst, "const"), (f.value, "param")] {
+            assert!(!orders_memory(&f.graph, id), "{name} must be inert");
+        }
+
+        // Barriers: safepoints and the JMM fence halves. A plain load or store
+        // is neither.
+        for (id, name) in [
+            (enter, "monitorenter"),
+            (exit, "monitorexit"),
+            (call, "call"),
+            (guard, "guard"),
+        ] {
+            assert!(is_memory_barrier(&f.graph, id), "{name} must be a barrier");
+        }
+        assert!(!is_memory_barrier(&f.graph, load));
+        assert!(!is_memory_barrier(&f.graph, store));
+    }
+
+    #[test]
+    fn an_unchanged_order_is_always_accepted() {
+        let mut f = mem_graph();
+        let load = f.load(f.mem, f.off_a);
+        let store = f.store(load, f.off_b);
+        let add = f
+            .graph
+            .add(Op::Add, IrType::Int, vec![load, f.value], None);
+        let seq = vec![load, store, add];
+        assert_eq!(check_memory_order(&f.graph, &seq, &seq), Ok(()));
+    }
+
+    /// Pure nodes are not this rule's business: moving one past a store
+    /// changes nothing the memory model can see, and dependence order (which
+    /// `topo_sort_block` enforces) is what pins them.
+    #[test]
+    fn pure_nodes_may_move_freely_around_memory_nodes() {
+        let mut f = mem_graph();
+        let k = f.graph.add(Op::Const(9), IrType::Int, vec![], None);
+        let load = f.load(f.mem, f.off_a);
+        let store = f.store(load, f.off_b);
+        let base = vec![load, k, store];
+        let moved = vec![k, load, store];
+        assert_eq!(check_memory_order(&f.graph, &base, &moved), Ok(()));
+    }
+
+    /// The defect the rule exists to catch: a load hoisted above a store to
+    /// the same cell reads the value that was there *before* the store.
+    #[test]
+    fn a_load_may_not_swap_with_an_aliasing_store() {
+        let mut f = mem_graph();
+        let store = f.store(f.mem, f.off_a);
+        let load = f.load(store, f.off_a); // same base, same constant offset
+        let base = vec![store, load];
+        let swapped = vec![load, store];
+        assert_eq!(
+            check_memory_order(&f.graph, &base, &swapped),
+            Err(OrderViolation {
+                earlier: store,
+                later: load,
+                refusal: OrderRefusal::Model(ReorderBlock::MayAlias),
+            })
+        );
+    }
+
+    /// Two accesses the model proves disjoint do commute.
+    #[test]
+    fn provably_disjoint_accesses_may_swap() {
+        let mut f = mem_graph();
+        let store = f.store(f.mem, f.off_a);
+        let load = f.load(store, f.off_b); // different constant offset
+        let base = vec![store, load];
+        let swapped = vec![load, store];
+        assert_eq!(check_memory_order(&f.graph, &base, &swapped), Ok(()));
+    }
+
+    /// A monitor-enter is an acquire and a safepoint. Nothing that orders
+    /// memory crosses it — including a load the pairwise memory model would
+    /// wave through.
+    #[test]
+    fn nothing_crosses_a_barrier() {
+        let mut f = mem_graph();
+        let enter = f.graph.add(
+            Op::MonitorEnter,
+            IrType::Memory,
+            vec![f.ctrl, f.mem, f.base],
+            None,
+        );
+        let load = f.load(enter, f.off_a);
+        let base = vec![enter, load];
+        let swapped = vec![load, enter];
+        assert_eq!(
+            check_memory_order(&f.graph, &base, &swapped),
+            Err(OrderViolation {
+                earlier: enter,
+                later: load,
+                refusal: OrderRefusal::Barrier,
+            })
+        );
+    }
+
+    /// Specifically the case where the rule is deliberately stronger than
+    /// `may_reorder`: an allocation is a safepoint, the model says a read may
+    /// cross it, and the scheduler still refuses because a faulting load below
+    /// a safepoint deopts into a frame that safepoint has already passed.
+    #[test]
+    fn the_barrier_rule_is_stronger_than_the_pairwise_model() {
+        let mut f = mem_graph();
+        let alloc = f.graph.add(
+            Op::New {
+                class_id: 0,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![f.ctrl, f.mem],
+            None,
+        );
+        let load = f.load(alloc, f.off_a);
+        // The memory model itself permits the swap …
+        assert!(f.graph.may_reorder(alloc, load).is_allowed());
+        // … and the scheduler still refuses it.
+        assert_eq!(
+            check_memory_order(&f.graph, &[alloc, load], &[load, alloc]),
+            Err(OrderViolation {
+                earlier: alloc,
+                later: load,
+                refusal: OrderRefusal::Barrier,
+            })
+        );
+    }
+
+    /// Two allocations do not commute: which one runs first is observable
+    /// through `OutOfMemoryError` and through identity hashes.
+    #[test]
+    fn two_allocations_may_not_swap() {
+        let mut f = mem_graph();
+        let a = f.graph.add(
+            Op::New {
+                class_id: 0,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![f.ctrl, f.mem],
+            None,
+        );
+        let b = f.graph.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![f.ctrl, a],
+            None,
+        );
+        assert!(check_memory_order(&f.graph, &[a, b], &[b, a]).is_err());
+    }
+
+    /// A schedule that drops or invents a node is refused whatever else is
+    /// true of it — a dropped store is a dropped write.
+    #[test]
+    fn a_non_permutation_is_refused() {
+        let mut f = mem_graph();
+        let load = f.load(f.mem, f.off_a);
+        let store = f.store(load, f.off_b);
+        let dropped = vec![load];
+        assert_eq!(
+            check_memory_order(&f.graph, &[load, store], &dropped),
+            Err(OrderViolation {
+                earlier: NO_NODE,
+                later: NO_NODE,
+                refusal: OrderRefusal::NotAPermutation,
+            })
+        );
+        let invented = vec![load, f.value];
+        assert_eq!(
+            check_memory_order(&f.graph, &[load, store], &invented),
+            Err(OrderViolation {
+                earlier: NO_NODE,
+                later: NO_NODE,
+                refusal: OrderRefusal::NotAPermutation,
+            })
+        );
+        let duplicated = vec![load, load];
+        assert_eq!(
+            check_memory_order(&f.graph, &[load, store], &duplicated),
+            Err(OrderViolation {
+                earlier: NO_NODE,
+                later: NO_NODE,
+                refusal: OrderRefusal::NotAPermutation,
+            })
+        );
+    }
+
+    /// The priority scheduler's output must satisfy the rule on every block it
+    /// touches. This is the property the validator was wired in to guarantee,
+    /// checked against the real pass rather than asserted about it.
+    #[test]
+    fn the_priority_scheduler_never_violates_the_memory_order() {
+        // `int f(int a, int b) { return (a + b) * a - b; }` — enough data
+        // nodes in one block for the priority pass to have something to do
+        // (it declines blocks of two or fewer).
+        let code = [
+            0x1a, // 0: iload_0
+            0x1b, // 1: iload_1
+            0x60, // 2: iadd
+            0x1a, // 3: iload_0
+            0x68, // 4: imul
+            0x1b, // 5: iload_1
+            0x64, // 6: isub
+            0xac, // 7: ireturn
+            0, 0,
+        ];
+        let builder = IrBuilder::new(2, 2);
+        let mut graph = builder.build(&code, 8).expect("build failed");
+        ir_optimize::optimize(&mut graph);
+
+        let plain = schedule(&graph);
+        let opts = ScheduleOptions {
+            priority_within_blocks: true,
+            ..ScheduleOptions::default()
+        };
+        let prioritised = schedule_with_options(&graph, &opts);
+        assert_eq!(plain.blocks.len(), prioritised.blocks.len());
+        for (b, p) in plain.blocks.iter().zip(prioritised.blocks.iter()) {
+            assert_eq!(
+                check_memory_order(&graph, &b.nodes, &p.nodes),
+                Ok(()),
+                "block {} was reordered illegally",
+                b.id
+            );
+        }
+    }
+
+    /// The validator may only ever *reject* a reordering, never cause one: a
+    /// block keeps exactly the node set it had, whether or not the priority
+    /// pass ran. (A node the pass dropped would also be a node `plan_slots`
+    /// never colours and `ir_lower` never emits.)
+    #[test]
+    fn priority_scheduling_preserves_every_block_node_set() {
+        let code = [
+            0x1a, 0x1b, 0x60, 0x1a, 0x68, 0x1b, 0x64, 0xac, 0, 0,
+        ];
+        let builder = IrBuilder::new(2, 2);
+        let mut graph = builder.build(&code, 8).expect("build failed");
+        ir_optimize::optimize(&mut graph);
+        let plain = schedule(&graph);
+        let prioritised = schedule_with_options(
+            &graph,
+            &ScheduleOptions {
+                priority_within_blocks: true,
+                ..ScheduleOptions::default()
+            },
+        );
+        assert_eq!(plain.blocks.len(), prioritised.blocks.len());
+        for (x, y) in plain.blocks.iter().zip(prioritised.blocks.iter()) {
+            let mut a = x.nodes.clone();
+            let mut b = y.nodes.clone();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "block {} lost or gained a node", x.id);
         }
     }
 }
