@@ -3605,6 +3605,18 @@ impl<'a> NativeContextImpl<'a> {
                 snapshot.push(m);
             }
         }
+        // The JIT's stashed deopt / exceptional frames, for a thread about to
+        // PARK. They live in `jit/` thread-locals, so a peer collector cannot
+        // see them at all — and once this thread blocks, `GcBarrier` drops it
+        // from `expected` and collects without it ever running its own scan.
+        // Depositing them here is what makes that window survivable: the
+        // callee-handler path can block with a frame stashed.
+        // See `docs/jit/deopt-thread-local-roots.md`.
+        cratonvm_jit::deopt::for_each_stashed_deopt_object(|addr| {
+            if let Some(obj) = self.shared.mem.heap.is_object_address(addr as usize) {
+                snapshot.push(obj);
+            }
+        });
         // cceres3 FIX (blocked-window exact slot tracking): record every
         // Object frame slot with the address it currently holds. GC folds
         // advance each entry's `cur` through their pointer maps; the wake
@@ -3980,6 +3992,14 @@ impl<'a> NativeContextImpl<'a> {
             for val in &mut self.thread.printed {
                 update_value_ref(val, &fixup);
             }
+            // The remap half for this thread's stashed deopt / exceptional
+            // frames, against the same composed fixup the frames above use.
+            // Deposited on the way into the blocking region; rewritten here on
+            // the way out, because the collection that moved them ran while
+            // this thread was parked and could not run its own remap.
+            cratonvm_jit::deopt::remap_stashed_deopt_objects(|addr| {
+                fixup.get(&(addr as usize)).map(|&to| to as u64)
+            });
             if let Some(ref mut obj_ref) = self.thread.java_thread_obj {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = fixup.get(&old_addr) {

@@ -20053,6 +20053,12 @@ pub(super) fn execute_jit_call(
     // (which can't safely match without a known PC) but still matches
     // typed handlers by exception class.
     if sig.npe {
+        // These three arms synthesize a FRESH exception and route it; none of
+        // them consumes the stashed deopt frame. Draining it here bounds the
+        // window in which that frame holds raw heap addresses nothing scans —
+        // and stops a later drain for the same method claiming it, since the
+        // match compares method names only.
+        let _ = cratonvm_jit::deopt::take_last_deopt();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -20092,6 +20098,12 @@ pub(super) fn execute_jit_call(
     // observes the throw. `usize::MAX` for `throw_pc` mirrors the NPE path
     // (skip catch-all `finally` entries, still match typed handlers).
     if let Some((index, length)) = sig.aioobe {
+        // These three arms synthesize a FRESH exception and route it; none of
+        // them consumes the stashed deopt frame. Draining it here bounds the
+        // window in which that frame holds raw heap addresses nothing scans —
+        // and stops a later drain for the same method claiming it, since the
+        // match compares method names only.
+        let _ = cratonvm_jit::deopt::take_last_deopt();
         let msg = format!("Index {index} out of bounds for length {length}");
         match crate::runtime::exceptions::create_exception_object(
             shared,
@@ -20128,6 +20140,12 @@ pub(super) fn execute_jit_call(
     // divergence). `usize::MAX` throw_pc mirrors the NPE/AIOOBE blocks (match
     // typed handlers by class, skip catch-all `finally`).
     if sig.arithmetic {
+        // These three arms synthesize a FRESH exception and route it; none of
+        // them consumes the stashed deopt frame. Draining it here bounds the
+        // window in which that frame holds raw heap addresses nothing scans —
+        // and stops a later drain for the same method claiming it, since the
+        // match compares method names only.
+        let _ = cratonvm_jit::deopt::take_last_deopt();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,

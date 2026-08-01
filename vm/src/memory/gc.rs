@@ -397,6 +397,14 @@ pub(crate) fn remap_thread_object_slots(
             rewritten += 1;
         }
     }
+    // The remap half for the JIT's stashed deopt / exceptional frames. The scan
+    // half is in `roots.rs` §10 and the two must land together — the visitor
+    // carries a debug assertion that this thread scanned at least once whenever
+    // there is anything to remap, precisely so the half-wiring that shipped
+    // once already trips instead of going quiet.
+    cratonvm_jit::deopt::remap_stashed_deopt_objects(|addr| {
+        pointer_map.get(&(addr as usize)).map(|&to| to as u64)
+    });
     rewritten
 }
 

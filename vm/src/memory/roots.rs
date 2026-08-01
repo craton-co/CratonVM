@@ -547,6 +547,22 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     if let Some(ref obj_ref) = thread.jit_pending_exception {
         roots.push(*obj_ref);
     }
+    // The JIT's stashed deopt / exceptional frames. Those live in `jit/`
+    // thread-locals — that crate cannot depend on `vm/`, so they cannot become
+    // `JvmThread` fields the way the slot above did — and are reached through
+    // an on-thread visitor instead. That works for the same reason the slots
+    // above do: this scan already runs ON the owning thread. Paired with the
+    // remap in `gc.rs`; wiring one without the other is refused by a debug
+    // assertion in the visitor. See `docs/jit/deopt-thread-local-roots.md`.
+    //
+    // `is_object_address` rather than a bare `ObjectRef`, matching the
+    // `pinned_addrs` block above: the stash can name an address the heap no
+    // longer owns, if an earlier collection already ran while it was unrooted.
+    cratonvm_jit::deopt::for_each_stashed_deopt_object(|addr| {
+        if let Some(obj) = shared.mem.heap.is_object_address(addr as usize) {
+            roots.push(obj);
+        }
+    });
 
     // 10b. Registry-held java.lang.Thread mirrors of every ALIVE thread.
     //      HotSpot semantics: a thread's mirror is a strong root while the

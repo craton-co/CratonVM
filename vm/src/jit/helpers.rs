@@ -2428,6 +2428,14 @@ unsafe fn route_implicit_exc_through_callee(
                     if let Some(v) =
                         try_run_callee_handler(vm, thread, info, receiver_class_id, args_slice, exc, throw_pc)
                     {
+                        // The handler ran and the call is complete, so any
+                        // exceptional frame the callee's compiled body
+                        // published describes a FINISHED attempt. Drop it here
+                        // as well as on the fall-through below. Leaving it
+                        // stashed keeps a heap reference alive for an unbounded
+                        // time, and lets a later drain for the same method
+                        // claim it — the match compares method names only.
+                        cratonvm_jit::deopt::clear_exceptional_frame();
                         return v;
                     }
                     // No handler covers this throw site -- restore the signal
