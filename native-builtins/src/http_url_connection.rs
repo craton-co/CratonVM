@@ -1923,37 +1923,92 @@ fn huc_hostname_verifier(
     }
 }
 
-/// Run the caller-installed `HostnameVerifier` against the completed
-/// handshake, immediately after the `TrustManager` check and before a single
-/// request byte is written — the same point real JSSE runs it.
+/// Class names that mean "no application `HostnameVerifier` is installed".
 ///
-/// WHY THIS EXISTS. `setHostnameVerifier`/`setDefaultHostnameVerifier` store
-/// the verifier (see `t27_tls`), but nothing consulted it, so an application
-/// that installed one had its check silently dropped. That is NOT a hole in
-/// ordinary TLS — rustls performs RFC 6125 endpoint identification itself
-/// during the handshake above, so the DEFAULT verifier's job is already done
-/// by the time we get here. The gap is an app-supplied verifier that is
-/// STRICTER than the default: certificate pinning, a CN/SAN allow-list, a
-/// corporate policy check. Such an app believed it had pinned and had not.
+/// Two shapes reach `huc_verify_hostname`, and BOTH are non-checks:
 ///
-/// NO DOUBLE-VERIFY. The VM's own default verifier is an instance of the bare
-/// `javax/net/ssl/HostnameVerifier` interface (see the interface-level `verify`
-/// native in `t27_tls`, which short-circuits `true` for exactly that shape).
-/// Recognising it here and returning early keeps the ordinary HTTPS path
-/// allocation-free and means rustls's identity check is never re-run — only a
-/// genuinely app-supplied concrete verifier causes any work. A permissive
-/// app verifier (`(h, s) -> true`, the usual test shape) cannot WEAKEN
-/// anything either: rustls has already validated, and this runs strictly in
-/// addition to it, never instead of it.
+///   * `javax/net/ssl/HostnameVerifier` — this VM's own stand-in, allocated as
+///     a bare-interface instance by `t27_tls`'s `get{,Default}HostnameVerifier`
+///     when nothing was ever installed (the interface-level `verify` native in
+///     that file short-circuits `true` for exactly this shape).
+///   * `javax/net/ssl/HttpsURLConnection$DefaultHostnameVerifier` — the REAL
+///     JDK's default, installed by `HttpsURLConnection.<clinit>` and copied
+///     into every instance's `hostnameVerifier` field by its constructor. Its
+///     entire body is `iconst_0; ireturn` — it always answers `false`. That is
+///     not a policy: real JSSE recognises it BY NAME (`HttpsClient
+///     .afterConnect`, `defaultHVCanonicalName`) and, when it is the one
+///     installed, performs endpoint identification inside the handshake
+///     (`setEndpointIdentificationAlgorithm("HTTPS")`) and never calls the
+///     verifier at all. A VM that instead calls it and reads its `false` as a
+///     rejection fails EVERY https request — which is precisely what happened
+///     once `f6028ba50` started honouring the stored verifier, and is the
+///     defect this predicate exists to prevent.
 ///
-/// FAIL CLOSED. A verifier that throws, or returns something that is not a
-/// boolean `true`, is treated as a rejection. `perform` returns
-/// `Result<_, String>` and cannot carry a pending Java exception, so the throw
-/// cannot be propagated verbatim; the alternative — swallowing it and
-/// proceeding — would turn a broken pinning check into a silent pass, which is
-/// the exact failure mode this whole change exists to remove. Same choice, and
-/// the same reasoning, as `run_client_trust_check_for_chain`'s `map_err` at
-/// the TrustManager gate a few lines above the call site.
+/// `None` (a receiver whose class cannot be named) is folded in here too: with
+/// no identifiable verifier there is nothing to consult, and real JSSE treats
+/// a null verifier as the default for the same reason.
+fn is_default_hostname_verifier(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        None | Some("javax/net/ssl/HostnameVerifier")
+            | Some("javax/net/ssl/HttpsURLConnection$DefaultHostnameVerifier")
+    )
+}
+
+/// RFC 2818 §3.1 endpoint identification against the presented leaf — the same
+/// check `sun.security.util.HostnameChecker` (`TYPE_TLS`) performs for JSSE,
+/// and the FIRST thing `HttpsClient.checkURLSpoofing` does.
+///
+/// Shares `x509_manager::verify_hostname` with the `X509TrustManager`
+/// validation path so the two can never drift into disagreeing about what
+/// `localhost` matches.
+///
+/// This is deliberately re-derived here rather than assumed from the
+/// handshake. rustls only performs endpoint identification when it owns the
+/// server-certificate policy; when the application supplied Java
+/// `TrustManager`s, `t27_tls::PassthroughServerCertVerifier` is installed
+/// instead and ignores the server name entirely, with
+/// `run_client_trust_check_for_chain` (a plain `checkServerTrusted(chain,
+/// authType)`) doing chain policy only. On that path nothing else in the VM
+/// checks the hostname, so skipping this would leave a real hole.
+fn huc_builtin_endpoint_identification(host: &str, chain: &[Vec<u8>]) -> Result<(), String> {
+    let Some(leaf_der) = chain.first() else {
+        return Err("no peer certificate was presented".to_string());
+    };
+    let leaf = crate::x509_manager::parse_certificate(leaf_der)
+        .map_err(|e| format!("peer certificate could not be parsed: {e}"))?;
+    crate::x509_manager::verify_hostname(&leaf, host).map_err(|e| e.to_string())
+}
+
+/// Endpoint identification for a completed client handshake, run immediately
+/// after the `TrustManager` check and before a single request byte is written
+/// — the same point, and in the same order, real JSSE runs it.
+///
+/// SHAPE, and why it is not "additionally run the app's verifier". Real JSSE's
+/// `HostnameVerifier` is a FALLBACK, never an extra gate
+/// (`sun.net.www.protocol.https.HttpsClient.checkURLSpoofing`): it first runs
+/// `HostnameChecker.match(host, peerCert)` and, **if that passes, returns
+/// without ever calling the verifier**. Only a FAILED built-in check consults
+/// it, and a `true` answer there rescues the connection. So a verifier can
+/// only ever WIDEN what is accepted, never narrow it — an app "pinning" with a
+/// `HostnameVerifier` on `HttpsURLConnection` is not consulted at all while the
+/// name matches, on HotSpot exactly as here.
+///
+/// The previous shape inverted that: it treated the installed verifier as an
+/// additional gate every connection had to pass. Because the real JDK's
+/// default verifier is a hardcoded `return false` (see
+/// `is_default_hostname_verifier`), that made every https request fail with
+/// `SSLPeerUnverifiedException` — across the Spring Boot
+/// `SimpleClientHttpRequestFactoryBuilderTests` and seven Tomcat TLS classes.
+///
+/// FAIL CLOSED, still. Once the built-in check has failed, a verifier that
+/// throws — or answers anything that is not boolean `true` — leaves the peer
+/// unverified. `perform` returns `Result<_, String>` and cannot carry a
+/// pending Java exception, so a throw cannot be propagated verbatim;
+/// swallowing it and proceeding would turn a failed identity check into a
+/// silent pass. Same choice, and the same reasoning, as
+/// `run_client_trust_check_for_chain`'s `map_err` at the TrustManager gate a
+/// few lines above the call site.
 fn huc_verify_hostname(
     ctx: &mut dyn NativeContext,
     connection: Option<ObjectRef>,
@@ -1962,15 +2017,37 @@ fn huc_verify_hostname(
     cipher: &str,
     peer_chain_der: Vec<Vec<u8>>,
 ) -> Result<(), String> {
-    let Some(verifier0) = huc_hostname_verifier(ctx, connection) else {
+    // STEP 1 — the built-in check, always first and always on its own.
+    let builtin = huc_builtin_endpoint_identification(host, &peer_chain_der);
+    if crate::nbflags().dbg_tls_auth_ok {
+        eprintln!(
+            "[dbg-tls-auth] huc_verify_hostname host={host:?} chain_len={} builtin={:?}",
+            peer_chain_der.len(),
+            builtin
+        );
+    }
+    if builtin.is_ok() {
         return Ok(());
+    }
+
+    // STEP 2 — the built-in check failed. Consult the installed verifier, if
+    // one that is not a JDK/VM default stand-in was actually installed.
+    let verifier0 = huc_hostname_verifier(ctx, connection);
+    let verifier_class = match verifier0 {
+        Some(v) => {
+            let cid = ctx.class_id_of_object(v);
+            ctx.class_name_of_id(cid)
+        }
+        None => None,
     };
-    let verifier_cid = ctx.class_id_of_object(verifier0);
-    match ctx.class_name_of_id(verifier_cid).as_deref() {
-        // The VM's own default verifier (bare-interface instance), or a
-        // receiver whose class cannot be named: rustls already did this job.
-        Some("javax/net/ssl/HostnameVerifier") | None => return Ok(()),
-        Some(_) => {}
+    if crate::nbflags().dbg_tls_auth_ok {
+        eprintln!("[dbg-tls-auth] huc_verify_hostname verifier={verifier_class:?}");
+    }
+    let Some(verifier0) = verifier0 else {
+        return Err(huc_unverified_peer_message(host));
+    };
+    if is_default_hostname_verifier(verifier_class.as_deref()) {
+        return Err(huc_unverified_peer_message(host));
     }
 
     // GC: `verifier0` is a raw ObjectRef that must survive four allocations
@@ -2036,15 +2113,25 @@ fn huc_verify_hostname(
 
     match outcome {
         Ok(Some(v)) if v.as_int().unwrap_or(0) != 0 => Ok(()),
-        Ok(_) => Err(format!(
-            "{TLS_PEER_UNVERIFIED_SENTINEL}Certificate for <{host}> does not match the \
-             installed HostnameVerifier"
-        )),
+        Ok(_) => Err(huc_unverified_peer_message(host)),
         Err(_) => Err(format!(
             "{TLS_PEER_UNVERIFIED_SENTINEL}the installed HostnameVerifier threw while \
              verifying <{host}>; treating the peer as unverified"
         )),
     }
+}
+
+/// The one rejection message for a failed endpoint identification, shared by
+/// every exit in `huc_verify_hostname` so the three ways to get there (no
+/// verifier installed, a default stand-in, an app verifier that declined)
+/// cannot describe the same outcome three different ways. Wording follows real
+/// JSSE's `checkURLSpoofing` ("should be <host>"), which likewise reports the
+/// hostname mismatch rather than naming the verifier.
+fn huc_unverified_peer_message(host: &str) -> String {
+    format!(
+        "{TLS_PEER_UNVERIFIED_SENTINEL}Certificate for <{host}> does not match any of the \
+         subject alternative names or the common name: HTTPS hostname wrong, should be <{host}>"
+    )
 }
 
 fn perform(
@@ -2310,18 +2397,17 @@ fn perform(
                         )
                     })?;
             }
-            // Hostname verification, at real JSSE's ordering: after the trust
-            // check, before the request is written. See `huc_verify_hostname`
-            // for why this is additive to (never a replacement for) rustls's
-            // own RFC 6125 endpoint identification, and why the ordinary path
-            // — no app verifier installed — costs nothing here.
+            // Endpoint identification, at real JSSE's ordering: after the
+            // trust check, before the request is written. See
+            // `huc_verify_hostname` for why an installed `HostnameVerifier` is
+            // a FALLBACK for a failed built-in check and never an extra gate.
             //
             // The chain is re-read from the connection rather than reusing the
             // `peer_chain` above: that binding only exists inside the
             // TrustManager branch, which is skipped entirely when no custom
-            // TrustManager is configured — the common case, and precisely the
-            // one where an app is most likely to be pinning with a verifier
-            // instead.
+            // TrustManager is configured — and the built-in name check below
+            // has to run on both paths, since the TrustManager branch is
+            // exactly the one where rustls skipped the name check itself.
             {
                 let peer_chain_der: Vec<Vec<u8>> = stream
                     .conn
@@ -4089,6 +4175,76 @@ mod http_url_connection_tests {
             matches!(observed, Ok(0)),
             "peer should see EOF after the pooled connection goes idle, got {observed:?}"
         );
+    }
+
+    /// A `localhost` leaf with `SAN dNSName=localhost` (plus `foo.test`,
+    /// `bar.test`, `IP 127.0.0.1`) — the same fixture the rustls loopback
+    /// self-test serves, and the same shape every Spring Boot / Tomcat TLS
+    /// test's keystore presents.
+    fn localhost_leaf_der() -> Vec<u8> {
+        let pem = include_str!("t27_certs/server.crt");
+        crate::t27_tls::parse_cert_chain_pem(pem)
+            .expect("t27_certs/server.crt must parse")
+            .remove(0)
+            .as_ref()
+            .to_vec()
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// The real JDK's `HttpsURLConnection.<clinit>` installs
+    /// `HttpsURLConnection$DefaultHostnameVerifier`, whose entire body is
+    /// `iconst_0; ireturn`, and every `HttpsURLConnection` instance inherits it
+    /// through the constructor. Failing to recognise that class as a default
+    /// stand-in — as the first version of this code did, which knew only about
+    /// the VM's own bare-interface synthetic — turns its unconditional `false`
+    /// into a rejection of every single https request.
+    ///
+    /// Deliberately spelled out as literals rather than derived: this is a
+    /// name-matching contract with the JDK (real JSSE matches the same class by
+    /// canonical name in `HttpsClient.afterConnect`), so a rename must break a
+    /// test rather than silently fall through to "app verifier".
+    #[test]
+    fn jdk_default_hostname_verifier_is_recognised_as_a_non_check() {
+        assert!(is_default_hostname_verifier(Some(
+            "javax/net/ssl/HttpsURLConnection$DefaultHostnameVerifier"
+        )));
+        assert!(is_default_hostname_verifier(Some(
+            "javax/net/ssl/HostnameVerifier"
+        )));
+        assert!(is_default_hostname_verifier(None));
+        // Anything else is a genuine application verifier and must be
+        // consulted (as a fallback) rather than skipped.
+        assert!(!is_default_hostname_verifier(Some("com/example/PinningHV")));
+        assert!(!is_default_hostname_verifier(Some(
+            "org/apache/http/conn/ssl/NoopHostnameVerifier"
+        )));
+    }
+
+    /// The built-in RFC 2818 check must ACCEPT the ordinary loopback case on
+    /// its own, before any verifier is consulted — that is what makes the
+    /// verifier a fallback rather than a gate. If this ever returns `Err`, the
+    /// JDK default verifier's hardcoded `false` becomes the deciding answer
+    /// again and every https request fails.
+    #[test]
+    fn builtin_endpoint_identification_accepts_a_localhost_leaf() {
+        let chain = vec![localhost_leaf_der()];
+        assert_eq!(huc_builtin_endpoint_identification("localhost", &chain), Ok(()));
+        // Case-insensitive, per RFC 6125.
+        assert_eq!(huc_builtin_endpoint_identification("LOCALHOST", &chain), Ok(()));
+        // The same leaf's IP SAN.
+        assert_eq!(huc_builtin_endpoint_identification("127.0.0.1", &chain), Ok(()));
+    }
+
+    /// ...and must REJECT a host the leaf does not assert, so the fallback to
+    /// the installed verifier is actually reachable. A check that always
+    /// passed would silently disable app-supplied verifiers altogether.
+    #[test]
+    fn builtin_endpoint_identification_rejects_a_foreign_host_and_an_empty_chain() {
+        let chain = vec![localhost_leaf_der()];
+        assert!(huc_builtin_endpoint_identification("evil.example.com", &chain).is_err());
+        assert!(huc_builtin_endpoint_identification("localhost", &[]).is_err());
+        assert!(huc_builtin_endpoint_identification("localhost", &[vec![0u8; 8]]).is_err());
     }
 
     #[test]
