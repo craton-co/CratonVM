@@ -3482,6 +3482,7 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+        crate::memory::roots::push_off_frame_thread_roots(self.thread, &mut snapshot);
         // The blocked-thread snapshot is the only marking view a collector on
         // another thread has of this JIT worker.  Publish the direct HashMap
         // cache here as well as in the safepoint snapshot so its map/node pair
