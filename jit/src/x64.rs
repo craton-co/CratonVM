@@ -38701,10 +38701,20 @@ mod flag_and_header_contracts {
     #[test]
     fn ir_lower_header_offset_sites_are_inventoried_too() {
         let src = include_str!("ir_lower.rs");
-        let cases: [(&str, &str, usize); 3] = [
+        let cases: [(&str, &str, usize); 4] = [
             ("HEADER_SIZE", " as u8", 2),
             ("HEADER_SIZE", " as i32", 2),
-            ("ARRAY_LENGTH_OFFSET", " as u8", 1),
+            // 0, deliberately: this site moved to
+            // `disp::disp8_const(ARRAY_LENGTH_OFFSET as i64)`, which is a
+            // `const fn` that fails the BUILD if the constant ever exceeds 127.
+            // That is strictly stronger than counting the raw narrowing here —
+            // an inventory notices drift after the fact, the const check makes
+            // the drift unrepresentable. A future raw `as u8` reintroduces the
+            // silent negative-disp8 hazard and trips this back to 1.
+            ("ARRAY_LENGTH_OFFSET", " as u8", 0),
+            // The checked form must stay present; deleting it would silently
+            // restore an unchecked site elsewhere.
+            ("ARRAY_LENGTH_OFFSET", " as i64", 1),
         ];
         for (base, suffix, expected) in cases {
             let needle = format!("{base}{suffix}");

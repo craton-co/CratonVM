@@ -4197,7 +4197,14 @@ fn reloc_emit_enabled() -> bool {
         // continues; otherwise (index >= length, OR a negative index whose
         // unsigned value is huge) deopt → AIOOBE.
         self.buf
-            .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // MOV R10D,[RAX+12]
+            .emit(&[
+                0x44,
+                0x8B,
+                0x50,
+                // Compile-time checked: a layout constant past 127 would encode a
+                // NEGATIVE disp8 and read before the object.
+                crate::x64::disp::disp8_const(ARRAY_LENGTH_OFFSET as i64) as u8,
+            ]); // MOV R10D,[RAX+12]
         self.buf.emit(&[0x44, 0x39, 0xD1]); // CMP ECX, R10D
         self.emit_deopt_unless(0x82, bci, DeoptReason::BoundsCheck); // JB continue
     }
@@ -7007,7 +7014,12 @@ mod tests {
         ));
         assert!(contains_seq(
             &code,
-            &[0x4D, 0x8B, 0x5A, JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8]
+            &[
+                0x4D,
+                0x8B,
+                0x5A,
+                crate::x64::disp::disp8_const(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as i64) as u8,
+            ]
         ));
         assert!(
             contains_seq(
@@ -7050,7 +7062,13 @@ mod tests {
             assert!(
                 contains_seq(
                     &code,
-                    &[0x4D, 0x8B, 0x5A, JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8]
+                    &[
+                        0x4D,
+                        0x8B,
+                        0x5A,
+                        crate::x64::disp::disp8_const(JitPICSlot::ENTRY_PTR_OFFSETS[i] as i64)
+                            as u8,
+                    ]
                 ),
                 "PIC entry {i} cached-entry load must be emitted"
             );
