@@ -73,7 +73,25 @@
 > (480 → 496 bytes; every ABI tripwire updated deliberately).
 > **Remaining:** (a) an `ir_lower` emission arm, and (b) an `IrBuilder`
 > `monitorenter`/`monitorexit` arm.
-> **(a) is not mechanical:** both ops carry `safepoint: true`, so the call site
+> **(a) — the two blockers are now RESOLVED; it is mechanical.**
+> *Safepoint map:* not novel work. It is the reusable two-line pattern used by
+> `Op::Call` — `let sp_live_hi = self.spill_high_water; self.emit_safepoint_map(
+> sp_live_hi);` — published BEFORE `alloc_slot`, because the result slot is not
+> written until the call returns and covering it early would publish whatever
+> the previous frame left there as a live reference.
+> *Store-back vs double-remap:* `jit_monitor_enter` returns the remapped object
+> (a contended acquire can move it while parked), and the object's slot is also
+> published in the safepoint map. The question was whether storing the return
+> over that slot double-remaps. **It does not.** `conservative_roots::
+> remap_one_jit_frame` rewrites published slots in place keyed on the slot's
+> CURRENT value (`pointer_map.get(&old)`), so if the collector already rewrote
+> it to `new`, storing `new` again is idempotent; the helper's own copy was
+> pinned and remapped internally, so both paths converge on the same address.
+> Storing back is correct in either order.
+> Remaining for (a): arg setup (context → arg0, obj → arg1), the absolute call,
+> the `i64::MIN` sentinel → shared exception epilogue (the helper publishes a
+> pending NPE for a null receiver), and the store-back.
+> *Superseded note:* both ops carry `safepoint: true`, so the call site
 > must publish a correct oop map or the collector misses roots — the same silent
 > failure class as the G1 barrier and TLAB sweep bugs found on this branch. It
 > also needs the remapped-return store-back (a contended acquire can move the
