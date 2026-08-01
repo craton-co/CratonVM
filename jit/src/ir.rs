@@ -1918,6 +1918,1102 @@ impl Graph {
     }
 }
 
+// ── Memory-effect model ──────────────────────────────────────────────
+//
+// The IR's only *encoded* ordering relation between two memory operations is
+// the memory-token chain: every memory-effecting node takes the previous
+// writer as an input edge and hands itself on as the token for the next one.
+// That chain is a total order. It is sound — the scheduler's topological sort
+// cannot reorder across an input edge — and it is far stronger than the Java
+// Memory Model requires: it serialises a load of `a.x` behind a store to
+// `b.y`, two reads behind each other, and an `ArrayLength` behind everything.
+//
+// Every pass that wanted to beat that order had to re-derive, privately, what
+// the chain means. `ir_optimize` grew `RefPointsTo` / `resolve_ref_points_to`
+// / `loop_store_clobber` for LICM and a second, differently-shaped
+// `StoreLoc` / `is_memory_barrier` pair for dead-store elimination; `lib.rs`
+// grew a third copy of the token predicate for the escape-analysis bridge;
+// `ir_verify` a fourth for its ordering lane. Four private notions of "may
+// these two touch the same memory", none of them able to answer the question
+// an optimizer actually asks.
+//
+// This section is that answer, in one place:
+//
+//   * [`AliasClass`] — *where* a node touches memory: a named field cell, an
+//     array element, an array's length word, a static field, an object's
+//     monitor, nothing, or anything.
+//   * [`MemOrder`] — *how strongly* it is ordered: the JMM acquire/release
+//     lattice, so a monitor-enter and a volatile read pin later accesses
+//     below them and a monitor-exit and a volatile write pin earlier
+//     accesses above them.
+//   * [`MemEffect`] — the pair of alias classes a node reads and writes, its
+//     [`MemOrder`], and whether it is a safepoint / an allocation.
+//   * [`Graph::may_alias`], [`Graph::may_reorder`],
+//     [`Graph::may_reorder_effects`] — the query API. The answer is a
+//     [`Reorder`], which carries the *reason*: a [`ReorderProof`] naming the
+//     fact that licenses the move, or a [`ReorderBlock`] naming the fact that
+//     forbids it. A pass records the proof rather than re-deriving it.
+//
+// **The token chain becomes a consumer of this model, not a rival truth.**
+// [`memory_token_slot`] and [`is_memory_token_slot`] — the canonical
+// spellings of the predicate that exists in three private copies today — are
+// *derived* from the same [`Op::memory_shape`] table the effect
+// classification reads, so the two can no longer drift apart. The chain stays
+// as the graph's conservative default ordering; [`Graph::may_reorder`] is how
+// a pass proves it may deviate from it.
+//
+// ## What this model deliberately does NOT answer
+//
+// `may_reorder` is a **memory-side** question. Two other orderings constrain
+// node placement and are unaffected by any answer here:
+//
+//   * **Control dependence.** A node's `ctrl` input pins it to a block. The
+//     query refuses outright ([`ReorderBlock::Control`]) when either node is
+//     a control node, and it never licenses moving a node across its own
+//     control edge.
+//   * **Implicit exception order.** `Op::Load` / `Op::Store` /
+//     `Op::ArrayLoad` / `Op::ArrayStore` fault on a null base or an
+//     out-of-range index and deopt. Whether `a.f = 1; b.g = 2` may be swapped
+//     when `b` is null is a question about the *exception*, not about the
+//     memory: the two stores provably touch disjoint cells, and it is the
+//     control/exception edge that keeps them in order. That is why those four
+//     ops are **not** flagged [`MemEffect::safepoint`] — flagging them would
+//     make the model answer "no" to every question and it would be answering
+//     the wrong one. A scheduler must combine this answer with control
+//     dependence; it must not use it alone.
+//
+// The query is also **pairwise**: `may_reorder(a, b)` says nothing about a
+// third node between them. Moving `b` above `a` past an intervening `c`
+// requires the query to hold for `(c, b)` too.
+
+/// The offset operand of a memory access — the second half of an
+/// [`AliasClass`]'s address, after the base reference.
+///
+/// Two accesses to the same base are disjoint exactly when their offsets are
+/// two *different compile-time constants*. Every other combination is
+/// "possibly the same cell": two runtime values may be equal, and a runtime
+/// value may equal any constant. Note that [`AccessOffset::Dynamic`] naming
+/// the *same* node twice is a must-alias, not a disjointness — the same node
+/// computes the same value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AccessOffset {
+    /// A compile-time constant: a field index (`Op::Load` / `Op::Store`) or a
+    /// constant-folded array index.
+    Const(i64),
+    /// A runtime value produced by this node.
+    Dynamic(NodeId),
+    /// The layout carries no offset operand at all — the compact
+    /// `[base, value]` `Store` and `[base]` `Load` forms the EA bridge and the
+    /// hand-built test graphs use. Treated as "the object's storage", so it is
+    /// never disjoint from another access to the same base.
+    Absent,
+}
+
+impl AccessOffset {
+    /// True when these two offsets provably name different cells.
+    ///
+    /// The whole precision of the model lives in this one line, so it is
+    /// stated positively: disjointness must be *proved*, and only a pair of
+    /// unequal constants proves it.
+    pub fn provably_distinct(self, other: AccessOffset) -> bool {
+        match (self, other) {
+            (AccessOffset::Const(a), AccessOffset::Const(b)) => a != b,
+            _ => false,
+        }
+    }
+}
+
+/// Where in memory a node reads or writes.
+///
+/// The classes are *storage kinds*, and different kinds never overlap: an
+/// instance field cell is not an array element, an array's length word is not
+/// a field cell, a class's static storage is not any object's instance
+/// storage, and an object's monitor is not any of them. Those cross-kind
+/// disjointness claims are the model's premises, and each is recorded at its
+/// arm in [`Graph::may_alias`] so a future op that violates one is caught at
+/// the place that would silently start returning the wrong answer.
+///
+/// [`AliasClass::Any`] is the top of the lattice ("could be anywhere") and
+/// [`AliasClass::None`] the bottom ("touches no memory"). An unreadable node
+/// layout always degrades to `Any`, never to `None`: the failure direction has
+/// to be the one that refuses optimizations, not the one that licenses them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AliasClass {
+    /// No memory at all. The bottom of the lattice — aliases nothing, not even
+    /// itself.
+    None,
+    /// The instance field cell `base.#offset`. `Op::Load` / `Op::Store`.
+    Field {
+        /// The object reference.
+        base: NodeId,
+        /// The field index (constant in the builder-emitted form).
+        offset: AccessOffset,
+    },
+    /// The array element `array[index]`. `Op::ArrayLoad` / `Op::ArrayStore`.
+    ArrayElem {
+        /// The array reference.
+        array: NodeId,
+        /// The element index — usually [`AccessOffset::Dynamic`].
+        index: AccessOffset,
+    },
+    /// An array's length word. `Op::ArrayLength`.
+    ///
+    /// Its own class because array length is **immutable**: nothing in the JVM
+    /// writes it after the allocation that produced it, so no store — not even
+    /// an opaque call — can clobber it. That is what lets the model prove an
+    /// `ArrayLength` commutes with a store, which the token chain (where it
+    /// sits between two writers) cannot.
+    ArrayLength {
+        /// The array reference.
+        array: NodeId,
+    },
+    /// A class's static field cell.
+    ///
+    /// Keyed by `(class_id, field)` rather than by a base node, because static
+    /// storage has no reference operand to resolve — which makes static
+    /// accesses the one class the model can disambiguate *exactly*. No op
+    /// produces this yet (`getstatic` / `putstatic` have no IR lowering); the
+    /// class exists so the lowering lands with a classification instead of
+    /// widening everything to [`AliasClass::Any`].
+    Static {
+        /// Declaring class.
+        class_id: u32,
+        /// Field index within the class's static storage.
+        field: u32,
+    },
+    /// An object's monitor (lock word). `monitorenter` / `monitorexit`.
+    ///
+    /// Aliasing is only half the story for a monitor: its *ordering* comes
+    /// from [`MemOrder`], not from this class. Two monitor operations on
+    /// provably distinct objects do not alias, and they still do not commute
+    /// with the accesses between them, because monitor-enter is an acquire and
+    /// monitor-exit a release.
+    Monitor {
+        /// The locked object.
+        obj: NodeId,
+    },
+    /// Anywhere. The top of the lattice: aliases everything except
+    /// [`AliasClass::None`].
+    Any,
+}
+
+impl AliasClass {
+    /// True when this names no memory at all.
+    pub fn is_none(self) -> bool {
+        matches!(self, AliasClass::None)
+    }
+
+    /// True when this names memory (anything but [`AliasClass::None`]).
+    pub fn is_some(self) -> bool {
+        !self.is_none()
+    }
+
+    /// The base reference operand, when the class has one.
+    ///
+    /// [`AliasClass::Static`] has no base by construction, and `None` / `Any`
+    /// are not addressed by a reference.
+    pub fn base(self) -> Option<NodeId> {
+        match self {
+            AliasClass::Field { base, .. } => Some(base),
+            AliasClass::ArrayElem { array, .. } => Some(array),
+            AliasClass::ArrayLength { array } => Some(array),
+            AliasClass::Monitor { obj } => Some(obj),
+            AliasClass::None | AliasClass::Static { .. } | AliasClass::Any => Option::None,
+        }
+    }
+}
+
+/// The Java Memory Model ordering strength of a node.
+///
+/// The lattice is the two independent fence halves:
+///
+/// ```text
+///            SeqCst          (both — a volatile write)
+///           /      \
+///      Acquire    Release    (monitor-enter / volatile read,
+///           \      /          monitor-exit / volatile write)
+///            Plain           (an ordinary load or store)
+/// ```
+///
+/// Read the two halves as motion bans, which is what the query needs:
+///
+/// * **Acquire** on the *earlier* node — nothing after it may move above it.
+/// * **Release** on the *later* node — nothing before it may move below it.
+///
+/// That asymmetry is the JMM's "roach motel": accesses may move *into* a
+/// synchronized region from either end, never *out* of it. It is what makes
+/// `monitorenter … monitorexit` bound the operations between them without
+/// pinning the operations outside them.
+///
+/// A volatile **read** is `Acquire`. A volatile **write** is
+/// [`MemOrder::SeqCst`] rather than a bare `Release`: the JMM requires
+/// sequential consistency across volatile accesses, which HotSpot implements
+/// with a `StoreLoad` fence after the write, so it is a barrier in both
+/// directions. Being stronger than a bare release here is the conservative
+/// direction and it is what the acceptance test pins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemOrder {
+    /// No ordering of its own — the ordinary case.
+    Plain,
+    /// Acquire: no later access may move above this node.
+    Acquire,
+    /// Release: no earlier access may move below this node.
+    Release,
+    /// A full fence: both halves.
+    SeqCst,
+}
+
+impl MemOrder {
+    /// True when nothing after this node may move above it.
+    pub fn has_acquire(self) -> bool {
+        matches!(self, MemOrder::Acquire | MemOrder::SeqCst)
+    }
+
+    /// True when nothing before this node may move below it.
+    pub fn has_release(self) -> bool {
+        matches!(self, MemOrder::Release | MemOrder::SeqCst)
+    }
+
+    /// True for a full (bidirectional) fence.
+    pub fn is_fence(self) -> bool {
+        matches!(self, MemOrder::SeqCst)
+    }
+
+    /// True when this imposes no ordering of its own.
+    pub fn is_plain(self) -> bool {
+        matches!(self, MemOrder::Plain)
+    }
+
+    /// Least upper bound: the strength of a node that does both.
+    pub fn join(self, other: MemOrder) -> MemOrder {
+        match (
+            self.has_acquire() || other.has_acquire(),
+            self.has_release() || other.has_release(),
+        ) {
+            (true, true) => MemOrder::SeqCst,
+            (true, false) => MemOrder::Acquire,
+            (false, true) => MemOrder::Release,
+            (false, false) => MemOrder::Plain,
+        }
+    }
+}
+
+/// The complete memory effect of one node: what it reads, what it writes, how
+/// strongly it is ordered, and whether it is a safepoint or an allocation.
+///
+/// Reads and writes are kept as two separate [`AliasClass`]es rather than one
+/// class plus a read/write flag, because the interesting nodes do both to
+/// *different* places — and because a read-read pair commutes regardless of
+/// aliasing, which a merged representation cannot express.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MemEffect {
+    /// Locations this node may read.
+    pub reads: AliasClass,
+    /// Locations this node may write.
+    pub writes: AliasClass,
+    /// JMM ordering strength — see [`MemOrder`].
+    pub order: MemOrder,
+    /// This node is a safepoint: control may leave for the runtime here and
+    /// an interpreter frame may be rebuilt from it (`Op::Call`, `Op::New`,
+    /// `Op::NewArray`, `Op::Guard`).
+    ///
+    /// The constraint that follows is specifically about **writes**: every
+    /// store the method has performed must have happened before the frame is
+    /// rebuilt, and no store it has not yet performed may have. Loads may
+    /// cross a safepoint freely — a load has no visible effect, and re-running
+    /// one after a deopt reproduces it. Two safepoints may cross each other
+    /// unless one of them allocates.
+    ///
+    /// See the section header for why the implicit null/bounds faults of
+    /// `Op::Load` and friends are *not* modelled here.
+    pub safepoint: bool,
+    /// This node may allocate (`Op::New`, `Op::NewArray`, and any call, whose
+    /// callee may). Two allocating nodes do not commute: which one runs first
+    /// is observable through `OutOfMemoryError` and through the addresses and
+    /// identity hashes the collector hands out.
+    pub allocates: bool,
+}
+
+impl MemEffect {
+    /// The effect of a node that touches no memory and imposes no ordering.
+    pub const NONE: MemEffect = MemEffect {
+        reads: AliasClass::None,
+        writes: AliasClass::None,
+        order: MemOrder::Plain,
+        safepoint: false,
+        allocates: false,
+    };
+
+    /// Reads and writes anything, is a safepoint, and may allocate — the
+    /// effect of a call whose callee is unknown, and the fallback for any node
+    /// whose layout could not be read. The top of the effect lattice.
+    pub const OPAQUE: MemEffect = MemEffect {
+        reads: AliasClass::Any,
+        writes: AliasClass::Any,
+        order: MemOrder::Plain,
+        safepoint: true,
+        allocates: true,
+    };
+
+    /// A plain read of one location.
+    pub fn read(class: AliasClass) -> MemEffect {
+        MemEffect {
+            reads: class,
+            ..MemEffect::NONE
+        }
+    }
+
+    /// A plain write of one location.
+    pub fn write(class: AliasClass) -> MemEffect {
+        MemEffect {
+            writes: class,
+            ..MemEffect::NONE
+        }
+    }
+
+    /// A fresh allocation: writes only storage nothing else can yet name, but
+    /// is a safepoint and orders against other allocations.
+    pub fn allocation() -> MemEffect {
+        MemEffect {
+            safepoint: true,
+            allocates: true,
+            ..MemEffect::NONE
+        }
+    }
+
+    /// `monitorenter` on `obj` — an **acquire**.
+    ///
+    /// No op produces this yet (`monitorenter` has no IR lowering, so a
+    /// synchronized method bails to the single-pass backend). The constructor
+    /// exists so the lowering lands with a classification, and so the ordering
+    /// discipline can be stated and tested now rather than discovered later.
+    pub fn monitor_enter(obj: NodeId) -> MemEffect {
+        MemEffect {
+            reads: AliasClass::Monitor { obj },
+            writes: AliasClass::Monitor { obj },
+            order: MemOrder::Acquire,
+            safepoint: true,
+            allocates: false,
+        }
+    }
+
+    /// `monitorexit` on `obj` — a **release**. See [`MemEffect::monitor_enter`].
+    pub fn monitor_exit(obj: NodeId) -> MemEffect {
+        MemEffect {
+            reads: AliasClass::Monitor { obj },
+            writes: AliasClass::Monitor { obj },
+            order: MemOrder::Release,
+            safepoint: true,
+            allocates: false,
+        }
+    }
+
+    /// A volatile read of `class` — an **acquire**. See
+    /// [`MemEffect::monitor_enter`] for why this has no producing op yet.
+    pub fn volatile_read(class: AliasClass) -> MemEffect {
+        MemEffect {
+            reads: class,
+            writes: AliasClass::None,
+            order: MemOrder::Acquire,
+            safepoint: false,
+            allocates: false,
+        }
+    }
+
+    /// A volatile write of `class` — a **full fence**, so a barrier in both
+    /// directions. See [`MemOrder`] for why this is `SeqCst` and not a bare
+    /// release.
+    pub fn volatile_write(class: AliasClass) -> MemEffect {
+        MemEffect {
+            reads: AliasClass::None,
+            writes: class,
+            order: MemOrder::SeqCst,
+            safepoint: false,
+            allocates: false,
+        }
+    }
+
+    /// True when this node reads or writes memory.
+    pub fn touches_memory(self) -> bool {
+        self.reads.is_some() || self.writes.is_some()
+    }
+
+    /// True when this node writes memory.
+    pub fn is_write(self) -> bool {
+        self.writes.is_some()
+    }
+
+    /// True when this node constrains motion in *no* way — no memory, no
+    /// fence, no safepoint, no allocation. Such a node commutes with anything.
+    pub fn is_inert(self) -> bool {
+        !self.touches_memory() && self.order.is_plain() && !self.safepoint && !self.allocates
+    }
+}
+
+/// What kind of memory access an op performs — the `access` half of
+/// [`OpMemoryShape`], and the discriminator [`access_location`] keys off when
+/// it reads the base/offset operands out of a node's edge list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemAccess {
+    /// Reads one instance field cell.
+    FieldRead,
+    /// Writes one instance field cell.
+    FieldWrite,
+    /// Reads one array element.
+    ArrayRead,
+    /// Writes one array element.
+    ArrayWrite,
+    /// Reads an array's (immutable) length word.
+    LengthRead,
+    /// Allocates fresh storage.
+    Allocate,
+    /// Reads and writes anything.
+    Opaque,
+}
+
+/// Static description of a memory-effecting op: where its incoming memory
+/// token sits, what distinguishes the documented full layout from the compact
+/// ones, and what it does to memory.
+///
+/// **This is the single table.** [`memory_token_slot`] reads it to answer
+/// "which slot is the token", and [`effect_of_node`] reads it to answer "what
+/// does this node touch". Before this existed the two questions had separate
+/// tables in separate files (three copies of the first, four private notions
+/// of the second), which is how they drifted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OpMemoryShape {
+    /// Input slot carrying the incoming memory token in the documented
+    /// `[ctrl, mem, …]` form. Always 1 today; named rather than assumed.
+    pub token_slot: usize,
+    /// Minimum input count of the documented full form.
+    ///
+    /// The arity guard is what distinguishes that form from the compact
+    /// hand-built / EA-bridge layouts `ir_optimize::store_operands` and
+    /// `ir_optimize::load_base` also accept — a compact `Store` is
+    /// `[base, value]`, whose slot 1 is a *value*, not a token. Below this
+    /// arity the node has no memory token at all.
+    pub min_full_arity: usize,
+    /// What the op does to memory.
+    pub access: MemAccess,
+}
+
+impl Op {
+    /// The memory shape of this op, or `None` when it consumes no memory token
+    /// in the documented `[ctrl, mem, …]` layout.
+    ///
+    /// `None` here is **not** "touches no memory": a memory-typed `Op::Phi`
+    /// consumes a token from every predecessor rather than at one fixed slot,
+    /// and `Op::Return` ends the method. Both are classified directly by
+    /// [`effect_of_node`] / [`is_memory_token_slot`]. This table answers the
+    /// narrower question "does this op have a single token slot, and where".
+    ///
+    /// The arities are the ones `ir_optimize::memory_token_slot`,
+    /// `ir_verify::is_memory_token_input` and `lib.rs::ea_memory_token_slot`
+    /// each carry a private copy of; the anti-drift test in this file asserts
+    /// all of them still agree, op by op and arity by arity.
+    pub fn memory_shape(&self) -> Option<OpMemoryShape> {
+        let (min_full_arity, access) = match self {
+            Op::Load(_) => (3, MemAccess::FieldRead), // [ctrl, mem, base]
+            Op::Store(_) => (4, MemAccess::FieldWrite), // [ctrl, mem, base, value]
+            Op::ArrayLoad(_) => (4, MemAccess::ArrayRead), // [ctrl, mem, array, index]
+            Op::ArrayStore(_) => (5, MemAccess::ArrayWrite), // [ctrl, mem, array, index, value]
+            Op::ArrayLength => (3, MemAccess::LengthRead), // [ctrl, mem, array_ref]
+            Op::New { .. } => (2, MemAccess::Allocate), // [ctrl, mem]
+            Op::NewArray { .. } => (3, MemAccess::Allocate), // [ctrl, mem, length]
+            Op::Call { .. } => (2, MemAccess::Opaque), // [ctrl, mem, args…]
+            Op::LambdaIntToDouble => (4, MemAccess::Opaque), // [ctrl, mem, lambda, index]
+            _ => return None,
+        };
+        Some(OpMemoryShape {
+            token_slot: 1,
+            min_full_arity,
+            access,
+        })
+    }
+}
+
+/// The input slot carrying `node`'s incoming memory token, or `None` when this
+/// op does not consume one.
+///
+/// **The canonical spelling.** Three private copies of this predicate exist —
+/// `ir_optimize::memory_token_slot`, `ir_verify::is_memory_token_input` and
+/// `lib.rs::ea_memory_token_slot` — reconciled by hand and kept numerically
+/// identical by a comment in each. They should all become calls to this
+/// function; see the anti-drift test, which fails the moment any of the
+/// reachable ones diverges.
+///
+/// Derived from [`Op::memory_shape`], so the token convention and the effect
+/// classification cannot disagree about which ops are memory operations.
+pub fn memory_token_slot(node: &Node) -> Option<usize> {
+    let shape = node.op.memory_shape()?;
+    if node.inputs.len() >= shape.min_full_arity {
+        Some(shape.token_slot)
+    } else {
+        None
+    }
+}
+
+/// True when input `idx` of `node` is a memory *token* — an ordering edge
+/// naming the previous writer — rather than a value the node reads.
+///
+/// A memory-typed φ is the one op whose token edges are not a single slot:
+/// *every* value input (slots 1.., past the control anchor) is a token from
+/// one predecessor.
+pub fn is_memory_token_slot(node: &Node, idx: usize) -> bool {
+    if matches!(node.op, Op::Phi) {
+        return node.ty == IrType::Memory && idx >= 1;
+    }
+    memory_token_slot(node) == Some(idx)
+}
+
+/// Read the `(base, offset)` a memory access addresses, out of whichever edge
+/// layout the node is in.
+///
+/// Mirrors `ir_optimize::store_operands` / `ir_optimize::load_base` exactly,
+/// including their tolerance for the compact hand-built and EA-bridge forms.
+/// An unreadable layout returns [`AliasClass::Any`] — the direction that
+/// refuses optimizations.
+///
+/// Offsets come back as [`AccessOffset::Dynamic`]; [`Graph::memory_effect`]
+/// constant-folds them, which is where the model gets the precision that lets
+/// two field stores commute.
+fn access_location(node: &Node, access: MemAccess) -> AliasClass {
+    let inputs = node.inputs.as_slice();
+    let dyn_at = |i: usize| match inputs.get(i).copied().and_then(node_id_opt) {
+        Some(id) => AccessOffset::Dynamic(id),
+        None => AccessOffset::Absent,
+    };
+    match access {
+        // `load_base`: compact `[base]` / `[base, index]`, full
+        // `[ctrl, mem, base, index?]`.
+        MemAccess::FieldRead => match inputs.len() {
+            1 | 2 => AliasClass::Field {
+                base: inputs[0],
+                offset: dyn_at(1),
+            },
+            n if n >= 3 => AliasClass::Field {
+                base: inputs[2],
+                offset: dyn_at(3),
+            },
+            _ => AliasClass::Any,
+        },
+        // `store_operands`: compact `[base, value]`, full-without-offset
+        // `[ctrl, mem, base, value]`, full `[ctrl, mem, base, offset, value]`.
+        // Note the arity-4 form's slot 3 is the *value*, so the offset is
+        // Absent there — reading it as an offset would invent a disjointness.
+        MemAccess::FieldWrite => match inputs.len() {
+            2 => AliasClass::Field {
+                base: inputs[0],
+                offset: AccessOffset::Absent,
+            },
+            4 => AliasClass::Field {
+                base: inputs[2],
+                offset: AccessOffset::Absent,
+            },
+            n if n >= 5 => AliasClass::Field {
+                base: inputs[2],
+                offset: dyn_at(3),
+            },
+            _ => AliasClass::Any,
+        },
+        // `[ctrl, mem, array, index]` — the only documented form.
+        MemAccess::ArrayRead | MemAccess::ArrayWrite => {
+            if inputs.len() >= 4 {
+                AliasClass::ArrayElem {
+                    array: inputs[2],
+                    index: dyn_at(3),
+                }
+            } else {
+                AliasClass::Any
+            }
+        }
+        // `[ctrl, mem, array_ref]`, or the hand-built `[array]`. The arity
+        // range is deliberately 1..=3 (see `ir_verify`'s arity lane).
+        MemAccess::LengthRead => match inputs.len() {
+            1 | 2 => AliasClass::ArrayLength { array: inputs[0] },
+            n if n >= 3 => AliasClass::ArrayLength { array: inputs[2] },
+            _ => AliasClass::Any,
+        },
+        MemAccess::Allocate => AliasClass::None,
+        MemAccess::Opaque => AliasClass::Any,
+    }
+}
+
+/// The memory effect of a node, read from its op and edge layout alone.
+///
+/// Offsets stay [`AccessOffset::Dynamic`] because folding one needs the graph;
+/// use [`Graph::memory_effect`] to get the folded form. Everything else — the
+/// alias classes, the ordering, the safepoint and allocation flags — is final
+/// here.
+///
+/// Ops with no memory shape are classified explicitly:
+///
+/// * a **memory-typed φ** is [`MemEffect::OPAQUE`]. It performs no access of
+///   its own, but it is the merge of two token chains, and letting an access
+///   float across it is a control-flow question this model does not answer.
+/// * a **non-memory φ** is inert: it computes a value, it reads no memory.
+/// * `Op::Return` is [`MemEffect::OPAQUE`] — the method's writes must all have
+///   happened.
+/// * every other **control** op is inert. `Op::Start`'s `Proj(1)` is the
+///   initial memory token, but producing a token is not an access; a control
+///   node's placement is governed by control edges, and
+///   [`Graph::may_reorder`] refuses control nodes outright.
+/// * `Op::Dead` is [`MemEffect::OPAQUE`]. A killed node should never be
+///   queried; if one is, it must not answer "commutes with everything".
+/// * everything else (arithmetic, comparisons, conversions, constants,
+///   parameters, `Op::Phi` on data) is inert. `Op::Div` / `Op::Rem` throw on a
+///   zero divisor, which is an exception-ordering question, not a memory one —
+///   see the section header.
+pub fn effect_of_node(node: &Node) -> MemEffect {
+    match &node.op {
+        Op::Phi => {
+            if node.ty == IrType::Memory {
+                MemEffect::OPAQUE
+            } else {
+                MemEffect::NONE
+            }
+        }
+        Op::Return | Op::Dead => MemEffect::OPAQUE,
+        Op::Guard { .. } => MemEffect {
+            safepoint: true,
+            ..MemEffect::NONE
+        },
+        op => match op.memory_shape() {
+            None => MemEffect::NONE,
+            Some(shape) => {
+                let class = access_location(node, shape.access);
+                match shape.access {
+                    MemAccess::FieldRead | MemAccess::ArrayRead | MemAccess::LengthRead => {
+                        MemEffect::read(class)
+                    }
+                    MemAccess::FieldWrite | MemAccess::ArrayWrite => MemEffect::write(class),
+                    MemAccess::Allocate => MemEffect::allocation(),
+                    MemAccess::Opaque => MemEffect::OPAQUE,
+                }
+            }
+        },
+    }
+}
+
+/// Largest allocation set [`Graph::ref_origin`] will carry before giving up
+/// and reporting unknown provenance.
+///
+/// A reference that may be one of nine different allocations is not a
+/// reference any pass profits from disambiguating, and the bound keeps the
+/// join over a deep φ web linear.
+pub const MAX_ALIAS_ALLOC_SET: usize = 8;
+
+/// Recursion bound for [`Graph::ref_origin`]. A loop-carried φ cycle resolves
+/// to unknown rather than hanging.
+const REF_ORIGIN_MAX_DEPTH: u32 = 32;
+
+/// What a reference node may point to — the provenance half of
+/// [`Graph::may_alias`].
+///
+/// Same shape as `ir_optimize`'s private `RefPointsTo`, which it is meant to
+/// replace: `allocs` is the set of in-method allocations the reference may
+/// name (`None` = unknown provenance, may be anything), and `pre_existing`
+/// records whether it may be an object that existed before the method ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefOrigin {
+    /// The fresh in-method allocations this reference may name, or `None` when
+    /// its provenance is unknown (a loaded reference, a call result, an
+    /// over-wide φ join).
+    pub allocs: Option<Vec<NodeId>>,
+    /// True when it may be a *pre-existing* reference — a parameter, `this`.
+    /// Never an in-method allocation.
+    pub pre_existing: bool,
+}
+
+impl RefOrigin {
+    /// Unknown provenance: may be any object at all.
+    pub fn unknown() -> RefOrigin {
+        RefOrigin {
+            allocs: None,
+            pre_existing: false,
+        }
+    }
+
+    /// True when nothing is known about this reference.
+    pub fn is_unknown(&self) -> bool {
+        self.allocs.is_none()
+    }
+
+    /// Exactly one fresh allocation.
+    fn alloc(id: NodeId) -> RefOrigin {
+        RefOrigin {
+            allocs: Some(vec![id]),
+            pre_existing: false,
+        }
+    }
+
+    /// A pre-existing reference and nothing else.
+    fn pre_existing_only() -> RefOrigin {
+        RefOrigin {
+            allocs: Some(Vec::new()),
+            pre_existing: true,
+        }
+    }
+
+    /// Join another origin into this one (the φ merge). Any unknown input
+    /// poisons the result, and overflowing [`MAX_ALIAS_ALLOC_SET`] degrades it
+    /// to unknown.
+    fn absorb(&mut self, other: RefOrigin) {
+        self.pre_existing |= other.pre_existing;
+        match (self.allocs.as_mut(), other.allocs) {
+            (Some(mine), Some(theirs)) => {
+                for id in theirs {
+                    if !mine.contains(&id) {
+                        mine.push(id);
+                    }
+                }
+                if mine.len() > MAX_ALIAS_ALLOC_SET {
+                    self.allocs = None;
+                }
+            }
+            _ => self.allocs = None,
+        }
+    }
+
+    /// True when these two references provably name **different** objects.
+    ///
+    /// Requires both sides to have known provenance, their allocation sets to
+    /// be disjoint, and at most one of them to be possibly-pre-existing —
+    /// because two parameters can be the same object (`foo(x, x)`), while a
+    /// fresh allocation can never be a value that existed before the method
+    /// ran.
+    pub fn provably_distinct(&self, other: &RefOrigin) -> bool {
+        let (mine, theirs) = match (&self.allocs, &other.allocs) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return false,
+        };
+        if self.pre_existing && other.pre_existing {
+            return false;
+        }
+        !mine.iter().any(|id| theirs.contains(id))
+    }
+}
+
+/// A `may_reorder` answer, with the fact that justifies it.
+///
+/// The point of returning a reason rather than a `bool` is the acceptance
+/// criterion: *"optimizations cannot reorder through side effects without a
+/// proof encoded in the graph."* A pass that moves a node records the
+/// [`ReorderProof`] it moved on; a pass that declines records the
+/// [`ReorderBlock`] it hit. Both are checkable after the fact, and a `Blocked`
+/// reason is the diagnostic a missed optimization report needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Reorder {
+    /// The two nodes may be swapped, on the strength of this fact.
+    Allowed(ReorderProof),
+    /// They may not, because of this fact.
+    Blocked(ReorderBlock),
+}
+
+impl Reorder {
+    /// True when the swap is licensed.
+    pub fn is_allowed(self) -> bool {
+        matches!(self, Reorder::Allowed(_))
+    }
+
+    /// True when the swap is refused.
+    pub fn is_blocked(self) -> bool {
+        matches!(self, Reorder::Blocked(_))
+    }
+}
+
+/// Why a reorder is licensed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReorderProof {
+    /// At least one of the two constrains motion in no way at all — no memory,
+    /// no fence, no safepoint, no allocation.
+    EffectFree,
+    /// Neither node writes memory, so no read can observe a difference.
+    ReadOnly,
+    /// Both touch memory, but the locations are provably disjoint.
+    DisjointLocations,
+}
+
+/// Why a reorder is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReorderBlock {
+    /// One of the ids does not name a node.
+    UnknownNode,
+    /// One of them is a control node. Control placement is governed by control
+    /// edges, which this model does not reason about.
+    Control,
+    /// The later node consumes the earlier one as a **value** (or control)
+    /// input. Note this deliberately does *not* fire for a memory-token edge:
+    /// breaking an over-strict token edge is exactly what the model is for.
+    DataDependence,
+    /// One of them is a full fence — a volatile access.
+    Fence,
+    /// The earlier node is an acquire (monitor-enter, volatile read), so
+    /// nothing after it may move above it.
+    Acquire,
+    /// The later node is a release (monitor-exit, volatile write), so nothing
+    /// before it may move below it.
+    Release,
+    /// Both allocate, and allocation order is observable.
+    Allocation,
+    /// One is a safepoint and the other writes memory.
+    Safepoint,
+    /// Their locations may be the same, and at least one of them writes.
+    MayAlias,
+}
+
+impl Graph {
+    /// The memory effect of `id`, with constant offsets folded.
+    ///
+    /// The graph-aware form of [`effect_of_node`]: an offset operand that
+    /// resolves to an `Op::Const` becomes an [`AccessOffset::Const`], which is
+    /// the *only* thing that ever proves two accesses to the same base
+    /// disjoint. A node id that names nothing answers [`MemEffect::OPAQUE`].
+    pub fn memory_effect(&self, id: NodeId) -> MemEffect {
+        let node = match self.node_opt(id) {
+            Some(n) => n,
+            None => return MemEffect::OPAQUE,
+        };
+        let mut eff = effect_of_node(node);
+        eff.reads = self.fold_offsets(eff.reads);
+        eff.writes = self.fold_offsets(eff.writes);
+        eff
+    }
+
+    /// Replace a [`AccessOffset::Dynamic`] offset with [`AccessOffset::Const`]
+    /// when the node it names is an integer constant.
+    fn fold_offsets(&self, class: AliasClass) -> AliasClass {
+        let fold = |off: AccessOffset| match off {
+            AccessOffset::Dynamic(id) => match self.node_opt(id).map(|n| &n.op) {
+                Some(Op::Const(v)) => AccessOffset::Const(*v),
+                _ => off,
+            },
+            other => other,
+        };
+        match class {
+            AliasClass::Field { base, offset } => AliasClass::Field {
+                base,
+                offset: fold(offset),
+            },
+            AliasClass::ArrayElem { array, index } => AliasClass::ArrayElem {
+                array,
+                index: fold(index),
+            },
+            other => other,
+        }
+    }
+
+    /// What reference `id` may point to, following `Op::Phi` merges.
+    ///
+    /// Leaves: `Op::New` / `Op::NewArray` are exactly themselves (the node *is*
+    /// the reference — see the builder's `new` arm); `Op::Param` is a
+    /// pre-existing reference; anything else is unknown provenance. A φ joins
+    /// its value inputs, skipping the control anchor at its head.
+    pub fn ref_origin(&self, id: NodeId) -> RefOrigin {
+        self.ref_origin_at(id, 0)
+    }
+
+    fn ref_origin_at(&self, id: NodeId, depth: u32) -> RefOrigin {
+        if depth > REF_ORIGIN_MAX_DEPTH {
+            return RefOrigin::unknown();
+        }
+        let node = match self.node_opt(id) {
+            Some(n) => n,
+            None => return RefOrigin::unknown(),
+        };
+        match &node.op {
+            Op::New { .. } | Op::NewArray { .. } => RefOrigin::alloc(id),
+            Op::Param(_) => RefOrigin::pre_existing_only(),
+            Op::Phi => {
+                let mut joined = RefOrigin {
+                    allocs: Some(Vec::new()),
+                    pre_existing: false,
+                };
+                let mut saw_value = false;
+                for &inp in node.inputs.iter() {
+                    let pred = match self.node_opt(inp) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    if pred.op.is_control() {
+                        continue; // the φ's region/merge anchor, not a value
+                    }
+                    saw_value = true;
+                    joined.absorb(self.ref_origin_at(inp, depth + 1));
+                }
+                if saw_value {
+                    joined
+                } else {
+                    RefOrigin::unknown()
+                }
+            }
+            _ => RefOrigin::unknown(),
+        }
+    }
+
+    /// True when two reference nodes may name the same object.
+    ///
+    /// The same id is always a must-alias. Otherwise the answer is the
+    /// negation of [`RefOrigin::provably_distinct`].
+    pub fn refs_may_alias(&self, a: NodeId, b: NodeId) -> bool {
+        if a == b {
+            return true;
+        }
+        !self.ref_origin(a).provably_distinct(&self.ref_origin(b))
+    }
+
+    /// True when two alias classes may name overlapping memory.
+    ///
+    /// This is the model's core disjointness judgement, and every "false" it
+    /// returns is a claim that has to be true of the VM's object layout:
+    ///
+    /// * **Different storage kinds never overlap.** A field cell is not an
+    ///   array element (a Java object is either an array or a class instance,
+    ///   never both, and verified bytecode never reaches `getfield` on an
+    ///   array or `aaload` on a non-array); an array's length word is not a
+    ///   field cell; a class's static storage is a per-class area no object
+    ///   reference addresses; an object's monitor is not any of them. If an op
+    ///   is ever added that violates one of these — a raw `Unsafe`-style
+    ///   access with a computed offset, say — it must classify as
+    ///   [`AliasClass::Any`], not as one of the structured classes.
+    /// * **`ArrayLength` is read-only storage.** Nothing writes an array's
+    ///   length, so [`AliasClass::ArrayLength`] never conflicts with a write —
+    ///   not even an opaque one, since [`AliasClass::Any`] is handled by the
+    ///   earlier arm only because an opaque node may *read* it too. (An
+    ///   `Any` write does conservatively conflict with a length read; the
+    ///   precision available here is the cross-kind one, which is what lets an
+    ///   `ArrayLength` commute with a field or element store.)
+    /// * **Same kind, same base:** disjoint only when the offsets are two
+    ///   different compile-time constants ([`AccessOffset::provably_distinct`]).
+    /// * **Same kind, different base:** disjoint only when the bases are
+    ///   provably different objects ([`Graph::refs_may_alias`]).
+    ///
+    /// Aliasing alone does not decide reordering — see
+    /// [`Graph::may_reorder_effects`], which also applies the JMM fences and
+    /// the safepoint rule.
+    pub fn may_alias(&self, a: AliasClass, b: AliasClass) -> bool {
+        use AliasClass as C;
+        match (a, b) {
+            // Bottom: no memory, nothing to conflict with.
+            (C::None, _) | (_, C::None) => false,
+            // Top: could be anywhere.
+            (C::Any, _) | (_, C::Any) => true,
+            (C::Field { base: x, offset: i }, C::Field { base: y, offset: j }) => {
+                !i.provably_distinct(j) && self.refs_may_alias(x, y)
+            }
+            (C::ArrayElem { array: x, index: i }, C::ArrayElem { array: y, index: j }) => {
+                !i.provably_distinct(j) && self.refs_may_alias(x, y)
+            }
+            (C::ArrayLength { array: x }, C::ArrayLength { array: y }) => self.refs_may_alias(x, y),
+            (C::Static { class_id: c, field: i }, C::Static { class_id: d, field: j }) => {
+                c == d && i == j
+            }
+            (C::Monitor { obj: x }, C::Monitor { obj: y }) => self.refs_may_alias(x, y),
+            // Different storage kinds — see the premises in the doc above.
+            _ => false,
+        }
+    }
+
+    /// May the node `earlier` and the node `later` — given in **program
+    /// order** — be swapped?
+    ///
+    /// This is the question a pass asks as *"may I move this load above that
+    /// store?"*: `may_reorder(store, load)`, with the store first because that
+    /// is the order they are in today.
+    ///
+    /// On top of [`Graph::may_reorder_effects`] it adds the two graph-level
+    /// refusals:
+    ///
+    /// * either node being a **control** node ([`ReorderBlock::Control`]);
+    /// * `later` consuming `earlier` through a **non-token** input edge
+    ///   ([`ReorderBlock::DataDependence`]). A memory-token edge is
+    ///   deliberately *not* a refusal: the token chain is this model's
+    ///   conservative default, and overriding it with a proof is the entire
+    ///   purpose of the query. A pass that acts on an `Allowed` answer must
+    ///   then repair the chain (`ir_optimize::kill_store_splicing_memory_chain`
+    ///   is the existing splice) so the graph still encodes the new order.
+    ///
+    /// See the section header for what this does *not* cover: control
+    /// dependence, implicit-exception order, and any third node between the
+    /// two.
+    pub fn may_reorder(&self, earlier: NodeId, later: NodeId) -> Reorder {
+        let (a, b) = match (self.node_opt(earlier), self.node_opt(later)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Reorder::Blocked(ReorderBlock::UnknownNode),
+        };
+        if a.op.is_control() || b.op.is_control() {
+            return Reorder::Blocked(ReorderBlock::Control);
+        }
+        for (i, &inp) in b.inputs.iter().enumerate() {
+            if inp == earlier && !is_memory_token_slot(b, i) {
+                return Reorder::Blocked(ReorderBlock::DataDependence);
+            }
+        }
+        self.may_reorder_effects(self.memory_effect(earlier), self.memory_effect(later))
+    }
+
+    /// [`Graph::may_reorder`] over two effects directly, for a caller holding
+    /// an effect that no node produces yet.
+    ///
+    /// That is not a hypothetical: `monitorenter` / `monitorexit` and volatile
+    /// field access have no `Op` variant (a synchronized method bails to the
+    /// single-pass backend today), so [`MemEffect::monitor_enter`],
+    /// [`MemEffect::volatile_write`] and friends are the only way to state
+    /// their ordering — and the only way to test it before the ops land.
+    ///
+    /// The rules, in the order they are applied:
+    ///
+    /// 1. Either side inert → allowed ([`ReorderProof::EffectFree`]).
+    /// 2. Either side a full fence → [`ReorderBlock::Fence`].
+    /// 3. `earlier` is an acquire → [`ReorderBlock::Acquire`]: nothing after a
+    ///    monitor-enter or a volatile read may move above it.
+    /// 4. `later` is a release → [`ReorderBlock::Release`]: nothing before a
+    ///    monitor-exit or a volatile write may move below it.
+    ///    Rules 3 and 4 are one-sided on purpose — that asymmetry is the JMM's
+    ///    roach motel, and it is why a synchronized region *bounds* the
+    ///    accesses inside it without pinning the ones outside.
+    /// 5. Both allocate → [`ReorderBlock::Allocation`].
+    /// 6. Their locations may conflict (write/read, read/write, write/write) →
+    ///    [`ReorderBlock::MayAlias`].
+    /// 7. One is a safepoint and the other writes → [`ReorderBlock::Safepoint`].
+    /// 8. Neither writes → allowed ([`ReorderProof::ReadOnly`]).
+    /// 9. Otherwise allowed ([`ReorderProof::DisjointLocations`]).
+    ///
+    /// The alias test precedes the safepoint test only so that the *reason* a
+    /// call blocks a store is the sharper `MayAlias` rather than `Safepoint`;
+    /// both refuse.
+    pub fn may_reorder_effects(&self, earlier: MemEffect, later: MemEffect) -> Reorder {
+        if earlier.is_inert() || later.is_inert() {
+            return Reorder::Allowed(ReorderProof::EffectFree);
+        }
+        if earlier.order.is_fence() || later.order.is_fence() {
+            return Reorder::Blocked(ReorderBlock::Fence);
+        }
+        if earlier.order.has_acquire() {
+            return Reorder::Blocked(ReorderBlock::Acquire);
+        }
+        if later.order.has_release() {
+            return Reorder::Blocked(ReorderBlock::Release);
+        }
+        if earlier.allocates && later.allocates {
+            return Reorder::Blocked(ReorderBlock::Allocation);
+        }
+        let conflicts = self.may_alias(earlier.writes, later.reads)
+            || self.may_alias(earlier.reads, later.writes)
+            || self.may_alias(earlier.writes, later.writes);
+        if conflicts {
+            return Reorder::Blocked(ReorderBlock::MayAlias);
+        }
+        if (earlier.safepoint && later.is_write()) || (later.safepoint && earlier.is_write()) {
+            return Reorder::Blocked(ReorderBlock::Safepoint);
+        }
+        if !earlier.is_write() && !later.is_write() {
+            return Reorder::Allowed(ReorderProof::ReadOnly);
+        }
+        Reorder::Allowed(ReorderProof::DisjointLocations)
+    }
+}
+
 // ── IR Builder ───────────────────────────────────────────────────────
 
 /// Loop-carried phis created eagerly at a loop header, so a backward branch

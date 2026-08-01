@@ -446,6 +446,38 @@ pub fn mark_process_start() {
     });
 }
 
+/// Move the reconciliation basis onto the calling thread, keeping the epoch
+/// [`mark_process_start`] already seeded.
+///
+/// Needed because "the thread that is earliest" and "the thread that runs the
+/// VM" are not the same thread in every launcher. `vm-cli` is the case that
+/// forces it: the flags only become readable on the launcher thread (after
+/// `flag_groups::expand_process_env`), but the whole VM then runs on a spawned
+/// `main-vm` thread with a 128 MB stack while the launcher blocks in `join`
+/// for the rest of the process. Leaving the basis on the launcher would make
+/// `reconciles` a verdict about a thread that does nothing but wait — it would
+/// read as ~100% unattributed no matter how well the VM itself was
+/// instrumented, and the per-category values on the summary line (§7 of
+/// `docs/observability/phase-accounting.md`) would all be zero.
+///
+/// Unlike [`mark_process_start`] this **overwrites** an existing claim, and it
+/// deliberately does not touch the epoch: `process_wall_ns` keeps measuring
+/// from the earlier call, so the launcher prologue is still inside the
+/// process wall even though it is outside `basis_wall_ns`. The two are
+/// reported separately for exactly this reason.
+///
+/// Last caller wins. Call it once, from the thread whose wall clock the
+/// benchmark's wall clock is meant to be.
+pub fn claim_reconciliation_basis() {
+    if !enabled() {
+        return;
+    }
+    let _ = with_or_init_state(|state| {
+        let id = state.account.thread_id;
+        registry().primary_thread_id.store(id, Ordering::Relaxed);
+    });
+}
+
 // ── Per-thread accounting ────────────────────────────────────────────
 
 /// Sentinel in [`ThreadAccount::end_ns`] meaning "this thread is still
@@ -1962,6 +1994,155 @@ mod tests {
             );
         }
         assert_eq!(workers, THREADS);
+
+        set_level_for_test(Level::Off);
+        reset_for_test();
+    }
+
+    // --- Reconciliation basis --------------------------------------------
+
+    /// The `vm-cli` shape: the thread that can first read the flags is not the
+    /// thread that runs the VM, and the first one spends the run blocked in
+    /// `join`. Without [`claim_reconciliation_basis`] the basis stays on the
+    /// waiter and `reconciles()` is a verdict about a thread that did nothing.
+    #[test]
+    fn the_basis_moves_to_the_thread_that_claims_it_last() {
+        let _g = TEST_LOCK.lock();
+        set_level_for_test(Level::Coarse);
+        reset_for_test();
+
+        // The launcher: seeds the epoch, claims the basis, then only waits.
+        mark_process_start();
+        let launcher_id = with_or_init_state(|s| s.account.thread_id).expect("launcher account");
+        assert_eq!(
+            registry().primary_thread_id.load(Ordering::Relaxed),
+            launcher_id,
+            "mark_process_start did not claim the calling thread"
+        );
+
+        let builder = std::thread::Builder::new().name("phase-basis-vm".into());
+        let worker = builder
+            .spawn(|| {
+                claim_reconciliation_basis();
+                let _p = enter(Category::VmStartup);
+                spin_ns(200_000);
+            })
+            .expect("spawn");
+        worker.join().expect("join");
+
+        let report = report();
+        let primary = report.primary.as_ref().expect("a basis thread");
+        assert_eq!(
+            primary.name, "phase-basis-vm",
+            "the basis stayed on the launcher thread"
+        );
+        assert!(
+            primary.categories[Category::VmStartup.index()].1 > 0,
+            "the basis thread recorded no vm_startup time"
+        );
+        // The launcher is still tracked — moving the basis must not drop its
+        // account, only its verdict-carrying role.
+        assert!(
+            report.threads.iter().any(|t| t.thread_id == launcher_id),
+            "the launcher account disappeared when the basis moved"
+        );
+        // And the epoch is still the launcher's: the process wall covers at
+        // least the worker's whole life.
+        assert!(
+            report.process_wall_ns >= primary.wall_ns,
+            "claim_reconciliation_basis re-seeded the epoch"
+        );
+
+        set_level_for_test(Level::Off);
+        reset_for_test();
+    }
+
+    /// Same guarantee as [`mark_process_start`]: when collection is off,
+    /// claiming the basis must not register an account or read the clock.
+    #[test]
+    fn claiming_the_basis_while_disabled_registers_nothing() {
+        let _g = TEST_LOCK.lock();
+        set_level_for_test(Level::Off);
+        reset_for_test();
+
+        mark_process_start();
+        claim_reconciliation_basis();
+
+        let report = report();
+        assert!(
+            report.threads.is_empty(),
+            "the disabled path registered a thread account"
+        );
+        assert_eq!(registry().primary_thread_id.load(Ordering::Relaxed), 0);
+
+        reset_for_test();
+    }
+
+    /// The `vm-cli` span nesting, end to end: `vm_startup` then
+    /// `java_execution` then `vm_shutdown`, on one thread, charging disjoint
+    /// time that sums to that thread's wall clock.
+    #[test]
+    fn the_launcher_span_sequence_charges_disjoint_time() {
+        let _g = TEST_LOCK.lock();
+        set_level_for_test(Level::Coarse);
+        reset_for_test();
+
+        let builder = std::thread::Builder::new().name("phase-launcher-seq".into());
+        let worker = builder
+            .spawn(|| {
+                claim_reconciliation_basis();
+                let startup = enter(Category::VmStartup);
+                spin_ns(300_000);
+                // A class load nests inside startup and subtracts from it.
+                {
+                    let _load = enter(Category::ClassLoad);
+                    spin_ns(300_000);
+                }
+                startup.end();
+
+                let exec = enter(Category::JavaExecution);
+                spin_ns(300_000);
+                exec.end();
+
+                let _shutdown = enter(Category::VmShutdown);
+                spin_ns(300_000);
+            })
+            .expect("spawn");
+        worker.join().expect("join");
+
+        let report = report();
+        let primary = report.primary.as_ref().expect("a basis thread");
+        let cat = |c: Category| primary.categories[c.index()].1;
+
+        let charged = [
+            Category::VmStartup,
+            Category::ClassLoad,
+            Category::JavaExecution,
+            Category::VmShutdown,
+        ];
+        for c in charged {
+            assert!(
+                cat(c) > 0,
+                "{} charged nothing in the launcher sequence",
+                c.name()
+            );
+        }
+        // Disjoint, not overlapping: these four are the only spans opened, so
+        // they account for all of the thread's attributed time exactly. A
+        // nested `class_load` that was *added* to `vm_startup` rather than
+        // carved out of it would push this sum past `attributed_ns`.
+        let sum: u64 = charged.iter().map(|c| cat(*c)).sum();
+        assert_eq!(
+            sum, primary.attributed_ns,
+            "the four launcher categories do not partition the attributed time"
+        );
+        assert_eq!(primary.over_attributed_ns, 0, "over-attribution");
+        assert_eq!(primary.out_of_order_closes, 0, "an out-of-order close");
+        assert_eq!(
+            primary.attributed_ns + primary.open_ns + primary.unattributed_ns,
+            primary.wall_ns,
+            "the launcher sequence does not reconcile"
+        );
 
         set_level_for_test(Level::Off);
         reset_for_test();

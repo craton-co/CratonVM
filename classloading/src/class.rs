@@ -1320,6 +1320,19 @@ impl ClassStore {
         self.live_count
     }
 
+    /// The number of `ClassId` **slots** ever allocated, including the
+    /// tombstones left behind by [`Self::remove`].
+    ///
+    /// This — not [`Self::len`] — is the exclusive upper bound on a valid
+    /// `ClassId`, because ids are never reused: after an unload the slot
+    /// vector still holds the (now empty) entry. The generational-handle
+    /// resolver in [`crate::metadata_handle`] uses it to tell "index past the
+    /// end of the table" apart from "in range, but the class was unloaded",
+    /// which are different bugs.
+    pub fn slot_count(&self) -> usize {
+        self.classes.len()
+    }
+
     /// Returns true if no classes have been loaded.
     pub fn is_empty(&self) -> bool {
         self.live_count == 0
