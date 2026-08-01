@@ -16,6 +16,10 @@ use std::sync::{Arc, OnceLock};
 // sit together, away from this file's 3,000-line `NativeContext` trait.
 use crate::native_id::{NativeMethodId, NativeMethodKey};
 
+// The ambiguous-vs-absent distinction, and the refusal a by-name lookup is
+// allowed to return. See `class_identity` for why a native needs both.
+use crate::class_identity::{ClassIdentityError, NameLookup};
+
 /// NIO-SERVER-SOCKET (route 1): cached check of the `CRATONVM_REAL_NET_SOCKETS`
 /// env var. When set, the native registry drops all synthetic
 /// `java/net/Socket` / `java/net/ServerSocket` registrations so real JDK
@@ -575,7 +579,40 @@ pub trait NativeClassAccess {
     fn superclass_of(&self, class_id: ClassId) -> Option<ClassId>;
 
     /// Get the ClassId for a loaded class by name. Returns None if not loaded.
+    ///
+    /// # `None` is two answers
+    ///
+    /// It means *either* "no loader has a class under this name" *or* "several
+    /// distinct classes do, and with no initiating loader to disambiguate
+    /// there is no correct one to return". Those demand opposite actions from
+    /// a caller that reacts to a miss by loading or fabricating, so a caller
+    /// that does anything other than give up should ask
+    /// [`Self::classify_class_name`] instead.
     fn class_id_by_name(&self, name: &str) -> Option<ClassId>;
+
+    /// The loader-aware form of [`Self::class_id_by_name`]: tells *why* there
+    /// is no unique answer.
+    ///
+    /// Consult this — rather than the `Option` — from any native that would
+    /// **act** on a miss (load the class, mint a stand-in, fall back to a
+    /// same-named class of its own). Acting on
+    /// [`NameLookup::Ambiguous`] adds one more class to a name that already
+    /// has too many, and the new one usually outranks the others.
+    ///
+    /// # Default implementation
+    ///
+    /// Delegates to [`Self::class_id_by_name`], so a context that cannot tell
+    /// the two apart keeps answering exactly what it answers today (`Absent`
+    /// for both). That is the honest default for mocks and non-VM contexts:
+    /// they have no name index and no ambiguity to report. The VM's own
+    /// context overrides it against the class manager's `classify_loaded_name`,
+    /// which is O(1) against the definition-count index.
+    fn classify_class_name(&self, name: &str) -> NameLookup {
+        match self.class_id_by_name(name) {
+            Some(id) => NameLookup::Unique(id),
+            None => NameLookup::Absent,
+        }
+    }
 
     /// Whether `class_id`'s static initializer has already run to completion.
     ///
@@ -3545,11 +3582,84 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// fields) produces an "undersized object layout" object that the GC's
     /// `get_field` bounds guard rejects on every field access.
     ///
+    /// # This spelling cannot report a refusal — prefer the fallible one
+    ///
+    /// [`Self::try_ensure_synthetic_class`] is the same operation with an
+    /// error channel, and it is what a native should call whenever its own
+    /// signature can carry a failure (`MethodCallResult` and friends —
+    /// `ClassIdentityError` converts into `MethodCallFailed` with `?`).
+    ///
+    /// "Never fails" above is a statement about the *signature*, not about
+    /// reality. There is one question this operation genuinely cannot answer:
+    /// a `name` that two or more **distinct** classes already carry. Minting a
+    /// stand-in for it is the defect this pair exists to remove — the stand-in
+    /// is filed under the bootstrap loader, which is probed first, so it then
+    /// outranks every real class that made the name ambiguous. Behaviour when
+    /// that happens:
+    ///
+    /// * **this method** does *not* mint under `name`. The VM's context hands
+    ///   back a distinctly-named, correctly-sized
+    ///   `cratonvm/synthetic/AmbiguousName$…` stand-in: safe to allocate
+    ///   against, and it fails every identity question about `name` (a
+    ///   `checkcast` to `name` is false, a method lookup finds nothing) so the
+    ///   failure surfaces at the call that depended on the answer, naming the
+    ///   requested class.
+    /// * **the default implementation** below returns `ClassId::new(0)`, as it
+    ///   always has.
+    ///
+    /// Neither is a guess between the ambiguous candidates, and neither
+    /// registers anything under `name`.
+    ///
     /// The default implementation falls back to `ClassId::new(0)` so mocks
     /// and non-VM contexts still compile; real VM contexts override it.
     fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        self.try_ensure_synthetic_class(name, num_fields)
+            .unwrap_or(ClassId::new(0))
+    }
+
+    /// The fallible spelling of [`Self::ensure_synthetic_class`] — same
+    /// operation, with a channel for the two answers that are not a `ClassId`.
+    ///
+    /// # The ambiguity contract
+    ///
+    /// [`ClassIdentityError::AmbiguousName`] means the name is carried by two
+    /// or more distinct classes and the VM refuses to pick or to mint a third.
+    /// **A native that receives it should refuse in turn** — propagate with
+    /// `?`, or re-ask with an initiating loader
+    /// ([`NativeClassAccess::class_id_by_name_and_loader`],
+    /// [`NativeClassAccess::class_id_by_name_via_referencing_class`]) if it has
+    /// one. It must not fall back to `ensure_synthetic_class`, to
+    /// `ClassId::new(0)`, or to any same-named class of its own choosing:
+    /// every one of those is the guess the refusal exists to prevent, and two
+    /// distinct classes treated as one is type confusion — it defeats the
+    /// verifier and produces machine code that reads the wrong object layout.
+    ///
+    /// **The stated consequence:** a shim that hits this stops working, and
+    /// its Java-visible failure is an exception from the refusing native
+    /// rather than a wrong answer. That is the intended trade. It is reachable
+    /// only when an application really does have two distinct classes under
+    /// one name (two `GroovyClassLoader$InnerLoader`s compiling the same
+    /// script name, a webapp loader shadowing a container class), which is
+    /// exactly the situation in which the old behaviour silently corrupted
+    /// both.
+    ///
+    /// [`ClassIdentityError::Refused`] is the `--jdk-only` policy refusal:
+    /// propagate it, retrying cannot help.
+    ///
+    /// # Default implementation
+    ///
+    /// `Ok(ClassId::new(0))` — the same answer the infallible default has
+    /// always given, so mocks and non-VM contexts are unaffected. A context
+    /// that overrides only `ensure_synthetic_class` (several test harnesses
+    /// do) keeps working: this default is what *its* callers get, unchanged
+    /// from before this method existed.
+    fn try_ensure_synthetic_class(
+        &mut self,
+        name: &str,
+        num_fields: usize,
+    ) -> Result<ClassId, ClassIdentityError> {
         let _ = (name, num_fields);
-        ClassId::new(0)
+        Ok(ClassId::new(0))
     }
 
     /// Check if a ClassId represents an interface.

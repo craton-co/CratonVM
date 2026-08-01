@@ -3004,7 +3004,7 @@ extern "C" fn jni_set_long_field(_env: JNIEnv, obj: JObject, field_id: JFieldID,
             && bits & 0x7 == 0
             && shared.mem.heap.is_object_address(bits as usize).is_some()
         {
-            crate::memory::smuggled_longs::record_minted_long(bits);
+            crate::memory::smuggled_longs::record_minted_long(&shared.mem.heap, bits);
         }
         shared
             .mem
@@ -3892,7 +3892,7 @@ extern "C" fn jni_set_long_array_region(
                 && bits & 0x7 == 0
                 && shared.mem.heap.is_object_address(bits as usize).is_some()
             {
-                crate::memory::smuggled_longs::record_minted_long(bits);
+                crate::memory::smuggled_longs::record_minted_long(&shared.mem.heap, bits);
             }
             let _ = shared
                 .mem
@@ -4019,6 +4019,13 @@ extern "C" fn jni_define_class(
         if let Some(n) = class_name.as_deref() {
             let _ = shared.jit.jit_cache.write().invalidate_for_class(n);
             let _ = shared.invalidate_jit_for_class(n);
+            let _ = shared
+                .jit
+                .compilation_broker
+                .lock()
+                .invalidate(&cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(
+                    n.to_string(),
+                ));
         }
         Some(cid.as_u32() as JClass)
     })
@@ -4958,7 +4965,7 @@ pub unsafe fn dispatch_jni_native(
             if bits != 0 && bits & 0x7 == 0 {
                 with_shared_vm(|shared| {
                     if shared.mem.heap.is_object_address(bits as usize).is_some() {
-                        crate::memory::smuggled_longs::record_minted_long(bits);
+                        crate::memory::smuggled_longs::record_minted_long(&shared.mem.heap, bits);
                     }
                     Some(())
                 });
@@ -6265,19 +6272,74 @@ extern "C" fn jni_call_static_void_method_v(
 // NIO Direct ByteBuffer support (slots 229-231)
 // ---------------------------------------------------------------------------
 //
-// DirectByteBuffer objects are represented as regular Java objects with two
-// special fields: a native memory address (long) and a capacity (int).
-// We store these in fields [0] (address as long) and [1] (capacity as long).
+// A DirectByteBuffer's native address and capacity live in the buffer object's
+// own fields — there is no side table. Which slots those are depends on the
+// class we actually got:
+//
+//   * **real-JDK mode** — `java/nio/DirectByteBuffer` resolves to the real
+//     class, so `address` (`J`) and `capacity` (`I`) are inherited from
+//     `java.nio.Buffer` at their real layout slots. `dbb_slots` finds them by
+//     name+descriptor and both the setter and the getters use those slots.
+//   * **synthetic-jdk / stub mode** — the class is a fabricated stub with no
+//     declared fields, so nothing resolves by name and we fall back to the
+//     historical fixed slots 0 (address, `Long`) and 1 (capacity, `Long`),
+//     which a stub object stores as tagged `Value`s and therefore round-trips
+//     exactly.
+//
+// PROCESS-GLOBAL-STATE ROUND 2 — this replaces a `LazyLock<Mutex<HashMap<u64,
+// (SendPtr, i64)>>>` side table keyed on `obj_to_jobject(obj)`, i.e. on the
+// buffer's **raw heap address**. That table was never remapped after a moving
+// collection, never swept when a buffer died, shared by every VM in the
+// process, and consulted BEFORE the authoritative field read. Once the
+// collector recycled a dead buffer's address for any new object, a
+// `GetDirectBufferAddress` on that new object returned the *previous* buffer's
+// `malloc` pointer — an arbitrary out-of-bounds native read/write reachable
+// from ordinary Java code (Netty and Elasticsearch both drive this path).
+//
+// The table also masked a second bug: writing `Value::Long(address)` into slot
+// 0 of a *real* `java.nio.Buffer` targets `mark` (an `int`), and
+// `write_compact_field`'s `Int` arm stores 0 for a non-`Int` value — so in
+// real-JDK mode the buffer handed back to Java had `address == 0`,
+// `mark == 0` and `position == capacity`. Only the side table made the JNI
+// getters appear to work. Writing by name fixes the object itself, which is
+// what Java-side `ByteBuffer` operations read.
 
-/// Wrapper around a raw pointer to make it Send+Sync for the global registry.
-/// Safety: direct buffer memory is allocated via malloc and is valid for the lifetime of the buffer.
-struct SendPtr(*mut u8);
-unsafe impl Send for SendPtr {}
-unsafe impl Sync for SendPtr {}
+/// Resolve the `(address, capacity)` layout slots of a real `java.nio.Buffer`
+/// hierarchy, or `None` when the class is a fabricated stub with no declared
+/// fields (synthetic-jdk mode).
+///
+/// Descriptor-qualified so a subclass field that merely shares the name cannot
+/// shadow `Buffer.address` / `Buffer.capacity`. Both slots must resolve — a
+/// half-resolved layout is not a layout we can round-trip through, so the
+/// caller falls back to the fixed-slot form for *both* values and the setter
+/// and getters therefore always agree.
+fn dbb_slots(shared: &SharedVm, class_id: ClassId) -> Option<(usize, usize)> {
+    let cm = shared.classes.class_manager.read();
+    let addr = crate::vm::vm_exec::resolve_field_index_in_hierarchy_desc(
+        class_id,
+        "address",
+        Some("J"),
+        &cm.class_store,
+    )?;
+    let cap = crate::vm::vm_exec::resolve_field_index_in_hierarchy_desc(
+        class_id,
+        "capacity",
+        Some("I"),
+        &cm.class_store,
+    )?;
+    Some((addr, cap))
+}
 
-/// Global registry of direct buffer metadata: maps JObject handle → (address, capacity).
-static DIRECT_BUFFERS: std::sync::LazyLock<parking_lot::Mutex<HashMap<u64, (SendPtr, i64)>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+/// Read a slot that may hold either an `I` or a `J` payload, widening to i64.
+/// Returns `None` for any other `Value` (notably `Object(None)`, which is what
+/// the heap's bounds guard returns for an out-of-range slot).
+fn dbb_read_integral(shared: &SharedVm, obj: ObjectRef, index: usize) -> Option<i64> {
+    match shared.mem.heap.get_field(obj, index) {
+        Value::Long(v) => Some(v),
+        Value::Int(v) => Some(v as i64),
+        _ => None,
+    }
+}
 
 // Index 229: NewDirectByteBuffer
 extern "C" fn jni_new_direct_byte_buffer(
@@ -6289,11 +6351,11 @@ extern "C" fn jni_new_direct_byte_buffer(
         return 0;
     }
     with_shared_vm(|shared| {
-        // Allocate a java/nio/DirectByteBuffer-like object with 2 fields
-        // (address, capacity). The object's class must declare those 2
-        // fields — allocating with `ClassId::new(0)` (`java/lang/Object`,
-        // zero declared fields) yields an undersized object that the GC's
-        // `get_field` bounds guard rejects on every access.
+        // Allocate a java/nio/DirectByteBuffer-like object with at least 2
+        // fields. The object's class must declare those fields — allocating
+        // with `ClassId::new(0)` (`java/lang/Object`, zero declared fields)
+        // yields an undersized object that the GC's `get_field` bounds guard
+        // rejects on every access.
         let dbb_class_id = shared
             .load_class_concurrent("java/nio/DirectByteBuffer")
             .unwrap_or_else(|_| {
@@ -6310,19 +6372,53 @@ extern "C" fn jni_new_direct_byte_buffer(
             .get_class(dbb_class_id)
             .map_or(2, |c| c.num_total_fields.max(2));
         let obj = shared.mem.heap.alloc_object(dbb_class_id, num_fields);
-        let handle = obj_to_jobject(obj);
-        // Store the address as a long in field 0.
-        shared
-            .mem
-            .heap
-            .set_field(obj, 0, Value::Long(address as i64));
-        // Store the capacity in field 1.
-        shared.mem.heap.set_field(obj, 1, Value::Long(capacity));
-        // Also register in our side-table for GetDirectBufferAddress.
-        DIRECT_BUFFERS
-            .lock()
-            .insert(handle, (SendPtr(address), capacity));
-        handle
+        let heap = &shared.mem.heap;
+        match dbb_slots(shared, dbb_class_id) {
+            Some((addr_idx, cap_idx)) => {
+                // Real `java.nio.Buffer` layout. Seed the whole invariant set
+                // (`mark`/`position`/`limit`/`capacity`), not just the two the
+                // JNI getters read: the object is handed straight to Java, and
+                // `java.nio.Buffer`'s own methods assume
+                // `mark <= position <= limit <= capacity`. A default-zeroed
+                // `limit` would make every `get`/`put` throw
+                // `BufferUnderflow`/`BufferOverflow`.
+                // Resolve every slot FIRST and release the class-manager read
+                // lock before touching the heap: `set_field`'s diagnostic paths
+                // can resolve class metadata themselves, and holding a reader
+                // across them risks a writer-starvation stall.
+                let extra: Vec<(usize, Value)> = {
+                    let cm = shared.classes.class_manager.read();
+                    [
+                        ("limit", Value::Int(capacity as i32)),
+                        ("position", Value::Int(0)),
+                        ("mark", Value::Int(-1)),
+                    ]
+                    .into_iter()
+                    .filter_map(|(name, value)| {
+                        crate::vm::vm_exec::resolve_field_index_in_hierarchy_desc(
+                            dbb_class_id,
+                            name,
+                            Some("I"),
+                            &cm.class_store,
+                        )
+                        .map(|idx| (idx, value))
+                    })
+                    .collect()
+                };
+                heap.set_field(obj, addr_idx, Value::Long(address as i64));
+                heap.set_field(obj, cap_idx, Value::Int(capacity as i32));
+                for (idx, value) in extra {
+                    heap.set_field(obj, idx, value);
+                }
+            }
+            None => {
+                // Fabricated-stub layout: tagged `Value` slots, so a `Long`
+                // round-trips verbatim. Historical fixed slots.
+                heap.set_field(obj, 0, Value::Long(address as i64));
+                heap.set_field(obj, 1, Value::Long(capacity));
+            }
+        }
+        obj_to_jobject(obj)
     })
     .unwrap_or(0)
 }
@@ -6332,17 +6428,24 @@ extern "C" fn jni_get_direct_buffer_address(_env: JNIEnv, buf: JObject) -> *mut 
     if buf == 0 {
         return std::ptr::null_mut();
     }
-    // First try the side-table (fast path for buffers we created).
-    if let Some(&(SendPtr(addr), _)) = DIRECT_BUFFERS.lock().get(&buf) {
-        return addr;
-    }
-    // Fall back to reading the address field from the object.
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(buf)?;
-        match shared.mem.heap.get_field(oref, 0) {
-            Value::Long(addr) => Some(addr as *mut u8),
-            _ => None,
+        let class_id = shared.mem.heap.class_id_of(oref);
+        // The same resolution the setter used, so setter and getter always
+        // address the same slot. The `or_else` covers exactly one drift case:
+        // the class was a stub when the buffer was allocated and has since been
+        // upgraded to the real class, so the *object* is still stub-shaped and
+        // the named slot reads out of bounds (`Object(None)` -> `None`). Only a
+        // `None` falls through — a named slot that reads a real value is always
+        // preferred, so a real `Buffer`'s `mark` can never be mistaken for an
+        // address.
+        match dbb_slots(shared, class_id) {
+            Some((addr_idx, _)) => dbb_read_integral(shared, oref, addr_idx)
+                .or_else(|| dbb_read_integral(shared, oref, 0)),
+            None => dbb_read_integral(shared, oref, 0),
         }
+        .filter(|&a| a != 0)
+        .map(|a| a as *mut u8)
     })
     .flatten()
     .unwrap_or(std::ptr::null_mut())
@@ -6353,16 +6456,18 @@ extern "C" fn jni_get_direct_buffer_capacity(_env: JNIEnv, buf: JObject) -> JLon
     if buf == 0 {
         return -1;
     }
-    // First try the side-table.
-    if let Some(&(_, cap)) = DIRECT_BUFFERS.lock().get(&buf) {
-        return cap;
-    }
-    // Fall back to reading the capacity field.
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(buf)?;
-        match shared.mem.heap.get_field(oref, 1) {
-            Value::Long(cap) => Some(cap),
-            _ => None,
+        let class_id = shared.mem.heap.class_id_of(oref);
+        // A capacity of 0 is legal (`NewDirectByteBuffer(addr, 0)`), so unlike
+        // the address there is no "non-zero means present" test available.
+        // Resolution decides: if the class has a real `capacity` field, that
+        // field is authoritative; otherwise slot 1 is. The `or_else` covers the
+        // stub-upgraded-under-a-live-object case, as in the address getter.
+        match dbb_slots(shared, class_id) {
+            Some((_, cap_idx)) => dbb_read_integral(shared, oref, cap_idx)
+                .or_else(|| dbb_read_integral(shared, oref, 1)),
+            None => dbb_read_integral(shared, oref, 1),
         }
     })
     .flatten()
@@ -8533,6 +8638,132 @@ mod tests {
         assert_eq!(
             retrieved_cap, capacity,
             "GetDirectBufferCapacity must match"
+        );
+        clear_jni_context();
+    }
+
+    /// Write `value` into whichever slot the direct-buffer accessors treat as
+    /// authoritative for `field` on `obj` — the same resolution
+    /// `jni_new_direct_byte_buffer` performs, so the test cannot drift away
+    /// from production if the layout choice changes.
+    fn poke_dbb_slot(shared: &SharedVm, obj: ObjectRef, field: &str, value: Value) {
+        let class_id = shared.mem.heap.class_id_of(obj);
+        let idx = match (dbb_slots(shared, class_id), field) {
+            (Some((a, _)), "address") => a,
+            (Some((_, c)), "capacity") => c,
+            (None, "address") => 0,
+            (None, "capacity") => 1,
+            _ => unreachable!("unknown direct-buffer field {field}"),
+        };
+        shared.mem.heap.set_field(obj, idx, value);
+    }
+
+    /// PROCESS-GLOBAL-STATE ROUND 2 regression: `GetDirectBufferAddress` must
+    /// read the buffer OBJECT, never a side table keyed on the object's raw
+    /// heap address.
+    ///
+    /// The removed `DIRECT_BUFFERS` map was keyed on `obj_to_jobject(obj)` and
+    /// consulted before the field read, so it answered from the address alone.
+    /// Once a moving collection recycled a dead buffer's address, the *next*
+    /// object at that address inherited the dead buffer's `malloc` pointer.
+    /// This test drives the same divergence deterministically: change what the
+    /// object says without touching the handle. With the cache present the
+    /// getter returned the stale pointer; it must now follow the object.
+    #[test]
+    fn jni_direct_buffer_address_follows_the_object_not_a_cache() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        set_jni_context_arc(shared.clone());
+        let env = get_jni_env();
+
+        let mut first: Vec<u8> = vec![0u8; 256];
+        let mut second: Vec<u8> = vec![0u8; 512];
+        let first_addr = first.as_mut_ptr();
+        let second_addr = second.as_mut_ptr();
+        assert_ne!(first_addr, second_addr);
+
+        let buf = jni_new_direct_byte_buffer(env, first_addr, 256);
+        assert_ne!(buf, 0);
+        assert_eq!(jni_get_direct_buffer_address(env, buf), first_addr);
+
+        // Re-point the OBJECT at a different allocation, leaving the handle
+        // (the old cache key) untouched.
+        let oref = jobject_to_obj(buf).expect("handle must resolve");
+        poke_dbb_slot(&shared, oref, "address", Value::Long(second_addr as i64));
+        poke_dbb_slot(&shared, oref, "capacity", Value::Int(512));
+
+        assert_eq!(
+            jni_get_direct_buffer_address(env, buf),
+            second_addr,
+            "GetDirectBufferAddress must read the object's address field, not a \
+             cache keyed on the object's raw heap address"
+        );
+        assert_eq!(
+            jni_get_direct_buffer_capacity(env, buf),
+            512,
+            "GetDirectBufferCapacity must read the object's capacity field"
+        );
+
+        // A zeroed address field (what a recycled slot looks like) must produce
+        // a null answer, not a stale `malloc` pointer.
+        poke_dbb_slot(&shared, oref, "address", Value::Long(0));
+        assert!(
+            jni_get_direct_buffer_address(env, buf).is_null(),
+            "a cleared address field must read back as null"
+        );
+        clear_jni_context();
+    }
+
+    /// Two live direct buffers must not cross-talk. With the address-keyed
+    /// cache this held only by luck of allocation; with per-object fields it is
+    /// structural.
+    #[test]
+    fn jni_direct_buffers_are_independent() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        set_jni_context_arc(shared.clone());
+        let env = get_jni_env();
+
+        let mut a: Vec<u8> = vec![0u8; 64];
+        let mut b: Vec<u8> = vec![0u8; 128];
+        let a_addr = a.as_mut_ptr();
+        let b_addr = b.as_mut_ptr();
+
+        let buf_a = jni_new_direct_byte_buffer(env, a_addr, 64);
+        let buf_b = jni_new_direct_byte_buffer(env, b_addr, 128);
+        assert_ne!(buf_a, 0);
+        assert_ne!(buf_b, 0);
+        assert_ne!(buf_a, buf_b, "two buffers must be distinct objects");
+
+        assert_eq!(jni_get_direct_buffer_address(env, buf_a), a_addr);
+        assert_eq!(jni_get_direct_buffer_address(env, buf_b), b_addr);
+        assert_eq!(jni_get_direct_buffer_capacity(env, buf_a), 64);
+        assert_eq!(jni_get_direct_buffer_capacity(env, buf_b), 128);
+        clear_jni_context();
+    }
+
+    /// A zero capacity is legal (`NewDirectByteBuffer(addr, 0)`), so the
+    /// capacity getter must not use "non-zero means present" as its presence
+    /// test the way the address getter does.
+    #[test]
+    fn jni_direct_buffer_zero_capacity_round_trips() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        set_jni_context_arc(shared.clone());
+        let env = get_jni_env();
+
+        let mut backing = [0u8; 8];
+        let addr = backing.as_mut_ptr();
+        let buf = jni_new_direct_byte_buffer(env, addr, 0);
+        assert_ne!(buf, 0, "zero capacity is legal and must allocate a buffer");
+        assert_eq!(jni_get_direct_buffer_address(env, buf), addr);
+        assert_eq!(
+            jni_get_direct_buffer_capacity(env, buf),
+            0,
+            "a zero capacity must read back as 0, not -1"
         );
         clear_jni_context();
     }

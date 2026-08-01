@@ -23,7 +23,7 @@ inside `gc/` — a `debug_assert!` now names it.
 |---|---|---|---|
 | T-1 | `jit_tlab_skip_offsets` returned the published reserved tails un-deduplicated and un-coalesced, while both consumers' comments asserted "ascending & disjoint" and `skip_free_blocks` requires it. Two partially-overlapping spans make the walk resync twice and silently skip every object between them. | **High** (missed objects → premature reclamation) | **Fixed** — the heap now sorts, coalesces and `debug_assert!`s the invariant. |
 | T-2 | `Tlab::reserved_tail()` could publish a non-8-aligned start, which `jit_tlab_skip_offsets` silently *drops*, after which the sweep walks the un-retired tail as objects. Held only because every production allocation uses `align = 8`. | **Medium** (unreachable today, one `Tlab::alloc(_, 1)` away) | **Fixed** — `debug_assert!` names it; release rounds the published start up, which is the fail-safe direction. |
-| T-3 | A moving young collection can run while reserved TLAB tails are published, which by construction means an alive mutator left a TLAB un-retired across its exclusion point. The walk is still correct, but after the semispace swap the owner's cursor points into recycled memory. | **High if reachable**; no reproducer found | **Tripwire added** in the moving path (warn, rate-limited). The producing transition, if any, is in `vm/`. |
+| T-3 | A moving young collection can run while reserved TLAB tails are published, which by construction means an alive mutator left a TLAB un-retired across its exclusion point. The walk is still correct, but after the semispace swap the owner's cursor points into recycled memory. | **High if reachable**; no reproducer found | **Escalated from tripwire to refusal** (2026-07-31, §1.3). A non-empty clipped tail set on the moving path now sets `start_walk_complete = false` and **skips the young collection** — over-retain one cycle, spill to old gen, retry — instead of only warning. The condition is exact (the tails are already clipped to this from-space), and on a correct transition graph it is unreachable, so the refusal costs nothing and prevents a UAF otherwise. The rate-limited warn is retained as the reproducer budget. The producing transition, if any, is still in `vm/` and still unidentified. |
 | T-4 | `install_tail_filler` had one exit (`< 8` bytes of unaligned slack) that returned with `cursor < end`, leaving a publishable span the filler had not covered — breaking its callers' "after this, the TLAB is fully consumed" assumption. | Low | **Fixed** — the function is now total. |
 | T-5 | "Size the outgoing TLAB *before* retiring it" is load-bearing (`retire` zeroes the `cursor - start` span the sizer reads, and a zero reads as *idle*, reviving the JIT-blind one-way shrink ratchet) and was enforced by nothing. | Low (correct today) | **Tripwire added** — `debug_assert!` in `Tlab::next_refill_size`. |
 | T-6 | `VmNativeThreadBlocker::enter_blocked` (`vm/src/vm/vm_exec.rs:4615`) excludes a thread from the STW census **without** retiring its TLAB, unlike every other blocking-region entry — and threads reached through it publish no `tlab_addr`, so the collector's reserved-tail backstop cannot see them either. Both defences absent. | Open | **Not fixed** — `vm/`-side, outside this change's ownership. No evidence found that such a thread ever holds a TLAB. |
@@ -140,11 +140,36 @@ table above says should hold.
 If it does not hold, a moving Cheney cycle runs while some alive thread owns a
 TLAB in the arena about to be evacuated, swapped and reset. The walk itself is
 fine (the tail is skipped, not parsed); the hazard is afterwards, when the owner
-resumes and bump-allocates from a cursor into recycled memory. Since the
-condition is precisely detectable from inside the collector, the moving path now
-carries a rate-limited `warn` tripwire naming it. Diverting to the sweep on a
-heuristic would be a worse trade than naming the offending transition, so this
-is a diagnostic, not a policy change.
+resumes and bump-allocates from a cursor into recycled memory.
+
+**Escalated 2026-07-31: this is now a refusal, not only a warn**
+(`gc/src/gen_heap.rs`, `moving_with_reserved_tails`). The earlier position — "a
+diagnostic, not a policy change", because diverting a live moving cycle on a
+heuristic is the worse trade — no longer holds, for two reasons:
+
+* **It is not a heuristic.** `jit_tlab_skip_offsets` has already clipped the
+  published tails to `[young_base, young_base + young_used)` — *this*
+  from-space. A non-empty result **is** the hazard condition, not a proxy for
+  it.
+* **It is expected to be unreachable.** Per §1.2, every alive thread retires at
+  its exclusion point, and the one intentional un-retired case (an OS-frozen
+  in-JIT peer) makes the VM call `mark_moving_young_coverage_incomplete`, which
+  routes the cycle to the non-moving path before it reaches here. So the refusal
+  costs nothing on a correct transition graph and prevents a use-after-free on
+  an incorrect one.
+
+The refusal sets `start_walk_complete = false`, taking the **same exit as an
+incomplete object-start walk**: skip this young collection entirely, over-retain
+for one cycle, spill to old gen, retry on the next trigger. It deliberately does
+**not** divert to the non-moving sweep — on this precise-root path the sweep
+lacks the conservative over-marking it needs and reclaims still-live young
+objects (the HIB-CV-22/32/33 family). Nothing destructive has happened at the
+refusal point: only the pre-collection bounds publish and the card-buffer drain,
+both idempotent.
+
+The rate-limited `warn` stays, and stays rate-limited, because its occurrence
+count is the reproducer budget for finding the producing transition (§5 item 6).
+The first occurrence is always printed.
 
 **T-4 — `install_tail_filler` was not total.** Its `aligned >= end_addr` exit
 (fewer than 8 bytes of *unaligned* slack) returned with `cursor < end`, so a
@@ -178,9 +203,11 @@ untouched.
   does not run at all, so an un-retired tail is neither skipped nor reported.
   `vm/`-side.
 * The single-threaded collection arms never publish skip regions, which is
-  correct (the only thread is the initiator, and it retired) but means the
-  tripwire in §1.3 T-3 only fires on multi-threaded cycles.
-* G1's remembered set is not yet fed into the counters (§2.3).
+  correct (the only thread is the initiator, and it retired) but means the T-3
+  refusal in §1.3 can only trigger on multi-threaded cycles.
+* ~~G1's remembered set is not yet fed into the counters (§2.3).~~ **Closed** —
+  `cleanup` now calls `gc_metrics::record_remembered_set_bytes` once per mark
+  cycle (`docs/gc/g1-audit.md` G1-6).
 
 ---
 
@@ -438,7 +465,13 @@ deliberate increments break another's arithmetic assertion.
    why the threads reaching it provably hold none.
 4. **T-7** — the reserved-tail backstop should not be conditional on
    cross-thread takeover being enabled (`vm/src/runtime/interpreter.rs:598`).
-5. G1's remembered set should be fed into `gc_metrics::record_remembered_set_bytes`
-   so `rset_bytes_per_live_byte` means something under `-XX:+UseG1GC`.
-6. If the §1.3 T-3 tripwire ever fires, the transition table in §1.2 has a row
-   that is wrong, and the warn line's occurrence count is the reproducer budget.
+5. ~~G1's remembered set should be fed into
+   `gc_metrics::record_remembered_set_bytes` so `rset_bytes_per_live_byte` means
+   something under `-XX:+UseG1GC`.~~ **DONE** — published once per mark cycle
+   from `cleanup`, after the prune (`docs/gc/g1-audit.md` G1-6). Nothing has
+   *read* the number on a real workload yet; that is what decides G1 audit §9
+   item 5.
+6. If the §1.3 T-3 warn ever fires, the transition table in §1.2 has a row that
+   is wrong, and the warn's occurrence count is the reproducer budget. Since the
+   escalation this also means a young collection was **skipped**, so a burst of
+   these lines is a throughput symptom as well as a correctness signal.

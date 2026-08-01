@@ -4,7 +4,9 @@
 **Crate:** `native-api` (`native-api/src/capability.rs`).
 **Addresses:** C2 review P0 *"Gate all native and FFI capabilities"* (confidence:
 Confirmed) and the related finding that `System.setSecurityManager` installs a
-process-wide singleton.
+process-wide singleton — **that second finding is now fixed** (per-VM index +
+GC root source; see §7.1). The capability gate itself is still the mechanism,
+not the enforcement.
 
 > **Read this first.** The capability gate ships in `Permissive` mode. It allows
 > everything and records what was used. Nothing in this document is enforced
@@ -432,55 +434,83 @@ JDK-only gate's `synthetic_stub_invocations == 0` assertion.
 
 ## 7. Per-VM versus process-global, and the `setSecurityManager` singleton
 
-### 7.1 The singleton
+### 7.1 The singleton — **FIXED**
 
-`native-builtins/src/security_manager.rs:117`:
+> **Status: this finding is closed.** The three process-global singletons in
+> `native-builtins/src/security_manager.rs` are gone. What follows describes
+> the defect as found, then the shape that replaced it — both are kept because
+> the *reasoning* is what generalises to the globals in §7.3 that are still
+> process-wide.
 
-```rust
-static SECURITY_MANAGER: Mutex<Option<(i32, ObjectRef)>> = Mutex::new(None);
-```
-
-and `:205`:
-
-```rust
-static ACTIVE_POLICY_OBJECT: Mutex<Option<(i32, ObjectRef)>> = Mutex::new(None);
-```
-
-Both are process-wide. `System.setSecurityManager` (`:973`) writes the first;
-`Policy.setPolicy` writes the second. The `ACTIVE_POLICY_OBJECT` comment already
-states the intent — *"The singleton is process-wide. A hostile caller from
-inside the JVM can read or overwrite it; that mirrors real JDK behaviour and is
-intentional."* — which is correct for a **one-VM-per-process** JVM and wrong for
-an embedding.
+**As found.** Three process-wide statics, each
+`Mutex<Option<(i32, ObjectRef)>>`: `SECURITY_MANAGER` (written by
+`System.setSecurityManager`), `ACTIVE_POLICY_OBJECT` (written by
+`Policy.setPolicy`), and the shared `Permissions` collection. The
+`ACTIVE_POLICY_OBJECT` comment stated the intent — *"The singleton is
+process-wide… that mirrors real JDK behaviour and is intentional."* — which is
+correct for a **one-VM-per-process** JVM and wrong for an embedding.
 
 In an embedding (`cratonvm-embed`, `libcratonvm`) with two `Vm`s in one process,
-the consequences are concrete:
+the consequences were concrete:
 
 1. **Cross-VM policy interference.** VM A calling `System.setSecurityManager(sm)`
-   installs an `ObjectRef` into VM B's gate as well. `check_exec_or_throw`
-   (`lang_system.rs:1849`) reads the singleton and, on a hit, calls
+   installed an `ObjectRef` into VM B's gate as well. `check_exec_or_throw`
+   read the singleton and, on a hit, called
    `ctx.invoke_virtual(sm_ref, "checkExec", …)` — invoking **VM A's heap object
-   through VM B's context**. That is not merely a policy leak; it is a
-   cross-heap `ObjectRef` use.
+   through VM B's context**. Not merely a policy leak; a cross-heap `ObjectRef`
+   use.
 2. **Privilege escalation by removal.** VM A calling
-   `System.setSecurityManager(null)` disarms VM B's `Runtime.exec` and
+   `System.setSecurityManager(null)` disarmed VM B's `Runtime.exec` and
    `System.loadLibrary` gates, because both consult
-   `get_security_manager(...).is_none()` and return `Ok(())` on `None`
-   (`security_manager.rs:83`, `lang_system.rs:1850`).
-3. **The same applies to every other global.** `set_native_access_enabled`
-   (`panama.rs:122`) and `set_path_confine_to_cwd` are process-wide setters; a
-   permissive embedder and a hardened one cannot coexist.
-4. **GC coupling.** The singleton stores `(identity_key, ObjectRef)` and re-reads
+   `get_security_manager(...).is_none()` and return `Ok(())` on `None`.
+3. **GC coupling.** The singleton stored `(identity_key, ObjectRef)` and re-read
    the current address through `read_var_handle_root` on *the calling context*.
-   With two VMs, the key was registered in one VM's var-handle-root registry and
-   is looked up in the other's — a miss, so the code falls back to the **stale
-   raw ref** (`security_manager.rs:145`: `ctx.read_var_handle_root(key).unwrap_or(cached)`).
-   Under a moving young GC that fallback is a use-after-move.
+   The var-handle-root registry is **per-VM**, so with two VMs the key was
+   registered in one and looked up in the other — a miss, and the code fell back
+   to the **stale raw ref** (`read_var_handle_root(key).unwrap_or(cached)`).
+   That address belongs to a heap the reading VM's collector never scans and the
+   owning VM's collector cannot rewrite (it rewrites the registry entry, not the
+   static copy). Under a moving young GC it is a use-after-move — exactly the
+   unrewritable holder `docs/threading/objectref-concurrency-contract.md`
+   forbids.
 
-`CapabilitySet` does not fix these statics — that is out of scope for a change
-confined to `native-api` — but it is the mechanism that makes fixing them
-possible, because it gives every one of those decisions a per-VM home to move
-to. Items 10-25 of §5 are that migration.
+**The fix, in three parts:**
+
+* **A per-VM index.** `SECURITY_STATE:
+  OnceLock<Mutex<HashMap<usize, VmSecurityState>>>`, keyed by
+  `NativeContext::vm_identity()`. `VmSecurityState` holds all three slots
+  (`security_manager`, `policy_object`, `shared_permissions`) as
+  `Option<(i32, ObjectRef)>`, reached only through `Slot`-named accessors
+  (`security_slot` / `set_security_slot`) that take the key **from `ctx`, never
+  from a caller**. A cross-VM read is therefore unrepresentable at the call
+  sites. Clearing the last occupied slot drops the VM's row rather than leaving
+  an all-`None` shell. This is deliberately the same shape as
+  `native-api/src/capability.rs`'s `VM_CAPABILITIES`: *an index, not a policy.*
+* **A real GC root source.** `gc_scan_security_manager_roots` /
+  `gc_update_security_manager_refs` (the `lang_math::gc_scan_value_of_cache_roots`
+  shape) are registered as the `"security-manager"` source in
+  `vm/src/memory/native_roots.rs`, alongside `scan_security_manager` /
+  `remap_security_manager`. The cached copy is now collector-**visible** and
+  collector-**rewritable**, which is what closes finding 3 — per-VM keying alone
+  would not have.
+* **A stated lock discipline.** The state lock is never held across a Java
+  allocation or any other re-entry into the VM, because the scan callback takes
+  the same lock at a safepoint; the two lazy initialisers allocate first and
+  publish afterwards.
+
+**Still process-global (§7.3 territory, unchanged):**
+`set_native_access_enabled` (`panama.rs`) and `set_path_confine_to_cwd` are
+still process-wide setters, so a permissive embedder and a hardened one still
+cannot coexist. `CapabilitySet` is the per-VM home those decisions move to;
+items 10-25 of §5 are that migration, and the `security_manager.rs` rework above
+is the worked example of what each of them looks like when done.
+
+**Code comments that still cite this as open** (not edited here — outside this
+doc's ownership): `native-api/src/capability.rs:15` (the mechanism table's
+`SECURITY_MANAGER` row and the "cross-VM policy interference" consequence at
+`:23-26`) and `native-api/src/registry.rs:2087` (`read_var_handle_root`'s
+rationale, which lists `SECURITY_MANAGER` among the caches that must re-read
+through it).
 
 ### 7.2 What is per-VM in the new model
 

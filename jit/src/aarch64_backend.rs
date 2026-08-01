@@ -71,27 +71,44 @@
 //!
 //! ## Safety-critical gaps (these are the reason for the warning above)
 //!
-//! - **No GC safepoint polls.** x64 emits a cooperative poll of
-//!   `helpers.safepoint_flag_addr` at method entry and at every loop
-//!   back-edge (`x64::jit_safepoint_polls_enabled`, on by default). This
-//!   backend emits none. Since it also emits no calls, a compiled loop
-//!   contains *no* safepoint of any kind: a thread inside one never reaches
-//!   a stop-the-world request, so a GC that needs this thread hangs. Because
-//!   the compilable population is exactly "pure arithmetic, often loops",
-//!   this is the likely failure mode, not an edge case.
+//! A full mechanism-by-mechanism comparison against the x86-64 backend lives in
+//! `docs/jit/aarch64-parity.md`. The short version:
+//!
+//! - **No GC safepoint polls — so loops are now REFUSED.** x64 emits a
+//!   cooperative poll of `helpers.safepoint_flag_addr` at method entry and at
+//!   every loop back-edge (`x64::jit_safepoint_polls_enabled`, on by default).
+//!   This backend emits none, and cannot: no helper address is plumbed in, and
+//!   taking a poll needs a CALL, which `emit_invoke` refuses. A compiled loop
+//!   would therefore contain *no* safepoint of any kind — a thread inside one
+//!   never reaches a stop-the-world request, hanging any GC that needs it.
+//!   Since the compilable population is exactly "pure arithmetic, often loops",
+//!   that was the likely failure mode, not an edge case. As of the 2026-08-01
+//!   parity audit, [`Arm64Backend::label_for_pc`] refuses any method containing
+//!   a backward branch target, so only straight-line / forward-branching bodies
+//!   compile.
 //! - **Oop maps are always empty.** [`Arm64Backend::mark_top_operand_as_oop`]
 //!   is called from three opcode arms, but its only consumer,
 //!   [`Arm64Backend::emit_oop_map_for_safepoint`], has **zero call sites** —
 //!   so `Arm64CompileResult::oop_maps` is unconditionally `Vec::new()`. The
 //!   GC walker therefore always takes its conservative fallback for AArch64
 //!   frames. That is sound (a superset), but the "precise AArch64 oop maps"
-//!   the T1.1.3 comments describe do not exist at runtime.
+//!   the T1.1.3 comments describe do not exist at runtime. The writer is now
+//!   fail-closed: its native-PC key (`instruction_count * 4`) is wrong for a
+//!   variable-expansion pseudo-op stream, so calling it refuses the method
+//!   rather than publishing a mis-keyed map.
 //! - **No deoptimization and no OSR.** Neither word appears in this file.
 //!   There is no frame reconstruction, no uncommon-trap stub, no
 //!   `osr_pc_to_native` table. There is nothing to tier down *from* (this is
 //!   the only tier), so a deopt cannot occur — but equally, no speculative
 //!   optimization may ever be added here without building that first.
-//! - **No stack-overflow bang** in the prologue (x64 emits one).
+//! - **No stack-overflow bang** in the prologue (x64 emits one). Frames that
+//!   could step past the first guard page (>= 4096 bytes) are refused as of the
+//!   2026-08-01 audit; smaller frames cannot skip the guard.
+//! - **Float locals are not homed in FP registers.** `regalloc::ARM64_LOCAL_FPS`
+//!   offers `D8`–`D15`, which AAPCS64 makes callee-saved, and this backend's
+//!   prologue/epilogue save only GPRs — so homing a float local there destroyed
+//!   the caller's copy. The allocator's FP assignments are ignored (2026-08-01);
+//!   float locals live in frame slots or GPRs.
 //! - **32-bit int ops are lowered to 64-bit X-form instructions.** `iadd`,
 //!   `isub`, `imul`, `ineg`, `ishl`, `ishr`, `iand`, `ior`, `ixor` all use
 //!   the same emitters as their `l*` counterparts, so JVM 32-bit wrapping
@@ -101,7 +118,11 @@
 //!   Fixing this needs W-form variants threaded through the whole operand
 //!   pipeline (loads, compares, returns, `i2l`), which is a backend-wide
 //!   type-discipline change and is **not** attempted piecemeal.
-//! - **Loops were infinite self-branches** until this audit. Branch targets
+//! - **32-bit int ops are still lowered to 64-bit X-form** (see the entry
+//!   above). This remains the largest *silent* correctness gap on this backend
+//!   and is deliberately NOT fixed piecemeal; `docs/jit/aarch64-parity.md`
+//!   records the shape a correct fix takes.
+//! - **Loops were infinite self-branches** until the 2026-07-26 audit. Branch targets
 //!   were discovered lazily as each branch was decoded, so a back-edge target
 //!   (already walked past) never got a label bound, and the encoder left the
 //!   displacement-0 placeholder — `B .`. Fixed by giving
@@ -849,6 +870,13 @@ pub struct Arm64Backend {
     float_scratch_cursor: u8,
     /// Bytecode PC -> label mapping for branch targets.
     pc_labels: HashMap<usize, u32>,
+    /// Bytecode PC of the instruction currently being lowered.
+    ///
+    /// Read by [`Arm64Backend::label_for_pc`] to classify a branch target as
+    /// forward or backward. A backward target is a loop back-edge, and this
+    /// backend has no safepoint poll to put on one — see the "no GC safepoint
+    /// polls" note in the module header and `docs/jit/aarch64-parity.md`.
+    cur_bytecode_pc: usize,
     /// Label for the shared epilogue.
     epilogue_label: u32,
     /// Number of parameters for the current method (used for self-recursive calls).
@@ -911,6 +939,7 @@ impl Arm64Backend {
             scratch_cursor: 0,
             float_scratch_cursor: 0,
             pc_labels: HashMap::new(),
+            cur_bytecode_pc: 0,
             epilogue_label: 0,
             num_params: 0,
             method_info: HashMap::new(),
@@ -954,8 +983,33 @@ impl Arm64Backend {
     /// the GC walker falls back to conservative scanning for that
     /// frame, which is always a correct super-set of the precise
     /// coverage.
+    ///
+    /// # This helper is fail-closed and must stay that way
+    ///
+    /// (aarch64 parity audit, 2026-08-01.) It has zero call sites, and the
+    /// native PC it records — `instruction_count * 4` — is **wrong**, because
+    /// the pseudo-op stream is not 4 bytes per entry: `Label` and `Comment`
+    /// emit nothing, `ConstantPoolEntry` emits 8 bytes, and `MovImm` /
+    /// `AddImm` / `CmpImm` / out-of-range `Ldr`/`Str` expand to 1–4 words
+    /// (`mov_imm64`, `emit_addsub_imm_safe`, `emit_addr_into_ip0`). A map keyed
+    /// by a wrong PC is worse than no map: the GC would read the *wrong frame
+    /// slots* as oops at a real safepoint and either miss a live reference or
+    /// treat a primitive as one.
+    ///
+    /// So the first caller must not silently inherit a broken PC. This sets
+    /// `self.failed`, refusing the method, and the correct fix for whoever
+    /// wires up the first real aarch64 safepoint is to key oop maps off the
+    /// *encoder's* byte offset (`Aarch64Emitter::offset()` in
+    /// `emit_machine_code`), not off the pseudo-op count — then delete this
+    /// guard.
     #[allow(dead_code)]
     fn emit_oop_map_for_safepoint(&mut self) {
+        // Fail closed — see the doc comment above. The map-building body is
+        // left below rather than deleted: it is the shape a correct
+        // implementation takes, and keeping it means the `native_pc` mistake
+        // it embodies stays visible next to the explanation of why it is
+        // wrong. It is unreachable at runtime because of this assignment.
+        self.failed = true;
         if self.failed {
             return;
         }
@@ -1090,7 +1144,53 @@ impl Arm64Backend {
     }
 
     /// Get or create a label for a bytecode PC.
+    ///
+    /// Also the single chokepoint where a **loop back-edge** is detected. Every
+    /// branch target on this backend — `goto`, `if*`, `if_icmp*`, `if_acmp*`,
+    /// and every `tableswitch`/`lookupswitch` case and default — is resolved
+    /// through here, so a target at or before the instruction currently being
+    /// lowered is exactly the set of back-edges.
+    ///
+    /// **Why that refuses the method (aarch64 parity audit, 2026-08-01).**
+    /// x86-64 emits a cooperative safepoint poll of `helpers.safepoint_flag_addr`
+    /// at method entry and at every loop back-edge
+    /// (`x64::Backend::emit_safepoint_poll` /
+    /// `emit_safepoint_poll_prologue`, enabled by default via
+    /// `x64::jit_safepoint_polls_enabled`). This backend emits none, and
+    /// it cannot: no safepoint-helper address is plumbed into
+    /// `compile_method_with_info`, and even if it were, taking the poll requires
+    /// a CALL — which `emit_invoke` refuses to emit because there is no
+    /// call-target resolution here.
+    ///
+    /// A compiled loop therefore contains no safepoint of any kind. A thread
+    /// inside one never observes a stop-the-world request, so any GC that needs
+    /// to stop it hangs the whole VM — and since the compilable population is
+    /// "leaf pure-arithmetic methods", loops are the *typical* case, not an edge
+    /// case. The module header already documented this hazard; it was
+    /// documented but not defended, and a straight-line-only compiled body is
+    /// the only shape that is actually safe to run. So: bail, and interpret.
+    ///
+    /// This is a liveness bail, deliberately conservative — it refuses reducible
+    /// and irreducible back-edges alike, and refuses a backward `goto` even when
+    /// the loop provably terminates, because "provably terminates" is not the
+    /// property that matters. What matters is bounded time to the next
+    /// safepoint, and without a poll there is no bound.
     fn label_for_pc(&mut self, pc: usize) -> u32 {
+        if pc <= self.cur_bytecode_pc {
+            self.failed = true;
+        }
+        self.label_for_pc_unchecked(pc)
+    }
+
+    /// Label allocation without the back-edge check.
+    ///
+    /// Used only by the walk loop's pre-seed step, which binds a label at a PC
+    /// the *discovery* pass already identified as a branch target. That step is
+    /// not itself a branch, so running the back-edge test there would misfire
+    /// (notably at `pc == 0`, where `cur_bytecode_pc` is still its initial `0`).
+    /// The branch that created the target already went through
+    /// [`label_for_pc`], so nothing is missed.
+    fn label_for_pc_unchecked(&mut self, pc: usize) -> u32 {
         if let Some(&label) = self.pc_labels.get(&pc) {
             label
         } else {
@@ -1361,6 +1461,7 @@ impl Arm64Backend {
         self.scratch_cursor = 0;
         self.float_scratch_cursor = 0;
         self.pc_labels.clear();
+        self.cur_bytecode_pc = 0;
         self.local_regs.clear();
         self.float_local_regs.clear();
         self.spill_map.clear();
@@ -1385,13 +1486,34 @@ impl Arm64Backend {
             self.local_regs.push(None);
         }
 
-        // Build float_local_regs from FP assignments.
-        // FP register numbers 8-15 map to callee-saved D8-D15.
-        // We encode them as 32+n for the Arm64Register representation.
-        for &a in &alloc.xmm_assignments {
-            self.float_local_regs.push(a.map(|n| Arm64Register(32 + n)));
-        }
-        while self.float_local_regs.len() < num_locals {
+        // Float/double locals get NO dedicated FP register on this backend.
+        //
+        // Bug-fix (aarch64 parity audit, 2026-08-01 — AAPCS64 violation):
+        // `regalloc::ARM64_LOCAL_FPS` is `D8..D15`, and on AAPCS64 those are
+        // precisely the **callee-saved** FP registers
+        // (the low 64 bits of V8-V15 must be preserved across a call). This
+        // backend's prologue/epilogue save and restore only the callee-saved
+        // GPRs in `alloc.used_callee_saved` — `alloc.used_xmm_regs` is never
+        // consulted and `Arm64FrameLayout` reserves no space for FP saves. So
+        // the previous code, which homed float locals in D8-D15, silently
+        // destroyed the *caller's* D8-D15 on every compiled method that used a
+        // float or double local. The caller is either the interpreter (Rust,
+        // compiled by LLVM, which very much does keep values in D8-D15 across
+        // calls) or another compiled frame; either way it is corruption.
+        //
+        // Two ways to close it: save/restore the used FP registers in the
+        // prologue/epilogue, or stop allocating them. The second is chosen here
+        // — it is the change that cannot itself be wrong, and this backend
+        // compiles nothing whose performance is worth the risk. Float locals now
+        // live in a frame slot (via `FpLdr`/`FpStr`, whose negative-offset
+        // lowering is fixed in `emit_machine_code`) or, when the allocator gave
+        // the slot a GPR, in that GPR via `FmovToFp`/`FmovFromFp`.
+        //
+        // If FP homing is ever wanted back, the prerequisite is an FP
+        // save/restore area in `Arm64FrameLayout::compute` plus prologue and
+        // epilogue emission driven by `alloc.used_xmm_regs` — not a revert of
+        // this loop. Asserted by `float_locals_never_use_callee_saved_fp_regs`.
+        for _ in 0..num_locals {
             self.float_local_regs.push(None);
         }
 
@@ -1412,11 +1534,32 @@ impl Arm64Backend {
             .count();
         let _ = fp_spills; // float spills use the same frame slots
         let num_spills = gpr_spills + max_stack;
-        self.frame = Some(Arm64FrameLayout::compute(
-            num_locals,
-            num_spills,
-            &saved_regs,
-        ));
+        let layout = Arm64FrameLayout::compute(num_locals, num_spills, &saved_regs);
+
+        // Refuse frames that could step over the stack guard page.
+        //
+        // Bug-fix (aarch64 parity audit, 2026-08-01 — missing stack bang):
+        // x86-64 probes every page the new frame crosses BEFORE moving RSP
+        // (`x64::Backend::emit_stack_bang_before_frame_alloc`, page size
+        // `x64::reg_encoding::STACK_BANG_PAGE_SIZE == 4096`), which converts
+        // stack exhaustion
+        // into a fault ON the guard page — recoverable, and reported as
+        // `StackOverflowError`. This backend emits no bang at all: its prologue
+        // is a bare `SUB SP, SP, #frame_size`. A frame larger than one guard
+        // page can therefore move SP clean PAST the guard and land in unrelated
+        // mapped memory, at which point the first spill store silently corrupts
+        // whatever is there instead of trapping.
+        //
+        // `frame_size` here is attacker-influenced in the ordinary sense —
+        // `max_locals` and `max_stack` come from the class file and are u16 —
+        // so this is not theoretical: `num_spills = gpr_spills + max_stack`,
+        // giving frames up to ~512 KiB. Until a bang exists, any frame that
+        // could reach beyond the first guard page is refused.
+        const AARCH64_GUARD_PAGE_BYTES: i32 = 4096;
+        if layout.frame_size >= AARCH64_GUARD_PAGE_BYTES {
+            self.failed = true;
+        }
+        self.frame = Some(layout);
 
         self.epilogue_label = self.buffer.new_label();
 
@@ -1445,7 +1588,7 @@ impl Arm64Backend {
             // after the branch is decoded) ever get bound — see
             // `compile_method_with_info`.
             if branch_targets.binary_search(&pc).is_ok() {
-                let _ = self.label_for_pc(pc);
+                let _ = self.label_for_pc_unchecked(pc);
             }
 
             // Bind label if any branch targets this PC.
@@ -1457,6 +1600,10 @@ impl Arm64Backend {
 
             let opcode = bytecode[pc];
             let start_pc = pc;
+            // Publish the instruction boundary before lowering, so every
+            // `label_for_pc` call made by this opcode's arm can tell a forward
+            // branch from a back-edge (see `label_for_pc`).
+            self.cur_bytecode_pc = start_pc;
             pc += 1;
 
             match opcode {
@@ -3945,13 +4092,21 @@ fn emit_addr_into_ip0(
 /// magnitude handed to the encoding is always non-negative. IP0 (X16) is the
 /// AAPCS64 intra-procedure-call scratch and is never a regalloc output, so the
 /// register-form fallback never clobbers a live value.
+///
+/// Returns `false` when no sound encoding exists (the SP case below), in which
+/// case the caller must abandon the method. Previously this path emitted
+/// `BRK #0` and reported success: the compile "succeeded", the body was
+/// published, and the SP adjustment it was supposed to perform simply never
+/// happened — the first thread to reach it died with SIGTRAP, which nothing in
+/// the VM converts into anything. A trap is not a lowering; refuse instead.
+#[must_use]
 fn emit_addsub_imm_safe(
     emitter: &mut crate::aarch64::Aarch64Emitter,
     rd: crate::aarch64::Reg,
     rn: crate::aarch64::Reg,
     imm: i32,
     is_sub: bool,
-) {
+) -> bool {
     // Normalize: fold the sign into the operation so `mag` is non-negative.
     // (i32::MIN's magnitude does not fit i32, so widen to i64 first.)
     let signed = if is_sub { -(imm as i64) } else { imm as i64 };
@@ -3965,6 +4120,7 @@ fn emit_addsub_imm_safe(
         } else {
             emitter.add_imm(rd, rn, mag as u16, false);
         }
+        true
     } else if mag & 0xFFF == 0 && (mag >> 12) <= 0xFFF {
         // Fits the LSL #12 shifted 12-bit immediate form.
         let hi = (mag >> 12) as u16;
@@ -3973,6 +4129,7 @@ fn emit_addsub_imm_safe(
         } else {
             emitter.add_imm(rd, rn, hi, true);
         }
+        true
     } else if rd.enc() == 31 || rn.enc() == 31 {
         // SP edge case. Encoding 31 means SP in the ADD/SUB *immediate* form but
         // XZR in the shifted-*register* form, so we cannot fall back to the
@@ -3980,10 +4137,11 @@ fn emit_addsub_imm_safe(
         // (and no extended-register `ADD/SUB (extended)` encoder exists here).
         // This only arises for an SP adjustment whose magnitude exceeds 0xFFF
         // and is not 4 KiB-aligned — i.e. a frame larger than 4095 bytes that
-        // isn't page-step-aligned, which this backend never generates. Trap
-        // loudly instead of emitting a silently-wrong SP update. If this ever
-        // fires, plumb an extended-register ADD/SUB into aarch64.rs.
-        emitter.brk(0);
+        // isn't page-step-aligned. Refuse the method instead of emitting a
+        // silently-wrong SP update (or, as before, a BRK that reports success
+        // and then kills the process on first execution). If this ever needs to
+        // succeed, plumb an extended-register ADD/SUB into aarch64.rs.
+        false
     } else {
         // Out of immediate range: materialize into IP0 (X16) and use the
         // register form. Never silently truncate. (rd/rn are guaranteed not to
@@ -3994,6 +4152,7 @@ fn emit_addsub_imm_safe(
         } else {
             emitter.add(rd, rn, crate::aarch64::Reg::X16);
         }
+        true
     }
 }
 
@@ -4001,8 +4160,11 @@ fn emit_addsub_imm_safe(
 /// Uses `Aarch64Emitter` from `aarch64.rs` to encode each instruction.
 ///
 /// Returns `None` — bail this method to the interpreter — when the pseudo-op
-/// sequence cannot be encoded soundly. Three independent reasons:
+/// sequence cannot be encoded soundly. Four independent reasons:
 ///
+/// 0. an `AddImm`/`SubImm` with no sound encoding — see
+///    [`emit_addsub_imm_safe`], which returns `false` for the SP case that
+///    used to emit `BRK #0` while still reporting a successful compile;
 /// 1. `result.success == false` (an opcode arm refused the method);
 /// 2. a branch or literal reference whose label is never bound (see the patch
 ///    loops at the end — an unbound label used to be left as "branch to
@@ -4048,13 +4210,18 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
                 // Range-checked lowering: fits 12-bit / shifted-12-bit form, or
                 // materializes into IP0 and uses the register form. Never
                 // silently truncates a wide immediate (see emit_addsub_imm_safe).
-                emit_addsub_imm_safe(&mut emitter, r(*rd), r(*rn), *imm, false);
+                // `false` = no sound encoding exists → bail the method.
+                if !emit_addsub_imm_safe(&mut emitter, r(*rd), r(*rn), *imm, false) {
+                    return None;
+                }
             }
             Arm64Instruction::Sub { rd, rn, rm } => {
                 emitter.sub(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::SubImm { rd, rn, imm } => {
-                emit_addsub_imm_safe(&mut emitter, r(*rd), r(*rn), *imm, true);
+                if !emit_addsub_imm_safe(&mut emitter, r(*rd), r(*rn), *imm, true) {
+                    return None;
+                }
             }
             Arm64Instruction::Mul { rd, rn, rm } => {
                 emitter.mul(r(*rd), r(*rn), r(*rm));
@@ -4297,16 +4464,50 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
             }
 
             // -- FP Load / Store --
+            //
+            // Bug-fix (aarch64 parity audit 2026-08-01, FP twin of ARM64 BUG #1):
+            // the previous lowering was `*offset as u16` straight into the
+            // SCALED UNSIGNED-offset form. Every FP spill slot is at a NEGATIVE
+            // offset from FP (`Arm64FrameLayout::spill_offset` is always < 0),
+            // and `-24i32 as u16` is 65512, which the encoder then scales by 8
+            // — a load/store roughly 64 KiB ABOVE FP, i.e. into the caller's
+            // frame. Silent memory corruption on every `fstore`/`fload` of a
+            // spilled float or double.
+            //
+            // Routing now mirrors the GPR `Ldr`/`Str` arms exactly:
+            //   * offset >= 0, correctly scaled, in range → scaled unsigned form
+            //   * offset in the signed imm9 range (−256..=255) → unscaled,
+            //     non-writeback LDUR/STUR (FP variants)
+            //   * otherwise → materialize the address into IP0 (X16) and use a
+            //     zero-offset access.
             Arm64Instruction::FpLdr {
                 vt,
                 rn,
                 offset,
                 is_double,
             } => {
-                if *is_double {
-                    emitter.ldr_fp_d(fp(*vt), r(*rn), *offset as u16);
+                // Scaled unsigned form: imm12 scaled by the access size, so the
+                // reachable byte range is 8*4095 for D and 4*4095 for S.
+                let (scale, max_scaled) = if *is_double { (8i32, 32760i32) } else { (4, 16380) };
+                if *offset >= 0 && *offset % scale == 0 && *offset <= max_scaled {
+                    if *is_double {
+                        emitter.ldr_fp_d(fp(*vt), r(*rn), *offset as u16);
+                    } else {
+                        emitter.ldr_fp_s(fp(*vt), r(*rn), *offset as u16);
+                    }
+                } else if (-256..=255).contains(offset) {
+                    if *is_double {
+                        emitter.ldur_fp_d(fp(*vt), r(*rn), *offset as i16);
+                    } else {
+                        emitter.ldur_fp_s(fp(*vt), r(*rn), *offset as i16);
+                    }
                 } else {
-                    emitter.ldr_fp_s(fp(*vt), r(*rn), *offset as u16);
+                    emit_addr_into_ip0(&mut emitter, r(*rn), *offset);
+                    if *is_double {
+                        emitter.ldur_fp_d(fp(*vt), crate::aarch64::Reg::X16, 0);
+                    } else {
+                        emitter.ldur_fp_s(fp(*vt), crate::aarch64::Reg::X16, 0);
+                    }
                 }
             }
             Arm64Instruction::FpStr {
@@ -4315,10 +4516,26 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
                 offset,
                 is_double,
             } => {
-                if *is_double {
-                    emitter.str_fp_d(fp(*vt), r(*rn), *offset as u16);
+                let (scale, max_scaled) = if *is_double { (8i32, 32760i32) } else { (4, 16380) };
+                if *offset >= 0 && *offset % scale == 0 && *offset <= max_scaled {
+                    if *is_double {
+                        emitter.str_fp_d(fp(*vt), r(*rn), *offset as u16);
+                    } else {
+                        emitter.str_fp_s(fp(*vt), r(*rn), *offset as u16);
+                    }
+                } else if (-256..=255).contains(offset) {
+                    if *is_double {
+                        emitter.stur_fp_d(fp(*vt), r(*rn), *offset as i16);
+                    } else {
+                        emitter.stur_fp_s(fp(*vt), r(*rn), *offset as i16);
+                    }
                 } else {
-                    emitter.str_fp_s(fp(*vt), r(*rn), *offset as u16);
+                    emit_addr_into_ip0(&mut emitter, r(*rn), *offset);
+                    if *is_double {
+                        emitter.stur_fp_d(fp(*vt), crate::aarch64::Reg::X16, 0);
+                    } else {
+                        emitter.stur_fp_s(fp(*vt), crate::aarch64::Reg::X16, 0);
+                    }
                 }
             }
 
@@ -5429,7 +5646,7 @@ mod tests {
 
         // Small immediate (fits 12 bits): one ADD-immediate instruction.
         let mut e_small = Aarch64Emitter::new();
-        emit_addsub_imm_safe(&mut e_small, Reg::X9, Reg::X9, 5, false);
+        assert!(emit_addsub_imm_safe(&mut e_small, Reg::X9, Reg::X9, 5, false));
         assert_eq!(
             e_small.code().len(),
             4,
@@ -5442,7 +5659,13 @@ mod tests {
         // instruction and never encodes the (wrong) masked immediate.
         let wide = 5000i32; // 0x1388 — low 12 bits 0x388 != 0, > 0xFFF
         let mut e_wide = Aarch64Emitter::new();
-        emit_addsub_imm_safe(&mut e_wide, Reg::X9, Reg::X9, wide, false);
+        assert!(emit_addsub_imm_safe(
+            &mut e_wide,
+            Reg::X9,
+            Reg::X9,
+            wide,
+            false
+        ));
         assert!(
             e_wide.code().len() > 4,
             "a >12-bit immediate must not collapse into one (truncated) ADD-imm"
@@ -5608,20 +5831,163 @@ mod tests {
         assert!(has_spill_load, "11th local should spill to stack");
     }
 
+    /// Float locals must NOT be homed in `D8`–`D15`.
+    ///
+    /// Replaces `p95_backend_float_local_uses_fp_reg`, which asserted the
+    /// opposite. `regalloc::ARM64_LOCAL_FPS` is `D8..D15`, which AAPCS64 makes
+    /// **callee-saved**, and this backend's prologue/epilogue save only GPRs —
+    /// so homing a float local there destroyed the caller's copy. See the
+    /// comment on the `float_local_regs` loop in `compile_pass`.
+    ///
+    /// The observable consequence is that a spilled float local goes through a
+    /// frame slot (`FpStr`/`FpLdr`) or a GPR bit-move, never `FmovFp` from a
+    /// callee-saved D register.
     #[test]
-    fn p95_backend_float_local_uses_fp_reg() {
+    fn float_locals_never_use_callee_saved_fp_regs() {
         // fconst_1 (0x0c), fstore_0 (0x43), fload_0 (0x22), return void (0xb1)
         let result = make_backend_with_method(1, 0, &[0x0c, 0x43, 0x22, 0xb1]);
         assert!(result.success);
-        // fload_0 should use FmovFp (FP reg to FP reg) since graph coloring assigns D8-D15.
-        let has_fmov_fp = result
+
+        // No instruction may name an FP register outside the caller-saved
+        // scratch set V0-V7 (encoded 32..=39). D8-D15 would appear as 40..=47.
+        let mut offenders: Vec<u8> = Vec::new();
+        fn note(reg: Arm64Register, offenders: &mut Vec<u8>) {
+            if reg.0 >= 40 {
+                offenders.push(reg.0);
+            }
+        }
+        for inst in &result.instructions {
+            match inst {
+                Arm64Instruction::FmovFp { vd, vn } => {
+                    note(*vd, &mut offenders);
+                    note(*vn, &mut offenders);
+                }
+                Arm64Instruction::FmovToFp { vd, .. } => note(*vd, &mut offenders),
+                Arm64Instruction::FmovFromFp { vn, .. } => note(*vn, &mut offenders),
+                Arm64Instruction::FpLdr { vt, .. } | Arm64Instruction::FpStr { vt, .. } => {
+                    note(*vt, &mut offenders)
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "float locals must not be homed in callee-saved D8-D15 \
+             (this backend never saves them); saw register encodings {offenders:?}"
+        );
+
+        // And the value really does round-trip through a frame slot, i.e. the
+        // spill path — not silently dropped.
+        let has_fp_spill = result
             .instructions
             .iter()
-            .any(|inst| matches!(inst, Arm64Instruction::FmovFp { .. }));
+            .any(|i| matches!(i, Arm64Instruction::FpStr { .. }));
+        let has_gpr_home = result
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Arm64Instruction::FmovFromFp { .. }));
         assert!(
-            has_fmov_fp,
-            "float local with FP register should use FmovFp for loads"
+            has_fp_spill || has_gpr_home,
+            "fstore_0 must store the float somewhere (frame slot or GPR)"
         );
+    }
+
+    /// The FP frame-slot lowering must never use the scaled unsigned-offset
+    /// form for a negative displacement.
+    ///
+    /// `Arm64FrameLayout::spill_offset` is always negative, and the previous
+    /// lowering did `offset as u16` — turning −24 into 65512, which the encoder
+    /// then scales by 8. That is a load/store ~64 KiB *above* FP, inside the
+    /// caller's frame. This checks the encoded bytes directly: an unscaled
+    /// LDUR/STUR (bit 24 clear) rather than the scaled form (bit 24 set).
+    #[test]
+    fn fp_frame_slot_access_uses_unscaled_form_for_negative_offsets() {
+        let result = result_from_instructions(vec![
+            Arm64Instruction::FpStr {
+                vt: Arm64Register::V0,
+                rn: Arm64Register::FP,
+                offset: -24,
+                is_double: true,
+            },
+            Arm64Instruction::FpLdr {
+                vt: Arm64Register::V1,
+                rn: Arm64Register::FP,
+                offset: -24,
+                is_double: true,
+            },
+            Arm64Instruction::Ret,
+        ]);
+        let bytes = emit_machine_code(&result).expect("FP frame access must encode");
+        assert_eq!(bytes.len(), 3 * 4);
+
+        // STUR D0, [X29, #-24] = 0xFC1E83A0; LDUR D1, [X29, #-24] = 0xFC5E83A1.
+        // (Derived from the GPR STUR/LDUR words with the V bit — 1<<26 — set;
+        // imm9 = -24 & 0x1FF = 0x1E8.)
+        let w0 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let w1 = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(w0, 0xFC1E_83A0, "STUR D0, [X29, #-24]");
+        assert_eq!(w1, 0xFC5E_83A1, "LDUR D1, [X29, #-24]");
+
+        for (name, w) in [("store", w0), ("load", w1)] {
+            assert_eq!(
+                (w >> 24) & 1,
+                0,
+                "{name} must NOT be the scaled unsigned-offset form (that form \
+                 cannot encode a negative displacement — it reads -24 as 65512)"
+            );
+            assert_eq!(
+                (w >> 10) & 0x3,
+                0b00,
+                "{name} must not write back to the base register (FP)"
+            );
+        }
+    }
+
+    /// A positive, correctly-scaled FP offset must still take the compact
+    /// scaled form, so the fix above is a routing change and not a blanket
+    /// switch to the (shorter-range) unscaled encoding.
+    #[test]
+    fn fp_positive_aligned_offset_still_uses_scaled_form() {
+        let result = result_from_instructions(vec![
+            Arm64Instruction::FpLdr {
+                vt: Arm64Register::V0,
+                rn: Arm64Register::X1,
+                offset: 16,
+                is_double: true,
+            },
+            Arm64Instruction::Ret,
+        ]);
+        let bytes = emit_machine_code(&result).expect("must encode");
+        let w = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        // LDR D0, [X1, #16] — scaled unsigned form has bit 24 set, imm12 = 2.
+        assert_eq!((w >> 24) & 1, 1, "positive aligned offset uses the scaled form");
+        assert_eq!((w >> 10) & 0xFFF, 2, "imm12 must be 16/8 == 2");
+    }
+
+    /// An FP offset outside the imm9 range must materialize the address rather
+    /// than truncate. 4 words: MOVN/MOVZ(+MOVK) into IP0, ADD, then the access.
+    #[test]
+    fn fp_far_offset_materializes_address() {
+        let result = result_from_instructions(vec![
+            Arm64Instruction::FpStr {
+                vt: Arm64Register::V0,
+                rn: Arm64Register::FP,
+                offset: -100_000,
+                is_double: true,
+            },
+            Arm64Instruction::Ret,
+        ]);
+        let bytes = emit_machine_code(&result).expect("must encode");
+        assert!(
+            bytes.len() > 2 * 4,
+            "a far FP offset must expand into an address materialization, \
+             not a single truncated access"
+        );
+        // Last instruction before RET is the zero-offset access off IP0 (X16).
+        let n = bytes.len();
+        let access = u32::from_le_bytes([bytes[n - 8], bytes[n - 7], bytes[n - 6], bytes[n - 5]]);
+        assert_eq!((access >> 5) & 0x1F, 16, "access base must be IP0 (X16)");
+        assert_eq!((access >> 12) & 0x1FF, 0, "materialized access uses offset 0");
     }
 
     // ===================================================================
@@ -5789,8 +6155,18 @@ mod tests {
         assert!(result.success, "nop should compile");
     }
 
+    /// A loop must be REFUSED, because this backend emits no safepoint poll.
+    ///
+    /// Formerly `p95_backend_fibonacci_compiles`, which asserted the opposite.
+    /// See [`Arm64Backend::label_for_pc`]: x86-64 polls
+    /// `helpers.safepoint_flag_addr` at every back-edge
+    /// (`x64::Backend::emit_safepoint_poll`); this backend has no poll and no
+    /// way to emit one, so a compiled loop is a region a thread can sit in
+    /// forever without ever reaching a stop-the-world request — the GC then
+    /// hangs the VM. Refusing the method and interpreting it is the only sound
+    /// option, and interpretation restores the interpreter's own polls.
     #[test]
-    fn p95_backend_fibonacci_compiles() {
+    fn loop_method_bails_no_safepoint_poll() {
         // Fibonacci-like: int fib(int n) with loop
         // local 0 = n (param), local 1 = a = 0, local 2 = b = 1, local 3 = tmp
         // istore_1(a=0), iconst_1, istore_2(b=1), iload_0, ifle done,
@@ -5821,14 +6197,86 @@ mod tests {
         ];
         let result = make_backend_with_method(4, 1, bytecode);
         assert!(
-            result.success,
-            "fibonacci method should compile successfully"
+            !result.success,
+            "a method with a loop back-edge must bail: there is no safepoint \
+             poll to place on the back-edge, so a thread in this loop would \
+             never reach a stop-the-world request"
         );
-        // All 4 locals should get registers (X19-X22 via graph coloring)
         assert!(
-            result.frame.saved_regs.len() >= 3,
-            "fibonacci needs at least 3 callee-saved regs, got {}",
-            result.frame.saved_regs.len()
+            emit_machine_code(&result).is_none(),
+            "the encoder must also refuse a bailed result"
+        );
+
+        // Negative control: the same shape of body with only a FORWARD branch
+        // still compiles, so the bail is specific to the back-edge and is not a
+        // blanket refusal of branching methods.
+        let straight_line: &[u8] = &[
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x04, // 2: iconst_1
+            0x3d, // 3: istore_2
+            0x1a, // 4: iload_0
+            0x9e, 0x00, 0x0a, // 5: ifle +10 → pc 15 (forward)
+            0x1c, // 8: iload_2
+            0x1b, // 9: iload_1
+            0x60, // 10: iadd
+            0x3e, // 11: istore_3
+            0x1b, // 12: iload_1
+            0xac, // 13: ireturn
+            0x00, // 14: nop
+            0x1b, // 15: iload_1
+            0xac, // 16: ireturn
+        ];
+        let ok = make_backend_with_method(4, 1, straight_line);
+        assert!(
+            ok.success,
+            "the same body with only a forward branch must still compile"
+        );
+    }
+
+    /// A single backward `goto` — the minimal back-edge — must bail, including
+    /// the degenerate `goto 0` self-loop.
+    #[test]
+    fn backward_goto_and_self_loop_both_bail() {
+        // nop; goto -1 from pc 1 → target pc 0, the tightest possible loop.
+        let self_loop = make_backend_with_method(0, 0, &[0x00, 0xa7, 0xff, 0xff]);
+        assert!(!self_loop.success, "a one-instruction loop must bail");
+
+        // nop; nop; goto -2 (back to pc 0)
+        let back = make_backend_with_method(0, 0, &[0x00, 0x00, 0xa7, 0xff, 0xfe]);
+        assert!(!back.success, "a backward goto must bail");
+
+        // Forward goto over a return — still fine.
+        let fwd = make_backend_with_method(0, 0, &[0xa7, 0x00, 0x04, 0xb1, 0xb1]);
+        assert!(fwd.success, "a forward goto must still compile");
+    }
+
+    /// A backward `tableswitch` case target is a back-edge too, and switch
+    /// targets take a different code path (`label_for_pc` from the switch arm
+    /// rather than from an `if*` arm), so it gets its own guard.
+    #[test]
+    fn backward_switch_case_target_bails() {
+        // pc 0: nop
+        // pc 1: nop
+        // pc 2: nop
+        // pc 3: iconst_1
+        // pc 4: tableswitch, padding to pc 8, default +12 (→ pc 16), low=0,
+        //       high=0, case 0 offset = -4 (→ pc 0, a back-edge)
+        let bytecode: &[u8] = &[
+            0x00, 0x00, 0x00, // 0-2: nop nop nop
+            0x04, // 3: iconst_1
+            0xaa, // 4: tableswitch
+            0x00, 0x00, 0x00, // 5-7: padding to 4-byte boundary
+            0x00, 0x00, 0x00, 0x14, // 8: default → +20 → pc 24 (forward)
+            0x00, 0x00, 0x00, 0x00, // 12: low = 0
+            0x00, 0x00, 0x00, 0x00, // 16: high = 0
+            0xff, 0xff, 0xff, 0xfc, // 20: case 0 → -4 → pc 0 (BACK-EDGE)
+            0xb1, // 24: return
+        ];
+        let result = make_backend_with_method(0, 0, bytecode);
+        assert!(
+            !result.success,
+            "a backward switch case target is a back-edge and must bail too"
         );
     }
 
@@ -6215,36 +6663,42 @@ mod tests {
     /// 6: goto -4         0xa7 ff fc  // back to pc 2
     /// ```
     ///
-    /// (The `goto` is unconditional, so the loop never exits — irrelevant
-    /// here: the point is purely that the branch encodes a nonzero backward
-    /// displacement rather than targeting itself.)
+    /// (The `goto` is unconditional, so the loop never exits.)
+    ///
+    /// **This method no longer compiles at all** — see
+    /// `loop_method_bails_no_safepoint_poll` and [`Arm64Backend::label_for_pc`]:
+    /// a back-edge is refused because there is no safepoint poll to place on it.
+    /// The original assertion ("a pure-arithmetic loop must compile") is
+    /// therefore inverted here.
+    ///
+    /// The *encoder-level* guard the original test existed for — that a
+    /// backward branch resolves to a real target rather than being left as the
+    /// displacement-0 `B .` placeholder — is preserved below by driving
+    /// `emit_machine_code` with a hand-built pseudo-op sequence containing a
+    /// bound backward branch. That is a strictly stronger check on the piece
+    /// that can still regress (the patch loop), and it survives the front-end
+    /// policy change.
     #[test]
     fn backward_branch_resolves_to_its_target_not_itself() {
+        // Front end: the loop is now refused outright.
         let code = [0x03, 0x3c, 0x1b, 0x04, 0x60, 0x3c, 0xa7, 0xff, 0xfc];
         let result = make_backend_with_method(2, 1, &code);
-        assert!(result.success, "a pure-arithmetic loop must compile");
-
-        // The Label pseudo-op for the back-edge target must be present, and
-        // must sit BEFORE the terminating branch rather than after it.
-        let label_idx = result
-            .instructions
-            .iter()
-            .position(|i| matches!(i, Arm64Instruction::Label(_)))
-            .expect("back-edge target must be bound to a Label");
-        let branch_idx = result
-            .instructions
-            .iter()
-            .rposition(|i| matches!(i, Arm64Instruction::B { .. }))
-            .expect("the goto must lower to a B");
         assert!(
-            label_idx < branch_idx,
-            "back-edge label must be bound before the branch that targets it"
+            !result.success,
+            "a loop must bail — no safepoint poll exists for its back-edge"
         );
 
-        let bytes = emit_machine_code(&result).expect("loop must encode");
-        // Locate the last unconditional B (opcode bits 31:26 == 0b000101 —
-        // no other instruction this method emits shares that pattern) and
-        // check that it does NOT branch to itself.
+        // Encoder: a bound backward branch must still patch to a real negative
+        // displacement, never to `B .`.
+        let looped = result_from_instructions(vec![
+            Arm64Instruction::Label(1),
+            Arm64Instruction::Nop,
+            Arm64Instruction::Nop,
+            Arm64Instruction::B { label: 1 },
+        ]);
+        let bytes = emit_machine_code(&looped).expect("bound back-edge must encode");
+        assert_eq!(bytes.len(), 3 * 4, "Label emits nothing; 3 real words");
+
         let mut last_b: Option<(usize, u32)> = None;
         for (i, w) in bytes.chunks_exact(4).enumerate() {
             let word = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
@@ -6261,11 +6715,12 @@ mod tests {
         // Sign-extend imm26 and confirm it points backwards, at a real
         // instruction inside the buffer.
         let signed = ((imm26 << 6) as i32) >> 6;
-        assert!(signed < 0, "a back-edge must branch backwards");
+        assert_eq!(signed, -2, "B at word 2 targeting word 0 is a -2 displacement");
         let target = (b_index as i64 + signed as i64) * 4;
+        assert_eq!(target, 0, "back-edge target must be the bound label");
         assert!(
-            target >= 0 && (target as usize) < bytes.len(),
-            "back-edge target {target} must land inside the emitted buffer"
+            (target as usize) < bytes.len(),
+            "back-edge target must land inside the emitted buffer"
         );
     }
 
@@ -6283,5 +6738,110 @@ mod tests {
             "oop_maps is always empty (no safepoints are emitted); if this \
              fires, precise AArch64 maps became real — update the header"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // aarch64 parity audit (2026-08-01) — fail-closed gates
+    // -----------------------------------------------------------------------
+
+    /// `emit_oop_map_for_safepoint` computes its native-PC key as
+    /// `instruction_count * 4`, which is wrong for a stream where `Label` and
+    /// `Comment` emit nothing, `ConstantPoolEntry` emits 8 bytes and
+    /// `MovImm`/`AddImm` expand to several words. A map keyed by a wrong PC
+    /// makes the GC read the wrong frame slots at a real safepoint, so the
+    /// helper refuses the method rather than let the first caller inherit it.
+    #[test]
+    fn oop_map_writer_is_fail_closed() {
+        let mut backend = Arm64Backend::new();
+        assert!(!backend.failed);
+        backend.emit_oop_map_for_safepoint();
+        assert!(
+            backend.failed,
+            "the oop-map writer must refuse the method: its native-PC key is \
+             derived from the pseudo-op count, not the encoded byte offset"
+        );
+        assert!(
+            backend.oop_maps.is_empty(),
+            "and it must not have recorded a (mis-keyed) map"
+        );
+    }
+
+    /// A frame big enough to step over the stack guard page must bail, because
+    /// this backend emits no stack bang (x86-64 does — `emit_stack_bang_before_frame_alloc`).
+    #[test]
+    fn oversized_frame_bails_no_stack_bang() {
+        // max_stack = 600 → 600 spill slots → ~4.8 KiB frame, past one guard page.
+        let mut big = Arm64Backend::new();
+        let result = big.compile_method(0, 0, 600, &[0xb1]);
+        assert!(
+            result.frame.frame_size >= 4096,
+            "test precondition: frame must exceed a guard page (got {})",
+            result.frame.frame_size
+        );
+        assert!(
+            !result.success,
+            "a frame larger than the guard page must bail: `SUB SP, SP, #frame` \
+             with no bang can jump clean past the guard"
+        );
+
+        // Negative control: an ordinary small frame still compiles, so the gate
+        // is a size threshold and not a blanket refusal.
+        let mut small = Arm64Backend::new();
+        let ok = small.compile_method(0, 0, 4, &[0xb1]);
+        assert!(ok.frame.frame_size < 4096);
+        assert!(ok.success, "a normal frame must still compile");
+    }
+
+    /// The one ADD/SUB-immediate shape with no sound encoding (SP operand,
+    /// magnitude > 0xFFF, not 4 KiB-aligned) must report failure, not emit a
+    /// `BRK` and claim success. A BRK raises SIGTRAP, which nothing in the VM
+    /// converts into anything — the process just dies on first execution.
+    #[test]
+    fn addsub_imm_safe_refuses_unencodable_sp_adjustment() {
+        use crate::aarch64::{Aarch64Emitter, Reg};
+
+        let mut e = Aarch64Emitter::new();
+        assert!(
+            !emit_addsub_imm_safe(&mut e, Reg::SP, Reg::SP, 5000, true),
+            "an unencodable SP adjustment must be refused"
+        );
+
+        // A 4 KiB-aligned SP adjustment of the same magnitude class IS
+        // encodable (shifted-by-12 immediate form) and must still succeed.
+        let mut e2 = Aarch64Emitter::new();
+        assert!(
+            emit_addsub_imm_safe(&mut e2, Reg::SP, Reg::SP, 8192, true),
+            "a shifted-12 encodable SP adjustment must still lower"
+        );
+        assert_eq!(e2.code().len(), 4, "and it lowers to a single instruction");
+    }
+
+    /// `emit_machine_code` must propagate that refusal instead of publishing a
+    /// body whose SP adjustment silently did not happen.
+    #[test]
+    fn emit_machine_code_bails_on_unencodable_sp_immediate() {
+        let result = result_from_instructions(vec![
+            Arm64Instruction::SubImm {
+                rd: Arm64Register::SP,
+                rn: Arm64Register::SP,
+                imm: 5000,
+            },
+            Arm64Instruction::Ret,
+        ]);
+        assert!(
+            emit_machine_code(&result).is_none(),
+            "an unencodable SP adjustment must bail the method, not emit a BRK"
+        );
+
+        // Negative control: the encodable form still produces code.
+        let ok = result_from_instructions(vec![
+            Arm64Instruction::SubImm {
+                rd: Arm64Register::SP,
+                rn: Arm64Register::SP,
+                imm: 8192,
+            },
+            Arm64Instruction::Ret,
+        ]);
+        assert!(emit_machine_code(&ok).is_some());
     }
 }

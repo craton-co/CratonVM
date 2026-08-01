@@ -1,0 +1,249 @@
+# The bytecode loop rewriter, wired into `compile_with_param_slots`
+
+Companion to [`loop-transforms.md`](loop-transforms.md) (the transform itself)
+and [`loop-transform-wiring.md`](loop-transform-wiring.md) (the state before
+this change, and the acceptance criterion it set out). This file records what
+is wired **now**, how to turn it on, the side-table census, and what is not
+validated.
+
+Everything here lives in `jit/src/x64.rs` and `jit/src/x64/licm.rs`.
+
+## Status
+
+| Piece | State |
+|---|---|
+| `plan_loop_unroll` as the native unroller's admission oracle | wired (unchanged) |
+| Compiling `xform.code` instead of `code` | **wired**, opt-in |
+| Replicating the pc-keyed side tables | **wired**, all 21, one expression |
+| Translating baked-in bcis via `bci_at` | **wired**, 4 sites |
+| `osr_pc_to_native` rebuilt in original-bci space | **wired** (`rebuild_pc_to_native`) |
+| `osr_dead_mask` rebuilt in original-bci space | **wired** |
+| Validated by anything larger than a unit test | **no** |
+
+## How it is enabled
+
+```rust
+let previous = cratonvm_jit::x64::set_bytecode_loop_rewriter_armed(true);
+// … compiles on THIS thread now route unrolling through the bytecode rewriter …
+cratonvm_jit::x64::set_bytecode_loop_rewriter_armed(previous);
+```
+
+It is a **thread-local**, off process-wide, and nothing in the VM arms it. Two
+reasons it is not an environment variable:
+
+* this repo latches declared flags, and the declaration table
+  (`types/src/flag_groups.rs::INVENTORY`) is in a crate this change does not
+  touch. An *undeclared* flag is invisible to `runtime_var_os` under a flag
+  override and would therefore be untestable — the exact trap recorded in
+  `declared-flags-latch-so-set-var-is-invisible-to-tests`;
+* the unit tests in `x64.rs` run concurrently in one process. A process-wide
+  switch would leak one test's rewrite into another test's compile.
+
+The cost on the default path is one `Cell<bool>` load per compile.
+
+If a `CRATONVM_JIT_BYTECODE_UNROLL` flag is wanted later it must be added to
+`types/src/flag_groups.rs` first and then consulted *once* to seed the
+thread-local on each compiler worker — not consulted per compile, because
+`runtime_var_os` on a declared flag reads the latched snapshot anyway.
+
+`bytecode_loop_xform_rewrites_bytecode()` now answers this thread-local rather
+than a hard-coded `false`, and `native_unroller_enabled()` is still its exact
+complement — so arming the rewriter turns the native byte-copy unroller off in
+the same motion. That mutual exclusion is a correctness requirement, not
+tidiness: if both ran, `k+1` bytecode copies would be machine-code-duplicated
+`k+1` more times behind one back-edge poll.
+
+## What happens when it is armed
+
+`plan_bytecode_loop_xform` picks **one** loop and rewrites the whole method.
+One, because a `LoopXform` describes one rewrite and the primitives in
+`licm.rs` do not compose two provenance maps. The first admitted loop in
+`detect_loops` order wins (innermost-first for a nest). Every other loop is
+shifted correctly by the rewriter and simply not duplicated.
+
+The profitability band is character-for-character the native unroller's,
+including its PGO arm and its "a PGO refusal does not fall back to the static
+heuristic" behaviour. So arming changes *which machinery* unrolls a loop, not
+*which loops* are eligible. Legality is `plan_loop_unroll`'s 17 refusals, as
+it already was for the native unroller.
+
+`compile_with_param_slots` then
+
+1. shadows `code` / `code_len` with the rewritten bytes and `exception_ranges`
+   with `xform.exception_ranges` (a range enclosing the loop is widened over
+   the copies);
+2. rebinds all 21 pc-keyed tables through `LoopXform::replicate_pc_keyed`;
+3. compiles exactly as before — the ~40 analyses and the emitter are
+   unmodified, they simply see a different method;
+4. changes coordinates back on the way out.
+
+## Coordinate change: where a pc becomes a bci
+
+The report's plan assumed step 4 could be "a single post-pass over the produced
+`CompiledMethod`". **It cannot.** Four sites bake the bci as an *immediate into
+machine code*, and the stub emitters run at the end of `compile_bytecode`,
+before any artifact exists:
+
+| Site | What it bakes | Consumer |
+|---|---|---|
+| `emit_bounds_check_stubs` | arg 4 of `jit_throw_aioobe` | reported bytecode index |
+| `emit_exception_check_stub` | the arg of `set_throw_bci` | range-tested against this method's exception table |
+| `emit_deopt_stubs` | arg 3 of `jit_uncommon_trap` | interpreter resume point |
+| the `athrow` (`0xbf`) lowering | arg 2 of `jit_throw_exception` | `route_jit_exception_through_method`'s throw pc |
+
+All four now call `Compiler::orig_bci`, which reads `Compiler::bci_provenance`
+(`LoopXform::bci_of`, installed before `compile_bytecode`) and is the identity
+when it is `None`. The fourth site is not in `loop-transform-wiring.md`'s list
+— it was found by grepping every `pc as i32` / `bci as u64` immediate in the
+backend rather than by reading that list.
+
+Two things are deliberately **not** translated:
+
+* **`OopMapEntry::bytecode_pc`.** `loop-transform-wiring.md` lists it as
+  requiring `bci_at`. Reading the code says otherwise: the only value it is
+  ever compared against is the one this same codegen stores into the frame's
+  safepoint-id slot (`emit_pre_safepoint_spill`, `self.cur_bc_pc`), which
+  `conservative_roots` reads back from `[rbp - sp_id_slot_off]`. Both sides
+  live in output-PC space and are consistent. Translating one of them would
+  actively break `find_oop_map_for_safepoint_id`, whose `.find()` would then
+  see several maps sharing one key and pick an arbitrary one.
+* **`pc_to_native`.** Internal to branch patching, never published.
+
+`osr_entry_native` *is* published (as `CompiledMethod::osr_pc_to_native`) and
+*is* indexed by interpreter bci by the runtime, so it is rebuilt with
+`LoopXform::rebuild_pc_to_native`. This cannot be a translation-on-read: a bci
+inside a transformed region has several native offsets and picking the wrong
+one re-runs iterations. `rebuild_pc_to_native` applies `osr_entry_pc`'s
+steady-state choice pointwise and leaves `-1` across the unrolled back-edge
+gap, where OSR entry must be refused outright. `osr_dead_mask` is indexed by
+the same bci and gets the same treatment with the same image choice.
+
+`despec_contains` is consulted with `bci_at(loop_header)` at both call sites
+(the aaload/arith LICM hoist filter and the speculative-BCE guard filter),
+because the de-spec registry is keyed by interpreter bci.
+
+## Table census: all 21, and the sound/refused split
+
+Counted by reading the signature and body of `compile_with_param_slots`, not
+taken from the report. All 21 are replicated in **one** `let (…) = match` so a
+22nd parameter cannot be forgotten silently — omitting one is a destructuring
+arity error, not a miscompile.
+
+### Replicated, payload trivially shareable (13)
+
+`multianewarray_info`, `field_info`, `static_field_info`, `new_info`,
+`new_deferred_info`, `anewarray_info`, `anewarray_deferred_info`,
+`direct_calls`, `ldc_info`, `ldc2w_info`, `branch_hints`,
+`loop_unroll_hints`, `compact_field_info`.
+
+Plain data. `direct_calls` goes through the same primitive via a packed tuple
+because `JitDirectCall` (in `jit/src/lib.rs`) has no `Clone`; deriving it there
+would let this call `replicate_pc_keyed` directly.
+
+`loop_unroll_hints` is keyed by back-edge pc, and under `Unroll` an original
+back-edge bci has exactly one image (only the last copy carries the back edge),
+so the rebuilt map stays single-valued.
+
+### Replicated, payload is a READ-ONLY pointer — sound (3)
+
+`typecheck_info` (`*const u8` class name), `invoke_info`
+(`*const JitInvokeInfo`), `ldc_string_info` (`*const u8` interned string).
+
+Immutable, caller-owned, outlive the compile. Sharing one target across copies
+is indistinguishable from the single-copy case.
+
+### Replicated, payload is a MUTABLE pointer — sound, argued (2)
+
+`mic_slots` (`*const JitMICSlot`), `pic_slots` (`*const JitPICSlot`).
+
+The copies share **one** inline-cache slot. This is correct rather than a
+compromise: an inline cache keyed on a call site sees the same receiver
+distribution in every copy, which is exactly what happens today when a
+non-unrolled loop executes many times. It is also the only sound option here —
+the slots are allocated and owned by `jit/src/lib.rs::try_compile`, and minting
+fresh ones per copy needs code outside this file. (The *native* unroller does
+mint fresh slots, via `cloned_mic_slots`/`cloned_pic_slots`; it duplicates
+machine code with a baked `imm64` and has no other choice.)
+
+### Replicated, but the transform is refused when non-empty (3)
+
+`non_escaping_new`, `inline_sites`, `indy_info`.
+
+* `non_escaping_new` is replicated and is *not* a refusal — it is listed here
+  only because the authoritative escape analysis re-runs on the rewritten code
+  whenever `new_info` is non-empty, so the replicated parameter is consumed
+  only on the `new_info.is_empty()` path.
+* `inline_sites` — **refused** (`InlineSitesPresent`). An inlined callee
+  contributes its own bci space (`deopt-inline-scopes.md`) that this
+  caller-only provenance map does not describe.
+* `indy_info` — **refused** (`InvokedynamicPresent`). The `0xba` lowering is an
+  unconditional trap that records an `UnreachedCode` snapshot through
+  `emit_osr_exit_map_at_reason`, whose `DeoptimizationPoint::bci` the VM
+  resumes at — and unlike the other snapshot paths it is **not** gated on
+  `deopt_real_enabled()`, so it would fire in production.
+
+Both are still routed through `replicate_pc_keyed` so the census has no
+"handled elsewhere" entry and so lifting the refusal is a one-line change.
+
+### Not parameters, handled separately (2)
+
+* `exception_ranges` (from `PENDING_EXCEPTION_RANGES`) — replaced wholesale by
+  `xform.exception_ranges`, which the rewriter produced.
+* `protected_ranges` (from `PROTECTED_RANGES_REQUEST`) — **not** rewritten,
+  and it does not need to be: its only consumer, `Compiler::pc_is_protected`,
+  is read exclusively on the `precise_exception_frames` paths, which the
+  transform refuses.
+
+## Whole-compile refusals
+
+`plan_bytecode_loop_xform` returns `LoopRewriteRefusal` and the compile
+continues with the caller's original bytecode. Refusing costs speed and
+nothing else, which is why it is a refusal rather than a `BailoutReason`:
+bailing would abandon a method the backend can compile perfectly well.
+
+| Refusal | Why |
+|---|---|
+| `NotArmed` | the default |
+| `DeoptRealEnabled` | `CRATONVM_DEOPT_REAL`: precise snapshots record a resume bci from the emitter pc |
+| `PreciseExceptionFrames` | same, via `emit_post_invoke_exception_check` / `emit_precise_null_check_field_store` |
+| `InvokedynamicPresent` | see above; the one such path that is live in production |
+| `InlineSitesPresent` | inlined-callee bci space |
+| `NoCandidateLoop` | nothing passed the band + `bypassable_headers` |
+| `Planner(_)` | one of `plan_loop_unroll`'s 17 structural refusals |
+| `ProvenanceNotTotal` | unreachable; re-checked because `orig_bci` rests on it |
+
+There is one more, later and louder: if a transform is in effect and the
+compile nevertheless recorded a `deopt_points` entry, `compile_with_param_slots`
+**discards the method** (returns `None`) rather than publish an output PC as an
+interpreter resume point. The three refusals above make that vector provably
+empty; the check exists so a future emit path cannot silently break it.
+
+## What is NOT validated
+
+* No suite has run with the rewriter armed. No stress harness, no sanitizer,
+  no benchmark A/B. The unit tests in `x64.rs::loop_unroll_admission` are the
+  only evidence.
+* The end-to-end test compiles one helper-free integer loop and checks the
+  published OSR metadata is `orig_code_len + 1` long with `-1` across the
+  back-edge gap. It does **not** execute the compiled code.
+* Nothing has exercised a rewritten method through a real GC pause, a real
+  deopt, a real OSR entry, or a real exception.
+* Inline-cache sharing across copies is *argued*, not measured. If it is ever
+  wrong, the symptom is a megamorphic slot where the native unroller would have
+  had `k+1` monomorphic ones — slower, not incorrect.
+* The peel path (`plan_loop_peel`) is not reachable from here. Only
+  `plan_loop_unroll` is wired; the `rebuild_pc_to_native` /
+  `osr_dead_mask` code paths handle peel correctly by construction
+  (`osr_entry_pc` answers the steady-state copy for both kinds) but no peel
+  has ever been compiled.
+
+## Follow-ups this change deliberately did not take
+
+1. `#[derive(Clone)]` on `JitDirectCall` in `jit/src/lib.rs`, which would
+   delete the packed-tuple detour.
+2. Translating `DeoptimizationPoint::bci` at `build_and_record_deopt_point`,
+   which would retire `DeoptRealEnabled`, `PreciseExceptionFrames` and
+   `InvokedynamicPresent` in one move. That is the largest remaining piece.
+3. `loop-transform-wiring.md` still describes the pre-wiring state and lists
+   `OopMapEntry::bytecode_pc` as needing translation. It should be superseded
+   by this file.

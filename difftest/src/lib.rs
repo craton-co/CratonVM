@@ -75,7 +75,16 @@
 //!   paths disagreeing needs no reference JDK to be a defect.
 //! * [`matrix`] derives, from the corpus class files themselves, which opcodes
 //!   and operand forms each path actually reaches — so the gaps are visible
-//!   instead of assumed.
+//!   instead of assumed. Each `(opcode, axis)` cell is **covered**, **uncovered**
+//!   with the gap that names its fix, or **unreachable-by-construction** with
+//!   the reason; a boolean cell could not tell "nobody wrote a seed" from
+//!   "nothing can write one", and `jsr` is permanently the second.
+//! * [`opcorpus`] is what makes that number mean something. A matrix over the
+//!   three committed seeds reports on roughly four of 202 opcodes; this emits a
+//!   deterministic, checksum-declaring Java program per opcode — 197 of them,
+//!   with the five `javac` cannot produce named and explained — each wrapping
+//!   its focus in a loop and a handler so the `osr` and `exception` columns have
+//!   code sites at all.
 //!
 //! `docs/testing/differential.md` is the operator-facing write-up: what is
 //! compared, every normalization rule, the mode axis and the real VM flags it
@@ -92,5 +101,6 @@ pub mod matrix;
 pub mod minimize;
 pub mod mutate;
 pub mod normalize;
+pub mod opcorpus;
 pub mod oracle;
 pub mod runner;
