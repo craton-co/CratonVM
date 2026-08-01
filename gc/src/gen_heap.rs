@@ -358,6 +358,17 @@ fn watchref_dbg() -> bool {
     gc_flags().dbg_watchref
 }
 
+/// DBG (`CRATONVM_DBG_PROMO_SEED`): report how many of THIS cycle's young→old
+/// promotion destinations the in-place old sweep seeded its mark from, and how
+/// many `old_gen_mark_candidate_plausible` rejected. A nonzero rejection count
+/// is the measurement the first attempt at that seeding inferred but never
+/// took — see `sweep_old_gen_non_moving`.
+fn promo_seed_dbg() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PROMO_SEED").is_some())
+}
+
 /// DBG: optional young-GC stress threshold (bytes). Read from
 /// `CRATONVM_DBG_GC_STRESS`, or `CRATONVM_GC_STRESS` as an accepted alias
 /// (the latter is what several handoff/repro docs use; without the alias the
@@ -8825,37 +8836,79 @@ impl GenerationalHeap {
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
         let mut root_shadow = roots.to_vec();
-        // NOT DONE HERE — and the reason is measured, not theoretical.
+        // Seed this sweep from THIS cycle's promotion destinations.
         //
         // `sweep_young_non_moving` commits selective promotions (young→old)
         // into `promotions` but leaves the caller's roots on their PRE-
-        // promotion young addresses. This sweep marks from those roots, and
-        // `old_gen_gc`'s seed loop drops any address `old_gen.contains()`
-        // rejects — so a stale young address seeds NOTHING, the object at its
-        // new old-gen home is never marked, and this sweep hands a LIVE
-        // object's block back to the free list. That is defect 4 in
-        // `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`,
-        // it is real, and `ROverlaySystemGcStress` catches it in seconds.
+        // promotion young addresses. `old_gen_gc`'s seed loop screens out any
+        // address that is not a plausible old-gen object base, so a stale young
+        // root seeds NOTHING — the object at its new old-gen home is never
+        // marked and this sweep hands a LIVE object's block back to the free
+        // list.
         //
-        // The obvious repair — rewrite the roots through `promotions` before
-        // marking — fixes that probe and the whole regression suite, and makes
-        // `DefaultCatalogAndSchemaTest` SIGSEGV. Measured on the same host and
-        // fixture, `rc=139` counts out of three runs each:
+        // `mark_young_to_old_refs` normally covers a promoted object via its
+        // referrer, but only while that referrer is still in young from-space.
+        // A promoted object whose every referrer was ALSO promoted this cycle
+        // has nothing young pointing at it, so the only seed left is the stale
+        // root — and it is freed. That shape is what
+        // `old_sweep_seeds_from_this_cycles_promotion_destinations` stages, and
+        // it is a genuine differential: disable the loop below and the test
+        // fails with "returned a LIVE promoted object's block to the free list".
         //
-        //     baseline (no fixup)              0/3
-        //     fixup applied to `root_shadow`   2/3
-        //     fixup applied to caller's roots  3/3
+        // It also explains why a freed-while-referenced assertion over heap→heap
+        // edges stays silent on this defect: when a whole subgraph is condemned
+        // together, no SURVIVING heap object points into the doomed set, so
+        // there is no edge for such a detector to report. Silence there is not
+        // evidence the mark was complete.
         //
-        // So it is not merely that mutating the caller's snapshot was wrong
-        // (it was — that slice outlives this call); marking the extra
-        // destinations is itself destabilising, which means at least one
-        // address in `promotions` is not the valid old-gen object base this
-        // seed loop assumes. Until that is understood, seeding them trades a
-        // silent use-after-free for a crash, which is not an improvement.
+        // Seed EVERY destination, not just the ones a root happens to name.
+        // A promotion destination is live BY CONSTRUCTION — `sweep_young_non_
+        // moving` promotes exactly the objects its young mark just proved live
+        // — so marking all of them is correct rather than merely conservative.
+        // Root-matching alone would miss the commoner case: a promoted object
+        // referenced from a HEAP slot whose rewrite happens in the VM's post-GC
+        // fixup, i.e. after this sweep has already run and freed it.
         //
-        // `promotions` is threaded in and deliberately unused so the next
-        // attempt starts from the measurement rather than rediscovering it.
-        let _ = promotions;
+        // ADDITIVE, and on the shadow only. Two things went wrong the first
+        // time this was attempted (defect 4 in
+        // `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`):
+        // rewriting the CALLER's slice corrupted a root snapshot that outlives
+        // this call, and seeding destinations was itself destabilising because
+        // that seed loop did not validate what it marked. The second cause is
+        // gone: since `c3dbb011a` every push site into the mark worklist goes
+        // through `old_gen_mark_candidate_plausible`, so a destination that is
+        // not a real old-gen object base is REJECTED rather than blindly
+        // `gc_flags`-RMW'd — which is precisely the "at least one address in
+        // `promotions` is not a valid old-gen object base" the earlier attempt
+        // correctly inferred from its crashes but could not screen for.
+        // Appending (rather than replacing) keeps the pre-promotion entries
+        // too, so this can only ever mark MORE — the safe direction for a sweep
+        // that frees purely on `GC_FLAG_MARKED`.
+        //
+        // `CRATONVM_DBG_PROMO_SEED=1` reports how many destinations were seeded
+        // and how many the screen rejected — the fact the earlier attempt
+        // inferred but never measured.
+        let mut promo_seeds = 0usize;
+        let mut promo_rejected = 0usize;
+        for &dest in promotions.values() {
+            if old_gen_mark_candidate_plausible(dest as *mut u8, &old_gen, false) {
+                promo_seeds += 1;
+                // SAFETY: the screen verified 8-alignment, old-gen containment
+                // and a header whose claimed extent fits inside old gen.
+                root_shadow.push(unsafe { ObjectRef::from_raw(dest as *mut u8) });
+            } else {
+                promo_rejected += 1;
+            }
+        }
+        if promo_seed_dbg() {
+            eprintln!(
+                "[promo-seed] old sweep seeded {promo_seeds} promotion destination(s), \
+                 rejected {promo_rejected} implausible, from {} promotion entr(ies) \
+                 against {} root(s)",
+                promotions.len(),
+                roots.len(),
+            );
+        }
         let survivors = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
         (before.saturating_sub(old_gen.used()), survivors)
     }
@@ -14636,6 +14689,60 @@ mod tests {
             vm.is_addr_live(victim_addr),
             "the BFS must mark a victim reachable from a live holder's ref slot; \
              if this fails the detector's premise is wrong, not just its output",
+        );
+    }
+
+    /// A root left on its PRE-promotion young address must still seed the
+    /// in-place old sweep, via THIS cycle's promotion destination.
+    ///
+    /// `sweep_young_non_moving` commits young→old promotions into the map it
+    /// returns but leaves the caller's roots on their pre-promotion addresses.
+    /// `old_gen_gc`'s seed loop screens out anything that is not a plausible
+    /// old-gen object base, so a stale young root seeds NOTHING.
+    ///
+    /// `mark_young_to_old_refs` normally rescues a promoted object through a
+    /// referrer still sitting in young from-space. When an entire chain is
+    /// promoted in one cycle nothing young points at any of it, the only seed
+    /// left is the stale root, and the sweep frees a LIVE object — without
+    /// zeroing it, so the mutator keeps using an object whose block is on the
+    /// free list while the overlay prune correctly reads it as dead and drops
+    /// its side table. `ROverlaySystemGcStress` is the end-to-end form
+    /// (`tm size 0 != 24`, and it passes under `CRATONVM_OLD_SWEEP_JIT=0`);
+    /// this is the unit-level shape.
+    #[test]
+    fn old_sweep_seeds_from_this_cycles_promotion_destinations() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 8 * 1024);
+        let monitors = NoOpMonitors;
+
+        let victim = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(victim, 0, Value::Int(7));
+        let mut roots = vec![victim];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let promoted = roots[0];
+        assert!(
+            heap.is_in_old(promoted.as_ptr()),
+            "the victim must be promoted before an old-gen sweep is meaningful",
+        );
+
+        // Stage the defect: the only root still holds a PRE-promotion young
+        // address, and this cycle's promotion map records where it went. That
+        // is exactly the state `sweep_young_non_moving` hands over.
+        let stale_young = heap.alloc_object(ClassId::new(0), 0);
+        let promoted_addr = promoted.as_ptr() as usize;
+        let mut promotions = HashMap::new();
+        promotions.insert(stale_young.as_ptr() as usize, promoted_addr);
+
+        let stale_roots = vec![stale_young];
+        let (_reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&stale_roots, &promotions);
+
+        let vm = crate::vm_heap::VmHeap::Generational(heap);
+        assert!(
+            vm.is_addr_live(promoted_addr),
+            "the in-place old sweep returned a LIVE promoted object's block to \
+             the free list: its only root still held the pre-promotion young \
+             address, and the promotion destination was never seeded",
         );
     }
 

@@ -3482,6 +3482,7 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+        crate::memory::roots::push_off_frame_thread_roots(self.thread, &mut snapshot);
         // The blocked-thread snapshot is the only marking view a collector on
         // another thread has of this JIT worker.  Publish the direct HashMap
         // cache here as well as in the safepoint snapshot so its map/node pair
@@ -5232,21 +5233,6 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .read()
             .get(&class_id)
             .and_then(|cs| cs.functional_interface_id)
-    }
-
-    fn lambda_call_site_descriptors(&self, class_id: ClassId) -> Option<(String, String, String)> {
-        self.shared
-            .classes
-            .lambda_proxies
-            .read()
-            .get(&class_id)
-            .map(|cs| {
-                (
-                    cs.sam_method_name.to_string(),
-                    cs.sam_descriptor.to_string(),
-                    cs.instantiated_descriptor.to_string(),
-                )
-            })
     }
 
     fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {

@@ -1,5 +1,14 @@
 # DoHead family — post-fix sporadic residuals (OPEN)
 
+**Re-verified 2026-08-01, FIXED:** local Windows fixture, fresh `dev` build,
+full 64-parameterization DoHead matrix (`TestHttpServletDoHeadInvalidWrite*`,
+17 classes) rerun as part of `rerun-20260731-4shard` — all 17 classes PASS
+(`.suite/results/rerun-20260731-4shard/real-jit/results.csv`), zero HTTP
+response loss or read-timeout signatures. Leaving the historical record below
+intact; superseded by this verification.
+
+Original write-up follows for the record.
+
 **Status: OPEN 2026-07-18.** The earlier 2026-07-17 closure was not
 sufficient: a fresh isolated build still shows low-rate HTTP response loss and
 read timeouts in the 64-class DoHead matrix. This record has consequently been

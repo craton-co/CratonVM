@@ -37,6 +37,12 @@ notify = { version = "6", default-features = false, features = ["macos_kqueue"] 
 # allocate/free and getIntOption0/setIntOption0 paths. Matches the migration
 # already done in native-api (`fd_table`, `ffi`, `native_ring`, `registry`).
 rustc-hash.workspace = true
+# Diagnostics that must reach the operator's normal log stream rather than a
+# debug-only `eprintln!` — e.g. a `WatchService.register` whose
+# `WatchEvent.Kind` arguments could not be decoded, which would otherwise
+# install a watch that can never fire and look identical to a quiet
+# filesystem.
+tracing.workspace = true
 
 # WP3.1 — real platform-backed Selector. Linux uses epoll via libc; Windows
 # uses WSAPoll via raw `#[link(name = "Ws2_32")]` FFI (same approach as

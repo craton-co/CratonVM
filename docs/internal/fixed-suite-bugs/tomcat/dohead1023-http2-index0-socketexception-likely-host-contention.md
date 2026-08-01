@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🟡 UNCONFIRMED / likely NOT a CratonVM bug — does not reproduce in isolation; best evidence points to shared-host contention. Left open rather than fixed. |
+| **Status** | ✅ Re-verified 2026-08-01: `TestHttpServletDoHeadInvalidWrite1023ValidWrite1023` full class PASS (126.1s) in `rerun-20260731-4shard` (`.suite/results/rerun-20260731-4shard/real-jit/results.csv`), confirming the shared-host-contention hypothesis — closing as not-a-bug. Original entry below kept for the record. |
 | **Area** | HTTP/2 connection preface (`Http2TestBase.validateHttp2InitialResponse`) over CratonVM's `native-io` socket-channel layer |
 | **Sibling finding** | The other failure in the same log (`testDoHeadHttp2[25]`, `Thread.setPriority()` NPE) was a **confirmed, deterministic, real** bug — fixed separately, see `../../../../native-builtins/src/lib.rs`'s `populate_real_thread_holder` (merged to `dev` at `3e7f4a30`, commit `34faddd9`). This doc covers only the other, unrelated failure. |
 
