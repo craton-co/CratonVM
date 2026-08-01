@@ -681,6 +681,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "poison-free", on_key: Some("CRATONVM_JIT_POISON_FREE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "precise-coverage-pin", on_key: Some("CRATONVM_PRECISE_COVERAGE_PIN"), off_key: None, off_word: None },
+    // Wrong-answer A/B lever, not a tuning knob: OFF restores the params-only
+    // `run_jit_callee_handler` resume that zeroed a compiled callee's
+    // non-parameter locals. See `params_only_callee_handler_frames`.
+    E { group: Group::JIT, token: "callee-handler-precise-frame", on_key: None, off_key: Some("CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME"), off_word: None },
     E { group: Group::JIT, token: "precise-handler-frames", on_key: None, off_key: Some("CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES"), off_word: None },
     E { group: Group::JIT, token: "precise-inline-frame-record", on_key: None, off_key: Some("CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD"), off_word: None },
     E { group: Group::JIT, token: "precise-jit-maps", on_key: None, off_key: Some("CRATONVM_NO_PRECISE_JIT_MAPS"), off_word: None },

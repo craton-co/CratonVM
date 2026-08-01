@@ -1764,7 +1764,23 @@ impl Compiler {
             0
         };
         let locals_size = (total_locals.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
-        let spill_size = (max_stack.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
+        // Headroom above the operand stack for the direct-call argument-service
+        // copy. That copy preserves a direct callee's Java arguments for the cold
+        // exception-table service, and it must NOT be placed on the argument slots
+        // themselves: `pop_stack` reclaims them but the popped `StackSlot::Frame`s
+        // stay live until `emit_stack_arg_setup` marshals them, so an aliased
+        // reservation reverses the arguments into themselves and the callee gets
+        // arg0 in every slot (docs/known-issues/jit-direct-call-arg1-clobbered-by-arg0.md).
+        //
+        // The copy needs one slot per argument, and a call site's arguments are
+        // themselves on the operand stack, so `max_stack` slots of headroom is
+        // always sufficient. Cap it so a deep-stack method does not double its
+        // frame for a service copy that can never be that wide; a call with more
+        // than `DIRECT_CALL_SERVICE_HEADROOM_SLOTS` arguments simply fails the
+        // reservation and falls back, exactly as an over-wide method does today.
+        const DIRECT_CALL_SERVICE_HEADROOM_SLOTS: usize = 16;
+        let spill_slots = max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS));
+        let spill_size = (spill_slots.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
                                   // Reserved bytes ABOVE the shadow region for in-frame stack args to
                                   // any helper called without `emit_stack_arg_setup` (which would
@@ -2477,8 +2493,10 @@ impl Compiler {
                     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXCFRAME").is_some() {
                         eprintln!(
                             "[excframe] DROP local={i} at bci={bci} live_mask={live_here:#x} \
-                             precise={} handler_ranges={}",
-                            self.precise_exception_frames, self.exception_ranges_dbg_len,
+                             precise={} handler_ranges={} method={}",
+                            self.precise_exception_frames,
+                            self.exception_ranges_dbg_len,
+                            self.method_key,
                         );
                     }
                     locals.push(FrameValue::Undefined);
@@ -2550,6 +2568,22 @@ impl Compiler {
                 frame_value_for_slot(reg, xmm, off, false)
             };
             locals.push(fv);
+        }
+
+        // `CRATONVM_DBG_EXCFRAME=1` also dumps the WHOLE published locals vector,
+        // not just the slots the liveness mask dropped. A slot that survives
+        // liveness can still be published with the wrong *type source* — a
+        // ref-typed local that the oop mask does not claim comes out as
+        // `Register`/`StackSlot`, which the resume sink turns into a
+        // `Value::Int`, and reading it back with `aload` then behaves as null.
+        // That failure is invisible in the DROP lines alone, so print the
+        // provenance the snapshot actually chose for every slot.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXCFRAME").is_some() {
+            eprintln!(
+                "[excframe] FRAME method={} bci={bci} reason={reason:?} oop_reached={oop_reached} \
+                 oop_mask={oop_mask:#x} locals={:?}",
+                self.method_key, locals,
+            );
         }
 
         // Operand stack (empty at a BCE loop header; non-empty at OSR-exit loop
@@ -18997,6 +19031,16 @@ impl Compiler {
                             }
                             // Direct call to a JIT-compiled callee
                             let n = callee_params;
+                            // `pop_stack` rewinds `next_spill_offset` when it pops a
+                            // top-of-stack `Frame` slot, but it still HANDS THE SLOT
+                            // BACK, and every `arg_slots` entry stays live until
+                            // `emit_stack_arg_setup` marshals it into the entry ABI far
+                            // below. Anything that reserves spill space in between is
+                            // therefore handed the argument slots themselves. Remember
+                            // the pre-pop top so such a reservation can be placed above
+                            // them. See
+                            // docs/known-issues/jit-direct-call-arg1-clobbered-by-arg0.md.
+                            let args_frame_top = self.next_spill_offset;
                             let mut arg_slots = Vec::with_capacity(n);
                             for _ in 0..n {
                                 arg_slots.push(self.pop_stack());
@@ -19090,6 +19134,21 @@ impl Compiler {
                             // dispatch helper frame to recover them from when its own
                             // exception table must run.
                             let service_args_base = info_ptr.and_then(|_| {
+                                // Reserve ABOVE the argument slots. `pop_stack` reclaimed
+                                // them, so a bare `reserve_spill_slots` hands the SAME
+                                // slots back — and the copy below writes
+                                // `base + (len-1-i)` while reading `arg_slots[i]`, i.e. a
+                                // reversing copy into itself. With two int args that
+                                // stored arg0 over arg1 before `emit_stack_arg_setup`
+                                // read it, so the callee received arg0 in BOTH parameter
+                                // slots and every comparison in it evaluated `cmp a, a`.
+                                // The reservation also has to outlive the CALL for
+                                // `emit_inline_callee_deopt_check`, which the aliased
+                                // range could not. `reset_spills` recycles the extra
+                                // slots at the next bytecode boundary.
+                                if self.next_spill_offset < args_frame_top {
+                                    self.next_spill_offset = args_frame_top;
+                                }
                                 let base = self.reserve_spill_slots(arg_slots.len())?;
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     self.load_slot_to_reg(R11, *slot);
@@ -20852,6 +20911,16 @@ impl Compiler {
                             // Direct call: pop receiver + params, call compiled entry
                             // invokespecial has a receiver, so total args = callee_params + 1
                             let n = callee_params + 1; // receiver + params
+                            // `pop_stack` rewinds `next_spill_offset` when it pops a
+                            // top-of-stack `Frame` slot, but it still HANDS THE SLOT
+                            // BACK, and every `arg_slots` entry stays live until
+                            // `emit_stack_arg_setup` marshals it into the entry ABI far
+                            // below. Anything that reserves spill space in between is
+                            // therefore handed the argument slots themselves. Remember
+                            // the pre-pop top so such a reservation can be placed above
+                            // them. See
+                            // docs/known-issues/jit-direct-call-arg1-clobbered-by-arg0.md.
+                            let args_frame_top = self.next_spill_offset;
                             let mut arg_slots = Vec::with_capacity(n);
                             for _ in 0..n {
                                 arg_slots.push(self.pop_stack());
@@ -20861,6 +20930,21 @@ impl Compiler {
                             // Preserve Java arguments for the cold direct-callee
                             // exception-table service before call marshalling.
                             let service_args_base = info_ptr.and_then(|_| {
+                                // Reserve ABOVE the argument slots. `pop_stack` reclaimed
+                                // them, so a bare `reserve_spill_slots` hands the SAME
+                                // slots back — and the copy below writes
+                                // `base + (len-1-i)` while reading `arg_slots[i]`, i.e. a
+                                // reversing copy into itself. With two int args that
+                                // stored arg0 over arg1 before `emit_stack_arg_setup`
+                                // read it, so the callee received arg0 in BOTH parameter
+                                // slots and every comparison in it evaluated `cmp a, a`.
+                                // The reservation also has to outlive the CALL for
+                                // `emit_inline_callee_deopt_check`, which the aliased
+                                // range could not. `reset_spills` recycles the extra
+                                // slots at the next bytecode boundary.
+                                if self.next_spill_offset < args_frame_top {
+                                    self.next_spill_offset = args_frame_top;
+                                }
                                 let base = self.reserve_spill_slots(arg_slots.len())?;
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     self.load_slot_to_reg(R11, *slot);
@@ -25839,7 +25923,22 @@ mod tests {
             Vec::new(),
         );
 
-        assert!(matches!(compiler.push_stack(), Some(StackSlot::Frame(_))));
+        // Fill the spill region rather than assuming a single push exhausts it.
+        // `spill_size` reserves `max_stack` slots PLUS the direct-call
+        // argument-service headroom, so the limit no longer sits at
+        // `max_stack`. What this test pins is the refusal AT the limit — and
+        // that the refusal leaves the cursor untouched — not where the limit
+        // happens to fall.
+        let mut pushes = 0;
+        while compiler.next_spill_offset < compiler.spill_limit_offset {
+            assert!(
+                matches!(compiler.push_stack(), Some(StackSlot::Frame(_))),
+                "push {pushes} is still inside the spill region and must succeed",
+            );
+            pushes += 1;
+            assert!(!compiler.failed, "push {pushes} must not have failed");
+        }
+        assert!(pushes > 0, "the spill region must hold at least one slot");
         assert_eq!(compiler.next_spill_offset, compiler.spill_limit_offset);
 
         let cursor = compiler.next_spill_offset;
