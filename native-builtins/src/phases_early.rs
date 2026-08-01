@@ -10213,6 +10213,34 @@ fn tu_nanos_per(ordinal: i32) -> i64 {
     }
 }
 
+/// Read a `TimeUnit`'s ordinal.
+///
+/// The constants are minted as synthetic objects whose single field is
+/// unnamed, so `set_field_by_name(.., "ordinal", ..)` and `get_field(.., 0)`
+/// do not necessarily address the same storage. Readers that consulted only
+/// slot 0 saw the uninitialised default and silently decayed to ordinal 0 —
+/// `NANOSECONDS` — which made every conversion off by up to 10^9 and turned
+/// `SECONDS.toNanos(1)` into `1`. Always go through this pair so the name and
+/// the slot cannot drift apart again.
+fn tu_ordinal(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field_by_name(this, "ordinal") {
+        Value::Int(v) => v,
+        _ => match ctx.get_field(this, 0) {
+            Value::Int(v) => v,
+            // SECONDS: the least surprising unit to attribute an
+            // unreadable ordinal to, and the pre-existing default here.
+            _ => 3,
+        },
+    }
+}
+
+/// Write a `TimeUnit`'s ordinal to both the named field and slot 0 — see
+/// [`tu_ordinal`] for why one of the two is not enough.
+pub(crate) fn tu_set_ordinal(ctx: &mut dyn NativeContext, this: ObjectRef, ordinal: i32) {
+    ctx.set_field_by_name(this, "ordinal", Value::Int(ordinal));
+    ctx.set_field(this, 0, Value::Int(ordinal));
+}
+
 pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -10234,7 +10262,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
         ];
         for (i, name) in NAMES.iter().enumerate() {
             let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-            ctx.set_field_by_name(tu, "ordinal", Value::Int(i as i32));
+            tu_set_ordinal(ctx, tu, i as i32);
             ctx.set_static_field_by_name(
                 "java/util/concurrent/TimeUnit",
                 name,
@@ -10263,7 +10291,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
                 _ => 3,
             };
             let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-            ctx.set_field_by_name(tu, "ordinal", Value::Int(ordinal));
+            tu_set_ordinal(ctx, tu, ordinal);
             Ok(Some(Value::Object(Some(tu))))
         },
     );
@@ -10275,7 +10303,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 7);
             for i in 0..7 {
                 let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
-                ctx.set_field_by_name(tu, "ordinal", Value::Int(i));
+                tu_set_ordinal(ctx, tu, i);
                 ctx.set_array_element(arr, i as usize, Value::Object(Some(tu)));
             }
             Ok(Some(Value::Object(Some(arr))))
@@ -10292,20 +10320,8 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let su = obj_arg(args, 2)?;
-            let to = match ctx.get_field_by_name(this, "ordinal") {
-                Value::Int(v) => v,
-                _ => match ctx.get_field(this, 0) {
-                    Value::Int(v) => v,
-                    _ => 3,
-                },
-            };
-            let so = match ctx.get_field_by_name(su, "ordinal") {
-                Value::Int(v) => v,
-                _ => match ctx.get_field(su, 0) {
-                    Value::Int(v) => v,
-                    _ => 3,
-                },
-            };
+            let to = tu_ordinal(ctx, this);
+            let so = tu_ordinal(ctx, su);
             Ok(Some(Value::Long(dur * tu_nanos_per(so) / tu_nanos_per(to))))
         },
     );
@@ -10315,10 +10331,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        let o = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 3,
-        };
+        let o = tu_ordinal(ctx, this);
         Ok(Some(Value::Long(d * tu_nanos_per(o))))
     });
     r.register(c, "toMicros", "(J)J", |ctx, args| {
@@ -10327,10 +10340,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        let o = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 3,
-        };
+        let o = tu_ordinal(ctx, this);
         Ok(Some(Value::Long(d * tu_nanos_per(o) / 1_000)))
     });
     r.register(c, "toMillis", "(J)J", |ctx, args| {
@@ -10339,10 +10349,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        let o = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 3,
-        };
+        let o = tu_ordinal(ctx, this);
         Ok(Some(Value::Long(d * tu_nanos_per(o) / 1_000_000)))
     });
     r.register(c, "toSeconds", "(J)J", |ctx, args| {
@@ -10351,10 +10358,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        let o = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 3,
-        };
+        let o = tu_ordinal(ctx, this);
         Ok(Some(Value::Long(d * tu_nanos_per(o) / 1_000_000_000)))
     });
     r.register(c, "toMinutes", "(J)J", |ctx, args| {
@@ -10363,10 +10367,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        let o = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 3,
-        };
+        let o = tu_ordinal(ctx, this);
         Ok(Some(Value::Long(d * tu_nanos_per(o) / 60_000_000_000)))
     });
     r.register(c, "toHours", "(J)J", |ctx, args| {
@@ -10375,10 +10376,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        let o = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 3,
-        };
+        let o = tu_ordinal(ctx, this);
         Ok(Some(Value::Long(d * tu_nanos_per(o) / 3_600_000_000_000)))
     });
     r.register(c, "toDays", "(J)J", |ctx, args| {
@@ -10387,18 +10385,12 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        let o = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 3,
-        };
+        let o = tu_ordinal(ctx, this);
         Ok(Some(Value::Long(d * tu_nanos_per(o) / 86_400_000_000_000)))
     });
     r.register(c, "name", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let o = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 3,
-        };
+        let o = tu_ordinal(ctx, this);
         let n = match o {
             0 => "NANOSECONDS",
             1 => "MICROSECONDS",
@@ -10414,14 +10406,11 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(c, "ordinal", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Int(tu_ordinal(ctx, this))))
     });
     r.register(c, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let o = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 3,
-        };
+        let o = tu_ordinal(ctx, this);
         let n = match o {
             0 => "NANOSECONDS",
             1 => "MICROSECONDS",
@@ -10452,13 +10441,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
         if d <= 0 {
             return Ok(None);
         }
-        let o = match ctx.get_field_by_name(this, "ordinal") {
-            Value::Int(v) => v,
-            _ => match ctx.get_field(this, 0) {
-                Value::Int(v) => v,
-                _ => 3,
-            },
-        };
+        let o = tu_ordinal(ctx, this);
         let nanos = (d as i128) * (tu_nanos_per(o) as i128);
         // Count down the remaining duration rather than comparing against a
         // deadline `Instant`: `DAYS.sleep(Long.MAX_VALUE)` would overflow
