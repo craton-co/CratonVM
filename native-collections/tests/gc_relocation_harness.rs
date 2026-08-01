@@ -434,6 +434,69 @@ fn every_overlay_value_is_reachable_through_an_always_true_owner_predicate() {
     }
 }
 
+/// The owner-index seed must survive the OWNER moving, not just the value.
+///
+/// Every root path that is not the unconditional table scan reaches an
+/// overlay through `overlay_owner_keys`, an ADDRESS-keyed reverse index: the
+/// moving young collector's `external_roots_for_matching_owners(&|_| true)`
+/// seed, the non-moving young marker's per-owner walk, and `old_gen_gc`'s
+/// `external_roots_for_owner(obj_ptr)` in its mark BFS. The side tables
+/// themselves are keyed by the relocation-invariant identity hash, so the
+/// collection keeps reading its own state correctly after a move whether or
+/// not that index was re-keyed — which is precisely what makes a missed
+/// re-key silent. The only thing it breaks is the GC's ability to answer
+/// "which refs does this collection own?", and the first symptom is a
+/// reclaimed backing array surfacing as `checkcast: not an object reference`
+/// somewhere else entirely.
+///
+/// `gc_update_collection_overlay_refs` is what maintains that index across a
+/// move. Assert both readers against the POST-move address.
+#[test]
+fn owner_seeded_roots_follow_the_owner_across_a_relocation() {
+    let mut ctx = MockCtx::new();
+    let (cols, vals) = plant_one_value_per_overlay(&mut ctx);
+
+    // Move the COLLECTIONS and leave the values put — the mirror image of
+    // `all_overlay_object_values_survive_relocation`, and the case the
+    // address-keyed index actually depends on.
+    let mut pm: HashMap<usize, usize> = HashMap::new();
+    let mut moved_cols = [cols[0]; 5];
+    for (i, c) in cols.iter().enumerate() {
+        let post = ctx.relocate_object(*c);
+        pm.insert(c.as_ptr() as usize, post.as_ptr() as usize);
+        moved_cols[i] = post;
+    }
+
+    gc_update_collection_overlay_refs(&pm);
+
+    // 1. The always-true seed the moving young collector uses. It unions
+    //    every indexed owner's refs, so it fails only if the re-key LOST an
+    //    entry rather than merely leaving it at a stale address.
+    let seeded = gc_overlay_roots_for_matching_owners(&|_| true);
+    for (i, v) in vals.iter().enumerate() {
+        assert!(
+            seeded.iter().any(|r| r.as_ptr() == v.as_ptr()),
+            "{} dropped out of the always-true owner seed after its owner \
+             relocated — the moving young collector would reclaim it",
+            OVERLAY_LABELS[i]
+        );
+    }
+
+    // 2. The per-owner walk, queried at the POST-move address. This is the
+    //    stricter of the two: it fails if the entry merely stayed at the
+    //    owner's OLD address, which the union above cannot see.
+    for (i, v) in vals.iter().enumerate() {
+        let owned = gc_overlay_roots_for_collection(moved_cols[i].as_ptr() as usize);
+        assert!(
+            owned.iter().any(|r| r.as_ptr() == v.as_ptr()),
+            "{} is not reachable from its owner's POST-move address — the \
+             owner index still names the pre-move address, so the non-moving \
+             young marker and old_gen_gc's mark BFS both miss this edge",
+            OVERLAY_LABELS[i]
+        );
+    }
+}
+
 /// `for_each_overlay_ref` (via `gc_update_collection_overlay_refs`) must
 /// remap every overlay's object value after a moving GC.
 #[test]
