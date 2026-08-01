@@ -1680,23 +1680,15 @@ fn is_memory_barrier(op: &Op) -> bool {
 /// stricter of the two can only make this side *refuse* a splice, never
 /// perform a wrong one.
 pub(crate) fn memory_token_slot(node: &Node) -> Option<usize> {
-    let min_full_arity = match node.op {
-        Op::Load(_) => 3,          // [ctrl, mem, base]
-        Op::Store(_) => 4,         // [ctrl, mem, base, value]
-        Op::ArrayLoad(_) => 4,     // [ctrl, mem, array, index]
-        Op::ArrayStore(_) => 5,    // [ctrl, mem, array, index, value]
-        Op::ArrayLength => 3,      // [ctrl, mem, array_ref]
-        Op::New { .. } => 2,       // [ctrl, mem]
-        Op::NewArray { .. } => 3,  // [ctrl, mem, length]
-        Op::Call { .. } => 2,      // [ctrl, mem, args…]
-        Op::LambdaIntToDouble => 4, // [ctrl, mem, lambda, index]
-        _ => return None,
-    };
-    if node.inputs.len() >= min_full_arity {
-        Some(1)
-    } else {
-        None
-    }
+    // Delegates to the single table (`ir::Op::memory_shape`).
+    //
+    // This used to be a hand-maintained copy of the arity list, and a third
+    // copy lived in `lib.rs`. They were only ever *numerically* identical, and
+    // the moment `Op::MonitorEnter`/`MonitorExit` joined the table the copies
+    // began answering `None` for a real token slot — which would have let dead-
+    // store elimination and the EA applier treat a monitor's memory edge as a
+    // value and splice the chain wrongly.
+    crate::ir::memory_token_slot(node)
 }
 
 /// True when input `idx` of `node` is a memory *token* — an ordering edge
@@ -2080,7 +2072,20 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
         .filter(|(_, n)| {
             matches!(
                 n.op,
-                Op::Return | Op::Store(_) | Op::Call { .. } | Op::ArrayLoad(_) | Op::ArrayStore(_)
+                Op::Return
+                    | Op::Store(_)
+                    | Op::Call { .. }
+                    | Op::ArrayLoad(_)
+                    | Op::ArrayStore(_)
+                    // Monitors are observable side effects and must be roots.
+                    // Without this, DCE deletes a `monitorenter` whose result
+                    // nobody reads — lock elision by liveness sweep, with no
+                    // plan, no escape proof and no balance check, which is
+                    // exactly what `escape_analysis`' all-or-nothing elision
+                    // exists to prevent. Deleting only one of a pair is an
+                    // IllegalMonitorStateException.
+                    | Op::MonitorEnter
+                    | Op::MonitorExit
             )
         })
         .map(|(id, _)| id as NodeId)

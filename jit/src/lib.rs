@@ -9758,23 +9758,13 @@ fn ea_mark_cold_from_branch_hints(
 /// hand-built `[base, value]` `Store` layout's slot 1 is a *value*, not a token,
 /// so only the documented full `[ctrl, mem, …]` form has one.
 fn ea_memory_token_slot(node: &ir::Node) -> Option<usize> {
-    let min_full_arity = match node.op {
-        ir::Op::Load(_) => 3,           // [ctrl, mem, base]
-        ir::Op::Store(_) => 4,          // [ctrl, mem, base, value]
-        ir::Op::ArrayLoad(_) => 4,      // [ctrl, mem, array, index]
-        ir::Op::ArrayStore(_) => 5,     // [ctrl, mem, array, index, value]
-        ir::Op::ArrayLength => 3,       // [ctrl, mem, array_ref]
-        ir::Op::New { .. } => 2,        // [ctrl, mem]
-        ir::Op::NewArray { .. } => 3,   // [ctrl, mem, length]
-        ir::Op::Call { .. } => 2,       // [ctrl, mem, args…]
-        ir::Op::LambdaIntToDouble => 4, // [ctrl, mem, lambda, index]
-        _ => return None,
-    };
-    if node.inputs.len() >= min_full_arity {
-        Some(1)
-    } else {
-        None
-    }
+    // Delegates to the single table (`ir::Op::memory_shape`). This was the
+    // third hand-maintained copy of the arity list; the moment monitors joined
+    // the table the copies started answering `None` for a real token slot — and
+    // this is the copy `apply_ea_to_ir`'s `value_used` check is built on, so a
+    // stale answer here is what would let the EA applier treat a monitor's
+    // ordering edge as a value it may rewrite.
+    ir::memory_token_slot(node)
 }
 
 /// True when input `idx` of `node` is a memory *token* — an ordering edge

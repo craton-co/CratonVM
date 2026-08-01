@@ -869,6 +869,33 @@ pub fn analyze_counted_loop(
             let after = pc + iload_len(code, pc);
             if let Some((bound, q)) = decode_bound_expr(code, after, end, resolve) {
                 if q < end {
+                    // The branch must actually be able to LEAVE the loop.
+                    //
+                    // Without this the first `iload x; <limit>; if_icmp*` triple
+                    // in the body wins, so an ordinary in-body
+                    // `if (i >= limit) { … }` is read as the loop's exit
+                    // condition — and `iv_span` then claims every executed
+                    // iteration satisfies `i < limit`, which is unsound for
+                    // every consumer that trusts the span.
+                    //
+                    // One edge must leave, not specifically the taken one: a
+                    // pre-tested loop exits on the taken edge, while the
+                    // rotated `if_icmplt`-continue shape exits on the
+                    // fall-through and branches backward into the body. An
+                    // in-body test has both edges inside.
+                    let leaves_loop = if q + 2 < code.len() {
+                        let off = i16::from_be_bytes([code[q + 1], code[q + 2]]) as i32;
+                        let taken = q as i32 + off;
+                        let fallthrough = (q + 3) as i32;
+                        let outside = |t: i32| t < header_pc as i32 || t >= end as i32;
+                        outside(taken) || outside(fallthrough)
+                    } else {
+                        false
+                    };
+                    if !leaves_loop {
+                        pc += iload_len(code, pc);
+                        continue;
+                    }
                     if let Some(cmp) = ExitCmp::from_opcode(code[q]) {
                         if let Some(stride) = find_iv_stride(code, header_pc, end, candidate) {
                             let init = constant_iv_init(code, code_len, header_pc, end, candidate)
