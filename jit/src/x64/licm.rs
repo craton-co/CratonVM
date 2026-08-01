@@ -3371,6 +3371,38 @@ impl LoopXform {
         self.header + self.body_len
     }
 
+    /// Every output PC that is an image of original `bci`, ascending.
+    ///
+    /// The inverse of [`Self::bci_at`], one-to-many by construction: a peeled
+    /// or unrolled body appears `copies + 1` times. This is what a side-table
+    /// replication pass needs. `compile_with_param_slots` takes **21** tables
+    /// keyed by bytecode PC (`field_info`, `typecheck_info`, `invoke_info`,
+    /// `mic_slots`, `pic_slots`, `ldc_info`, `inline_sites`, `indy_info`, …),
+    /// and compiling the rewritten bytes means every entry inside the region
+    /// must appear once per copy. Replicating one table and missing another
+    /// does not fail loudly — it yields a copy that silently loses a field
+    /// resolution or an inline cache — so the mapping has to come from one
+    /// place rather than being open-coded per table.
+    ///
+    /// Sharing a pointer-carrying entry (`mic_slots`, `pic_slots`,
+    /// `invoke_info`) across copies is CORRECT rather than a compromise: an
+    /// inline cache keyed on a call site sees the same receiver distribution in
+    /// every copy, which is exactly what happens today when a non-unrolled loop
+    /// executes many times. The copies share one slot; they do not need one
+    /// each.
+    ///
+    /// Empty for a `bci` with no image — impossible for a PC inside the
+    /// rewritten region, possible for one past the end.
+    pub(super) fn outputs_for_bci(&self, bci: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (pc, &b) in self.bci_of.iter().enumerate() {
+            if b as usize == bci {
+                out.push(pc);
+            }
+        }
+        out
+    }
+
     /// Output PC an OSR entry for `bci` must use, or `None` when `bci` has no
     /// steady-state image and OSR there must be REFUSED.
     ///
@@ -4990,6 +5022,47 @@ mod loop_xform_tests {
     /// `Some(bci)`, named output pc `header + body_len` — the first byte of
     /// copy 1, i.e. the header — so an OSR entry there resumed a "back edge
     /// next" frame at the top of a fresh body and ran an extra iteration.
+    /// `outputs_for_bci` is an exact inverse of `bci_at`, and one-to-many
+    /// inside the rewritten region.
+    ///
+    /// This is the property a side-table replication pass rests on. If an
+    /// output PC were missing from its bci's image list, that bci's entry in
+    /// one of the 21 pc-keyed tables would not be replicated into that copy,
+    /// and the copy would silently lose a field resolution or an inline cache.
+    #[test]
+    fn outputs_for_bci_is_the_exact_inverse_of_bci_at() {
+        for (name, code, header, back_edge) in admissible_fixtures() {
+            let len = code.len();
+            for k in 1..=LOOP_XFORM_MAX_COPIES {
+                for planned in [
+                    plan_loop_peel(&code, len, header, back_edge, k, &[]),
+                    plan_loop_unroll(&code, len, header, back_edge, k, &[]),
+                ] {
+                    let Ok(x) = planned else { continue };
+                    // Forward then back.
+                    for pc in 0..x.code.len() {
+                        let Some(bci) = x.bci_at(pc) else { continue };
+                        assert!(
+                            x.outputs_for_bci(bci).contains(&pc),
+                            "{name} k={k}: output {pc} maps to bci {bci} but is missing \
+                             from its image list"
+                        );
+                    }
+                    // Back then forward.
+                    for bci in 0..len {
+                        for pc in x.outputs_for_bci(bci) {
+                            assert_eq!(x.bci_at(pc), Some(bci), "{name} k={k}");
+                        }
+                    }
+                    // The header survives, so it has at least one image.
+                    assert!(
+                        !x.outputs_for_bci(header).is_empty(),
+                        "{name} k={k}: the header must have an image"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn osr_refuses_the_unrolled_back_edge_gap_and_answers_the_steady_state_elsewhere() {
         let code = shape_a();
