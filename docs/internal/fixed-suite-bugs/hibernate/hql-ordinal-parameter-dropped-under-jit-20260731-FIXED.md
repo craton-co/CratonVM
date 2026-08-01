@@ -16,8 +16,16 @@ JIT mode, 1 failure in 14 runs (2026-07-31, `cratonvm-antlrfix-20260731.exe`).
 | --- | --- | --- | --- |
 | baseline (dev tip) | 24 (22 valid) | **103/106 on every one** | 0 |
 | after the fix | 24 | **106/106 on 18**; 105/106 on the other 6 | 0 |
+| after re-merging `dev` | 6 | **106/106 on every one** | 0 |
 
 HotSpot runs the class 106/106 in 18.8s, so 106 is the right target.
+
+`dev` advanced by twenty-odd commits during the work — including one that
+disables every JIT ban, which changes what gets compiled — so the branch was
+re-merged and everything re-run on the result: the six runs above, plus 120/120
+PASS over a `passed.txt` slice, 100 000 clean iterations of
+`FunctionalInterfaceHijackProbe`, and the `native-collections` unit tests. A
+107-class slice on the pre-merge binary was also clean.
 
 The six 105/106 runs were one round, all failing the *same* test
 (`testJpaTypeOperator`) with the *same* cause — JUnit's 120s per-test timeout —
