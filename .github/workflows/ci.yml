@@ -478,6 +478,48 @@ jobs:
       - name: Run the semantic differential gate
         run: cargo run -p cratonvm-difftest --bin cratonvm-difftest -- gate --corpus difftest/seeds
 
+      # Opcode / execution-path coverage (docs/testing/opcode-coverage.md §8).
+      # Reuses this job's JDK 25 and build deliberately: `matrix` compiles the
+      # generated corpus with the *same* javac the differential run uses, so the
+      # grid describes the exact bytes that run executes.
+      #
+      # REPORT, NOT A GATE. `matrix` always exits 0 on a scannable corpus — a
+      # coverage gap is a backlog item, and failing here would make *adding an
+      # axis* a red build. Exit 3 (bootstrap: empty corpus, or no javac) is
+      # accepted too, so the step is adoptable before anyone commits to a
+      # ratchet. Any other exit code is a real failure and is not swallowed.
+      - name: Generate the opcode corpus and the coverage matrix
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          cargo run -p cratonvm-difftest --bin cratonvm-difftest -- \
+            gen-opcodes --out target/difftest-opcodes || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "::notice title=opcode corpus::gen-opcodes bootstrapped (exit 3); nothing to measure."
+            exit 0
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          status=0
+          cargo run -p cratonvm-difftest --bin cratonvm-difftest -- \
+            matrix --corpus target/difftest-opcodes --show-gaps \
+            --out target/coverage-matrix.json || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "::notice title=coverage matrix::matrix bootstrapped (exit 3); no corpus or no javac."
+            exit 0
+          fi
+          exit "$status"
+
+      # if-no-files-found: warn, not error — the generate step legitimately
+      # produces no matrix on the exit-3 bootstrap path above.
+      - name: Upload the coverage matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: opcode-coverage-matrix
+          path: target/coverage-matrix.json
+          if-no-files-found: warn
+
   # Hermetic self-test for the JDK-only blocker generator
   # (`tools/jdk-only-blockers/blockers.py`, the tool that derives the design-§6
   # artifacts the `jdk-only` job below uploads). 51 assertions over synthetic

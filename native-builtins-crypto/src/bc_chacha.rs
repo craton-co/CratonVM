@@ -45,16 +45,45 @@
 
 use crate::failure::{CryptoFailure, CryptoResult};
 
-/// BouncyCastle's own rejection for an odd round count
-/// (`Salsa20Engine`/`ChaChaEngine`: `throw new IllegalArgumentException("Number
-/// of rounds must be even")`).
+/// BouncyCastle's own admission rule for a round count. `Salsa20Engine`'s
+/// constructor is the authority:
 ///
-/// This matters more than it looks. The `for (i = rounds; i > 0; i -= 2)` loop
-/// simply runs one round fewer when `rounds` is odd, so an odd count produces a
-/// *plausible but wrong* keystream — no error, no crash, just a stream that
-/// will not interoperate and whose security properties are not the ones ChaCha
-/// was analysed under. It is the archetype of a failure disguised as output.
+/// ```text
+/// if (rounds <= 0 || (rounds & 1) != 0) {
+///     throw new IllegalArgumentException("'rounds' must be a positive, even number");
+/// }
+/// ```
+///
+/// **Both halves matter, and only the parity half used to be checked here.**
+///
+/// * *Odd* — the `for (i = rounds; i > 0; i -= 2)` loop simply runs one round
+///   fewer, so an odd count produces a *plausible but wrong* keystream: no
+///   error, no crash, just a stream that will not interoperate and whose
+///   security properties are not the ones ChaCha was analysed under.
+///
+/// * *Non-positive* — far worse, and the reason this guard was tightened.
+///   `rounds == 0` passes a parity-only check (`0 % 2 == 0`) and runs **zero**
+///   permutation rounds, so `chacha_core`/`salsa_core` emit
+///   `x[i] = 2 * input[i]` — a "keystream" that is an invertible function of
+///   the engine state, and the engine state *is the key*. XOR that against
+///   plaintext and the key falls out. `permute` with zero rounds is the
+///   identity, which makes the SPHINCS hash trivially forgeable.
+///
+///   Zero is not a hypothetical value. The
+///   `Salsa20Engine.processBytes` native reads its round count out of the Java
+///   object by name — `native-builtins/src/phases_late/bouncycastle.rs:6994` —
+///   and a by-name read of an unwritten `int` slot yields `Value::Int(0)`,
+///   which that `match` accepts as a genuine round count. Refusing it here is
+///   the backstop.
+///
+/// A *negative even* count is also refused: the Java loop would run zero
+/// iterations, i.e. it is `rounds == 0` wearing a different hat.
 fn check_rounds(rounds: i32) -> CryptoResult<()> {
+    if rounds <= 0 {
+        return Err(CryptoFailure::illegal_argument(
+            "'rounds' must be a positive, even number",
+        ));
+    }
     if rounds % 2 != 0 {
         return Err(CryptoFailure::illegal_argument(
             "Number of rounds must be even",
@@ -63,12 +92,40 @@ fn check_rounds(rounds: i32) -> CryptoResult<()> {
     Ok(())
 }
 
-/// Fail-loud [`chacha_core`]: rejects an odd round count instead of silently
-/// running `rounds - 1` rounds.
+/// The guard applied by the **infallible** kernels, which have no way to return
+/// a failure to their caller.
 ///
-/// Every in-tree caller already performs this check before invoking the
-/// infallible form (`native-builtins/src/phases_late/bouncycastle.rs:7233`);
-/// this expresses the same guard as a value the facade can throw.
+/// A `-> ()` kernel that cannot report a refusal has exactly three options for
+/// a round count it must not honour: emit the wrong keystream (silent, and the
+/// zero-round case leaks the key), leave the output buffer untouched (silent,
+/// and the caller then XORs against a stale or zero keystream — plaintext in
+/// the clear), or abort. Only the third is a refusal, so that is what this
+/// does. The panic message carries BouncyCastle's own wording.
+///
+/// No live path is expected to reach it. Of the six in-tree call sites, four
+/// already validate the round count themselves — the three registered natives
+/// re-check parity (`native-builtins/src/phases_late/bouncycastle.rs:7233`,
+/// `:7260`, `:7284`) and `bc_scrypt_block_mix` (`:9385`) passes the literal
+/// `8`. The remaining two are the `bc_stream_generate_key_stream` arms
+/// (`:6890`, `:6894`), which validate nothing and take the field-read value
+/// described on [`check_rounds`]; `Salsa20Engine`/`ChaChaEngine` reject a bad
+/// round count in their Java constructors, which is the only thing standing
+/// between that read and this guard. Prefer the `try_*` forms, which report
+/// the same conditions as a catchable Java exception.
+#[inline]
+fn demand_rounds(rounds: i32, kernel: &str) {
+    if let Err(e) = check_rounds(rounds) {
+        panic!("{kernel}: refusing to run with rounds={rounds} — {e}");
+    }
+}
+
+/// Fail-loud [`chacha_core`]: rejects a round count that is odd (silently
+/// running `rounds - 1` rounds) **or** non-positive (silently publishing the
+/// engine state as a keystream). See [`check_rounds`].
+///
+/// The in-tree callers re-check *parity* before invoking the infallible form
+/// (`native-builtins/src/phases_late/bouncycastle.rs:7233`); none of them
+/// checks positivity, so that half of the guard exists only here.
 pub fn try_chacha_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) -> CryptoResult<()> {
     check_rounds(rounds)?;
     chacha_core(rounds, input, x);
@@ -96,10 +153,14 @@ pub fn try_permute(rounds: i32, x: &mut [i32; 16]) -> CryptoResult<()> {
 /// rounds) to the 16-word state in place. Transcribed verbatim from BC's
 /// `chachaCore`/`Permute.permute` inner `for (i = rounds; i > 0; i -= 2)` loop.
 ///
-/// `rounds` must be even (BC throws `IllegalArgumentException` otherwise — the
-/// caller enforces this before calling; see [`check_rounds`] and the `try_*`
-/// wrappers for the guard expressed as a catchable failure). A non-positive
-/// `rounds` runs zero iterations, exactly like the Java `for` loop.
+/// `rounds` must be positive and even. This function itself does not check —
+/// it is a private helper and every entry point that reaches it has already
+/// gone through [`check_rounds`] (the `try_*` wrappers) or [`demand_rounds`]
+/// (the infallible kernels), except [`chacha_permute_bytes`], which passes the
+/// compile-time constant [`SPHINCS_CHACHA_ROUNDS`]. A non-positive `rounds`
+/// here would run zero iterations, exactly like the Java `for` loop — which is
+/// precisely the leak [`check_rounds`] documents, so do not add a caller that
+/// skips the guard.
 #[inline]
 fn chacha_rounds(s: &mut [u32; 16], rounds: i32) {
     let mut i = rounds;
@@ -178,7 +239,15 @@ fn chacha_rounds(s: &mut [u32; 16], rounds: i32) {
 /// int[] input, int[] x)` — the stream-cipher block function: permute `input`
 /// and write `x[i] = state_i + input[i]`. `input` and `x` may be distinct
 /// arrays (they are, in `generateKeyStream`). Byte-identical to the bytecode.
+///
+/// # Panics
+///
+/// If `rounds` is not a positive even number. See [`demand_rounds`] for why
+/// the refusal is an abort rather than a degraded keystream, and prefer
+/// [`try_chacha_core`], which reports the same condition as a catchable Java
+/// `IllegalArgumentException`.
 pub fn chacha_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
+    demand_rounds(rounds, "ChaChaEngine.chachaCore");
     let mut s = [0u32; 16];
     for k in 0..16 {
         s[k] = input[k] as u32;
@@ -195,7 +264,12 @@ pub fn chacha_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
 /// `org.bouncycastle.crypto.engines.Salsa20Engine.salsaCore(int rounds,
 /// int[] input, int[] x)` - the Salsa20 stream-cipher block function.
 /// Transcribed from BC's Java source; all additions are Java int wrapping adds.
+///
+/// # Panics
+///
+/// If `rounds` is not a positive even number — see [`chacha_core`].
 pub fn salsa_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
+    demand_rounds(rounds, "Salsa20Engine.salsaCore");
     let mut x00 = input[0] as u32;
     let mut x01 = input[1] as u32;
     let mut x02 = input[2] as u32;
@@ -260,7 +334,14 @@ pub fn salsa_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
     }
 }
 
+///
+/// # Panics
+///
+/// If `rounds` is not a positive even number — see [`chacha_core`]. A
+/// zero-round `permute` is the *identity*, which would make the SPHINCS hash
+/// trivially forgeable, so it is refused rather than performed.
 pub fn permute(rounds: i32, x: &mut [i32; 16]) {
+    demand_rounds(rounds, "Permute.permute");
     let mut s = [0u32; 16];
     for k in 0..16 {
         s[k] = x[k] as u32;
@@ -433,20 +514,90 @@ mod tests {
         }
     }
 
-    /// `rounds <= 0` runs zero ChaCha rounds, mirroring the Java `for` loop;
-    /// `chacha_core` then yields `x[i] = 2*input[i]` (state == input, plus the
-    /// input-add) and `permute` is the identity.
+    /// **The zero-round key leak.** `rounds == 0` passes a parity-only check
+    /// and runs zero ChaCha rounds, so `chacha_core` emits
+    /// `x[i] = 2 * input[i]` — a "keystream" that is an invertible function of
+    /// the engine state, and the engine state holds the key. This test asserts
+    /// both halves of the fix: the checked form refuses with BouncyCastle's own
+    /// wording, and it refuses *without touching the output buffer*, so no
+    /// caller can XOR plaintext against a partially written stream.
+    ///
+    /// The arithmetic that used to happen is spelled out (not performed) so a
+    /// future reader can see exactly what is being refused: with the RFC 8439
+    /// state, word 4 is the first key word `0x03020100`, and a zero-round
+    /// `chacha_core` would have published `0x06040200` — the key word, shifted
+    /// left by one bit.
     #[test]
-    fn zero_rounds_is_loop_skipped() {
+    fn zero_rounds_is_refused_because_it_publishes_the_engine_state() {
         let input: [i32; 16] = RFC8439_INPUT.map(|w| w as i32);
         let mut x = [0i32; 16];
-        chacha_core(0, &input, &mut x);
-        for k in 0..16 {
-            assert_eq!(x[k] as u32, (input[k] as u32).wrapping_mul(2));
-        }
+        let err = try_chacha_core(0, &input, &mut x).expect_err("zero rounds must be refused");
+        assert_eq!(err.java_class(), "java/lang/IllegalArgumentException");
+        assert_eq!(err.message(), "'rounds' must be a positive, even number");
+        assert_eq!(x, [0i32; 16], "a refusal must not write a keystream");
+
+        // The leak that would have been: 2 * key-word-0, i.e. the key with one
+        // bit shifted out. Asserted as arithmetic, never as kernel output.
+        assert_eq!(
+            (RFC8439_INPUT[4]).wrapping_mul(2),
+            0x0604_0200,
+            "sanity: the zero-round output would be the doubled key word"
+        );
+
         let mut perm = input;
-        permute(0, &mut perm);
-        assert_eq!(perm, input);
+        assert!(
+            try_permute(0, &mut perm).is_err(),
+            "a zero-round permute is the identity — the SPHINCS hash would be forgeable"
+        );
+        assert_eq!(perm, input, "a refusal must not modify the state");
+        assert!(try_salsa_core(0, &input, &mut x).is_err());
+        assert_eq!(x, [0i32; 16]);
+    }
+
+    /// A *negative even* count is `rounds == 0` wearing a different hat (the
+    /// Java loop runs zero iterations for both), so it is refused identically
+    /// rather than slipping through the parity test.
+    #[test]
+    fn negative_even_round_counts_are_refused_like_zero() {
+        let input = [0i32; 16];
+        let mut x = [0i32; 16];
+        for rounds in [-2i32, -20, i32::MIN] {
+            let err =
+                try_chacha_core(rounds, &input, &mut x).expect_err("negative rounds must refuse");
+            assert_eq!(err.message(), "'rounds' must be a positive, even number");
+            assert!(try_salsa_core(rounds, &input, &mut x).is_err());
+            assert!(try_permute(rounds, &mut [0i32; 16]).is_err());
+        }
+    }
+
+    /// The infallible kernels have no channel to report a refusal, so they
+    /// abort. That is the only remaining option that is not "emit something
+    /// the caller will treat as a keystream"; see `demand_rounds`.
+    #[test]
+    #[should_panic(expected = "must be a positive, even number")]
+    fn infallible_chacha_core_aborts_on_zero_rounds() {
+        let mut x = [0i32; 16];
+        chacha_core(0, &[0i32; 16], &mut x);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a positive, even number")]
+    fn infallible_salsa_core_aborts_on_zero_rounds() {
+        let mut x = [0i32; 16];
+        salsa_core(0, &[0i32; 16], &mut x);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a positive, even number")]
+    fn infallible_permute_aborts_on_zero_rounds() {
+        permute(0, &mut [0i32; 16]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Number of rounds must be even")]
+    fn infallible_chacha_core_aborts_on_odd_rounds() {
+        let mut x = [0i32; 16];
+        chacha_core(7, &[0i32; 16], &mut x);
     }
 
     /// `chacha_permute_bytes` must equal: LE-decode 64 bytes -> `permute(12)` ->
@@ -496,7 +647,11 @@ mod tests {
     fn odd_round_counts_raise_illegal_argument() {
         let input = [0i32; 16];
         let mut x = [0i32; 16];
-        for rounds in [1i32, 7, 11, 19, 21, -3] {
+        // Positive odds only — a *negative* odd count is refused first by the
+        // positivity half of the guard, with a different message, and is
+        // covered by `negative_even_round_counts_are_refused_like_zero`'s
+        // sibling assertions.
+        for rounds in [1i32, 7, 11, 19, 21] {
             let err = try_chacha_core(rounds, &input, &mut x)
                 .expect_err("odd round count must be rejected");
             assert_eq!(err.java_class(), "java/lang/IllegalArgumentException");
@@ -517,7 +672,9 @@ mod tests {
     #[test]
     fn even_round_counts_succeed_and_match_the_infallible_kernels() {
         let input: [i32; 16] = RFC8439_INPUT.map(|w| w as i32);
-        for rounds in [0i32, 2, 8, 12, 20] {
+        // `0` is deliberately absent: it is no longer an accepted round count
+        // (see `zero_rounds_is_refused_because_it_publishes_the_engine_state`).
+        for rounds in [2i32, 8, 12, 20] {
             let mut plain = [0i32; 16];
             chacha_core(rounds, &input, &mut plain);
             let mut checked = [0i32; 16];

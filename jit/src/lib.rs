@@ -96,6 +96,7 @@ pub mod null_check_elim;
 pub mod pgo;
 pub mod platform;
 pub mod profile;
+pub mod range_analysis;
 pub mod regalloc;
 pub(crate) mod runtime_lowering;
 pub mod scev;
@@ -513,12 +514,20 @@ impl ExecutableBuffer {
     /// interpreter; the caller may ignore the `Err` and rely on that bail.
     pub fn try_patch_i32(&mut self, offset: usize, value: i32) -> Result<(), CompileError> {
         if offset.checked_add(4).map_or(true, |end| end > self.len) {
+            // Log only the FIRST overflow for this buffer. `overflowed` is
+            // sticky, so every later patch in the same compile hits this arm
+            // too; one oversized method used to emit tens of thousands of
+            // identical lines. The actionable diagnostic (method, code_len,
+            // capacity, wanted) is logged once per method by the compile
+            // driver's "code buffer estimate too small" bail.
+            if !self.overflowed {
+                tracing::warn!(
+                    offset = offset,
+                    len = self.len,
+                    "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
+                );
+            }
             self.overflowed = true;
-            tracing::warn!(
-                offset = offset,
-                len = self.len,
-                "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
-            );
             return Err(CompileError::PatchFailed {
                 kind: "i32",
                 offset,
@@ -540,12 +549,15 @@ impl ExecutableBuffer {
     /// [`try_patch_i32`](Self::try_patch_i32) for the bail-out contract.
     pub fn try_patch_byte(&mut self, offset: usize, value: u8) -> Result<(), CompileError> {
         if offset >= self.len {
+            // First overflow only; see `try_patch_i32` for why.
+            if !self.overflowed {
+                tracing::warn!(
+                    offset = offset,
+                    len = self.len,
+                    "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
+                );
+            }
             self.overflowed = true;
-            tracing::warn!(
-                offset = offset,
-                len = self.len,
-                "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
-            );
             return Err(CompileError::PatchFailed {
                 kind: "byte",
                 offset,
@@ -1081,6 +1093,38 @@ pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
     (addr >= entry && addr < end).then_some(cm)
 }
 
+/// Resolve `addr` to a *retained* owner of the compiled body containing it.
+///
+/// [`lookup_jit_code_range`] returns a bare `usize` — the address of an
+/// `Arc<CompiledMethod>`'s inner value with no keep-alive. Between that call
+/// returning and the caller dereferencing it, the last strong reference can be
+/// dropped and the artifact (its oop maps, its deopt tables, its inline-cache
+/// slot boxes, and its executable buffer) freed. Today that window is closed
+/// only indirectly, by `defer_jit_owner` declining to reclaim while any thread
+/// is inside compiled code — which holds for a root scan of a *running* JIT
+/// frame but is not an invariant the signature states or a caller can check.
+///
+/// This is the same lookup with the keep-alive attached: the returned `Arc`
+/// makes the metadata and the code buffer valid for as long as it is held.
+/// `None` means "no live body covers this address", which is the safe answer.
+///
+/// Costs one mutex acquisition on `jit_entry_owners` over the lock-free range
+/// search, so it belongs on the per-frame paths (a root scan naming one frame),
+/// not on the per-stack-word conservative sweep — that one wants
+/// [`snapshot_code_ranges_into`], which hands out no owner pointer at all.
+pub fn pin_jit_code_range_owner(addr: usize) -> Option<Arc<CompiledMethod>> {
+    let entry = {
+        let ranges = jit_code_ranges().snapshot.load();
+        let candidate = ranges.partition_point(|&(entry, _, _)| entry <= addr);
+        let &(entry, end, _) = ranges.get(candidate.checked_sub(1)?)?;
+        if addr < entry || addr >= end {
+            return None;
+        }
+        entry
+    };
+    resolve_jit_entry_owner(entry)
+}
+
 /// Copy the registered code ranges into `buf` as `(start, end)` pairs sorted by
 /// `start`, taking the table lock exactly ONCE.
 ///
@@ -1246,11 +1290,48 @@ pub fn register_jit_method_name(entry: usize, len: usize, name: String) {
     }
 }
 
+/// Withdraw every name range starting at `entry`.
+///
+/// Called from [`CompiledMethod::drop`], BEFORE the buffer is unmapped, for the
+/// same reason [`unregister_jit_code_range`] is. Without it the table both grows
+/// without bound and, worse, keeps naming an address the OS is free to hand to
+/// the next `mmap`: a crash inside a *new* body at a recycled address would be
+/// reported under the *dead* body's name. A crash report that names the wrong
+/// method is worse than one that names none, because it is believed.
+pub fn unregister_jit_method_name(entry: usize) {
+    if entry == 0 {
+        return;
+    }
+    // Only when the registry was ever populated — `jit_names_enabled()` is the
+    // usual reason it was not, and `get()` avoids creating it on the drop path.
+    if let Some(lock) = JIT_NAME_RANGES.get() {
+        if let Ok(mut v) = lock.lock() {
+            v.retain(|(e, _, _)| *e != entry);
+        }
+    }
+}
+
+/// Number of registered JIT method-name ranges (diagnostic; also the assertion
+/// hook for "the registry does not grow without bound").
+pub fn jit_method_name_range_count() -> usize {
+    JIT_NAME_RANGES
+        .get()
+        .and_then(|lock| lock.try_lock().ok().map(|v| v.len()))
+        .unwrap_or(0)
+}
+
 /// Resolve the method name whose code range contains `addr`. Uses `try_lock` so
 /// it is safe to call from a crash handler (never blocks on a held lock).
+///
+/// Searches from the END: entries are appended in publication order, so the
+/// most recent registration for an address wins. That is the belt to
+/// [`unregister_jit_method_name`]'s braces — if a withdrawal is ever missed, a
+/// recycled address still symbolizes as the body currently mapped there rather
+/// than as the dead one that was mapped there first.
 pub fn lookup_jit_method_name(addr: usize) -> Option<String> {
     let v = jit_name_ranges().try_lock().ok()?;
     v.iter()
+        .rev()
         .find(|(e, end, _)| addr >= *e && addr < *end)
         .map(|(_, _, name)| name.clone())
 }
@@ -1278,6 +1359,7 @@ pub fn lookup_jit_method_name_detailed(addr: usize) -> JitNameLookup {
     };
     match v
         .iter()
+        .rev()
         .find(|(e, end, _)| addr >= *e && addr < *end)
         .map(|(_, _, name)| name.clone())
     {
@@ -1545,10 +1627,22 @@ pub struct CompiledMethod {
     /// by tests to assert backend routing (e.g. that a self-recursive long/FP
     /// method stays on single-pass, the fib44-regression guard). Not read by codegen.
     pub used_ir_backend: bool,
-    /// Methods that were inlined into this compiled method.
+    /// Methods that were inlined into this compiled method, and the receiver
+    /// types its guarded sites speculated on.
     /// Each entry is (class_name, method_name, descriptor).
     /// Used by invalidation: if the inlined method's class changes, this code must be evicted.
+    ///
+    /// Populated from [`InlinePlan::invalidation_triples`], so a SPECULATIVE
+    /// site contributes both its callee and the class it guarded on — see
+    /// [`InlineDependency`] for why the second entry is a retirement
+    /// obligation rather than a correctness one.
     pub inlined_methods: Vec<(String, String, String)>,
+    /// Per-compilation inlining decision totals. Introspection only — never
+    /// read by codegen. Present on every artifact (default-empty when nothing
+    /// was inlined) so `metrics::CompileRecorder::installed` can harvest it
+    /// from the artifact rather than needing a new thread through
+    /// `try_compile_inner`'s ~40 return paths.
+    pub inline_tally: InlineDecisionTally,
     /// Deoptimization points: native code offsets where deopt can occur.
     /// Used by the deopt framework to reconstruct interpreter state.
     pub deopt_points: Vec<deopt::DeoptimizationPoint>,
@@ -1694,6 +1788,25 @@ pub struct CompiledMethod {
     /// lookup was pure overhead — and reading the owner off the live artifact
     /// cannot return a retired entry's stale answer.
     pub owner_class_id: u32,
+    /// Value of [`jit_install_epoch`] when this artifact's COMPILATION began.
+    ///
+    /// The install-side half of the redefinition hole. `redefineClass` bumps
+    /// the epoch and then flushes the cache
+    /// (`vm/src/vm/vm_exec.rs::redefine_class`), and a synthetic-stub layout
+    /// upgrade flushes it too (`vm/src/vm/vm_init.rs::jit_invalidate_adapter`).
+    /// Neither reaches a compilation that is ALREADY RUNNING: the broker has no
+    /// epoch on its queued or in-flight requests, so a compile that read the
+    /// pre-redefinition bytecode completes afterwards and — until this field
+    /// existed — was published unconditionally and called. The published body
+    /// then executes bytecode the agent replaced, or (for a layout upgrade)
+    /// reads field offsets that no longer describe the class.
+    ///
+    /// [`JitCache::put`] / [`put_osr`](JitCache::put_osr) compare this against
+    /// the owning cache's `flush_barrier` and refuse a stale artifact. Stamped
+    /// in both constructors from [`current_compile_install_epoch`], which reads
+    /// the compile-wide thread-local witness [`open_compile_epoch_witness`]
+    /// opens (so the stamp is the epoch at compile START, not at finalize).
+    pub install_epoch: u64,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -1706,6 +1819,10 @@ impl Drop for CompiledMethod {
             report_stale_ic_holders(entry);
         }
         unregister_jit_code_range(entry);
+        // Same withdrawal, same reason, and it must happen here too: the buffer
+        // this artifact owns is unmapped as soon as this function returns, and
+        // the address is then reusable by the next `alloc_executable`.
+        unregister_jit_method_name(entry);
         if let Some(owners) = JIT_ENTRY_OWNERS.get() {
             let mut owners = owners.lock();
             if owners
@@ -1810,6 +1927,7 @@ impl CompiledMethod {
             has_dispatch: false,
             used_ir_backend: false,
             inlined_methods: Vec::new(),
+            inline_tally: InlineDecisionTally::default(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
@@ -1833,6 +1951,7 @@ impl CompiledMethod {
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
+            install_epoch: current_compile_install_epoch(),
         }
     }
 
@@ -1876,6 +1995,7 @@ impl CompiledMethod {
             has_dispatch: false,
             used_ir_backend: false,
             inlined_methods: Vec::new(),
+            inline_tally: InlineDecisionTally::default(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
@@ -1899,6 +2019,7 @@ impl CompiledMethod {
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
+            install_epoch: current_compile_install_epoch(),
         }
     }
 
@@ -2312,6 +2433,968 @@ impl CompiledMethod {
             self.shadow_off_in_thread,
             thread_ptr,
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validated OSR entry (C2 review P1 — "Add on-stack replacement")
+// ---------------------------------------------------------------------------
+//
+// What was already here before this section, and is NOT re-implemented:
+//
+//   * `CompiledMethod::osr_pc_to_native` — the per-bci entry table, built from
+//     `x64::Compiler::osr_entry_native` (which points *before* a LICM-hoisted
+//     preheader, and `-1` for a pc strictly inside a hoisted body).
+//   * `can_osr_enter` / `can_osr_enter_with` — "is there a native offset here,
+//     and is the dead-local mask acceptable".
+//   * `osr_enter` + `osr_trampoline` — the machine-level transition: seed
+//     locals into their register/frame homes, build the frame, jump.
+//   * `osr_dead_mask` + `osr_dead_local_entry_allowed` — the coalesced-register
+//     hazard and its kill switch.
+//   * `is_osr_entry_rejected` / `mark_osr_entry_rejected` — the per-(method,pc)
+//     negative memo so a permanent refusal is decided once.
+//   * `deopt_points` / `osr_exit_points` / `can_osr_exit` — the OSR-*exit*
+//     snapshots the VM's in-place transfer consumes.
+//
+// What this section adds is the part the acceptance criterion ("long-running
+// loops tier up without restarting and survive forced deopt") needs and that
+// none of the above does: a **typed admission check**. `osr_enter` takes
+// `jit_locals: &[i64]` — raw words with no types attached — so nothing ever
+// compared the interpreter's idea of a slot against the compiled entry's. A
+// `double` local seeded into a GPR home, or a `long` seeded where the compiled
+// body reads a reference, is a silent miscompile, not a refusal.
+//
+// The three rules this section is built around:
+//
+// 1. **Refuse, never guess.** Every rejection is a `bailout::Bailout` carrying
+//    a `BailoutReason::UnsupportedShape` tag from the closed taxonomy below,
+//    counted through `bailout::record_bailout`. No panics, no `Option::None`
+//    with the reason thrown away.
+//
+// 2. **The resume bci is exact, or there is no entry.** `OsrEntryPlan` is
+//    derived from `OsrEntryState::pc` — the interpreter's *current* pc, which
+//    at a taken back-edge is the loop header with zero bytes of the new
+//    iteration executed. There is no separate "entry pc" argument that could
+//    disagree with it. See [`OsrEntryPlan::resume_bci`].
+//
+// 3. **Only a validation that ran BEFORE entry may resume at the entry bci.**
+//    That is the whole of the known "an OSR bail re-runs loop iterations"
+//    defect: once compiled code has committed iterations, resuming the
+//    interpreter at the header replays them. `validate_osr_entry` failing is
+//    the only path that leaves the interpreter at `entry_pc`; after entry the
+//    only sanctioned resume is [`OsrEntryPlan::resume_after_exit`], which
+//    returns the *reconstructed frame's own* bci or refuses outright.
+
+/// The JVM value kind of one interpreter slot, as the OSR entry contract sees
+/// it.
+///
+/// Deliberately coarser than `deopt::FrameValue` (which also encodes *where*
+/// the value lives) and coarser than the verifier's type lattice (no class
+/// identity): the only question an OSR entry has to answer is "will the
+/// compiled body read this slot's 64 bits as the same kind of thing the
+/// interpreter wrote into it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsrSlotType {
+    /// Cat-1 `int` family (`int`/`short`/`char`/`byte`/`boolean`).
+    Int,
+    /// Cat-2 `long`.
+    Long,
+    /// Cat-1 `float`.
+    Float,
+    /// Cat-2 `double`.
+    Double,
+    /// Object or array reference (including `null`).
+    Ref,
+    /// No value: an uninitialized local, or the reserved upper half of a cat-2
+    /// pair. The JVM verification lattice's `top`.
+    Top,
+}
+
+impl OsrSlotType {
+    /// Stable short name, used in refusal context strings and test assertions.
+    pub fn name(self) -> &'static str {
+        match self {
+            OsrSlotType::Int => "int",
+            OsrSlotType::Long => "long",
+            OsrSlotType::Float => "float",
+            OsrSlotType::Double => "double",
+            OsrSlotType::Ref => "ref",
+            OsrSlotType::Top => "top",
+        }
+    }
+
+    /// The interpreter's side: map a `cratonvm_types` compact value tag.
+    ///
+    /// `None` for `VTAG_RETADDR` (a `jsr` return address, which has no JIT
+    /// representation at all) and for any tag this build does not know — both
+    /// route to a refusal rather than to a guess.
+    pub fn from_vtag(tag: u8) -> Option<OsrSlotType> {
+        Some(match tag {
+            cratonvm_types::VTAG_INT => OsrSlotType::Int,
+            cratonvm_types::VTAG_LONG => OsrSlotType::Long,
+            cratonvm_types::VTAG_FLOAT => OsrSlotType::Float,
+            cratonvm_types::VTAG_DOUBLE => OsrSlotType::Double,
+            // A `null` slot is still reference-*typed*; the compiled body will
+            // read it as a pointer, and 0 is the correct pointer.
+            cratonvm_types::VTAG_OBJECT | cratonvm_types::VTAG_NULL => OsrSlotType::Ref,
+            cratonvm_types::VTAG_UNINIT => OsrSlotType::Top,
+            _ => return None,
+        })
+    }
+
+    /// The compiled side: map a deopt-metadata `FrameValue`.
+    ///
+    /// `None` means **undescribable** — the artifact says something lives in
+    /// this slot but cannot say what. That covers
+    /// [`deopt::FrameValue::Unsupported`] (unknown width),
+    /// [`deopt::FrameValue::MaterializationRequired`] (an optimization deleted
+    /// the value and left no rebuild recipe), and the scalar-replacement
+    /// variants (which would need a heap allocation this crate cannot perform).
+    // The trailing `_` arm is redundant *today* — the arms before it name every
+    // `FrameValue` variant — and is kept deliberately so that a variant added to
+    // `deopt.rs` (a file this change does not own) lands on "undescribable ⇒
+    // refuse" instead of breaking this crate's build.
+    #[allow(unreachable_patterns)]
+    pub fn from_frame_value(v: &deopt::FrameValue) -> Option<OsrSlotType> {
+        use deopt::FrameValue as FV;
+        Some(match v {
+            FV::Int(_) | FV::Register(_) | FV::StackSlot(_) => OsrSlotType::Int,
+            FV::Long(_) | FV::RegisterLong(_) | FV::StackSlotLong(_) => OsrSlotType::Long,
+            FV::Float(_) | FV::XmmFloat(_) | FV::StackSlotFloat(_) => OsrSlotType::Float,
+            FV::Double(_) | FV::XmmDouble(_) | FV::StackSlotDouble(_) => OsrSlotType::Double,
+            FV::Object(_) | FV::RegisterRef(_) | FV::StackSlotRef(_) => OsrSlotType::Ref,
+            FV::Undefined => OsrSlotType::Top,
+            FV::Unsupported
+            | FV::MaterializationRequired(_)
+            | FV::VirtualObject(_)
+            | FV::VirtualObjectRef(_) => return None,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for OsrSlotType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// What the compiled OSR entry expects to find in one slot.
+///
+/// Two contract strengths, because two very different artifacts exist. An
+/// artifact compiled with `CRATONVM_DEOPT_REAL` carries a `FrameState` at the
+/// loop bci and therefore knows each slot's exact JVM type — that is
+/// [`OsrSlotExpectation::Exact`]. A production artifact carries no deopt
+/// metadata at all, and the only per-slot typing left is the register-home
+/// map: an XMM home can only ever hold FP, a GPR home can only ever hold an
+/// integral/reference word. Those are [`OsrSlotExpectation::FloatingPoint`]
+/// and [`OsrSlotExpectation::Integral`], and they are still enough to catch the
+/// class of mismatch that silently corrupts a frame (an FP value seeded into a
+/// GPR home is read back as an integer, and vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsrSlotExpectation {
+    /// Exactly this type, from a precise `FrameState` at the entry bci.
+    Exact(OsrSlotType),
+    /// A general-purpose register home: `int`, `long` or a reference.
+    Integral,
+    /// An XMM register home: `float` or `double`.
+    FloatingPoint,
+    /// Memory-homed with no precise type available — nothing to check.
+    Unconstrained,
+    /// The trampoline does not seed this slot at all (its `osr_dead_mask` bit
+    /// is set, so loading it would clobber the live owner of a coalesced
+    /// register). Whatever the interpreter holds is irrelevant.
+    NotSeeded,
+}
+
+impl OsrSlotExpectation {
+    /// Would seeding a slot of type `got` into this expectation be sound?
+    ///
+    /// `Exact(Top)` accepts anything: the precise contract says nothing reads
+    /// the slot at this bci. The converse is *not* true — an incoming `Top`
+    /// against an `Exact` live type is a refusal, because the compiled body
+    /// will read a slot the interpreter says has never been written.
+    ///
+    /// Under the inferred (register-home) contract an incoming `Top` **is**
+    /// accepted: the dead mask only names the *hazardous* dead locals (those
+    /// sharing a register with a live one), so a harmlessly-dead local reaches
+    /// here unmasked and legitimately uninitialized. Refusing those is what the
+    /// pre-2026-07-27 blanket dead-mask refusal did, and it cost H2's hottest
+    /// method every one of its OSR entries.
+    pub fn accepts(self, got: OsrSlotType) -> bool {
+        match self {
+            OsrSlotExpectation::Exact(OsrSlotType::Top) => true,
+            OsrSlotExpectation::Exact(want) => want == got,
+            OsrSlotExpectation::Integral => matches!(
+                got,
+                OsrSlotType::Int | OsrSlotType::Long | OsrSlotType::Ref | OsrSlotType::Top
+            ),
+            OsrSlotExpectation::FloatingPoint => matches!(
+                got,
+                OsrSlotType::Float | OsrSlotType::Double | OsrSlotType::Top
+            ),
+            OsrSlotExpectation::Unconstrained | OsrSlotExpectation::NotSeeded => true,
+        }
+    }
+}
+
+impl std::fmt::Display for OsrSlotExpectation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OsrSlotExpectation::Exact(t) => write!(f, "exactly {t}"),
+            OsrSlotExpectation::Integral => f.write_str("a gpr-homed int/long/ref"),
+            OsrSlotExpectation::FloatingPoint => f.write_str("an xmm-homed float/double"),
+            OsrSlotExpectation::Unconstrained => f.write_str("anything (memory-homed)"),
+            OsrSlotExpectation::NotSeeded => f.write_str("nothing (not seeded)"),
+        }
+    }
+}
+
+// ── Refusal taxonomy ─────────────────────────────────────────────────
+//
+// Each tag is the `&'static str` payload of a
+// `bailout::BailoutReason::UnsupportedShape`, so every OSR refusal lands in the
+// existing `unsupported_shape` bailout counter and prints through the existing
+// `Bailout: Display`. The strings are an external contract (tests and log greps
+// key on them) and must not be renamed with the code that raises them.
+
+/// The artifact publishes no OSR entry table at all (`osr_pc_to_native` is
+/// `None`) — it was never compiled for trampoline entry.
+pub const OSR_REFUSE_NO_ENTRY_TABLE: &str = "osr-entry-no-table";
+/// The table has no enterable native offset for this bci: past the end, or the
+/// `-1` the codegen writes for a pc strictly inside a LICM-hoisted loop body
+/// (whose preheader an entry here would skip).
+pub const OSR_REFUSE_PC_NOT_AN_ENTRY: &str = "osr-entry-pc-not-an-entry";
+/// A non-zero `osr_dead_mask` at this bci with `CRATONVM_JIT_OSR_DEAD_LOCALS=0`
+/// (the kill switch that restores the historical blanket refusal).
+pub const OSR_REFUSE_DEAD_LOCAL_MASK: &str = "osr-entry-dead-local-mask";
+/// The interpreter's local/tag (or stack/tag) slices disagree in length, or the
+/// local count does not match the compiled frame's `osr_num_locals`.
+pub const OSR_REFUSE_LOCAL_COUNT: &str = "osr-entry-local-count";
+/// The incoming operand stack is non-empty, or does not match the depth the
+/// compiled entry expects. The trampoline seeds **locals only**, so a
+/// non-empty stack would be silently dropped.
+pub const OSR_REFUSE_OPERAND_STACK: &str = "osr-entry-operand-stack";
+/// An incoming slot's JVM type is not one the compiled entry can accept there.
+pub const OSR_REFUSE_SLOT_TYPE: &str = "osr-entry-slot-type-mismatch";
+/// The compiled entry's own contract cannot describe a slot: `Unsupported`,
+/// `MaterializationRequired`, or a scalar-replaced object.
+pub const OSR_REFUSE_UNDESCRIBABLE_SLOT: &str = "osr-entry-undescribable-slot";
+/// An incoming slot holds a `jsr` return address, which has no JIT
+/// representation.
+pub const OSR_REFUSE_RETURNADDRESS: &str = "osr-entry-returnaddress-slot";
+/// The entry could land in — or exit from — an inlined scope that the deopt
+/// metadata cannot describe (`FrameState::caller` is still `None` at every
+/// producer).
+pub const OSR_REFUSE_INLINED_SCOPE: &str = "osr-entry-inlined-scope";
+/// The artifact contains an unconditional uncommon trap (`has_indy_trap`): it
+/// bails on every execution reaching that site, so entering it buys nothing and
+/// costs a bail whose resume may not be describable.
+pub const OSR_REFUSE_UNCONDITIONAL_TRAP: &str = "osr-entry-unconditional-trap";
+/// The artifact can take a frame-deopt exit whose reconstructed state is not
+/// resumable. Entering would commit loop iterations that a bail could then only
+/// discard — the replay this whole section exists to prevent.
+pub const OSR_REFUSE_UNRESUMABLE_EXIT: &str = "osr-entry-unresumable-exit";
+/// Post-entry: the reconstructed frame cannot name an exact resume point, so
+/// the interpreter must NOT be resumed (least of all at the entry bci).
+pub const OSR_REFUSE_EXIT_REPLAY: &str = "osr-exit-replay-refused";
+
+/// Every refusal tag, in taxonomy order. A new refusal must be added here; the
+/// tests assert the list is complete and duplicate-free.
+pub const OSR_REFUSAL_TAGS: [&str; 12] = [
+    OSR_REFUSE_NO_ENTRY_TABLE,
+    OSR_REFUSE_PC_NOT_AN_ENTRY,
+    OSR_REFUSE_DEAD_LOCAL_MASK,
+    OSR_REFUSE_LOCAL_COUNT,
+    OSR_REFUSE_OPERAND_STACK,
+    OSR_REFUSE_SLOT_TYPE,
+    OSR_REFUSE_UNDESCRIBABLE_SLOT,
+    OSR_REFUSE_RETURNADDRESS,
+    OSR_REFUSE_INLINED_SCOPE,
+    OSR_REFUSE_UNCONDITIONAL_TRAP,
+    OSR_REFUSE_UNRESUMABLE_EXIT,
+    OSR_REFUSE_EXIT_REPLAY,
+];
+
+/// Build (and count) an OSR refusal.
+///
+/// Counting here rather than at each call site is deliberate: a refusal that is
+/// not counted is invisible to the compiler report the review asks for, and
+/// there is exactly one constructor so none can be missed.
+fn osr_refusal(tag: &'static str, context: impl Into<String>) -> bailout::Bailout {
+    let b = bailout::Bailout::with_context(bailout::BailoutReason::UnsupportedShape(tag), context);
+    bailout::record_bailout(&b);
+    b
+}
+
+/// The subset of [`OSR_REFUSAL_TAGS`] whose answer is a pure function of the
+/// *artifact*, and therefore reproduces for every future back-edge over the
+/// same pc. See [`osr_refusal_is_permanent`].
+pub const OSR_PERMANENT_REFUSAL_TAGS: [&str; 7] = [
+    OSR_REFUSE_NO_ENTRY_TABLE,
+    OSR_REFUSE_PC_NOT_AN_ENTRY,
+    OSR_REFUSE_DEAD_LOCAL_MASK,
+    OSR_REFUSE_UNDESCRIBABLE_SLOT,
+    OSR_REFUSE_INLINED_SCOPE,
+    OSR_REFUSE_UNCONDITIONAL_TRAP,
+    OSR_REFUSE_UNRESUMABLE_EXIT,
+];
+
+/// Is this refusal a pure function of the *artifact* (as opposed to the
+/// incoming interpreter state)?
+///
+/// A permanent refusal will reproduce for every future back-edge over the same
+/// pc, so the caller should memo it through [`mark_osr_entry_rejected`] instead
+/// of re-running the whole pipeline. A state-dependent one must not be memoed:
+/// the next trip over the back-edge carries different locals.
+pub fn osr_refusal_is_permanent(b: &bailout::Bailout) -> bool {
+    match &b.reason {
+        bailout::BailoutReason::UnsupportedShape(tag) => {
+            OSR_PERMANENT_REFUSAL_TAGS.iter().any(|t| *t == *tag)
+        }
+        _ => false,
+    }
+}
+
+/// Where an [`OsrEntryPlan`]'s per-slot expectations came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsrContractSource {
+    /// A `FrameState` recorded at the entry bci (an `OsrExit`-tagged deopt
+    /// point, or any deopt point there): every slot's exact JVM type is known.
+    PreciseFrameState,
+    /// No deopt metadata at the entry bci — the production case. Expectations
+    /// are inferred from `osr_local_assignments` / `osr_xmm_assignments`.
+    RegisterHomes,
+}
+
+/// What a mid-loop bail out of the OSR'd body is allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsrExitPolicy {
+    /// Every frame-deopt exit this artifact can take reconstructs a resumable
+    /// frame in this method's own scope, so a bail transfers the JIT-advanced
+    /// loop state into the live frame and resumes at the bail's own bci.
+    ExactTransfer,
+    /// The artifact has no frame-deopt exits at all (the production case:
+    /// `deopt_points` is empty unless `CRATONVM_DEOPT_REAL` was on at compile).
+    /// Control can only leave the body by returning or by the exception routes,
+    /// which propagate out of the frame. The interpreter must never "resume"
+    /// this frame at the entry bci.
+    PropagateOnly,
+}
+
+/// The interpreter state offered to an OSR entry.
+///
+/// `locals` are the raw 64-bit words in JVM local-slot order (`Frame::
+/// get_local_raw`), `local_tags` the matching compact value tags (`Frame::
+/// get_local_tag`, which exists precisely "for JIT/OSR interop"). The two
+/// slices must be the same length.
+///
+/// `pc` is the interpreter's **current** pc. At a taken back-edge that is the
+/// loop header with zero bytes of the new iteration executed, which is exactly
+/// the invariant the exact-resume guarantee rests on — see
+/// [`OsrEntryPlan::resume_bci`]. There is no separate `entry_pc` parameter to
+/// disagree with it.
+#[derive(Debug, Clone, Copy)]
+pub struct OsrEntryState<'a> {
+    /// The interpreter's current pc; both the entry bci and the resume bci.
+    pub pc: usize,
+    /// Raw local words, JVM-slot-indexed.
+    pub locals: &'a [i64],
+    /// Compact value tag per local slot (`cratonvm_types::VTAG_*`).
+    pub local_tags: &'a [u8],
+    /// Raw operand-stack words, bottom-first.
+    pub stack: &'a [i64],
+    /// Compact value tag per operand-stack entry.
+    pub stack_tags: &'a [u8],
+}
+
+impl<'a> OsrEntryState<'a> {
+    /// The common back-edge shape: a loop header with an empty operand stack.
+    pub fn at(pc: usize, locals: &'a [i64], local_tags: &'a [u8]) -> Self {
+        OsrEntryState {
+            pc,
+            locals,
+            local_tags,
+            stack: &[],
+            stack_tags: &[],
+        }
+    }
+}
+
+/// A validated OSR entry: everything the transition needs, and nothing that
+/// could still be refused.
+///
+/// Obtained only from [`CompiledMethod::validate_osr_entry`]. Holding one is
+/// the proof that every incoming slot was type-checked against the compiled
+/// entry's contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsrEntryPlan {
+    /// The bci the compiled body starts executing at.
+    pub entry_pc: usize,
+    /// The bci the interpreter resumes at **if the entry never happens**.
+    ///
+    /// Equal to `entry_pc` by construction, and that equality is the exact-
+    /// resume guarantee: `entry_pc` is `OsrEntryState::pc`, the pc at which the
+    /// interpreter has executed nothing, so falling back to it repeats no work.
+    /// After the transition this field is *not* a resume point — use
+    /// [`resume_after_exit`](Self::resume_after_exit).
+    pub resume_bci: usize,
+    /// Offset of the entry point within the artifact's code buffer.
+    pub native_offset: u32,
+    /// The `osr_dead_mask` bits in force at `entry_pc`.
+    pub dead_mask: u64,
+    /// How the per-slot expectations were derived.
+    pub contract: OsrContractSource,
+    /// What a mid-loop bail may do.
+    pub exit_policy: OsrExitPolicy,
+    /// The validated per-local expectation, indexed by JVM local slot.
+    pub expected_locals: Vec<OsrSlotExpectation>,
+}
+
+impl OsrEntryPlan {
+    /// The exact bci to resume the (already mutated, already advanced)
+    /// interpreter frame at after the OSR'd body bailed with `rframe`.
+    ///
+    /// **This is the only sanctioned resume point once compiled code has run.**
+    /// It returns the reconstructed frame's own bci — never `entry_pc` unless
+    /// the bail genuinely landed back on the loop header having completed a
+    /// whole number of iterations, which is what a loop-boundary OSR-exit map
+    /// means. An `Err` means "this frame cannot name where it is": the caller
+    /// must propagate/unwind, and must **not** fall back to `entry_pc`, because
+    /// every iteration the compiled body committed would then run a second
+    /// time (the recorded `jit-osr-bail-reruns-loop-iterations` defect).
+    ///
+    /// The checks, in order:
+    ///
+    ///  * `caller_frames` non-empty → the bail is inside an inlined callee and
+    ///    `FrameState::caller` cannot describe the outer scope. Refuse.
+    ///  * held monitors → the in-place transfer has no re-lock path. Refuse.
+    ///  * `bci` must be one this artifact actually recorded a deopt point for.
+    ///    A bci from nowhere is a mis-routed stash, not a resume point.
+    ///  * that point's [`deopt::ResumeSemantics`] must be `REEXECUTE`. See
+    ///    below — this is the check that makes the returned bci *exact*.
+    ///  * every operand-stack slot must be describable.
+    ///  * every local must be describable, with one deliberate exception,
+    ///    below.
+    ///
+    /// **The returned bci is always a re-execute point.** `ResumeSemantics`
+    /// distinguishes three things a snapshot bci can mean, and only one of them
+    /// is a bci the interpreter may be parked at:
+    ///
+    ///  * `REEXECUTE` — the bytecode at `bci` has not taken effect. Setting
+    ///    `frame.pc = bci` runs it, which is exactly right. An `OsrExit` at a
+    ///    loop header is this: the header iteration has not run.
+    ///  * `RESUME` — the bytecode at `bci` has *already* taken effect and the
+    ///    interpreter must continue *after* it. Handing that bci back would
+    ///    re-execute it — the same double-execution this API exists to prevent,
+    ///    one bytecode instead of one loop iteration. Computing the successor
+    ///    bci needs the method's bytecode, which this crate does not have, so
+    ///    such a point is refused at *admission* (`osr_exit_policy`) and again
+    ///    here.
+    ///  * `RETHROW` — not a resume point at all; the bci names a throwing
+    ///    instruction to be routed through the exception table. Refused.
+    ///
+    /// **`Unsupported` vs `MaterializationRequired` in a local.** An
+    /// `Unsupported` local is tolerated: the 1-pass backend's
+    /// `classify_local_kinds` is a coarse whole-method scan that marks a slot
+    /// `Ambiguous` at *every* bci if it is accessed as two kinds *anywhere*, and
+    /// the already-verified bytecode guarantees such a slot is either dead or
+    /// re-stored before it is read — so leaving the live frame's current value
+    /// in place is safe. This mirrors the VM-side in-place transfer, which
+    /// makes the same call for the same reason.
+    /// `MaterializationRequired` is **not** tolerated: it means a value that
+    /// *was* live got deleted by an optimization with no rebuild recipe, so the
+    /// live frame's stale pre-entry word is genuinely wrong, not merely
+    /// unread. Guessing it is exactly what `FrameValue::MaterializationRequired`
+    /// was introduced to make impossible.
+    pub fn resume_after_exit(
+        &self,
+        artifact: &CompiledMethod,
+        rframe: &deopt::ReconstructedFrame,
+    ) -> Result<usize, bailout::Bailout> {
+        use deopt::FrameValue as FV;
+        if !rframe.caller_frames.is_empty() {
+            return Err(osr_refusal(
+                OSR_REFUSE_INLINED_SCOPE,
+                format!(
+                    "exit at bci {} carries {} inlined caller frame(s)",
+                    rframe.bci,
+                    rframe.caller_frames.len()
+                ),
+            ));
+        }
+        if !rframe.monitors.is_empty() {
+            return Err(osr_refusal(
+                OSR_REFUSE_EXIT_REPLAY,
+                format!(
+                    "exit at bci {} holds {} monitor(s)",
+                    rframe.bci,
+                    rframe.monitors.len()
+                ),
+            ));
+        }
+        let Some(point) = artifact.deopt_points.iter().find(|p| p.bci == rframe.bci) else {
+            return Err(osr_refusal(
+                OSR_REFUSE_EXIT_REPLAY,
+                format!(
+                    "exit bci {} is not a recorded deopt point of this artifact",
+                    rframe.bci
+                ),
+            ));
+        };
+        if point.semantics != deopt::ResumeSemantics::REEXECUTE {
+            return Err(osr_refusal(
+                OSR_REFUSE_EXIT_REPLAY,
+                format!(
+                    "exit at bci {} has {:?}: the bci is not one the interpreter may be \
+                     parked at (only REEXECUTE points are exact resume points)",
+                    rframe.bci, point.semantics
+                ),
+            ));
+        }
+        for (i, v) in rframe.stack.iter().enumerate() {
+            if OsrSlotType::from_frame_value(v).is_none() {
+                return Err(osr_refusal(
+                    OSR_REFUSE_EXIT_REPLAY,
+                    format!("exit at bci {}: stack slot {i} is {v:?}", rframe.bci),
+                ));
+            }
+        }
+        for (i, v) in rframe.locals.iter().enumerate() {
+            match v {
+                // See the doc comment: coarse-classifier noise, provably safe
+                // to leave at the live frame's current value.
+                FV::Unsupported => {}
+                FV::MaterializationRequired(ev) => {
+                    return Err(osr_refusal(
+                        OSR_REFUSE_EXIT_REPLAY,
+                        format!(
+                            "exit at bci {}: local {i} needs materialization ({ev})",
+                            rframe.bci
+                        ),
+                    ));
+                }
+                other => {
+                    if OsrSlotType::from_frame_value(other).is_none() {
+                        return Err(osr_refusal(
+                            OSR_REFUSE_EXIT_REPLAY,
+                            format!("exit at bci {}: local {i} is {other:?}", rframe.bci),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(rframe.bci as usize)
+    }
+}
+
+impl CompiledMethod {
+    /// The precise entry contract at `entry_pc`, if this artifact has one.
+    ///
+    /// Prefers the `OsrExit`-tagged point (that IS the loop-boundary snapshot
+    /// for this header) and falls back to any deopt point at the same bci. Both
+    /// describe the same program point's live state, which is what makes the
+    /// *exit* map usable as the *entry* contract — the symmetry the acceptance
+    /// criterion ("survive forced deopt") is asking for.
+    fn osr_entry_frame_state(&self, entry_pc: usize) -> Option<&deopt::FrameState> {
+        let bci = u32::try_from(entry_pc).ok()?;
+        self.deopt_points
+            .iter()
+            .find(|p| p.bci == bci && p.reason == deopt::DeoptReason::OsrExit)
+            .or_else(|| self.deopt_points.iter().find(|p| p.bci == bci))
+            .map(|p| &p.frame_state)
+    }
+
+    /// Classify what a mid-loop bail out of this artifact may do, refusing the
+    /// entry outright when some reachable exit could not be resumed.
+    ///
+    /// This is the "make the re-entry point exact, or refuse" rule applied at
+    /// admission time. Checking it *after* entering is useless: by then the
+    /// compiled body has committed iterations, and the only remaining options
+    /// are to replay them or to lose them.
+    fn osr_exit_policy(&self) -> Result<OsrExitPolicy, bailout::Bailout> {
+        if self.deopt_points.is_empty() {
+            return Ok(OsrExitPolicy::PropagateOnly);
+        }
+        for p in &self.deopt_points {
+            let fs = &p.frame_state;
+            // A recorded caller chain is *describable* — the good case — but
+            // the VM's in-place OSR-exit transfer is single-frame
+            // (`transfer_osr_exit_into_live_frame` bails on "inlined caller
+            // chain"), so it still cannot be resumed. Refuse at admission
+            // rather than after committing iterations. Lift this the same day
+            // that transfer grows a multi-frame path.
+            if fs.caller.is_some() {
+                return Err(osr_refusal(
+                    OSR_REFUSE_INLINED_SCOPE,
+                    format!(
+                        "deopt point at bci {} has an inlined caller scope, which the \
+                         single-frame in-place OSR-exit transfer cannot resume",
+                        p.bci
+                    ),
+                ));
+            }
+            if !fs.monitors.is_empty() {
+                return Err(osr_refusal(
+                    OSR_REFUSE_UNRESUMABLE_EXIT,
+                    format!("deopt point at bci {} holds monitors", p.bci),
+                ));
+            }
+            if !deopt::frame_state_is_resumable(fs) {
+                return Err(osr_refusal(
+                    OSR_REFUSE_UNRESUMABLE_EXIT,
+                    format!(
+                        "deopt point at bci {} ({:?}) reconstructs an unresumable frame",
+                        p.bci, p.reason
+                    ),
+                ));
+            }
+            // `RESUME` semantics mean "the bytecode at this bci already took
+            // effect; continue AFTER it". Parking the interpreter at that bci
+            // would re-execute it, and computing the successor bci needs the
+            // method's bytecode, which this crate does not have. `RETHROW`
+            // points are fine to *have* — they are stashed separately
+            // (`take_exceptional_frame`) and never routed to a resume — so only
+            // the plain `RESUME` shape disqualifies the entry.
+            if !p.semantics.reexecute && !p.semantics.rethrow_exception {
+                return Err(osr_refusal(
+                    OSR_REFUSE_UNRESUMABLE_EXIT,
+                    format!(
+                        "deopt point at bci {} ({:?}) has RESUME semantics: its successor \
+                         bci is not computable here",
+                        p.bci, p.reason
+                    ),
+                ));
+            }
+        }
+        Ok(OsrExitPolicy::ExactTransfer)
+    }
+
+    /// The register-home-inferred expectation for local `i`, used when the
+    /// artifact carries no precise `FrameState` at the entry bci.
+    fn osr_inferred_local_expectation(&self, i: usize, dead_mask: u64) -> OsrSlotExpectation {
+        if i < 64 && (dead_mask >> i) & 1 == 1 {
+            return OsrSlotExpectation::NotSeeded;
+        }
+        if self
+            .osr_xmm_assignments
+            .as_ref()
+            .and_then(|m| m.get(i))
+            .is_some_and(|a| a.is_some())
+        {
+            return OsrSlotExpectation::FloatingPoint;
+        }
+        if self
+            .osr_local_assignments
+            .as_ref()
+            .and_then(|m| m.get(i))
+            .is_some_and(|a| a.is_some())
+        {
+            return OsrSlotExpectation::Integral;
+        }
+        OsrSlotExpectation::Unconstrained
+    }
+
+    /// Type-check an offered interpreter state against this artifact's OSR
+    /// entry contract at `state.pc`, producing an [`OsrEntryPlan`] or a
+    /// structured refusal.
+    ///
+    /// Pure: it inspects metadata and the caller's slices only, allocates one
+    /// `Vec` for the plan, and never enters compiled code. That is what makes
+    /// a refusal free of side effects — the interpreter continues at
+    /// `state.pc` having executed nothing, so nothing can be replayed.
+    ///
+    /// Refusals are ordered cheapest-and-most-permanent first, so the memoable
+    /// artifact-level answers ([`osr_refusal_is_permanent`]) are reached before
+    /// the per-entry state checks.
+    #[must_use = "an OSR entry must not be taken without its validated plan"]
+    pub fn validate_osr_entry(
+        &self,
+        state: &OsrEntryState<'_>,
+    ) -> Result<OsrEntryPlan, bailout::Bailout> {
+        let entry_pc = state.pc;
+        let label = || {
+            if self.method_label.is_empty() {
+                format!("bci {entry_pc}")
+            } else {
+                format!("{} bci {entry_pc}", self.method_label)
+            }
+        };
+
+        // ── 1. Is there an entry here at all? ──────────────────────
+        let Some(table) = self.osr_pc_to_native.as_ref() else {
+            return Err(osr_refusal(OSR_REFUSE_NO_ENTRY_TABLE, label()));
+        };
+        let native_offset = match table.get(entry_pc) {
+            Some(&off) if off >= 0 => off as u32,
+            Some(_) => {
+                return Err(osr_refusal(
+                    OSR_REFUSE_PC_NOT_AN_ENTRY,
+                    format!("{}: native offset is -1", label()),
+                ))
+            }
+            None => {
+                return Err(osr_refusal(
+                    OSR_REFUSE_PC_NOT_AN_ENTRY,
+                    format!("{}: past the end of a {}-entry table", label(), table.len()),
+                ))
+            }
+        };
+
+        // ── 2. Coalesced-register hazard (and its kill switch) ─────
+        let dead_mask = self
+            .osr_dead_mask
+            .as_ref()
+            .and_then(|m| m.get(entry_pc).copied())
+            .unwrap_or(0);
+        if dead_mask != 0 && !osr_dead_local_entry_allowed() {
+            return Err(osr_refusal(
+                OSR_REFUSE_DEAD_LOCAL_MASK,
+                format!("{}: mask {dead_mask:#x} with CRATONVM_JIT_OSR_DEAD_LOCALS=0", label()),
+            ));
+        }
+
+        // ── 3. Artifact-level disqualifications ────────────────────
+        if self.has_indy_trap {
+            return Err(osr_refusal(
+                OSR_REFUSE_UNCONDITIONAL_TRAP,
+                format!("{}: artifact carries an unconditional uncommon trap", label()),
+            ));
+        }
+        // An artifact that inlined something and can also take a frame-deopt
+        // exit must be able to say which scope an exit belongs to. When no
+        // deopt point carries a caller chain, it cannot: an exit inside an
+        // inlined callee arrives under the OUTER method's key at the CALLEE's
+        // bci, indistinguishable from an outer-scope exit, and resuming it
+        // lands the interpreter at a bci that means something else entirely.
+        //
+        // (Entry itself is safe — `osr_pc_to_native` is indexed by the outer
+        // method's code array, so an entry pc is always an outer-scope block
+        // start. The hazard is the exit.)
+        //
+        // Written as "inlined AND no scope recorded anywhere" rather than
+        // "inlined AND has deopt points" so it relaxes on its own as producers
+        // start populating `FrameState::caller` (they do not yet — see
+        // `docs/jit/deopt-inline-scopes.md`). A chain that IS recorded is
+        // handled by `osr_exit_policy` below, which refuses it for a different
+        // and narrower reason: the VM's in-place transfer has no multi-frame
+        // path.
+        if !self.inlined_methods.is_empty()
+            && !self.deopt_points.is_empty()
+            && !self
+                .deopt_points
+                .iter()
+                .any(|p| p.frame_state.caller.is_some())
+        {
+            return Err(osr_refusal(
+                OSR_REFUSE_INLINED_SCOPE,
+                format!(
+                    "{}: {} inlined method(s) with {} deopt point(s) and no caller chain",
+                    label(),
+                    self.inlined_methods.len(),
+                    self.deopt_points.len()
+                ),
+            ));
+        }
+
+        // ── 4. Shape of the offered state ──────────────────────────
+        if state.locals.len() != state.local_tags.len() {
+            return Err(osr_refusal(
+                OSR_REFUSE_LOCAL_COUNT,
+                format!(
+                    "{}: {} local words but {} tags",
+                    label(),
+                    state.locals.len(),
+                    state.local_tags.len()
+                ),
+            ));
+        }
+        if state.stack.len() != state.stack_tags.len() {
+            return Err(osr_refusal(
+                OSR_REFUSE_OPERAND_STACK,
+                format!(
+                    "{}: {} stack words but {} tags",
+                    label(),
+                    state.stack.len(),
+                    state.stack_tags.len()
+                ),
+            ));
+        }
+        if state.locals.len() != self.osr_num_locals {
+            return Err(osr_refusal(
+                OSR_REFUSE_LOCAL_COUNT,
+                format!(
+                    "{}: interpreter offers {} locals, compiled frame has {}",
+                    label(),
+                    state.locals.len(),
+                    self.osr_num_locals
+                ),
+            ));
+        }
+
+        // ── 5. Build the contract, then check every slot ───────────
+        let frame_state = self.osr_entry_frame_state(entry_pc);
+        if let Some(fs) = frame_state {
+            if fs.caller.is_some() {
+                return Err(osr_refusal(
+                    OSR_REFUSE_INLINED_SCOPE,
+                    format!("{}: entry contract has an inlined caller scope", label()),
+                ));
+            }
+            if !fs.monitors.is_empty() {
+                return Err(osr_refusal(
+                    OSR_REFUSE_UNRESUMABLE_EXIT,
+                    format!("{}: entry contract holds monitors", label()),
+                ));
+            }
+        }
+        let contract = match frame_state {
+            Some(_) => OsrContractSource::PreciseFrameState,
+            None => OsrContractSource::RegisterHomes,
+        };
+
+        let mut expected_locals = Vec::with_capacity(self.osr_num_locals);
+        for i in 0..self.osr_num_locals {
+            let expectation = if i < 64 && (dead_mask >> i) & 1 == 1 {
+                // The trampoline skips this slot entirely; nothing to check.
+                OsrSlotExpectation::NotSeeded
+            } else {
+                match frame_state.and_then(|fs| fs.locals.get(i)) {
+                    Some(v) => match OsrSlotType::from_frame_value(v) {
+                        Some(t) => OsrSlotExpectation::Exact(t),
+                        None => {
+                            return Err(osr_refusal(
+                                OSR_REFUSE_UNDESCRIBABLE_SLOT,
+                                format!("{}: local {i} is {v:?}", label()),
+                            ))
+                        }
+                    },
+                    // Either there is no precise contract (production), or the
+                    // snapshot is shorter than the compiled frame — in which
+                    // case the trailing slots are simply not described.
+                    None => self.osr_inferred_local_expectation(i, dead_mask),
+                }
+            };
+            let tag = state.local_tags[i];
+            let Some(got) = OsrSlotType::from_vtag(tag) else {
+                return Err(osr_refusal(
+                    OSR_REFUSE_RETURNADDRESS,
+                    format!("{}: local {i} carries vtag {tag}", label()),
+                ));
+            };
+            if !expectation.accepts(got) {
+                return Err(osr_refusal(
+                    OSR_REFUSE_SLOT_TYPE,
+                    format!(
+                        "{}: local {i} — compiled entry expects {expectation}, interpreter has {got}",
+                        label()
+                    ),
+                ));
+            }
+            expected_locals.push(expectation);
+        }
+
+        // ── 6. Operand stack ───────────────────────────────────────
+        // Type-check the described overlap first, so a genuine type error is
+        // reported as one rather than as the blanket "stack not seeded" below.
+        let expected_stack = frame_state.map(|fs| fs.stack.as_slice()).unwrap_or(&[]);
+        for (i, want) in expected_stack.iter().enumerate() {
+            let Some(&tag) = state.stack_tags.get(i) else {
+                break;
+            };
+            let Some(want) = OsrSlotType::from_frame_value(want) else {
+                return Err(osr_refusal(
+                    OSR_REFUSE_UNDESCRIBABLE_SLOT,
+                    format!("{}: stack slot {i} is {:?}", label(), expected_stack[i]),
+                ));
+            };
+            let Some(got) = OsrSlotType::from_vtag(tag) else {
+                return Err(osr_refusal(
+                    OSR_REFUSE_RETURNADDRESS,
+                    format!("{}: stack slot {i} carries vtag {tag}", label()),
+                ));
+            };
+            if want != got && want != OsrSlotType::Top {
+                return Err(osr_refusal(
+                    OSR_REFUSE_SLOT_TYPE,
+                    format!(
+                        "{}: stack slot {i} — compiled entry expects {want}, interpreter has {got}",
+                        label()
+                    ),
+                ));
+            }
+        }
+        if state.stack.len() != expected_stack.len() {
+            return Err(osr_refusal(
+                OSR_REFUSE_OPERAND_STACK,
+                format!(
+                    "{}: interpreter offers {} operand(s), entry contract describes {}",
+                    label(),
+                    state.stack.len(),
+                    expected_stack.len()
+                ),
+            ));
+        }
+        // The trampoline (`osr_trampoline`) seeds locals into their register /
+        // frame homes and nothing else — it has no operand-stack seeding path.
+        // A non-empty stack would therefore be silently dropped. Back-edge
+        // entries are the empty-stack case by construction (the branch already
+        // consumed its operands), so this costs nothing today and fails closed
+        // if a future trigger fires somewhere else.
+        if !state.stack.is_empty() {
+            return Err(osr_refusal(
+                OSR_REFUSE_OPERAND_STACK,
+                format!(
+                    "{}: {} operand(s) live; the OSR trampoline seeds locals only",
+                    label(),
+                    state.stack.len()
+                ),
+            ));
+        }
+
+        // ── 7. Can every exit this body may take name its own bci? ─
+        // Deliberately last of the artifact-level checks: an undescribable slot
+        // in the *entry* contract also makes that point's frame unresumable, and
+        // the per-slot refusal above names the offending slot, which is strictly
+        // more actionable than the whole-artifact answer here. Reaching this
+        // means the entry contract itself is clean and some *other* deopt point
+        // is the problem.
+        let exit_policy = self.osr_exit_policy()?;
+
+        Ok(OsrEntryPlan {
+            entry_pc,
+            resume_bci: entry_pc,
+            native_offset,
+            dead_mask,
+            contract,
+            exit_policy,
+            expected_locals,
+        })
+    }
+
+    /// Take a validated OSR entry.
+    ///
+    /// A thin, deliberate wrapper over the existing [`osr_enter`](Self::
+    /// osr_enter): the plan carries the proof that every incoming slot was
+    /// type-checked, and this is the only place that proof is spent. Returns
+    /// what `osr_enter` returns (`None` when the machine-level entry itself
+    /// declined; `Some(word)` — possibly the `i64::MIN` deopt sentinel — when
+    /// the body ran).
+    ///
+    /// # Safety
+    /// Same requirements as [`osr_enter`](Self::osr_enter), and additionally
+    /// `plan` must have come from [`validate_osr_entry`](Self::
+    /// validate_osr_entry) on **this** artifact with **this** `state`.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub unsafe fn osr_enter_planned(
+        &self,
+        vm_ptr: i64,
+        state: &OsrEntryState<'_>,
+        plan: &OsrEntryPlan,
+        thread_ptr: i64,
+    ) -> Option<i64> {
+        self.osr_enter(vm_ptr, state.locals, plan.entry_pc, thread_ptr)
     }
 }
 
@@ -3313,6 +4396,1347 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
         MAX_INLINE_EXPANSION_COST
     };
     (cost <= cost_cap).then_some(cost)
+}
+
+// ---------------------------------------------------------------------------
+// Profile-guided inlining policy (C2-review P1)
+// ---------------------------------------------------------------------------
+//
+// Everything above this line decides ONE question — "is this callee small
+// enough?" — and the caller (`try_compile_inner`'s invoke loop) answered every
+// other question implicitly, by never asking it: no depth accounting, no
+// recursion accounting, no receiver-type profile, no record of WHY a candidate
+// was refused, and no dependency beyond the callee's own class name. This
+// section is the policy those decisions were missing. It does not replace the
+// size model; it wraps it.
+//
+// # What is admitted, and what is deliberately refused
+//
+// `plan_inline` is a pure function: it takes a resolved [`InlineSite`], the
+// site's profile evidence, the compilation's remaining budget and a
+// description of what the BACKEND can actually emit, and returns an
+// [`InlinePlan`]. It never resolves, allocates code, or mutates anything.
+//
+//   * A statically bound site (`invokestatic` / `invokespecial`) has exactly
+//     one possible target, so it is admitted on the pre-existing size/budget
+//     terms with no guard and no speculation. Every refusal added here for
+//     such a site is one that could not previously fire (see the per-variant
+//     notes on [`InlineRefusal`]), so an unprofiled compile inlines exactly as
+//     it did before.
+//   * A virtual/interface site is SPECULATIVE: the target is chosen from the
+//     receiver-type profile, so it is admitted only behind an exact receiver
+//     class-id guard AND only with a recorded invalidation dependency. Absent
+//     either, the plan refuses. That is the fail-closed rule for this task, and
+//     it is enforced in one place ([`plan_inline`]'s speculative arm) rather
+//     than at each call site.
+//
+// # Deopt safety with no caller scopes
+//
+// `deopt::FrameState::caller` exists but NO production site ever populates it
+// — every construction in `ir_lower.rs` and `x64.rs` passes `caller: None`, so
+// an inlined scope is not representable in deopt metadata. An inline that
+// needed to describe "we are inside callee C, called from caller M at bci N"
+// would therefore publish a frame naming M with C's bci: a silent wrong answer
+// of exactly the class this branch just closed.
+//
+// This policy does not rely on caller scopes, and does not need them, because
+// the single-pass inline emitter publishes NO deopt point inside a callee
+// body. `x64::try_emit_inline_body` (x64.rs:9772-11056) contains no
+// `snapshot_*`, no `build_and_record_deopt_point` and no `deopt_stubs` push;
+// every callee operation it cannot emit without one is a `return false` that
+// rolls the attempt back and falls through to a real call. The one construct
+// that could publish — `emit_post_invoke_exception_check` for an inlined
+// `<clinit>` helper — builds a reason-9 frame only when
+// `precise_exception_frames` is set, and `try_compile_inner` clears
+// `inline_sites` outright in that case (lib.rs, just above the backend call).
+// [`InlineRefusal::PreciseExceptionFrames`] states that interlock in the
+// policy as well, so the two cannot drift apart silently.
+//
+// The consequence, stated plainly: **an inlined body is only ever entered and
+// left within one frame that is described as the caller's own**. No deopt
+// point inside it is described at all, so there is no metadata that a missing
+// caller scope could make wrong. If a future emitter learns to publish deopt
+// points inside inlined callees, this policy must refuse until
+// `FrameState::caller` is populated — that is a hard precondition, not a
+// preference.
+
+/// Maximum nesting depth of inlined scopes. HotSpot's `MaxInlineLevel`.
+///
+/// The single-pass emitter cannot nest today (it bails on any callee invoke
+/// that is not a resolver-proven elidable super-`<init>`), so the wiring passes
+/// `depth = 1` and this never binds. It is enforced anyway so a nesting
+/// emitter inherits a limit instead of needing one added.
+pub const INLINE_MAX_DEPTH: usize = 9;
+
+/// Maximum number of copies of the SAME method allowed on one inline stack —
+/// HotSpot's `MaxRecursiveInlineLevel`. Counts ancestors, not siblings: a leaf
+/// called five times from one caller is five independent sites, each paying the
+/// per-method budget, and is not recursion.
+pub const INLINE_MAX_RECURSIVE_DEPTH: usize = 1;
+
+/// Receiver observations a virtual/interface site needs before its type
+/// profile may be speculated on at all.
+///
+/// Half of [`INLINE_HOT_SITE_OBSERVATIONS`]: a site can be worth SPECULATING on
+/// (the shape of its receiver distribution has stabilised) before it is hot
+/// enough to earn the `FreqInlineSize` allowance. Under this count the shape is
+/// reported as [`ReceiverShape::Cold`] and refused, so a site executed twice
+/// with one receiver is never mistaken for a monomorphic one.
+pub const INLINE_MIN_SPECULATION_OBSERVATIONS: u32 = 250;
+
+/// Share of observations the dominant receiver must hold for a site to count as
+/// monomorphic. Matches the `min_fraction_pct` convention of
+/// [`profile::dominant_receiver`], which the interpreter-side consumers already
+/// call with 80-90.
+pub const INLINE_MONOMORPHIC_SHARE_PCT: u32 = 90;
+
+/// Combined share the top TWO receivers must hold for a bimorphic split. Higher
+/// than the monomorphic threshold on purpose: a bimorphic site pays two guards,
+/// so the tail it may leave to the dispatch fallback has to be smaller for the
+/// second guard to earn its space.
+pub const INLINE_BIMORPHIC_SHARE_PCT: u32 = 92;
+
+/// Distinct receiver types above which a site is megamorphic regardless of how
+/// dominant its top type looks.
+///
+/// Twice the PIC cascade's four ways. A site with a 91%-dominant receiver and
+/// twenty tail types is not a devirtualisation opportunity: the guard hits, but
+/// the profile is describing a shape (a dispatch hub) that the next thousand
+/// calls are free to change, and every reshuffle costs a retire/recompile.
+pub const INLINE_MEGAMORPHIC_TYPE_CEILING: usize = 8;
+
+/// What a call site's receiver-type profile says about it.
+///
+/// Derived only from [`profile::MethodProfile::receivers`], which the
+/// interpreter really does feed (`record_receiver_borrowed`) for
+/// `invokevirtual` / `invokeinterface`. Statically bound sites have no
+/// receivers recorded and classify as [`ReceiverShape::Unprofiled`], which is
+/// correct and is why the statically bound arm of [`plan_inline`] never
+/// consults the shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReceiverShape {
+    /// No receiver observation at this bci: profiling was off, the site never
+    /// ran, or its invoke kind has no receiver. **Not** the same as "many
+    /// types" — see [`profile::CallSiteEvidence`] for the same distinction on
+    /// the count side.
+    Unprofiled,
+    /// Observed, but below [`INLINE_MIN_SPECULATION_OBSERVATIONS`].
+    Cold { observations: u32, types: usize },
+    /// One receiver class holds at least [`INLINE_MONOMORPHIC_SHARE_PCT`] of
+    /// the observations. A tail is allowed: the guard routes it to dispatch.
+    Monomorphic { class_id: u32, observations: u32 },
+    /// The top two classes together hold at least
+    /// [`INLINE_BIMORPHIC_SHARE_PCT`]. `class_ids` is ordered by descending
+    /// observation count, ties broken by ascending class id, so the same
+    /// profile always yields the same plan.
+    Bimorphic {
+        class_ids: [u32; 2],
+        observations: u32,
+    },
+    /// Too many types, or no sufficiently dominant one.
+    Megamorphic { types: usize, observations: u32 },
+}
+
+/// Why a candidate was not inlined. Every refusal is reported rather than
+/// silently dropped, because "the inliner did nothing" and "the inliner
+/// declined for a stated reason" are indistinguishable from the outside, and
+/// that is precisely the failure mode `docs/flag-census.md` tracks.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InlineRefusal {
+    /// The compilation requested precise exception frames. Mirrors the
+    /// unconditional `inline_sites.clear()` in `try_compile_inner`; stated here
+    /// so the policy and the interlock cannot drift.
+    PreciseExceptionFrames,
+    /// Inline nesting would exceed [`INLINE_MAX_DEPTH`].
+    DepthLimit { depth: usize },
+    /// The callee already appears [`INLINE_MAX_RECURSIVE_DEPTH`] times on this
+    /// inline stack.
+    RecursionLimit { copies: usize },
+    /// An invoke kind that has no inline lowering at all (`invokedynamic`).
+    UnsupportedInvokeKind { kind: u8 },
+    /// A virtual/interface site with no receiver observations.
+    NoProfileEvidence,
+    /// A virtual/interface site whose receiver profile is too thin to speculate
+    /// on.
+    ColdSite { observations: u32 },
+    /// A virtual/interface site with too many receiver types.
+    Megamorphic { types: usize },
+    /// A virtual/interface site whose top one or two receivers do not clear
+    /// their share thresholds.
+    ReceiverNotDominant { types: usize },
+    /// A SPECULATIVE site inside a protected range. The guard's miss edge is a
+    /// new control-flow edge in the middle of a `try` block, and the inlined
+    /// body publishes no exceptional frame of its own; statically bound sites
+    /// are unaffected and keep their existing behaviour.
+    SpeculationInsideProtectedRange,
+    /// The callee failed [`inline_site_expansion_cost_tiered`] — over its
+    /// tier's bytecode cap or its expansion cap.
+    CalleeTooLarge,
+    /// The per-method budget cannot pay for this site.
+    BudgetExhausted { cost: usize, remaining: usize },
+    /// The backend cannot emit the lowering this verdict requires. For a
+    /// speculative site this is today's production answer: the single-pass
+    /// backend consults `inline_sites` only at `invokestatic` (x64.rs:17274)
+    /// and `invokespecial` (x64.rs:19463), and its plain direct-call arm
+    /// (x64.rs:20716) emits no receiver guard at all. Fail closed.
+    GuardNotEmittable,
+    /// A speculative inline whose receiver class could not be named, so no
+    /// invalidation dependency could be recorded for it. Fail closed: a
+    /// speculation nothing can retire is worse than no speculation.
+    NoInvalidationDependency,
+}
+
+impl InlineRefusal {
+    /// Short stable category name, for metrics keys and log greps. Same
+    /// contract as [`bailout::BailoutReason::category`]: these strings are
+    /// consumed by dashboards and test assertions and must not be renamed with
+    /// the variants.
+    pub fn category(&self) -> &'static str {
+        match self {
+            InlineRefusal::PreciseExceptionFrames => "precise-exception-frames",
+            InlineRefusal::DepthLimit { .. } => "depth-limit",
+            InlineRefusal::RecursionLimit { .. } => "recursion-limit",
+            InlineRefusal::UnsupportedInvokeKind { .. } => "unsupported-invoke-kind",
+            InlineRefusal::NoProfileEvidence => "no-profile-evidence",
+            InlineRefusal::ColdSite { .. } => "cold-site",
+            InlineRefusal::Megamorphic { .. } => "megamorphic",
+            InlineRefusal::ReceiverNotDominant { .. } => "receiver-not-dominant",
+            InlineRefusal::SpeculationInsideProtectedRange => "speculation-in-protected-range",
+            InlineRefusal::CalleeTooLarge => "callee-too-large",
+            InlineRefusal::BudgetExhausted { .. } => "budget-exhausted",
+            InlineRefusal::GuardNotEmittable => "guard-not-emittable",
+            InlineRefusal::NoInvalidationDependency => "no-invalidation-dependency",
+        }
+    }
+}
+
+/// The lowering an admitted plan asks the backend for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InlineVerdict {
+    /// Statically bound callee — one possible target, no guard, no
+    /// speculation. This is the only verdict the single-pass backend can emit
+    /// today.
+    DirectBind,
+    /// Speculative: splice the callee body behind `CMP DWORD [recv+0],
+    /// guard_class_id` with the miss edge falling through to normal dispatch.
+    Monomorphic { guard_class_id: u32 },
+    /// Speculative: two guarded bodies, tried in descending profile order, with
+    /// the second miss edge falling through to normal dispatch.
+    Bimorphic { guard_class_ids: [u32; 2] },
+    /// Not inlined.
+    Refuse(InlineRefusal),
+}
+
+/// An assumption an inlined site makes about the world, and therefore a reason
+/// to retire the caller's code when the world changes.
+///
+/// Both variants flatten to the `(class, method, descriptor)` triple that
+/// [`CompiledMethod::inlined_methods`] already carries and that
+/// `JitCache::invalidate_for_class_change` / `invalidate_for_class` /
+/// `invalidate_unloaded_class` already scan — the dependency channel is the
+/// existing one, not a new one.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InlineDependency {
+    /// The callee body was spliced in. If its class is redefined, replaced or
+    /// unloaded, the caller's copy is stale.
+    InlinedCallee {
+        class_name: String,
+        method_name: String,
+        descriptor: String,
+    },
+    /// A receiver type was speculated on at a guarded site. Retiring on a
+    /// conflicting class load is a PERFORMANCE obligation, not a correctness
+    /// one — the exact class-id guard already routes every unexpected receiver
+    /// to dispatch — but without it a hierarchy change leaves the caller
+    /// paying a permanently-missing guard with no path back to a recompile.
+    SpeculatedReceiver {
+        class_name: String,
+        class_id: u32,
+        method_name: String,
+        descriptor: String,
+    },
+}
+
+impl InlineDependency {
+    /// The `(class, method, descriptor)` form the invalidation scans match on.
+    pub fn as_invalidation_triple(&self) -> (String, String, String) {
+        match self {
+            InlineDependency::InlinedCallee {
+                class_name,
+                method_name,
+                descriptor,
+            }
+            | InlineDependency::SpeculatedReceiver {
+                class_name,
+                method_name,
+                descriptor,
+                ..
+            } => (
+                class_name.clone(),
+                method_name.clone(),
+                descriptor.clone(),
+            ),
+        }
+    }
+}
+
+/// What the backend that will consume this plan is actually able to emit.
+///
+/// Passed in rather than probed, so the policy stays a pure function and so a
+/// test can exercise the speculative arm without the production backend
+/// silently deciding the answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InlineBackendCaps {
+    /// The backend splices callee bodies at statically bound sites.
+    pub inline_body_at_static_sites: bool,
+    /// The backend splices callee bodies at virtual/interface sites behind a
+    /// receiver class-id guard, with the miss edge falling through to normal
+    /// dispatch.
+    pub guarded_inline_body_at_virtual_sites: bool,
+}
+
+impl InlineBackendCaps {
+    /// What `x64::compile` can do TODAY, verified against the source:
+    ///
+    ///  * `invokestatic` consults `inline_sites` (x64.rs:17274) and
+    ///    `invokespecial` does too (x64.rs:19463, whose own comment reads
+    ///    "invokespecial only — virtual/interface not eligible"), so
+    ///    statically bound splicing is real;
+    ///  * the `0xb6 | 0xb7 | 0xb9` arm never consults `inline_sites` for
+    ///    `0xb6`/`0xb9`, and its plain direct-call path (x64.rs:20716) emits an
+    ///    unconditional `CALL` with no receiver test — the `guard_class_id`
+    ///    compare exists only inside the String and CRC32 intrinsic ladders.
+    ///
+    /// So a speculative plan has nowhere to be emitted and is refused. See
+    /// `docs/jit/profile-guided-inlining.md` for the exact backend edit that
+    /// would flip the second flag.
+    pub const fn single_pass_x64() -> InlineBackendCaps {
+        InlineBackendCaps {
+            inline_body_at_static_sites: true,
+            guarded_inline_body_at_virtual_sites: false,
+        }
+    }
+
+    /// A backend that can emit every lowering this policy knows how to plan.
+    /// No production caller: this exists so the speculative arm is testable
+    /// before the backend catches up.
+    pub const fn unrestricted() -> InlineBackendCaps {
+        InlineBackendCaps {
+            inline_body_at_static_sites: true,
+            guarded_inline_body_at_virtual_sites: true,
+        }
+    }
+}
+
+/// One inlining question, fully specified. Every field is evidence the caller
+/// already has; nothing here is resolved or computed by the policy.
+pub struct InlineRequest<'a> {
+    /// Caller bytecode pc of the invoke.
+    pub pc: usize,
+    /// `0` virtual, `1` special, `2` interface, `3` static — the same encoding
+    /// `try_compile_inner` and [`JitInvokeInfo`] use.
+    pub invoke_kind: u8,
+    /// The resolved callee.
+    pub site: &'a InlineSite,
+    /// Whether [`call_site_is_hot`] says this site earns the `FreqInlineSize`
+    /// tier.
+    pub site_is_hot: bool,
+    /// This bci's receiver-type profile, if any.
+    pub receivers: Option<&'a profile::ReceiverCounts>,
+    /// This bci's execution evidence, carried for metrics. Never used to
+    /// REFUSE a statically bound site: doing so would stop an unprofiled
+    /// compile from inlining anything, which is a regression, not a policy.
+    pub call_site_evidence: profile::CallSiteEvidence,
+    /// Nesting depth this inline would occupy; the outermost inline is `1`.
+    pub depth: usize,
+    /// How many copies of this callee are already on the inline stack
+    /// (ancestors only — siblings are not recursion).
+    pub recursive_copies: usize,
+    /// Per-method expansion budget still unspent.
+    pub budget_remaining: usize,
+    /// Whether `pc` lies inside one of the caller's protected ranges.
+    pub pc_in_protected_range: bool,
+    /// Whether this compilation requested precise exception frames.
+    pub precise_exception_frames: bool,
+    /// What the consuming backend can emit.
+    pub caps: InlineBackendCaps,
+    /// Resolves a receiver class id to its internal class name, so a
+    /// speculative plan can record a dependency the name-keyed invalidation
+    /// scans will match. `None` — or a `None` answer — refuses the
+    /// speculation.
+    pub receiver_class_namer: Option<&'a dyn Fn(u32) -> Option<String>>,
+}
+
+/// The decision, its price, and everything a metrics consumer or an
+/// invalidation registrar needs from it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct InlinePlan {
+    pub verdict: InlineVerdict,
+    /// What the receiver profile said. Reported even when the verdict ignored
+    /// it (statically bound sites), so a metrics consumer can tell a
+    /// devirtualised site from a naturally direct one.
+    pub shape: ReceiverShape,
+    /// Charge against the per-method budget. `0` for a refusal.
+    pub expansion_cost: usize,
+    /// Callee bytecodes this plan would splice. `0` for a refusal. This is the
+    /// "inlined bytecodes" figure the C2 review asks to be measured.
+    pub inlined_bytecodes: usize,
+    /// Observed executions of this call site, from whichever profile source
+    /// answered.
+    pub site_observations: u32,
+    /// Assumptions to record. Non-empty for every admitted plan — an admitted
+    /// plan with no dependency is unrepresentable, because the last check in
+    /// [`plan_inline`] converts that state into
+    /// [`InlineRefusal::NoInvalidationDependency`].
+    pub dependencies: Vec<InlineDependency>,
+}
+
+impl InlinePlan {
+    fn refuse(reason: InlineRefusal, shape: ReceiverShape, observations: u32) -> InlinePlan {
+        InlinePlan {
+            verdict: InlineVerdict::Refuse(reason),
+            shape,
+            expansion_cost: 0,
+            inlined_bytecodes: 0,
+            site_observations: observations,
+            dependencies: Vec::new(),
+        }
+    }
+
+    /// Whether the plan inlines.
+    pub fn is_admitted(&self) -> bool {
+        !matches!(self.verdict, InlineVerdict::Refuse(_))
+    }
+
+    /// Whether the plan rests on a profile speculation and therefore on a
+    /// guard.
+    pub fn is_speculative(&self) -> bool {
+        matches!(
+            self.verdict,
+            InlineVerdict::Monomorphic { .. } | InlineVerdict::Bimorphic { .. }
+        )
+    }
+
+    /// The refusal reason, if the plan refused.
+    pub fn refusal(&self) -> Option<&InlineRefusal> {
+        match &self.verdict {
+            InlineVerdict::Refuse(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Guard class ids this plan requires the backend to compare against.
+    /// Empty for [`InlineVerdict::DirectBind`]; an admitted SPECULATIVE plan
+    /// always returns at least one.
+    pub fn guard_class_ids(&self) -> Vec<u32> {
+        match &self.verdict {
+            InlineVerdict::Monomorphic { guard_class_id } => vec![*guard_class_id],
+            InlineVerdict::Bimorphic { guard_class_ids } => guard_class_ids.to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Dependencies in the `(class, method, descriptor)` form
+    /// [`CompiledMethod::inlined_methods`] carries.
+    pub fn invalidation_triples(&self) -> Vec<(String, String, String)> {
+        self.dependencies
+            .iter()
+            .map(InlineDependency::as_invalidation_triple)
+            .collect()
+    }
+}
+
+/// Classify a call site's receiver-type profile.
+///
+/// Ranking is deterministic — descending count, ties broken by ascending class
+/// id — because two runs over the same profile must produce the same artifact.
+/// An `FxHashMap` iteration order is not, which is exactly the kind of
+/// difference that makes a JIT bug irreproducible.
+pub fn classify_receiver_shape(counts: Option<&profile::ReceiverCounts>) -> ReceiverShape {
+    let Some(counts) = counts.filter(|c| !c.is_empty()) else {
+        return ReceiverShape::Unprofiled;
+    };
+    let mut ranked: Vec<(u32, u32)> = counts.iter().map(|(&cid, &n)| (cid, n)).collect();
+    ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let observations = ranked
+        .iter()
+        .map(|&(_, n)| n)
+        .fold(0u32, u32::saturating_add);
+    let types = ranked.len();
+    if observations == 0 {
+        return ReceiverShape::Unprofiled;
+    }
+    if observations < INLINE_MIN_SPECULATION_OBSERVATIONS {
+        return ReceiverShape::Cold {
+            observations,
+            types,
+        };
+    }
+    if types > INLINE_MEGAMORPHIC_TYPE_CEILING {
+        return ReceiverShape::Megamorphic {
+            types,
+            observations,
+        };
+    }
+    // u64 throughout: `count * 100` overflows u32 at 43M observations, which a
+    // long-running site reaches.
+    let total = u64::from(observations);
+    let top1 = u64::from(ranked[0].1);
+    if top1.saturating_mul(100) >= total.saturating_mul(u64::from(INLINE_MONOMORPHIC_SHARE_PCT)) {
+        return ReceiverShape::Monomorphic {
+            class_id: ranked[0].0,
+            observations,
+        };
+    }
+    if types >= 2 {
+        let top2 = top1.saturating_add(u64::from(ranked[1].1));
+        if top2.saturating_mul(100) >= total.saturating_mul(u64::from(INLINE_BIMORPHIC_SHARE_PCT)) {
+            return ReceiverShape::Bimorphic {
+                class_ids: [ranked[0].0, ranked[1].0],
+                observations,
+            };
+        }
+    }
+    ReceiverShape::Megamorphic {
+        types,
+        observations,
+    }
+}
+
+/// Whether `pc` lies inside any protected range of `exception_table`.
+///
+/// Same `[start_pc, end_pc)` test `precise_exception_frame_sites_supported`
+/// uses, factored out so the policy and that predicate cannot disagree about
+/// what "inside a `try` block" means.
+pub fn pc_in_protected_range(
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+    pc: usize,
+) -> bool {
+    exception_table
+        .iter()
+        .any(|entry| pc >= entry.start_pc as usize && pc < entry.end_pc as usize)
+}
+
+/// Decide one inline site.
+///
+/// Checks run cheapest-and-most-universal first, so the reported refusal is the
+/// most fundamental one rather than whichever fired last. The order is part of
+/// the contract the tests assert.
+pub fn plan_inline(req: &InlineRequest<'_>) -> InlinePlan {
+    let shape = classify_receiver_shape(req.receivers);
+    let observations = match shape {
+        ReceiverShape::Unprofiled => req.call_site_evidence.count_or_zero(),
+        ReceiverShape::Cold { observations, .. }
+        | ReceiverShape::Monomorphic { observations, .. }
+        | ReceiverShape::Bimorphic { observations, .. }
+        | ReceiverShape::Megamorphic { observations, .. } => observations,
+    };
+    let refuse = |reason: InlineRefusal| InlinePlan::refuse(reason, shape, observations);
+
+    // 1. The compilation-wide interlocks, which no per-site evidence can
+    //    override.
+    if req.precise_exception_frames {
+        return refuse(InlineRefusal::PreciseExceptionFrames);
+    }
+    if req.depth > INLINE_MAX_DEPTH {
+        return refuse(InlineRefusal::DepthLimit { depth: req.depth });
+    }
+    if req.recursive_copies > INLINE_MAX_RECURSIVE_DEPTH {
+        return refuse(InlineRefusal::RecursionLimit {
+            copies: req.recursive_copies,
+        });
+    }
+
+    // 2. Kind, and the speculation it does or does not require.
+    let mut dependencies = Vec::new();
+    let verdict = match req.invoke_kind {
+        1 | 3 => {
+            if !req.caps.inline_body_at_static_sites {
+                return refuse(InlineRefusal::GuardNotEmittable);
+            }
+            InlineVerdict::DirectBind
+        }
+        0 | 2 => {
+            let guard_ids: Vec<u32> = match shape {
+                ReceiverShape::Unprofiled => return refuse(InlineRefusal::NoProfileEvidence),
+                ReceiverShape::Cold { observations, .. } => {
+                    return refuse(InlineRefusal::ColdSite { observations })
+                }
+                ReceiverShape::Megamorphic { types, .. } => {
+                    // A type count over the ceiling is a genuinely polymorphic
+                    // dispatch hub; anything else that lands here failed the
+                    // share thresholds. Report them apart — they call for
+                    // different fixes (never speculate vs. wait for a longer
+                    // profile).
+                    return refuse(if types > INLINE_MEGAMORPHIC_TYPE_CEILING {
+                        InlineRefusal::Megamorphic { types }
+                    } else {
+                        InlineRefusal::ReceiverNotDominant { types }
+                    });
+                }
+                ReceiverShape::Monomorphic { class_id, .. } => vec![class_id],
+                ReceiverShape::Bimorphic { class_ids, .. } => class_ids.to_vec(),
+            };
+            if req.pc_in_protected_range {
+                return refuse(InlineRefusal::SpeculationInsideProtectedRange);
+            }
+            if !req.caps.guarded_inline_body_at_virtual_sites {
+                return refuse(InlineRefusal::GuardNotEmittable);
+            }
+            // Fail closed: a speculation whose receiver class cannot be NAMED
+            // cannot be recorded in the name-keyed invalidation channel, so
+            // nothing could ever retire it.
+            for &class_id in &guard_ids {
+                let Some(class_name) = req.receiver_class_namer.and_then(|f| f(class_id)) else {
+                    return refuse(InlineRefusal::NoInvalidationDependency);
+                };
+                if class_name.is_empty() {
+                    return refuse(InlineRefusal::NoInvalidationDependency);
+                }
+                dependencies.push(InlineDependency::SpeculatedReceiver {
+                    class_name,
+                    class_id,
+                    method_name: req.site.method_name.clone(),
+                    descriptor: req.site.descriptor.clone(),
+                });
+            }
+            if guard_ids.len() >= 2 {
+                InlineVerdict::Bimorphic {
+                    guard_class_ids: [guard_ids[0], guard_ids[1]],
+                }
+            } else {
+                InlineVerdict::Monomorphic {
+                    guard_class_id: guard_ids[0],
+                }
+            }
+        }
+        kind => return refuse(InlineRefusal::UnsupportedInvokeKind { kind }),
+    };
+
+    // 3. Price it. The size model is the pre-existing one; only the refusal
+    //    reporting is new.
+    let Some(cost) = inline_site_expansion_cost_tiered(req.site, req.site_is_hot) else {
+        return refuse(InlineRefusal::CalleeTooLarge);
+    };
+    if cost > req.budget_remaining {
+        return refuse(InlineRefusal::BudgetExhausted {
+            cost,
+            remaining: req.budget_remaining,
+        });
+    }
+
+    // 4. The callee body itself is always a dependency.
+    if req.site.class_name.is_empty() {
+        return refuse(InlineRefusal::NoInvalidationDependency);
+    }
+    dependencies.push(InlineDependency::InlinedCallee {
+        class_name: req.site.class_name.clone(),
+        method_name: req.site.method_name.clone(),
+        descriptor: req.site.descriptor.clone(),
+    });
+
+    InlinePlan {
+        verdict,
+        shape,
+        expansion_cost: cost,
+        inlined_bytecodes: req.site.callee_code_len,
+        site_observations: observations,
+        dependencies,
+    }
+}
+
+/// Per-compilation inlining totals — the "inlined bytecodes, call count,
+/// deopts, compile ms, code bytes" measurement the C2 review asks for, on the
+/// inlining side. Deopt count, wall time and code bytes are already recorded by
+/// [`metrics::CompilationReport`]; this supplies the three figures that report
+/// has no source for.
+///
+/// Carried on [`CompiledMethod::inline_tally`] so `metrics::CompileRecorder::
+/// installed` can harvest it from the artifact, the same way it already
+/// harvests `code_bytes` / `deopt_points` — no new plumbing through
+/// `try_compile_inner`'s forty return paths.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InlineDecisionTally {
+    /// Sites a resolver produced a candidate for.
+    pub candidates: u32,
+    /// Sites actually inlined.
+    pub inlined_sites: u32,
+    /// Of those, sites resting on a receiver-type speculation and a guard.
+    pub speculative_sites: u32,
+    /// Callee bytecodes spliced in total.
+    pub inlined_bytecodes: u32,
+    /// Budget spent.
+    pub expansion_cost: u32,
+    /// Summed profile-observed executions of the inlined sites — the "call
+    /// count" figure. Zero when the compile was unprofiled.
+    pub observed_calls_inlined: u64,
+    /// Refusals by [`InlineRefusal::category`], in first-seen order.
+    pub refusals: Vec<(&'static str, u32)>,
+}
+
+impl InlineDecisionTally {
+    /// Count one refusal without a plan behind it.
+    ///
+    /// Used for sites the compiler declines BEFORE paying for a resolver call
+    /// — chiefly virtual/interface sites, whose receiver shape is readable from
+    /// the profile alone. Without this the most interesting measurement of all
+    /// (how many hot virtual sites are actually monomorphic) would cost a full
+    /// callee resolution per site to obtain.
+    pub fn record_refusal(&mut self, reason: &InlineRefusal) {
+        self.candidates = self.candidates.saturating_add(1);
+        let category = reason.category();
+        match self.refusals.iter_mut().find(|(c, _)| *c == category) {
+            Some((_, n)) => *n = n.saturating_add(1),
+            None => self.refusals.push((category, 1)),
+        }
+    }
+
+    /// Fold one decision in.
+    pub fn record(&mut self, plan: &InlinePlan) {
+        match &plan.verdict {
+            InlineVerdict::Refuse(reason) => {
+                self.record_refusal(reason);
+            }
+            _ => {
+                self.candidates = self.candidates.saturating_add(1);
+                self.inlined_sites = self.inlined_sites.saturating_add(1);
+                if plan.is_speculative() {
+                    self.speculative_sites = self.speculative_sites.saturating_add(1);
+                }
+                self.inlined_bytecodes = self
+                    .inlined_bytecodes
+                    .saturating_add(plan.inlined_bytecodes.min(u32::MAX as usize) as u32);
+                self.expansion_cost = self
+                    .expansion_cost
+                    .saturating_add(plan.expansion_cost.min(u32::MAX as usize) as u32);
+                self.observed_calls_inlined = self
+                    .observed_calls_inlined
+                    .saturating_add(u64::from(plan.site_observations));
+            }
+        }
+    }
+
+    /// How many candidates were refused for `category`.
+    pub fn refusal_count(&self, category: &str) -> u32 {
+        self.refusals
+            .iter()
+            .find(|(c, _)| *c == category)
+            .map_or(0, |(_, n)| *n)
+    }
+}
+
+#[cfg(test)]
+mod profile_guided_inlining_tests {
+    use super::*;
+
+    /// A resolved leaf callee. `code_len` drives both the size tier and the
+    /// expansion estimate, which is what the budget tests turn.
+    fn leaf_site(class: &str, method: &str, code_len: usize) -> InlineSite {
+        InlineSite {
+            callee_code: vec![0; code_len.saturating_add(2)],
+            callee_code_len: code_len,
+            callee_max_locals: 1,
+            callee_num_args: 1,
+            callee_is_static: false,
+            return_type: b'I',
+            field_info: Vec::new(),
+            compact_field_info: Vec::new(),
+            static_field_info: Vec::new(),
+            ldc_info: Vec::new(),
+            ldc2w_info: Vec::new(),
+            needs_heap: false,
+            class_name: class.to_string(),
+            method_name: method.to_string(),
+            descriptor: "()I".to_string(),
+            elided_invoke_pcs: Vec::new(),
+        }
+    }
+
+    fn receivers(pairs: &[(u32, u32)]) -> profile::ReceiverCounts {
+        let mut counts = profile::ReceiverCounts::default();
+        for &(class_id, n) in pairs {
+            counts.insert(class_id, n);
+        }
+        counts
+    }
+
+    /// A request with every knob at its permissive setting, so each test turns
+    /// exactly one and the refusal it asserts is unambiguous. `caps` is
+    /// [`InlineBackendCaps::unrestricted`] — the production caps are asserted
+    /// separately, in `production_caps_refuse_every_speculative_site`.
+    fn request<'a>(site: &'a InlineSite, invoke_kind: u8) -> InlineRequest<'a> {
+        InlineRequest {
+            pc: 12,
+            invoke_kind,
+            site,
+            site_is_hot: true,
+            receivers: None,
+            call_site_evidence: profile::CallSiteEvidence::None,
+            depth: 1,
+            recursive_copies: 0,
+            budget_remaining: MAX_INLINE_BUDGET_HOT,
+            pc_in_protected_range: false,
+            precise_exception_frames: false,
+            caps: InlineBackendCaps::unrestricted(),
+            receiver_class_namer: None,
+        }
+    }
+
+    /// The VM's real invalidation reach on a class define, reproduced from
+    /// `vm/src/vm/vm_init.rs`'s `load_class`: it calls
+    /// `JitCache::invalidate_for_class_change` once for the newly loaded class
+    /// and once for its DIRECT superclass, and that scan matches a compiled
+    /// method when any recorded `inlined_methods` triple names the class.
+    fn class_load_evicts(
+        recorded: &[(String, String, String)],
+        loaded: &str,
+        direct_super: Option<&str>,
+    ) -> bool {
+        let names = |probe: &str| recorded.iter().any(|(class, _, _)| class == probe);
+        names(loaded) || direct_super.is_some_and(names)
+    }
+
+    // ── Receiver-shape classification ────────────────────────────────────
+
+    #[test]
+    fn receiver_shape_reads_the_live_profile() {
+        assert_eq!(classify_receiver_shape(None), ReceiverShape::Unprofiled);
+        assert_eq!(
+            classify_receiver_shape(Some(&receivers(&[]))),
+            ReceiverShape::Unprofiled,
+            "an empty map is 'no evidence', not 'zero types'"
+        );
+        // Below the speculation floor: one receiver, but only ten of them.
+        assert_eq!(
+            classify_receiver_shape(Some(&receivers(&[(7, 10)]))),
+            ReceiverShape::Cold {
+                observations: 10,
+                types: 1
+            }
+        );
+        // 950/1000 = 95% ≥ 90%: monomorphic, and the 5% tail is fine because
+        // the guard routes it to dispatch.
+        assert_eq!(
+            classify_receiver_shape(Some(&receivers(&[(7, 950), (9, 50)]))),
+            ReceiverShape::Monomorphic {
+                class_id: 7,
+                observations: 1000
+            }
+        );
+        // 60 + 35 = 95% ≥ 92%, ordered by descending count.
+        assert_eq!(
+            classify_receiver_shape(Some(&receivers(&[(9, 350), (7, 600), (3, 50)]))),
+            ReceiverShape::Bimorphic {
+                class_ids: [7, 9],
+                observations: 1000
+            }
+        );
+    }
+
+    /// Ties are broken by ascending class id so the same profile always plans
+    /// the same artifact — an `FxHashMap` iteration order would not.
+    #[test]
+    fn receiver_shape_ranking_is_deterministic() {
+        let counts = receivers(&[(31, 480), (4, 480), (12, 40)]);
+        for _ in 0..16 {
+            assert_eq!(
+                classify_receiver_shape(Some(&counts)),
+                ReceiverShape::Bimorphic {
+                    class_ids: [4, 31],
+                    observations: 1000
+                }
+            );
+        }
+    }
+
+    // ── The six behaviours the C2 review asks for ────────────────────────
+
+    /// A hot monomorphic virtual site inlines, and the plan carries the exact
+    /// receiver class-id guard the lowering must emit. Without the guard the
+    /// speculation would be a wrong-target bug for every other receiver.
+    #[test]
+    fn hot_monomorphic_virtual_site_inlines_behind_a_type_guard() {
+        let site = leaf_site("app/Circle", "area", 20);
+        let counts = receivers(&[(7, 980), (9, 20)]);
+        let namer = |id: u32| (id == 7).then(|| "app/Circle".to_string());
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+
+        let plan = plan_inline(&req);
+        assert_eq!(plan.verdict, InlineVerdict::Monomorphic { guard_class_id: 7 });
+        assert!(plan.is_speculative());
+        assert_eq!(plan.guard_class_ids(), vec![7]);
+        assert_eq!(plan.inlined_bytecodes, 20);
+        assert_eq!(plan.site_observations, 1000);
+        // Fail-closed invariant: an admitted speculative plan always carries
+        // both a guard and a dependency.
+        assert!(!plan.dependencies.is_empty());
+    }
+
+    /// The bimorphic split asks for two guards and records a dependency for
+    /// each speculated type.
+    #[test]
+    fn bimorphic_site_inlines_behind_two_guards() {
+        let site = leaf_site("app/Shape", "area", 12);
+        let counts = receivers(&[(7, 600), (9, 350), (3, 50)]);
+        let namer = |id: u32| match id {
+            7 => Some("app/Circle".to_string()),
+            9 => Some("app/Square".to_string()),
+            _ => None,
+        };
+        let mut req = request(&site, 2);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+
+        let plan = plan_inline(&req);
+        assert_eq!(
+            plan.verdict,
+            InlineVerdict::Bimorphic {
+                guard_class_ids: [7, 9]
+            }
+        );
+        let recorded = plan.invalidation_triples();
+        assert!(recorded.iter().any(|(c, _, _)| c == "app/Circle"));
+        assert!(recorded.iter().any(|(c, _, _)| c == "app/Square"));
+        assert!(recorded.iter().any(|(c, _, _)| c == "app/Shape"));
+    }
+
+    /// A megamorphic site is refused. Two distinct shapes reach this verdict
+    /// and they are reported apart, because they call for different responses:
+    /// "never speculate here" vs. "the profile has not settled".
+    #[test]
+    fn megamorphic_site_is_not_inlined() {
+        let site = leaf_site("app/Shape", "area", 12);
+        let namer = |_: u32| Some("app/Anything".to_string());
+
+        // Ten types: over the ceiling even though type 1 is 91% dominant.
+        let mut wide: Vec<(u32, u32)> = vec![(1, 9100)];
+        wide.extend((2..=10u32).map(|id| (id, 100)));
+        let counts = receivers(&wide);
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::Megamorphic { types: 10 })
+        );
+
+        // Four types, evenly spread: under the ceiling, but nothing dominates.
+        let counts = receivers(&[(1, 250), (2, 250), (3, 250), (4, 250)]);
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::ReceiverNotDominant { types: 4 })
+        );
+
+        // And a site with a settled receiver but too few observations is not
+        // "monomorphic" — it is unproven.
+        let counts = receivers(&[(1, INLINE_MIN_SPECULATION_OBSERVATIONS - 1)]);
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::ColdSite {
+                observations: INLINE_MIN_SPECULATION_OBSERVATIONS - 1
+            })
+        );
+    }
+
+    /// Recursion stops at the limit, and the limit counts ANCESTORS. A leaf
+    /// called many times from one caller is not recursion and must keep
+    /// inlining — that distinction is the whole reason the wiring passes an
+    /// ancestor count rather than the length of `inlined_methods`.
+    #[test]
+    fn recursion_stops_at_the_depth_limit() {
+        let site = leaf_site("app/Node", "walk", 20);
+
+        let mut req = request(&site, 3);
+        req.recursive_copies = INLINE_MAX_RECURSIVE_DEPTH;
+        assert_eq!(
+            plan_inline(&req).verdict,
+            InlineVerdict::DirectBind,
+            "one copy on the stack is within MaxRecursiveInlineLevel"
+        );
+
+        let mut req = request(&site, 3);
+        req.recursive_copies = INLINE_MAX_RECURSIVE_DEPTH + 1;
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::RecursionLimit {
+                copies: INLINE_MAX_RECURSIVE_DEPTH + 1
+            })
+        );
+
+        // Nesting depth is a separate limit with a separate reason.
+        let mut req = request(&site, 3);
+        req.depth = INLINE_MAX_DEPTH;
+        assert!(plan_inline(&req).is_admitted());
+        let mut req = request(&site, 3);
+        req.depth = INLINE_MAX_DEPTH + 1;
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::DepthLimit {
+                depth: INLINE_MAX_DEPTH + 1
+            })
+        );
+    }
+
+    /// The size budget is respected in both of its dimensions: the per-site
+    /// tier ceiling and the per-method running budget.
+    #[test]
+    fn size_budget_is_respected() {
+        // Per-site: 200 bytes clears `FreqInlineSize` at a hot site and fails
+        // `MaxInlineSize` at a cold one. Same decision `inline_site_expansion
+        // _cost_tiered` has always made — the policy only adds the reason.
+        let site = leaf_site("app/Big", "work", 200);
+        let mut req = request(&site, 3);
+        assert_eq!(plan_inline(&req).expansion_cost, 200);
+        req.site_is_hot = false;
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::CalleeTooLarge)
+        );
+
+        // Per-method: the running budget is what bounds committed code, so a
+        // site is refused once it no longer fits, and the refusal states both
+        // numbers.
+        let mut req = request(&site, 3);
+        req.budget_remaining = 199;
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::BudgetExhausted {
+                cost: 200,
+                remaining: 199
+            })
+        );
+        req.budget_remaining = 200;
+        assert!(plan_inline(&req).is_admitted(), "exactly-fits must be admitted");
+
+        // A budget walk: three 200-byte sites fit the hot budget many times
+        // over, and the tally reports what they cost.
+        let mut budget = MAX_INLINE_BUDGET;
+        let mut tally = InlineDecisionTally::default();
+        for _ in 0..5 {
+            let mut req = request(&site, 3);
+            req.budget_remaining = budget;
+            let plan = plan_inline(&req);
+            tally.record(&plan);
+            budget = budget.saturating_sub(plan.expansion_cost);
+        }
+        assert_eq!(tally.inlined_sites, 3, "750 / 200 = 3 sites, then refusals");
+        assert_eq!(tally.inlined_bytecodes, 600);
+        assert_eq!(tally.refusal_count("budget-exhausted"), 2);
+    }
+
+    /// Exception-path policy, stated in one place:
+    ///
+    ///  * a STATICALLY BOUND site inside a protected range is unchanged — it
+    ///    inlines exactly as it did before this policy existed, because the
+    ///    lowering it asks for is the one the backend has always emitted there;
+    ///  * a SPECULATIVE site inside a protected range is refused, because the
+    ///    guard's miss edge is a new control-flow edge in the middle of a `try`
+    ///    block and the inlined body publishes no exceptional frame of its own;
+    ///  * and when the compilation requested PRECISE exception frames, nothing
+    ///    inlines at all — the same interlock `try_compile_inner` enforces with
+    ///    `inline_sites.clear()`, restated here so the two cannot drift.
+    #[test]
+    fn exception_handler_sites_follow_the_stated_policy() {
+        let site = leaf_site("app/Helper", "clamp", 20);
+
+        let mut req = request(&site, 3);
+        req.pc_in_protected_range = true;
+        assert_eq!(
+            plan_inline(&req).verdict,
+            InlineVerdict::DirectBind,
+            "a statically bound site in a try block keeps its existing behaviour"
+        );
+
+        let counts = receivers(&[(7, 1000)]);
+        let namer = |_: u32| Some("app/Circle".to_string());
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+        assert!(plan_inline(&req).is_admitted());
+        req.pc_in_protected_range = true;
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::SpeculationInsideProtectedRange)
+        );
+
+        for kind in [0u8, 1, 2, 3] {
+            let mut req = request(&site, kind);
+            req.receivers = Some(&counts);
+            req.receiver_class_namer = Some(&namer);
+            req.precise_exception_frames = true;
+            assert_eq!(
+                plan_inline(&req).refusal(),
+                Some(&InlineRefusal::PreciseExceptionFrames),
+                "precise frames outrank every per-site consideration"
+            );
+        }
+    }
+
+    /// A speculative inline records a dependency, and a conflicting class load
+    /// reaches the code through it.
+    ///
+    /// The channel is the existing one: the plan's triples go into
+    /// `CompiledMethod::inlined_methods`, which `JitCache::
+    /// invalidate_for_class_change` scans on every class define. This test
+    /// reproduces the VM's real reach (`load_class` invalidates for the loaded
+    /// class AND its direct superclass) rather than asserting against a
+    /// convenient one — including the place where that reach falls short.
+    #[test]
+    fn speculative_inline_records_a_dependency_a_class_load_invalidates() {
+        let site = leaf_site("app/Circle", "area", 16);
+        let counts = receivers(&[(7, 1000)]);
+        let namer = |id: u32| (id == 7).then(|| "app/Circle".to_string());
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+
+        let plan = plan_inline(&req);
+        assert!(plan.is_speculative());
+        let recorded = plan.invalidation_triples();
+        assert!(
+            plan.dependencies.iter().any(|d| matches!(
+                d,
+                InlineDependency::SpeculatedReceiver { class_id: 7, .. }
+            )),
+            "the speculated receiver type must be recorded, not just the callee"
+        );
+
+        // Loading a subclass of the speculated receiver retires the code: the
+        // VM invalidates for the new class AND for `app/Circle`, its direct
+        // superclass, which the dependency names.
+        assert!(class_load_evicts(
+            &recorded,
+            "app/SmallCircle",
+            Some("app/Circle")
+        ));
+        // Redefining the speculated class itself retires it too.
+        assert!(class_load_evicts(&recorded, "app/Circle", None));
+        // An unrelated class does not — invalidation must stay targeted, or
+        // every define would flush the code cache.
+        assert!(!class_load_evicts(
+            &recorded,
+            "app/Unrelated",
+            Some("java/lang/Object")
+        ));
+
+        // KNOWN COARSENESS, asserted so it cannot rot into a surprise: the VM
+        // walks only the DIRECT superclass, so loading a GRANDCHILD of the
+        // speculated class does not reach this dependency. That is survivable
+        // only because correctness here rests on the exact class-id guard, not
+        // on the dependency: an `app/Tiny` receiver fails the `CMP` and takes
+        // the dispatch path. The cost is a stale speculation nothing retires.
+        // See `docs/jit/profile-guided-inlining.md`.
+        assert!(!class_load_evicts(
+            &recorded,
+            "app/Tiny",
+            Some("app/SmallCircle")
+        ));
+    }
+
+    // ── Fail-closed ──────────────────────────────────────────────────────
+
+    /// The production single-pass backend cannot emit a guarded inline body at
+    /// a virtual site, so the policy refuses every speculative plan there —
+    /// however good the profile looks. This is the check that keeps a "landed"
+    /// capability from silently emitting an unguarded direct call.
+    #[test]
+    fn production_caps_refuse_every_speculative_site() {
+        let caps = InlineBackendCaps::single_pass_x64();
+        assert!(caps.inline_body_at_static_sites);
+        assert!(
+            !caps.guarded_inline_body_at_virtual_sites,
+            "x64::compile consults inline_sites only at 0xb8/0xb7, and its plain \
+             direct-call arm emits no receiver guard"
+        );
+
+        let site = leaf_site("app/Circle", "area", 16);
+        let counts = receivers(&[(7, 100_000)]);
+        let namer = |_: u32| Some("app/Circle".to_string());
+        for kind in [0u8, 2] {
+            let mut req = request(&site, kind);
+            req.caps = caps;
+            req.receivers = Some(&counts);
+            req.receiver_class_namer = Some(&namer);
+            assert_eq!(
+                plan_inline(&req).refusal(),
+                Some(&InlineRefusal::GuardNotEmittable)
+            );
+        }
+        // The statically bound path is unaffected — that is what the backend
+        // does support.
+        let mut req = request(&site, 3);
+        req.caps = caps;
+        assert_eq!(plan_inline(&req).verdict, InlineVerdict::DirectBind);
+    }
+
+    /// No speculative inline without a recorded invalidation dependency. A
+    /// receiver class the compiler cannot NAME cannot be recorded in the
+    /// name-keyed channel, so nothing could ever retire the speculation — and
+    /// an unretirable speculation is refused.
+    #[test]
+    fn speculation_without_a_nameable_receiver_is_refused() {
+        let site = leaf_site("app/Circle", "area", 16);
+        let counts = receivers(&[(7, 1000)]);
+
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::NoInvalidationDependency),
+            "no resolver at all"
+        );
+
+        let empty = |_: u32| Some(String::new());
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&empty);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::NoInvalidationDependency),
+            "an empty name matches nothing and would never fire"
+        );
+
+        let missing = |_: u32| -> Option<String> { None };
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&missing);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::NoInvalidationDependency)
+        );
+    }
+
+    /// Every admitted plan carries a dependency, whatever the verdict. The
+    /// statically bound case rests on the callee's own class; that is the
+    /// entry `invalidate_for_class` and `invalidate_unloaded_class` have always
+    /// matched on.
+    #[test]
+    fn every_admitted_plan_records_at_least_one_dependency() {
+        let site = leaf_site("app/Helper", "clamp", 8);
+        let plan = plan_inline(&request(&site, 3));
+        assert_eq!(plan.verdict, InlineVerdict::DirectBind);
+        assert_eq!(
+            plan.invalidation_triples(),
+            vec![(
+                "app/Helper".to_string(),
+                "clamp".to_string(),
+                "()I".to_string()
+            )]
+        );
+
+        // A callee with no class name cannot be depended on, so it is refused
+        // rather than inlined blind.
+        let mut anonymous = leaf_site("", "clamp", 8);
+        anonymous.class_name = String::new();
+        assert_eq!(
+            plan_inline(&request(&anonymous, 3)).refusal(),
+            Some(&InlineRefusal::NoInvalidationDependency)
+        );
+    }
+
+    /// `invokedynamic` has no inline lowering at all and is named as such
+    /// rather than falling into a generic refusal.
+    #[test]
+    fn unsupported_invoke_kinds_are_named() {
+        let site = leaf_site("app/Helper", "clamp", 8);
+        assert_eq!(
+            plan_inline(&request(&site, 4)).refusal(),
+            Some(&InlineRefusal::UnsupportedInvokeKind { kind: 4 })
+        );
+    }
+
+    // ── Measurement ──────────────────────────────────────────────────────
+
+    /// The tally is the inlining half of the C2 review's measurement ask:
+    /// inlined bytecodes, inlined call count, and an attributed refusal
+    /// histogram. Deopt count, compile wall time and code bytes are already on
+    /// `metrics::CompilationReport`.
+    #[test]
+    fn tally_reports_inlined_bytecodes_calls_and_refusals() {
+        let small = leaf_site("app/Helper", "clamp", 20);
+        let huge = leaf_site("app/Helper", "parse", MAX_INLINE_BYTECODE_SIZE + 1);
+        let counts = receivers(&[(7, 4_000)]);
+        let namer = |_: u32| Some("app/Circle".to_string());
+
+        let mut tally = InlineDecisionTally::default();
+        tally.record(&plan_inline(&request(&small, 3)));
+        let mut speculative = request(&small, 0);
+        speculative.receivers = Some(&counts);
+        speculative.receiver_class_namer = Some(&namer);
+        tally.record(&plan_inline(&speculative));
+        tally.record(&plan_inline(&request(&huge, 3)));
+        let mut megamorphic = request(&small, 0);
+        let wide = receivers(&[(1, 300), (2, 300), (3, 300), (4, 300)]);
+        megamorphic.receivers = Some(&wide);
+        megamorphic.receiver_class_namer = Some(&namer);
+        tally.record(&plan_inline(&megamorphic));
+
+        assert_eq!(tally.candidates, 4);
+        assert_eq!(tally.inlined_sites, 2);
+        assert_eq!(tally.speculative_sites, 1);
+        assert_eq!(tally.inlined_bytecodes, 40);
+        assert_eq!(tally.expansion_cost, 40);
+        // Only the profiled site contributed a call count; the unprofiled one
+        // reports zero rather than pretending.
+        assert_eq!(tally.observed_calls_inlined, 4_000);
+        assert_eq!(tally.refusal_count("callee-too-large"), 1);
+        assert_eq!(tally.refusal_count("receiver-not-dominant"), 1);
+        assert_eq!(tally.refusal_count("megamorphic"), 0);
+    }
+
+    /// Refusal categories are an external contract (metrics keys, log greps),
+    /// so they are distinct and stable.
+    #[test]
+    fn refusal_categories_are_distinct() {
+        let all = [
+            InlineRefusal::PreciseExceptionFrames,
+            InlineRefusal::DepthLimit { depth: 1 },
+            InlineRefusal::RecursionLimit { copies: 1 },
+            InlineRefusal::UnsupportedInvokeKind { kind: 4 },
+            InlineRefusal::NoProfileEvidence,
+            InlineRefusal::ColdSite { observations: 1 },
+            InlineRefusal::Megamorphic { types: 9 },
+            InlineRefusal::ReceiverNotDominant { types: 4 },
+            InlineRefusal::SpeculationInsideProtectedRange,
+            InlineRefusal::CalleeTooLarge,
+            InlineRefusal::BudgetExhausted {
+                cost: 1,
+                remaining: 0,
+            },
+            InlineRefusal::GuardNotEmittable,
+            InlineRefusal::NoInvalidationDependency,
+        ];
+        let mut seen: Vec<&'static str> = all.iter().map(InlineRefusal::category).collect();
+        let total = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "two refusals share a category string");
+    }
+
+    /// The `pc_in_protected_range` helper agrees with the `[start, end)` test
+    /// `precise_exception_frame_sites_supported` uses.
+    #[test]
+    fn protected_range_membership_is_half_open() {
+        let table = vec![cratonvm_reader::attribute::ExceptionTableEntry {
+            start_pc: 8,
+            end_pc: 14,
+            handler_pc: 20,
+            catch_type: 0,
+        }];
+        assert!(!pc_in_protected_range(&table, 7));
+        assert!(pc_in_protected_range(&table, 8));
+        assert!(pc_in_protected_range(&table, 13));
+        assert!(!pc_in_protected_range(&table, 14));
+        assert!(!pc_in_protected_range(&[], 8));
+    }
 }
 
 #[cfg(test)]
@@ -5421,6 +7845,17 @@ impl JitPICSlot {
         if class_id == 0 {
             return;
         }
+        // Read the OWNER FIRST, then the entry pointer.
+        //
+        // `JitMICSlot::clear_compiled_entry` zeroes `cached_entry_ptr` and only
+        // then takes `compiled_owner`. Reading in the other order — as this did
+        // — admits the interleaving that copies a live raw entry into the PIC
+        // together with an owner that has already been taken: the PIC then holds
+        // a callable address with no keep-alive, and the emitted 4-way cascade
+        // `CALL`s it after the body is unmapped. Owner-then-entry makes that
+        // interleaving impossible: if the owner read lands after the take, the
+        // entry read (which follows it) necessarily lands after the zeroing.
+        let owner = mic.compiled_owner.lock().clone();
         let entry_ptr = mic
             .cached_entry_ptr
             .load(std::sync::atomic::Ordering::Acquire);
@@ -5431,7 +7866,17 @@ impl JitPICSlot {
         // per-hit clones in the dispatch helper) — convert on this rare
         // promotion path.
         let class_name = mic.cached_class_name.lock().as_deref().map(String::from);
-        *self.compiled_owners[0].lock() = mic.compiled_owner.lock().clone();
+        // And re-run the same admission the two other install paths run: an
+        // owner-less address that is still a `jit_entry_owners` key, or that
+        // lies inside a live JIT region, is a body we failed to retain — not a
+        // native trampoline. Copying it forward would launder a refusal the MIC
+        // itself would make today.
+        let (entry_ptr, needs_ctx) = if jit_entry_publishable(entry_ptr, &owner) {
+            (entry_ptr, needs_ctx)
+        } else {
+            (0, false)
+        };
+        *self.compiled_owners[0].lock() = owner;
         // BUG-24: publish entry_ptr / needs_context / name BEFORE the class_id,
         // exactly as `write_entry` does. The inline PIC cascade
         // (`jit/src/x64.rs`) reads `class_ids[i]` first and, on a match, loads
@@ -5991,6 +8436,24 @@ pub struct JitCache {
     mutation: parking_lot::Mutex<()>,
     string_arena: parking_lot::Mutex<Vec<Pin<Box<str>>>>,
     invoke_info_arena: parking_lot::Mutex<Vec<Pin<Box<JitInvokeInfo>>>>,
+    /// Highest [`JIT_INSTALL_EPOCH`] value this cache has been flushed at.
+    ///
+    /// An artifact whose [`CompiledMethod::install_epoch`] is below this began
+    /// compiling before the flush, so it was compiled against bytecode (or a
+    /// field layout) the flush exists to retire. [`Self::put`] and
+    /// [`Self::put_osr`] refuse it.
+    ///
+    /// Raised only by [`Self::clear_all`], under `mutation` — the same lock the
+    /// two publication paths hold — so a publication either completes entirely
+    /// before the flush (and is then wiped by it) or observes the raised
+    /// barrier. There is no third outcome.
+    ///
+    /// Deliberately per-cache rather than a global watermark: `clear_all` is
+    /// fanned out across every live VM by
+    /// `vm/src/vm/vm_init.rs::jit_invalidate_adapter`, so a real flush still
+    /// arms every cache, while a *test* flushing its own `JitCache` cannot
+    /// refuse a concurrent test's publication into a different one.
+    flush_barrier: std::sync::atomic::AtomicU64,
 }
 
 static JIT_ENTRY_OWNERS: std::sync::OnceLock<
@@ -6223,10 +8686,22 @@ fn drain_deferred_jit_owners_if_quiescent() {
     if jit_leak_code_enabled() {
         return;
     }
+    // Take the lock BEFORE reading the quiescence counter, and hold it across
+    // both.
+    //
+    // Reading `is_zero()` first is a use-after-free of executable memory: this
+    // thread can observe zero at t0, be descheduled while another thread enters
+    // JIT at t1 and a third unpublishes-and-queues a body at t2 > t1, then
+    // resume and free that body on the strength of a t0 witness that predates
+    // its unpublication. Queueing also takes this lock, so holding it across
+    // the read guarantees the witness postdates every queued body's
+    // unpublication.
+    let mut queue = deferred_jit_owners().lock();
     if !ACTIVE_JIT_EXECUTIONS.is_zero() {
         return;
     }
-    let retired = std::mem::take(&mut *deferred_jit_owners().lock());
+    let retired = std::mem::take(&mut *queue);
+    drop(queue);
     drop(retired);
 }
 
@@ -6355,9 +8830,122 @@ pub fn redefine_epoch() -> u32 {
 
 /// Record that a class was redefined. Invalidates every inline cache exactly
 /// once, lazily, as each slot is next dispatched through.
+///
+/// Also advances [`JIT_INSTALL_EPOCH`], so a compilation that is already in
+/// flight when this runs carries a strictly older stamp than any cache flush
+/// that follows. Arming is `JitCache::clear_all`'s job — see
+/// [`JitCache::flush_barrier`].
 #[inline]
 pub fn bump_redefine_epoch() {
     REDEFINE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    bump_jit_install_epoch();
+}
+
+/// Monotonic process-wide *compilation* epoch.
+///
+/// Read at the START of a compilation and stamped onto the resulting artifact
+/// ([`CompiledMethod::install_epoch`]); advanced by every event that makes an
+/// already-running compilation's input bytecode or class layout obsolete —
+/// [`bump_redefine_epoch`] and [`JitCache::clear_all`].
+///
+/// This is a *counter*, not a gate. The gate is per-cache
+/// ([`JitCache::flush_barrier`]) so that one VM's redefinition cannot refuse
+/// another VM's unrelated publication, and so a test flushing its own
+/// `JitCache` cannot refuse a concurrent test's `put`. Starts at 1 so `0` is
+/// never a legitimate stamp.
+pub static JIT_INSTALL_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Current compilation epoch (one acquire load).
+#[inline]
+pub fn jit_install_epoch() -> u64 {
+    JIT_INSTALL_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Advance the compilation epoch and return the NEW value.
+#[inline]
+pub fn bump_jit_install_epoch() -> u64 {
+    JIT_INSTALL_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+}
+
+thread_local! {
+    /// The install epoch the compilation running on this thread began at, or
+    /// `None` when no compilation is open.
+    static COMPILE_INSTALL_EPOCH: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII scope opened for the whole duration of one compilation.
+///
+/// Re-entrant and conservative: a nested compile (the `callee_compiler`
+/// recursion, or an inlined callee compiled on the same thread) keeps the
+/// OUTERMOST — i.e. oldest — epoch, because the inner artifact is only useful
+/// if the outer one is, and an outer stamp can only refuse more.
+#[must_use = "the witness must stay alive for the whole compilation"]
+pub struct CompileEpochWitness {
+    prev: Option<u64>,
+}
+
+impl Drop for CompileEpochWitness {
+    fn drop(&mut self) {
+        COMPILE_INSTALL_EPOCH.with(|c| c.set(self.prev));
+    }
+}
+
+/// Open a compilation scope, stamping every [`CompiledMethod`] built inside it
+/// with the epoch as of *now* rather than as of buffer finalize.
+///
+/// [`try_compile_with_invokespecial_resolver`] opens one around the whole
+/// pipeline. A backend entered directly (the OSR compile in
+/// `vm/src/runtime/interpreter/invoke.rs` calls `x64::compile_with_param_slots`
+/// without going through `try_compile`) simply gets the narrower
+/// finalize-to-publish window, which is still a real gate — see
+/// `docs/jit/code-cache-lifetime.md` for the one-line change that widens it.
+pub fn open_compile_epoch_witness() -> CompileEpochWitness {
+    COMPILE_INSTALL_EPOCH.with(|c| {
+        let prev = c.get();
+        if prev.is_none() {
+            c.set(Some(jit_install_epoch()));
+        }
+        CompileEpochWitness { prev }
+    })
+}
+
+/// The epoch a `CompiledMethod` built right now must be stamped with: the open
+/// compilation's start epoch, or (no compilation open) the live epoch.
+#[inline]
+fn current_compile_install_epoch() -> u64 {
+    COMPILE_INSTALL_EPOCH
+        .with(|c| c.get())
+        .unwrap_or_else(jit_install_epoch)
+}
+
+/// Publications refused because the compilation predated a cache flush.
+static STALE_INSTALL_EPOCH_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of artifacts refused publication for having been compiled against
+/// bytecode a later redefinition or layout upgrade replaced.
+pub fn stale_install_epoch_refusals() -> u64 {
+    STALE_INSTALL_EPOCH_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a compilation that predates a cache flush is refused publication.
+///
+/// DEFAULT-ON. Refusing costs one wasted compile: the method stays interpreted
+/// and recompiles on a later invocation, against the bytecode that is actually
+/// installed. Publishing anyway runs the code the redefinition replaced —
+/// silently, because nothing downstream can tell a stale body from a current
+/// one. `CRATONVM_JIT_STRICT_INSTALL_EPOCH=0` restores the historical
+/// publish-anyway behaviour for bisection; the refusal is still counted.
+fn strict_install_epoch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_STRICT_INSTALL_EPOCH")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 pub fn jit_cache_generation() -> u64 {
@@ -6375,6 +8963,8 @@ impl JitCache {
             mutation: parking_lot::Mutex::new(()),
             string_arena: parking_lot::Mutex::new(Vec::new()),
             invoke_info_arena: parking_lot::Mutex::new(Vec::new()),
+            // Never flushed: every artifact is at or above epoch 1.
+            flush_barrier: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -6496,6 +9086,27 @@ impl JitCache {
         }
     }
 
+    /// Returns `false` when this artifact was compiled against inputs a later
+    /// flush of THIS cache retired, in which case it must not be published.
+    ///
+    /// Callers must hold `mutation` — that is what makes the answer stable
+    /// against a concurrent [`Self::clear_all`].
+    fn publication_epoch_is_current(&self, compiled: &CompiledMethod) -> bool {
+        let barrier = self.flush_barrier.load(std::sync::atomic::Ordering::Acquire);
+        if compiled.install_epoch >= barrier {
+            return true;
+        }
+        STALE_INSTALL_EPOCH_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dbg_jit_pin_enabled() {
+            eprintln!(
+                "[jit-stale-install] refusing a body compiled at epoch {} into a cache \
+flushed at epoch {barrier}",
+                compiled.install_epoch,
+            );
+        }
+        !strict_install_epoch_enabled()
+    }
+
     /// Returns `false` when a baked direct-call target could not be pinned, in
     /// which case this body must NOT be published — its emitted code contains a
     /// `call` to an address nothing keeps alive.
@@ -6534,6 +9145,14 @@ impl JitCache {
         mut compiled: CompiledMethod,
     ) {
         let _mutation = self.mutation.lock();
+        if !self.publication_epoch_is_current(&compiled) {
+            // Compiled against bytecode a redefinition (or a synthetic-stub
+            // layout upgrade) has since replaced. Dropping it leaves the method
+            // interpreted; it recompiles on a later invocation, against the
+            // bytecode that is actually installed. See
+            // `CompiledMethod::install_epoch`.
+            return;
+        }
         let h = compute_jit_key_hash(&class_name, &method_name, &descriptor, declaring_class_id);
         let key = JitKey {
             class_name,
@@ -6624,6 +9243,11 @@ impl JitCache {
     ) {
         let _mutation = self.mutation.lock();
         debug_assert!(compiled.compiled_via_osr);
+        // Same gate as `put` — an OSR body compiled against retired bytecode is
+        // if anything worse, since it is entered into a loop already running.
+        if !self.publication_epoch_is_current(&compiled) {
+            return;
+        }
         let h = compute_jit_key_hash(&class_name, &method_name, &descriptor, declaring_class_id);
         let key = JitKey {
             class_name,
@@ -6891,8 +9515,21 @@ impl JitCache {
     /// not just methods declared by the redefined class. A full flush is rare
     /// but conservative; ownership pins any body still referenced by an
     /// already-loaded reader while new snapshots become empty atomically.
+    ///
+    /// Also **arms the install barrier**: emptying the maps retires every body
+    /// that is already here, but says nothing about the bodies still being
+    /// compiled from the same retired inputs. Raising `flush_barrier` under
+    /// `mutation` — the lock the two publication paths also hold — makes those
+    /// unpublishable, which is the half of the redefinition protocol the
+    /// compilation broker cannot supply (it stamps no epoch on a queued or
+    /// in-flight request, so a completion cannot notice its bytecode is gone).
     pub fn clear_all(&self) -> usize {
         let _mutation = self.mutation.lock();
+        // Advance first, then arm, so the barrier is strictly greater than the
+        // stamp of every compilation that had already started.
+        let barrier = bump_jit_install_epoch();
+        self.flush_barrier
+            .fetch_max(barrier, std::sync::atomic::Ordering::AcqRel);
         let mut count = 0;
         for shard in self.shards.iter() {
             for map in [shard.methods.load(), shard.osr_methods.load()] {
@@ -6955,8 +9592,14 @@ impl std::fmt::Debug for JitCache {
 /// recovered from its `Const(field_index)` offset operand (input[3]). Returns
 /// `None` for a compact / malformed node (no constant offset), letting the
 /// caller fall back to the `MemKind`-derived index. This is the single place
-/// the EA bridge interprets a production field access's index, so the EA
-/// graph's field edges and `apply_ea_to_ir`'s `field_values` lookup agree.
+/// the EA bridge interprets a production field access's index.
+///
+/// `plan_scalar_replacement` no longer *forwards* through this index — it asks
+/// `escape_analysis::ScalarReplacementInfo::load_value`, which is keyed by node
+/// rather than by field — but it still calls this as an agreement check, and
+/// `virtual_object_info_for` still indexes `field_values` by it. So the rule
+/// stands: the field index the EA graph keyed its edges by and the one the
+/// consumers recover here must be the same index.
 fn ir_load_store_field_index(ir_graph: &ir::Graph, node_id: ir::NodeId) -> Option<usize> {
     let node = ir_graph.nodes.get(node_id as usize)?;
     let offset_node = *node.inputs.get(3)?;
@@ -6995,6 +9638,14 @@ fn escape_analysis_from_ir(
         }
     }
 
+    // IR nodes this bridge classified as `escape_analysis::Op::IdentityHash`.
+    // Recorded in the first pass and consulted in the second, so the op choice
+    // and the operand re-packing can never disagree about which calls are
+    // intrinsics (an `IdentityHash` whose input 0 is the CONTROL edge would
+    // attribute the observation to the wrong node — or to none).
+    let mut identity_hash_calls: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+
     // First pass: create EA nodes for everything except entry/exit.
     for i in 0..ir_node_count {
         let ir_id = i as ir::NodeId;
@@ -7018,6 +9669,28 @@ fn escape_analysis_from_ir(
                 Some(f) => escape_analysis::Op::Store(f),
                 None => ir_op_to_ea_op(&ir_node.op),
             },
+            // ── Identity observations (docs/jit/escape-analysis.md §4, §6.2) ──
+            //
+            // Both arms below were previously fail-closed *by accident*: an
+            // `ir::Op::Cmp` hit `ir_op_to_ea_op`'s `Op::Other` catch-all and an
+            // identity-hash call hit `EaOp::Call`, whose rule escapes every
+            // reference argument. The outcome was right and the reason was not
+            // — it was unmeasurable, and it would silently become WRONG if
+            // `Op::Other` were relaxed or `Op::Call` ever gained an "inlined
+            // intrinsic, does not escape" arm.
+            //
+            // `EaOp::RefCompare` observes ALL its inputs and `EaOp::IdentityHash`
+            // observes input 0 (`escape_analysis::find_identity_observations`),
+            // and neither escapes anything — so misclassifying a node INTO
+            // either variant would be a relaxation. Both predicates are
+            // therefore written to fire only on a shape that provably is one.
+            ir::Op::Cmp(_) if ir_cmp_is_ref_compare(ir_graph, ir_node) => {
+                escape_analysis::Op::RefCompare
+            }
+            ir::Op::Call { info_ptr } if ir_call_is_identity_hash(ir_node, *info_ptr) => {
+                identity_hash_calls.insert(i);
+                escape_analysis::Op::IdentityHash
+            }
             _ => ir_op_to_ea_op(&ir_node.op),
         };
         // Don't wire inputs yet — we need all id_map entries populated.
@@ -7047,6 +9720,26 @@ fn escape_analysis_from_ir(
                 vec![map_id(ir_node.inputs[2]), map_id(ir_node.inputs[4])]
             }
             ir::Op::Load(_) if ir_node.inputs.len() >= 3 => vec![map_id(ir_node.inputs[2])],
+            // EA layout contract: the locked reference is input 0. The IR node
+            // carries `[ctrl, mem, obj]`, exactly like `Load`/`Store`, so
+            // forwarding verbatim would attribute the monitor to the MEMORY
+            // TOKEN and every lock decision would be made about the wrong node.
+            ir::Op::MonitorEnter | ir::Op::MonitorExit if ir_node.inputs.len() >= 3 => {
+                vec![map_id(ir_node.inputs[2])]
+            }
+            // `escape_analysis::Op::IdentityHash` reads the observed reference
+            // at input 0 — the same slot `Op::MonitorEnter` uses, so the two
+            // agree about which object a header read names. The IR call carries
+            // `[ctrl, mem, args…]`, so the observed reference is input 2.
+            // Forwarding verbatim would attribute the observation to the
+            // CONTROL edge and let the real receiver slip through unobserved.
+            // `ir_call_is_identity_hash` already required the arity.
+            ir::Op::Call { .. } if identity_hash_calls.contains(&i) => {
+                vec![map_id(ir_node.inputs[2])]
+            }
+            // `Op::Cmp` → `Op::RefCompare` needs NO re-packing: the IR node's
+            // inputs are `[left, right]` and `find_identity_observations` reads
+            // every input of a `RefCompare`.
             _ => ir_node.inputs.iter().map(|&inp| map_id(inp)).collect(),
         };
         ea.nodes[ea_id].inputs = ea_inputs.clone();
@@ -7060,6 +9753,123 @@ fn escape_analysis_from_ir(
 
     (ea, id_map)
 }
+
+/// True when `node` (an `ir::Op::Cmp`) is an `if_acmpeq`/`if_acmpne` — a
+/// comparison of two object *addresses*, which is one of the three ways the JVM
+/// observes an object's identity without publishing it.
+///
+/// Two shapes are deliberately excluded, because neither observes an address:
+///
+/// * a comparison with a non-`Ref` operand — an `if_icmp*` or a `lcmp`/`fcmp`
+///   result test, which never sees a reference at all;
+/// * **`ifnull` / `ifnonnull`**. The builder lowers those to the same
+///   `Op::Cmp` against `aconst_null`, which is an `Op::Const(0)` typed
+///   `IrType::Ref` — so a pure "both operands are `Ref`" test would classify
+///   every null check in the program as an identity observation and refuse
+///   scalar replacement for every object that is ever null-checked. A fresh
+///   allocation is non-null by construction, so `o == null` reads no address;
+///   it is answerable without the object existing. Only the *null literal* is
+///   excluded, not `Op::Const` in general — an interned constant oop, if one is
+///   ever introduced, must keep being treated as a real reference.
+fn ir_cmp_is_ref_compare(ir_graph: &ir::Graph, node: &ir::Node) -> bool {
+    if node.inputs.len() < 2 {
+        return false;
+    }
+    node.inputs[..2].iter().all(|&inp| {
+        ir_graph
+            .nodes
+            .get(inp as usize)
+            .is_some_and(|n| n.ty == ir::IrType::Ref && n.op != ir::Op::Const(0))
+    })
+}
+
+/// True when an `ir::Op::Call` is a **resolved** identity-hash intrinsic, whose
+/// argument's address is therefore observed.
+///
+/// This is a *relaxation* — it stops the call escaping its reference arguments
+/// through the `escape_analysis::Op::Call` rule — so it fires only where the
+/// target is provably `Object`'s header-derived hash, never on a virtual call
+/// that could dispatch to an override:
+///
+/// * `System.identityHashCode` is `static`: its answer is the header hash of
+///   whatever it is handed, whatever that object's class does with `hashCode`.
+/// * `Object.hashCode()` is accepted **only for `invokespecial`**
+///   (`invoke_kind == 1`, i.e. a `super.hashCode()` call), which is
+///   non-virtual and so provably lands on `Object`'s implementation. A
+///   *virtual* `hashCode()` on a receiver declared `java/lang/Object` can still
+///   dispatch to any override, and this bridge has no class hierarchy to prove
+///   otherwise — so it keeps the fail-closed `EaOp::Call` mapping.
+///
+/// The arity check is load-bearing: the second pass re-packs the observed
+/// reference from input 2 into `EaOp::IdentityHash`'s input 0, and an
+/// `IdentityHash` with no input observes *nothing* while also no longer
+/// escaping the receiver.
+///
+/// SAFETY / contract: `info_ptr` is the address of a `JitInvokeInfo` kept alive
+/// for the whole compile by the `CompiledMethod`'s `_jit_invoke_infos` arena —
+/// the same contract `ir_lower`'s `Op::Call` arm relies on when it reads
+/// `invoke_kind`. A hand-built test graph that wants an `Op::Call` must use
+/// `info_ptr: 0` (rejected here without a dereference) or a real interned info.
+fn ir_call_is_identity_hash(node: &ir::Node, info_ptr: usize) -> bool {
+    // `[ctrl, mem, arg0]` — the observed reference is arg0.
+    if info_ptr == 0 || node.inputs.len() < 3 {
+        return false;
+    }
+    let info = unsafe { &*(info_ptr as *const JitInvokeInfo) };
+    match (info.class_name, info.method_name, info.descriptor) {
+        // invoke_kind 3 = static.
+        ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I") => info.invoke_kind == 3,
+        // invoke_kind 1 = special (non-virtual).
+        ("java/lang/Object", "hashCode", "()I") => info.invoke_kind == 1,
+        _ => false,
+    }
+}
+
+// ── The monitor half of the bridge (docs/jit/lock-elimination.md §6.2) ──
+//
+// NOT WIRED, and not for want of an arm here: **`ir::Op` has no
+// `MonitorEnter`/`MonitorExit` variant at all.** `ir::MemEffect::monitor_enter`
+// / `monitor_exit` exist and classify a monitor as `MemOrder::Acquire`/`Release`
+// with `safepoint: true`, but their own doc says `monitorenter` has no IR
+// lowering, so a synchronized method bails to the single-pass backend before it
+// ever reaches this bridge. That bail — not this file — is the gate on lock
+// elision and lock coarsening running in production.
+//
+// When the variants land, add to `escape_analysis_from_ir`'s FIRST-pass
+// `match &ir_node.op` (op choice):
+//
+//     ir::Op::MonitorEnter => escape_analysis::Op::MonitorEnter,
+//     ir::Op::MonitorExit  => escape_analysis::Op::MonitorExit,
+//
+// and to its SECOND-pass `match &ir_node.op` (operand re-packing) — this half
+// is the one that is easy to get wrong:
+//
+//     ir::Op::MonitorEnter | ir::Op::MonitorExit if ir_node.inputs.len() >= 3 => {
+//         // EA layout contract: the locked reference is input 0. The IR node
+//         // carries `[ctrl, mem, obj]`, exactly like `Load`/`Store`. Forwarding
+//         // verbatim attributes the monitor to the MEMORY TOKEN.
+//         vec![map_id(ir_node.inputs[2])]
+//     }
+//
+// `apply_ea_to_ir`'s elision loop is already all-or-nothing per object, which
+// is the precondition `docs/jit/lock-elimination.md` §6.1 requires to be in
+// place *before* this block is uncommented.
+//
+// `Object.wait`/`notify`/`notifyAll` ⇒ `EaOp::MonitorWait`/`MonitorNotify` are
+// deliberately NOT wired ahead of the variants either. Those mappings are
+// relaxations (they stop escaping the receiver through the `Op::Call` rule),
+// and with no `MonitorEnter` in the graph they would buy nothing: their only
+// consumers are the `E3` refusal (`waits_or_notifies_on`) and the identity
+// gate, both of which need monitors to exist before they can decide anything.
+// Wire them in the same change as the variants, not before.
+//
+// `athrow` ⇒ `EaOp::Throw` cannot be wired at all: `ir::Op` has no throw and
+// `ir::IrBuilder` rejects the whole method when `scan.has_athrow` (there is no
+// athrow lowering — see the `ir_reject("scan.has_athrow")` gate). So no IR
+// graph reaching this bridge contains a throw, and `EaOp::Throw` stays
+// producerless until handler bodies are compiled. Note for whoever does that:
+// `escape_analysis::program_order_proves_dominance` explicitly assumes the
+// absence of exception control flow and must gain a `may_throw` term then.
 
 /// Map a single `ir::Op` variant to its `escape_analysis::Op` counterpart.
 fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
@@ -7077,6 +9887,12 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         ir::Op::Mul => EaOp::Mul,
         ir::Op::Load(mk) => EaOp::Load(*mk as usize),
         ir::Op::Store(mk) => EaOp::Store(*mk as usize),
+        // Monitors: the variants now exist, so lock elision and coarsening can
+        // finally see the operations they were written for. Operand re-packing
+        // is in the second pass — forwarding `[ctrl, mem, obj]` verbatim would
+        // attribute the monitor to the memory token.
+        ir::Op::MonitorEnter => EaOp::MonitorEnter,
+        ir::Op::MonitorExit => EaOp::MonitorExit,
         ir::Op::New {
             class_id,
             num_fields,
@@ -7132,6 +9948,158 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
 // slots, because that slot is the virtual-object descriptor
 // `ir_lower::resolve_frame_state` resolves through `ScalarReplacementMap`.
 
+// ---------------------------------------------------------------------------
+// Escape analysis: cold-path information
+// ---------------------------------------------------------------------------
+
+/// The control-flow predecessors of `node`, as input indices.
+///
+/// DE-DUPLICATION NOTE: this is `ir_verify::control_input_indices`
+/// (ir_verify.rs:482), which is private to that module. Making that declaration
+/// `pub(crate) fn` lets this one be deleted and the original imported instead;
+/// the two must stay in step because a control edge this function does not see
+/// is a path `ea_cold_control_nodes` will not consider when deciding a merge is
+/// cold.
+fn ea_control_preds(node: &ir::Node) -> &[ir::NodeId] {
+    match node.op {
+        // A merge takes one control edge per predecessor.
+        ir::Op::Merge | ir::Op::Region => node.inputs.as_slice(),
+        // Everything else pins control at input 0 (when it has one at all).
+        ir::Op::Return
+        | ir::Op::If
+        | ir::Op::Proj(_)
+        | ir::Op::Guard { .. }
+        | ir::Op::Load(_)
+        | ir::Op::Store(_)
+        | ir::Op::ArrayLoad(_)
+        | ir::Op::ArrayStore(_)
+        | ir::Op::New { .. }
+        | ir::Op::NewArray { .. }
+        | ir::Op::Call { .. }
+        | ir::Op::LambdaIntToDouble => &node.inputs[..node.inputs.len().min(1)],
+        // Start, and every floating pure node (Const, Add, Cmp, Phi, …). A node
+        // with no control input has no fixed position, so it is never cold.
+        _ => &[],
+    }
+}
+
+/// Every IR node that executes only on a profiled-cold path.
+///
+/// This is the producer `escape_analysis::Graph::cold_nodes` never had. Without
+/// it `EscapeAnalysisResult::partial_escapes` is always empty and the
+/// `EscapeState::PartialEscape` lattice level is dead code — see
+/// `docs/jit/escape-analysis.md` §2 and §6.3.
+///
+/// # What "cold" means here, exactly
+///
+/// `hints` is the `ir_branch_hints` map: keyed by a conditional branch's
+/// bytecode PC (`Node::bytecode_pc` on the `Op::If`), value `true` = usually
+/// TAKEN, `false` = usually NOT taken. The builder gives `Op::If` a `Proj(0)`
+/// true edge that goes to the branch target and a `Proj(1)` false edge that
+/// falls through, so the *cold* projection is `Proj(1)` for a usually-taken
+/// branch and `Proj(0)` for a usually-not-taken one.
+///
+/// `profile::BranchCounts` decides "usually" at 90/10 with ≥ 20 samples, so this
+/// is a **bias, not a proof of never**. That is why it may only ever feed the
+/// reported-only `PartialEscape` classification: an object reported partial has
+/// still escaped for real, and every *acting* consumer (`find_scalar_replacements`,
+/// `find_lock_elisions`) tests the connection graph's unrefined state. A future
+/// partial-escape applier that actually sinks an allocation should tighten this
+/// source to a never-observed edge before relying on it.
+///
+/// # Why over-marking is safe and under-marking is the default
+///
+/// `Graph::mark_cold` is additive and monotone: more cold nodes can only move
+/// an allocation from `ArgEscape`/`GlobalEscape` to the reported
+/// `PartialEscape`, which no consumer acts on. The propagation below is
+/// nevertheless deliberately conservative in the *under*-marking direction:
+///
+/// * a `Merge`/`Region` is cold only when EVERY predecessor is cold;
+/// * consequently a loop whose header is entered coldly never converges to
+///   cold, because its back edge is only cold once the header is — a precision
+///   loss, not a soundness one;
+/// * a node with no control input (a floating `Const`/`Add`/`Phi`) is never
+///   cold, because it has no fixed position to be cold at.
+fn ea_cold_control_nodes(
+    ir_graph: &ir::Graph,
+    hints: &HashMap<usize, bool>,
+) -> std::collections::HashSet<ir::NodeId> {
+    let mut cold: std::collections::HashSet<ir::NodeId> = std::collections::HashSet::new();
+    if hints.is_empty() {
+        return cold;
+    }
+
+    // Seed: the never-taken projection of each profiled `Op::If`.
+    for (idx, n) in ir_graph.nodes.iter().enumerate() {
+        if n.op != ir::Op::If {
+            continue;
+        }
+        let usually_taken = match n.bytecode_pc.and_then(|pc| hints.get(&pc)) {
+            Some(&t) => t,
+            None => continue, // inconclusive profile — nothing is cold here
+        };
+        let cold_proj = if usually_taken { 1u8 } else { 0u8 };
+        let if_id = idx as ir::NodeId;
+        for (pidx, p) in ir_graph.nodes.iter().enumerate() {
+            if p.op == ir::Op::Proj(cold_proj) && p.inputs.first() == Some(&if_id) {
+                cold.insert(pidx as ir::NodeId);
+            }
+        }
+    }
+    if cold.is_empty() {
+        return cold;
+    }
+
+    // Forward closure. Bounded by the node count: each round adds at least one
+    // node or stops, and a node is never removed.
+    for _ in 0..ir_graph.nodes.len() {
+        let mut changed = false;
+        for (idx, n) in ir_graph.nodes.iter().enumerate() {
+            let id = idx as ir::NodeId;
+            if n.op == ir::Op::Dead || cold.contains(&id) {
+                continue;
+            }
+            let preds = ea_control_preds(n);
+            if preds.is_empty() {
+                continue;
+            }
+            if preds.iter().all(|p| cold.contains(p)) {
+                cold.insert(id);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    cold
+}
+
+/// Feed the profiled cold paths into an EA graph built by
+/// [`escape_analysis_from_ir`], translating IR ids through the same `id_map`
+/// the results are read back through.
+///
+/// Call it between the bridge and `escape_analysis::analyze_escapes`; with an
+/// empty `hints` map (profiling off — the default) it marks nothing and the
+/// analysis is byte-identical to what it was before.
+fn ea_mark_cold_from_branch_hints(
+    ea: &mut escape_analysis::Graph,
+    ir_graph: &ir::Graph,
+    id_map: &[escape_analysis::NodeId],
+    hints: &HashMap<usize, bool>,
+) {
+    for ir_id in ea_cold_control_nodes(ir_graph, hints) {
+        // A node the bridge did not translate (`usize::MAX`) names nothing in
+        // the EA graph; skipping it only under-marks, which is the safe way to
+        // be wrong here.
+        if let Some(&ea_id) = id_map.get(ir_id as usize) {
+            if ea_id != usize::MAX {
+                ea.mark_cold(ea_id);
+            }
+        }
+    }
+}
+
 /// The input slot carrying `node`'s incoming memory token, or `None` when this
 /// op does not consume one.
 ///
@@ -7139,23 +10107,13 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
 /// hand-built `[base, value]` `Store` layout's slot 1 is a *value*, not a token,
 /// so only the documented full `[ctrl, mem, …]` form has one.
 fn ea_memory_token_slot(node: &ir::Node) -> Option<usize> {
-    let min_full_arity = match node.op {
-        ir::Op::Load(_) => 3,           // [ctrl, mem, base]
-        ir::Op::Store(_) => 4,          // [ctrl, mem, base, value]
-        ir::Op::ArrayLoad(_) => 4,      // [ctrl, mem, array, index]
-        ir::Op::ArrayStore(_) => 5,     // [ctrl, mem, array, index, value]
-        ir::Op::ArrayLength => 3,       // [ctrl, mem, array_ref]
-        ir::Op::New { .. } => 2,        // [ctrl, mem]
-        ir::Op::NewArray { .. } => 3,   // [ctrl, mem, length]
-        ir::Op::Call { .. } => 2,       // [ctrl, mem, args…]
-        ir::Op::LambdaIntToDouble => 4, // [ctrl, mem, lambda, index]
-        _ => return None,
-    };
-    if node.inputs.len() >= min_full_arity {
-        Some(1)
-    } else {
-        None
-    }
+    // Delegates to the single table (`ir::Op::memory_shape`). This was the
+    // third hand-maintained copy of the arity list; the moment monitors joined
+    // the table the copies started answering `None` for a real token slot — and
+    // this is the copy `apply_ea_to_ir`'s `value_used` check is built on, so a
+    // stale answer here is what would let the EA applier treat a monitor's
+    // ordering edge as a value it may rewrite.
+    ir::memory_token_slot(node)
 }
 
 /// True when input `idx` of `node` is a memory *token* — an ordering edge
@@ -7256,7 +10214,10 @@ fn plan_scalar_replacement(
         }
     };
 
-    let mut loads: Vec<(ir::NodeId, usize)> = Vec::new();
+    // Each load is kept with the EA node it came from, because the per-load
+    // answer below is keyed by EA id — no forward `id_map` lookup is needed,
+    // the EA id is already in hand here.
+    let mut loads: Vec<(ir::NodeId, escape_analysis::NodeId)> = Vec::new();
     for &ea_load in &info.replaced_loads {
         // An EA node with no IR counterpart names nothing we can kill.
         let l = match reverse_map.get(&ea_load) {
@@ -7266,9 +10227,16 @@ fn plan_scalar_replacement(
         if !matches!(ir_graph.node_opt(l)?.op, ir::Op::Load(_)) {
             return None;
         }
-        loads.push((l, field_index(l)?));
+        // Bridge/analysis agreement check. The index itself is no longer used
+        // to pick the forwarded value (`info.load_value` answers that), but a
+        // node whose field index cannot be recovered is one the bridge and the
+        // analysis disagree about — refuse rather than guess.
+        if field_index(l).is_none() {
+            return None;
+        }
+        loads.push((l, ea_load));
     }
-    let mut stores: Vec<(ir::NodeId, usize)> = Vec::new();
+    let mut stores: Vec<ir::NodeId> = Vec::new();
     for &ea_store in &info.eliminated_stores {
         let s = match reverse_map.get(&ea_store) {
             Some(&s) => s,
@@ -7277,44 +10245,53 @@ fn plan_scalar_replacement(
         if !matches!(ir_graph.node_opt(s)?.op, ir::Op::Store(_)) {
             return None;
         }
-        stores.push((s, field_index(s)?));
-    }
-
-    // LAST-WRITE-WINS HAZARD. `info.field_values[f]` records the value of the
-    // LAST store to field `f` in program order, and this pass forwards *every*
-    // replaced load of `f` to it — including a load that runs BEFORE that store
-    // and therefore reads a value the object does not hold yet (`Foo o = new
-    // Foo(); int a = o.x; o.x = 42;` would fold `a` to 42). Node ids are
-    // assigned in creation = program order, the same ordering
-    // `escape_analysis::find_scalar_replacements` itself uses to pick the
-    // winning store, so a store id above a load id means the store is later.
-    // Refuse the object rather than forward a value from its future.
-    for &(l, lf) in &loads {
-        if stores.iter().any(|&(s, sf)| sf == lf && s > l) {
+        if field_index(s).is_none() {
             return None;
         }
+        stores.push(s);
     }
 
+    // ── Per-load resolution (NOT `field_values`) ─────────────────────
+    //
+    // `info.field_values[f]` is the value of the LAST store to `f` in program
+    // order. Forwarding *every* replaced load of `f` to it folds
+    // `Foo o = new Foo(); int a = o.x; o.x = 42;` to `a == 42` — a value from
+    // the load's own future. This pass used to do exactly that, and guarded it
+    // with an id-comparison refusal ("refuse the object if any store to the
+    // loaded field has a higher node id than the load"). That guard was correct
+    // but pessimistic, and it did nothing for the branchy variant
+    // (`if (c) o.x = 1; else o.x = 2; int a = o.x;`), where no store has a
+    // higher id than the load yet `field_values[f]` is still the wrong answer
+    // on one path.
+    //
+    // `escape_analysis::ScalarReplacementInfo::load_value` replaces both. It is
+    // three-valued on purpose — collapsing `ZeroDefault` and `Unknown` into one
+    // `Option<NodeId>` is precisely how a load-before-store gets a value from
+    // its future — and it is gated on
+    // `escape_analysis::program_order_proves_dominance`, so the branchy graph
+    // above answers `Unknown` and is refused here rather than mis-forwarded.
+    // See `docs/jit/escape-analysis.md` §3 and §6.1.
     let mut load_plans: Vec<(ir::NodeId, Option<ir::NodeId>)> = Vec::with_capacity(loads.len());
-    for &(l, f) in &loads {
-        // The value the load resolves to: the stored field value, or — when the
-        // field was never stored — the freshly-allocated object's zero default
-        // (`None` here; the caller materialises one shared `Const(0)`).
-        // Soundness of that default rests on the object being genuinely
-        // zero-initialised: the front end only admits allocations whose
-        // constructor sets no non-zero field.
-        let value = match info.field_values.get(f) {
-            Some(Some(ea_val)) => match reverse_map.get(ea_val) {
+    for &(l, ea_load) in &loads {
+        let value = match info.load_value(ea_load) {
+            escape_analysis::LoadResolution::Value(ea_val) => match reverse_map.get(&ea_val) {
                 Some(&v) if ir_graph.node_opt(v).is_some_and(|n| n.op != ir::Op::Dead) => Some(v),
                 // The stored value has no live IR node, so this load cannot be
                 // described. REFUSE — the previous code killed the load anyway
                 // and left its consumers reading an `Op::Dead` node.
                 _ => return None,
             },
-            Some(None) => None,
-            // Field index outside the object's field vector: the bridge and the
-            // analysis disagree about this access. Refuse rather than guess.
-            None => return None,
+            // No store precedes the load: it reads the freshly-allocated
+            // object's zero default (`None` here; the caller materialises one
+            // shared `Const(0)`). Soundness rests on the object being genuinely
+            // zero-initialised — the front end only admits allocations whose
+            // constructor sets no non-zero field.
+            escape_analysis::LoadResolution::ZeroDefault => None,
+            // Not provable (a branchy graph, or a load this candidate does not
+            // describe at all). The analysis already refuses such an object
+            // outright, so this is unreachable — but it is the one answer that
+            // must never be guessed at, so fail closed rather than assume.
+            escape_analysis::LoadResolution::Unknown => return None,
         };
         load_plans.push((l, value));
     }
@@ -7342,7 +10319,7 @@ fn plan_scalar_replacement(
     // resolves the ordinary way (`StackSlotRef`), and the load forwarding above
     // still applies: this costs the elided allocation, not the optimization.
     let mut elide_alloc = true;
-    if stores.iter().any(|&(s, _)| ea_snapshot_names(ir_graph, s)) {
+    if stores.iter().any(|&s| ea_snapshot_names(ir_graph, s)) {
         // A snapshot naming a `Store` is already malformed — a store produces no
         // value a frame can be rebuilt from — but it is not this pass's business
         // to silently retarget it.
@@ -7355,9 +10332,7 @@ fn plan_scalar_replacement(
         elide_alloc = false;
     }
     if !ea_splice_feasible(ir_graph, new_node)
-        || stores
-            .iter()
-            .any(|&(s, _)| !ea_splice_feasible(ir_graph, s))
+        || stores.iter().any(|&s| !ea_splice_feasible(ir_graph, s))
     {
         elide_alloc = false;
     }
@@ -7370,13 +10345,13 @@ fn plan_scalar_replacement(
             let id = idx as ir::NodeId;
             if n.op == ir::Op::Dead
                 || id == new_node
-                || stores.iter().any(|&(s, _)| s == id)
+                || stores.contains(&id)
                 || load_plans.iter().any(|&(l, _)| l == id)
             {
                 continue;
             }
             for (i, &inp) in n.inputs.iter().enumerate() {
-                let names_victim = inp == new_node || stores.iter().any(|&(s, _)| s == inp);
+                let names_victim = inp == new_node || stores.contains(&inp);
                 if names_victim && !ea_is_memory_token_slot(n, i) {
                     elide_alloc = false;
                     break 'outer;
@@ -7391,7 +10366,7 @@ fn plan_scalar_replacement(
     Some(EaScalarPlan {
         loads: load_plans,
         new_node,
-        stores: stores.into_iter().map(|(s, _)| s).collect(),
+        stores,
         elide_alloc,
     })
 }
@@ -7487,35 +10462,66 @@ fn apply_ea_to_ir(
         }
     }
 
-    // Lock elision. `escape_analysis_from_ir` never produces
-    // `escape_analysis::Op::MonitorEnter` / `MonitorExit` (`ir_op_to_ea_op` has
-    // no arm that can), so `elide_locks` is empty for every IR-derived graph and
-    // this loop is a no-op today. It is kept — and now routed through the same
-    // splice and the same reference checks — so it cannot become the next chain
-    // break if a monitor op is added to the bridge. A monitor node that a
-    // snapshot slot or a value input still names is left ALIVE:
-    // `deopt::EliminationCause::ElidedLock` has no representation in a
-    // `SafepointSnapshot`, so the elision would be undescribable.
-    for &ea_lock in &ea_result.elide_locks {
-        let ir_lock = match reverse_map.get(&ea_lock) {
-            Some(&id) => id,
-            None => continue,
-        };
-        if ir_graph.node_opt(ir_lock).is_none()
-            || ea_snapshot_names(ir_graph, ir_lock)
-            || !ea_splice_feasible(ir_graph, ir_lock)
-        {
-            continue;
+    // ── Lock elision: ALL-OR-NOTHING PER OBJECT ──────────────────────
+    //
+    // This reads `ea_result.lock_elisions` (grouped per object), NOT the flat
+    // `ea_result.elide_locks`. The two carry the same monitors, but only the
+    // grouped view is *correct*: a monitor sequence is balanced as a whole, so
+    // dropping one node out of it leaves a `monitorexit` whose `monitorenter`
+    // was elided (`IllegalMonitorStateException`) or a monitor held past the end
+    // of the frame. The previous per-node loop applied exactly that partial
+    // filter — see `docs/jit/lock-elimination.md` §4 and §6.1.
+    //
+    // Each of the three refusals below is per NODE but decides the whole GROUP:
+    //
+    //   * a safepoint snapshot slot names the monitor —
+    //     `deopt::EliminationCause::ElidedLock` has no representation in a
+    //     `SafepointSnapshot`, so the elision would be undescribable;
+    //   * its memory-token chain cannot be spliced;
+    //   * some non-token input still reads its value.
+    //
+    // `escape_analysis_from_ir` still produces no `escape_analysis::Op::
+    // MonitorEnter` / `MonitorExit` (`ir::Op` has no monitor variant at all —
+    // see the ready-to-uncomment block in `escape_analysis_from_ir`), so
+    // `lock_elisions` is empty for every IR-derived graph and this loop is a
+    // no-op today. It is written correctly *first*, deliberately: bridging
+    // monitor ops while a per-node filter was in place is what would turn a
+    // latent hazard into a thrown `IllegalMonitorStateException`.
+    for plan in &ea_result.lock_elisions {
+        let mut group: Vec<ir::NodeId> = Vec::with_capacity(plan.monitors.len());
+        let mut ok = true;
+        for &ea_lock in &plan.monitors {
+            let ir_lock = match reverse_map.get(&ea_lock) {
+                Some(&id) => id,
+                // A monitor with no IR counterpart cannot be killed, and the
+                // group is only sound applied whole — so refuse the object.
+                None => {
+                    ok = false;
+                    break;
+                }
+            };
+            if ir_graph.node_opt(ir_lock).is_none()
+                || ea_snapshot_names(ir_graph, ir_lock)
+                || !ea_splice_feasible(ir_graph, ir_lock)
+            {
+                ok = false;
+                break;
+            }
+            let value_used = ir_graph.nodes.iter().any(|n| {
+                n.op != ir::Op::Dead
+                    && n.inputs
+                        .iter()
+                        .enumerate()
+                        .any(|(i, &inp)| inp == ir_lock && !ea_is_memory_token_slot(n, i))
+            });
+            if value_used {
+                ok = false;
+                break;
+            }
+            group.push(ir_lock);
         }
-        let value_used = ir_graph.nodes.iter().any(|n| {
-            n.op != ir::Op::Dead
-                && n.inputs
-                    .iter()
-                    .enumerate()
-                    .any(|(i, &inp)| inp == ir_lock && !ea_is_memory_token_slot(n, i))
-        });
-        if !value_used {
-            victims.push((ir_lock, EaVictimKind::Eliminated));
+        if ok {
+            victims.extend(group.into_iter().map(|id| (id, EaVictimKind::Eliminated)));
         }
     }
 
@@ -8660,6 +11666,13 @@ pub fn try_compile_with_invokespecial_resolver(
     // for a given site) bails the whole compile — see `try_compile_inner`.
     cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
 ) -> Option<CompiledMethod> {
+    // Open the compilation scope FIRST, before any constant-pool resolver runs.
+    // Every `CompiledMethod` built under it — including one built by a nested
+    // `callee_compiler` compile on this thread — is stamped with the install
+    // epoch as of right now, so a redefinition or layout upgrade that lands
+    // while this compile is reading bytecode makes the result unpublishable.
+    // See `CompiledMethod::install_epoch` and `JitCache::flush_barrier`.
+    let _compile_epoch = open_compile_epoch_witness();
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
     // scan/IR/lowering work per re-attempt (every 2000 invocations
@@ -10270,6 +13283,38 @@ fn try_compile_inner(
                 // are both on; otherwise stays `None` ⇒ byte-identical lowering.
                 let mut sr_map: Option<ir_lower::ScalarReplacementMap> = None;
 
+                // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
+                // optimizing IR (C2) lowerer the profiled branch bias so it can
+                // pick each `Op::If`'s fall-through edge from the C1/interpreter
+                // profile — the IR analogue of the single-pass backend's
+                // `branch_hints`. Keyed by the branch instruction's bytecode PC
+                // (matching `Op::If::bytecode_pc` and the interpreter's
+                // `record_branch` PC). Empty when there is no profile (profiling
+                // off, the default) → byte-identical codegen.
+                //
+                // HOISTED above escape analysis (it used to be computed just
+                // before `lower_inner`) because EA is its second consumer: it is
+                // the cold-path producer `escape_analysis::Graph::cold_nodes`
+                // never had — see `ea_cold_control_nodes`. Same expression, same
+                // value; only the position moved, and it reads nothing the
+                // passes below mutate (`profile` is a parameter).
+                let ir_branch_hints: std::collections::HashMap<usize, bool> = profile
+                    .map(|prof| {
+                        prof.branches
+                            .iter()
+                            .filter_map(|(&pc, counts)| {
+                                if counts.is_usually_taken() {
+                                    Some((pc, true))
+                                } else if counts.is_usually_not_taken() {
+                                    Some((pc, false))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 // --- Escape analysis (Phase 41 + G46 wiring) ---
                 // Convert IR graph to escape analysis graph, run analysis,
                 // and apply scalar replacement / lock elision to the IR graph.
@@ -10281,7 +13326,19 @@ fn try_compile_inner(
                     // is still EA-only work.
                     let metrics_ea = metrics.phase(metrics::Phase::EscapeAnalysis);
                     let metrics_nodes_before_ea = graph.nodes.len();
-                    let (ea_graph, id_map) = escape_analysis_from_ir(&graph);
+                    let (mut ea_graph, id_map) = escape_analysis_from_ir(&graph);
+                    // Cold-path information (docs/jit/escape-analysis.md §6.3).
+                    // Without this `EscapeAnalysisResult::partial_escapes` is
+                    // always empty and `EscapeState::PartialEscape` is dead. It
+                    // is additive and reported-only: no acting consumer reads a
+                    // refined state, so an empty `ir_branch_hints` (profiling
+                    // off, the default) leaves the analysis byte-identical.
+                    ea_mark_cold_from_branch_hints(
+                        &mut ea_graph,
+                        &graph,
+                        &id_map,
+                        &ir_branch_hints,
+                    );
                     let ea_result = escape_analysis::analyze_escapes(&ea_graph);
                     // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
                     // allocation-bearing method, report how many of its `new`s
@@ -10309,7 +13366,12 @@ fn try_compile_inner(
                             );
                         }
                     }
-                    if !ea_result.scalar_replaceable.is_empty() || !ea_result.elide_locks.is_empty()
+                    // Gated on `lock_elisions`, not the flat `elide_locks`, for
+                    // the same reason `apply_ea_to_ir` reads the grouped view:
+                    // one source of truth. The two are the same offers (the flat
+                    // list is their union), so this is not a behaviour change.
+                    if !ea_result.scalar_replaceable.is_empty()
+                        || !ea_result.lock_elisions.is_empty()
                     {
                         // Capture guard-surviving-SR metadata (gated) BEFORE
                         // `apply_ea_to_ir` marks the News/stores dead and clears
@@ -10402,30 +13464,6 @@ fn try_compile_inner(
                     let metrics_schedule = metrics.phase(metrics::Phase::Schedule);
                     let schedule = ir_schedule::schedule(&graph);
                     drop(metrics_schedule);
-                    // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
-                    // optimizing IR (C2) lowerer the profiled branch bias so it can
-                    // pick each `Op::If`'s fall-through edge from the C1/interpreter
-                    // profile — the IR analogue of the single-pass backend's
-                    // `branch_hints`. Keyed by the branch instruction's bytecode PC
-                    // (matching `Op::If::bytecode_pc` and the interpreter's
-                    // `record_branch` PC). Empty when there is no profile (profiling
-                    // off, the default) → byte-identical codegen.
-                    let ir_branch_hints: std::collections::HashMap<usize, bool> = profile
-                        .map(|prof| {
-                            prof.branches
-                                .iter()
-                                .filter_map(|(&pc, counts)| {
-                                    if counts.is_usually_taken() {
-                                        Some((pc, true))
-                                    } else if counts.is_usually_not_taken() {
-                                        Some((pc, false))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
                     // Supply BOTH the profiled branch hints (Step 4) and the
                     // guard-surviving scalar-replacement map (Front 3.2) to the
                     // shared lowering body. `sr_map` is `None` unless
@@ -10485,10 +13523,20 @@ fn try_compile_inner(
                             compiled._jit_pic_slots.extend(ir_pic_boxes);
                         }
                         if !ir_direct_callee_entries.is_empty() {
-                            ir_direct_callee_entries.sort_unstable();
-                            ir_direct_callee_entries.dedup();
-                            compiled._direct_callee_entries =
-                                std::mem::take(&mut ir_direct_callee_entries);
+                            // `append`, never assign — the same reasoning as the
+                            // `_jit_mic_slots` transfer three lines up. An
+                            // assignment silently DISCARDS any entry the lowerer
+                            // recorded on the artifact itself, and a discarded
+                            // entry is one `prepare_for_publication` will not
+                            // pin: the body would then be published with a baked
+                            // CALL to an address nothing keeps mapped. The
+                            // lowerer records none today, which is exactly why
+                            // the assignment looked safe.
+                            compiled
+                                ._direct_callee_entries
+                                .append(&mut ir_direct_callee_entries);
+                            compiled._direct_callee_entries.sort_unstable();
+                            compiled._direct_callee_entries.dedup();
                         }
                         // Backend-routing introspection (tests only): this body was
                         // produced by the optimizing IR pipeline. A method that
@@ -10834,6 +13882,9 @@ fn try_compile_inner(
         MAX_INLINE_BUDGET_HOT
     };
     let mut inlined_methods: Vec<(String, String, String)> = Vec::new();
+    // C2-review P1 — inlining decision totals for the metrics report. Attached
+    // to the artifact at the end of this function.
+    let mut inline_tally = InlineDecisionTally::default();
     // `java/lang/String` field layout, resolved ONCE for the whole
     // compilation. `try_resolve_string_intrinsic` (in the invoke loop
     // below) uses it to decide whether a String intrinsic can be
@@ -10915,6 +13966,43 @@ fn try_compile_inner(
             // roots.  Route through the checked re-entrant bridge instead;
             // it installs a distinct JitEntryGuard for the actual callee.
             let direct_jit_callee_calls_enabled = direct_jit_callee_calls_enabled();
+            // C2-review P1 — virtual/interface sites are NOT admitted for
+            // inlining (the single-pass backend has no guarded inline lowering
+            // for them; see `InlineBackendCaps::single_pass_x64`), but their
+            // receiver shape is readable from the profile alone and is the
+            // evidence that decides whether that backend work is worth doing.
+            // Classify and tally, without paying for a callee resolution.
+            //
+            // Gated on `metrics::enabled()` because `classify_receiver_shape`
+            // ranks the receiver map, which allocates: this is a measurement,
+            // and a measurement must not tax the compile path it measures. Off
+            // (the process default) it is one relaxed atomic load per virtual
+            // site.
+            if matches!(invoke_kind, 0 | 2) && metrics::enabled() {
+                let refusal = match classify_receiver_shape(
+                    profile.and_then(|p| p.receivers.get(&pc)),
+                ) {
+                    ReceiverShape::Unprofiled => InlineRefusal::NoProfileEvidence,
+                    ReceiverShape::Cold { observations, .. } => {
+                        InlineRefusal::ColdSite { observations }
+                    }
+                    ReceiverShape::Megamorphic { types, .. } => {
+                        if types > INLINE_MEGAMORPHIC_TYPE_CEILING {
+                            InlineRefusal::Megamorphic { types }
+                        } else {
+                            InlineRefusal::ReceiverNotDominant { types }
+                        }
+                    }
+                    // A shape this policy WOULD speculate on, refused only
+                    // because the backend cannot emit the guard. This counter
+                    // is the whole point of the arm: it measures the size of
+                    // the opportunity currently being left on the table.
+                    ReceiverShape::Monomorphic { .. } | ReceiverShape::Bimorphic { .. } => {
+                        InlineRefusal::GuardNotEmittable
+                    }
+                };
+                inline_tally.record_refusal(&refusal);
+            }
             if !is_recursive_call && (invoke_kind == 3 || invoke_kind == 1) {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
@@ -10935,21 +14023,79 @@ fn try_compile_inner(
                             //    the single-pass backend reserves ~64 buffer
                             //    bytes and ~1 frame slot per inlined bytecode,
                             //    both linear in this total.
+                            //
+                            // C2-review P1: both dimensions now live in
+                            // `plan_inline`, together with the depth,
+                            // recursion, exception-range and dependency rules
+                            // this site had none of. For a statically bound
+                            // callee — the only kind that reaches here, see the
+                            // enclosing `invoke_kind` test — the admission
+                            // decision is the SAME size/expansion/budget
+                            // arithmetic as before, so an unprofiled compile
+                            // inlines exactly as it did; what is new is that a
+                            // refusal now says why, and that the dependencies
+                            // are taken from the plan rather than assumed.
                             let site_hot = call_site_is_hot(pc, &inline_hot_loops, profile);
-                            if let Some(expansion_cost) =
-                                inline_site_expansion_cost_tiered(&site, site_hot)
-                                    .filter(|cost| *cost <= inline_budget_remaining)
-                            {
+                            let callee_triple = (
+                                site.class_name.clone(),
+                                site.method_name.clone(),
+                                site.descriptor.clone(),
+                            );
+                            // Ancestors only. The single-pass emitter cannot
+                            // nest (`try_emit_inline_body` bails on any callee
+                            // invoke that is not a resolver-proven elidable
+                            // super-`<init>`), so the only inline stack that
+                            // exists is [caller, callee] and the only possible
+                            // recursion is callee == caller — which
+                            // `is_recursive_call` has already excluded above.
+                            // Computed rather than hard-coded to `0` so a
+                            // nesting emitter inherits a correct count.
+                            let recursive_copies = usize::from(
+                                callee_triple.0 == &*cached.class_name
+                                    && callee_triple.1 == &*cached.method_name
+                                    && callee_triple.2 == &*cached.method_descriptor,
+                            );
+                            let plan = plan_inline(&InlineRequest {
+                                pc,
+                                invoke_kind,
+                                site: &site,
+                                site_is_hot: site_hot,
+                                receivers: profile.and_then(|p| p.receivers.get(&pc)),
+                                call_site_evidence: profile
+                                    .map(|p| p.call_site_count(pc))
+                                    .unwrap_or(profile::CallSiteEvidence::None),
+                                depth: 1,
+                                recursive_copies,
+                                budget_remaining: inline_budget_remaining,
+                                pc_in_protected_range: pc_in_protected_range(
+                                    &cached.exception_table,
+                                    pc,
+                                ),
+                                precise_exception_frames,
+                                caps: InlineBackendCaps::single_pass_x64(),
+                                // No class-id → name resolver is threaded into
+                                // this function, so a speculative plan could
+                                // not record its receiver dependency anyway.
+                                // Moot today: the caps above already refuse
+                                // every speculative site.
+                                receiver_class_namer: None,
+                            });
+                            inline_tally.record(&plan);
+                            if plan.is_admitted() {
                                 inline_budget_remaining =
-                                    inline_budget_remaining.saturating_sub(expansion_cost);
+                                    inline_budget_remaining.saturating_sub(plan.expansion_cost);
                                 if site.needs_heap {
                                     needs_heap = true;
                                 }
-                                inlined_methods.push((
-                                    site.class_name.clone(),
-                                    site.method_name.clone(),
-                                    site.descriptor.clone(),
-                                ));
+                                // The invalidation channel. Deduplicated: the
+                                // scans are `.any()` predicates run on every
+                                // class define, so a repeated triple is pure
+                                // cost.
+                                for dependency in plan.invalidation_triples() {
+                                    if !inlined_methods.contains(&dependency) {
+                                        inlined_methods.push(dependency);
+                                    }
+                                }
                                 inline_sites.insert(pc, site);
                                 planned_inline = true;
                                 if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
@@ -10959,6 +14105,13 @@ fn try_compile_inner(
                                         "[cratonvm-jitc] inline-planned {class_name}.{method_name}{descriptor} @pc={pc}"
                                     );
                                 }
+                            } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                                .is_some()
+                            {
+                                eprintln!(
+                                    "[cratonvm-jitc] inline-refused {class_name}.{method_name}{descriptor} @pc={pc} reason={}",
+                                    plan.refusal().map_or("none", InlineRefusal::category)
+                                );
                             }
                         }
                     }
@@ -11796,6 +14949,12 @@ fn try_compile_inner(
     direct_callee_entries.dedup();
     compiled._direct_callee_entries = direct_callee_entries;
     compiled.inlined_methods = inlined_methods;
+    // C2-review P1 — publish the inlining decision totals on the artifact so
+    // `metrics::CompileRecorder::installed` can harvest them alongside
+    // `code_bytes` / `deopt_points` / `frame_bytes`. Empty unless something was
+    // actually considered, so it costs one moved `Vec` header on every other
+    // compilation.
+    compiled.inline_tally = inline_tally;
 
     if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_CODE") {
         let full = format!(
@@ -13525,6 +16684,447 @@ mod tests {
         assert_memory_chain_intact(&f.g);
     }
 
+    // ── Wiring the finished escape-analysis work ─────────────────────────
+    //
+    // `docs/jit/escape-analysis.md` §6 and `docs/jit/lock-elimination.md` §6
+    // list four consumer-side edits. The tests below pin the three that changed
+    // behaviour here (all-or-nothing lock elision, per-load forwarding, the
+    // identity bridge) plus the cold-path producer that makes
+    // `EscapeState::PartialEscape` reachable at all.
+
+    /// `[ctrl, mem, obj, off, val]` full-layout graph with a *stand-in* monitor
+    /// pair on a returned (therefore escaping) object, and a deopt snapshot
+    /// naming the second of the pair. Returns `(graph, obj, m_enter, m_exit)`.
+    ///
+    /// `ir::Op` has no `MonitorEnter`/`MonitorExit` variant (see the
+    /// ready-to-uncomment block next to `ir_call_is_identity_hash`), so real
+    /// monitor nodes cannot be built. Nothing is lost: `apply_ea_to_ir`'s lock
+    /// loop asks three questions of a monitor — is it snapshot-named, is its
+    /// memory token spliceable, is its value still read — and none of the three
+    /// is monitor-specific. Two ordinary `Op::Store`s answer them the same way.
+    fn ea_lock_group_fixture() -> (
+        crate::ir::Graph,
+        crate::ir::NodeId,
+        crate::ir::NodeId,
+        crate::ir::NodeId,
+    ) {
+        use crate::ir::{Graph, IrType, MemKind, Op, SafepointSnapshot, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        // The stand-in monitor pair. `m_enter` passes every check
+        // `apply_ea_to_ir` makes (its token is `mem`, and `m_exit` names it only
+        // in a TOKEN slot, so it has no value use); `m_exit` fails exactly one,
+        // `ea_snapshot_names`.
+        let m_enter = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, val],
+            None,
+        );
+        let m_exit = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, m_enter, newobj, off, val],
+            None,
+        );
+        // Publishing the object keeps scalar replacement out of this test: only
+        // the lock path can touch these nodes.
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, newobj], None);
+        g.entry = start;
+        g.exit = ret;
+        g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![m_exit],
+        });
+        (g, newobj, m_enter, m_exit)
+    }
+
+    // A lock group is ALL-OR-NOTHING PER OBJECT.
+    //
+    // `apply_ea_to_ir` used to filter the flat `elide_locks` list per NODE: a
+    // monitor a safepoint slot named was skipped and its siblings were killed
+    // anyway. That is how a balanced monitor sequence becomes a `monitorexit`
+    // whose `monitorenter` is gone — `IllegalMonitorStateException` — or a
+    // monitor held past the end of the frame. It now reads the grouped
+    // `lock_elisions`, where one refusal refuses the whole object.
+    //
+    // This is the edit `docs/jit/lock-elimination.md` §6.1 requires to land
+    // BEFORE monitor ops are bridged.
+    #[test]
+    fn ea_a_partially_refusable_lock_group_is_refused_whole() {
+        use crate::ir::Op;
+
+        let (mut g, newobj, m_enter, m_exit) = ea_lock_group_fixture();
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let mut result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            result.scalar_replaceable.is_empty(),
+            "precondition: the returned object escapes, so scalar replacement \
+             cannot be what kills (or spares) these nodes"
+        );
+
+        // The offer the analysis would make once monitors exist: both nodes,
+        // grouped under one object.
+        let ea_enter = id_map[m_enter as usize];
+        let ea_exit = id_map[m_exit as usize];
+        result.lock_elisions = vec![escape_analysis::LockElisionPlan {
+            object: id_map[newobj as usize],
+            monitors: vec![ea_enter, ea_exit],
+        }];
+        result.elide_locks = vec![ea_enter, ea_exit];
+
+        apply_ea_to_ir(&mut g, &id_map, &result);
+
+        assert_ne!(
+            g.nodes[m_exit as usize].op,
+            Op::Dead,
+            "the snapshot-named monitor is refused (unchanged behaviour)"
+        );
+        assert_ne!(
+            g.nodes[m_enter as usize].op,
+            Op::Dead,
+            "THE REGRESSION THIS PINS: its sibling must be refused too. Killing \
+             it alone leaves an unbalanced monitor sequence."
+        );
+        assert_memory_chain_intact(&g);
+    }
+
+    // The flat `elide_locks` list is no longer what drives the applier — it
+    // stays on `EscapeAnalysisResult` for diagnostics only. A result that offers
+    // monitors ONLY through the flat list must change nothing, because a flat
+    // list cannot express "these two go together".
+    #[test]
+    fn ea_the_flat_elide_locks_list_no_longer_drives_the_applier() {
+        use crate::ir::Op;
+
+        let (mut g, _newobj, m_enter, m_exit) = ea_lock_group_fixture();
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let mut result = escape_analysis::analyze_escapes(&ea);
+        result.lock_elisions.clear();
+        result.elide_locks = vec![id_map[m_enter as usize], id_map[m_exit as usize]];
+
+        apply_ea_to_ir(&mut g, &id_map, &result);
+
+        assert_ne!(g.nodes[m_enter as usize].op, Op::Dead);
+        assert_ne!(g.nodes[m_exit as usize].op, Op::Dead);
+    }
+
+    // POSITIONAL LOAD FORWARDING. `Foo o = new Foo(); o.x = 7; int a = o.x;
+    // o.x = 42; return a;` must return 7.
+    //
+    // `info.field_values[0]` is 42 (the LAST store), and forwarding it here is
+    // the miscompilation this branch already paid for once. The applier used to
+    // guard against it with its own id-comparison heuristic — "refuse the object
+    // if any store to the loaded field has a higher node id than the load" —
+    // which is correct but refuses the optimization outright. It now asks
+    // `escape_analysis::ScalarReplacementInfo::load_value`, which answers the
+    // store that actually precedes THIS load, so the object is replaced *and*
+    // the load reads 7.
+    #[test]
+    fn ea_load_before_a_later_store_forwards_the_pre_store_value() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let seven = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let forty_two = g.add(Op::Const(42), IrType::Int, vec![], None);
+        // Node ids are creation order = program order, which is what the
+        // analysis's dominance stand-in reads: store(7) < load < store(42).
+        let store7 = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, seven],
+            None,
+        );
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, store7, newobj, off],
+            None,
+        );
+        // A load consumes a memory token but produces none, so the second store
+        // chains onto `store7`.
+        let store42 = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, store7, newobj, off, forty_two],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.entry = start;
+        g.exit = ret;
+
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        let info = result
+            .scalar_replaceable
+            .first()
+            .expect("the non-escaping object is scalar-replaceable");
+        assert!(
+            info.dominance_proved,
+            "precondition: a branch-free graph, so program order IS dominance"
+        );
+        assert_eq!(
+            info.field_values[0],
+            Some(id_map[forty_two as usize]),
+            "precondition: `field_values` — the source the applier used to read \
+             — names the LAST store's value, which is the wrong answer here"
+        );
+
+        apply_ea_to_ir(&mut g, &id_map, &result);
+
+        let retval = g.nodes[ret as usize].inputs[1];
+        assert_eq!(
+            g.nodes[retval as usize].op,
+            Op::Const(7),
+            "the load must read the value the field held AT THE LOAD (7), not \
+             the value it ends up holding (42)"
+        );
+        assert_eq!(g.nodes[load as usize].op, Op::Dead, "Load forwarded");
+        assert_eq!(g.nodes[store7 as usize].op, Op::Dead, "Store(7) killed");
+        assert_eq!(g.nodes[store42 as usize].op, Op::Dead, "Store(42) killed");
+        assert_eq!(g.nodes[newobj as usize].op, Op::Dead, "New killed");
+        assert_memory_chain_intact(&g);
+    }
+
+    // IDENTITY SENSITIVITY. An `if_acmpeq` on a fresh object observes its
+    // ADDRESS, so the object may not be scalar-replaced — two replaced objects
+    // with equal fields are indistinguishable, two heap objects are not.
+    //
+    // The outcome was already fail-closed before the bridge emitted
+    // `Op::RefCompare` (an `ir::Op::Cmp` hit `ir_op_to_ea_op`'s `Op::Other`
+    // catch-all, and the use walk refuses `Op::Other`), but it was invisible.
+    // `stats.identity_blocked` and `identity_observations` are what make the
+    // refusal reportable, and they are only populated when the observation is
+    // named for what it is.
+    #[test]
+    fn ea_an_identity_compared_object_is_not_replaced() {
+        use crate::ir::{CmpOp, Graph, IrType, MemKind, Op, NO_NODE};
+
+        // `null_rhs`: compare against `aconst_null` (an `ifnull`) instead of
+        // against another reference.
+        let build = |null_rhs: bool| -> (Graph, crate::ir::NodeId) {
+            let mut g = Graph {
+                nodes: Vec::new(),
+                entry: 0,
+                exit: NO_NODE,
+                safepoints: Vec::new(),
+                uses: Default::default(),
+            };
+            let start = g.add(Op::Start, IrType::Control, vec![], None);
+            let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+            let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+            let newobj = g.add(
+                Op::New {
+                    class_id: 7,
+                    num_fields: 1,
+                },
+                IrType::Ref,
+                vec![ctrl, mem],
+                None,
+            );
+            let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+            let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+            let _store = g.add(
+                Op::Store(MemKind::Int),
+                IrType::Memory,
+                vec![ctrl, mem, newobj, off, val],
+                None,
+            );
+            let rhs = if null_rhs {
+                // `IrBuilder::aconst_null` — an `Op::Const(0)` typed `Ref`.
+                g.add(Op::Const(0), IrType::Ref, vec![], None)
+            } else {
+                g.add(Op::Param(0), IrType::Ref, vec![], None)
+            };
+            let cmp = g.add(Op::Cmp(CmpOp::Eq), IrType::Int, vec![newobj, rhs], None);
+            let ret = g.add(Op::Return, IrType::Void, vec![ctrl, cmp], None);
+            g.entry = start;
+            g.exit = ret;
+            (g, newobj)
+        };
+
+        // (a) `o == p` — a real address comparison.
+        let (g, newobj) = build(false);
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            result.scalar_replaceable.is_empty(),
+            "an identity-compared object must not be scalar-replaced"
+        );
+        assert_eq!(
+            result.stats.identity_blocked, 1,
+            "and the refusal must be ATTRIBUTED to identity: this counts only \
+             CONFINED objects refused for that reason, so it also proves the \
+             object was otherwise replaceable (a non-vacuous test)"
+        );
+        assert!(
+            result
+                .identity_observations
+                .iter()
+                .any(|&(alloc, _)| alloc == id_map[newobj as usize]),
+            "the observation is reported, not merely acted on"
+        );
+
+        // (b) `o == null` — an `ifnull`, which the builder lowers to the SAME
+        // `Op::Cmp` with two `Ref`-typed operands. A fresh allocation is
+        // non-null by construction, so this reads no address; classifying it as
+        // an identity observation would refuse every null-checked object in the
+        // program.
+        let (g, _) = build(true);
+        let (ea, _) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            result.identity_observations.is_empty(),
+            "a null check is not an identity observation"
+        );
+        assert_eq!(result.stats.identity_blocked, 0);
+    }
+
+    // COLD-PATH CLASSIFICATION. An object whose only escape site is on a
+    // profiled never-taken branch is reported `EscapeState::PartialEscape`.
+    //
+    // `escape_analysis::Graph::cold_nodes` had no producer, so `partial_escapes`
+    // was always empty and the whole lattice level was dead code. The producer
+    // is `ea_cold_control_nodes`, fed from the `ir_branch_hints` map
+    // `try_compile_inner` already computes for the lowerer.
+    #[test]
+    fn ea_a_cold_path_escape_is_classified_partial() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+        use std::collections::HashMap;
+
+        // Foo o = new Foo(); o.x = 42; if (c) escape(o);   — with `c` profiled
+        // as never taken, so the call that publishes `o` is cold.
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, val],
+            None,
+        );
+        let cond = g.add(Op::Param(0), IrType::Int, vec![], None);
+        // bci 10 is the key `ir_branch_hints` is looked up by.
+        let iff = g.add(Op::If, IrType::Control, vec![ctrl, cond], Some(10));
+        let t_edge = g.add(Op::Proj(0), IrType::Control, vec![iff], Some(10));
+        let f_edge = g.add(Op::Proj(1), IrType::Control, vec![iff], Some(10));
+        // The publication, on the TRUE edge. `info_ptr: 0` is rejected by
+        // `ir_call_is_identity_hash` without a dereference, so this stays a
+        // plain `escape_analysis::Op::Call`.
+        let call = g.add(
+            Op::Call { info_ptr: 0 },
+            IrType::Void,
+            vec![t_edge, store, newobj],
+            Some(10),
+        );
+        let merge = g.add(Op::Merge, IrType::Control, vec![t_edge, f_edge], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![merge], None);
+        g.entry = start;
+        g.exit = ret;
+
+        // (a) No profile — the historical behaviour, byte for byte.
+        let (ea, _) = escape_analysis_from_ir(&g);
+        let unprofiled = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            unprofiled.partial_escapes.is_empty(),
+            "with no cold-path producer the classification is unreachable"
+        );
+
+        // (b) The branch is profiled usually-NOT-taken, so its `Proj(0)` (the
+        // branch target) is the cold edge and the call on it is cold.
+        let hints: HashMap<usize, bool> = [(10usize, false)].into_iter().collect();
+        let cold = ea_cold_control_nodes(&g, &hints);
+        assert!(cold.contains(&t_edge), "the never-taken edge is cold");
+        assert!(cold.contains(&call), "and so is everything pinned to it");
+        assert!(
+            !cold.contains(&f_edge) && !cold.contains(&merge) && !cold.contains(&ret),
+            "a merge is cold only when EVERY predecessor is"
+        );
+
+        let (mut ea, id_map) = escape_analysis_from_ir(&g);
+        ea_mark_cold_from_branch_hints(&mut ea, &g, &id_map, &hints);
+        let result = escape_analysis::analyze_escapes(&ea);
+        let pe = result
+            .partial_escapes
+            .first()
+            .expect("the object escapes only on the cold path");
+        assert_eq!(pe.alloc_node, id_map[newobj as usize]);
+        assert_eq!(
+            pe.without_refinement,
+            escape_analysis::EscapeState::ArgEscape,
+            "the unrefined state the connection graph keeps — every ACTING \
+             consumer still sees this one"
+        );
+        assert_eq!(pe.escape_sites, vec![id_map[call as usize]]);
+        assert_eq!(
+            result.escape_states.get(&id_map[newobj as usize]),
+            Some(&escape_analysis::EscapeState::PartialEscape)
+        );
+        assert!(
+            result.scalar_replaceable.is_empty(),
+            "PartialEscape is a REPORT and must not enable anything: the object \
+             is still offered to no acting consumer"
+        );
+    }
+
     // ── Op::New emission + scalar replacement, end-to-end via the builder ──
     //
     // The builder lowers `new` to `Op::New` and elides a trivial `<init>` on a
@@ -14985,6 +18585,802 @@ mod tests {
                 "CRATONVM_JIT_OSR_DEAD_LOCALS=0 must still bail before the trampoline"
             );
         }
+    }
+
+    // ── Validated OSR entry (C2 review P1, "Add on-stack replacement") ──
+    //
+    // The loop these tests model, with javac's bcis:
+    //
+    //     0: iconst_0                  // int i = 0
+    //     1: istore_1
+    //     2: goto 8
+    //     5: <body>                    // sum += a[i]; i++
+    //     8: iload_1                   // <-- LOOP HEADER = the OSR entry bci
+    //     9: … if_icmplt 5             // the back-edge targets bci 8
+    //
+    // Locals: 0 = `int[] a` (ref), 1 = `int i`, 2 = `int sum`.
+    //
+    // Every assertion below is on the *pure* validator and on the pure
+    // post-exit resume decision. Neither enters compiled code: these fixtures
+    // carry OSR metadata over a bare `RET` body, and actually entering such a
+    // stub through the trampoline access-violates (see
+    // `test_osr_enter_refuses_dead_mask_under_the_kill_switch` for the history).
+
+    /// The loop-header bci used by every fixture in this group.
+    const OSR_T_HEADER: usize = 8;
+
+    /// An artifact that publishes exactly one OSR entry, at [`OSR_T_HEADER`],
+    /// with `num_locals` memory-homed locals and no deopt metadata (the
+    /// production shape: `deopt_points` is empty unless `CRATONVM_DEOPT_REAL`
+    /// was on at compile time).
+    fn osr_t_artifact(num_locals: usize) -> CompiledMethod {
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET — metadata-only fixture, never executed.
+        let mut cm = CompiledMethod::new(buf);
+        cm.method_label = "craton/probe/OsrEntry.sum([I)I".to_string();
+        let mut table = vec![-1i32; OSR_T_HEADER + 2];
+        table[OSR_T_HEADER] = 0;
+        cm.osr_pc_to_native = Some(table);
+        cm.osr_num_locals = num_locals;
+        cm.osr_local_assignments = Some(vec![None; num_locals]);
+        cm.osr_xmm_assignments = Some(vec![None; num_locals]);
+        cm
+    }
+
+    /// An `OsrExit`-tagged deopt point at `bci` — the loop-boundary snapshot
+    /// that doubles as the *entry* contract at the same bci.
+    ///
+    /// `ResumeSemantics::for_reason(OsrExit)` is `REEXECUTE`, which is what a
+    /// loop-header snapshot means: the header iteration has not run.
+    fn osr_t_exit_point(
+        bci: u32,
+        locals: Vec<deopt::FrameValue>,
+        stack: Vec<deopt::FrameValue>,
+    ) -> deopt::DeoptimizationPoint {
+        deopt::DeoptimizationPoint {
+            native_offset: 0,
+            bci,
+            reason: deopt::DeoptReason::OsrExit,
+            action: deopt::DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: deopt::FrameState {
+                method_key: "craton/probe/OsrEntry.sum:([I)I".to_string(),
+                bci,
+                locals,
+                stack,
+                monitors: Vec::new(),
+                caller: None,
+            },
+            semantics: deopt::ResumeSemantics::for_reason(deopt::DeoptReason::OsrExit),
+        }
+    }
+
+    /// The three-slot contract every fixture here uses: `[ref, int, int]`.
+    fn osr_t_contract_locals() -> Vec<deopt::FrameValue> {
+        vec![
+            deopt::FrameValue::StackSlotRef(-16),
+            deopt::FrameValue::Register(0),
+            deopt::FrameValue::Register(1),
+        ]
+    }
+
+    /// The interpreter tags for `[int[] a, int i, int sum]`.
+    const OSR_T_TAGS: [u8; 3] = [
+        cratonvm_types::VTAG_OBJECT,
+        cratonvm_types::VTAG_INT,
+        cratonvm_types::VTAG_INT,
+    ];
+
+    /// The refusal tag carried by a bailout, or `None` if it is not an OSR
+    /// refusal at all.
+    fn osr_t_tag(b: &bailout::Bailout) -> Option<&'static str> {
+        match &b.reason {
+            bailout::BailoutReason::UnsupportedShape(tag) => Some(*tag),
+            _ => None,
+        }
+    }
+
+    /// The taxonomy is a closed set with no duplicates, and every tag routes to
+    /// the `unsupported_shape` bailout counter (never a panic, never a bare
+    /// `None`).
+    #[test]
+    fn osr_refusal_taxonomy_is_closed_and_counted() {
+        let mut seen: Vec<&str> = Vec::new();
+        for tag in OSR_REFUSAL_TAGS {
+            assert!(!seen.contains(&tag), "duplicate OSR refusal tag {tag}");
+            assert!(
+                tag.starts_with("osr-entry-") || tag.starts_with("osr-exit-"),
+                "{tag} does not name its phase"
+            );
+            seen.push(tag);
+        }
+        let before = bailout::bailout_count("unsupported_shape").expect("registered category");
+        let b = osr_refusal(OSR_REFUSE_SLOT_TYPE, "probe");
+        assert_eq!(b.category(), "unsupported_shape");
+        assert!(b.to_string().contains(OSR_REFUSE_SLOT_TYPE), "{b}");
+        assert!(
+            bailout::bailout_count("unsupported_shape").unwrap() > before,
+            "every OSR refusal must be counted"
+        );
+        // Permanence splits the taxonomy: artifact-only answers may be memoed
+        // through `mark_osr_entry_rejected`; state-dependent ones may not.
+        for tag in OSR_PERMANENT_REFUSAL_TAGS {
+            assert!(
+                OSR_REFUSAL_TAGS.contains(&tag),
+                "{tag} is permanent but not in the taxonomy"
+            );
+            assert!(osr_refusal_is_permanent(&osr_refusal(tag, "probe")));
+        }
+        assert!(!osr_refusal_is_permanent(&osr_refusal(
+            OSR_REFUSE_SLOT_TYPE,
+            "probe"
+        )));
+        assert!(!osr_refusal_is_permanent(&osr_refusal(
+            OSR_REFUSE_OPERAND_STACK,
+            "probe"
+        )));
+        // A non-OSR bailout is never an OSR memo candidate.
+        assert!(!osr_refusal_is_permanent(&bailout::Bailout::new(
+            bailout::BailoutReason::RegisterPressure
+        )));
+    }
+
+    /// A long-running loop must request an OSR compile at its back-edge — and a
+    /// short one must not. The request has to name the loop header, because the
+    /// entry bci is what the compiled artifact publishes a native offset for.
+    #[test]
+    fn a_long_running_loop_requests_osr_at_the_backedge() {
+        use tiered::{CompilationPolicy, CompilationTier, MethodKey, TieredCompilationManager};
+        // A manager of our own, and a method key no other test names, so this
+        // shares no state with the process-global OSR deny list or the
+        // per-method tables (which is why it does NOT clear them: another
+        // test's manager may be mid-run).
+        let policy = CompilationPolicy {
+            osr_threshold: 64,
+            ..CompilationPolicy::default()
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = MethodKey::new("craton/probe/OsrEntry", "sum", "([I)I");
+        let bci = OSR_T_HEADER as u32;
+
+        for i in 0..63 {
+            assert!(
+                mgr.on_backedge(&key, bci).is_none(),
+                "back-edge {i} is below the OSR threshold and must not tier up"
+            );
+        }
+        let task = mgr
+            .on_backedge(&key, bci)
+            .expect("the 64th back-edge crosses osr_threshold and must request an OSR compile");
+        assert_eq!(
+            task.osr_bci,
+            Some(bci),
+            "the request must name the loop header, not the method entry"
+        );
+        assert_eq!(task.target_tier, CompilationTier::C2);
+        assert_eq!(task.method_key, key);
+        // The loop keeps running while the compile is queued; it must not
+        // enqueue a task per iteration.
+        assert!(
+            mgr.on_backedge(&key, bci).is_none(),
+            "an already-queued OSR request must not be re-enqueued"
+        );
+    }
+
+    /// The happy path, on the production artifact shape (no deopt metadata):
+    /// the plan's resume bci IS the entry bci, which is the interpreter's own
+    /// pc — so a refusal repeats no work.
+    #[test]
+    fn a_validated_osr_entry_resumes_at_the_interpreters_own_pc() {
+        let cm = osr_t_artifact(3);
+        let locals = [0x1234_5678i64, 200, 4950];
+        let state = OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS);
+
+        let plan = cm.validate_osr_entry(&state).expect("clean entry");
+        assert_eq!(plan.entry_pc, OSR_T_HEADER);
+        assert_eq!(
+            plan.resume_bci, state.pc,
+            "the fallback resume point must be the pc the interpreter is already at"
+        );
+        assert_eq!(plan.native_offset, 0);
+        assert_eq!(plan.contract, OsrContractSource::RegisterHomes);
+        assert_eq!(
+            plan.exit_policy,
+            OsrExitPolicy::PropagateOnly,
+            "an artifact with no deopt points has no frame-deopt exit to transfer through"
+        );
+        assert_eq!(plan.expected_locals.len(), 3);
+        assert!(plan
+            .expected_locals
+            .iter()
+            .all(|e| *e == OsrSlotExpectation::Unconstrained));
+
+        // A pc the artifact published no entry for is refused, not guessed at.
+        let at_body = OsrEntryState::at(5, &locals, &OSR_T_TAGS);
+        assert_eq!(
+            osr_t_tag(&cm.validate_osr_entry(&at_body).unwrap_err()),
+            Some(OSR_REFUSE_PC_NOT_AN_ENTRY)
+        );
+    }
+
+    /// A type mismatch in an incoming slot refuses with a named reason, under
+    /// both contract strengths.
+    ///
+    /// Inferred (register-home) contract: an XMM-homed local can only hold FP,
+    /// so an incoming `int` there would be seeded into an XMM register and read
+    /// back as a double — a silent miscompile, which is what this check exists
+    /// to turn into a refusal.
+    ///
+    /// Precise (`FrameState`) contract: the exact JVM type is known, so an
+    /// `int` offered where the compiled body reads a reference is caught even
+    /// though both are GPR-homed 64-bit words.
+    #[test]
+    fn an_incoming_slot_type_mismatch_refuses_with_a_named_reason() {
+        // --- inferred contract ---
+        let mut cm = osr_t_artifact(3);
+        // Local 2 is XMM-homed: the compiled body treats it as a double.
+        cm.osr_xmm_assignments = Some(vec![None, None, Some(3)]);
+        let locals = [0x1234_5678i64, 200, 4950];
+
+        let ok_tags = [
+            cratonvm_types::VTAG_OBJECT,
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_DOUBLE,
+        ];
+        assert!(cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &ok_tags))
+            .is_ok());
+
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("an int offered to an xmm-homed slot must be refused");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_SLOT_TYPE));
+        let msg = err.to_string();
+        assert!(msg.contains("local 2"), "{msg}");
+        assert!(msg.contains("xmm-homed"), "{msg}");
+        assert!(msg.contains("int"), "{msg}");
+
+        // --- precise contract ---
+        let mut cm = osr_t_artifact(3);
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            vec![
+                deopt::FrameValue::StackSlotRef(-16),
+                deopt::FrameValue::Register(0),
+                deopt::FrameValue::Register(1),
+            ],
+            Vec::new(),
+        )];
+        assert!(cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .is_ok());
+
+        let ref_as_int = [
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_INT,
+        ];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &ref_as_int))
+            .expect_err("an int offered where the body reads a reference must be refused");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_SLOT_TYPE));
+        assert!(err.to_string().contains("local 0"), "{err}");
+
+        // A `jsr` return address has no JIT representation at all.
+        let retaddr = [
+            cratonvm_types::VTAG_RETADDR,
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_INT,
+        ];
+        assert_eq!(
+            osr_t_tag(
+                &cm.validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &retaddr))
+                    .unwrap_err()
+            ),
+            Some(OSR_REFUSE_RETURNADDRESS)
+        );
+    }
+
+    /// An OSR entry whose contract contains a slot the compiled frame cannot
+    /// describe refuses — it never guesses a value.
+    ///
+    /// `MaterializationRequired` is the case that matters: it means an
+    /// optimization deleted a value that WAS live and left no rebuild recipe.
+    /// Reconstructing it as `Undefined`/zero would be a silent
+    /// wrong-reconstruction, which is precisely why that variant exists as a
+    /// separate marker from `Undefined`.
+    #[test]
+    fn an_undescribable_slot_refuses_the_osr_entry() {
+        let locals = [0x1234_5678i64, 200, 4950];
+
+        for (slot_value, what) in [
+            (
+                deopt::FrameValue::MaterializationRequired(deopt::EliminatedValue::allocation(
+                    17,
+                    42,
+                    deopt::EliminationCause::ScalarReplacedObject,
+                )),
+                "MaterializationRequired",
+            ),
+            (deopt::FrameValue::Unsupported, "Unsupported"),
+            (
+                deopt::FrameValue::VirtualObjectRef(0),
+                "VirtualObjectRef (needs a heap allocation to rebuild)",
+            ),
+        ] {
+            let mut cm = osr_t_artifact(3);
+            cm.deopt_points = vec![osr_t_exit_point(
+                OSR_T_HEADER as u32,
+                vec![
+                    slot_value,
+                    deopt::FrameValue::Register(0),
+                    deopt::FrameValue::Register(1),
+                ],
+                Vec::new(),
+            )];
+            let result = cm.validate_osr_entry(&OsrEntryState::at(
+                OSR_T_HEADER,
+                &locals,
+                &OSR_T_TAGS,
+            ));
+            let err = match result {
+                Ok(plan) => panic!("{what} must refuse the entry, got {plan:?}"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                osr_t_tag(&err),
+                Some(OSR_REFUSE_UNDESCRIBABLE_SLOT),
+                "{what} refused with the wrong reason: {err}"
+            );
+        }
+    }
+
+    /// The refusal names the offending slot, is permanent (so the caller may
+    /// memo it), and is distinct from the whole-artifact "some other exit is
+    /// unresumable" answer.
+    #[test]
+    fn an_undescribable_slot_names_the_slot_it_refused() {
+        let locals = [0x1234_5678i64, 200, 4950];
+        let mut cm = osr_t_artifact(3);
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            vec![
+                deopt::FrameValue::MaterializationRequired(deopt::EliminatedValue::allocation(
+                    17,
+                    42,
+                    deopt::EliminationCause::ScalarReplacedObject,
+                )),
+                deopt::FrameValue::Register(0),
+                deopt::FrameValue::Register(1),
+            ],
+            Vec::new(),
+        )];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("a MaterializationRequired slot in the entry contract must refuse");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_UNDESCRIBABLE_SLOT));
+        assert!(err.to_string().contains("local 0"), "{err}");
+        assert!(osr_refusal_is_permanent(&err));
+
+        // An unresumable slot at some OTHER deopt point is a different, still
+        // pre-entry, refusal: entering would commit iterations that the bail
+        // could then only discard.
+        let mut cm = osr_t_artifact(3);
+        cm.deopt_points = vec![
+            osr_t_exit_point(
+                OSR_T_HEADER as u32,
+                vec![
+                    deopt::FrameValue::StackSlotRef(-16),
+                    deopt::FrameValue::Register(0),
+                    deopt::FrameValue::Register(1),
+                ],
+                Vec::new(),
+            ),
+            osr_t_exit_point(5, vec![deopt::FrameValue::Unsupported], Vec::new()),
+        ];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("an unresumable exit anywhere in the body must refuse the entry");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_UNRESUMABLE_EXIT));
+    }
+
+    /// The trampoline seeds locals only, so a live operand stack is refused
+    /// rather than silently dropped — and an inlined scope, which
+    /// `FrameState::caller` still cannot describe, is refused too.
+    #[test]
+    fn unrepresentable_entry_shapes_are_refused() {
+        let cm = osr_t_artifact(3);
+        let locals = [0x1234_5678i64, 200, 4950];
+        let stack = [7i64];
+        let stack_tags = [cratonvm_types::VTAG_INT];
+        let with_stack = OsrEntryState {
+            pc: OSR_T_HEADER,
+            locals: &locals,
+            local_tags: &OSR_T_TAGS,
+            stack: &stack,
+            stack_tags: &stack_tags,
+        };
+        assert_eq!(
+            osr_t_tag(&cm.validate_osr_entry(&with_stack).unwrap_err()),
+            Some(OSR_REFUSE_OPERAND_STACK)
+        );
+
+        // Local count must match the compiled frame exactly.
+        let short = [0x1234_5678i64, 200];
+        assert_eq!(
+            osr_t_tag(
+                &cm.validate_osr_entry(&OsrEntryState::at(
+                    OSR_T_HEADER,
+                    &short,
+                    &OSR_T_TAGS[..2]
+                ))
+                .unwrap_err()
+            ),
+            Some(OSR_REFUSE_LOCAL_COUNT)
+        );
+
+        // Inlined scope: `FrameState::caller` is `None` at every producer, so an
+        // artifact that inlined something and can also take a frame-deopt exit
+        // cannot tell an outer-scope bail from one inside the callee.
+        let mut inlined = osr_t_artifact(3);
+        inlined.inlined_methods = vec![(
+            "craton/probe/OsrEntry".to_string(),
+            "helper".to_string(),
+            "(I)I".to_string(),
+        )];
+        inlined.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            vec![
+                deopt::FrameValue::StackSlotRef(-16),
+                deopt::FrameValue::Register(0),
+                deopt::FrameValue::Register(1),
+            ],
+            Vec::new(),
+        )];
+        let err = inlined
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("an inlined region the deopt metadata cannot describe must refuse");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_INLINED_SCOPE));
+        assert!(osr_refusal_is_permanent(&err));
+
+        // An artifact with an unconditional uncommon trap is never worth
+        // entering: it bails on every execution reaching that site.
+        let mut trapping = osr_t_artifact(3);
+        trapping.has_indy_trap = true;
+        assert_eq!(
+            osr_t_tag(
+                &trapping
+                    .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+                    .unwrap_err()
+            ),
+            Some(OSR_REFUSE_UNCONDITIONAL_TRAP)
+        );
+    }
+
+    /// Entry, then a forced deopt at the loop boundary: the resume lands on the
+    /// SAME bci the entry used, carrying the same local layout — with the
+    /// JIT-advanced values, not the pre-entry ones.
+    #[test]
+    fn a_forced_deopt_returns_to_the_same_bci_with_the_same_locals() {
+        let mut cm = osr_t_artifact(3);
+        let contract_locals = vec![
+            deopt::FrameValue::StackSlotRef(-16),
+            deopt::FrameValue::Register(0),
+            deopt::FrameValue::Register(1),
+        ];
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            contract_locals.clone(),
+            Vec::new(),
+        )];
+
+        let array = 0x1234_5678i64;
+        let entry_locals = [array, 200, 4950];
+        let plan = cm
+            .validate_osr_entry(&OsrEntryState::at(
+                OSR_T_HEADER,
+                &entry_locals,
+                &OSR_T_TAGS,
+            ))
+            .expect("clean entry");
+        assert_eq!(plan.contract, OsrContractSource::PreciseFrameState);
+        assert_eq!(
+            plan.exit_policy,
+            OsrExitPolicy::ExactTransfer,
+            "every exit of this artifact reconstructs a resumable frame"
+        );
+
+        // The forced deopt: the OSR'd body ran to the loop boundary again with
+        // i = 700, sum = 244_650, and reconstructed its frame there.
+        let rframe = deopt::ReconstructedFrame {
+            method_key: "craton/probe/OsrEntry.sum:([I)I".to_string(),
+            bci: OSR_T_HEADER as u32,
+            locals: vec![
+                deopt::FrameValue::Object(array as u64),
+                deopt::FrameValue::Int(700),
+                deopt::FrameValue::Int(244_650),
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        };
+        let resume = plan
+            .resume_after_exit(&cm, &rframe)
+            .expect("a loop-boundary exit must resume exactly");
+        assert_eq!(
+            resume, OSR_T_HEADER,
+            "the resume bci is the loop header the entry used"
+        );
+        assert_eq!(resume, plan.entry_pc);
+
+        // Same slot layout, same per-slot types as the entry contract…
+        assert_eq!(rframe.locals.len(), plan.expected_locals.len());
+        for (i, want) in contract_locals.iter().enumerate() {
+            assert_eq!(
+                OsrSlotType::from_frame_value(&rframe.locals[i]),
+                OsrSlotType::from_frame_value(want),
+                "local {i} changed JVM type across the OSR transition"
+            );
+        }
+        // …but the induction variable carries the JIT's advanced value.
+        assert_eq!(rframe.locals[1], deopt::FrameValue::Int(700));
+        assert_ne!(rframe.locals[1], deopt::FrameValue::Int(entry_locals[1] as i64));
+    }
+
+    /// No iteration executes twice across the transition.
+    ///
+    /// The recorded defect ("an OSR bail re-runs loop iterations") is: compiled
+    /// code commits N iterations, then bails, and the interpreter resumes at the
+    /// *entry* bci from its own stale locals — replaying all N. This test
+    /// executes the whole trip through the API and asserts every iteration index
+    /// is executed exactly once, in order.
+    ///
+    /// The structural guarantee behind it: `resume_bci` (== the entry bci) is
+    /// only reachable when `validate_osr_entry` FAILED, i.e. before compiled
+    /// code ran; after entry the only sanctioned resume point is
+    /// `resume_after_exit`, which returns the reconstructed frame's own bci or
+    /// refuses.
+    #[test]
+    fn no_iteration_executes_twice_across_the_osr_transition() {
+        const TRIP: usize = 1000;
+        let mut executed: Vec<usize> = Vec::with_capacity(TRIP);
+
+        let mut cm = osr_t_artifact(3);
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            vec![
+                deopt::FrameValue::StackSlotRef(-16),
+                deopt::FrameValue::Register(0),
+                deopt::FrameValue::Register(1),
+            ],
+            Vec::new(),
+        )];
+
+        // Phase 1 — interpreted warm-up. `i` is the interpreter's local 1.
+        let mut i = 0usize;
+        while i < 200 {
+            executed.push(i);
+            i += 1;
+        }
+
+        // A refused entry must leave the interpreter exactly where it was: it
+        // resumes at `resume_bci` == its own pc, having executed nothing. Model
+        // that with a deliberately mistyped slot.
+        let bad_tags = [
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_INT,
+        ];
+        let locals = [0x1234_5678i64, i as i64, 0];
+        let refused = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &bad_tags))
+            .unwrap_err();
+        assert_eq!(osr_t_tag(&refused), Some(OSR_REFUSE_SLOT_TYPE));
+        assert_eq!(executed.len(), 200, "a refusal must execute nothing");
+
+        // Phase 2 — the entry actually validates.
+        let plan = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("clean entry");
+        assert_eq!(plan.resume_bci, OSR_T_HEADER);
+
+        // Phase 3 — compiled code runs iterations [200, 700) and is then forced
+        // to deopt at the loop boundary.
+        let jit_start = i;
+        while i < 700 {
+            executed.push(i);
+            i += 1;
+        }
+        assert!(i > jit_start, "the JIT must have committed real iterations");
+        let rframe = deopt::ReconstructedFrame {
+            method_key: "craton/probe/OsrEntry.sum:([I)I".to_string(),
+            bci: OSR_T_HEADER as u32,
+            locals: vec![
+                deopt::FrameValue::Object(0x1234_5678),
+                deopt::FrameValue::Int(i as i64),
+                deopt::FrameValue::Int(0),
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        };
+
+        // Phase 4 — the resume. The interpreter's induction variable comes from
+        // the RECONSTRUCTED frame, never from its own pre-entry copy.
+        let resume_bci = plan
+            .resume_after_exit(&cm, &rframe)
+            .expect("a loop-boundary exit must resume exactly");
+        assert_eq!(resume_bci, OSR_T_HEADER);
+        let resumed_i = match rframe.locals[1] {
+            deopt::FrameValue::Int(v) => v as usize,
+            ref other => panic!("induction variable came back as {other:?}"),
+        };
+        assert_eq!(
+            resumed_i, i,
+            "the resumed frame must carry the JIT's advanced counter, not the pre-entry one"
+        );
+        i = resumed_i;
+        while i < TRIP {
+            executed.push(i);
+            i += 1;
+        }
+
+        assert_eq!(
+            executed,
+            (0..TRIP).collect::<Vec<_>>(),
+            "every iteration must execute exactly once, in order"
+        );
+    }
+
+    /// A bail the artifact cannot describe must NOT hand back a resume point.
+    ///
+    /// This is the other half of the no-replay guarantee: when the frame is
+    /// unresumable the API refuses, so the caller has no sanctioned way to fall
+    /// back to the entry bci (which would replay every committed iteration).
+    #[test]
+    fn an_undescribable_exit_refuses_to_name_a_resume_point() {
+        let mut cm = osr_t_artifact(3);
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            vec![
+                deopt::FrameValue::StackSlotRef(-16),
+                deopt::FrameValue::Register(0),
+                deopt::FrameValue::Register(1),
+            ],
+            Vec::new(),
+        )];
+        let locals = [0x1234_5678i64, 200, 4950];
+        let plan = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("clean entry");
+
+        let base = deopt::ReconstructedFrame {
+            method_key: "craton/probe/OsrEntry.sum:([I)I".to_string(),
+            bci: OSR_T_HEADER as u32,
+            locals: vec![
+                deopt::FrameValue::Object(0x1234_5678),
+                deopt::FrameValue::Int(700),
+                deopt::FrameValue::Int(0),
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        };
+
+        // A deleted value in a local: the live frame's stale word is genuinely
+        // wrong, not merely unread, so it cannot be left in place.
+        let mut materialize = base.clone();
+        materialize.locals[1] = deopt::FrameValue::MaterializationRequired(
+            deopt::EliminatedValue::unknown(deopt::EliminationCause::EliminatedStore),
+        );
+        let err = plan.resume_after_exit(&cm, &materialize).unwrap_err();
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
+        assert!(err.to_string().contains("local 1"), "{err}");
+
+        // `Unsupported` in a LOCAL is the documented exception: the whole-method
+        // kind classifier is coarse, the verifier guarantees such a slot is dead
+        // or re-stored before it is read, so the live frame's current value
+        // stands and the resume goes ahead.
+        let mut unsupported_local = base.clone();
+        unsupported_local.locals[2] = deopt::FrameValue::Unsupported;
+        assert_eq!(
+            plan.resume_after_exit(&cm, &unsupported_local).unwrap(),
+            OSR_T_HEADER
+        );
+
+        // `Unsupported` on the operand STACK has no such argument.
+        let mut unsupported_stack = base.clone();
+        unsupported_stack.stack = vec![deopt::FrameValue::Unsupported];
+        assert_eq!(
+            osr_t_tag(&plan.resume_after_exit(&cm, &unsupported_stack).unwrap_err()),
+            Some(OSR_REFUSE_EXIT_REPLAY)
+        );
+
+        // An inlined caller chain: describable or not, the VM's in-place
+        // OSR-exit transfer is single-frame, so it cannot be resumed here.
+        let mut inlined = base.clone();
+        inlined.caller_frames = vec![base.clone()];
+        assert_eq!(
+            osr_t_tag(&plan.resume_after_exit(&cm, &inlined).unwrap_err()),
+            Some(OSR_REFUSE_INLINED_SCOPE)
+        );
+
+        // A bci this artifact never recorded a deopt point for is a mis-routed
+        // stash, not a resume point.
+        let mut stray = base.clone();
+        stray.bci = 5;
+        assert_eq!(
+            osr_t_tag(&plan.resume_after_exit(&cm, &stray).unwrap_err()),
+            Some(OSR_REFUSE_EXIT_REPLAY)
+        );
+    }
+
+    /// `ResumeSemantics` decides whether a snapshot bci is a place the
+    /// interpreter may be *parked*, and only `REEXECUTE` is.
+    ///
+    /// A `RESUME` point means the bytecode at `bci` already took effect, so
+    /// parking there re-executes it — the same double-execution defect as
+    /// replaying a loop iteration, one bytecode at a time. Its successor bci
+    /// needs the method's bytecode, which this crate does not have, so such a
+    /// point disqualifies the OSR entry up front and is refused again on the
+    /// way out.
+    #[test]
+    fn only_reexecute_semantics_yield_an_exact_resume_point() {
+        // Sanity: the convention this rests on.
+        assert_eq!(
+            deopt::ResumeSemantics::for_reason(deopt::DeoptReason::OsrExit),
+            deopt::ResumeSemantics::REEXECUTE
+        );
+
+        let locals = [0x1234_5678i64, 200, 4950];
+
+        // A `RESUME`-semantics point anywhere in the artifact refuses the ENTRY
+        // — before any iteration is committed.
+        let mut cm = osr_t_artifact(3);
+        let mut resume_point = osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            osr_t_contract_locals(),
+            Vec::new(),
+        );
+        resume_point.semantics = deopt::ResumeSemantics::RESUME;
+        cm.deopt_points = vec![resume_point];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("a RESUME-semantics exit must refuse the entry");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_UNRESUMABLE_EXIT));
+        assert!(err.to_string().contains("RESUME"), "{err}");
+
+        // A `RETHROW` point may EXIST — it is stashed separately and never
+        // routed to a resume — so it must not disqualify the entry…
+        let mut cm = osr_t_artifact(3);
+        let mut rethrow = osr_t_exit_point(5, osr_t_contract_locals(), Vec::new());
+        rethrow.reason = deopt::DeoptReason::PendingException;
+        rethrow.semantics = deopt::ResumeSemantics::RETHROW;
+        cm.deopt_points = vec![
+            osr_t_exit_point(OSR_T_HEADER as u32, osr_t_contract_locals(), Vec::new()),
+            rethrow,
+        ];
+        let plan = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("a RETHROW point elsewhere in the body must not refuse the entry");
+
+        // …but a frame that arrives naming it is refused: its bci is a throwing
+        // instruction, not a resume point.
+        let rframe = deopt::ReconstructedFrame {
+            method_key: "craton/probe/OsrEntry.sum:([I)I".to_string(),
+            bci: 5,
+            locals: vec![
+                deopt::FrameValue::Object(0x1234_5678),
+                deopt::FrameValue::Int(700),
+                deopt::FrameValue::Int(0),
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        };
+        let err = plan.resume_after_exit(&cm, &rframe).unwrap_err();
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
+        assert!(err.to_string().contains("REEXECUTE"), "{err}");
     }
 
     /// A crash handler must be able to tell "no compiled body covers this
@@ -18034,13 +22430,353 @@ mod layout_constant_inventory {
     }
 }
 
+/// Lifetime and ownership of compiled code and its side tables.
+///
+/// See `docs/jit/code-cache-lifetime.md`. Every test here is written to be
+/// robust against the other tests in this binary running concurrently: nothing
+/// asserts an absolute value of a process-global counter, and the install
+/// barrier these tests exercise is deliberately per-`JitCache` so that flushing
+/// one cache cannot refuse another's publication.
+#[cfg(test)]
+mod code_cache_lifetime_tests {
+    use super::*;
 
+    fn ret_body() -> CompiledMethod {
+        let mut buf = ExecutableBuffer::new(64).expect("alloc executable");
+        buf.emit(&[0xC3]); // RET
+        CompiledMethod::new(buf)
+    }
 
+    fn key() -> (Arc<str>, Arc<str>, Arc<str>, cratonvm_types::ClassId) {
+        (
+            Arc::from("cclt/Subject"),
+            Arc::from("m"),
+            Arc::from("()V"),
+            cratonvm_types::ClassId::new(1),
+        )
+    }
 
+    /// Read the name registry past a transient `Locked`.
+    ///
+    /// `lookup_jit_method_name*` is a `try_lock` accessor so it is safe from a
+    /// crash handler, which means "the registry was busy" and "no name covers
+    /// this address" are different answers that must not be conflated — the
+    /// distinction `JitNameLookup` exists for. Same convention as
+    /// `live_code_region_covers_a_buffer_the_name_registry_never_saw`.
+    fn name_of(addr: usize) -> Option<String> {
+        for _ in 0..200 {
+            match lookup_jit_method_name_detailed(addr) {
+                JitNameLookup::Found(n) => return Some(n),
+                JitNameLookup::NotFound => return None,
+                JitNameLookup::Locked => std::thread::yield_now(),
+            }
+        }
+        panic!("the name registry stayed locked for 200 attempts");
+    }
 
+    /// THE redefinition hole, from the install side.
+    ///
+    /// `redefineClass` bumps the epoch and flushes the cache, but the
+    /// compilation broker stamps nothing on a queued or in-flight request, so a
+    /// compile that already read the OLD bytecode completes afterwards. Before
+    /// the install barrier, `put` published it unconditionally and the VM then
+    /// executed the bytecode the agent had replaced.
+    #[test]
+    fn a_compilation_that_predates_a_cache_flush_is_not_installed() {
+        let cache = JitCache::new();
+        let (class, method, desc, cid) = key();
 
+        // A compilation opens, reads bytecode, and produces an artifact...
+        let witness = open_compile_epoch_witness();
+        let stale = ret_body();
 
+        // ...and a redefinition flushes the cache while it is still in flight.
+        cache.clear_all();
+        drop(witness);
 
+        cache.put(class.clone(), method.clone(), desc.clone(), cid, stale);
+        assert!(
+            cache.get(&class, &method, &desc, cid).is_none(),
+            "a body compiled against bytecode the flush retired must not be published"
+        );
+    }
 
+    /// The gate must refuse only what it is meant to: a compilation that STARTS
+    /// after the flush publishes normally. Without this the previous test would
+    /// also pass on a `put` that never publishes anything.
+    #[test]
+    fn a_compilation_that_starts_after_a_flush_installs_normally() {
+        let cache = JitCache::new();
+        let (class, method, desc, cid) = key();
 
+        cache.clear_all();
+        let witness = open_compile_epoch_witness();
+        let fresh = ret_body();
+        drop(witness);
 
+        cache.put(class.clone(), method.clone(), desc.clone(), cid, fresh);
+        assert!(
+            cache.get(&class, &method, &desc, cid).is_some(),
+            "a body compiled after the flush is current and must publish"
+        );
+    }
+
+    /// The stamp has to be the epoch at compile START, not at buffer finalize —
+    /// the whole window the broker cannot see is the one *before* codegen ends.
+    ///
+    /// Race-free by construction: both artifacts are compared against each
+    /// other rather than against a separately-read global, so a concurrent bump
+    /// from another test cannot change the outcome.
+    #[test]
+    fn the_compile_witness_stamps_the_start_epoch_not_the_finalize_epoch() {
+        let witness = open_compile_epoch_witness();
+        let at_start = ret_body().install_epoch;
+        bump_jit_install_epoch();
+        bump_jit_install_epoch();
+        let at_finalize = ret_body().install_epoch;
+        drop(witness);
+
+        assert_eq!(
+            at_start, at_finalize,
+            "an artifact finalized after a mid-compile epoch bump must still \
+             carry the epoch its compilation began at"
+        );
+
+        // And with no witness open, the live epoch is used — otherwise a
+        // backend entered directly would inherit a stale thread-local.
+        let unscoped = ret_body().install_epoch;
+        assert!(
+            unscoped > at_start,
+            "outside a compilation scope the stamp must track the live epoch \
+             (got {unscoped}, compile-scope stamp was {at_start})"
+        );
+    }
+
+    /// `callee_compiler` re-enters `try_compile` on the same thread. The nested
+    /// compile must keep the OUTER (older) epoch: it is only useful if the outer
+    /// artifact is, and an older stamp can only refuse more.
+    #[test]
+    fn a_nested_compile_keeps_the_outer_epoch() {
+        let outer = open_compile_epoch_witness();
+        let outer_stamp = ret_body().install_epoch;
+        {
+            let inner = open_compile_epoch_witness();
+            bump_jit_install_epoch();
+            assert_eq!(
+                ret_body().install_epoch,
+                outer_stamp,
+                "a nested compile must not adopt a newer epoch than its caller"
+            );
+            drop(inner);
+        }
+        assert_eq!(
+            ret_body().install_epoch,
+            outer_stamp,
+            "closing the nested scope must restore the outer compilation's epoch"
+        );
+        drop(outer);
+    }
+
+    /// The barrier is per-cache on purpose. A global watermark would make one
+    /// VM's redefinition refuse another VM's unrelated publication — and, in
+    /// this test binary, would make every `clear_all` test a random failure
+    /// generator for every concurrent `put` test.
+    #[test]
+    fn flushing_one_cache_does_not_refuse_another_caches_publication() {
+        let flushed = JitCache::new();
+        let untouched = JitCache::new();
+        let (class, method, desc, cid) = key();
+
+        let witness = open_compile_epoch_witness();
+        let body = ret_body();
+        flushed.clear_all();
+        drop(witness);
+
+        untouched.put(class.clone(), method.clone(), desc.clone(), cid, body);
+        assert!(
+            untouched.get(&class, &method, &desc, cid).is_some(),
+            "a cache that was never flushed must not inherit another cache's barrier"
+        );
+    }
+
+    /// `JitPICSlot::seed_from_mic` used to read the MIC's entry pointer BEFORE
+    /// its owner. `JitMICSlot::clear_compiled_entry` zeroes the entry and only
+    /// then takes the owner, so the old order could copy a live raw address into
+    /// the PIC together with an owner that had already been released — a
+    /// callable pointer with no keep-alive, which the emitted 4-way cascade
+    /// `CALL`s. This is that state, written directly.
+    #[test]
+    fn seeding_a_pic_refuses_a_mic_entry_that_lost_its_owner() {
+        use std::sync::atomic::Ordering;
+
+        // A live JIT code region: an unowned address inside one is a compiled
+        // body we failed to retain, never a native trampoline.
+        let buf = ExecutableBuffer::new(64).expect("alloc executable");
+        let orphan = buf.as_ptr() as u64;
+
+        let mic = JitMICSlot::new();
+        mic.cached_entry_ptr.store(orphan, Ordering::Release);
+        mic.cached_needs_context.store(true, Ordering::Relaxed);
+        mic.cached_class_id.store(7, Ordering::Release);
+        // `compiled_owner` deliberately left empty — the residue of the race.
+
+        let pic = JitPICSlot::new();
+        pic.seed_from_mic(&mic);
+
+        assert_eq!(
+            pic.class_ids[0].load(Ordering::Acquire),
+            7,
+            "the class guard is still worth carrying forward"
+        );
+        assert_eq!(
+            pic.entry_ptrs[0].load(Ordering::Acquire),
+            0,
+            "an entry with no live owner must be downgraded to unresolved, not \
+             copied into a slot generated code calls without validation"
+        );
+        assert!(
+            !pic.needs_context[0].load(Ordering::Relaxed),
+            "the ABI flag must be cleared alongside the refused entry"
+        );
+        drop(buf);
+    }
+
+    /// An admissible MIC entry still seeds through — the refusal above must not
+    /// be "seed_from_mic no longer copies anything".
+    #[test]
+    fn seeding_a_pic_carries_a_well_formed_mic_entry_forward() {
+        use std::sync::atomic::Ordering;
+
+        let mic = JitMICSlot::new();
+        // A synthetic non-JIT sentinel: unowned but outside every code region,
+        // which is the shape `jit_entry_publishable` admits (native/builtin
+        // targets, which nothing unmaps). Same value the sibling PIC tests in
+        // `mod tests` use, so it is empirically clear of every real mapping this
+        // suite makes.
+        let sentinel = 0x7000u64;
+        mic.cached_entry_ptr.store(sentinel, Ordering::Release);
+        mic.cached_class_id.store(9, Ordering::Release);
+
+        let pic = JitPICSlot::new();
+        pic.seed_from_mic(&mic);
+
+        assert_eq!(pic.class_ids[0].load(Ordering::Acquire), 9);
+        assert_eq!(pic.entry_ptrs[0].load(Ordering::Acquire), sentinel);
+    }
+
+    /// A retired body must stop naming its address. The OS is free to hand that
+    /// page to the next `alloc_executable`, and a crash report that names the
+    /// dead method is worse than one that names none — it is believed.
+    #[test]
+    fn a_retired_body_withdraws_its_crash_report_name() {
+        let cm = ret_body();
+        let entry = cm.entry_ptr() as usize;
+        let len = cm.code_len().max(1);
+        let name = "cclt/Retired.body()V".to_string();
+        register_jit_method_name(entry, len, name.clone());
+        assert_eq!(
+            name_of(entry).as_deref(),
+            Some(name.as_str()),
+            "the name must resolve while the body is live"
+        );
+
+        drop(cm);
+        // `!= our name` rather than `is_none`: the allocator may already have
+        // handed this page to a concurrently-running test, which would then
+        // legitimately own the address. What must never happen is the DEAD
+        // body still answering for it.
+        assert_ne!(
+            name_of(entry).as_deref(),
+            Some(name.as_str()),
+            "a dropped body must not keep symbolizing an address the allocator \
+             can hand to a different body"
+        );
+    }
+
+    /// Belt to the withdrawal's braces: if a registration is ever missed, the
+    /// newest range for an address must still win, so a recycled address
+    /// symbolizes as what is mapped there NOW.
+    #[test]
+    fn the_newest_registration_for_an_address_wins() {
+        let buf = ExecutableBuffer::new(64).expect("alloc executable");
+        let entry = buf.as_ptr() as usize;
+        register_jit_method_name(entry, 16, "cclt/First.old()V".to_string());
+        register_jit_method_name(entry, 16, "cclt/Second.new()V".to_string());
+        assert_eq!(
+            name_of(entry).as_deref(),
+            Some("cclt/Second.new()V"),
+            "the most recent publication for an address must be the one reported"
+        );
+        unregister_jit_method_name(entry);
+        assert_ne!(
+            name_of(entry).as_deref(),
+            Some("cclt/Second.new()V"),
+            "withdrawal must remove EVERY range starting at the entry, not just one"
+        );
+        assert_ne!(
+            name_of(entry).as_deref(),
+            Some("cclt/First.old()V"),
+            "and it must remove the older range for the same entry too"
+        );
+        drop(buf);
+    }
+
+    /// `lookup_jit_code_range` hands out a bare `Arc<CompiledMethod>` inner
+    /// address with no keep-alive; the pinning form must hand out a reference
+    /// that makes the metadata (and the code buffer) valid for as long as it is
+    /// held, even after the cache has released the body.
+    #[test]
+    fn pinning_a_code_range_owner_retains_the_artifact() {
+        let cache = JitCache::new();
+        let (class, method, desc, cid) = key();
+        cache.put(class.clone(), method.clone(), desc.clone(), cid, ret_body());
+        let published = cache.get(&class, &method, &desc, cid).expect("published");
+        let entry = published.entry_ptr() as usize;
+        register_jit_code_range(
+            entry,
+            published.code_len().max(1),
+            Arc::as_ptr(&published) as usize,
+        );
+
+        let pinned = pin_jit_code_range_owner(entry).expect("a live body must pin");
+        assert_eq!(pinned.entry_ptr() as usize, entry);
+        // A pin is a real strong reference: it survives every other holder
+        // releasing, which is exactly what the bare-address form cannot promise.
+        drop(published);
+        cache.clear_all();
+        assert_eq!(
+            pinned.entry_ptr() as usize,
+            entry,
+            "the pinned artifact must stay valid after the cache released it"
+        );
+        assert_eq!(
+            pinned.code_bytes().first().copied(),
+            Some(0xC3),
+            "and its code buffer must still be mapped and readable"
+        );
+        drop(pinned);
+        unregister_jit_code_range(entry);
+    }
+
+    /// A registered range whose body was never published — so nothing in
+    /// `jit_entry_owners` can retain it — must pin as `None`. `None` is the safe
+    /// answer; a raw address would not be.
+    #[test]
+    fn pinning_an_unowned_code_range_yields_none() {
+        let cm = ret_body();
+        let entry = cm.entry_ptr() as usize;
+        register_jit_code_range(entry, cm.code_len().max(1), &cm as *const _ as usize);
+        assert!(
+            pin_jit_code_range_owner(entry).is_none(),
+            "a body with no retainable owner must not be handed out as pinned"
+        );
+        drop(cm);
+    }
+
+    /// An address no body covers pins nothing.
+    #[test]
+    fn pinning_an_unmapped_address_yields_none() {
+        assert!(pin_jit_code_range_owner(0).is_none());
+        assert!(pin_jit_code_range_owner(0x10).is_none());
+    }
+}

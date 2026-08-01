@@ -407,14 +407,52 @@ pub struct CompilationTask {
     pub osr_bci: Option<u32>,
 }
 
+/// A queued [`CompilationTask`] plus the install epoch it was queued at.
+///
+/// The stamp lives on the queue entry, not on the task, on purpose:
+/// [`CompilationTask`] is constructed by the VM (`vm/src/jit/helpers.rs`) as
+/// well as by this module, and an epoch a caller has to remember to fill in is
+/// an epoch that will eventually be filled in wrong — or, worse, filled in
+/// with a *later* epoch than the request really carries, which reads as fresh.
+/// [`CompilationQueue::enqueue`] stamps every request that enters the queue by
+/// any door, so "everything queued carries the epoch it was queued at" holds
+/// by construction rather than by convention.
+///
+/// See `docs/jit/broker-install-epoch.md` for which epoch this is and what it
+/// answers — it is deliberately NOT [`CompilationBroker`]'s per-class epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedRequest {
+    /// [`crate::jit_install_epoch`] as of the moment this request entered the
+    /// queue.
+    install_epoch: u64,
+    task: CompilationTask,
+}
+
+/// A queued request that will not be compiled, and why.
+///
+/// Carried *out* of the queue rather than acted on in place so the drop can be
+/// counted and the method's in-flight slot released after the queue lock has
+/// been dropped — see [`CompilerCore::retire_stale`] for the lock-order reason
+/// that makes this mandatory rather than tidy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleRequest {
+    task: CompilationTask,
+    /// The [`crate::metrics::SCHEDULING_EVENTS`] name this drop is counted
+    /// under.
+    event: &'static str,
+    /// Epoch the request was queued at, and the epoch now.
+    queued_epoch: u64,
+    current_epoch: u64,
+}
+
 /// Priority queue for compilation tasks.
 pub struct CompilationQueue {
     /// High priority: C2 recompilations.
-    high: VecDeque<CompilationTask>,
+    high: VecDeque<QueuedRequest>,
     /// Normal priority: C1 compilations.
-    normal: VecDeque<CompilationTask>,
+    normal: VecDeque<QueuedRequest>,
     /// Low priority: speculative compilations.
-    low: VecDeque<CompilationTask>,
+    low: VecDeque<QueuedRequest>,
     /// Total tasks processed.
     total_processed: u64,
 }
@@ -429,24 +467,70 @@ impl CompilationQueue {
         }
     }
 
-    fn enqueue(&mut self, task: CompilationTask) {
-        match task.priority {
-            CompilationPriority::High => self.high.push_back(task),
-            CompilationPriority::Normal => self.normal.push_back(task),
-            CompilationPriority::Low => self.low.push_back(task),
+    /// Push `task`, stamped with `install_epoch`.
+    fn enqueue(&mut self, task: CompilationTask, install_epoch: u64) {
+        let entry = QueuedRequest {
+            install_epoch,
+            task,
+        };
+        match entry.task.priority {
+            CompilationPriority::High => self.high.push_back(entry),
+            CompilationPriority::Normal => self.normal.push_back(entry),
+            CompilationPriority::Low => self.low.push_back(entry),
         }
     }
 
-    fn dequeue(&mut self) -> Option<CompilationTask> {
-        let task = self
+    /// Pop the highest-priority request **without** consulting its stamp.
+    ///
+    /// The raw form, kept for [`TieredCompilationManager::dequeue_compilation`]
+    /// — a manual/diagnostic drain that is not the compile pipeline. A caller
+    /// that is about to *compile* the result must use [`Self::dequeue_fresh`].
+    fn dequeue(&mut self) -> Option<QueuedRequest> {
+        let entry = self
             .high
             .pop_front()
             .or_else(|| self.normal.pop_front())
             .or_else(|| self.low.pop_front());
-        if task.is_some() {
+        if entry.is_some() {
             self.total_processed += 1;
         }
-        task
+        entry
+    }
+
+    /// Pop the highest-priority request that is still current at install epoch
+    /// `current`, pushing every request queued at an older epoch onto `stale`
+    /// on the way past.
+    ///
+    /// Returns `None` only when the queue is empty. A run of stale requests
+    /// therefore cannot starve a fresh one sitting behind them, and cannot
+    /// make the worker read an occupied queue as empty.
+    ///
+    /// Nothing is dropped silently: every request that leaves the queue leaves
+    /// through either the return value or `stale`, and the caller is required
+    /// to retire `stale`. That is the whole fail-closed contract — a request
+    /// that vanished here with no counter and no released slot would be a
+    /// method that never compiles again, with nothing anywhere to say so.
+    ///
+    /// `total_processed` counts stale entries too: it means "left the queue",
+    /// and a request that was dropped did leave. The drop-specific count is
+    /// `crate::metrics::SCHEDULING_EVENTS[0]`.
+    fn dequeue_fresh(
+        &mut self,
+        current: u64,
+        stale: &mut Vec<StaleRequest>,
+    ) -> Option<CompilationTask> {
+        while let Some(entry) = self.dequeue() {
+            if entry.install_epoch >= current {
+                return Some(entry.task);
+            }
+            stale.push(StaleRequest {
+                task: entry.task,
+                event: crate::metrics::SCHEDULING_EVENTS[0],
+                queued_epoch: entry.install_epoch,
+                current_epoch: current,
+            });
+        }
+        None
     }
 
     fn len(&self) -> usize {
@@ -455,6 +539,19 @@ impl CompilationQueue {
 
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Remove and return every queued request.
+    ///
+    /// Used at worker shutdown so abandonment is an event with a count rather
+    /// than a queue that quietly stopped being drained.
+    fn drain_all(&mut self) -> Vec<CompilationTask> {
+        self.high
+            .drain(..)
+            .chain(self.normal.drain(..))
+            .chain(self.low.drain(..))
+            .map(|entry| entry.task)
+            .collect()
     }
 }
 
@@ -488,12 +585,36 @@ struct CompilerCore {
     shutdown: AtomicBool,
     /// Number of tasks the worker has finished compiling (for tests/diagnostics).
     completed: AtomicU64,
+    /// Requests discarded at dispatch instead of compiled — the local mirror
+    /// of `crate::metrics::scheduling_dropped_total`, so a test can assert on
+    /// one manager's behaviour without reading a process-wide table shared
+    /// with every other manager and every sibling test.
+    dropped: AtomicU64,
+    /// Install epoch the in-flight compile was dispatched at, or `0` when the
+    /// worker is idle.
+    ///
+    /// The dispatch-time gate can only refuse a request whose epoch had
+    /// *already* moved. This records the epoch of the compile that is running
+    /// now, so the worker can tell afterwards whether the world moved
+    /// underneath it — the window that only the per-cache flush barrier in
+    /// `JitCache::put` can close, and the one this field makes visible.
+    inflight_epoch: AtomicU64,
+    /// Test seam: when set, the source of "the current install epoch" instead
+    /// of the process-wide [`crate::jit_install_epoch`].
+    ///
+    /// The scheduling rule under test is "a request queued before an
+    /// invalidation is not compiled after it", and that is a statement about
+    /// epoch *ordering*, not about wall-clock time or about any real
+    /// redefinition. Driving it from an injected counter makes the test
+    /// deterministic and hermetic; driving it from the global would make it
+    /// depend on whatever every other test in the process happened to flush.
+    install_epoch_source: Option<Arc<AtomicU64>>,
     /// Aggregate compilation statistics (shared so the worker can update them).
     stats: CompilationStats,
 }
 
 impl CompilerCore {
-    fn new() -> Self {
+    fn with_install_epoch_source(install_epoch_source: Option<Arc<AtomicU64>>) -> Self {
         Self {
             methods: Mutex::new(FxHashMap::default()),
             queue: Mutex::new(CompilationQueue::new()),
@@ -501,14 +622,115 @@ impl CompilerCore {
             active: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             completed: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            inflight_epoch: AtomicU64::new(0),
+            install_epoch_source,
             stats: CompilationStats::default(),
         }
     }
 
-    /// Push a task and wake the worker (if any).
+    /// The install epoch as of right now.
+    ///
+    /// One relaxed-ish atomic load on the default path — the same load
+    /// `crate::jit_install_epoch` performs, which is already on every
+    /// compilation's entry path.
+    fn current_install_epoch(&self) -> u64 {
+        match &self.install_epoch_source {
+            Some(cell) => cell.load(Ordering::Acquire),
+            None => crate::jit_install_epoch(),
+        }
+    }
+
+    /// Push a task, stamped with the install epoch it was queued at, and wake
+    /// the worker (if any).
+    ///
+    /// Every enqueue in the process funnels through here — the two policy
+    /// paths in [`TieredCompilationManager`], the OSR paths, the C1→C2
+    /// upgrade, and the VM's direct [`TieredCompilationManager::enqueue_compilation`]
+    /// — so no door into the queue can produce an unstamped request.
     fn enqueue(&self, task: CompilationTask) {
-        self.queue.lock().enqueue(task);
+        let epoch = self.current_install_epoch();
+        self.queue.lock().enqueue(task, epoch);
         self.wake.notify_one();
+    }
+
+    /// Release the in-flight slot of every dropped request, count the drop,
+    /// and trace it under `CRATONVM_DBG_TIER_ENQUEUE`.
+    ///
+    /// ## Lock order
+    ///
+    /// This takes `methods` and **must not** be called while `queue` is held.
+    /// The established order in this file is `methods` → `queue`:
+    /// `should_compile_inner` holds `methods` across `CompilerCore::enqueue`,
+    /// which takes `queue`. The worker discovers stale requests while holding
+    /// `queue`, so it collects them into a `Vec`, drops the queue guard, and
+    /// only then calls this. Taking `methods` under `queue` here would invert
+    /// the order and deadlock against any thread on the invocation hook.
+    ///
+    /// ## What is deliberately NOT touched
+    ///
+    /// `current_tier`, `tier_fail_count` and `ineligible` are all left alone.
+    /// A stale request is not a compile failure and not a policy decline —
+    /// nothing was compiled and nothing was decided. Routing this through
+    /// [`Self::complete_task`] with `success = false` would spend one of the
+    /// method's [`MAX_TIER_FAIL_RETRIES`], so three redefinitions during
+    /// warmup would leave a hot method permanently un-compilable with no
+    /// diagnostic — precisely the silent loss this whole path exists to
+    /// prevent. Clearing the queued flag is the entire state change, and it is
+    /// what lets the next invocation re-admit the method against the bytecode
+    /// that is actually loaded.
+    fn retire_stale(&self, stale: &[StaleRequest]) {
+        if stale.is_empty() {
+            return;
+        }
+        let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TIER_ENQUEUE").is_some();
+        {
+            let mut methods = self.methods.lock();
+            for request in stale {
+                if let Some(state) = methods.get_mut(&request.task.method_key) {
+                    state.queued_for_compilation = false;
+                    state.queued_tier = None;
+                }
+            }
+        }
+        for request in stale {
+            crate::metrics::record_scheduling_event(request.event);
+            if trace {
+                eprintln!(
+                    "[cratonvm-tier] drop {}.{}{} tier={:?}{} reason={} queued_epoch={} epoch={}",
+                    request.task.method_key.class_name,
+                    request.task.method_key.method_name,
+                    request.task.method_key.descriptor,
+                    request.task.target_tier,
+                    request
+                        .task
+                        .osr_bci
+                        .map(|b| format!(" osr_bci={b}"))
+                        .unwrap_or_default(),
+                    request.event,
+                    request.queued_epoch,
+                    request.current_epoch,
+                );
+            }
+        }
+        self.dropped
+            .fetch_add(stale.len() as u64, Ordering::Release);
+    }
+
+    /// Pop the next request that is still current, dropping and retiring any
+    /// stale ones ahead of it.
+    ///
+    /// Never blocks: `None` means the queue held nothing fresh, not that the
+    /// caller should assume there was nothing there.
+    fn take_fresh(&self) -> Option<CompilationTask> {
+        let mut stale: Vec<StaleRequest> = Vec::new();
+        let task = {
+            let current = self.current_install_epoch();
+            let mut queue = self.queue.lock();
+            queue.dequeue_fresh(current, &mut stale)
+        };
+        self.retire_stale(&stale);
+        task
     }
 
     /// C1→C2 supersede: enqueue a Low-priority C2 recompile for a method
@@ -543,8 +765,12 @@ impl CompilerCore {
     }
 
     /// Pop the highest-priority task, or `None` if the queue is empty.
+    ///
+    /// Stamp-blind — see [`CompilationQueue::dequeue`]. Backs the manual
+    /// [`TieredCompilationManager::dequeue_compilation`] drain only; the
+    /// compile pipeline goes through [`Self::take_fresh`].
     fn dequeue(&self) -> Option<CompilationTask> {
-        self.queue.lock().dequeue()
+        self.queue.lock().dequeue().map(|entry| entry.task)
     }
 
     /// Record that `key` finished a compile attempt at `tier`. Mirrors
@@ -768,6 +994,31 @@ impl BackgroundCompiler {
             let _ = h.join();
         }
         self.core.active.store(false, Ordering::Release);
+        // Whatever was still queued is abandoned here. That is correct at
+        // teardown, but it is still a set of compilation requests that will
+        // never be serviced, so it is counted rather than left to be inferred
+        // from a queue that simply stopped moving. A non-zero
+        // `queue_shutdown_abandoned` in the middle of a run says the worker
+        // was stopped with work outstanding, which is a different — and worse
+        // — story than the same number at exit.
+        //
+        // Drained (not merely counted) so a restarted worker cannot resume
+        // requests stamped at a pre-teardown epoch, and so the count and the
+        // queue can never disagree. Joined first: the worker owns the queue
+        // until then.
+        let abandoned = self.core.queue.lock().drain_all();
+        if !abandoned.is_empty() {
+            let stale: Vec<StaleRequest> = abandoned
+                .into_iter()
+                .map(|task| StaleRequest {
+                    task,
+                    event: crate::metrics::SCHEDULING_EVENTS[3],
+                    queued_epoch: 0,
+                    current_epoch: 0,
+                })
+                .collect();
+            self.core.retire_stale(&stale);
+        }
     }
 }
 
@@ -1020,11 +1271,31 @@ const MAX_RECEIVER_TYPES: usize = 3;
 impl TieredCompilationManager {
     /// Create a new manager with the given policy.
     pub fn new(policy: CompilationPolicy) -> Self {
+        Self::with_install_epoch_source(policy, None)
+    }
+
+    /// [`Self::new`], but reading "the current install epoch" from `source`
+    /// instead of the process-wide [`crate::jit_install_epoch`].
+    ///
+    /// The seam that makes the stale-request drop testable without a clock,
+    /// without a sleep, and without a real class redefinition: the rule under
+    /// test is an ordering statement about epochs, so a test bumps the
+    /// injected counter exactly where a redefinition would have bumped the
+    /// global one and asserts on what the queue then does. Driving it from the
+    /// real global would make the test depend on every other test in the
+    /// process that happens to flush a `JitCache`.
+    ///
+    /// `None` is the production configuration and is what [`Self::new`] passes.
+    #[doc(hidden)]
+    pub fn with_install_epoch_source(
+        policy: CompilationPolicy,
+        install_epoch_source: Option<Arc<AtomicU64>>,
+    ) -> Self {
         // Seed the process-start timestamp as early as possible (this
         // manager is constructed during VM init) so `process_uptime_ms`
         // reports genuine process age, not "time since first compile".
         process_start();
-        let core = Arc::new(CompilerCore::new());
+        let core = Arc::new(CompilerCore::with_install_epoch_source(install_epoch_source));
         // Diagnostic-only: the VM constructs exactly one manager per process
         // (this is an embedded single-JVM-per-process binary, not a
         // multi-tenant host), so a "last one registered" global handle is
@@ -1039,21 +1310,36 @@ impl TieredCompilationManager {
     }
 
     /// Remove queued and historical tiering state for an unloaded class.
+    ///
+    /// Called from the VM's class-unload path (`vm/src/memory/gc.rs`). The
+    /// queued requests it removes are counted as drops — they are compilation
+    /// requests that will never be serviced, and "the class went away" is a
+    /// perfectly good reason that is still worth being able to see. It is also
+    /// the one drop reason that is genuinely final: unlike a stale-epoch drop,
+    /// there is no next invocation to re-admit the method.
     pub fn invalidate_class(&self, class_name: &str) {
         self.core
             .methods
             .lock()
             .retain(|key, _| key.class_name != class_name);
-        let mut queue = self.core.queue.lock();
-        queue
-            .high
-            .retain(|task| task.method_key.class_name != class_name);
-        queue
-            .normal
-            .retain(|task| task.method_key.class_name != class_name);
-        queue
-            .low
-            .retain(|task| task.method_key.class_name != class_name);
+        let dropped = {
+            let mut queue = self.core.queue.lock();
+            let before = queue.len();
+            queue
+                .high
+                .retain(|entry| entry.task.method_key.class_name != class_name);
+            queue
+                .normal
+                .retain(|entry| entry.task.method_key.class_name != class_name);
+            queue
+                .low
+                .retain(|entry| entry.task.method_key.class_name != class_name);
+            (before - queue.len()) as u64
+        };
+        if dropped > 0 {
+            crate::metrics::record_scheduling_events(crate::metrics::SCHEDULING_EVENTS[1], dropped);
+            self.core.dropped.fetch_add(dropped, Ordering::Release);
+        }
     }
 
     /// Create a new manager with the default policy.
@@ -1422,6 +1708,46 @@ impl TieredCompilationManager {
         self.core.queue.lock().len()
     }
 
+    /// Pop the next request that is still current at the install epoch,
+    /// dropping (and retiring) any stale ones ahead of it.
+    ///
+    /// This is the dispatch API the background worker uses. Exposed so the
+    /// dispatch rule can be exercised — and asserted on — without a thread, a
+    /// backend, or a clock: enqueue, bump the epoch, call this, read
+    /// [`Self::dropped_requests`].
+    ///
+    /// `None` means nothing fresh was queued. It does **not** mean nothing was
+    /// there: stale entries ahead of an empty tail are consumed and counted.
+    pub fn next_fresh_task(&self) -> Option<CompilationTask> {
+        self.core.take_fresh()
+    }
+
+    /// The install epoch this manager currently considers current.
+    ///
+    /// Equal to [`crate::jit_install_epoch`] in production. The accessor
+    /// exists so a diagnostic can print the number the dispatch gate is
+    /// actually comparing against, rather than a number that is usually the
+    /// same one.
+    pub fn install_epoch(&self) -> u64 {
+        self.core.current_install_epoch()
+    }
+
+    /// Install epoch of the compile running right now, or `0` when idle.
+    pub fn inflight_install_epoch(&self) -> u64 {
+        self.core.inflight_epoch.load(Ordering::Acquire)
+    }
+
+    /// Compilation requests this manager discarded without compiling them.
+    ///
+    /// The per-manager mirror of
+    /// [`crate::metrics::scheduling_dropped_total`], which is process-wide.
+    /// A steadily climbing value with a flat
+    /// [`Self::completed_compilations`] is the signature of a queue that is
+    /// being invalidated faster than it is being drained.
+    pub fn dropped_requests(&self) -> u64 {
+        self.core.dropped.load(Ordering::Acquire)
+    }
+
     /// Get all method states: (key, current_tier, invocation_count).
     pub fn method_states(&self) -> Vec<(MethodKey, CompilationTier, u64)> {
         self.core
@@ -1529,30 +1855,87 @@ impl TieredCompilationManager {
     /// effect: while the worker idles on `core.wake`, it holds no lock a mutator
     /// could need, so a mutator never stalls behind it and a concurrent STW
     /// completes promptly.
+    ///
+    /// ## Stale-request drop (install epoch)
+    ///
+    /// A request is dispatched only if the process-wide JIT install epoch is
+    /// still the one it was queued at. If a JVMTI redefinition or a code-cache
+    /// flush moved the epoch in between, the request describes a world that no
+    /// longer exists and is dropped HERE, before the backend is entered,
+    /// rather than after — the per-cache flush barrier in `JitCache::put`
+    /// would refuse the resulting body anyway, so compiling it is pure waste.
+    /// The drop is explicit: counted under
+    /// `crate::metrics::SCHEDULING_EVENTS[0]`, the method's in-flight slot
+    /// released, no retry spent. See [`CompilerCore::retire_stale`] and
+    /// `docs/jit/broker-install-epoch.md`.
     fn compiler_loop(core: &Arc<CompilerCore>, compile_fn: CompileFn) {
         loop {
-            // Pop one task while holding ONLY the jit-crate queue lock; block on
-            // the core's own condvar when empty so the worker idles instead of
-            // spinning. No VM lock is — or can be — held across this wait.
-            let task = {
-                let mut q = core.queue.lock();
-                loop {
-                    if core.shutdown.load(Ordering::Acquire) {
-                        return;
+            // Pop one FRESH task while holding ONLY the jit-crate queue lock;
+            // block on the core's own condvar when empty so the worker idles
+            // instead of spinning. No VM lock is — or can be — held across
+            // this wait.
+            //
+            // Stale requests found on the way are collected, not acted on:
+            // retiring one takes `core.methods`, and taking `methods` while
+            // holding `queue` would invert this file's `methods` → `queue`
+            // order (see `retire_stale`). So the queue guard is released
+            // first, `retire_stale` runs, and the loop re-enters — which is
+            // also why `stale` is re-created per iteration.
+            let task = loop {
+                let mut stale: Vec<StaleRequest> = Vec::new();
+                let mut shutting_down = false;
+                let popped = {
+                    let mut q = core.queue.lock();
+                    loop {
+                        if core.shutdown.load(Ordering::Acquire) {
+                            shutting_down = true;
+                            break None;
+                        }
+                        let current = core.current_install_epoch();
+                        match q.dequeue_fresh(current, &mut stale) {
+                            Some(task) => break Some(task),
+                            // Nothing fresh AND something to retire: give up
+                            // the queue lock so the slots can be released
+                            // under `methods`, then come back around.
+                            None if !stale.is_empty() => break None,
+                            // `parking_lot::Condvar::wait` releases `q` while parked and
+                            // re-acquires on wake; spurious wakeups re-check the loop.
+                            None => core.wake.wait(&mut q),
+                        }
                     }
-                    if let Some(task) = q.dequeue() {
-                        break task;
-                    }
-                    // `parking_lot::Condvar::wait` releases `q` while parked and
-                    // re-acquires on wake; spurious wakeups re-check the loop.
-                    core.wake.wait(&mut q);
+                };
+                // Guard released. Retire first — these requests are already
+                // out of the queue, so returning without retiring them (the
+                // shutdown path included) would lose them with no counter and
+                // leave their methods marked in-flight forever. Anything still
+                // IN the queue is `BackgroundCompiler::shutdown`'s to drain.
+                core.retire_stale(&stale);
+                if shutting_down {
+                    return;
+                }
+                if let Some(task) = popped {
+                    break task;
                 }
             };
 
             // Compile off the mutator thread with NO lock held by this frame
             // (`q` was dropped above), then publish completion. `compile_fn`
             // bounds its own VM-lock scopes internally.
+            //
+            // `dispatch_epoch` is the in-flight stamp: the dispatch gate above
+            // proved the epoch had not moved *yet*, and this is what lets the
+            // completion below notice that it moved *during* the compile. That
+            // window cannot be closed here — the artifact is already built —
+            // and it is not this loop's to close: `JitCache::put`/`put_osr`
+            // refuse a body stamped below the owning cache's flush barrier.
+            // Recording it makes the residual visible instead of invisible.
+            let dispatch_epoch = core.current_install_epoch();
+            core.inflight_epoch.store(dispatch_epoch, Ordering::Release);
             let outcome = compile_fn(&task);
+            core.inflight_epoch.store(0, Ordering::Release);
+            if core.current_install_epoch() != dispatch_epoch {
+                crate::metrics::record_scheduling_event(crate::metrics::SCHEDULING_EVENTS[2]);
+            }
             core.complete_task(
                 &task.method_key,
                 task.target_tier,
@@ -2611,12 +2994,32 @@ impl BoundedCompileQueue {
     /// Drop every queued request for `class_name`, returning them. Mirrors the
     /// queue half of [`TieredCompilationManager::invalidate_class`].
     pub fn drain_class(&mut self, class_name: &str) -> Vec<CompilationTask> {
+        self.drain_matching(|task| task.method_key.class_name == class_name)
+    }
+
+    /// Drop every queued request for one method, returning them.
+    ///
+    /// The method-granular counterpart of [`Self::drain_class`]. It exists
+    /// because a deoptimization invalidates the premises of a *method's*
+    /// queued request without touching the rest of its class — see
+    /// [`CompilationBroker::on_deoptimization`], which must drop the request
+    /// rather than clear the in-flight flag and leave it queued.
+    pub fn drain_method(&mut self, key: &MethodKey) -> Vec<CompilationTask> {
+        self.drain_matching(|task| task.method_key == *key)
+    }
+
+    /// Remove and return every queued request matching `pred`, preserving the
+    /// arrival order of the ones that stay.
+    fn drain_matching(
+        &mut self,
+        pred: impl Fn(&CompilationTask) -> bool,
+    ) -> Vec<CompilationTask> {
         let mut dropped = Vec::new();
         for band in CompilationPriority::BY_RANK {
             let queue = self.band_mut(band);
             let mut kept = VecDeque::with_capacity(queue.len());
             while let Some(task) = queue.pop_front() {
-                if task.method_key.class_name == class_name {
+                if pred(&task) {
                     dropped.push(task);
                 } else {
                     kept.push_back(task);
@@ -2809,6 +3212,130 @@ impl CompileVerdict {
     }
 }
 
+// ── Request identity, epochs, completion ─────────────────────────────
+
+/// Identity of one compilation **request**.
+///
+/// Distinct from [`ArtifactId`], which names a compiled *body*: two requests
+/// can target the same artifact at different tiers (a C1 body superseded by a
+/// C2 one), and the queue has to be able to tell them apart to answer "is this
+/// already queued?".
+///
+/// The tier is part of the key because "already queued" is a question about a
+/// (method, tier) pair — a C1 request in flight must not suppress the C2
+/// upgrade that follows it. The OSR bci is part of the key for the reason
+/// [`ArtifactId`] documents: an OSR artifact and a method-entry body live in
+/// different caches and are never interchangeable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RequestKey {
+    /// Method the request is for.
+    pub method: MethodKey,
+    /// Tier the backend is being asked for.
+    pub tier: CompilationTier,
+    /// `Some(bci)` for an OSR artifact, `None` for a method-entry body.
+    pub osr_bci: Option<u32>,
+}
+
+impl PartialOrd for MethodKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MethodKey {
+    /// Total order by (class, name, descriptor).
+    ///
+    /// Added for [`RequestKey`] so a diagnostic can list outstanding requests
+    /// in a stable order — the same reason [`sort_artifact_ids`] exists. A
+    /// report whose row order depends on hashing is not observable.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.class_name
+            .cmp(&other.class_name)
+            .then_with(|| self.method_name.cmp(&other.method_name))
+            .then_with(|| self.descriptor.cmp(&other.descriptor))
+    }
+}
+
+impl RequestKey {
+    /// The identity of `task`.
+    pub fn of(task: &CompilationTask) -> Self {
+        RequestKey {
+            method: task.method_key.clone(),
+            tier: task.target_tier,
+            osr_bci: task.osr_bci,
+        }
+    }
+
+    /// Whether this request is for an OSR artifact.
+    pub fn is_osr(&self) -> bool {
+        self.osr_bci.is_some()
+    }
+}
+
+/// Broker-side bookkeeping for a request that has been admitted and not yet
+/// completed — i.e. one that is queued, or handed to the backend and still
+/// running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutstandingRequest {
+    /// The class epoch (see [`CompilationBroker::class_epoch`]) that was
+    /// current when the request was admitted. If the class epoch has moved by
+    /// the time the request is dispatched or completed, the request was formed
+    /// against bytecode that no longer exists.
+    epoch: u64,
+    /// Whether [`CompilationBroker::next_request`] has handed this to a
+    /// backend. Used only to detect a completion for a request that was never
+    /// dispatched, which is a wiring bug worth counting.
+    dispatched: bool,
+}
+
+/// What [`CompilationBroker::next_request`] decided about a request it popped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchVerdict {
+    /// The request is still valid: hand it to the backend.
+    Fresh,
+    /// The request's class was redefined or unloaded after it was admitted.
+    Stale,
+    /// The queue holds a request the broker no longer tracks — it was dropped
+    /// by [`CompilationBroker::on_deoptimization`] or `purge_class` while it
+    /// sat in a band. Dropping it here is the second half of that drop, not a
+    /// new decision.
+    Orphaned,
+}
+
+/// What [`CompilationBroker::complete`] did with a backend verdict.
+///
+/// `#[must_use]` deliberately: the whole point of
+/// [`Self::DiscardedStale`] is to tell the caller *not* to publish the body it
+/// just produced. A caller that drops this value on the floor installs code
+/// compiled from bytecode that has since been replaced, which is a wrong-code
+/// bug and not a missed optimization.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionOutcome {
+    /// The verdict was applied to the method's state as given.
+    Recorded,
+    /// The verdict was **thrown away**: the method's class was redefined or
+    /// unloaded between the request's admission and its completion, so nothing
+    /// the backend produced describes the class that is loaded now.
+    ///
+    /// Nothing about the method's state was touched — not `current_tier`, not
+    /// `tier_fail_count`, not `ineligible` — because none of those verdicts
+    /// were reached against the bytecode that is live. The method's in-flight
+    /// slot is released, so the next invocation re-admits it and it is
+    /// recompiled against the new bytecode. Fail-closed: the request is not
+    /// silently lost, it is explicitly counted
+    /// ([`BrokerCounters::completions_discarded_stale`]) and re-derivable.
+    ///
+    /// If the backend already published a body, the **caller must retire it**.
+    /// The broker cannot: it never sees the code buffer.
+    DiscardedStale {
+        /// Class epoch when the request was admitted.
+        admitted_epoch: u64,
+        /// Class epoch now.
+        current_epoch: u64,
+    },
+}
+
 // ── Counters ─────────────────────────────────────────────────────────
 
 /// Everything the broker counted, as a plain comparable value.
@@ -2827,23 +3354,131 @@ pub struct BrokerCounters {
     pub declined: u64,
     /// Requests shed to make room for a higher-priority one.
     pub shed: u64,
-    /// Requests drained by [`CompilationBroker::next_request`].
+    /// Requests refused because an identical (method, tier, OSR bci) request
+    /// was already queued or in flight. Counted **in addition to**
+    /// `declined` / `decline_reasons["already_queued"]`, because a
+    /// deduplication and a policy decline are the same verdict for very
+    /// different reasons: a non-zero value here means some other path cleared
+    /// the per-method in-flight flag while the request was still live.
+    pub deduplicated: u64,
+    /// Requests drained by [`CompilationBroker::next_request`] and handed to a
+    /// backend. "Started", in the vocabulary of a stuck-queue triage: compare
+    /// against `admitted` and `completed`.
     pub dispatched: u64,
+    /// Requests reaching [`CompilationBroker::complete`], whatever the verdict.
+    /// `admitted - dispatched` is the queue depth plus whatever was dropped;
+    /// `dispatched - completed` is the number of compiles in flight. Both
+    /// being stuck at a non-zero constant is the signature of a wedged worker.
+    pub completed: u64,
     /// Bodies installed.
     pub installed: u64,
     /// Backend bailouts consumed.
     pub bailed: u64,
     /// Permanent VM declines recorded.
     pub declined_permanently: u64,
+    /// Completions whose verdict was thrown away because the method's class
+    /// moved on — see [`CompletionOutcome::DiscardedStale`].
+    pub completions_discarded_stale: u64,
+    /// Completions for a request the broker never dispatched. Always a wiring
+    /// bug; the state update is still applied so no method is left marked
+    /// in-flight forever.
+    pub unsolicited_completions: u64,
     /// Bodies retired by invalidation.
     pub retired: u64,
-    /// Queued requests dropped because their class went away.
+    /// Queued requests dropped explicitly — the class was unloaded, or the
+    /// method deoptimized out from under them.
     pub requests_dropped: u64,
+    /// Queued requests discarded at dispatch because their class epoch moved
+    /// after they were admitted (a redefine or unload). This is the *lazy*
+    /// half of invalidation: the epoch bump is O(1), the drop happens when the
+    /// request surfaces.
+    pub dropped_stale: u64,
+    /// Queued requests discarded at dispatch because the broker no longer
+    /// tracked them — the second half of an explicit drop that left the band
+    /// entry behind.
+    pub dropped_orphaned: u64,
     /// Declines by [`DeclineReason::category`].
     pub decline_reasons: BTreeMap<&'static str, u64>,
     /// Bailouts by [`crate::bailout::Bailout::category`] — the same keys
     /// [`crate::bailout::bailout_counts`] reports.
     pub bailout_categories: BTreeMap<&'static str, u64>,
+}
+
+impl BrokerCounters {
+    /// Every request that entered the queue and left it without being
+    /// dispatched.
+    pub fn dropped_total(&self) -> u64 {
+        self.shed + self.requests_dropped + self.dropped_stale + self.dropped_orphaned
+    }
+
+    /// The scalar counters as `(name, value)` pairs.
+    ///
+    /// Same shape as [`crate::metrics::MetricsSummary`]'s `by_outcome` /
+    /// `by_path` / `bailout_categories` fields, and the names are an external
+    /// contract for the same reason [`crate::bailout::Bailout::category`]'s
+    /// are: a dashboard or a test keys on them, so they must not be renamed
+    /// with the fields.
+    pub fn to_pairs(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("admitted", self.admitted),
+            ("osr_admitted", self.osr_admitted),
+            ("declined", self.declined),
+            ("deduplicated", self.deduplicated),
+            ("shed", self.shed),
+            ("dispatched", self.dispatched),
+            ("completed", self.completed),
+            ("installed", self.installed),
+            ("bailed", self.bailed),
+            ("declined_permanently", self.declined_permanently),
+            (
+                "completions_discarded_stale",
+                self.completions_discarded_stale,
+            ),
+            ("unsolicited_completions", self.unsolicited_completions),
+            ("retired", self.retired),
+            ("requests_dropped", self.requests_dropped),
+            ("dropped_stale", self.dropped_stale),
+            ("dropped_orphaned", self.dropped_orphaned),
+        ]
+    }
+
+    /// One JSON object: the scalars, then `decline_reasons` and
+    /// `bailout_categories` as nested objects.
+    ///
+    /// Hand-rolled for the same reason [`crate::metrics::CompilationReport`]'s
+    /// encoder is: this crate has no serde dependency, and the value set is
+    /// closed (every key is a `&'static str` from a fixed vocabulary, every
+    /// value a `u64`).
+    pub fn to_json(&self) -> String {
+        use std::fmt::Write as _;
+        fn object(s: &mut String, pairs: impl IntoIterator<Item = (&'static str, u64)>) {
+            s.push('{');
+            for (i, (name, count)) in pairs.into_iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let _ = write!(s, "\"{name}\":{count}");
+            }
+            s.push('}');
+        }
+        let mut s = String::with_capacity(512);
+        s.push('{');
+        for (i, (name, count)) in self.to_pairs().into_iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(s, "\"{name}\":{count}");
+        }
+        s.push_str(",\"decline_reasons\":");
+        object(&mut s, self.decline_reasons.iter().map(|(k, v)| (*k, *v)));
+        s.push_str(",\"bailout_categories\":");
+        object(
+            &mut s,
+            self.bailout_categories.iter().map(|(k, v)| (*k, *v)),
+        );
+        s.push('}');
+        s
+    }
 }
 
 // ── The broker ───────────────────────────────────────────────────────
@@ -2864,6 +3499,13 @@ pub struct CompilationBroker {
     queue: BoundedCompileQueue,
     states: HashMap<MethodKey, MethodState>,
     installed: HashMap<ArtifactId, CompiledRecord>,
+    /// Every admitted-and-not-yet-completed request: queued, or dispatched and
+    /// still compiling. This — not `MethodState::queued_for_compilation` — is
+    /// the broker's authority on "is this already being compiled?".
+    outstanding: HashMap<RequestKey, OutstandingRequest>,
+    /// Bytecode generation per class name. Bumped by every redefine/unload; a
+    /// request admitted at epoch N is stale the moment the epoch is N+1.
+    class_epochs: HashMap<String, u64>,
     cache_cap_bytes: u64,
     cache_used_bytes: u64,
     counters: BrokerCounters,
@@ -2878,6 +3520,8 @@ impl CompilationBroker {
             queue: BoundedCompileQueue::new(DEFAULT_COMPILE_QUEUE_CAPACITY),
             states: HashMap::new(),
             installed: HashMap::new(),
+            outstanding: HashMap::new(),
+            class_epochs: HashMap::new(),
             cache_cap_bytes: u64::MAX,
             cache_used_bytes: 0,
             counters: BrokerCounters::default(),
@@ -2964,6 +3608,73 @@ impl CompilationBroker {
     /// Requests waiting.
     pub fn queue_depth(&self) -> usize {
         self.queue.len()
+    }
+
+    /// The bytecode generation of `class_name`.
+    ///
+    /// Starts at 0 for every class the broker has never been told about and
+    /// increases by one on each [`InvalidationEvent::ClassRedefined`] or
+    /// [`InvalidationEvent::ClassUnloaded`]. A request records the epoch that
+    /// was current when it was admitted; a mismatch at dispatch or completion
+    /// means the request describes bytecode that is no longer loaded.
+    ///
+    /// This is the answer to "what happens to a queued request when its method
+    /// is redefined?" — see `docs/jit/compilation-broker.md`. It is a monotone
+    /// counter rather than a queue scan so that a redefine costs O(1) even
+    /// when instrumentation is retransforming thousands of classes.
+    pub fn class_epoch(&self, class_name: &str) -> u64 {
+        self.class_epochs.get(class_name).copied().unwrap_or(0)
+    }
+
+    fn epoch_of(&self, class_name: &str) -> u64 {
+        self.class_epoch(class_name)
+    }
+
+    fn bump_epoch(&mut self, class_name: &str) -> u64 {
+        let slot = self.class_epochs.entry(class_name.to_string()).or_insert(0);
+        *slot += 1;
+        *slot
+    }
+
+    /// Whether an identical request is queued or in flight.
+    pub fn is_outstanding(&self, request: &RequestKey) -> bool {
+        self.outstanding.contains_key(request)
+    }
+
+    /// Admitted requests that have not completed: queue depth plus in-flight
+    /// compiles.
+    pub fn outstanding_len(&self) -> usize {
+        self.outstanding.len()
+    }
+
+    /// Every outstanding request, in a stable order.
+    ///
+    /// The diagnostic a stuck queue needs: `counters().admitted` says how much
+    /// went in and `counters().completed` how much came out, and this says
+    /// exactly *what* is sitting between the two.
+    pub fn outstanding_requests(&self) -> Vec<RequestKey> {
+        let mut keys: Vec<RequestKey> = self.outstanding.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// Clear a method's coarse in-flight flag, but only once nothing is
+    /// outstanding for it.
+    ///
+    /// `MethodState::queued_for_compilation` is a single bool shared by the
+    /// method-entry and OSR pipelines (see [`CompilerCore::complete_task`]).
+    /// Clearing it while another request for the same method is still live is
+    /// what re-opens the tier gate and admits a duplicate, so the clear is
+    /// conditioned on the authoritative `outstanding` table instead of being
+    /// written unconditionally by each of the five paths that used to do it.
+    fn release_slot(&mut self, key: &MethodKey) {
+        if self.outstanding.keys().any(|request| request.method == *key) {
+            return;
+        }
+        if let Some(state) = self.states.get_mut(key) {
+            state.queued_for_compilation = false;
+            state.queued_tier = None;
+        }
     }
 
     /// The request queue, for inspection.
@@ -3092,18 +3803,41 @@ impl CompilationBroker {
             enqueue_time_ms: 0,
             osr_bci: ticket.osr_bci,
         };
+        // ── Structural idempotence gate ──────────────────────────────
+        //
+        // `TierPolicy` already declines a method whose
+        // `queued_for_compilation` flag is set, but that flag is a single
+        // per-method bool that several *other* paths clear: a deopt, a shed, a
+        // completion, a class purge. If any of them clears it while the request
+        // is still queued or in flight, the coarse gate re-opens and a SECOND
+        // request for the same artifact is admitted — two compiles and two
+        // installs for one method. This VM has already shipped two
+        // use-after-frees in code reclamation; a duplicate install is the same
+        // family, so admission is refused on the request's own identity here
+        // rather than on a flag whose clearing is somebody else's job.
+        //
+        // `TieredCompilationManager` has no equivalent: its
+        // `enqueue_compilation` sets the flag and pushes unconditionally, and
+        // `on_deoptimization` / `on_c2_bailout` clear the flag without removing
+        // the queued task. See `docs/jit/compilation-broker.md`.
+        let request = RequestKey::of(&task);
+        if self.outstanding.contains_key(&request) {
+            self.counters.deduplicated += 1;
+            let reason = DeclineReason::AlreadyQueued;
+            self.count_decline(&reason);
+            return AdmissionDecision::Decline(reason);
+        }
+        let epoch = self.epoch_of(&key.class_name);
         let outcome = self.queue.enqueue(task);
         match outcome {
             EnqueueOutcome::Accepted => {}
             EnqueueOutcome::AcceptedAfterShedding(evicted) => {
                 self.counters.shed += 1;
-                // The shed method is no longer in flight. Leaving its flag set
-                // would make every later `select_tier` answer `AlreadyQueued`
-                // for a request that no longer exists.
-                if let Some(state) = self.states.get_mut(&evicted.method_key) {
-                    state.queued_for_compilation = false;
-                    state.queued_tier = None;
-                }
+                // The shed method is no longer in flight. Leaving its record
+                // and flag in place would make every later `select_tier`
+                // answer `AlreadyQueued` for a request that no longer exists.
+                self.outstanding.remove(&RequestKey::of(&evicted));
+                self.release_slot(&evicted.method_key);
             }
             EnqueueOutcome::Rejected { depth, capacity } => {
                 // `gate` already refuses this case, so reaching it means a
@@ -3114,6 +3848,13 @@ impl CompilationBroker {
                 return AdmissionDecision::Decline(reason);
             }
         }
+        self.outstanding.insert(
+            request,
+            OutstandingRequest {
+                epoch,
+                dispatched: false,
+            },
+        );
         {
             let tier = ticket.tier;
             let state = self.state_mut(key);
@@ -3139,12 +3880,45 @@ impl CompilationBroker {
     /// Drain the highest-priority request. The backend-facing half of the
     /// interface: everything above decided *what* to compile, this hands it
     /// over.
+    ///
+    /// Never returns a **stale** request. A request whose class epoch moved
+    /// after it was admitted (a redefine or an unload) describes bytecode that
+    /// is no longer loaded; compiling it would install code for a method that
+    /// no longer exists in that shape, which is a wrong-code bug rather than a
+    /// wasted compile. Such a request is dropped here — explicitly, counted in
+    /// [`BrokerCounters::dropped_stale`], and with the method's in-flight slot
+    /// released so the very next invocation re-admits it against the new
+    /// bytecode. Nothing is silently lost; the loop continues to the next
+    /// band entry so a burst of stale requests cannot starve a fresh one.
     pub fn next_request(&mut self) -> Option<CompilationTask> {
-        let task = self.queue.dequeue();
-        if task.is_some() {
-            self.counters.dispatched += 1;
+        loop {
+            let task = self.queue.dequeue()?;
+            let request = RequestKey::of(&task);
+            let current = self.epoch_of(&task.method_key.class_name);
+            let verdict = match self.outstanding.get(&request) {
+                Some(outstanding) if outstanding.epoch == current => DispatchVerdict::Fresh,
+                Some(_) => DispatchVerdict::Stale,
+                None => DispatchVerdict::Orphaned,
+            };
+            match verdict {
+                DispatchVerdict::Fresh => {
+                    if let Some(outstanding) = self.outstanding.get_mut(&request) {
+                        outstanding.dispatched = true;
+                    }
+                    self.counters.dispatched += 1;
+                    return Some(task);
+                }
+                DispatchVerdict::Stale => {
+                    self.outstanding.remove(&request);
+                    self.release_slot(&task.method_key);
+                    self.counters.dropped_stale += 1;
+                }
+                DispatchVerdict::Orphaned => {
+                    self.release_slot(&task.method_key);
+                    self.counters.dropped_orphaned += 1;
+                }
+            }
         }
-        task
     }
 
     /// Record what the backend did with `task`.
@@ -3154,11 +3928,44 @@ impl CompilationBroker {
     /// `current_tier` (its artifact lives in a separate cache), a permanent
     /// decline must not spend a retry, and a C2 compile over the time budget
     /// demotes the method through the same `c2_bailout` flag three deopts use.
-    pub fn complete(&mut self, task: &CompilationTask, verdict: CompileVerdict) {
+    ///
+    /// One rule the live manager does not have: if the method's class epoch
+    /// moved between admission and completion, the whole verdict is discarded
+    /// and [`CompletionOutcome::DiscardedStale`] is returned. Nothing the
+    /// backend concluded applies to bytecode that has since been replaced —
+    /// not the published body (installing it is wrong code), and not the
+    /// failure either (spending a retry or setting `ineligible` would punish
+    /// the *new* bytecode for the old one's compile).
+    pub fn complete(
+        &mut self,
+        task: &CompilationTask,
+        verdict: CompileVerdict,
+    ) -> CompletionOutcome {
         let key = task.method_key.clone();
         let tier = task.target_tier;
         let osr = task.is_osr();
         let time_budget = self.policy.max_c2_compile_time_ms();
+
+        let request = RequestKey::of(task);
+        let current_epoch = self.epoch_of(&key.class_name);
+        let record = self.outstanding.remove(&request);
+        self.counters.completed += 1;
+        if !matches!(record, Some(OutstandingRequest { dispatched: true, .. })) {
+            // Either the broker never saw this request, or it was completed
+            // without ever being dispatched. Both are wiring bugs, and both
+            // still fall through to the state update below (minus a stale
+            // discard) so no method is left permanently marked in-flight.
+            self.counters.unsolicited_completions += 1;
+        }
+        let admitted_epoch = record.map_or(current_epoch, |outstanding| outstanding.epoch);
+        if admitted_epoch != current_epoch {
+            self.counters.completions_discarded_stale += 1;
+            self.release_slot(&key);
+            return CompletionOutcome::DiscardedStale {
+                admitted_epoch,
+                current_epoch,
+            };
+        }
 
         match verdict {
             CompileVerdict::Installed {
@@ -3172,8 +3979,6 @@ impl CompilationBroker {
                         state.current_tier = tier;
                     }
                     state.tier_fail_count = 0;
-                    state.queued_for_compilation = false;
-                    state.queued_tier = None;
                     state.last_compile_time_ms = compile_time_ms;
                     if tier == CompilationTier::C2
                         && compile_time_ms > time_budget
@@ -3192,7 +3997,7 @@ impl CompilationBroker {
                 if let Some(previous) = self.installed.insert(
                     id,
                     CompiledRecord {
-                        key,
+                        key: key.clone(),
                         tier,
                         osr_bci: task.osr_bci,
                         code_bytes,
@@ -3208,8 +4013,6 @@ impl CompilationBroker {
                 {
                     let state = self.state_mut(&key);
                     state.tier_fail_count = state.tier_fail_count.saturating_add(1);
-                    state.queued_for_compilation = false;
-                    state.queued_tier = None;
                 }
                 self.counters.bailed += 1;
                 *self
@@ -3221,26 +4024,42 @@ impl CompilationBroker {
             CompileVerdict::Declined { .. } => {
                 let state = self.state_mut(&key);
                 state.ineligible = true;
-                state.queued_for_compilation = false;
-                state.queued_tier = None;
                 self.counters.declined_permanently += 1;
             }
         }
+        // One place clears the coarse in-flight flag, and it consults the
+        // authoritative `outstanding` table first — see `release_slot`.
+        self.release_slot(&key);
+        CompletionOutcome::Recorded
     }
 
     /// Record a deoptimization. Three demote the method out of C2, the rule
     /// [`TieredCompilationManager::on_deoptimization`] already applies.
+    ///
+    /// **Delta from the live manager, deliberate.** The manager clears
+    /// `queued_for_compilation` and leaves any queued task in the queue
+    /// (`tiered.rs`, `TieredCompilationManager::on_deoptimization`), so the
+    /// next invocation past the threshold enqueues a *second* task for the same
+    /// method. Here the queued request is dropped explicitly instead: a deopt
+    /// says the profile the request was formed under was wrong, so the request
+    /// is not worth keeping, and dropping it is what makes the flag clear
+    /// honest. An already-dispatched request is left alone — it is mid-compile,
+    /// and the broker cannot cancel a backend it does not own.
     pub fn on_deoptimization(&mut self, key: &MethodKey) {
         {
             let state = self.state_mut(key);
             state.deopt_count += 1;
             state.current_tier = CompilationTier::Interpreter;
-            state.queued_for_compilation = false;
-            state.queued_tier = None;
             if state.deopt_count >= MAX_DEOPTS_BEFORE_BAILOUT {
                 state.c2_bailout = true;
             }
         }
+        let dropped = self.queue.drain_method(key);
+        for task in &dropped {
+            self.outstanding.remove(&RequestKey::of(task));
+        }
+        self.counters.requests_dropped += dropped.len() as u64;
+        self.release_slot(key);
         for id in self.artifact_ids_of(key) {
             self.drop_artifact(&id);
         }
@@ -3283,7 +4102,24 @@ impl CompilationBroker {
     /// Only a retired **method-entry** body cascades: a direct call is baked
     /// against a method's entry point, so retiring an OSR artifact leaves
     /// every caller valid.
+    ///
+    /// ## Queued requests
+    ///
+    /// A redefine or an unload also bumps the class's epoch
+    /// ([`Self::class_epoch`]). That is what invalidates requests that are
+    /// merely *queued*: they are not scanned for here (a redefine would then
+    /// cost a queue walk per event, and instrumentation retransforms classes
+    /// in the thousands), they are discarded lazily when
+    /// [`Self::next_request`] surfaces them, and a request that was already
+    /// dispatched has its verdict discarded by [`Self::complete`]. The epoch
+    /// bump is the single O(1) act that makes all three true.
     pub fn invalidate(&mut self, event: &InvalidationEvent) -> Vec<ArtifactId> {
+        if let InvalidationEvent::ClassRedefined(class)
+        | InvalidationEvent::ClassUnloaded(class) = event
+        {
+            let class = class.clone();
+            self.bump_epoch(&class);
+        }
         let mut retired: Vec<ArtifactId> = Vec::new();
         let mut pending: Vec<InvalidationEvent> = vec![event.clone()];
         while let Some(current) = pending.pop() {
@@ -3338,6 +4174,17 @@ impl CompilationBroker {
         }
         let dropped = self.queue.drain_class(class_name);
         self.counters.requests_dropped += dropped.len() as u64;
+        // Unlike a redefine, an unload discards the tracked state outright, so
+        // the queue is drained eagerly rather than left to the lazy epoch
+        // check. Only the *queued* records go with it: an already-dispatched
+        // request must keep its record, because that record is what carries
+        // the pre-unload epoch that makes `complete` discard the body the
+        // backend is about to hand back. Forgetting it here would make the
+        // completion look unsolicited-but-current and install a body for a
+        // class that is gone.
+        for task in &dropped {
+            self.outstanding.remove(&RequestKey::of(task));
+        }
         for task in &dropped {
             if let Some(state) = self.states.get_mut(&task.method_key) {
                 state.queued_for_compilation = false;
@@ -4869,6 +5716,1333 @@ mod tests {
 
         drop(bg);
         assert!(!mgr.compiler_active(), "worker stopped after shutdown");
+    }
+
+    // ── Install-epoch stamping and the stale-request drop ────────────────
+    //
+    // Every test here drives a manager whose install epoch comes from an
+    // INJECTED `AtomicU64`, so a "redefinition" is one `store` and the
+    // scheduling rule is exercised with no thread, no backend, no clock and no
+    // sleep. Bumping the real `crate::JIT_INSTALL_EPOCH` would be both
+    // non-deterministic (every `JitCache::clear_all` anywhere in this test
+    // binary advances it) and untestable in the other direction — there is no
+    // way to hold it still.
+    //
+    // The scheduling counters are process-wide, so the tests that assert exact
+    // counts take `crate::metrics::METRICS_TEST_LOCK` and reset the table,
+    // exactly as the metrics tests do.
+
+    /// A manager reading its install epoch from `epoch` instead of the global.
+    fn epoch_driven_manager(epoch: &Arc<AtomicU64>) -> TieredCompilationManager {
+        TieredCompilationManager::with_install_epoch_source(
+            CompilationPolicy::default(),
+            Some(Arc::clone(epoch)),
+        )
+    }
+
+    fn epoch_key(name: &str) -> MethodKey {
+        MethodKey::new("craton/test/EpochSubject", name, "()V")
+    }
+
+    fn c1_task(key: &MethodKey) -> CompilationTask {
+        CompilationTask {
+            method_key: key.clone(),
+            target_tier: CompilationTier::C1,
+            priority: CompilationPriority::Normal,
+            enqueue_time_ms: 0,
+            osr_bci: None,
+        }
+    }
+
+    #[test]
+    fn a_request_queued_at_the_current_epoch_dispatches() {
+        let epoch = Arc::new(AtomicU64::new(7));
+        let mgr = epoch_driven_manager(&epoch);
+        let key = epoch_key("stillCurrent");
+        mgr.enqueue_compilation(c1_task(&key));
+
+        assert_eq!(mgr.install_epoch(), 7);
+        assert_eq!(mgr.next_fresh_task(), Some(c1_task(&key)));
+        assert_eq!(mgr.dropped_requests(), 0);
+        assert_eq!(mgr.queue_size(), 0);
+    }
+
+    #[test]
+    fn a_request_queued_before_an_epoch_bump_is_dropped_before_it_is_compiled() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let key = epoch_key("queuedThenRedefined");
+        mgr.enqueue_compilation(c1_task(&key));
+        assert!(
+            mgr.method_states()
+                .iter()
+                .any(|(k, _, _)| *k == key),
+            "enqueue tracks the method"
+        );
+
+        // A JVMTI redefinition / code-cache flush lands while the request sits
+        // in the queue.
+        epoch.store(2, Ordering::Release);
+
+        assert_eq!(
+            mgr.next_fresh_task(),
+            None,
+            "the stale request must not reach the backend"
+        );
+        assert_eq!(mgr.dropped_requests(), 1, "and must be counted, not lost");
+        assert_eq!(mgr.queue_size(), 0);
+    }
+
+    #[test]
+    fn a_dropped_request_releases_the_slot_without_spending_a_retry() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let key = epoch_key("reAdmitted");
+        mgr.enqueue_compilation(c1_task(&key));
+        epoch.store(2, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None);
+
+        // THE property. A stale drop is not a compile failure: the method's
+        // in-flight flag is cleared so the next invocation can re-admit it,
+        // and none of `current_tier` / `tier_fail_count` / `ineligible` moved.
+        // Routing the drop through `complete_task(success = false)` would burn
+        // one of MAX_TIER_FAIL_RETRIES, so three redefinitions during warmup
+        // would leave a hot method permanently interpreted.
+        {
+            let methods = mgr.core.methods.lock();
+            let state = methods.get(&key).expect("state survives a stale drop");
+            assert!(
+                !state.queued_for_compilation,
+                "the in-flight slot must be released so the method can re-admit"
+            );
+            assert_eq!(state.queued_tier, None);
+            assert_eq!(state.tier_fail_count, 0, "a stale drop is not a failure");
+            assert!(!state.ineligible, "a stale drop is not a policy decline");
+            assert_eq!(state.current_tier, CompilationTier::Interpreter);
+        }
+
+        // Re-admission works, at the new epoch, and now dispatches.
+        mgr.enqueue_compilation(c1_task(&key));
+        assert_eq!(mgr.next_fresh_task(), Some(c1_task(&key)));
+        assert_eq!(mgr.dropped_requests(), 1, "the re-admitted one was not dropped");
+    }
+
+    #[test]
+    fn stale_requests_do_not_starve_a_fresh_one_behind_them() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let stale_a = epoch_key("staleA");
+        let stale_b = epoch_key("staleB");
+        let fresh = epoch_key("fresh");
+        // Same band, so the order in the queue is exactly the enqueue order and
+        // the fresh request really is behind both stale ones.
+        mgr.enqueue_compilation(c1_task(&stale_a));
+        mgr.enqueue_compilation(c1_task(&stale_b));
+        epoch.store(2, Ordering::Release);
+        mgr.enqueue_compilation(c1_task(&fresh));
+
+        assert_eq!(
+            mgr.next_fresh_task(),
+            Some(c1_task(&fresh)),
+            "the drop loop must skip past stale entries, not stop at the first one"
+        );
+        assert_eq!(mgr.dropped_requests(), 2);
+        assert_eq!(mgr.queue_size(), 0);
+    }
+
+    #[test]
+    fn priority_order_survives_the_epoch_gate() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let low = epoch_key("low");
+        let high = epoch_key("high");
+        mgr.enqueue_compilation(CompilationTask {
+            priority: CompilationPriority::Low,
+            ..c1_task(&low)
+        });
+        mgr.enqueue_compilation(CompilationTask {
+            target_tier: CompilationTier::C2,
+            priority: CompilationPriority::High,
+            ..c1_task(&high)
+        });
+
+        // The gate filters; it does not reorder.
+        let first = mgr.next_fresh_task().expect("a fresh task");
+        assert_eq!(first.method_key, high);
+        let second = mgr.next_fresh_task().expect("a fresh task");
+        assert_eq!(second.method_key, low);
+        assert_eq!(mgr.dropped_requests(), 0);
+    }
+
+    #[test]
+    fn an_empty_queue_is_not_a_drop() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        assert_eq!(mgr.next_fresh_task(), None);
+        epoch.store(9, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None);
+        assert_eq!(mgr.dropped_requests(), 0);
+    }
+
+    #[test]
+    fn every_enqueue_door_stamps_the_epoch() {
+        // The stamp is applied by the queue, not by the caller, so a request
+        // that entered through the policy path (`on_method_invocation`) or the
+        // OSR path is gated identically to one the VM pushed directly. A
+        // per-caller stamp is what would eventually be forgotten on one door.
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            c2_threshold: 1_000_000,
+            osr_threshold: 1,
+            tiered_enabled: true,
+            c2_min_invocations: 1_000_000,
+            c1_profiling: false,
+        };
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr =
+            TieredCompilationManager::with_install_epoch_source(policy, Some(Arc::clone(&epoch)));
+
+        let invoked = epoch_key("viaInvocationHook");
+        assert_eq!(
+            mgr.on_method_invocation(&invoked),
+            Some(CompilationTier::C1),
+            "crossing c1_threshold=1 enqueues"
+        );
+        epoch.store(2, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None, "policy-path request is gated");
+        assert_eq!(mgr.dropped_requests(), 1);
+
+        let osr = epoch_key("viaOsrRequest");
+        assert!(mgr.request_osr(&osr, 12).is_some(), "OSR request enqueues");
+        epoch.store(3, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None, "OSR request is gated too");
+        assert_eq!(mgr.dropped_requests(), 2);
+    }
+
+    #[test]
+    fn drops_reach_the_process_wide_scheduling_counters() {
+        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
+        crate::metrics::reset_scheduling_counts_for_test();
+
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let key = epoch_key("counted");
+        mgr.enqueue_compilation(c1_task(&key));
+        epoch.store(2, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None);
+
+        assert_eq!(
+            crate::metrics::scheduling_count("queue_dropped_stale_install_epoch"),
+            Some(1),
+            "the drop must be visible in the metrics idiom, not only on the manager"
+        );
+        assert_eq!(crate::metrics::scheduling_dropped_total(), 1);
+
+        crate::metrics::reset_scheduling_counts_for_test();
+    }
+
+    #[test]
+    fn invalidate_class_counts_the_requests_it_discards() {
+        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
+        crate::metrics::reset_scheduling_counts_for_test();
+
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let a = epoch_key("unloadedA");
+        let b = epoch_key("unloadedB");
+        let survivor = MethodKey::new("craton/test/OtherClass", "kept", "()V");
+        mgr.enqueue_compilation(c1_task(&a));
+        mgr.enqueue_compilation(CompilationTask {
+            priority: CompilationPriority::High,
+            ..c1_task(&b)
+        });
+        mgr.enqueue_compilation(c1_task(&survivor));
+
+        mgr.invalidate_class("craton/test/EpochSubject");
+
+        assert_eq!(mgr.queue_size(), 1, "only the unrelated class survives");
+        assert_eq!(
+            crate::metrics::scheduling_count("queue_dropped_class_invalidated"),
+            Some(2),
+        );
+        assert_eq!(mgr.dropped_requests(), 2);
+        // Still dispatchable: invalidating one class must not gate another.
+        assert_eq!(mgr.next_fresh_task(), Some(c1_task(&survivor)));
+
+        crate::metrics::reset_scheduling_counts_for_test();
+    }
+
+    #[test]
+    fn shutdown_counts_the_requests_it_abandons() {
+        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
+        crate::metrics::reset_scheduling_counts_for_test();
+
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        // No worker is started, so nothing drains: the queue is exactly what
+        // teardown finds. Deterministic, and no thread to race.
+        mgr.enqueue_compilation(c1_task(&epoch_key("abandonedA")));
+        mgr.enqueue_compilation(c1_task(&epoch_key("abandonedB")));
+
+        let mut bg = BackgroundCompiler {
+            core: Arc::clone(&mgr.core),
+            handle: None,
+        };
+        bg.shutdown();
+
+        assert_eq!(mgr.queue_size(), 0, "shutdown drains rather than leaves");
+        assert_eq!(
+            crate::metrics::scheduling_count("queue_shutdown_abandoned"),
+            Some(2),
+            "abandoning work at teardown is correct, but it is still countable"
+        );
+        assert_eq!(mgr.dropped_requests(), 2);
+
+        crate::metrics::reset_scheduling_counts_for_test();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Broker tests
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Every test here runs the broker with synthetic counters and no VM, no method
+// body, no backend and no executable memory — that is the whole point of the
+// type. There are deliberately **no wall-clock assertions and no sleeps**: the
+// only "time" in the broker is the `compile_time_ms` a caller hands to
+// `complete`, which is an input, not a measurement.
+//
+// Class names are unique per test (`craton/test/<Something>`) because two
+// process-global sets leak across tests in this binary: `osr_deny_list()` and
+// the `MutableBigInteger` class deny. A shared key is how
+// `stats_osr_compilations` intermittently saw the wrong answer — see
+// `osr_deny_only_key` in the module above.
+
+#[cfg(test)]
+mod broker_tests {
+    use super::*;
+    use crate::bailout::BailoutReason;
+
+    fn key(class: &str, name: &str) -> MethodKey {
+        MethodKey::new(class, name, "()V")
+    }
+
+    /// Thresholds small enough for a test to cross by hand. The *shape* of the
+    /// policy is the shipped one; only the numbers shrink, so nothing here
+    /// depends on the production tuning staying put.
+    fn fast_policy() -> CompilationPolicy {
+        CompilationPolicy {
+            c1_threshold: 2,
+            c2_threshold: 10,
+            osr_threshold: 3,
+            tiered_enabled: true,
+            c2_min_invocations: 4,
+            c1_profiling: true,
+        }
+    }
+
+    fn task_for(
+        class: &str,
+        tier: CompilationTier,
+        priority: CompilationPriority,
+    ) -> CompilationTask {
+        CompilationTask {
+            method_key: key(class, "m"),
+            target_tier: tier,
+            priority,
+            enqueue_time_ms: 0,
+            osr_bci: None,
+        }
+    }
+
+    /// Drive `key` to exactly `fast_policy`'s `c1_threshold` (2) invocations
+    /// and return the decision the crossing produced.
+    fn warm(broker: &mut CompilationBroker, key: &MethodKey) -> AdmissionDecision {
+        let below = broker.on_invocation(key, 0);
+        assert_eq!(
+            below.category(),
+            "below_invocation_threshold",
+            "the first invocation must not reach c1_threshold=2"
+        );
+        broker.on_invocation(key, 0)
+    }
+
+    /// Install a body directly, without going through the queue.
+    ///
+    /// This is an *undispatched* completion, so it also bumps
+    /// `unsolicited_completions` — see
+    /// `an_undispatched_completion_is_counted_but_still_clears_the_slot` for
+    /// why that path deliberately still applies the state update.
+    fn install(
+        broker: &mut CompilationBroker,
+        key: &MethodKey,
+        tier: CompilationTier,
+        code_bytes: u64,
+        dependencies: Vec<Dependency>,
+    ) {
+        let task = CompilationTask {
+            method_key: key.clone(),
+            target_tier: tier,
+            priority: CompilationPriority::Normal,
+            enqueue_time_ms: 0,
+            osr_bci: None,
+        };
+        assert_eq!(
+            broker.complete(
+                &task,
+                CompileVerdict::Installed {
+                    compile_time_ms: 1,
+                    code_bytes,
+                    dependencies,
+                },
+            ),
+            CompletionOutcome::Recorded
+        );
+    }
+
+    // ── The policy is a faithful copy of the live one ────────────────
+
+    /// The oracle test the [`ThresholdPolicy`] doc comment promises: a table of
+    /// synthetic states run through BOTH the extracted policy and the live
+    /// `TieredCompilationManager::should_compile`, asserting they never
+    /// disagree. Without this, "the extraction changed no threshold" is a
+    /// claim rather than a fact.
+    #[test]
+    fn threshold_policy_reproduces_todays_tier_decisions() {
+        let policy = fast_policy();
+        let mgr = TieredCompilationManager::new(fast_policy());
+        let extracted = ThresholdPolicy::new(fast_policy());
+        let k = key("craton/test/Oracle", "m");
+
+        let mut cases = 0u32;
+        for tier in [
+            CompilationTier::Interpreter,
+            CompilationTier::C1,
+            CompilationTier::C1WithProfiling,
+            CompilationTier::FullProfile,
+            CompilationTier::C2,
+        ] {
+            for invocations in [0u64, 1, 2, 3, 9, 10, 50] {
+                for profiled in [0u64, 1] {
+                    for bailed_out in [false, true] {
+                        for fails in [0u32, 1, MAX_TIER_FAIL_RETRIES] {
+                            let mut state = MethodState::new(k.clone());
+                            state.current_tier = tier;
+                            state.invocation_count = invocations;
+                            state.profile.profiled_invocations = profiled;
+                            state.c2_bailout = bailed_out;
+                            state.tier_fail_count = fails;
+
+                            let live = mgr.should_compile(&state, &policy);
+                            let brokered = extracted
+                                .select_tier(&TierSignals::from_state(&state))
+                                .admitted_tier();
+                            assert_eq!(
+                                live, brokered,
+                                "tier={tier:?} invocations={invocations} \
+                                 profiled={profiled} c2_bailout={bailed_out} fails={fails}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 5 * 7 * 2 * 2 * 3, "the whole table ran");
+    }
+
+    /// The second oracle: the back-edge OSR trigger. The live manager counts
+    /// back-edges itself and fires at `osr_threshold`; so does the broker, and
+    /// both then refuse while the request is in flight.
+    #[test]
+    fn osr_backedge_trigger_matches_the_live_manager() {
+        let k = key("craton/test/OsrOracle", "loop");
+        let mgr = TieredCompilationManager::new(fast_policy());
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        for edge in 1..=5u32 {
+            let live = mgr.on_backedge(&k, 7).is_some();
+            let brokered = broker.on_backedge(&k, 7).is_admit();
+            assert_eq!(live, brokered, "back-edge {edge}");
+            if edge == 3 {
+                assert!(live, "osr_threshold=3 fires on the third back-edge");
+            } else {
+                assert!(!live, "back-edge {edge} must not enqueue");
+            }
+        }
+    }
+
+    #[test]
+    fn decisions_are_deterministic_given_identical_inputs() {
+        let broker = CompilationBroker::with_thresholds(fast_policy());
+        let mut signals = TierSignals::new(key("craton/test/Det", "m"));
+        signals.invocation_count = 7;
+        let first = broker.decide(&signals);
+        let second = broker.decide(&signals);
+        assert_eq!(first, second, "`decide` is pure");
+        assert!(first.is_admit());
+
+        // Two independently-built brokers fed the same history agree on the
+        // whole decision stream AND on every counter.
+        fn feed(broker: &mut CompilationBroker) -> Vec<AdmissionDecision> {
+            let k = key("craton/test/Det2", "m");
+            (0..6).map(|_| broker.on_invocation(&k, 0)).collect()
+        }
+        let mut a = CompilationBroker::with_thresholds(fast_policy());
+        let mut b = CompilationBroker::with_thresholds(fast_policy());
+        assert_eq!(feed(&mut a), feed(&mut b));
+        assert_eq!(a.counters(), b.counters());
+    }
+
+    #[test]
+    fn every_decline_names_a_reason_and_says_whether_it_can_change() {
+        assert!(!DeclineReason::PermanentlyIneligible.is_transient());
+        assert!(!DeclineReason::ClassDenied.is_transient());
+        assert!(!DeclineReason::OsrDenied.is_transient());
+        assert!(!DeclineReason::RetriesExhausted {
+            failures: 3,
+            limit: 3
+        }
+        .is_transient());
+        assert!(DeclineReason::QueueFull {
+            depth: 1,
+            capacity: 1
+        }
+        .is_transient());
+        assert!(DeclineReason::CodeCacheFull {
+            used_bytes: 1,
+            cap_bytes: 1
+        }
+        .is_transient());
+
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let denied = MethodKey::new("java/math/MutableBigInteger", "divideMagnitude", "()V");
+        let decision = broker.on_invocation(&denied, 5_000);
+        assert_eq!(decision.category(), "class_denied");
+        assert!(decision.to_string().starts_with("declined [class_denied]"));
+        assert_eq!(broker.queue_depth(), 0);
+    }
+
+    // ── Queue policy: priority, bound, shed rule ─────────────────────
+
+    #[test]
+    fn the_default_queue_bound_is_the_documented_one() {
+        let broker = CompilationBroker::with_default_policy();
+        assert_eq!(broker.queue().capacity(), DEFAULT_COMPILE_QUEUE_CAPACITY);
+        assert_eq!(broker.policy_name(), "threshold");
+    }
+
+    #[test]
+    fn a_full_queue_sheds_the_newest_strictly_lower_priority_request() {
+        let mut q = BoundedCompileQueue::new(2);
+        let old_low = task_for(
+            "craton/test/Low1",
+            CompilationTier::C2,
+            CompilationPriority::Low,
+        );
+        let new_low = task_for(
+            "craton/test/Low2",
+            CompilationTier::C2,
+            CompilationPriority::Low,
+        );
+        let high = task_for(
+            "craton/test/High",
+            CompilationTier::C2,
+            CompilationPriority::High,
+        );
+        assert_eq!(q.enqueue(old_low.clone()), EnqueueOutcome::Accepted);
+        assert_eq!(q.enqueue(new_low.clone()), EnqueueOutcome::Accepted);
+        assert_eq!(
+            q.enqueue(high.clone()),
+            EnqueueOutcome::AcceptedAfterShedding(new_low),
+            "the NEWEST low-band entry is shed, not the one that has waited"
+        );
+        assert_eq!(q.dequeue(), Some(high), "bands drain highest-first");
+        assert_eq!(
+            q.dequeue(),
+            Some(old_low),
+            "the request that waited longest survived the shed"
+        );
+        assert_eq!(q.dequeue(), None);
+        assert_eq!(q.total_shed(), 1);
+        assert_eq!(q.total_processed(), 2);
+    }
+
+    #[test]
+    fn a_full_queue_rejects_when_nothing_ranks_below() {
+        let mut q = BoundedCompileQueue::new(1);
+        let a = task_for(
+            "craton/test/RejA",
+            CompilationTier::C1,
+            CompilationPriority::Normal,
+        );
+        let b = task_for(
+            "craton/test/RejB",
+            CompilationTier::C1,
+            CompilationPriority::Normal,
+        );
+        assert_eq!(q.enqueue(a), EnqueueOutcome::Accepted);
+        assert!(q.would_reject(CompilationPriority::Normal));
+        assert!(
+            !q.would_reject(CompilationPriority::High),
+            "a High request may displace the Normal one"
+        );
+        assert_eq!(
+            q.enqueue(b),
+            EnqueueOutcome::Rejected {
+                depth: 1,
+                capacity: 1
+            },
+            "an equal-priority burst must not churn the queue"
+        );
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn zero_capacity_is_clamped_so_the_compiler_is_never_permanently_starved() {
+        let mut q = BoundedCompileQueue::new(0);
+        assert_eq!(q.capacity(), 1);
+        assert_eq!(
+            q.enqueue(task_for(
+                "craton/test/Zero",
+                CompilationTier::C1,
+                CompilationPriority::Normal
+            )),
+            EnqueueOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn queue_pressure_declines_with_a_named_transient_reason() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        broker.set_queue_capacity(1);
+        let first = key("craton/test/QueueA", "m");
+        let second = key("craton/test/QueueB", "m");
+        assert!(warm(&mut broker, &first).is_admit());
+        assert_eq!(broker.queue_depth(), 1);
+
+        let blocked = warm(&mut broker, &second);
+        assert_eq!(blocked.category(), "queue_full");
+        match blocked {
+            AdmissionDecision::Decline(reason) => assert!(reason.is_transient()),
+            other => panic!("expected a decline, got {other:?}"),
+        }
+        assert_eq!(
+            broker.counters().decline_reasons.get("queue_full").copied(),
+            Some(1)
+        );
+        // Fail closed: the refused method kept its counters and no in-flight
+        // flag, so draining the queue makes it admissible again.
+        assert!(broker.next_request().is_some());
+        assert!(broker.on_invocation(&second, 0).is_admit());
+    }
+
+    // ── Idempotence ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_request_key_separates_tier_and_osr_artifacts() {
+        let k = key("craton/test/Ident", "m");
+        let entry_c1 = RequestKey {
+            method: k.clone(),
+            tier: CompilationTier::C1,
+            osr_bci: None,
+        };
+        let entry_c2 = RequestKey {
+            method: k.clone(),
+            tier: CompilationTier::C2,
+            osr_bci: None,
+        };
+        let osr_c2 = RequestKey {
+            method: k,
+            tier: CompilationTier::C2,
+            osr_bci: Some(3),
+        };
+        assert_ne!(entry_c1, entry_c2, "tier is part of request identity");
+        assert_ne!(entry_c2, osr_c2, "an OSR artifact is a different request");
+        assert!(osr_c2.is_osr() && !entry_c2.is_osr());
+
+        let mut sorted = vec![osr_c2.clone(), entry_c2.clone(), entry_c1.clone()];
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![entry_c1, entry_c2, osr_c2],
+            "outstanding requests list in a stable order"
+        );
+    }
+
+    /// The idempotence guarantee: even with the coarse per-method in-flight
+    /// flag cleared out from under it — which is exactly what
+    /// `TieredCompilationManager::on_deoptimization` does to a still-queued
+    /// task — the broker refuses to queue the same request twice.
+    #[test]
+    fn an_identical_request_is_deduplicated_not_queued_twice() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/Dedup", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        assert_eq!(broker.queue_depth(), 1);
+        assert_eq!(broker.outstanding_len(), 1);
+
+        broker
+            .states
+            .get_mut(&k)
+            .expect("state exists")
+            .queued_for_compilation = false;
+
+        let again = broker.on_invocation(&k, 0);
+        assert_eq!(
+            again,
+            AdmissionDecision::Decline(DeclineReason::AlreadyQueued),
+            "the request's own identity refuses the duplicate"
+        );
+        assert_eq!(broker.queue_depth(), 1, "no second code buffer is possible");
+        assert_eq!(broker.outstanding_len(), 1);
+        assert_eq!(broker.counters().deduplicated, 1);
+        assert_eq!(
+            broker.counters().decline_reasons.get("already_queued").copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_dispatched_request_still_blocks_a_duplicate_until_it_completes() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/InFlight", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        let task = broker.next_request().expect("queued");
+        assert_eq!(broker.queue_depth(), 0);
+        assert_eq!(broker.outstanding_len(), 1, "in flight is still outstanding");
+
+        broker
+            .states
+            .get_mut(&k)
+            .expect("state exists")
+            .queued_for_compilation = false;
+        assert_eq!(
+            broker.on_invocation(&k, 0),
+            AdmissionDecision::Decline(DeclineReason::AlreadyQueued)
+        );
+        assert_eq!(broker.counters().deduplicated, 1);
+
+        assert_eq!(
+            broker.complete(&task, CompileVerdict::installed(1, 16)),
+            CompletionOutcome::Recorded
+        );
+        assert_eq!(broker.outstanding_len(), 0, "completion releases the slot");
+    }
+
+    #[test]
+    fn a_deoptimization_drops_the_queued_request_instead_of_leaving_a_duplicate() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/DeoptDup", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        assert_eq!(broker.queue_depth(), 1);
+
+        broker.on_deoptimization(&k);
+        assert_eq!(
+            broker.queue_depth(),
+            0,
+            "the queued request went with the deopt that invalidated its premises"
+        );
+        assert_eq!(broker.outstanding_len(), 0);
+        assert_eq!(broker.counters().requests_dropped, 1);
+
+        // Re-admission produces exactly ONE request, not a second one racing a
+        // survivor of the first.
+        assert!(broker.on_invocation(&k, 0).is_admit());
+        assert_eq!(broker.queue_depth(), 1);
+        assert_eq!(broker.outstanding_len(), 1);
+    }
+
+    // ── Invalidation of queued and in-flight requests ────────────────
+
+    #[test]
+    fn a_redefined_class_loses_its_queued_request_at_dispatch() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/Redef", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        assert_eq!(broker.queue_depth(), 1);
+        assert_eq!(broker.class_epoch(&k.class_name), 0);
+
+        let retired = broker.invalidate(&InvalidationEvent::ClassRedefined(k.class_name.clone()));
+        assert!(retired.is_empty(), "nothing was compiled yet");
+        assert_eq!(broker.class_epoch(&k.class_name), 1);
+
+        assert_eq!(
+            broker.next_request(),
+            None,
+            "a request formed against replaced bytecode is never handed to a backend"
+        );
+        assert_eq!(broker.counters().dropped_stale, 1);
+        assert_eq!(broker.counters().dispatched, 0);
+        assert_eq!(broker.outstanding_len(), 0);
+
+        // Fail closed: the drop is explicit, counted, and the method is
+        // immediately re-admissible — the request is deferred, never lost.
+        assert!(broker.on_invocation(&k, 0).is_admit());
+        assert_eq!(broker.queue_depth(), 1);
+    }
+
+    #[test]
+    fn a_redefine_between_dispatch_and_completion_refuses_the_install() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/RedefRace", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        let task = broker.next_request().expect("a request was queued");
+        assert_eq!(broker.counters().dispatched, 1);
+
+        broker.invalidate(&InvalidationEvent::ClassRedefined(k.class_name.clone()));
+
+        let outcome = broker.complete(&task, CompileVerdict::installed(1, 4096));
+        assert_eq!(
+            outcome,
+            CompletionOutcome::DiscardedStale {
+                admitted_epoch: 0,
+                current_epoch: 1
+            },
+            "installing a body compiled from replaced bytecode is a wrong-code bug"
+        );
+        assert!(broker.installed_body(&k).is_none());
+        assert_eq!(
+            broker.pressure().used_bytes,
+            0,
+            "the discarded body's bytes never entered the code cache"
+        );
+        assert_eq!(
+            broker.state(&k).map(|s| s.current_tier),
+            Some(CompilationTier::Interpreter),
+            "the discarded verdict did not advance the tier"
+        );
+        assert_eq!(
+            broker.state(&k).map(|s| s.tier_fail_count),
+            Some(0),
+            "nor did it spend the new bytecode's retry budget"
+        );
+        assert_eq!(broker.counters().completions_discarded_stale, 1);
+        assert_eq!(broker.counters().installed, 0);
+        assert!(broker.on_invocation(&k, 0).is_admit());
+    }
+
+    #[test]
+    fn a_stale_bailout_does_not_punish_the_new_bytecode() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/StaleBail", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        let task = broker.next_request().expect("queued");
+        broker.invalidate(&InvalidationEvent::ClassRedefined(k.class_name.clone()));
+        let outcome = broker.complete(
+            &task,
+            CompileVerdict::Bailed(Bailout::new(BailoutReason::RegisterPressure)),
+        );
+        assert!(matches!(outcome, CompletionOutcome::DiscardedStale { .. }));
+        assert_eq!(broker.state(&k).map(|s| s.tier_fail_count), Some(0));
+        assert_eq!(broker.counters().bailed, 0);
+    }
+
+    #[test]
+    fn stale_requests_do_not_starve_the_fresh_ones_behind_them() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let doomed_a = MethodKey::new("craton/test/Doomed", "a", "()V");
+        let doomed_b = MethodKey::new("craton/test/Doomed", "b", "()V");
+        let live = MethodKey::new("craton/test/StillLive", "m", "()V");
+        for k in [&doomed_a, &doomed_b, &live] {
+            assert!(warm(&mut broker, k).is_admit());
+        }
+        assert_eq!(broker.queue_depth(), 3);
+
+        broker.invalidate(&InvalidationEvent::ClassRedefined(
+            "craton/test/Doomed".to_string(),
+        ));
+        let next = broker
+            .next_request()
+            .expect("the fresh request behind two stale ones is still reachable");
+        assert_eq!(next.method_key, live);
+        assert_eq!(broker.counters().dropped_stale, 2);
+        assert_eq!(broker.next_request(), None);
+    }
+
+    #[test]
+    fn class_unload_purges_bodies_and_queued_requests() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let compiled = key("craton/test/Unload", "compiled");
+        let sibling = key("craton/test/Unload", "sibling");
+        let survivor = key("craton/test/UnloadSurvivor", "m");
+
+        assert!(warm(&mut broker, &compiled).is_admit());
+        let task = broker.next_request().expect("queued");
+        assert_eq!(
+            broker.complete(&task, CompileVerdict::installed(1, 128)),
+            CompletionOutcome::Recorded
+        );
+        assert_eq!(broker.pressure().used_bytes, 128);
+
+        assert!(warm(&mut broker, &sibling).is_admit());
+        assert!(warm(&mut broker, &survivor).is_admit());
+        assert_eq!(broker.queue_depth(), 2);
+
+        let retired = broker.purge_class("craton/test/Unload");
+        assert_eq!(retired, vec![ArtifactId::entry(compiled.clone())]);
+        assert_eq!(
+            broker.pressure().used_bytes,
+            0,
+            "retiring a body returns its bytes to the cache"
+        );
+        assert_eq!(
+            broker.queue_depth(),
+            1,
+            "only the unloaded class's request was dropped"
+        );
+        assert_eq!(broker.counters().requests_dropped, 1);
+        assert!(broker.state(&sibling).is_none());
+        assert!(broker.state(&survivor).is_some());
+        let next = broker
+            .next_request()
+            .expect("the surviving class's request still dispatches");
+        assert_eq!(next.method_key, survivor);
+    }
+
+    /// An unload while a compile is in flight: the record is deliberately kept
+    /// so its pre-unload epoch can refuse the body the backend is about to hand
+    /// back for a class that no longer exists.
+    #[test]
+    fn an_unload_during_a_compile_refuses_the_body_that_comes_back() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/UnloadRace", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        let task = broker.next_request().expect("queued");
+
+        broker.purge_class(&k.class_name);
+        let outcome = broker.complete(&task, CompileVerdict::installed(1, 256));
+        assert!(
+            matches!(outcome, CompletionOutcome::DiscardedStale { .. }),
+            "got {outcome:?}"
+        );
+        assert!(broker.installed_body(&k).is_none());
+        assert_eq!(broker.pressure().used_bytes, 0);
+        assert_eq!(broker.installed_count(), 0);
+    }
+
+    #[test]
+    fn invalidation_cascades_through_direct_callers_deterministically() {
+        let mut broker = CompilationBroker::with_default_policy();
+        let callee = MethodKey::new("craton/test/Callee", "target", "()V");
+        let caller = MethodKey::new("craton/test/CallerA", "m", "()V");
+        let outer = MethodKey::new("craton/test/CallerB", "m", "()V");
+        install(
+            &mut broker,
+            &callee,
+            CompilationTier::C2,
+            10,
+            vec![Dependency::ClassUnchanged("craton/test/Callee".to_string())],
+        );
+        install(
+            &mut broker,
+            &caller,
+            CompilationTier::C2,
+            20,
+            vec![Dependency::DirectCall(callee.clone())],
+        );
+        install(
+            &mut broker,
+            &outer,
+            CompilationTier::C2,
+            30,
+            vec![Dependency::DirectCall(caller.clone())],
+        );
+        assert_eq!(broker.pressure().used_bytes, 60);
+
+        let retired = broker.invalidate(&InvalidationEvent::ClassRedefined(
+            "craton/test/Callee".to_string(),
+        ));
+        assert_eq!(
+            retired,
+            vec![
+                ArtifactId::entry(callee),
+                ArtifactId::entry(caller),
+                ArtifactId::entry(outer),
+            ],
+            "the transitive closure retires in a hash-order-independent sequence"
+        );
+        assert_eq!(broker.installed_count(), 0);
+        assert_eq!(broker.pressure().used_bytes, 0);
+        assert_eq!(broker.counters().retired, 3);
+    }
+
+    #[test]
+    fn retiring_an_osr_artifact_does_not_cascade_to_callers() {
+        let mut broker = CompilationBroker::with_default_policy();
+        let looper = MethodKey::new("craton/test/OsrOnly", "loop", "()V");
+        let caller = MethodKey::new("craton/test/OsrCaller", "m", "()V");
+        let osr_task = CompilationTask {
+            method_key: looper.clone(),
+            target_tier: CompilationTier::C2,
+            priority: CompilationPriority::High,
+            enqueue_time_ms: 0,
+            osr_bci: Some(21),
+        };
+        assert_eq!(
+            broker.complete(
+                &osr_task,
+                CompileVerdict::Installed {
+                    compile_time_ms: 1,
+                    code_bytes: 8,
+                    dependencies: vec![Dependency::ClassUnchanged(
+                        "craton/test/OsrOnly".to_string()
+                    )],
+                },
+            ),
+            CompletionOutcome::Recorded
+        );
+        install(
+            &mut broker,
+            &caller,
+            CompilationTier::C2,
+            8,
+            vec![Dependency::DirectCall(looper.clone())],
+        );
+
+        let retired = broker.invalidate(&InvalidationEvent::BodyRetired(looper.clone()));
+        assert_eq!(
+            retired,
+            vec![ArtifactId::entry(caller)],
+            "a direct call is baked against the entry point, so only that cascades"
+        );
+        assert!(broker.installed_osr_body(&looper, 21).is_some());
+    }
+
+    // ── Code-cache pressure is a real admission input ────────────────
+
+    #[test]
+    fn code_cache_pressure_declines_and_retirement_readmits() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        broker.set_code_cache_cap_bytes(1_000);
+        let hot = key("craton/test/Cache", "hot");
+        assert!(warm(&mut broker, &hot).is_admit());
+        let task = broker.next_request().expect("queued");
+        assert_eq!(
+            broker.complete(
+                &task,
+                CompileVerdict::Installed {
+                    compile_time_ms: 1,
+                    code_bytes: 1_000,
+                    dependencies: vec![Dependency::ClassUnchanged("craton/test/Cache".to_string())],
+                },
+            ),
+            CompletionOutcome::Recorded
+        );
+        assert!(broker.pressure().at_capacity());
+        assert_eq!(broker.pressure().free_bytes(), 0);
+
+        let cold = key("craton/test/CacheOther", "m");
+        assert_eq!(warm(&mut broker, &cold).category(), "code_cache_full");
+
+        let retired = broker.invalidate(&InvalidationEvent::ClassRedefined(
+            "craton/test/Cache".to_string(),
+        ));
+        assert_eq!(retired, vec![ArtifactId::entry(hot)]);
+        assert_eq!(broker.pressure().used_bytes, 0);
+        assert!(
+            broker.on_invocation(&cold, 0).is_admit(),
+            "pressure is an input to admission, not a statistic"
+        );
+    }
+
+    #[test]
+    fn an_external_occupancy_reading_overrides_the_brokers_own_tally() {
+        let mut broker = CompilationBroker::with_default_policy();
+        broker.set_code_cache_cap_bytes(64);
+        broker.note_code_cache_used(1_000);
+        assert!(broker.pressure().at_capacity());
+        broker.note_code_cache_used(0);
+        assert!(!broker.pressure().at_capacity());
+        assert!(!CodeCachePressure::UNBOUNDED.at_capacity());
+    }
+
+    // ── Tier semantics preserved from the live manager ───────────────
+
+    #[test]
+    fn osr_and_entry_artifacts_are_tracked_separately() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/OsrArtifacts", "loop");
+        assert!(warm(&mut broker, &k).is_admit());
+        let entry = broker.next_request().expect("queued");
+        assert!(entry.osr_bci.is_none());
+        assert_eq!(
+            broker.complete(&entry, CompileVerdict::installed(1, 32)),
+            CompletionOutcome::Recorded
+        );
+        assert_eq!(
+            broker.state(&k).map(|s| s.current_tier),
+            Some(CompilationTier::C1)
+        );
+
+        assert!(broker.request_osr(&k, 11).is_osr());
+        let osr = broker.next_request().expect("osr queued");
+        assert_eq!(osr.osr_bci, Some(11));
+        assert_eq!(osr.target_tier, CompilationTier::C2);
+        assert_eq!(osr.priority, CompilationPriority::High);
+        assert_eq!(
+            broker.complete(&osr, CompileVerdict::installed(1, 16)),
+            CompletionOutcome::Recorded
+        );
+        assert_eq!(
+            broker.state(&k).map(|s| s.current_tier),
+            Some(CompilationTier::C1),
+            "an OSR publish must not advance the method-entry tier"
+        );
+        assert!(broker.installed_body(&k).is_some());
+        assert!(broker.installed_osr_body(&k, 11).is_some());
+        assert_eq!(broker.installed_count(), 2);
+        assert_eq!(broker.counters().osr_admitted, 1);
+    }
+
+    #[test]
+    fn a_c2_upgrade_is_low_priority_and_idempotent() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/Upgrade", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        let c1 = broker.next_request().expect("queued");
+        assert_eq!(
+            broker.complete(&c1, CompileVerdict::installed(1, 8)),
+            CompletionOutcome::Recorded
+        );
+
+        match broker.request_c2_upgrade(&k) {
+            AdmissionDecision::Admit(ticket) => {
+                assert_eq!(ticket.tier, CompilationTier::C2);
+                assert_eq!(
+                    ticket.priority,
+                    CompilationPriority::Low,
+                    "an upgrade must never displace a method that is still interpreting"
+                );
+                assert_eq!(ticket.reason, AdmitReason::C2Upgrade);
+                assert_eq!(ticket.reason.category(), "c2_upgrade");
+            }
+            other => panic!("expected an admitted upgrade, got {other:?}"),
+        }
+        assert_eq!(
+            broker.request_c2_upgrade(&k),
+            AdmissionDecision::Decline(DeclineReason::AlreadyQueued)
+        );
+        assert_eq!(broker.queue_depth(), 1);
+    }
+
+    #[test]
+    fn a_permanent_decline_does_not_spend_the_retry_budget() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/Permanent", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        let task = broker.next_request().expect("queued");
+        assert_eq!(
+            broker.complete(&task, CompileVerdict::Declined { rule: "skip_list" }),
+            CompletionOutcome::Recorded
+        );
+        let state = broker.state(&k).expect("state");
+        assert!(state.ineligible);
+        assert_eq!(state.tier_fail_count, 0, "a policy verdict is not a failure");
+        assert_eq!(
+            broker.on_invocation(&k, 0).category(),
+            "permanently_ineligible"
+        );
+        assert_eq!(broker.counters().declined_permanently, 1);
+    }
+
+    #[test]
+    fn repeated_failures_exhaust_the_retry_budget_exactly_once() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/Retries", "m");
+        for attempt in 0..MAX_TIER_FAIL_RETRIES {
+            // Only the first attempt needs to cross the threshold; afterwards
+            // the counter is already past it, so one invocation re-admits (a
+            // failed compile does not advance `current_tier`).
+            let decision = if attempt == 0 {
+                warm(&mut broker, &k)
+            } else {
+                broker.on_invocation(&k, 0)
+            };
+            assert!(decision.is_admit(), "attempt {attempt}: {decision:?}");
+            let task = broker.next_request().expect("queued");
+            assert_eq!(
+                broker.complete(
+                    &task,
+                    CompileVerdict::Bailed(Bailout::with_context(
+                        BailoutReason::RegisterPressure,
+                        "test",
+                    )),
+                ),
+                CompletionOutcome::Recorded
+            );
+        }
+        assert_eq!(
+            broker.state(&k).map(|s| s.tier_fail_count),
+            Some(MAX_TIER_FAIL_RETRIES)
+        );
+        assert_eq!(broker.on_invocation(&k, 0).category(), "retries_exhausted");
+        assert_eq!(
+            broker.counters().bailout_categories.get("register_pressure").copied(),
+            Some(u64::from(MAX_TIER_FAIL_RETRIES))
+        );
+    }
+
+    #[test]
+    fn a_c2_compile_over_budget_demotes_the_method() {
+        let mut broker = CompilationBroker::with_default_policy();
+        let k = key("craton/test/SlowCompile", "m");
+        let task = CompilationTask {
+            method_key: k.clone(),
+            target_tier: CompilationTier::C2,
+            priority: CompilationPriority::High,
+            enqueue_time_ms: 0,
+            osr_bci: None,
+        };
+        assert_eq!(
+            broker.complete(
+                &task,
+                CompileVerdict::installed(MAX_C2_COMPILE_TIME_MS + 1, 8),
+            ),
+            CompletionOutcome::Recorded
+        );
+        assert!(
+            broker.state(&k).expect("state").c2_bailout,
+            "a C2 compile over the wall-clock budget demotes exactly as three deopts would"
+        );
+    }
+
+    // ── Observability ────────────────────────────────────────────────
+
+    #[test]
+    fn an_undispatched_completion_is_counted_but_still_clears_the_slot() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/Unsolicited", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        // Bypass `next_request`, i.e. a wiring bug that hands a task to a
+        // backend behind the broker's back.
+        let queued = broker.queue.dequeue().expect("queued");
+        assert_eq!(
+            broker.complete(&queued, CompileVerdict::installed(1, 8)),
+            CompletionOutcome::Recorded
+        );
+        assert_eq!(broker.counters().unsolicited_completions, 1);
+        assert_eq!(broker.counters().dispatched, 0);
+        assert_eq!(broker.outstanding_len(), 0);
+        assert!(
+            !broker.state(&k).expect("state").queued_for_compilation,
+            "the in-flight slot is released even on the error path, so the method \
+             is never stuck marked in-flight forever"
+        );
+    }
+
+    #[test]
+    fn counters_account_for_every_admitted_request() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        for i in 0..8 {
+            let k = MethodKey::new(format!("craton/test/Acct{i}"), "m", "()V");
+            assert!(warm(&mut broker, &k).is_admit());
+        }
+        let mut dispatched = Vec::new();
+        while let Some(task) = broker.next_request() {
+            dispatched.push(task);
+        }
+        assert_eq!(dispatched.len(), 8);
+        for (n, task) in dispatched.iter().enumerate() {
+            let verdict = if n % 2 == 0 {
+                CompileVerdict::installed(1, 64)
+            } else {
+                CompileVerdict::Bailed(Bailout::new(BailoutReason::RegisterPressure))
+            };
+            assert_eq!(broker.complete(task, verdict), CompletionOutcome::Recorded);
+        }
+
+        let counters = broker.counters().clone();
+        assert_eq!(counters.admitted, 8);
+        assert_eq!(counters.dispatched, 8, "admitted == started");
+        assert_eq!(counters.completed, 8, "started == completed");
+        assert_eq!(counters.installed + counters.bailed, counters.completed);
+        assert_eq!(counters.dropped_total(), 0);
+        assert_eq!(counters.deduplicated, 0);
+        assert_eq!(counters.unsolicited_completions, 0);
+        assert_eq!(broker.outstanding_len(), 0);
+        assert_eq!(broker.queue_depth(), 0);
+        assert_eq!(
+            counters.bailout_categories.get("register_pressure").copied(),
+            Some(4)
+        );
+
+        // The stuck-queue invariant, stated as the triage rule the doc gives:
+        // outstanding == admitted - completed - dropped.
+        assert_eq!(
+            broker.outstanding_len() as u64,
+            counters.admitted - counters.completed - counters.dropped_total()
+        );
+    }
+
+    #[test]
+    fn counters_report_in_the_metrics_pair_idiom() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let k = key("craton/test/Report", "m");
+        assert!(warm(&mut broker, &k).is_admit());
+        let task = broker.next_request().expect("queued");
+        assert_eq!(
+            broker.complete(&task, CompileVerdict::installed(1, 8)),
+            CompletionOutcome::Recorded
+        );
+
+        let pairs = broker.counters().to_pairs();
+        let names: Vec<&'static str> = pairs.iter().map(|(name, _)| *name).collect();
+        for expected in [
+            "admitted",
+            "dispatched",
+            "completed",
+            "installed",
+            "deduplicated",
+            "shed",
+            "requests_dropped",
+            "dropped_stale",
+            "dropped_orphaned",
+        ] {
+            assert!(names.contains(&expected), "missing counter `{expected}`");
+        }
+        assert_eq!(
+            pairs.iter().find(|(name, _)| *name == "installed"),
+            Some(&("installed", 1))
+        );
+
+        let json = broker.counters().to_json();
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        assert!(json.contains("\"admitted\":1"));
+        assert!(json.contains("\"installed\":1"));
+        assert!(json.contains("\"decline_reasons\":{"));
+        assert!(json.contains("\"bailout_categories\":{}"));
+    }
+
+    #[test]
+    fn outstanding_requests_are_listable_for_a_stuck_queue() {
+        let mut broker = CompilationBroker::with_thresholds(fast_policy());
+        let a = MethodKey::new("craton/test/StuckB", "m", "()V");
+        let b = MethodKey::new("craton/test/StuckA", "m", "()V");
+        assert!(warm(&mut broker, &a).is_admit());
+        assert!(warm(&mut broker, &b).is_admit());
+        let listed = broker.outstanding_requests();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[0].method, b,
+            "listed in a stable order, not hash order"
+        );
+        assert!(broker.is_outstanding(&listed[0]));
+    }
+
+    #[test]
+    fn an_admit_decision_renders_the_string_the_metrics_report_stores() {
+        let broker = CompilationBroker::with_thresholds(fast_policy());
+        let mut signals = TierSignals::new(key("craton/test/Render", "m"));
+        signals.invocation_count = 5;
+        let decision = broker.decide(&signals);
+        assert_eq!(decision.category(), "invocation_threshold");
+        let rendered = decision.to_string();
+        assert!(rendered.starts_with("admitted to C1 [invocation_threshold]"));
+        assert!(rendered.contains("5 invocations >= threshold 2"));
+
+        let osr = broker.decide_osr(&signals, 9, OsrTrigger::CallerJudged);
+        assert!(osr.is_osr());
+        assert!(osr.to_string().contains("(OSR at bci 9)"));
     }
 }
 

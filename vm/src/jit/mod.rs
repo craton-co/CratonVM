@@ -10,6 +10,7 @@
 pub use cratonvm_jit::*;
 
 pub mod alloc_class_cache;
+pub mod code_cache_lifecycle;
 pub mod conservative_roots;
 pub mod disasm;
 pub mod helpers;

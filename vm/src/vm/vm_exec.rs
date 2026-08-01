@@ -583,6 +583,186 @@ pub fn dispatch_policy(shared: &SharedVm) -> cratonvm_types::compat::ExecutionPo
     shared.config.execution_policy()
 }
 
+/// Dispatch-side capability gate: the coarse safety net under the per-call-site
+/// gates in `native-builtins` / `native-io`.
+///
+/// # Why it exists
+///
+/// The per-call-site gates cover the natives someone has edited. This one
+/// covers every native whose `(class, method)` is in
+/// [`classify_native`](cratonvm_native_api::capability::classify_native) —
+/// `ProcessBuilder.start`, `Runtime.exec`, `System.load*`, `Unsafe.*`, the FFM
+/// `Linker`, the `java.io` file streams, the `java.net` sockets — *including the
+/// ones whose implementation still has no gate of its own*. It can only ever
+/// report [`Scope::Any`](cratonvm_native_api::Scope::Any): the arguments have
+/// not been decoded here, so there is no path or host to name. An `Enforce`
+/// deployment therefore has to hold the unscoped grant (`process-spawn:*`) for
+/// a class of native to dispatch at all, and the per-call-site gate then makes
+/// the scoped decision.
+///
+/// # Cost, on the path every native dispatch in the VM takes
+///
+/// Three early-outs, in this order:
+///
+/// 1. `capabilities()` — one `Option` discriminant test on a registry field.
+///    This is the *only* cost when no policy is installed (an embedder that
+///    builds its registry by hand, and every `NativeMethodRegistry::new`).
+/// 2. `classify_native(class, method)` — a `match` on `class_name`, which
+///    rustc lowers to a length switch plus a handful of `memcmp`s and answers
+///    `None` for the ~3,100 natives that are not capability-relevant. This is
+///    the *whole* cost of the installed-but-`Permissive` default for all but a
+///    few dozen triples.
+/// 3. For those few dozen, under `Permissive` only, a thread-local memo (see
+///    below). `Audit` and `Enforce` skip it and take the full check every time.
+///
+/// No allocation, no lock, no atomic and no hashing on any of the three. In
+/// particular there is no `NativeMethodId` resolution on the common path, which
+/// is deliberate: `NativeMethodRegistry::check_dispatch_capability` wants an id,
+/// these three dispatch sites reach their callback through `find_with_kind`,
+/// which does not return one, and re-deriving it with `resolve_id` would pay a
+/// *second* full 128-bit `(class, method, descriptor)` hash per dispatch — the
+/// exact duplicate-hash cost `find_with_kind` was introduced to remove (see its
+/// doc comment and the H2 `TestFileSystem.testConcurrent` profile). The id is
+/// resolved only after step 2 has said this native is capability-relevant, in
+/// the `#[cold]` half.
+///
+/// A `find_with_kind`-shaped registry lookup that also returned the
+/// `NativeMethodId` would let step 2 collapse into the precomputed
+/// `sensitive_slots` lookup; that is a `native-api` edit and is reported
+/// separately.
+///
+/// # Why `Permissive` is memoized and what that trades away
+///
+/// `classify_native` maps **all** of `jdk/internal/misc/Unsafe` to
+/// `RawMemory` — every `compareAndSetInt`, `getReferenceVolatile`, `park`,
+/// every AQS and every j.u.c collection operation that lands in a native.
+/// `CapabilitySet::check` takes a `parking_lot::Mutex` on the audit map, and
+/// that map is **shared by every thread of the VM**. Recording per call would
+/// put a single VM-wide mutex on the hottest native path in the interpreter —
+/// not a per-call instruction cost but a serialization point, which is how a
+/// throughput regression becomes a hang.
+///
+/// So under `Permissive` (and only under `Permissive`, which cannot refuse
+/// anything) the first dispatch of each `CapabilityKind` for each policy on
+/// each thread takes the full check, and later ones are a thread-local load, two
+/// `usize` compares and a bit test. The trade is the same one
+/// `native-builtins`' `gate_raw_memory` already documents and accepts
+/// (`docs/security/capability-wiring.md` §4.4): the report still names the
+/// capability, its scope and its first call site, and **under-reports `count`**.
+/// `count` is the one number a least-privilege grant set does not depend on,
+/// and `Audit` — the mode that exists to price an `Enforce` flip — counts every
+/// call exactly.
+///
+/// The memo is keyed on `(vm_identity, policy address)`, so swapping a VM's
+/// policy or creating a second VM invalidates it rather than inheriting a
+/// neighbour's answer.
+#[inline]
+fn check_native_dispatch_capability(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    let registry = &shared.natives.native_methods;
+    let Some(caps) = registry.capabilities() else {
+        return Ok(());
+    };
+    let Some(kind) = cratonvm_native_api::capability::classify_native(class_name, method_name)
+    else {
+        return Ok(());
+    };
+    if caps.mode() == cratonvm_native_api::CapabilityMode::Permissive
+        && permissive_dispatch_already_recorded(shared.vm_identity, caps, kind)
+    {
+        return Ok(());
+    }
+    check_native_dispatch_capability_cold(registry, kind, class_name, method_name, descriptor)
+}
+
+std::thread_local! {
+    /// `(vm_identity, policy address, kinds already recorded)` for this thread.
+    ///
+    /// A `Cell` of a `Copy` payload: no `RefCell` borrow flag, no `Arc` clone,
+    /// no allocation. `vm_identity` is never 0 (`NEXT_VM_IDENTITY` starts at 1),
+    /// so the all-zero initial value cannot collide with a real VM.
+    static PERMISSIVE_DISPATCH_MEMO: std::cell::Cell<(usize, usize, u16)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Whether this thread has already recorded `kind` for this VM's current
+/// policy — and mark it recorded if not.
+///
+/// Only ever consulted under [`CapabilityMode::Permissive`], where the answer
+/// can only suppress a *counter*, never an authorization decision.
+#[inline]
+fn permissive_dispatch_already_recorded(
+    vm_identity: usize,
+    caps: &std::sync::Arc<cratonvm_native_api::CapabilitySet>,
+    kind: cratonvm_native_api::CapabilityKind,
+) -> bool {
+    // `CapabilityKind` is `#[repr(u8)]` with 9 fieldless variants, so the
+    // discriminant is a shift amount in 0..9 and the mask fits a `u16`.
+    let bit = 1u16 << (kind as u8);
+    let policy = std::sync::Arc::as_ptr(caps) as usize;
+    PERMISSIVE_DISPATCH_MEMO.with(|memo| {
+        let (memo_vm, memo_policy, mask) = memo.get();
+        if memo_vm == vm_identity && memo_policy == policy {
+            if mask & bit != 0 {
+                return true;
+            }
+            memo.set((vm_identity, policy, mask | bit));
+        } else {
+            // Different VM, or this VM's policy was replaced: start over rather
+            // than inherit the other one's answer.
+            memo.set((vm_identity, policy, bit));
+        }
+        false
+    })
+}
+
+/// Drop this thread's [`PERMISSIVE_DISPATCH_MEMO`], so the next dispatch of
+/// every kind is recorded again. For tests that install a policy after boot.
+#[cfg(test)]
+fn reset_permissive_dispatch_memo() {
+    PERMISSIVE_DISPATCH_MEMO.with(|memo| memo.set((0, 0, 0)));
+}
+
+/// The ~35-native half of [`check_native_dispatch_capability`]. Out of line so
+/// the hot path is two predicted-not-taken branches and nothing else.
+#[cold]
+#[inline(never)]
+fn check_native_dispatch_capability_cold(
+    registry: &crate::native::registry::NativeMethodRegistry,
+    kind: cratonvm_native_api::CapabilityKind,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    // Preferred route: the registry's own gate, reading the classification it
+    // precomputed for this slot at registration time. Costs one `resolve_id`
+    // (a triple hash) — irrelevant next to spawning a process or opening a file.
+    if let Some(id) = registry.resolve_id(class_name, method_name, descriptor) {
+        if registry.capability_of_id(id).is_some() {
+            return registry.check_dispatch_capability(id).map_err(Into::into);
+        }
+    }
+    // Fallback: the slot carries no classification. That happens when the
+    // registration predates the policy (an embedder that calls
+    // `set_capabilities` after its own `register_*` pass), or when the
+    // descriptor-quirk path resolved to a slot registered under a different
+    // descriptor. `classify_native` already answered for this `(class, method)`,
+    // so check that answer directly rather than let the gate vanish.
+    match registry.capabilities() {
+        Some(caps) => caps
+            .check(cratonvm_native_api::Capability::of(
+                kind,
+                cratonvm_native_api::Scope::Any,
+            ))
+            .map_err(Into::into),
+        None => Ok(()),
+    }
+}
+
 /// §4 census hook: count one native dispatch for the `(class, method,
 /// descriptor)` triple.
 ///
@@ -1649,7 +1829,7 @@ fn safe_native_call_impl(
     // flipped to a non-zero `<0x1000` value was corrupted by THIS native.
     // Gated separately (expensive: O(watch-list) per native).
     if crate::runtime::ec_watch::native_enabled() {
-        let hits = crate::runtime::ec_watch::detect();
+        let hits = crate::runtime::ec_watch::detect(shared.vm_identity);
         if !hits.is_empty() {
             let native = cratonvm_native_api::native_ring::name_of(callback as usize)
                 .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
@@ -3425,6 +3605,18 @@ impl<'a> NativeContextImpl<'a> {
                 snapshot.push(m);
             }
         }
+        // The JIT's stashed deopt / exceptional frames, for a thread about to
+        // PARK. They live in `jit/` thread-locals, so a peer collector cannot
+        // see them at all — and once this thread blocks, `GcBarrier` drops it
+        // from `expected` and collects without it ever running its own scan.
+        // Depositing them here is what makes that window survivable: the
+        // callee-handler path can block with a frame stashed.
+        // See `docs/jit/deopt-thread-local-roots.md`.
+        cratonvm_jit::deopt::for_each_stashed_deopt_object(|addr| {
+            if let Some(obj) = self.shared.mem.heap.is_object_address(addr as usize) {
+                snapshot.push(obj);
+            }
+        });
         // cceres3 FIX (blocked-window exact slot tracking): record every
         // Object frame slot with the address it currently holds. GC folds
         // advance each entry's `cur` through their pointer maps; the wake
@@ -3801,6 +3993,14 @@ impl<'a> NativeContextImpl<'a> {
             for val in &mut self.thread.printed {
                 update_value_ref(val, &fixup);
             }
+            // The remap half for this thread's stashed deopt / exceptional
+            // frames, against the same composed fixup the frames above use.
+            // Deposited on the way into the blocking region; rewritten here on
+            // the way out, because the collection that moved them ran while
+            // this thread was parked and could not run its own remap.
+            cratonvm_jit::deopt::remap_stashed_deopt_objects(|addr| {
+                fixup.get(&(addr as usize)).map(|&to| to as u64)
+            });
             if let Some(ref mut obj_ref) = self.thread.java_thread_obj {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = fixup.get(&old_addr) {
@@ -4562,6 +4762,20 @@ impl<'a> NativeContextImpl<'a> {
             );
         }
         let _ = self.shared.invalidate_jit_for_class(&name);
+        // Bump the broker's per-class epoch so a queued or in-flight
+        // compilation of the PREVIOUS bytecode is dropped rather than
+        // installed. Deliberately here and not beside the install-epoch
+        // bump above: that pairing has its own ordering comment and the two
+        // epochs answer different questions — global "was the cache flushed"
+        // versus per-class "was THIS class replaced".
+        let _ = self
+            .shared
+            .jit
+            .compilation_broker
+            .lock()
+            .invalidate(&cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(
+                name.to_string(),
+            ));
         Ok(())
     }
 }
@@ -5030,10 +5244,65 @@ impl<'a> NativeContextImpl<'a> {
         }
         None
     }
+
+    /// The `ClassId` a native call should resolve *array* descriptors against:
+    /// the innermost Java frame that is not part of the reflection plumbing
+    /// that got us here.
+    ///
+    /// `Class.forName` / `Array.newInstance` / `Class.arrayType` are all
+    /// caller-sensitive, and their own declaring classes are bootstrap-defined,
+    /// so taking `frames.last()` blindly would always answer "bootstrap" and
+    /// defeat the whole point. Mirrors the frame walk
+    /// `lang_class::class_for_name_one_arg_caller_loader` already does for the
+    /// one-argument `Class.forName` overload; only the innermost non-plumbing
+    /// frame is consulted, because walking further out crosses loader
+    /// namespaces.
+    fn array_resolution_referencing_class(&self) -> Option<ClassId> {
+        const REFLECTION_PLUMBING: &[&str] = &[
+            "java/lang/Class",
+            "java/lang/reflect/Array",
+            "java/lang/invoke/MethodType",
+        ];
+        let cm = self.shared.classes.class_manager.read();
+        self.thread.frames.iter().rev().find_map(|frame| {
+            let cid = frame.class_id;
+            let class = cm.get_class(cid)?;
+            if REFLECTION_PLUMBING.contains(&&*class.name) {
+                None
+            } else {
+                Some(cid)
+            }
+        })
+    }
 }
 
 impl<'a> NativeClassAccess for NativeContextImpl<'a> {
     fn load_class(&mut self, name: &str) -> MethodCallResult {
+        // JVMS §5.3.3: an array class is defined by the defining loader of its
+        // component type. `resolve_class_loader_faithful` below cannot express
+        // that — it resolves the array descriptor as a flat global name, so
+        // `[Lp/X;` came out bootstrap-keyed and two isolating loaders' arrays
+        // collapsed onto one runtime class. Try the loader-faithful array path
+        // first; it returns `None` for every non-array name and for a
+        // built-in calling loader, so this is strictly additive.
+        if name.starts_with('[') {
+            // Bind before the `if let`: an `if let` scrutinee's temporaries
+            // (here the autoref `&*self`) live for the whole body, which would
+            // collide with the `&mut self` reborrows inside it.
+            let referencing = self.array_resolution_referencing_class();
+            if let Some(referencing_class_id) = referencing {
+                let resolved = crate::runtime::interpreter::resolve_array_class_loader_aware(
+                    self.shared,
+                    self.thread,
+                    referencing_class_id,
+                    name,
+                );
+                if let Some(class_id) = resolved {
+                    let mirror = super::get_or_create_class_mirror(self.shared, class_id);
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+            }
+        }
         // See `class_via_caller_loader_before_stub`: a name that would only
         // resolve to a fabricated synthetic stub must first be offered to the
         // calling class's own ClassLoader, before the stub is minted and
@@ -5235,21 +5504,6 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .and_then(|cs| cs.functional_interface_id)
     }
 
-    fn lambda_call_site_descriptors(&self, class_id: ClassId) -> Option<(String, String, String)> {
-        self.shared
-            .classes
-            .lambda_proxies
-            .read()
-            .get(&class_id)
-            .map(|cs| {
-                (
-                    cs.sam_method_name.to_string(),
-                    cs.sam_descriptor.to_string(),
-                    cs.instantiated_descriptor.to_string(),
-                )
-            })
-    }
-
     fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
         // Prefer the recorded *defining* class (where the lambda / method-ref's
         // invokedynamic appears) — this is what HotSpot names the proxy after and
@@ -5352,6 +5606,38 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .find_unique_class_by_name(name)
     }
 
+    /// The real answer behind [`Self::class_id_by_name`]'s `None`.
+    ///
+    /// `find_unique_class_by_name` above already fails closed on an ambiguous
+    /// name — it returns `None` rather than picking one of several same-named
+    /// classes — but `None` is also what an absent name returns, and the two
+    /// demand opposite actions from a native that would load or fabricate on a
+    /// miss. `classify_loaded_name` is the same index read (O(1) against the
+    /// per-name definition count) with the two cases kept apart, so this costs
+    /// a native nothing until it asks.
+    ///
+    /// The variant mapping is one-to-one on purpose: `native-api` cannot
+    /// depend on `classloading`, so `NameLookup` mirrors `NameResolution`, and
+    /// this method is the single place the two meet. A future variant added on
+    /// either side must fail to compile here rather than silently fold into a
+    /// neighbouring case.
+    fn classify_class_name(&self, name: &str) -> cratonvm_native_api::NameLookup {
+        use cratonvm_classloading::NameResolution;
+        use cratonvm_native_api::NameLookup;
+
+        match self
+            .shared
+            .classes
+            .class_manager
+            .read()
+            .classify_loaded_name(name)
+        {
+            NameResolution::Absent => NameLookup::Absent,
+            NameResolution::Unique(id) => NameLookup::Unique(id),
+            NameResolution::Ambiguous { definitions } => NameLookup::Ambiguous { definitions },
+        }
+    }
+
     /// Real initialization state, for `Unsafe.shouldBeInitialized`. Reuses the
     /// memoised helper the interpreter itself uses, so this is a thread-local
     /// hit plus (on a miss) one class-manager read — it does NOT run `<clinit>`.
@@ -5380,7 +5666,12 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         referencing_class_id: ClassId,
         name: &str,
     ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
-        crate::runtime::interpreter::resolve_class_loader_aware(
+        // `resolve_class_or_array_loader_aware`, not the plain variant: an
+        // array descriptor arriving here (`Class.forName("[Lp/X;")`,
+        // `Array.newInstance`, generic-signature parsing) must be keyed on its
+        // component's defining loader per JVMS §5.3.3, and the plain resolver
+        // explicitly declines `[` names.
+        crate::runtime::interpreter::resolve_class_or_array_loader_aware(
             self.shared,
             self.thread,
             referencing_class_id,
@@ -6404,6 +6695,16 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 // T5.4.4 вЂ” additionally consult the InvalidationManager's
                 // LeafClass/class_dependencies entries.
                 let cha_evicted = self.shared.invalidate_jit_for_class(name);
+                // A define over an already-loaded name replaces that class's
+                // bytecode, so a queued compilation of the previous body is stale.
+                let _ = self
+                    .shared
+                    .jit
+                    .compilation_broker
+                    .lock()
+                    .invalidate(&cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(
+                        name.to_string(),
+                    ));
                 if cha_evicted > 0 {
                     tracing::debug!(
                         "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
@@ -6478,6 +6779,16 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                 }
                 // T5.4.4 вЂ” CHA-listener invalidation
                 let cha_evicted = self.shared.invalidate_jit_for_class(name);
+                // A define over an already-loaded name replaces that class's
+                // bytecode, so a queued compilation of the previous body is stale.
+                let _ = self
+                    .shared
+                    .jit
+                    .compilation_broker
+                    .lock()
+                    .invalidate(&cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(
+                        name.to_string(),
+                    ));
                 if cha_evicted > 0 {
                     tracing::debug!(
                         "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
@@ -6583,6 +6894,16 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             tracing::debug!("JIT: invalidated {evicted} method(s) due to defineClass: {name}");
         }
         let cha_evicted = self.shared.invalidate_jit_for_class(name);
+        // A define over an already-loaded name replaces that class's
+        // bytecode, so a queued compilation of the previous body is stale.
+        let _ = self
+            .shared
+            .jit
+            .compilation_broker
+            .lock()
+            .invalidate(&cratonvm_jit::tiered::InvalidationEvent::ClassRedefined(
+                name.to_string(),
+            ));
         if cha_evicted > 0 {
             tracing::debug!("JIT: CHA-invalidated {cha_evicted} method(s) for: {name}");
         }
@@ -12432,11 +12753,74 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // matches the allocated slot count, instead of `ClassId::new(0)`
         // (`java/lang/Object`, zero declared fields) which the GC's
         // `get_field` bounds guard rejects as an undersized layout.
+        //
+        // Still the infallible spelling: this signature has no way to report
+        // the one case the class manager now refuses (a name two or more
+        // distinct classes already carry). For that case `ClassManager::
+        // ensure_synthetic_class` hands back a distinctly-named, correctly
+        // sized `cratonvm/synthetic/AmbiguousName$…` stand-in instead of a
+        // stub filed under the ambiguous name — see its doc comment, and
+        // `docs/known-issues/synthetic-class-fallibility.md` for the migration
+        // that removes this method's callers.
         self.shared
             .classes
             .class_manager
             .write()
             .ensure_synthetic_class(name, num_fields)
+    }
+
+    /// The fallible spelling: the same operation, with the refusal the
+    /// infallible one cannot express.
+    ///
+    /// Two differences from [`Self::ensure_synthetic_class`], both intended:
+    ///
+    /// 1. it can return [`ClassIdentityError::AmbiguousName`] instead of a
+    ///    stand-in, so a native that can fail gets to fail;
+    /// 2. it goes through `ClassManager::try_ensure_synthetic_class`, which
+    ///    **enforces** `--jdk-only` (the infallible one only records the
+    ///    violation and fabricates anyway). Under the default `Compatible`
+    ///    mode the two are identical; under `--jdk-only` a call site migrated
+    ///    to this spelling starts refusing, which is exactly step 2 of the
+    ///    JDK-ONLY-WAVE2 recipe in `class_manager.rs`.
+    ///
+    /// The error is re-derived from the name index rather than pattern-matched
+    /// out of the returned `VmError`: the classifier is the authority on
+    /// *which* refusal this is, and matching on an error's shape would make
+    /// this mapping quietly wrong the day a third refusal is added.
+    fn try_ensure_synthetic_class(
+        &mut self,
+        name: &str,
+        num_fields: usize,
+    ) -> Result<ClassId, cratonvm_native_api::ClassIdentityError> {
+        use cratonvm_classloading::NameResolution;
+        use cratonvm_native_api::ClassIdentityError;
+
+        // Same real-class preference as the infallible spelling: a name that
+        // resolves to real bytes is not a fabrication and cannot be ambiguous
+        // (the loader answered with one class).
+        if let Ok(cid) = self.shared.load_class_concurrent(name) {
+            return Ok(cid);
+        }
+        let mut manager = self.shared.classes.class_manager.write();
+        // Bound to a local so the `&mut` borrow of the guard ends before the
+        // classifier's `&` borrow below, rather than relying on the match
+        // scrutinee's borrow ending early.
+        let fabricated = manager.try_ensure_synthetic_class(name, num_fields);
+        match fabricated {
+            Ok(id) => Ok(id),
+            Err(err) => Err(match manager.classify_loaded_name(name) {
+                NameResolution::Ambiguous { definitions } => ClassIdentityError::AmbiguousName {
+                    name: name.to_string(),
+                    definitions,
+                },
+                NameResolution::Absent | NameResolution::Unique(_) => {
+                    ClassIdentityError::Refused {
+                        name: name.to_string(),
+                        reason: err.to_string(),
+                    }
+                }
+            }),
+        }
     }
 
     fn is_interface_class(&self, class_id: ClassId) -> bool {
@@ -14112,6 +14496,17 @@ pub fn invoke_or_native(
             }
             Some(decision) => {
                 if let Some(callback) = decision.native_callback() {
+                    // CAPABILITY GATE, dispatch site 1 of 3. Deliberately here
+                    // and not up at the `find_with_kind` hit: this is the last
+                    // point before the native actually runs, and the arms above
+                    // can still route the call to real bytecode instead. A
+                    // capability is only exercised by a native that executes.
+                    check_native_dispatch_capability(
+                        shared,
+                        effective_class,
+                        method_name,
+                        descriptor,
+                    )?;
                     return safe_native_call(shared, thread, callback, args)
                         .map(|v| coerce_native_return(v, descriptor));
                 }
@@ -18092,6 +18487,17 @@ fn invoke_on_class_shared_inner(
                             && method_name == "newFileChannel"
                             && descriptor
                                 == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;")
+                        // The same story for the three link operations:
+                        // concrete `throw new UnsupportedOperationException()`
+                        // bodies on the base class, and no concrete subclass to
+                        // override them because the default provider IS the
+                        // base class here. Shared with the interpreter gate so
+                        // both paths agree.
+                        || crate::runtime::interpreter::is_file_system_provider_link_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || matches!(
                             (class_name, method_name, descriptor),
                             ("java/nio/charset/Charset", "contains", "(Ljava/nio/charset/Charset;)Z")
@@ -21676,6 +22082,36 @@ fn invoke_on_class_shared_inner(
                             blocked_flag,
                             shared.mem.heap.collection_count(),
                         );
+                        // What the receiver actually IS. Every other line in
+                        // this dump describes the address's *history*; none of
+                        // them answers the first question a wrong-receiver miss
+                        // raises — is this the intended object carrying a wrong
+                        // class, or a different object entirely? Those need
+                        // opposite fixes, and the shape settles it: a `Class`
+                        // mirror is registered in `class_mirrors_reverse`, so a
+                        // hit there with a non-`java/lang/Class` header is a
+                        // mirror-header defect, a miss with plausible field
+                        // values is a wrong-value read, and a miss with junk is
+                        // a recycled address.
+                        let mirror_of = crate::vm::vm_object::class_id_from_mirror(shared, *r)
+                            .and_then(|cid| {
+                                shared
+                                    .classes
+                                    .class_manager
+                                    .read()
+                                    .get_class(cid)
+                                    .map(|c| c.name.to_string())
+                            });
+                        let nf = shared.mem.heap.num_fields(*r);
+                        let fields: Vec<String> = (0..nf.min(4))
+                            .map(|i| format!("[{i}]={:?}", shared.mem.heap.get_field(*r, i)))
+                            .collect();
+                        eprintln!(
+                            "  NSME-RECV SHAPE kind={:?} num_fields={nf} mirror_of={} {}",
+                            shared.mem.heap.kind_of(*r),
+                            mirror_of.as_deref().unwrap_or("<not a registered mirror>"),
+                            fields.join(" "),
+                        );
                         for (e, moved_to, mlen, as_dest) in crate::memory::gc::gcpart_probe(addr) {
                             eprintln!(
                                 "  NSME-RECV [gcpart] epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
@@ -21888,6 +22324,17 @@ fn invoke_on_class_shared_inner(
                     }
                     Some(decision) => {
                         if let Some(callback) = decision.native_callback() {
+                            // CAPABILITY GATE, dispatch site 2 of 3 — the
+                            // "force the registered native in front of real JDK
+                            // bytecode" path. Same placement rule as site 1:
+                            // immediately before the call, after routing has
+                            // committed to the native.
+                            check_native_dispatch_capability(
+                                shared,
+                                &class_name_for_force,
+                                method_name,
+                                descriptor,
+                            )?;
                             return safe_native_call(shared, thread, callback, args);
                         }
                     }
@@ -22027,8 +22474,19 @@ fn invoke_on_class_shared_inner(
             || class_name.starts_with("io/netty/internal/tcnative/");
 
         if let Some(callback) = registry_native {
-            // Fast path: Rust NativeCallback registered in the built-in registry.
-            safe_native_call(shared, thread, callback, args)
+            // CAPABILITY GATE, dispatch site 3 of 3 — the general
+            // `is_native` dispatch every ACC_NATIVE method reaches. Chained
+            // rather than sequenced so the arm still evaluates to the
+            // `MethodCallResult` the surrounding `let result = if …` expects; a
+            // refusal short-circuits and the native never runs.
+            //
+            // The JNI-function-pointer and bytecode arms below are NOT gated
+            // here: a JNI native registered by a host library is not in
+            // `classify_native`'s table, so the gate would be a guaranteed
+            // `None`. Covering host-registered JNI needs `RegisterNatives`
+            // itself to be gated, which is a separate row.
+            check_native_dispatch_capability(shared, &class_name, method_name, descriptor)
+                .and_then(|()| safe_native_call(shared, thread, callback, args))
         } else if let Some(fn_ptr) = if skip_jni_incompatible_host_lib {
             None
         } else {
@@ -24484,5 +24942,239 @@ mod tests {
             .thread_registry
             .frame_trace_of_resolved(ThreadId(0xDEAD), &store)
             .is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispatch-side capability gate
+    // -----------------------------------------------------------------------
+    //
+    // Every test here builds its own VM, so it works under its own `VmId` and
+    // the process-global `VmId -> CapabilitySet` index cannot leak a policy
+    // into a concurrently-running test. Dropping the `SharedVm` uninstalls it
+    // (`impl Drop for SharedVm`).
+
+    use cratonvm_native_api::{
+        capabilities_for, install_capabilities, Capability, CapabilityMode, CapabilitySet, VmId,
+    };
+
+    /// A native that `classify_native` maps to a capability…
+    const SENSITIVE: (&str, &str, &str) = (
+        "java/lang/ProcessBuilder",
+        "start",
+        "()Ljava/lang/Process;",
+    );
+    /// …and one it does not, which is the answer for ~3,100 of the ~3,100.
+    const BENIGN: (&str, &str, &str) = ("java/lang/Object", "hashCode", "()I");
+
+    /// Replace this VM's boot policy with one in `mode`, in both places the
+    /// install path puts it: the registry (dispatch + registration gate) and
+    /// the process index (per-call-site gates reached through `NativeContext`).
+    /// The same `Arc` in both, so there is one audit log.
+    fn vm_in_mode(mode: CapabilityMode) -> (SharedVm, Arc<CapabilitySet>) {
+        let mut shared = SharedVm::new(VmConfig::default());
+        let caps = Arc::new(CapabilitySet::new(
+            VmId::from_raw(shared.vm_identity),
+            mode,
+        ));
+        shared
+            .natives
+            .native_methods
+            .set_capabilities(Arc::clone(&caps));
+        install_capabilities(Arc::clone(&caps));
+        // Boot ran under its own policy and may already have marked kinds in
+        // this thread's `Permissive` memo. Swapping the policy invalidates it by
+        // construction (the memo is keyed on the policy address), but clear it
+        // anyway so a test asserting on counts is reading its own traffic only.
+        reset_permissive_dispatch_memo();
+        (shared, caps)
+    }
+
+    fn gate(shared: &SharedVm, triple: (&str, &str, &str)) -> Result<(), MethodCallFailed> {
+        check_native_dispatch_capability(shared, triple.0, triple.1, triple.2)
+    }
+
+    /// The default a VM boots with. Nothing is refused, and the use is counted
+    /// so `capability_audit(vm)` can derive a grant set from a real run.
+    #[test]
+    fn permissive_dispatch_allows_and_records() {
+        let (shared, caps) = vm_in_mode(CapabilityMode::Permissive);
+        assert!(gate(&shared, SENSITIVE).is_ok());
+
+        let report = caps.audit_report();
+        assert_eq!(
+            report.total_checks(),
+            1,
+            "the dispatch gate must record exactly one use:\n{report}"
+        );
+        assert_eq!(
+            report.uses[0].capability.kind(),
+            cratonvm_native_api::CapabilityKind::ProcessSpawn
+        );
+        assert_eq!(
+            report.total_ungranted(),
+            1,
+            "Permissive still prices the flip; it just does not act on it"
+        );
+    }
+
+    /// The `Permissive` gate is behaviour-identical to having no policy: it
+    /// never refuses, for a classified native or an unclassified one, and it
+    /// touches the audit log only for the classified one — so the ~3,100
+    /// non-capability natives pay a discriminant test and a `match` on the
+    /// class name, and nothing else.
+    #[test]
+    fn permissive_dispatch_is_behaviour_identical_to_no_policy() {
+        // Reference: a registry with no policy at all answers `Ok` for
+        // everything, which is the behaviour that must not change.
+        let bare = crate::native::registry::NativeMethodRegistry::new();
+        assert!(bare.capabilities().is_none());
+
+        let (shared, caps) = vm_in_mode(CapabilityMode::Permissive);
+        for triple in [SENSITIVE, BENIGN] {
+            assert!(
+                gate(&shared, triple).is_ok(),
+                "Permissive must never refuse {triple:?}"
+            );
+        }
+        let report = caps.audit_report();
+        assert_eq!(
+            report.uses.len(),
+            1,
+            "only the classified native may reach the audit log:\n{report}"
+        );
+    }
+
+    /// The `Permissive` memo, both halves of the trade in one test: the
+    /// capability IS recorded (so the audit report names it and can derive a
+    /// grant for it), and it is recorded ONCE per kind per thread rather than
+    /// once per dispatch — which is what keeps the VM-wide audit mutex off the
+    /// `Unsafe` dispatch path, where `classify_native` maps every method to
+    /// `RawMemory`.
+    #[test]
+    fn permissive_records_a_kind_once_per_thread_then_goes_transparent() {
+        let (shared, caps) = vm_in_mode(CapabilityMode::Permissive);
+        for _ in 0..64 {
+            assert!(gate(&shared, SENSITIVE).is_ok());
+        }
+        let report = caps.audit_report();
+        assert_eq!(
+            report.total_checks(),
+            1,
+            "64 dispatches must cost ONE audit-mutex acquisition:\n{report}"
+        );
+
+        // Clearing the memo makes the next one record again — i.e. the
+        // suppression is a memo, not a latch that loses the capability.
+        reset_permissive_dispatch_memo();
+        assert!(gate(&shared, SENSITIVE).is_ok());
+        assert_eq!(caps.audit_report().total_checks(), 2);
+    }
+
+    /// `Audit` is the mode a deployment runs its suite in before flipping:
+    /// everything is still allowed, and the ungranted uses are tallied so the
+    /// cost of `Enforce` is a number rather than a guess.
+    #[test]
+    fn audit_dispatch_records_without_denying() {
+        let (shared, caps) = vm_in_mode(CapabilityMode::Audit);
+        assert!(
+            gate(&shared, SENSITIVE).is_ok(),
+            "Audit must not deny — that is what Enforce is for"
+        );
+        assert!(gate(&shared, SENSITIVE).is_ok());
+
+        let report = caps.audit_report();
+        assert_eq!(report.total_checks(), 2, "{report}");
+        assert_eq!(
+            report.total_ungranted(),
+            2,
+            "with no grants, an Enforce flip would have refused both:\n{report}"
+        );
+        assert_eq!(
+            report.suggested_grants(),
+            "process-spawn:*",
+            "the report must hand back the grant that would fix it"
+        );
+    }
+
+    /// The point of the whole exercise: under `Enforce` a native that is not
+    /// covered by a grant does not run.
+    #[test]
+    fn enforce_denies_an_ungranted_dispatch() {
+        let (shared, _caps) = vm_in_mode(CapabilityMode::Enforce);
+
+        let denied = gate(&shared, SENSITIVE).expect_err("ProcessSpawn is not granted");
+        let text = denied.to_string();
+        assert!(
+            text.contains("SecurityException"),
+            "a refusal must surface as SecurityException, not as an I/O or \
+             internal error: {text}"
+        );
+        assert!(
+            text.contains("process-spawn"),
+            "the refusal must name the capability so it is actionable: {text}"
+        );
+
+        // The `Permissive` memo must not reach `Enforce`: a refusal is a
+        // decision, not a counter, and it has to be taken every time.
+        for _ in 0..8 {
+            assert!(gate(&shared, SENSITIVE).is_err());
+        }
+
+        // A native that exercises no capability is untouched even under
+        // Enforce — the gate is not a global switch.
+        assert!(gate(&shared, BENIGN).is_ok());
+    }
+
+    /// The unscoped grant the dispatch gate needs. It cannot name a program (no
+    /// arguments have been decoded yet), so `Scope::Any` is the only request it
+    /// can make and only an unscoped grant admits it — the per-call-site gate
+    /// in `native-io` then makes the scoped decision.
+    #[test]
+    fn enforce_admits_a_dispatch_covered_by_an_unscoped_grant() {
+        let mut shared = SharedVm::new(VmConfig::default());
+        let mut set = CapabilitySet::new(
+            VmId::from_raw(shared.vm_identity),
+            CapabilityMode::Enforce,
+        );
+        set.grant(Capability::parse_grant("process-spawn:*").unwrap());
+        let caps = Arc::new(set);
+        shared
+            .natives
+            .native_methods
+            .set_capabilities(Arc::clone(&caps));
+        install_capabilities(Arc::clone(&caps));
+
+        assert!(gate(&shared, SENSITIVE).is_ok());
+        // A *scoped* grant does not admit it: the gate's request is
+        // `Scope::Any`, and fail-closed means a narrow grant refuses it.
+        let mut narrow = CapabilitySet::new(
+            VmId::from_raw(shared.vm_identity),
+            CapabilityMode::Enforce,
+        );
+        narrow.grant(Capability::parse_grant("process-spawn:/bin/sh").unwrap());
+        let narrow = Arc::new(narrow);
+        shared
+            .natives
+            .native_methods
+            .set_capabilities(Arc::clone(&narrow));
+        install_capabilities(narrow);
+        assert!(gate(&shared, SENSITIVE).is_err());
+    }
+
+    /// Two VMs in one process must not be able to change each other's answer —
+    /// the cross-VM policy interference the capability model exists to remove.
+    #[test]
+    fn two_vms_gate_independently() {
+        let (strict, _s) = vm_in_mode(CapabilityMode::Enforce);
+        let (lax, _l) = vm_in_mode(CapabilityMode::Permissive);
+
+        assert!(gate(&strict, SENSITIVE).is_err());
+        assert!(
+            gate(&lax, SENSITIVE).is_ok(),
+            "an Enforce VM must not make its neighbour deny"
+        );
+        assert_ne!(strict.vm_identity, lax.vm_identity);
+        assert!(capabilities_for(VmId::from_raw(strict.vm_identity)).is_some());
+        assert!(capabilities_for(VmId::from_raw(lax.vm_identity)).is_some());
     }
 }
