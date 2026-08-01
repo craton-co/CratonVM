@@ -207,6 +207,27 @@ P-521 key generation, so this also reconfirms the earlier
 this bug had been masking (`asCertificate` calls
 `Mockito.mock(X509Certificate.class)` before any DSA key pair is touched).
 
+**Spring Boot suite regression, A/B on the same 247-class slice** (every 8th
+class of the 1975-class `all-tests.tsv`, so every module is represented),
+`-Parallel 4 -TimeoutSec 300`, pre-fix binary vs. post-fix binary:
+
+| | PASS | FAIL | EMPTY | HANG |
+|---|---:|---:|---:|---:|
+| Arm A (`cratonvm-derenc-base`) | 234 | 7 | 4 | 2 |
+| Arm B (`cratonvm-derenc-fix`) | **235** | 8 | 4 | 0 |
+
+**Zero PASS → non-PASS.** The only two status changes are the two classes that
+`HANG`ed in arm A — the shared host was heavily contended during that arm:
+
+- `DataJdbcRepositoriesAutoConfigurationTests` `HANG → PASS`
+- `GraphQlWebMvcAutoConfigurationTests` `HANG → FAIL`
+
+Re-run in isolation, both binaries answer that second one identically
+(`tests=17 failed=11 containersFailed=0`), so it is a pre-existing failure
+surfacing through a load-induced timeout, not a regression. This matters
+because fix (2) sits on the interpreter's cached-invoke path, which every
+`invokespecial` in the VM traverses.
+
 **Rust regression tests** (new, both in `vm/tests/`):
 
 - `sealed_bootstrap_permitted_subclasses.rs` — asserts
@@ -217,6 +238,15 @@ this bug had been masking (`asCertificate` calls
 - `null_receiver_cached_invoke.rs` — asserts all three instance-invoke opcodes
   NPE on a null receiver **after** warming, JIT on and off. A cold-only test
   passed throughout the entire lifetime of the bug.
+
+Both were mutation-checked against the pre-fix binary
+(`CRATONVM_BIN=cratonvm-derenc-base.exe`), and both fail there —
+`sealed_bootstrap` on `RAW0 n=8 nulls=8`, `null_receiver_cached` on both the
+interpreted and JIT variants. That check is not ceremony: the first draft of
+the nest-member assertions shadowed two locals, javac errored, `compile_probe`
+returned `None`, and the test reported `ok` in 0.8 s against a binary that
+reproduces the bug perfectly. `compile_probe` now panics on a compile error
+and only skips when `javac` is genuinely absent.
 
 ## Notes for the next reader
 
