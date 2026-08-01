@@ -398,7 +398,11 @@ pub fn update_all_roots(
     // gets served that array's device buffer. Not a root source: see
     // `memory::addr_keyed`.
     #[cfg(feature = "gpu-offload")]
-    crate::runtime::offload::input_cache::remap_and_sweep(pointer_map, &shared.mem.heap);
+    crate::runtime::offload::input_cache::remap_and_sweep(
+        shared.vm_identity,
+        pointer_map,
+        &shared.mem.heap,
+    );
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ALTRACE").is_some() {
         eprintln!(
             "[altrace GC] count={} moved={} tid={}",

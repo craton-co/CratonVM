@@ -1814,9 +1814,15 @@ mod tests {
         // NEW-9's fix rejects this with a clear "must hold a returnAddress"
         // message.
         //   iconst_0 (0x03), istore_0 (0x3B), ret 0 (0xA9, 0x00)
+        //
+        // The rejection now comes from the structural subroutine check, which
+        // runs ahead of type inference and states the same defect in stronger
+        // terms: the `ret` is covered by no reachable jsr/astore prologue, so
+        // no returnAddress can reach that local on ANY path. The contract under
+        // test is the rejection, not the phrasing.
         let class = make_pre_java7_method_class("bad", "()V", 1, 1, vec![0x03, 0x3B, 0xA9, 0x00]);
         let res = verify_pre_java7(&class);
-        assert_verify_err_contains(&res, "returnAddress");
+        assert_verify_err_contains(&res, "subroutine");
     }
 
     #[test]

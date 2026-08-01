@@ -27,6 +27,8 @@
 //! - [`attribute`] — Class/method/field attributes (30+ types)
 //! - [`stack_map`] — StackMapTable verification frames (Java 7+)
 //! - [`field_type`] / [`method_descriptor`] — JVM type descriptor parsing
+//! - [`limits`] — resource limits for untrusted input, and the checked
+//!   arithmetic helpers that enforce them
 
 pub mod attribute;
 pub mod buffer;
@@ -41,6 +43,7 @@ pub mod field;
 pub mod field_type;
 pub mod instruction;
 pub mod jimage;
+pub mod limits;
 pub mod method;
 pub mod quickened;
 pub mod method_descriptor;

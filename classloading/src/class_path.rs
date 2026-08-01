@@ -2720,6 +2720,30 @@ impl ClassPath {
     ///
     /// Returns `None` if the class isn't on this classpath or lives in a
     /// JMOD/jimage module (JDK internals have no user-visible code source).
+    ///
+    /// # TRUST BOUNDARY — what a non-empty certificate vector means
+    ///
+    /// This is the API a Java caller ultimately sees, via
+    /// `Class.getCodeSource().getCertificates()`, and the point at which
+    /// application code is most likely to conclude "this class came from a
+    /// trusted publisher". A non-empty vector means **all** of the
+    /// following held (see `docs/security/signed-jar-trust.md`):
+    ///
+    ///   * a `META-INF/*.RSA|.DSA|.EC` signer block verified against its
+    ///     `.SF` companion and chained to an anchor in the process trust
+    ///     store — [`crate::jar_signer::verify_signer_block`];
+    ///   * that `.SF` committed to this archive's exact `MANIFEST.MF`;
+    ///   * every entry the manifest declares a digest for matched its bytes;
+    ///   * **this specific class entry** is one the manifest committed to,
+    ///     and the bytes about to be loaded still hash to the signed digest
+    ///     (re-checked per class in [`Self::certs_for_signed_class`]).
+    ///
+    /// It does **not** mean the signer's certificate is unrevoked (no
+    /// CRL/OCSP is consulted), nor that name-constraint or policy
+    /// processing was performed. And an **empty** vector is not evidence of
+    /// tampering: an unsigned JAR, a directory classpath entry, and a host
+    /// with no trust anchors configured all produce the same empty result.
+    /// Callers must fail closed on empty, never infer a reason from it.
     pub fn find_class_code_source_info(&self, class_name: &str) -> Option<(String, Vec<Vec<u8>>)> {
         // Audit-fix #6: match `find_class` / `find_class_source_path`'s full
         // validation set (NUL bytes, leading slash, backslash, drive letter,
@@ -2866,12 +2890,24 @@ impl ClassPath {
     ///     null — **never garbage** — which matches what HotSpot does
     ///     for a JAR that fails `jarsigner -verify`.
     ///
-    /// # TODO(post-orchestrator)
+    /// # TRUST BOUNDARY
     ///
-    /// Pub-key signature verification over the authenticated-attributes
-    /// blob, and trust-store chaining, are tracked in
-    /// `jar_signer.rs` module docs.  Once `crypto_impl::Rsa::verify_*`
-    /// is hoisted out of `cratonvm-native-builtins` we plug it in here.
+    /// Public-key verification of the SignerInfo signature and full
+    /// certification-path construction to a trust anchor **are** performed
+    /// (the older `TODO` here, which said neither was, is obsolete — see
+    /// `jar_signer.rs` module docs and `docs/security/signed-jar-trust.md`).
+    ///
+    /// `chain` carries only the certificates on the *validated path*:
+    /// [`crate::jar_signer::verify_signer_block`] narrows the
+    /// attacker-supplied CMS `certificates` set to the certs it actually
+    /// checked, so an extra certificate appended to a legitimately signed
+    /// JAR cannot be surfaced here as one of the signer's.
+    ///
+    /// What remains unproven for a non-empty `chain`: **revocation** (no
+    /// CRL/OCSP), name constraints, and certificate policies. And note the
+    /// two-stage gate — a non-empty `chain` is archive-level; it is
+    /// [`Self::certs_for_signed_class`] that decides whether any given
+    /// class entry is entitled to it.
     fn extract_jar_signer_blocks(archive: &Mutex<SharedArchive>) -> JarSignerInfo {
         let mut guard = archive.lock();
         // Collect every safe META-INF entry name once; we need both the
@@ -3025,6 +3061,21 @@ impl ClassPath {
     /// otherwise a versioned override could be smuggled in unsigned while
     /// inheriting the base entry's certs. We resolve the served name with
     /// the same descending search `find_in_multi_release_archive` uses.
+    ///
+    /// # TRUST BOUNDARY: this is the per-entry gate
+    ///
+    /// Archive-level verification is necessary but nowhere near sufficient.
+    /// "The JAR is signed" and "this class is signed" are different claims,
+    /// and only the second one licenses attaching `info.chain`. Every path
+    /// out of this function that is not the final `info.chain.clone()`
+    /// returns an **empty** vector — no chain, no signer, unsigned — and
+    /// that is the fail-closed default for: an unverified archive, an entry
+    /// the manifest never named, an entry the manifest named without a
+    /// digest, an unreadable entry, a bytes-vs-digest mismatch, and (for a
+    /// multi-release JAR) a versioned override the signer did not commit
+    /// to. The last of those matters on its own: without resolving the
+    /// *served* entry name first, an unsigned `META-INF/versions/<N>/`
+    /// override would inherit the base entry's certificates.
     fn certs_for_signed_class(
         info: &JarSignerInfo,
         archive: &Mutex<SharedArchive>,
@@ -3114,6 +3165,21 @@ impl ClassPath {
     /// even though they live inside the signed JAR (closing the JAR-spec
     /// unsigned-entry attack, where an injected `.class` not named in the
     /// manifest would otherwise inherit the signer's certificates).
+    ///
+    /// # TRUST BOUNDARY: INTEGRITY, conditional on the caller
+    ///
+    /// Every check here is a digest comparison — no key, no certificate.
+    /// It is meaningful only because the caller has *already* obtained a
+    /// `Some(_)` from [`crate::jar_signer::verify_signer_block`] for these
+    /// exact `sf_bytes`; that is what turns "the manifest matches the `.SF`"
+    /// into "the manifest matches what a verified signer committed to".
+    /// Called with an unverified `.SF` this function would happily confirm
+    /// an attacker's own manifest, so the ordering in
+    /// [`Self::extract_jar_signer_blocks`] is load-bearing, not stylistic.
+    ///
+    /// The returned list is also **exhaustive by omission**: an archive
+    /// entry with no manifest section simply does not appear, and callers
+    /// must read "absent" as "unsigned".
     #[allow(clippy::type_complexity)]
     fn verify_signed_entries(
         archive: &mut SharedArchive,

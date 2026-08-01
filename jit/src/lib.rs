@@ -91,6 +91,7 @@ pub mod ir_optimize;
 pub mod ir_schedule;
 pub mod ir_verify;
 pub mod loop_analysis;
+pub mod metrics;
 pub mod null_check_elim;
 pub mod pgo;
 pub mod platform;
@@ -3521,6 +3522,55 @@ pub enum JitLdcConstant {
     String(String),
 }
 
+/// Compile-time resolution of a `new` (0xbb) / `anewarray` (0xbd)
+/// constant-pool site, as reported by `cp_new_resolver`.
+///
+/// # Why this is an enum and not just `Option<(class_id, …)>`
+///
+/// The resolver can only name a `class_id` for a class that is ALREADY
+/// LOADED — it deliberately does not run `ClassLoader.loadClass` (arbitrary
+/// Java code from inside the compile path, with the class-manager lock in
+/// play, loading classes the program itself never would). Before this enum
+/// existed, "not loaded yet" and "this CP entry can never be a class"
+/// collapsed into the same `None`, which bailed the WHOLE compile.
+///
+/// That made any hot method whose only un-taken branch does
+/// `throw new SomeException(...)` permanently uncompilable: `SomeException`
+/// is never loaded while nothing throws, so the resolver missed, the compile
+/// bailed, and after `MAX_TIER_FAIL_RETRIES` the method interpreted forever
+/// (json-smart's `JSONParserBase.readMain` — 293,940 interpreted invocations
+/// of a workload's hottest method; see
+/// `docs/internal/jit-compile-bail-unresolved-new-cold-class.md`).
+///
+/// [`JitNewSite::Deferred`] separates the two: the site compiles, and the
+/// class is resolved at RUN TIME by the `new_object_cp` /
+/// `anewarray_object_cp` helper — on the same thread, at the same program
+/// point, and by the same code path the interpreter's own `0xbb`/`0xbd`
+/// handler uses. A `None` return is now reserved for a genuinely malformed
+/// site (the holder class is gone, or the CP entry is not a class
+/// reference), which stays a permanent bail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JitNewSite {
+    /// The target class is loaded and its layout is known.
+    ///
+    /// `has_prim_init` / `has_finalizer` feed the inline-TLAB fast path,
+    /// which skips the `jit_post_tlab_init` helper call when BOTH are false.
+    /// A resolver that cannot compute them must report `true, true` so the
+    /// helper call stays in place.
+    Resolved {
+        class_id: u32,
+        num_fields: usize,
+        has_prim_init: bool,
+        has_finalizer: bool,
+    },
+    /// The target class is not loaded yet. Compile the site to the
+    /// CP-indexed slow-path helper, which resolves + initialises it on first
+    /// execution. `holder_class_id` is the class whose constant pool
+    /// `cp_idx` indexes — i.e. the *referencing* class, which also supplies
+    /// the initiating loader.
+    Deferred { holder_class_id: u32, cp_idx: u16 },
+}
+
 /// Compile-time resolved field layout of `java/lang/String`, for the
 /// String call-site intrinsics (`length`/`charAt`/`hashCode`/`isEmpty`/
 /// `equals`/`compareTo`/`indexOf`, implemented by a later wave).
@@ -6396,6 +6446,34 @@ impl JitCache {
         }
     }
 
+    /// DIAG: every `declaring_class_id` under which this (class, method,
+    /// descriptor) triple is published, ignoring the id entirely.
+    ///
+    /// [`get`](Self::get) requires an EXACT `declaring_class_id` match, so a
+    /// caller that probes with the wrong id (notably
+    /// `get_loaded_class_id(..).unwrap_or(0)`) misses a body that is sitting
+    /// right there. This says so instead of leaving it to inference.
+    pub fn debug_ids_for(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        for shard in self.shards.iter() {
+            let methods = shard.methods.load();
+            for (key, _) in methods.values() {
+                if &*key.class_name == class_name
+                    && &*key.method_name == method_name
+                    && &*key.descriptor == descriptor
+                {
+                    out.push(key.declaring_class_id.as_u32());
+                }
+            }
+        }
+        out
+    }
+
     /// Look up the independently published OSR body for a method.
     pub fn get_osr(
         &self,
@@ -7030,12 +7108,317 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
 // Escape analysis: apply EA results to the IR graph
 // ---------------------------------------------------------------------------
 
+// ── Memory-token chain surgery (EA-local twin of `ir_optimize`'s) ────
+//
+// Every memory-effecting node carries an incoming *memory token* naming the
+// previous writer and hands itself on as the token for the next one. That chain
+// is the only ordering relation the IR has between two writes. Marking such a
+// node `Op::Dead` without first rewiring its token consumers leaves the
+// surviving memory operation's token slot pointing into the hole: it has lost
+// the transitive ordering edge to everything written before the deleted node,
+// and the scheduler is then free to hoist it above those writes. That is the
+// defect `ir_optimize::eliminate_dead_stores` was fixed for in f00cc5dd8; this
+// pass had exactly the same hole — for its stores, its loads AND its `Op::New`.
+//
+// DE-DUPLICATION NOTE: `ir_optimize::memory_token_slot` (ir_optimize.rs:1682)
+// and `ir_optimize::is_memory_token_slot` (ir_optimize.rs:1708) are the
+// reference predicates and the two below are equivalent to them, but both are
+// private to that module. Changing those two declarations to `pub(crate) fn`
+// lets `ea_memory_token_slot` / `ea_is_memory_token_slot` be deleted outright
+// and the originals imported instead. The *kill* helper,
+// `kill_store_splicing_memory_chain`, is deliberately NOT reused even if it
+// were public: it is `Op::Store`-only, and it refuses any node a safepoint slot
+// names — whereas an eliminated `Op::New` must KEEP being named by its snapshot
+// slots, because that slot is the virtual-object descriptor
+// `ir_lower::resolve_frame_state` resolves through `ScalarReplacementMap`.
+
+/// The input slot carrying `node`'s incoming memory token, or `None` when this
+/// op does not consume one.
+///
+/// Mirrors `ir_optimize::memory_token_slot`, arity guard included: the compact
+/// hand-built `[base, value]` `Store` layout's slot 1 is a *value*, not a token,
+/// so only the documented full `[ctrl, mem, …]` form has one.
+fn ea_memory_token_slot(node: &ir::Node) -> Option<usize> {
+    let min_full_arity = match node.op {
+        ir::Op::Load(_) => 3,           // [ctrl, mem, base]
+        ir::Op::Store(_) => 4,          // [ctrl, mem, base, value]
+        ir::Op::ArrayLoad(_) => 4,      // [ctrl, mem, array, index]
+        ir::Op::ArrayStore(_) => 5,     // [ctrl, mem, array, index, value]
+        ir::Op::ArrayLength => 3,       // [ctrl, mem, array_ref]
+        ir::Op::New { .. } => 2,        // [ctrl, mem]
+        ir::Op::NewArray { .. } => 3,   // [ctrl, mem, length]
+        ir::Op::Call { .. } => 2,       // [ctrl, mem, args…]
+        ir::Op::LambdaIntToDouble => 4, // [ctrl, mem, lambda, index]
+        _ => return None,
+    };
+    if node.inputs.len() >= min_full_arity {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// True when input `idx` of `node` is a memory *token* — an ordering edge
+/// naming the previous writer — rather than a value the node reads. Mirrors
+/// `ir_optimize::is_memory_token_slot`; a memory-typed φ is the one op whose
+/// token edges are every value input rather than a single slot.
+fn ea_is_memory_token_slot(node: &ir::Node, idx: usize) -> bool {
+    if matches!(node.op, ir::Op::Phi) {
+        return node.ty == ir::IrType::Memory && idx >= 1;
+    }
+    ea_memory_token_slot(node) == Some(idx)
+}
+
+/// Whether `victim` can be spliced out of the memory-token chain: either
+/// nothing names it as a token, or it has an incoming token of its own to hand
+/// on to whoever does.
+///
+/// Same bias as `ir_optimize::kill_store_splicing_memory_chain`: a node we
+/// decline to delete is a missed optimization, a node deleted out of a chain we
+/// could not repair is wrong code.
+fn ea_splice_feasible(ir_graph: &ir::Graph, victim: ir::NodeId) -> bool {
+    let named_as_token = ir_graph.nodes.iter().any(|n| {
+        n.op != ir::Op::Dead
+            && n.inputs
+                .iter()
+                .enumerate()
+                .any(|(i, &inp)| inp == victim && ea_is_memory_token_slot(n, i))
+    });
+    if !named_as_token {
+        return true;
+    }
+    ir_graph
+        .node_opt(victim)
+        .and_then(|n| ea_memory_token_slot(n).and_then(|s| n.input_opt(s)))
+        .is_some()
+}
+
+/// True when some safepoint snapshot slot names `id`.
+fn ea_snapshot_names(ir_graph: &ir::Graph, id: ir::NodeId) -> bool {
+    ir_graph
+        .safepoints
+        .iter()
+        .any(|sp| sp.locals.iter().chain(sp.stack.iter()).any(|&v| v == id))
+}
+
+/// How [`apply_ea_to_ir`] retires one node.
+#[derive(Clone, Copy)]
+enum EaVictimKind {
+    /// Every *non-token* reference — node input and safepoint snapshot slot
+    /// alike — is rewired to this replacement value before the node is killed.
+    /// Used for a scalar-replaced field `Op::Load`, whose value is known.
+    Forwarded(ir::NodeId),
+    /// Killed outright. Planning has already proved that the only references
+    /// left are memory tokens (spliced at kill time) and — for an eliminated
+    /// `Op::New` — safepoint slots that deliberately keep naming it.
+    Eliminated,
+}
+
+/// One scalar-replacement candidate's decided edit, computed without touching
+/// the graph so a refusal costs nothing and can never leave a half-applied
+/// object behind.
+struct EaScalarPlan {
+    /// `(load node, replacement value)` per field load to forward. The value is
+    /// `None` for a never-stored field until the shared zero default is made.
+    loads: Vec<(ir::NodeId, Option<ir::NodeId>)>,
+    /// The allocation and its field stores — killed only when `elide_alloc`.
+    new_node: ir::NodeId,
+    stores: Vec<ir::NodeId>,
+    /// Whether the allocation itself (and its initialising stores) may go.
+    elide_alloc: bool,
+}
+
+/// Decide what may be done to one scalar-replacement candidate. Pure: it never
+/// mutates `ir_graph`. `None` refuses the object entirely (it stays allocated,
+/// its stores stay, its loads stay).
+fn plan_scalar_replacement(
+    ir_graph: &ir::Graph,
+    reverse_map: &HashMap<escape_analysis::NodeId, ir::NodeId>,
+    info: &escape_analysis::ScalarReplacementInfo,
+    deopt_descriptor_available: bool,
+) -> Option<EaScalarPlan> {
+    let new_node = *reverse_map.get(&info.alloc_node)?;
+    if !matches!(ir_graph.node_opt(new_node)?.op, ir::Op::New { .. }) {
+        return None;
+    }
+
+    // The field index a load/store accesses. Must match the index the EA bridge
+    // keyed its field edges by: the real index from the `Const` offset operand
+    // of a full-layout production node, falling back to the `MemKind`-derived
+    // index for a compact / hand-built one.
+    let field_index = |id: ir::NodeId| -> Option<usize> {
+        if let Some(f) = ir_load_store_field_index(ir_graph, id) {
+            return Some(f);
+        }
+        match &ir_graph.node_opt(id)?.op {
+            ir::Op::Load(mk) | ir::Op::Store(mk) => Some(*mk as usize),
+            _ => None,
+        }
+    };
+
+    let mut loads: Vec<(ir::NodeId, usize)> = Vec::new();
+    for &ea_load in &info.replaced_loads {
+        // An EA node with no IR counterpart names nothing we can kill.
+        let l = match reverse_map.get(&ea_load) {
+            Some(&l) => l,
+            None => continue,
+        };
+        if !matches!(ir_graph.node_opt(l)?.op, ir::Op::Load(_)) {
+            return None;
+        }
+        loads.push((l, field_index(l)?));
+    }
+    let mut stores: Vec<(ir::NodeId, usize)> = Vec::new();
+    for &ea_store in &info.eliminated_stores {
+        let s = match reverse_map.get(&ea_store) {
+            Some(&s) => s,
+            None => continue,
+        };
+        if !matches!(ir_graph.node_opt(s)?.op, ir::Op::Store(_)) {
+            return None;
+        }
+        stores.push((s, field_index(s)?));
+    }
+
+    // LAST-WRITE-WINS HAZARD. `info.field_values[f]` records the value of the
+    // LAST store to field `f` in program order, and this pass forwards *every*
+    // replaced load of `f` to it — including a load that runs BEFORE that store
+    // and therefore reads a value the object does not hold yet (`Foo o = new
+    // Foo(); int a = o.x; o.x = 42;` would fold `a` to 42). Node ids are
+    // assigned in creation = program order, the same ordering
+    // `escape_analysis::find_scalar_replacements` itself uses to pick the
+    // winning store, so a store id above a load id means the store is later.
+    // Refuse the object rather than forward a value from its future.
+    for &(l, lf) in &loads {
+        if stores.iter().any(|&(s, sf)| sf == lf && s > l) {
+            return None;
+        }
+    }
+
+    let mut load_plans: Vec<(ir::NodeId, Option<ir::NodeId>)> = Vec::with_capacity(loads.len());
+    for &(l, f) in &loads {
+        // The value the load resolves to: the stored field value, or — when the
+        // field was never stored — the freshly-allocated object's zero default
+        // (`None` here; the caller materialises one shared `Const(0)`).
+        // Soundness of that default rests on the object being genuinely
+        // zero-initialised: the front end only admits allocations whose
+        // constructor sets no non-zero field.
+        let value = match info.field_values.get(f) {
+            Some(Some(ea_val)) => match reverse_map.get(ea_val) {
+                Some(&v) if ir_graph.node_opt(v).is_some_and(|n| n.op != ir::Op::Dead) => Some(v),
+                // The stored value has no live IR node, so this load cannot be
+                // described. REFUSE — the previous code killed the load anyway
+                // and left its consumers reading an `Op::Dead` node.
+                _ => return None,
+            },
+            Some(None) => None,
+            // Field index outside the object's field vector: the bridge and the
+            // analysis disagree about this access. Refuse rather than guess.
+            None => return None,
+        };
+        load_plans.push((l, value));
+    }
+    for &(l, _) in &load_plans {
+        if !ea_splice_feasible(ir_graph, l) {
+            return None;
+        }
+    }
+
+    // ── May the ALLOCATION itself go? ────────────────────────────────
+    //
+    // Killing the `Op::New` removes the object from the machine frame, so a
+    // deopt snapshot slot that names it can only be reconstructed from the
+    // virtual-object descriptor (`ir_lower::ScalarReplacementMap` →
+    // `FrameValue::VirtualObject`). When that descriptor will NOT be emitted —
+    // the flags are off, or `build_scalar_replacement_map` would omit this
+    // object — the slot resolves to `FrameValue::Undefined`, which every resume
+    // sink turns into `Value::Int(0)`: a NULL where a live object was. That is
+    // precisely the silent wrong-reconstruction `deopt`'s
+    // `FrameValue::MaterializationRequired` exists to make impossible, and a
+    // `SafepointSnapshot` slot — a bare `NodeId` — cannot spell it.
+    //
+    // So keep the allocation AND its initialising stores. The object is then a
+    // real, correctly-initialised heap object at the safepoint whose slot
+    // resolves the ordinary way (`StackSlotRef`), and the load forwarding above
+    // still applies: this costs the elided allocation, not the optimization.
+    let mut elide_alloc = true;
+    if stores.iter().any(|&(s, _)| ea_snapshot_names(ir_graph, s)) {
+        // A snapshot naming a `Store` is already malformed — a store produces no
+        // value a frame can be rebuilt from — but it is not this pass's business
+        // to silently retarget it.
+        elide_alloc = false;
+    }
+    if ea_snapshot_names(ir_graph, new_node)
+        && !(deopt_descriptor_available
+            && virtual_object_info_for(ir_graph, reverse_map, info).is_some())
+    {
+        elide_alloc = false;
+    }
+    if !ea_splice_feasible(ir_graph, new_node)
+        || stores
+            .iter()
+            .any(|&(s, _)| !ea_splice_feasible(ir_graph, s))
+    {
+        elide_alloc = false;
+    }
+    // Nothing outside the object's own (about to be killed) nodes may still read
+    // the allocation or one of its stores as a VALUE. EA's escape rule should
+    // already guarantee that; this is the belt-and-braces check that keeps a
+    // bridge gap from turning into a live use of a removed node.
+    if elide_alloc {
+        'outer: for (idx, n) in ir_graph.nodes.iter().enumerate() {
+            let id = idx as ir::NodeId;
+            if n.op == ir::Op::Dead
+                || id == new_node
+                || stores.iter().any(|&(s, _)| s == id)
+                || load_plans.iter().any(|&(l, _)| l == id)
+            {
+                continue;
+            }
+            for (i, &inp) in n.inputs.iter().enumerate() {
+                let names_victim = inp == new_node || stores.iter().any(|&(s, _)| s == inp);
+                if names_victim && !ea_is_memory_token_slot(n, i) {
+                    elide_alloc = false;
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    if load_plans.is_empty() && !elide_alloc {
+        return None; // nothing left to do for this object
+    }
+    Some(EaScalarPlan {
+        loads: load_plans,
+        new_node,
+        stores: stores.into_iter().map(|(s, _)| s).collect(),
+        elide_alloc,
+    })
+}
+
 /// Apply escape analysis results back onto the IR graph.
 ///
-/// Maps EA node IDs back to IR node IDs using the reverse of `id_map`,
-/// then performs scalar replacement (redirect load uses, kill stores and
-/// allocations) and lock elision (kill monitor nodes) by marking nodes
-/// as `ir::Op::Dead`.
+/// Maps EA node IDs back to IR node IDs using the reverse of `id_map`, then
+/// performs scalar replacement (forward each field load to the stored value,
+/// kill the stores and the allocation) and lock elision, by marking nodes as
+/// `ir::Op::Dead`.
+///
+/// It runs after `ir_optimize::optimize` and is the last mutator before
+/// `ir_schedule::schedule` / `ir_lower::lower_inner`, so the two invariants it
+/// used to break are ones nothing downstream repairs:
+///
+/// * **the memory-token chain** — every node killed here is first *spliced* out
+///   of the chain (consumers naming it as a token are rewired to its own
+///   incoming token), exactly as `ir_optimize::eliminate_dead_stores` does. It
+///   previously killed loads, stores and the `Op::New` with a plain
+///   `op = Op::Dead`, leaving the next memory operation's token slot pointing at
+///   a removed node — and, worse, rewrote token slots naming a forwarded load to
+///   that load's *data* replacement, so an ordering edge became a data edge.
+/// * **safepoint snapshots** — `graph.safepoints` were never touched. A slot
+///   naming a forwarded load now follows the value (it used to keep naming the
+///   killed load ⇒ `FrameValue::Undefined` ⇒ a wrong value at deopt), and the
+///   allocation is only elided when a slot naming it can still be described.
+///   See `plan_scalar_replacement` for that rule.
 fn apply_ea_to_ir(
     ir_graph: &mut ir::Graph,
     id_map: &[escape_analysis::NodeId],
@@ -7049,103 +7432,182 @@ fn apply_ea_to_ir(
         }
     }
 
-    // Apply scalar replacements
+    // Will the lowerer be handed a `ScalarReplacementMap` at all? This MUST be
+    // the same predicate the caller uses to decide whether to call
+    // `build_scalar_replacement_map` (the EA block in `try_compile_inner`); if
+    // the two ever disagree, an elided allocation loses its deopt descriptor.
+    let deopt_descriptor_available = scalar_deopt_enabled() && deopt_real_enabled();
+
+    // ── Phase 1: plan (no mutation) ──────────────────────────────────
+    let mut plans: Vec<EaScalarPlan> = Vec::new();
     for info in &ea_result.scalar_replaceable {
-        // For each replaced load, redirect all IR nodes that read from it
-        // to read from the stored field value instead, then mark it dead.
-        for &ea_load in &info.replaced_loads {
-            let ir_load = match reverse_map.get(&ea_load) {
-                Some(&id) => id,
-                None => continue,
-            };
-            let idx = ir_load as usize;
-            if idx >= ir_graph.nodes.len() {
-                continue;
-            }
+        if let Some(plan) =
+            plan_scalar_replacement(ir_graph, &reverse_map, info, deopt_descriptor_available)
+        {
+            plans.push(plan);
+        }
+    }
 
-            // Determine the field index of this load so we can look up the
-            // replacement value in `field_values`. It must match the index the
-            // EA bridge keyed field edges by: the real field index from the
-            // `Const` offset operand (full-layout production load), falling back
-            // to the `MemKind`-derived index for a compact/hand-built node.
-            if info.field_values.is_empty() {
-                continue;
-            }
-            let ea_field_idx = match ir_load_store_field_index(ir_graph, ir_load) {
-                Some(f) => f,
-                None => match &ir_graph.nodes[idx].op {
-                    ir::Op::Load(mk) => *mk as usize,
-                    _ => continue,
-                },
-            };
-
-            // The value the load resolves to: the stored field value, or — when
-            // the field was never stored (`field_values[idx] == None`) — the
-            // freshly-allocated object's zero default. WITHOUT the latter, a
-            // load of an un-stored field was killed below with NO replacement,
-            // leaving its consumers reading a dead node (a miscompile that was
-            // latent only because scalar replacement does not yet fire on
-            // production IR). A `Const(0)` is the correct default for a
-            // zero-initialised object's int field. (Soundness depends on the
-            // object being genuinely zero-initialised — the caller must only
-            // admit allocations whose constructor sets no non-zero field.)
-            let replacement: Option<ir::NodeId> = if ea_field_idx < info.field_values.len() {
-                match info.field_values[ea_field_idx] {
-                    Some(ea_val) => reverse_map.get(&ea_val).copied(),
-                    None => Some(ir_graph.add(ir::Op::Const(0), ir::IrType::Int, vec![], None)),
-                }
-            } else {
-                None
-            };
-
-            if let Some(ir_val) = replacement {
-                // Redirect: replace all references to ir_load with ir_val
-                // across the entire IR graph.
-                let load_id = ir_load;
-                for node in ir_graph.nodes.iter_mut() {
-                    for inp in node.inputs.iter_mut() {
-                        if *inp == load_id {
-                            *inp = ir_val;
-                        }
+    // Materialise ONE shared zero default for every never-stored field load
+    // (the old code appended a fresh `Const(0)` per load).
+    let mut zero_default: Option<ir::NodeId> = None;
+    for plan in plans.iter_mut() {
+        for (_, value) in plan.loads.iter_mut() {
+            if value.is_none() {
+                let z = match zero_default {
+                    Some(z) => z,
+                    None => {
+                        let z = ir_graph.add(ir::Op::Const(0), ir::IrType::Int, vec![], None);
+                        zero_default = Some(z);
+                        z
                     }
-                }
-            }
-
-            // Mark load as dead
-            ir_graph.nodes[idx].op = ir::Op::Dead;
-            ir_graph.nodes[idx].inputs.clear();
-        }
-
-        // Mark eliminated stores as dead
-        for &ea_store in &info.eliminated_stores {
-            if let Some(&ir_store) = reverse_map.get(&ea_store) {
-                let idx = ir_store as usize;
-                if idx < ir_graph.nodes.len() {
-                    ir_graph.nodes[idx].op = ir::Op::Dead;
-                    ir_graph.nodes[idx].inputs.clear();
-                }
-            }
-        }
-
-        // Mark the allocation as dead
-        if let Some(&ir_alloc) = reverse_map.get(&info.alloc_node) {
-            let idx = ir_alloc as usize;
-            if idx < ir_graph.nodes.len() {
-                ir_graph.nodes[idx].op = ir::Op::Dead;
-                ir_graph.nodes[idx].inputs.clear();
+                };
+                *value = Some(z);
             }
         }
     }
 
-    // Apply lock elision
-    for &ea_lock in &ea_result.elide_locks {
-        if let Some(&ir_lock) = reverse_map.get(&ea_lock) {
-            let idx = ir_lock as usize;
-            if idx < ir_graph.nodes.len() {
-                ir_graph.nodes[idx].op = ir::Op::Dead;
-                ir_graph.nodes[idx].inputs.clear();
+    // ── Phase 2: collect victims, then apply in ascending node id ────
+    //
+    // Ascending order matters for the splice: a victim's incoming token is an
+    // earlier (smaller-id) node, so by the time we reach a victim, every token
+    // it could name has already been rewritten or recorded in `spliced`.
+    let mut victims: Vec<(ir::NodeId, EaVictimKind)> = Vec::new();
+    for plan in &plans {
+        for &(load, value) in &plan.loads {
+            if let Some(v) = value {
+                victims.push((load, EaVictimKind::Forwarded(v)));
             }
         }
+        if plan.elide_alloc {
+            for &store in &plan.stores {
+                victims.push((store, EaVictimKind::Eliminated));
+            }
+            victims.push((plan.new_node, EaVictimKind::Eliminated));
+        }
+    }
+
+    // Lock elision. `escape_analysis_from_ir` never produces
+    // `escape_analysis::Op::MonitorEnter` / `MonitorExit` (`ir_op_to_ea_op` has
+    // no arm that can), so `elide_locks` is empty for every IR-derived graph and
+    // this loop is a no-op today. It is kept — and now routed through the same
+    // splice and the same reference checks — so it cannot become the next chain
+    // break if a monitor op is added to the bridge. A monitor node that a
+    // snapshot slot or a value input still names is left ALIVE:
+    // `deopt::EliminationCause::ElidedLock` has no representation in a
+    // `SafepointSnapshot`, so the elision would be undescribable.
+    for &ea_lock in &ea_result.elide_locks {
+        let ir_lock = match reverse_map.get(&ea_lock) {
+            Some(&id) => id,
+            None => continue,
+        };
+        if ir_graph.node_opt(ir_lock).is_none()
+            || ea_snapshot_names(ir_graph, ir_lock)
+            || !ea_splice_feasible(ir_graph, ir_lock)
+        {
+            continue;
+        }
+        let value_used = ir_graph.nodes.iter().any(|n| {
+            n.op != ir::Op::Dead
+                && n.inputs
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &inp)| inp == ir_lock && !ea_is_memory_token_slot(n, i))
+        });
+        if !value_used {
+            victims.push((ir_lock, EaVictimKind::Eliminated));
+        }
+    }
+
+    victims.sort_by_key(|&(id, _)| id);
+    victims.dedup_by_key(|&mut (id, _)| id);
+
+    // `spliced[v]` = the live memory token `v` handed on when it was killed;
+    // `forwarded[v]` = the value a killed load resolved to. Both are followed
+    // transitively so a chain of kills never lands on an already-dead node.
+    let mut spliced: HashMap<ir::NodeId, ir::NodeId> = HashMap::new();
+    let mut forwarded: HashMap<ir::NodeId, ir::NodeId> = HashMap::new();
+    let node_count = ir_graph.nodes.len();
+    for (victim, kind) in victims {
+        // The token this victim hands on, followed through earlier splices so a
+        // run of chained kills closes onto a LIVE node instead of relocating the
+        // break one link along.
+        let mut token = ir_graph
+            .node_opt(victim)
+            .and_then(|n| ea_memory_token_slot(n).and_then(|s| n.input_opt(s)));
+        let mut hops = 0usize;
+        while let Some(t) = token {
+            if ir_graph.node_opt(t).is_some_and(|n| n.op != ir::Op::Dead) {
+                break;
+            }
+            token = spliced.get(&t).copied();
+            hops += 1;
+            if hops > node_count {
+                token = None;
+                break;
+            }
+        }
+        // Likewise for the replacement value: a load can resolve to a value that
+        // is itself a load this pass retires.
+        let kind = match kind {
+            EaVictimKind::Forwarded(v) => {
+                let mut r = v;
+                let mut steps = 0usize;
+                while let Some(&next) = forwarded.get(&r) {
+                    r = next;
+                    steps += 1;
+                    if steps > node_count {
+                        break;
+                    }
+                }
+                EaVictimKind::Forwarded(r)
+            }
+            k => k,
+        };
+
+        for n in ir_graph.nodes.iter_mut() {
+            if n.op == ir::Op::Dead {
+                continue;
+            }
+            let mem_phi = matches!(n.op, ir::Op::Phi) && n.ty == ir::IrType::Memory;
+            let token_slot = ea_memory_token_slot(n);
+            for (i, inp) in n.inputs.iter_mut().enumerate() {
+                if *inp != victim {
+                    continue;
+                }
+                let is_token = if mem_phi { i >= 1 } else { token_slot == Some(i) };
+                if is_token {
+                    // An ordering edge follows the CHAIN, never the data
+                    // replacement — the bug the old blanket rewrite had.
+                    if let Some(t) = token {
+                        *inp = t;
+                    }
+                } else if let EaVictimKind::Forwarded(v) = kind {
+                    *inp = v;
+                }
+            }
+        }
+        // Safepoint snapshots are references too: a slot naming a forwarded load
+        // must follow the value, exactly as `ir::Graph::replace_all_uses` does.
+        // A slot naming an eliminated `Op::New` is deliberately LEFT in place —
+        // that slot is the "materialise this virtual object" descriptor, and
+        // planning has already refused the elision when no descriptor will exist.
+        if let EaVictimKind::Forwarded(v) = kind {
+            forwarded.insert(victim, v);
+            for sp in ir_graph.safepoints.iter_mut() {
+                for slot in sp.locals.iter_mut().chain(sp.stack.iter_mut()) {
+                    if *slot == victim {
+                        *slot = v;
+                    }
+                }
+            }
+        }
+        if let Some(t) = token {
+            spliced.insert(victim, t);
+        }
+        let idx = victim as usize;
+        ir_graph.nodes[idx].op = ir::Op::Dead;
+        ir_graph.nodes[idx].inputs.clear();
     }
 }
 
@@ -7160,6 +7622,10 @@ fn apply_ea_to_ir(
 /// leaves its slot `Undefined` (safe whole-method re-run) rather than emit a
 /// partial/garbage object. Only called when `scalar_deopt_enabled() &&
 /// deopt_real_enabled()`.
+///
+/// Also omitted: any candidate `apply_ea_to_ir` will *refuse* to elide. Those
+/// keep a real allocation, and a `VirtualObject` recipe for a live object would
+/// have a deopt materialize a second one — see the loop body.
 fn build_scalar_replacement_map(
     ir_graph: &ir::Graph,
     id_map: &[escape_analysis::NodeId],
@@ -7171,10 +7637,53 @@ fn build_scalar_replacement_map(
             reverse_map.insert(ea_id, ir_id as ir::NodeId);
         }
     }
+    // The predicate `apply_ea_to_ir` will compute for itself. Recomputed rather
+    // than passed in so the two cannot drift apart at the call site.
+    let deopt_descriptor_available = scalar_deopt_enabled() && deopt_real_enabled();
+    let mut objects: HashMap<ir::NodeId, ir_lower::VirtualObjectInfo> = HashMap::new();
+    for info in &ea_result.scalar_replaceable {
+        // Only objects `apply_ea_to_ir` will actually ELIDE may be described. A
+        // candidate it refuses (its allocation survives — see
+        // `plan_scalar_replacement`) must NOT get a `VirtualObject` recipe: the
+        // JIT frame holds the real reference, and materializing the recipe at a
+        // deopt would create a SECOND object with the same field values, so the
+        // resumed interpreter frame would hold a different identity than the
+        // compiled frame did. `plan_scalar_replacement` is pure and runs on this
+        // same pre-apply graph, so the two answers are the same answer.
+        let elided =
+            plan_scalar_replacement(ir_graph, &reverse_map, info, deopt_descriptor_available)
+                .is_some_and(|p| p.elide_alloc);
+        if !elided {
+            continue;
+        }
+        if let Some((ir_new, vo)) = virtual_object_info_for(ir_graph, &reverse_map, info) {
+            objects.insert(ir_new, vo);
+        }
+    }
+    ir_lower::ScalarReplacementMap { objects }
+}
+
+/// The [`ir_lower::VirtualObjectInfo`] describing one scalar-replacement
+/// candidate, keyed by the IR `NodeId` of its `Op::New`, or `None` when the
+/// object cannot be described to the deopt producer at all.
+///
+/// Split out of [`build_scalar_replacement_map`] so [`plan_scalar_replacement`]
+/// can ask the *same* question — "will this object have a virtual-object
+/// descriptor?" — before it decides whether eliding the allocation is safe. Two
+/// copies of this admission rule would mean an object the map omits could still
+/// have its `Op::New` killed, and its snapshot slot would then resolve to
+/// `FrameValue::Undefined` (a silent null).
+///
+/// MUST be called on the pre-`apply_ea_to_ir` graph: it reads the control
+/// inputs of nodes that pass clears.
+fn virtual_object_info_for(
+    ir_graph: &ir::Graph,
+    reverse_map: &HashMap<escape_analysis::NodeId, ir::NodeId>,
+    info: &escape_analysis::ScalarReplacementInfo,
+) -> Option<(ir::NodeId, ir_lower::VirtualObjectInfo)> {
     // Control input (slot 0) of a node, used to recover a node's block for the
     // dominance gate AFTER the node itself is marked `Op::Dead` (its inputs are
-    // cleared then, but the captured control node stays live). MUST be called
-    // before `apply_ea_to_ir`.
+    // cleared then, but the captured control node stays live).
     let ctrl_of = |n: ir::NodeId| -> Option<ir::NodeId> {
         ir_graph
             .nodes
@@ -7182,56 +7691,40 @@ fn build_scalar_replacement_map(
             .and_then(|node| node.inputs.first().copied())
             .filter(|&c| c != ir::NO_NODE)
     };
-    let mut objects: HashMap<ir::NodeId, ir_lower::VirtualObjectInfo> = HashMap::new();
-    'obj: for info in &ea_result.scalar_replaceable {
-        let ir_new = match reverse_map.get(&info.alloc_node) {
-            Some(&id) => id,
-            None => continue,
-        };
-        // Control of the allocation — bail (omit) if it has none (hand-built /
-        // malformed), so the producer can't emit without a dominance anchor.
-        let new_ctrl = match ctrl_of(ir_new) {
-            Some(c) => c,
-            None => continue,
-        };
-        // Per-field IR value node. A `None` EA entry is a never-stored field
-        // (zero default). A `Some(ea)` that fails to map back to an IR node means
-        // we cannot reconstruct that field — omit the whole object (safe).
-        let mut field_values: Vec<Option<ir::NodeId>> = Vec::with_capacity(info.field_values.len());
-        for fv in &info.field_values {
-            match fv {
-                None => field_values.push(None),
-                Some(ea) => match reverse_map.get(ea) {
-                    Some(&ir_id) => field_values.push(Some(ir_id)),
-                    None => continue 'obj,
-                },
-            }
+    let ir_new = *reverse_map.get(&info.alloc_node)?;
+    // Control of the allocation — bail (omit) if it has none (hand-built /
+    // malformed), so the producer can't emit without a dominance anchor.
+    let new_ctrl = ctrl_of(ir_new)?;
+    // Per-field IR value node. A `None` EA entry is a never-stored field
+    // (zero default). A `Some(ea)` that fails to map back to an IR node means
+    // we cannot reconstruct that field — omit the whole object (safe).
+    let mut field_values: Vec<Option<ir::NodeId>> = Vec::with_capacity(info.field_values.len());
+    for fv in &info.field_values {
+        match fv {
+            None => field_values.push(None),
+            Some(ea) => field_values.push(Some(*reverse_map.get(ea)?)),
         }
-        // Capture each eliminated store's control node (its block). A store with
-        // no resolvable control omits the object (can't prove dominance).
-        let mut store_ctrls: Vec<ir::NodeId> = Vec::with_capacity(info.eliminated_stores.len());
-        for ea in &info.eliminated_stores {
-            let ir_store = match reverse_map.get(ea) {
-                Some(&id) => id,
-                None => continue, // a store with no IR node can't have executed observably
-            };
-            match ctrl_of(ir_store) {
-                Some(c) => store_ctrls.push(c),
-                None => continue 'obj,
-            }
-        }
-        objects.insert(
-            ir_new,
-            ir_lower::VirtualObjectInfo {
-                class_id: info.class_id,
-                num_fields: info.num_fields,
-                field_values,
-                new_ctrl,
-                store_ctrls,
-            },
-        );
     }
-    ir_lower::ScalarReplacementMap { objects }
+    // Capture each eliminated store's control node (its block). A store with
+    // no resolvable control omits the object (can't prove dominance).
+    let mut store_ctrls: Vec<ir::NodeId> = Vec::with_capacity(info.eliminated_stores.len());
+    for ea in &info.eliminated_stores {
+        let ir_store = match reverse_map.get(ea) {
+            Some(&id) => id,
+            None => continue, // a store with no IR node can't have executed observably
+        };
+        store_ctrls.push(ctrl_of(ir_store)?);
+    }
+    Some((
+        ir_new,
+        ir_lower::VirtualObjectInfo {
+            class_id: info.class_id,
+            num_fields: info.num_fields,
+            field_values,
+            new_ctrl,
+            store_ctrls,
+        },
+    ))
 }
 
 /// Verify `graph` and, on failure, record a structured bailout.
@@ -7258,10 +7751,29 @@ fn ir_verify_reject(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
-    match ir_verify::verify_graph(graph, phase, ir_verify::VerifyOptions::from_env()) {
+    // `metrics::current_phase` charges this verification run to whichever
+    // compilation is innermost on this thread. A thread-local hook rather than
+    // a new parameter precisely because this function has three call sites in
+    // `try_compile_inner` and the task's constraint is "do not change any
+    // signature". It is a no-op (and reads no clock) unless
+    // `CRATONVM_JIT_METRICS=1`.
+    let _metrics_phase = metrics::current_phase(metrics::Phase::Verify);
+    // `for_phase`, not `from_env`: the environment can only ADD lanes, and each
+    // pipeline point runs every lane that is known clean there. At
+    // `PHASE_POST_OPTIMIZE` that is the frame-state and memory-chain lanes
+    // (`ir_optimize` roots snapshots in DCE and splices the chain in DSE); after
+    // `apply_ea_to_ir` it is whatever `ir_verify::APPLY_EA_SPLICES_MEMORY_CHAIN`
+    // and `ir_verify::APPLY_EA_ROUTES_ALL_SAFEPOINTS` say. Flipping those two
+    // constants is what turns the lanes on at `"post-escape-analysis"` and
+    // `"pre-lower"` — see this function's callers.
+    match ir_verify::verify_graph(graph, phase, ir_verify::VerifyOptions::for_phase(phase)) {
         Ok(()) => false,
         Err(b) => {
             bailout::record_bailout(&b);
+            // Attribution, not duplication: `record_bailout` above owns the
+            // process-wide category counters; this attaches the same bailout to
+            // *this* method and *this* phase in the per-compilation report.
+            metrics::note_current_bailout(&b, phase);
             if ir_stage_reporting() {
                 eprintln!("[ir] verifier rejected {class_name}.{method_name}{descriptor}: {b}");
             }
@@ -8000,7 +8512,7 @@ pub fn try_compile(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>,
     profile: Option<&profile::MethodProfile>,
@@ -8075,11 +8587,14 @@ pub fn try_compile_with_invokespecial_resolver(
     // `classloading::invokespecial_selection_start` for the algorithm.
     cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    // CRIT-2 — returns (class_id, num_fields, has_nonzero_tag_primitive_init,
-    // has_finalizer). The two flags feed the inline-TLAB `new` fast path;
-    // resolvers that cannot compute them must return `(_, _, true, true)`
-    // so the post-init helper call stays in place.
-    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
+    // CRIT-2 / cold-`new` fix — see [`JitNewSite`]. `Resolved` carries
+    // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer);
+    // the two flags feed the inline-TLAB `new` fast path and a resolver that
+    // cannot compute them must report `true, true` so the post-init helper
+    // call stays in place. `Deferred` means "class not loaded yet" and
+    // compiles to the CP-indexed runtime-resolving helper; only `None` (a
+    // malformed site) still bails the compile.
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
     profile: Option<&profile::MethodProfile>,
@@ -8676,7 +9191,7 @@ fn try_compile_inner(
     cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
-    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
     profile: Option<&profile::MethodProfile>,
@@ -8720,6 +9235,20 @@ fn try_compile_inner(
     backend_attempted: &mut bool,
     self_call_identity_stable: bool,
 ) -> Option<CompiledMethod> {
+    // C2-review P0 "Measure compilation quality": one structured
+    // `metrics::CompilationReport` per compilation, published when this handle
+    // drops. `Drop` is deliberate — this function has ~40 `return None` exits
+    // (every `jitc_bail!`, the scan reject, the `?` on the single-pass
+    // backend), and publishing from the destructor covers all of them without
+    // touching a single control-flow edge. Off unless `CRATONVM_JIT_METRICS=1`,
+    // in which case `begin` is one relaxed atomic load and no allocation.
+    let metrics = metrics::CompileRecorder::begin(
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+        optimize,
+    );
+
     // Architecture-specific backend selection.
     // On ARM64 (aarch64), the ARM64 backend would be used instead of x64.
     // Both x64 and ARM64 backends have bytecode→native compilation pipelines.
@@ -8836,6 +9365,10 @@ fn try_compile_inner(
         };
     }
 
+    // Phase 1 (scan/parse). The guard also covers the `return None` arm below:
+    // a scan reject is a real compilation that spent real time, and its report
+    // should say so.
+    let metrics_scan = metrics.phase(metrics::Phase::Scan);
     let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
         Some(s) => s,
         None => {
@@ -8858,6 +9391,7 @@ fn try_compile_inner(
             return None;
         }
     };
+    drop(metrics_scan);
 
     // RBC.6 (RELAXED, see docs/feature-designs/jit-local-exception-handlers.md)
     // — this gate used to unconditionally refuse any method that combines
@@ -9026,7 +9560,13 @@ fn try_compile_inner(
     // Under `CRATONVM_DBG_JITC` / `CRATONVM_DBG_IR_COMPILES` each candidate now
     // reports which term declined it. Evaluated lazily (and only under the
     // flag) so the default path pays nothing.
-    if ir_stage_reporting() {
+    //
+    // C2-review P0 "Measure compilation quality": the same verdict is the
+    // per-method report's `admission` field, so "why did the optimizing tier
+    // never see method X?" is answerable structurally instead of by grepping
+    // this line out of stderr. `metrics.is_enabled()` is one relaxed atomic
+    // load, and the verdict is still built only when somebody will read it.
+    if ir_stage_reporting() || metrics.is_enabled() {
         let verdict = if !optimize {
             "optimize=false — the C1/fast tier was requested, not C2".to_string()
         } else if moving_young_disables_optimizing_tier() {
@@ -9054,10 +9594,13 @@ fn try_compile_inner(
                 )
             }
         };
-        eprintln!(
-            "[ir] admission {}.{}{}: {verdict}",
-            cached.class_name, cached.method_name, cached.method_descriptor,
-        );
+        metrics.set_admission(&verdict);
+        if ir_stage_reporting() {
+            eprintln!(
+                "[ir] admission {}.{}{}: {verdict}",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
     }
     if optimize
         // IR lowering has no exact-RBP or safepoint-map publication, so a
@@ -9154,6 +9697,11 @@ fn try_compile_inner(
             // double literals (`1.5`, `3.14`, …) no longer bail.
             || (ir_emit_fp && fp_in_body(code, code_len)))
     {
+        // Every conjunct above passed: the optimizing pipeline is entered. The
+        // report records this before anything can decline, so a later
+        // `enter_single_pass` is recognisable as a FALL-THROUGH rather than a
+        // method that was never a C2 candidate at all.
+        metrics.enter_optimizing_pipeline();
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
@@ -9250,7 +9798,18 @@ fn try_compile_inner(
             if !scan.new_ops.is_empty() {
                 let mut new_info_map = std::collections::HashMap::with_capacity(scan.new_ops.len());
                 for &(pc, cp_idx) in &scan.new_ops {
-                    if let Some((class_id, num_fields, _hp, _hf)) = new_resolver(cp_idx) {
+                    // A `Deferred` site has no compile-time class id or field
+                    // count, so it gets no map entry: the IR builder's 0xbb arm
+                    // then bails this method to the single-pass backend, which
+                    // DOES compile the site (through the CP-indexed helper).
+                    // That is strictly better than the pre-fix behaviour, where
+                    // the site bailed BOTH backends.
+                    if let Some(JitNewSite::Resolved {
+                        class_id,
+                        num_fields,
+                        ..
+                    }) = new_resolver(cp_idx)
+                    {
                         new_info_map.insert(pc, (class_id, num_fields));
                     }
                 }
@@ -9608,7 +10167,17 @@ fn try_compile_inner(
                 }
             }
         }
+        // Phase 2 (build). `nodes_built` is recorded straight after, so the
+        // report can separate "the front end refused this bytecode" (build
+        // returned None, `nodes_built` stays unmeasured) from "the graph was
+        // built and then rejected for size".
+        let metrics_build = metrics.phase(metrics::Phase::Build);
         let built = builder.build(code, code_len);
+        drop(metrics_build);
+        if let Some(g) = built.as_ref() {
+            metrics.set_nodes_built(g.nodes.len());
+            metrics.phase_nodes(metrics::Phase::Build, 0, g.nodes.len());
+        }
         // jit-inlining-and-ir-calls — tier-4 compile-time guard.
         // `ir_compatible`'s bytecode budget rose from 200 to HotSpot's 8000-byte
         // HugeMethodLimit, which is the right *admission* rule but a poor proxy
@@ -9632,6 +10201,19 @@ fn try_compile_inner(
                         ir::IR_MAX_GRAPH_NODES,
                     );
                 }
+                // This *is* `BailoutReason::GraphTooLarge`; the check predates
+                // `bailout.rs` and still signals with a bare `None`. Recording
+                // it on the report (and not through `bailout::record_bailout`)
+                // names the reason without changing what the process-wide
+                // counters count — converting the signal itself belongs to the
+                // owner of this gate.
+                metrics.note_bailout_reason(
+                    bailout::BailoutReason::GraphTooLarge {
+                        nodes: g.nodes.len(),
+                        limit: ir::IR_MAX_GRAPH_NODES,
+                    },
+                    "post-build",
+                );
                 None
             }
             other => other,
@@ -9692,11 +10274,33 @@ fn try_compile_inner(
                 // Nothing on the success path changes.
                 let mut ir_verify_bail = false;
 
+                // Phase 3 (optimize). `ir_optimize::optimize` is opaque — GVN,
+                // DCE, reassociation, LICM and unrolling all run inside it and
+                // it publishes no per-pass boundary — so this is one row, not
+                // one row per pass. The before/after node counts are still the
+                // useful number, but they are no longer a frame-size figure:
+                // `ir_lower::estimate_frame_bytes` multiplies the
+                // liveness-COLOURED slot count (`SlotPlan::slots`) by 8, not the
+                // node count. Shrinking the graph therefore shrinks the frame
+                // only when it also shrinks peak simultaneous liveness — which
+                // is what the report's `peak_live_values` is for.
+                let metrics_optimize = metrics.phase(metrics::Phase::Optimize);
+                let metrics_nodes_before_optimize = graph.nodes.len();
                 ir_optimize::optimize(&mut graph);
+                drop(metrics_optimize);
+                metrics.phase_nodes(
+                    metrics::Phase::Optimize,
+                    metrics_nodes_before_optimize,
+                    graph.nodes.len(),
+                );
                 if ir_verify::verify_enabled() {
                     ir_verify_bail |= ir_verify_reject(
                         &graph,
-                        "post-optimize",
+                        // The one hook that runs BEFORE `apply_ea_to_ir`, which
+                        // is what makes its extra lanes safe; the name is the
+                        // constant `VerifyOptions::for_phase` matches on, so the
+                        // two cannot drift.
+                        ir_verify::PHASE_POST_OPTIMIZE,
                         &cached.class_name,
                         &cached.method_name,
                         &cached.method_descriptor,
@@ -9714,6 +10318,13 @@ fn try_compile_inner(
                 // Convert IR graph to escape analysis graph, run analysis,
                 // and apply scalar replacement / lock elision to the IR graph.
                 {
+                    // Phase 4 (escape analysis). Dropped explicitly before the
+                    // post-EA verifier run below so the two phases do not
+                    // double-charge each other; on the path where EA changes
+                    // nothing it drops at the end of this block instead, which
+                    // is still EA-only work.
+                    let metrics_ea = metrics.phase(metrics::Phase::EscapeAnalysis);
+                    let metrics_nodes_before_ea = graph.nodes.len();
                     let (ea_graph, id_map) = escape_analysis_from_ir(&graph);
                     let ea_result = escape_analysis::analyze_escapes(&ea_graph);
                     // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
@@ -9755,6 +10366,9 @@ fn try_compile_inner(
                                 Some(build_scalar_replacement_map(&graph, &id_map, &ea_result));
                         }
                         apply_ea_to_ir(&mut graph, &id_map, &ea_result);
+                        // Stop charging EA here: the verifier run below is its
+                        // own phase and must not be billed to escape analysis.
+                        drop(metrics_ea);
                         // `apply_ea_to_ir` is a mutating pass: it kills the
                         // scalar-replaced allocation, its stores and its loads,
                         // and rewires their consumers. Verify the result under
@@ -9769,6 +10383,14 @@ fn try_compile_inner(
                             );
                         }
                     }
+                    // Recorded on BOTH paths — EA that scalar-replaced nothing
+                    // still ran, and `nodes_before == nodes_after` is the
+                    // finding, not a missing measurement.
+                    metrics.phase_nodes(
+                        metrics::Phase::EscapeAnalysis,
+                        metrics_nodes_before_ea,
+                        graph.nodes.len(),
+                    );
                 }
 
                 // Arrays still use the baseline tier's specialized allocation
@@ -9805,7 +10427,25 @@ fn try_compile_inner(
                     );
                 }
                 if !has_live_new_array && !ir_verify_bail {
+                    // The graph the lowerer will actually see. `live_nodes` is
+                    // the non-`Op::Dead` count: the gap against `nodes` is dead
+                    // arena the optimizer left behind. That gap no longer costs
+                    // frame bytes — `ir_lower::plan_slots` colours by live range
+                    // and only nodes that actually take a slot get one — so it is
+                    // now a statement about the optimizer's leftovers alone.
+                    metrics.set_graph_at_lower(
+                        graph.nodes.len(),
+                        graph
+                            .nodes
+                            .iter()
+                            .filter(|n| !matches!(n.op, ir::Op::Dead))
+                            .count(),
+                        graph.safepoints.len(),
+                    );
+                    // Phase 6 (schedule).
+                    let metrics_schedule = metrics.phase(metrics::Phase::Schedule);
                     let schedule = ir_schedule::schedule(&graph);
+                    drop(metrics_schedule);
                     // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
                     // optimizing IR (C2) lowerer the profiled branch bias so it can
                     // pick each `Op::If`'s fall-through edge from the C1/interpreter
@@ -9834,7 +10474,15 @@ fn try_compile_inner(
                     // guard-surviving scalar-replacement map (Front 3.2) to the
                     // shared lowering body. `sr_map` is `None` unless
                     // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL` are set.
-                    if let Some(mut compiled) = ir_lower::lower_inner(
+                    // Phase 7 (lower). `lower_inner` selects instructions,
+                    // encodes them and installs the executable buffer in one
+                    // call, which is why `Phase::Encode` and `Phase::Install`
+                    // report "not measured" for this path rather than 0.
+                    // Hoisted out of the `if let` (same call, same arguments,
+                    // same control flow) purely so the timer can stop before
+                    // the post-lowering bookkeeping below.
+                    let metrics_lower = metrics.phase(metrics::Phase::Lower);
+                    let lowered = ir_lower::lower_inner(
                         &graph,
                         &schedule,
                         num_params,
@@ -9845,7 +10493,9 @@ fn try_compile_inner(
                         &ir_direct_calls,
                         &ir_ic_slots,
                         &ir_compact_fields,
-                    ) {
+                    );
+                    drop(metrics_lower);
+                    if let Some(mut compiled) = lowered {
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
                         // for the code's lifetime, and mark the method as using
@@ -9922,6 +10572,11 @@ fn try_compile_inner(
                                 cached.class_name, cached.method_name, cached.method_descriptor,
                             );
                         }
+                        // Optimizing-tier success: harvest code bytes, frame
+                        // bytes, oop-map and deopt-metadata sizes, and the
+                        // code-cache occupancy, from the finished artifact.
+                        // Reads public accessors only; cannot perturb it.
+                        metrics.installed(&compiled);
                         return Some(compiled);
                     }
                     if ir_stage_reporting() {
@@ -9934,6 +10589,14 @@ fn try_compile_inner(
             } // end else (IR-lowering path)
         }
     }
+
+    // Control reaches here either because the optimizing pipeline was never
+    // admitted, or because it was entered and declined (an unbuildable graph,
+    // a verifier rejection, a surviving `NewArray`, a lowerer bail). The
+    // recorder already knows which — `enter_single_pass` flags the second case
+    // as a fall-through, which is what makes "the C2 tier produced no bodies"
+    // separable from "the C2 tier was never asked".
+    metrics.enter_single_pass();
 
     // Resolve multianewarray entries
     let mut mna_info = Vec::new();
@@ -10041,24 +10704,67 @@ fn try_compile_inner(
     // resolver computes the real flags from class metadata; a resolver
     // that cannot determine them must return `(true, true)` so the
     // helper call stays in place.
+    //
+    // A `JitNewSite::Deferred` site (target class not loaded yet) goes into
+    // the parallel `new_deferred_info` / `anewarray_deferred_info` lists
+    // instead: those compile to the CP-indexed helper, which resolves the
+    // class on first execution. Before that existed, a `Deferred` site was
+    // indistinguishable from a malformed one and bailed the WHOLE compile —
+    // permanently, after `MAX_TIER_FAIL_RETRIES` — which is what left every
+    // hot method carrying a cold `throw new SomeException(...)` in the
+    // interpreter forever. `None` (malformed CP entry / missing holder) is
+    // still a bail: no runtime resolution can rescue it.
+    //
+    // The `new_object_cp` / `anewarray_object_cp` helpers are optional in the
+    // ABI (a hand-built test table leaves them 0), so an unwired helper falls
+    // back to the historical whole-compile bail rather than emitting a CALL
+    // to address 0.
     let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
     let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
+    let mut new_deferred_info: Vec<(usize, u32, u16)> = Vec::new();
+    let mut anewarray_deferred_info: Vec<(usize, u32, u16)> = Vec::new();
     if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() {
         let Some(resolver) = cp_new_resolver else {
             jitc_bail!("cp_new_resolver")
         };
         for &(pc, cp_idx) in &scan.new_ops {
-            let Some((class_id_raw, num_fields, has_prim_init, has_finalizer)) = resolver(cp_idx)
-            else {
-                jitc_bail!("new_resolve")
-            };
-            new_info.push((pc, class_id_raw, num_fields, has_prim_init, has_finalizer));
+            match resolver(cp_idx) {
+                Some(JitNewSite::Resolved {
+                    class_id,
+                    num_fields,
+                    has_prim_init,
+                    has_finalizer,
+                }) => {
+                    new_info.push((pc, class_id, num_fields, has_prim_init, has_finalizer));
+                }
+                Some(JitNewSite::Deferred {
+                    holder_class_id,
+                    cp_idx,
+                }) => {
+                    if helpers.new_object_cp == 0 {
+                        jitc_bail!("new_resolve_deferred_unwired")
+                    }
+                    new_deferred_info.push((pc, holder_class_id, cp_idx));
+                }
+                None => jitc_bail!("new_resolve"),
+            }
         }
         for &(pc, cp_idx) in &scan.anewarray_ops {
-            let Some((class_id_raw, ..)) = resolver(cp_idx) else {
-                jitc_bail!("anewarray_resolve")
-            };
-            anewarray_info.push((pc, class_id_raw));
+            match resolver(cp_idx) {
+                Some(JitNewSite::Resolved { class_id, .. }) => {
+                    anewarray_info.push((pc, class_id));
+                }
+                Some(JitNewSite::Deferred {
+                    holder_class_id,
+                    cp_idx,
+                }) => {
+                    if helpers.anewarray_object_cp == 0 {
+                        jitc_bail!("anewarray_resolve_deferred_unwired")
+                    }
+                    anewarray_deferred_info.push((pc, holder_class_id, cp_idx));
+                }
+                None => jitc_bail!("anewarray_resolve"),
+            }
         }
     }
 
@@ -11075,6 +11781,10 @@ fn try_compile_inner(
             })
             .collect(),
     );
+    // Phase 10 (single-pass backend). Like `lower_inner`, this one call does
+    // selection, encoding and buffer install together. The guard also covers
+    // the `?` below: a backend bail is a compilation that spent this time.
+    let metrics_single_pass = metrics.phase(metrics::Phase::SinglePass);
     let mut compiled = x64::compile_with_param_slots(
         code,
         code_len,
@@ -11086,7 +11796,9 @@ fn try_compile_inner(
         typecheck_info,
         static_field_info,
         new_info,
+        new_deferred_info,
         anewarray_info,
+        anewarray_deferred_info,
         invoke_info,
         direct_calls,
         mic_slots,
@@ -11107,6 +11819,7 @@ fn try_compile_inner(
         &despec_method_key,
         indy_info,
     )?;
+    drop(metrics_single_pass);
 
     compiled._jit_strings = owned_strings;
     compiled._jit_invoke_infos = owned_invoke_infos;
@@ -11152,6 +11865,10 @@ fn try_compile_inner(
         }
     }
 
+    // Single-pass success: same harvest as the optimizing path. `installed`
+    // takes the artifact's own `used_ir_backend` as the authority on which
+    // backend produced it, so the recorded path cannot drift from the truth.
+    metrics.installed(&compiled);
     Some(compiled)
 }
 
@@ -12519,6 +13236,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -12579,6 +13297,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -12627,6 +13346,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -12681,6 +13401,253 @@ mod tests {
             Op::Const(0),
             "the un-stored field's load must resolve to the zero default"
         );
+    }
+
+    // ── apply_ea_to_ir: safepoints and the memory-token chain ────────────
+    //
+    // `apply_ea_to_ir` runs after `ir_optimize::optimize` and is the last
+    // mutator before `ir_schedule::schedule`, so nothing downstream repairs a
+    // snapshot slot it strands or a memory-token chain it breaks. The four tests
+    // below pin both.
+
+    /// `Object o = new Foo(); o.f1 = 42; return o.f1;` in the PRODUCTION full
+    /// layout (`[ctrl, mem, base, offset, value]`), with no safepoints yet.
+    struct EaFixture {
+        g: crate::ir::Graph,
+        mem: crate::ir::NodeId,
+        newobj: crate::ir::NodeId,
+        val: crate::ir::NodeId,
+        store: crate::ir::NodeId,
+        load: crate::ir::NodeId,
+    }
+
+    fn ea_full_layout_fixture() -> EaFixture {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 2,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let off = g.add(Op::Const(1), IrType::Int, vec![], None); // field index 1
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, val],
+            None,
+        );
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, store, newobj, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.entry = start;
+        g.exit = ret;
+        EaFixture {
+            g,
+            mem,
+            newobj,
+            val,
+            store,
+            load,
+        }
+    }
+
+    fn run_ea(g: &mut crate::ir::Graph) {
+        let (ea, id_map) = escape_analysis_from_ir(g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            !result.scalar_replaceable.is_empty(),
+            "fixture precondition: the non-escaping New is scalar-replaceable"
+        );
+        apply_ea_to_ir(g, &id_map, &result);
+    }
+
+    /// No live node may take its memory token from a removed node — the
+    /// invariant `ir_verify`'s memory-chain lane reports on, asserted directly so
+    /// the test does not depend on which lanes that module currently enables.
+    fn assert_memory_chain_intact(g: &crate::ir::Graph) {
+        for (idx, n) in g.nodes.iter().enumerate() {
+            if n.op == crate::ir::Op::Dead {
+                continue;
+            }
+            for (i, &inp) in n.inputs.iter().enumerate() {
+                if inp == crate::ir::NO_NODE || !ea_is_memory_token_slot(n, i) {
+                    continue;
+                }
+                let target = g
+                    .nodes
+                    .get(inp as usize)
+                    .unwrap_or_else(|| panic!("n{idx} memory token n{inp} is out of range"));
+                assert_ne!(
+                    target.op,
+                    crate::ir::Op::Dead,
+                    "n{idx}:{:?} takes its memory token from removed node n{inp}",
+                    n.op
+                );
+            }
+        }
+    }
+
+    /// Run the verifier's frame-state lane (and only it, on top of the always-on
+    /// structural lane) over a post-EA graph.
+    fn assert_frame_state_lane_clean(g: &crate::ir::Graph) {
+        let mut opts = crate::ir_verify::VerifyOptions::structural();
+        opts.check_frame_states = true;
+        if let Err(b) = crate::ir_verify::verify_graph(g, "post-escape-analysis", opts) {
+            panic!("frame-state lane rejected a post-apply_ea_to_ir graph: {b}");
+        }
+    }
+
+    // A scalar-replaced object that is LIVE ACROSS A SAFEPOINT either
+    // materialises correctly or is not scalar-replaced. With
+    // `CRATONVM_SCALAR_DEOPT` unset (the default, and what the test harness
+    // runs with) no `FrameValue::VirtualObject` descriptor is emitted, so
+    // killing the `Op::New` would leave the snapshot slot resolving to
+    // `FrameValue::Undefined` — `Value::Int(0)`, i.e. a NULL where a live object
+    // was. The pass refuses the allocation elision; the field load is still
+    // forwarded, so the cost is one allocation, not the optimization.
+    #[test]
+    fn ea_refuses_to_elide_an_allocation_a_safepoint_names() {
+        use crate::ir::{Op, SafepointSnapshot, NO_NODE};
+
+        let mut f = ea_full_layout_fixture();
+        f.g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![f.newobj],
+        });
+        run_ea(&mut f.g);
+
+        assert!(
+            matches!(f.g.nodes[f.newobj as usize].op, Op::New { .. }),
+            "the allocation must survive: a deopt snapshot names it and no \
+             virtual-object descriptor will be emitted for it"
+        );
+        assert!(
+            matches!(f.g.nodes[f.store as usize].op, Op::Store(_)),
+            "the initialising store must survive with the allocation, or the \
+             surviving object would reach deopt with an unwritten field"
+        );
+        assert_eq!(
+            f.g.nodes[f.load as usize].op,
+            Op::Dead,
+            "the field load is still forwarded to the stored value"
+        );
+        let ret = f.g.nodes[f.g.exit as usize].inputs[1];
+        assert_eq!(ret, f.val, "the load's consumer reads the stored constant");
+        assert_eq!(
+            f.g.safepoints[0].stack[0], f.newobj,
+            "the snapshot slot still names the (live) allocation"
+        );
+        assert_memory_chain_intact(&f.g);
+        assert_frame_state_lane_clean(&f.g);
+    }
+
+    // The mirror case: no snapshot slot names the allocation, so eliding it
+    // cannot strand a frame state and the full scalar replacement applies.
+    #[test]
+    fn ea_elides_an_allocation_no_safepoint_names() {
+        use crate::ir::{Op, SafepointSnapshot, NO_NODE};
+
+        let mut f = ea_full_layout_fixture();
+        f.g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![f.val],
+        });
+        run_ea(&mut f.g);
+
+        assert_eq!(f.g.nodes[f.newobj as usize].op, Op::Dead, "New killed");
+        assert_eq!(f.g.nodes[f.store as usize].op, Op::Dead, "Store killed");
+        assert_eq!(f.g.nodes[f.load as usize].op, Op::Dead, "Load killed");
+        assert_eq!(
+            f.g.nodes[f.g.exit as usize].inputs[1],
+            f.val,
+            "the load result is redirected to the stored value"
+        );
+        assert_memory_chain_intact(&f.g);
+        assert_frame_state_lane_clean(&f.g);
+    }
+
+    // A snapshot slot naming a SCALAR-REPLACED LOAD must follow the value, the
+    // way `ir::Graph::replace_all_uses` does for every other rewrite. The pass
+    // used to rewrite `graph.nodes` only, so the slot kept naming the killed
+    // load and the deopt frame rebuilt that local from `FrameValue::Undefined`.
+    #[test]
+    fn ea_safepoint_slot_naming_a_replaced_load_follows_the_value() {
+        use crate::ir::{Op, SafepointSnapshot, NO_NODE};
+
+        let mut f = ea_full_layout_fixture();
+        f.g.safepoints.push(SafepointSnapshot {
+            bci: 13,
+            locals: vec![f.load],
+            stack: vec![NO_NODE],
+        });
+        run_ea(&mut f.g);
+
+        assert_eq!(f.g.nodes[f.load as usize].op, Op::Dead, "the load is killed");
+        assert_eq!(
+            f.g.safepoints[0].locals[0], f.val,
+            "the snapshot slot follows the load to its replacement value"
+        );
+        assert_memory_chain_intact(&f.g);
+        assert_frame_state_lane_clean(&f.g);
+    }
+
+    // Killing a store in this pass must leave the memory-token chain intact: the
+    // next memory operation is spliced onto the killed store's OWN incoming
+    // token, not left naming an `Op::Dead` node (and not, as the old code did,
+    // rewritten to the killed load's *data* replacement — an ordering edge
+    // silently turned into a data edge).
+    #[test]
+    fn ea_killed_store_leaves_the_memory_chain_intact() {
+        use crate::ir::{IrType, MemKind, Op};
+
+        let mut f = ea_full_layout_fixture();
+        // A later, unrelated field read whose memory token is the (about to be
+        // killed) load: `[ctrl, mem=load, base=param, offset]`.
+        let ctrl = f.g.nodes[f.newobj as usize].inputs[0];
+        let param = f.g.add(Op::Param(0), IrType::Ref, vec![], None);
+        let off0 = f.g.add(Op::Const(0), IrType::Int, vec![], None);
+        let trailing = f.g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, f.load, param, off0],
+            None,
+        );
+
+        run_ea(&mut f.g);
+
+        assert_eq!(f.g.nodes[f.store as usize].op, Op::Dead, "Store killed");
+        assert_eq!(f.g.nodes[f.load as usize].op, Op::Dead, "Load killed");
+        assert_eq!(
+            f.g.nodes[trailing as usize].inputs[1], f.mem,
+            "the trailing load is spliced onto the chain the killed store/load \
+             inherited from, not left pointing into the hole"
+        );
+        assert_ne!(
+            f.g.nodes[trailing as usize].inputs[1], f.val,
+            "a memory token must never be rewritten to a data replacement"
+        );
+        assert_memory_chain_intact(&f.g);
     }
 
     // ── Op::New emission + scalar replacement, end-to-end via the builder ──
@@ -12738,10 +13705,8 @@ mod tests {
         );
         apply_ea_to_ir(&mut graph, &id_map, &result);
 
-        assert!(
-            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
-            "the New must be scalar-replaced away"
-        );
+        // The FIELD ACCESS is still scalar-replaced: the load folds to the
+        // stored constant.
         let ret = graph
             .nodes
             .iter()
@@ -12753,6 +13718,58 @@ mod tests {
             Op::Const(42),
             "the field load must resolve to the stored value (42)"
         );
+        // The ALLOCATION, however, is retained. The builder records a safepoint
+        // snapshot at every bytecode boundary, and the fresh reference sits on
+        // the operand stack (and, in the astore variant, in a local) at several
+        // of them — so a snapshot slot names the `Op::New`. With
+        // `CRATONVM_SCALAR_DEOPT` off no `FrameValue::VirtualObject` descriptor
+        // is emitted for it, and killing it would leave those slots resolving to
+        // `FrameValue::Undefined` ⇒ `Value::Int(0)` ⇒ a NULL where a live object
+        // was. `apply_ea_to_ir` refuses the elision instead; see the "May the
+        // ALLOCATION itself go?" block in `plan_scalar_replacement`.
+        assert!(
+            graph.safepoints.iter().any(|sp| sp
+                .locals
+                .iter()
+                .chain(sp.stack.iter())
+                .any(|&s| matches!(graph.nodes.get(s as usize), Some(n) if matches!(n.op, Op::New { .. })))),
+            "precondition: a deopt snapshot slot names the allocation"
+        );
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New is retained because a deopt snapshot names it and no \
+             virtual-object descriptor will be emitted"
+        );
+        assert_no_snapshot_names_a_dead_node(&graph);
+    }
+
+    /// Every safepoint snapshot slot must name a live node — the condition
+    /// `ir_verify::check_frame_states` enforces, restated where the EA tests can
+    /// assert it directly.
+    fn assert_no_snapshot_names_a_dead_node(graph: &crate::ir::Graph) {
+        for (si, sp) in graph.safepoints.iter().enumerate() {
+            for (kind, i, s) in sp
+                .locals
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| ("local", i, s))
+                .chain(sp.stack.iter().enumerate().map(|(i, &s)| ("stack", i, s)))
+            {
+                if s == crate::ir::NO_NODE {
+                    continue;
+                }
+                let node = graph
+                    .nodes
+                    .get(s as usize)
+                    .unwrap_or_else(|| panic!("safepoint[{si}] {kind}[{i}] = n{s} out of range"));
+                assert_ne!(
+                    node.op,
+                    crate::ir::Op::Dead,
+                    "safepoint[{si}] at bci {} {kind}[{i}] = n{s} names a removed node",
+                    sp.bci
+                );
+            }
+        }
     }
 
     // REGRESSION (astore gap): the same scalar-replacement end-to-end, but the
@@ -12816,10 +13833,6 @@ mod tests {
             "the astore-local non-escaping new must be scalar-replaceable"
         );
         apply_ea_to_ir(&mut graph, &id_map, &result);
-        assert!(
-            !graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
-            "the New must be scalar-replaced away"
-        );
         let ret = graph
             .nodes
             .iter()
@@ -12831,6 +13844,14 @@ mod tests {
             Op::Const(42),
             "the field load (via astore/aload local) must resolve to the stored value (42)"
         );
+        // Same rule as `ir_new_scalar_replaces_end_to_end`: the allocation is
+        // live in a deopt snapshot (here in local 0 as well as on the stack), so
+        // the elision is refused and the object stays real and initialised.
+        assert!(
+            graph.nodes.iter().any(|n| matches!(n.op, Op::New { .. })),
+            "the New is retained because a deopt snapshot names it"
+        );
+        assert_no_snapshot_names_a_dead_node(&graph);
     }
 
     // A `<init>` whose receiver is NOT a fresh `new` (e.g. a super() call on
@@ -12888,10 +13909,26 @@ mod tests {
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
             quickened: std::sync::OnceLock::new(),
         };
-        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
-        let new_resolver = |cp: u16| -> Option<(u32, usize, bool, bool)> {
+        let mut helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        // `lower_inner` refuses a graph whose `new`/field ops have no helper to
+        // call. Those guards used to be unreachable here because escape
+        // analysis elided the allocation and folded its loads and stores away;
+        // it no longer does (an allocation named by a safepoint slot is not
+        // elided unless the scalar-deopt path is on), so `Op::New`, `Op::Load`
+        // and `Op::Store` all survive to lowering. A real VM never presents a
+        // null helper; supply the three this graph reaches. The compiled code
+        // is never executed by this test, only inspected for routing.
+        helpers.new_object = 1;
+        helpers.getfield = 1;
+        helpers.putfield_int = 1;
+        let new_resolver = |cp: u16| -> Option<JitNewSite> {
             if cp == 1 {
-                Some((7, 1, false, false))
+                Some(JitNewSite::Resolved {
+                    class_id: 7,
+                    num_fields: 1,
+                    has_prim_init: false,
+                    has_finalizer: false,
+                })
             } else {
                 None
             }
@@ -12975,6 +14012,98 @@ mod tests {
             IR_LOWER_COMPILES.with(|c| c.get()),
             0,
             "without the elidable resolver, `new` must NOT take the IR pipeline"
+        );
+    }
+
+    // ── cold-`new` fix: a `new` of a NOT-YET-LOADED class must still compile ──
+    //
+    // The gap this guards (docs/internal/jit-compile-bail-unresolved-new-cold-class.md):
+    // `resolve_jit_new_site` only sees already-loaded classes, so a hot method
+    // whose only un-taken branch does `throw new SomeException(...)` reported
+    // `None`, `try_compile_inner` bailed the WHOLE compile at the `new_resolve`
+    // site, and after `MAX_TIER_FAIL_RETRIES` the method interpreted forever
+    // (json-smart's `JSONParserBase.readMain`: 293,940 interpreted invocations).
+    //
+    // Differential, so it cannot pass vacuously: the SAME bytecode is compiled
+    // three ways. `Resolved` proves the shape is compilable at all; `Deferred`
+    // with the CP helper wired must ALSO compile (the fix); `Deferred` with the
+    // helper unwired must still bail (a hand-built test table must never get a
+    // CALL to address 0).
+    #[test]
+    fn deferred_new_site_compiles_when_cp_helper_is_wired() {
+        use std::sync::Arc;
+        // `static int f() { new Cold(); pop; return 0; }`
+        //   new #1; pop; iconst_0; ireturn
+        let mk = |name: &str| CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/ColdNew"),
+            method_name: Arc::from(name),
+            method_descriptor: Arc::from("()I"),
+            source_file: None,
+            code: Arc::from([0xbb, 0x00, 0x01, 0x57, 0x03, 0xac, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 2,
+            max_locals: 1,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        };
+
+        // Non-null placeholders: this test only compiles, never executes, so the
+        // backend just needs the slots to read as "wired".
+        let mut wired: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        wired.new_object = 0x1000;
+        wired.new_object_cp = 0x2000;
+        let mut unwired = wired;
+        unwired.new_object_cp = 0;
+
+        let resolved = |cp: u16| -> Option<JitNewSite> {
+            (cp == 1).then_some(JitNewSite::Resolved {
+                class_id: 7,
+                num_fields: 1,
+                has_prim_init: true,
+                has_finalizer: true,
+            })
+        };
+        let deferred = |cp: u16| -> Option<JitNewSite> {
+            (cp == 1).then_some(JitNewSite::Deferred {
+                holder_class_id: 1,
+                cp_idx: cp,
+            })
+        };
+
+        let compile = |cached: &CachedBytecodeMethod,
+                       helpers: &JitRuntimeHelpers,
+                       r: &dyn Fn(u16) -> Option<JitNewSite>| {
+            try_compile(
+                cached, None, None, None, None, None,
+                Some(r),
+                None, None, None, helpers, None, None, None, None,
+                // Single-pass backend: this is about the CP-resolution
+                // pre-pass, not the IR tier.
+                false, false, false, false, false, false, None,
+            )
+        };
+
+        assert!(
+            compile(&mk("resolved"), &wired, &resolved).is_some(),
+            "control arm: a resolved `new` of this shape must compile — if it \
+             does not, the two Deferred assertions below prove nothing"
+        );
+        assert!(
+            compile(&mk("deferred"), &wired, &deferred).is_some(),
+            "THE FIX: a `new` whose class is not loaded yet must compile to the \
+             CP-indexed helper instead of bailing the whole method"
+        );
+        assert!(
+            compile(&mk("deferred_unwired"), &unwired, &deferred).is_none(),
+            "with `new_object_cp` unwired (hand-built test tables) a deferred \
+             site must keep the historical bail, never emit a CALL to 0"
         );
     }
 
@@ -15820,6 +16949,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let c = g.add(ir::Op::Const(42), ir::IrType::Int, vec![], None);
@@ -15849,6 +16979,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let alloc = g.add(

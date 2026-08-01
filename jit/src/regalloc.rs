@@ -23,6 +23,14 @@
 
 use super::x64::{LOCAL_REGS, LOCAL_XMMS};
 
+// Used only by the IR-level linear-scan allocator at the bottom of this file.
+use crate::bailout::{Bailout, BailoutReason, CompileResult};
+use crate::ir::{Graph, IrType, NodeId, Op, NO_NODE};
+use crate::ir_schedule::Schedule;
+use crate::metrics::CompileRecorder;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+
 /// Conservative cap on `tableswitch` table size used by [`bc_len`].
 ///
 /// JVM method code is at most 65535 bytes, which by itself caps a real
@@ -3448,5 +3456,1815 @@ mod handler_liveness_tests {
              {:#x})",
             interference[2]
         );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Linear-scan register allocation over the scheduled IR
+// ═════════════════════════════════════════════════════════════════════
+//
+// Everything above this line allocates **JVM bytecode locals** to callee-saved
+// registers by graph colouring, for the single-pass backend. Everything below
+// allocates **IR values** (`ir::Graph` nodes, post-`ir_schedule`) to the
+// physical register file, for the optimizing backend. The two share this file
+// and the loop-frequency weights, and nothing else — different inputs,
+// different units, different clients.
+//
+// ## Relationship to `ir_lower`'s frame-slot colouring
+//
+// `ir_lower::plan_slots` already computes, for the same graph, a liveness
+// colouring that packs every value into the smallest set of 8-byte frame
+// words. This allocator answers the *next* question: of those values, which
+// can live in a machine register instead of a frame word, and for how long.
+//
+// The two must agree about liveness or they will disagree about aliasing, so
+// [`build_live_model`] reproduces `plan_slots`' position model **exactly**:
+//
+//   * one linear position per scheduled node, in block order, then one for the
+//     block terminator, then one for the block's *outgoing edge*;
+//   * a phi's value inputs are consumed at the **predecessor's edge position**,
+//     never at the phi;
+//   * ranges are widened to whole block spans wherever the backward liveness
+//     fixed point says the value is live-in / live-out, which is what makes a
+//     loop-carried value live across the entire loop;
+//   * overlap is **endpoint-inclusive**: `[4, 7]` and `[7, 9]` overlap.
+//
+// It is a deliberate *re-implementation* rather than a call: `plan_slots`,
+// `SlotPlan`, `LiveRange` and `SlotClass` are all private to `ir_lower.rs`, and
+// this wave may not edit that file. See `docs/jit/linear-scan-regalloc.md` for
+// the one-line visibility change that would let the two share a single
+// implementation, which is the right end state.
+//
+// ## What is *not* modelled
+//
+//   * **Lifetime holes.** An interval is one contiguous `[lo, hi]` range, as in
+//     `plan_slots`. A value that is dead across the middle of its range still
+//     holds its register there. This over-approximates liveness, which is the
+//     safe direction: it costs registers, it cannot alias two live values.
+//   * **Register pairs / sub-registers.** Every value occupies exactly one
+//     register of its class. `Long` and `Int` are both one GP register (x86-64),
+//     `Float` and `Double` both one XMM.
+//   * **Coalescing.** Phi webs are resolved with explicit copies
+//     ([`resolve_parallel_copy`]), not by biasing the allocation.
+
+/// Which physical register bank a value is drawn from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RegClass {
+    /// General-purpose integer registers (`Int`, `Long`, `Ref`).
+    Gp,
+    /// SSE registers (`Float`, `Double`).
+    Xmm,
+}
+
+impl RegClass {
+    /// The bank an [`IrType`] must live in, or `None` for the types that carry
+    /// no runtime value at all (`Void`, `Control`, `Memory`).
+    ///
+    /// `Ref` maps to [`RegClass::Gp`] like any other 64-bit integer — the
+    /// *class* is not what keeps a reference describable to the collector; see
+    /// the safepoint rule on [`allocate_linear_scan`].
+    pub fn of(ty: IrType) -> Option<RegClass> {
+        match ty {
+            IrType::Int | IrType::Long | IrType::Ref => Some(RegClass::Gp),
+            IrType::Float | IrType::Double => Some(RegClass::Xmm),
+            IrType::Void | IrType::Control | IrType::Memory => None,
+        }
+    }
+}
+
+/// One physical register: a bank plus the encoding number the backend uses
+/// (`RAX` = 0 … `R15` = 15 for [`RegClass::Gp`], `XMM0` = 0 … `XMM15` = 15 for
+/// [`RegClass::Xmm`]) — the same numbering as `x64.rs` and `ir_lower.rs`.
+///
+/// The class is part of the identity on purpose: `Gp(8)` (R8) and `Xmm(8)`
+/// (XMM8) are different registers that would otherwise compare equal, and the
+/// aliasing check in [`verify_allocation`] is exactly a comparison of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PhysReg {
+    /// Which bank.
+    pub class: RegClass,
+    /// Encoding number within the bank.
+    pub num: u8,
+}
+
+impl PhysReg {
+    /// A general-purpose register by encoding number.
+    pub const fn gp(num: u8) -> PhysReg {
+        PhysReg {
+            class: RegClass::Gp,
+            num,
+        }
+    }
+
+    /// An SSE register by encoding number.
+    pub const fn xmm(num: u8) -> PhysReg {
+        PhysReg {
+            class: RegClass::Xmm,
+            num,
+        }
+    }
+}
+
+impl std::fmt::Display for PhysReg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.class {
+            RegClass::Gp => write!(f, "r{}", self.num),
+            RegClass::Xmm => write!(f, "xmm{}", self.num),
+        }
+    }
+}
+
+/// One allocatable register and the only ABI fact the allocator needs about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegSpec {
+    /// The register.
+    pub reg: PhysReg,
+    /// True when a call destroys it. A value live across a call may only be
+    /// placed in a register for which this is false; otherwise the interval is
+    /// split at the call (see [`allocate_linear_scan`]).
+    pub caller_saved: bool,
+}
+
+/// The set of registers the allocator may hand out, in preference order.
+///
+/// Deliberately a *value*, not a constant: the platform file is what the
+/// compiler uses, but a test needs to be able to say "two registers, both
+/// caller-saved" and get a deterministic, over-pressure allocation out of it.
+/// Every heuristic below is written against this type, so the small-file tests
+/// exercise the same code the real one does.
+#[derive(Clone, Debug, Default)]
+pub struct RegFile {
+    regs: Vec<RegSpec>,
+}
+
+impl RegFile {
+    /// A register file from an explicit list, in preference order (earlier
+    /// registers are handed out first). Duplicates are dropped, keeping the
+    /// first occurrence, so a caller cannot accidentally double-count a bank.
+    pub fn from_specs(specs: impl IntoIterator<Item = RegSpec>) -> RegFile {
+        let mut regs: Vec<RegSpec> = Vec::new();
+        for spec in specs {
+            if !regs.iter().any(|r| r.reg == spec.reg) {
+                regs.push(spec);
+            }
+        }
+        RegFile { regs }
+    }
+
+    /// The x86-64 file this crate's optimizing backend could allocate over.
+    ///
+    /// GP: [`LOCAL_REGS`] (callee-saved on the host ABI — R12–R15 + RBX, plus
+    /// RSI/RDI on Win64) followed by R8/R9, which mirror `x64.rs`'s
+    /// `SCRATCH_REGS` and are caller-saved on both ABIs. RAX/RCX/RDX/R10/R11
+    /// are **excluded**: `ir_lower` uses them as fixed scratch for essentially
+    /// every opcode, so they are modelled as clobbers rather than as allocatable
+    /// (see [`MachineModel::for_graph`]).
+    ///
+    /// XMM: [`LOCAL_XMMS`] (XMM8–XMM15). Win64 makes XMM6–15 callee-saved; the
+    /// SysV ABI makes **every** XMM caller-saved, so on Linux/macOS no FP value
+    /// survives a call in a register and every FP interval spanning a call is
+    /// split there. That is not a limitation of this allocator, it is the ABI.
+    pub fn x86_64() -> RegFile {
+        let mut specs: Vec<RegSpec> = Vec::new();
+        for &num in LOCAL_REGS.iter() {
+            specs.push(RegSpec {
+                reg: PhysReg::gp(num),
+                caller_saved: false,
+            });
+        }
+        // R8 / R9 — caller-saved on both Win64 and SysV.
+        for num in [8u8, 9u8] {
+            specs.push(RegSpec {
+                reg: PhysReg::gp(num),
+                caller_saved: true,
+            });
+        }
+        let xmm_caller_saved = !cfg!(target_os = "windows");
+        for &num in LOCAL_XMMS.iter() {
+            specs.push(RegSpec {
+                reg: PhysReg::xmm(num),
+                caller_saved: xmm_caller_saved,
+            });
+        }
+        RegFile::from_specs(specs)
+    }
+
+    /// Every allocatable register, in preference order.
+    pub fn specs(&self) -> &[RegSpec] {
+        &self.regs
+    }
+
+    /// How many registers of `class` this file offers.
+    pub fn class_size(&self, class: RegClass) -> usize {
+        self.regs.iter().filter(|r| r.reg.class == class).count()
+    }
+
+    /// The registers of `class`, in preference order.
+    pub fn of_class(&self, class: RegClass) -> impl Iterator<Item = PhysReg> + '_ {
+        self.regs
+            .iter()
+            .filter(move |r| r.reg.class == class)
+            .map(|r| r.reg)
+    }
+
+    /// Is `reg` allocatable at all?
+    pub fn contains(&self, reg: PhysReg) -> bool {
+        self.regs.iter().any(|r| r.reg == reg)
+    }
+
+    /// Does a call destroy `reg`? `None` when `reg` is not in the file, which
+    /// callers must treat as "not allocatable", never as "callee-saved".
+    pub fn is_caller_saved(&self, reg: PhysReg) -> Option<bool> {
+        self.regs
+            .iter()
+            .find(|r| r.reg == reg)
+            .map(|r| r.caller_saved)
+    }
+}
+
+/// A closed interval of linear emission positions.
+///
+/// The mirror of `ir_lower`'s private `LiveRange`, down to the
+/// endpoint-inclusive overlap rule: a value whose last use is at `p` and a
+/// value defined at `p` are treated as simultaneously live, because a node's
+/// lowering may allocate its result before or after reading its operands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PosRange {
+    /// First position, inclusive.
+    pub lo: usize,
+    /// Last position, inclusive.
+    pub hi: usize,
+}
+
+impl PosRange {
+    /// Endpoint-inclusive overlap: `[4, 7]` and `[7, 9]` overlap.
+    pub fn overlaps(self, other: PosRange) -> bool {
+        self.lo <= other.hi && other.lo <= self.hi
+    }
+
+    /// Is `pos` inside this range?
+    pub fn contains(self, pos: usize) -> bool {
+        self.lo <= pos && pos <= self.hi
+    }
+}
+
+/// How a value can be recomputed instead of reloaded.
+///
+/// A rematerializable value is never *stored*: its defining instruction is
+/// cheaper than the round trip through memory, so evicting it from a register
+/// costs a re-materialisation at the next use and nothing at the eviction
+/// point. This is what makes constants nearly free to spill, and it is why the
+/// eviction heuristic prefers them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Remat {
+    /// `Op::Const` — a `mov reg, imm` with no memory traffic.
+    Const(i64),
+    /// `Op::ConstF` — the raw bit pattern; the backend materialises it via an
+    /// integer immediate and a `movq`, still no memory traffic.
+    ConstF(u64),
+    /// `Op::Param` — a reload from the *incoming* argument slot, which the
+    /// prologue wrote and which nothing in the method may overwrite. Costs one
+    /// load, but never a store, and the slot exists whether or not we use it.
+    Param(u16),
+}
+
+/// A value that must occupy a specific register at a specific position.
+///
+/// Two sources, in principle: the entry ABI (`Op::Param(i)` arrives in the
+/// platform's i-th argument register — see [`MachineModel::pin_entry_params`])
+/// and fixed-operand instructions (x86 `idiv` reads its dividend in RAX, a
+/// variable shift reads its count in RCX). The second kind never reaches the
+/// allocator today because `ir_lower` keeps RAX/RCX/RDX outside the allocatable
+/// file and loads them from frame slots per opcode; those are modelled as
+/// [`MachineModel::clobbers`] instead. The constraint machinery is here, and
+/// verified, so an ABI-aware lowering does not have to invent it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedConstraint {
+    /// The value that must be in `reg`.
+    pub node: NodeId,
+    /// The position at which the requirement holds.
+    pub pos: usize,
+    /// The register it must be in.
+    pub reg: PhysReg,
+}
+
+/// Everything about the target the allocator needs beyond the liveness model.
+#[derive(Clone, Debug, Default)]
+pub struct MachineModel {
+    /// Registers the allocator may hand out.
+    pub regs: RegFile,
+    /// `(position, registers destroyed at that position)`. A register may not
+    /// hold a value across a position at which it is clobbered.
+    pub clobbers: Vec<(usize, Vec<PhysReg>)>,
+    /// Values pinned to specific registers at specific positions.
+    pub fixed: Vec<FixedConstraint>,
+    /// Positions at which the collector may run and read the oop map. Sorted,
+    /// deduplicated.
+    pub safepoints: Vec<usize>,
+}
+
+/// Work budget for the liveness fixed point, in `nodes × blocks` units.
+///
+/// The same budget `ir_lower::plan_slots` uses, for the same reason: past this
+/// the analysis is skipped, every value is treated as live for the whole method
+/// and nothing is promoted to a register. A compiler must not turn a
+/// pathological graph into a pathological compile.
+const LIVE_MODEL_WORK_BUDGET: usize = 8_000_000;
+
+/// Hard cap on liveness fixed-point iterations; mirrors
+/// `ir_lower::SLOT_PLAN_MAX_ITERATIONS`. A truncated may-analysis
+/// under-approximates liveness, so a non-converging fixed point discards the
+/// answer (nothing is promoted) rather than using a partial one.
+const LIVE_MODEL_MAX_ITERATIONS: usize = 256;
+
+/// The liveness model the allocator runs on: positions, intervals, uses and
+/// frequencies for one scheduled graph.
+///
+/// Produced by [`build_live_model`], which is total — it never panics and never
+/// fails. When it cannot analyse a graph, `converged` is false and every value
+/// is given the whole method as its range, which makes the allocator promote
+/// nothing and leave the frame layout exactly as `ir_lower` would have it.
+#[derive(Clone, Debug)]
+pub struct LiveModel {
+    /// `pos_of[id]` = the linear emission position of node `id`, or `None` when
+    /// the schedule never places it.
+    pub pos_of: Vec<Option<usize>>,
+    /// `span[b]` = `(first position in block b, block b's outgoing-edge
+    /// position)`. Phi arguments are consumed at the second element.
+    pub span: Vec<(usize, usize)>,
+    /// One past the last position.
+    pub total_positions: usize,
+    /// `block_of_pos[p]` = the block position `p` belongs to.
+    pub block_of_pos: Vec<usize>,
+    /// `wants_loc[id]` = node `id` produces a value that needs a location.
+    /// Exactly `ir_lower`'s `wants_slot`.
+    pub wants_loc: Vec<bool>,
+    /// `range[id]` = the live interval of node `id`, or `None` when
+    /// `!wants_loc[id]`.
+    pub range: Vec<Option<PosRange>>,
+    /// `class[id]` = which register bank `id`'s value belongs to.
+    pub class: Vec<Option<RegClass>>,
+    /// `is_ref[id]` = node `id` produces an object reference.
+    pub is_ref: Vec<bool>,
+    /// `pinned[id]` = node `id` may never share a frame slot, and is never
+    /// promoted to a register: phis (whose home the edge copies write) and any
+    /// value a deopt frame names. Mirrors `ir_lower`'s `SlotClass::Pinned`.
+    pub pinned: Vec<bool>,
+    /// `uses[id]` = the sorted, deduplicated positions at which `id`'s value is
+    /// *read* — direct operand reads plus the predecessor-edge reads of phi
+    /// arguments. Does not include the definition.
+    pub uses: Vec<Vec<usize>>,
+    /// `weight[id]` = the loop-frequency-weighted use count, using the same
+    /// [`LOOP_WEIGHT_PER_DEPTH`] model the bytecode allocator above uses.
+    pub weight: Vec<u64>,
+    /// `loop_depth[b]` = nesting depth of block `b`.
+    pub loop_depth: Vec<u32>,
+    /// Maximum number of intervals covering any one position. The floor a
+    /// perfect allocation could reach; reported, never sized from.
+    pub peak_live: usize,
+    /// False when the fixed point was skipped or did not converge. Every range
+    /// is then the whole method and nothing is promotable.
+    pub converged: bool,
+}
+
+/// Does this op define a value that needs a machine location?
+///
+/// **Verbatim mirror of `ir_lower::op_defines_result_slot`**, including its
+/// omissions (`I2B`/`I2C`/`I2S`, `ArrayLength`, `NewArray` are absent there and
+/// absent here). The two lists must stay in lockstep: a value this predicate
+/// claims exists but `ir_lower` never allocates for has no home to spill to,
+/// and a value `ir_lower` allocates for but this predicate omits is invisible
+/// to the interference check. If that file's list changes, change this one.
+fn ir_op_defines_value(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Const(_)
+            | Op::ConstF(_)
+            | Op::Param(_)
+            | Op::Phi
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::Cmp(_)
+            | Op::LCmp
+            | Op::FCmp { .. }
+            | Op::I2L
+            | Op::L2I
+            | Op::I2F
+            | Op::I2D
+            | Op::L2F
+            | Op::L2D
+            | Op::F2I
+            | Op::F2L
+            | Op::F2D
+            | Op::D2I
+            | Op::D2L
+            | Op::D2F
+            | Op::Load(_)
+            | Op::ArrayLoad(_)
+            | Op::ArrayStore(_)
+            | Op::New { .. }
+            | Op::Call { .. }
+            | Op::LambdaIntToDouble
+    )
+}
+
+/// Does this op reach a safepoint at which the collector may read the oop map?
+///
+/// Conservative superset of what `ir_lower` emits (`emit_safepoint_map` at
+/// `Op::Call`, `emit_safepoint_poll` at back edges): allocation and the lambda
+/// adapter can also transfer to the runtime, and `Op::Guard` transfers to the
+/// deopt trampoline. Over-approximating costs promotions, never correctness.
+fn ir_op_is_safepoint(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Call { .. }
+            | Op::New { .. }
+            | Op::NewArray { .. }
+            | Op::LambdaIntToDouble
+            | Op::Guard { .. }
+    )
+}
+
+/// Does this op destroy the caller-saved registers?
+fn ir_op_is_call(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Call { .. } | Op::New { .. } | Op::NewArray { .. } | Op::LambdaIntToDouble
+    )
+}
+
+/// Set bit `i`; out-of-range indices are ignored rather than panicking (the
+/// model runs on a graph nothing has verified yet).
+#[inline]
+fn ls_bit_set(bits: &mut [u64], i: usize) {
+    if let Some(word) = bits.get_mut(i / 64) {
+        *word |= 1u64 << (i % 64);
+    }
+}
+
+/// Is bit `i` set?
+#[inline]
+fn ls_bit_get(bits: &[u64], i: usize) -> bool {
+    bits.get(i / 64).is_some_and(|w| w & (1u64 << (i % 64)) != 0)
+}
+
+/// Visit every set bit, in increasing order.
+#[inline]
+fn ls_bits_for_each(bits: &[u64], mut f: impl FnMut(usize)) {
+    for (w, &word) in bits.iter().enumerate() {
+        let mut rest = word;
+        while rest != 0 {
+            let b = rest.trailing_zeros() as usize;
+            f(w * 64 + b);
+            rest &= rest - 1;
+        }
+    }
+}
+
+/// Resolve the block that produces control token `ctrl`, so a phi's value
+/// inputs are attributed to exactly the predecessor block `ir_lower`'s
+/// `emit_phi_copies` copies them from. Mirror of `ir_lower::ctrl_block_of`.
+fn ls_ctrl_block_of(graph: &Graph, schedule: &Schedule, mut ctrl: NodeId) -> Option<usize> {
+    for _ in 0..graph.nodes.len() {
+        if ctrl == NO_NODE {
+            return None;
+        }
+        let blk = *schedule.node_to_block.get(ctrl as usize)?;
+        if blk != usize::MAX && schedule.blocks.get(blk).map(|b| b.ctrl) == Some(ctrl) {
+            return Some(blk);
+        }
+        let node = graph.nodes.get(ctrl as usize)?;
+        match node.inputs.first() {
+            Some(&next) if next != ctrl => ctrl = next,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Build the liveness model for one scheduled graph.
+///
+/// Total: never panics, never fails. See [`LiveModel`] for the fallback when
+/// the analysis is skipped or does not converge.
+pub fn build_live_model(graph: &Graph, schedule: &Schedule) -> LiveModel {
+    let n = graph.nodes.len();
+    let nb = schedule.blocks.len();
+
+    // ── 1. Which values need a location ──────────────────────────────
+    let mut wants_loc = vec![false; n];
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if matches!(node.op, Op::Phi) {
+            wants_loc[id] = true;
+        }
+    }
+    for block in &schedule.blocks {
+        for &nid in &block.nodes {
+            if let Some(node) = graph.nodes.get(nid as usize) {
+                if ir_op_defines_value(&node.op) {
+                    wants_loc[nid as usize] = true;
+                }
+            }
+        }
+    }
+
+    // ── 2. Linear positions and block spans ──────────────────────────
+    let mut pos_of: Vec<Option<usize>> = vec![None; n];
+    let mut span: Vec<(usize, usize)> = Vec::with_capacity(nb);
+    let mut block_of_pos: Vec<usize> = Vec::new();
+    let mut seq = 0usize;
+    for (b, block) in schedule.blocks.iter().enumerate() {
+        let start = seq;
+        for &nid in &block.nodes {
+            if let Some(cell) = pos_of.get_mut(nid as usize) {
+                *cell = Some(seq);
+            }
+            block_of_pos.push(b);
+            seq += 1;
+        }
+        if let Some(term) = block.terminator {
+            if let Some(cell) = pos_of.get_mut(term as usize) {
+                *cell = Some(seq);
+            }
+            block_of_pos.push(b);
+            seq += 1;
+        }
+        // One position past the block's last instruction: the outgoing edge,
+        // where `emit_phi_copies` reads this block's phi arguments.
+        let end = seq;
+        block_of_pos.push(b);
+        seq += 1;
+        span.push((start, end));
+    }
+    let total_positions = seq;
+
+    // ── 3. Loop depth and per-position frequency weight ──────────────
+    //
+    // A back edge is a successor at or before its own block index — exactly the
+    // test `ir_lower::lower_block` uses to decide where to place a safepoint
+    // poll, so the two agree about what a loop is.
+    let mut loop_depth = vec![0u32; nb];
+    for (b, block) in schedule.blocks.iter().enumerate() {
+        for &s in &block.successors {
+            if s <= b && s < nb {
+                for depth in loop_depth.iter_mut().take(b + 1).skip(s) {
+                    *depth = depth.saturating_add(1);
+                }
+            }
+        }
+    }
+    let pos_weight = |p: usize| -> u64 {
+        let b = block_of_pos.get(p).copied().unwrap_or(0);
+        let depth = loop_depth.get(b).copied().unwrap_or(0);
+        LOOP_WEIGHT_PER_DEPTH
+            .checked_pow(depth)
+            .unwrap_or(MAX_LOOP_DEPTH_WEIGHT)
+            .min(MAX_LOOP_DEPTH_WEIGHT) as u64
+    };
+
+    // ── 4. Pinned classes ────────────────────────────────────────────
+    //
+    // Same two sources `plan_slots` pins: phis (their home is what the edge
+    // copies write, and `zero_ref_phi_slots` publishes `Ref` phi slots as GC
+    // roots from the prologue) and every value a deopt frame names (the slot
+    // must still hold the value at *any* recorded bci, which is not a property
+    // a register allocator can establish).
+    let mut pinned = vec![false; n];
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if wants_loc[id] && matches!(node.op, Op::Phi) {
+            pinned[id] = true;
+        }
+    }
+    for sp in &graph.safepoints {
+        for &v in sp.locals.iter().chain(sp.stack.iter()) {
+            if v != NO_NODE {
+                if let Some(slot) = pinned.get_mut(v as usize) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+
+    // ── 5. Uses, definitions and the backward fixed point ────────────
+    let mut lo = vec![usize::MAX; n];
+    let mut hi = vec![0usize; n];
+    let mut uses: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut weight = vec![0u64; n];
+    let mut converged = n.saturating_mul(nb) <= LIVE_MODEL_WORK_BUDGET;
+
+    if converged {
+        let words = n.div_ceil(64).max(1);
+        let mut def_bits = vec![0u64; words * nb];
+        let mut use_bits = vec![0u64; words * nb];
+        let mut phi_out_bits = vec![0u64; words * nb];
+
+        let mut local_def = vec![0u64; words];
+        for b in 0..nb {
+            let base = b * words;
+            local_def.fill(0);
+            let block = &schedule.blocks[b];
+            for u in block.nodes.iter().copied().chain(block.terminator) {
+                let ui = u as usize;
+                let node = match graph.nodes.get(ui) {
+                    Some(node) => node,
+                    None => continue,
+                };
+                let upos = pos_of.get(ui).copied().flatten().unwrap_or(span[b].0);
+                // A phi's value inputs are NOT read here — the predecessor's
+                // edge copy reads them, below; `inputs[0]` is control.
+                if !matches!(node.op, Op::Phi) {
+                    for &inp in &node.inputs {
+                        let ii = inp as usize;
+                        if inp == NO_NODE || ii >= n || !wants_loc[ii] {
+                            continue;
+                        }
+                        lo[ii] = lo[ii].min(upos);
+                        hi[ii] = hi[ii].max(upos);
+                        uses[ii].push(upos);
+                        weight[ii] = weight[ii].saturating_add(pos_weight(upos));
+                        if !ls_bit_get(&local_def, ii) {
+                            ls_bit_set(&mut use_bits[base..base + words], ii);
+                        }
+                    }
+                }
+                if wants_loc[ui] {
+                    ls_bit_set(&mut local_def, ui);
+                    ls_bit_set(&mut def_bits[base..base + words], ui);
+                    lo[ui] = lo[ui].min(upos);
+                    hi[ui] = hi[ui].max(upos);
+                }
+            }
+        }
+
+        // Phi edge copies: a phi's k-th value input is read at the outgoing-edge
+        // position of the k-th predecessor, not at the phi.
+        let mut phis_of: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if !matches!(node.op, Op::Phi) {
+                continue;
+            }
+            if let Some(&merge) = node.inputs.first() {
+                if merge != NO_NODE {
+                    phis_of.entry(merge).or_default().push(id as NodeId);
+                }
+            }
+        }
+        for succ in 0..nb {
+            let merge_ctrl = schedule.blocks[succ].ctrl;
+            let merge_node = match graph.nodes.get(merge_ctrl as usize) {
+                Some(m) if matches!(m.op, Op::Merge | Op::Region) => m,
+                _ => continue,
+            };
+            let phis = match phis_of.get(&merge_ctrl) {
+                Some(phis) => phis,
+                None => continue,
+            };
+            for (k, &ctrl_in) in merge_node.inputs.iter().enumerate() {
+                let pred = match ls_ctrl_block_of(graph, schedule, ctrl_in) {
+                    Some(pred) if pred < nb => pred,
+                    _ => continue,
+                };
+                let at = span[pred].1;
+                for &pid in phis {
+                    let v = match graph
+                        .nodes
+                        .get(pid as usize)
+                        .and_then(|p| p.inputs.get(k + 1))
+                    {
+                        Some(&v) if v != NO_NODE => v,
+                        _ => continue,
+                    };
+                    let vi = v as usize;
+                    if vi >= n || !wants_loc[vi] {
+                        continue;
+                    }
+                    lo[vi] = lo[vi].min(at);
+                    hi[vi] = hi[vi].max(at);
+                    uses[vi].push(at);
+                    weight[vi] = weight[vi].saturating_add(pos_weight(at));
+                    ls_bit_set(&mut phi_out_bits[pred * words..(pred + 1) * words], vi);
+                }
+            }
+        }
+
+        let mut live_in = vec![0u64; words * nb];
+        let mut live_out = vec![0u64; words * nb];
+        let mut scratch = vec![0u64; words];
+        let mut settled = false;
+        for _ in 0..LIVE_MODEL_MAX_ITERATIONS {
+            let mut changed = false;
+            for b in (0..nb).rev() {
+                let base = b * words;
+                scratch.copy_from_slice(&phi_out_bits[base..base + words]);
+                for &s in &schedule.blocks[b].successors {
+                    if s >= nb {
+                        continue;
+                    }
+                    for w in 0..words {
+                        scratch[w] |= live_in[s * words + w];
+                    }
+                }
+                for w in 0..words {
+                    let merged_out = live_out[base + w] | scratch[w];
+                    if merged_out != live_out[base + w] {
+                        live_out[base + w] = merged_out;
+                        changed = true;
+                    }
+                    let entering = use_bits[base + w] | (merged_out & !def_bits[base + w]);
+                    let merged_in = live_in[base + w] | entering;
+                    if merged_in != live_in[base + w] {
+                        live_in[base + w] = merged_in;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                settled = true;
+                break;
+            }
+        }
+        converged = settled;
+
+        // Widen each range over every block it is live in. This is where loops
+        // are handled: a value used inside a loop is live-out of every block on
+        // the back edge's path, so its range covers the whole loop without the
+        // model ever knowing what a loop is.
+        if converged {
+            for b in 0..nb {
+                let base = b * words;
+                let (start, end) = span[b];
+                ls_bits_for_each(&live_in[base..base + words], |v| {
+                    if v < n && wants_loc[v] {
+                        lo[v] = lo[v].min(start);
+                    }
+                });
+                ls_bits_for_each(&live_out[base..base + words], |v| {
+                    if v < n && wants_loc[v] {
+                        hi[v] = hi[v].max(end);
+                    }
+                });
+            }
+        }
+    }
+
+    // ── 6. Finalise ──────────────────────────────────────────────────
+    let whole_method = PosRange {
+        lo: 0,
+        hi: total_positions.saturating_sub(1),
+    };
+    let mut range: Vec<Option<PosRange>> = vec![None; n];
+    let mut class: Vec<Option<RegClass>> = vec![None; n];
+    let mut is_ref = vec![false; n];
+    for id in 0..n {
+        if !wants_loc[id] {
+            continue;
+        }
+        if !converged {
+            pinned[id] = true;
+        }
+        range[id] = Some(if lo[id] == usize::MAX || !converged {
+            whole_method
+        } else {
+            PosRange {
+                lo: lo[id],
+                hi: hi[id].max(lo[id]),
+            }
+        });
+        let ty = graph.nodes[id].ty;
+        class[id] = RegClass::of(ty);
+        is_ref[id] = ty == IrType::Ref;
+        uses[id].sort_unstable();
+        uses[id].dedup();
+    }
+
+    // Peak simultaneous liveness, by sweeping the interval endpoints.
+    let mut delta = vec![0i64; total_positions + 2];
+    for r in range.iter().flatten() {
+        if r.lo < delta.len() && r.hi + 1 < delta.len() {
+            delta[r.lo] += 1;
+            delta[r.hi + 1] -= 1;
+        }
+    }
+    let mut running = 0i64;
+    let mut peak_live = 0i64;
+    for d in &delta {
+        running += d;
+        peak_live = peak_live.max(running);
+    }
+
+    LiveModel {
+        pos_of,
+        span,
+        total_positions,
+        block_of_pos,
+        wants_loc,
+        range,
+        class,
+        is_ref,
+        pinned,
+        uses,
+        weight,
+        loop_depth,
+        peak_live: peak_live.max(0) as usize,
+        converged,
+    }
+}
+
+impl LiveModel {
+    /// The first read of `node` at or after `pos`, if any.
+    pub fn next_use_at_or_after(&self, node: NodeId, pos: usize) -> Option<usize> {
+        let uses = self.uses.get(node as usize)?;
+        let idx = uses.partition_point(|&u| u < pos);
+        uses.get(idx).copied()
+    }
+
+    /// The first read of `node` strictly after `pos`, if any.
+    pub fn next_use_after(&self, node: NodeId, pos: usize) -> Option<usize> {
+        self.next_use_at_or_after(node, pos.saturating_add(1))
+    }
+}
+
+impl MachineModel {
+    /// Derive the machine model for one scheduled graph over `regs`.
+    ///
+    /// Produces the clobber set (every call position destroys every
+    /// caller-saved register in the file; `Div`/`Rem` destroy RAX/RDX and a
+    /// variable shift destroys RCX, which matter only if a caller puts those in
+    /// the file) and the safepoint set. The fixed-constraint list starts empty;
+    /// see [`MachineModel::pin_entry_params`].
+    pub fn for_graph(graph: &Graph, schedule: &Schedule, live: &LiveModel, regs: RegFile) -> Self {
+        let caller_saved: Vec<PhysReg> = regs
+            .specs()
+            .iter()
+            .filter(|s| s.caller_saved)
+            .map(|s| s.reg)
+            .collect();
+        let mut clobbers: Vec<(usize, Vec<PhysReg>)> = Vec::new();
+        let mut safepoints: Vec<usize> = Vec::new();
+
+        for (b, block) in schedule.blocks.iter().enumerate() {
+            for &nid in block.nodes.iter().chain(block.terminator.iter()) {
+                let node = match graph.nodes.get(nid as usize) {
+                    Some(node) => node,
+                    None => continue,
+                };
+                let pos = match live.pos_of.get(nid as usize).copied().flatten() {
+                    Some(pos) => pos,
+                    None => continue,
+                };
+                if ir_op_is_safepoint(&node.op) {
+                    safepoints.push(pos);
+                }
+                let mut destroyed: Vec<PhysReg> = Vec::new();
+                if ir_op_is_call(&node.op) {
+                    destroyed.extend_from_slice(&caller_saved);
+                }
+                // Fixed-operand x86 instructions. Only meaningful when a caller
+                // puts these registers in the file; `RegFile::x86_64` does not.
+                match node.op {
+                    Op::Div | Op::Rem => {
+                        destroyed.push(PhysReg::gp(0)); // RAX
+                        destroyed.push(PhysReg::gp(2)); // RDX
+                    }
+                    Op::Shl | Op::Shr | Op::UShr => destroyed.push(PhysReg::gp(1)), // RCX
+                    _ => {}
+                }
+                destroyed.retain(|r| regs.contains(*r));
+                if !destroyed.is_empty() {
+                    destroyed.sort_unstable();
+                    destroyed.dedup();
+                    clobbers.push((pos, destroyed));
+                }
+            }
+            // `lower_terminator` / the fall-through edge emit a safepoint poll
+            // on any back edge, which publishes the oop map exactly as a call
+            // site does. Both the terminator position and the edge position are
+            // covered because the poll sits between them.
+            if block.successors.iter().any(|&s| s <= b) {
+                if let Some(&(_, edge)) = live.span.get(b) {
+                    safepoints.push(edge.saturating_sub(1));
+                    safepoints.push(edge);
+                }
+            }
+        }
+
+        clobbers.sort_by_key(|(pos, _)| *pos);
+        safepoints.sort_unstable();
+        safepoints.dedup();
+        MachineModel {
+            regs,
+            clobbers,
+            fixed: Vec::new(),
+            safepoints,
+        }
+    }
+
+    /// Pin each `Op::Param(i)` to the register the entry ABI delivers it in.
+    ///
+    /// `abi` is the platform's integer argument register list *as the callee
+    /// sees it* — `ir_lower::ENTRY_ABI_REGS`, offset by one when the callee
+    /// takes the hidden VM-context pointer. Parameters whose ABI register is
+    /// not in the allocatable file are skipped: the prologue spills those to
+    /// their frame slot and the allocator has nothing to say about them.
+    pub fn pin_entry_params(&mut self, graph: &Graph, live: &LiveModel, abi: &[PhysReg]) {
+        for (id, node) in graph.nodes.iter().enumerate() {
+            let Op::Param(i) = node.op else { continue };
+            if !live.wants_loc.get(id).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(&reg) = abi.get(i as usize) else {
+                continue;
+            };
+            if !self.regs.contains(reg) || RegClass::of(node.ty) != Some(reg.class) {
+                continue;
+            }
+            self.fixed.push(FixedConstraint {
+                node: id as NodeId,
+                pos: 0,
+                reg,
+            });
+        }
+        self.fixed.sort_by_key(|f| (f.pos, f.reg, f.node));
+    }
+
+    /// Every register destroyed at `pos`.
+    fn clobbered_at(&self, pos: usize) -> &[PhysReg] {
+        match self.clobbers.binary_search_by_key(&pos, |(p, _)| *p) {
+            Ok(idx) => &self.clobbers[idx].1,
+            Err(_) => &[],
+        }
+    }
+
+    /// Is any position in `range` a safepoint?
+    fn range_covers_safepoint(&self, range: PosRange) -> bool {
+        let idx = self.safepoints.partition_point(|&p| p < range.lo);
+        self.safepoints.get(idx).is_some_and(|&p| p <= range.hi)
+    }
+}
+
+// ── Allocation result ────────────────────────────────────────────────
+
+/// Where a value is at some position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ValueLoc {
+    /// In a physical register.
+    Reg(PhysReg),
+    /// In its home frame slot (an 8-byte word index, as `SlotPlan::node_color`
+    /// numbers them).
+    Slot(u32),
+}
+
+/// One stretch of a value's life spent in one location.
+///
+/// A value's segments tile its whole live range with no gaps and no overlaps —
+/// [`verify_allocation`] checks exactly that. `reg == None` means "in the home
+/// slot", which is the location `ir_lower` uses today for every value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    /// The positions this segment covers.
+    pub range: PosRange,
+    /// The register held over `range`, or `None` for the home slot.
+    pub reg: Option<PhysReg>,
+}
+
+/// What the backend must emit at a location transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpillKind {
+    /// Register → home slot. Counted in [`Allocation::spills`]. At most one per
+    /// value: the IR is SSA, so once the home is written it stays correct.
+    Store,
+    /// Home slot → register. Counted in [`Allocation::reloads`].
+    Load,
+    /// Value recomputed into a register instead of being loaded. Counted in
+    /// [`Allocation::remats`]; costs no memory traffic and no preceding store.
+    Remat,
+    /// Register → a different register. Counted in [`Allocation::reg_moves`].
+    Move,
+}
+
+/// One transition the backend must materialise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpillEvent {
+    /// The value.
+    pub node: NodeId,
+    /// For [`SpillKind::Store`], the **last** position at which the register
+    /// still holds the value; the store may be sunk anywhere between the
+    /// definition and here. For every other kind, the position at which the
+    /// value must already be in its new location.
+    pub pos: usize,
+    /// What to emit.
+    pub kind: SpillKind,
+    /// Source register, when there is one.
+    pub from: Option<PhysReg>,
+    /// Destination register, when there is one.
+    pub to: Option<PhysReg>,
+}
+
+/// The result of [`allocate_linear_scan`].
+#[derive(Clone, Debug, Default)]
+pub struct Allocation {
+    /// `segments[id]` = node `id`'s location timeline, ordered and contiguous.
+    /// Empty for nodes that produce no value.
+    pub segments: Vec<Vec<Segment>>,
+    /// `stack_slot[id]` = the home word index, or `None` when the value never
+    /// touches memory. A drop-in replacement for `ir_lower`'s
+    /// `SlotPlan::node_color`: same numbering, same Ref/Prim/pinned pool
+    /// separation.
+    pub stack_slot: Vec<Option<u32>>,
+    /// Distinct home words the plan needs.
+    pub stack_slots: usize,
+    /// Register → memory transitions. Feeds `CompilationReport::spills`.
+    pub spills: usize,
+    /// Memory → register transitions. Feeds `CompilationReport::reloads`.
+    pub reloads: usize,
+    /// Values recomputed rather than reloaded. Reported separately so a
+    /// dashboard cannot mistake a free re-materialisation for memory traffic.
+    pub remats: usize,
+    /// Register → register transitions.
+    pub reg_moves: usize,
+    /// Interval splits performed.
+    pub splits: usize,
+    /// Values that spent at least one position in a register.
+    pub promoted: usize,
+    /// Every transition, in position order.
+    pub events: Vec<SpillEvent>,
+    /// Copied from [`LiveModel::peak_live`] so a report has the pressure and
+    /// the outcome in one place.
+    pub peak_live: usize,
+}
+
+impl Allocation {
+    /// Where is `node`'s value at `pos`? `None` when `pos` is outside its live
+    /// range or the node produces no value.
+    pub fn location_at(&self, node: NodeId, pos: usize) -> Option<ValueLoc> {
+        let segs = self.segments.get(node as usize)?;
+        let seg = segs.iter().find(|s| s.range.contains(pos))?;
+        match seg.reg {
+            Some(reg) => Some(ValueLoc::Reg(reg)),
+            None => self
+                .stack_slot
+                .get(node as usize)
+                .copied()
+                .flatten()
+                .map(ValueLoc::Slot),
+        }
+    }
+
+    /// Does `node` ever occupy a register?
+    pub fn is_promoted(&self, node: NodeId) -> bool {
+        self.segments
+            .get(node as usize)
+            .is_some_and(|segs| segs.iter().any(|s| s.reg.is_some()))
+    }
+
+    /// The register `node` holds over its first segment, if any.
+    pub fn first_reg(&self, node: NodeId) -> Option<PhysReg> {
+        self.segments.get(node as usize)?.first()?.reg
+    }
+}
+
+// ── Spill cost model ─────────────────────────────────────────────────
+
+/// Scale factor for the eviction score, so integer division by the frequency
+/// weight keeps useful resolution.
+const SPILL_DISTANCE_SCALE: u64 = 1024;
+
+/// Score handed to a rematerializable value, which is always the first thing
+/// evicted: dropping it costs no store and its reload is an immediate.
+const SPILL_SCORE_REMAT: u64 = u64::MAX;
+
+/// Splits allowed before the allocator gives up.
+///
+/// Every split strictly advances the suffix's start, so the scan terminates
+/// regardless; this budget is about *compile time*. A graph that needs more
+/// splits than this over the given register file is one where every promotion
+/// immediately costs a reload, i.e. one where linear scan buys nothing — so it
+/// bails with [`BailoutReason::RegisterPressure`] rather than spending the
+/// compile budget arriving at the frame layout `ir_lower` already had.
+fn split_budget(intervals: usize) -> usize {
+    intervals.saturating_mul(4).saturating_add(16)
+}
+
+/// How `node` can be recomputed, if it can.
+fn remat_of(graph: &Graph, node: NodeId) -> Option<Remat> {
+    match graph.nodes.get(node as usize)?.op {
+        Op::Const(v) => Some(Remat::Const(v)),
+        Op::ConstF(bits) => Some(Remat::ConstF(bits)),
+        Op::Param(i) => Some(Remat::Param(i)),
+        _ => None,
+    }
+}
+
+/// An interval waiting to be allocated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Pending {
+    lo: usize,
+    hi: usize,
+    node: NodeId,
+}
+
+/// An interval currently holding a register.
+#[derive(Clone, Copy, Debug)]
+struct Active {
+    reg: PhysReg,
+    lo: usize,
+    hi: usize,
+    node: NodeId,
+    /// Index into `reg_segments[node]`, so an eviction can shorten the segment
+    /// that was already recorded.
+    seg: usize,
+}
+
+/// Which interval loses its register when nothing is free.
+enum Victim {
+    /// The interval being allocated stays in memory until its next use.
+    Current,
+    /// An active interval is cut short at the current position.
+    Active(usize),
+}
+
+/// Linear-scan register allocation over a scheduled IR graph.
+///
+/// ## Algorithm
+///
+/// Poletto–Sarkar linear scan, extended with interval splitting, a
+/// frequency-weighted spill cost model and re-materialisation:
+///
+///  1. Intervals are the [`LiveModel`]'s contiguous ranges, processed in
+///     increasing start order.
+///  2. Actives whose range ends before the current start expire (the overlap
+///     rule is endpoint-inclusive, so an active expires at `hi < lo`).
+///  3. A register is chosen from the free set, preferring one with no clobber
+///     and no foreign fixed constraint anywhere in the interval. If only a
+///     partially-usable register is free, the interval is **split** at the
+///     first blocking position: the prefix keeps the register, the suffix is
+///     re-queued at its next use. This is what makes a call cost a spill/reload
+///     pair for exactly the values that could not be given a callee-saved
+///     register, and nothing for the ones that could.
+///  4. With nothing free, a victim is chosen among the current interval and the
+///     actives of the same class that started strictly earlier, maximising
+///     `next_use_distance × 1024 / frequency_weight`, with rematerializable
+///     values scored [`SPILL_SCORE_REMAT`] so they always go first. The victim
+///     is cut at the current position and its suffix re-queued at its next use.
+///
+/// Every re-queue strictly advances the interval's start, so the scan
+/// terminates; [`split_budget`] bounds compile time on top of that.
+///
+/// ## The subset that is promoted
+///
+/// A value is a candidate only if **all** of these hold. Everything else keeps
+/// the home slot `ir_lower` gives it today, which is always correct:
+///
+///   * the liveness fixed point converged (otherwise nothing is promoted);
+///   * it is not pinned — not a phi (its home is what the edge copies write)
+///     and not named by any deopt frame state (the home must hold the value at
+///     *any* recorded bci, which is not a property this pass establishes);
+///   * its type has a register class (`Void`/`Control`/`Memory` do not);
+///   * **if it is a `Ref`, its live range contains no safepoint.**
+///
+/// ## The `Ref`-at-safepoint decision
+///
+/// References are kept **in memory across every safepoint**. A `Ref` whose
+/// range covers a safepoint position is never promoted at all; one that lives
+/// and dies strictly between safepoints may take a register.
+///
+/// The alternative — allowing a `Ref` in a register across a safepoint and
+/// naming that register in the oop map — requires a register bank in the oop
+/// map, in the GC's frame walker, and in the deopt frame reconstructor, and it
+/// requires the collector to be able to *update* the register on a moving
+/// collection. `ir_lower::emit_safepoint_map` publishes frame slots and nothing
+/// else. Promoting a reference across a safepoint without that would either
+/// hide a live oop from the collector or hand it a stale one after evacuation;
+/// both are silent heap corruption. The conservative rule costs GP registers in
+/// reference-heavy code and costs nothing in the arithmetic and loop kernels
+/// this pass exists for.
+pub fn allocate_linear_scan(
+    graph: &Graph,
+    live: &LiveModel,
+    model: &MachineModel,
+) -> CompileResult<Allocation> {
+    let n = graph.nodes.len();
+
+    // ── Fixed constraints: index them and refuse the unsatisfiable ───
+    //
+    // Two values requiring the same register at the same position is not a
+    // heuristic failure, it is an unsatisfiable model. That is what
+    // `RegisterPressure` means.
+    let mut fixed_at: HashMap<(usize, PhysReg), NodeId> = HashMap::new();
+    let mut fixed_of: HashMap<NodeId, Vec<(usize, PhysReg)>> = HashMap::new();
+    for f in &model.fixed {
+        if !model.regs.contains(f.reg) {
+            // Outside the allocatable file: the emitter's fixed scratch, which
+            // `MachineModel::for_graph` already records as a clobber.
+            continue;
+        }
+        if let Some(&other) = fixed_at.get(&(f.pos, f.reg)) {
+            if other != f.node {
+                return Err(Bailout::with_context(
+                    BailoutReason::RegisterPressure,
+                    format!(
+                        "n{} and n{other} both require {} at position {}",
+                        f.node, f.reg, f.pos
+                    ),
+                ));
+            }
+        }
+        fixed_at.insert((f.pos, f.reg), f.node);
+        let slots = fixed_of.entry(f.node).or_default();
+        if let Some(&(pos, reg)) = slots.iter().find(|(pos, _)| *pos == f.pos) {
+            if reg != f.reg {
+                return Err(Bailout::with_context(
+                    BailoutReason::RegisterPressure,
+                    format!(
+                        "n{} requires both {reg} and {} at position {pos}",
+                        f.node, f.reg
+                    ),
+                ));
+            }
+        }
+        slots.push((f.pos, f.reg));
+    }
+
+    // ── Candidate set ────────────────────────────────────────────────
+    let mut promotable = vec![false; n];
+    let mut unhandled: BinaryHeap<Reverse<Pending>> = BinaryHeap::new();
+    for id in 0..n {
+        if !live.wants_loc.get(id).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(range) = live.range.get(id).copied().flatten() else {
+            continue;
+        };
+        if !live.converged || live.pinned[id] || live.class[id].is_none() {
+            continue;
+        }
+        if live.is_ref[id] && model.range_covers_safepoint(range) {
+            continue;
+        }
+        if model.regs.class_size(live.class[id].unwrap_or(RegClass::Gp)) == 0 {
+            continue;
+        }
+        promotable[id] = true;
+        unhandled.push(Reverse(Pending {
+            lo: range.lo,
+            hi: range.hi,
+            node: id as NodeId,
+        }));
+    }
+
+    let budget = split_budget(unhandled.len());
+    let mut reg_segments: Vec<Vec<(PosRange, PhysReg)>> = vec![Vec::new(); n];
+    let mut active: Vec<Active> = Vec::new();
+    let mut splits = 0usize;
+
+    // ── The scan ─────────────────────────────────────────────────────
+    while let Some(Reverse(current)) = unhandled.pop() {
+        let Pending { lo, hi, node } = current;
+        if lo > hi {
+            continue;
+        }
+        let Some(class) = live.class.get(node as usize).copied().flatten() else {
+            continue;
+        };
+        active.retain(|a| a.hi >= lo);
+
+        // A register this value is *required* to hold somewhere in this
+        // interval overrides free choice.
+        let required: Option<PhysReg> = fixed_of.get(&node).and_then(|slots| {
+            slots
+                .iter()
+                .find(|(pos, _)| lo <= *pos && *pos <= hi)
+                .map(|(_, reg)| *reg)
+        });
+
+        let mut attempts = 0usize;
+        let choice = loop {
+            attempts += 1;
+            if attempts > model.regs.class_size(class).saturating_add(2) {
+                break None;
+            }
+            if let Some(found) = ls_select_register(model, live, &active, class, required, current)?
+            {
+                break Some(found);
+            }
+            match ls_pick_victim(graph, live, &active, class, current) {
+                Victim::Current => break None,
+                Victim::Active(idx) => {
+                    let victim = active.remove(idx);
+                    splits += 1;
+                    if splits > budget {
+                        return Err(Bailout::with_context(
+                            BailoutReason::RegisterPressure,
+                            format!(
+                                "linear scan exceeded {budget} splits over {} registers \
+                                 (peak live {})",
+                                model.regs.class_size(class),
+                                live.peak_live
+                            ),
+                        ));
+                    }
+                    // The victim keeps the register up to, but not including,
+                    // the position that displaced it.
+                    if let Some(seg) = reg_segments
+                        .get_mut(victim.node as usize)
+                        .and_then(|segs| segs.get_mut(victim.seg))
+                    {
+                        seg.0.hi = lo.saturating_sub(1);
+                    }
+                    if let Some(u) = live.next_use_at_or_after(victim.node, lo) {
+                        if u <= victim.hi {
+                            unhandled.push(Reverse(Pending {
+                                lo: u,
+                                hi: victim.hi,
+                                node: victim.node,
+                            }));
+                        }
+                    }
+                }
+            }
+        };
+
+        match choice {
+            Some((reg, until)) => {
+                let end = until.unwrap_or(hi);
+                let segs = &mut reg_segments[node as usize];
+                segs.push((PosRange { lo, hi: end }, reg));
+                active.push(Active {
+                    reg,
+                    lo,
+                    hi: end,
+                    node,
+                    seg: segs.len() - 1,
+                });
+                if let Some(split_at) = until {
+                    splits += 1;
+                    if splits > budget {
+                        return Err(Bailout::with_context(
+                            BailoutReason::RegisterPressure,
+                            format!("linear scan exceeded {budget} splits at a clobber point"),
+                        ));
+                    }
+                    // The suffix resumes at the first use at or after the
+                    // blocking position; between the split and that use the
+                    // value simply sits in its home slot.
+                    if let Some(u) = live.next_use_at_or_after(node, split_at + 1) {
+                        if u <= hi {
+                            unhandled.push(Reverse(Pending { lo: u, hi, node }));
+                        }
+                    }
+                }
+            }
+            None => {
+                // Nothing free and this interval lost the eviction contest: it
+                // stays in memory until its next use, then competes again.
+                if let Some(u) = live.next_use_after(node, lo) {
+                    if u <= hi {
+                        splits += 1;
+                        if splits > budget {
+                            return Err(Bailout::with_context(
+                                BailoutReason::RegisterPressure,
+                                format!(
+                                    "linear scan exceeded {budget} splits; {} registers of \
+                                     class {class:?} for peak live {}",
+                                    model.regs.class_size(class),
+                                    live.peak_live
+                                ),
+                            ));
+                        }
+                        unhandled.push(Reverse(Pending { lo: u, hi, node }));
+                    }
+                }
+                // A required register that could not be honoured is a genuine
+                // ABI failure, not a missed optimisation: the value must be in
+                // that register at that position and it is not.
+                if required.is_some() {
+                    return Err(Bailout::with_context(
+                        BailoutReason::RegisterPressure,
+                        format!(
+                            "n{node} requires a fixed register in [{lo}, {hi}] that no \
+                             allocation could honour"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    ls_finish(graph, live, reg_segments, splits)
+}
+
+/// Pick a free register for `current`, or `None` when nothing is usable.
+///
+/// Returns `(register, split_position)`: `split_position` is `Some(p)` when the
+/// register is only usable up to `p - 1` because a clobber or a foreign fixed
+/// constraint claims it at `p`.
+#[allow(clippy::type_complexity)]
+fn ls_select_register(
+    model: &MachineModel,
+    live: &LiveModel,
+    active: &[Active],
+    class: RegClass,
+    required: Option<PhysReg>,
+    current: Pending,
+) -> CompileResult<Option<(PhysReg, Option<usize>)>> {
+    let range = PosRange {
+        lo: current.lo,
+        hi: current.hi,
+    };
+    let busy: HashSet<PhysReg> = active.iter().map(|a| a.reg).collect();
+
+    // The first position in `range` at which `reg` is unavailable to
+    // `current.node`: a clobber, or a fixed constraint belonging to someone
+    // else. Positions are scanned through the model's sorted clobber list plus
+    // the (small) fixed list, so this stays linear in the blocking events.
+    let first_block = |reg: PhysReg| -> Option<usize> {
+        let mut earliest: Option<usize> = None;
+        let start = model.clobbers.partition_point(|(p, _)| *p < range.lo);
+        for (pos, regs) in model.clobbers[start..].iter() {
+            if *pos > range.hi {
+                break;
+            }
+            if regs.contains(&reg) {
+                earliest = Some(earliest.map_or(*pos, |e: usize| e.min(*pos)));
+                break;
+            }
+        }
+        for f in &model.fixed {
+            if f.reg == reg && f.node != current.node && range.contains(f.pos) {
+                earliest = Some(earliest.map_or(f.pos, |e: usize| e.min(f.pos)));
+            }
+        }
+        earliest
+    };
+
+    if let Some(reg) = required {
+        if busy.contains(&reg) {
+            return Ok(None);
+        }
+        return match first_block(reg) {
+            // A clobber inside the range of a value pinned to that register is
+            // unsatisfiable by construction; the caller turns this into a
+            // structured bailout rather than a wrong assignment.
+            Some(_) => Ok(None),
+            None => Ok(Some((reg, None))),
+        };
+    }
+
+    let mut fallback: Option<(PhysReg, usize)> = None;
+    for reg in model.regs.of_class(class) {
+        if busy.contains(&reg) {
+            continue;
+        }
+        match first_block(reg) {
+            None => return Ok(Some((reg, None))),
+            Some(p) if p > range.lo => {
+                // Usable for the prefix. Prefer the register that survives
+                // longest — it is the one that needs the fewest splits.
+                if fallback.is_none_or(|(_, best)| p > best) {
+                    fallback = Some((reg, p));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    let _ = live;
+    Ok(fallback.map(|(reg, p)| (reg, Some(p))))
+}
+
+/// Choose what loses its register when nothing is free.
+///
+/// Maximises `next_use_distance × SPILL_DISTANCE_SCALE / frequency_weight`, so
+/// a value whose next use is far away and whose uses are cold goes first, and a
+/// value used on the next instruction inside a nested loop goes last.
+/// Rematerializable values score [`SPILL_SCORE_REMAT`] and always go first:
+/// evicting one costs no store at all.
+fn ls_pick_victim(
+    graph: &Graph,
+    live: &LiveModel,
+    active: &[Active],
+    class: RegClass,
+    current: Pending,
+) -> Victim {
+    let score = |node: NodeId, from: usize, end: usize| -> u64 {
+        if remat_of(graph, node).is_some() {
+            return SPILL_SCORE_REMAT;
+        }
+        let next = live.next_use_at_or_after(node, from).unwrap_or(end);
+        let dist = next.saturating_sub(from) as u64;
+        let w = live.weight.get(node as usize).copied().unwrap_or(1).max(1);
+        dist.saturating_mul(SPILL_DISTANCE_SCALE) / w
+    };
+
+    // The current interval's own next use is strictly after its start: it is
+    // being defined (or reloaded) at `lo`, so a use *at* `lo` cannot be served
+    // from memory.
+    let self_next = live
+        .next_use_after(current.node, current.lo)
+        .unwrap_or(current.hi);
+    let mut best_key = (
+        score(current.node, current.lo, current.hi),
+        self_next.saturating_sub(current.lo),
+        0u8,
+        u32::MAX - current.node,
+    );
+    let mut best = Victim::Current;
+
+    for (idx, a) in active.iter().enumerate() {
+        if a.reg.class != class {
+            continue;
+        }
+        // An active that starts at the same position cannot be cut short —
+        // there is no prefix to keep — and evicting it would not advance
+        // anything. Skipping it is what guarantees progress.
+        if a.lo >= current.lo {
+            continue;
+        }
+        let next = live
+            .next_use_at_or_after(a.node, current.lo)
+            .unwrap_or(a.hi);
+        let key = (
+            score(a.node, current.lo, a.hi),
+            next.saturating_sub(current.lo),
+            1u8,
+            u32::MAX - a.node,
+        );
+        if key > best_key {
+            best_key = key;
+            best = Victim::Active(idx);
+        }
+    }
+    best
+}
+
+/// Turn the raw register segments into a checked [`Allocation`]: tile every
+/// live range, colour the home slots, and derive the transition events.
+fn ls_finish(
+    graph: &Graph,
+    live: &LiveModel,
+    mut reg_segments: Vec<Vec<(PosRange, PhysReg)>>,
+    splits: usize,
+) -> CompileResult<Allocation> {
+    let n = graph.nodes.len();
+    let mut segments: Vec<Vec<Segment>> = vec![Vec::new(); n];
+    let mut needs_home = vec![false; n];
+    let mut promoted = 0usize;
+
+    for id in 0..n {
+        if !live.wants_loc.get(id).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(range) = live.range.get(id).copied().flatten() else {
+            continue;
+        };
+        let segs = &mut reg_segments[id];
+        segs.retain(|(r, _)| r.lo <= r.hi);
+        segs.sort_by_key(|(r, _)| (r.lo, r.hi));
+        // Two register segments of the same value may not overlap: that would
+        // mean the value is in two registers at once and the later store wins.
+        for pair in segs.windows(2) {
+            if pair[0].0.hi >= pair[1].0.lo {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("regalloc: a value holds two registers at once"),
+                    format!(
+                        "n{id}: [{}, {}] and [{}, {}]",
+                        pair[0].0.lo, pair[0].0.hi, pair[1].0.lo, pair[1].0.hi
+                    ),
+                ));
+            }
+        }
+
+        let mut timeline: Vec<Segment> = Vec::with_capacity(segs.len() * 2 + 1);
+        let mut cursor = range.lo;
+        for &(r, reg) in segs.iter() {
+            if r.lo < range.lo || r.hi > range.hi {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("regalloc: a register segment escapes its live range"),
+                    format!(
+                        "n{id}: segment [{}, {}] outside [{}, {}]",
+                        r.lo, r.hi, range.lo, range.hi
+                    ),
+                ));
+            }
+            if r.lo > cursor {
+                timeline.push(Segment {
+                    range: PosRange {
+                        lo: cursor,
+                        hi: r.lo - 1,
+                    },
+                    reg: None,
+                });
+                needs_home[id] = true;
+            }
+            timeline.push(Segment {
+                range: r,
+                reg: Some(reg),
+            });
+            cursor = r.hi.saturating_add(1);
+        }
+        if cursor <= range.hi {
+            timeline.push(Segment {
+                range: PosRange {
+                    lo: cursor,
+                    hi: range.hi,
+                },
+                reg: None,
+            });
+            needs_home[id] = true;
+        }
+        if timeline.iter().any(|s| s.reg.is_some()) {
+            promoted += 1;
+        }
+        segments[id] = timeline;
+    }
+
+    let (stack_slot, stack_slots) = ls_color_homes(graph, live, &needs_home);
+
+    // ── Transition events ────────────────────────────────────────────
+    let mut events: Vec<SpillEvent> = Vec::new();
+    let (mut spills, mut reloads, mut remats, mut reg_moves) = (0usize, 0usize, 0usize, 0usize);
+    for id in 0..n {
+        let timeline = &segments[id];
+        if timeline.len() < 2 {
+            continue;
+        }
+        let node = id as NodeId;
+        let rematerializable = remat_of(graph, node).is_some();
+        // SSA: the home is written once and stays correct, so a value never
+        // needs a second store.
+        let mut stored = false;
+        for pair in timeline.windows(2) {
+            let (prev, cur) = (pair[0], pair[1]);
+            match (prev.reg, cur.reg) {
+                (Some(a), Some(b)) if a != b => {
+                    reg_moves += 1;
+                    events.push(SpillEvent {
+                        node,
+                        pos: cur.range.lo,
+                        kind: SpillKind::Move,
+                        from: Some(a),
+                        to: Some(b),
+                    });
+                }
+                (Some(a), None) => {
+                    if !rematerializable && !stored {
+                        stored = true;
+                        spills += 1;
+                        events.push(SpillEvent {
+                            node,
+                            pos: prev.range.hi,
+                            kind: SpillKind::Store,
+                            from: Some(a),
+                            to: None,
+                        });
+                    }
+                }
+                (None, Some(b)) => {
+                    if rematerializable {
+                        remats += 1;
+                        events.push(SpillEvent {
+                            node,
+                            pos: cur.range.lo,
+                            kind: SpillKind::Remat,
+                            from: None,
+                            to: Some(b),
+                        });
+                    } else {
+                        reloads += 1;
+                        events.push(SpillEvent {
+                            node,
+                            pos: cur.range.lo,
+                            kind: SpillKind::Load,
+                            from: None,
+                            to: Some(b),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    events.sort_by_key(|e| (e.pos, e.node));
+
+    Ok(Allocation {
+        segments,
+        stack_slot,
+        stack_slots,
+        spills,
+        reloads,
+        remats,
+        reg_moves,
+        splits,
+        promoted,
+        events,
+        peak_live: live.peak_live,
+    })
+}
+
+/// Which home-slot pool a value draws from. Mirror of `ir_lower`'s `SlotClass`:
+/// a colour's class is fixed at its first assignment and the pools are
+/// disjoint, so a word the oop map names can never come to hold a primitive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomeClass {
+    Ref,
+    Prim,
+    Pinned,
+}
+
+/// Colour the home frame words for every value that needs one.
+///
+/// The same expiry-driven colouring `ir_lower::plan_slots` performs, reproduced
+/// here because the register allocator changes *which* values need a home: a
+/// value that lives its whole life in a register needs none at all, which is
+/// the frame-size win on top of the colouring's.
+fn ls_color_homes(
+    graph: &Graph,
+    live: &LiveModel,
+    needs_home: &[bool],
+) -> (Vec<Option<u32>>, usize) {
+    let n = graph.nodes.len();
+    let mut color: Vec<Option<u32>> = vec![None; n];
+    let mut next_color: u32 = 0;
+
+    // Pinned values first, in node-id order — the order `prealloc_phi_slots`
+    // walks — so a phi web's words stay where they have always been.
+    for id in 0..n {
+        if needs_home.get(id).copied().unwrap_or(false) && live.pinned[id] {
+            color[id] = Some(next_color);
+            next_color = next_color.saturating_add(1);
+        }
+    }
+
+    // `Ref` results of `Op::Call` may donate a colour but never receive a
+    // recycled one: `emit_safepoint_map` publishes every `Ref` slot defined so
+    // far, and the self-recursive route's shadow reload would overwrite a
+    // recycled word after the call result was stored into it.
+    let fresh_only = |id: usize| -> bool {
+        graph
+            .nodes
+            .get(id)
+            .is_some_and(|node| node.ty == IrType::Ref && matches!(node.op, Op::Call { .. }))
+    };
+
+    let mut order: Vec<usize> = (0..n)
+        .filter(|&id| needs_home.get(id).copied().unwrap_or(false) && !live.pinned[id])
+        .collect();
+    order.sort_by_key(|&id| (live.range[id].map_or(0, |r| r.lo), id));
+
+    let mut active: BinaryHeap<Reverse<(usize, u32, bool)>> = BinaryHeap::new();
+    let mut free_ref: Vec<u32> = Vec::new();
+    let mut free_prim: Vec<u32> = Vec::new();
+    for id in order {
+        let Some(r) = live.range[id] else { continue };
+        while let Some(&Reverse((active_hi, active_color, active_is_ref))) = active.peek() {
+            if active_hi >= r.lo {
+                break;
+            }
+            active.pop();
+            if active_is_ref {
+                free_ref.push(active_color);
+            } else {
+                free_prim.push(active_color);
+            }
+        }
+        let is_ref = live.is_ref.get(id).copied().unwrap_or(false);
+        let recycled = if fresh_only(id) {
+            None
+        } else if is_ref {
+            free_ref.pop()
+        } else {
+            free_prim.pop()
+        };
+        let c = match recycled {
+            Some(c) => c,
+            None => {
+                let c = next_color;
+                next_color = next_color.saturating_add(1);
+                c
+            }
+        };
+        color[id] = Some(c);
+        active.push(Reverse((r.hi, c, is_ref)));
+    }
+
+    (color, next_color as usize)
+}
+
+/// The home-slot pool a value belongs to, for the aliasing check.
+fn ls_home_class(live: &LiveModel, id: usize) -> HomeClass {
+    if live.pinned.get(id).copied().unwrap_or(false) {
+        HomeClass::Pinned
+    } else if live.is_ref.get(id).copied().unwrap_or(false) {
+        HomeClass::Ref
+    } else {
+        HomeClass::Prim
     }
 }

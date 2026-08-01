@@ -978,8 +978,19 @@ pub(crate) fn native_secure_random_next_long(
         if let Some(hi) = sha1prng_next(ctx, this, 32) {
             // `Random.nextLong()`: ((long)next(32) << 32) + next(32) — the low
             // half is sign-extended, exactly as the JDK's `+` does.
-            let lo = sha1prng_next(ctx, this, 32).unwrap_or(0) as i64;
-            return Ok(Some(Value::Long(((hi as i64) << 32).wrapping_add(lo))));
+            //
+            // SECURITY: the low half used to be `.unwrap_or(0)`. The high half
+            // having succeeded makes a low-half failure near-impossible, but
+            // "near-impossible" is not a property a random number generator
+            // may rely on: the result would be a value whose bottom 32 bits are
+            // a constant, returned as a `SecureRandom` draw with no signal.
+            // Fall through to the OS entropy path below instead, which raises
+            // if entropy is genuinely unavailable.
+            if let Some(lo) = sha1prng_next(ctx, this, 32) {
+                return Ok(Some(Value::Long(
+                    ((hi as i64) << 32).wrapping_add(lo as i64),
+                )));
+            }
         }
     }
     // SECURITY FIX (V2): propagate entropy failure instead of silently

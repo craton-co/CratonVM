@@ -113,6 +113,34 @@
 //! * **Reading the `.SF` from a remote / nested location.**  Caller is
 //!   responsible for feeding us the matching `.SF` bytes.
 //!
+//! # TRUST BOUNDARY — what a verified signer does and does not mean
+//!
+//! Audited in `docs/security/signed-jar-trust.md`; read that before
+//! treating any result from this module as an authorisation decision.
+//! The short form:
+//!
+//! * Every API here is labelled **trust** or **integrity** in its own
+//!   doc comment.  The integrity ones ([`verify_sf_binds_manifest`],
+//!   [`digest_matches`], [`parse_manifest_entry_digests`]) are digest
+//!   comparisons with no key and no certificate anywhere in them.  They
+//!   are useful and they are complete — but a `true` from them is not
+//!   evidence about *who* produced the bytes, and they must not be read
+//!   that way.
+//! * The trust ones ([`verify_signer_block`], [`verify_chain`],
+//!   [`verify_chain_path`]) do perform real certification-path
+//!   validation: signature per link, anchor match, validity windows, and
+//!   the RFC 5280 BasicConstraints / KeyUsage / EKU / unknown-critical
+//!   rules.  What they do **not** do is revocation, name constraints, or
+//!   policy processing — enumerated under "Residual gaps" below.
+//! * Every verification result is three-valued, not boolean (see
+//!   [`SigVerify`]).  "We checked and it failed" and "we never checked"
+//!   are different answers and are kept different all the way to the
+//!   caller; both refuse.
+//! * Certification-path validation is *necessary* for trust and is not
+//!   *sufficient* for it: a `Some(_)` from [`verify_signer_block`] covers
+//!   the signer block and its `.SF`, and nothing else in the archive.
+//!   Per-entry coverage is enforced in `class_path.rs`.
+//!
 //! # Hard limits
 //!
 //! * Signer-block input capped at 1 MiB (CMS DER blobs are typically <8 KiB).
@@ -200,6 +228,19 @@ const OID_SHA1: &str = "1.3.14.3.2.26";
 pub struct VerifiedSigner {
     /// DER-encoded X.509 certificate chain, end-entity first (matches
     /// the order Sun `jarsigner` emits).  `chain[0]` is the leaf.
+    ///
+    /// # TRUST BOUNDARY
+    ///
+    /// When [`verify_signer_block`] returns through a real (non-legacy)
+    /// trust store this is **the validated certification path**, not the
+    /// raw CMS `certificates` set: every element had its signature checked
+    /// against its issuer, its validity window checked, and its RFC 5280
+    /// extensions enforced, and the last element is a trust anchor.
+    /// Certificates the signer block carried but that took no part in the
+    /// path are dropped, because nothing about them was verified.
+    ///
+    /// Still **not** established for these certs: revocation status, name
+    /// constraints, and certificate policies.
     pub chain: Vec<Vec<u8>>,
     /// Human-readable subject principal (best-effort UTF-8 of the
     /// `IssuerAndSerialNumber.issuer` Name, or `"<unparsed>"` if the
@@ -276,6 +317,43 @@ pub enum DigestAlg {
 /// ECParameters, an unusual DSA digest, ...) surface as
 /// [`TrustError::NotImplemented`], which this function maps to `None`
 /// (fail-closed: treated as failure, never success).
+///
+/// # TRUST BOUNDARY
+///
+/// **Proven** by a `Some(_)` return:
+///
+///   * the `.SF` bytes the caller supplied are the ones the signer
+///     authenticated (`messageDigest` attribute over `H(sf_bytes)`);
+///   * the SignerInfo signature over the DER `SignedAttributes` verifies
+///     under the leaf certificate's public key, with a signature algorithm
+///     this build really implements;
+///   * the leaf chains to an anchor in `trust_store`, every link
+///     cryptographically verified, every cert in date, and the RFC 5280
+///     BasicConstraints / KeyUsage / ExtendedKeyUsage / unknown-critical
+///     rules enforced for the role each cert played;
+///   * `chain` contains **only** the certificates on that validated path.
+///
+/// **Not proven**, and therefore never to be inferred from a `Some(_)`:
+///
+///   * *revocation* — no CRL or OCSP is consulted, so a cert whose issuer
+///     has revoked it still validates (RFC 5280 §6.3 is not implemented);
+///   * *name constraints and certificate policies* — not processed.  A
+///     chain whose CA marks `nameConstraints` **critical** (as CAs do) is
+///     rejected by the unknown-critical-extension gate rather than being
+///     accepted unprocessed, so the omission cannot silently broaden
+///     trust; a non-critical one is ignored;
+///   * *the rest of the JAR* — this function sees a signer block and a
+///     `.SF`.  It says nothing about `MANIFEST.MF` or about any archive
+///     entry.  Binding those is [`verify_sf_binds_manifest`] plus
+///     [`parse_manifest_entry_digests`] / [`digest_matches`], and the
+///     per-entry gate lives in
+///     `class_path::ClassPath::certs_for_signed_class`.  A JAR entry that
+///     is present in the archive but absent from the manifest is
+///     **unsigned** no matter what this function returned;
+///   * *additional signers* — only the first `SignerInfo` is examined.
+///
+/// A caller must not treat `Some(_)` alone as "this JAR is from a trusted
+/// publisher".  See `docs/security/signed-jar-trust.md`.
 pub fn verify_signer_block(
     signer_block_der: &[u8],
     sf_bytes: &[u8],
@@ -295,7 +373,7 @@ pub fn verify_signer_block(
     // signature, so they run with the pubkey gate off — exactly as they
     // already ran with the chain gate off.
     let enforce_pubkey = !trust_store.permissive_legacy;
-    let vs = match parse_signed_data(signer_block_der, sf_bytes, enforce_pubkey) {
+    let mut vs = match parse_signed_data(signer_block_der, sf_bytes, enforce_pubkey) {
         Ok(vs) => vs,
         Err(e) => {
             warn!("jar signer: rejecting signer block: {}", e);
@@ -307,26 +385,38 @@ pub fn verify_signer_block(
     // permissive_legacy_tests` short-circuits the walk for the older
     // self-consistency-only fixtures; every other trust store enforces.
     if !trust_store.permissive_legacy {
-        let leaf = match X509Cert::parse(&vs.chain[0]) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("jar signer: leaf cert is not parseable X.509: {}", e);
-                return None;
+        // Borrow `vs.chain` only for the duration of the walk; the walk
+        // hands back owned DER, so the reassignment below is unambiguous.
+        let validated_path = {
+            let leaf = match X509Cert::parse(&vs.chain[0]) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("jar signer: leaf cert is not parseable X.509: {}", e);
+                    return None;
+                }
+            };
+            let intermediates: Vec<X509Cert> = vs
+                .chain
+                .iter()
+                .skip(1)
+                .filter_map(|der| X509Cert::parse(der).ok())
+                .collect();
+            match verify_chain_path(&leaf, &intermediates, trust_store) {
+                Ok(path) => path,
+                Err(e) => {
+                    warn!("jar signer: chain validation rejected leaf: {:?}", e);
+                    return None;
+                }
             }
         };
-        let intermediates: Vec<X509Cert> = vs
-            .chain
-            .iter()
-            .skip(1)
-            .filter_map(|der| X509Cert::parse(der).ok())
-            .collect();
-        match verify_chain(&leaf, &intermediates, trust_store) {
-            Ok(()) => {}
-            Err(e) => {
-                warn!("jar signer: chain validation rejected leaf: {:?}", e);
-                return None;
-            }
-        }
+        // TRUST BOUNDARY: report only what was proven.  The CMS
+        // `certificates` set is attacker-supplied and may carry extra
+        // certificates that played no part in path construction; those were
+        // never validated, so they must not travel out of here as part of
+        // "the signer's certificates".  Narrowing `chain` to the validated
+        // path is what makes `VerifiedSigner.chain` mean *every element of
+        // this was checked* rather than *some element of this was checked*.
+        vs.chain = validated_path;
     }
     Some(vs)
 }
@@ -508,15 +598,23 @@ fn parse_signed_data(
         ) {
             SigVerify::Ok => {}
             SigVerify::Bad => {
+                // A verifier ran and rejected the bytes — a genuine negative.
                 return Err("SignerInfo signature does not verify against signer public key");
             }
             SigVerify::Unsupported => {
-                // RSA, ECDSA P-256/P-384, and DSA SHA-1/256 are all
-                // verified; this only fires for a curve/digest/key combo
-                // outside that set (P-521, Brainpool, explicit
-                // ECParameters, an unusual DSA digest, ...).  Fail-closed.
+                // TRUST BOUNDARY: nothing was verified here, so this is NOT
+                // "the signature is bad" — it is "we have no evidence either
+                // way".  RSA, ECDSA P-256/P-384 and DSA SHA-1/256 are really
+                // verified; this arm fires for a curve/digest/key combination
+                // outside that set (P-521, Brainpool, explicit ECParameters,
+                // an unusual DSA digest), an unparseable SPKI, a key the
+                // backend refused (e.g. an RSA modulus over 4096 bits), or a
+                // malformed signature encoding.  Absence of evidence is not
+                // evidence of trust: refuse, with a message that does not
+                // claim a verdict we did not reach.
                 return Err(
-                    "SignerInfo signature algorithm not verifiable (unsupported curve/key)",
+                    "SignerInfo signature could not be verified \
+                     (unsupported or unusable algorithm/key) — refusing",
                 );
             }
         }
@@ -1303,18 +1401,55 @@ enum PublicKey {
 }
 
 /// Outcome of a public-key signature verification attempt.
+///
+/// # The three-valued contract
+///
+/// This enum exists to keep **"we checked and the answer is no"** distinct
+/// from **"we never checked"**.  Collapsing the two into a `bool` is the
+/// defect this type prevents: at the call site a `false` that means *the
+/// key was unusable* reads identically to a `false` that means *this is a
+/// forgery*, and the second is a security decision while the first is the
+/// absence of one.  See `docs/security/signed-jar-trust.md` §2 and
+/// `docs/security/crypto-failure-contract.md` §1.
+///
+/// | Variant | Meaning | Verified? |
+/// |---|---|---|
+/// | [`SigVerify::Ok`] | Valid signature under this key. | Yes — positive. |
+/// | [`SigVerify::Bad`] | The bytes do not match. **A real decision.** | Yes — negative. |
+/// | [`SigVerify::Unsupported`] | Nothing was verified. | **No.** |
+///
+/// All three are handled explicitly at every call site; `Bad` and
+/// `Unsupported` both refuse, and there is deliberately no `_ =>` arm that
+/// could let a fourth state default into acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SigVerify {
     /// Signature is cryptographically valid.
     Ok,
-    /// Signature did not verify against the key.
+    /// Signature did not verify against the key.  **A genuine negative:**
+    /// the full verification ran and the padded digest did not match.
+    /// Never used for "the input was unusable" — that is
+    /// [`SigVerify::Unsupported`].
     Bad,
-    /// The signature algorithm / key type is recognised in the abstract
-    /// but not verifiable in this build — an EC curve we do not carry
-    /// (P-521 / Brainpool / explicit ECParameters), DSA with an unusual
-    /// digest, or a key/algorithm mismatch.  (RSA, ECDSA P-256/P-384, and
-    /// DSA SHA-1/256 are all verified — see module docs.)  Treated as
-    /// failure by all callers (fail-closed).
+    /// **No verification was performed.**  Covers every reason the check
+    /// could not run:
+    ///
+    ///   * the signature-algorithm OID is not recognised at all;
+    ///   * the algorithm is recognised but the key type / curve is not
+    ///     carried by this build (P-521, Brainpool, explicit
+    ///     `ECParameters`, DSA with a digest other than SHA-1/256, or a
+    ///     key/algorithm family mismatch);
+    ///   * the `SubjectPublicKeyInfo` would not parse;
+    ///   * the crypto backend **rejected the key** — notably an RSA
+    ///     modulus above `RsaPublicKey::MAX_SIZE` (4096 bits), so a
+    ///     *legitimate* 8192-bit signer key lands here rather than being
+    ///     mis-reported as a bad signature;
+    ///   * the signature *encoding* is malformed (wrong length for the
+    ///     modulus, un-decodable DER `SEQUENCE { r, s }`).
+    ///
+    /// (RSA PKCS#1 v1.5 SHA-1/256/384/512, ECDSA P-256/P-384, and DSA
+    /// SHA-1/256 are all really verified — see module docs.)  Treated as
+    /// **not trusted** by every caller, and never conflated with
+    /// [`SigVerify::Bad`].
     Unsupported,
 }
 
@@ -1499,13 +1634,44 @@ fn digest_info_prefix(alg: DigestAlg) -> &'static [u8] {
 
 /// RSA PKCS#1 v1.5 verify: `signature^e mod n` must equal the expected
 /// `EM = 0x00 || 0x01 || PS || 0x00 || DigestInfo(H(message))`.
+///
+/// # TRUST BOUNDARY: this proves possession of a key, not trust in it
+///
+/// [`SigVerify::Ok`] means exactly one thing: *these bytes are a valid
+/// PKCS#1 v1.5 signature over this message under this public key*.  It
+/// says nothing about whose key it is.  Trust is established (or not) by
+/// [`verify_chain`], never here.
+///
+/// # Why this calls the `_checked` form
+///
+/// The shared kernel also exposes a `bool` wrapper
+/// (`verify_rsa_pkcs1_v15`).  That wrapper is fail-closed but **ambiguous**:
+/// it returns `false` both when the padded digest genuinely did not match
+/// *and* when the backend refused the key outright — including for an
+/// entirely legitimate signer whose modulus exceeds `RsaPublicKey::MAX_SIZE`
+/// (4096 bits).  On a trust path that is the difference between "this is a
+/// forgery" and "we never checked", and this site used to report the second
+/// as the first.  `verify_rsa_pkcs1_v15_checked` keeps them apart:
+///
+///   * `Ok(true)`  → [`SigVerify::Ok`]          — verified.
+///   * `Ok(false)` → [`SigVerify::Bad`]         — **preserved negative**:
+///     the RSA operation ran and the digest did not match.
+///   * `Err(_)`    → [`SigVerify::Unsupported`] — the key was rejected
+///     (`InvalidKeyException`) or the signature encoding was malformed
+///     (`SignatureException`).  Nothing was verified, so this is not a
+///     negative security decision and must never be reported as one.
+///
+/// Both refusals fail closed; the migration changes the *diagnosis*, not
+/// the accept/reject outcome.  See `docs/security/signed-jar-trust.md` §2.
 fn rsa_pkcs1v15_verify(
     key: &RsaPublicKey,
     digest_alg: DigestAlg,
     message: &[u8],
     signature: &[u8],
 ) -> SigVerify {
-    use cratonvm_native_builtins_crypto::signature::{verify_rsa_pkcs1_v15, DigestAlgorithm};
+    use cratonvm_native_builtins_crypto::signature::{
+        verify_rsa_pkcs1_v15_checked, DigestAlgorithm,
+    };
     let digest = match digest_alg {
         DigestAlg::Sha1 => DigestAlgorithm::Sha1,
         DigestAlg::Sha256 => DigestAlgorithm::Sha256,
@@ -1513,16 +1679,27 @@ fn rsa_pkcs1v15_verify(
         DigestAlg::Sha512 => DigestAlgorithm::Sha512,
     };
     let exponent_len = (key.e.bit_length() + 7) / 8;
-    if verify_rsa_pkcs1_v15(
+    match verify_rsa_pkcs1_v15_checked(
         &key.n.to_bytes_be_padded(key.k),
         &key.e.to_bytes_be_padded(exponent_len),
         digest,
         message,
         signature,
     ) {
-        SigVerify::Ok
-    } else {
-        SigVerify::Bad
+        Ok(true) => SigVerify::Ok,
+        // PRESERVED NEGATIVE: the verification ran to completion and said no.
+        Ok(false) => SigVerify::Bad,
+        Err(e) => {
+            // Not a verdict on the signature — a refusal to form one. Logged
+            // so an over-large-but-legitimate signer key is diagnosable
+            // instead of looking like a tampered JAR.
+            warn!(
+                "jar signer: RSA verification could not be performed ({}) — \
+                 treating as unverifiable, NOT as a bad signature",
+                e
+            );
+            SigVerify::Unsupported
+        }
     }
 }
 
@@ -1530,10 +1707,23 @@ fn rsa_pkcs1v15_verify(
 /// `signer_spki_der`, where `sig_alg_oid` names the signature algorithm.
 ///
 /// FEAT(jar-signer): RSA PKCS#1 v1.5 (SHA-1/256/384/512), ECDSA P-256/P-384
-/// (SHA-256/384/512), and DSA (SHA-1/256) are all fully verified.  A
-/// recognised algorithm whose key/curve we cannot handle returns
-/// `SigVerify::Unsupported`; an unrecognised OID likewise.  A
-/// well-formed-but-invalid signature returns `SigVerify::Bad`.
+/// (SHA-256/384/512), and DSA (SHA-1/256) are all fully verified.
+///
+/// # TRUST BOUNDARY: proves key possession, not signer identity
+///
+/// A [`SigVerify::Ok`] here proves only that `sig` is a valid signature
+/// over `message` under the key in `signer_spki_der`.  Whether that key
+/// belongs to a party this VM trusts is decided exclusively by
+/// [`verify_chain`].
+///
+/// # Result mapping (three-valued — see [`SigVerify`])
+///
+/// * [`SigVerify::Bad`] — and **only** — when a verifier actually ran and
+///   rejected the signature bytes.  That is the shape of a forgery.
+/// * [`SigVerify::Unsupported`] whenever no verification could be
+///   performed: unrecognised algorithm OID, an SPKI that will not parse, a
+///   key type / curve this build does not carry, a key the backend refused,
+///   or a malformed signature encoding.
 fn verify_signature_with_spki(
     signer_spki_der: &[u8],
     sig_alg_oid: &str,
@@ -1544,9 +1734,14 @@ fn verify_signature_with_spki(
         Some(v) => v,
         None => return SigVerify::Unsupported,
     };
+    // An SPKI we cannot decode is a key we never used — no verification
+    // happened, so this is `Unsupported`, not a negative verdict.
     let key = match parse_spki(signer_spki_der) {
         Ok(k) => k,
-        Err(_) => return SigVerify::Bad,
+        Err(e) => {
+            warn!("jar signer: signer SubjectPublicKeyInfo unusable: {}", e);
+            return SigVerify::Unsupported;
+        }
     };
     match (key, family) {
         (PublicKey::Rsa(rsa), SigFamily::Rsa) => {
@@ -1579,6 +1774,10 @@ fn verify_signature_with_spki(
 // semantics exactly (ECDSA signs H(tbs) / H(SignedAttributes)).
 // ---------------------------------------------------------------------------
 
+/// A key that will not decode (including an off-curve point) and a
+/// signature that is not a decodable DER `SEQUENCE { r, s }` both mean the
+/// ECDSA verification never ran — [`SigVerify::Unsupported`].  Only
+/// `verify_prehash` saying "no" is a [`SigVerify::Bad`] verdict.
 fn ecdsa_p256_verify(
     spki_der: &[u8],
     digest_alg: DigestAlg,
@@ -1591,11 +1790,11 @@ fn ecdsa_p256_verify(
 
     let vk = match VerifyingKey::from_public_key_der(spki_der) {
         Ok(k) => k,
-        Err(_) => return SigVerify::Bad,
+        Err(_) => return SigVerify::Unsupported,
     };
     let signature = match Signature::from_der(sig) {
         Ok(s) => s,
-        Err(_) => return SigVerify::Bad,
+        Err(_) => return SigVerify::Unsupported,
     };
     let prehash = raw_digest(digest_alg, message);
     match vk.verify_prehash(&prehash, &signature) {
@@ -1614,13 +1813,15 @@ fn ecdsa_p384_verify(
     use p384::ecdsa::{Signature, VerifyingKey};
     use p384::pkcs8::DecodePublicKey;
 
+    // See `ecdsa_p256_verify`: undecodable key or signature ⇒ nothing was
+    // checked ⇒ `Unsupported`, never `Bad`.
     let vk = match VerifyingKey::from_public_key_der(spki_der) {
         Ok(k) => k,
-        Err(_) => return SigVerify::Bad,
+        Err(_) => return SigVerify::Unsupported,
     };
     let signature = match Signature::from_der(sig) {
         Ok(s) => s,
-        Err(_) => return SigVerify::Bad,
+        Err(_) => return SigVerify::Unsupported,
     };
     let prehash = raw_digest(digest_alg, message);
     match vk.verify_prehash(&prehash, &signature) {
@@ -1648,14 +1849,16 @@ fn dsa_verify(spki_der: &[u8], digest_alg: DigestAlg, message: &[u8], sig: &[u8]
     if !matches!(digest_alg, DigestAlg::Sha1 | DigestAlg::Sha256) {
         return SigVerify::Unsupported;
     }
+    // See `ecdsa_p256_verify`: an undecodable `(p, q, g, y)` or a signature
+    // that is not a DER `SEQUENCE { r, s }` means no verification ran.
     let vk = match VerifyingKey::from_public_key_der(spki_der) {
         Ok(k) => k,
-        Err(_) => return SigVerify::Bad,
+        Err(_) => return SigVerify::Unsupported,
     };
     // `Signature` decodes from the DER `SEQUENCE { r, s }` via `TryFrom<&[u8]>`.
     let signature = match Signature::try_from(sig) {
         Ok(s) => s,
-        Err(_) => return SigVerify::Bad,
+        Err(_) => return SigVerify::Unsupported,
     };
     let prehash = raw_digest(digest_alg, message);
     match vk.verify_prehash(&prehash, &signature) {
@@ -2248,6 +2451,20 @@ fn parse_pkcs12_certs(bytes: &[u8], password: &str) -> Result<Vec<Vec<u8>>, &'st
 ///
 /// `class_path.rs::extract_jar_signer_blocks` reaches for this; tests
 /// in this file build a private one instead.
+///
+/// # TRUST BOUNDARY: an empty store is the strict outcome, not a broken one
+///
+/// [`TrustStore::load_default`] logs and skips every source it cannot
+/// read, so on a host with no `JAVA_HOME/lib/security/cacerts`, no
+/// `javax.net.ssl.trustStore` and no `CRATONVM_TRUST_PEM` this returns a
+/// store with **zero anchors**.  That is deliberate and safe: with no
+/// anchor, [`verify_chain`] bottoms out in [`TrustError::NoTrustAnchor`]
+/// and every JAR is reported unsigned.  It is never "trust everything".
+///
+/// The consequence to be aware of is availability, not security: signed
+/// JARs stop being *recognised* as signed rather than starting to be
+/// wrongly trusted.  Inspect `TrustStore::sources_loaded` to tell the two
+/// situations apart.
 pub fn default_trust_store() -> &'static TrustStore {
     static TS: OnceLock<TrustStore> = OnceLock::new();
     TS.get_or_init(TrustStore::load_default)
@@ -2470,6 +2687,14 @@ impl<'a> X509Cert<'a> {
                 Err(TrustError::BadSignature)
             };
         }
+        // TRUST BOUNDARY: this proves ONE link (parent's key signs self's
+        // TBSCertificate).  It proves nothing about the parent being an
+        // anchor, about validity windows, or about extensions — those are
+        // [`verify_chain`]'s job.  The three-valued result is kept distinct
+        // all the way out: `Bad` = a verifier ran and said no;
+        // `NotImplemented` = no verification was performed at all.  Both
+        // refuse, and neither can be mistaken for the other by a caller
+        // matching on `TrustError`.
         match verify_signature_with_spki(
             parent.spki_der,
             &self.sig_alg_oid,
@@ -2549,20 +2774,46 @@ fn now_utc_14() -> [u8; 14] {
     out
 }
 
-/// Check that `now` falls within `[notBefore, notAfter]`.  If either bound
-/// fails to parse we conservatively treat the cert as valid on the date
-/// axis (the cryptographic link check is the real gate); a parse failure
-/// must not cause a *false reject* of an otherwise-good chain, nor a
-/// false-accept of a bad signature.
+/// Check that `now` falls within `[notBefore, notAfter]`.
+///
+/// # TRUST BOUNDARY: fail-closed on an unreadable validity window
+///
+/// A bound we cannot parse means the validity check **did not happen**.
+/// This function previously returned `true` in that case, which recorded
+/// "in date" for a cert whose dates were never examined — the same
+/// did-not-check-reads-as-checked conflation the three-valued
+/// [`SigVerify`] exists to prevent, one level up.  It now refuses.
+///
+/// RFC 5280 §4.1.2.5 admits exactly two encodings — `UTCTime` (tag 0x17)
+/// and `GeneralizedTime` (tag 0x18) — and [`parse_asn1_time`] accepts
+/// both, so a conforming certificate always parses.  What is rejected is a
+/// cert with a missing, truncated, or non-`Time` validity field, which
+/// [`X509Cert::parse`] tolerates structurally (it leaves the tag `0` and
+/// the bytes empty) but which no CA emits.
+///
+/// The synthetic `OID_STUB_SIG` fixtures are exempted by the callers via
+/// [`is_stub_sig_fixture`], which is hard-`false` in production builds.
 fn cert_dates_ok(cert: &X509Cert) -> bool {
     let now = now_utc_14();
-    if let Some(nb) = parse_asn1_time(cert.not_before_tag, cert.not_before) {
-        if now < nb {
+    match parse_asn1_time(cert.not_before_tag, cert.not_before) {
+        Some(nb) => {
+            if now < nb {
+                return false;
+            }
+        }
+        None => {
+            warn!("jar signer: cert notBefore is not a readable ASN.1 Time — refusing");
             return false;
         }
     }
-    if let Some(na) = parse_asn1_time(cert.not_after_tag, cert.not_after) {
-        if now > na {
+    match parse_asn1_time(cert.not_after_tag, cert.not_after) {
+        Some(na) => {
+            if now > na {
+                return false;
+            }
+        }
+        None => {
+            warn!("jar signer: cert notAfter is not a readable ASN.1 Time — refusing");
             return false;
         }
     }
@@ -2793,7 +3044,44 @@ pub fn verify_chain<'a>(
     intermediates: &'a [X509Cert<'a>],
     trust_store: &TrustStore,
 ) -> Result<(), TrustError> {
+    verify_chain_path(leaf, intermediates, trust_store).map(|_| ())
+}
+
+/// Exactly [`verify_chain`], but on success returns **the certificates that
+/// actually formed the validated path**, leaf first and anchor last.
+///
+/// # TRUST BOUNDARY: only these certs were validated
+///
+/// A CMS `certificates` set is attacker-supplied and may carry any number
+/// of certificates that took no part in path construction.  [`verify_chain`]
+/// silently ignores them, which is correct for the accept/reject decision
+/// but leaves the caller holding a bag of certs of which only some were
+/// checked.  Surfacing that whole bag as
+/// `Class.getCodeSource().getCertificates()` would let an attacker append a
+/// certificate of their choosing to an otherwise legitimately signed JAR
+/// and have it reported as one of the signer's certificates — enough to
+/// fool a policy `signedBy` filter that scans the array.
+///
+/// This function therefore returns the path itself, so the caller can
+/// report *only* what was proven.  Every element has had its signature
+/// verified against its issuer, its validity window checked, and its RFC
+/// 5280 extensions enforced for the role it played; the final element is a
+/// trust anchor.  Certificates present in the input but absent from the
+/// returned path are, by construction, unverified.
+///
+/// What is still **not** proven for the returned path: revocation status
+/// (no CRL/OCSP), name constraints, and certificate policies — see
+/// `docs/security/signed-jar-trust.md` §4.
+pub fn verify_chain_path<'a>(
+    leaf: &'a X509Cert<'a>,
+    intermediates: &'a [X509Cert<'a>],
+    trust_store: &TrustStore,
+) -> Result<Vec<Vec<u8>>, TrustError> {
     let mut current: &'a X509Cert<'a> = leaf;
+    // The validated path, leaf first. Nothing is appended before the step
+    // that validates it, so a `?` early-return can never leave an
+    // unverified cert in the result.
+    let mut path: Vec<Vec<u8>> = vec![leaf.full_der.to_vec()];
     // PERF(cl-jarsigner-perf): track visited Subject DNs in a `HashSet` of
     // borrowed `&'a [u8]` slices for O(1) cycle-detection membership instead
     // of the former `Vec<Vec<u8>>` + linear `iter().any(...)` scan per step.
@@ -2849,7 +3137,9 @@ pub fn verify_chain<'a>(
                 check_ca_ext_facts(&facts, ca_certs_below)?;
             }
             current.link_signature_ok(&parent)?;
-            return Ok(());
+            // Anchor reached and the link to it verified — record it last.
+            path.push(anchor.der.clone());
+            return Ok(path);
         }
         // Look up an intermediate whose subject == current.issuer.
         // PERF(cl-jarsigner-perf): O(1) indexed lookup (was a linear
@@ -2873,6 +3163,9 @@ pub fn verify_chain<'a>(
                     check_ca_ext_facts(&facts, ca_certs_below)?;
                 }
                 current.link_signature_ok(parent)?;
+                // Link verified, dates checked, CA constraints enforced —
+                // only now does this intermediate join the validated path.
+                path.push(parent.full_der.to_vec());
                 // PERF(cl-jarsigner-perf): insert borrowed DN slice (no alloc).
                 visited.insert(parent.subject_dn);
                 // A non-self-issued intermediate adds to the CA count that
@@ -3029,6 +3322,19 @@ fn fold_manifest_lines(text: &str) -> Vec<String> {
 /// **and** its base64 value equals `H_alg(manifest_bytes)`.  An absent
 /// `*-Digest-Manifest` returns `false` (fail-closed: we will not trust a
 /// manifest the `.SF` did not commit to).
+///
+/// # TRUST BOUNDARY: this is an INTEGRITY check, not a trust check
+///
+/// A `true` proves one thing: *`manifest_bytes` hashes to the value
+/// recorded in these `.SF` bytes.*  It is a digest comparison — no key, no
+/// certificate, no anchor is involved, and this function does not know or
+/// care whether the `.SF` it was handed was ever signed.  Feeding it a
+/// `.SF` you wrote yourself yields `true`, correctly.
+///
+/// It becomes meaningful only in composition: the caller must **first**
+/// have obtained a `Some(_)` from [`verify_signer_block`] for *these same*
+/// `.SF` bytes.  That, and only that, turns "the manifest matches the
+/// `.SF`" into "the manifest matches what a verified signer committed to".
 pub fn verify_sf_binds_manifest(sf_bytes: &[u8], manifest_bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(sf_bytes);
     let lines = fold_manifest_lines(&text);
@@ -3080,6 +3386,22 @@ pub fn verify_sf_binds_manifest(sf_bytes: &[u8], manifest_bytes: &[u8]) -> bool 
 /// The returned vector lists, per signed entry, the entry name, the
 /// digest algorithm, and the expected digest bytes — the caller fetches
 /// the entry's actual bytes and compares with [`digest_matches`].
+///
+/// # TRUST BOUNDARY: this is a PARSER, and the list is exhaustive
+///
+/// This function makes no security decision at all; it reports what the
+/// manifest text says.  The security-relevant property is what it
+/// *omits*: an archive entry with no `Name:` section, or a section
+/// carrying no recognised `<alg>-Digest`, produces **no element**.  A
+/// caller must therefore treat "absent from this list" as **unsigned** —
+/// that is the classic partial-signing gap, where a `.class` injected into
+/// a signed JAR but never named in the manifest would otherwise inherit
+/// the signer's certificates.  Enumerating the archive and asking "is this
+/// entry in the list?" is the check; the enforcement site is
+/// `class_path::ClassPath::certs_for_signed_class`.
+///
+/// Directory sections (`Name:` ending in `/`) carry no digest and are
+/// likewise absent — correctly, since a directory has no bytes to sign.
 pub fn parse_manifest_entry_digests(manifest_bytes: &[u8]) -> Vec<ManifestEntryDigest> {
     let text = String::from_utf8_lossy(manifest_bytes);
     let lines = fold_manifest_lines(&text);
@@ -3153,6 +3475,17 @@ pub fn parse_manifest_entry_digests(manifest_bytes: &[u8]) -> Vec<ManifestEntryD
 /// Constant-time check that `H_alg(data)` equals the `expected` digest
 /// recorded in a manifest entry section.  Returns `false` on length
 /// mismatch (i.e. tampered or wrong-algorithm bytes).
+///
+/// # TRUST BOUNDARY: this is an INTEGRITY check, not a trust check
+///
+/// A `true` proves that `data` hashes to `expected` under `alg` — nothing
+/// more.  `expected` is only worth anything if it came out of a manifest
+/// that a verified signer committed to; supplied from anywhere else this
+/// is a plain hash comparison.  There is no key and no certificate here.
+///
+/// Fail-closed in both directions: an `expected` of the wrong length —
+/// including the empty slice, the classic success-shaped default — can
+/// never match, because `ct_eq` compares lengths first.
 pub fn digest_matches(alg: DigestAlg, data: &[u8], expected: &[u8]) -> bool {
     let actual = raw_digest(alg, data);
     !actual.is_empty() && ct_eq(expected, &actual)
@@ -4003,12 +4336,23 @@ mod tests {
             super::PublicKey::Rsa(k) => k,
             _ => unreachable!(),
         };
-        // Wrong signature length → Bad.
+        // Wrong signature length → `Unsupported`, NOT `Bad`.
+        //
+        // SunRsaSign raises `SignatureException("Signature length not
+        // correct")` here, *before* any RSA operation runs — so no
+        // verification decision was reached. Reporting it as `Bad` would
+        // claim we compared this signature against the key and found it
+        // wanting, which we did not. Both outcomes refuse; only one is
+        // honest about why. (A genuine mismatch always has the correct
+        // length, so this arm can never swallow a real negative — see the
+        // `s == n` case below, which does stay `Bad`.)
         assert_eq!(
             super::rsa_pkcs1v15_verify(&key, DigestAlg::Sha256, b"msg", &[0u8; 10]),
-            SigVerify::Bad
+            SigVerify::Unsupported,
+            "a malformed signature encoding is 'not checked', not 'checked and failed'"
         );
-        // s == n (>= n) → Bad.
+        // s == n (>= n): correct length, so the RSA operation really does
+        // run and really does reject → the preserved negative, `Bad`.
         let n_be = key.n.to_bytes_be_padded(key.k);
         assert_eq!(
             super::rsa_pkcs1v15_verify(&key, DigestAlg::Sha256, b"msg", &n_be),
@@ -4132,8 +4476,10 @@ mod tests {
     fn ecdsa_malformed_ec_key_is_bad_not_accepted() {
         use super::{verify_signature_with_spki, SigVerify};
         // FEAT(jar-signer): an EC SPKI carrying an all-zero (off-curve)
-        // "point" must NEVER verify.  With real ECDSA wired up the point
-        // fails to decode → Bad (still fail-closed, never Ok).
+        // "point" must NEVER verify.  The point fails to decode, so no
+        // ECDSA verification runs at all → `Unsupported` (fail-closed,
+        // never `Ok`; and deliberately not `Bad`, which would claim a
+        // verdict we never reached).
         let ec_algid = {
             let mut inner = oid("1.2.840.10045.2.1"); // id-ecPublicKey
             inner.extend_from_slice(&oid("1.2.840.10045.3.1.7")); // prime256v1
@@ -4672,5 +5018,476 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].alg, DigestAlg::Sha256, "strongest digest wins");
         assert!(digest_matches(parsed[0].alg, body, &parsed[0].expected));
+    }
+
+    // ---------------------------------------------------------------------
+    // TRUST BOUNDARY — the three-valued result, and what "verified" covers.
+    //
+    // These pin the contract written up in
+    // `docs/security/signed-jar-trust.md`:
+    //
+    //   * "we checked and it failed" (`SigVerify::Bad`) and "we never
+    //     checked" (`SigVerify::Unsupported`) must stay distinguishable, and
+    //     both must refuse;
+    //   * an integrity check must never be readable as a trust check;
+    //   * a trust-shaped API must refuse unless every step it claims
+    //     actually ran — including for certificates it merely carried.
+    //
+    // The fixtures use real RSA (the 512-bit test key) so they drive the
+    // production verification path, not the `OID_STUB_SIG` test backdoor.
+    // ---------------------------------------------------------------------
+
+    /// A validity window that contains "now" — `notBefore` 2020 (UTCTime),
+    /// `notAfter` 2099 (GeneralizedTime), matching the encodings real CAs
+    /// emit either side of the 2050 boundary.
+    fn tb_validity_now() -> Vec<u8> {
+        seq(&[
+            tlv(0x17, b"200101000000Z").as_slice(),
+            tlv(0x18, b"20990101000000Z").as_slice(),
+        ]
+        .concat())
+    }
+
+    /// A real `sha256WithRSAEncryption` certificate signed by (and carrying
+    /// the SPKI of) the RSA-512 test key, with a caller-chosen `validity`
+    /// SEQUENCE. Self-signed when `subject_cn == issuer_cn`.
+    fn tb_cert(subject_cn: &str, issuer_cn: &str, validity: &[u8]) -> Vec<u8> {
+        let spki = rsa_spki(RSA512_N, 65537);
+        let subject_dn = x509_name(subject_cn);
+        let issuer_dn = x509_name(issuer_cn);
+        let tbs = seq(&[
+            ctx_imp(0, &integer(2)).as_slice(),
+            integer(1).as_slice(),
+            algorithm_identifier("1.2.840.113549.1.1.11").as_slice(),
+            issuer_dn.as_slice(),
+            validity,
+            subject_dn.as_slice(),
+            spki.as_slice(),
+        ]
+        .concat());
+        let sig = rsa_sign(&tbs, DigestAlg::Sha256, RSA512_N, RSA512_D);
+        let mut bs = vec![0u8];
+        bs.extend_from_slice(&sig);
+        seq(&[
+            tbs.as_slice(),
+            algorithm_identifier("1.2.840.113549.1.1.11").as_slice(),
+            tlv(0x03, &bs).as_slice(),
+        ]
+        .concat())
+    }
+
+    /// A real RSA-signed CMS signer block over `sf`. The `certificates` set
+    /// is the leaf followed by `extra_certs` verbatim — the hook for the
+    /// "attacker appends a cert" case. `signer_sig_alg_oid` names the
+    /// SignerInfo `signatureAlgorithm`. Returns `(block, leaf_der, root_der)`.
+    fn tb_signer_block_with_alg(
+        sf: &[u8],
+        extra_certs: &[Vec<u8>],
+        signer_sig_alg_oid: &str,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let validity = tb_validity_now();
+        let leaf_der = tb_cert("TB-Leaf", "TB-Root", &validity);
+        let root_der = tb_cert("TB-Root", "TB-Root", &validity);
+
+        let dig = sha256::digest(sf).to_vec();
+        let attr_ct = seq(&[
+            oid(OID_CONTENT_TYPE).as_slice(),
+            set(&oid(OID_DATA)).as_slice(),
+        ]
+        .concat());
+        let attr_md = seq(&[
+            oid(OID_MESSAGE_DIGEST).as_slice(),
+            set(&octet(&dig)).as_slice(),
+        ]
+        .concat());
+        let attrs_inner = [attr_ct.as_slice(), attr_md.as_slice()].concat();
+        // RFC 5652 §5.4: the signature covers the explicit SET OF form.
+        let signed_attrs_der = set(&attrs_inner);
+        let si_sig = rsa_sign(&signed_attrs_der, DigestAlg::Sha256, RSA512_N, RSA512_D);
+        let auth_attrs = ctx_imp(0, &attrs_inner);
+
+        let signer_info = seq(&[
+            integer(1).as_slice(),
+            issuer_and_serial("TB-Root", 1).as_slice(),
+            algorithm_identifier(OID_SHA256).as_slice(),
+            auth_attrs.as_slice(),
+            algorithm_identifier(signer_sig_alg_oid).as_slice(),
+            octet(&si_sig).as_slice(),
+        ]
+        .concat());
+
+        let mut certs_concat = leaf_der.clone();
+        for c in extra_certs {
+            certs_concat.extend_from_slice(c);
+        }
+        let signed_data = seq(&[
+            integer(1).as_slice(),
+            set(&algorithm_identifier(OID_SHA256)).as_slice(),
+            seq(&oid(OID_DATA)).as_slice(),
+            ctx_imp(0, &certs_concat).as_slice(),
+            set(&signer_info).as_slice(),
+        ]
+        .concat());
+        let block = seq(&[
+            oid(OID_SIGNED_DATA).as_slice(),
+            ctx_imp(0, &signed_data).as_slice(),
+        ]
+        .concat());
+        (block, leaf_der, root_der)
+    }
+
+    /// [`tb_signer_block_with_alg`] with the ordinary `sha256WithRSA` OID.
+    fn tb_signer_block(sf: &[u8], extra_certs: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        tb_signer_block_with_alg(sf, extra_certs, "1.2.840.113549.1.1.11")
+    }
+
+    #[test]
+    fn tb_unsupported_signature_algorithm_is_unsupported_not_bad() {
+        use super::{verify_signature_with_spki, SigVerify};
+        let spki = rsa_spki(RSA1024_N, 65537);
+        let msg = b"payload";
+        let sig = rsa_sign(msg, DigestAlg::Sha256, RSA1024_N, RSA1024_D);
+
+        // RSASSA-PSS (1.2.840.113549.1.1.10) is a *different padding scheme*
+        // and is deliberately absent from `sig_alg_digest` — verifying it
+        // with the PKCS#1 v1.5 verifier would be the wrong operation.
+        let r = verify_signature_with_spki(&spki, "1.2.840.113549.1.1.10", msg, &sig);
+        assert_eq!(
+            r,
+            SigVerify::Unsupported,
+            "an algorithm we do not implement must report that we did not check"
+        );
+        assert_ne!(
+            r,
+            SigVerify::Bad,
+            "reporting 'unsupported' as 'the signature is bad' claims a verdict \
+             that was never reached — that is the ambiguity this enum removes"
+        );
+
+        // Recognised OID, wrong key family: an ECDSA algorithm against an
+        // RSA key. There is no verification to perform.
+        assert_eq!(
+            verify_signature_with_spki(&spki, "1.2.840.10045.4.3.2", msg, &sig),
+            SigVerify::Unsupported
+        );
+        // An OID we have never heard of.
+        assert_eq!(
+            verify_signature_with_spki(&spki, "1.1.1.1", msg, &sig),
+            SigVerify::Unsupported
+        );
+        // An SPKI that will not parse is likewise "not checked", not "failed".
+        assert_eq!(
+            verify_signature_with_spki(b"\x30\x03not-a-key", "1.2.840.113549.1.1.11", msg, &sig),
+            SigVerify::Unsupported
+        );
+    }
+
+    #[test]
+    fn tb_unsupported_algorithm_is_rejected_at_the_trust_api() {
+        // The distinction has to survive all the way out, and `Unsupported`
+        // must refuse just as hard as `Bad` does.
+        let sf = b"Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: AAAA\r\n\r\n";
+        let (block, _leaf, root) = tb_signer_block_with_alg(sf, &[], "1.2.840.113549.1.1.10");
+
+        let mut ts = TrustStore::empty();
+        assert!(ts.add_anchor_der(root));
+        assert!(
+            verify_signer_block(&block, sf, &ts).is_none(),
+            "a signer block whose algorithm we cannot verify must never be accepted"
+        );
+
+        // ...and the refusal says so, rather than accusing the JAR of
+        // carrying a bad signature.
+        let err = super::parse_signed_data(&block, sf, true)
+            .expect_err("unsupported signer algorithm must refuse");
+        assert!(
+            err.contains("could not be verified"),
+            "expected an 'unverifiable' diagnosis, got: {err}"
+        );
+        assert!(
+            !err.contains("does not verify"),
+            "an unsupported algorithm must not be reported as a failed verification: {err}"
+        );
+    }
+
+    #[test]
+    fn tb_genuine_signature_mismatch_is_bad_not_unsupported() {
+        use super::{verify_signature_with_spki, SigVerify};
+        // PRESERVED NEGATIVE: when a verifier really runs and says no, that
+        // is a security decision and must stay one. Turning this into
+        // `Unsupported` would be just as wrong in the other direction.
+        let spki = rsa_spki(RSA1024_N, 65537);
+        let msg = b"the real message";
+        let sig = rsa_sign(msg, DigestAlg::Sha256, RSA1024_N, RSA1024_D);
+
+        let other = b"a different message";
+        assert_eq!(
+            verify_signature_with_spki(&spki, "1.2.840.113549.1.1.11", other, &sig),
+            SigVerify::Bad,
+            "a completed verification that fails is a genuine negative"
+        );
+
+        // Corrupt signature bits keep the correct length, so the encoding
+        // guard cannot fire — this is exactly what a forgery looks like.
+        let mut corrupt = sig.clone();
+        corrupt[5] ^= 0xFF;
+        assert_eq!(
+            verify_signature_with_spki(&spki, "1.2.840.113549.1.1.11", msg, &corrupt),
+            SigVerify::Bad
+        );
+
+        // And the same input still verifies untouched, so the assertions
+        // above are not passing for an unrelated reason.
+        assert_eq!(
+            verify_signature_with_spki(&spki, "1.2.840.113549.1.1.11", msg, &sig),
+            SigVerify::Ok
+        );
+    }
+
+    #[test]
+    fn tb_unsupported_and_bad_stay_distinct_trust_errors() {
+        let validity = tb_validity_now();
+        let parent_der = tb_cert("TB-Root", "TB-Root", &validity);
+        let parent = X509Cert::parse(&parent_der).expect("parent parses");
+
+        // Same key, tampered signature bytes → a verifier ran and said no.
+        let mut bad_der = tb_cert("TB-Leaf", "TB-Root", &validity);
+        let last = bad_der.len() - 1;
+        bad_der[last] ^= 0xFF;
+        let bad = X509Cert::parse(&bad_der).expect("tampered cert still parses");
+        assert_eq!(
+            bad.link_signature_ok(&parent)
+                .expect_err("tampered link must reject"),
+            TrustError::BadSignature
+        );
+
+        // A parent whose SPKI names a key type we do not carry → nothing
+        // was verified → `NotImplemented`, which a caller matching on
+        // `TrustError` cannot confuse with `BadSignature`.
+        let stub_parent_der = build_x509_cert("TB-Root", "TB-Root", &x509_name("TB-Root"));
+        let stub_parent = X509Cert::parse(&stub_parent_der).expect("stub parent parses");
+        let child_der = tb_cert("TB-Leaf", "TB-Root", &validity);
+        let child = X509Cert::parse(&child_der).expect("child parses");
+        assert_eq!(
+            child
+                .link_signature_ok(&stub_parent)
+                .expect_err("unverifiable link must reject"),
+            TrustError::NotImplemented
+        );
+    }
+
+    #[test]
+    fn tb_self_consistent_signature_without_an_anchor_is_not_trusted() {
+        let sf = b"Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: AAAA\r\n\r\n";
+        let (block, leaf_der, root_der) = tb_signer_block(sf, &[]);
+
+        // The block IS internally consistent — with its root as an anchor it
+        // verifies. Establishing that first is what keeps the negative below
+        // from passing vacuously.
+        let mut anchored = TrustStore::empty();
+        assert!(anchored.add_anchor_der(root_der.clone()));
+        assert!(
+            verify_signer_block(&block, sf, &anchored).is_some(),
+            "fixture must be a genuinely valid signature"
+        );
+
+        // Identical bytes, no anchor: a valid signature by an unknown party
+        // establishes nothing. This is the whole point of a trust anchor —
+        // anyone can produce a self-consistent signed JAR.
+        assert!(
+            verify_signer_block(&block, sf, &TrustStore::empty()).is_none(),
+            "a cryptographically valid signature with no path to an anchor \
+             must not be reported as a verified signer"
+        );
+
+        // The reason is specifically the missing anchor, not a parse accident.
+        let leaf = X509Cert::parse(&leaf_der).expect("leaf parses");
+        assert_eq!(
+            verify_chain(&leaf, &[], &TrustStore::empty())
+                .expect_err("empty store must find no path"),
+            TrustError::NoTrustAnchor
+        );
+    }
+
+    #[test]
+    fn tb_unvalidated_certificates_are_not_surfaced_as_the_signers() {
+        // A CMS `certificates` set is attacker-supplied. Appending a
+        // certificate to an otherwise legitimately signed JAR must not get
+        // it reported through `CodeSource.getCertificates()`: it took no
+        // part in path construction, so nothing about it was verified.
+        let sf = b"Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: AAAA\r\n\r\n";
+        let interloper = tb_cert("TB-Interloper", "TB-Interloper", &tb_validity_now());
+        let (block, leaf_der, root_der) = tb_signer_block(sf, &[interloper.clone()]);
+
+        let mut ts = TrustStore::empty();
+        assert!(ts.add_anchor_der(root_der.clone()));
+        let vs = verify_signer_block(&block, sf, &ts)
+            .expect("the legitimate signer must still verify");
+
+        assert_eq!(
+            vs.chain,
+            vec![leaf_der, root_der],
+            "chain must be exactly the validated path, leaf first, anchor last"
+        );
+        assert!(
+            !vs.chain.contains(&interloper),
+            "a certificate that was never validated was surfaced as the signer's"
+        );
+    }
+
+    #[test]
+    fn tb_expired_and_not_yet_valid_certs_reject() {
+        let in_date = tb_validity_now();
+        let root_der = tb_cert("TB-Root", "TB-Root", &in_date);
+        let mut ts = TrustStore::empty();
+        assert!(ts.add_anchor_der(root_der));
+
+        // notAfter in the past.
+        let expired = tb_cert(
+            "TB-Leaf",
+            "TB-Root",
+            &seq(&[
+                tlv(0x17, b"000101000000Z").as_slice(),
+                tlv(0x17, b"010101000000Z").as_slice(),
+            ]
+            .concat()),
+        );
+        let cert = X509Cert::parse(&expired).expect("expired cert parses");
+        assert_eq!(
+            verify_chain(&cert, &[], &ts).expect_err("expired leaf must reject"),
+            TrustError::Expired
+        );
+
+        // notBefore in the future.
+        let premature = tb_cert(
+            "TB-Leaf",
+            "TB-Root",
+            &seq(&[
+                tlv(0x18, b"20900101000000Z").as_slice(),
+                tlv(0x18, b"20990101000000Z").as_slice(),
+            ]
+            .concat()),
+        );
+        let cert = X509Cert::parse(&premature).expect("not-yet-valid cert parses");
+        assert_eq!(
+            verify_chain(&cert, &[], &ts).expect_err("not-yet-valid leaf must reject"),
+            TrustError::Expired
+        );
+
+        // The same fixture with a window covering "now" chains fine, so the
+        // two rejections above are about the dates and nothing else.
+        let good = tb_cert("TB-Leaf", "TB-Root", &in_date);
+        let cert = X509Cert::parse(&good).expect("in-date cert parses");
+        verify_chain(&cert, &[], &ts).expect("in-date leaf must chain to the anchor");
+    }
+
+    #[test]
+    fn tb_unreadable_validity_window_rejects() {
+        // RFC 5280 §4.1.2.5 admits only UTCTime and GeneralizedTime. A
+        // validity SEQUENCE carrying something else is structurally
+        // parseable, so it used to reach `cert_dates_ok` — which answered
+        // "in date" for a window it could not read. A window we could not
+        // read is a window we did not check, and it now refuses.
+        let bogus = seq(&[
+            tlv(0x0C, b"whenever").as_slice(), // UTF8String, not a Time
+            tlv(0x0C, b"eventually").as_slice(),
+        ]
+        .concat());
+        let der = tb_cert("TB-Leaf", "TB-Root", &bogus);
+        let cert = X509Cert::parse(&der).expect("structurally parseable");
+        assert!(
+            !super::cert_dates_ok(&cert),
+            "an unreadable validity window must not be reported as in-date"
+        );
+
+        // ...and it is fatal to the chain, not merely logged.
+        let root_der = tb_cert("TB-Root", "TB-Root", &tb_validity_now());
+        let mut ts = TrustStore::empty();
+        assert!(ts.add_anchor_der(root_der));
+        assert_eq!(
+            verify_chain(&cert, &[], &ts).expect_err("must reject"),
+            TrustError::Expired
+        );
+    }
+
+    #[test]
+    fn tb_entry_absent_from_manifest_is_not_covered() {
+        // The classic partial-signing gap: an archive holds entries the
+        // manifest never named. `parse_manifest_entry_digests` is the
+        // authority on what the signer committed to, and it must simply not
+        // list them — "absent" is the signal callers gate on.
+        let signed_body = b"class bytes that were signed";
+        let dig = b64enc(&raw_digest(DigestAlg::Sha256, signed_body));
+        // The archive also contains `pkg/Injected.class` (no section at all)
+        // and `pkg/NoDigest.class` (a section carrying no digest).
+        let manifest = format!(
+            "Manifest-Version: 1.0\r\n\r\n\
+             Name: pkg/Signed.class\r\nSHA-256-Digest: {dig}\r\n\r\n\
+             Name: pkg/NoDigest.class\r\nComment: not a digest attribute\r\n\r\n"
+        );
+        let declared = parse_manifest_entry_digests(manifest.as_bytes());
+        let names: Vec<&str> = declared.iter().map(|d| d.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["pkg/Signed.class"],
+            "only entries the manifest commits to with a digest are covered"
+        );
+        assert!(
+            !names.contains(&"pkg/Injected.class"),
+            "an entry with no manifest section must never be treated as covered"
+        );
+        assert!(
+            !names.contains(&"pkg/NoDigest.class"),
+            "a Name: section without a recognised <alg>-Digest commits to nothing"
+        );
+        // Guard against the whole assertion set passing because the parser
+        // returned nothing at all: the one covered entry really is covered.
+        assert!(digest_matches(
+            declared[0].alg,
+            signed_body,
+            &declared[0].expected
+        ));
+    }
+
+    #[test]
+    fn tb_integrity_checking_still_works() {
+        // The integrity half of the JAR chain — .SF → MANIFEST.MF → entry
+        // bytes — is genuinely complete, and this audit preserves it rather
+        // than rejecting it. It is named as integrity, not trust.
+        let body = b"the real class bytes";
+        let entry_digest = b64enc(&raw_digest(DigestAlg::Sha256, body));
+        let manifest = format!(
+            "Manifest-Version: 1.0\r\n\r\n\
+             Name: pkg/Real.class\r\nSHA-256-Digest: {entry_digest}\r\n\r\n"
+        );
+        let manifest_digest = b64enc(&raw_digest(DigestAlg::Sha256, manifest.as_bytes()));
+        let sf =
+            format!("Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: {manifest_digest}\r\n\r\n");
+
+        assert!(
+            verify_sf_binds_manifest(sf.as_bytes(), manifest.as_bytes()),
+            ".SF must bind the manifest it committed to"
+        );
+        let declared = parse_manifest_entry_digests(manifest.as_bytes());
+        assert_eq!(declared.len(), 1);
+        assert!(
+            digest_matches(declared[0].alg, body, &declared[0].expected),
+            "the committed-to entry's bytes must match"
+        );
+
+        // Tamper at either link and it breaks.
+        assert!(!digest_matches(declared[0].alg, b"swapped bytes", &declared[0].expected));
+        let tampered = manifest.replace("pkg/Real.class", "pkg/Evil.class");
+        assert!(!verify_sf_binds_manifest(sf.as_bytes(), tampered.as_bytes()));
+
+        // TRUST BOUNDARY: everything above used no key and no certificate.
+        // A `.SF` anyone can write produces the same `true`, so integrity is
+        // not, and must not be read as, trust — that comes only from
+        // `verify_signer_block` against a real anchor.
+        assert!(
+            verify_signer_block(sf.as_bytes(), sf.as_bytes(), &TrustStore::empty()).is_none(),
+            "manifest integrity says nothing about who produced the bytes"
+        );
     }
 }

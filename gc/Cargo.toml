@@ -15,6 +15,13 @@ categories.workspace = true
 
 [dependencies]
 cratonvm-types = { path = "../types", version = "0.3.0" }
+# Phase accounting (`docs/observability/phase-accounting.md` §10.2): the
+# `Category::GcPause` / `Category::GcConcurrent` spans in `g1.rs`, `gen_heap.rs`
+# and `concurrent_mark.rs` need `cratonvm_jfr::phase`. Acyclic by inspection:
+# `cratonvm-jfr` depends on `cratonvm-types` and nothing else in the workspace
+# (and has no `[dev-dependencies]` at all). The `cratonvm-jit` edge below is
+# `[dev-dependencies]`-only and is unaffected.
+cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
 parking_lot.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true

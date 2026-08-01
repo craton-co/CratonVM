@@ -250,6 +250,46 @@ Unit tests: 877 `cratonvm-gc`, 3153 `cratonvm-native-builtins`, 2326
   A good starting point is why `xt-helper-window` can stay latched for
   minutes at a time under this thread count.
 
+## Follow-up: the fragmentation half is fixed (`7303483521`, 2026-08-01)
+
+The `OutOfMemoryError` recorded above — "a catchable `OutOfMemoryError`
+after ~20 minutes of back-to-back `xt-helper-window-conservative-scan`
+fallbacks" — was root-caused to the old generation's free list never
+coalescing.
+
+`OldGen::free` defers coalescing to `compact`, which only runs on the
+moving path's Phase 5. Under conservative JIT roots the old generation is
+reclaimed IN PLACE by `old_gen_gc(compact = false)`, which never compacts,
+so every reclaimed object became a permanently isolated free block: free
+BYTES stayed high while the LARGEST block collapsed toward one object, and
+the fallible native-side allocator (which deliberately cannot GC-and-retry)
+reported a spurious OOM on a mostly-free generation. The young generation
+has had exactly this coalescer since the bintrees18 allocation cliff; old
+gen never got the counterpart.
+
+The magnitude, now that `[GC] oldgen_coalesce: calls=N blocks_merged=M` is
+reported in the GC summary:
+
+| run | heap | result | blocks merged in ONE sweep |
+| --- | --- | --- | --- |
+| this workload, JIT on | `--Xmx 1g` | exit 0 | **40,645** |
+| this workload, JIT on | `--Xmx 256m` | direct-buffer OOM (unrelated) | **374,573** |
+
+So the free list really was reaching hundreds of thousands of isolated
+blocks, and the fix demonstrably fires in the shipping configuration.
+Note this also removes an O(n) best-fit scan per old-gen allocation, the
+same throughput cliff the young-side coalescer was added for.
+
+**Superseding this doc's earlier caveat:** the commit message for
+`7303483521` says old gen "never reached the 75% occupancy that triggers
+the in-place sweep at all" on a quiet host. That was true of the runs
+available when it was written; the confirmation run on the integrated tree
+(`major=2`, `calls=1`, 40,645 blocks merged, exit 0) shows the regime IS
+reached at the default heap size. What remains unproven is only the
+counterfactual — the original OOM itself never recurred, so "this specific
+OOM is gone" is inference from the mechanism, not a before/after
+observation.
+
 ## Repro (historical)
 
 ```bash

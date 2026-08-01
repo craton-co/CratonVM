@@ -371,9 +371,13 @@ fn arrstore_check(
 fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool {
     use parking_lot::Mutex;
     use std::sync::OnceLock;
-    static MEMO: OnceLock<Mutex<std::collections::HashMap<u32, bool>>> = OnceLock::new();
+    // PER-VM STATE (P0, `docs/architecture/per-vm-state.md`): the memo answers
+    // "does this ClassId's name match the EC watch list?", and `ClassId`s are
+    // allocated per-VM, so the key must carry `vm_identity` or a second VM
+    // reads the first VM's verdict for an unrelated class.
+    static MEMO: OnceLock<Mutex<std::collections::HashMap<(usize, u32), bool>>> = OnceLock::new();
     let memo = MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let key = cid.as_u32();
+    let key = (shared.vm_identity, cid.as_u32());
     if let Some(&v) = memo.lock().get(&key) {
         return v;
     }
@@ -7218,6 +7222,18 @@ pub fn execute(
                     // extract the real flags from class metadata to enable the skip path.
                     let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
                     let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
+                    // Cold-`new` fix - sites this path cannot resolve at compile
+                    // time. Previously baked as the nonsense sentinel entry
+                    // `(pc, class_id 0, 0 fields, true, true)`, which did NOT
+                    // "make the JIT skip this site and defer to the interpreter"
+                    // as the comment below claimed: the codegen found an entry at
+                    // that pc and compiled an allocation against class id 0. They
+                    // now compile to the CP-indexed helper, which performs the
+                    // real loader-faithful resolution, the JVMS 5.4.4 access
+                    // check and `<clinit>` at the actual program point - the same
+                    // work `Instruction::New` does.
+                    let mut new_deferred_info: Vec<(usize, u32, u16)> = Vec::new();
+                    let mut anewarray_deferred_info: Vec<(usize, u32, u16)> = Vec::new();
                     let is_real_class = shared
                         .classes.class_manager
                         .read()
@@ -7227,7 +7243,7 @@ pub fn execute(
                     if is_real_class && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty())
                     {
                         // Collect class names from constant pool (read lock)
-                        let new_class_names: Vec<(usize, Option<String>)> = {
+                        let new_class_names: Vec<(usize, u16, Option<String>)> = {
                             let cm_lock = shared.classes.class_manager.read();
                             if let Some(class) = cm_lock.get_class(class_id) {
                                 scan.new_ops
@@ -7235,6 +7251,7 @@ pub fn execute(
                                     .map(|&(pc_new, cp_idx)| {
                                         (
                                             pc_new,
+                                            cp_idx,
                                             class
                                                 .constant_pool
                                                 .get_class_name(cp_idx)
@@ -7246,7 +7263,7 @@ pub fn execute(
                                 Vec::new()
                             }
                         };
-                        let arr_class_names: Vec<(usize, Option<String>)> = {
+                        let arr_class_names: Vec<(usize, u16, Option<String>)> = {
                             let cm_lock = shared.classes.class_manager.read();
                             if let Some(class) = cm_lock.get_class(class_id) {
                                 scan.anewarray_ops
@@ -7254,6 +7271,7 @@ pub fn execute(
                                     .map(|&(pc_arr, cp_idx)| {
                                         (
                                             pc_arr,
+                                            cp_idx,
                                             class
                                                 .constant_pool
                                                 .get_class_name(cp_idx)
@@ -7266,7 +7284,7 @@ pub fn execute(
                             }
                         };
                         // Resolve class names to ClassIds (write lock for loading)
-                        for (pc_new, name_opt) in new_class_names {
+                        for (pc_new, cp_idx_new, name_opt) in new_class_names {
                             if let Some(name) = name_opt {
                                 let load_result = shared.load_class_concurrent(&name);
                                 if let Ok(target_id) = load_result {
@@ -7311,19 +7329,21 @@ pub fn execute(
                                             true,
                                         ));
                                     } else {
-                                        new_info.push((pc_new, 0, 0, true, true));
+                                        new_deferred_info
+                                            .push((pc_new, class_id.as_u32(), cp_idx_new));
                                     }
                                 } else {
-                                    new_info.push((pc_new, 0, 0, true, true));
+                                    new_deferred_info.push((pc_new, class_id.as_u32(), cp_idx_new));
                                 }
                             }
                         }
-                        for (pc_arr, name_opt) in arr_class_names {
+                        for (pc_arr, cp_idx_arr, name_opt) in arr_class_names {
                             if let Some(name) = name_opt {
                                 if let Ok(target_id) = shared.load_class_concurrent(&name) {
                                     anewarray_info.push((pc_arr, target_id.as_u32()));
                                 } else {
-                                    anewarray_info.push((pc_arr, 0));
+                                    anewarray_deferred_info
+                                        .push((pc_arr, class_id.as_u32(), cp_idx_arr));
                                 }
                             }
                         }
@@ -7574,7 +7594,9 @@ pub fn execute(
                         typecheck_info,
                         static_field_info,
                         new_info,
+                        new_deferred_info,
                         anewarray_info,
+                        anewarray_deferred_info,
                         invoke_info,
                         direct_calls_early,
                         mic_slots_early,
@@ -13425,6 +13447,18 @@ fn resume_from_ir_deopt(
         );
     }
     push_frame_and_fire_entry(thread, frame);
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // the `Deoptimizing -> JavaRunning` edge. The reconstructed values now live
+    // in a GC-scanned interpreter frame, which is precisely the property the
+    // `Deoptimizing` state exists to say the thread did NOT have. Usually a
+    // no-op self-edge — the JIT entry pop that returned us here already
+    // resolved the window (see `conservative_roots::leaving_compiled_state`) —
+    // but this is the site that closes it for any deopt path that materialises
+    // frames without an intervening pop.
+    crate::threading::thread_state::record_transition(
+        crate::threading::thread_state::ThreadExecState::JavaRunning,
+        "interpreter::resume_from_ir_deopt",
+    );
     Some(CachedCallResult::FramePushed)
 }
 
@@ -14312,6 +14346,18 @@ fn real_frame_deopt_resume_and_despeculate(
                 );
             }
         }
+    }
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // close the `Deoptimizing` window on the RESUMED path only. A `None` here
+    // means no frame was materialised and the caller falls back to the
+    // whole-method re-run — that path leaves compiled code through the JIT
+    // entry pop, which resolves the window itself
+    // (`conservative_roots::leaving_compiled_state`).
+    if resumed.is_some() {
+        crate::threading::thread_state::record_transition(
+            crate::threading::thread_state::ThreadExecState::JavaRunning,
+            "interpreter::real_frame_deopt_resume_and_despeculate",
+        );
     }
     resumed
 }
@@ -15780,6 +15826,10 @@ fn execute_instruction(
                     }
                     RuntimeError::ArrayIndexOutOfBoundsException { index: i }
                 })?;
+            // Phase 10 #2: the host just wrote this array, so any device
+            // buffer mirroring it is stale.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
         // WP4.3 fix: long[] / double[] store must use typed pop so that the
         // CompactValue type-erasure (raw long bits decoding as Value::Double via
@@ -15835,6 +15885,9 @@ fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Long(v))
                 .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
+            // Phase 10 #2 — see the `Iastore` arm.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
         Instruction::Dastore => {
             let d = thread.frames[frame_idx].stack.pop_double()?;
@@ -15874,6 +15927,9 @@ fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Double(d))
                 .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
+            // Phase 10 #2 — see the `Iastore` arm.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
 
         // -- Stack manipulation (T10.9.D direct CompactValue path) --

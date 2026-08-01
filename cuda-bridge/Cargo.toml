@@ -18,6 +18,12 @@ publish = false
 [dependencies]
 thiserror = { workspace = true }
 bytemuck = "1.16"
+# `critical.rs` names the holder of a leaked GPU critical-section token at
+# `error` level and reports an expired collector wait at `warn` level. Both
+# are defect signals that must be visible without anyone asking for a
+# report, which is the same argument every other crate in the workspace
+# makes for taking the workspace `tracing` pin.
+tracing = { workspace = true }
 
 # cudarc is optional: when the `cuda` feature is off, the crate
 # exposes the same surface but every entry point returns

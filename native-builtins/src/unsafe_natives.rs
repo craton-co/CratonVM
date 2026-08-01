@@ -47,7 +47,7 @@
 //! overwrite, either of which is a bug.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{LinkageError, MethodCallResult, RuntimeError};
+use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::{
@@ -183,13 +183,56 @@ fn invalidate_arena_cache() {
 // store). TAGGED rejects are freed/out-of-bounds handles and MUST keep surfacing
 // the use-after-free `IllegalArgumentException` — never raw-access them (that would
 // dereference a synthetic 0x4000_… address and SIGSEGV), so they are excluded here.
+//
+// GAP M2 (C2 review, "gate all native and FFI capabilities"): this pair is the
+// single most powerful thing an untrusted class can reach, because a raw read
+// and a raw write at an arbitrary address subsume every other capability —
+// they can rewrite the gates themselves. They are therefore the one place a
+// `Capability::RawMemory` check has to sit; one edit here covers every
+// untagged-address `Unsafe` get/put (`getByte`/`putByte`/`getShort`/…/`putLong`).
+//
+// The gate runs only AFTER the two cheap address predicates have decided this
+// really is a raw-pointer access. That ordering matters twice: an arena or
+// tagged address must keep its existing use-after-free diagnosis untouched,
+// and the audit report must not be flooded with rows for accesses that never
+// dereferenced a raw pointer.
+//
+// `Ok(false)` means "not a raw pointer / the copy failed" — exactly what the
+// old `bool` meant, so every caller's fallback path is unchanged. `Err` is a
+// capability refusal, which is a `SecurityException` and must not be
+// misreported as the "not in any live arena" `IllegalArgumentException`.
+//
+// See `capability_gate::gate_raw_memory` for why the permissive path here is a
+// thread-local load and an integer compare rather than a full check.
 #[inline]
-fn real_ptr_read(ctx: &dyn NativeContext, addr: i64, out: &mut [u8]) -> bool {
-    addr > 0 && !crate::unsafe_arena_addr_is_tagged(addr) && ctx.copy_from_native_memory(addr, out)
+fn real_ptr_read(
+    ctx: &dyn NativeContext,
+    addr: i64,
+    out: &mut [u8],
+) -> Result<bool, MethodCallFailed> {
+    if addr <= 0 || crate::unsafe_arena_addr_is_tagged(addr) {
+        return Ok(false);
+    }
+    crate::capability_gate::gate_raw_memory(
+        ctx,
+        crate::capability_gate::RAW_MEMORY_UNSAFE_ADDRESS,
+    )?;
+    Ok(ctx.copy_from_native_memory(addr, out))
 }
 #[inline]
-fn real_ptr_write(ctx: &mut dyn NativeContext, addr: i64, data: &[u8]) -> bool {
-    addr > 0 && !crate::unsafe_arena_addr_is_tagged(addr) && ctx.copy_to_native_memory(addr, data)
+fn real_ptr_write(
+    ctx: &mut dyn NativeContext,
+    addr: i64,
+    data: &[u8],
+) -> Result<bool, MethodCallFailed> {
+    if addr <= 0 || crate::unsafe_arena_addr_is_tagged(addr) {
+        return Ok(false);
+    }
+    crate::capability_gate::gate_raw_memory(
+        &*ctx,
+        crate::capability_gate::RAW_MEMORY_UNSAFE_ADDRESS,
+    )?;
+    Ok(ctx.copy_to_native_memory(addr, data))
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +415,7 @@ fn native_unsafe_get_byte_at_address(
         None => {
             // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw read.
             let mut b = [0u8; 1];
-            if real_ptr_read(ctx, addr, &mut b) {
+            if real_ptr_read(ctx, addr, &mut b)? {
                 // Sign-extend — see the comment on the arena-hit branch above.
                 return Ok(Some(Value::Int(b[0] as i8 as i32)));
             }
@@ -412,7 +455,7 @@ fn native_unsafe_put_byte_at_address(
     // and surface the `IllegalArgumentException` the validated path (and
     // Java's `Unsafe.putByte(long, byte)` contract) mandates.
     // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw write.
-    if real_ptr_write(ctx, addr, &[v]) {
+    if real_ptr_write(ctx, addr, &[v])? {
         return Ok(None);
     }
     invalidate_arena_cache();
@@ -441,7 +484,7 @@ fn native_unsafe_get_short_at_address(
         None => {
             // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw read.
             let mut b = [0u8; 2];
-            if real_ptr_read(ctx, addr, &mut b) {
+            if real_ptr_read(ctx, addr, &mut b)? {
                 return Ok(Some(Value::Int(i16::from_le_bytes(b) as i32)));
             }
             invalidate_arena_cache();
@@ -473,7 +516,7 @@ fn native_unsafe_put_short_at_address(
     // audit-round6 fix (LOW): see `put_byte_at_address`. A stale cache hit
     // must not mask the validated accessor's freed-arena rejection.
     // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw write.
-    if real_ptr_write(ctx, addr, &v.to_le_bytes()) {
+    if real_ptr_write(ctx, addr, &v.to_le_bytes())? {
         return Ok(None);
     }
     invalidate_arena_cache();
@@ -502,7 +545,7 @@ fn native_unsafe_get_int_at_address(
         None => {
             // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw read.
             let mut b = [0u8; 4];
-            if real_ptr_read(ctx, addr, &mut b) {
+            if real_ptr_read(ctx, addr, &mut b)? {
                 return Ok(Some(Value::Int(i32::from_le_bytes(b))));
             }
             invalidate_arena_cache();
@@ -534,7 +577,7 @@ fn native_unsafe_put_int_at_address(
     // audit-round6 fix (LOW): see `put_byte_at_address`. A stale cache hit
     // must not mask the validated accessor's freed-arena rejection.
     // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw write.
-    if real_ptr_write(ctx, addr, &v.to_le_bytes()) {
+    if real_ptr_write(ctx, addr, &v.to_le_bytes())? {
         return Ok(None);
     }
     invalidate_arena_cache();
@@ -563,7 +606,7 @@ fn native_unsafe_get_long_at_address(
         None => {
             // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw read.
             let mut b = [0u8; 8];
-            if real_ptr_read(ctx, addr, &mut b) {
+            if real_ptr_read(ctx, addr, &mut b)? {
                 return Ok(Some(Value::Long(i64::from_le_bytes(b))));
             }
             invalidate_arena_cache();
@@ -596,7 +639,7 @@ fn native_unsafe_put_long_at_address(
     // audit-round6 fix (LOW): see `put_byte_at_address`. A stale cache hit
     // must not mask the validated accessor's freed-arena rejection.
     // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw write.
-    if real_ptr_write(ctx, addr, &v.to_le_bytes()) {
+    if real_ptr_write(ctx, addr, &v.to_le_bytes())? {
         return Ok(None);
     }
     invalidate_arena_cache();

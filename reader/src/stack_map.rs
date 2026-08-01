@@ -12,6 +12,10 @@
 //! the previous frame (or the start of the method for the first frame).
 
 use crate::class_reader_error::ClassReaderError;
+// Preallocation is bounded by the input length via `bounded_capacity`; the
+// limit constants live in `crate::limits` (see
+// `docs/security/reader/limits.md`).
+use crate::limits::{bounded_capacity, MAX_STACK_MAP_ENTRIES};
 
 // ---------------------------------------------------------------------------
 // Verification type info — the type tags used in StackMapTable
@@ -127,11 +131,27 @@ impl StackMapTable {
         let mut pos = 0;
 
         let number_of_entries = read_u16(data, &mut pos)?;
-        // Cap pre-allocation to prevent malicious class files from causing huge allocations.
-        // 65535 is the maximum number of bytecode offsets in a Code attribute.
-        const MAX_STACK_MAP_ENTRIES: usize = 65535;
-        let mut entries =
-            Vec::with_capacity((number_of_entries as usize).min(MAX_STACK_MAP_ENTRIES));
+        // Cap pre-allocation to prevent malicious class files from causing
+        // huge allocations. `MAX_STACK_MAP_ENTRIES` (65 535) is the maximum
+        // number of bytecode offsets in a Code attribute, so it is the
+        // absolute ceiling — but on its own it is a *weak* bound: a
+        // two-byte header can still ask for 65 535 `StackMapFrame`s (each
+        // carrying two `Vec`s, ~56 bytes) from an otherwise empty
+        // attribute, i.e. several megabytes reserved before the first
+        // frame byte is even read.
+        //
+        // C2 remediation: reserve from what the input can actually hold.
+        // The shortest legal frame is one byte (`same_frame`, tags 0..=63),
+        // so `remaining` bytes can hold at most `remaining` frames.
+        // Under-reserving is free — the `Vec` grows on demand — while
+        // over-reserving is the whole attack.
+        let remaining = data.len().saturating_sub(pos);
+        const MIN_FRAME_BYTES: usize = 1; // same_frame is a bare tag byte
+        let mut entries = Vec::with_capacity(bounded_capacity(
+            (number_of_entries as usize).min(MAX_STACK_MAP_ENTRIES),
+            MIN_FRAME_BYTES,
+            remaining,
+        ));
 
         for _ in 0..number_of_entries {
             let frame = parse_frame(data, &mut pos)?;
@@ -275,8 +295,18 @@ fn parse_verification_types(
     pos: &mut usize,
     count: u16,
 ) -> Result<Vec<VerificationTypeInfo>, ClassReaderError> {
-    // Cap pre-allocation — max_locals and max_stack are each u16, so 65535 is the absolute max.
-    let mut types = Vec::with_capacity((count as usize).min(65535));
+    // Cap pre-allocation — max_locals and max_stack are each u16, so 65535
+    // is the absolute max. C2 remediation: also bound by the bytes that
+    // remain. A `verification_type_info` is at least one tag byte, so a
+    // `full_frame` claiming 65 535 locals in a 4-byte attribute reserves
+    // nothing rather than a quarter-megabyte it can never fill.
+    const MIN_VERIFICATION_TYPE_BYTES: usize = 1;
+    let remaining = data.len().saturating_sub(*pos);
+    let mut types = Vec::with_capacity(bounded_capacity(
+        count as usize,
+        MIN_VERIFICATION_TYPE_BYTES,
+        remaining,
+    ));
     for _ in 0..count {
         types.push(parse_verification_type(data, pos)?);
     }
@@ -763,5 +793,126 @@ mod tests {
         // pos now at end: a further read is out of bounds.
         assert!(read_u16(&data, &mut pos).is_err());
         assert_eq!(pos, 2);
+    }
+
+    // ── Declared-count vs. input-length boundary corpus ──────────────────
+
+    /// `number_of_entries` is a `u2` in a two-byte header. Declaring the
+    /// maximum with no frame bytes must be an error, and — critically —
+    /// must not reserve 65 535 `StackMapFrame`s first. The must-accept
+    /// twins below keep this from passing vacuously.
+    #[test]
+    fn hostile_frame_count_is_rejected_and_honest_counts_still_parse() {
+        // Must reject: 65 535 frames declared, zero frame bytes present.
+        assert!(StackMapTable::parse(&u16::MAX.to_be_bytes()).is_err());
+
+        // Must accept: three `same_frame` frames (tags 0..=63), present.
+        let table = StackMapTable::parse(&build_table(&[0u8, 1, 2], 3))
+            .expect("three same_frames must parse");
+        assert_eq!(table.entries.len(), 3);
+
+        // Off-by-one: one more frame declared than present.
+        assert!(StackMapTable::parse(&build_table(&[0u8, 1, 2], 4)).is_err());
+
+        // Zero-length: an empty table is legal.
+        let empty = StackMapTable::parse(&build_table(&[], 0)).expect("empty table must parse");
+        assert!(empty.entries.is_empty());
+
+        // A truncated header (one byte) is an error, not a panic.
+        assert!(StackMapTable::parse(&[0x00]).is_err());
+        assert!(StackMapTable::parse(&[]).is_err());
+    }
+
+    /// `full_frame` carries two `u2` counts of `verification_type_info`.
+    /// Each is capped at 65 535 by its width; neither may drive a
+    /// reservation the attribute cannot fill.
+    #[test]
+    fn full_frame_type_counts_are_bounded_by_the_remaining_bytes() {
+        // Must reject: num_locals = 65 535 with no type bytes following.
+        let mut hostile = vec![255u8, 0, 0]; // tag, offset_delta
+        hostile.extend_from_slice(&u16::MAX.to_be_bytes()); // num_locals
+        assert!(StackMapTable::parse(&build_table(&hostile, 1)).is_err());
+
+        // Must reject: honest locals, then num_stack = 65 535 with nothing
+        // after it. Exercises the second count independently.
+        let mut hostile_stack = vec![255u8, 0, 0];
+        hostile_stack.extend_from_slice(&1u16.to_be_bytes()); // num_locals = 1
+        hostile_stack.push(ITEM_INTEGER);
+        hostile_stack.extend_from_slice(&u16::MAX.to_be_bytes()); // num_stack
+        assert!(StackMapTable::parse(&build_table(&hostile_stack, 1)).is_err());
+
+        // Must accept: one local, one stack entry, both present.
+        let mut ok = vec![255u8, 0, 0];
+        ok.extend_from_slice(&1u16.to_be_bytes());
+        ok.push(ITEM_INTEGER);
+        ok.extend_from_slice(&1u16.to_be_bytes());
+        ok.push(ITEM_FLOAT);
+        let table =
+            StackMapTable::parse(&build_table(&ok, 1)).expect("well-formed full_frame must parse");
+        match &table.entries[0] {
+            StackMapFrame::FullFrame { locals, stack, .. } => {
+                assert_eq!(locals.len(), 1);
+                assert_eq!(stack.len(), 1);
+            }
+            other => panic!("expected FullFrame, got {other:?}"),
+        }
+
+        // Zero-length: a full_frame with no locals and no stack is legal.
+        let mut empty = vec![255u8, 0, 0];
+        empty.extend_from_slice(&0u16.to_be_bytes());
+        empty.extend_from_slice(&0u16.to_be_bytes());
+        assert!(StackMapTable::parse(&build_table(&empty, 1)).is_ok());
+    }
+
+    /// The delta accumulator in `absolute_offsets` must reject exactly at
+    /// `u16::MAX + 1` and accept exactly at `u16::MAX`.
+    #[test]
+    fn absolute_offset_accumulator_boundary() {
+        // Accept: a single frame landing exactly on u16::MAX.
+        let at_max = StackMapTable {
+            entries: vec![StackMapFrame::SameFrameExtended {
+                offset_delta: u16::MAX,
+            }],
+        };
+        assert_eq!(at_max.absolute_offsets().unwrap(), vec![u16::MAX]);
+
+        // Reject: one past it. The second frame's absolute offset is
+        // 65535 + 0 + 1 = 65536.
+        let past_max = StackMapTable {
+            entries: vec![
+                StackMapFrame::SameFrameExtended {
+                    offset_delta: u16::MAX,
+                },
+                StackMapFrame::SameFrame { offset_delta: 0 },
+            ],
+        };
+        assert!(past_max.absolute_offsets().is_err());
+
+        // Accept: the largest pair that still fits — 65534 then delta 0
+        // (65534 + 0 + 1 = 65535).
+        let just_fits = StackMapTable {
+            entries: vec![
+                StackMapFrame::SameFrameExtended {
+                    offset_delta: u16::MAX - 1,
+                },
+                StackMapFrame::SameFrame { offset_delta: 0 },
+            ],
+        };
+        assert_eq!(
+            just_fits.absolute_offsets().unwrap(),
+            vec![u16::MAX - 1, u16::MAX]
+        );
+
+        // A long run of maximal deltas saturates rather than overflowing
+        // the u32 accumulator in a debug build; the bound check still
+        // rejects.
+        let many = StackMapTable {
+            entries: (0..64)
+                .map(|_| StackMapFrame::SameFrameExtended {
+                    offset_delta: u16::MAX,
+                })
+                .collect(),
+        };
+        assert!(many.absolute_offsets().is_err());
     }
 }

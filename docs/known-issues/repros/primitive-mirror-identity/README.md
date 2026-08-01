@@ -2,7 +2,7 @@
 
 Both probes **pass** on CratonVM and match HotSpot. They are checked in as
 *eliminations*, not reproducers: they encode two plausible explanations for
-[`../../spring/spring-bean-attribute-type-null-flake.md`](../../spring/spring-bean-attribute-type-null-flake.md)
+[`../../spring/spring-bean-attribute-type-null-flake.md`](../../springboot/spring-bean-attribute-type-null-flake.md)
 that have been tested and are not it, so nobody spends an afternoon on them
 again.
 

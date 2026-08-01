@@ -8,7 +8,10 @@
 /// upper bound that rejects malicious headers like
 /// `low = i32::MIN+1, high = i32::MAX` (which would otherwise pre-allocate
 /// ~8.6 GB) while accepting any switch that can fit in a real method body.
-pub const MAX_SWITCH_ENTRIES: usize = 16_384;
+///
+/// Canonical value lives in [`crate::limits::MAX_SWITCH_ENTRIES`]; this
+/// re-export is kept because downstream crates reference it by this path.
+pub const MAX_SWITCH_ENTRIES: usize = crate::limits::MAX_SWITCH_ENTRIES;
 
 /// Out-of-line payload of a `tableswitch`.
 ///

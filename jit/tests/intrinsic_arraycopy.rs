@@ -397,12 +397,14 @@ fn compile_despec_arraycopy_with_dispatch(
         5, // num_params: src, srcPos, dst, dstPos, len
         5, // max_locals
         true,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        Vec::new(), // multianewarray_info
+        Vec::new(), // field_info
+        Vec::new(), // typecheck_info
+        Vec::new(), // static_field_info
+        Vec::new(), // new_info
+        Vec::new(), // new_deferred_info
+        Vec::new(), // anewarray_info
+        Vec::new(), // anewarray_deferred_info
         vec![(6, info as *const JitInvokeInfo)],
         vec![(
             6,

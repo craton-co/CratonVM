@@ -66,8 +66,10 @@ use crate::JitRuntimeHelpers;
 /// `build_helpers`) and consumers (the JIT backends) that disagree on this
 /// number disagree on where the helpers live.
 ///
-/// `1` is the revision of the 58-field, 464-byte table shipped today.
-pub const JIT_HELPERS_ABI_VERSION: u32 = 1;
+/// `2` is the revision of the 60-field, 480-byte table shipped today —
+/// revision `1` was the 58-field, 464-byte table, which `2` extends by
+/// appending `new_object_cp` and `anewarray_object_cp`.
+pub const JIT_HELPERS_ABI_VERSION: u32 = 2;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -357,6 +359,14 @@ helper_fn_slots! {
     // (vm_ptr, info_ptr, args_ptr, num_args).
     HelperFnServiceCalleeDeopt, service_callee_deopt, service_callee_deopt_fn,
         (i64, i64, i64, i64) -> i64;
+
+    // Constant-pool-indexed allocation, for a `new`/`anewarray` whose target
+    // class was not loaded when the method compiled — (vm_ptr,
+    // holder_class_id, cp_idx), plus the array length for the `anewarray`
+    // form. See `JitRuntimeHelpers::new_object_cp`.
+    HelperFnNewObjectCp, new_object_cp, new_object_cp_fn, (i64, i64, i64) -> i64;
+    HelperFnAnewarrayObjectCp, anewarray_object_cp, anewarray_object_cp_fn,
+        (i64, i64, i64, i64) -> i64;
 }
 
 // ---------------------------------------------------------------------
@@ -460,6 +470,11 @@ helper_field_table! {
     (jit_card_old_end,               Constant, false),
     (set_throw_bci,                  Function, true),
     (service_callee_deopt,           Function, false),
+    // Constant-pool-indexed allocation. Optional: a hand-built test table
+    // leaves these zero, and the backend then refuses a deferred
+    // (not-yet-loaded) `new`/`anewarray` site instead of emitting a CALL to 0.
+    (new_object_cp,                  Function, false),
+    (anewarray_object_cp,            Function, false),
 }
 
 // ---------------------------------------------------------------------
@@ -480,7 +495,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 58,
+    NUM_HELPER_FIELDS == 60,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -488,8 +503,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 464,
-    "JitRuntimeHelpers size changed (expected 58 * 8 = 464) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 480,
+    "JitRuntimeHelpers size changed (expected 60 * 8 = 480) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -818,6 +833,8 @@ mod tests {
             ("jit_card_old_end", offset_of!(H, jit_card_old_end)),
             ("set_throw_bci", offset_of!(H, set_throw_bci)),
             ("service_callee_deopt", offset_of!(H, service_callee_deopt)),
+            ("new_object_cp", offset_of!(H, new_object_cp)),
+            ("anewarray_object_cp", offset_of!(H, anewarray_object_cp)),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -848,15 +865,15 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 464);
+        assert_eq!(core::mem::size_of::<H>(), 480);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 464);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 480);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 58);
-        assert_eq!(H::NUM_FIELDS, 58);
-        assert_eq!(H::NUM_HELPER_FN_FIELDS, 49);
-        assert_eq!(JIT_HELPERS_ABI_VERSION, 1);
+        assert_eq!(NUM_HELPER_FIELDS, 60);
+        assert_eq!(H::NUM_FIELDS, 60);
+        assert_eq!(H::NUM_HELPER_FN_FIELDS, 51);
+        assert_eq!(JIT_HELPERS_ABI_VERSION, 2);
     }
 
     /// The descriptor table and the crate root's `helper_fields!` list are two
@@ -1009,11 +1026,13 @@ mod tests {
     fn as_words_matches_the_struct_fields() {
         let mut h = H::default();
         h.newarray = 1;
-        h.service_callee_deopt = 2;
+        // The LAST field, whatever it currently is — `anewarray_object_cp`
+        // since the CP-indexed allocation slots were appended.
+        h.anewarray_object_cp = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 58);
+        assert_eq!(w.len(), 60);
     }
 
     /// Build a table with every *required* slot non-zero and every optional
