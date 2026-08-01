@@ -1700,6 +1700,18 @@ impl CountedLoop {
                             return BoundsProof::Refused(RefusalReason::UnboundedIndex);
                         }
                     }
+                    // Discharge against the length's LOWER bound. `length` is a
+                    // range, so an array whose proven minimum already covers the
+                    // demand (`new int[16]` for a `[0,16)` loop) satisfies this
+                    // on every admissible run. Emitting the guard anyway pays a
+                    // preheader compare for a fact already proven, and makes an
+                    // otherwise-`Static` proof look conditional to every
+                    // consumer.
+                    if let Some(lo) = length.lo() {
+                        if (c as i64) <= lo as i64 {
+                            continue;
+                        }
+                    }
                 }
                 guards.push(PreheaderGuard::LengthAtLeast(needed));
             }

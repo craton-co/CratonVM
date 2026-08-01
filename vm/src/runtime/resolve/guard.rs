@@ -622,8 +622,7 @@ fn the_access_control_implementations_are_the_two_known_ones() {
     expected.sort();
 
     assert_eq!(
-        found,
-        expected,
+        found, expected,
         "the set of member access-control implementations changed.\n\n\
          There are supposed to be two, and that is already one too many: \
          `classloading::access_control` implements JVMS §5.4.4 (and is not \
@@ -657,11 +656,16 @@ fn the_scanner_counts_calls_and_not_prose() {
         1
     );
     // Rule 1 — prose is skipped, in all three comment shapes.
-    assert!(is_comment_line("/// walks via find_method_recursive(cid, …)"));
+    assert!(is_comment_line(
+        "/// walks via find_method_recursive(cid, …)"
+    ));
     assert!(is_comment_line("    // .resolution_cache is taken here"));
     assert!(is_comment_line("     * find_field_recursive( is the walk"));
     assert_eq!(
-        hits_in_line("// uses find_method_recursive(a, b)", "find_method_recursive("),
+        hits_in_line(
+            "// uses find_method_recursive(a, b)",
+            "find_method_recursive("
+        ),
         0
     );
     // …and the regression the flag guard's docs describe: a deref at the
@@ -682,7 +686,10 @@ fn the_scanner_counts_calls_and_not_prose() {
         0
     );
     assert_eq!(
-        hits_in_line("fn find_method_recursive(cid: ClassId) {", "find_method_recursive("),
+        hits_in_line(
+            "fn find_method_recursive(cid: ClassId) {",
+            "find_method_recursive("
+        ),
         0
     );
     // The limit of rule 2, recorded rather than discovered later: a
@@ -694,7 +701,10 @@ fn the_scanner_counts_calls_and_not_prose() {
     // scan will not see its declaration OR its call sites written the same
     // way. Add a needle for it rather than assuming this rule covers it.
     assert_eq!(
-        hits_in_line("pub fn find_method_recursive<'a>(", "find_method_recursive("),
+        hits_in_line(
+            "pub fn find_method_recursive<'a>(",
+            "find_method_recursive("
+        ),
         0
     );
     // Rule 3 — the leading dot keeps the initiating-loader table out.
@@ -734,9 +744,7 @@ fn a_planted_bypass_is_caught_and_the_allowlist_is_tolerated() {
                 .map(|(_, _, c, _)| *c)
             {
                 Some(expected) if expected == *count => {}
-                Some(expected) => {
-                    offenders.push(format!("{path}/{needle}: {count} vs {expected}"))
-                }
+                Some(expected) => offenders.push(format!("{path}/{needle}: {count} vs {expected}")),
                 None => offenders.push(format!("{path}/{needle}: {count}, unlisted")),
             }
         }
@@ -752,10 +760,7 @@ fn a_planted_bypass_is_caught_and_the_allowlist_is_tolerated() {
 
     // The allowlisted site at its allowlisted count is tolerated.
     let mut hits: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
-    hits.insert(
-        ("vm/src/runtime/old_site.rs".to_string(), NEEDLES[0]),
-        2,
-    );
+    hits.insert(("vm/src/runtime/old_site.rs".to_string(), NEEDLES[0]), 2);
     assert!(verdict(&hits, allowed).is_empty());
 
     // A brand-new file with a bypass is caught.
@@ -767,20 +772,14 @@ fn a_planted_bypass_is_caught_and_the_allowlist_is_tolerated() {
     // A new bypass added to an ALREADY-allowlisted file is caught too — this
     // is the case a presence-only allowlist would miss.
     let mut hits: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
-    hits.insert(
-        ("vm/src/runtime/old_site.rs".to_string(), NEEDLES[0]),
-        3,
-    );
+    hits.insert(("vm/src/runtime/old_site.rs".to_string(), NEEDLES[0]), 3);
     let offenders = verdict(&hits, allowed);
     assert_eq!(offenders.len(), 1);
     assert!(offenders[0].contains("3 vs 2"), "{offenders:?}");
 
     // And a MIGRATED site leaves a stale row, which is also a failure.
     let mut hits: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
-    hits.insert(
-        ("vm/src/runtime/old_site.rs".to_string(), NEEDLES[0]),
-        1,
-    );
+    hits.insert(("vm/src/runtime/old_site.rs".to_string(), NEEDLES[0]), 1);
     let offenders = verdict(&hits, allowed);
     assert_eq!(offenders.len(), 1);
     assert!(offenders[0].contains("1 vs 2"), "{offenders:?}");

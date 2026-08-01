@@ -364,9 +364,7 @@ impl From<LinkageError> for ResolveError {
                 class_name,
                 field_name,
             },
-            LinkageError::IllegalAccessError { message } => {
-                ResolveError::IllegalAccess { message }
-            }
+            LinkageError::IllegalAccessError { message } => ResolveError::IllegalAccess { message },
             LinkageError::NoClassDefFoundError { class_name } => {
                 ResolveError::NoClassDefFound { class_name }
             }
@@ -399,9 +397,7 @@ impl From<ResolveError> for LinkageError {
                 class_name,
                 field_name,
             },
-            ResolveError::IllegalAccess { message } => {
-                LinkageError::IllegalAccessError { message }
-            }
+            ResolveError::IllegalAccess { message } => LinkageError::IllegalAccessError { message },
             ResolveError::NoClassDefFound { class_name } => {
                 LinkageError::NoClassDefFoundError { class_name }
             }
@@ -1104,10 +1100,7 @@ impl<'a> MemberResolver<'a> {
     /// fallback, because installing one would change dispatch behaviour.
     pub fn vtable_manager(
         &self,
-    ) -> Result<
-        Arc<parking_lot::RwLock<crate::runtime::vtable::VtableManager>>,
-        ResolveError,
-    > {
+    ) -> Result<Arc<parking_lot::RwLock<crate::runtime::vtable::VtableManager>>, ResolveError> {
         let mine = &self.shared.classes.vtable_manager;
         match crate::runtime::vtable::global_vtable_manager() {
             // No VM has installed one (isolated unit-test harness): this VM's

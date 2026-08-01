@@ -134,6 +134,51 @@ pub enum Op {
     Call,
     MonitorEnter,
     MonitorExit,
+    /// `Object.wait` / `wait(long)`. Input `[obj]`.
+    ///
+    /// Semantically a *monitor* operation, not a call: it requires the monitor
+    /// to be held (else `IllegalMonitorStateException`), releases it to the
+    /// recorded depth, blocks, and reacquires it at that same depth. Every one
+    /// of those three facts is destroyed by eliding the monitor, so an object
+    /// with a live `MonitorWait` is refused both lock transforms outright — see
+    /// [`find_lock_elision_plans`].
+    ///
+    /// NOTE: no producer yet. `ir_op_to_ea_op` maps the underlying
+    /// `invokevirtual` to [`Op::Call`], which arg-escapes the receiver and
+    /// therefore already refuses the elision. This variant makes that refusal
+    /// *intentional and reportable* rather than a side effect of the call rule,
+    /// and it keeps the refusal alive if `Op::Call` ever gains an
+    /// "inlined intrinsic, does not escape" arm.
+    MonitorWait,
+    /// `Object.notify` / `notifyAll`. Input `[obj]`.
+    ///
+    /// Same status and same treatment as [`Op::MonitorWait`]: it requires the
+    /// monitor to be held, and the thread it wakes is a thread that must have
+    /// been able to reach the object — so a `notify` on an object the analysis
+    /// believes is confined is a contradiction the analysis fails closed on
+    /// rather than resolves.
+    MonitorNotify,
+    /// A safepoint / deoptimization point. Inputs: the references the frame
+    /// state names (may be empty).
+    ///
+    /// Present so lock **coarsening** can ask "does a deopt land between these
+    /// two regions?". A deopt in a coarsened gap would reconstruct an
+    /// interpreter frame whose monitor set says the object is *unlocked* while
+    /// the compiled frame holds it — see [`find_lock_coarsening_plans`].
+    ///
+    /// NOTE: no producer yet. `ir::Graph` carries safepoints in a side table
+    /// (`ir_graph.safepoints`), not as nodes, and `escape_analysis_from_ir`
+    /// does not bridge them. Until it does, [`LockRefusal::SafepointInGap`] is
+    /// unreachable from production IR and coarsening relies on the gap
+    /// allowlist alone — which admits no node that can be a safepoint.
+    Safepoint,
+    /// `athrow`. Inputs: the thrown reference.
+    ///
+    /// Throwing publishes the reference out of the frame (same rule as
+    /// [`Op::Return`]) and unwinds every monitor the frame holds.
+    ///
+    /// NOTE: no producer yet — `ir_op_to_ea_op` has no `athrow` arm.
+    Throw,
     ArrayLength,
     /// Reference **identity comparison** (`if_acmpeq` / `if_acmpne`, and the
     /// `Objects.isNull`-style folds that lower to one).  Inputs: the compared
@@ -810,8 +855,11 @@ fn build_connection_graph(graph: &Graph) -> ConnectionGraph {
                 }
             }
 
-            // Return: any ref input escapes globally.
-            Op::Return => {
+            // Return / Throw: any ref input escapes globally.  A thrown
+            // reference leaves the frame exactly as a returned one does — the
+            // handler that catches it is, from this method's point of view,
+            // outside.
+            Op::Return | Op::Throw => {
                 for &inp in &node.inputs {
                     if is_ref_producer(graph, inp) {
                         cg.set_escape(inp, EscapeState::GlobalEscape);
@@ -1118,8 +1166,13 @@ pub fn find_identity_observations(cg: &ConnectionGraph, graph: &Graph) -> Vec<(N
         let observed: &[NodeId] = match &node.op {
             // The monitor is the object header of input 0 — the same operand
             // `find_lock_elisions` reads, so the two agree about which object a
-            // monitor names.
-            Op::MonitorEnter | Op::MonitorExit | Op::IdentityHash => match node.inputs.first() {
+            // monitor names.  `wait`/`notify` are monitor operations too: they
+            // read the header AND require the monitor to be held.
+            Op::MonitorEnter
+            | Op::MonitorExit
+            | Op::MonitorWait
+            | Op::MonitorNotify
+            | Op::IdentityHash => match node.inputs.first() {
                 Some(first) => std::slice::from_ref(first),
                 None => continue,
             },
@@ -1394,7 +1447,12 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                     // disagree. Refuse either way — see
                     // `find_identity_observations` for the two-phase story that
                     // makes a synchronized object replaceable.
-                    Op::MonitorEnter | Op::MonitorExit | Op::RefCompare | Op::IdentityHash => {
+                    Op::MonitorEnter
+                    | Op::MonitorExit
+                    | Op::MonitorWait
+                    | Op::MonitorNotify
+                    | Op::RefCompare
+                    | Op::IdentityHash => {
                         can_replace = false;
                         break;
                     }
@@ -1658,8 +1716,8 @@ fn escape_sites_for(cg: &ConnectionGraph, graph: &Graph, alloc: NodeId) -> Vec<N
     for (id, node) in graph.nodes.iter().enumerate() {
         match &node.op {
             Op::Dead => {}
-            // Returning or passing the reference publishes it.
-            Op::Return | Op::Call => {
+            // Returning, throwing or passing the reference publishes it.
+            Op::Return | Op::Throw | Op::Call => {
                 if node
                     .inputs
                     .iter()

@@ -66,8 +66,10 @@
 //! Inherited from the parent module: no panics, no `unwrap`/`expect` outside
 //! `#[cfg(test)]`. Every fallible operation returns [`SelError`].
 
-use super::{base_requires_sib, is_extended, rex, Disp, DispOutOfRange};
-use super::{GPR64_NAMES, RAX, RCX, RDX, RSP, XMM_NAMES};
+use super::{
+    base_requires_sib, is_extended, rex, Disp, DispOutOfRange, GPR64_NAMES, RAX, RCX, RDX, RSP,
+    XMM_NAMES,
+};
 
 // ---------------------------------------------------------------------------
 // Operations, types and operand kinds
@@ -2399,7 +2401,7 @@ fn reg_name(kind: OpKind, reg: u8) -> &'static str {
 fn mem_text(base: u8, index: Option<u8>, scale: u8, disp: i64) -> String {
     let mut s = format!("[{}", GPR64_NAMES[usize::from(base & 15)]);
     if let Some(ix) = index {
-        s.push_str(&format!(" + {}*{}", GPR64_NAMES[usize::from(ix & 15)], scale));
+        s.push_str(&format!(" + {}*{scale}", GPR64_NAMES[usize::from(ix & 15)]));
     }
     if disp < 0 {
         s.push_str(&format!(" - {}", disp.unsigned_abs()));
@@ -2457,8 +2459,7 @@ pub fn render(p: &Pattern, d: &Decoded) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::x64::{RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP};
-    use crate::x64::{R11, R12, R13, R15, R8, R9};
+    use crate::x64::{R11, R12, R13, R15, R8, R9, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP};
 
     // ── reference-emitter harness ─────────────────────────────────────────
 
@@ -2942,7 +2943,8 @@ mod tests {
                         let want = r.emit(|c: &mut super::super::Compiler| {
                             c.emit_movx_r64_mem_disp32(dst, base, disp, bits, signed)
                         });
-                        assert_eq!(sel(&rm(op, ty)), want, "MOV{}X {bits}", if signed { "S" } else { "Z" });
+                        let kind = if signed { "MOVSX" } else { "MOVZX" };
+                        assert_eq!(sel(&rm(op, ty)), want, "{kind} {bits} disp32");
                     }
                 }
             }

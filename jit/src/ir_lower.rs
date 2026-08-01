@@ -10,7 +10,10 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::num::NonZeroU32;
 
-use super::ir::{Graph, IrType, MemKind, NodeId, Op, SafepointSnapshot, NO_NODE};
+use super::ir::{
+    Graph, InlineScopeTable, IrType, MemKind, NodeId, Op, SafepointSnapshot, MAX_INLINE_SCOPE_DEPTH,
+    NO_NODE,
+};
 use super::ir_schedule::Schedule;
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo, JitRuntimeHelpers};
 use crate::bailout::{
@@ -19,7 +22,8 @@ use crate::bailout::{
 };
 use crate::deopt::{
     ir_deopt_entry, DeoptAction, DeoptReason, DeoptVerifier, DeoptimizationPoint, EliminatedValue,
-    EliminationCause, FrameState, FrameValue, MethodFrameLimits, OopCoverage, VirtualObjectState,
+    EliminationCause, FrameState, FrameValue, MethodFrameLimits, OopCoverage, ResumeSemantics,
+    VirtualObjectState,
 };
 use cratonvm_types::{ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
 
@@ -434,6 +438,14 @@ struct Lowerer<'a> {
     /// `Op::New` so a deopt snapshot slot holding it lowers to a
     /// `FrameValue::VirtualObject`. `None` ⇒ disabled (byte-identical default).
     sr_map: Option<&'a ScalarReplacementMap>,
+    /// Which inlined callee each safepoint snapshot belongs to, and the caller
+    /// scopes stacked above it. Consumed by [`Lowerer::caller_chain_for`] to
+    /// fill `FrameState::caller`, which was hard-coded `None` before this
+    /// existed.
+    ///
+    /// Empty on every compile today — `IrBuilder::build` does not inline — and
+    /// an empty table reproduces the historical flat frame states exactly.
+    inline_scopes: &'a InlineScopeTable,
 }
 
 impl<'a> Lowerer<'a> {
@@ -450,6 +462,7 @@ impl<'a> Lowerer<'a> {
         direct_calls: &'a HashMap<usize, (usize, bool)>,
         ic_slots: &'a HashMap<usize, (usize, usize)>,
         compact_fields: &HashMap<usize, (u32, bool, u8)>,
+        inline_scopes: &'a InlineScopeTable,
     ) -> Self {
         // Frame homes of the reference PARAMETERS, in `[rbp - off]` form. Every
         // safepoint map republishes these; see `emit_safepoint_map`.
@@ -645,6 +658,7 @@ impl<'a> Lowerer<'a> {
             service_callee_deopt: helpers.service_callee_deopt,
             branch_hints,
             sr_map,
+            inline_scopes,
         }
     }
 
@@ -3076,13 +3090,19 @@ fn reloc_emit_enabled() -> bool {
                 // baked below). The point's frame state comes from the safepoint
                 // snapshot recorded for `bci` during IR building.
                 let frame_state = self.resolve_frame_state_for_bci(bci);
+                let reason = DeoptReason::UncommonTrap;
                 let point = Box::new(DeoptimizationPoint {
                     native_offset: self.buf.pos() as u32,
                     bci: bci as u32,
-                    reason: DeoptReason::UncommonTrap,
+                    reason,
                     action: DeoptAction::Reinterpret,
                     speculation_id: 0,
                     frame_state,
+                    // The guard fires BEFORE the bytecode it protects, so the
+                    // interpreter re-runs that bytecode. `for_reason` is the
+                    // convention this file already documents, now written down
+                    // in the metadata instead of inferred by each consumer.
+                    semantics: ResumeSemantics::for_reason(reason),
                 });
                 let point_ptr = point.as_ref() as *const DeoptimizationPoint as u64;
                 self.deopt_boxes.push(point);
@@ -3828,9 +3848,14 @@ fn reloc_emit_enabled() -> bool {
     /// snapshot. Falls back to an empty frame if no snapshot exists (e.g. a
     /// hand-built graph that did not register one) — the resume bci is still
     /// carried so the deopt is well-formed.
+    ///
+    /// First match on `bci` wins, exactly as before. The *index* of that match
+    /// is what binds the snapshot to its inlined scope
+    /// ([`InlineScopeTable::snapshot_scope`]), so the search is a `position`
+    /// rather than a `find`.
     fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
-        match self.graph.safepoints.iter().find(|s| s.bci == bci) {
-            Some(sp) => self.resolve_frame_state(sp),
+        match self.graph.safepoints.iter().position(|s| s.bci == bci) {
+            Some(idx) => self.resolve_frame_state(&self.graph.safepoints[idx], idx),
             None => FrameState {
                 method_key: String::new(),
                 bci: bci as u32,
@@ -3974,6 +3999,10 @@ fn reloc_emit_enabled() -> bool {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state,
+            // Null / bounds / div-by-zero guards all fire before the bytecode
+            // they protect; `PendingException` (the one rethrow reason) never
+            // reaches here. See `ResumeSemantics::for_reason`.
+            semantics: ResumeSemantics::for_reason(reason),
         });
         let point_ptr = point.as_ref() as *const DeoptimizationPoint as u64;
         self.deopt_boxes.push(point);
@@ -4111,7 +4140,35 @@ fn reloc_emit_enabled() -> bool {
     /// `method_key` is left to the VM caller to fill (the lowerer does not
     /// know it); deopt resume keys on the running `CompiledMethod`, not this
     /// string. It is recorded empty here.
-    fn resolve_frame_state(&self, sp: &SafepointSnapshot) -> FrameState {
+    ///
+    /// `index` is the snapshot's position in `Graph::safepoints`, which is what
+    /// binds it to its inlined scope: `caller` is the chain of frames parked
+    /// mid-`invoke` above this one ([`Self::caller_chain_for`]). With an empty
+    /// [`InlineScopeTable`] — every compile today — `caller` is `None` and this
+    /// produces exactly the frame state it always did.
+    fn resolve_frame_state(&self, sp: &SafepointSnapshot, index: usize) -> FrameState {
+        let (locals, stack) = self.resolve_frame_values(sp);
+        FrameState {
+            method_key: String::new(),
+            bci: sp.bci as u32,
+            locals,
+            stack,
+            monitors: Vec::new(),
+            caller: self.caller_chain_for(index),
+        }
+    }
+
+    /// The `(locals, stack)` halves of one snapshot's frame — everything
+    /// [`Self::resolve_frame_state`] builds except the identity and the caller
+    /// chain.
+    ///
+    /// Split out so [`Self::caller_chain_for`] can resolve a *caller's*
+    /// snapshot without re-entering `resolve_frame_state`. Chaining those two
+    /// would be mutually recursive, and a table that (wrongly) named a scope's
+    /// own snapshot as its `caller_snapshot` would recurse until the stack ran
+    /// out — inside a compile, for a metadata defect. There is no cycle to
+    /// defend against here because this function never looks at a scope.
+    fn resolve_frame_values(&self, sp: &SafepointSnapshot) -> (Vec<FrameValue>, Vec<FrameValue>) {
         // Guard-surviving scalar replacement (producer): when `sr_map` is set, a
         // snapshot slot holding a scalar-replaced (now-`Op::Dead`) `Op::New`
         // lowers to a `FrameValue::VirtualObject` (first occurrence) /
@@ -4155,23 +4212,68 @@ fn reloc_emit_enabled() -> bool {
                     self.frame_value_for(n)
                 });
             }
-            return FrameState {
-                method_key: String::new(),
-                bci: sp.bci as u32,
+            return (locals, stack);
+        }
+        (
+            sp.locals.iter().map(|&n| self.frame_value_for(n)).collect(),
+            sp.stack.iter().map(|&n| self.frame_value_for(n)).collect(),
+        )
+    }
+
+    /// The chain of inlined **caller** frames above the snapshot at `index`,
+    /// outermost last — i.e. exactly what `FrameState::caller` wants.
+    ///
+    /// `None` when the snapshot belongs to no inlined callee, which is every
+    /// snapshot on every compile today (`IrBuilder::build` does not inline, so
+    /// [`Lowerer::inline_scopes`] is empty). The early return keeps that path
+    /// allocation-free.
+    ///
+    /// ## Fail-closed on an undescribed caller
+    ///
+    /// A caller frame is not empty: its locals and operand stack are live, and
+    /// a resume has to rebuild them. When the scope names no
+    /// `caller_snapshot` — or names one that does not exist — this emits a
+    /// frame holding a single [`FrameValue::Unsupported`] rather than an empty
+    /// one. An empty caller frame is *silently wrong*: every resume sink maps a
+    /// missing slot to `Value::Int(0)`, so the interpreter would resume the
+    /// caller with all-zero locals and no error anywhere. `Unsupported` makes
+    /// the whole chain fail [`crate::deopt::frame_state_is_resumable`], so the
+    /// deopt takes the safe whole-method re-run instead. That predicate walks
+    /// the caller chain precisely so this cannot be resumed as if clean.
+    fn caller_chain_for(&self, index: usize) -> Option<Box<FrameState>> {
+        if self.inline_scopes.is_empty() {
+            return None;
+        }
+        let scope = self.inline_scopes.snapshot_scope(index)?;
+        // Outermost-first, so each frame can be built with the one already
+        // built as its own caller. `chain` is capped at
+        // `MAX_INLINE_SCOPE_DEPTH`, so this cannot run away on a bad table.
+        let chain = self.inline_scopes.chain(scope);
+        debug_assert!(chain.len() <= MAX_INLINE_SCOPE_DEPTH);
+        let mut built: Option<Box<FrameState>> = None;
+        for &handle in chain.iter().rev() {
+            let Some(sc) = self.inline_scopes.scope(handle) else {
+                continue;
+            };
+            let described = sc
+                .caller_snapshot
+                .and_then(|si| self.graph.safepoints.get(si as usize))
+                .map(|sp| self.resolve_frame_values(sp));
+            let (locals, stack) = match described {
+                Some(parts) => parts,
+                // See "Fail-closed on an undescribed caller" above.
+                None => (vec![FrameValue::Unsupported], Vec::new()),
+            };
+            built = Some(Box::new(FrameState {
+                method_key: sc.method_key.clone(),
+                bci: sc.caller_bci,
                 locals,
                 stack,
                 monitors: Vec::new(),
-                caller: None,
-            };
+                caller: built.take(),
+            }));
         }
-        FrameState {
-            method_key: String::new(),
-            bci: sp.bci as u32,
-            locals: sp.locals.iter().map(|&n| self.frame_value_for(n)).collect(),
-            stack: sp.stack.iter().map(|&n| self.frame_value_for(n)).collect(),
-            monitors: Vec::new(),
-            caller: None,
-        }
+        built
     }
 
     /// Block where the deopt at `bci` fires — the program point all of a
@@ -4368,21 +4470,23 @@ fn reloc_emit_enabled() -> bool {
     /// search. Snapshots whose bci emitted no machine code are skipped.
     fn build_deopt_points(&self) -> Vec<DeoptimizationPoint> {
         let mut points: Vec<DeoptimizationPoint> = Vec::with_capacity(self.graph.safepoints.len());
-        for sp in &self.graph.safepoints {
+        for (index, sp) in self.graph.safepoints.iter().enumerate() {
             let native_offset = match self.bci_native.get(&sp.bci) {
                 Some(&off) => off as u32,
                 // bci produced no node / no machine code — nothing to anchor.
                 None => continue,
             };
+            // No speculation yet — these are plain resume points (step 2,
+            // emit-and-discard). A real guard (step 3) sets its own reason.
+            let reason = DeoptReason::TransferToInterpreter;
             points.push(DeoptimizationPoint {
                 native_offset,
                 bci: sp.bci as u32,
-                // No speculation yet — these are plain resume points (step 2,
-                // emit-and-discard). A real guard (step 3) sets its own reason.
-                reason: DeoptReason::TransferToInterpreter,
+                reason,
                 action: DeoptAction::Reinterpret,
                 speculation_id: 0,
-                frame_state: self.resolve_frame_state(sp),
+                frame_state: self.resolve_frame_state(sp, index),
+                semantics: ResumeSemantics::for_reason(reason),
             });
         }
         points.sort_by_key(|p| p.native_offset);

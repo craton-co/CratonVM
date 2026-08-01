@@ -4237,7 +4237,8 @@ mod loop_xform_tests {
                     }
                     assert!(
                         trips <= polls * (k + 1) + 2 * (k + 1),
-                        "{:?} k = {k}, n = {n}: {trips} iterations for {polls} polls"
+                        "{:?} k = {k}, n = {n}: {trips} iterations for {polls} polls",
+                        x.kind
                     );
                 }
             }

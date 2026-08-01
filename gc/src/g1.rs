@@ -996,6 +996,17 @@ pub struct G1Region {
     /// mark-start snapshot (its content then has no mark information and
     /// must be treated as live) — the TAMS-equivalent guard.
     pub reuse_epoch: u64,
+    /// G1AUD-5 (defect G1-8) — value of [`G1Collector::rset_cache_epoch`] at
+    /// this region's most recent [`Self::reset`].
+    ///
+    /// Remembered-set entries carry the generation they were recorded in
+    /// (`RememberedSet::add_reference_in_generation`); an entry naming THIS
+    /// region as a source is dead once `recycled_in_generation` exceeds its
+    /// stamp, because `reset` zero-filled everything that could have held the
+    /// edge. Starts at 0 (== the initial `rset_cache_epoch`), so an entry
+    /// recorded before any collection is never mistaken for stale, and a reset
+    /// site that ever forgets to advance it only over-retains.
+    pub recycled_in_generation: u64,
     /// Per-region mark bitmap for concurrent marking.
     ///
     /// Round-2 fix (HIGH — GC #5): the bitmap is keyed off the region's
@@ -1029,6 +1040,7 @@ impl G1Region {
             pin_count: 0,
             age: 0,
             reuse_epoch: 0,
+            recycled_in_generation: 0,
             mark_bitmap,
         }
     }
@@ -1059,7 +1071,14 @@ impl G1Region {
     }
 
     /// Reset this region to Free state.
-    fn reset(&mut self) {
+    ///
+    /// `rset_generation` is the collector's current
+    /// [`G1Collector::rset_cache_epoch`], which every recycle/retype phase
+    /// bumps before it touches a region. Recording it here is what lets the
+    /// remembered set drop entries that name this region as a source from an
+    /// earlier incarnation (G1AUD-5 / defect G1-8): the parameter is mandatory
+    /// so a new reset site cannot silently skip the stamp.
+    fn reset(&mut self, rset_generation: u64) {
         self.region_type = RegionType::Free;
         self.cursor = 0;
         self.live_bytes = 0;
@@ -1071,6 +1090,11 @@ impl G1Region {
         // New incarnation: content allocated from here on postdates any
         // in-flight mark cycle's snapshot (see `cleanup`).
         self.reuse_epoch = self.reuse_epoch.wrapping_add(1);
+        // G1AUD-5: every rset entry naming this region as a source with a
+        // stamp strictly below this value describes an object this reset just
+        // zero-filled. Monotone by construction (`rset_cache_epoch` only ever
+        // increases), so a later reset can never lower the bar.
+        self.recycled_in_generation = rset_generation;
         // Round-2 fix (HIGH — GC #5): clear stale mark bits so they don't
         // pollute the next concurrent-mark cycle. The Vec is never
         // reallocated (only `fill(0)`'d) so the bitmap's base address
@@ -1904,6 +1928,9 @@ impl G1Collector {
             .collect();
 
         let mut bytes_freed = 0usize;
+        // G1AUD-5: every pause bumps `rset_cache_epoch` before it reclassifies
+        // anything, so this reads the generation this pause owns.
+        let generation = self.rset_generation();
         for &cset_idx in cset {
             if failed.contains(&cset_idx) {
                 if regions[cset_idx].region_type == RegionType::Eden {
@@ -1917,7 +1944,7 @@ impl G1Collector {
                     );
                 }
                 bytes_freed += regions[cset_idx].cursor;
-                regions[cset_idx].reset();
+                regions[cset_idx].reset(generation);
             }
         }
         bytes_freed
@@ -5777,6 +5804,11 @@ impl G1Collector {
         // fast-path cache before that reclassification — see
         // `rset_cache_epoch`.
         self.rset_cache_epoch.fetch_add(1, Ordering::Release);
+        // G1AUD-5: the generation this cleanup owns. Read AFTER the bump so
+        // every region recycled below is stamped with a value strictly greater
+        // than any generation a still-running mutator could have recorded an
+        // edge in.
+        let cleanup_generation = self.rset_generation();
         let region_size = self.config.region_size;
         // G1MARK-8 fail-safe: the marker skipped an implausible-header gray
         // entry this cycle, so the closure may be incomplete — a 0-live
@@ -5998,7 +6030,7 @@ impl G1Collector {
                         region.cursor
                     );
                 }
-                region.reset();
+                region.reset(cleanup_generation);
             }
         }
 
@@ -6179,8 +6211,9 @@ impl G1Collector {
             let pinned = regions[i..end].iter().any(|r| r.pinned);
             if regions[i].live_bytes == 0 && !pinned {
                 reclaimed = reclaimed.saturating_add(total_size);
+                let generation = self.rset_generation();
                 for region in &mut regions[i..end] {
-                    region.reset();
+                    region.reset(generation);
                 }
                 i = end;
             } else {
@@ -6911,6 +6944,69 @@ impl G1Collector {
     /// block reuse) with a matching epoch history, which let this fast
     /// path write through a pointer into the dropped collector's freed
     /// regions storage (intermittent 0xC0000374 under parallel gc tests).
+    /// G1AUD-5 (defect G1-8) — the current remembered-set *generation*.
+    ///
+    /// This is [`Self::rset_cache_epoch`], reused as a monotone reclassification
+    /// clock: it is bumped (Release, under the regions lock) at the start of
+    /// every phase that can recycle or re-type a region, so within one
+    /// generation no region is reset. Every rset entry is stamped with the
+    /// generation it was recorded in and every recycled region records the
+    /// generation it was reset in (`G1Region::recycled_in_generation`); an entry
+    /// is dead exactly when `stamp < source.recycled_in_generation`.
+    ///
+    /// `Acquire` pairs with the `Release` bump so a mutator that observes a new
+    /// generation also observes the reclassification that caused it.
+    #[inline]
+    fn rset_generation(&self) -> u64 {
+        self.rset_cache_epoch.load(Ordering::Acquire)
+    }
+
+    /// G1AUD-5 — is this remembered-set entry dead?
+    ///
+    /// True when the source region was recycled *after* the edge was recorded:
+    /// [`G1Region::reset`] zero-filled the region and cleared its own rset, so
+    /// nothing that could have held the edge survived. An out-of-range source
+    /// index is also dead (it can never be walked).
+    ///
+    /// Deliberately a strict `<`: an edge recorded in the SAME generation that
+    /// later reset the source (the Phase-4 rebuild runs before Phase 5's frees)
+    /// is retained. That over-retains for one cycle and is the fail-safe
+    /// direction — the scan side independently refuses `Free` sources, so a
+    /// retained-but-dead entry costs a lookup, while a dropped-but-live one is
+    /// a use-after-free.
+    fn rset_entry_is_stale(regions: &[G1Region], source: usize, recorded_generation: u64) -> bool {
+        match regions.get(source) {
+            Some(r) => recorded_generation < r.recycled_in_generation,
+            None => true,
+        }
+    }
+
+    /// G1AUD-5 — the remembered-set sources of `cset` that are still live,
+    /// deduplicated.
+    ///
+    /// Drops entries whose source was recycled since the edge was recorded
+    /// (defect G1-8: such a source, once re-typed into a live region, was
+    /// otherwise re-walked *wholesale* every pause on behalf of an object that
+    /// no longer exists, resurrecting its referents). `Free` sources are left
+    /// to `scan_source_region_for_cset_refs`'s own early return, which already
+    /// handles them.
+    fn live_rset_sources(
+        regions: &[G1Region],
+        cset: &[usize],
+    ) -> std::collections::HashSet<usize> {
+        let mut set = std::collections::HashSet::new();
+        for &cset_idx in cset {
+            // `sources_with_generations()` snapshots under the per-rset mutex
+            // and returns owned pairs, so the lock is not held across the body.
+            for (source, generation) in regions[cset_idx].rset.sources_with_generations() {
+                if !Self::rset_entry_is_stale(regions, source, generation) {
+                    set.insert(source);
+                }
+            }
+        }
+        set
+    }
+
     pub fn post_write_barrier_rset(&self, src_obj: ObjectRef, stored_ref: ObjectRef) {
         let src_addr = src_obj.as_ptr() as usize;
         let dst_addr = stored_ref.as_ptr() as usize;

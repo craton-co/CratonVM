@@ -2611,6 +2611,30 @@ fn unroll(graph: &mut Graph) -> bool {
         if to_clone.len() > UNROLL_MAX_BODY {
             continue;
         }
+        // Refuse a loop whose body (or carried phi) is named by a safepoint
+        // snapshot.
+        //
+        // Unrolling kills every `to_clone` node and every carried phi below.
+        // Those kills do not route `graph.safepoints`, so `eliminate_dead_nodes`'
+        // defensive normalisation later rewrites the stranded slots to
+        // `NO_NODE`, which `ir_lower::frame_value_for` resolves to
+        // `FrameValue::Undefined` — a deopt into an unrolled loop silently
+        // loses those interpreter locals.
+        //
+        // Refusing is the correct minimal fix rather than cloning the
+        // snapshots: `SafepointSnapshot` is keyed by a single `bci`, so a loop
+        // unrolled `trip` times has `trip` copies of each body bci and cannot
+        // represent per-iteration frames with one snapshot. Representing them
+        // needs a per-iteration snapshot index, which is a lowerer change.
+        let body_named_by_safepoint = graph.safepoints.iter().any(|sp| {
+            sp.locals
+                .iter()
+                .chain(sp.stack.iter())
+                .any(|&slot| slot != NO_NODE && (to_clone.contains(&slot) || carried_set.contains(&slot)))
+        });
+        if body_named_by_safepoint {
+            continue;
+        }
         // Bail on invariant loads pinned to the loop header (we'd have to
         // re-anchor them); milestone-1 only handles variant (cloned) loads.
         let mut pinned_invariant_load = false;

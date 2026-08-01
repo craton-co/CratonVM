@@ -102,19 +102,212 @@ pub(crate) fn check_host_native_access_or_throw(
 }
 
 // ---------------------------------------------------------------------------
-// Global SecurityManager singleton
+// Per-VM SecurityManager / Policy state
 // ---------------------------------------------------------------------------
 
-/// Process-wide SecurityManager singleton. Kept alive across calls + GC via
-/// `register_var_handle_root`. Stored as `(identity_key, ObjectRef)`: the GC
-/// remaps the var-handle-root REGISTRY entry after a move, but it cannot
-/// rewrite this raw static copy — so every use must re-read the current
-/// address via `read_var_handle_root(identity_key)` (use-after-move otherwise
-/// once the SM object is relocated by a moving young GC or promotion). Before
-/// this fix the slot held a bare `ObjectRef` that was neither rooted nor
-/// remapped, so the installed SM was ALSO collectable. Same pattern as
-/// `ASYNC_POOL` in lib.rs.
-static SECURITY_MANAGER: Mutex<Option<(i32, ObjectRef)>> = Mutex::new(None);
+/// The heap objects this module owns, for ONE VM.
+///
+/// Every slot is `(identity_key, ObjectRef)`: the `ObjectRef` is the address as
+/// last known to this table, and the identity key (stable across moves) lets a
+/// read re-fetch the current address from the owning VM's var-handle-root
+/// registry. Both halves are per-VM — that is the whole point of the struct,
+/// see [`SECURITY_STATE`].
+#[derive(Clone, Copy, Default)]
+struct VmSecurityState {
+    /// The `java.lang.SecurityManager` installed by `System.setSecurityManager`.
+    security_manager: Option<(i32, ObjectRef)>,
+    /// The `java.security.Policy` installed by `Policy.setPolicy`, or the
+    /// lazily-materialised synthetic default.
+    policy_object: Option<(i32, ObjectRef)>,
+    /// The shared read-only `Permissions` collection handed out by
+    /// `Policy.getPermissions(...)`.
+    shared_permissions: Option<(i32, ObjectRef)>,
+}
+
+impl VmSecurityState {
+    /// True once every slot is empty, so the VM's row can be dropped instead of
+    /// kept as an all-`None` shell.
+    fn is_empty(&self) -> bool {
+        self.security_manager.is_none()
+            && self.policy_object.is_none()
+            && self.shared_permissions.is_none()
+    }
+}
+
+/// Process-global INDEX of per-VM security state, keyed by
+/// `NativeContext::vm_identity()`.
+///
+/// It is an index, not a policy: nothing in it is reachable without a
+/// `NativeContext`, so a cross-VM read is unrepresentable at the call sites.
+/// `native-api/src/capability.rs`'s `VM_CAPABILITIES` is the same shape and the
+/// model this follows.
+///
+/// It replaces three process-global `Mutex<Option<(i32, ObjectRef)>>`
+/// singletons — the SecurityManager, the `Policy` object, and the shared
+/// `Permissions` collection — which were wrong twice over:
+///
+///   * **Memory safety.** The rooting they leaned on
+///     (`register_var_handle_root` → `HeapRealm::var_handle_roots`) is PER-VM,
+///     so the `read_var_handle_root(key).unwrap_or(cached)` read MISSED in any
+///     other VM and handed back the installing VM's raw address. That address
+///     belongs to a heap the reading VM's collector never scans and the owning
+///     VM's collector cannot rewrite (it rewrites the registry entry, not the
+///     static copy) — a use-after-move under a moving young GC, and exactly the
+///     unrewritable holder `docs/threading/objectref-concurrency-contract.md`
+///     forbids.
+///   * **Sandboxing.** `System.setSecurityManager(null)` wrote `None` to the
+///     shared slot and thereby disarmed EVERY other VM's `checkExec` /
+///     `loadLibrary` gate, so an unsandboxed VM could unarm a sandboxed one
+///     unchallenged.
+///
+/// Keying on VM identity closes the second; rooting the held refs through
+/// [`gc_scan_security_manager_roots`] / [`gc_update_security_manager_refs`]
+/// (the `lang_math::gc_scan_value_of_cache_roots` shape) closes the first by
+/// making the cached copy itself collector-visible AND rewritable.
+static SECURITY_STATE: OnceLock<Mutex<std::collections::HashMap<usize, VmSecurityState>>> =
+    OnceLock::new();
+
+fn security_state() -> &'static Mutex<std::collections::HashMap<usize, VmSecurityState>> {
+    SECURITY_STATE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Run `f` with the state table locked.
+///
+/// The lock is NEVER held across a Java allocation or any other re-entry into
+/// the VM: [`gc_scan_security_manager_roots`] takes the same lock at a
+/// safepoint, so a thread that allocated while holding it could deadlock
+/// against its own collection. The two lazy initialisers below therefore
+/// allocate first and publish afterwards.
+fn with_security_state<R>(
+    f: impl FnOnce(&mut std::collections::HashMap<usize, VmSecurityState>) -> R,
+) -> R {
+    let mut guard = security_state().lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut guard)
+}
+
+/// Read one slot of the CALLING VM's state. Another VM's slot is not
+/// addressable from here — the key comes from `ctx`, never from a caller.
+fn security_slot(
+    ctx: &dyn NativeContext,
+    pick: impl Fn(&VmSecurityState) -> Option<(i32, ObjectRef)>,
+) -> Option<(i32, ObjectRef)> {
+    let vm = ctx.vm_identity();
+    with_security_state(|table| table.get(&vm).and_then(|state| pick(state)))
+}
+
+/// Store (or clear) one slot of the CALLING VM's state. Clearing the last
+/// occupied slot drops the VM's row entirely.
+fn set_security_slot(
+    ctx: &dyn NativeContext,
+    entry: Option<(i32, ObjectRef)>,
+    pick: impl Fn(&mut VmSecurityState) -> &mut Option<(i32, ObjectRef)>,
+) {
+    let vm = ctx.vm_identity();
+    with_security_state(|table| match entry {
+        Some(_) => *pick(table.entry(vm).or_default()) = entry,
+        None => {
+            if let Some(state) = table.get_mut(&vm) {
+                *pick(state) = None;
+                if state.is_empty() {
+                    table.remove(&vm);
+                }
+            }
+        }
+    });
+}
+
+/// Re-read the CURRENT address of a cached `(identity_key, ObjectRef)` pair.
+///
+/// The collector now repoints the cached copy directly (see
+/// [`gc_update_security_manager_refs`]), but the var-handle-root registry is
+/// still consulted first so the two agree; contexts without a registry (mocks)
+/// fall back to the cached ref.
+fn resolve_slot(ctx: &dyn NativeContext, slot: (i32, ObjectRef)) -> ObjectRef {
+    let (key, cached) = slot;
+    ctx.read_var_handle_root(key).unwrap_or(cached)
+}
+
+/// Root `obj` in the calling VM and return the `(identity_key, ObjectRef)` pair
+/// to cache. The key MUST be computed on the same address that was registered,
+/// with no allocating call in between.
+fn root_for_cache(ctx: &mut dyn NativeContext, obj: ObjectRef) -> (i32, ObjectRef) {
+    ctx.register_var_handle_root(obj);
+    (ctx.identity_hash_code(obj), obj)
+}
+
+/// GC root scan hook — companion to [`gc_update_security_manager_refs`].
+///
+/// Reports the SecurityManager, the `Policy` object and the shared
+/// `Permissions` collection held for `vm_identity`, so the owning collector
+/// relocates rather than reclaims them. Scoped to one VM: a heap address only
+/// means anything inside the heap that produced it, and handing another VM's
+/// address to this collector would be a pointer into a heap it does not own.
+///
+/// Takes a blocking lock that is never held across a Java allocation, so the
+/// allocating thread cannot self-deadlock here.
+pub fn gc_scan_security_manager_roots(vm_identity: usize, out: &mut Vec<ObjectRef>) {
+    with_security_state(|table| {
+        let Some(state) = table.get(&vm_identity) else {
+            return;
+        };
+        for slot in [
+            state.security_manager,
+            state.policy_object,
+            state.shared_permissions,
+        ] {
+            if let Some((_, obj)) = slot {
+                out.push(obj);
+            }
+        }
+    });
+}
+
+/// GC post-compaction hook — companion to [`gc_scan_security_manager_roots`].
+///
+/// Repoints every slot held for `vm_identity` through the collector's old→new
+/// map. This is the half that was missing: the var-handle-root REGISTRY entry
+/// was remapped but the cached copy never was, so after a move the cache
+/// pointed at a vacated from-space slot. Identity keys are untouched — an
+/// identity hash is stable across a move.
+pub fn gc_update_security_manager_refs(
+    vm_identity: usize,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    with_security_state(|table| {
+        let Some(state) = table.get_mut(&vm_identity) else {
+            return;
+        };
+        for slot in [
+            &mut state.security_manager,
+            &mut state.policy_object,
+            &mut state.shared_permissions,
+        ] {
+            if let Some((_, obj_ref)) = slot {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+    });
+}
+
+/// Per-VM teardown: drop every security slot held for `vm_identity`.
+///
+/// Call when a VM is disposed of. Without it the row — and the raw heap
+/// addresses in it — outlives the heap that produced them, and a later VM that
+/// reused the identity would inherit a dead SecurityManager. Nothing else in
+/// the process holds these refs: they are not shared across VMs by
+/// construction.
+pub fn forget_vm_security_state(vm_identity: usize) {
+    with_security_state(|table| {
+        table.remove(&vm_identity);
+    });
+}
 
 #[cfg(test)]
 static SECURITY_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -130,34 +323,31 @@ pub(crate) fn security_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|error| error.into_inner())
 }
 
-/// Return the currently-installed `java.lang.SecurityManager` reference,
-/// or `None` if `System.setSecurityManager(null)` is in effect (the default).
+/// Return the `java.lang.SecurityManager` installed in the CALLING VM, or
+/// `None` if `System.setSecurityManager(null)` is in effect there (the
+/// default).
 ///
 /// `pub(crate)` so security-sensitive native entry points can consult the same
-/// singleton: `ProcessBuilder.start` / `Runtime.exec*` via
+/// slot: `ProcessBuilder.start` / `Runtime.exec*` via
 /// `lang_system::check_exec_or_throw`, and the Panama host-call gate via
 /// `panama::check_native_access`.
+///
+/// The answer is scoped to `ctx`: another VM's manager is neither readable nor
+/// clearable from here, so one VM can no longer disarm another's gates.
 pub(crate) fn get_security_manager(ctx: &dyn NativeContext) -> Option<ObjectRef> {
-    let (key, cached) = (*SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner()))?;
-    // Re-read the CURRENT address: the GC remaps the var-handle-root registry
-    // entry after a move, not this raw static copy. Contexts without a
-    // registry (mocks) fall back to the cached ref.
-    Some(ctx.read_var_handle_root(key).unwrap_or(cached))
+    let slot = security_slot(ctx, |state| state.security_manager)?;
+    // Re-read the CURRENT address (see `resolve_slot`).
+    Some(resolve_slot(ctx, slot))
 }
 
 fn set_security_manager(ctx: &mut dyn NativeContext, sm: Option<ObjectRef>) {
-    let entry = sm.map(|obj| {
-        // Keep alive + registry-remapped across GC moves (VarHandle-root
-        // pattern); the identity key lets every later read re-read the
-        // current address. The key MUST be computed on the same address that
-        // was registered, with no allocating call in between.
-        ctx.register_var_handle_root(obj);
-        (ctx.identity_hash_code(obj), obj)
-    });
-    *SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = entry;
+    // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
+    // the identity key lets every later read re-read the current address.
+    let entry = sm.map(|obj| root_for_cache(ctx, obj));
+    set_security_slot(&*ctx, entry, |state| &mut state.security_manager);
 }
 
-/// Override the SecurityManager singleton for tests. Lets unit tests
+/// Override the calling VM's SecurityManager slot for tests. Lets unit tests
 /// install a synthetic SM object so they can exercise the checkExec
 /// gating path without going through `System.setSecurityManager`.
 ///
@@ -165,12 +355,24 @@ fn set_security_manager(ctx: &mut dyn NativeContext, sm: Option<ObjectRef>) {
 /// Tests run against `MockNativeContext`, whose `read_var_handle_root`
 /// returns `None` — readers fall back to the cached raw ref — so a dummy
 /// identity key is fine here (no moving GC in unit tests).
+///
+/// `ctx` is required for the same reason production callers need one: the slot
+/// belongs to a VM, and there is no "current VM" to infer.
 #[cfg(test)]
-pub(crate) fn set_security_manager_for_test(sm: Option<ObjectRef>) -> Option<ObjectRef> {
-    let mut guard = SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = guard.map(|(_, obj)| obj);
-    *guard = sm.map(|obj| (0, obj));
-    prev
+pub(crate) fn set_security_manager_for_test(
+    ctx: &dyn NativeContext,
+    sm: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    let vm = ctx.vm_identity();
+    with_security_state(|table| {
+        let state = table.entry(vm).or_default();
+        let prev = state.security_manager.map(|(_, obj)| obj);
+        state.security_manager = sm.map(|obj| (0, obj));
+        if state.is_empty() {
+            table.remove(&vm);
+        }
+        prev
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -193,110 +395,103 @@ pub(crate) fn set_security_manager_for_test(sm: Option<ObjectRef>) -> Option<Obj
 // null-deref window can occur because the lazy init runs under the same
 // mutex that gates the read.
 //
-// The singleton is process-wide. A hostile caller from inside the JVM can
-// read or overwrite it; that mirrors real JDK behaviour and is intentional.
+// The singleton is per-VM, and within one VM it is process-wide in the sense
+// the JDK means: a hostile caller from inside that JVM can read or overwrite
+// it, mirroring real JDK behaviour, and that is intentional. What it is NOT is
+// shared with a SECOND VM in the same process — see [`SECURITY_STATE`] for why
+// that was both a use-after-move and a sandbox hole.
 //
-// GC: stored as `(identity_key, ObjectRef)` — kept alive + registry-remapped
-// via `register_var_handle_root`; every read re-fetches the CURRENT address
-// via `read_var_handle_root(identity_key)` because the GC cannot rewrite this
-// raw static copy (ASYNC_POOL pattern, lib.rs). Before this fix the slot held
-// a bare `ObjectRef` that was neither rooted nor remapped — the installed
-// Policy was ALSO collectable.
-static ACTIVE_POLICY_OBJECT: Mutex<Option<(i32, ObjectRef)>> = Mutex::new(None);
+// GC: stored as `(identity_key, ObjectRef)` in the owning VM's row — kept alive
+// + registry-remapped via `register_var_handle_root`, AND scanned/repointed
+// directly by `gc_scan_security_manager_roots` /
+// `gc_update_security_manager_refs`. Reads still re-fetch the CURRENT address
+// via `read_var_handle_root(identity_key)`.
 
-/// Process-wide cache of the read-only permissive `Permissions` collection
-/// returned by `Policy.getPermissions(...)`. Decoupled from
-/// `ACTIVE_POLICY_OBJECT` because the natives that return this collection
-/// fire on any vanilla-Policy receiver (most commonly the lazy default),
-/// and we want a stable reference for callers that perform
-/// reference-equality checks across calls.
-///
-/// GC: same `(identity_key, ObjectRef)` var-handle-root pattern as
-/// [`ACTIVE_POLICY_OBJECT`] — previously neither rooted nor remapped.
-static SHARED_PERMISSION_COLLECTION: Mutex<Option<(i32, ObjectRef)>> = Mutex::new(None);
-
-/// Read the currently-installed Java `Policy` object, if any. Re-reads the
-/// CURRENT (post-GC) address from the var-handle-root registry; contexts
+/// Read the Java `Policy` object installed in the CALLING VM, if any. Re-reads
+/// the CURRENT (post-GC) address from the var-handle-root registry; contexts
 /// without a registry (mocks) fall back to the cached raw ref.
 fn get_policy_object(ctx: &dyn NativeContext) -> Option<ObjectRef> {
-    let (key, cached) = (*ACTIVE_POLICY_OBJECT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()))?;
-    Some(ctx.read_var_handle_root(key).unwrap_or(cached))
+    let slot = security_slot(ctx, |state| state.policy_object)?;
+    Some(resolve_slot(ctx, slot))
 }
 
-/// Cheap "is a Policy installed?" probe that does not touch object
+/// Cheap "is a Policy installed in this VM?" probe that does not touch object
 /// addresses (used by `Policy.isSet`, which only needs presence).
-fn policy_object_installed() -> bool {
-    ACTIVE_POLICY_OBJECT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some()
+fn policy_object_installed(ctx: &dyn NativeContext) -> bool {
+    security_slot(ctx, |state| state.policy_object).is_some()
 }
 
-/// Store a new Java `Policy` reference (or clear with `None`). This matches
-/// `Policy.setPolicy(Policy)` semantics: `null` is accepted and results in
-/// a future `getPolicy()` call lazily allocating the synthetic default.
+/// Store a new Java `Policy` reference for the calling VM (or clear with
+/// `None`). This matches `Policy.setPolicy(Policy)` semantics: `null` is
+/// accepted and results in a future `getPolicy()` call lazily allocating the
+/// synthetic default.
 fn set_policy_object(ctx: &mut dyn NativeContext, p: Option<ObjectRef>) {
-    let entry = p.map(|obj| {
-        // Keep alive + registry-remapped across GC moves (VarHandle-root
-        // pattern). The identity key MUST be computed on the same address
-        // that was registered, with no allocating call in between.
-        ctx.register_var_handle_root(obj);
-        (ctx.identity_hash_code(obj), obj)
-    });
-    *ACTIVE_POLICY_OBJECT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = entry;
+    // Keep alive + registry-remapped across GC moves (VarHandle-root pattern).
+    let entry = p.map(|obj| root_for_cache(ctx, obj));
+    set_security_slot(&*ctx, entry, |state| &mut state.policy_object);
 }
 
-/// Lazily allocate the synthetic default Policy used when no caller has
-/// invoked `setPolicy(...)`. Performed lazily inside the singleton mutex
-/// so the default is never observed in a partially-initialised state.
+/// Lazily allocate the calling VM's synthetic default Policy, used when no
+/// caller in that VM has invoked `setPolicy(...)`.
 ///
 /// The instance carries no per-Policy fields — `getPermissions(...)` is
-/// answered from `SHARED_PERMISSION_COLLECTION` directly so the default
+/// answered from the VM's shared-`Permissions` slot directly so the default
 /// Policy doesn't need its own cache slot. Real JDK's `Policy` has a
 /// `pdMapping` field, but we deliberately leave it null because none of
 /// our overridden natives read it.
+///
+/// The allocation happens BEFORE the state lock is taken, not under it: the GC
+/// root scan takes the same lock at a safepoint, so holding it across
+/// `alloc_concurrent_synthetic` (which can trigger a collection) would deadlock
+/// the allocating thread against its own GC. Publication is still a single
+/// atomic step, so no caller can observe a half-initialised default; if two
+/// threads race, the loser drops its allocation and BOTH return the same
+/// object, which is the identity guarantee callers actually depend on.
 fn ensure_default_policy_object(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let mut g = ACTIVE_POLICY_OBJECT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some((key, cached)) = *g {
-        // Re-read the CURRENT address (see the static's GC note).
-        return ctx.read_var_handle_root(key).unwrap_or(cached);
+    if let Some(existing) = get_policy_object(&*ctx) {
+        return existing;
     }
     let p = alloc_concurrent_synthetic(ctx, "java/security/Policy", 0);
     // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
     // key computed on the just-registered address, no allocation in between.
-    ctx.register_var_handle_root(p);
-    let key = ctx.identity_hash_code(p);
-    *g = Some((key, p));
-    p
+    let entry = root_for_cache(ctx, p);
+    let vm = ctx.vm_identity();
+    let winner = with_security_state(|table| {
+        *table
+            .entry(vm)
+            .or_default()
+            .policy_object
+            .get_or_insert(entry)
+    });
+    resolve_slot(&*ctx, winner)
 }
 
-/// Return the process-wide read-only permissive `Permissions` collection,
-/// lazily allocating it on first call. Subsequent calls return the same
-/// reference so callers that do `getPermissions(pd1) == getPermissions(pd2)`
-/// see consistent identity.
+/// Return the calling VM's read-only permissive `Permissions` collection,
+/// lazily allocating it on first call. Subsequent calls in the same VM return
+/// the same reference so callers that do
+/// `getPermissions(pd1) == getPermissions(pd2)` see consistent identity.
+///
+/// Allocates outside the state lock for the same reason as
+/// [`ensure_default_policy_object`] — see the note there.
 fn ensure_shared_permission_collection(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let mut g = SHARED_PERMISSION_COLLECTION
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some((key, cached)) = *g {
-        // Re-read the CURRENT address (see the static's GC note).
-        return ctx.read_var_handle_root(key).unwrap_or(cached);
+    if let Some(slot) = security_slot(&*ctx, |state| state.shared_permissions) {
+        return resolve_slot(&*ctx, slot);
     }
     let perms = build_permissive_collection(ctx);
     // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
     // key computed on the just-registered address, no allocation in between.
     // The AllPermission entry in slot 0 stays live via normal heap tracing
     // from this root.
-    ctx.register_var_handle_root(perms);
-    let key = ctx.identity_hash_code(perms);
-    *g = Some((key, perms));
-    perms
+    let entry = root_for_cache(ctx, perms);
+    let vm = ctx.vm_identity();
+    let winner = with_security_state(|table| {
+        *table
+            .entry(vm)
+            .or_default()
+            .shared_permissions
+            .get_or_insert(entry)
+    });
+    resolve_slot(&*ctx, winner)
 }
 
 /// Build a synthetic `java.security.Permissions` collection seeded with a
@@ -1434,10 +1629,11 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
     // We treat the default-singleton path as "set" once it has been
     // materialised, matching `Policy.policyInfo.initialized` semantics in
     // real JDK after the first `getPolicy()` returns.
-    r.register(p, "isSet", "()Z", |_ctx, _args| {
+    r.register(p, "isSet", "()Z", |ctx, _args| {
         // Presence-only probe — no object address is dereferenced, so no
-        // var-handle-root re-read is needed here.
-        let set = policy_object_installed();
+        // var-handle-root re-read is needed here. `ctx` is still required: the
+        // answer is about THIS VM's Policy slot, not the process's.
+        let set = policy_object_installed(&*ctx);
         Ok(Some(Value::Int(if set { 1 } else { 0 })))
     });
 
@@ -1738,13 +1934,13 @@ mod tests {
     #[test]
     fn test_system_get_set_security_manager() {
         let _guard = security_state_test_lock();
-        // Reset global state
-        let _ = set_security_manager_for_test(None);
 
         let mut registry = NativeMethodRegistry::new();
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
+        // Reset this VM's state (the mock reports identity 0).
+        let _ = set_security_manager_for_test(&ctx, None);
 
         // getSecurityManager() should return null initially
         let get_sm = registry
@@ -1778,7 +1974,7 @@ mod tests {
         assert_eq!(result.unwrap(), Some(Value::Object(Some(sm_obj))));
 
         // Clean up
-        let _ = set_security_manager_for_test(None);
+        let _ = set_security_manager_for_test(&ctx, None);
     }
 
     #[test]
@@ -2100,20 +2296,26 @@ mod tests {
     }
 
     /// Reset global state between policy-sensitive tests.
+    ///
+    /// The object slots are per-VM now; every `MockNativeContext` reports
+    /// `vm_identity() == 0` unless a test overrides it, so clearing scope 0 is
+    /// exactly what the old whole-static clear did for these tests.
     fn clear_policy_and_stack() {
         set_active_policy(None);
-        // Clear the singleton slots directly (no ctx needed for a clear —
-        // registration only happens on store of Some).
-        *ACTIVE_POLICY_OBJECT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        // Also clear the shared permission collection so the stale
-        // ObjectRef from a prior test's MockNativeContext heap doesn't
-        // leak into the next test — calls to ensure_shared_permission_collection
-        // must allocate fresh.
-        *SHARED_PERMISSION_COLLECTION
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        // Clear the mock VM's Policy slot directly (no ctx needed for a clear —
+        // registration only happens on store of Some). The shared permission
+        // collection goes too, so a stale ObjectRef from a prior test's
+        // MockNativeContext heap doesn't leak into the next test — calls to
+        // `ensure_shared_permission_collection` must allocate fresh.
+        with_security_state(|table| {
+            if let Some(state) = table.get_mut(&0) {
+                state.policy_object = None;
+                state.shared_permissions = None;
+                if state.is_empty() {
+                    table.remove(&0);
+                }
+            }
+        });
         PRIVILEGED_STACK.with(|s| s.borrow_mut().clear());
         // Tests reuse small `ClassId` values across `MockNativeContext`
         // instances (each fresh ctx starts at id=1), so the per-ClassId
@@ -2869,13 +3071,13 @@ mod tests {
     #[test]
     fn t19_n3_ac_get_stack_context_returns_null_when_no_security_manager() {
         let _guard = security_state_test_lock();
-        // No SecurityManager is installed; the spec-matching answer is null.
-        let _ = set_security_manager_for_test(None);
 
         let mut registry = NativeMethodRegistry::new();
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
+        // No SecurityManager is installed; the spec-matching answer is null.
+        let _ = set_security_manager_for_test(&ctx, None);
         let result = call_native(
             &registry,
             &mut ctx,

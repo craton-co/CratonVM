@@ -905,6 +905,264 @@ impl SafepointSnapshot {
     }
 }
 
+// ── Inlined scopes (deopt caller chains) ─────────────────────────────
+//
+// A [`SafepointSnapshot`] describes ONE interpreter frame: the locals and
+// operand stack of the method whose bci it names. That is the whole story
+// while the method being compiled is the only method in the artifact — and it
+// is a silent lie the moment a callee is inlined into it, because the deopt
+// then has to rebuild *two* interpreter frames (the callee's, and the caller's
+// parked mid-`invoke`). `deopt::FrameState::caller` is the field that models
+// it, and `ir_lower` hard-coded it `None` because nothing upstream recorded
+// which inlined scope a snapshot belonged to.
+//
+// [`InlineScopeTable`] is that missing upstream record. It is deliberately a
+// **side table** rather than a field on [`SafepointSnapshot`] or [`Graph`]:
+// both of those are constructed by struct literal in files this crate spreads
+// across (`ir_optimize.rs`, `ir_verify.rs`, `ir_schedule.rs`, `lib.rs`,
+// `escape_analysis.rs`), and a new field breaks every one of them. A table
+// threaded alongside the graph costs one parameter at the lowering entry point
+// and nothing at all to the ~30 hand-built graphs in the test suites.
+//
+// The table is EMPTY on every compile today: `IrBuilder::build` does not
+// inline (the single-pass backend does, via `lib.rs`'s `inline_sites`), so
+// nothing registers a scope and `ir_lower` produces exactly the flat, caller-
+// less frame states it always did.
+
+/// Hard cap on inline-scope chain length.
+///
+/// Chains are acyclic by construction — [`InlineScopeTable::push_scope`] only
+/// accepts a parent that was pushed *before* the child, so parent ids are
+/// strictly smaller — but every walk is bounded anyway: a metadata defect must
+/// not turn into an unbounded loop on a deopt path. HotSpot's own inline depth
+/// limit is 9 (`MaxInlineLevel` + `MaxRecursiveInlineLevel`), so 64 is far
+/// above anything a real inliner produces.
+pub const MAX_INLINE_SCOPE_DEPTH: usize = 64;
+
+/// Handle to one scope in an [`InlineScopeTable`].
+///
+/// Only meaningful in the table that issued it. Handles are dense and
+/// monotonically increasing, and a scope's `parent` is always strictly smaller
+/// than the scope itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InlineScopeId(u32);
+
+impl InlineScopeId {
+    /// Raw index, for diagnostics and stable ordering only.
+    #[inline]
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
+/// One **caller** frame of an inlined call chain.
+///
+/// Read it as "the frame that is parked mid-`invoke` while the scope below it
+/// runs": `method_key` is the *caller's* `"<class>.<method>:<descriptor>"`,
+/// `caller_bci` is the bci of the `invoke` inside it, and `parent` is that
+/// caller's own caller (`None` at the outermost, i.e. the method actually being
+/// compiled). A [`SafepointSnapshot`] bound to scope `s` is the innermost
+/// frame; `s`, `s.parent`, … are the frames stacked above it, innermost-first.
+///
+/// `caller_snapshot` is what makes the caller frame *describable*. A caller
+/// frame is not empty — its locals and operand stack are live and the resume
+/// has to rebuild them — so the scope names the [`SafepointSnapshot`] (by index
+/// into `Graph::safepoints`) that records the caller's state at `caller_bci`.
+/// `None` means "this scope exists but nobody recorded the caller's values",
+/// which `ir_lower` renders as an explicitly **unresumable** frame rather than
+/// as an empty one: an empty caller frame reconstructs as a method whose
+/// locals are all `0`, which is the same class of silent wrong-reconstruction
+/// [`crate::deopt::FrameValue::MaterializationRequired`] exists to prevent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineScope {
+    /// The caller's fully-qualified method key.
+    pub method_key: String,
+    /// Bci of the `invoke` in the caller. The call is already in progress, so
+    /// this bci must NOT be re-executed on resume — see
+    /// [`crate::deopt::ResumeSemantics::for_caller_scope`].
+    pub caller_bci: u32,
+    /// Index into `Graph::safepoints` of the snapshot describing the caller's
+    /// locals/stack at `caller_bci`, or `None` when it was not recorded.
+    pub caller_snapshot: Option<u32>,
+    /// The caller's own caller, or `None` at the outermost frame.
+    pub parent: Option<InlineScopeId>,
+}
+
+/// Per-graph table of inlined caller scopes, plus the snapshot → scope binding.
+///
+/// Two maps in one, because they have the same lifetime and the same producer:
+///
+/// * the scope arena — `(method_key, caller_bci, caller_snapshot, parent)`
+///   tuples, parent-linked so a depth-`n` chain costs `n` entries in total
+///   rather than `n` per safepoint;
+/// * `by_snapshot` — which scope (if any) each `Graph::safepoints` entry
+///   belongs to, keyed by the snapshot's **index**.
+///
+/// Keying by index is sound because nothing in the pipeline removes or reorders
+/// `Graph::safepoints`: `IrBuilder` pushes, `ir_optimize` and `lib.rs` rewrite
+/// slots in place, and the lowerer only reads. An index past the end simply
+/// reads back `None`, so a table built against a shorter graph degrades to "no
+/// inlining info" rather than to a wrong scope.
+#[derive(Clone, Debug, Default)]
+pub struct InlineScopeTable {
+    scopes: Vec<InlineScope>,
+    by_snapshot: Vec<Option<InlineScopeId>>,
+}
+
+impl InlineScopeTable {
+    /// An empty table — the state of every compile that inlines nothing.
+    pub fn new() -> Self {
+        Self {
+            scopes: Vec::new(),
+            by_snapshot: Vec::new(),
+        }
+    }
+
+    /// `true` when no scope has been registered. The lowerer's fast path: an
+    /// empty table produces exactly the caller-less frame states it always did.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.scopes.is_empty()
+    }
+
+    /// Number of distinct scopes held.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// Register a caller scope, returning its handle.
+    ///
+    /// `None` — the scope is **refused**, not silently accepted — when:
+    ///
+    /// * `parent` names a scope this table never issued. A forward or foreign
+    ///   parent is the one way a chain could become cyclic, so it is rejected
+    ///   at the door rather than defended against at every walk.
+    /// * the resulting chain would exceed [`MAX_INLINE_SCOPE_DEPTH`].
+    /// * the arena is full (`u32::MAX` scopes).
+    ///
+    /// A refused scope means the producer must leave the snapshot unbound, and
+    /// the deopt point stays flat — the same conservative outcome as not
+    /// inlining at all.
+    pub fn push_scope(
+        &mut self,
+        method_key: &str,
+        caller_bci: u32,
+        caller_snapshot: Option<u32>,
+        parent: Option<InlineScopeId>,
+    ) -> Option<InlineScopeId> {
+        if let Some(p) = parent {
+            // Strictly smaller than the id about to be issued: acyclicity.
+            if p.0 as usize >= self.scopes.len() {
+                return None;
+            }
+            if self.depth(p) >= MAX_INLINE_SCOPE_DEPTH {
+                return None;
+            }
+        }
+        let id = u32::try_from(self.scopes.len()).ok()?;
+        if id == u32::MAX {
+            return None;
+        }
+        self.scopes.push(InlineScope {
+            method_key: method_key.to_string(),
+            caller_bci,
+            caller_snapshot,
+            parent,
+        });
+        Some(InlineScopeId(id))
+    }
+
+    /// The scope `id` names, or `None` for a handle this table never issued.
+    #[inline]
+    pub fn scope(&self, id: InlineScopeId) -> Option<&InlineScope> {
+        self.scopes.get(id.0 as usize)
+    }
+
+    /// The caller-of-the-caller, or `None` at the outermost scope (and for an
+    /// unknown handle).
+    #[inline]
+    pub fn parent(&self, id: InlineScopeId) -> Option<InlineScopeId> {
+        self.scope(id).and_then(|s| s.parent)
+    }
+
+    /// How many scopes `id`'s chain holds, `id` included. `0` for an unknown
+    /// handle; capped at [`MAX_INLINE_SCOPE_DEPTH`].
+    pub fn depth(&self, id: InlineScopeId) -> usize {
+        let mut n = 0;
+        let mut cursor = Some(id);
+        while let Some(handle) = cursor {
+            if self.scope(handle).is_none() {
+                break;
+            }
+            n += 1;
+            if n >= MAX_INLINE_SCOPE_DEPTH {
+                break;
+            }
+            cursor = self.parent(handle);
+        }
+        n
+    }
+
+    /// `id`'s whole chain, innermost (i.e. `id` itself) first. Empty for an
+    /// unknown handle; capped at [`MAX_INLINE_SCOPE_DEPTH`].
+    pub fn chain(&self, id: InlineScopeId) -> Vec<InlineScopeId> {
+        let mut out = Vec::new();
+        let mut cursor = Some(id);
+        while let Some(handle) = cursor {
+            if self.scope(handle).is_none() {
+                break;
+            }
+            out.push(handle);
+            if out.len() >= MAX_INLINE_SCOPE_DEPTH {
+                break;
+            }
+            cursor = self.parent(handle);
+        }
+        out
+    }
+
+    /// Bind the snapshot at `Graph::safepoints[snapshot]` to `scope`.
+    ///
+    /// `false` (and nothing is recorded) for a handle this table never issued —
+    /// an unbound snapshot lowers exactly as it does today, so refusing is the
+    /// conservative direction.
+    pub fn bind_snapshot(&mut self, snapshot: usize, scope: InlineScopeId) -> bool {
+        if self.scope(scope).is_none() {
+            return false;
+        }
+        if self.by_snapshot.len() <= snapshot {
+            self.by_snapshot.resize(snapshot + 1, None);
+        }
+        self.by_snapshot[snapshot] = Some(scope);
+        true
+    }
+
+    /// [`Self::bind_snapshot`] over a half-open range of snapshot indices — the
+    /// shape a producer has after splicing an inlined callee, which appends a
+    /// contiguous run of snapshots to `Graph::safepoints`.
+    pub fn bind_snapshot_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        scope: InlineScopeId,
+    ) -> bool {
+        if self.scope(scope).is_none() {
+            return false;
+        }
+        for i in range {
+            self.bind_snapshot(i, scope);
+        }
+        true
+    }
+
+    /// The scope the snapshot at `Graph::safepoints[snapshot]` belongs to, or
+    /// `None` when it is not inside any inlined callee.
+    #[inline]
+    pub fn snapshot_scope(&self, snapshot: usize) -> Option<InlineScopeId> {
+        self.by_snapshot.get(snapshot).copied().flatten()
+    }
+}
+
 // ── Def-use edges ────────────────────────────────────────────────────
 
 /// Which half of a [`SafepointSnapshot`] a slot lives in.
@@ -7278,5 +7536,95 @@ mod tests {
         );
         assert_eq!(graph.verify_use_lists(), Ok(()));
         assert_eq!(graph.use_counts(), scanned_use_counts(&graph));
+    }
+
+    // ── Inline scopes ────────────────────────────────────────────────
+
+    /// The empty table — what every compile has today — answers "no scope"
+    /// for every snapshot index, including ones past the end.
+    #[test]
+    fn inline_scope_table_is_empty_by_default() {
+        let t = InlineScopeTable::new();
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+        assert_eq!(t.snapshot_scope(0), None);
+        assert_eq!(t.snapshot_scope(9_999), None);
+        assert_eq!(InlineScopeTable::default().len(), 0);
+    }
+
+    /// A depth-3 chain: each scope names the one pushed before it, `chain`
+    /// reports it innermost-first, and `depth` counts the scope itself.
+    #[test]
+    fn inline_scope_chain_is_parent_linked_innermost_first() {
+        let mut t = InlineScopeTable::new();
+        let outer = t.push_scope("A.a:()V", 10, Some(0), None).unwrap();
+        let mid = t.push_scope("B.b:()V", 20, Some(1), Some(outer)).unwrap();
+        let inner = t.push_scope("C.c:()V", 30, Some(2), Some(mid)).unwrap();
+
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.depth(outer), 1);
+        assert_eq!(t.depth(mid), 2);
+        assert_eq!(t.depth(inner), 3);
+        assert_eq!(t.chain(inner), vec![inner, mid, outer]);
+        assert_eq!(t.chain(outer), vec![outer]);
+        assert_eq!(t.parent(inner), Some(mid));
+        assert_eq!(t.parent(outer), None);
+
+        let s = t.scope(mid).expect("issued handle resolves");
+        assert_eq!(s.method_key, "B.b:()V");
+        assert_eq!(s.caller_bci, 20);
+        assert_eq!(s.caller_snapshot, Some(1));
+    }
+
+    /// A parent this table never issued is refused outright — that is the one
+    /// way a chain could be made cyclic, and it is rejected at the door.
+    #[test]
+    fn inline_scope_rejects_a_foreign_parent() {
+        let mut t = InlineScopeTable::new();
+        assert_eq!(t.push_scope("A.a:()V", 1, None, Some(InlineScopeId(7))), None);
+        assert!(t.is_empty());
+        // …and an unknown handle reads back as nothing, never as scope 0.
+        assert_eq!(t.scope(InlineScopeId(0)), None);
+        assert_eq!(t.depth(InlineScopeId(3)), 0);
+        assert!(t.chain(InlineScopeId(3)).is_empty());
+    }
+
+    /// The depth cap is enforced at push time, so no walk can be long.
+    #[test]
+    fn inline_scope_depth_is_capped() {
+        let mut t = InlineScopeTable::new();
+        let mut last = t.push_scope("A.a:()V", 0, None, None).unwrap();
+        for i in 1..MAX_INLINE_SCOPE_DEPTH {
+            last = t
+                .push_scope("A.a:()V", i as u32, None, Some(last))
+                .unwrap_or_else(|| panic!("depth {i} is within the cap"));
+        }
+        assert_eq!(t.depth(last), MAX_INLINE_SCOPE_DEPTH);
+        assert_eq!(
+            t.push_scope("A.a:()V", 999, None, Some(last)),
+            None,
+            "one past the cap is refused"
+        );
+    }
+
+    /// Snapshot bindings are by index, grow on demand, and refuse a handle the
+    /// table never issued.
+    #[test]
+    fn inline_scope_snapshot_binding_is_by_index() {
+        let mut t = InlineScopeTable::new();
+        let s = t.push_scope("A.a:()V", 4, Some(0), None).unwrap();
+        assert!(!t.bind_snapshot(0, InlineScopeId(9)), "foreign handle");
+        assert_eq!(t.snapshot_scope(0), None);
+
+        assert!(t.bind_snapshot(3, s));
+        assert_eq!(t.snapshot_scope(3), Some(s));
+        assert_eq!(t.snapshot_scope(2), None, "holes stay holes");
+        assert_eq!(t.snapshot_scope(4), None, "past the end reads as absent");
+
+        assert!(t.bind_snapshot_range(5..8, s));
+        for i in 5..8 {
+            assert_eq!(t.snapshot_scope(i), Some(s));
+        }
+        assert_eq!(t.snapshot_scope(8), None);
     }
 }
