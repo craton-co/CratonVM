@@ -864,14 +864,21 @@ fn stw_take_over_and_wait(
         // Helper-window roots are conservative (unprovable coverage) — the
         // collection must stay non-moving so a false-positive candidate can
         // only over-retain, never relocate under a live JIT/blocked frame.
-        // xt-hardening (2026-07-03): this flag now ALSO disables selective
-        // promotion for the cycle (a frozen peer's registers can hold only a
-        // derived/interior pointer whose base would otherwise be evacuated
-        // from under it, then zeroed and re-served). Scoped to cycles with
-        // actually-frozen/scanned peers — reserved TLAB tails alone freeze
-        // nobody, and gating on them would starve promotion on every
-        // cooperative multi-threaded cycle.
+        // xt-hardening (2026-07-03): such a cycle ALSO disables selective
+        // promotion (a frozen peer's registers can hold only a derived/interior
+        // pointer whose base would otherwise be evacuated from under it, then
+        // zeroed and re-served). Scoped to cycles with actually-frozen/scanned
+        // peers — reserved TLAB tails alone freeze nobody, and gating on them
+        // would starve promotion on every cooperative multi-threaded cycle.
+        //
+        // HIB-GCOVERHEAD-HALFFULL.1: the promotion half now travels on its own
+        // narrow flag. `mark_moving_young_coverage_incomplete` acquired dozens
+        // of unrelated callers (every unproven compiled-frame oop map) and had
+        // stopped meaning "un-rewritable peer state" — see
+        // `gc_quiescence::unrewritable_peer_state`. Both are set here because
+        // this cycle genuinely satisfies both.
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
+        cratonvm_gc::gc_quiescence::mark_unrewritable_peer_state();
     }
     taken
 }
@@ -1735,8 +1742,9 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
 }
 
 /// Default number of consecutive unproductive allocation-failure GCs (each
-/// leaving the heap ≥98% full) after which the allocation paths declare OOM
-/// instead of continuing to GC-thrash. Overridable via
+/// freeing < 2% of capacity *while the old generation cannot absorb 2% of
+/// capacity* — see [`note_gc_productivity`]) after which the allocation paths
+/// declare OOM instead of continuing to GC-thrash. Overridable via
 /// `CRATONVM_GC_OVERHEAD_LIMIT` (set to `0` to disable the limit entirely).
 const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 
@@ -1745,7 +1753,9 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// the bytes it freed: `before - after` live bytes, where `before` is the live
 /// set at `maybe_gc_forced` entry (post-TLAB-retire) and `after` is the live set
 /// once the collection finishes. A forced GC that freed < 2% of total heap
-/// capacity counts toward the GC-overhead streak; one that freed more resets it.
+/// capacity counts toward the GC-overhead streak — provided the old generation
+/// is also too full to absorb 2% of capacity, see the HIB-GCOVERHEAD-HALFFULL.1
+/// note below; one that freed more resets the streak either way.
 ///
 /// The *freed-amount* signal (not post-GC fullness) is the right one for a
 /// generational heap: in a retained-allocation death-spiral the young semi-space
@@ -1760,6 +1770,27 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// more than 2% and resets it.
 /// Forced GCs only happen on genuine allocation failure (young full *and*
 /// promotion blocked), so this never fires during ordinary young-GC churn.
+///
+/// HIB-GCOVERHEAD-HALFFULL.1 (2026-07-31) — the freed-bytes test is only HALF
+/// of HotSpot's `UseGCOverheadLimit`, which additionally requires a free-space
+/// condition before it will convert GC pressure into an `OutOfMemoryError`.
+/// Without that half, any defect that stops young draining reads identically to
+/// the death spiral: `DefaultCatalogAndSchemaTest` died with `OutOfMemoryError`
+/// after thirty forced GCs on a heap that was **49 % full with 570 MB free**,
+/// because a 5 KB array allocation ran into a latched streak rather than a full
+/// heap. The condition added here is the death spiral's own defining fact, taken
+/// straight from the paragraph above: *"a wedged, ~full old generation cannot
+/// absorb 2 % of total heap capacity per cycle"*. So a cycle counts toward the
+/// streak only when the old generation genuinely cannot absorb that much. It is
+/// deliberately NOT a total-fullness gate — those were rejected for the reason
+/// stated above, and rightly.
+///
+/// This is the safety net, not the fix. The `promoted=0`-forever condition that
+/// exposed it was a real collector defect (selective promotion switched off by a
+/// flag that had changed meaning — see `gc_quiescence::unrewritable_peer_state`)
+/// and is fixed at its source. What this guarantees is that the next such defect
+/// surfaces as slowness, which is diagnosable, rather than as a spurious OOM on
+/// a half-empty heap, which is not.
 fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: u64) {
     let cap = shared.mem.heap.heap_capacity();
     if cap == 0 {
@@ -1782,9 +1813,17 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: 
     let freed = before_live
         .saturating_sub(after_live)
         .saturating_add(promoted);
-    // unproductive: freed < 2% of capacity
+    // The free-space half (see the doc comment): the old generation must be
+    // unable to absorb 2% of total capacity — the death spiral's own definition
+    // of "wedged" — before a sliver-freeing cycle counts toward the streak.
+    // Same 2%-of-`cap` yardstick as the freed-bytes test, so the two halves
+    // cannot drift apart.
+    let old_headroom = shared.mem.heap.old_gen_headroom();
     // Cast: numeric/representation conversion
-    let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
+    let old_gen_wedged = (old_headroom as u128) * 100 < (cap as u128) * 2;
+    // unproductive: freed < 2% of capacity AND the old gen is wedged
+    let freed_sliver = (freed as u128) * 100 < (cap as u128) * 2;
+    let unproductive = freed_sliver && old_gen_wedged;
     let streak = if unproductive {
         shared
             .mem
@@ -1800,14 +1839,20 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: 
     };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
         eprintln!(
-            "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
+            "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} \
+             freed={freed} cap={cap} old_headroom={old_headroom} freed_sliver={freed_sliver} \
+             old_gen_wedged={old_gen_wedged} unproductive={unproductive} streak={streak}"
         );
     }
 }
 
 /// Returns `true` when the heap has GC-thrashed past the overhead limit — i.e.
 /// `GC_OVERHEAD_LIMIT_CYCLES` consecutive forced GCs each freed < 2% of the
-/// heap. The allocation-failure paths call this right after `maybe_gc_forced`
+/// heap while the old generation was too full to absorb that much (both halves
+/// required — see `note_gc_productivity`, and
+/// `docs/internal/fixed-suite-bugs/hibernate/` for the spurious-OOM-at-49%-full
+/// report that added the second half).
+/// The allocation-failure paths call this right after `maybe_gc_forced`
 /// and, when it is `true`, surface a catchable `OutOfMemoryError` (the
 /// pre-allocated `singleton_oom`) instead of retrying into an O(n²) death-spiral
 /// on a heap full of live (retained) objects. Mirrors HotSpot's

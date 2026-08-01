@@ -39,14 +39,46 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   force-added past the blanket `apps/` ignore, LF-pinned, self-reporting
   `overrides=N (loaded)`) — retired to
   `../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`.
-  **The class still does not pass.** Running it to completion for the first time
-  disproved the inherited "clean but slow, just needs a bigger timeout" premise:
-  HotSpot does it in 119.7 s on the same `-Xmx1500m`, while CratonVM fails in
-  both modes, for two newly-found reasons now tracked on their own:
-  - JIT on (the suite's lane) — [`OutOfMemoryError` on a 49 %-full heap](gc-overhead-limit-spurious-oom-at-half-full-heap-20260731.md)
-    at ~41 min. A manifestation of the already-open
+  **Three real VM defects were found and fixed here**, and the class reached
+  `132/132 failed=0` three runs for three against base `32f9db9a2` — but it is
+  **not green on the `dev` tip**, and neither is any other collector arm. A
+  fourth, older fault remains: the class is
+  [intermittently unstable in every arm](defaultcatalogandschema-late-phase-instability-20260801.md),
+  including on `dev` with no local changes at all. Running it to completion for
+  the first time disproved the inherited "clean but slow, just needs a bigger
+  timeout" premise: HotSpot does it in 119.7 s on the same `-Xmx1500m`, while
+  CratonVM failed in both modes, for reasons now tracked on their own.
+
+  ⚠️ **Do not use this class to re-check any of those fixes.** It has stopped
+  discriminating: it also passes `132/132` on a `dev` tip that still carries the
+  un-fixed collector gate, because its allocation profile no longer reliably
+  crosses the thresholds involved. Each fix ships with its own deterministic
+  repro — `probes/GcPromoteProbe.java` for the drain, gc unit tests for the other
+  two — and those are what to run.
+
+  - JIT on (the suite's lane) — `OutOfMemoryError` on a 49 %-full heap at
+    ~41 min. **FIXED 2026-07-31**, retired to
+    [`../../internal/fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md).
+    It was **not** a manifestation of the moving-young gap, as first reported: it
+    was an independent regression in which the non-moving sweep's selective
+    promotion — the young generation's only drain — had been switched off by a
+    flag that changed meaning underneath its gate. With that restored the class
+    runs to completion with **zero** forced GCs, where it previously took thirty
+    and died on the eighth unproductive one.
+    Reaching the end of the class for the first time then exposed a **second**
+    defect, in `[class-template-invocation:#12]`, which had been unreachable
+    behind the OOM: selective promotion was evacuating roots published as
+    "movable" precise-JIT roots on cycles whose coverage proof had *failed*.
+    Also **FIXED**, retired to
+    [`../../internal/fixed-suite-bugs/hibernate/invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md).
+    With both fixes the class reaches **`132/132 failed=0`, 3 runs for 3**
+    against base `32f9db9a2` — but see the late-phase instability doc above
+    before treating that as green on the `dev` tip.
+
+    A throughput residual, unchanged and not a regression: ~35–50 min against
+    HotSpot's 120 s. That part *is* the
     [moving-young-inert-under-JIT](moving-young-inert-under-jit-throughput-tax-20260730.md)
-    gap, as a *correctness* failure rather than only a throughput tax.
+    throughput tax, and it stays there.
   - `--nojit` — [the collector leaves reference fields UN-FORWARDED](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md).
     The SIGSEGV is **fixed** (the class now completes, `rc=0` @ 5110 s, where it
     crashed at 2103–2611 s), but it still does not match HotSpot: `found=99` vs
@@ -54,6 +86,13 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
     `map_resize_inner` attribution is RETRACTED. A second corrupt writer in
     the same runs (`HIB-WEAKREF-RECYCLE.1`, post-GC weak/phantom referent
     restore) was root-caused and **fixed** on the same branch.
+
+    Worth a re-measure on this branch before further investigation: "`found=N`
+    below 132, with `TestPlan` losing identifiers" is *exactly* the face the JIT
+    lane showed (`found=121`), and there it turned out to be one symptom of a
+    stale reference in a frame, cured by the movable-JIT-root bound above. The
+    `--nojit` lane runs the same non-moving sweep and the same selective
+    promotion, so the fix applies to it too and this number predates it.
 
   The class's `MutableBigInteger` AIOOBE quarantine (`41cdfdf94`) is untouched
   and not in question.
@@ -174,14 +213,21 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   `ClassLoaderServiceImpl.classForName` — the same bug shape, in the class-loading
   natives.
 
-- [Spurious `OutOfMemoryError` with 570 MB free](gc-overhead-limit-spurious-oom-at-half-full-heap-20260731.md)
-  (OPEN; proximate cause confirmed by differential) — `HIB-GCOVERHEAD-HALFFULL.1`. The
-  GC-overhead limit latches after 8 cycles that each free < 2 % of *capacity*, on a heap
-  that is only 49 % full with `promoted=0` on every cycle — the case
-  `note_gc_productivity`'s "wedged full old gen" reasoning explicitly does not cover.
-  `CRATONVM_GC_OVERHEAD_LIMIT=0` runs 85 min without an OOM where the default dies at 41.
-  Underneath it is the moving-young fallback below, showing up as a correctness failure
-  rather than only a throughput tax.
+- ~~Spurious `OutOfMemoryError` with 570 MB free~~ — `HIB-GCOVERHEAD-HALFFULL.1`,
+  **FIXED 2026-07-31**, retired to
+  [`../../internal/fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md).
+  The report's `promoted=0`-on-every-cycle observation was the whole story, and it
+  was **not** downstream of the moving-young fallback as that report concluded: the
+  non-moving sweep's selective promotion, the young generation's only young→old
+  drain under a live JIT frame, was gated on
+  `moving_young_coverage_incomplete()` — a flag that had exactly one (cross-thread
+  takeover) caller when the gate was written and, after `arch-2026-07-26` reused it
+  for relocation policy, became true on essentially every JIT-active collection.
+  Young filled with live objects it could not evict; the streak latched; the VM
+  OOM'd at 49 % full. Fixed by splitting the two verdicts
+  (`gc_quiescence::unrewritable_peer_state`), plus the missing free-space half of
+  HotSpot's `UseGCOverheadLimit` as a safety net so the next drain defect is slow
+  rather than fatal.
 
 - [`action.queue` GRAPH-default tests — blocked by flush-planner throughput](../../internal/fixed-suite-bugs/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md)
   (OPEN; one of two root causes fixed) — real-JDK CratonVM defaults
