@@ -6629,11 +6629,11 @@ pub fn execute(
                 let cm = shared.classes.class_manager.read();
                 cm.get_class(class_id).map_or(false, |c| c.is_interface())
             };
-            let policy = if shared.config.jit_aggressive_compilation {
-                crate::jit::skip_list::SkipPolicy::Aggressive
-            } else {
-                crate::jit::skip_list::SkipPolicy::Conservative
-            };
+            // The static JIT ban list was deleted 2026-07-31 (see
+            // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
+            // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
+            // remaining force-interpret lever, applied in `jit::try_compile`.
+            let policy = ();
             // T1.1.f — classify init complexity so trivial `<init>`/`<clinit>`
             // methods (just `aload_0; invokespecial; return`) become
             // JIT-eligible. The classifier walks the bytecode and returns
@@ -6641,20 +6641,8 @@ pub fn execute(
             // and no invokedynamic. For any other method name, the
             // classifier result is `Unknown` (the classifier is only
             // consulted for `<init>`/`<clinit>`).
-            let init_complexity = if method_name == "<init>" || method_name == "<clinit>" {
-                crate::jit::skip_list::classify_init_complexity(&code_attr.code)
-            } else {
-                crate::jit::skip_list::InitComplexity::Unknown
-            };
-            let static_skip_reason = crate::jit::skip_list::should_skip_jit_with_init(
-                &*class_name_str,
-                method_name,
-                is_interface_default,
-                std::thread::current().name().is_some(),
-                policy,
-                crate::jit::skip_list::allow_packages_from_env(),
-                init_complexity,
-            );
+            let _ = policy;
+            let static_skip_reason: Option<()> = None;
             // RFJP.1 — see is_fjp_subclass_blocklisted: methods on classes that
             // transitively extend `java/util/concurrent/ForkJoinTask` miscompile
             // under deep recursion and must run in the interpreter pending a

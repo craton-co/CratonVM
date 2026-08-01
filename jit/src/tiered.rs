@@ -109,18 +109,6 @@ pub fn clear_osr_deny_list_for_test() {
     osr_deny_list().write().clear();
 }
 
-/// HIB-BIGINTEGER-AIOOBE.1: the VM static skip-list and this tier manager
-/// must agree. The latter owns normal background-enqueue decisions and would
-/// otherwise repeatedly schedule a method that the final compiler gate has to
-/// reject. This is intentionally an exact implementation-class match: public
-/// `BigInteger` callers remain eligible for JIT.
-pub(crate) fn is_biginteger_arithmetic_jit_denied(class_name: &str) -> bool {
-    matches!(
-        class_name,
-        "java/math/MutableBigInteger" | "java.math.MutableBigInteger"
-    )
-}
-
 // ───────────────────────────────────────────────────────────────────────────────
 // CompilationTier
 // ───────────────────────────────────────────────────────────────────────────────
@@ -1644,10 +1632,6 @@ impl TieredCompilationManager {
         // Keep the background compiler from queueing the known-corrupting
         // BigInteger implementation. `try_compile` carries the same final
         // guard for direct/manual queue paths that bypass this policy method.
-        if is_biginteger_arithmetic_jit_denied(&state.method_key.class_name) {
-            return None;
-        }
-
         // Give up after repeated compile-attempt failures (the attempt ran
         // but never published a body — see `complete_task`), matching the
         // "3+ deopts" convention `c2_bailout` already uses below. Without
@@ -1835,8 +1819,10 @@ pub struct TierSignals {
     pub c2_bailout: bool,
     /// The VM declined this method for a reason fixed for the process's life.
     pub ineligible: bool,
-    /// A static class-level deny applies (see
-    /// [`is_biginteger_arithmetic_jit_denied`]).
+    /// Always `false` since 2026-07-31: the static class-level deny sets were
+    /// removed along with `vm/src/jit/skip_list.rs`. Retained so tier-policy
+    /// call sites and their tests keep their shape; `CRATONVM_JIT_DENY` is the
+    /// remaining force-interpret lever and is applied in `try_compile`.
     pub class_denied: bool,
     /// OSR is permanently disabled for this method (see [`is_osr_denied`]).
     pub osr_denied: bool,
@@ -1885,7 +1871,7 @@ impl TierSignals {
     /// test never has to reason about what some other test wrote into
     /// `osr_deny_list()`.
     pub fn with_process_rules(mut self) -> Self {
-        self.class_denied = is_biginteger_arithmetic_jit_denied(&self.key.class_name);
+        self.class_denied = false;
         self.osr_denied = is_osr_denied(&self.key);
         self
     }
@@ -3414,6 +3400,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "BigInteger JIT deny removed 2026-07-31 with the last static ban mirrors (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md); the assertion is kept as the record of what the ban covered"]
     fn hibernate_biginteger_divide_cluster_is_never_background_enqueued() {
         let policy = CompilationPolicy {
             c1_threshold: 1,
@@ -4884,3 +4871,4 @@ mod tests {
         assert!(!mgr.compiler_active(), "worker stopped after shutdown");
     }
 }
+
