@@ -96,6 +96,7 @@ pub mod null_check_elim;
 pub mod pgo;
 pub mod platform;
 pub mod profile;
+pub mod range_analysis;
 pub mod regalloc;
 pub(crate) mod runtime_lowering;
 pub mod scev;
