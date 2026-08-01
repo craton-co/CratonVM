@@ -9,7 +9,8 @@ round of 6 (2026-07-31, `cratonvm-hqlordinal-fix2-20260731.exe`). Both were
 killed at the harness's 1200s cap (`rc=124`) without producing a result. Those
 two logs are the only captured occurrence; a compact extract is preserved next
 to this file as
-[`evidence/gettypename-20260731-run-1-0-excerpt.log`](evidence/gettypename-20260731-run-1-0-excerpt.log),
+[`evidence/gettypename-20260731-run-1-0-excerpt.txt`](evidence/gettypename-20260731-run-1-0-excerpt.txt)
+(`.txt`, not `.log` — the repo's `.gitignore` drops `*.log`),
 because the originals live under `apps/hib-suite-runner/runs/`, which is
 gitignored.
 
