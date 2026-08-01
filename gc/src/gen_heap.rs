@@ -8712,35 +8712,37 @@ impl GenerationalHeap {
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
         let mut root_shadow = roots.to_vec();
-        // Apply this cycle's selective promotions to the SHADOW ONLY.
+        // NOT DONE HERE — and the reason is measured, not theoretical.
         //
-        // `sweep_young_non_moving` commits promotions (young→old) and records
-        // them in `promotions`, but leaves the caller's roots on their PRE-
+        // `sweep_young_non_moving` commits selective promotions (young→old)
+        // into `promotions` but leaves the caller's roots on their PRE-
         // promotion young addresses. This sweep marks from those roots, and
-        // `old_gen_gc`'s seed loop drops anything `old_gen.contains()` rejects,
-        // so a stale young address seeds NOTHING, the object at its new old-gen
-        // home is never marked, and the sweep hands a LIVE object's block back
-        // to the free list — measured, as `[oldsweep] FREEING overlay owner`,
-        // on collections Java still holds in a live `ArrayList`.
+        // `old_gen_gc`'s seed loop drops any address `old_gen.contains()`
+        // rejects — so a stale young address seeds NOTHING, the object at its
+        // new old-gen home is never marked, and this sweep hands a LIVE
+        // object's block back to the free list. That is defect 4 in
+        // `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`,
+        // it is real, and `ROverlaySystemGcStress` catches it in seconds.
         //
-        // Corrected HERE and not in the caller. Rewriting the caller's slice
-        // instead — which is what the first version of this fix did — made
-        // `DefaultCatalogAndSchemaTest` SIGSEGV 3 runs out of 3 against 2 of 2
-        // clean without it: that slice is the VM's root snapshot and outlives
-        // this call, so mutating it changed what every LATER consumer saw. The
-        // sweep is the only thing that needs post-promotion addresses, and
-        // `root_shadow` already exists precisely because this mode must not
-        // disturb the caller's roots.
-        if !promotions.is_empty() {
-            for root in root_shadow.iter_mut() {
-                if let Some(&new_addr) = promotions.get(&(root.as_ptr() as usize)) {
-                    debug_assert!(new_addr != 0, "promotion map contains a null destination");
-                    // SAFETY: `new_addr` is a destination recorded by selective
-                    // promotion, i.e. a live old-gen object this cycle wrote.
-                    *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-                }
-            }
-        }
+        // The obvious repair — rewrite the roots through `promotions` before
+        // marking — fixes that probe and the whole regression suite, and makes
+        // `DefaultCatalogAndSchemaTest` SIGSEGV. Measured on the same host and
+        // fixture, `rc=139` counts out of three runs each:
+        //
+        //     baseline (no fixup)              0/3
+        //     fixup applied to `root_shadow`   2/3
+        //     fixup applied to caller's roots  3/3
+        //
+        // So it is not merely that mutating the caller's snapshot was wrong
+        // (it was — that slice outlives this call); marking the extra
+        // destinations is itself destabilising, which means at least one
+        // address in `promotions` is not the valid old-gen object base this
+        // seed loop assumes. Until that is understood, seeding them trades a
+        // silent use-after-free for a crash, which is not an improvement.
+        //
+        // `promotions` is threaded in and deliberately unused so the next
+        // attempt starts from the measurement rather than rediscovering it.
+        let _ = promotions;
         let survivors = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
         (before.saturating_sub(old_gen.used()), survivors)
     }

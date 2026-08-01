@@ -23,6 +23,26 @@
  * Deterministic output; the runner diffs it against HotSpot.
  *
  *   cratonvm --nojit --Xmx 256m ROverlaySystemGcStress
+ *
+ * KNOWN FAILING with JIT ON against a real JDK, and deliberately NOT wired into
+ * `run.sh`'s `CORE_CLASSES` for that reason — it would make the suite red on a
+ * defect that has no accepted fix yet:
+ *
+ *     AssertionError: tm size 0 != 24 (bundle 0)
+ *
+ * and on `dev`'s own tip, harder:
+ *
+ *     ClassCastException: class java.lang.Object cannot be cast to Bundle
+ *
+ * That is defect 4 in
+ * `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`:
+ * the in-place old-gen sweep returns a LIVE promoted object's block to the free
+ * list, because selective promotion leaves the roots on their pre-promotion
+ * young addresses and the sweep's seed loop drops them as not-old-gen. Run it
+ * by hand when working on that:
+ *
+ *   cratonvm --java-home <jdk> -cp build ROverlaySystemGcStress        # fails
+ *   CRATONVM_OLD_SWEEP_JIT=0 cratonvm --java-home <jdk> -cp build ...  # passes
  */
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
