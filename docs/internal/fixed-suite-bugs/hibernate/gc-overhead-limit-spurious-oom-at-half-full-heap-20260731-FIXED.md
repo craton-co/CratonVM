@@ -5,8 +5,8 @@
 | **Status** | ✅ **FIXED** 2026-07-31 — `fix/hib-gcoverhead-halffull-20260731`. Real VM defect, root-caused and fixed at source; the mitigation the original report asked for was also added, as a safety net. |
 | **ID** | `HIB-GCOVERHEAD-HALFFULL.1` |
 | **Found** | 2026-07-31, validating the `DefaultCatalogAndSchemaTest` runner accommodation. |
-| **Repro** | `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`, JIT **on**, `--Xmx 1500m`, real JDK. OOM at ~41 min, 3 for 3. |
-| **Fast repro** | `probes/GcPromoteProbe.java` — same mechanism in seconds, no Hibernate. |
+| **Repro** | **`probes/GcPromoteProbe.java`** — deterministic, seconds, no Hibernate. Use this one, and note it still reproduces on the `dev` tip. |
+| **Original repro** | `DefaultCatalogAndSchemaTest`, JIT on, `--Xmx 1500m`, real JDK — OOM at ~41 min, 3 for 3 against `32f9db9a2`. **No longer discriminating**: it now passes on the unfixed `dev` tip too. See Verification. |
 
 ## Symptom
 
@@ -122,39 +122,41 @@ promotion is no longer zero. Old-gen headroom keeps working.
 
 ## Verification
 
-- **`probes/GcPromoteProbe.java`**, `--Xmx 128m`, JIT on, 36 MB live set:
-  wedged (>300 s, no progress past 20 MB) → **3.4 s**, `promoted` 2–4.6 MB per
-  cycle. HotSpot control: 0.14 s.
-- **`DefaultCatalogAndSchemaTest`**, `--Xmx 1500m`, JIT on, real JDK — the
-  original repro:
+**`probes/GcPromoteProbe.java` is the authoritative repro — not the Hibernate
+class.** `--Xmx 128m`, JIT on, 36 MB live set; deterministic, and it answers in
+seconds:
 
-  ```
-  @@TOTALS tests=132 containers=16      failed=0      (3 runs for 3)
-  ```
+| binary | result |
+|---|---|
+| base `32f9db9a2` | `promoted=0`, `unproductive=true`, **wedged** — no progress past 20 MB |
+| `origin/dev` @ `cc8167f94` (2026-08-01) | `promoted=0`, `unproductive=true`, **wedged**, times out at 240 s |
+| **this branch** | `promoted` 2–4.6 MB *per cycle*, completes in **2.3 s** |
+| HotSpot control | 0.14 s |
 
-  **132 of 132, zero failures, matching the HotSpot control exactly.**
+The second row is the one to keep: the defect is **still live on the current
+`dev` tip**, which carries the `selective_on` gate unmodified. Re-check with this
+probe, never with the Hibernate class — see below.
 
-  The decisive number is not the test count: it is that
-  `CRATONVM_DBG_GC_OVERHEAD=1` printed **not one line** across a whole run —
-  *zero* forced GCs, where the failing run took thirty and latched the streak on
-  eight of them. The heap never comes under pressure at all now, because young
-  drains.
+### `DefaultCatalogAndSchemaTest` — and why it is no longer the repro
 
-  Progress is linear throughout. The failing run's signature collapse — 104
-  tests in the first 41 min, then only 7 more in the next 44 — is gone.
+On this branch the class runs **`132/132 failed=0`, 3 runs for 3**, matching the
+HotSpot control exactly, and `CRATONVM_DBG_GC_OVERHEAD=1` prints **not one line**
+across a whole run — *zero* forced GCs, where the failing run took thirty and
+latched the streak on eight of them. Progress is linear; the signature collapse
+(104 tests in the first 41 min, then 7 more in the next 44) is gone.
 
-  Getting to that clean result took a **second** fix, on a hazard this one
-  exposed: restoring the drain also re-enabled evacuation of roots published as
-  "movable" precise-JIT roots, on cycles whose coverage proof had failed. See
-  [`invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md`](invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md).
-  Both fixes are load-bearing.
+**But the class also passed 132/132 on the unfixed `dev` tip.** The original
+report's "OOM at ~41 min, 3 for 3" was measured against `32f9db9a2`; `dev` has
+since moved 187 files, and the class's allocation profile no longer reliably
+crosses the threshold. It is *not* evidence that the defect is gone — the probe
+shows it is not — and it is *not* evidence that this fix is unnecessary. It only
+means this class stopped being a discriminator, which is precisely why the probe
+was written and committed alongside the fix.
 
-  Wall time is ~35–50 min against HotSpot's 120 s, on a shared box with other
-  work running. That gap is the
-  [moving-young-inert-under-JIT](../../../known-issues/hibernate/moving-young-inert-under-jit-throughput-tax-20260730.md)
-  throughput tax and stays with it. (An earlier "105 min" figure recorded here
-  was measured while three full workspace builds were running concurrently —
-  discount it.)
+Wall time on the class is ~35–50 min against HotSpot's 120 s. That gap is the
+[moving-young-inert-under-JIT](../../../known-issues/hibernate/moving-young-inert-under-jit-throughput-tax-20260730.md)
+throughput tax and stays with it. (An earlier "105 min" figure recorded here was
+measured with three full workspace builds running concurrently — discount it.)
 
 ### What that took: a second fix
 

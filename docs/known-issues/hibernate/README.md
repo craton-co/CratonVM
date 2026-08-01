@@ -44,7 +44,15 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   VM fixes, because running it to completion for the first time disproved the
   inherited "clean but slow, just needs a bigger timeout" premise: HotSpot does
   it in 119.7 s on the same `-Xmx1500m`, while CratonVM failed in both modes,
-  for reasons now tracked on their own:
+  for reasons now tracked on their own.
+
+  ⚠️ **Do not use this class to re-check any of those fixes.** It has stopped
+  discriminating: it also passes `132/132` on a `dev` tip that still carries the
+  un-fixed collector gate, because its allocation profile no longer reliably
+  crosses the thresholds involved. Each fix ships with its own deterministic
+  repro — `probes/GcPromoteProbe.java` for the drain, gc unit tests for the other
+  two — and those are what to run.
+
   - JIT on (the suite's lane) — `OutOfMemoryError` on a 49 %-full heap at
     ~41 min. **FIXED 2026-07-31**, retired to
     [`../../internal/fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md).
