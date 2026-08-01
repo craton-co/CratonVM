@@ -489,14 +489,33 @@ probe and the regression suite, and SIGSEGVed `DefaultCatalogAndSchemaTest` 3
 runs out of 3. That slice is the VM's root snapshot and outlives the collector
 call.
 
-| arm | outcome |
-|---|---|
-| G — no root fixup | rc=0 @ 1414 s, `found=99` |
-| G again | rc=0 @ 1252 s, `found=110` |
-| M — caller's roots rewritten | **rc=139** @ 1049 s |
-| M again | **rc=139** @ 1019 s |
-| M, `CRATONVM_OLD_SWEEP_JIT=0` | **rc=139** @ 1117 s |
-| **N — shadow only** | rc=0 @ 967 s, `found=99` |
+| arm | `rc` across runs | crashes |
+|---|---|---|
+| G — no root fixup | 0, 0, 0 | 0/3 |
+| M — caller's roots rewritten | 139, 139, 139¹ | 3/3 |
+| N — fixup on the sweep's shadow only | 0, 139, 139 | 2/3 |
+| P — fixup REVERTED | 0, 139 | 1/2 |
+| Q — P + a later `origin/dev` merge | 139, 0 | 1/2 |
+
+¹ the third M run had `CRATONVM_OLD_SWEEP_JIT=0`.
+
+### …and then the baseline moved, which invalidates the comparison above
+
+**P and Q are functionally identical to G** — the fixup is reverted in both, and
+everything else added since is gated off by default. G crashed 0 times in 3
+runs; P and Q crashed 2 times in 4. So the true baseline crash rate for this
+class is roughly one run in three, **not zero**, and G's clean sweep was luck.
+
+That matters, because the decision to revert was made on "0/3 baseline versus
+3/3 and 2/3". Against a ~1-in-3 baseline, 3/3 and 2/3 are not significant.
+**The revert stands as the conservative default — an unproven change to the
+collector is not worth shipping — but it should not be read as evidence that the
+fixup is harmful.** Settling that needs a properly powered comparison, on the
+order of eight runs per arm, ideally paired on the same host so background load
+cannot skew one arm (the G-vs-M runs were not paired, and the load differed).
+
+Anyone re-attempting defect 4 should start there rather than trusting the table
+above.
 
 ### Next steps
 
