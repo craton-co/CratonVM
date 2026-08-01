@@ -467,6 +467,34 @@ struct Lowerer<'a> {
     /// Empty on every compile today — `IrBuilder::build` does not inline — and
     /// an empty table reproduces the historical flat frame states exactly.
     inline_scopes: &'a InlineScopeTable,
+
+    // ── Linear-scan register read cache ──────────────────────────────
+    //
+    // All four are empty / zero unless `CRATONVM_JIT_IR_LINEAR_SCAN` is on, in
+    // which case `lower_inner_with_scopes` installs the plan after
+    // construction. See the section on [`plan_register_residency`].
+    /// `reg_of[id]` = the XMM number [`plan_register_residency`] gave node
+    /// `id`'s value for its whole life. Empty when the path is off.
+    reg_of: Vec<Option<u8>>,
+    /// `reg_live[id]` = the DEFINITION site for `id` has actually run and
+    /// copied the value into `reg_of[id]`.
+    ///
+    /// This is the safety interlock, not bookkeeping. A read consults
+    /// `reg_live`, never `reg_of` directly, so a definition arm this wave did
+    /// not convert can only cost an optimization — never produce a read of a
+    /// register that was never written. Adding a converted definition site is
+    /// therefore additive; forgetting one is not a correctness event.
+    reg_live: Vec<bool>,
+    /// Register → memory transitions this backend EMITTED for resident values
+    /// (one per resident definition, because the wiring is write-through).
+    /// Reported as `CompilationReport::spills`.
+    ls_spills: usize,
+    /// Memory → register transitions emitted for resident values: the
+    /// materialisation of a value whose definition arm computes into RAX
+    /// (`Op::ConstF`, `Op::Neg`, `Op::Param`) and therefore reaches its
+    /// register through its home word. Reported as
+    /// `CompilationReport::reloads`.
+    ls_reloads: usize,
 }
 
 impl<'a> Lowerer<'a> {
@@ -701,6 +729,120 @@ impl<'a> Lowerer<'a> {
             branch_hints,
             sr_map,
             inline_scopes,
+            // Off by default; `lower_inner_with_scopes` installs a plan when
+            // `CRATONVM_JIT_IR_LINEAR_SCAN` is on. Empty vectors, not
+            // node-sized ones: `resident_xmm` reads through `get`, so an
+            // absent plan costs one bounds check and no allocation.
+            reg_of: Vec::new(),
+            reg_live: Vec::new(),
+            ls_spills: 0,
+            ls_reloads: 0,
+        }
+    }
+
+    /// Install the linear-scan register plan. Called once, after construction
+    /// and before any emission, only when the path is enabled.
+    fn set_residency(&mut self, residency: RegResidency) {
+        self.reg_live = vec![false; residency.reg_of.len()];
+        self.reg_of = residency.reg_of;
+    }
+
+    /// The XMM register `id`'s value is CURRENTLY resident in, if any.
+    ///
+    /// Gated on `reg_live`, not on `reg_of`: a value is only readable from a
+    /// register once its definition site has published it there. See the field
+    /// comment for why that direction is the safe one.
+    fn resident_xmm(&self, id: NodeId) -> Option<u8> {
+        if !self.reg_live.get(id as usize).copied().unwrap_or(false) {
+            return None;
+        }
+        self.reg_of.get(id as usize).copied().flatten()
+    }
+
+    /// MOVAPS `dst`, `src` — a full 128-bit register copy.
+    ///
+    /// `MOVAPS` rather than `MOVSS`/`MOVSD` so the copy has no false
+    /// dependency on `dst`'s previous contents and one encoding serves both
+    /// widths: the low 32 or 64 bits are what every consumer reads, and a bit
+    /// copy preserves them exactly (NaN payloads included — this must never be
+    /// an arithmetic move).
+    fn fp_reg_move(&mut self, dst: u8, src: u8) {
+        if dst == src {
+            return;
+        }
+        // REX.R for dst >= 8, REX.B for src >= 8. `IR_LOWER_LS_XMMS` is
+        // XMM2–XMM5 and the value tier is XMM0/XMM1, so no REX is emitted
+        // today; encoding it anyway keeps the helper correct if the file grows.
+        let rex = 0x40u8 | (((dst >= 8) as u8) << 2) | ((src >= 8) as u8);
+        if rex != 0x40 {
+            self.buf.emit_byte(rex);
+        }
+        self.buf
+            .emit(&[0x0F, 0x28, 0xC0 | ((dst & 7) << 3) | (src & 7)]);
+    }
+
+    /// Load `id`'s value into `xmm`, from its resident register when it has
+    /// one and from its home word otherwise.
+    ///
+    /// The read half of the cache. Every FP operand read in `lower_data_node`
+    /// goes through here; a site left calling `fp_load(self.slot_of(id))`
+    /// directly is simply not accelerated.
+    fn fp_load_value(&mut self, xmm: u8, id: NodeId, is_double: bool) {
+        // Bound out of the scrutinee position: every read of `self` here must
+        // finish before the emitters take `&mut self`.
+        let resident = self.resident_xmm(id);
+        match resident {
+            Some(src) => self.fp_reg_move(xmm, src),
+            None => {
+                let off = self.slot_of(id);
+                self.fp_load(xmm, off, is_double);
+            }
+        }
+    }
+
+    /// The register `id`'s value has been ASSIGNED, whether or not its
+    /// definition has published it yet. Only the two publishing sites may use
+    /// this; every reader goes through [`Self::resident_xmm`].
+    fn assigned_xmm(&self, id: NodeId) -> Option<u8> {
+        self.reg_of.get(id as usize).copied().flatten()
+    }
+
+    /// Mark `id` readable from its assigned register.
+    fn mark_reg_live(&mut self, id: NodeId) {
+        if let Some(cell) = self.reg_live.get_mut(id as usize) {
+            *cell = true;
+        }
+    }
+
+    /// Write `id`'s result from `xmm`: ALWAYS to the home word, and
+    /// additionally into its resident register.
+    ///
+    /// The write-through invariant lives here. The home store is emitted
+    /// unconditionally and first, so the frame image is complete at every
+    /// instruction boundary — which is what lets `emit_safepoint_map`,
+    /// `build_deopt_points` and `emit_phi_copies` stay untouched.
+    fn fp_store_value(&mut self, id: NodeId, slot: i32, xmm: u8, is_double: bool) {
+        self.fp_store(slot, xmm, is_double);
+        let dst = self.assigned_xmm(id);
+        if let Some(dst) = dst {
+            self.fp_reg_move(dst, xmm);
+            self.ls_spills += 1;
+            self.mark_reg_live(id);
+        }
+    }
+
+    /// Publish a result that was computed in RAX and already stored to its home
+    /// word (`Op::ConstF`, FP `Op::Neg`, FP `Op::Param`) into its register.
+    ///
+    /// A memory → register transition, and counted as one: the value's only
+    /// materialisation is the home word this reads back. It is still a win in
+    /// a loop, where the alternative is that load once per use.
+    fn publish_fp_from_slot(&mut self, id: NodeId, slot: i32, is_double: bool) {
+        let dst = self.assigned_xmm(id);
+        if let Some(dst) = dst {
+            self.fp_load(dst, slot, is_double);
+            self.ls_reloads += 1;
+            self.mark_reg_live(id);
         }
     }
 
@@ -2790,16 +2932,22 @@ fn reloc_emit_enabled() -> bool {
                 let param_offset = ((*idx as i32) + 1) * 8;
                 self.load_to_rax(param_offset);
                 self.store_rax(slot);
+                // An FP parameter is a loop invariant often enough to be worth
+                // a register; the copy comes from the home word this just
+                // wrote, because the prologue delivered it through a GPR.
+                if matches!(node.ty, IrType::Float | IrType::Double) {
+                    self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
+                }
             }
             Op::Add => {
                 let slot = self.alloc_slot(id);
                 if matches!(node.ty, IrType::Float | IrType::Double) {
                     // ADDSS/ADDSD XMM0, XMM1
                     let is_d = node.ty == IrType::Double;
-                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
-                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_load_value(XMM0, node.inputs[0], is_d);
+                    self.fp_load_value(XMM1, node.inputs[1], is_d);
                     self.fp_binop(0x58, XMM0, XMM1, is_d);
-                    self.fp_store(slot, XMM0, is_d);
+                    self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.load_to_rax(self.slot_of(node.inputs[0]));
                     self.load_to_rcx(self.slot_of(node.inputs[1]));
@@ -2818,10 +2966,10 @@ fn reloc_emit_enabled() -> bool {
                 if matches!(node.ty, IrType::Float | IrType::Double) {
                     // SUBSS/SUBSD XMM0, XMM1
                     let is_d = node.ty == IrType::Double;
-                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
-                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_load_value(XMM0, node.inputs[0], is_d);
+                    self.fp_load_value(XMM1, node.inputs[1], is_d);
                     self.fp_binop(0x5C, XMM0, XMM1, is_d);
-                    self.fp_store(slot, XMM0, is_d);
+                    self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.load_to_rax(self.slot_of(node.inputs[0]));
                     self.load_to_rcx(self.slot_of(node.inputs[1]));
@@ -2840,10 +2988,10 @@ fn reloc_emit_enabled() -> bool {
                 if matches!(node.ty, IrType::Float | IrType::Double) {
                     // MULSS/MULSD XMM0, XMM1
                     let is_d = node.ty == IrType::Double;
-                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
-                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_load_value(XMM0, node.inputs[0], is_d);
+                    self.fp_load_value(XMM1, node.inputs[1], is_d);
                     self.fp_binop(0x59, XMM0, XMM1, is_d);
-                    self.fp_store(slot, XMM0, is_d);
+                    self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.load_to_rax(self.slot_of(node.inputs[0]));
                     self.load_to_rcx(self.slot_of(node.inputs[1]));
@@ -2864,10 +3012,10 @@ fn reloc_emit_enabled() -> bool {
                 // and is never a deopt point.
                 if matches!(node.ty, IrType::Float | IrType::Double) {
                     let is_d = node.ty == IrType::Double;
-                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d);
-                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d);
+                    self.fp_load_value(XMM0, node.inputs[0], is_d);
+                    self.fp_load_value(XMM1, node.inputs[1], is_d);
                     self.fp_binop(0x5E, XMM0, XMM1, is_d);
-                    self.fp_store(slot, XMM0, is_d);
+                    self.fp_store_value(id, slot, XMM0, is_d);
                     return;
                 }
                 let ty = node.ty;
@@ -2908,12 +3056,12 @@ fn reloc_emit_enabled() -> bool {
                 // there is NO exception-sentinel check, unlike `Op::Call`.
                 if matches!(node.ty, IrType::Float | IrType::Double) {
                     let is_d = node.ty == IrType::Double;
-                    self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d); // a
-                    self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d); // b
+                    self.fp_load_value(XMM0, node.inputs[0], is_d); // a
+                    self.fp_load_value(XMM1, node.inputs[1], is_d); // b
                     let helper = if is_d { self.drem } else { self.frem };
                     self.emit_mov_reg_imm64(RAX, helper as u64);
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
-                    self.fp_store(slot, XMM0, is_d);
+                    self.fp_store_value(id, slot, XMM0, is_d);
                     return;
                 }
                 let ty = node.ty;
@@ -3043,6 +3191,11 @@ fn reloc_emit_enabled() -> bool {
                     }
                 }
                 self.store_rax(slot);
+                // The FP arms computed in RAX, so an XMM-resident result
+                // reaches its register through the home word it just wrote.
+                if matches!(node.ty, IrType::Float | IrType::Double) {
+                    self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
+                }
             }
             Op::And => {
                 let slot = self.alloc_slot(id);
@@ -3181,8 +3334,8 @@ fn reloc_emit_enabled() -> bool {
                 //         ⇒ AL-DL = {a>b:+1, a<b:-1, eq:0, NaN:+1}.
                 let is_d = *double;
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), is_d); // a
-                self.fp_load(XMM1, self.slot_of(node.inputs[1]), is_d); // b
+                self.fp_load_value(XMM0, node.inputs[0], is_d); // a
+                self.fp_load_value(XMM1, node.inputs[1], is_d); // b
                 if *nan_greater {
                     // UCOMIS XMM1, XMM0 (compare b vs a) — ModRM C8.
                     if is_d {
@@ -3459,7 +3612,7 @@ fn reloc_emit_enabled() -> bool {
                 let sib = if is_d { 0xC8 } else { 0x88 };
                 self.buf
                     .emit(&[prefix, 0x0F, 0x10, 0x44, sib, HEADER_SIZE as u8]);
-                self.fp_store(slot, XMM0, is_d);
+                self.fp_store_value(id, slot, XMM0, is_d);
             }
             // FP array element store (Slice B) — `fastore`/`dastore`. inputs =
             // [ctrl, mem, array, index, value]. Load the value into XMM0 first
@@ -3471,7 +3624,7 @@ fn reloc_emit_enabled() -> bool {
                 let _slot = self.alloc_slot(id);
                 let is_d = matches!(kind, MemKind::Double);
                 let bci = node.bytecode_pc.unwrap_or(0);
-                self.fp_load(XMM0, self.slot_of(node.inputs[4]), is_d); // value → XMM0
+                self.fp_load_value(XMM0, node.inputs[4], is_d); // value → XMM0
                 self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
                 self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
                 self.emit_array_null_bounds_guards(bci);
@@ -3639,6 +3792,11 @@ fn reloc_emit_enabled() -> bool {
                 let slot = self.alloc_slot(id);
                 self.emit_mov_rax_imm64(*bits as i64);
                 self.store_rax(slot);
+                // A float/double constant is materialised as an integer
+                // immediate, so its register copy comes from the home word.
+                // `regalloc` calls `Op::ConstF` rematerializable and evicts it
+                // first for exactly this reason; here it is simply cheap.
+                self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
             }
             // int → float / double. Load the int operand to EAX and convert.
             Op::I2F => {
@@ -3646,14 +3804,14 @@ fn reloc_emit_enabled() -> bool {
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 // CVTSI2SS XMM0, EAX
                 self.buf.emit(&[0xF3, 0x0F, 0x2A, 0xC0]);
-                self.fp_store(slot, XMM0, false);
+                self.fp_store_value(id, slot, XMM0, false);
             }
             Op::I2D => {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 // CVTSI2SD XMM0, EAX
                 self.buf.emit(&[0xF2, 0x0F, 0x2A, 0xC0]);
-                self.fp_store(slot, XMM0, true);
+                self.fp_store_value(id, slot, XMM0, true);
             }
             // long → float / double (64-bit source operand in RAX).
             Op::L2F => {
@@ -3661,21 +3819,21 @@ fn reloc_emit_enabled() -> bool {
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 // CVTSI2SS XMM0, RAX (REX.W)
                 self.buf.emit(&[0xF3, 0x48, 0x0F, 0x2A, 0xC0]);
-                self.fp_store(slot, XMM0, false);
+                self.fp_store_value(id, slot, XMM0, false);
             }
             Op::L2D => {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 // CVTSI2SD XMM0, RAX (REX.W)
                 self.buf.emit(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
-                self.fp_store(slot, XMM0, true);
+                self.fp_store_value(id, slot, XMM0, true);
             }
             // float → int / long (truncate toward zero, with the JVM
             // NaN→0 / overflow→MAX|MIN fixup). Source stays in XMM0 for the
             // fixup's sign/NaN test.
             Op::F2I => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), false);
+                self.fp_load_value(XMM0, node.inputs[0], false);
                 // CVTTSS2SI EAX, XMM0
                 self.buf.emit(&[0xF3, 0x0F, 0x2C, 0xC0]);
                 self.emit_fp_to_int_fixup(/* is_double */ false, /* is_long */ false);
@@ -3685,7 +3843,7 @@ fn reloc_emit_enabled() -> bool {
             }
             Op::F2L => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), false);
+                self.fp_load_value(XMM0, node.inputs[0], false);
                 // CVTTSS2SI RAX, XMM0 (REX.W)
                 self.buf.emit(&[0xF3, 0x48, 0x0F, 0x2C, 0xC0]);
                 self.emit_fp_to_int_fixup(/* is_double */ false, /* is_long */ true);
@@ -3694,15 +3852,15 @@ fn reloc_emit_enabled() -> bool {
             // float → double.
             Op::F2D => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), false);
+                self.fp_load_value(XMM0, node.inputs[0], false);
                 // CVTSS2SD XMM0, XMM0
                 self.buf.emit(&[0xF3, 0x0F, 0x5A, 0xC0]);
-                self.fp_store(slot, XMM0, true);
+                self.fp_store_value(id, slot, XMM0, true);
             }
             // double → int / long (truncate toward zero, with the JVM fixup).
             Op::D2I => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), true);
+                self.fp_load_value(XMM0, node.inputs[0], true);
                 // CVTTSD2SI EAX, XMM0
                 self.buf.emit(&[0xF2, 0x0F, 0x2C, 0xC0]);
                 self.emit_fp_to_int_fixup(/* is_double */ true, /* is_long */ false);
@@ -3711,7 +3869,7 @@ fn reloc_emit_enabled() -> bool {
             }
             Op::D2L => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), true);
+                self.fp_load_value(XMM0, node.inputs[0], true);
                 // CVTTSD2SI RAX, XMM0 (REX.W)
                 self.buf.emit(&[0xF2, 0x48, 0x0F, 0x2C, 0xC0]);
                 self.emit_fp_to_int_fixup(/* is_double */ true, /* is_long */ true);
@@ -3720,10 +3878,10 @@ fn reloc_emit_enabled() -> bool {
             // double → float.
             Op::D2F => {
                 let slot = self.alloc_slot(id);
-                self.fp_load(XMM0, self.slot_of(node.inputs[0]), true);
+                self.fp_load_value(XMM0, node.inputs[0], true);
                 // CVTSD2SS XMM0, XMM0
                 self.buf.emit(&[0xF2, 0x0F, 0x5A, 0xC0]);
-                self.fp_store(slot, XMM0, false);
+                self.fp_store_value(id, slot, XMM0, false);
             }
             // Control and meta nodes — skip
             Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {}
@@ -5805,6 +5963,433 @@ fn verify_slot_colouring(
     Ok(())
 }
 
+// ── Linear-scan register residency (`CRATONVM_JIT_IR_LINEAR_SCAN`) ───
+//
+// `regalloc::allocate_linear_scan` is a complete, self-verifying linear-scan
+// allocator that had no production consumer. This section is its first one.
+//
+// It is deliberately NOT a replacement for the frame-slot colouring. The
+// colourer still runs, still decides every value's home word, and every value
+// is still WRITTEN to that home. What the allocator adds is a *read cache*: a
+// value the allocation keeps in one register for its entire live range is also
+// copied into that register at its definition, and its later reads take the
+// register instead of the frame.
+//
+// ## Why write-through, and why that is the safe shape
+//
+// The frame image stays authoritative at every instruction boundary. That is
+// what makes this wiring cheap to reason about:
+//
+//   * `emit_safepoint_map` publishes frame slots. Every live value is still in
+//     its slot, so the oop map is exactly as complete as it was — there is no
+//     register a collector would have to know about, walk, or *update* on an
+//     evacuation. (The register file below is XMM-only, so a reference cannot
+//     be register-resident at all; see `IR_LOWER_LS_XMMS`. Two independent
+//     reasons, either one sufficient.)
+//   * `build_deopt_points` / `FrameState` name frame words. Unchanged.
+//   * `emit_phi_copies`, call-argument marshalling and the shadow push all read
+//     home slots. Unchanged.
+//   * A definition site this wave did not convert simply never publishes
+//     residency (see `Lowerer::reg_live`), so all of its reads stay memory
+//     reads. A missed *use* site is a missed optimization; there is no edit
+//     that turns into wrong code by omission.
+//
+// The cost is that the store side is not eliminated: this buys loads, not
+// stores. Eliminating the store requires the whole lowerer to stop treating the
+// frame as the value's identity, which is the large change this one is the
+// increment towards. See `docs/jit/linear-scan-wiring.md`.
+
+/// The registers this wiring may hand out.
+///
+/// XMM2–XMM5, and the choice is forced rather than tuned:
+///
+///   * **Caller-saved on both ABIs.** Win64 makes XMM0–XMM5 volatile and
+///     XMM6–XMM15 non-volatile; System V makes every XMM volatile. The IR
+///     prologue saves NO callee-saved register (`emit_prologue` pushes RBP and
+///     nothing else), so any register the caller expects preserved is unusable
+///     here until that prologue grows a save area — which rules out every
+///     register in `regalloc::RegFile::x86_64` (`LOCAL_REGS` = RBX/R12–R15,
+///     plus R8/R9 and XMM8–XMM15).
+///   * **Never touched by this emitter.** The FP value tier is XMM0/XMM1; the
+///     GP tier is RAX/RCX/RDX with R10/R11 as safepoint and shadow-stack
+///     scratch and R8/R9 as call-argument registers. XMM2–XMM5 appear nowhere.
+///   * **Encodable without REX**, which `fp_load` / `fp_store` / `fp_binop`
+///     require: they emit ModRM with `(xmm & 7) << 3` and no REX.R, so only
+///     XMM0–XMM7 are addressable by them at all.
+///
+/// The consequence worth stating plainly: this wiring is **FP-only**. An `int`
+/// loop counter gets nothing out of it. That is the price of not touching the
+/// prologue, and it is the first thing to revisit — see the doc.
+const IR_LOWER_LS_XMMS: [u8; 4] = [2, 3, 4, 5];
+
+/// `CRATONVM_JIT_IR_LINEAR_SCAN=1` — run the linear-scan allocator and use its
+/// result as a register read cache. Default OFF.
+///
+/// Declared-flag note: the name must also be listed in
+/// `types/src/flag_groups.rs` for `-XX:` options and `with_thread_overrides` to
+/// reach it. Until it is, `runtime_var` falls through to a live `std::env`
+/// read, which still honours the environment but is invisible to the flag
+/// snapshot. Tests do not depend on either — they drive [`LsForce`] — so a
+/// declaration change cannot silently make them vacuous.
+fn linear_scan_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = ls_forced() {
+            return forced;
+        }
+    }
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LINEAR_SCAN") {
+        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`linear_scan_enabled`], so a unit test never
+    /// depends on the process environment or on whether the flag has been
+    /// declared yet. Thread-local, so parallel tests cannot see each other's
+    /// setting.
+    static LS_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn ls_forced() -> Option<bool> {
+    LS_FORCE.with(|c| c.get())
+}
+
+/// Test-only RAII override of [`linear_scan_enabled`] on this thread.
+#[cfg(test)]
+struct LsForce;
+
+#[cfg(test)]
+impl LsForce {
+    fn on() -> LsForce {
+        LS_FORCE.with(|c| c.set(Some(true)));
+        LsForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for LsForce {
+    fn drop(&mut self) {
+        LS_FORCE.with(|c| c.set(None));
+    }
+}
+
+/// Which XMM register holds each value for its whole life, plus what the
+/// decision cost.
+#[derive(Clone, Debug, Default)]
+struct RegResidency {
+    /// `reg_of[id]` = the XMM number holding node `id`'s value from its
+    /// definition to its last use, with no split, no spill and no reload.
+    /// `None` for everything else, which is the majority.
+    reg_of: Vec<Option<u8>>,
+    /// How many values that is.
+    promoted: usize,
+    /// Values the allocator promoted that this file then refused, because the
+    /// allocator's liveness model and `plan_slots`' disagreed about them. A
+    /// non-zero count is a compiler bug worth chasing; it is not wrong code,
+    /// because a refusal only sends the value back to memory.
+    demoted: usize,
+    /// Copied out of the liveness model so the caller can report it.
+    #[allow(dead_code)]
+    peak_live: usize,
+}
+
+/// The machine model for `ir_lower`'s emission, over `regs`.
+///
+/// [`crate::regalloc::MachineModel::for_graph`] derives clobbers from ops. It
+/// is correct as far as it goes, and it cannot know about the calls a
+/// particular backend emits *between* ops. This adds the one `ir_lower` has:
+/// the cooperative safepoint poll, which on a loop back edge tests a byte and
+/// on a set flag calls its slow path (`emit_safepoint_poll`) — at the block's
+/// outgoing-edge position, which belongs to no node. `for_graph` already marks
+/// those positions safepoints; they must also be clobbers, because a value in
+/// a caller-saved register across a back edge would be destroyed by that call.
+///
+/// The entry poll (before block 0) needs nothing: no value is live yet.
+fn ir_lower_machine_model(
+    graph: &Graph,
+    schedule: &Schedule,
+    live: &crate::regalloc::LiveModel,
+    regs: crate::regalloc::RegFile,
+) -> crate::regalloc::MachineModel {
+    use std::collections::BTreeMap;
+    let all: Vec<crate::regalloc::PhysReg> = regs.specs().iter().map(|s| s.reg).collect();
+    let mut model = crate::regalloc::MachineModel::for_graph(graph, schedule, live, regs);
+
+    // `MachineModel::clobbered_at` binary-searches by position, so the list
+    // must stay sorted AND hold one entry per position. Merge through a map
+    // rather than push-and-sort.
+    let mut merged: BTreeMap<usize, Vec<crate::regalloc::PhysReg>> = BTreeMap::new();
+    for (pos, regs) in model.clobbers.drain(..) {
+        merged.entry(pos).or_default().extend(regs);
+    }
+    for (b, block) in schedule.blocks.iter().enumerate() {
+        if !block.successors.iter().any(|&s| s <= b) {
+            continue;
+        }
+        let Some(&(_, edge)) = live.span.get(b) else {
+            continue;
+        };
+        // `lower_terminator` and `lower_block`'s fall-through arm both emit the
+        // poll immediately before the edge's phi copies, i.e. between the
+        // terminator position and the edge position. Clobber both, for the same
+        // reason `MachineModel::for_graph` makes both safepoints.
+        for pos in [edge.saturating_sub(1), edge] {
+            merged.entry(pos).or_default().extend_from_slice(&all);
+        }
+    }
+    model.clobbers = merged
+        .into_iter()
+        .map(|(pos, mut regs)| {
+            regs.sort_unstable();
+            regs.dedup();
+            (pos, regs)
+        })
+        .collect();
+    model
+}
+
+/// Plan register residency for one scheduled graph, or `None` when nothing is
+/// promotable and the colourer's memory layout stands unchanged.
+///
+/// Every refusal here is a *demotion*, never a bailout: a value that does not
+/// take a register keeps the home slot the lowerer has always given it, which
+/// is correct by construction. The one hard failure is
+/// [`crate::regalloc::verify_allocation`] rejecting the allocation, which is a
+/// compiler bug — that returns `Err` and the caller refuses the compile rather
+/// than emitting against an allocation nothing proved.
+fn plan_register_residency(
+    graph: &Graph,
+    schedule: &Schedule,
+    plan: &SlotPlan,
+) -> CompileResult<Option<RegResidency>> {
+    use crate::regalloc::{
+        allocate_linear_scan, build_live_model, verify_allocation, PhysReg, RegClass, RegFile,
+        RegSpec,
+    };
+
+    let mut live = build_live_model(graph, schedule);
+    if !live.converged {
+        // Every range is the whole method; nothing is promotable and the scan
+        // would only burn compile time proving it.
+        return Ok(None);
+    }
+
+    // ── Release the deopt pins, and why that is legal HERE ───────────
+    //
+    // Without this the wiring is inert on every real method. `IrBuilder`
+    // records a `SafepointSnapshot` of the locals and the operand stack at
+    // EVERY bytecode boundary, so every temporary is named by some frame state
+    // and `build_live_model` pins the entire value set — `allocate_linear_scan`
+    // then promotes nothing at all, on any graph that came from bytecode.
+    //
+    // The pin's premise is "the home word must hold the value at any recorded
+    // bci, and an allocator cannot establish that". This consumer establishes
+    // it by construction rather than by analysis: `fp_store_value` emits the
+    // home store at EVERY definition, promoted or not, so a deopt frame read
+    // out of home words is bit-identical to the one the colourer-only path
+    // produces. `build_deopt_points` is not modified and does not need to be.
+    //
+    // The price, per `release_deopt_pins`' contract, is `Allocation::stack_slot`
+    // — which this file must not read, and does not: every home offset comes
+    // from `plan_slots`, which keeps every pin, through `alloc_slot_checked`.
+    let released = live.release_deopt_pins(graph);
+
+    // ── Agreement check: two liveness models, one program ────────────
+    //
+    // `build_live_model` re-implements `plan_slots`' position model rather than
+    // calling it (`SlotPlan` and `LiveRange` are private to this file). Two
+    // implementations of one model drifting apart is precisely how a register
+    // allocator comes to alias two live values, so the agreement is CHECKED
+    // before either is used, not documented and hoped for.
+    //
+    // A disagreement disables promotion entirely. It is not a bailout: the
+    // colourer's answer is still correct on its own terms, and it is the one
+    // the frame is built from.
+    let expected_positions: usize = schedule
+        .blocks
+        .iter()
+        .map(|b| b.nodes.len() + usize::from(b.terminator.is_some()) + 1)
+        .sum();
+    if live.total_positions != expected_positions {
+        return Ok(None);
+    }
+    if live.wants_loc.len() != plan.node_color.len()
+        || live
+            .wants_loc
+            .iter()
+            .zip(plan.node_color.iter())
+            .any(|(wants, color)| *wants != color.is_some())
+    {
+        return Ok(None);
+    }
+
+    // ── The register file ────────────────────────────────────────────
+    let regs = RegFile::from_specs(IR_LOWER_LS_XMMS.iter().map(|&n| RegSpec {
+        reg: PhysReg::xmm(n),
+        // Not "the ABI says so" but "this frame never saves them", which is the
+        // property that matters: a value may not stay in one across a call.
+        caller_saved: true,
+    }));
+    let model = ir_lower_machine_model(graph, schedule, &live, regs);
+
+    let alloc = match allocate_linear_scan(graph, &live, &model) {
+        Ok(alloc) => alloc,
+        // Register pressure, an unsatisfiable fixed constraint or an exhausted
+        // split budget is a property of the input program, not a compiler bug.
+        // Decline to promote and keep the frame layout the colourer already
+        // produced; there is no reason to lose the whole optimized body over
+        // an optimization that did not fit.
+        Err(_) => return Ok(None),
+    };
+    // `allocate_linear_scan` verifies its own result. Re-verify anyway: this
+    // call site's guarantee must not rest on an internal detail of another
+    // module, and the check is the only thing standing between a bug in the
+    // scan and machine code that reads a register two values are in.
+    //
+    // THIS one propagates. A verifier failure is a compiler bug, and emitting
+    // against an allocation nothing proved is exactly the trade that has
+    // produced silent heap corruption in this VM before.
+    verify_allocation(graph, &live, &model, &alloc)?;
+
+    let n = graph.nodes.len();
+    let mut reg_of: Vec<Option<u8>> = vec![None; n];
+    let mut demoted = 0usize;
+    for id in 0..n {
+        let Some(segs) = alloc.segments.get(id) else {
+            continue;
+        };
+        // ONE segment, and it holds a register. Anything else — a split, a
+        // spill, a reload, a home-slot stretch in the middle — is refused
+        // rather than emitted: this wiring has no reload machinery, so a value
+        // whose register goes away partway through must not be read from one.
+        let reg = match segs.as_slice() {
+            [seg] => match seg.reg {
+                Some(reg) => reg,
+                None => continue,
+            },
+            _ => continue,
+        };
+        // Defensive, all three: the file is XMM-only and FP-only by
+        // construction, so a `Ref` (or an `int`, or XMM8) arriving here means
+        // the file or `RegClass::of` changed under this code.
+        if reg.class != RegClass::Xmm || !IR_LOWER_LS_XMMS.contains(&reg.num) {
+            continue;
+        }
+        if !matches!(
+            graph.nodes.get(id).map(|node| node.ty),
+            Some(IrType::Float) | Some(IrType::Double)
+        ) {
+            continue;
+        }
+        // Write-through needs a home to write to.
+        if plan.node_color.get(id).copied().flatten().is_none() {
+            continue;
+        }
+        // A phi's home is written by `emit_phi_copies` at each incoming edge,
+        // not by a definition arm, so there is no site that could publish it
+        // into a register. `allocate_linear_scan` already refuses phis; this
+        // says so locally rather than relying on that.
+        //
+        // NOT `SlotClass::Pinned`. That class means "never shares a frame
+        // word", and after `release_deopt_pins` it covers exactly the
+        // deopt-named values — i.e., on a bytecode graph, nearly all of them.
+        // Testing it here would undo the release and make this wiring inert
+        // again. A dedicated home word is if anything the safer case for
+        // write-through.
+        let is_phi = graph
+            .nodes
+            .get(id)
+            .is_some_and(|node| matches!(node.op, Op::Phi));
+        if is_phi {
+            continue;
+        }
+        reg_of[id] = Some(reg.num);
+    }
+
+    // ── Second opinion on the aliasing property ──────────────────────
+    //
+    // `verify_allocation` proves "no two values hold one register at one
+    // position" against the ALLOCATOR's liveness model. Re-prove it against
+    // `plan_slots`' independently computed ranges. If the two models disagree
+    // about an overlap, both values lose the register — the disagreement
+    // itself is the reason not to trust either answer for that pair.
+    let mut holders: HashMap<u8, Vec<usize>> = HashMap::new();
+    for (id, reg) in reg_of.iter().enumerate() {
+        if let Some(reg) = reg {
+            holders.entry(*reg).or_default().push(id);
+        }
+    }
+    let mut drop_ids: Vec<usize> = Vec::new();
+    for ids in holders.values() {
+        for (i, &a) in ids.iter().enumerate() {
+            let Some(ra) = plan.range.get(a).copied().flatten() else {
+                drop_ids.push(a);
+                continue;
+            };
+            for &b in &ids[i + 1..] {
+                match plan.range.get(b).copied().flatten() {
+                    Some(rb) if !ra.overlaps(rb) => {}
+                    _ => {
+                        drop_ids.push(a);
+                        drop_ids.push(b);
+                    }
+                }
+            }
+        }
+    }
+    // ── Second opinion on the ABI property ───────────────────────────
+    //
+    // The same idea for `verify_allocation`'s clobber check: re-run it against
+    // `plan_slots`' range for the value rather than the allocator's.
+    for (id, reg) in reg_of.iter().enumerate() {
+        let Some(reg) = reg else { continue };
+        let Some(range) = plan.range.get(id).copied().flatten() else {
+            continue;
+        };
+        let me = PhysReg::xmm(*reg);
+        if model
+            .clobbers
+            .iter()
+            .any(|(pos, regs)| *pos >= range.lo && *pos <= range.hi && regs.contains(&me))
+        {
+            drop_ids.push(id);
+        }
+    }
+    for id in drop_ids {
+        if reg_of[id].take().is_some() {
+            demoted += 1;
+        }
+    }
+
+    let promoted = reg_of.iter().filter(|r| r.is_some()).count();
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+        eprintln!(
+            "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
+             scan_promoted={} resident={promoted} demoted={demoted} splits={} \
+             scan_spills={} scan_reloads={}",
+            live.total_positions,
+            live.peak_live,
+            alloc.promoted,
+            alloc.splits,
+            alloc.spills,
+            alloc.reloads,
+        );
+    }
+    if promoted == 0 {
+        return Ok(None);
+    }
+    Ok(Some(RegResidency {
+        reg_of,
+        promoted,
+        demoted,
+        peak_live: live.peak_live,
+    }))
+}
+
 /// Funnel every refusal in this file through one place: count it, then return
 /// the `None` the public entry points have always returned, which is the
 /// caller's signal to run the method in a lower tier. A compiler refusal must
@@ -6190,6 +6775,38 @@ pub(crate) fn lower_inner_with_scopes(
         return refuse(bailout);
     }
 
+    // ── Linear-scan register residency (default OFF) ─────────────────
+    //
+    // The production call site for `regalloc::allocate_linear_scan`. Installed
+    // BEFORE the prologue and never touched again, so residency is a property
+    // of the whole emission rather than something that changes mid-body.
+    //
+    // A verifier failure is the one hard stop. `plan_register_residency`
+    // returns `Err` only when `verify_allocation` rejects the allocation — a
+    // compiler bug — and emitting against an allocation nothing proved is
+    // exactly the trade that has produced silent heap corruption here before.
+    // Refuse the body; the method runs in a lower tier, which is always valid.
+    // Everything else it can decline (register pressure, a liveness-model
+    // disagreement, a value it cannot prove) comes back as `Ok(None)` and
+    // leaves the colourer's memory layout in charge.
+    let mut ls_active = false;
+    if linear_scan_enabled() {
+        match plan_register_residency(graph, schedule, &slot_plan) {
+            Ok(Some(residency)) => {
+                if crate::ir_stage_reporting() {
+                    eprintln!(
+                        "[ir] linear scan: {} values resident, {} demoted",
+                        residency.promoted, residency.demoted
+                    );
+                }
+                lowerer.set_residency(residency);
+                ls_active = true;
+            }
+            Ok(None) => {}
+            Err(bailout) => return refuse(bailout),
+        }
+    }
+
     lowerer.emit_prologue();
     lowerer.emit_safepoint_poll();
 
@@ -6357,6 +6974,22 @@ pub(crate) fn lower_inner_with_scopes(
     // rather than a parameter because `lower_inner`'s signature is pinned (see
     // `metrics::note_current_peak_live_values`); a no-op when metrics are off.
     crate::metrics::note_current_peak_live_values(slot_plan.peak_live);
+
+    // `CompilationReport::spills` / `::reloads` are reported ONLY when the
+    // linear-scan path actually ran, and they count what this backend EMITTED,
+    // not what `regalloc::Allocation` planned — the plan is a full
+    // spill/reload/split schedule, and this wiring executes only the subset it
+    // can prove (see `plan_register_residency`). Reporting the plan's numbers
+    // would describe machine code that was never generated.
+    //
+    // The colourer-only path leaves both `NotMeasured`, which is the truth: it
+    // allocates no registers, so it has no register↔memory transitions to
+    // count, and a reported `0` would be indistinguishable from "measured, and
+    // it spilled nothing".
+    if ls_active {
+        crate::metrics::note_current_spills(lowerer.ls_spills);
+        crate::metrics::note_current_reloads(lowerer.ls_reloads);
+    }
 
     let buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
@@ -9582,6 +10215,432 @@ mod tests {
             "{literals} `DeoptimizationPoint` literal(s) but only {stamped} \
              `semantics:` initialiser(s) — a construction site is inferring \
              the re-execute convention again instead of recording it"
+        );
+    }
+
+    // ── Linear-scan register residency ──────────────────────────────────
+
+    /// `double f(double a) { return a * a * 2.0 + a; }` as a hand-built graph.
+    ///
+    /// Hand-built rather than compiled from `dload_0; dmul; …`, because the
+    /// point of these tests is the ALLOCATION, and a bytecode-built graph
+    /// carries a `SafepointSnapshot` per bci whose interaction with pinning is
+    /// the subject of its own test below.
+    fn fp_chain_graph() -> (Graph, Schedule) {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Double, vec![start], Some(0));
+        let sq = graph.add(Op::Mul, IrType::Double, vec![a, a], Some(1));
+        let two = graph.add(Op::ConstF(2.0f64.to_bits()), IrType::Double, vec![], Some(2));
+        let scaled = graph.add(Op::Mul, IrType::Double, vec![sq, two], Some(3));
+        let sum = graph.add(Op::Add, IrType::Double, vec![scaled, a], Some(4));
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum], Some(5));
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
+    #[test]
+    fn linear_scan_promotes_fp_values_and_nothing_else() {
+        let (graph, schedule) = fp_chain_graph();
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("the colouring verifies");
+
+        let residency = plan_register_residency(&graph, &schedule, &plan)
+            .expect("the allocation verifies")
+            .expect("an FP arithmetic chain has something to promote");
+
+        assert!(residency.promoted > 0);
+        assert_eq!(
+            residency.demoted, 0,
+            "the two liveness models must agree on a straight-line graph"
+        );
+        for (id, reg) in residency.reg_of.iter().enumerate() {
+            let Some(reg) = reg else { continue };
+            assert!(
+                IR_LOWER_LS_XMMS.contains(reg),
+                "n{id} was given xmm{reg}, which is outside the file this \
+                 backend may clobber"
+            );
+            assert!(
+                matches!(graph.nodes[id].ty, IrType::Float | IrType::Double),
+                "n{id} is {:?} — only FP values may take a register here, which \
+                 is what makes a reference at a safepoint unrepresentable",
+                graph.nodes[id].ty
+            );
+        }
+    }
+
+    /// A value named by a deopt frame state must still be promotable, and its
+    /// home word must still be written.
+    ///
+    /// This is the regression witness for the check that nearly made the whole
+    /// wiring inert: `plan_slots` marks every deopt-named value
+    /// `SlotClass::Pinned` (= never shares a frame word), and refusing to
+    /// promote that class would have undone `release_deopt_pins` for exactly
+    /// the values it exists to release. `IrBuilder` names essentially every
+    /// value in some frame state, so this is not a corner case — it is the
+    /// common case on real bytecode.
+    #[test]
+    fn a_deopt_named_value_is_still_promotable() {
+        let (mut graph, _) = fp_chain_graph();
+        // Name every FP value in a frame state, as `IrBuilder` would.
+        let fp: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.ty, IrType::Float | IrType::Double))
+            .map(|(id, _)| id as NodeId)
+            .collect();
+        assert!(!fp.is_empty());
+        graph.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: fp.clone(),
+            stack: fp.clone(),
+        });
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        // Precondition: the colourer really does pin them, so this test is
+        // asserting against the state it means to.
+        assert!(
+            fp.iter()
+                .any(|&id| plan.class[id as usize] == Some(SlotClass::Pinned)),
+            "the colourer must pin a deopt-named value"
+        );
+
+        let residency = plan_register_residency(&graph, &schedule, &plan)
+            .expect("the allocation verifies")
+            .expect(
+                "a deopt-named FP value must still be promotable — write-through \
+                 keeps its home word correct at every bci",
+            );
+        assert!(residency.promoted > 0);
+    }
+
+    /// The GC cliff, stated as a property rather than a comment: no reference
+    /// can be register-resident, so `emit_safepoint_map`'s frame-slot-only
+    /// publication stays complete.
+    #[test]
+    fn a_reference_is_never_register_resident() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        // A live array reference and an int index, both genuinely read.
+        let arr = graph.add(Op::Param(0), IrType::Ref, vec![start], Some(0));
+        let idx = graph.add(Op::Param(1), IrType::Int, vec![start], Some(1));
+        let elem = graph.add(
+            Op::ArrayLoad(MemKind::Double),
+            IrType::Double,
+            vec![ctrl, mem, arr, idx],
+            Some(2),
+        );
+        let doubled = graph.add(Op::Add, IrType::Double, vec![elem, elem], Some(3));
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, doubled], Some(4));
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        let residency = plan_register_residency(&graph, &schedule, &plan)
+            .expect("the allocation verifies")
+            .expect("the FP values are promotable");
+        assert_eq!(
+            residency.reg_of[arr as usize], None,
+            "a reference took a register; `emit_safepoint_map` publishes frame \
+             slots only, so the collector could neither see nor relocate it"
+        );
+        assert_eq!(
+            residency.reg_of[idx as usize], None,
+            "an int took a register, but this file's register set is XMM-only"
+        );
+        assert!(
+            residency.reg_of[doubled as usize].is_some(),
+            "the FP value must be promoted, or the two assertions above are \
+             vacuous"
+        );
+    }
+
+    /// A value live across a helper call must not keep a caller-saved register.
+    ///
+    /// FP `Op::Rem` is the sharp case: it lowers to `CALL jit_drem`, and
+    /// `regalloc::ir_op_is_call` did not count it until this wiring landed.
+    #[test]
+    fn a_value_live_across_a_helper_call_keeps_no_register() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Double, vec![start], Some(0));
+        let m = graph.add(Op::ConstF(3.0f64.to_bits()), IrType::Double, vec![], Some(1));
+        // `jit_drem` — a call that returns into the body.
+        let r = graph.add(Op::Rem, IrType::Double, vec![a, m], Some(2));
+        // `a` is read again AFTER the call, so its range spans it.
+        let sum = graph.add(Op::Add, IrType::Double, vec![r, a], Some(3));
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum], Some(4));
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        let residency = plan_register_residency(&graph, &schedule, &plan)
+            .expect("the allocation verifies");
+        let reg_of_a = residency
+            .as_ref()
+            .and_then(|res| res.reg_of.get(a as usize).copied().flatten());
+        assert_eq!(
+            reg_of_a, None,
+            "n{a} spans a `CALL jit_drem`, which destroys every XMM this file \
+             allocates over"
+        );
+    }
+
+    /// `MachineModel::for_graph` cannot see the safepoint poll's slow-path
+    /// call, because it belongs to no node. `ir_lower_machine_model` adds it.
+    ///
+    /// Without this the first loop-carried FP value would be handed a register
+    /// the poll destroys on every back edge.
+    #[test]
+    fn the_machine_model_clobbers_the_back_edge_poll() {
+        use crate::regalloc::{build_live_model, MachineModel, PhysReg, RegFile, RegSpec};
+
+        // int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        // Unoptimized on purpose: the schedule's back edges are the subject,
+        // and the optimizer is free to reshape them.
+        let builder = IrBuilder::new(1, 3);
+        let graph = builder.build(&code, 21).expect("IR build");
+        let schedule = ir_schedule::schedule(&graph);
+        let live = build_live_model(&graph, &schedule);
+        assert!(live.converged);
+
+        let file = || {
+            RegFile::from_specs(IR_LOWER_LS_XMMS.iter().map(|&n| RegSpec {
+                reg: PhysReg::xmm(n),
+                caller_saved: true,
+            }))
+        };
+        let bare = MachineModel::for_graph(&graph, &schedule, &live, file());
+        let ours = ir_lower_machine_model(&graph, &schedule, &live, file());
+
+        let back_edges: Vec<usize> = schedule
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, block)| block.successors.iter().any(|&s| s <= *b))
+            .filter_map(|(b, _)| live.span.get(b).map(|&(_, edge)| edge))
+            .collect();
+        assert!(
+            !back_edges.is_empty(),
+            "a counted loop must have a back edge to poll on"
+        );
+
+        let xmm2 = PhysReg::xmm(2);
+        let holds = |model: &MachineModel, pos: usize| {
+            model
+                .clobbers
+                .iter()
+                .any(|(p, regs)| *p == pos && regs.contains(&xmm2))
+        };
+        for edge in back_edges {
+            assert!(
+                holds(&ours, edge),
+                "the poll at the outgoing edge of a back-edge block calls its \
+                 slow path; position {edge} must be a clobber"
+            );
+            assert!(
+                !holds(&bare, edge),
+                "this test is only meaningful while `for_graph` still misses \
+                 the poll — if it now models it, delete the augmentation"
+            );
+        }
+
+        // `MachineModel::clobbered_at` binary-searches this list.
+        assert!(
+            ours.clobbers.windows(2).all(|w| w[0].0 < w[1].0),
+            "the clobber list must stay sorted with one entry per position"
+        );
+    }
+
+    /// The finding that decides whether any of this does anything on real
+    /// code: `IrBuilder` snapshots the frame at every bci, so `build_live_model`
+    /// pins the whole value set and the allocator promotes nothing until the
+    /// deopt pins are released.
+    #[test]
+    fn a_bytecode_graph_pins_everything_until_the_deopt_pins_are_released() {
+        use crate::regalloc::{allocate_linear_scan, build_live_model, MachineModel, RegFile};
+
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        let builder = IrBuilder::new(1, 3);
+        let graph = builder.build(&code, 21).expect("IR build");
+        let schedule = ir_schedule::schedule(&graph);
+
+        let mut live = build_live_model(&graph, &schedule);
+        assert!(live.converged);
+        assert!(
+            !graph.safepoints.is_empty(),
+            "the IR builder records a frame state per bci"
+        );
+
+        let wants = live.wants_loc.iter().filter(|w| **w).count();
+        let pinned_before = live
+            .wants_loc
+            .iter()
+            .zip(live.pinned.iter())
+            .filter(|(w, p)| **w && **p)
+            .count();
+        assert!(
+            wants > 0 && pinned_before * 2 > wants,
+            "most values ({pinned_before} of {wants}) should be pinned by the \
+             per-bci frame states — that is the whole finding"
+        );
+
+        let model = MachineModel::for_graph(&graph, &schedule, &live, RegFile::x86_64());
+        let before = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+
+        let released = live.release_deopt_pins(&graph);
+        assert!(released > 0, "there were pins to release");
+        let after = allocate_linear_scan(&graph, &live, &model).expect("allocates");
+        crate::regalloc::verify_allocation(&graph, &live, &model, &after).expect("verifies");
+        assert!(
+            after.promoted > before.promoted,
+            "releasing the deopt pins is what makes the allocator do anything \
+             on a real method ({} → {})",
+            before.promoted,
+            after.promoted
+        );
+        // Phi pins are structural and must survive.
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if matches!(node.op, Op::Phi) && live.wants_loc[id] {
+                assert!(
+                    live.pinned[id],
+                    "phi n{id} lost its pin; its home is what the edge copies write"
+                );
+            }
+        }
+    }
+
+    /// Write-through, end to end: the same method must return the same bits
+    /// with the register cache on and off, and the "on" body must still emit
+    /// every home store the "off" body did.
+    #[test]
+    fn the_register_cache_changes_no_result_and_drops_no_home_store() {
+        let (graph, schedule) = fp_chain_graph();
+
+        let (off_code, off_bits) = {
+            let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("lowers");
+            // SAFETY: one incoming argument, delivered as the raw bits of a
+            // double in an integer ABI register, exactly as `Op::Param`
+            // expects; the body calls no helper.
+            let bits = unsafe { cm.try_call(&[3.0f64.to_bits() as i64]).expect("call") };
+            (cm.code_bytes().to_vec(), bits)
+        };
+        assert_eq!(
+            f64::from_bits(off_bits as u64),
+            3.0 * 3.0 * 2.0 + 3.0,
+            "the fixture itself must compute a*a*2+a"
+        );
+
+        let (on_code, on_bits, resident) = {
+            let _flag = LsForce::on();
+            let plan = plan_slots(&graph, &schedule, None);
+            let resident = plan_register_residency(&graph, &schedule, &plan)
+                .expect("verifies")
+                .map(|r| r.promoted)
+                .unwrap_or(0);
+            let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("lowers");
+            // SAFETY: as above.
+            let bits = unsafe { cm.try_call(&[3.0f64.to_bits() as i64]).expect("call") };
+            (cm.code_bytes().to_vec(), bits, resident)
+        };
+
+        assert!(resident > 0, "the fixture must actually promote something");
+        assert_eq!(
+            on_bits, off_bits,
+            "the register cache changed the computed value"
+        );
+
+        // MOVAPS xmm, xmm — the register copy, emitted only by the cache.
+        // Compared rather than counted absolutely: a two-byte needle can also
+        // fall inside some other instruction's encoding.
+        assert!(
+            count_seq(&on_code, &[0x0F, 0x28]) > count_seq(&off_code, &[0x0F, 0x28]),
+            "the enabled body emitted no register copy, so the wiring did \
+             nothing and the rest of this test is vacuous"
+        );
+
+        // MOVSD [rbp - disp32], xmm0 — the home store. Write-through means the
+        // cached body emits at least as many as the uncached one.
+        let home_store = [0xF2u8, 0x0F, 0x11, 0x85];
+        let off_stores = count_seq(&off_code, &home_store);
+        assert!(off_stores > 0, "the fixture must store FP results to memory");
+        assert!(
+            count_seq(&on_code, &home_store) >= off_stores,
+            "a home store disappeared: the frame image is no longer complete \
+             at every instruction boundary, which is what `emit_safepoint_map` \
+             and `build_deopt_points` rely on"
+        );
+    }
+
+    /// The publication interlock, asserted on the source because it is a
+    /// property of *which accessor* every read uses, and a behavioural test
+    /// cannot reach a lowering that forgot to convert a definition site.
+    ///
+    /// `reg_of` says which register a value was ASSIGNED; `reg_live` says the
+    /// definition has actually written it. Every read must go through
+    /// `resident_xmm` (which checks `reg_live`) or `assigned_xmm` (which is
+    /// only for the two publishing sites). A definition arm nobody converted
+    /// must therefore cost an optimization, never a read of a register that
+    /// was never written.
+    #[test]
+    fn the_register_read_path_is_gated_on_publication() {
+        // Only the emitter, not this module: the assertion below quotes the
+        // very strings it looks for.
+        let src = include_str!("ir_lower.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let reads: Vec<String> = body
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| l.contains("self.reg_of") && !l.starts_with("//"))
+            .collect();
+        let allowed = [
+            "self.reg_of = residency.reg_of;",
+            "self.reg_of.get(id as usize).copied().flatten()",
+        ];
+        for line in &reads {
+            assert!(
+                allowed.contains(&line.as_str()),
+                "new read of the register assignment outside `resident_xmm` / \
+                 `assigned_xmm`: {line}"
+            );
+        }
+        assert_eq!(
+            reads.len(),
+            3,
+            "expected exactly the install site and the two accessors"
         );
     }
 }

@@ -3896,10 +3896,42 @@ fn ir_op_is_safepoint(op: &Op) -> bool {
 }
 
 /// Does this op destroy the caller-saved registers?
+///
+/// A **superset** of the ops that are obviously calls, because `ir_lower`
+/// lowers three more to a `MOV RAX,helper ; CALL RAX` that returns into the
+/// body — and a caller-saved register live across a call the model does not
+/// know about is silent wrong code, not a missed optimization:
+///
+/// * `Op::Rem` on `Float`/`Double` calls `jit_frem` / `jit_drem`
+///   (`ir_lower.rs`, the `Op::Rem` arm — IEEE remainder has no single SSE
+///   instruction);
+/// * `Op::Load(_)` calls `jit_getfield` whenever the helper is wired, which is
+///   every real compile (`compact_ref_fields_enabled` makes the inline
+///   displacement wrong, and a `Ref` field has no correct inline lowering at
+///   all);
+/// * `Op::Store(_)` calls `jit_putfield_int` for the same reason.
+///
+/// `Op::Guard` is deliberately **absent**. Its failure edge jumps to the shared
+/// deopt stub, which calls `ir_deopt_entry` and then runs the epilogue — it
+/// never returns into the body, so what it destroys cannot be read again.
+/// Treating every guard as a clobber would deny a register to every value in a
+/// bounds-checked loop, which is most of them, for no soundness gain.
+///
+/// This predicate covers ops. It cannot cover the calls a backend emits
+/// *between* ops — `ir_lower`'s cooperative safepoint poll calls its slow path
+/// on a loop back edge, at the block's edge position and not at any node. A
+/// backend allocating over caller-saved registers must add those positions to
+/// [`MachineModel::clobbers`] itself; `ir_lower::ir_lower_machine_model` does.
 fn ir_op_is_call(op: &Op) -> bool {
     matches!(
         op,
-        Op::Call { .. } | Op::New { .. } | Op::NewArray { .. } | Op::LambdaIntToDouble
+        Op::Call { .. }
+            | Op::New { .. }
+            | Op::NewArray { .. }
+            | Op::LambdaIntToDouble
+            | Op::Rem
+            | Op::Load(_)
+            | Op::Store(_)
     )
 }
 
@@ -4291,6 +4323,63 @@ impl LiveModel {
     pub fn next_use_after(&self, node: NodeId, pos: usize) -> Option<usize> {
         self.next_use_at_or_after(node, pos.saturating_add(1))
     }
+
+    /// Drop the **deopt-frame** pins, keeping the phi pins. Returns how many
+    /// values were released.
+    ///
+    /// ## Why this exists
+    ///
+    /// `build_step_4` pins every value a `SafepointSnapshot` names, because the
+    /// home word must hold the value at any recorded bci and a general
+    /// allocator cannot establish that. On a graph built from real bytecode
+    /// that is *every value*: `ir::IrBuilder` records a snapshot of the locals
+    /// and the operand stack at **every bytecode boundary**, so a temporary
+    /// sitting on the stack across one boundary — which is every temporary —
+    /// is named by a frame state. Measured on any `IrBuilder` graph, the pin
+    /// set is the whole value set and [`allocate_linear_scan`] promotes
+    /// nothing. The allocator is not conservative here, it is inert.
+    ///
+    /// ## When it is sound to release them
+    ///
+    /// Exactly when the consumer is **write-through**: it emits the home store
+    /// at every definition regardless of the register it also assigns, so the
+    /// frame image is complete at every instruction boundary and a deopt frame
+    /// built from home words is bit-identical to the one a register-free
+    /// lowering would build. `ir_lower`'s wiring is that consumer — see
+    /// `docs/jit/linear-scan-wiring.md`.
+    ///
+    /// ## What a caller gives up
+    ///
+    /// [`Allocation::stack_slot`] and [`Allocation::stack_slots`]. Releasing a
+    /// pin also moves the value out of the `Pinned` home pool, so the home
+    /// colouring this model produces may put two deopt-named values in one
+    /// word — correct for their live ranges, and NOT what a deopt frame
+    /// reconstructor expecting one word per named value assumes. A caller that
+    /// calls this **must** take its home layout from somewhere else
+    /// (`ir_lower` takes it from `plan_slots`, which keeps every pin). Nothing
+    /// enforces that; it is why this is an explicit call and not a default.
+    ///
+    /// A no-op on an unconverged model: there every value is pinned *because
+    /// nothing was analysed*, which no write-through property repairs.
+    pub fn release_deopt_pins(&mut self, graph: &Graph) -> usize {
+        if !self.converged {
+            return 0;
+        }
+        let mut released = 0usize;
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if !self.pinned.get(id).copied().unwrap_or(false) {
+                continue;
+            }
+            // A phi's home is what the edge copies write; its pin is structural
+            // and has nothing to do with deopt.
+            if matches!(node.op, Op::Phi) {
+                continue;
+            }
+            self.pinned[id] = false;
+            released += 1;
+        }
+        released
+    }
 }
 
 impl MachineModel {
@@ -4301,6 +4390,16 @@ impl MachineModel {
     /// variable shift destroys RCX, which matter only if a caller puts those in
     /// the file) and the safepoint set. The fixed-constraint list starts empty;
     /// see [`MachineModel::pin_entry_params`].
+    ///
+    /// **The clobber set is derived from ops alone.** It is complete for calls
+    /// a *node* makes (`ir_op_is_call` is a superset of those, helper calls
+    /// included) and necessarily silent about calls a backend emits *between*
+    /// nodes. `ir_lower`'s cooperative safepoint poll is one: on a loop back
+    /// edge it calls its slow path at the block's outgoing-edge position, which
+    /// belongs to no node. This function marks that position a **safepoint**
+    /// but not a clobber. A backend that allocates over caller-saved registers
+    /// must add its own emission's clobbers on top — see
+    /// `ir_lower::ir_lower_machine_model`, which does exactly that.
     pub fn for_graph(graph: &Graph, schedule: &Schedule, live: &LiveModel, regs: RegFile) -> Self {
         let caller_saved: Vec<PhysReg> = regs
             .specs()
@@ -6698,5 +6797,43 @@ mod linear_scan_tests {
             "an unanalysed graph keeps the frame layout ir_lower already had"
         );
         verify_allocation(&graph, &live, &model, &alloc).expect("verifies");
+    }
+
+    /// The clobber model must count every op `ir_lower` lowers to a `CALL`
+    /// that RETURNS into the body, not only the ops whose name says "call".
+    ///
+    /// Found while giving this allocator its first production call site: with
+    /// a caller-saved register file, an FP value held across an `Op::Load`
+    /// (which calls `jit_getfield`) or an `Op::Rem` (which calls `jit_drem`)
+    /// would have been destroyed by the helper and read back as garbage. The
+    /// old predicate named only `Call`/`New`/`NewArray`/`LambdaIntToDouble`.
+    #[test]
+    fn every_op_ir_lower_lowers_to_a_returning_call_is_a_clobber() {
+        for op in [
+            Op::Call { info_ptr: 0 },
+            Op::New {
+                class_id: 0,
+                num_fields: 0,
+            },
+            Op::NewArray { element_type: 0 },
+            Op::LambdaIntToDouble,
+            // `jit_frem` / `jit_drem`.
+            Op::Rem,
+            // `jit_getfield` / `jit_putfield_int`.
+            Op::Load(crate::ir::MemKind::Double),
+            Op::Store(crate::ir::MemKind::Int),
+        ] {
+            assert!(
+                ir_op_is_call(&op),
+                "{op:?} is lowered to a CALL that returns into the body, so it \
+                 destroys the caller-saved registers"
+            );
+        }
+        // A guard's failure edge never returns into the body: the deopt stub
+        // runs the epilogue. Counting it would cost a register in every
+        // bounds-checked loop for no soundness gain.
+        assert!(!ir_op_is_call(&Op::Guard { bci: 0 }));
+        assert!(!ir_op_is_call(&Op::Add));
+        assert!(!ir_op_is_call(&Op::ArrayLoad(crate::ir::MemKind::Double)));
     }
 }

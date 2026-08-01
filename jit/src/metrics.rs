@@ -42,13 +42,28 @@
 //! * [`CompilationReport::peak_live_values`] is fed: `ir_lower`'s
 //!   liveness-based frame-slot colouring computes the peak and
 //!   [`note_current_peak_live_values`] carries it here.
-//! * [`CompilationReport::spills`] / [`CompilationReport::reloads`] have a
-//!   producer — `regalloc::Allocation` counts both, and
-//!   `regalloc::record_allocation_metrics` publishes them to a recorder —
-//!   but `regalloc::allocate_linear_scan` has no production caller yet, so on
-//!   a real compile they stay `NotMeasured`. [`note_current_spills`] /
-//!   [`note_current_reloads`] are the ambient form, for the day the allocator
-//!   runs inside `ir_lower::lower_inner`, whose signature is pinned.
+//! * [`CompilationReport::spills`] / [`CompilationReport::reloads`] are fed on
+//!   exactly one path: `ir_lower::lower_inner_with_scopes` with
+//!   `CRATONVM_JIT_IR_LINEAR_SCAN` on, which runs
+//!   `regalloc::allocate_linear_scan` and reports the register↔memory
+//!   transitions it EMITTED through [`note_current_spills`] /
+//!   [`note_current_reloads`] (the ambient form, because that function's
+//!   signature is pinned and cannot take a recorder). The numbers describe
+//!   generated code, not `regalloc::Allocation`'s plan: that wiring executes
+//!   only the subset of the plan it can prove, so reporting
+//!   `Allocation::spills` would describe instructions nobody emitted.
+//!
+//!   With the flag off — the default, and every compile today — the lowerer
+//!   allocates no registers at all: every value lives in a frame slot and
+//!   there is no register↔memory transition to count. Both stay
+//!   `NotMeasured`, which is the honest answer. A reported `0` would be
+//!   indistinguishable from "an allocator ran and spilled nothing", and that
+//!   distinction is the entire reason [`Measured`] exists.
+//!   `regalloc::record_allocation_metrics` remains the recorder-holding
+//!   sibling of the two hooks, for a caller that has one.
+//!
+//!   See `docs/jit/linear-scan-wiring.md` for what that path does and does
+//!   not do.
 //! * the inlining tallies ([`CompilationReport::inline_candidates`] and
 //!   friends) are harvested from `CompiledMethod::inline_tally` in
 //!   [`CompileRecorder::installed`], so they are measured on every installed
@@ -504,14 +519,16 @@ pub struct CompilationReport {
     /// [`note_current_peak_live_values`]. Optimizing path only; the single-pass
     /// backend computes no live ranges and leaves this unmeasured.
     pub peak_live_values: Measured<u32>,
-    /// Register → memory transitions the allocator emitted
-    /// (`regalloc::Allocation::spills`). Supplied by
-    /// `regalloc::record_allocation_metrics` when a caller holds a recorder, or
-    /// by [`note_current_spills`] from a pinned signature. `NotMeasured` on the
-    /// paths that allocate no registers — which today is every production path,
-    /// because `regalloc::allocate_linear_scan` has no production call site yet.
+    /// Register → memory transitions the backend **emitted**.
+    ///
+    /// Supplied by [`note_current_spills`] from
+    /// `ir_lower::lower_inner_with_scopes` when `CRATONVM_JIT_IR_LINEAR_SCAN`
+    /// is on, or by `regalloc::record_allocation_metrics` when a caller holds
+    /// a recorder. `NotMeasured` on every path that allocates no registers,
+    /// which is the default build: absence of an allocator is not a spill
+    /// count of zero.
     pub spills: Measured<u32>,
-    /// Memory → register transitions (`regalloc::Allocation::reloads`). See
+    /// Memory → register transitions the backend **emitted**. See
     /// [`spills`](Self::spills) for who supplies it.
     pub reloads: Measured<u32>,
     /// `CompiledMethod::frame_layout.frame_size` — bytes subtracted from RSP.
@@ -880,18 +897,23 @@ pub fn note_current_peak_live_values(n: usize) {
     };
 }
 
-/// Record the allocator's spill count against the innermost in-flight
-/// compilation on this thread.
+/// Record the emitted spill count against the innermost in-flight compilation
+/// on this thread.
 ///
-/// The producer is `regalloc::Allocation::spills`. There are two ways to get it
-/// here and they exist for different callers:
+/// Two ways to get a spill count here, for two different callers:
 ///
 /// * `regalloc::record_allocation_metrics(&recorder, &alloc)` — for a caller
-///   that holds a [`CompileRecorder`];
+///   that holds a [`CompileRecorder`], reporting what the *allocation* plans;
 /// * this function — for a caller that does not, because its signature is
-///   pinned. `ir_lower::lower_inner` is that caller: it takes no recorder and
-///   already reports [`note_current_peak_live_values`] the same way, so wiring
-///   the allocator into it must not widen its parameter list.
+///   pinned. `ir_lower::lower_inner_with_scopes` is that caller: it takes no
+///   recorder and already reports [`note_current_peak_live_values`] the same
+///   way, so wiring the allocator into it must not widen its parameter list.
+///   It passes what it **emitted**, which is the smaller number — its wiring
+///   executes only the subset of the allocation it can prove.
+///
+/// Only call this from a path that actually allocated registers. Leaving the
+/// field `NotMeasured` is the correct report for a backend that keeps every
+/// value in a frame slot; a `0` there would claim a measurement nobody made.
 ///
 /// Same shape and same reason as [`note_current_bailout`]. A no-op when metrics
 /// are off, and a no-op when no compilation is in flight — so an allocator run
