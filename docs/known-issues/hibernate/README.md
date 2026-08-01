@@ -142,15 +142,20 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 ## Open
 
 - [`Type.getTypeName()` dispatches on `java/lang/Integer` during a SessionFactory rebuild cascade](gettypename-wrong-receiver-in-sessionfactory-rebuild-cascade-20260801.md)
-  (OPEN; correlations established, **not reproduced**) — a `Class` mirror resolving as the class it
-  DESCRIBES, in `JavaTypeRegistry.addBaselineDescriptor`'s inlined `getTypeName()` call. Exact
-  correlation with a SessionFactory rebuild cascade: the 2 runs of 24 that showed it did 21
-  bootstraps and 32 warnings each and were killed at the 1200s cap; every run that did 3-4
-  bootstraps showed none. During the cascade the log has no test activity at all. The VM recovers
-  and no test fails. Ruled out by measurement, not argument: the `getJavaType()` accessor (810k
-  checks), `Type.getTypeName()` dispatch over 30 mirrors (1.8M checks), and `VIRTUAL_TARGET_CACHE`
-  pointer recycling (the cached name is a pure function of the ClassId half of the key). The
-  blocker is inducing the cascade — every attempt topped out at 5 bootstraps.
+  (OPEN, **not reproduced**; rewritten 2026-08-01 after re-reading the witness logs line by line —
+  its first version's causal story was wrong) — a `Class` mirror resolving as the class it
+  DESCRIBES, in `JavaTypeRegistry.addBaselineDescriptor`'s inlined `getTypeName()` call. The
+  cascade is not the consequence of a JUnit timeout: an affected run dies inside
+  `testNumericExpressionReturnTypes` at ~11% of the class, rebuilds, and from the SIXTH bootstrap
+  on **every** rebuild fails at priming before reaching the connection pool — 16 attempts, 2
+  warnings each, zero completed builds, until the wall cap. So it is self-feeding and **permanent**,
+  which rules out a transient race and points at state nothing invalidates. Ruled out by
+  measurement: the `getJavaType()` accessor (810k checks), `getTypeName()` over 30 mirrors (1.8M),
+  `VIRTUAL_TARGET_CACHE` recycling, 35 000 primings (fresh VM and post-suite), and 61 completed runs
+  of the class across dev, the lambda-fix commit and the witness's own era — including forced
+  `CRATONVM_NO_MOVING_YOUNG=1`. The witness era no longer reproduces even its own 103/106 baseline
+  on this host, which is the honest reason for the null result. Next: explain why
+  `testNumericExpressionReturnTypes` stopped — the earliest divergence, and nothing records it.
 
 - [Old-generation header corruption kills `DefaultCatalogAndSchemaTest` under `--nojit`](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md)
   (NARROWED, still OPEN) — `HIB-MAPRESIZE-STALE.1`. **The `map_resize_inner` attribution

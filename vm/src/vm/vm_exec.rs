@@ -21661,6 +21661,36 @@ fn invoke_on_class_shared_inner(
                             blocked_flag,
                             shared.mem.heap.collection_count(),
                         );
+                        // What the receiver actually IS. Every other line in
+                        // this dump describes the address's *history*; none of
+                        // them answers the first question a wrong-receiver miss
+                        // raises — is this the intended object carrying a wrong
+                        // class, or a different object entirely? Those need
+                        // opposite fixes, and the shape settles it: a `Class`
+                        // mirror is registered in `class_mirrors_reverse`, so a
+                        // hit there with a non-`java/lang/Class` header is a
+                        // mirror-header defect, a miss with plausible field
+                        // values is a wrong-value read, and a miss with junk is
+                        // a recycled address.
+                        let mirror_of = crate::vm::vm_object::class_id_from_mirror(shared, *r)
+                            .and_then(|cid| {
+                                shared
+                                    .classes
+                                    .class_manager
+                                    .read()
+                                    .get_class(cid)
+                                    .map(|c| c.name.to_string())
+                            });
+                        let nf = shared.mem.heap.num_fields(*r);
+                        let fields: Vec<String> = (0..nf.min(4))
+                            .map(|i| format!("[{i}]={:?}", shared.mem.heap.get_field(*r, i)))
+                            .collect();
+                        eprintln!(
+                            "  NSME-RECV SHAPE kind={:?} num_fields={nf} mirror_of={} {}",
+                            shared.mem.heap.kind_of(*r),
+                            mirror_of.as_deref().unwrap_or("<not a registered mirror>"),
+                            fields.join(" "),
+                        );
                         for (e, moved_to, mlen, as_dest) in crate::memory::gc::gcpart_probe(addr) {
                             eprintln!(
                                 "  NSME-RECV [gcpart] epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
