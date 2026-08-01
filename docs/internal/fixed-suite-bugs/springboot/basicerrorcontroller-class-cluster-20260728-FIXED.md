@@ -14,7 +14,14 @@ the one the original 2026-07-28 report named**:
 1. a GC one — collection-overlay backing stores reclaimed while their owner was
    live — fixed across `3211b8c74`, `c3dbb011a`, `0b18f15eb` and `19cb55343`;
 2. a JIT one — the JIT-to-JIT exception-handler resume rebuilding a handler
-   frame from the callee's arguments alone — fixed here, in `843b780baa`.
+   frame from the callee's arguments alone. Fixed twice, independently and on
+   the same day: `843b780baa` on this branch, reached from
+   `BasicErrorControllerDirectMockMvcTests`, and `063be4f186` on `dev`, reached
+   from `LiquibaseAutoConfigurationTests`. Both landed on the identical
+   `BindConverter.convert` witness. `dev`'s version is the one that survives
+   the merge — it is a superset — and this branch keeps only the piece dev did
+   not have: the same fail-closed refusal in the OTHER sink,
+   `route_jit_signal_exception`.
 
 A third, unrelated defect turned up while validating and is fixed here too
 (`6c2a8a677d`): `Locale.toString()` returned `""` for every real-JDK `Locale`.
@@ -230,14 +237,25 @@ failures pre-date this work** — `panama::tests::test_85_4_upcall_handle_and_in
 and `tls_deny::tests::every_plaintext_base_overload_is_accounted_for` fail
 identically with these changes stashed.
 
-`JettyServletWebServerFactoryTests` is not 113/113 every run. One test,
-`whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade`, fails
-intermittently — 1 of the 4 runs made on a binary carrying the `Locale`
-fix — with a `404` where a refused connection is expected. That is the residual the GC report already recorded, it has nothing
-to do with this cluster, and it is re-filed — see below. The class's other
-failure, `localeCharsetMappingsAreConfigured`, WAS fixed here (`6c2a8a677d`):
-`Locale.toString()` returned `""` for every real-JDK `Locale`, and Jetty keys
-its locale→encoding map on exactly that string.
+`JettyServletWebServerFactoryTests` had two failures left, and both are now
+closed — one here and one on `dev`, in parallel:
+
+* `localeCharsetMappingsAreConfigured` is fixed here (`6c2a8a677d`).
+  `Locale.toString()` returned `""` for every real-JDK `Locale`, and Jetty keys
+  its locale→encoding map on exactly that string, so a mapping registered for
+  GERMAN answered a lookup for ITALIAN. The GC report's own retirement flagged
+  this as "a separate regression that landed on `dev` in the same window" and
+  left it open; this is its root cause.
+* `whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade` was
+  root-caused and fixed on `dev` while this branch was in flight, and it is not
+  a Jetty problem at all: `ServerSocketChannel.close()` left a duplicate OS
+  handle open, because `ssc_accept` had `try_clone()`d the listener before its
+  poll loop. A connection arriving inside the 10 ms poll window was accepted
+  and served. See
+  [`springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md`](springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md).
+  An earlier draft of this document filed it as a new OPEN report; that was
+  written before the fix landed and has been withdrawn rather than published
+  stale.
 
 ## Affected classes
 
@@ -249,8 +267,8 @@ its locale→encoding map on exactly that string.
 
 ## What this does NOT close
 
-Two items travelled with these reports and are neither fixed nor invalidated
-here. Both were re-filed rather than retired with this document:
+One item travelled with these reports and is neither fixed nor invalidated
+here. It was re-filed rather than retired with this document:
 
 * The JIT code-buffer overflow flood
   (`JIT try_patch_i32: offset out of bounds; marking buffer overflowed`, 3552
@@ -260,12 +278,9 @@ here. Both were re-filed rather than retired with this document:
   the attribution: `CRATONVM_DBG_IR_BAILOUT=1` shows 54 optimizing-tier
   `code_buffer_exhausted` bailouts against 5 from `x64::compile`, so it is the
   IR tier's `nodes*32 + calls*448 + 1024` estimate, not `x64.rs`'s.
-* `JettyServletWebServerFactoryTests.whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade`
-  →
-  `docs/known-issues/springboot/jetty-graceful-shutdown-accepts-new-connections-20260801.md`.
-  A connection made after graceful shutdown begins gets a `404` instead of
-  being refused at the TCP level; intermittent, 1 of 5 runs. Unrelated to any
-  comparator or GC path, and not yet shown to be a CratonVM defect at all.
+(The Jetty graceful-shutdown residual was going to be the second entry here.
+It was fixed on `dev` first — see the Jetty paragraph above — so there is
+nothing left to file.)
 
 One further loose end from the retired
 `basicerrorcontroller-jit-only-failure-20260731.md` is recorded but NOT

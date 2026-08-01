@@ -175,6 +175,20 @@ const ENTRY_ABI_REGS: &[u8] = &[1, 2, 8, 9]; // RCX, RDX, R8, R9
 #[cfg(not(target_os = "windows"))]
 const ENTRY_ABI_REGS: &[u8] = &[7, 6, 2, 1, 8, 9]; // RDI, RSI, RDX, RCX, R8, R9
 
+/// How many incoming argument slots this backend's prologue can actually
+/// deposit — the context pointer (when present) plus the Java arguments,
+/// receiver included.
+///
+/// `emit_prologue` reads incoming arguments from `ENTRY_ABI_REGS` and nothing
+/// else, so this is a hard capacity, not a heuristic: an argument past it
+/// arrives on the caller's stack and is silently dropped. `lower()` refuses
+/// such a graph up front — see the Gap B bail there for what that cost the
+/// last time the two got out of step.
+#[inline]
+fn incoming_abi_reg_capacity() -> usize {
+    ENTRY_ABI_REGS.len()
+}
+
 // ── Lowering state ───────────────────────────────────────────────────
 
 struct Lowerer<'a> {
@@ -1359,17 +1373,32 @@ fn reloc_emit_enabled() -> bool {
 
         // Store params from ABI registers to local frame slots.
         // Windows: RCX, RDX, R8, R9.  SysV: RDI, RSI, RDX, RCX, R8, R9.
-        #[cfg(target_os = "windows")]
-        let abi_regs: &[u8] = &[RCX, RDX, 8, 9]; // RCX, RDX, R8, R9
-        #[cfg(not(target_os = "windows"))]
-        let abi_regs: &[u8] = &[7, 6, RDX, RCX, 8, 9]; // RDI, RSI, RDX, RCX, R8, R9
+        // One list, shared with `incoming_abi_reg_capacity()` — the local copy
+        // this used to keep could (and did) disagree with the bail that is
+        // supposed to keep the `break` below unreachable.
+        let abi_regs: &[u8] = ENTRY_ABI_REGS;
 
         // Gap B: a `needs_context` method receives the VM context pointer in
         // ABI[0] (the `try_call_with_context` convention), with the Java params
         // shifted to ABI[1..]. Store the context to its slot, then the params to
-        // their local slots. `lower()` bails (single-pass) before reaching here
-        // if `1 + num_params` would exceed the register args, so every param
-        // below comes from a register.
+        // their local slots.
+        //
+        // `lower()` refuses the graph before reaching here when the context
+        // slot plus the Java arguments would exceed `incoming_abi_reg_capacity()`,
+        // so every param below comes from a register. The `break` is that
+        // guard's backstop, NOT a supported path: an argument past the register
+        // file arrives on the caller's stack, and dropping it leaves the local
+        // holding whatever the frame slot contained — a silent wrong value, no
+        // diagnostic. That is what shipped while the bail was scoped to
+        // `needs_context` only.
+        debug_assert!(
+            self.num_params + usize::from(self.needs_context) <= abi_regs.len(),
+            "lower() must refuse {} incoming slots (needs_context={}) — the prologue \
+             can only deposit {}",
+            self.num_params,
+            self.needs_context,
+            abi_regs.len(),
+        );
         let base = if self.needs_context {
             self.store_abi_reg(abi_regs[0], self.context_slot_off);
             1
@@ -6753,19 +6782,35 @@ pub(crate) fn lower_inner_with_scopes(
         inline_scopes,
     );
 
-    // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
-    // VM pointer as a hidden first arg, but only `abi_regs.len()` integer
-    // registers carry incoming args. If `1 + num_params` would spill a param to
-    // the stack, the prologue can't load it — bail to single-pass (the safety
-    // net) rather than mis-read the param. `abi_regs` is 4 on Win64, 6 on SysV.
-    if lowerer.needs_context {
-        #[cfg(target_os = "windows")]
-        let abi_len = 4usize;
-        #[cfg(not(target_os = "windows"))]
-        let abi_len = 6usize;
-        if 1 + num_params > abi_len {
-            return None;
-        }
+    // Gap B: only `abi_regs.len()` integer registers carry incoming args (4 on
+    // Win64, 6 on SysV), and a `needs_context` method (one containing an
+    // `Op::Call`) spends the first of them on the hidden VM pointer. Anything
+    // past that arrives on the caller's stack, and `emit_prologue` can only
+    // read registers — its deposit loop `break`s at `abi_regs.len()` and leaves
+    // the remaining locals holding whatever the frame slot happened to contain.
+    // Bail to the single-pass backend (which does load stack params, see
+    // `x64.rs`'s "ROUND-12 fix") rather than mis-read them.
+    //
+    // The check used to sit INSIDE `if lowerer.needs_context`, which left every
+    // LEAF method — no `Op::Call`, so `needs_context == false` — completely
+    // unguarded. Those are the ones the prologue drops from ABI index
+    // `abi_regs.len()` on, with no diagnostic: a method returning its own last
+    // parameter returned null instead. `probes/EntryAbiArgSlotProbe.java`
+    // measured the boundary exactly (the receiver is an incoming slot too, so
+    // an instance method with N parameters occupies N+1): `i3`/`s4` = 4 slots
+    // correct, `i4`/`s5` = 5 slots wrong, and `i6`/`s6` wrong 299_445 times in
+    // 300_000. Downstream it silently emptied Spring Boot's property binding,
+    // because `BindHandler.onSuccess(name, target, context, result)` is
+    // `aload 4; areturn` over five slots — see
+    // `docs/internal/fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
+    // for the trail from there to `BindResult.isBound() == false` for every
+    // property.
+    //
+    // `emit_prologue`'s `break` is what this guard exists to keep unreachable;
+    // `ir_lower_refuses_more_incoming_slots_than_abi_registers` pins the pair
+    // together so the two cannot drift apart again.
+    if num_params + usize::from(lowerer.needs_context) > incoming_abi_reg_capacity() {
+        return None;
     }
 
     // BUG FIX [jit-irlower #2]: reserve phi destination slots before any
@@ -7295,6 +7340,43 @@ mod tests {
         // SAFETY: the generated function has no arguments and returns int 1.
         assert_eq!(unsafe { compiled.try_call(&[]) }, Ok(1));
         assert_eq!(HITS.load(Ordering::SeqCst), 1);
+    }
+
+    /// `emit_prologue` deposits incoming arguments out of `ENTRY_ABI_REGS` and
+    /// nothing else, so a graph with more incoming slots than that must be
+    /// REFUSED — the single-pass backend is the one that loads stack-passed
+    /// params. A leaf method (no `Op::Call`, so `needs_context == false`) used
+    /// to skip the check entirely and be lowered anyway, which dropped every
+    /// argument past the register file and left its local null.
+    ///
+    /// Tested through the return value rather than the emitted bytes: the body
+    /// is `aload_<last>; areturn`, so a lowering that dropped the argument
+    /// would answer with the wrong slot. `num_params` counts the receiver, so
+    /// capacity+1 is the first refused shape.
+    #[test]
+    fn ir_lower_refuses_more_incoming_slots_than_abi_registers() {
+        let cap = incoming_abi_reg_capacity();
+
+        // At capacity: every slot is register-passed, so lowering is allowed.
+        // `aload_0; areturn` keeps the body legal for any slot count.
+        let code = [0x2a, 0xb0]; // aload_0; areturn
+        assert!(
+            compile_via_ir(&code, code.len(), cap, cap).is_some(),
+            "a graph with exactly {cap} incoming slots fits the entry ABI and must lower",
+        );
+
+        // One past capacity: the last argument arrives on the caller's stack,
+        // which `emit_prologue` cannot read. Refuse instead of dropping it.
+        for extra in 1..=3 {
+            let slots = cap + extra;
+            assert!(
+                compile_via_ir(&code, code.len(), slots, slots).is_none(),
+                "a graph with {slots} incoming slots exceeds the {cap}-register entry \
+                 ABI and must bail to the single-pass backend, not silently drop \
+                 argument {}",
+                slots - 1,
+            );
+        }
     }
 
     fn compile_via_ir(
