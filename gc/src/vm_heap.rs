@@ -573,6 +573,35 @@ impl VmHeap {
         }
     }
 
+    /// Diagnostic decomposition of [`Self::is_addr_live`] into its two arms,
+    /// plus where the address actually sits.
+    ///
+    /// `is_addr_live` ORs an old-gen allocation test with a young-survivor
+    /// test, so a `false` is indistinguishable between "the old-gen block is on
+    /// the free list", "the address is in the wrong semispace" and "it is in
+    /// neither generation". Those have completely different causes, and the one
+    /// consumer that DESTROYS state on a `false` — the collection-overlay prune
+    /// — has to be debugged against the specific arm.
+    ///
+    /// Returns `(old_gen_allocated, young_survivor, region)`.
+    pub fn liveness_arms(&self, addr: usize) -> (bool, bool, &'static str) {
+        match self {
+            VmHeap::Generational(h) => {
+                let old = h.is_live_old_gen_addr(addr);
+                let young = h.is_live_young_survivor(addr);
+                let region = if h.is_in_old(addr as *const u8) {
+                    "old-gen"
+                } else if h.is_heap_addr(addr).is_some() {
+                    "young"
+                } else {
+                    "off-heap"
+                };
+                (old, young, region)
+            }
+            _ => (false, false, "n/a"),
+        }
+    }
+
     /// T1.7.1 — Brooks-pointer read barrier.
     ///
     /// Consults the object's compact header: if the `LockState` is
@@ -1064,6 +1093,30 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.stats().snapshot().bytes_promoted,
             _ => 0,
+        }
+    }
+
+    /// Bytes the TENURED space can still absorb — the "is the heap actually
+    /// wedged?" half of the GC-overhead limit (see
+    /// `interpreter::note_gc_productivity`).
+    ///
+    /// The freed-bytes threshold on its own cannot tell a genuine
+    /// retained-allocation death spiral (survivors promoted into an old
+    /// generation that is already full, so nothing drains) from a young
+    /// generation that simply has nothing to promote while old gen sits nearly
+    /// empty. The distinguishing fact is whether old gen can still absorb a
+    /// young drain, which is a question about the OLD generation specifically,
+    /// not about total fullness: in the spiral the young semi is emptied every
+    /// cycle, so *total* fullness parks near young/total and never looks
+    /// exhausted — which is exactly why a total-fullness gate was rejected.
+    ///
+    /// Non-generational backends have no separate tenured space; report their
+    /// whole-heap headroom, which for a single-space collector is the same
+    /// question.
+    pub fn old_gen_headroom(&self) -> usize {
+        match self {
+            VmHeap::Generational(h) => h.old_gen_capacity().saturating_sub(h.old_gen_used()),
+            _ => self.heap_capacity().saturating_sub(self.allocated_bytes()),
         }
     }
 
@@ -1829,6 +1882,18 @@ impl VmHeap {
             // below divides by the CURRENT heap rather than by whatever the
             // last collection saw. Cheap: two arena locks at shutdown.
             h.publish_gc_metrics_occupancy();
+        }
+        // Old-gen free-list coalescing (the counterpart of the young sweep's
+        // post-sweep coalescer). A large `merged` with compaction never having
+        // run is the fragmentation regime this exists for; `calls>0 merged=0`
+        // says the free list was already maximally coalesced.
+        {
+            use std::sync::atomic::Ordering as O;
+            let calls = crate::old_gen::COALESCE_CALLS.load(O::Relaxed);
+            let merged = crate::old_gen::BLOCKS_MERGED.load(O::Relaxed);
+            if calls > 0 {
+                eprintln!("[GC] oldgen_coalesce: calls={calls} blocks_merged={merged}");
+            }
         }
         // What the collector actually did on the last cycle and why. This is
         // the line that settles the `docs/GC.md` ("young collections run

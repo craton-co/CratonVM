@@ -1,5 +1,14 @@
 # TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady — client never observes the connection failure HotSpot produces
 
+**Re-verified 2026-08-01, FIXED:** local Windows fixture, fresh `dev` build,
+`org.apache.catalina.nonblocking.TestNonBlockingAPI` (44 methods, includes
+`testNonBlockingReadIgnoreIsReady`) rerun as part of `rerun-20260731-4shard` —
+full class PASS in 661.4s
+(`.suite/results/rerun-20260731-4shard/real-jit/results.csv`). Leaving the
+historical record below intact; superseded by this verification.
+
+Original write-up follows for the record.
+
 **Status:** OPEN. **Severity:** low-to-medium (this specific test is a
 narrow, deliberately-adversarial scenario, but the root cause — see the
 2026-07-10 correction below — is a general connector-timing issue tracked

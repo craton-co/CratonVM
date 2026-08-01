@@ -192,6 +192,19 @@ ancestor walk misses it.
 
 ### Residual 3 (FIXED, same session): `Class.getGenericInterfaces()` on a lambda proxy returns a raw `Class`, never a real `ParameterizedType`
 
+> **SUPERSEDED 2026-08-01 — this fix was REVERTED.** Its premise was wrong:
+> real HotSpot never exposes a `ParameterizedType` for a lambda proxy (a
+> `LambdaMetafactory`-spun class carries no `Signature` attribute at all), and
+> `GenericTypeResolver.resolveTypeArgument` succeeds on the raw `Class` through
+> `ResolvableType`'s type-variable BOUND fallback. The real defect behind
+> `SpringBootContextLoaderAotTests` was Residual 4's loader-blind interface
+> resolution below, which is still in place — that test passes with the
+> reconstruction removed. Fabricating the type broke
+> `ApplicationConversionServiceTests` and `LambdaSafeTests`; see
+> `lambda-getgenericinterfaces-fabricates-parameterizedtype-FIXED.md` in this
+> directory. `lambda_functional_interface_generic_type` and
+> `NativeContext::lambda_call_site_descriptors` no longer exist.
+
 Fixing residual 2 progressed the test into `IllegalStateException: No generic
 type found for initializer of type class
 SpringBootContextLoader$ContextLoaderHook$1$$Lambda/...` —

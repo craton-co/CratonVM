@@ -1,6 +1,149 @@
 # CratonVM Spring suite — genuine bug list (dev `8719dca85`)
 
 
+## 2026-08-01 six-class session — 4 VM bugs, 2 harness bugs, all six now green
+
+Scope: `context.annotation.Spr15042Tests`, `context.annotation.Spr15275Tests`,
+`core.io.support.PathMatchingResourcePatternResolverTests`,
+`http.client.SimpleClientHttpRequestFactoryTests`,
+`mock.web.MockServletContextTests`, `scripting.bsh.BshScriptFactoryTests`.
+
+**Final: 76/76 test methods pass on CratonVM, identical to HotSpot** (1, 6,
+22, 10, 19, 18), stable over 3 consecutive repeats. Gradle
+(`:spring-context:test --tests …`) was used as the independent ground truth
+for the two classes the harness was lying about.
+
+### Read this first: two of the six were never VM bugs
+
+`apps/spring-suite-runner` produced HotSpot failures for four of these six
+classes. Both defects are fixed in `run-suite.sh`, `one.sh` and `hs.sh`.
+
+1. **The runner prepended the module's main output ahead of the classpath
+   dump.** `build/cratonvm-testcp.txt` is a verbatim dump of Gradle's
+   `sourceSets.test.runtimeClasspath` (see `dump-testcp.init.gradle`), so it
+   already carries the module's own outputs in Gradle's order — test output
+   FIRST. Prepending `build/classes/java/main` put the MAIN package
+   directories in front of the TEST ones, and any lookup that resolves a
+   package *directory* off the classpath then landed in the wrong one.
+   `MockServletContextTests.getResourcePaths` (19/19 → 18/19) and
+   `PathMatchingResourcePatternResolverTests
+   .usingClasspathStarProtocolWithWildcardInPatternAndEndingInSlash`
+   (22/22 → 21/22) failed **on HotSpot** because of this alone. CratonVM was
+   already bug-for-bug identical on both.
+2. **The runner passed none of Spring's own test JVM args.**
+   `spring-framework` `buildSrc/.../TestConventions.java` gives every test JVM
+   `--add-opens=java.base/java.lang=ALL-UNNAMED`,
+   `--add-opens=java.base/java.util=ALL-UNNAMED`, `-Xshare:off` and three
+   system properties. Without the first one Spring-CGLIB's `ReflectUtils`
+   cannot reach `ClassLoader.defineClass` and **every** CGLIB-generated class
+   fails with "No compatible defineClass mechanism detected" — HotSpot scored
+   `BshScriptFactoryTests` 5/18 and `Spr15042Tests` 0/1 without the flag,
+   18/18 and 1/1 with it.
+
+Lesson, same shape as the 2026-07-27 discovery that 79 of 127 "non-passed"
+classes were runner defects: **run the class the way the build system runs
+it, and get the HotSpot number for the identical invocation** — a matching
+CratonVM failure is not evidence of correctness when the harness is what
+broke HotSpot.
+
+### VM bug 1 — FactoryBean interface-proxy handler used the *generic* signature
+
+`Spr15275Tests` `withAbstractFactoryBean`, `withAbstractFactoryBeanForInterface`,
+`withFinalFactoryBean` (3/6) died with
+`NoSuchMethodError: …$1.isSingleton()Ljava/lang/Object;`.
+
+`native-builtins/src/cglib_enhancer.rs::fb_handler_invoke` — the
+`InvocationHandler.invoke` body behind
+`build_or_get_factory_bean_interface_proxy` — delegated every non-`getObject`
+method to the raw factory using a descriptor read from the `Method` mirror's
+**`signature`** field. `Method.signature` is the *generic* signature and is
+`null` for every non-generic method, so the read fell through to a hardcoded
+`"()Ljava/lang/Object;"` default: `isSingleton()Z` and
+`getObjectType()Ljava/lang/Class;` were both dispatched as
+`()Ljava/lang/Object;`. Fixed by using
+`lang_class::method_descriptor_for_invoke` (composed from `parameterTypes`
+/`returnType`), and `method_name_value` for the name.
+
+Second, latent behind it: the handler returned the delegate's raw primitive
+`Value`, but `InvocationHandler.invoke` returns `Object` and the generated
+proxy body immediately `checkcast`s it — with the descriptor fixed, the VM
+aborted with `checkcast: not an object reference (got Int(1)) at
+jdk/proxy2/$Proxy23.isSingleton()Z`. Primitive returns are now boxed and
+`void` maps to `null`.
+
+Only the three tests whose `@Bean` method exposes a `FactoryBean` *interface*
+over a final class / final `getObject()` hit this — those are the ones real
+Spring routes through `createInterfaceProxyForFactoryBean` rather than the
+CGLIB subclass path. (`AbstractFactoryBean.getObject()` is `final`.)
+
+### VM bug 2 — `--add-opens` was parsed and then ignored
+
+`native-builtins/src/lang_class.rs::check_class_loader_define_class_is_encapsulated`
+hardcodes the one deep-reflection edge CratonVM's general module gate cannot
+enforce: classpath code may not `setAccessible(true)` the protected
+`ClassLoader.defineClass`. It denied **unconditionally**, so
+`--add-opens=java.base/java.lang=ALL-UNNAMED` — the exact grant its own
+denial message tells the user to add, already parsed by the CLI into
+`ModuleRegistry::add_opens` — was a no-op.
+
+Now it consults the registry (`is_package_open_unqualified` /
+`is_package_open_to`), so both the CLI flag and a runtime
+`java.lang.Module.addOpens` are honoured. With neither, nothing changes and
+the denial stands, which is what keeps a bare `cratonvm Main` matching a bare
+`java Main`.
+
+Closed `BshScriptFactoryTests` 5/18 → 18/18 (`ScriptFactoryPostProcessor
+.createConfigInterface` needs CGLIB) and `Spr15042Tests` 0/1 → 1/1
+(`ProxyFactoryBean.getObjectType()` returns `null` when
+`createAopProxy().getProxyClass()` cannot define the proxy, so the scoped
+proxy could not determine its target type).
+
+### VM bug 3 — the real-HttpURLConnection-carrier exemption had two holes
+
+`SimpleClientHttpRequestFactoryTests.interceptor()` lost the interceptor's
+added header; `headerWithNullValue()` lost the mock's `addRequestProperty`
+interaction.
+
+`vm/src/runtime/interpreter/invoke.rs` carries an exemption that keeps
+CratonVM's `java/net/HttpURLConnection` natives firing for a genuinely real
+carrier even after `Mockito.mock(HttpURLConnection.class)` has tripped the
+class-wide redefine counter for every instance. It was keyed on
+`class_name == "java/net/HttpURLConnection"` and lived **only** in
+`intercept_force_registered_native`:
+
+* the cached/hot twin, `intercept_force_registered_native_cached`, never had
+  it — so the exemption silently stopped applying the moment a call site
+  warmed into the invoke cache;
+* `class_name` is the *resolved* method's declaring class, and the same
+  `connection.addRequestProperty(...)` call site inside
+  `SimpleClientHttpRequest.addHeaders` reports `java/net/HttpURLConnection`
+  at first and `java/net/URLConnection` once an unrelated mock has re-resolved
+  it — after which the name test never matched again.
+
+Replaced by `real_http_url_connection_native()`, keyed on the **receiver**
+and used by both paths: exact match against CratonVM's four carrier classes
+plus a non-null inherited `URLConnection.url` field 0. An Objenesis-built
+Mockito mock never runs a constructor, so its field 0 stays unset and mocking
+still routes through Mockito's advice; a user subclass such as the test's own
+`TestHttpURLConnection` is excluded by the exact-class match and keeps running
+its own bytecode.
+
+### Regression evidence
+
+15 adjacent classes (299 methods) covering CGLIB proxying, `@Configuration`
+FactoryBean handling and the HTTP client — `CglibProxyTests`,
+`ProxyFactoryBeanTests`, `ConfigurationClassPostProcessorTests`,
+`ConfigurationWithFactoryBean*Tests`, `BeanMethodPolymorphismTests`,
+`Spr6602Tests`, `FactoryBeanTests`, `FactoryBeanLookupTests`,
+`GroovyScriptFactoryTests`, `BufferingClientHttpRequestFactoryTests`,
+`InterceptingClientHttpRequestFactoryTests`, `SimpleClientHttpResponseTests`
+— all match HotSpot exactly and all pass. `cargo test -p
+cratonvm-native-builtins --lib` fails the same 2 pre-existing tests
+(`panama::tests::test_85_4_upcall_handle_and_invoke`,
+`tls_deny::tests::every_plaintext_base_overload_is_accounted_for`) on a
+pristine `origin/dev` control build, so neither is attributable to this work.
+
+
 ## 2026-07-21 FactoryBean-enhancement + general AOP-CGLIB-of-native-class session
 
 Scope: the two open items this doc flagged as needing "substantial new

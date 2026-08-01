@@ -85,6 +85,33 @@ pub static XT_HELPER_WINDOWS_SCANNED: AtomicU64 = AtomicU64::new(0);
 /// A4 (fork6-fjp) — conservative roots contributed by helper-window peers.
 pub static XT_HELPER_WINDOW_ROOTS: AtomicU64 = AtomicU64::new(0);
 
+/// Peers the STW cross-thread scan could NOT classify: it signalled them and
+/// they did not reach the handler before the deadline (`STATE_CANCELLED`), or
+/// no slot was free to arm. Such a peer is neither parked nor proven
+/// interpreter-side, so its JIT-frame oops are absent from the root set while
+/// it KEEPS RUNNING — and the non-moving sweep then frees on `GC_FLAG_MARKED`
+/// alone. This is the counter that says whether that happened.
+pub static XT_PEERS_UNCLASSIFIED: AtomicU64 = AtomicU64::new(0);
+/// Collections during which at least one peer went unclassified.
+pub static XT_CYCLES_WITH_UNCLASSIFIED: AtomicU64 = AtomicU64::new(0);
+
+/// Deadline for a signalled peer to reach the takeover handler.
+///
+/// `CRATONVM_XT_PEER_DEADLINE_MS` (default 20). The default is a scheduling
+/// bet: a runnable peer under heavy CPU contention can simply not be
+/// scheduled within it.
+pub fn peer_deadline_ms() -> u64 {
+    use std::sync::OnceLock;
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_XT_PEER_DEADLINE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(20)
+    })
+}
+
 /// Whether the cross-thread STW JIT root scan is enabled.
 ///
 /// Default ON (opt-OUT): set `CRATONVM_XT_JIT_ROOT_SCAN=0` (or `false`/`off`)
@@ -727,6 +754,8 @@ mod imp {
     const MAX_STACK_SCAN: usize = 8 * 1024 * 1024;
     const REG_COUNT: usize = 17;
 
+    use super::{peer_deadline_ms, XT_CYCLES_WITH_UNCLASSIFIED, XT_PEERS_UNCLASSIFIED};
+
     const STATE_EMPTY: u8 = 0;
     const STATE_ARMED: u8 = 1;
     const STATE_PARKED: u8 = 2;
@@ -1120,19 +1149,25 @@ mod imp {
         let self_tid = gettid();
         let mut newly = 0usize;
         let mut examined = 0usize;
+        let mut unclassified = 0usize;
         for tid in list_thread_tids() {
             if tid == self_tid || taken.contains(tid) {
                 continue;
             }
             let Some(slot) = arm_slot(tid) else {
+                // No free slot: every remaining peer goes unscanned.
+                XT_PEERS_UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
+                unclassified += 1;
                 break;
             };
             examined += 1;
             if !send_takeover_signal(tid) {
+                // ESRCH: the thread exited between listing and signalling.
+                // Nothing to scan and nothing running — not a coverage hole.
                 slot.clear();
                 continue;
             }
-            match wait_for_response(slot, Duration::from_millis(20)) {
+            match wait_for_response(slot, Duration::from_millis(peer_deadline_ms())) {
                 STATE_PARKED => {
                     let found = scan_slot(slot, is_obj, roots);
                     taken.handles.push(0);
@@ -1153,8 +1188,22 @@ mod imp {
                         );
                     }
                 }
+                // `STATE_NOT_JIT` is a real answer: the peer reached the
+                // handler and its `Rip` was outside JIT code, so it is a
+                // cooperative barrier participant publishing its own precise
+                // roots. `STATE_CANCELLED` is NOT an answer — the peer never
+                // reached the handler, is STILL RUNNING, and its JIT-frame
+                // oops are in no root set.
+                STATE_CANCELLED => {
+                    XT_PEERS_UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
+                    unclassified += 1;
+                    slot.clear();
+                }
                 _ => slot.clear(),
             }
+        }
+        if unclassified > 0 {
+            XT_CYCLES_WITH_UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
         }
         if taken.tids.is_empty() {
             ACTIVE.store(false, Ordering::Release);
@@ -1207,19 +1256,25 @@ mod imp {
         let mut windows = 0usize;
         let mut found_total = 0usize;
         let mut examined = 0usize;
+        let mut unclassified = 0usize;
         for &tid in blocked_os_tids {
             if tid == self_tid || taken.contains(tid) {
                 continue;
             }
             let Some(slot) = arm_slot(tid) else {
+                // No free slot: every remaining peer goes unscanned.
+                XT_PEERS_UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
+                unclassified += 1;
                 break;
             };
             examined += 1;
             if !send_takeover_signal(tid) {
+                // ESRCH: the thread exited between listing and signalling.
+                // Nothing to scan and nothing running — not a coverage hole.
                 slot.clear();
                 continue;
             }
-            match wait_for_response(slot, Duration::from_millis(20)) {
+            match wait_for_response(slot, Duration::from_millis(peer_deadline_ms())) {
                 STATE_PARKED => {
                     candidates.clear();
                     let has_jit = classify_slot_helper_window(
@@ -1242,8 +1297,22 @@ mod imp {
                     }
                     release_slot(slot);
                 }
+                // `STATE_NOT_JIT` is a real answer: the peer reached the
+                // handler and its `Rip` was outside JIT code, so it is a
+                // cooperative barrier participant publishing its own precise
+                // roots. `STATE_CANCELLED` is NOT an answer — the peer never
+                // reached the handler, is STILL RUNNING, and its JIT-frame
+                // oops are in no root set.
+                STATE_CANCELLED => {
+                    XT_PEERS_UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
+                    unclassified += 1;
+                    slot.clear();
+                }
                 _ => slot.clear(),
             }
+        }
+        if unclassified > 0 {
+            XT_CYCLES_WITH_UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
         }
 
         HELPER_MODE.store(false, Ordering::Release);

@@ -513,12 +513,20 @@ impl ExecutableBuffer {
     /// interpreter; the caller may ignore the `Err` and rely on that bail.
     pub fn try_patch_i32(&mut self, offset: usize, value: i32) -> Result<(), CompileError> {
         if offset.checked_add(4).map_or(true, |end| end > self.len) {
+            // Log only the FIRST overflow for this buffer. `overflowed` is
+            // sticky, so every later patch in the same compile hits this arm
+            // too; one oversized method used to emit tens of thousands of
+            // identical lines. The actionable diagnostic (method, code_len,
+            // capacity, wanted) is logged once per method by the compile
+            // driver's "code buffer estimate too small" bail.
+            if !self.overflowed {
+                tracing::warn!(
+                    offset = offset,
+                    len = self.len,
+                    "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
+                );
+            }
             self.overflowed = true;
-            tracing::warn!(
-                offset = offset,
-                len = self.len,
-                "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
-            );
             return Err(CompileError::PatchFailed {
                 kind: "i32",
                 offset,
@@ -540,12 +548,15 @@ impl ExecutableBuffer {
     /// [`try_patch_i32`](Self::try_patch_i32) for the bail-out contract.
     pub fn try_patch_byte(&mut self, offset: usize, value: u8) -> Result<(), CompileError> {
         if offset >= self.len {
+            // First overflow only; see `try_patch_i32` for why.
+            if !self.overflowed {
+                tracing::warn!(
+                    offset = offset,
+                    len = self.len,
+                    "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
+                );
+            }
             self.overflowed = true;
-            tracing::warn!(
-                offset = offset,
-                len = self.len,
-                "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
-            );
             return Err(CompileError::PatchFailed {
                 kind: "byte",
                 offset,
@@ -6444,6 +6455,34 @@ impl JitCache {
         } else {
             None
         }
+    }
+
+    /// DIAG: every `declaring_class_id` under which this (class, method,
+    /// descriptor) triple is published, ignoring the id entirely.
+    ///
+    /// [`get`](Self::get) requires an EXACT `declaring_class_id` match, so a
+    /// caller that probes with the wrong id (notably
+    /// `get_loaded_class_id(..).unwrap_or(0)`) misses a body that is sitting
+    /// right there. This says so instead of leaving it to inference.
+    pub fn debug_ids_for(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        for shard in self.shards.iter() {
+            let methods = shard.methods.load();
+            for (key, _) in methods.values() {
+                if &*key.class_name == class_name
+                    && &*key.method_name == method_name
+                    && &*key.descriptor == descriptor
+                {
+                    out.push(key.declaring_class_id.as_u32());
+                }
+            }
+        }
+        out
     }
 
     /// Look up the independently published OSR body for a method.

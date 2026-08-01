@@ -9881,6 +9881,103 @@ pub(super) fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Val
     )
 }
 
+/// CratonVM's own HTTP carrier classes — the concrete classes its
+/// `URL.openConnection()` hands back, and the ones
+/// `register_http_url_connection_real` registers natives on. Matched EXACTLY
+/// (not by subtype): a user subclass such as
+/// `SimpleClientHttpRequestFactoryTests$TestHttpURLConnection` has real
+/// bytecode of its own and must keep running it.
+const CRATONVM_HTTP_CARRIER_CLASSES: [&str; 4] = [
+    "java/net/HttpURLConnection",
+    "sun/net/www/protocol/http/HttpURLConnection",
+    "sun/net/www/protocol/https/HttpsURLConnectionImpl",
+    "javax/net/ssl/HttpsURLConnection",
+];
+
+/// Resolve the registered native for a call landing on a genuinely real,
+/// `URL.openConnection()`-constructed CratonVM HTTP carrier — the one case
+/// where the native must fire even though the class counts as "redefined"
+/// somewhere in the process.
+///
+/// Why the exemption exists: Mockito's mock makers trip the class-wide
+/// `class_redefine_generation` counter for EVERY instance of
+/// `java/net/HttpURLConnection`, mock or not, for the rest of the process.
+/// Without this, `should_force_registered_native_over_bytecode` cedes to the
+/// real-JDK bytecode for a real, non-mock connection too — observed as
+/// `getResponseCode()` returning 0 and `addRequestProperty`/`getHeaderField`
+/// silently no-op'ing, because CratonVM's carrier keeps its request/response
+/// state in native side tables the real JDK bytecode never touches. That is
+/// `SimpleClientHttpRequestFactoryTests.interceptor()` losing the
+/// interceptor's added header.
+///
+/// Keyed on the RECEIVER, not on `class_name`, and that is load-bearing twice:
+///
+///  * `class_name` is the resolved method's declaring class, so the very same
+///    `connection.addRequestProperty(...)` call site in
+///    `SimpleClientHttpRequest.addHeaders` reports `java/net/HttpURLConnection`
+///    at first and `java/net/URLConnection` once an unrelated
+///    `Mockito.mock(HttpURLConnection.class)` has re-resolved it. The old
+///    `class_name == "java/net/HttpURLConnection"` test silently stopped
+///    matching at that point — and it was missing from the cached/hot twin
+///    entirely, so it also stopped applying as soon as a call site warmed up.
+///  * a Mockito mock is Objenesis-constructed (no constructor ever runs), so
+///    its inherited `URLConnection.url` field 0 stays unset, while a real
+///    carrier's is always populated. The field-0 test therefore never fires
+///    for a mock, and mocking `HttpURLConnection` still routes through
+///    Mockito's advice for stubbing and verification.
+///
+/// Returns the callback to force, or `None` to let normal dispatch decide.
+pub(super) fn real_http_url_connection_native(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    args: &[Value],
+) -> Option<cratonvm_native_api::registry::NativeCallback> {
+    // Cheap gate first: only the connection hierarchy can reach the exemption.
+    if !matches!(
+        class_name,
+        "java/net/URLConnection"
+            | "java/net/HttpURLConnection"
+            | "javax/net/ssl/HttpsURLConnection"
+            | "sun/net/www/protocol/http/HttpURLConnection"
+            | "sun/net/www/protocol/https/HttpsURLConnectionImpl"
+    ) {
+        return None;
+    }
+    let Some(Value::Object(Some(receiver))) = args.first() else {
+        return None;
+    };
+    // Objenesis-constructed mock => field 0 unset => not a real carrier.
+    if !matches!(
+        shared.mem.heap.get_field(*receiver, 0),
+        Value::Object(Some(_))
+    ) {
+        return None;
+    }
+    let receiver_cid = shared.mem.heap.class_id_of(*receiver);
+    let receiver_name = shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(receiver_cid)
+        .map(|class| class.name.to_string())?;
+    if !CRATONVM_HTTP_CARRIER_CLASSES.contains(&receiver_name.as_str()) {
+        return None;
+    }
+    shared
+        .natives
+        .native_methods
+        .find(&receiver_name, method_name, method_descriptor)
+        .or_else(|| {
+            shared.natives.native_methods.find(
+                "java/net/HttpURLConnection",
+                method_name,
+                method_descriptor,
+            )
+        })
+}
+
 pub(super) fn intercept_force_registered_native(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -10078,30 +10175,20 @@ pub(super) fn intercept_force_registered_native(
     // stubbing/verification. Deliberately not narrowed to a specific method
     // allowlist: any native registered on this class for a real carrier is
     // safe to force, since the receiver check alone already gates out mocks.
-    if class_name == "java/net/HttpURLConnection"
-        && matches!(
-            args.first(),
-            Some(Value::Object(Some(receiver)))
-                if matches!(shared.mem.heap.get_field(*receiver, 0), Value::Object(Some(_)))
-        )
+    if let Some(callback) =
+        real_http_url_connection_native(shared, class_name, method_name, method_descriptor, args)
     {
-        if let Some(callback) = shared.natives.native_methods.find(
-            "java/net/HttpURLConnection",
-            method_name,
-            method_descriptor,
-        ) {
-            return Some((|| {
-                let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
-                if let Some(value) = result {
-                    push_invoke_return_value(
-                        &mut thread.frames[frame_idx].stack,
-                        coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
-                    )?;
-                    crate::vm::native_return_pushed_to_stack(shared, thread);
-                }
-                Ok(CachedCallResult::Handled)
-            })());
-        }
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
     }
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
@@ -10248,6 +10335,28 @@ pub(super) fn intercept_force_registered_native_cached(
             let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
                 push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
+    // Same real-carrier exemption the uncached twin applies (see
+    // `real_http_url_connection_native`). This path used to omit it entirely,
+    // so the exemption held only until a call site warmed into the invoke
+    // cache and then silently stopped applying — one
+    // `Mockito.mock(HttpURLConnection.class)` anywhere in the process then
+    // permanently broke every genuinely real connection's
+    // `addRequestProperty`/`getResponseCode`/`getHeaderField`.
+    if let Some(callback) =
+        real_http_url_connection_native(shared, class_name, method_name, method_descriptor, args)
+    {
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                )?;
                 crate::vm::native_return_pushed_to_stack(shared, thread);
             }
             Ok(CachedCallResult::Handled)
@@ -10859,6 +10968,79 @@ fn resolve_step1_native(
             None => None,
         },
         // JdkOnly, §7 step 3: concrete bytecode beats this bridge.
+        None => None,
+    }
+}
+
+/// Resolve the complete identity stored by a warmed native invoke target.
+///
+/// `find` alone discards both the stable registry slot and `NativeKind`, which
+/// used to force cache hits back through constant-pool resolution, a
+/// class-manager lock and a second triple hash. Keep all three values together
+/// at population time so the steady state remains genuinely O(1).
+#[inline]
+fn resolve_cached_native_registration(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<(
+    cratonvm_native_api::NativeCallback,
+    cratonvm_native_api::NativeMethodId,
+    cratonvm_native_api::NativeKind,
+)> {
+    let registry = &shared.natives.native_methods;
+    let id = registry.resolve_id(class_name, method_name, descriptor)?;
+    Some((registry.callback_of(id)?, id, registry.kind_of_id(id)?))
+}
+
+/// Revalidate and count a warmed native target without name-based lookup.
+///
+/// Compatible mode is the former direct-callback path plus one relaxed census
+/// increment. Both modes redeem the current callback and kind from the stable
+/// slot, preserving last-registration-wins; strict mode then routes the
+/// decision through the central §7 policy. The name triple is materialized
+/// only in strict mode, solely for a diagnostic if the live slot is refused.
+#[inline]
+fn revalidate_cached_native(
+    shared: &SharedVm,
+    id: cratonvm_native_api::NativeMethodId,
+    cached_callback: cratonvm_native_api::NativeCallback,
+    cached_kind: cratonvm_native_api::NativeKind,
+) -> Option<cratonvm_native_api::NativeCallback> {
+    let registry = &shared.natives.native_methods;
+    let policy = crate::vm::dispatch_policy(shared);
+
+    // Native slots are updated in place on re-registration. Redeeming both
+    // values before the compatible fast return prevents any warmed entry from
+    // defeating last-write-wins while retaining indexed O(1) access.
+    let callback = registry.callback_of(id).unwrap_or(cached_callback);
+    let kind = registry.kind_of_id(id).unwrap_or(cached_kind);
+    if !policy.is_jdk_only() {
+        registry.record_invocation(id);
+        return Some(callback);
+    }
+
+    let (class_name, method_name, descriptor) = registry.triple_of(id)?;
+    match crate::vm::resolve_native_dispatch_wave1(
+        policy,
+        class_name,
+        method_name,
+        descriptor,
+        Some((callback, kind)),
+        // A published native target has already won this call site's
+        // compatibility decision.
+        true,
+        // Concrete bytecode precedence was decided before publication. If
+        // redefinition can change that fact, the RedefineGate is checked and
+        // evicts this target before we get here.
+        false,
+    ) {
+        Some(decision) => {
+            let callback = decision.native_callback()?;
+            registry.record_invocation(id);
+            Some(callback)
+        }
         None => None,
     }
 }
@@ -12810,6 +12992,14 @@ pub(super) fn populate_invoke_cache(
     // invoking one, and counting it here would inflate every counter by one per
     // call site regardless of whether the site ever ran.
     if let Some(callback) = native_for_cache {
+        let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
+            shared,
+            &class_name,
+            &method_name,
+            &descriptor,
+        ) else {
+            return;
+        };
         let cm = shared.classes.class_manager.read();
         let gate = match cm.get_loaded_class_id(&class_name) {
             Some(cid) => RedefineGate::snapshot(cm.class_redefine_generation_handle(cid)),
@@ -12855,18 +13045,10 @@ pub(super) fn populate_invoke_cache(
                 return;
             }
         }
-        // JDK-ONLY-WAVE2: `CachedInvokeTarget::Native` stores the callback and
-        // throws the `NativeKind` away. A cache HIT therefore cannot re-ask the
-        // §7 question — it has no idea whether it is about to run a reviewed
-        // intrinsic or a `SyntheticStub` — which is why
-        // `execute_invokestatic_cached` has to re-derive the triple from the
-        // constant pool just to run the stub-yield gate. What must replace it:
-        // a `kind: NativeKind` field on the variant (and on
-        // `CachedInvokeTarget::VirtualNative`), populated here where the kind is
-        // already in hand. That variant lives in
-        // `classloading/src/resolution.rs`, outside this wave's file ownership.
         let target = CachedInvokeTarget::Native {
             callback,
+            native_id,
+            native_kind,
             num_params: num_params as u16, // Widening: parameter count conversion
             gate,
         };
@@ -12957,17 +13139,21 @@ pub(super) fn populate_invoke_cache(
                 && !method.is_native()
                 && method.code().is_some();
         if !stub_yields {
-            if let Some(callback) =
-                shared
-                    .natives
-                    .native_methods
-                    .find(declaring_name, &method_name, &descriptor)
+            if let Some((callback, native_id, native_kind)) =
+                resolve_cached_native_registration(
+                    shared,
+                    declaring_name,
+                    &method_name,
+                    &descriptor,
+                )
             {
                 let gate =
                     RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
                 drop(cm);
                 let target = CachedInvokeTarget::Native {
                     callback,
+                    native_id,
+                    native_kind,
                     // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                     num_params: num_params as u16,
                     gate,
@@ -12987,11 +13173,12 @@ pub(super) fn populate_invoke_cache(
     if method.is_native() {
         // Already handled above, but the method might be native in a superclass
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        if let Some(callback) =
-            shared
-                .natives
-                .native_methods
-                .find(declaring_name, &method_name, &descriptor)
+        if let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
+            shared,
+            declaring_name,
+            &method_name,
+            &descriptor,
+        )
         {
             // WP2.4-F1: gate bound to the *declaring* class — that's the
             // class whose method body could be replaced via redefine.
@@ -12999,6 +13186,8 @@ pub(super) fn populate_invoke_cache(
             drop(cm);
             let target = CachedInvokeTarget::Native {
                 callback,
+                native_id,
+                native_kind,
                 num_params: num_params as u16, // Widening: parameter count conversion
                 gate,
             };
@@ -13120,42 +13309,6 @@ pub(super) fn execute_invokestatic_cached(
         thread.invoke_cache.evict(caller_class_id, cp_index, false);
         return Ok(CachedCallResult::CacheMiss);
     }
-    // A call site can first resolve while a bootstrap fallback class is
-    // synthetic, then observe that class upgraded in place to real bytecode.
-    // Cached native entries do not otherwise revisit the SyntheticStub
-    // precedence gate, so evict instead of serving a stale fallback callback.
-    if matches!(&target, CachedInvokeTarget::Native { .. }) {
-        if let Ok((class_name, method_name, descriptor, _)) =
-            resolve_method_ref(shared, caller_class_id, cp_index)
-        {
-            if synthetic_stub_should_yield_to_real_bytecode(
-                shared,
-                &class_name,
-                &method_name,
-                &descriptor,
-            ) {
-                thread.invoke_cache.evict(caller_class_id, cp_index, false);
-                return Ok(CachedCallResult::CacheMiss);
-            }
-            // §4 census ONLY — the dispatch decision was taken when this entry
-            // was cached and is not revisited here (see the
-            // `CachedInvokeTarget::Native` marker in `populate_invoke_cache`).
-            // The triple is already resolved by the gate above, so the census
-            // costs one triple hash on a path that just paid a constant-pool
-            // resolution; without it, every warmed static native call site
-            // would be invisible to the zero-stub acceptance criterion. This
-            // does not change what runs.
-            crate::vm::record_native_dispatch(shared, &class_name, &method_name, &descriptor);
-        }
-    }
-    // JDK-ONLY-WAVE2: the cached *virtual* native path
-    // (`CachedInvokeTarget::VirtualNative` in `execute_invokevirtual_cached`)
-    // is deliberately left UNCOUNTED. It has no equivalent already-paid
-    // constant-pool resolution to piggyback on, so a census increment there
-    // would add a full triple hash to the hottest warmed dispatch in the
-    // interpreter for a measurement-only feature. What must replace it: the
-    // `kind`+id carried on the cached target (same marker as above), which
-    // makes the increment a relaxed add and the hash unnecessary.
     if crate::runtime::env_cache::modstatic_dbg() {
         if let Ok((mcn, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
             if mn.as_ref() == "initBootModuleLoader" {
@@ -13167,46 +13320,17 @@ pub(super) fn execute_invokestatic_cached(
     match target {
         CachedInvokeTarget::Native {
             callback,
+            native_id,
+            native_kind,
             num_params,
             gate: _,
         } => {
-            // Real-JDK `String.toLowerCase(Locale)` delegates to this static
-            // `StringLatin1` helper. The cached target already proves the
-            // callback and the three-reference signature, while the generic
-            // path below would still resolve and parse that descriptor on
-            // every cache hit. Retain the ordinary prevalidated native
-            // machinery for pinning, forwarding, exceptions and return
-            // coercion.
-            if num_params == 3
-                && cratonvm_native_builtins::lang_string::is_lower_case_native_callback(callback)
-            {
-                let locale = thread.frames[frame_idx]
-                    .stack
-                    .pop_compact_with_long_mark()?
-                    .0
-                    .decode_by_descriptor(b'L');
-                let value = thread.frames[frame_idx]
-                    .stack
-                    .pop_compact_with_long_mark()?
-                    .0
-                    .decode_by_descriptor(b'L');
-                let source = thread.frames[frame_idx]
-                    .stack
-                    .pop_compact_with_long_mark()?
-                    .0
-                    .decode_by_descriptor(b'L');
-                let mut args = [source, value, locale];
-                refresh_stale_object_args(shared, &mut args);
-                invoke_cached_native_callback_prevalidated(
-                    shared,
-                    thread,
-                    frame_idx,
-                    callback,
-                    &args,
-                    "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
-                )?;
-                return Ok(CachedCallResult::Handled);
-            }
+            let Some(callback) =
+                revalidate_cached_native(shared, native_id, callback, native_kind)
+            else {
+                thread.invoke_cache.evict(caller_class_id, cp_index, false);
+                return Ok(CachedCallResult::CacheMiss);
+            };
             let (args, method_descriptor) = pop_coerced_invoke_args_static(
                 shared,
                 caller_class_id,
@@ -17569,6 +17693,9 @@ pub fn try_jit_compile_callee(
     // RBC.4 — short-circuit permanently-uncompilable methods before the
     // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
     if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
+        if callee_probe_dbg() {
+            callee_probe_note("BAIL-LISTED", class_name, method_name, descriptor);
+        }
         return None;
     }
     // This API hands a raw entry pointer to direct dispatchers. Even if the
@@ -17577,6 +17704,9 @@ pub fn try_jit_compile_callee(
     // Keep them on the generic invocation path; background tiering uses the
     // separate wrapped-entry helper below.
     if named_method_is_synchronized(shared, class_name, method_name, descriptor) {
+        if callee_probe_dbg() {
+            callee_probe_note("SYNCHRONIZED", class_name, method_name, descriptor);
+        }
         return None;
     }
     // JIT-cache probe. Deliberately BEFORE the negative cache so a method
@@ -17616,6 +17746,23 @@ pub fn try_jit_compile_callee(
             let needs_ctx = compiled.needs_context();
             return Some((compiled, entry, needs_ctx));
         }
+        // DIAG (`CRATONVM_DBG_CALLEE_PROBE=1`): the probe above requires an
+        // EXACT `declaring_class_id`. Report the miss UNCONDITIONALLY, with the
+        // exact strings — an empty `ids` list is as informative as a populated
+        // one (it separates "wrong id" from "the name never matches at all").
+        if callee_probe_dbg() {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 25 {
+                let ids = jit_cache.debug_ids_for(class_name, method_name, descriptor);
+                eprintln!(
+                    "[callee-probe] CACHE-MISS class={class_name:?} method={method_name:?} \
+                     desc={descriptor:?} probe_id={} ids_in_cache={:?}",
+                    probe_class_id.as_u32(),
+                    ids
+                );
+            }
+        }
     }
     let fp = callee_neg_fingerprint(class_name, method_name, descriptor);
     // Widening: small integer index -> usize (non-negative, fits in pointer width)
@@ -17637,6 +17784,9 @@ pub fn try_jit_compile_callee(
         &mut cache_negative,
         false,
     );
+    if res.is_none() && callee_probe_dbg() {
+        callee_probe_note("SLOW-PATH-NONE", class_name, method_name, descriptor);
+    }
     match res {
         None if cache_negative => slot.store(fp, Ordering::Relaxed),
         // A re-probe that succeeded — drop the stale negative entry.
@@ -17644,6 +17794,26 @@ pub fn try_jit_compile_callee(
         _ => {}
     }
     res
+}
+
+/// Is the callee-probe diagnostic on? (`CRATONVM_DBG_CALLEE_PROBE=1`)
+///
+/// `try_jit_compile_callee` has four independent ways to answer `None`, and
+/// they were indistinguishable from the outside — which is what made
+/// "`hit_entry=0` forever" unfalsifiable. Each now names itself.
+fn callee_probe_dbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CALLEE_PROBE").is_some()
+    })
+}
+
+fn callee_probe_note(why: &str, class_name: &str, method_name: &str, descriptor: &str) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 25 {
+        eprintln!("[callee-probe] {why} {class_name}.{method_name}{descriptor}");
+    }
 }
 
 pub(super) fn named_method_is_synchronized(
@@ -22582,6 +22752,8 @@ pub(super) fn execute_invokevirtual_cached(
         CachedInvokeTarget::VirtualNative {
             receiver_class_id,
             callback,
+            native_id,
+            native_kind,
             num_params,
             gate: _,
         } => {
@@ -22625,54 +22797,14 @@ pub(super) fn execute_invokevirtual_cached(
                     if actual_class_id != receiver_class_id {
                         return Ok(CachedCallResult::CacheMiss);
                     }
-                    // The class may have been upgraded in place after this
-                    // call site cached a SyntheticStub callback. Re-run the
-                    // real-bytecode precedence gate before serving that
-                    // cached callback; otherwise an earlier stub result can
-                    // keep the same receiver ClassId pinned to its fallback
-                    // `toString()` forever.
-                    //
-                    // PERF (H2 TestFileSystem.testConcurrent, 2026-07-26):
-                    // this used to run `resolve_method_ref` — a resolution-
-                    // cache `RwLock` read, a hash probe and four `Arc` clone/
-                    // drop pairs — on EVERY cached virtual-native call, before
-                    // discovering (as it almost always does) that the receiver
-                    // is not a real-protected stub class at all. The predicate
-                    // it feeds, `synthetic_stub_should_yield_to_real_bytecode`,
-                    // is `kind_of(...) == SyntheticStub && real_protected_stub_class(class)`,
-                    // and the class term depends only on the RECEIVER name —
-                    // which needs neither the method ref nor the 128-bit
-                    // native-registry triple hash. Test that term first, so the
-                    // expensive half runs only for the handful of classes
-                    // (`ReentrantLock`, `EnumSet`, `Instant`, …) that can
-                    // actually yield. Same predicate, same order of the two
-                    // surviving terms inside the helper — just hoisted out of
-                    // the resolve.
-                    let receiver_name = shared
-                        .classes
-                        .class_manager
-                        .read()
-                        .get_class(actual_class_id)
-                        .map(|class| class.name.clone());
-                    if let Some(receiver_name) =
-                        receiver_name.filter(|n| real_protected_stub_class(n))
-                    {
-                        if let Ok((_owner, method_name, descriptor, _)) =
-                            resolve_method_ref(shared, caller_class_id, cp_index)
-                        {
-                            if synthetic_stub_should_yield_to_real_bytecode(
-                                shared,
-                                &receiver_name,
-                                &method_name,
-                                &descriptor,
-                            ) {
-                                thread
-                                    .invoke_cache
-                                    .evict(caller_class_id, cp_index, is_special);
-                                return Ok(CachedCallResult::CacheMiss);
-                            }
-                        }
-                    }
+                    let Some(callback) =
+                        revalidate_cached_native(shared, native_id, callback, native_kind)
+                    else {
+                        thread
+                            .invoke_cache
+                            .evict(caller_class_id, cp_index, is_special);
+                        return Ok(CachedCallResult::CacheMiss);
+                    };
                     // The callback identity proves this cache entry is one of
                     // the eight real-layout Matcher leaves. The receiver was
                     // just checked against the cache's monomorphic class guard,
@@ -23156,9 +23288,19 @@ pub(super) fn execute_invokevirtual_cached(
         }
         CachedInvokeTarget::Native {
             callback,
+            native_id,
+            native_kind,
             num_params,
             gate: _,
         } => {
+            let Some(callback) =
+                revalidate_cached_native(shared, native_id, callback, native_kind)
+            else {
+                thread
+                    .invoke_cache
+                    .evict(caller_class_id, cp_index, is_special);
+                return Ok(CachedCallResult::CacheMiss);
+            };
             let (args, method_descriptor) = pop_coerced_invoke_args_virtual(
                 shared,
                 caller_class_id,
@@ -23506,16 +23648,18 @@ pub(super) fn populate_virtual_invoke_cache(
             && cm.class_redefine_generation(receiver_class_id) > 0
             && !redefine_immune_reflection_native(&lookup_name, &method_name)
             && !redefine_immune_layout_native(&lookup_name, &method_name, &descriptor);
-        let direct_native_callback =
+        let direct_native =
             if native_signature_may_exist && !is_real_tpe_execute && !receiver_redefined {
-                shared
-                    .natives
-                    .native_methods
-                    .find(&lookup_name, &method_name, &descriptor)
+                resolve_cached_native_registration(
+                    shared,
+                    &lookup_name,
+                    &method_name,
+                    &descriptor,
+                )
             } else {
                 None
             };
-        if let Some(callback) = direct_native_callback {
+        if let Some((callback, native_id, native_kind)) = direct_native {
             // WP2.4-F1: gate bound to the receiver class (where dispatch
             // landed). A redefine of the receiver swaps the method body.
             let gate =
@@ -23524,6 +23668,8 @@ pub(super) fn populate_virtual_invoke_cache(
             let target = CachedInvokeTarget::VirtualNative {
                 receiver_class_id,
                 callback,
+                native_id,
+                native_kind,
                 // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                 num_params: num_params as u16,
                 gate,
@@ -23621,7 +23767,9 @@ pub(super) fn populate_virtual_invoke_cache(
                         break;
                     }
                     if parent.find_method(&method_name, &descriptor).is_some() {
-                        if let Some(callback) = shared.natives.native_methods.find(
+                        if let Some((callback, native_id, native_kind)) =
+                            resolve_cached_native_registration(
+                            shared,
                             &parent_name,
                             &method_name,
                             &descriptor,
@@ -23633,6 +23781,8 @@ pub(super) fn populate_virtual_invoke_cache(
                             let target = CachedInvokeTarget::VirtualNative {
                                 receiver_class_id,
                                 callback,
+                                native_id,
+                                native_kind,
                                 // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                                 num_params: num_params as u16,
                                 gate,
@@ -23655,11 +23805,13 @@ pub(super) fn populate_virtual_invoke_cache(
                         }
                         break;
                     }
-                    if let Some(callback) =
-                        shared
-                            .natives
-                            .native_methods
-                            .find(&parent_name, &method_name, &descriptor)
+                    if let Some((callback, native_id, native_kind)) =
+                        resolve_cached_native_registration(
+                            shared,
+                            &parent_name,
+                            &method_name,
+                            &descriptor,
+                        )
                     {
                         let gate = RedefineGate::snapshot(
                             cm.class_redefine_generation_handle(receiver_class_id),
@@ -23668,6 +23820,8 @@ pub(super) fn populate_virtual_invoke_cache(
                         let target = CachedInvokeTarget::VirtualNative {
                             receiver_class_id,
                             callback,
+                            native_id,
+                            native_kind,
                             // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                             num_params: num_params as u16,
                             gate,
@@ -23708,11 +23862,12 @@ pub(super) fn populate_virtual_invoke_cache(
 
     if method.is_native() {
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        if let Some(callback) =
-            shared
-                .natives
-                .native_methods
-                .find(declaring_name, &method_name, &descriptor)
+        if let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
+            shared,
+            declaring_name,
+            &method_name,
+            &descriptor,
+        )
         {
             // WP2.4-F1: gate bound to the declaring class.
             let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
@@ -23720,6 +23875,8 @@ pub(super) fn populate_virtual_invoke_cache(
             let target = CachedInvokeTarget::VirtualNative {
                 receiver_class_id,
                 callback,
+                native_id,
+                native_kind,
                 num_params: num_params as u16, // Widening: parameter count conversion
                 gate,
             };
@@ -23800,11 +23957,13 @@ pub(super) fn populate_virtual_invoke_cache(
             | "keys" | "elements"
                 )));
         if force {
-            if let Some(callback) =
-                shared
-                    .natives
-                    .native_methods
-                    .find(declaring_name, &method_name, &descriptor)
+            if let Some((callback, native_id, native_kind)) =
+                resolve_cached_native_registration(
+                    shared,
+                    declaring_name,
+                    &method_name,
+                    &descriptor,
+                )
             {
                 let gate =
                     RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
@@ -23812,6 +23971,8 @@ pub(super) fn populate_virtual_invoke_cache(
                 let target = CachedInvokeTarget::VirtualNative {
                     receiver_class_id,
                     callback,
+                    native_id,
+                    native_kind,
                     // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
                     num_params: num_params as u16,
                     gate,
@@ -23846,7 +24007,8 @@ pub(super) fn populate_virtual_invoke_cache(
     {
         let receiver_name = store.get(receiver_class_id).map(|c| &*c.name).unwrap_or("");
         if receiver_name == "org/python/core/PyModule" {
-            if let Some(callback) = shared.natives.native_methods.find(
+            if let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
+                shared,
                 "org/python/core/PyModule",
                 &method_name,
                 &descriptor,
@@ -23857,6 +24019,8 @@ pub(super) fn populate_virtual_invoke_cache(
                 let target = CachedInvokeTarget::VirtualNative {
                     receiver_class_id,
                     callback,
+                    native_id,
+                    native_kind,
                     num_params: num_params as u16,
                     gate,
                 };
@@ -23886,7 +24050,8 @@ pub(super) fn populate_virtual_invoke_cache(
     {
         let receiver_name = store.get(receiver_class_id).map(|c| &*c.name).unwrap_or("");
         if receiver_name == "org/python/core/PyJavaType" {
-            if let Some(callback) = shared.natives.native_methods.find(
+            if let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
+                shared,
                 "org/python/core/PyJavaType",
                 &method_name,
                 &descriptor,
@@ -23897,6 +24062,8 @@ pub(super) fn populate_virtual_invoke_cache(
                 let target = CachedInvokeTarget::VirtualNative {
                     receiver_class_id,
                     callback,
+                    native_id,
+                    native_kind,
                     num_params: num_params as u16,
                     gate,
                 };
@@ -23920,17 +24087,29 @@ pub(super) fn populate_virtual_invoke_cache(
     }
 
     let declaring_for_reflect = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-    if let Some(callback) = native_override_for_cached_reflect_invoke(
+    if native_override_for_cached_reflect_invoke(
         shared,
         declaring_for_reflect,
         method_name.as_ref(),
         descriptor.as_ref(),
-    ) {
+    )
+    .is_some()
+    {
+        let Some((callback, native_id, native_kind)) = resolve_cached_native_registration(
+            shared,
+            declaring_for_reflect,
+            method_name.as_ref(),
+            descriptor.as_ref(),
+        ) else {
+            return;
+        };
         let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(receiver_class_id));
         drop(cm);
         let target = CachedInvokeTarget::VirtualNative {
             receiver_class_id,
             callback,
+            native_id,
+            native_kind,
             // Truncation: usize -> u16 (param count fits in 16 bits per JVM method limit)
             num_params: num_params as u16,
             gate,

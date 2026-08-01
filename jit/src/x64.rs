@@ -29323,6 +29323,7 @@ mod tests {
                 true,
                 Vec::new(),
                 vec![(2usize, 0usize, b'L')],
+                Vec::new(), // typecheck_info
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -29334,6 +29335,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(), // ldc_string_info
                 Vec::new(),
+                Vec::new(), // ldc2w_info
                 HashMap::new(),
                 HashMap::new(),
                 helpers,
