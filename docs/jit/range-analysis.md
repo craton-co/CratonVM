@@ -24,8 +24,9 @@ be attributable to one of them without a rebuild.
 | | counted-loop reason | guard-dominated reason |
 |---|---|---|
 | question | "is this index the IV of a loop whose exit test bounds it?" | "does a dominating comparison prove `0 <= i < a.length` here?" |
-| kill switch | `CRATONVM_JIT_NO_SPEC_BCE=1` (speculative half only) | `CRATONVM_JIT_NO_RANGE_BCE=1` |
-| both | `CRATONVM_JIT_NO_BCE=1` | |
+| default | ON | **OFF** — opt in with `CRATONVM_JIT_RANGE_BCE=1` |
+| switch | `CRATONVM_JIT_NO_SPEC_BCE=1` (speculative half only) | `CRATONVM_JIT_RANGE_BCE=1` turns it on |
+| both | `CRATONVM_JIT_NO_BCE=1` kills every reason | |
 | needs the exception table | no | **yes** |
 
 ## The lattices
@@ -272,7 +273,10 @@ design: `None` refuses rather than assuming the method has no handlers.
   reason, which is why `CRATONVM_JIT_INCLUSIVE_BCE` is still default-off.
   Expect the same question here, and answer it with a measurement.
 * **No differential run.** The pass has not been exercised against the Spring /
-  H2 / Tomcat suites, nor against a `CRATONVM_JIT_NO_RANGE_BCE=1` control.
+  H2 / Tomcat suites, nor against a control run. This is why the reason was
+  flipped to **default-off** at merge: a new reason for deleting a bounds check
+  does not get to be on by default before a differential run, because a wrong
+  elision is an out-of-bounds heap write.
 * **`analyze_graph` has no consumer**, so its transfer functions are validated
   only by their own unit tests and not by any downstream proof.
 * **The positional operand decode is narrower than the loop path's.**

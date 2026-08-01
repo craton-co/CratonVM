@@ -24055,7 +24055,12 @@ pub fn compile_with_param_slots(
     let (bounds_safe_pcs, speculative_bce_guards) = if no_bce {
         (FxHashSet::default(), Vec::new())
     } else {
-        analyze_bounds_elimination(code, code_len, &loops)
+        // The handler table is REQUIRED by the guard-dominated range reason: a
+        // flow-sensitive fact is a claim about every way control reaches a
+        // point, and an exception edge is one of those. Without the table that
+        // reason refuses outright. `exception_ranges` here is the shadowed
+        // output-coordinate copy, which is the space BCE works in.
+        analyze_bounds_elimination_with_handlers(code, code_len, &loops, Some(&exception_ranges))
     };
 
     // Guarded matrix dot-product lowering.  This is a pre-header replacement

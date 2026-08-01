@@ -2014,19 +2014,28 @@ pub fn __set_range_bce_override(v: Option<bool>) {
 
 /// Whether the guard-dominated range reason may contribute PCs.
 ///
-/// **Default ON**, disabled by `CRATONVM_JIT_NO_RANGE_BCE=1` — the same
-/// polarity and the same bisection role as `CRATONVM_JIT_NO_SPEC_BCE`
-/// ([`jit_no_spec_bce`]). The two reasons are independently switchable
-/// precisely so a bounds-check regression can be attributed to one of them
-/// without rebuilding: `CRATONVM_JIT_NO_BCE` kills both, and each of the two
-/// narrower switches kills exactly one.
+/// **Default OFF**, enabled by `CRATONVM_JIT_RANGE_BCE=1`.
+///
+/// This reason landed with an opt-OUT switch (`CRATONVM_JIT_NO_RANGE_BCE`),
+/// matching `CRATONVM_JIT_NO_SPEC_BCE`'s polarity. The polarity was flipped
+/// deliberately at merge: this is a brand-new reason for DELETING a bounds
+/// check, it has never been benchmarked or differentially tested, and a wrong
+/// elision is an out-of-bounds heap write — the worst failure this compiler
+/// can produce. Its own author's note applies: "the proof got stronger" is not
+/// evidence the elision is a win, and inclusive counted-loop elision measured
+/// a ~2x net LOSS on one OSR artifact for pure code-layout reasons.
+///
+/// Flip it back to opt-out once it has a differential run behind it.
+/// `CRATONVM_JIT_NO_BCE` still kills every reason including this one, and
+/// `CRATONVM_JIT_NO_SPEC_BCE` still kills exactly the speculative one, so the
+/// bisection story the two narrow switches provide is unchanged.
 pub(super) fn range_bce_enabled() -> bool {
     if let Some(v) = RANGE_BCE_TEST_OVERRIDE.with(|c| c.get()) {
         return v;
     }
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_RANGE_BCE").is_none())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_RANGE_BCE").is_some())
 }
 
 /// Largest method this pass will analyse, in bytecode bytes.
