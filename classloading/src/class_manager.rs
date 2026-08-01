@@ -6979,6 +6979,70 @@ impl ClassManager {
         let new_entries = self.build_vtable_descriptors(class_id, class_super_id);
         self.vtable_descriptors
             .insert(class_id, new_entries.clone());
+
+        // ---- Step 6b: repair ALREADY-LINKED subclasses' cached descriptors ----
+        //
+        // `VtableManager::install_vtable` (fired just below) repairs the LIVE
+        // dispatch tables of every already-linked subclass in place. It does
+        // not -- cannot -- reach this map, which is the *other* consumer of a
+        // slot descriptor: `build_vtable_descriptors_with_overrides` seeds a
+        // newly linked class's vtable by cloning its superclass's entry from
+        // here. A subclass linked BEFORE the redefine therefore kept the
+        // pre-redefine dispatch snapshot in this cache, and every class linked
+        // AFTER the redefine through that subclass inherited the ORIGINAL
+        // bytecode -- permanently, with no generation check anywhere to catch
+        // it (the entry is `resolved: true` and its `declaring_class_id` is
+        // the redefined class, so every redefine guard reads "current").
+        //
+        // Canonical victim: Mockito's inline mock maker retransforms
+        // `java.io.OutputStream` to weave `MockMethodAdvice` into
+        // `write([BII)V`, then generates
+        // `jakarta.servlet.ServletOutputStream$MockitoMock$...`. That subclass
+        // is linked after the retransform but seeds from the *already-linked*
+        // `ServletOutputStream`, whose cached descriptor still named the
+        // un-woven 36-byte body. The first call at any site went down the slow
+        // path and ran the woven body correctly; the moment the vtable slot
+        // was consulted the mock silently stopped intercepting and the real
+        // `OutputStream.write` default loop ran instead. Symptom:
+        // `AsyncRequestNotUsableTests.useInAsyncState` threw
+        // `ArrayIndexOutOfBoundsException` out of
+        // `verify(mock).write(buf, 1, 2)`.
+        let mut fresh_owned: FxHashMap<(Arc<str>, Arc<str>), VtableSlotDescriptor> =
+            FxHashMap::default();
+        for descriptor in new_entries.iter().flatten() {
+            if descriptor.declaring_class_id == class_id_u32 {
+                fresh_owned.insert(
+                    (
+                        Arc::clone(&descriptor.method_name),
+                        Arc::clone(&descriptor.descriptor),
+                    ),
+                    descriptor.clone(),
+                );
+            }
+        }
+        if !fresh_owned.is_empty() {
+            for (other_id, entries) in self.vtable_descriptors.iter_mut() {
+                if *other_id == class_id {
+                    continue;
+                }
+                for slot in entries.iter_mut() {
+                    let Some(existing) = slot.as_ref() else {
+                        continue;
+                    };
+                    if existing.declaring_class_id != class_id_u32 {
+                        continue;
+                    }
+                    let key = (
+                        Arc::clone(&existing.method_name),
+                        Arc::clone(&existing.descriptor),
+                    );
+                    if let Some(fresh) = fresh_owned.get(&key) {
+                        *slot = Some(fresh.clone());
+                    }
+                }
+            }
+        }
+
         fire_vtable_install_hook(class_id_u32, new_entries);
 
         // ---- Step 7: bump generation counter ----
