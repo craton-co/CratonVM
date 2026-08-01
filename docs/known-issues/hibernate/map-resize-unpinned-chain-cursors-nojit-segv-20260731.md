@@ -282,6 +282,39 @@ name. Hibernate's `AggregatedClassLoader` is `super(null)` and overrides
 Both are rooted now. Whether that was the canary's exact site is unconfirmed —
 it is the same defect shape on the named path, found by audit, not by a red test.
 
+### Where to look first — `update_refs_in_object` skips everything outside old gen
+
+`OldGen::update_refs_in_object` (`gc/src/old_gen.rs`, reached from
+`OldGen::compact`) is the pass that rewrites an old-gen object's own reference
+slots after compaction. Its closure returns `None` — i.e. **leaves the slot
+untouched** — for any target outside the compacted region:
+
+```rust
+let r = ref_ptr as usize;
+if r < data_start || r >= data_end {
+    return None; // reference outside the compacted old-gen region
+}
+```
+
+That is correct *only* if every old→young edge is rewritten by the young
+collector instead, via the card table / remembered set. Which puts the whole
+weight on that set being accurate — and the card table is indexed by
+`(addr - base) / CARD_SIZE`, so a compaction that **relocates the referrers
+themselves** invalidates every recorded dirty-card index. A composed cycle
+(young + major in one `collect_garbage_inner`) is exactly where that ordering
+can bite.
+
+The sibling pass `fixup_young_old_refs` (`gen_heap.rs`) already carries a
+hardening comment naming this whole failure mode for the *other* direction —
+"then `break` and leave the rest of from-space's old-gen refs un-fixed-up after a
+compaction → dangling pointers" — and falls back to a conservative word rewrite
+over any stretch it cannot parse. The old→young direction has no equivalent
+backstop.
+
+This is a hypothesis from reading, **not** a measurement. Confirm it before
+changing anything: the reported referrers' addresses versus the old-gen bounds,
+and whether their cards were dirty, will settle it.
+
 ### Next steps
 
 1. Chase the `UN-FORWARDED` edge above — that is the actual corruptor, and it is
