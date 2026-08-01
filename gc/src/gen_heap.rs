@@ -9971,8 +9971,14 @@ impl GenerationalHeap {
             // above. Major GC also uses stable pre-compaction addresses, so it
             // can reclaim an unreachable old collection and its side-table
             // graph together instead of treating every entry as a global root.
+            // Owner identity: the index is keyed by ADDRESS, so a recycled
+            // block hands this BFS the previous tenant's overlay refs. The
+            // header here is already validated (this object is marked), so
+            // pass its class id and let the provider reject a stale entry.
+            // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
+            let owner_class = Some(unsafe { &*(obj_ptr as *const ObjectHeader) }.class_id.as_u32());
             for overlay_ref in
-                crate::external_roots::external_roots_for_owner(obj_ptr as usize)
+                crate::external_roots::external_roots_for_owner(obj_ptr as usize, owner_class)
             {
                 mark_and_push_old_gen(
                     overlay_ref.as_ptr(),
@@ -12861,7 +12867,12 @@ fn scan_young_object(
         .as_ref()
         .is_some_and(|owners| owners.contains(&obj_addr))
     {
-        for overlay_ref in crate::external_roots::external_roots_for_owner(obj_addr) {
+        // Same owner-identity check as the old-gen BFS: reject an overlay
+        // entry left behind by a previous tenant of this address.
+        for overlay_ref in crate::external_roots::external_roots_for_owner(
+            obj_addr,
+            Some(header.class_id.as_u32()),
+        ) {
             mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist);
         }
     }
@@ -16799,7 +16810,7 @@ mod tests {
             }
         }
 
-        fn roots_for_owner(owner_addr: usize) -> Vec<ObjectRef> {
+        fn roots_for_owner(owner_addr: usize, _class_id: Option<u32>) -> Vec<ObjectRef> {
             let owner = OWNER.load(Ordering::Relaxed);
             if owner != 0 && owner == owner_addr {
                 held()

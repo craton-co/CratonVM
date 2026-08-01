@@ -971,6 +971,33 @@ fn pack_obj_key(hash: u32, generation: u32) -> usize {
     (((hash as u64) << 32) | (generation as u64)) as usize
 }
 
+/// Does the object-key registry record `actual_class_id` for `key`'s slot?
+///
+/// The owner index (`overlay_owner_keys`) is keyed by ADDRESS and therefore
+/// cannot tell a live collection from an unrelated object that recycled its
+/// block. The registry slot behind the packed key does carry the registering
+/// collection's `class_id`, which is GC-invariant, so comparing it against the
+/// class actually at the address is a sound identity check — the same one
+/// `widened_obj_key` uses for recycled identity hashes.
+///
+/// Unknown key (no such slot) answers `true`: absence of evidence is not
+/// evidence of a mismatch, and dropping a root on it would be the unsafe
+/// direction. Over-retaining one cycle is the safe one.
+fn owner_key_class_matches(key: usize, actual_class_id: u32) -> bool {
+    let hash = (key >> 32) as u32;
+    let generation = key as u32;
+    let shard = obj_key_shard_for(hash)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match shard.get(&hash) {
+        None => true,
+        Some(slots) => match slots.iter().find(|s| s.generation == generation) {
+            None => true,
+            Some(slot) => slot.class_id == actual_class_id,
+        },
+    }
+}
+
 /// Authoritative lazy store for fresh, exact-class HashMaps with primitive
 /// Integer keys. Heap HashMap$Node objects are materialized on demand when an
 /// operation outside the fast put/get/size surface needs the ordinary table.
@@ -34922,12 +34949,38 @@ pub fn gc_overlay_owner_addrs() -> Option<std::collections::HashSet<usize>> {
 /// it only after the collection object itself has been found reachable through
 /// ordinary Java roots/fields. The returned copy deliberately releases every
 /// side-table lock before the collector recursively marks the values.
-pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
+/// `owner_class_id` is the class id of the object CURRENTLY at `owner_addr`.
+/// The owner index is keyed by address, and an address is recycled the moment
+/// its previous tenant is reclaimed — so without this check the marker is
+/// handed the DEAD collection's references on behalf of whatever unrelated
+/// object now sits there. `widened_obj_key` already applies exactly this
+/// discriminator on the mutator side (its case 2b re-keys and clears a
+/// different-class recycle), but that only runs when the recycled address is
+/// used as a COLLECTION again; an ordinary object landing there is never
+/// observed, so the stale entry survives indefinitely. `None` skips the check.
+pub fn gc_overlay_roots_for_collection(
+    owner_addr: usize,
+    owner_class_id: Option<u32>,
+) -> Vec<ObjectRef> {
     let keys = {
         let index = overlay_owner_keys()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         index.get(&owner_addr).cloned().unwrap_or_default()
+    };
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    // Drop any key whose registry slot records a DIFFERENT class than the
+    // object now at this address. A class id is GC-invariant (it travels with
+    // the header), so a mismatch means the registering collection is gone and
+    // this entry belongs to a previous tenant.
+    let keys: Vec<usize> = match owner_class_id {
+        None => keys,
+        Some(actual) => keys
+            .into_iter()
+            .filter(|key| owner_key_class_matches(*key, actual))
+            .collect(),
     };
     if keys.is_empty() {
         return Vec::new();
@@ -35037,7 +35090,13 @@ pub fn gc_overlay_roots_for_matching_owners(
     };
     let mut roots = Vec::new();
     for owner in owners {
-        roots.extend(gc_overlay_roots_for_collection(owner));
+        // `None`: this seed is address-based by construction — the predicate
+        // selects owners by generation/range, and no class id is available for
+        // them. It is already a deliberate over-approximation ("retain the
+        // edges of every current owner"), so skipping the recycled-owner check
+        // here only over-retains, which is this path's existing contract. The
+        // precise per-owner rule runs in the BFS, which does pass a class id.
+        roots.extend(gc_overlay_roots_for_collection(owner, None));
     }
     roots
 }
@@ -51268,6 +51327,83 @@ mod tests {
 
     // Fix item 1: a recycled identity hash on a different class must not inherit
     // a dead object's slot — `pack_obj_key`/`ObjKeyEntry` carry a class marker.
+    /// Defect 5: the MARKER's owner→overlay edge is unvalidated where the
+    /// MUTATOR's is validated.
+    ///
+    /// `widened_obj_key` guards address recycling with a GC-invariant
+    /// `class_id` comparison (its case 2b re-keys and clears the dead
+    /// collection's overlay when a different class lands on a recycled
+    /// identity hash). But that runs only when the recycled address is used as
+    /// an overlay-backed COLLECTION again. When an ordinary object lands there
+    /// instead, nothing ever clears the entry, and
+    /// `gc_overlay_roots_for_collection` — a bare address lookup with no
+    /// identity check at all — hands the old-gen marker the DEAD collection's
+    /// references on behalf of the unrelated live object now at that address.
+    ///
+    /// Observed in the wild as eight
+    /// `old-gen mark: rejecting external-overlay(BFS owner) candidate … not a
+    /// plausible object base` warnings whose first words decode to ASCII string
+    /// payload (`0x766f206b63617473` = "stack ov"), a raw heap pointer, and an
+    /// interior address — i.e. the marker being handed non-headers for a live,
+    /// already-marked owner.
+    #[test]
+    fn marker_owner_lookup_survives_address_recycling_by_a_non_collection() {
+        use super::{
+            gc_overlay_roots_for_collection, ll_overlay, obj_key_shard_for, pack_obj_key,
+            register_overlay_owner_key, ObjKeyEntry,
+        };
+
+        // A never-dereferenced, 8-aligned fake address for the dead collection.
+        const DEAD_HASH: u32 = 0x5EED_BEEF;
+        const LINKED_LIST_CLASS: u32 = 4242;
+        const UNRELATED_CLASS: u32 = 7777;
+        let recycled_addr = 0x5EED_0000usize;
+        let dead_key = pack_obj_key(DEAD_HASH, 0);
+
+        // A live LinkedList at `recycled_addr`, with one overlay reference and
+        // the registry slot `widened_obj_key` would have created for it.
+        let payload = unsafe { cratonvm_types::ObjectRef::from_raw(0x1234_5000 as *mut u8) };
+        ll_overlay()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(dead_key)
+            .or_default()
+            .insert("head", Value::Object(Some(payload)));
+        obj_key_shard_for(DEAD_HASH)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(DEAD_HASH)
+            .or_default()
+            .push(ObjKeyEntry {
+                last_ptr: recycled_addr,
+                generation: 0,
+                class_id: LINKED_LIST_CLASS,
+                vm: 0,
+            });
+        register_overlay_owner_key(recycled_addr, dead_key);
+
+        // While it is alive the marker must still see its references.
+        let live = gc_overlay_roots_for_collection(recycled_addr, Some(LINKED_LIST_CLASS));
+        assert!(
+            live.iter().any(|r| r.as_ptr() == payload.as_ptr()),
+            "a LIVE collection's overlay reference must still be marked"
+        );
+
+        // Now it dies, its block is REALLOCATED to an ordinary object of a
+        // different class, and that object never touches an overlay — so
+        // `widened_obj_key` (and therefore case 2b's cleanup) never runs and
+        // nothing in the system observes the handover.
+        let roots = gc_overlay_roots_for_collection(recycled_addr, Some(UNRELATED_CLASS));
+
+        assert!(
+            !roots.iter().any(|r| r.as_ptr() == payload.as_ptr()),
+            "the marker was handed a DEAD collection's overlay reference on \
+             behalf of an unrelated object that merely reuses its address; \
+             `gc_overlay_roots_for_collection` needs the same identity check \
+             `widened_obj_key` already applies"
+        );
+    }
+
     #[test]
     fn pack_obj_key_roundtrip() {
         use super::pack_obj_key;
