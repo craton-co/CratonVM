@@ -15567,7 +15567,7 @@ pub(super) fn try_osr(
     // ~12696). Re-stashing preserves the exception across the
     // OSR→interpreter handoff without expanding the OSR signature
     // (`Option<Option<Value>>`, no error channel).
-    if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+    if let Some(exc) = crate::jit::helpers::take_jit_pending_exception(thread) {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
             let cid = shared.mem.heap.class_id_of(exc);
             let cname = shared
@@ -15611,7 +15611,7 @@ pub(super) fn try_osr(
         if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
             return None;
         }
-        crate::jit::helpers::stash_jit_pending_exception(exc);
+        crate::jit::helpers::stash_jit_pending_exception(thread, exc);
         return None;
     }
     if crate::jit::helpers::take_jit_pending_npe() {
@@ -15656,7 +15656,7 @@ pub(super) fn try_osr(
                 }
                 // Historical fallback (unreachable while RBC.6b holds): keep
                 // the NPE alive across the OSR→interpreter handoff.
-                crate::jit::helpers::stash_jit_pending_exception(exc);
+                crate::jit::helpers::stash_jit_pending_exception(thread, exc);
             }
             _ => {
                 // Couldn't construct a Java NPE object (e.g. rt.jar not
@@ -19926,7 +19926,7 @@ pub(super) fn execute_jit_call(
                 }
             }
         };
-        let sig = crate::jit::helpers::take_all_jit_signals();
+        let sig = crate::jit::helpers::take_all_jit_signals(thread);
         match fast_result {
             Ok(v) => (v, sig),
             Err(jit_err) => {
@@ -19973,7 +19973,7 @@ pub(super) fn execute_jit_call(
         // The routing function still skips catch-all (`finally`) entries
         // when the pc is unknown, so they cannot spuriously swallow
         // exceptions thrown outside their protected region.
-        let mut sig = crate::jit::helpers::take_all_jit_signals();
+        let mut sig = crate::jit::helpers::take_all_jit_signals(thread);
         if let Some(exc) = sig.exception.take() {
             // The exception consumes the deopt — the one-shot drain above
             // already cleared the out-of-band deopt signal (MEDIUM
@@ -20442,7 +20442,7 @@ pub(super) fn execute_jit_call_decoded(
                 }
             }
         };
-        let sig = crate::jit::helpers::take_all_jit_signals();
+        let sig = crate::jit::helpers::take_all_jit_signals(thread);
         match fast_result {
             Ok(v) => (v, sig),
             Err(jit_err) => {
@@ -20468,7 +20468,7 @@ pub(super) fn execute_jit_call_decoded(
             }))
         };
         crate::jit::helpers::restore_jit_thread(saved_jit_thread);
-        let mut sig = crate::jit::helpers::take_all_jit_signals();
+        let mut sig = crate::jit::helpers::take_all_jit_signals(thread);
         if let Some(exc) = sig.exception.take() {
             // The one-shot drain already cleared the out-of-band deopt signal
             // (MEDIUM `i64::MIN`-collision fix) so it cannot leak to the next

@@ -531,11 +531,20 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
+    // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception,
+    //     jit_pending_exception
     if let Some(ref obj_ref) = thread.java_thread_obj {
         roots.push(*obj_ref);
     }
     if let Some(ref obj_ref) = thread.pending_async_exception {
+        roots.push(*obj_ref);
+    }
+    // The JIT's pending throwable. It used to live in a thread-local `Cell`,
+    // where the collector could not reach it at all — TLS is invisible from a
+    // collecting thread, which is precisely why the two slots above are fields.
+    // Without this push the remap half is half-wired: the reference would be
+    // relocated but never kept alive.
+    if let Some(ref obj_ref) = thread.jit_pending_exception {
         roots.push(*obj_ref);
     }
 

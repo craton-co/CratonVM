@@ -32,7 +32,8 @@ use common::MockCtx;
 use cratonvm_native_api::NativeContext;
 use cratonvm_native_collections::{
     __test_cslm_get, __test_cslm_init_comparator, __test_cslm_put, __test_cslm_size,
-    __test_tm_force_array_mode, __test_tm_set_force_array, gc_prune_dead_collection_overlays,
+    __test_tm_force_array_len, __test_tm_force_array_mode, __test_tm_set_force_array,
+    gc_prune_dead_collection_overlays,
 };
 use cratonvm_types::{ObjectRef, Value};
 

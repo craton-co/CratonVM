@@ -7945,7 +7945,7 @@ pub fn execute(
                             // hasn't been consulted yet (no frame pushed). Instead, save the
                             // exception and fall through to the interpreter, which will push a
                             // frame and route through the exception table.
-                            if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+                            if let Some(exc) = crate::jit::helpers::take_jit_pending_exception(thread) {
                                 // This legacy sink routes the exception against a
                                 // freshly pushed, method-entry frame rather than
                                 // through `route_jit_signal_exception`, so a frame

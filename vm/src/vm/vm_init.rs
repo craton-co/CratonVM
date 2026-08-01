@@ -3276,13 +3276,19 @@ impl SharedVm {
             }
         }
 
-        // T6.3.1: install the process-wide JVMTI event manager if none was
-        // installed yet, and fire VMInit once all core subsystems are up.
-        // `install_global_manager` is idempotent so repeated `SharedVm::new`
-        // calls in the same process (rare; mostly test harnesses) are safe.
-        crate::runtime::jvmti::install_global_manager(std::sync::Arc::new(
-            crate::runtime::jvmti::JvmtiEventManager::new(),
-        ));
+        // T6.3.1: install this VM's JVMTI event manager, and fire VMInit once
+        // all core subsystems are up.
+        //
+        // Per-VM, not process-wide: a single global manager sent VM B's events
+        // to VM A's callbacks and dropped VM B's own manager on the floor. The
+        // unattributed fallback means this is safe to land before the
+        // interpreter's delivery sites are threaded through.
+        crate::runtime::jvmti::install_manager_for_vm(
+            vm.vm_identity,
+            std::sync::Arc::new(crate::runtime::jvmti::JvmtiEventManager::new_for_vm(
+                vm.vm_identity,
+            )),
+        );
 
         // Bridge the classloading crate's JVMTI hooks to the runtime JVMTI
         // manager. `classloading` cannot depend on `vm`, so it exposes a
@@ -7289,6 +7295,10 @@ pub fn release_vm_native_state(vm_identity: usize) {
     cratonvm_native_api::uninstall_capabilities(cratonvm_native_api::VmId::from_raw(vm_identity));
     cratonvm_native_builtins::security_manager::forget_vm_security_state(vm_identity);
     crate::runtime::instrument::forget_vm_transformers(vm_identity);
+    // Without this a disposed VM's JVMTI row leaks its agent's callback
+    // closures, and its listener flags keep every OTHER VM's interpreter on the
+    // slow path — the flags are a process-wide union by design.
+    crate::runtime::jvmti::forget_vm_jvmti_state(vm_identity);
 }
 
 /// The precise hook: the last `Arc<SharedVm>` is gone, so no thread can still
