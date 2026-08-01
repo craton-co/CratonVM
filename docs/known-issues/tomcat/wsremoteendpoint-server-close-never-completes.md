@@ -1,23 +1,25 @@
 # `TestWsRemoteEndpointImplServerDeadlock`: the server session never reaches CLOSED
 
-**Status:** ROOT-CAUSED 2026-08-01. The defect is not in the WebSocket stack —
-it is a JIT miscompilation, filed separately at
-`docs/known-issues/jit-direct-call-arg1-clobbered-by-arg0.md`. **HotSpot:** PASS.
-Found while fixing the separate inline-completion deadlock in the same test
+**Status:** cause ROOT-CAUSED and FIXED 2026-08-01; **end-to-end reverification
+still owed** (see the last section). The defect was never in the WebSocket stack
+— it was a JIT miscompilation, written up at
+`docs/internal/fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md`.
+**HotSpot:** PASS. Found while fixing the separate inline-completion deadlock in
+the same test
 (`docs/internal/fixed-suite-bugs/tomcat/websocket-client-completion-on-app-thread-deadlock-FIXED.md`).
 
 ## Symptom
 
 `org.apache.tomcat.websocket.server.TestWsRemoteEndpointImplServerDeadlock`
-fails ~35% of runs with
+failed ~35% of runs with
 
 ```
 java.lang.AssertionError: Close delay was [19034931192] ns
 ```
 
 19.03 s is the test's own polling ceiling (190 x 100 ms), i.e. the server
-`WsSession.state` never became `CLOSED` at all. When it fails it fails parameter
-combinations 0, 1 and 2 and never 3 — combination 3
+`WsSession.state` never became `CLOSED` at all. When it failed it failed
+parameter combinations 0, 1 and 2 and never 3 — combination 3
 (`useAsyncIO=true, sendOnContainerThread=true`) passes for a degenerate reason:
 its server session dies immediately with `ClosedChannelException` and closes with
 code 1006, well inside the polling window.
@@ -26,15 +28,15 @@ code 1006, well inside the polling window.
 
 Established with an instrumented replica of the test (compiled outside the Tomcat
 fixture and prepended to the classpath), `tcpdump` on loopback, and
-`CRATONVM_DBG_SC_CLOSE=1`. **48 runs: `closedelay` and the count of Tomcat's
-"Executor rejected socket" warning agree 1:1, in every single run.**
+`CRATONVM_DBG_SC_CLOSE=1`. **48 runs: the assertion and Tomcat's "Executor
+rejected socket" warning agree 1:1, in every single run.**
 
 1. Under CratonVM the connector's exec pool grows from 10 to its full
-   `maxThreads=200` about 0.5 s into the test — CratonVM dispatches ~5,600
+   `maxThreads=200` about 0.5 s in — CratonVM dispatches ~5,600
    socket-processing tasks where HotSpot dispatches 524, so Tomcat's `TaskQueue`
-   does exactly what it is designed to do under load and spawns threads to the
-   cap. HotSpot's pool never leaves 10. (A throughput difference, not a defect;
-   it is the *precondition*, not the cause.)
+   does what it is designed to do under load and spawns threads to the cap.
+   HotSpot's pool never leaves 10. Precondition, not cause — but the ~10x task
+   amplification is its own open throughput question.
 
 2. At `poolSize == maxPoolSize` there is a benign race in Tomcat's own executor:
    `TaskQueue.offer` can return `false` (asking for a new thread) just as
@@ -43,19 +45,20 @@ fixture and prepended to the classpath), `tcpdump` on loopback, and
    HotSpot reaches this path too; there, `force` simply queues the task.
 
 3. `TaskQueue.force` throws only for `parent == null || parent.isShutdown()`.
-   On CratonVM it throws while the connector is running. Two independent
-   captures with a diagnostic shadow of `TaskQueue`:
+   On CratonVM it threw while the connector was running. Two independent captures
+   with a diagnostic shadow of `TaskQueue`:
 
    ```
    [TASKQ] force-reject p1=@157489 sd1=true p2=@157489 sd2=false sd3=false
            ctl=-536870712 (0xe00000c8) pool=200 max=200 thread=...-Poller
    ```
 
-   `parent` is the same non-null object on both reads; `isShutdown()` answers
-   `true` and then `false` microseconds later; `ctl` is `0xe00000c8`, negative,
-   so `runStateAtLeast(ctl.get(), SHUTDOWN)` — literally `c >= 0` — must be
-   false. A sampler reading `isShutdown()` on the same executor 50 ms either side
-   reports `false` throughout.
+   Same non-null `parent` on both reads; `isShutdown()` answered `true` then
+   `false` microseconds later; `ctl` was `0xe00000c8`, negative, so
+   `runStateAtLeast(ctl.get(), SHUTDOWN)` — literally `c >= 0` — must be false.
+   **This is the defect**, and it is the JIT bug linked above:
+   `isShutdown()` is `f(g(), k)` with a callee that compares its two arguments,
+   and the direct-call edge was passing arg0 in both slots.
 
 4. `AbstractEndpoint.processSocket` catches the rejection and Tomcat closes the
    socket at `NioEndpoint$Poller.processKey:1005`:
@@ -68,9 +71,9 @@ fixture and prepended to the classpath), `tcpdump` on loopback, and
      at NioEndpoint$Poller.processKey(NioEndpoint.java:1005)
    ```
 
-   This bypasses `WsSession` entirely, which is why the session stays `OPEN`,
-   `WsRemoteEndpointImplServer.closed` stays `false`, and no `onError` /
-   `onClose` fires.
+   This bypasses `WsSession` entirely, which is why the session stayed `OPEN`,
+   `WsRemoteEndpointImplServer.closed` stayed `false`, and no `onError` /
+   `onClose` fired.
 
 5. The close emits nothing on the wire: the server has ~2.6 MB queued with the
    client's receive window at zero, so the FIN cannot be sent. 1.6 s later the
@@ -88,17 +91,36 @@ fixture and prepended to the classpath), `tcpdump` on loopback, and
 6. The client's next read gets `ECONNRESET`, it stops draining at ~12 messages,
    and the test polls out at 19.03 s with the server session still `OPEN`.
 
-Step 3 is the defect. It reduces to a JIT miscompilation of `f(g(), k)` where the
-callee compares its two int arguments — see
-`docs/known-issues/jit-direct-call-arg1-clobbered-by-arg0.md`, which carries the
-disassembly and a 20-line repro.
+## What is verified, and what is not
+
+Step 3 is fixed and directly measured. `TaskQueue.force` is public, so it can be
+driven on a running executor with no dependence on host load
+(`probes/ForceProbe.java`, needs the Tomcat jar on the classpath):
+
+| | `force()` calls | "Executor not running" rejections |
+|---|---|---|
+| HotSpot | 47,786,000 | 0 |
+| CratonVM before | 1,681,000 | **1,680,487** (99.97%) |
+| CratonVM after | 194,000 | **0** |
+
+**Not yet verified end to end.** The test's own failure rate swings hard with
+host load — 5-in-6 during a busy window, then 0-in-14 on both arms of an
+interleaved A/B two hours later on the same binaries. Capping `maxThreads` to 20
+and to 10 did not restore the failing regime either. So the post-fix runs
+(4-combo test PASS 3/3 and 4/4, combo-0 PASS 14/14) are consistent with the fix
+but carry little weight on their own: the pre-fix binary passed just as often in
+that window.
+
+**To close this doc**, re-run it during a genuinely loaded window and confirm
+zero `Executor rejected socket` warnings across ~20 runs where the pre-fix binary
+still produces them.
 
 ## Reproduction
 
 `/data/data/wsdead-probes/probe-run.sh <exe> <outfile>` on the Azure host, with
-`PROBE_COMBOS=0` to run only the first parameter combination (~8 s per pass,
-~25 s per failure). Roughly 1 run in 3 fails; the rate varies with host load.
-Classify on either signature — they are equivalent:
+`PROBE_COMBOS=0` to run only the first parameter combination (~8 s pass, ~25 s
+fail), and `PROBE_MAXTHREADS=<n>` to cap the connector pool. Classify on either
+signature — they are equivalent:
 
 ```
 grep -c 'Close delay was'            # the assertion
