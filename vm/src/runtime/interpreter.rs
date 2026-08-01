@@ -2269,7 +2269,48 @@ fn process_references_after_gc(
         // above already relies on — so pruning here with pre-remap addresses
         // is correct; the later `gc_update_collection_overlay_refs` remap
         // pass in `update_all_roots` only touches whatever prune left behind.
-        cratonvm_gc::external_roots::prune_external_roots(&is_marked);
+        //
+        // MEASURED FALSE-DEAD (2026-08-01): the paragraph above is wrong about
+        // which addresses reach here. `run_non_moving_young_cycle` calls
+        // `remap_external_roots` INSIDE the collector, so by this point
+        // `slot.last_ptr` is already POST-GC — and `is_marked`'s first arm
+        // (`pointer_map.contains_key`) only ever matches a PRE-GC address, so
+        // for anything that moved the whole verdict falls to `is_addr_live`.
+        // `ROverlaySystemGcStress` shows that verdict killing 10 LIVE
+        // collections in one cycle (`dead_keys=10`, immediately followed by a
+        // populated `TreeMap` reading back as `size 0`). A false-dead here is
+        // silent data loss with no dangling pointer for any verifier to find;
+        // a false-live is one cycle of retained bookkeeping. The two are not
+        // symmetric and this predicate treats them as if they were.
+        //
+        // `CRATONVM_DBG_OVERLAY_PRUNE=1` reports every address this is about
+        // to condemn, with the evidence, so the arm responsible is a fact and
+        // not another inference.
+        let prune_dbg =
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY_PRUNE").is_some();
+        let is_live_for_prune = |addr: usize| -> bool {
+            let live = is_marked(addr);
+            if prune_dbg && !live {
+                let in_heap = shared.mem.heap.is_heap_addr(addr).is_some();
+                let words: [u64; 3] = if in_heap {
+                    // SAFETY: `is_heap_addr` placed `addr` in a mapped region.
+                    unsafe { std::ptr::read_unaligned(addr as *const [u64; 3]) }
+                } else {
+                    [0; 3]
+                };
+                eprintln!(
+                    "[overlay-prune] CONDEMNED 0x{addr:x} in_heap={in_heap} \
+                     in_pointer_map={} addr_live={} w0=0x{:016x} w1=0x{:016x} w2=0x{:016x}",
+                    pointer_map.contains_key(&addr),
+                    shared.mem.heap.is_addr_live(addr),
+                    words[0],
+                    words[1],
+                    words[2],
+                );
+            }
+            live
+        };
+        cratonvm_gc::external_roots::prune_external_roots(&is_live_for_prune);
         // Opt-in audit of what prune left behind: an overlay ref pointing at a
         // reclaimed object. Here rather than in `update_all_roots` because that
         // early-returns on an empty `pointer_map`, i.e. never runs on the
