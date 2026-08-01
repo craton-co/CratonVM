@@ -1077,10 +1077,38 @@ fn stub_may_answer_load_class() -> bool {
     *ON.get_or_init(|| std::env::var("CRATONVM_CL_STUB_DELEGATION").ok().as_deref() == Some("1"))
 }
 
+/// GC-SAFETY wrapper — the real-JDK sibling of
+/// `classloader::cl_load_class_base_delegation_inner`, and the one this
+/// workload actually takes (the repro runs with `--java-home`). The body
+/// dispatches arbitrary Java twice, at the parent's `loadClass` and at the
+/// receiver's `findClass` override, and keeps using `this` and
+/// `class_name_obj` on every fall-through arm. Both are bare Rust locals:
+/// `safe_native_call` pins the native's ARGS and the collector remaps those
+/// pins, but nothing rewrites these copies. Hibernate's
+/// `AggregatedClassLoader` is `super(null)` and overrides `findClass` to
+/// iterate its scoped child loaders, so the `findClass` arm is the hot one
+/// here and its body allocates heavily —
+/// `CRATONVM_DBG_STALE_OBJREF` caught a stale deref in a native invoked from
+/// `ClassLoaderServiceImpl.classForName`. See
+/// docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md.
 fn cl_real_load_class_base(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     class_name_obj: ObjectRef,
+) -> cratonvm_types::error::MethodCallResult {
+    let this_pin = ctx.pin_native_root(this);
+    let name_pin = ctx.pin_native_root(class_name_obj);
+    let result = cl_real_load_class_base_rooted(ctx, this, this_pin, class_name_obj, name_pin);
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+fn cl_real_load_class_base_rooted(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    this_pin: usize,
+    class_name_obj: ObjectRef,
+    name_pin: usize,
 ) -> cratonvm_types::error::MethodCallResult {
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
@@ -1301,12 +1329,18 @@ fn cl_real_load_class_base(
     let mut parent_user_defined_authoritative_miss = false;
     if let Some(parent) = parent {
         if crate::classloader::is_user_defined_loader(ctx, parent) {
-            match ctx.invoke_virtual(
+            let delegated = ctx.invoke_virtual(
                 parent,
                 "loadClass",
                 "(Ljava/lang/String;)Ljava/lang/Class;",
                 &[Value::Object(Some(class_name_obj))],
-            ) {
+            );
+            // Arbitrary Java ran: refresh both locals before the
+            // fall-through arms below reuse them.
+            let this = ctx.read_native_pin(this_pin, this);
+            let class_name_obj = ctx.read_native_pin(name_pin, class_name_obj);
+            let _ = (this, class_name_obj);
+            match delegated {
                 Ok(Some(Value::Object(Some(mirror)))) => {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
@@ -1387,6 +1421,12 @@ fn cl_real_load_class_base(
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(class_name_obj))],
         );
+        // The override is the loader's own Java (Hibernate's
+        // AggregatedClassLoader iterates its scoped child loaders here);
+        // refresh before the fall-through arms reuse either local.
+        let this = ctx.read_native_pin(this_pin, this);
+        let class_name_obj = ctx.read_native_pin(name_pin, class_name_obj);
+        let _ = class_name_obj;
         match result {
             // findClass produced the class — that is the answer.
             Ok(Some(Value::Object(Some(_)))) => return result,

@@ -342,6 +342,20 @@ impl MockCtx {
                 }
             }
         }
+        // The production collectors also hand the pointer map to the native
+        // collections' overlay tables (`lhm_overlay`, the TreeMap/TreeSet array
+        // tables, ...), which hold `ObjectRef`s in process-global Rust state
+        // that no heap walk can reach. Without this the mock would report
+        // corruption for maps whose state lives in an overlay even when the
+        // native is perfectly rooted — and, worse, would hide a native that
+        // wrongly relies on the overlay staying pointer-stable.
+        if !moved.is_empty() {
+            let pointer_map: std::collections::HashMap<usize, usize> = moved
+                .iter()
+                .map(|(old, new)| (*old, new.as_ptr() as usize))
+                .collect();
+            cratonvm_native_collections::gc_update_collection_overlay_refs(&pointer_map);
+        }
         // SAFETY: single-threaded test code.
         unsafe {
             *self.native_pin_roots.get() = new_roots;
