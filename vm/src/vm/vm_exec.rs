@@ -5586,6 +5586,38 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .find_unique_class_by_name(name)
     }
 
+    /// The real answer behind [`Self::class_id_by_name`]'s `None`.
+    ///
+    /// `find_unique_class_by_name` above already fails closed on an ambiguous
+    /// name — it returns `None` rather than picking one of several same-named
+    /// classes — but `None` is also what an absent name returns, and the two
+    /// demand opposite actions from a native that would load or fabricate on a
+    /// miss. `classify_loaded_name` is the same index read (O(1) against the
+    /// per-name definition count) with the two cases kept apart, so this costs
+    /// a native nothing until it asks.
+    ///
+    /// The variant mapping is one-to-one on purpose: `native-api` cannot
+    /// depend on `classloading`, so `NameLookup` mirrors `NameResolution`, and
+    /// this method is the single place the two meet. A future variant added on
+    /// either side must fail to compile here rather than silently fold into a
+    /// neighbouring case.
+    fn classify_class_name(&self, name: &str) -> cratonvm_native_api::NameLookup {
+        use cratonvm_classloading::NameResolution;
+        use cratonvm_native_api::NameLookup;
+
+        match self
+            .shared
+            .classes
+            .class_manager
+            .read()
+            .classify_loaded_name(name)
+        {
+            NameResolution::Absent => NameLookup::Absent,
+            NameResolution::Unique(id) => NameLookup::Unique(id),
+            NameResolution::Ambiguous { definitions } => NameLookup::Ambiguous { definitions },
+        }
+    }
+
     /// Real initialization state, for `Unsafe.shouldBeInitialized`. Reuses the
     /// memoised helper the interpreter itself uses, so this is a thread-local
     /// hit plus (on a miss) one class-manager read — it does NOT run `<clinit>`.
@@ -12671,11 +12703,74 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // matches the allocated slot count, instead of `ClassId::new(0)`
         // (`java/lang/Object`, zero declared fields) which the GC's
         // `get_field` bounds guard rejects as an undersized layout.
+        //
+        // Still the infallible spelling: this signature has no way to report
+        // the one case the class manager now refuses (a name two or more
+        // distinct classes already carry). For that case `ClassManager::
+        // ensure_synthetic_class` hands back a distinctly-named, correctly
+        // sized `cratonvm/synthetic/AmbiguousName$…` stand-in instead of a
+        // stub filed under the ambiguous name — see its doc comment, and
+        // `docs/known-issues/synthetic-class-fallibility.md` for the migration
+        // that removes this method's callers.
         self.shared
             .classes
             .class_manager
             .write()
             .ensure_synthetic_class(name, num_fields)
+    }
+
+    /// The fallible spelling: the same operation, with the refusal the
+    /// infallible one cannot express.
+    ///
+    /// Two differences from [`Self::ensure_synthetic_class`], both intended:
+    ///
+    /// 1. it can return [`ClassIdentityError::AmbiguousName`] instead of a
+    ///    stand-in, so a native that can fail gets to fail;
+    /// 2. it goes through `ClassManager::try_ensure_synthetic_class`, which
+    ///    **enforces** `--jdk-only` (the infallible one only records the
+    ///    violation and fabricates anyway). Under the default `Compatible`
+    ///    mode the two are identical; under `--jdk-only` a call site migrated
+    ///    to this spelling starts refusing, which is exactly step 2 of the
+    ///    JDK-ONLY-WAVE2 recipe in `class_manager.rs`.
+    ///
+    /// The error is re-derived from the name index rather than pattern-matched
+    /// out of the returned `VmError`: the classifier is the authority on
+    /// *which* refusal this is, and matching on an error's shape would make
+    /// this mapping quietly wrong the day a third refusal is added.
+    fn try_ensure_synthetic_class(
+        &mut self,
+        name: &str,
+        num_fields: usize,
+    ) -> Result<ClassId, cratonvm_native_api::ClassIdentityError> {
+        use cratonvm_classloading::NameResolution;
+        use cratonvm_native_api::ClassIdentityError;
+
+        // Same real-class preference as the infallible spelling: a name that
+        // resolves to real bytes is not a fabrication and cannot be ambiguous
+        // (the loader answered with one class).
+        if let Ok(cid) = self.shared.load_class_concurrent(name) {
+            return Ok(cid);
+        }
+        let mut manager = self.shared.classes.class_manager.write();
+        // Bound to a local so the `&mut` borrow of the guard ends before the
+        // classifier's `&` borrow below, rather than relying on the match
+        // scrutinee's borrow ending early.
+        let fabricated = manager.try_ensure_synthetic_class(name, num_fields);
+        match fabricated {
+            Ok(id) => Ok(id),
+            Err(err) => Err(match manager.classify_loaded_name(name) {
+                NameResolution::Ambiguous { definitions } => ClassIdentityError::AmbiguousName {
+                    name: name.to_string(),
+                    definitions,
+                },
+                NameResolution::Absent | NameResolution::Unique(_) => {
+                    ClassIdentityError::Refused {
+                        name: name.to_string(),
+                        reason: err.to_string(),
+                    }
+                }
+            }),
+        }
     }
 
     fn is_interface_class(&self, class_id: ClassId) -> bool {

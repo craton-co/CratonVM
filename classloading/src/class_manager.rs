@@ -73,6 +73,34 @@ pub const DEFAULT_CLASS_BYTES_CACHE_CAP: usize = 16 * 1024 * 1024;
 const ENSURE_SYNTHETIC_STUB_REASON: &str =
     "VM-requested stand-in: ensure_synthetic_class called with no class file on any classpath entry";
 
+/// The refusal [`ClassManager::fabricate_class`] returns when it is asked to
+/// mint a compatibility stand-in for a name that two or more **distinct**
+/// classes already carry.
+///
+/// # Why this is a `LinkageError` and not a `ClassNotFound`
+///
+/// `ClassFileError::ClassNotFound` is what the `--jdk-only` policy refusal
+/// returns, and it is also what "absent" looks like everywhere else in this
+/// file. Reusing it here would put ambiguity back on top of absence at the call
+/// site — the exact collapse [`ClassManager::classify_loaded_name`] exists to
+/// undo, one layer up. A caller must be able to tell "there is no such class,
+/// go and load one" from "there are two, and you may not pick", because only
+/// the second is fixed by re-asking with an initiating loader.
+///
+/// `IncompatibleClassChangeError` is the `LinkageError` family HotSpot uses for
+/// loader-constraint violations, which is the same disease: one name, two
+/// runtime types.
+fn ambiguous_stand_in_refused(name: &str, definitions: usize) -> VmError {
+    VmError::Linkage(LinkageError::IncompatibleClassChangeError {
+        message: format!(
+            "ambiguous class name {name}: {definitions} distinct classes are already defined \
+             under it, so a synthetic stand-in filed under the bootstrap loader would shadow \
+             every one of them; refusing to fabricate. Re-ask with an initiating loader \
+             (ClassManager::find_class_by_name_for_loader / find_class_by_name_for_class)."
+        ),
+    })
+}
+
 /// Reason for the `java/lang/ProcessHandle` / `ProcessHandle$Info` exemption:
 /// the host JDK image may not carry these class files, but CratonVM implements
 /// their API through native bridges, so `load_class` fabricates a carrier for
@@ -3089,16 +3117,43 @@ impl ClassManager {
     //      and propagate the `ClassNotFoundException` up through the native's
     //      own error path.
     //   3. When no caller remains, delete this method.
+    ///
+    /// # Behaviour when the name is ambiguous
+    ///
+    /// This signature cannot report a failure, and the one failure it can now
+    /// meet is a name that two or more **distinct** classes already carry (see
+    /// [`Self::classify_loaded_name`]). Fabricating for such a name is the
+    /// defect this method is being retired for: the stub lands under
+    /// `(Bootstrap, name)`, the bootstrap loader is probed first, and the stub
+    /// therefore outranks *every* real class that made the name ambiguous.
+    ///
+    /// So the ambiguous case does **not** mint a stub under `name`. It returns
+    /// an [`Self::ambiguity_stand_in`] instead: a distinctly-named,
+    /// correctly-sized `cratonvm/synthetic/AmbiguousName$…` class registered
+    /// under a name nothing else resolves. The caller gets a `ClassId` it can
+    /// allocate against without corrupting the heap, the real classes keep
+    /// resolving, and any `checkcast` / `instanceof` / method lookup against
+    /// the *requested* name fails — loudly, and naming the stand-in. That is a
+    /// refusal wearing an infallible signature; a caller that can do better
+    /// should use [`Self::try_ensure_synthetic_class`], which says so in a
+    /// `Result`.
     pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-        self.fabricate_class(
+        let fabricated = self.fabricate_class(
             name,
             num_fields,
             ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON),
-            // Record the violation, then fabricate anyway — there is no error
-            // channel on this signature.
+            // Record the `--jdk-only` violation, then fabricate anyway — there
+            // is no error channel on this signature. NOTE: `enforce` governs
+            // only the jdk-only refusal. The ambiguity refusal added below is
+            // unconditional (it is a correctness gate, not a policy one), so an
+            // `Err` can still arrive here, and `.expect`ing it would turn a
+            // recoverable identity conflict into a VM abort.
             false,
-        )
-        .expect("non-enforcing fabrication never returns Err")
+        );
+        match fabricated {
+            Ok(id) => id,
+            Err(_) => self.ambiguity_stand_in(name, num_fields),
+        }
     }
 
     /// The enforcing sibling of [`Self::ensure_synthetic_class`].
@@ -3112,6 +3167,25 @@ impl ClassManager {
     /// This is the entry point for compatibility stand-ins whose caller *can*
     /// report a failure — chiefly the `java/util/function/Function$Identity`
     /// stand-in minted by the stream/function natives.
+    ///
+    /// # Two distinct refusals
+    ///
+    /// 1. **Policy** — `--jdk-only` forbids compatibility stand-ins at all.
+    ///    `ClassFileError::ClassNotFound`. Only under `JdkOnly`.
+    ///    *Migrating a call site from [`Self::ensure_synthetic_class`] to this
+    ///    method therefore also opts that call site into `--jdk-only`
+    ///    enforcement — which is step 2 of the wave-2 recipe above, but it is a
+    ///    second behaviour change riding along with the first, and under the
+    ///    default `Compatible` mode it changes nothing.*
+    /// 2. **Identity** — the name is already carried by two or more distinct
+    ///    classes, so a stand-in filed under `(Bootstrap, name)` would shadow
+    ///    all of them. `LinkageError::IncompatibleClassChangeError`, in **both**
+    ///    modes. See [`Self::classify_loaded_name`] and
+    ///    `docs/known-issues/synthetic-class-fallibility.md`.
+    ///
+    /// The two are deliberately different error shapes: a caller retrying with
+    /// an initiating loader (the right response to 2) must not confuse it with
+    /// a policy refusal it cannot retry out of.
     pub fn try_ensure_synthetic_class(
         &mut self,
         name: &str,
@@ -3140,6 +3214,16 @@ impl ClassManager {
     /// the other two entry points are for. Passing one anyway is a caller bug
     /// and is caught by a debug assertion rather than silently laundering a
     /// stub past the policy.
+    ///
+    /// # Why there is no `.expect` here any more
+    ///
+    /// Both of [`Self::fabricate_class`]'s refusals are gated on
+    /// `origin.is_compatibility_stub()`, which the debug assertion above says
+    /// is false for every caller — so in a debug build this cannot fail. In a
+    /// **release** build the assertion is compiled out, and a caller that did
+    /// pass a stub origin would reach the ambiguity gate and get an `Err`;
+    /// `.expect`ing it would abort the VM for what is a recoverable naming
+    /// conflict. The stand-in keeps the failure local to the one allocation.
     pub fn ensure_generated_class(
         &mut self,
         name: &str,
@@ -3152,8 +3236,63 @@ impl ClassManager {
              {name} was passed a CompatibilityStub origin — use \
              try_ensure_synthetic_class instead so the policy can see it",
         );
-        self.fabricate_class(name, num_fields, origin, false)
-            .expect("non-enforcing fabrication never returns Err")
+        let fabricated = self.fabricate_class(name, num_fields, origin, false);
+        match fabricated {
+            Ok(id) => id,
+            Err(_) => self.ambiguity_stand_in(name, num_fields),
+        }
+    }
+
+    /// The class handed back when a compatibility fabrication was refused and
+    /// the caller's signature has no way to say so.
+    ///
+    /// # The contract
+    ///
+    /// This is a **miss, not a guess**. It is emphatically *not* a stub for
+    /// `name`:
+    ///
+    /// * it is registered under `cratonvm/synthetic/AmbiguousName$<mangled
+    ///   name>$<fields>`, a name in the VM's own reserved namespace, so it can
+    ///   never be reached by a resolution of `name` and can never outrank the
+    ///   classes that made `name` ambiguous;
+    /// * it declares exactly `num_fields` slots, so an object allocated
+    ///   against it has a layout the GC's `get_field` bounds guard accepts —
+    ///   the alternative (`ClassId::new(0)`, `java/lang/Object`, zero fields)
+    ///   produces an undersized object that faults on the *first field write*,
+    ///   somewhere unrelated to the cause;
+    /// * it carries [`ClassOrigin::VmInternal`], because that is what it is: a
+    ///   VM bookkeeping shape. It is not a compatibility stand-in for anyone's
+    ///   class, so it must not be counted as one in the `--jdk-only` census.
+    ///
+    /// The `num_fields` suffix keeps two different requested shapes for the
+    /// same ambiguous name from colliding on one undersized stand-in.
+    ///
+    /// # What the caller sees
+    ///
+    /// A valid `ClassId` that fails every identity question about `name`:
+    /// `checkcast`/`instanceof` to `name` is false, a virtual call resolves to
+    /// nothing but `java/lang/Object`'s natives, and the class name in any
+    /// resulting `ClassCastException` / `NoSuchMethodError` message contains
+    /// the requested name — which is how this is diagnosed in the field.
+    fn ambiguity_stand_in(&mut self, name: &str, num_fields: usize) -> ClassId {
+        let mangled: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let stand_in = format!("cratonvm/synthetic/AmbiguousName${mangled}${num_fields}");
+        debug!(
+            requested = name,
+            stand_in = stand_in.as_str(),
+            "refusing to fabricate a stand-in under an ambiguous class name"
+        );
+        // `VmInternal` is not a compatibility stub, so neither of
+        // `fabricate_class`'s two refusals can fire for it and this recursion
+        // is exactly one level deep. `unwrap_or` rather than `expect` all the
+        // same: a future third refusal must not turn this into an abort, and
+        // `ClassId::new(0)` is the same last-resort the `NativeContext` default
+        // has always used.
+        self.fabricate_class(&stand_in, num_fields, ClassOrigin::VmInternal, false)
+            .unwrap_or(ClassId::new(0))
     }
 
     /// Shared body of the three `ensure_*_class` entry points.
@@ -3237,6 +3376,44 @@ impl ClassManager {
                 }
             }
             return Ok(id);
+        }
+        // ── Identity gate (classloading-identity-audit, Open 2) ───────────────
+        //
+        // `get_loaded_class_id` just answered `None`, and that single answer
+        // carries two opposite facts: *nobody* has this name (fabricate away),
+        // or **several distinct classes do** and it has no context-free answer
+        // (it returns `None` for exactly that case — "ambiguous is a miss, not
+        // a guess"). Everything below this line assumes the first reading. On
+        // the second, both of the remaining paths are wrong:
+        //
+        //   * the `load_class` retry would define a *third* copy of the name;
+        //   * the fabrication would file an empty stub under
+        //     `(Bootstrap, name)`, and since the built-in chain is probed
+        //     first, that stub then outranks **both** real classes for every
+        //     subsequent by-name resolution. Symptom in the field:
+        //     `NoSuchMethodError` / `<init> … has no Code attribute` on a class
+        //     that is demonstrably loaded. This is the Groovy
+        //     `$_run_closureN` shape — two `GroovyClassLoader$InnerLoader`s,
+        //     one name, two genuinely different classes.
+        //
+        // So refuse, and say which of the two it is. The gate is scoped to
+        // compatibility stand-ins on purpose: `ensure_generated_class` is
+        // minting a *new* VM class (a lambda, a proxy, an allocation shape)
+        // under a name it just constructed, which is a different question and
+        // one this lane deliberately does not answer.
+        //
+        // NOT covered, and tracked in
+        // `docs/known-issues/synthetic-class-fallibility.md`: when a built-in
+        // loader *also* has a class under the name, `get_loaded_class_id`
+        // returns that copy from the early return above and never reaches this
+        // gate. That is the pre-existing built-in-first delegation answer every
+        // context-free lookup in this file gives; closing it means migrating
+        // the early return itself to `classify_loaded_name`, which changes the
+        // answer for callers that are relying on it today.
+        if origin.is_compatibility_stub() {
+            if let NameResolution::Ambiguous { definitions } = self.classify_loaded_name(name) {
+                return Err(ambiguous_stand_in_refused(name, definitions));
+            }
         }
         // Not loaded yet: prefer the real `.class` file over a possibly
         // undersized synthetic stub. `ensure_synthetic_class` is frequently
@@ -15662,6 +15839,162 @@ mod tests {
             mgr.classify_loaded_name("never.Defined"),
             NameResolution::Absent
         );
+    }
+
+    /// Two user loaders, one name, two distinct classes — then a native asks
+    /// for a compatibility stand-in under that name. Fabricating one files it
+    /// under `(Bootstrap, name)`, and because the built-in chain is probed
+    /// first, the empty stub then outranks BOTH real classes for every
+    /// subsequent by-name resolution. The fallible spelling must refuse, and
+    /// the refusal must be distinguishable from "absent".
+    #[test]
+    fn try_ensure_synthetic_class_refuses_an_ambiguous_name() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let first = ClassLoaderId::UserDefined(0x5EED_0010);
+        let second = ClassLoaderId::UserDefined(0x5EED_0011);
+
+        let id_a = mgr.define_class("Foo", &v1, first).expect("loader A");
+        let id_b = mgr.define_class("Foo", &v1, second).expect("loader B");
+        assert_ne!(id_a, id_b);
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Ambiguous { definitions: 2 },
+        );
+
+        let refused = mgr
+            .try_ensure_synthetic_class("Foo", 3)
+            .expect_err("an ambiguous name must not be fabricated for");
+        // Not a `ClassNotFound`: that is what the jdk-only policy refusal and
+        // plain absence both look like, and the caller's correct response to
+        // ambiguity (re-ask with an initiating loader) differs from both.
+        assert!(
+            matches!(
+                refused,
+                VmError::Linkage(LinkageError::IncompatibleClassChangeError { .. })
+            ),
+            "ambiguity refusal must not be spelled like absence: {refused:?}",
+        );
+        let rendered = refused.to_string();
+        assert!(rendered.contains("Foo"), "{rendered}");
+        assert!(rendered.contains('2'), "the count is diagnostic: {rendered}");
+
+        // Nothing was minted, nothing was re-homed: both real classes still
+        // resolve from their own loader and the name is still ambiguous.
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Ambiguous { definitions: 2 },
+        );
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", first), Some(id_a));
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", second), Some(id_b));
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "Foo"),
+            None,
+            "the refusal must not have filed a bootstrap alias for the name",
+        );
+    }
+
+    /// The infallible spelling has no channel for the refusal, so it must
+    /// degrade to something that is still a *miss*: a distinctly-named,
+    /// correctly-sized stand-in. What it must never do is the thing it used to
+    /// do — mint a stub under the ambiguous name itself.
+    #[test]
+    fn ensure_synthetic_class_hands_back_a_stand_in_not_a_shadowing_stub() {
+        let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let first = ClassLoaderId::UserDefined(0x5EED_0012);
+        let second = ClassLoaderId::UserDefined(0x5EED_0013);
+        let id_a = mgr.define_class("Foo", &v1, first).expect("loader A");
+        let id_b = mgr.define_class("Foo", &v1, second).expect("loader B");
+
+        let stand_in = mgr.ensure_synthetic_class("Foo", 3);
+
+        assert_ne!(stand_in, id_a);
+        assert_ne!(stand_in, id_b);
+        let class = mgr.get_class(stand_in).expect("the stand-in is registered");
+        assert_ne!(
+            &*class.name, "Foo",
+            "the stand-in must not carry the ambiguous name",
+        );
+        assert!(
+            class.name.starts_with("cratonvm/synthetic/AmbiguousName$"),
+            "unexpected stand-in name: {}",
+            class.name,
+        );
+        assert!(
+            class.name.contains("Foo"),
+            "the requested name has to survive into the diagnostic: {}",
+            class.name,
+        );
+        assert_eq!(
+            class.num_total_fields, 3,
+            "an undersized stand-in faults on the first field write instead of \
+             at the cause",
+        );
+        assert!(
+            !class.origin.is_compatibility_stub(),
+            "the stand-in stands in for nobody's class; counting it as a \
+             compatibility stub would pollute the --jdk-only census",
+        );
+
+        // The real classes are untouched and the name is still ambiguous.
+        assert_eq!(
+            mgr.classify_loaded_name("Foo"),
+            NameResolution::Ambiguous { definitions: 2 },
+        );
+        assert_eq!(mgr.get_loaded_class_id("Foo"), None);
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "Foo"),
+            None,
+        );
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", first), Some(id_a));
+        assert_eq!(mgr.find_class_by_name_for_loader("Foo", second), Some(id_b));
+
+        // Idempotent: the same request returns the same stand-in rather than
+        // minting one per allocation.
+        assert_eq!(mgr.ensure_synthetic_class("Foo", 3), stand_in);
+        // A different requested shape gets its own stand-in, so a later,
+        // larger request is not served an undersized layout.
+        let wider = mgr.ensure_synthetic_class("Foo", 9);
+        assert_ne!(wider, stand_in);
+        assert_eq!(
+            mgr.get_class(wider).expect("wider stand-in").num_total_fields,
+            9,
+        );
+    }
+
+    /// The identity gate must be invisible to every name that is not
+    /// ambiguous — which is all of them, in every run that is not reproducing
+    /// this bug.
+    #[test]
+    fn fabrication_is_unchanged_for_absent_and_unique_names() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        // Absent → fabricate, filed under the bootstrap loader, memoized.
+        let id = mgr.ensure_synthetic_class("p/Absent", 2);
+        assert_eq!(&*mgr.get_class(id).expect("minted").name, "p/Absent");
+        assert_eq!(
+            loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "p/Absent"),
+            Some(id),
+        );
+        assert_eq!(mgr.ensure_synthetic_class("p/Absent", 2), id);
+        assert_eq!(
+            mgr.classify_loaded_name("p/Absent"),
+            NameResolution::Unique(id),
+        );
+
+        // Unique → the existing early return, on both spellings.
+        assert_eq!(
+            mgr.try_ensure_synthetic_class("p/Absent", 2)
+                .expect("a unique name is not refused"),
+            id,
+        );
+
+        // And a fresh unique name through the fallible spelling.
+        let other = mgr
+            .try_ensure_synthetic_class("p/Other", 0)
+            .expect("an absent name is not refused");
+        assert_ne!(other, id);
     }
 
     /// Both separator spellings reach the same index entry.
