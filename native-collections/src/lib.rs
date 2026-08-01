@@ -587,6 +587,116 @@ fn remove_overlay_owner_key(owner_addr: usize, key: usize) {
     }
 }
 
+/// Whether the reverse owner index still records `key` as belonging to the
+/// collection object at `owner_addr`.
+///
+/// This is the "is the previous tenant of this address really gone?" question.
+/// The index is maintained in lockstep with the object-key registry across a
+/// collection: `gc_update_collection_overlay_refs` RE-KEYS a relocated
+/// collection's entry from its old address to its new one, and
+/// `clear_overlay_entries_for_key` drops it outright when the collection dies.
+/// So for an address that a fresh object has just been allocated over:
+///   * still recorded here -> the previous tenant died and has not been pruned
+///     yet, and its overlay state is genuinely garbage;
+///   * no longer recorded  -> the previous tenant MOVED and is still alive, and
+///     its overlay state is its only storage.
+/// See `native_map_init`, the one caller, for why that distinction matters.
+fn overlay_owner_still_at(owner_addr: usize, key: usize) -> bool {
+    overlay_owner_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&owner_addr)
+        .is_some_and(|keys| keys.contains(&key))
+}
+
+#[cfg(test)]
+mod overlay_owner_liveness_tests {
+    use super::*;
+
+    fn object(addr: usize) -> ObjectRef {
+        unsafe { ObjectRef::from_raw(addr as *mut u8) }
+    }
+
+    /// A collection that DIED leaves its owner-index entry at the address it
+    /// died at, so a fresh object allocated over that address may evict its
+    /// overlay state. This is the case `native_map_init`'s purge exists for.
+    #[test]
+    fn dead_tenant_is_still_recorded_at_its_address() {
+        let addr = 0x5EAD_0100_usize;
+        let key = 0x5EAD_0101_usize;
+        register_overlay_owner_key(addr, key);
+        assert!(
+            overlay_owner_still_at(addr, key),
+            "a tenant that has not been pruned must still be recorded at its address"
+        );
+    }
+
+    /// A collection that MOVED is re-keyed to its new address by the post-GC
+    /// remap, so its old address no longer names it. Evicting on a raw-pointer
+    /// match alone would empty this still-live collection; the guard must
+    /// answer `false` for the old address and `true` for the new one.
+    #[test]
+    fn relocated_tenant_is_no_longer_recorded_at_its_old_address() {
+        let old_addr = 0x5EAD_0200_usize;
+        let new_addr = 0x5EAD_0300_usize;
+        let key = 0x5EAD_0201_usize;
+        register_overlay_owner_key(old_addr, key);
+        assert!(overlay_owner_still_at(old_addr, key));
+
+        let mut pointer_map = StdHashMap::new();
+        pointer_map.insert(old_addr, new_addr);
+        gc_update_collection_overlay_refs(&pointer_map);
+
+        assert!(
+            !overlay_owner_still_at(old_addr, key),
+            "a relocated collection must not still be recorded at its pre-move address, \
+             or HashMap.<init> on a fresh object at that address would evict its live overlay"
+        );
+        assert!(
+            overlay_owner_still_at(new_addr, key),
+            "the relocated collection must be recorded at its post-move address"
+        );
+        // Leave the global index as we found it so sibling tests in this
+        // process see no residue.
+        clear_overlay_entries_for_key(key, new_addr);
+    }
+
+    /// End-to-end on the overlay itself: an entry registered for a relocated
+    /// owner survives the address recycle, and one registered for a dead owner
+    /// is still evictable.
+    #[test]
+    fn relocated_owners_overlay_entry_survives_an_address_recycle() {
+        let old_addr = 0x5EAD_0400_usize;
+        let new_addr = 0x5EAD_0500_usize;
+        let key = 0x5EAD_0401_usize;
+        register_overlay_owner_key(old_addr, key);
+        hm_int_fast_shard_for(key)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_default()
+            .entries
+            .insert(1, (object(0x1000), Value::Int(7)));
+
+        let mut pointer_map = StdHashMap::new();
+        pointer_map.insert(old_addr, new_addr);
+        gc_update_collection_overlay_refs(&pointer_map);
+
+        // What `native_map_init` now asks before evicting.
+        assert!(!overlay_owner_still_at(old_addr, key));
+        assert_eq!(
+            hm_int_fast_shard_for(key)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .map(|state| state.entries.len()),
+            Some(1),
+            "the live, relocated map's only storage must still hold its entry"
+        );
+        clear_overlay_entries_for_key(key, new_addr);
+    }
+}
+
 /// Select the registry shard for an identity hash. Mixes with the 64-bit
 /// Fibonacci/golden-ratio constant first because identity hashes can be
 /// low-entropy / sequentially assigned, which would otherwise cluster nearby
@@ -6659,16 +6769,49 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         ensure_hashtable_load_factor(ctx, this, &cname);
         return Ok(None);
     }
+    // Evict the integer overlay of whatever used to live at this address.
+    //
+    // The memo is matched on the raw pointer ALONE — deliberately, since its
+    // whole job here is to catch the previous tenant of a recycled address, and
+    // the newcomer's identity hash can never match the old one. But "a fresh
+    // object is at this address" does NOT imply "the previous tenant is dead":
+    // under a copying young collection the previous tenant may simply have been
+    // relocated (or promoted), leaving its old address free for reuse while it
+    // is still very much alive. The overlay is the AUTHORITATIVE store for such
+    // a map — its heap buckets are empty and its `size` field is 0 — so
+    // dropping that entry silently empties a live `HashMap<Integer,?>`: `get`
+    // returns null, `size()` returns 0, `keySet()` iterates nothing, and no
+    // exception is raised anywhere. That is the
+    // `docs/internal/fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`
+    // failure: Hibernate's `ParameterMetadataImpl.queryParametersByPosition` is
+    // exactly this shape (fresh exact-class `HashMap`, boxed-Integer keys, long
+    // lived), and losing it reports `No parameter labelled '?1' in query with
+    // ordinal parameters []` on a query that parsed perfectly.
+    //
+    // `overlay_owner_still_at` separates the two cases using the reverse owner
+    // index, which the collector already re-keys on relocation and clears on
+    // death — so a moved-but-live tenant is no longer recorded at its old
+    // address, while a dead-but-unpruned one still is. The memo itself is
+    // cleared either way: it names an address this thread will never see that
+    // tenant at again.
     let ptr = this.as_ptr() as usize;
     if let Some((_, _, stale_key)) = HM_INT_FAST_LAST_KEY
         .with(|cache| cache.get())
         .filter(|(cached_ptr, _, _)| *cached_ptr == ptr)
     {
-        hm_int_fast_shard_for(stale_key)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&stale_key);
         HM_INT_FAST_LAST_KEY.with(|cache| cache.set(None));
+        let previous_tenant_is_dead = overlay_owner_still_at(ptr, stale_key);
+        if dbg_hminit_purge() {
+            eprintln!(
+                "[hminit-purge] ptr={ptr:#x} key={stale_key:#x} previous_tenant_dead={previous_tenant_is_dead}"
+            );
+        }
+        if previous_tenant_is_dead {
+            hm_int_fast_shard_for(stale_key)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&stale_key);
+        }
     }
     // Legacy synthetic layout — what every other native HashMap op expects.
     // GC-safety: same hazard as the Hashtable branch above — `alloc_ref_array`
@@ -7856,6 +7999,19 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(None)))
+}
+
+/// `true` iff `CRATONVM_DBG_HMINIT_PURGE` is set. Cached: `HashMap.<init>` is
+/// one of the hottest natives in the VM, so this must not re-read the
+/// environment. Reports every recycled-address overlay eviction `native_map_init`
+/// considers, and — the number that matters — whether the address's previous
+/// tenant was actually dead. A `previous_tenant_dead=false` line is a live
+/// `HashMap<Integer,?>` that the pre-fix code would have silently emptied.
+fn dbg_hminit_purge() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HMINIT_PURGE").is_some()
+    })
 }
 
 /// `true` iff `CRATONVM_DBG_MAP_MISS_AUDIT` is set. Cached: this is consulted on
@@ -19118,6 +19274,23 @@ fn collector_tag_of(ctx: &mut dyn NativeContext, v: Value) -> Option<i32> {
     None
 }
 
+/// The source `Collector` a synthetic collector-function object carries in
+/// field 0, or `Object(None)` when the receiver is not one.
+///
+/// `make_collector_fn` allocates these with exactly one field, but the SAM
+/// natives that read that field are registered on the PUBLIC functional
+/// interfaces, so a receiver with no fields at all can reach them — a
+/// non-capturing user lambda proxy, for instance. Reading slot 0 of a
+/// zero-slot object is an out-of-bounds field read: the heap drops it, but not
+/// before `CRATONVM_DBG`-grade machinery captures a full Rust backtrace per
+/// call. Ask the layout first.
+fn collector_fn_source(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    if ctx.object_num_fields(this) == 0 {
+        return Value::Object(None);
+    }
+    ctx.get_field(this, 0)
+}
+
 /// `Collector.supplier()/accumulator()/finisher()/combiner()` — return a synthetic
 /// functional object (class == the SAM interface) carrying the source Collector in
 /// field 0 so its SAM (registered above) can read the tag.
@@ -19147,7 +19320,7 @@ fn native_collfn_supplier_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return make_list_of(ctx, &[]),
     };
-    let coll = ctx.get_field(this, 0);
+    let coll = collector_fn_source(ctx, this);
     match collector_tag_of(ctx, coll) {
         Some(COLLECTOR_TAG_TO_SET) => make_set_of(ctx, &[]),
         Some(COLLECTOR_TAG_TO_MAP) | Some(COLLECTOR_TAG_TO_MAP_MERGE) => make_map_of(ctx, &[]),
@@ -19190,7 +19363,7 @@ fn native_collfn_accumulator_accept(
     };
     let container = args.get(1).copied().unwrap_or(Value::Object(None));
     let item = args.get(2).copied().unwrap_or(Value::Object(None));
-    let coll = ctx.get_field(this, 0);
+    let coll = collector_fn_source(ctx, this);
     match collector_tag_of(ctx, coll) {
         Some(COLLECTOR_TAG_TO_MAP)
         | Some(COLLECTOR_TAG_TO_MAP_MERGE)
@@ -19627,7 +19800,7 @@ fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(container)),
     };
-    let coll = ctx.get_field(this, 0);
+    let coll = collector_fn_source(ctx, this);
     let read_str = |ctx: &dyn NativeContext, field: usize| -> String {
         match coll {
             Value::Object(Some(c)) => match ctx.get_field(c, field) {

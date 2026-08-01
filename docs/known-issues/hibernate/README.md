@@ -120,18 +120,24 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   (~29 functions) were fixed on the way through. Full write-up:
   `docs/internal/fixed-suite-bugs/hibernate/antlr-native-roots-moving-young-hql-misparse-20260730-FIXED.md`.
 
-## Open
+- **A user lambda could be routed to the collector natives under the JIT** — FIXED
+  2026-07-31, closing the HQL ordinal-parameter report. `Collector.accumulator()` and its
+  siblings return synthetic objects whose class name IS the SAM interface, so the natives
+  serving them are registered on `java/util/function/{Supplier.get, BiConsumer.accept,
+  Function.apply, BinaryOperator.apply}`. A lambda proxy has no class of its own in the class
+  store, so the JIT's by-name dispatch bails resolved it as its functional interface and ran
+  those natives instead of the lambda: `Supplier.get` returned an empty `ArrayList`,
+  `Function.apply` returned its argument, `BiConsumer.accept(a,b)` called `a.add(b)`. Three of
+  the four are silent; the fourth is the `NoSuchMethodError: ....add(Ljava/lang/Object;)Z` that
+  failed three `ASTParserLoadingTest` tests on **every** JIT run. Needs the site compiled
+  (the interpreter resolves proxies through the registry first) and megamorphic. A shared
+  `try_lambda_proxy_sam_dispatch` now guards both bails.
+  `FunctionalInterfaceHijackProbe.java` is the reduced witness. The report that prompted the
+  hunt — a one-in-fourteen `ordinal parameters []` — never reproduced and is **not** attributed
+  to this; read the write-up's "What is and is not proven" before citing it.
+  Full write-up: `docs/internal/fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`.
 
-- [HQL ordinal parameter silently dropped — `ordinal parameters []` under JIT](hql-ordinal-parameter-dropped-under-jit-20260731.md)
-  (OPEN; observed once, cause not located) — `ASTParserLoadingTest#testComponentNullnessChecks`
-  failed 1 run in 14 under JIT with `No parameter labelled '?1' in query with ordinal parameters []`
-  and has not recurred (a follow-up 8-run interleaved A/B was clean on both binaries).
-  The query parses without a syntax error but its ordinal parameter never reaches
-  `ParameterMetadataImpl`, so this is a *missing production*, not the rejected-parse shape of the
-  (now fixed) ANTLR moving-young root defect — zero `SyntaxException`s appeared in any of the
-  twelve witness runs. `HqlParseStress` now asserts that every parameter marker survives into
-  `statement().getText()`; 3500 parses per arm across jit/nojit x default/GC-stress reproduce
-  nothing on either binary, so the defect is likely downstream of the parse tree.
+## Open
 
 - [`map_resize_inner` publishes stale chain heads into the resized bucket array](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md)
   (OPEN; root cause located, fix not landed) — `HIB-MAPRESIZE-STALE.1`. The JDK-style

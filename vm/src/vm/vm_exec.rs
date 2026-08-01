@@ -21537,9 +21537,18 @@ fn invoke_on_class_shared_inner(
                 // MechanismDatabase when a Reader ref went stale). Dump the
                 // frame stack so the producing frame is named, exactly like
                 // CCE-BT-STK.
-                if class_name == "java/lang/Object"
-                    && crate::runtime::interpreter::dbg_cce_bt_enabled()
-                {
+                //
+                // `java/lang/Object` is only the cid=0 END of that family's
+                // range. A recycled address that now holds a REAL object of an
+                // unrelated class produces the identical defect with a concrete
+                // class name — `EmbeddableInitializerImpl.add(Ljava/lang/Object;)Z`
+                // for a `Collection.add` call site, say — and the old class-name
+                // test made the tracer blind to exactly those, which are the ones
+                // where naming the producing frame matters most. The flag is
+                // opt-in and this is a terminal error path, so every miss gets
+                // the dump; the receiver's resolved class is printed with it so
+                // "wrong class" and "no class" stay distinguishable in the log.
+                if crate::runtime::interpreter::dbg_cce_bt_enabled() {
                     eprintln!(
                         "CRATONVM_DBG_CCE_BT: site=nsme_dispatch method={class_name}.{method_name}{descriptor}"
                     );
