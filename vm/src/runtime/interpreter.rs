@@ -22282,6 +22282,58 @@ mod tests {
     }
 
     #[test]
+    fn file_system_provider_link_ops_force_native_over_the_base_class_throw() {
+        // The base class gives all three a concrete
+        // `throw new UnsupportedOperationException()` body, and CratonVM's
+        // default provider IS that base class — so both dispatch gates have to
+        // admit the registered natives or `Files.createSymbolicLink` dies at
+        // `FileSystemProvider.createSymbolicLink`.
+        let providers = [
+            "java/nio/file/spi/FileSystemProvider",
+            "sun/nio/fs/WindowsFileSystemProvider",
+            "sun/nio/fs/UnixFileSystemProvider",
+        ];
+        let ops = [
+            (
+                "createSymbolicLink",
+                "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)V",
+            ),
+            ("createLink", "(Ljava/nio/file/Path;Ljava/nio/file/Path;)V"),
+            (
+                "readSymbolicLink",
+                "(Ljava/nio/file/Path;)Ljava/nio/file/Path;",
+            ),
+        ];
+        for provider in providers {
+            for (name, descriptor) in ops {
+                assert!(
+                    is_file_system_provider_link_native_override(provider, name, descriptor),
+                    "{provider}.{name}{descriptor} must route to the registered native"
+                );
+                assert!(
+                    force_native_over_real_jdk_bytecode(provider, name, descriptor),
+                    "real-JDK bytecode dispatch must force the {name} native"
+                );
+            }
+        }
+        // The `Files` static wrapper is NOT the receiver these run on: a
+        // registration there loses to `Files`' own bytecode, which is what made
+        // the original three stubs dead code. The exemption must not pretend
+        // otherwise.
+        assert!(!is_file_system_provider_link_native_override(
+            "java/nio/file/Files",
+            "createSymbolicLink",
+            "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/file/Path;"
+        ));
+        // A neighbouring provider method must not be swept in.
+        assert!(!is_file_system_provider_link_native_override(
+            "java/nio/file/spi/FileSystemProvider",
+            "delete",
+            "(Ljava/nio/file/Path;)V"
+        ));
+    }
+
+    #[test]
     fn native_thread_set_force_native_covers_filechannel_blocking_bookkeeping() {
         let nts = "sun/nio/ch/NativeThreadSet";
         for (name, descriptor) in [("add", "()I"), ("remove", "(I)V"), ("signalAndWait", "()V")] {

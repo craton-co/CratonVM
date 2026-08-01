@@ -305,6 +305,19 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
     // Release (and, for handler-less writes, apply) any buffer roots parked
     // by `Job::Write` workers.
     flush_pending_root_releases(ctx);
+    // The flushes above are pure VM-state bookkeeping and are safe on any
+    // thread. DISPATCHING is not: it runs arbitrary Java. Only a designated
+    // completion thread may do that — see `on_completion_thread`. An
+    // application thread that merely called some other AIO native (a
+    // `write`, an `isOpen`) must not have a `CompletionHandler` run on it.
+    if !on_completion_thread() && dispatcher_available() {
+        if !completion_queue().lock().is_empty() {
+            ensure_dispatcher();
+            // Same condvar `push_handler_completion` signals.
+            read_completion_state().1.notify_one();
+        }
+        return;
+    }
     for _ in 0..DRAIN_LIMIT {
         let next = completion_queue().lock().pop_front();
         let Some(c) = next else { break };
@@ -585,6 +598,10 @@ const READ_DRAIN_LIMIT: usize = 256;
 /// `CompletionHandler.completed` / `failed` on the calling (dispatcher) thread.
 /// Requires a live `NativeContext`, so it must run on a VM/attached thread.
 pub fn drain_completions_pub(ctx: &mut dyn NativeContext) {
+    // This IS the pool thread of our `AsynchronousChannelGroup` equivalent, so
+    // it — and anything it calls, including a handler re-arming its next read —
+    // may invoke Java completion callbacks.
+    let _delivering = CompletionThreadGuard::enter();
     // Handler-form accept/connect/write completions live in a separate queue
     // that used to have no dispatcher at all — see `push_handler_completion`.
     drain_completions(ctx);
@@ -912,6 +929,66 @@ fn dispatcher_launcher() -> &'static Mutex<Option<DispatcherLauncher>> {
 /// Install the AIO dispatcher launcher (called once by the VM at init).
 pub fn set_dispatcher_launcher(f: DispatcherLauncher) {
     *dispatcher_launcher().lock() = Some(f);
+}
+
+thread_local! {
+    /// True while this thread is acting as an AIO *completion-delivery* thread
+    /// — i.e. it is the VM-attached dispatcher (`drain_completions_pub`), or
+    /// the JDK's own port dispatcher loop (`Iocp`/`EPollPort`/`KQueuePort`
+    /// `drain`/`poll`), or it is already inside a delivery on one of those.
+    ///
+    /// Invoking a Java `CompletionHandler` is only permitted on such a thread.
+    /// `AsynchronousChannelGroup` allows an immediate completion to run on the
+    /// initiating thread ONLY "where ... the initiating thread is one of the
+    /// pooled threads in the group" — the qualifier exists precisely so an
+    /// application thread is never hijacked into running a handler that may
+    /// block. See [`on_completion_thread`].
+    static DELIVERING_COMPLETIONS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks the calling thread as a completion-delivery thread for its lifetime,
+/// restoring the previous state on drop (so nesting and unwinding are safe).
+struct CompletionThreadGuard(bool);
+
+impl CompletionThreadGuard {
+    fn enter() -> Self {
+        CompletionThreadGuard(DELIVERING_COMPLETIONS.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for CompletionThreadGuard {
+    fn drop(&mut self) {
+        DELIVERING_COMPLETIONS.with(|c| c.set(self.0));
+    }
+}
+
+/// Whether this thread may invoke Java `CompletionHandler` callbacks.
+///
+/// BUG (TestWsRemoteEndpointImplServerDeadlock, 2026-08-01): before this gate,
+/// ANY thread that armed a handler-form read whose bytes had already arrived
+/// ran `completed()` itself, and any thread that called an unrelated AIO native
+/// drained the pending-handler queue. Tomcat's WebSocket client arms its first
+/// read from `WsFrameClient.startInputProcessing`, which runs on the
+/// APPLICATION thread inside `WsWebSocketContainer.connectToServer`. On
+/// loopback the server's frames are already buffered, so `completed()` fired
+/// inline, re-armed, completed inline again, and delivered a whole text message
+/// to `onMessage` — all on the application thread, still inside
+/// `connectToServer`. That test's `@OnMessage` blocks on a latch that only the
+/// application thread can count down, so it deadlocked permanently (~35-50% of
+/// runs, whenever the frames happened to be buffered in time).
+///
+/// A completion parked for the dispatcher is never delayed by this: every
+/// `push_*_completion` signals the dispatcher's condvar.
+fn on_completion_thread() -> bool {
+    DELIVERING_COMPLETIONS.with(|c| c.get())
+}
+
+/// Whether a real dispatcher can be started. Pure-Rust users of this crate (the
+/// in-crate tests) never install a launcher, and for them the opportunistic
+/// drain remains the only delivery mechanism — so the gate above must not
+/// strand completions there.
+fn dispatcher_available() -> bool {
+    dispatcher_launcher().lock().is_some()
 }
 
 /// Start the AIO dispatcher on first use (idempotent).
@@ -2173,6 +2250,17 @@ fn try_deliver_ready_read(
     attachment: Option<ObjectRef>,
     buffer: ObjectRef,
 ) -> bool {
+    // HARD PRECONDITION, checked before anything else: only a designated
+    // completion thread may run `completed()`. On any other thread this must
+    // fall back to the worker pool no matter how ready the socket is — see
+    // `on_completion_thread` for the deadlock this closes. (Checked first
+    // because it is a TLS read, versus a `FIONREAD` syscall below.)
+    if !on_completion_thread() {
+        if aio_inline_dbg_enabled() {
+            aio_inline_record(&AIO_INLINE_FOREIGN_THREAD);
+        }
+        return false;
+    }
     // Probe readiness BEFORE the depth check, so a read that is both capped and
     // has no data is attributed to "not ready" rather than to the cap. Getting
     // this order wrong reported 491 depth-capped reads that were really just
@@ -2316,6 +2404,13 @@ fn aio_inline_dbg_enabled() -> bool {
 static AIO_INLINE_TAKEN: AtomicUsize = AtomicUsize::new(0);
 static AIO_INLINE_NOT_READY: AtomicUsize = AtomicUsize::new(0);
 static AIO_INLINE_DEPTH_CAPPED: AtomicUsize = AtomicUsize::new(0);
+/// Reads declined by the inline fast path because the initiating thread is not
+/// a completion-delivery thread. Expected to be non-zero and harmless: it
+/// counts the first read of each handler chain, which an application thread
+/// arms (e.g. `WsFrameClient.startInputProcessing`). Only the follow-on reads,
+/// armed from inside `completed()` on the dispatcher, are eligible to inline —
+/// which is the case the fast path was built for.
+static AIO_INLINE_FOREIGN_THREAD: AtomicUsize = AtomicUsize::new(0);
 
 /// Split of where a NOT-READY read's latency goes, under
 /// `CRATONVM_DBG_AIO_INLINE`.
@@ -2413,11 +2508,12 @@ fn aio_inline_record(counter: &AtomicUsize) {
     let taken = AIO_INLINE_TAKEN.load(Ordering::Relaxed);
     let not_ready = AIO_INLINE_NOT_READY.load(Ordering::Relaxed);
     let capped = AIO_INLINE_DEPTH_CAPPED.load(Ordering::Relaxed);
-    let total = taken + not_ready + capped;
+    let foreign = AIO_INLINE_FOREIGN_THREAD.load(Ordering::Relaxed);
+    let total = taken + not_ready + capped + foreign;
     if total % 500 == 0 {
         eprintln!(
             "[DBG_AIO_INLINE] reads={total} inline={taken} not_ready={not_ready} \
-             depth_capped={capped} inline_rate={:.3}",
+             depth_capped={capped} foreign_thread={foreign} inline_rate={:.3}",
             taken as f64 / total as f64
         );
     }
@@ -2974,6 +3070,9 @@ fn iocp_close(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult
 }
 
 fn iocp_drain(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // `Iocp`/`EPollPort`/`KQueuePort` `drain`/`poll` are called from the JDK's
+    // own dispatcher loop, so this caller is a pool thread by construction.
+    let _delivering = CompletionThreadGuard::enter();
     drain_completions(ctx);
     flush_pending_array_writes_inner(ctx);
     Ok(None)
