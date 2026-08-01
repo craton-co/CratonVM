@@ -3,7 +3,7 @@
 `jit/src/regalloc.rs` has had a complete, self-verifying linear-scan register
 allocator (`allocate_linear_scan`, `verify_allocation`, `resolve_parallel_copy`)
 and no production consumer — which is what
-`docs/known-issues/deep-research-vm-c2.md` item 3 is about, and what
+`docs/known-issues/c2/deep-research-vm-c2.md` item 3 is about, and what
 `docs/jit/linear-scan-regalloc.md` documents from the allocator's side.
 
 This document is the *consumer* side: what `ir_lower.rs` now does with that

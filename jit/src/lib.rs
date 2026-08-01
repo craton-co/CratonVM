@@ -10742,7 +10742,7 @@ fn virtual_object_info_for(
 /// optimizing tier is an optimization, never a requirement.
 ///
 /// This is the adapter the P0 "JIT correctness" lane of
-/// `docs/known-issues/deep-research-vm-c2.md` asks for: `verify_graph` returns
+/// `docs/known-issues/c2/deep-research-vm-c2.md` asks for: `verify_graph` returns
 /// `Result`, the compile path returns `Option`, and rather than change the
 /// signature of anything already in the pipeline the conversion happens here,
 /// at the call site. The bailout is *counted* (`bailout::bailout_counts`) so
@@ -13264,7 +13264,7 @@ fn try_compile_inner(
                 // Branchy-IR explicitly disabled (CRATONVM_NO_IR_BRANCHY) and
                 // reassoc off → fall through to the single-pass backend below.
             } else {
-                // P0 "JIT correctness" (docs/known-issues/deep-research-vm-c2.md):
+                // P0 "JIT correctness" (docs/known-issues/c2/deep-research-vm-c2.md):
                 // the IR verifier runs after every mutating pass when
                 // `ir_verify::verify_enabled()` (debug builds, or
                 // `CRATONVM_JIT_VERIFY_IR=1`), and unconditionally immediately

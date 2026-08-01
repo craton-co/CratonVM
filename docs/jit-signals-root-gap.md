@@ -189,7 +189,7 @@ a reclaimed slot, which is worse than either failure alone):
     }
     // The JIT's out-of-band pending throwable — paired with the remap in
     // `gc.rs::remap_thread_object_slots`. See
-    // `docs/known-issues/jit-signals-root-gap.md`.
+    // `docs/jit-signals-root-gap.md`.
     if let Some(ref obj_ref) = thread.jit_pending_exception {
         roots.push(*obj_ref);
     }

@@ -324,7 +324,7 @@ fixed here: `type_maps`' directory is a lock-free `AtomicPtr` chunk array whose
 readers are `&'static`-returning free functions, and `is_bootstrap_appended_class`
 is a free function called from `native-builtins` with no manager in hand. Both
 need a VM handle threaded to the reader. Track with the `vm/src/` half in
-`docs/known-issues/vm-process-global-state.md`.
+`docs/known-issues/c2/vm-process-global-state.md`.
 
 ### Open 5 — no initiating-loader records and no loader constraints (MEDIUM, architectural)
 
@@ -377,5 +377,5 @@ loaders, one shared interface name, a method whose descriptor mentions it.
 * `docs/internal/loader-identity.md` — per-file tally of remaining
   `find_class_by_name` call sites.
 * `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`
-* `docs/known-issues/vm-process-global-state.md` — the `vm/src/` half of
+* `docs/known-issues/c2/vm-process-global-state.md` — the `vm/src/` half of
   *Open 4*.

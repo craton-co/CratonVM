@@ -284,7 +284,7 @@ thread_local! {
     /// [`JvmThread::jit_pending_exception`], because a `thread_local!` is
     /// unreachable from a collecting thread and the throwable was therefore
     /// neither scanned nor remapped for the whole stash→drain window (see
-    /// `docs/known-issues/jit-signals-root-gap.md`). Every remaining field is a
+    /// `docs/jit-signals-root-gap.md`). Every remaining field is a
     /// plain scalar the collector has no interest in, which is why they may
     /// stay here and keep the one-TLS-access drain. **Do not add an
     /// `ObjectRef`, a `Value`, or a raw heap address to this struct** — put it
@@ -664,7 +664,7 @@ pub fn clear_jit_thread() {
 ///
 /// Scalars only — the pending throwable lives on
 /// [`JvmThread::jit_pending_exception`] so the collector can see and relocate
-/// it (`docs/known-issues/jit-signals-root-gap.md`).
+/// it (`docs/jit-signals-root-gap.md`).
 struct JitSignals {
     /// RBC.6 correctness fix — the bytecode pc of the `athrow` that produced
     /// the thread's `jit_pending_exception`, when statically known at
@@ -1718,7 +1718,7 @@ const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
 /// cross-VM hit therefore does not degrade to a slow path — it CALLs another
 /// VM's compiled body, or runs `java/util/HashMap`'s native against whatever
 /// class happens to hold that id in this VM. See
-/// `docs/known-issues/vm-jit-cache-keying.md`.
+/// `docs/vm-jit-cache-keying.md`.
 ///
 /// `vm_identity` is a monotonically issued counter (`vm_init.rs`
 /// `NEXT_VM_IDENTITY`), never an address, so it is never recycled — unlike a
@@ -5328,7 +5328,7 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
 /// the `OWNER` latch, and every other VM answers `is_initialized == false` and
 /// takes the authoritative `ensure_class_initialized_shared` path forever. That
 /// is a correct-but-slower outcome for VM #2, and no shared mutable state can
-/// give a wrong answer. See `docs/known-issues/vm-jit-cache-keying.md`.
+/// give a wrong answer. See `docs/vm-jit-cache-keying.md`.
 mod class_init_memo {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -6940,7 +6940,7 @@ pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     } else if let Some((thread, _guard)) = jit_thread_mut() {
         // The throwable is stashed on the `JvmThread` so the collector can
         // both keep it alive and relocate it before the interpreter's drain
-        // reads it back (`docs/known-issues/jit-signals-root-gap.md`).
+        // reads it back (`docs/jit-signals-root-gap.md`).
         set_jit_pending_exception_with_bci(
             thread,
             ObjectRef::from_raw(exc_ptr as usize as *mut u8),
@@ -11384,7 +11384,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Per-VM keying of the JIT dispatch memos
-    // (docs/known-issues/vm-jit-cache-keying.md)
+    // (docs/vm-jit-cache-keying.md)
     // -----------------------------------------------------------------------
 
     /// Serializes the tests that reset the two process-global, VM-owned
@@ -11400,7 +11400,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // The pending JIT exception is thread-resident, not TLS-resident
-    // (docs/known-issues/jit-signals-root-gap.md)
+    // (docs/jit-signals-root-gap.md)
     // -----------------------------------------------------------------------
 
     fn scratch_thread(id: u64) -> JvmThread {
@@ -13177,7 +13177,7 @@ pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 /// another VM's safepoint flag and write card marks into another VM's
 /// table. A missed card mark is a missed remembered-set update, which is a
 /// use-after-free, not a slowdown. See
-/// `docs/known-issues/vm-process-global-state.md`.
+/// `docs/known-issues/c2/vm-process-global-state.md`.
 ///
 /// Every production caller has its own `SharedVm` in scope and should use
 /// this. [`build_helpers`] remains for VM-less unit tests.

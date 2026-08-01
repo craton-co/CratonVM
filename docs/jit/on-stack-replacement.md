@@ -1,7 +1,7 @@
 # On-stack replacement: what exists, what this change adds, what it refuses
 
 Scope: the P1 item *"Add on-stack replacement"* of
-`docs/known-issues/deep-research-vm-c2.md`.
+`docs/known-issues/c2/deep-research-vm-c2.md`.
 
 > Build HIR from interpreter state at a loop BCI, validate local/stack types,
 > enter compiled code, and support deoptimization back to the same loop state.

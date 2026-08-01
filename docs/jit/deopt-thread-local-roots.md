@@ -6,7 +6,7 @@ land, `LAST_DEOPT` and `LAST_EXCEPTIONAL` are still neither scanned nor
 remapped, exactly as before. `jit/src/ir_verify.rs`: swept, nothing to fix.
 
 This is the `jit/`-crate sibling of
-`docs/known-issues/jit-signals-root-gap.md`, which moved the JIT's pending
+`docs/jit-signals-root-gap.md`, which moved the JIT's pending
 throwable off a `thread_local!` and onto `JvmThread`. Same defect, same
 consequence, different crate — and, because `jit/` cannot depend on `vm/`, a
 different fix shape.

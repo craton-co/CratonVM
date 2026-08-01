@@ -1745,7 +1745,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             // Reference-typed return: `get_field_by_name` is not
             // descriptor-aware and answers `Int(0)` for an unwritten `rawType`
             // slot, which then fails a `checkcast` to Class/Type. Read by
-            // resolved index. See `docs/known-issues/by-name-field-reads.md`.
+            // resolved index. See `docs/known-issues/c2/by-name-field-reads.md`.
             Ok(Some(crate::field_read::ref_field(ctx, this, "rawType")))
         },
     );
@@ -1758,7 +1758,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             // Reference-typed return: `get_field_by_name` is not
             // descriptor-aware and answers `Int(0)` for an unwritten `rawType`
             // slot, which then fails a `checkcast` to Class/Type. Read by
-            // resolved index. See `docs/known-issues/by-name-field-reads.md`.
+            // resolved index. See `docs/known-issues/c2/by-name-field-reads.md`.
             Ok(Some(crate::field_read::ref_field(ctx, this, "rawType")))
         },
     );

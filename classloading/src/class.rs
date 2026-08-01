@@ -392,7 +392,7 @@ pub struct Class {
     /// same name and different components are genuinely different classes.
     /// `ClassManager::load_array_class_for_loader` reads it to decide whether a
     /// pre-existing bootstrap-keyed array class may be re-keyed or must be left
-    /// alone — see `docs/known-issues/array-class-defining-loader.md`.
+    /// alone — see `docs/array-class-defining-loader.md`.
     pub array_info: Option<ArrayInfo>,
 
     /// Round 8 audit fix (CRIT #4): per-class initialization-state
