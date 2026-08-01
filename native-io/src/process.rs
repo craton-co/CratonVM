@@ -153,6 +153,26 @@ const SYNTHETIC_PROCESS_CLASS: &str = "cratonvm/synthetic/Process";
 const SYNTHETIC_PROCESS_INPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeInputStream";
 const SYNTHETIC_PROCESS_OUTPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeOutputStream";
 
+/// Class the `Process.onExit()` reaper Runnable is allocated under.
+///
+/// `onExit()` on a still-running child must hand back an *incomplete* future
+/// and complete it later, so somebody has to block on the child off the
+/// calling thread. Rather than attach a foreign thread (the AIO dispatcher
+/// route in `async_socket.rs`), this is a plain daemon `java.lang.Thread`
+/// whose Runnable is a synthetic object carrying a native `run()` — the same
+/// shape as `cratonvm/xnio/AcceptPump`. That keeps the waiter a genuine VM
+/// thread with a live `NativeContext`, so it can call `CompletableFuture
+/// .complete` directly, and it mirrors real JDK's own per-process reaper
+/// thread (`ProcessHandleImpl.processReaperExecutor`, also daemon).
+const SYNTHETIC_PROCESS_EXIT_WAITER: &str = "cratonvm/synthetic/ProcessExitWaiter";
+/// The `Process` the future completes with.
+const EXIT_WAITER_FIELD_PROCESS: usize = 0;
+/// The `CompletableFuture` to complete once the child exits.
+const EXIT_WAITER_FIELD_FUTURE: usize = 1;
+/// `process_table` handle to block on (see `wait_for_handle`).
+const EXIT_WAITER_FIELD_HANDLE: usize = 2;
+const EXIT_WAITER_FIELD_COUNT: usize = 3;
+
 fn pb_debug_enabled() -> bool {
     io_flags().dbg_pb
 }
@@ -1303,6 +1323,231 @@ fn native_process_wait_for_timeout(
     }
 }
 
+/// Allocate a real, initially-incomplete `CompletableFuture`.
+///
+/// `new_object` rather than the `completedFuture` factory is deliberate: the
+/// no-arg constructor adds nothing beyond the null/zero fields allocation
+/// already installs, whereas a pre-completed future is exactly the lie this
+/// method exists to avoid. Same helper shape as `async_socket`'s
+/// `aio_pending_future`, which completes its futures the same way.
+fn pending_future(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    match ctx.new_object("java/util/concurrent/CompletableFuture")? {
+        Some(Value::Object(Some(future))) => Ok(future),
+        _ => Err(RuntimeError::IOException {
+            message: "Process.onExit: could not allocate CompletableFuture".to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Complete `future` with `process`, first publishing `code` into the
+/// process's cached exit-status field.
+///
+/// `complete` is dispatched virtually on purpose: the VM's synthetic
+/// `CompletableFuture` model overrides it, and the real-JDK native behind it
+/// is real-aware (it drives the real `postComplete` waiter release), so this
+/// one call is correct under both JDK modes.
+fn complete_exit_future(
+    ctx: &mut dyn NativeContext,
+    process: ObjectRef,
+    future: ObjectRef,
+    code: i32,
+) -> MethodCallResult {
+    ctx.set_field(process, PROC_FIELD_EXIT, Value::Int(code));
+    ctx.invoke_virtual(
+        future,
+        "complete",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(process))],
+    )
+}
+
+/// `java.lang.Process.onExit()Ljava/util/concurrent/CompletableFuture;`
+///
+/// HotSpot returns a `CompletableFuture<Process>` that completes with *this*
+/// process once the child exits. It was the one `Process` virtual missing from
+/// the dual registration below, so in compatible mode — where
+/// `ProcessBuilder.start()` is shadowed to produce a
+/// `cratonvm/synthetic/Process`, whose class chain never reaches
+/// `java/lang/Process` — it raised `NoSuchMethodError` with no bytecode left
+/// to fall back to.
+///
+/// A child that has ALREADY exited is completed inline: that is a fact, not a
+/// constant standing in for one. A child that is still running gets a genuinely
+/// incomplete future plus a daemon reaper thread (see
+/// `SYNTHETIC_PROCESS_EXIT_WAITER`); `isDone()` stays false until the child
+/// really exits, which is what distinguishes this from the pre-completed stub
+/// `ProcessHandle.onExit()` used to be.
+///
+/// Two `onExit()` calls on the same live child produce two futures and two
+/// reaper threads, where real JDK shares one completion per pid
+/// (`ProcessHandleImpl.completions`). Both futures still complete with the same
+/// process and the same exit code, so the difference is not observable through
+/// the `Process` API; `wait_for_handle` serialises on the process table and
+/// caches the code, so the second waiter returns the cached value.
+fn native_process_on_exit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Process.onExit on a null receiver".to_string()),
+            }
+            .into())
+        }
+    };
+    let handle = handle_of(ctx, this);
+
+    // The future allocation can move `this`, and every later step reads it.
+    let this_pin = ctx.pin_native_root(this);
+    let future = match pending_future(ctx) {
+        Ok(future) => future,
+        Err(error) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(error);
+        }
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    let future_pin = ctx.pin_native_root(future);
+
+    // Legacy / stub Process (handle 0) has no live child to wait on — its exit
+    // code is whatever is already cached in field 0, exactly as `waitFor`
+    // reads it, so the future is complete on arrival.
+    //
+    // Otherwise probe without blocking: `try_exit_handle` returning `Some`
+    // means the child has genuinely terminated (this is the `p.waitFor();
+    // p.onExit()` ordering, where the child was already reaped).
+    let settled = if handle == 0 {
+        match ctx.get_field(this, PROC_FIELD_EXIT) {
+            Value::Int(code) => Some(code),
+            _ => Some(-1),
+        }
+    } else {
+        try_exit_handle(handle)
+    };
+    if let Some(code) = settled {
+        let this = ctx.read_native_pin(this_pin, this);
+        let future = ctx.read_native_pin(future_pin, future);
+        let result = complete_exit_future(ctx, this, future, code);
+        let future = ctx.read_native_pin(future_pin, future);
+        ctx.unpin_native_roots(this_pin);
+        result?;
+        return Ok(Some(Value::Object(Some(future))));
+    }
+
+    // Still running: park the wait on a daemon thread so the caller gets an
+    // incomplete future back immediately.
+    let this = ctx.read_native_pin(this_pin, this);
+    let future = ctx.read_native_pin(future_pin, future);
+    let spawned = spawn_exit_waiter(ctx, this, future, handle);
+    let future = ctx.read_native_pin(future_pin, future);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+
+    if !spawned {
+        // No reaper thread — completing the future is now this thread's job.
+        // Blocking here is worse than HotSpot's asynchrony, but it is the only
+        // remaining way to keep the future's answer true.
+        let mut held = [Value::Object(Some(this)), Value::Object(Some(future))];
+        ctx.begin_blocking_region();
+        let code = wait_for_handle(handle);
+        ctx.end_blocking_region_refs(&mut held);
+        let (Value::Object(Some(this)), Value::Object(Some(future))) = (held[0], held[1]) else {
+            return Ok(Some(Value::Object(Some(future))));
+        };
+        let future_pin = ctx.pin_native_root(future);
+        let result = complete_exit_future(ctx, this, future, code);
+        let future = ctx.read_native_pin(future_pin, future);
+        ctx.unpin_native_roots(future_pin);
+        result?;
+        return Ok(Some(Value::Object(Some(future))));
+    }
+
+    Ok(Some(Value::Object(Some(future))))
+}
+
+/// Start the daemon reaper thread for `onExit()`. Returns false if the thread
+/// could not be created, leaving the caller to complete the future itself.
+fn spawn_exit_waiter(
+    ctx: &mut dyn NativeContext,
+    process: ObjectRef,
+    future: ObjectRef,
+    handle: i64,
+) -> bool {
+    let process_pin = ctx.pin_native_root(process);
+    let future_pin = ctx.pin_native_root(future);
+
+    let waiter_class =
+        ctx.ensure_synthetic_class(SYNTHETIC_PROCESS_EXIT_WAITER, EXIT_WAITER_FIELD_COUNT);
+    let waiter = ctx.alloc_object(waiter_class, EXIT_WAITER_FIELD_COUNT);
+    let waiter_pin = ctx.pin_native_root(waiter);
+    ctx.set_field(
+        waiter,
+        EXIT_WAITER_FIELD_PROCESS,
+        Value::Object(Some(ctx.read_native_pin(process_pin, process))),
+    );
+    ctx.set_field(
+        waiter,
+        EXIT_WAITER_FIELD_FUTURE,
+        Value::Object(Some(ctx.read_native_pin(future_pin, future))),
+    );
+    ctx.set_field(waiter, EXIT_WAITER_FIELD_HANDLE, Value::Long(handle));
+
+    // `create_string` allocates — refresh the waiter through its pin after it.
+    let name = ctx.create_string(&format!("process-reaper-{handle}"));
+    let name_pin = ctx.pin_native_root(name);
+    let waiter = ctx.read_native_pin(waiter_pin, waiter);
+    let name = ctx.read_native_pin(name_pin, name);
+    let thread = ctx.new_object_initialized(
+        "java/lang/Thread",
+        "(Ljava/lang/Runnable;Ljava/lang/String;)V",
+        &[Value::Object(Some(waiter)), Value::Object(Some(name))],
+    );
+    ctx.unpin_native_roots(process_pin);
+
+    let thread = match thread {
+        Ok(Some(Value::Object(Some(thread)))) => thread,
+        _ => return false,
+    };
+    // Daemon, like real JDK's process reapers: a pending onExit() must not
+    // hold the VM open past the last application thread.
+    let thread_pin = ctx.pin_native_root(thread);
+    let _ = ctx.invoke_virtual(thread, "setDaemon", "(Z)V", &[Value::Int(1)]);
+    let thread = ctx.read_native_pin(thread_pin, thread);
+    ctx.unpin_native_roots(thread_pin);
+    ctx.invoke_virtual(thread, "start", "()V", &[]).is_ok()
+}
+
+/// `run()` of the `onExit()` reaper thread — blocks on the child, then
+/// completes the future with the `Process`.
+fn native_process_exit_waiter_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let handle = match ctx.get_field(this, EXIT_WAITER_FIELD_HANDLE) {
+        Value::Long(h) => h,
+        _ => return Ok(None),
+    };
+
+    // Read both refs out BEFORE the blocking region and carry them through it:
+    // `wait_for_handle` can block for the child's whole lifetime, across any
+    // number of moving collections, so a raw local read afterwards would be a
+    // stale address (the native stale-local family).
+    let mut held = [
+        ctx.get_field(this, EXIT_WAITER_FIELD_PROCESS),
+        ctx.get_field(this, EXIT_WAITER_FIELD_FUTURE),
+    ];
+    ctx.begin_blocking_region();
+    let code = wait_for_handle(handle);
+    ctx.end_blocking_region_refs(&mut held);
+
+    let (Value::Object(Some(process)), Value::Object(Some(future))) = (held[0], held[1]) else {
+        return Ok(None);
+    };
+    complete_exit_future(ctx, process, future, code)?;
+    Ok(None)
+}
+
 /// `java.lang.Process.exitValue()I`
 ///
 /// Throws `IllegalThreadStateException` if the process is still running
@@ -2375,7 +2620,23 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
             "()Ljava/util/stream/Stream;",
             native_process_descendants,
         );
+        // onExit() was the one Process virtual left out of this loop, so it
+        // raised NoSuchMethodError on every process the shadowed
+        // `ProcessBuilder.start()` returns. See `native_process_on_exit`.
+        registry.register(
+            proc_cls,
+            "onExit",
+            "()Ljava/util/concurrent/CompletableFuture;",
+            native_process_on_exit,
+        );
     }
+    // Runnable body of the reaper thread `onExit()` starts for a live child.
+    registry.register(
+        SYNTHETIC_PROCESS_EXIT_WAITER,
+        "run",
+        "()V",
+        native_process_exit_waiter_run,
+    );
 
     registry.register(
         SYNTHETIC_PROCESS_OUTPUT_STREAM,

@@ -8910,6 +8910,27 @@ fn jdk_superclass(name: &str) -> &'static str {
 /// declarations, the verifier rejects `String` where `CharSequence` is expected.
 fn jdk_interfaces(name: &str) -> &'static [&'static str] {
     match name {
+        // The process `ProcessBuilder.start()` hands back in compatible mode
+        // is `cratonvm/synthetic/Process` (native-io's `spawn_and_wrap`), and
+        // nothing linked it to `java/lang/Process`: `instanceof Process` was
+        // false and every `checkcast java/lang/Process` raised
+        // ClassCastException. javac emits that checkcast wherever the static
+        // type is erased — `Process p = p.onExit().get()` is the canonical
+        // case, so `Process.onExit()` stayed unusable even once the native
+        // behind it existed.
+        //
+        // Recorded as a supertype HERE rather than as the `superclass` in
+        // `fabricate_class` (where SSLSocketInputStream/OutputStream solve the
+        // same checkcast problem that way) because `java.lang.Process` is not
+        // field-less: it declares six instance fields (the
+        // `inputReader`/`outputWriter`/… caches, JDK 17+). A superclass link
+        // would put those at the very slot indices the synthetic Process
+        // already uses for its exit code and pipe fds, so any real
+        // `java.lang.Process` bytecode reaching this receiver would read an
+        // `int` fd as an object reference. Listing it here keeps
+        // checkcast/instanceof honest — what this table is for — without
+        // putting an aliased field layout into the dispatch chain.
+        "cratonvm/synthetic/Process" => &["java/lang/Process"],
         "java/lang/String" => &[
             "java/io/Serializable",
             "java/lang/Comparable",
