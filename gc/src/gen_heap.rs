@@ -11915,6 +11915,30 @@ fn parallel_sweep_walk(
 /// this is `#[inline]`.
 #[inline]
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
+    // GCAUD-3 (2026-08-01) — the "not a real object" backstop, hoisted.
+    //
+    // The `kind as u8 != Object` screen in the legacy arm below is documented
+    // as this function's backstop for a `HumongousFiller` sentinel or an
+    // out-of-range kind byte reaching a walk that failed to screen it. It was
+    // not one: it sat in the THIRD arm of the dispatch, so any such header
+    // that also carried `GC_FLAG_COMPACT` took the `is_compact_object` arm
+    // instead — a pure `gc_flags` bit test that never looks at `kind` — and
+    // came back as `HEADER_SIZE + object_body_size(header)`. For an
+    // unregistered class id `object_body_size` is `0`, so the sentinel sized
+    // as exactly `HEADER_SIZE`: large enough to pass every caller's
+    // `total_size < HEADER_SIZE` corruption test, and therefore a stride that
+    // walks the sentinel as a real 40-byte object instead of re-syncing.
+    //
+    // Screening both non-`Object`/`Array` kinds here makes the backstop total
+    // and leaves the two live arms byte-identical. Compare the RAW byte, not
+    // the enum: the optimiser is entitled to assume `kind` is a valid `0..=2`
+    // discriminant, which is exactly what would let it fold away the
+    // out-of-range case this screen exists to catch.
+    let kind_byte = header.kind as u8;
+    if kind_byte != ObjectKind::Object as u8 && kind_byte != ObjectKind::Array as u8 {
+        warn_non_object_kind_in_object_arm(header);
+        return 0;
+    }
     let raw_size = if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length() as usize, header.element_type) {
             Ok(data) => HEADER_SIZE + data,
@@ -12008,6 +12032,12 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         // the optimiser may assume `kind` is a valid 0..=2 discriminant, which
         // is precisely what would let it fold this screen away for the
         // out-of-range case the screen exists to catch.
+        //
+        // GCAUD-3: this check is now REDUNDANT — the same screen runs at the
+        // top of the function, where it also covers the `is_compact_object`
+        // arm that used to bypass it. Retained because it is the one the
+        // paragraphs above are written against, and because a future edit that
+        // reorders the dispatch should not silently lose it twice.
         if header.kind as u8 != ObjectKind::Object as u8 {
             warn_non_object_kind_in_object_arm(header);
             return 0;
@@ -12666,6 +12696,50 @@ mod tests {
         );
         noisy.shape = 55;
         assert_eq!(gen_object_total_size(&noisy), 0);
+    }
+
+    /// GCAUD-3 — the "not a real object" screen must not be reachable only
+    /// through the legacy-object arm.
+    ///
+    /// `gen_object_total_size` dispatches Array → compact → legacy, and the
+    /// screen lived in the LEGACY arm. `is_compact_object` is a bare
+    /// `gc_flags & GC_FLAG_COMPACT` test that never inspects `kind`, so any
+    /// non-`Object`/`Array` header carrying that bit took the compact arm and
+    /// was sized as `HEADER_SIZE + object_body_size(header)` — for an
+    /// unregistered class id, exactly `HEADER_SIZE`. That is a
+    /// plausible-looking stride: every caller's corruption test is
+    /// `total_size < HEADER_SIZE`, so none of them re-sync, and the walk
+    /// strides the sentinel as a 40-byte object.
+    ///
+    /// The out-of-range-kind-byte half of the screen is deliberately NOT
+    /// exercised here: materialising an `ObjectKind` with an invalid
+    /// discriminant is UB in Rust, so a test that builds one would be testing
+    /// the optimiser rather than the collector. The sentinel kind is a real
+    /// variant and exercises the same hoisted branch.
+    #[test]
+    fn gen_object_total_size_screens_a_bad_kind_even_with_the_compact_flag() {
+        let mut compact_filler = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::HumongousFiller,
+            ArrayElementType::Reference,
+            0,
+            0,
+            0,
+        );
+        compact_filler.gc_flags |= GC_FLAG_COMPACT;
+        assert_eq!(
+            gen_object_total_size(&compact_filler),
+            0,
+            "a region sentinel that happens to carry GC_FLAG_COMPACT must \
+             still refuse to be sized — the compact arm bypassed the kind screen"
+        );
+
+        // A stale `shape` must not rescue it either: the compact arm reads the
+        // class layout registry, not `shape`, so this is the input that made
+        // the pre-fix result exactly `HEADER_SIZE` (a stride every caller's
+        // `total_size < HEADER_SIZE` corruption test accepts).
+        compact_filler.shape = 3;
+        assert_eq!(gen_object_total_size(&compact_filler), 0);
     }
 
     // -----------------------------------------------------------------

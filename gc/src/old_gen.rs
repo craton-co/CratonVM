@@ -119,6 +119,17 @@ fn min_satisfying_bucket(size: usize) -> usize {
 pub static COALESCE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BLOCKS_MERGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// GCAUD-2: how many old-gen compactions were ABANDONED because Phase 0's
+/// live-set closure escaped the object walk (see
+/// [`OldGen::close_live_set_over_old_gen`]). A non-zero value means the
+/// generation was retained wholesale for that cycle — a reclamation the
+/// collector declined to make rather than manufacture a dangling slot — and
+/// that some earlier phase left a live reference to an unwalked address.
+/// Silent before this counter existed; a compaction that reclaims nothing and
+/// a compaction that had nothing to reclaim look identical from outside.
+pub static COMPACT_ESCAPE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Non-moving free-list allocator for the old generation.
 ///
 /// Objects are allocated from a size-segregated free list (round-5 #14
@@ -161,6 +172,23 @@ pub struct OldGen {
     /// `true` when `buckets` has been mutated since `sorted_free_cache` was
     /// last rebuilt, so the cache must be regenerated before use.
     sorted_free_dirty: Cell<bool>,
+    /// GCAUD-4 — monotone stamp of "old-gen storage has been RECLAIMED or
+    /// RELOCATED since you last looked".
+    ///
+    /// Every side table an out-of-STW consumer keys on an old-gen ADDRESS
+    /// (`ConcurrentMarker`'s mark bitmap and its `sweep_eligible` snapshot are
+    /// the live examples) is only valid while no other collector has handed a
+    /// block back to the free list or slid an object. Both events make an
+    /// address ambiguous: after `compact` the address names a different
+    /// object, and after `free` + a later `alloc` it names a brand-new one —
+    /// and in both cases the stale table says "existed at remark, not marked",
+    /// which is the sweep's licence to FREE it.
+    ///
+    /// This is the generational-heap analogue of G1's
+    /// `recycled_in_generation` stamp (defect G1-8): a bare address is not an
+    /// identity, an address plus an epoch is. Bumped by [`Self::free`] and by
+    /// [`Self::compact`]; read via [`Self::reclaim_epoch`].
+    reclaim_epoch: u64,
 }
 
 impl OldGen {
@@ -207,7 +235,21 @@ impl OldGen {
             // Start dirty: the cache is empty and the first walk rebuilds it.
             sorted_free_cache: RefCell::new(Vec::new()),
             sorted_free_dirty: Cell::new(true),
+            reclaim_epoch: 0,
         }
+    }
+
+    /// GCAUD-4 — the current reclamation epoch (see the field doc).
+    ///
+    /// A consumer that caches anything keyed on an old-gen address across a
+    /// window in which it does NOT hold the old-gen lock must record this
+    /// value and re-check it before acting on the cache. An unequal value
+    /// means at least one block was freed or relocated in between, so every
+    /// cached address may now name a different object; the only safe response
+    /// is to discard the cache.
+    #[inline]
+    pub fn reclaim_epoch(&self) -> u64 {
+        self.reclaim_epoch
     }
 
     /// Mark the cached offset-sorted free-block view stale.
@@ -454,7 +496,29 @@ impl OldGen {
         // caller that frees with the originally-requested sub-HEADER_SIZE
         // size must decrement — and return to the free list — the same
         // rounded amount. This expression MUST match `alloc`'s rounding.
-        let size = size.max(HEADER_SIZE.max(8));
+        //
+        // GCAUD-1 (2026-08-01): the clause above was only HALF of `alloc`'s
+        // rounding. `alloc_from_buckets` follows the `max` with
+        // `size.checked_add(align - 1).map(|v| v & !(align - 1))`, i.e. it
+        // rounds the reservation UP to a multiple of `align`, charges
+        // `used_bytes` that rounded amount, and starts the next object there.
+        // `free` did not round, so an unrounded `free(ptr, 44)` after
+        // `alloc(44, 8)` returned a 44-byte block covering a 48-byte
+        // reservation and left a 4-byte sliver OUTSIDE the free list. That
+        // sliver reads as ALLOCATED to `walk_objects` (which derives allocated
+        // extents as the gaps between free blocks), so the walk resumes at a
+        // non-object-start, mis-parses it as a header, and `break`s — dropping
+        // every object after it from the walk. `compact` then treats those
+        // objects as absent and Phase 4 rebuilds the free list over them.
+        //
+        // Every production caller passes an already-8-aligned `total_size`
+        // from `walk_objects`, and every production `alloc` uses `align = 8`,
+        // so the asymmetry is latent rather than live — the same shape as the
+        // TLAB audit's T-2. Rounding UP to 8 here is exactly `alloc`'s
+        // arithmetic for `align <= 8` and is strictly conservative for a
+        // larger alignment (it returns no more than was reserved, so it can
+        // never hand a live neighbour's bytes to the free list).
+        let size = (size.max(HEADER_SIZE.max(8)) + 7) & !7;
 
         let base = self.data.as_ptr() as usize;
         let addr = ptr as usize;
@@ -462,6 +526,10 @@ impl OldGen {
         let offset = addr - base;
 
         self.used_bytes = self.used_bytes.saturating_sub(size);
+        // GCAUD-4: this address may be handed to a different object by the
+        // next `alloc`, so every address-keyed cache taken before now is
+        // ambiguous from here on.
+        self.reclaim_epoch = self.reclaim_epoch.wrapping_add(1);
 
         // Push into the appropriate size bucket — O(1).
         // Coalescing happens during the next `compact()` call.
@@ -765,6 +833,10 @@ impl OldGen {
     pub fn compact(&mut self) -> HashMap<usize, usize> {
         let base = self.data.as_mut_ptr();
         let objects = self.walk_objects();
+        // GCAUD-4: bumped up front, so it covers the abandoned path too — that
+        // path clears mark bits, which is itself a change no address-keyed
+        // snapshot taken earlier may assume away.
+        self.reclaim_epoch = self.reclaim_epoch.wrapping_add(1);
 
         // Phase 0 (dangling-ref guard): close the live set under "referenced
         // by a live old-gen object".
@@ -789,7 +861,34 @@ impl OldGen {
         // rather than producing a dangling pointer (fatal). It is task option
         // (a) — "treat any object reachable from a live referrer as live" —
         // applied locally and bounded to the objects we are about to walk.
-        Self::close_live_set_over_old_gen(&objects, &self.data);
+        // GCAUD-2 (2026-08-01): Phase 0 also answers "can Phase 1 give every
+        // reference a live object holds a forwarding address?". When it
+        // reports an ESCAPE — a live referrer pointing at an in-old-gen
+        // address that `walk_objects` did not yield — the answer is no, and
+        // sliding anything is guaranteed to leave that slot dangling. Abandon
+        // the compaction: clear the marks this cycle set (so the postcondition
+        // "no survivor leaves with GC_FLAG_MARKED" still holds and the next
+        // cycle starts clean), touch neither the free list nor `used_bytes`,
+        // and return an empty map so the caller runs no fixups. Nothing is
+        // reclaimed this cycle; over-retention is the only safe response.
+        if Self::close_live_set_over_old_gen(&objects, &self.data) {
+            let n = COMPACT_ESCAPE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                tracing::warn!(
+                    walked_objects = objects.len(),
+                    "old-gen compaction ABANDONED: a live object references an in-old-gen \
+                     address the object walk did not yield (freed block or walk desync). \
+                     Relocating would leave that slot dangling; retaining the whole \
+                     generation for this cycle instead.",
+                );
+            }
+            for &(obj_ptr, _size) in &objects {
+                // SAFETY: `walk_objects` yielded this as a valid object start.
+                let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
+                header.gc_flags &= !GC_FLAG_MARKED;
+            }
+            return HashMap::new();
+        }
 
         // Phase 1: Compute forwarding addresses for live objects.
         // `write_cursor` tracks the next available byte offset (8-byte aligned).
@@ -972,15 +1071,58 @@ impl OldGen {
     /// `objects` is the address-ordered `(ptr, size)` list from
     /// [`Self::walk_objects`]; it is treated as the complete set of old-gen
     /// objects. The closure is conservative (it only ever *adds* survivors)
-    /// so it can never drop a live object or corrupt the heap; the worst case
-    /// is retaining a little floating garbage for one extra cycle.
+    /// so it can never drop a live object; the ordinary worst case is
+    /// retaining a little floating garbage for one extra cycle.
     ///
     /// Cost: in the normal case (a transitively-correct marker) the first pass
     /// promotes nothing — every target of a live object is already live — so
     /// this is a single O(objects) walk and returns. Additional passes only
     /// occur when the marker under-marked (the exact failure this guards), and
     /// the fixpoint is bounded by the longest under-marked chain.
-    fn close_live_set_over_old_gen(objects: &[(*mut u8, usize)], data: &[u8]) {
+    ///
+    /// # GCAUD-2 (2026-08-01) — the escape case, and why it must fail closed
+    ///
+    /// "`objects` is the complete set of old-gen objects" is an assumption,
+    /// not a check, and the whole Phase 0 → Phase 1 → Phase 2 chain rests on
+    /// it. A live object can hold an in-old-gen reference to an address that
+    /// is **not** in `objects` for two reachable reasons:
+    ///
+    /// * the target's block is on the FREE list — `walk_objects` derives
+    ///   allocated extents as the gaps between free blocks, so a freed block
+    ///   is invisible to it. That is exactly the state the in-place sweep
+    ///   leaves behind when the mark under-marks (defect 4 in
+    ///   `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`);
+    /// * `scan_region` hit a header anomaly and `break`ed out of an allocated
+    ///   region, dropping every object after it in that region.
+    ///
+    /// The pre-fix code responded to both by blindly `|=`-ing `GC_FLAG_MARKED`
+    /// into `ref_ptr + GC_FLAGS_OFFSET` — an unvalidated byte inside a free
+    /// block or another object's payload — and then Phase 1, which iterates
+    /// only `objects`, gave that address no forwarding pointer. Phase 2 leaves
+    /// the referrer's slot on the pre-compaction address, and Phase 3 slides a
+    /// different object onto it: a dangling pointer manufactured by the
+    /// compactor itself, i.e. precisely the failure the whole of Phase 0
+    /// exists to prevent.
+    ///
+    /// So an escaped referent is now (a) never written through, and (b)
+    /// reported to the caller, which abandons the compaction. Over-retaining
+    /// the entire old generation for one cycle is the fail-safe answer to "I
+    /// cannot relocate this heap without leaving a dangling slot".
+    ///
+    /// Returns `true` when the closure escaped `objects`.
+    fn close_live_set_over_old_gen(objects: &[(*mut u8, usize)], data: &[u8]) -> bool {
+        // `walk_objects` yields ascending object starts, so a binary search
+        // over the same slice is an exact membership test with no extra
+        // allocation. Assert the ordering rather than assume it: this is the
+        // predicate that decides whether a mark-bit write is legal.
+        debug_assert!(
+            objects.windows(2).all(|w| w[0].0 < w[1].0),
+            "close_live_set_over_old_gen requires ascending object starts",
+        );
+        let is_walked_base =
+            |addr: usize| objects.binary_search_by_key(&addr, |&(p, _)| p as usize).is_ok();
+
+        let mut escaped = false;
         // Fixpoint: keep re-scanning marked objects until a pass promotes
         // nothing. `objects` is finite and each pass can only flip flags
         // from 0→1, so this terminates in at most `objects.len()` passes.
@@ -995,12 +1137,23 @@ impl OldGen {
                     continue; // only trace *live* referrers
                 }
                 Self::for_each_old_gen_ref(obj_ptr, data, |ref_ptr| {
-                    // SAFETY: `ref_ptr` is in-bounds (filtered by
-                    // `for_each_old_gen_ref`) and points at an old-gen object
-                    // header. The pre-pass runs before any relocation, so the
-                    // referent is still at its original address. No outstanding
-                    // borrow of this header is live here (fields were copied
-                    // out before the walk), so the `&mut` does not alias.
+                    // GCAUD-2: `for_each_old_gen_ref` filters only on the
+                    // backing store's [start, end) range — no alignment, no
+                    // object-start validation. Writing a mark bit through an
+                    // address the compactor cannot also FORWARD is what turns
+                    // an under-marking bug into heap corruption, so refuse the
+                    // write and record the escape instead.
+                    if !is_walked_base(ref_ptr) {
+                        escaped = true;
+                        return;
+                    }
+                    // SAFETY: `ref_ptr` was just proven to be one of the object
+                    // bases `walk_objects` yielded, so it is a valid old-gen
+                    // object header. The pre-pass runs before any relocation,
+                    // so the referent is still at its original address. No
+                    // outstanding borrow of this header is live here (fields
+                    // were copied out before the walk), so the `&mut` does not
+                    // alias.
                     let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
                     if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
                         ref_header.gc_flags |= GC_FLAG_MARKED;
@@ -1012,6 +1165,7 @@ impl OldGen {
                 break;
             }
         }
+        escaped
     }
 
     /// Update reference slots within a single live old-gen object so they point
@@ -1459,6 +1613,151 @@ mod tests {
             // GC metadata cleared on the survivor.
             assert!(b_hdr.forwarding_ptr.is_null());
             assert_eq!(b_hdr.gc_flags & GC_FLAG_MARKED, 0);
+        }
+    }
+
+    /// GCAUD-1 — `free` must return the SAME extent `alloc` reserved.
+    ///
+    /// `alloc_from_buckets` rounds the reservation up to a multiple of `align`
+    /// and charges `used_bytes` that rounded amount; `free` mirrored only the
+    /// `max(HEADER_SIZE, 8)` half of that expression. The bytes between the
+    /// unrounded and rounded ends were therefore never returned to the free
+    /// list: `used_bytes` drifted up, and — the part that matters —
+    /// `walk_objects` derives allocated extents as the GAPS between free
+    /// blocks, so the sliver read as an allocated non-object-start. The walk
+    /// then mis-parses it as a header and `break`s out of the region, dropping
+    /// every later object in it from the walk that drives compaction.
+    #[test]
+    fn free_returns_the_whole_extent_alloc_reserved() {
+        let mut og = OldGen::new(4096);
+        // 44 is not a multiple of 8: `alloc` reserves 48 (see
+        // `alloc_alignment_reserves_compact_object_padding`).
+        let a = og.alloc(44, 8).expect("fresh old gen serves 44 bytes");
+        let b = og.alloc(64, 8).expect("fresh old gen serves 64 bytes");
+        assert_eq!(
+            b as usize - a as usize,
+            48,
+            "alloc must reserve the align-rounded extent",
+        );
+        assert_eq!(og.used(), 48 + 64);
+
+        // SAFETY: `a` is a live block of this OldGen and 44 is the size it was
+        // requested with — exactly the call shape the accounting must survive.
+        unsafe { og.free(a, 44) };
+        assert_eq!(
+            og.used(),
+            64,
+            "freeing with the requested size must decrement the RESERVED size",
+        );
+
+        // The recovered hole must be the full 48 bytes, not 44: a 48-byte
+        // request has to be servable from it, at the same address.
+        let c = og.alloc(48, 8).expect("the freed 48-byte hole must be reusable");
+        assert_eq!(
+            c, a,
+            "a 48-byte request must land back in the freed block, not past the \
+             live neighbour — a short free leaves an unusable 4-byte sliver",
+        );
+    }
+
+    /// GCAUD-2 — the compactor must refuse to slide a heap it cannot fully
+    /// forward.
+    ///
+    /// Phase 0 closes the live set over old gen so Phase 1 can stamp a
+    /// forwarding address on every object a live referrer can reach. It
+    /// assumed `walk_objects` yields EVERY old-gen object. It does not: a
+    /// block that is on the free list is invisible to the walk (allocated
+    /// extents are the gaps between free blocks), which is exactly the state
+    /// an under-marking in-place sweep leaves behind. Phase 0 used to `|=`
+    /// `GC_FLAG_MARKED` into that freed block anyway, Phase 1 gave it no
+    /// forwarding address, and Phase 3 slid a different object onto it —
+    /// the compactor manufacturing the dangling pointer it exists to prevent.
+    ///
+    /// The fail-safe answer is to reclaim nothing this cycle.
+    #[test]
+    fn compact_is_abandoned_when_a_live_ref_escapes_the_object_walk() {
+        let mut og = OldGen::new(4096);
+        const C_TAG: i32 = 0x0BAD_F00D_u32 as i32;
+
+        // A: the live referrer.
+        let a_size = HEADER_SIZE + SLOT_SIZE;
+        let a = og.alloc(a_size, 8).unwrap();
+        // B: the target, freed below so the object walk stops yielding it.
+        let b_size = HEADER_SIZE + SLOT_SIZE;
+        let b = og.alloc(b_size, 8).unwrap();
+        // Dead filler, so a compaction that DID run would definitely move C.
+        let filler_size = HEADER_SIZE + 4 * SLOT_SIZE;
+        let filler = og.alloc(filler_size, 8).unwrap();
+        // C: a second live object, the one whose non-movement proves the
+        // compaction was abandoned rather than merely uneventful.
+        let c_size = HEADER_SIZE + SLOT_SIZE;
+        let c = og.alloc(c_size, 8).unwrap();
+
+        // SAFETY: every pointer above is a live block of this OldGen, sized to
+        // hold a header plus the slots written here.
+        unsafe {
+            (*(filler as *mut ObjectHeader)).set_num_slots(4);
+
+            let a_hdr = &mut *(a as *mut ObjectHeader);
+            a_hdr.set_num_slots(1);
+            a_hdr.gc_flags |= GC_FLAG_MARKED;
+            std::ptr::write(
+                a.add(HEADER_SIZE) as *mut Value,
+                Value::Object(Some(ObjectRef::from_raw(b))),
+            );
+
+            (*(b as *mut ObjectHeader)).set_num_slots(1);
+
+            let c_hdr = &mut *(c as *mut ObjectHeader);
+            c_hdr.set_num_slots(1);
+            c_hdr.gc_flags |= GC_FLAG_MARKED;
+            c_hdr.identity_hash_code = C_TAG;
+        }
+
+        // Return B's block to the free list WITHOUT zeroing it — the exact
+        // shape the in-place old-gen sweep produces when the mark under-marks.
+        // SAFETY: `(b, b_size)` is the pair `alloc` handed out.
+        unsafe { og.free(b, b_size) };
+        assert!(
+            og.walk_objects().iter().all(|&(p, _)| p != b),
+            "precondition: the freed block must be invisible to the object walk",
+        );
+
+        let used_before = og.used();
+        let escapes_before = COMPACT_ESCAPE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let map = og.compact();
+
+        assert!(
+            map.is_empty(),
+            "a compaction that cannot forward every live reference must relocate \
+             nothing, so it can report no relocations",
+        );
+        assert!(
+            COMPACT_ESCAPE_HITS.load(std::sync::atomic::Ordering::Relaxed) > escapes_before,
+            "the abandoned compaction must be counted, not silent",
+        );
+        assert_eq!(
+            og.used(),
+            used_before,
+            "an abandoned compaction must not rewrite the occupancy",
+        );
+
+        // SAFETY: nothing moved, so every pointer above still names its object.
+        unsafe {
+            // A's slot is untouched — still naming B, which is still where it
+            // was. A rewrite here (or a slide over B) is the use-after-free.
+            let Value::Object(Some(target)) = std::ptr::read(a.add(HEADER_SIZE) as *const Value)
+            else {
+                panic!("A's reference field was clobbered by an abandoned compaction");
+            };
+            assert_eq!(target.as_ptr(), b);
+
+            // C did not slide over the filler, and its mark bit was cleared so
+            // the next cycle starts from a clean slate.
+            let c_hdr = &*(c as *const ObjectHeader);
+            assert_eq!(c_hdr.identity_hash_code, C_TAG, "C must not have moved");
+            assert_eq!(c_hdr.gc_flags & GC_FLAG_MARKED, 0, "marks must be cleared");
+            assert!(c_hdr.forwarding_ptr.is_null());
         }
     }
 
