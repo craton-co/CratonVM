@@ -143,7 +143,11 @@ its worker thread, and `AbstractDevToolsDataSourceAutoConfigurationTests
 Binary `cratonvm-devtools-cluster-20260801-r6.exe`
 (SHA-256 `755B7AC085B177C25DF74727B4C27C676ADC72F5634133CBCB5750E4431C8A6F`),
 built from `fix/springboot-devtools-cluster-20260801`, against the shared
-Spring Boot fixture at `apps\spring-boot`.
+Spring Boot fixture at `apps\spring-boot`. Re-verified after merging 111
+commits of `dev` forward, on
+`cratonvm-devtools-cluster-20260801-r7.exe`
+(SHA-256 `ED1186871C1A755AEE308205945B085C6193A670866FD35A70CDEFB89E39AB1F`):
+same 45/45 in both modes, all probes still pass.
 
 | Class | JIT | `--nojit` |
 |---|---|---|
@@ -172,6 +176,25 @@ The whole `module/spring-boot-devtools` module (51 classes,
   each), and it fails under `--nojit` too, so it is neither of the two VM-level
   defects fixed here. It was PASS in the 2026-07-31 full-suite reference, so it
   is a separate regression that landed on `dev` in between; tracked separately.
+
+### Regression sweep
+
+Two of the three fixes are VM-level, so `core/spring-boot` (358 classes, the
+largest module) was swept as well
+(`RunName=devtools-cluster-coreregr-20260801`): **342 PASS, 7 EMPTY, 4 FAIL,
+4 HANG, 1 CRASH**. Five classes differ from the 2026-07-31 full-suite
+reference; every one was A/B'd against a binary built from the same base
+commit with none of these changes:
+
+| Class | ref | sweep | A/B verdict |
+|---|---|---|---|
+| `ConfigDataEnvironmentPostProcessorIntegrationTests` | PASS | CRASH | **repaired by these fixes** — 67/87 tests fail on the unmodified base, 87/87 pass with them (2 runs each). The sweep's CRASH is a `raw_vec` capacity panic at 4s under `-Parallel 4` plus a concurrent `cargo build`; it does not reproduce standalone. |
+| `ConfigurationPropertiesTests` | PASS | FAIL | **improved** — 40 failures unmodified, 39 with these fixes, stable across 3 runs each, and the fixed set is a strict subset. (The post-`dev`-merge binary shows 41: two `…ConstructorParametersWith*DataUnitShouldBind` failures arriving with the 111 merged commits, not from here.) |
+| `ConfigurationPropertiesBeanRegistrationAotProcessorTests` | PASS | HANG | **load artifact** — 9/9 passes on both binaries standalone, taking 187–195 s against the sweep's 300 s timeout. |
+| `ApplicationConversionServiceTests` | FAIL | PASS | improvement, unattributed |
+| `LambdaSafeTests` | FAIL | PASS | improvement, unattributed |
+
+No class regressed. The remaining FAIL/HANG rows match the reference exactly.
 
 ### Probes
 
