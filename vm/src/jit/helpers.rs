@@ -6662,6 +6662,46 @@ pub unsafe extern "C" fn jit_checkcast(
         // reclaimed span; free-list membership tells the two apart.
         // See docs/known-issues/h2/
         // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+        // H2-CID0 follow-up: ask the reclamation ring on EVERY failing cast, not
+        // only when the receiver reads back as `ClassId(0)`. A block freed while
+        // still referenced only reads as `java.lang.Object` while it stays on
+        // the free list; once reused, the same stale reference sees a valid
+        // object of an unrelated class (observed: `java.util.BitSet cannot be
+        // cast to org.h2.mvstore.Chunk`). Same defect, one step later.
+        {
+            let addr = obj_ref.as_ptr() as usize;
+            if let Some((cid, kind, site, seq)) = cratonvm_gc::gen_heap::old_freed_lookup(addr) {
+                static F: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if F.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    let orig = vm
+                        .classes
+                        .class_manager
+                        .try_read()
+                        .and_then(|cm| {
+                            cm.get_class(cratonvm_types::ClassId::new(cid))
+                                .map(|c| c.name.to_string())
+                        })
+                        .unwrap_or_else(|| format!("class_id={cid}"));
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{addr:#x}"),
+                        actual_class_id = obj_class_id.as_u32(),
+                        target_class = %class_name,
+                        original_class = %orig,
+                        original_kind = kind,
+                        freed_by = if site == 1 {
+                            "in-place old-gen sweep"
+                        } else {
+                            "old-gen mark-compact"
+                        },
+                        free_seq = seq,
+                        "JIT checkcast receiver is an OLD-GEN block this process RECLAIMED while \
+                         it was still referenced. `original_class` is what the block held when it \
+                         was freed; `freed_by` names the mark phase with the gap.",
+                    );
+                }
+            }
+        }
         if obj_class_id.as_u32() == 0 {
             let addr = obj_ref.as_ptr() as usize;
             if let Some((what, span, size)) = vm.mem.heap.reclaimed_hole_at(addr) {
