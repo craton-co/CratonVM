@@ -1,8 +1,8 @@
-# The collector leaves reference fields UN-FORWARDED — `DefaultCatalogAndSchemaTest` silently loses a third of its tests
+# The in-place old-gen sweep frees LIVE promoted objects — `DefaultCatalogAndSchemaTest` still loses a quarter of its tests
 
 | | |
 |---|---|
-| **Status** | 🟠 **SIGSEGV FIXED, correctness residual OPEN.** The class now runs to completion (`rc=0`, 5110 s) instead of crashing at 2103–2611 s. It still does **not** match HotSpot: `found=99` vs `132`. The collector still leaves reference fields UN-FORWARDED (defect 3), which is the live defect. |
+| **Status** | 🟠 **Three defects fixed, the class still does not match HotSpot.** No crash (`rc=0`, 2 runs), but `found=99..110` against HotSpot's `132`. The newest fix is real and seconds-reproducible — the in-place old-gen sweep returned a LIVE promoted object's block to the free list (defect 4) — but it does not close the gap on this class. **Two earlier framings in this doc are RETRACTED: the `UN-FORWARDED` collector hypothesis (a verifier artefact) and `map_resize_inner` (a false premise about write barriers).** |
 | **ID** | `HIB-MAPRESIZE-STALE.1` |
 | **Found** | 2026-07-31, validating the `DefaultCatalogAndSchemaTest` runner accommodation ([`../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md)). |
 | **Repro** | [`probes/hib-mapresize-repro-20260731.sh`](../../../probes/hib-mapresize-repro-20260731.sh) — `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`, `--nojit`, `--Xmx 1500m`, real JDK, `-Dcraton.batch=1`. |
@@ -10,7 +10,7 @@
 
 The title and the whole of this doc's first two revisions named
 `map_resize_inner`. That attribution is **retracted** — see "The original
-diagnosis was wrong" below. Three separate defects were tangled together here;
+diagnosis was wrong" below. Four separate defects were tangled together here;
 telling them apart is what finally produced progress.
 
 ## Measured arms
@@ -56,16 +56,48 @@ exception at 7269, and they continue together to the end. A map whose nodes have
 been reclaimed returns null for a key it holds; JUnit's `Preconditions.notNull`
 turns that into the exception, and the summary undercounts.
 
-And the deep verifier still reports **≥40 UN-FORWARDED fields per major GC** on F
-(the report caps at 40), against `pointer_map size=3295701`, with the same
-referrer shapes as on C.
-
-So there is **one** defect left, not two: fix the un-forwarded edges and the
+So there is **one** defect left, not two: stop the premature frees and the
 `found` count should follow.
 
-So `c3dbb011a` removed the crash, not the corruption. Defect 3 is unchanged and
-is now a **silent wrong answer** — a third of the class's tests quietly vanish —
-which is the worse failure mode of the two.
+So `c3dbb011a` removed the crash, not the corruption. The residual is now a
+**silent wrong answer** — a third of the class's tests quietly vanish — which is
+the worse failure mode of the two.
+
+### Every one of those dropped accesses is a reclaimed object, not a bad index
+
+The guard's own message says "class layout is correct; the bug is in the
+caller's slot computation". For this workload that is **wrong**, and reading it
+literally cost a round of investigation. Classifying all 107 events in F's log
+by receiver:
+
+```
+$ grep "out-of-bounds field read dropped" mapstale-F-oldgenfix.log | …
+     48 idx=0 ns=0 cid=0 cls=java/lang/Object
+     28 idx=1 ns=0 cid=0 cls=java/lang/Object
+     18 idx=3 ns=0 cid=0 cls=java/lang/Object
+      3 idx=5 …   2 idx=8 …   1 idx=4 …   1 idx=2 …
+```
+
+**101 of 101 reads and 6 of 6 writes have `num_slots=0 class_id=0`** — a zeroed
+header. There is not a single genuine wrong-index event in the run. Every one is
+a dereference of an object that was **freed while still referenced**. The slot
+index is whatever field the caller legitimately wanted; the receiver is gone.
+
+The interpreter's own receiver check names three of the victims outright:
+
+```
+WARN …invoke: Stale pointer detected in invokevirtual receiver (ptr=0x1caa2c76270, all-zero header)
+     — falling back to CP class org/junit/jupiter/engine/extension/MutableExtensionRegistry$Entry
+WARN …invoke: … (ptr=0x1caa2bbb200, …) — org/junit/platform/engine/support/hierarchical/ThrowableCollector
+WARN …invoke: … (ptr=0x1caa50c5190, …) — java/util/concurrent/RunnableScheduledFuture   (×278)
+```
+
+JUnit's own execution machinery, reclaimed underneath the run. That is the
+`TestPlan` losing its entries.
+
+**All of it — the 8 GC warnings below, the 107 dropped accesses, and all 281
+stale-receiver fallbacks — falls in one three-second window,
+`02:15:13.569` to `02:15:16.353`.** One collection did this.
 
 Two independent F runs agree on `found=99` and on 6 drops, so the discovery gap
 is stable, not run-to-run noise (which for this reproducer is otherwise large —
@@ -113,7 +145,7 @@ gen_heap::set_field: out-of-bounds field write dropped
 ```
 
 (`index=3` is both `HashMap$Node.next` and `LinkedHashMap$Node.next`), and a
-write through such a reference is one plausible supplier of defect 3's invalid
+write through such a reference is one plausible supplier of defect 3a's invalid
 old-gen headers.
 
 **Localised** with [`regression-suite/src/RMapGcStress.java`](../../../regression-suite/src/RMapGcStress.java):
@@ -164,9 +196,9 @@ reads a `&str` from past the end of that table and the formatter walks a wild
 pointer. Fixed on `dev` by `22107d512`
 ([retired report](../../internal/fixed-suite-bugs/gc-corrupt-header-diagnostic-debug-formats-invalid-enum-sigsegv-FIXED.md)),
 inherited here by merge. That commit deliberately did not answer *why* such a
-header exists — which is defect 3.
+header exists — which is defects 3a and 3b.
 
-## Defect 3 — the collector leaves reference fields UN-FORWARDED — OPEN, this is the residual
+## Defect 3a — the old-gen mark walked unvalidated worklist addresses — FIXED on `dev`
 
 Arm C logs 48 of these before dying:
 
@@ -180,7 +212,10 @@ bytes look like **text written over an old-generation object header**, not a
 relocated or zeroed one. (Arm B's kinds were varied garbage; arm C's are
 consistently `0x3a`. One run settles nothing here — see the variance caution.)
 
-### The corruptor is an UN-FORWARDED old-to-young edge
+### RETRACTED: the `UN-FORWARDED` evidence was a verifier artefact
+
+Revisions 3–4 of this doc built their whole open hypothesis on this, and it does
+not hold. Read the next few paragraphs before reusing any `[heap-stale]` output.
 
 `CRATONVM_DBG_HEAP_STALE=1` (the deep post-GC verifier: walks every live object
 and classifies each reference field) fires on this reproducer. In one major
@@ -196,25 +231,29 @@ collection:
 [heap-stale] ^ 40 stale field(s) this GC (pointer_map size=3436289)
 ```
 
-**`UN-FORWARDED` is the verifier's most actionable class**: the target address is
-still a KEY in the collector's own `pointer_map`, i.e. the object *was* moved and
-this referrer's field was never rewritten. Not a native local, not a missing
-root — a **missed referrer edge in the collector**.
+The reasoning was: `UN-FORWARDED` means the target address is still a KEY in the
+collector's own `pointer_map`, so the object *was* moved and this referrer's
+field was never rewritten — a missed referrer edge in the collector.
 
-That closes the causal chain end to end: an un-forwarded field keeps pointing at
-the pre-move address; once that young space is reused the address holds
-arbitrary bytes; a later old-gen scan reads those bytes as an object header and
-gets `kind=0x3a` (ASCII, i.e. text) — the corrupt headers above — and eventually
-a dereference lands on unmapped memory.
+**That inference is invalid, because `verify_heap_object_fields` was missing the
+recycled-destination filter its sibling `verify_no_stale_refs` documents at
+length.** An address that is BOTH a key and a value in `pointer_map` was vacated
+by one object and handed out again as the *destination* of another; a slot the
+remap rewrote **correctly** then points at a map key and gets reported. On the
+major-GC path that is not a corner case: `pointer_map` there is the composition
+of the young map with `OldGen::compact`'s, and a **sliding** compactor moves
+survivors down into space its predecessors just vacated, so key∩value overlap is
+the normal case. With `pointer_map size≈3.4 M` the report cap of 40 says
+essentially nothing.
 
-Two details worth keeping:
+The filter is added (`vm/src/memory/gc.rs`), so the instrument can be trusted
+from here on. Everything derived from those 40 lines — including the
+"17 distinct referrers, one un-forwarded target" argument and the
+`update_refs_in_object` lead that used to close this doc — is withdrawn.
 
-- The 17 `NumericIdentifierAttributeImpl field[2]` lines are 17 **distinct
-  referrer objects all pointing at the same un-forwarded target**, and likewise
-  for `ListAttributeImpl field[3]`. One moved object, many referrers, none
-  updated — so this is a scan gap over a *set* of referrers, not a one-off.
-- `pointer_map size=3436289` — 3.4 M objects moved in that cycle. Whatever the
-  gap is, it survives a full compaction.
+**The lesson is the one this codebase keeps re-learning: a diagnostic that
+cannot distinguish its own false positives will confidently invent a defect.**
+The real corruptor was in the log the whole time, in plain `WARN` lines.
 
 ### The faulting frame, symbolized
 
@@ -242,17 +281,13 @@ mark-worklist push sites validated nothing … a bare `old_gen.contains()` range
 check followed by a blind `gc_flags |= GC_FLAG_MARKED` RMW and a push", plus
 `is_addr_live` reporting freed old-gen blocks as live. An unvalidated address on
 that worklist makes `scan_object_for_old_refs` read a bogus header, compute a
-bogus extent, and walk into unmapped memory — and a bogus mark is equally a good
-explanation for the UN-FORWARDED edges above, since the compaction's notion of
-what is live and where it moved comes from that same mark.
+bogus extent, and walk into unmapped memory.
 
 **Measured since:** arm F (built from the merge that includes `c3dbb011a`) no
-longer crashes — `rc=0`, 5110 s. So the validation does fix the *fault*. It does
-**not** fix the un-forwarded edges: the same `CRATONVM_DBG_HEAP_STALE=1` run on F
-still reports the report-cap of 40 stale fields in a major collection, with the
-same referrer shapes. Whatever leaves those fields un-rewritten is still there;
-`c3dbb011a` stopped the mark from *walking into unmapped memory* on a bogus
-address, which is a different thing from making the mark complete.
+longer crashes — `rc=0`, 5110 s. So the validation does fix the *fault*, and
+defect 3a is closed. It does not fix the premature frees, which are defect 3b
+below — `c3dbb011a` stopped the mark from *walking into unmapped memory* on a
+bogus address, which is a different thing from making the mark complete.
 
 ### The class-loading lead (separate, and fixed)
 
@@ -282,47 +317,214 @@ name. Hibernate's `AggregatedClassLoader` is `super(null)` and overrides
 Both are rooted now. Whether that was the canary's exact site is unconfirmed —
 it is the same defect shape on the named path, found by audit, not by a red test.
 
-### Where to look first — `update_refs_in_object` skips everything outside old gen
+## Defect 3b — a same-cycle major GC frees collection-overlay objects — FIXED here
 
-`OldGen::update_refs_in_object` (`gc/src/old_gen.rs`, reached from
-`OldGen::compact`) is the pass that rewrites an old-gen object's own reference
-slots after compaction. Its closure returns `None` — i.e. **leaves the slot
-untouched** — for any target outside the compacted region:
+The eight `WARN` lines in F's log that nobody had decoded are the thread to
+pull:
 
-```rust
-let r = ref_ptr as usize;
-if r < data_start || r >= data_end {
-    return None; // reference outside the compacted old-gen region
-}
+```
+old-gen mark: rejecting external-overlay(BFS owner) candidate 0x1ca84911920 —
+  not a plausible object base (aligned=true, w0=0xcc453e9000000004 …)
 ```
 
-That is correct *only* if every old→young edge is rewritten by the young
-collector instead, via the card table / remembered set. Which puts the whole
-weight on that set being accurate — and the card table is indexed by
-`(addr - base) / CARD_SIZE`, so a compaction that **relocates the referrers
-themselves** invalidates every recorded dirty-card index. A composed cycle
-(young + major in one `collect_garbage_inner`) is exactly where that ordering
-can bite.
+`ObjectHeader` is `class_id:u32 | kind:u8 | element_type:u8 | gc_age:u8 |
+gc_flags:u8` in its first word, so `w0=0xcc453e9000000004` decodes as
+`class_id=4, kind=0x90, element_type=0x3e, gc_age=0x45, gc_flags=0xcc`. Only
+three `gc_flags` bits are defined and `kind` is `0..=2`; this is garbage, and
+the screen is right to reject it. All eight decode the same way — one is a raw
+**heap pointer** (`0x1ca8e2695f8`) sitting where a header belongs.
 
-The sibling pass `fixup_young_old_refs` (`gen_heap.rs`) already carries a
-hardening comment naming this whole failure mode for the *other* direction —
-"then `break` and leave the rest of from-space's old-gen refs un-fixed-up after a
-compaction → dangling pointers" — and falls back to a conservative word rewrite
-over any stretch it cannot parse. The old→young direction has no equivalent
-backstop.
+So an external-root provider — the collection overlays — is handing the major
+GC's marker addresses that are not object bases. Which is exactly what happens
+when a provider's stored address is one collection cycle out of date.
 
-This is a hypothesis from reading, **not** a measurement. Confirm it before
-changing anything: the reported referrers' addresses versus the old-gen bounds,
-and whether their cards were dirty, will settle it.
+### The mechanism
+
+Overlay-backed collections (`LinkedHashMap`, `LinkedList`, `TreeMap`, `TreeSet`)
+keep their backing state in process-global Rust side tables, not Java heap
+slots, so neither a root slot nor a dirty card can describe the edge. The
+collector reaches them through `crate::external_roots`.
+
+In a moving young cycle, **Phase 1a** forwards every overlay-held young object —
+and, when the promotion policy says so, *promotes* it into old gen. It
+deliberately does **not** repoint the side tables; its own comment says so:
+
+> Only forwarding is needed here: the side tables themselves are repointed
+> afterwards by `remap_external_roots` from `pointer_map`.
+
+That "afterwards" is the VM's post-GC pass, which runs **after
+`collect_garbage_inner` returns**. But **Phase 5 can run a major GC inside the
+same call**, and `old_gen_gc` seeds its mark worklist from those very side
+tables:
+
+- `external_roots_for_matching_owners(|o| young_from.contains(o))` tests a
+  pre-copy address against the **post-swap** from-space, so it matches nothing
+  and that owner's refs are never seeded at all;
+- `external_roots_for_owner(..)` in the BFS hands back the **pre-copy** address
+  of an object this cycle just promoted, so `old_gen.contains()` is false, the
+  promoted copy is never marked, and the compaction frees it — while the
+  overlay still holds the only reference to it.
+
+The freed payload is then read back through the relocation-invariant
+identity-hash key and comes out as a zeroed header. Hence
+`class_id=0 num_slots=0 class_name=java/lang/Object` on 107 accesses, the 281
+stale-receiver fallbacks, and — one cycle later, once the provider is still
+holding an address that was *freed* rather than *moved*, so the post-GC remap
+has nothing to rewrite it to — the eight garbage-header rejections above.
+
+`run_non_moving_young_cycle` has published at this boundary all along, and its
+comment names this failure mode almost word for word:
+
+> Waiting for the VM's ordinary post-GC remap is therefore too late: the old
+> marker would consult a provider that still points at the forwarded young
+> source, fail to seed the promoted destination, and immediately reclaim it.
+
+The moving path never had that call. It does now — one line, immediately before
+`Self::major_gc`, idempotent with the VM's later pass (at that point
+`pointer_map` holds only young→to-space / young→old-gen entries, whose keys and
+values live in disjoint arenas).
+
+### The guard test
+
+`gen_heap.rs::moving_cycle_publishes_relocation_to_external_roots_before_major_gc`
+registers a test `ExternalRootProvider` that owns the **only** reference to a
+payload object, pushes old gen past the 75 % threshold so the promoting cycle
+also compacts, and asserts the payload is still allocated afterwards.
+
+Without the fix it fails with
+
+```
+the major GC returned to the free list an object the external-root provider
+holds the only reference to
+```
+
+and with it, passes. The whole `cratonvm-gc` lib suite is 929/929.
+
+Two things it deliberately does **not** do: it does not use the process-global
+`System.gc()` request flag (a concurrently running test could consume it), and
+it asserts its own preconditions — old-gen occupancy ≥ 75 %, and the payload
+actually in old gen — so a promotion- or sizing-policy change makes it fail
+loudly rather than pass vacuously.
+
+### The sibling registries, checked and left alone
+
+`loader_pin`, `mirror_pin` and `metadata_pin` are consulted by the same BFS and
+are likewise only rebuilt post-GC, so they have the same *shape* of exposure.
+They are left unchanged, on the argument that they are supplementary pins over
+objects that are already precise roots (loader singletons via
+`gc_scan_loader_singleton_roots`, mirrors via the class-mirror cache), whereas
+the collection overlay is genuinely the sole owner — which is why it, and only
+it, broke. That is an argument, not a measurement; if a premature free ever
+implicates a mirror or a loader, this is the first place to look.
+
+**Measured since:** the fix is real but **inert for this reproducer**, and that
+was predictable rather than a surprise. `System.gc()` sets `explicit_full_gc`,
+which diverts `collect_garbage_inner` to the NON-moving young sweep — so the
+`System.gc()` path never reaches the moving Phase 5 at all. And under `--nojit`
+neither `gc_quiescence::is_active()` nor `unregistered_jit_frame_on_stack()` is
+ever true, so the conditional overlay-root scan is never skipped and the precise
+root set already covers what the major GC's owner walk would have missed. Arm G
+(this fix) returns `found=99`, unchanged from F.
+
+Where it IS live is a JIT-on run, where `is_active()` makes
+`scan_collection_overlays` skip the precise scan by design. Kept for that.
+
+## Defect 4 — the in-place old-gen sweep frees LIVE promoted objects — FIXED here
+
+This is the one with a seconds-long reproducer, and it is a genuine
+use-after-free rather than a bookkeeping loss.
+
+[`regression-suite/src/ROverlaySystemGcStress.java`](../../../regression-suite/src/ROverlaySystemGcStress.java)
+— JIT **on**, real JDK, `System.gc()` per round, collections kept live across
+rounds so the old ones get PROMOTED — fails deterministically at round 5:
+
+```
+TMDIAG bundle=0 size=0 isEmpty=true get(k0.0)=null containsKey=false iterCount=0 identity=100
+```
+
+On `dev`'s own tip it fails harder still, with
+`ClassCastException: class java.lang.Object cannot be cast to Bundle` — the same
+block after another allocation has been handed it.
+
+### The mechanism
+
+`sweep_young_non_moving` commits selective promotions (young→old) and records
+each in `result.0.pointer_map`, but leaves every root on its PRE-promotion young
+address. `sweep_old_gen_non_moving` then marks from exactly that slice, and
+`old_gen_gc`'s seed loop drops any address `old_gen.contains()` rejects. So a
+stale young address seeds **nothing**, the object at its new old-gen home is
+never marked, and the sweep returns a **live** object's block to the free list.
+
+The `CRATONVM_OLD_SWEEP_JIT` gate's own comment predicted this exactly — "the
+young sweep survives an imperfect root set via conservative over-marking and
+side-mark containment, but this old sweep frees purely on `GC_FLAG_MARKED`, so
+any root-set gap frees a LIVE promoted object". The gap was self-inflicted, one
+statement earlier in the same function.
+
+Fixed by passing the promotion map into `sweep_old_gen_non_moving` and applying
+it to `root_shadow` — the private copy that already exists because this mode
+must not disturb the caller's roots.
+
+### The three false trails, each killed by a measurement
+
+Worth recording, because each was plausible and each cost a build:
+
+- **the overlay prune** — `dead_keys=10` immediately precedes the loss, so it
+  looked causal. It is the messenger: `[overlay-prune] CONDEMNED … region=old-gen
+  old_gen_allocated=false` shows it reacting correctly to a block that is
+  already on the free list;
+- **the identity-hash key** — `[objkey]` stayed silent and
+  `probes/IdentityHashStabilityProbe.java` shows the hash stable across the
+  failing window;
+- **a dangling side-table ref** — `[overlay-stale]` stayed silent on this probe.
+
+Also ruled out: JIT tier-up. `CRATONVM_JIT_THRESHOLD` of 1e3, 1e5 and 1e8 fail
+identically while `--nojit` passes, so what matters is the JIT being ENABLED and
+the root/quiescence decisions that follow, not any method being compiled.
+
+### The first version of this fix was a regression — don't repeat it
+
+Rewriting the CALLER's root slice (rather than the sweep's shadow) fixed the
+probe and the regression suite, and SIGSEGVed `DefaultCatalogAndSchemaTest` 3
+runs out of 3. That slice is the VM's root snapshot and outlives the collector
+call.
+
+| arm | `rc` across runs | crashes |
+|---|---|---|
+| G — no root fixup | 0, 0, 0 | 0/3 |
+| M — caller's roots rewritten | 139, 139, 139¹ | 3/3 |
+| N — fixup on the sweep's shadow only | 0, 139, 139 | 2/3 |
+| P — fixup REVERTED | 0, 139 | 1/2 |
+| Q — P + a later `origin/dev` merge | 139, 0 | 1/2 |
+
+¹ the third M run had `CRATONVM_OLD_SWEEP_JIT=0`.
+
+### …and then the baseline moved, which invalidates the comparison above
+
+**P and Q are functionally identical to G** — the fixup is reverted in both, and
+everything else added since is gated off by default. G crashed 0 times in 3
+runs; P and Q crashed 2 times in 4. So the true baseline crash rate for this
+class is roughly one run in three, **not zero**, and G's clean sweep was luck.
+
+That matters, because the decision to revert was made on "0/3 baseline versus
+3/3 and 2/3". Against a ~1-in-3 baseline, 3/3 and 2/3 are not significant.
+**The revert stands as the conservative default — an unproven change to the
+collector is not worth shipping — but it should not be read as evidence that the
+fixup is harmful.** Settling that needs a properly powered comparison, on the
+order of eight runs per arm, ideally paired on the same host so background load
+cannot skew one arm (the G-vs-M runs were not paired, and the load differed).
+
+Anyone re-attempting defect 4 should start there rather than trusting the table
+above.
 
 ### Next steps
 
-1. Chase the `UN-FORWARDED` edge above — that is the actual corruptor, and it is
-   a collector bug, not a native-rooting one.
-2. Symbolized build (`RUSTFLAGS="-Cdebuginfo=2 -Cforce-frame-pointers=yes"`,
-   separate `CARGO_TARGET_DIR`) + the canary run, to name the remaining stale
-   frame outright. The release binary carries no symbols and every frame in the
-   canary's backtrace prints `<unknown>`.
+1. **`found` is not a stable signal.** Two runs of the same clean binary gave
+   `found=99` and `found=110`. Any future claim about this class needs several
+   runs, and a per-test comparison against HotSpot's 132 rather than a count.
+2. The residual gap (99–110 vs 132) is still open and still unexplained. The
+   `[overlay-stale] lhm-overlay` reports are the strongest remaining lead, but
+   see the caution below before trusting the count.
 
 ### Cautions for whoever picks this up
 
@@ -337,6 +539,23 @@ and whether their cards were dirty, will settle it.
   collections happened.
 - **Do not close this doc on the strength of a fix that has not run the class to
   completion.** That mistake has now been made twice.
+- **`[heap-stale] UN-FORWARDED` was reporting false positives** on every
+  major-GC cycle until the recycled-destination filter was added. If you are
+  reading an older log, discount it entirely.
+- **The out-of-bounds field guard's message misattributes this shape.** It says
+  the caller's slot computation is wrong; when `num_slots=0 class_id=0` the
+  receiver is simply a freed object and the index is fine. Always classify the
+  events before believing the text.
+- **`[overlay-stale]` over-reports, and cannot self-correct.** A genuinely DEAD
+  `LinkedHashMap`'s overlay entries legitimately point at reclaimed memory from
+  the moment it dies until the prune removes them — and the prune's own
+  liveness predicate is the thing under investigation. So the 600 (arm G) /
+  1886 (arm M) `ZEROED(reclaimed) lhm-overlay` reports are an **upper bound**,
+  possibly all benign. What makes such a report real is the collection still
+  being reachable from Java, which a heap walk cannot establish and
+  `ROverlaySystemGcStress` can.
+- **`found` moves run to run on a clean binary** (99 and 110 on the same
+  build). It is a weak signal; do not bisect on it.
 
 ## Follow-up 2 — 2026-07-31: relocation is RULED OUT as the mechanism
 
