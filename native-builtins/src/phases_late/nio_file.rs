@@ -4523,8 +4523,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "walk",
         "(Ljava/nio/file/Path;[Ljava/nio/file/FileVisitOption;)Ljava/util/stream/Stream;",
         |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
+            // Read the options FIRST: the Set form calls back into `isEmpty()`
+            // bytecode, which can allocate, so any `ObjectRef` copied out of
+            // `args` before it would be a stale local under a moving young GC.
             let follow = p57_visit_options_follow_links(ctx, args.get(1));
+            let path_obj = obj_arg(args, 0)?;
             files_walk_stream(ctx, path_obj, usize::MAX, follow)
         },
     );
@@ -4533,12 +4536,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "walk",
         "(Ljava/nio/file/Path;I[Ljava/nio/file/FileVisitOption;)Ljava/util/stream/Stream;",
         |ctx, args| {
+            let follow = p57_visit_options_follow_links(ctx, args.get(2));
             let path_obj = obj_arg(args, 0)?;
             let max_depth = match args.get(1) {
                 Some(Value::Int(n)) if *n >= 0 => *n as usize,
                 _ => usize::MAX,
             };
-            let follow = p57_visit_options_follow_links(ctx, args.get(2));
             files_walk_stream(ctx, path_obj, max_depth, follow)
         },
     );
@@ -4547,6 +4550,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "find",
         "(Ljava/nio/file/Path;ILjava/util/function/BiPredicate;[Ljava/nio/file/FileVisitOption;)Ljava/util/stream/Stream;",
         |ctx, args| {
+            // Options first — see the `walk` registration above.
+            let follow = p57_visit_options_follow_links(ctx, args.get(3));
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
             let max_depth = match args.get(1) {
@@ -4557,7 +4562,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(o)) => Some(o),
                 _ => None,
             };
-            let follow = p57_visit_options_follow_links(ctx, args.get(3));
             let mut paths = Vec::new();
             vfs_or_host_walk(&p, 0, max_depth, follow, &mut paths);
             // Without FOLLOW_LINKS the JDK's walker reads each entry's
@@ -15070,6 +15074,10 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "walkFileTree",
         "(Ljava/nio/file/Path;Ljava/util/Set;ILjava/nio/file/FileVisitor;)Ljava/nio/file/Path;",
         |ctx, args| {
+            // Options first: the `Set<FileVisitOption>` probe calls `isEmpty()`
+            // bytecode, which can allocate, and both the root path and the
+            // visitor copied out of `args` would be stale locals after it.
+            let follow = p57_visit_options_follow_links(ctx, args.get(1));
             let path_obj = args.first().copied().unwrap_or(Value::Object(None));
             let requested_depth = args.get(2).and_then(Value::as_int).unwrap_or(i32::MAX);
             let max_depth = if requested_depth == i32::MAX {
@@ -15077,7 +15085,6 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
             } else {
                 requested_depth.max(0) as usize
             };
-            let follow = p57_visit_options_follow_links(ctx, args.get(1));
             let visitor = args.get(3).copied().unwrap_or(Value::Object(None));
             p98_walk_file_tree(ctx, &[path_obj, visitor], max_depth, follow)
         },
