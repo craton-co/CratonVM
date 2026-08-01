@@ -231,6 +231,24 @@ lands. All green on a quiet box: both probes, `BasicErrorControllerDirectMockMvc
 to trust: a merge is exactly where a fix like this gets silently relocated or
 dropped.
 
+`dev` then landed its own fix for the same JIT defect and its own retirement of
+the GC report, so the whole set was run a THIRD time, on the resolved merge of
+both — the tree that is actually pushed — on a quiet box (load ~10, against the
+80–145 the middle rounds ran under):
+
+| class | result |
+| --- | --- |
+| `BasicErrorControllerDirectMockMvcTests` | PASS 4/4, 3 runs |
+| `BasicErrorControllerIntegrationTests` | PASS 26/26, 4 runs |
+| `JettyServletWebServerFactoryTests` | PASS 113/113, 2 runs — including `whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade` |
+| `OAuth2ResourceServerAutoConfigurationTests` | PASS 52/52 |
+| `CloudFoundryActuatorAutoConfigurationTests` | PASS 14/14 |
+| both probes | clean |
+
+One unit test is red on that tree and is NOT from this work:
+`x64::tests::push_stack_refuses_to_cross_spill_limit`. `jit/src/x64.rs` is
+byte-identical to `origin/dev` here — this branch never touches it.
+
 Unit tests on the fix branch: `cratonvm-jit --lib` 1228/0, `cratonvm-vm --lib`
 2330/0. `cratonvm-native-builtins --lib` is 3202 passed / 2 failed, and **both
 failures pre-date this work** — `panama::tests::test_85_4_upcall_handle_and_invoke`
