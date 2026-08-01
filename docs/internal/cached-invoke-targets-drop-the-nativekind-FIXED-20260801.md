@@ -1,9 +1,39 @@
 # `CachedInvokeTarget` stores a native callback without its `NativeKind`, so a cache *hit* cannot re-apply the dispatch policy
 
-**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31, re-verified
-against the re-landed tree the same day. **DANGEROUS: the policy is applied on
-the cold path and only partially on the warm path.** This is the structural
-reason CratonVM keeps two divergent copies of every native-vs-bytecode decision.
+**Status:** FIXED and retired on 2026-08-01.
+
+## Resolution
+
+`CachedInvokeTarget::Native` and `::VirtualNative` now retain both the stable
+`NativeMethodId` and its `NativeKind`. Every construction site resolves that
+identity once. On a compatible-mode cache hit, the current callback and kind
+are read back by id, preserving last-registration-wins semantics. On a
+JDK-only hit, the cached native is revalidated through the central
+`resolve_native_dispatch_wave1` policy. The existing `RedefineGate` is checked
+first and evicts an entry if bytecode availability may have changed.
+
+Both warm arms now call `record_invocation(id)`. This removes the old static
+constant-pool/name re-resolution and triple hash, closes the previously
+uncounted virtual path, and removes the virtual hit path's
+`real_protected_stub_class` pre-filter.
+
+Validation used the final release binary
+`cratonvm-tomcat-charsetcache-r11-20260801-019fb049` (SHA-256
+`12aa822f5c0f5d8ba3712900ad14a71b01b550ccdbff51f58e2aac95c700012f`):
+
+* `cratonvm-vm --test jdk_only_dispatch`: 12/12 passed.
+* A warm-cache JDK-only probe passed in both JIT and `--nojit` modes and
+  produced identical non-vacuous schema-2 census totals: 300,047 bridge
+  invocations, one intrinsic invocation, and zero synthetic-stub invocations.
+* Each report attributed exactly 100,000 calls to virtual
+  `Runtime.freeMemory`, virtual `Thread.isAlive`, and static `System.nanoTime`,
+  proving that both cached native shapes are counted rather than merely that
+  the aggregate counter is non-zero.
+* The exact Tomcat `TestCharsetCachePerformance` class passed under JIT
+  (`OK (1 test)`), while a 1,000,000-lookup charset semantic stress passed in
+  both JIT and `--nojit` modes.
+
+The rest of this record is retained as the pre-fix analysis.
 
 ## What is wrong
 

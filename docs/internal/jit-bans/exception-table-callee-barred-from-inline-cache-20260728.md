@@ -66,7 +66,7 @@ callee.
 ## What this corrects
 
 The 2026-07-27 write-up in
-`docs/known-issues/tomcat/23-charsetcache-pathological-slowdown.md` attributed
+`docs/internal/fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md` attributed
 this same d8/d9 gap to the optimizing tier refusing exception-table methods
 (`cached.exception_table.is_empty()` in `try_compile_inner`). That exclusion was
 real and has now been fixed — but it is **not** what the d8/d9 pair measured:

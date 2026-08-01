@@ -86,7 +86,7 @@ else is investigated.
 
 ## Not this bug
 
-`docs/known-issues/tomcat/23-charsetcache-pathological-slowdown.md` cited a
+`docs/internal/fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md` cited a
 "~630 ns marginal cost of an un-inlined call". That figure came from
 `NativeCallCostProbe`, whose timing loop sits inside a lambda invoked on a
 freshly started thread, inflating every rung roughly uniformly. A plain

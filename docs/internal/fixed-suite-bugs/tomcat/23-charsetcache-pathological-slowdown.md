@@ -1,8 +1,45 @@
 # `TestCharsetCachePerformance` — the cached paths lose to the uncached one
 
-**Status:** OPEN (last measured 2026-07-31). Both assertions still fail, but
-the reason has changed and is now specific. **Read the 2026-07-31 section at
-the end first — it supersedes every diagnosis above it.**
+**Status:** FIXED and retired on 2026-08-01.
+
+## Resolution and retirement evidence (2026-08-01)
+
+The direct JIT-call gate repair in `7f1b1f263` removed the last performance
+floor. A fresh release binary built from this record's final source
+(`cratonvm-tomcat-charsetcache-r11-20260801-019fb049`, SHA-256
+`12aa822f5c0f5d8ba3712900ad14a71b01b550ccdbff51f58e2aac95c700012f`)
+passes the exact upstream class:
+
+```text
+NoCsCache:   17,685,915,015 ns
+FullCsCache:  9,834,529,612 ns (0.556x uncached)
+LazyCsCache:  9,610,033,767 ns (0.543x uncached)
+Time: 37.313
+OK (1 test)
+```
+
+The residual warm-native invoke-cache defect discovered during this
+remeasurement is also fixed. `CachedInvokeTarget::{Native,VirtualNative}` now
+carry the stable `NativeMethodId` and `NativeKind`; every warm hit revalidates
+through the central native-dispatch policy and records its invocation by id,
+without the former constant-pool/name re-resolution or triple hash. The
+redefinition generation gate still evicts stale targets before policy
+revalidation.
+
+The exact performance assertion is a JIT gate: the interpreter intentionally
+does not provide compiled-call elimination, so its arm ratios are not a useful
+`--nojit` acceptance criterion. Semantic coverage was nevertheless exercised
+in both modes: 10 threads completed 1,000,000 direct, eager-cache, and real
+Tomcat `CharsetCache` lookups with identical canonical charset names. Both runs
+reported `DOC23_CORRECTNESS_OK`. A JDK-only warm-cache census in both JIT and
+`--nojit` modes recorded 100,000 calls each to a virtual `Runtime.freeMemory`,
+virtual `Thread.isAlive`, and static `System.nanoTime`; each report contained
+300,047 bridge invocations, one intrinsic invocation, and zero synthetic-stub
+invocations. This is non-vacuous evidence that both cached native arms are
+policy-checked and counted.
+
+The remaining text is retained as the investigation history. Its earlier
+diagnoses were superseded as the layers were removed.
 
 The thread-scaling wall the previous status described is fixed: the class goes
 from not finishing inside a 300s per-class timeout to a completed 154s run, and

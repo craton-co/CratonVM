@@ -1141,7 +1141,7 @@ impl std::fmt::Debug for LinkResolver {
 // Invoke cache — stores everything needed to create a Frame directly
 // ---------------------------------------------------------------------------
 
-use cratonvm_native_api::NativeCallback;
+use cratonvm_native_api::{NativeCallback, NativeKind, NativeMethodId};
 
 // Re-export from jit-api crate — the canonical definition lives there now.
 pub use cratonvm_jit_api::CachedBytecodeMethod;
@@ -1231,6 +1231,12 @@ pub enum CachedInvokeTarget<JitMethod = ()> {
     /// Native method: direct function pointer (invokestatic/invokespecial).
     Native {
         callback: NativeCallback,
+        /// Stable registry slot. Makes census and live kind/callback redemption
+        /// O(1) on a warmed call site, without re-hashing the name triple.
+        native_id: NativeMethodId,
+        /// Registration category captured when this entry was populated.
+        /// Strict-mode hits revalidate it from `native_id` before dispatch.
+        native_kind: NativeKind,
         num_params: u16,
         /// WP2.4-F1 — redefine staleness gate; bound to the resolved
         /// declaring class. A redefine that swaps a native method body for
@@ -1249,6 +1255,12 @@ pub enum CachedInvokeTarget<JitMethod = ()> {
     VirtualNative {
         receiver_class_id: ClassId,
         callback: NativeCallback,
+        /// Stable registry slot. Makes census and live kind/callback redemption
+        /// O(1) on a warmed call site, without re-hashing the name triple.
+        native_id: NativeMethodId,
+        /// Registration category captured when this entry was populated.
+        /// Strict-mode hits revalidate it from `native_id` before dispatch.
+        native_kind: NativeKind,
         num_params: u16,
         /// WP2.4-F1 — redefine staleness gate.
         gate: RedefineGate,
