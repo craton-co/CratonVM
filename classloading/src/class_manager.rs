@@ -1893,6 +1893,12 @@ pub struct ClassManager {
     /// T10.9.B: FxHashSet — keys are internal class names during loading.
     loading_guard: FxHashSet<String>,
 
+    /// JVMS 5.3.4 loader constraints. Populated at supertype link time
+    /// (5.3.5 step 3: a class and its superclass must agree on the
+    /// superclass's name). Violations are RECORDED, not thrown — see the
+    /// module doc for why detection and enforcement are separated.
+    loader_constraints: crate::loader_constraints::LoaderConstraints,
+
     /// Names of synthetic-stub classes whose real `.class` is known to be
     /// absent from every current classpath.
     ///
@@ -2504,6 +2510,7 @@ impl ClassManager {
             class_bytes_cache_cap: DEFAULT_CLASS_BYTES_CACHE_CAP,
             cds_class_cache: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             loading_guard: FxHashSet::default(),
+            loader_constraints: crate::loader_constraints::LoaderConstraints::new(),
             synthetic_upgrade_absent: FxHashSet::default(),
             vtable_descriptors: FxHashMap::with_capacity_and_hasher(256, Default::default()),
             skip_bytecode_verification: FxHashSet::default(),
@@ -4872,6 +4879,30 @@ impl ClassManager {
             },
             None => None, // java/lang/Object has no superclass
         };
+
+        // JVMS 5.3.5 step 3 / 5.3.4: the class being defined and the loader
+        // that DEFINED its superclass must agree on the superclass's name.
+        // Without this, each loader can define its own copy and the verifier
+        // passes on both sides — it checks each against its own namespace —
+        // while field offsets and vtable indices are read against the wrong
+        // layout at run time. Recorded, not thrown: see
+        // `loader_constraints`'s module doc.
+        if let (Some(sup_name), Some(sup_id)) = (class_file.super_class.as_ref(), superclass_id)
+        {
+            let sup_loader = self.get_class(sup_id).map(|c| c.loader_id);
+            if let Some(sup_loader) = sup_loader {
+                let _ = self.loader_constraints.pin(
+                    sup_name,
+                    sup_loader.to_native_id(),
+                    sup_id.as_u32(),
+                );
+                let _ = self.loader_constraints.impose(
+                    sup_name,
+                    loader_id.to_native_id(),
+                    sup_loader.to_native_id(),
+                );
+            }
+        }
 
         // Recursively load all interfaces. Each `iface_name` is `&Arc<str>`;
         // deref to `&str` for `load_class`. Same loader-faithful preference as

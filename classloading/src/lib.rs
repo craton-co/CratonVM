@@ -44,6 +44,7 @@ mod class_path;
 pub(crate) mod fx_hash;
 pub mod jar_signer;
 pub mod metadata_handle;
+pub mod loader_constraints;
 pub mod loaders;
 pub mod module;
 pub mod proxy_gen;
