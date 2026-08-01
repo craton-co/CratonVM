@@ -2052,7 +2052,18 @@ pub fn throw_linkage_error(
     }
     match create_exception_object(shared, thread, class_name, Some(&detail)) {
         Ok(obj_ref) => MethodCallFailed::ExceptionThrown(obj_ref),
-        Err(_) => MethodCallFailed::InternalError(VmError::Linkage(error)),
+        Err(e) => {
+            // Falling back means the linkage error stays a `VmError`, which no
+            // Java `catch` can ever observe — it unwinds past every handler and
+            // kills the VM at `main-vm run()`. That is a very different outcome
+            // from "an error was thrown", so say why the throwable could not be
+            // built instead of failing silently.
+            tracing::warn!(
+                "throw_linkage_error: could not materialize {class_name} ({detail}); \
+                 propagating as an uncatchable VM error instead: {e:?}"
+            );
+            MethodCallFailed::InternalError(VmError::Linkage(error))
+        }
     }
 }
 

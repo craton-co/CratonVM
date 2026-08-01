@@ -10951,6 +10951,13 @@ pub fn osr_entry_reject_count() -> usize {
 
 /// Parsed `CRATONVM_JIT_DENY` filter (see the `try_compile` call site).
 /// `None` = disabled.
+///
+/// This is the SINGLE force-interpret lever. It absorbed
+/// `CRATONVM_JIT_BISECT_SKIP` (deleted 2026-07-31 along with
+/// `vm/src/jit/skip_list.rs`), which did the same `Class.method` match on a
+/// smaller feature set: entries here are substrings of `Class.method`, so an
+/// exact `org/h2/mvstore/MVStore.commit` pins one method and a bare
+/// `org/keycloak/` pins a whole package.
 fn jit_deny_filter() -> Option<&'static Vec<String>> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Option<Vec<String>>> = OnceLock::new();
@@ -10965,60 +10972,30 @@ fn jit_deny_filter() -> Option<&'static Vec<String>> {
         .as_ref()
 }
 
-fn jit_allow_packages_filter() -> &'static Vec<String> {
+/// Parsed `CRATONVM_JIT_BISECT_ONLY` allowlist — the INVERSE of
+/// `CRATONVM_JIT_DENY`: when set, a class whose name starts with none of the
+/// listed prefixes is force-interpreted. Bisects "which package holds the
+/// miscompile" from the other direction, which `CRATONVM_JIT_DENY` cannot
+/// express. Moved here from `vm/src/jit/skip_list.rs` when that file was
+/// deleted (2026-07-31); deliberately NOT folded into the deny lever, because
+/// allow-list and deny-list are different questions. `None` = disabled.
+fn jit_bisect_only_filter() -> Option<&'static Vec<String>> {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<Vec<String>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var("CRATONVM_JIT_ALLOW_PACKAGES")
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(|entry| entry.trim().to_string())
-                    .filter(|entry| !entry.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
-fn jit_allow_entry_allows_prefix(entry: &str, prefix: &str) -> bool {
-    !entry.is_empty() && prefix.starts_with(entry)
-}
-
-fn jit_allow_package(prefix: &str) -> bool {
-    jit_allow_packages_filter()
-        .iter()
-        .any(|entry| jit_allow_entry_allows_prefix(entry, prefix))
-}
-
-fn hsqldb_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
-    const SLASH_PREFIX: &str = "org/hsqldb/";
-    const DOT_PREFIX: &str = "org.hsqldb.";
-    if class_name.starts_with(SLASH_PREFIX) {
-        Some(SLASH_PREFIX)
-    } else {
-        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
-    }
-}
-fn xerces_schema_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
-    const SLASH_PREFIX: &str = "com/sun/org/apache/xerces/internal/";
-    const DOT_PREFIX: &str = "com.sun.org.apache.xerces.internal.";
-    if class_name.starts_with(SLASH_PREFIX) {
-        Some(SLASH_PREFIX)
-    } else {
-        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
-    }
-}
-
-fn snakeyaml_emitter_emit_jit_deny_prefix(
-    class_name: &str,
-    method_name: &str,
-) -> Option<&'static str> {
-    if class_name == "org/yaml/snakeyaml/emitter/Emitter" && method_name == "emit" {
-        Some("org/yaml/snakeyaml/emitter/")
-    } else {
-        None
-    }
+    static CACHE: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let v = cratonvm_types::flags::runtime_var("CRATONVM_JIT_BISECT_ONLY").ok()?;
+            let prefixes: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if prefixes.is_empty() {
+                return None;
+            }
+            Some(prefixes)
+        })
+        .as_ref()
 }
 
 /// Diagnostic: number of `try_compile` calls short-circuited because
@@ -11712,19 +11689,10 @@ pub fn try_compile_with_invokespecial_resolver(
     // Keep the final compiler admission gate aligned with the VM static
     // skip-list. The tiered background worker bypasses VM-side eligibility and
     // otherwise continued compiling MutableBigInteger after it was quarantined.
-    if tiered::is_biginteger_arithmetic_jit_denied(&cached.class_name) {
-        return None;
-    }
-
     // SPB-FLYWAY-HSQLDB.1: Keep the final admission gate aligned with the VM
     // skip-list. The Flyway HSQLDB integration SIGSEGVs under JIT, while the
     // package-level interpreted control completes the entire class. Background
     // compilation can bypass VM eligibility checks, so fail closed here too.
-    if let Some(prefix) = hsqldb_jit_deny_prefix(&cached.class_name) {
-        if !jit_allow_package(prefix) {
-            return None;
-        }
-    }
     // The `org/glassfish/jaxb/` final-admission mirror of the VM skip-list
     // guard was removed 2026-07-27. It is the SECOND of the two gates that
     // enforced that ban, and deleting `jaxb_mapping_residual_skip_prefix` from
@@ -11746,34 +11714,14 @@ pub fn try_compile_with_invokespecial_resolver(
     // guard. Background compilation bypasses the VM skip-list, and JITting
     // this package corrupts SchemaGrammar's SymbolHash during Hazelcast XML
     // schema validation.
-    if let Some(prefix) = xerces_schema_jit_deny_prefix(&cached.class_name) {
-        if !jit_allow_package(prefix) {
-            return None;
-        }
-    }
-
     // SPB-FLYWAY-HSQLDB.1: Keep the final admission gate aligned with the VM
     // skip-list. The Flyway HSQLDB integration SIGSEGVs under JIT, while the
     // package-level interpreted control completes the entire class. Background
     // compilation can bypass VM eligibility checks, so fail closed here too.
-    if let Some(prefix) = hsqldb_jit_deny_prefix(&cached.class_name) {
-        if !jit_allow_package(prefix) {
-            return None;
-        }
-    }
-
     // ES-JIT-DEOPT-GC.1: final fail-closed companion to the VM skip-list guard
     // for `org/yaml/snakeyaml/emitter/Emitter.emit`. Tiered/background compile
     // can reach this crate after the VM-side enqueue path has logged work; keep
     // the exact proven corruptor interpreted unless explicitly lifted.
-    if let Some(prefix) =
-        snakeyaml_emitter_emit_jit_deny_prefix(&cached.class_name, &cached.method_name)
-    {
-        if !jit_allow_package(prefix) {
-            return None;
-        }
-    }
-
     // DBG (RandomizedContext WeakHashMap JIT investigation, 2026-07-02):
     // `CRATONVM_JIT_DENY` — comma-separated substrings matched against
     // `Class.method`; a matching method is force-interpreted (never
@@ -11784,6 +11732,14 @@ pub fn try_compile_with_invokespecial_resolver(
         let sig = format!("{}.{}", cached.class_name, cached.method_name);
         filter.iter().any(|f| sig.contains(f.as_str()))
     }) {
+        return None;
+    }
+
+    // `CRATONVM_JIT_BISECT_ONLY` — the inverse: only the listed class-name
+    // prefixes stay JIT-eligible. No-op unless set.
+    if jit_bisect_only_filter()
+        .is_some_and(|prefixes| !prefixes.iter().any(|p| cached.class_name.starts_with(p.as_str())))
+    {
         return None;
     }
 
@@ -15852,18 +15808,6 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 // Tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn hsqldb_jit_deny_matches_slash_and_dot_names() {
-    assert_eq!(
-        hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
-        Some("org/hsqldb/")
-    );
-    assert_eq!(
-        hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
-        Some("org.hsqldb.")
-    );
-    assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
-}
 #[cfg(test)]
 mod tests {
     /// Poll `cond` until it holds, for up to ~1s.
@@ -15901,75 +15845,6 @@ mod tests {
         assert!(invoke_kind_uses_inline_cache(2), "invokeinterface");
         assert!(!invoke_kind_uses_inline_cache(1), "invokespecial");
         assert!(!invoke_kind_uses_inline_cache(3), "invokestatic");
-    }
-
-    #[test]
-    fn hibernate_biginteger_final_guard_matches_internal_and_dotted_names() {
-        assert!(tiered::is_biginteger_arithmetic_jit_denied(
-            "java/math/MutableBigInteger"
-        ));
-        assert!(tiered::is_biginteger_arithmetic_jit_denied(
-            "java.math.MutableBigInteger"
-        ));
-        assert!(!tiered::is_biginteger_arithmetic_jit_denied(
-            "java/math/BigInteger"
-        ));
-        assert!(!tiered::is_biginteger_arithmetic_jit_denied(
-            "java/math/MutableBigInteger$Helper"
-        ));
-    }
-
-    #[test]
-    fn xerces_schema_jit_deny_matches_slash_and_dot_names() {
-        assert_eq!(
-            xerces_schema_jit_deny_prefix("com/sun/org/apache/xerces/internal/util/SymbolHash"),
-            Some("com/sun/org/apache/xerces/internal/")
-        );
-        assert_eq!(
-            xerces_schema_jit_deny_prefix(
-                "com.sun.org.apache.xerces.internal.impl.xs.SchemaGrammar"
-            ),
-            Some("com.sun.org.apache.xerces.internal.")
-        );
-        assert_eq!(
-            xerces_schema_jit_deny_prefix("com/sun/org/apache/xml/internal/Foo"),
-            None
-        );
-    }
-
-    #[test]
-    fn hsqldb_jit_deny_matches_slash_and_dot_names() {
-        assert_eq!(
-            hsqldb_jit_deny_prefix("org/hsqldb/map/BaseHashMap"),
-            Some("org/hsqldb/")
-        );
-        assert_eq!(
-            hsqldb_jit_deny_prefix("org.hsqldb.map.BaseHashMap"),
-            Some("org.hsqldb.")
-        );
-        assert_eq!(hsqldb_jit_deny_prefix("org/example/Foo"), None);
-    }
-
-    #[test]
-    fn snakeyaml_emitter_emit_final_guard_is_exact() {
-        assert_eq!(
-            snakeyaml_emitter_emit_jit_deny_prefix("org/yaml/snakeyaml/emitter/Emitter", "emit",),
-            Some("org/yaml/snakeyaml/emitter/")
-        );
-        assert_eq!(
-            snakeyaml_emitter_emit_jit_deny_prefix(
-                "org/yaml/snakeyaml/emitter/Emitter",
-                "writeWhitespace",
-            ),
-            None
-        );
-        assert_eq!(
-            snakeyaml_emitter_emit_jit_deny_prefix(
-                "org/yaml/snakeyaml/emitter/ScalarAnalysis",
-                "isEmpty",
-            ),
-            None
-        );
     }
 
     /// BUG-1 companion — routing of NON-tail static self-recursive call sites.

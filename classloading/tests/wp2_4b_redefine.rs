@@ -38,6 +38,8 @@ const REDEFINE_FIXTURES: &[&str] = &[
     "Foo.extra_field.class",
     "Foo.extra_method.class",
     "Foo.impl_serializable.class",
+    "FooSubA.class",
+    "FooSubB.class",
 ];
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -496,5 +498,107 @@ fn redefine_unknown_class_id_rejected() {
     assert!(
         msg.contains("UnsupportedClassRedefinition") && msg.contains("not loaded"),
         "expected 'not loaded' UnsupportedClassRedefinitionError, got: {msg}"
+    );
+}
+
+// --------------------------------------------------------------------------
+// Redefine must not leave a stale dispatch snapshot in the cached vtable
+// slot descriptors of ALREADY-LINKED subclasses.
+//
+// `vtable_descriptors` is the seed a newly linked class copies its inherited
+// slots from (`build_vtable_descriptors_with_overrides`). Refreshing only the
+// redefined class's own vec left every subclass linked BEFORE the redefine
+// naming the OLD code, so a class linked AFTER the redefine inherited the
+// pre-redefine bytecode with no generation check anywhere able to notice
+// (the descriptor is `resolved`, and its `declaring_class_id` is the
+// redefined class, so every redefine guard reads "current").
+//
+// Real-world shape: Mockito's inline mock maker retransforms
+// `java.io.OutputStream`, then generates a mock subclass of the
+// already-linked `jakarta.servlet.ServletOutputStream`. The mock's
+// `write([BII)V` vtable slot pointed at the un-woven body, so the mock
+// silently stopped intercepting once the call site reached the vtable fast
+// path.
+// --------------------------------------------------------------------------
+
+#[test]
+fn redefine_refreshes_dispatch_snapshot_in_already_linked_subclasses() {
+    let (v1, v2, sub_a, sub_b) = match (
+        load_fixture("Foo.v1.class"),
+        load_fixture("Foo.v2.class"),
+        load_fixture("FooSubA.class"),
+        load_fixture("FooSubB.class"),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => return, // fixtures not available
+    };
+
+    let mut cm = fresh_manager();
+    let foo_id = cm
+        .define_class_with_options(
+            "Foo",
+            &v1,
+            ClassLoaderId::Application,
+            DefineClassOptions::default(),
+        )
+        .expect("Foo v1 define ok");
+    // FooSubA is linked BEFORE the redefine, so its cached descriptor vec
+    // captures Foo's v1 dispatch snapshot for the inherited `foo()I` slot.
+    let sub_a_id = cm
+        .define_class_with_options(
+            "FooSubA",
+            &sub_a,
+            ClassLoaderId::Application,
+            DefineClassOptions::default(),
+        )
+        .expect("FooSubA define ok");
+
+    let inherited_foo_code = |cm: &ClassManager, id| -> Vec<u8> {
+        cm.vtable_descriptors_of(id)
+            .expect("vtable present")
+            .iter()
+            .flatten()
+            .find(|d| &*d.method_name == "foo" && &*d.descriptor == "()I")
+            .and_then(|d| d.dispatch.as_ref())
+            .expect("foo slot carries a dispatch snapshot")
+            .code
+            .to_vec()
+    };
+
+    let v1_code = inherited_foo_code(&cm, foo_id);
+    assert_eq!(
+        inherited_foo_code(&cm, sub_a_id),
+        v1_code,
+        "subclass must inherit the superclass snapshot at link time",
+    );
+
+    cm.redefine_class(foo_id, v2, RedefineOptions::default())
+        .expect("redefine to v2 ok");
+
+    let v2_code = inherited_foo_code(&cm, foo_id);
+    assert_ne!(v1_code, v2_code, "fixtures must differ in `foo` body");
+
+    // The already-linked subclass's cached descriptor must have been
+    // refreshed in place.
+    assert_eq!(
+        inherited_foo_code(&cm, sub_a_id),
+        v2_code,
+        "already-linked subclass kept a stale pre-redefine dispatch snapshot",
+    );
+
+    // ...and a class linked AFTER the redefine, which seeds from that
+    // subclass, must therefore see the redefined body too.
+    let sub_b_id = cm
+        .define_class_with_options(
+            "FooSubB",
+            &sub_b,
+            ClassLoaderId::Application,
+            DefineClassOptions::default(),
+        )
+        .expect("FooSubB define ok");
+    assert_eq!(
+        inherited_foo_code(&cm, sub_b_id),
+        v2_code,
+        "class linked after the redefine inherited the pre-redefine body",
     );
 }

@@ -1,13 +1,21 @@
 # `BasicErrorControllerIntegrationTests` is NOT a usable acceptance gate right now
 
-**Status:** OPEN, measured 2026-07-31 against dev `f14b64379`.
+**Status:** OPEN, measured 2026-07-31 against dev `f14b64379`; still present
+2026-08-01 (26 tests, 23 failed, JIT on).
 
-This is a narrow companion to the two existing reports on this class —
-[`../spring/springboot-basicerrorcontroller-checkcast-abort-20260731.md`](springboot-basicerrorcontroller-checkcast-abort-20260731.md)
-and
-[`../spring/basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md).
+This is a narrow companion to the two other reports on this class —
+[`../../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md)
+(**FIXED 2026-08-01**, retired to the internal folder) and
+[`basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md).
 It does not re-file those. It records one fact they do not cover, which will
 otherwise cause a wrong conclusion about a different subsystem.
+
+**This is now the only thing keeping the class red.** The checkcast abort is
+closed. What remains is `IllegalStateException: Cannot bind to
+SpringApplication` -> `BindException` -> `NullPointerException` in
+`BindConverter.convert` (`Cannot invoke "java.util.Iterator.hasNext()" because
+"<local5>" is null`), which is JIT-only and unrelated to the
+collection-overlay GC mechanism that produced the abort.
 
 ## Why this needs saying
 

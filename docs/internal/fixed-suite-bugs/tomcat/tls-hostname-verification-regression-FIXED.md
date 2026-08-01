@@ -1,5 +1,49 @@
 # TLS hostname verification regression — breaks all 7 classes doc 21 fixed
 
+**Status: RESOLVED (2026-08-01).** All 7 classes rechecked on a fixed binary;
+not one of their logs still contains the hostname-verifier message.
+
+This doc's diagnosis in "Why this is a genuinely new, single defect" was
+correct on every point: one shared mechanism, client-side, and hostname
+verification "happening on a path where it wasn't the deciding factor before".
+
+The root cause, the fix and the A/B are written up once, in
+`docs/internal/fixed-suite-bugs/springboot/simpleclienthttprequestfactory-app-hostnameverifier-rejects-localhost-FIXED.md`
+— the same defect was filed independently from the Spring Boot side. In short:
+the real JDK's default `HostnameVerifier` is a hardcoded `return false`, it was
+NOT recognised as a default stand-in, and it was being consulted as a mandatory
+gate rather than as the fallback JSSE actually makes it.
+
+Results (one process per class, fixed binary):
+
+```
+  PASS         26,1s  org.apache.catalina.valves.rewrite.TestResolverSSL
+  PASS         28,7s  org.apache.tomcat.util.net.TestCustomSslTrustManager
+  PASS           18s  org.apache.tomcat.util.net.TestSslHandshakeFailure
+  PASS         51,1s  org.apache.tomcat.util.net.TestSSLHostConfigCompat
+  PASS         18,7s  org.apache.tomcat.util.net.TestSSLHostConfigProtocol
+  PASS         21,7s  org.apache.tomcat.util.net.TestSSLHostConfigCipher
+  FAIL        445,3s  org.apache.tomcat.util.net.TestSsl   (7 failures -> 1)
+```
+
+Two questions this doc raised, both now answered:
+
+- `TestSSLHostConfigProtocol` — "worth confirming it's not silently exercising
+  a code path that skips hostname verification". It is not: it passes, and its
+  log carries no verifier message.
+- `TestSsl`'s remaining single failure,
+  `testClientInitiatedRenegotiation[JSSE]`, is **not** part of this defect — it
+  fails identically on a pre-fix baseline binary. Split out to
+  `docs/known-issues/tomcat/testssl-client-initiated-renegotiation-20260801.md`
+  so it survives this doc's retirement.
+
+The `git log` bisect proposed below as the next step was not needed: the
+culprit commit (`f6028ba50`) was already named by the Spring Boot filing.
+
+---
+
+*Original report follows, unedited.*
+
 **Status:** OPEN, new regression. Not the bug
 [21-tls-handshake-enforcement-gap-FIXED.md](21-tls-handshake-enforcement-gap-FIXED.md)
 fixed — a different, later-introduced defect that happens to break the same
