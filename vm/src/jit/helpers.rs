@@ -279,9 +279,20 @@ thread_local! {
     /// overhead on short-callee shapes. One struct = one TLS address
     /// computation for the whole drain (`take_all_jit_signals`).
     ///
+    /// **This block holds NO heap references.** The one signal that did —
+    /// `exception`, the pending Java throwable — now lives on
+    /// [`JvmThread::jit_pending_exception`], because a `thread_local!` is
+    /// unreachable from a collecting thread and the throwable was therefore
+    /// neither scanned nor remapped for the whole stash→drain window (see
+    /// `docs/known-issues/jit-signals-root-gap.md`). Every remaining field is a
+    /// plain scalar the collector has no interest in, which is why they may
+    /// stay here and keep the one-TLS-access drain. **Do not add an
+    /// `ObjectRef`, a `Value`, or a raw heap address to this struct** — put it
+    /// on `JvmThread` and root it in `memory/roots.rs` + `memory/gc.rs`.
+    ///
     /// Field semantics (formerly the individual statics):
-    /// * `exception` — pending Java exception from JIT dispatch; the
-    ///   interpreter routes it through exception tables after JIT returns.
+    /// * `athrow_bci` — see the field; the bci of the `athrow` that produced
+    ///   the (thread-resident) pending exception.
     /// * `aioobe` — pending AIOOBE `(index, length)` from a JIT bounds
     ///   check (`jit_throw_aioobe`), consumed on the `i64::MIN` sentinel.
     /// * `arithmetic` — pending `ArithmeticException` ("/ by zero") from
@@ -302,7 +313,6 @@ thread_local! {
     ///   would spuriously re-run it, double-executing side effects).
     static JIT_SIGNALS: JitSignals = const {
         JitSignals {
-            exception: Cell::new(None),
             athrow_bci: Cell::new(-1),
             aioobe: Cell::new(None),
             arithmetic: Cell::new(false),
@@ -651,13 +661,17 @@ pub fn clear_jit_thread() {
 
 /// The consolidated out-of-band JIT→interpreter signal block — see the
 /// [`JIT_SIGNALS`] thread-local for field semantics.
+///
+/// Scalars only — the pending throwable lives on
+/// [`JvmThread::jit_pending_exception`] so the collector can see and relocate
+/// it (`docs/known-issues/jit-signals-root-gap.md`).
 struct JitSignals {
-    exception: Cell<Option<ObjectRef>>,
     /// RBC.6 correctness fix — the bytecode pc of the `athrow` that produced
-    /// `exception`, when statically known at JIT-compile time (`-1` = unknown,
+    /// the thread's `jit_pending_exception`, when statically known at
+    /// JIT-compile time (`-1` = unknown,
     /// e.g. an exception propagated up from a dispatched callee, which this
-    /// method has no bci for). Set ONLY by `jit_throw_exception` alongside
-    /// `exception`; every other site that stashes a general exception (no
+    /// method has no bci for). Set ONLY by `jit_throw_exception` alongside the
+    /// throwable itself; every other site that stashes a general exception (no
     /// known local throw site) leaves/resets this to `-1`. Consumed by
     /// `execute_jit_call` to give `route_jit_exception_through_method` a real
     /// `throw_pc` instead of the `usize::MAX`-means-unknown fallback, which
@@ -700,14 +714,22 @@ pub(crate) struct DrainedJitSignals {
     pub deopt: bool,
 }
 
-/// Snapshot-and-clear ALL JIT signals in ONE thread-local access. Draining
-/// everything unconditionally is deliberate: a signal surviving into the
-/// next unrelated JIT call was the recurring Round-8..11 leak-bug class, and
-/// clearing a flag nobody set is free.
+/// Snapshot-and-clear ALL JIT signals: one thread-local access for the six
+/// scalars, plus one field read on `thread` for the pending throwable.
+/// Draining everything unconditionally is deliberate: a signal surviving into
+/// the next unrelated JIT call was the recurring Round-8..11 leak-bug class,
+/// and clearing a flag nobody set is free.
+///
+/// `thread` must be the thread whose JIT call just returned — the same one
+/// that was installed via `set_jit_thread`. It is the drain's *only* way to
+/// reach the throwable now that the reference is GC-rooted on the thread
+/// rather than parked in TLS; passing a different thread silently drains an
+/// empty slot and strands the exception on the real one.
 #[inline]
-pub(crate) fn take_all_jit_signals() -> DrainedJitSignals {
+pub(crate) fn take_all_jit_signals(thread: &mut JvmThread) -> DrainedJitSignals {
+    let exception = thread.jit_pending_exception.take();
     JIT_SIGNALS.with(|s| DrainedJitSignals {
-        exception: s.exception.take(),
+        exception,
         athrow_bci: s.athrow_bci.replace(-1),
         aioobe: s.aioobe.take(),
         arithmetic: s.arithmetic.take(),
@@ -725,11 +747,12 @@ pub(crate) fn take_all_jit_signals() -> DrainedJitSignals {
 /// the direct-local-athrow path. Only `jit_throw_exception`'s dedicated
 /// `set_jit_pending_exception_with_bci` may set a real bci, and only for the
 /// exception it is stashing in that same call.
-fn set_jit_pending_exception(exc: ObjectRef) {
-    JIT_SIGNALS.with(|s| {
-        s.exception.set(Some(exc));
-        s.athrow_bci.set(-1);
-    });
+/// The throwable is stored on `thread` (not in `JIT_SIGNALS`) so that a
+/// collection occurring between this stash and the interpreter's drain both
+/// keeps it alive and rewrites it — see [`JvmThread::jit_pending_exception`].
+fn set_jit_pending_exception(thread: &mut JvmThread, exc: ObjectRef) {
+    thread.jit_pending_exception = Some(exc);
+    JIT_SIGNALS.with(|s| s.athrow_bci.set(-1));
 }
 
 /// RBC.6 correctness fix — sibling of `set_jit_pending_exception` for the ONE
@@ -738,11 +761,9 @@ fn set_jit_pending_exception(exc: ObjectRef) {
 /// `JitSignals::athrow_bci` for why this matters (typed-handler routing
 /// correctness with 2+ exception-table entries when `throw_pc` would
 /// otherwise be `usize::MAX`).
-fn set_jit_pending_exception_with_bci(exc: ObjectRef, bci: i64) {
-    JIT_SIGNALS.with(|s| {
-        s.exception.set(Some(exc));
-        s.athrow_bci.set(bci);
-    });
+fn set_jit_pending_exception_with_bci(thread: &mut JvmThread, exc: ObjectRef, bci: i64) {
+    thread.jit_pending_exception = Some(exc);
+    JIT_SIGNALS.with(|s| s.athrow_bci.set(bci));
 }
 
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
@@ -758,8 +779,8 @@ fn set_jit_pending_exception_with_bci(exc: ObjectRef, bci: i64) {
 /// one) — always falls back to the pre-existing `usize::MAX`-means-unknown
 /// behavior for the re-stashed exception, never a regression, just not the
 /// newly-precise case.
-pub(crate) fn stash_jit_pending_exception(exc: ObjectRef) {
-    set_jit_pending_exception(exc);
+pub(crate) fn stash_jit_pending_exception(thread: &mut JvmThread, exc: ObjectRef) {
+    set_jit_pending_exception(thread, exc);
 }
 
 /// Forget the `athrow` bci carried by the pending exception, keeping the
@@ -800,8 +821,13 @@ pub(crate) fn stash_jit_pending_aioobe(index: i64, length: i64) {
 
 /// Take (consume) any pending Java exception set by JIT dispatch.
 /// Returns `Some(ObjectRef)` if an exception was pending, `None` otherwise.
-pub fn take_jit_pending_exception() -> Option<ObjectRef> {
-    JIT_SIGNALS.with(|s| s.exception.take())
+///
+/// `thread` must be the thread whose JIT call stashed it — see
+/// [`take_all_jit_signals`]. The returned `ObjectRef` is the *post-move*
+/// address if a collection intervened, because the slot it comes out of is
+/// rooted and remapped (`memory/roots.rs` §10, `memory/gc.rs` §10).
+pub fn take_jit_pending_exception(thread: &mut JvmThread) -> Option<ObjectRef> {
+    thread.jit_pending_exception.take()
 }
 
 /// Non-consuming peek: returns `true` if a pending Java exception is set.
@@ -811,13 +837,24 @@ pub fn take_jit_pending_exception() -> Option<ObjectRef> {
 /// post-invoke exception guard fires and the interpreter routes the
 /// stashed exception through the method's exception table — instead of
 /// returning a bogus `0` that the JIT would keep computing with.
+/// Resolves the thread through [`current_jit_thread_ptr`] rather than taking a
+/// `&mut JvmThread`, because three of its four call sites sit *before* the
+/// `jit_thread_mut()` acquisition in their function and cannot name one. That
+/// is sound here and only here: this is a **read**, so it creates no aliasing
+/// `&mut`, and every call site runs inside a JIT helper on the thread that
+/// installed the pointer. A null pointer (no JIT thread installed — the only
+/// way to reach that is from outside JIT dispatch, where nothing can have
+/// stashed an exception) reads as "nothing pending", which is the same answer
+/// the empty TLS cell used to give.
 pub(crate) fn jit_pending_exception_is_set() -> bool {
-    JIT_SIGNALS.with(|s| {
-        let v = s.exception.take();
-        let present = v.is_some();
-        s.exception.set(v);
-        present
-    })
+    let t = current_jit_thread_ptr();
+    if t.is_null() {
+        return false;
+    }
+    // SAFETY: `t` is this OS thread's own `JvmThread`, installed by
+    // `set_jit_thread` and alive for the whole JIT call; the read is a
+    // shared-reference-shaped `Option` load with no aliasing `&mut` created.
+    unsafe { (*t).jit_pending_exception.is_some() }
 }
 
 /// Take (consume) a pending AIOOBE from JIT bounds check.
@@ -977,17 +1014,18 @@ pub extern "C" fn jit_set_deopt_pending() {
 /// `i64::MIN` is a real `Long.MIN_VALUE` return — the caller keeps it). The peek
 /// is non-destructive so the outer interpreter drain still observes the flag.
 ///
-/// SAFETY: no pointer arguments; only reads thread-locals. Safe to call from
-/// JIT-compiled code immediately after a dispatch returns `i64::MIN`.
+/// SAFETY: no pointer arguments; only reads this thread's own signal block and
+/// `JvmThread`. Safe to call from JIT-compiled code immediately after a
+/// dispatch returns `i64::MIN`.
 pub extern "C" fn jit_dispatch_threw() -> i64 {
-    let pending = JIT_SIGNALS.with(|s| {
-        // Non-destructive peek across the whole signal block in ONE
-        // thread-local access (the former per-flag statics cost four).
-        let exc = s.exception.take();
-        let exc_set = exc.is_some();
-        s.exception.set(exc);
-        exc_set || s.npe.get() || s.aioobe.get().is_some() || s.deopt.get()
-    }) || cratonvm_jit::deopt::has_last_deopt();
+    // The throwable half lives on the `JvmThread` (GC-rooted); the scalar
+    // flags stay in TLS. Both are this OS thread's own state, so the peek is
+    // still allocation-free and lock-free — it just reads two places instead
+    // of one. See `jit_pending_exception_is_set` for why resolving the thread
+    // through the raw pointer is sound in a read-only peek.
+    let pending = (jit_pending_exception_is_set()
+        || JIT_SIGNALS.with(|s| s.npe.get() || s.aioobe.get().is_some() || s.deopt.get()))
+        || cratonvm_jit::deopt::has_last_deopt();
     if pending {
         1
     } else {
@@ -2130,11 +2168,31 @@ unsafe fn try_run_callee_handler(
     exc: cratonvm_types::ObjectRef,
     throw_pc: usize,
 ) -> Option<i64> {
-    let cached = resolve_callee_cached(vm, info, receiver_class_id)?;
+    // `exc` arrives here having already been DRAINED out of
+    // `thread.jit_pending_exception` by the caller, so for the length of this
+    // function it is a bare Rust local — the one heap reference to a live
+    // throwable that no root provider knows about. `resolve_callee_cached` can
+    // load the callee's class (a user `ClassLoader.loadClass`, hence
+    // allocation, hence a collection), and `run_jit_callee_handler` runs
+    // arbitrary Java before it pushes `exc` onto the resumed frame's operand
+    // stack. Pin it across both. `native_pin_roots` is the right home: it is
+    // both scanned (`memory/roots.rs`) and remapped (`memory/gc.rs`), so we
+    // re-read the slot afterwards to pick up a relocation instead of handing
+    // the interpreter a from-space address.
+    let pin_base = thread.native_pin_roots.len();
+    thread.native_pin_roots.push(exc);
+    let resolved = resolve_callee_cached(vm, info, receiver_class_id);
+    let Some(cached) = resolved else {
+        thread.native_pin_roots.truncate(pin_base);
+        return None;
+    };
     let args = decode_dispatch_values(vm, info, args_slice);
+    let exc = thread.native_pin_roots[pin_base];
     let res = crate::runtime::interpreter::run_jit_callee_handler(
         vm, thread, &cached, throw_pc, exc, &args,
-    )?;
+    );
+    thread.native_pin_roots.truncate(pin_base);
+    let res = res?;
     Some(match res {
         Ok(Some(Value::Int(v))) => v as i64,
         Ok(Some(Value::Long(v))) => v,
@@ -2351,7 +2409,7 @@ unsafe fn route_implicit_exc_through_callee(
                 // re-run then adds its own balanced pass. Witnessed by
                 // `CallPathProbe`/`FinallyShapeProbe`
                 // (docs/known-issues/repros/jitban-remaining-20260726/).
-                let signals = take_all_jit_signals();
+                let signals = take_all_jit_signals(thread);
                 if let Some(exc) = signals.exception {
                     // `signals.athrow_bci` is always -1 here: the entry clear
                     // above ran before this drain. Fall back to the value
@@ -2375,12 +2433,12 @@ unsafe fn route_implicit_exc_through_callee(
                     // No handler covers this throw site -- restore the signal
                     // exactly as it was found and fall through.
                     if throw_pc == usize::MAX {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     } else {
-                        set_jit_pending_exception_with_bci(exc, throw_pc as i64);
+                        set_jit_pending_exception_with_bci(thread, exc, throw_pc as i64);
                     }
                 }
-                let _ = take_jit_pending_exception();
+                let _ = take_jit_pending_exception(thread);
                 // The callee is about to be re-executed from its entry in the
                 // interpreter, which regenerates and routes the exception
                 // itself. Any exceptional frame its compiled body published
@@ -2633,7 +2691,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     // outgoing arguments still identify that callee, and run its handler at
     // the recorded throw bci.  Re-entering the callee from bytecode 0 used to
     // duplicate all side effects before a caught bounds/null/divide exception.
-    let signals = take_all_jit_signals();
+    let signals = take_all_jit_signals(thread);
     let throw_pc = if signals.athrow_bci >= 0 {
         signals.athrow_bci as usize
     } else {
@@ -2701,7 +2759,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     // original signal shape so the existing caller-side drain remains the
     // fallback; this preserves behaviour for a miss or a non-covering catch.
     if let Some(exc) = signals.exception {
-        set_jit_pending_exception(exc);
+        set_jit_pending_exception(thread, exc);
     }
     if let Some((index, length)) = signals.aioobe {
         stash_jit_pending_aioobe(index, length);
@@ -3222,6 +3280,10 @@ fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
 fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
     // SAFETY: called only from a JIT alloc helper on the thread that installed the
     // JIT thread pointer; no other `&mut JvmThread` borrow is live here.
+    // SAFETY (both acquisitions): see the comment above — this runs on the JIT
+    // thread and no other `&mut JvmThread` borrow is live. The two are separate
+    // because the first `_guard` must drop before the singleton fallback can
+    // re-borrow.
     if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
         if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
             vm,
@@ -3229,13 +3291,20 @@ fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
             "java/lang/OutOfMemoryError",
             Some(msg),
         ) {
-            set_jit_pending_exception(exc);
+            set_jit_pending_exception(thread, exc);
             return 0;
         }
     }
-    // Fresh creation failed (or no JIT thread) — use the pre-allocated singleton.
+    // Fresh creation failed (or no JIT thread) — use the pre-allocated
+    // singleton. This needs the thread too now that the stash is a GC-rooted
+    // `JvmThread` field: the singleton OOME is exactly the reference most
+    // likely to be live across a collection (we are here *because* the heap is
+    // full), so parking it anywhere the collector cannot see would be the
+    // worst possible place for it.
     if let Some(oom) = *vm.mem.singleton_oom.read() {
-        set_jit_pending_exception(oom);
+        if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
+            set_jit_pending_exception(thread, oom);
+        }
     }
     0
 }
@@ -3261,7 +3330,7 @@ fn jit_negative_array_size(vm: &SharedVm, length: i64) -> i64 {
             "java/lang/NegativeArraySizeException",
             Some(&length.to_string()),
         ) {
-            set_jit_pending_exception(exc);
+            set_jit_pending_exception(thread, exc);
         }
     }
     0
@@ -3513,7 +3582,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
             use crate::error::MethodCallFailed;
             match err {
                 MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                 }
                 MethodCallFailed::InternalError(vm_err) => {
                     let msg =
@@ -3524,7 +3593,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
                         "java/lang/InternalError",
                         Some(&msg),
                     ) {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     }
                 }
             }
@@ -3685,7 +3754,7 @@ unsafe fn jit_cp_alloc_internal_error(vm: &SharedVm, msg: &str) -> i64 {
             "java/lang/InternalError",
             Some(msg),
         ) {
-            set_jit_pending_exception(exc);
+            set_jit_pending_exception(thread, exc);
         }
     }
     0
@@ -3703,7 +3772,7 @@ fn jit_cp_alloc_stash_failure(
 ) -> i64 {
     use crate::error::MethodCallFailed;
     match err {
-        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(exc),
+        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(thread, exc),
         MethodCallFailed::InternalError(vm_err) => {
             let msg = format!("{context}: {vm_err}");
             if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
@@ -3712,7 +3781,7 @@ fn jit_cp_alloc_stash_failure(
                 "java/lang/InternalError",
                 Some(&msg),
             ) {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
             }
         }
     }
@@ -3846,7 +3915,7 @@ unsafe fn jit_resolve_cp_class(
                     "java/lang/IllegalAccessError",
                     Some(&message),
                 ) {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                 }
             }
             return Err(0);
@@ -4096,12 +4165,12 @@ fn stash_jit_monitor_error(
 ) {
     use crate::error::{MethodCallFailed, VmError};
     match err {
-        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(exc),
+        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(thread, exc),
         MethodCallFailed::InternalError(VmError::Runtime(runtime)) => {
             if let MethodCallFailed::ExceptionThrown(exc) =
                 crate::runtime::exceptions::throw_runtime_error(vm, thread, runtime)
             {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
             }
         }
         MethodCallFailed::InternalError(other) => {
@@ -4111,7 +4180,7 @@ fn stash_jit_monitor_error(
                 "java/lang/InternalError",
                 Some(&format!("JIT monitor operation failed: {other}")),
             ) {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
             }
         }
     }
@@ -4539,7 +4608,7 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
                     "java/lang/ArrayStoreException",
                     Some(&elem_cls),
                 ) {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                     return;
                 }
             }
@@ -5503,7 +5572,7 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
                 use crate::error::MethodCallFailed;
                 match err {
                     MethodCallFailed::ExceptionThrown(exc) => {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     }
                     MethodCallFailed::InternalError(vm_err) => {
                         let msg = format!(
@@ -5515,7 +5584,7 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
                             "java/lang/InternalError",
                             Some(&msg),
                         ) {
-                            set_jit_pending_exception(exc);
+                            set_jit_pending_exception(thread, exc);
                         }
                     }
                 }
@@ -5762,7 +5831,7 @@ unsafe fn jit_putstatic_class_init_guard(vm: &SharedVm, class_id_raw: i64) -> Op
             use crate::error::MethodCallFailed;
             match err {
                 MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                 }
                 MethodCallFailed::InternalError(vm_err) => {
                     let msg = format!(
@@ -5774,7 +5843,7 @@ unsafe fn jit_putstatic_class_init_guard(vm: &SharedVm, class_id_raw: i64) -> Op
                         "java/lang/InternalError",
                         Some(&msg),
                     ) {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     }
                 }
             }
@@ -6605,7 +6674,7 @@ pub unsafe extern "C" fn jit_checkcast(
                 "java/lang/ClassCastException",
                 Some(&msg),
             ) {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
                 return i64::MIN;
             }
         }
@@ -6860,8 +6929,31 @@ pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if exc_ptr == 0 {
         stash_jit_pending_npe();
+    } else if let Some((thread, _guard)) = jit_thread_mut() {
+        // The throwable is stashed on the `JvmThread` so the collector can
+        // both keep it alive and relocate it before the interpreter's drain
+        // reads it back (`docs/known-issues/jit-signals-root-gap.md`).
+        set_jit_pending_exception_with_bci(
+            thread,
+            ObjectRef::from_raw(exc_ptr as usize as *mut u8),
+            bci,
+        );
     } else {
-        set_jit_pending_exception_with_bci(ObjectRef::from_raw(exc_ptr as usize as *mut u8), bci);
+        // Unreachable in a compiled method: `emitted_athrow` forces
+        // `has_dispatch` (`jit/src/x64.rs`), and `has_dispatch` is exactly what
+        // makes `execute_jit_call` install `JIT_THREAD` before entering. If
+        // that ever stops holding, the throwable has nowhere GC-visible to go
+        // and the fast entry path would not drain it either — so say so loudly
+        // in debug rather than silently dropping an exception.
+        debug_assert!(
+            false,
+            "jit_throw_exception with no JIT thread installed: `emitted_athrow` \
+             must force has_dispatch (jit/src/x64.rs)"
+        );
+        // Still record the bci, and let the sentinel propagate exactly as
+        // before; the interpreter treats a sentinel with no signal as a plain
+        // deopt.
+        JIT_SIGNALS.with(|s| s.athrow_bci.set(bci));
     }
     i64::MIN // deopt sentinel — interpreter drains the pending exception
 }
@@ -7335,7 +7427,7 @@ fn raise_jit_stack_overflow(vm: &SharedVm) -> i64 {
             "java/lang/StackOverflowError",
             None,
         ) {
-            set_jit_pending_exception(exc);
+            set_jit_pending_exception(thread, exc);
         }
     }
     i64::MIN
@@ -7441,7 +7533,7 @@ fn handle_jit_dispatch_error(
     use crate::error::{ClassFileError, MethodCallFailed, RuntimeError, VmError};
     match err {
         MethodCallFailed::ExceptionThrown(exc) => {
-            set_jit_pending_exception(exc);
+            set_jit_pending_exception(thread, exc);
         }
         // A native callee that returns `Err(RuntimeError::X)` is, by the
         // exception model, asking the VM to throw the Java exception that
@@ -7475,7 +7567,7 @@ fn handle_jit_dispatch_error(
         {
             match crate::runtime::exceptions::throw_runtime_error(vm, thread, rt_err) {
                 MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                 }
                 MethodCallFailed::InternalError(vm_err2) => {
                     // Exception-object construction failed — fall back to
@@ -7491,7 +7583,7 @@ fn handle_jit_dispatch_error(
                         "java/lang/InternalError",
                         Some(&msg),
                     ) {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     }
                 }
             }
@@ -7517,7 +7609,7 @@ fn handle_jit_dispatch_error(
                 crate::runtime::exceptions::throw_linkage_error(vm, thread, linkage_err);
             match converted {
                 MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(exc);
+                    set_jit_pending_exception(thread, exc);
                 }
                 MethodCallFailed::InternalError(vm_err2) => {
                     let msg = format!(
@@ -7530,7 +7622,7 @@ fn handle_jit_dispatch_error(
                         "java/lang/InternalError",
                         Some(&msg),
                     ) {
-                        set_jit_pending_exception(exc);
+                        set_jit_pending_exception(thread, exc);
                     }
                 }
             }
@@ -7556,7 +7648,7 @@ fn handle_jit_dispatch_error(
                 "java/lang/NoClassDefFoundError",
                 Some(class_name),
             ) {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
             }
         }
         MethodCallFailed::InternalError(vm_err) => {
@@ -7577,14 +7669,19 @@ fn handle_jit_dispatch_error(
                 "java/lang/InternalError",
                 Some(&msg),
             ) {
-                set_jit_pending_exception(exc);
+                set_jit_pending_exception(thread, exc);
             }
         }
     }
     // Return the deopt sentinel iff a pending exception was actually
     // stashed; otherwise `0` (legacy silent-drop — exception construction
     // itself failed, nothing for the caller to route).
-    if jit_pending_exception_is_set() {
+    //
+    // Read the field through `thread` rather than `jit_pending_exception_is_set()`:
+    // that helper resolves the thread from the raw `JIT_THREAD` pointer, and we
+    // are holding a live `&mut JvmThread` for the same thread, so going through
+    // the pointer here would manufacture an aliasing reference for no reason.
+    if thread.jit_pending_exception.is_some() {
         i64::MIN
     } else {
         0
@@ -11293,6 +11390,130 @@ mod tests {
         MEMO_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    // -----------------------------------------------------------------------
+    // The pending JIT exception is thread-resident, not TLS-resident
+    // (docs/known-issues/jit-signals-root-gap.md)
+    // -----------------------------------------------------------------------
+
+    fn scratch_thread(id: u64) -> JvmThread {
+        use crate::threading::jvm_thread::ThreadId;
+        JvmThread::new(ThreadId(id), "jit-signals-test")
+    }
+
+    /// Clear this test thread's TLS signal block so a test never inherits the
+    /// scalar flags of whichever test ran before it on the same OS thread
+    /// (libtest may reuse one under `--test-threads=1`).
+    fn reset_tls_signals() {
+        let mut scratch = scratch_thread(u64::MAX);
+        let _ = take_all_jit_signals(&mut scratch);
+    }
+
+    /// A throwable stashed for thread A must be reachable **through A's
+    /// `JvmThread`** — that is the whole point of the move, because a
+    /// `thread_local!` is invisible to the collector's root scan and post-move
+    /// fixup. Draining a different thread must not see it.
+    #[test]
+    fn a_stashed_jit_exception_is_reachable_through_the_thread_it_belongs_to() {
+        reset_tls_signals();
+        // SAFETY: an aligned, non-null address that is never dereferenced —
+        // the signal plumbing only moves the `ObjectRef` around.
+        let exc = unsafe { ObjectRef::from_raw(0x4000usize as *mut u8) };
+        let mut a = scratch_thread(1);
+        let mut b = scratch_thread(2);
+
+        set_jit_pending_exception(&mut a, exc);
+
+        assert_eq!(
+            a.jit_pending_exception.map(|o| o.as_ptr() as usize),
+            Some(0x4000),
+            "the stash must land in the GC-rooted `JvmThread` slot; if this is \
+             None the reference has gone back into a thread-local and is \
+             unrooted again"
+        );
+        assert!(
+            b.jit_pending_exception.is_none(),
+            "another thread's slot must stay empty"
+        );
+
+        // The drain is per-thread and consuming.
+        assert!(
+            take_all_jit_signals(&mut b).exception.is_none(),
+            "draining B must not steal A's pending exception"
+        );
+        assert_eq!(
+            take_all_jit_signals(&mut a)
+                .exception
+                .map(|o| o.as_ptr() as usize),
+            Some(0x4000)
+        );
+        assert!(
+            a.jit_pending_exception.is_none(),
+            "the drain must consume the slot"
+        );
+    }
+
+    /// `take_jit_pending_exception` is the interpreter's other drain door; it
+    /// must consume the same slot.
+    #[test]
+    fn take_jit_pending_exception_consumes_the_thread_slot() {
+        reset_tls_signals();
+        // SAFETY: never dereferenced.
+        let exc = unsafe { ObjectRef::from_raw(0x4100usize as *mut u8) };
+        let mut t = scratch_thread(3);
+
+        stash_jit_pending_exception(&mut t, exc);
+        assert_eq!(
+            take_jit_pending_exception(&mut t).map(|o| o.as_ptr() as usize),
+            Some(0x4100)
+        );
+        assert!(take_jit_pending_exception(&mut t).is_none());
+    }
+
+    /// The RBC.6 `athrow_bci` stays in TLS (it is a scalar the collector has no
+    /// interest in) but must still travel with the thread-resident throwable
+    /// through one drain, and reset afterwards.
+    #[test]
+    fn the_athrow_bci_still_pairs_with_the_thread_resident_exception() {
+        reset_tls_signals();
+        // SAFETY: never dereferenced.
+        let exc = unsafe { ObjectRef::from_raw(0x4200usize as *mut u8) };
+        let mut t = scratch_thread(4);
+
+        set_jit_pending_exception_with_bci(&mut t, exc, 17);
+        assert_eq!(peek_jit_athrow_bci(), 17);
+
+        let drained = take_all_jit_signals(&mut t);
+        assert_eq!(
+            drained.exception.map(|o| o.as_ptr() as usize),
+            Some(0x4200)
+        );
+        assert_eq!(drained.athrow_bci, 17);
+        assert_eq!(
+            peek_jit_athrow_bci(),
+            -1,
+            "the drain must reset the bci so it cannot leak onto the next \
+             unrelated exception"
+        );
+
+        // The general setter always clears the bci back to "unknown".
+        set_jit_pending_exception(&mut t, exc);
+        assert_eq!(peek_jit_athrow_bci(), -1);
+        let _ = take_all_jit_signals(&mut t);
+    }
+
+    /// `jit_pending_exception_is_set` resolves the thread through the raw
+    /// `JIT_THREAD` pointer. With no JIT thread installed (this test thread
+    /// never enters compiled code) it must answer "nothing pending" rather
+    /// than dereference null.
+    #[test]
+    fn the_pending_exception_peek_is_null_safe_without_a_jit_thread() {
+        // Establish the premise rather than assuming it: another test may have
+        // run on this OS thread first.
+        clear_jit_thread();
+        assert!(current_jit_thread_ptr().is_null());
+        assert!(!jit_pending_exception_is_set());
+    }
+
     #[test]
     fn jit_site_key_separates_vm_identities() {
         let info_ptr = &INTEGER_VALUE_OF_INFO as *const JitInvokeInfo as usize;
@@ -13047,7 +13268,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
             .and_then(|shared| shared.mem.heap.jit_card_table_info())
             .unwrap_or((0, 0, 0));
 
-    JitRuntimeHelpers {
+    let helpers = JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,
         new_object: jit_new_object as *const () as usize,
         anewarray_object: jit_anewarray_object as *const () as usize,
@@ -13186,8 +13407,148 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         jit_card_table_addr,
         jit_card_old_base,
         jit_card_old_end,
+    };
+
+    // Actually run the validator this table has always shipped with.
+    //
+    // `JitRuntimeHelpers::validate_abi` checks the ABI revision, the struct
+    // size, that every `required` slot is non-zero, and that every `Offset`
+    // slot is a plausible displacement — and until now it had **no callers
+    // outside `jit-api`'s own tests** (`docs/jit/helper-abi-audit.md` §4). A
+    // zeroed required slot therefore left the producer silently and surfaced
+    // as a `CALL 0` from RWX memory somewhere downstream, with the crash
+    // pointing at the JIT backend rather than at the one line here that failed
+    // to wire a helper.
+    //
+    // Panicking is the correct severity: every required slot is an
+    // unconditional `f as *const () as usize` of a function that exists in this
+    // binary, so a failure is a build-integrity problem, not a runtime
+    // condition — there is no degraded mode to fall back to, and continuing
+    // means compiling machine code around a null pointer. The optional slots
+    // (`safepoint_flag_addr`, `frame_record`, `region_bounds_addr`, the card
+    // table triple) are legitimately zero when their mechanism is off or when
+    // `process_vm()` is not yet published, and `validate_abi` does not require
+    // them, so a VM-less `build_helpers()` still passes.
+    //
+    // The hand-built tables in `jit/tests/*` and `jit/src/x64.rs`'s
+    // `test_helpers()` do NOT reach this: they construct `JitRuntimeHelpers`
+    // literals directly and never call `build_helpers`, which is defined only
+    // here.
+    if let Err(e) = helpers.validate_abi() {
+        panic!("JIT helper table is not usable: {e}");
     }
+    helpers
 }
+
+// ---------------------------------------------------------------------------
+// Helper-slot signature checks (`docs/jit/helper-abi-audit.md` §4)
+// ---------------------------------------------------------------------------
+//
+// `build_helpers` above stores every callable slot as
+// `jit_foo as *const () as usize`. That cast type-checks against **nothing**:
+// any `extern "C"` function of any arity, argument width or return type casts
+// to `*const ()` just as cleanly, so the signatures declared in `jit-api`'s
+// `helper_fn_slots!` — which are what the backends bake call sequences from —
+// were never compared against the functions actually installed. A helper that
+// grew a parameter, or whose return went from `i64` to `()`, would compile
+// fine on both sides and go wrong only in generated machine code.
+//
+// Each line below binds one helper to its declared alias. A fn item coerces to
+// a fn-pointer type only when its `extern`-ness, arity, argument types and
+// return type all match, so a divergence is a compile error naming the exact
+// slot. `const _` blocks emit no code and cost nothing at run time.
+//
+// Deliberately NOT in `build_helpers`: keeping the checks out of the function
+// leaves the (already long) table literal untouched and lets the list be read
+// as a census.
+//
+// NOTE — `get_current_thread` is absent, and cannot be added as-is. Its alias
+// is declared `() -> *mut c_void` while `jit_get_current_thread` returns
+// `*mut JvmThread`. The two are ABI-identical (both are thin pointers in RAX)
+// which is why the raw cast has always "worked", but fn-pointer types are
+// invariant in their return type, so the coercion below cannot express it and
+// no cast can either. Reconciling that needs a one-word change in `jit-api`'s
+// `helper_fn_slots!` row — see this lane's report.
+const _: () = {
+    use cratonvm_jit_api::helpers_abi::*;
+
+    // Allocation.
+    let _: HelperFnNewarray = jit_newarray;
+    let _: HelperFnNewObject = jit_new_object;
+    let _: HelperFnAnewarrayObject = jit_anewarray_object;
+    let _: HelperFnNewObjectCp = jit_new_object_cp;
+    let _: HelperFnAnewarrayObjectCp = jit_anewarray_object_cp;
+    let _: HelperFnMultianewarray2d = jit_multianewarray_2d;
+    let _: HelperFnTlabPostInit = jit_post_tlab_init;
+
+    // Monitors.
+    let _: HelperFnMonitorEnter = jit_monitor_enter;
+    let _: HelperFnMonitorExit = jit_monitor_exit;
+
+    // Array access.
+    let _: HelperFnBaload = jit_baload;
+    let _: HelperFnBastore = jit_bastore;
+    let _: HelperFnIaload = jit_iaload;
+    let _: HelperFnIastore = jit_iastore;
+    let _: HelperFnAaload = jit_aaload;
+    let _: HelperFnAastore = jit_aastore;
+    let _: HelperFnArraylength = jit_arraylength;
+
+    // Instance fields.
+    let _: HelperFnGetfield = jit_getfield;
+    let _: HelperFnPutfieldInt = jit_putfield_int;
+    let _: HelperFnPutfieldLong = jit_putfield_long;
+    let _: HelperFnPutfieldFloat = jit_putfield_float;
+    let _: HelperFnPutfieldDouble = jit_putfield_double;
+    let _: HelperFnPutfieldObject = jit_putfield_object;
+
+    // Statics.
+    let _: HelperFnGetstatic = jit_getstatic;
+    let _: HelperFnPutstaticInt = jit_putstatic_int;
+    let _: HelperFnPutstaticLong = jit_putstatic_long;
+    let _: HelperFnPutstaticFloat = jit_putstatic_float;
+    let _: HelperFnPutstaticDouble = jit_putstatic_double;
+    let _: HelperFnPutstaticObject = jit_putstatic_object;
+
+    // Type checks.
+    let _: HelperFnCheckcast = jit_checkcast;
+    let _: HelperFnInstanceofCheck = jit_instanceof;
+
+    // Implicit exceptions and the out-of-band signal plumbing.
+    let _: HelperFnThrowAioobe = jit_throw_aioobe;
+    let _: HelperFnThrowArithmetic = jit_throw_arithmetic;
+    let _: HelperFnThrowException = jit_throw_exception;
+    let _: HelperFnSetThrowBci = jit_set_throw_bci;
+    let _: HelperFnJitNpeWithAction = jit_npe_with_action;
+    let _: HelperFnDispatchThrew = jit_dispatch_threw;
+
+    // Invocation and deopt.
+    let _: HelperFnInvokeDispatch = jit_invoke_dispatch;
+    let _: HelperFnInvokeVirtualMic = jit_invoke_virtual_mic;
+    let _: HelperFnServiceCalleeDeopt = jit_service_callee_deopt;
+    let _: HelperFnUncommonTrap = jit_uncommon_trap;
+    let _: HelperFnLambdaIntToDouble = jit_lambda_int_to_double;
+
+    // GC barriers.
+    let _: HelperFnWriteBarrier = jit_write_barrier;
+    let _: HelperFnSatbPreWriteBarrier = jit_satb_pre_write_barrier;
+
+    // Floating point.
+    let _: HelperFnMathFmaDouble = jit_math_fma_double;
+    let _: HelperFnMathFmaFloat = jit_math_fma_float;
+    let _: HelperFnJitFrem = jit_frem;
+    let _: HelperFnJitDrem = jit_drem;
+
+    // Stack guards, precise maps, strings, safepoints.
+    let _: HelperFnSelfCallStackGuard = jit_self_call_stack_guard;
+    let _: HelperFnNativeStackFloor = jit_native_stack_floor;
+    // Both candidates for the one `frame_record` slot — `build_helpers`
+    // chooses between them at run time, so both must match the alias.
+    let _: HelperFnFrameRecord = jit_frame_record;
+    let _: HelperFnFrameRecord = jit_verify_inline_frame_record;
+    let _: HelperFnLdcString = jit_ldc_string;
+    let _: HelperFnSafepointSlowPath = jit_safepoint_slow_path;
+};
 
 /// GC-safe materialization for a compiled `ldc "..."` instruction.
 ///
