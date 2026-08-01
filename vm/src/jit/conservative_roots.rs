@@ -639,14 +639,14 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         n
     });
     GLOBAL_JIT_DEPTH.inc();
-    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
-    // this is the ONLY point at which a thread becomes
-    // `CompiledUninterruptible`. A nested entry re-records the same state,
-    // which the recorder treats as the counting event it is (self-edges are
-    // legal) rather than a transition.
-    thread_state::record_transition(
-        ThreadExecState::CompiledUninterruptible,
-        "jit::conservative_roots::push_entry_full",
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // this is the ONLY point at which a thread becomes
+    // `CompiledUninterruptible`. A nested entry re-records the same state,
+    // which the recorder treats as the counting event it is (self-edges are
+    // legal) rather than a transition.
+    thread_state::record_transition(
+        ThreadExecState::CompiledUninterruptible,
+        "jit::conservative_roots::push_entry_full",
     );
     cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
@@ -716,12 +716,22 @@ pub fn pop_jit_entry() -> Option<usize> {
     });
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.dec();
-        thread_state::record_transition(
-            leaving_compiled_state(remaining),
-            "jit::conservative_roots::pop_jit_entry",
+        thread_state::record_transition(
+            leaving_compiled_state(remaining),
+            "jit::conservative_roots::pop_jit_entry",
         );
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
+        // P1 code-cache retirement: leaving a compiled frame is one of the two
+        // moments `GLOBAL_JIT_DEPTH` can reach zero, and therefore one of the
+        // two moments an unpublished body can become reclaimable. The sweep
+        // asks the quiescence question itself (with the retirement queue lock
+        // held — see `code_cache_lifecycle`'s §1.2); all this site owes it is
+        // the wake-up. The gate is one relaxed load, and with nothing queued —
+        // the overwhelmingly common case — that is the whole cost.
+        if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
+            crate::jit::code_cache_lifecycle::sweep_if_quiescent();
+        }
         Some(entry.entry_sp)
     } else {
         None
@@ -812,6 +822,15 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
             pruned,
             scanner_sp,
         );
+        // P1 code-cache retirement: the self-heal is the OTHER way
+        // `GLOBAL_JIT_DEPTH` reaches zero. Without this wake-up a leaked
+        // `JitEntryGuard` would wedge the retirement queue exactly as it used
+        // to wedge the moving collector — and because retention is the
+        // fail-safe, that would show up as unbounded code-cache growth rather
+        // than as a crash. See `code_cache_lifecycle`'s §1.3.
+        if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
+            crate::jit::code_cache_lifecycle::sweep_if_quiescent();
+        }
     }
     pruned
 }

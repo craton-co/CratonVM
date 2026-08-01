@@ -24031,7 +24031,15 @@ pub(super) fn adapt_isin_seen() -> bool {
 /// Besides the symbolic names and parameter count, this stores the exact
 /// native callback/category for the symbolic owner. The registry hash is paid
 /// once per resolved CP entry, not once per call site that consumes it.
-pub(super) fn resolve_method_metadata(
+///
+/// **This is the resolution core, not the public entry point.** New callers
+/// outside `crate::runtime::interpreter` go through
+/// [`crate::runtime::resolve::MemberResolver::method_ref`], which tags the
+/// answer with the VM that produced it and converts failures into the
+/// structured [`crate::runtime::resolve::ResolveError`]. It is `pub(crate)`
+/// only so that `MemberResolver` can delegate here; `runtime::resolve::guard`
+/// fails the build if anything else names it.
+pub(crate) fn resolve_method_metadata(
     shared: &SharedVm,
     current_class_id: ClassId,
     cp_index: u16,
@@ -24104,12 +24112,27 @@ pub(super) fn resolve_method_metadata(
         ADAPT_ISIN_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Module access check (JPMS §5.4.4): verify accessor can reach the target class's module.
+    // Module access check (JPMS §5.4.4): verify accessor can reach the target
+    // class's module.
+    //
+    // C2 P0 — routed through `runtime::resolve::MemberResolver`, the one
+    // access-control entry point in `vm/src/runtime/`. `MemberFlags::OwnerOnly`
+    // + `AccessPolicy::ModuleOnly` is the exact shape of what this call has
+    // always been: at this point the hierarchy walk has not happened, so there
+    // is no declaring method and no method flags to check — only the owner
+    // class the constant pool names. That is also why the member half of JVMS
+    // §5.4.4 is not enforced on this path; see
+    // `classloading::access_control`'s module docs. Unchanged behaviour,
+    // named policy.
     if let Some(target_id) = cm.get_loaded_class_id(&class_name) {
-        crate::classloading::access_control::check_module_access_by_id(
-            current_class_id,
-            target_id,
+        let resolver = crate::runtime::resolve::MemberResolver::new(shared);
+        let _grant = resolver.check_member_access(
             &cm,
+            resolver.scope(current_class_id),
+            resolver.scope(target_id),
+            crate::runtime::resolve::MemberFlags::OwnerOnly,
+            None,
+            crate::runtime::resolve::AccessPolicy::ModuleOnly,
         )?;
     }
 

@@ -2589,3 +2589,1953 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
     }
     true
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Loop transforms — peeling and unrolling (bytecode → bytecode)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// ## The transform
+//
+// A bytecode-to-bytecode rewriter that duplicates a natural loop's body,
+// plus the analyses that decide whether duplicating it is legal at all.
+// Peeling and unrolling share one rewriter because the two outputs are
+// byte-identical except for the back edge's target:
+//
+// ```text
+//     original          peel(k)                unroll(k)
+//     ────────          ───────                ─────────
+//     H: body           H: body    (copy 0)    H: body    (copy 0)
+//        goto H            …                      …
+//                          body    (copy k-1)     body    (copy k-1)
+//                       S: body    (copy k)    S: body    (copy k)
+//                          goto S                 goto H
+// ```
+//
+// Peel's back edge targets the LAST copy, so copies `0..k-1` run exactly
+// once and the steady-state loop is copy `k`. Unroll's targets the FIRST,
+// so all `k+1` copies run on every trip. Nothing else differs — same byte
+// layout, same provenance map, same refusal set.
+//
+// Every copy carries the body's own exit branches, so the transform needs
+// **no trip-count precondition**: a copy whose exit test fires leaves the
+// loop from the middle of the unrolled group exactly as the original would
+// have left it from the middle of the sequence. Trip counts 0 and 1 are not
+// special cases — with trip 0 the first copy's exit test fires before any
+// body effect, which is the same instruction the original would have run.
+//
+// ## Preconditions (each is a refusal, never a guess)
+//
+//  1. The back edge is an unconditional `goto` whose target is the header
+//     ([`LoopXformRefusal::ConditionalBackEdge`] / `NotABackEdge`). A
+//     `do { } while` back edge is a conditional whose test would have to be
+//     replicated at the end of every copy; that is a different rewriter, and
+//     duplicating a `do`-body *without* its test would run the body `k+1`
+//     times per test. The existing x86-64 byte-copy unroller has the same
+//     precondition (`x64.rs`: `if code[back_edge] != 0xa7 { return None }`).
+//  2. The header dominates every instruction in `[header, back_edge_end)`
+//     ([`LoopXformRefusal::Irreducible`]). This is the textbook reducibility
+//     condition for this loop, and it subsumes the "branch from outside into
+//     the middle of the body" shape that
+//     [`find_bypassable_loop_headers`] was written for: an entry that skips
+//     the header is exactly an instruction the header does not dominate.
+//     An explicit edge scan reports that case as `ExternalEntry` first,
+//     purely for a better diagnostic.
+//  3. Every cycle strictly inside the body is itself reducible
+//     ([`LoopXformRefusal::IrreducibleInnerLoop`]). Duplication would in fact
+//     preserve an irreducible inner cycle's semantics — the copy is a
+//     relabelling — but every downstream consumer (loop detection, LICM,
+//     OSR entry selection) assumes reducibility, so we refuse rather than
+//     hand them a second irreducible nest.
+//  4. Every instruction in the region is reachable from method entry
+//     ([`LoopXformRefusal::UnreachableInRegion`]) — an unreachable
+//     instruction has no dominator and cannot be reasoned about.
+//  5. No `jsr` / `ret` / `jsr_w` / `goto_w` anywhere in the method
+//     ([`LoopXformRefusal::OpaqueControlFlow`]): the first two have
+//     successors that are not statically known, and `goto_w` is a backward
+//     branch the emitter does **not** poll (see the poll argument below).
+//  6. No `tableswitch` / `lookupswitch` anywhere in the method
+//     ([`LoopXformRefusal::SwitchInMethod`]). Their 4-byte operand alignment
+//     is a function of their own PC, so shifting code changes their *length*,
+//     not just their offsets. Conservative and documented; lifting it means
+//     re-padding and re-encoding every switch, which is a separate change.
+//  7. No branch inside the region targets the back-edge instruction itself
+//     ([`LoopXformRefusal::BranchToBackEdge`]) — the back edge exists in the
+//     last copy only, so such an edge has no image in copies `0..k-1`.
+//     (A `continue` written as a branch to the *header* is fine and is
+//     relocated to the next copy; that is javac's `while`-loop shape.)
+//  8. No exception handler lands in the region, and no protected range
+//     partially overlaps it (`HandlerInRegion` /
+//     `HandlerRangeStraddlesRegion`). A range that *encloses* the region is
+//     fine and is widened to cover the copies.
+//  9. Every rewritten branch offset still fits the 2-byte signed field
+//     ([`LoopXformRefusal::OffsetOverflow`]). We refuse rather than widen to
+//     `goto_w`, which would silently drop a safepoint poll (see below).
+//
+// ## Safepoint polls — why they survive
+//
+// The x86-64 emitter's rule is uniform and PC-local: at `ifeq..if_acmpne`
+// (`0x99..=0xa6`), `goto` (`0xa7`), `tableswitch`/`lookupswitch`
+// (`0xaa`/`0xab`) and `ifnull`/`ifnonnull` (`0xc6`/`0xc7`), if any decoded
+// target is `<= pc` it emits [`emit_safepoint_poll`] *before* the compare and
+// branch, so the poll runs whether or not the branch is taken.
+// [`poll_bearing_opcode`] is that opcode set, transcribed. `goto_w`/`jsr_w`
+// are absent from it — they are rejected by `jit_scan` today, and a rewriter
+// that introduced one would introduce an unpolled backward branch.
+//
+// That gives a structural theorem:
+//
+// > In a linear bytecode CFG every edge is either a fall-through or a branch,
+// > and every fall-through strictly increases the PC. So every cycle contains
+// > at least one edge whose target is `<= ` its source, i.e. at least one
+// > backward branch. If every backward branch in the method sits at a
+// > poll-bearing opcode, every cycle is polled.
+//
+// [`all_backward_edges_are_polled`] checks exactly that antecedent, and the
+// rewriter runs it **on its own output** before returning: a transform that
+// somehow produced a poll-free cycle refuses instead of publishing itself.
+// The check is not vacuous — it fails on a backward `goto_w`, on `jsr`/`ret`,
+// and on a malformed branch.
+//
+// Per transform:
+//
+// * **Peel** does not touch the loop: the steady-state copy still ends in the
+//   same `goto`, so the poll happens once per trip exactly as before. The
+//   peeled copies execute once each, ahead of the loop, and add
+//   `k * body_len` bytecodes to the one-shot span between the method-entry
+//   poll ([`emit_safepoint_poll_prologue`]) and the first back-edge poll.
+// * **Unroll** keeps one back edge for `k+1` bodies, so the *steady-state*
+//   time-to-safepoint grows by the unroll factor. It stays bounded because
+//   both factors are bounded: `body_len <= LOOP_XFORM_MAX_BODY_BYTES` and
+//   `k+1 <= LOOP_XFORM_MAX_COPIES + 1`, and the product is re-checked against
+//   [`LOOP_XFORM_MAX_POLL_FREE_BYTES`] per call.
+//
+// `LoopXform::poll_free_bytes` records the worst-case poll-free span
+// (`(k+1) * body_len`) for both, which is the steady-state figure for unroll
+// and the one-shot prefix for peel. It is an upper bound on straight-line
+// bytecodes, not a cycle count: a body containing an inner loop polls inside
+// that inner loop too.
+//
+// ## Deopt, OSR and provenance
+//
+// `LoopXform::bci_of` maps **every byte** of the output to the original
+// bytecode index it was copied from — the prefix and suffix map to
+// themselves, and each copy of the body maps back to the one original body.
+// Two facts make that enough to reconstruct an interpreter frame from any
+// point in a transformed loop:
+//
+//  * the rewriter copies bytes and rewrites branch *offsets* only, so no
+//    local index and no operand-stack shape is ever renamed or reordered;
+//  * every copy is entered with the same abstract state the original body is
+//    entered with, because the copies are laid out in execution order.
+//
+// So the interpreter state at output PC `p` equals the state the original
+// method had at `bci_of[p]` on the corresponding iteration, and a deopt maps
+// through `bci_of` with the frame already correct. The test
+// `deopt_into_a_transformed_loop_resolves_its_locals` asserts the strong form
+// of this: the *entire* `(bci, locals)` step sequence of the transformed run
+// is equal to the original's.
+//
+// The reverse map is one-to-many, which is the OSR hazard: a bci inside the
+// region has `k+1` images. [`LoopXform::osr_entry_pc`] returns the
+// steady-state one — copy `k` for peel, copy `0` for unroll. Entering a
+// *peeled* copy from OSR would re-run the peeled iterations and execute the
+// loop `k` times too many. This is the same class of bug as the LICM
+// pre-header bypass (an entry edge that lands on the wrong side of
+// duplicated code), so it is answered here explicitly rather than left to
+// the consumer.
+//
+// ## Composition with LICM and the pre-header bypass fix
+//
+// The transform is a *source-to-source* rewrite that runs before loop
+// detection, so `detect_loops`, `find_arith_loop_hoists`,
+// `find_bypassable_loop_headers` and the speculative-BCE guards all re-run on
+// the transformed bytecode and see a consistent CFG. Nothing here needs to
+// know about hoist slots, and the pre-header bypass guard keeps working
+// unchanged. Peeling in fact *removes* bypassability of the steady-state
+// loop: after peel(k) the only edge into copy `k` is the fall-through from
+// copy `k-1` and the back edge, both internal, so a hoist the guard had to
+// drop before can be kept. `peeled_loop_is_not_bypassable` pins that.
+
+/// Largest loop body (in bytecodes) either transform will duplicate.
+#[allow(dead_code)]
+pub(super) const LOOP_XFORM_MAX_BODY_BYTES: usize = 256;
+
+/// Largest number of EXTRA body copies (`k`) either transform will make.
+#[allow(dead_code)]
+pub(super) const LOOP_XFORM_MAX_COPIES: usize = 7;
+
+/// Time-to-safepoint budget: the largest poll-free straight-line span, in
+/// bytecodes, a transform may leave behind. See the poll argument above.
+#[allow(dead_code)]
+pub(super) const LOOP_XFORM_MAX_POLL_FREE_BYTES: usize = 1024;
+
+/// `true` when the x86-64 emitter emits a cooperative safepoint poll at an
+/// instruction of this opcode *whose branch target is backward*.
+///
+/// Transcribed from the emitter's `if target_pc <= pc { self.emit_safepoint_poll(); }`
+/// sites in `x64.rs` — the `ifeq..ifle`, `if_icmpeq..if_icmple`,
+/// `if_acmpeq/ne`, `goto`, `tableswitch`, `lookupswitch`, `ifnull` and
+/// `ifnonnull` arms. `goto_w`/`jsr_w`/`jsr`/`ret` are deliberately absent:
+/// the emitter has no poll for them (they are rejected by `jit_scan`), so a
+/// backward one would be an unpolled cycle.
+#[allow(dead_code)]
+pub(super) fn poll_bearing_opcode(op: u8) -> bool {
+    matches!(op, 0x99..=0xa7 | 0xaa | 0xab | 0xc6 | 0xc7)
+}
+
+/// `true` when an opcode's fall-through successor exists (i.e. control can
+/// reach the next instruction in linear order).
+#[allow(dead_code)]
+pub(super) fn opcode_falls_through(op: u8) -> bool {
+    !matches!(op, 0xa7 | 0xa9 | 0xaa | 0xab | 0xac..=0xb1 | 0xbf | 0xc8)
+}
+
+/// Decode the explicit branch targets of the instruction at `pc` into `out`
+/// (the fall-through successor is NOT included).
+///
+/// Returns `false` — meaning *refuse* — when the successor set is not
+/// statically known (`jsr`/`jsr_w`/`ret`) or the encoding is malformed or
+/// points outside `[0, code_len)`. Callers must treat `false` as opaque, not
+/// as "no targets": guessing here is how a transform loses an edge.
+#[allow(dead_code)]
+pub(super) fn branch_targets_at(
+    code: &[u8],
+    pc: usize,
+    code_len: usize,
+    out: &mut Vec<usize>,
+) -> bool {
+    if code_len > code.len() || pc >= code_len {
+        return false;
+    }
+    // Cast: pc/target to isize for signed branch-displacement arithmetic.
+    let push_t = |off: isize, out: &mut Vec<usize>| -> bool {
+        let t = pc as isize + off;
+        if t < 0 || t as usize >= code_len {
+            return false;
+        }
+        out.push(t as usize); // Cast: non-negative index to usize
+        true
+    };
+    match code[pc] {
+        // `jsr`/`jsr_w` push a return address that a `ret` later consumes out
+        // of a local: neither end of that pair has statically known
+        // successors here.
+        0xa8 | 0xa9 | 0xc9 => false,
+        0x99..=0xa7 | 0xc6 | 0xc7 => {
+            if pc + 2 >= code_len {
+                return false;
+            }
+            // Cast: signed branch displacement to isize
+            let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+            push_t(off, out)
+        }
+        0xc8 => {
+            if pc + 4 >= code_len {
+                return false;
+            }
+            let off =
+                i32::from_be_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]])
+                    // Cast: signed branch displacement to isize
+                    as isize;
+            push_t(off, out)
+        }
+        0xaa => {
+            let mut p = pc + 1;
+            while p % 4 != 0 {
+                p += 1;
+            }
+            if p + 12 > code_len {
+                return false;
+            }
+            let rd = |at: usize| -> isize {
+                // Cast: signed branch displacement to isize
+                i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
+            };
+            if !push_t(rd(p), out) {
+                return false;
+            }
+            // Cast: table bound to i32
+            let low = rd(p + 4) as i32;
+            // Cast: table bound to i32
+            let high = rd(p + 8) as i32;
+            let count = match checked_tableswitch_count(low, high) {
+                Some(c) => c,
+                None => return false,
+            };
+            let mut jp = p + 12;
+            for _ in 0..count {
+                if jp + 4 > code_len {
+                    return false;
+                }
+                if !push_t(rd(jp), out) {
+                    return false;
+                }
+                jp += 4;
+            }
+            true
+        }
+        0xab => {
+            let mut p = pc + 1;
+            while p % 4 != 0 {
+                p += 1;
+            }
+            if p + 8 > code_len {
+                return false;
+            }
+            let rd = |at: usize| -> isize {
+                // Cast: signed branch displacement to isize
+                i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
+            };
+            if !push_t(rd(p), out) {
+                return false;
+            }
+            let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
+            if npairs < 0 {
+                return false;
+            }
+            // Cast: non-negative count to usize
+            let npairs = npairs as usize;
+            let mut jp = p + 8;
+            for _ in 0..npairs {
+                if jp + 8 > code_len {
+                    return false;
+                }
+                // A pair is (match:i32, offset:i32); the offset is at jp + 4.
+                if !push_t(rd(jp + 4), out) {
+                    return false;
+                }
+                jp += 8;
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+/// `true` when the emitter will emit a cooperative safepoint poll at `pc`.
+#[allow(dead_code)]
+pub(super) fn emits_safepoint_poll_at(code: &[u8], pc: usize, code_len: usize) -> bool {
+    let op = match code.get(pc) {
+        Some(&o) => o,
+        None => return false,
+    };
+    if !poll_bearing_opcode(op) {
+        return false;
+    }
+    let mut targets: Vec<usize> = Vec::new();
+    if !branch_targets_at(code, pc, code_len, &mut targets) {
+        return false;
+    }
+    targets.iter().any(|&t| t <= pc)
+}
+
+/// `true` when EVERY backward branch in the method sits at an opcode the
+/// emitter polls — which, since every cycle in a linear bytecode CFG contains
+/// a backward branch, proves every cycle is polled.
+///
+/// Returns `false` (i.e. "not proven") on opaque or malformed control flow
+/// and on a backward `goto_w`, which the emitter does not poll.
+#[allow(dead_code)]
+pub(super) fn all_backward_edges_are_polled(code: &[u8], code_len: usize) -> bool {
+    if code_len > code.len() {
+        return false;
+    }
+    let mut targets: Vec<usize> = Vec::new();
+    let mut pc = 0usize;
+    while pc < code_len {
+        targets.clear();
+        if !branch_targets_at(code, pc, code_len, &mut targets) {
+            return false;
+        }
+        if targets.iter().any(|&t| t <= pc) && !poll_bearing_opcode(code[pc]) {
+            return false;
+        }
+        let len = bytecode_len_at(code, pc);
+        if len == 0 {
+            return false;
+        }
+        pc += len;
+    }
+    true
+}
+
+/// Sentinel for "no such node" / "unreachable" in [`MethodCfg`].
+const CFG_NONE: usize = usize::MAX;
+
+/// Instruction-granularity control-flow graph of one method, with immediate
+/// dominators.
+///
+/// Built only to answer the questions a loop transform must not guess at: is
+/// this region single-entry, is the loop reducible, is every instruction in
+/// it reachable. Nodes are instruction start PCs in ascending order; node `0`
+/// is the method entry.
+#[allow(dead_code)]
+pub(super) struct MethodCfg {
+    /// Instruction start PCs, ascending. Node `i` is `pcs[i]`.
+    pcs: Vec<usize>,
+    /// `pc` → node index, [`CFG_NONE`] when `pc` is not an instruction start.
+    idx_of: Vec<usize>,
+    /// Reverse-post-order number, [`CFG_NONE`] when unreachable from entry.
+    rpo_num: Vec<usize>,
+    /// Immediate dominator node index, [`CFG_NONE`] when unknown/unreachable.
+    idom: Vec<usize>,
+}
+
+/// Cooper/Harvey/Kennedy `intersect`: walk two dominator-tree paths up until
+/// they meet. Returns [`CFG_NONE`] if either chain is incomplete — the caller
+/// then leaves the dominator unknown, which every query treats as "does not
+/// dominate" (conservative: it can only cause a refusal).
+fn dom_intersect(idom: &[usize], rpo_num: &[usize], a0: usize, b0: usize) -> usize {
+    let (mut a, mut b) = (a0, b0);
+    let limit = idom.len().saturating_mul(2).saturating_add(8);
+    let mut steps = 0usize;
+    while a != b {
+        steps += 1;
+        if steps > limit || a >= rpo_num.len() || b >= rpo_num.len() {
+            return CFG_NONE;
+        }
+        let (ra, rb) = (rpo_num[a], rpo_num[b]);
+        if ra == CFG_NONE || rb == CFG_NONE {
+            return CFG_NONE;
+        }
+        // Reverse-post-order numbers are unique, so `a != b` implies
+        // `ra != rb` and each step strictly decreases `max(ra, rb)`.
+        if ra > rb {
+            let na = idom[a];
+            if na == CFG_NONE || na == a {
+                return CFG_NONE;
+            }
+            a = na;
+        } else {
+            let nb = idom[b];
+            if nb == CFG_NONE || nb == b {
+                return CFG_NONE;
+            }
+            b = nb;
+        }
+    }
+    a
+}
+
+#[allow(dead_code)]
+impl MethodCfg {
+    /// Build the CFG, or `None` when the bytecode cannot be walked exactly
+    /// (a length-table desync), a branch target is not an instruction
+    /// boundary, control flow is opaque (`jsr`/`ret`), or the dominator
+    /// fixpoint did not settle. Every `None` is a refusal.
+    pub(super) fn build(code: &[u8], code_len: usize) -> Option<MethodCfg> {
+        if code_len == 0 || code_len > code.len() {
+            return None;
+        }
+        // Instruction starts, from the same forward walk every other
+        // PC-stepping consumer uses (see `instruction_start_map`).
+        let mut pcs: Vec<usize> = Vec::new();
+        let mut idx_of: Vec<usize> = vec![CFG_NONE; code_len + 1];
+        let mut pc = 0usize;
+        while pc < code_len {
+            idx_of[pc] = pcs.len();
+            pcs.push(pc);
+            let len = bytecode_len_at(code, pc);
+            if len == 0 {
+                return None;
+            }
+            pc += len;
+        }
+        if pc != code_len {
+            // The walk stepped past the end: the length table and this code
+            // disagree, so nothing below can be trusted.
+            return None;
+        }
+
+        let n = pcs.len();
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut targets: Vec<usize> = Vec::new();
+        for i in 0..n {
+            let at = pcs[i];
+            targets.clear();
+            if !branch_targets_at(code, at, code_len, &mut targets) {
+                return None;
+            }
+            for &t in &targets {
+                let ti = idx_of[t];
+                if ti == CFG_NONE {
+                    return None; // target lands mid-instruction
+                }
+                succs[i].push(ti);
+            }
+            if opcode_falls_through(code[at]) {
+                let nxt = at + bytecode_len_at(code, at);
+                if nxt < code_len {
+                    let ni = idx_of[nxt];
+                    if ni == CFG_NONE {
+                        return None;
+                    }
+                    succs[i].push(ni);
+                }
+            }
+        }
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in 0..n {
+            for &s in &succs[i] {
+                preds[s].push(i);
+            }
+        }
+
+        // Reverse post-order from the entry node, iteratively (no recursion:
+        // a deep method must not blow the compiler thread's stack).
+        let mut visited = vec![false; n];
+        let mut post: Vec<usize> = Vec::with_capacity(n);
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        visited[0] = true;
+        stack.push((0, 0));
+        while let Some((node, ci)) = stack.pop() {
+            if ci < succs[node].len() {
+                stack.push((node, ci + 1));
+                let s = succs[node][ci];
+                if !visited[s] {
+                    visited[s] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                post.push(node);
+            }
+        }
+        let mut rpo_num = vec![CFG_NONE; n];
+        let mut order: Vec<usize> = Vec::with_capacity(post.len());
+        for (k, &node) in post.iter().rev().enumerate() {
+            rpo_num[node] = k;
+            order.push(node);
+        }
+        if order.first().copied() != Some(0) {
+            return None; // entry must be first in reverse post-order
+        }
+
+        // Cooper/Harvey/Kennedy iterative dominators. Capped so a malformed
+        // graph refuses instead of spinning on the JIT thread.
+        let mut idom = vec![CFG_NONE; n];
+        idom[0] = 0;
+        let mut settled = false;
+        for _ in 0..(n + 2) {
+            let mut changed = false;
+            for &b in order.iter().skip(1) {
+                let mut new_idom = CFG_NONE;
+                for &p in &preds[b] {
+                    if rpo_num[p] == CFG_NONE || idom[p] == CFG_NONE {
+                        continue; // unreachable or not yet processed
+                    }
+                    new_idom = if new_idom == CFG_NONE {
+                        p
+                    } else {
+                        dom_intersect(&idom, &rpo_num, p, new_idom)
+                    };
+                    if new_idom == CFG_NONE {
+                        break;
+                    }
+                }
+                if new_idom != CFG_NONE && idom[b] != new_idom {
+                    idom[b] = new_idom;
+                    changed = true;
+                }
+            }
+            if !changed {
+                settled = true;
+                break;
+            }
+        }
+        if !settled {
+            return None;
+        }
+
+        Some(MethodCfg {
+            pcs,
+            idx_of,
+            rpo_num,
+            idom,
+        })
+    }
+
+    /// Instruction start PCs, ascending.
+    pub(super) fn nodes(&self) -> &[usize] {
+        &self.pcs
+    }
+
+    /// Node index for an instruction start PC.
+    pub(super) fn node_of(&self, pc: usize) -> Option<usize> {
+        match self.idx_of.get(pc).copied() {
+            Some(i) if i != CFG_NONE => Some(i),
+            _ => None,
+        }
+    }
+
+    /// `true` when `node` is reachable from method entry.
+    pub(super) fn is_reachable(&self, node: usize) -> bool {
+        self.rpo_num.get(node).copied().unwrap_or(CFG_NONE) != CFG_NONE
+    }
+
+    /// `true` when `a` dominates `b` (every path from entry to `b` passes
+    /// through `a`). Unknown/unreachable answers `false`, so a caller that
+    /// requires domination refuses rather than assuming it.
+    pub(super) fn dominates(&self, a: usize, b: usize) -> bool {
+        if a >= self.idom.len() || b >= self.idom.len() {
+            return false;
+        }
+        if !self.is_reachable(a) || !self.is_reachable(b) {
+            return false;
+        }
+        let mut cur = b;
+        let mut steps = 0usize;
+        let limit = self.idom.len() + 8;
+        loop {
+            if cur == a {
+                return true;
+            }
+            steps += 1;
+            if steps > limit {
+                return false;
+            }
+            let nxt = self.idom[cur];
+            if nxt == CFG_NONE || nxt == cur {
+                return false; // reached the entry without meeting `a`
+            }
+            cur = nxt;
+        }
+    }
+}
+
+/// Which loop transform produced a [`LoopXform`]. See the section header for
+/// the layout diagram — the two differ only in the back edge's target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum LoopXformKind {
+    /// `k` copies of the body run once each, ahead of the loop.
+    Peel,
+    /// `k` extra copies of the body run inside the loop, on every trip.
+    Unroll,
+}
+
+/// Why a loop transform refused.
+///
+/// Every variant is a REFUSAL — the caller keeps the original bytecode and
+/// loses an optimisation. None of them is a "best effort" path: a transform
+/// that cannot prove its precondition must not guess, because every guess
+/// here is either a wrong loop bound, a lost interpreter local, or an
+/// unpolled cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum LoopXformRefusal {
+    /// Malformed or out-of-range inputs (bad PCs, truncated branch, oversized
+    /// method), or an internal invariant that did not hold.
+    BadShape,
+    /// The instruction at `back_edge` does not branch to `header`.
+    NotABackEdge,
+    /// The back edge is conditional (`do { } while`): its test would have to
+    /// be replicated at the end of every copy.
+    ConditionalBackEdge,
+    /// Body larger than [`LOOP_XFORM_MAX_BODY_BYTES`].
+    BodyTooLarge,
+    /// `k` is zero or larger than [`LOOP_XFORM_MAX_COPIES`].
+    TooManyCopies,
+    /// `jsr`/`ret`/`jsr_w`/`goto_w`, a mid-instruction branch target, or a
+    /// bytecode walk that did not land on the method's end.
+    OpaqueControlFlow,
+    /// The method contains a `tableswitch`/`lookupswitch`: shifting code
+    /// changes their 4-byte operand padding, hence their length.
+    SwitchInMethod,
+    /// A branch from outside the region targets the body below the header —
+    /// the pre-header-bypass shape (see [`find_bypassable_loop_headers`]).
+    ExternalEntry,
+    /// The header does not dominate its own region: the loop is irreducible.
+    Irreducible,
+    /// A cycle strictly inside the body is irreducible.
+    IrreducibleInnerLoop,
+    /// An instruction in the region is unreachable from method entry.
+    UnreachableInRegion,
+    /// A branch targets the back-edge instruction, which exists in the last
+    /// copy only.
+    BranchToBackEdge,
+    /// An exception handler lands inside the region.
+    HandlerInRegion,
+    /// A protected range partially overlaps the region.
+    HandlerRangeStraddlesRegion,
+    /// A rewritten branch no longer fits the 2-byte signed offset field. We
+    /// refuse rather than widen to `goto_w`, which the emitter does not poll.
+    OffsetOverflow,
+    /// The rewritten code has a backward branch at an opcode the emitter does
+    /// not poll, or the steady-state back edge lost its poll. Defensive: this
+    /// should be unreachable, and is checked on the emitted bytes anyway.
+    UnpolledBackEdge,
+    /// The transform would leave a poll-free span longer than
+    /// [`LOOP_XFORM_MAX_POLL_FREE_BYTES`] bytecodes.
+    TimeToSafepointBudget,
+}
+
+/// A transformed method: rewritten bytecode plus everything a consumer needs
+/// to keep deopt, OSR and exception dispatch correct across the rewrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) struct LoopXform {
+    /// Which transform produced this.
+    pub(super) kind: LoopXformKind,
+    /// The rewritten bytecode.
+    pub(super) code: Vec<u8>,
+    /// `code.len()` — the transformed method's code length.
+    pub(super) code_len: usize,
+    /// Provenance: `bci_of[p]` is the ORIGINAL bytecode index byte `p` was
+    /// copied from. Total — every byte has one — so a deopt at any output PC
+    /// resolves to a real bci with the frame already correct.
+    pub(super) bci_of: Vec<u32>,
+    /// Exception ranges rewritten into output coordinates. A range enclosing
+    /// the loop is widened to cover the copies.
+    pub(super) exception_ranges: Vec<(usize, usize, usize)>,
+    /// Loop header PC — unchanged by the rewrite (the prefix does not move).
+    pub(super) header: usize,
+    /// Body length in bytes (header .. back edge, excluding the back edge).
+    pub(super) body_len: usize,
+    /// Number of EXTRA body copies (`k`).
+    pub(super) copies: usize,
+    /// Output PC the back edge targets: copy `k` for peel, copy `0` for
+    /// unroll.
+    pub(super) loop_entry: usize,
+    /// Worst-case poll-free straight-line span, in bytecodes.
+    pub(super) poll_free_bytes: usize,
+    /// Original `code_len`, for provenance range checks.
+    orig_code_len: usize,
+    /// Original PC just past the back-edge instruction.
+    orig_back_edge_end: usize,
+}
+
+#[allow(dead_code)]
+impl LoopXform {
+    /// Output PC of the (single) back-edge instruction.
+    pub(super) fn back_edge_pc(&self) -> usize {
+        self.header + (self.copies + 1) * self.body_len
+    }
+
+    /// Output PC where the steady-state copy of the body begins — the copy
+    /// the back edge re-enters.
+    pub(super) fn steady_state_base(&self) -> usize {
+        match self.kind {
+            LoopXformKind::Peel => self.header + self.copies * self.body_len,
+            LoopXformKind::Unroll => self.header,
+        }
+    }
+
+    /// Original bci for an output PC.
+    pub(super) fn bci_at(&self, pc: usize) -> Option<usize> {
+        // Widening: u32 -> usize
+        self.bci_of.get(pc).map(|&b| b as usize)
+    }
+
+    /// Output PC an OSR entry for `bci` must use.
+    ///
+    /// The reverse of [`Self::bci_at`] is one-to-many inside the region, and
+    /// picking the wrong image is a real bug, not a missed optimisation:
+    /// entering a *peeled* copy re-runs the peeled iterations, so the loop
+    /// executes `k` times too many. This always answers with the
+    /// steady-state copy.
+    pub(super) fn osr_entry_pc(&self, bci: usize) -> Option<usize> {
+        if bci >= self.orig_code_len {
+            return None;
+        }
+        if bci < self.header {
+            Some(bci)
+        } else if bci < self.orig_back_edge_end {
+            let steady = match self.kind {
+                LoopXformKind::Peel => self.copies,
+                LoopXformKind::Unroll => 0,
+            };
+            Some(bci + steady * self.body_len)
+        } else {
+            Some(bci + self.copies * self.body_len)
+        }
+    }
+
+    /// `true` when every output byte carries a provenance bci inside the
+    /// original method.
+    pub(super) fn provenance_is_total(&self) -> bool {
+        self.bci_of.len() == self.code.len()
+            // Widening: u32 -> usize
+            && self.bci_of.iter().all(|&b| (b as usize) < self.orig_code_len)
+    }
+}
+
+/// Peel `iterations` copies of a natural loop's body out ahead of the loop.
+///
+/// `header`/`back_edge` are a `(header_pc, back_edge_pc)` pair as produced by
+/// [`detect_loops`]. `exception_ranges` are `(start, end, handler)` triples.
+/// See the section header for preconditions, the poll argument and the
+/// provenance contract; every failure mode is a [`LoopXformRefusal`].
+///
+/// Peeling does not change the loop's per-trip safepoint behaviour at all:
+/// the steady-state copy keeps the same `goto` back edge, so it still polls
+/// once per iteration.
+#[allow(dead_code)]
+pub(super) fn plan_loop_peel(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+    iterations: usize,
+    exception_ranges: &[(usize, usize, usize)],
+) -> Result<LoopXform, LoopXformRefusal> {
+    rewrite_loop_copies(
+        code,
+        code_len,
+        header,
+        back_edge,
+        iterations,
+        exception_ranges,
+        LoopXformKind::Peel,
+    )
+}
+
+/// Unroll a natural loop by `extra_copies` extra bodies (an unroll factor of
+/// `extra_copies + 1`).
+///
+/// Same preconditions as [`plan_loop_peel`]. Each copy keeps the body's own
+/// exit branches, so no trip-count precondition is needed and a trip count
+/// that is not a multiple of the factor leaves from the middle of the group.
+///
+/// This is the one transform that lengthens time-to-safepoint: the single
+/// back edge now polls once per `extra_copies + 1` iterations. The product
+/// `(extra_copies + 1) * body_len` is checked against
+/// [`LOOP_XFORM_MAX_POLL_FREE_BYTES`], so the span stays bounded by a
+/// constant rather than by the trip count.
+#[allow(dead_code)]
+pub(super) fn plan_loop_unroll(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+    extra_copies: usize,
+    exception_ranges: &[(usize, usize, usize)],
+) -> Result<LoopXform, LoopXformRefusal> {
+    rewrite_loop_copies(
+        code,
+        code_len,
+        header,
+        back_edge,
+        extra_copies,
+        exception_ranges,
+        LoopXformKind::Unroll,
+    )
+}
+
+/// The shared peel/unroll rewriter. See the section header.
+fn rewrite_loop_copies(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+    extra: usize,
+    exception_ranges: &[(usize, usize, usize)],
+    kind: LoopXformKind,
+) -> Result<LoopXform, LoopXformRefusal> {
+    use LoopXformRefusal as R;
+
+    // ── Shape ─────────────────────────────────────────────────────────
+    if extra == 0 || extra > LOOP_XFORM_MAX_COPIES {
+        return Err(R::TooManyCopies);
+    }
+    // Widening: usize vs u32::MAX — provenance entries are u32.
+    if code_len == 0 || code_len > code.len() || code_len > u32::MAX as usize {
+        return Err(R::BadShape);
+    }
+    if header >= back_edge || back_edge + 3 > code_len {
+        return Err(R::BadShape);
+    }
+    let body_len = back_edge - header;
+    if body_len > LOOP_XFORM_MAX_BODY_BYTES {
+        return Err(R::BodyTooLarge);
+    }
+    if code[back_edge] != 0xa7 {
+        return Err(R::ConditionalBackEdge);
+    }
+    // Cast: signed branch displacement to isize
+    let off = i16::from_be_bytes([code[back_edge + 1], code[back_edge + 2]]) as isize;
+    // Cast: PCs to isize for the signed comparison
+    if back_edge as isize + off != header as isize {
+        return Err(R::NotABackEdge);
+    }
+    let back_edge_end = back_edge + 3;
+    let delta = extra * body_len;
+
+    // ── Structural admission ──────────────────────────────────────────
+    let cfg = MethodCfg::build(code, code_len).ok_or(R::OpaqueControlFlow)?;
+    let hnode = cfg.node_of(header).ok_or(R::BadShape)?;
+    if cfg.node_of(back_edge).is_none() {
+        return Err(R::BadShape);
+    }
+
+    // Switches anywhere: their operand padding depends on their own PC, so
+    // shifting them changes their length and the whole layout below.
+    for &at in cfg.nodes() {
+        if matches!(code[at], 0xaa | 0xab) {
+            return Err(R::SwitchInMethod);
+        }
+        // `jsr`/`ret`/`jsr_w` already fail `MethodCfg::build`; `goto_w` does
+        // not, and it is the one backward branch the emitter never polls, so
+        // it must not survive into a method we are about to duplicate code
+        // in. Refuse the whole method rather than reason about where it is.
+        if matches!(code[at], 0xa8 | 0xa9 | 0xc8 | 0xc9) {
+            return Err(R::OpaqueControlFlow);
+        }
+    }
+
+    // Single-entry, and no branch to the back edge itself.
+    let mut targets: Vec<usize> = Vec::new();
+    for &at in cfg.nodes() {
+        targets.clear();
+        if !branch_targets_at(code, at, code_len, &mut targets) {
+            return Err(R::OpaqueControlFlow);
+        }
+        let src_inside = at >= header && at < back_edge_end;
+        for &t in &targets {
+            let dst_inside = t >= header && t < back_edge_end;
+            if dst_inside && !src_inside && t != header {
+                return Err(R::ExternalEntry);
+            }
+            if t == back_edge && at != back_edge {
+                return Err(R::BranchToBackEdge);
+            }
+        }
+    }
+
+    // Reducibility of this loop: the header dominates its whole region. This
+    // is the condition that makes "duplicate the region" meaningful — every
+    // execution that reaches any part of the region reached the header first,
+    // so every copy starts an iteration.
+    for (i, &at) in cfg.nodes().iter().enumerate() {
+        if at < header || at >= back_edge_end {
+            continue;
+        }
+        if !cfg.is_reachable(i) {
+            return Err(R::UnreachableInRegion);
+        }
+        if !cfg.dominates(hnode, i) {
+            return Err(R::Irreducible);
+        }
+    }
+
+    // Reducibility of every cycle strictly inside the body.
+    for (i, &at) in cfg.nodes().iter().enumerate() {
+        if at < header || at >= back_edge_end {
+            continue;
+        }
+        targets.clear();
+        if !branch_targets_at(code, at, code_len, &mut targets) {
+            return Err(R::OpaqueControlFlow);
+        }
+        for &t in &targets {
+            if t > at || t == header {
+                continue; // forward edge, or this loop's own back edge
+            }
+            let tnode = cfg.node_of(t).ok_or(R::BadShape)?;
+            if !cfg.dominates(tnode, i) {
+                return Err(R::IrreducibleInnerLoop);
+            }
+        }
+    }
+
+    // ── Exception ranges ──────────────────────────────────────────────
+    let shift = |p: usize| -> usize {
+        if p >= back_edge_end {
+            p + delta
+        } else {
+            p
+        }
+    };
+    let mut ranges_out: Vec<(usize, usize, usize)> = Vec::with_capacity(exception_ranges.len());
+    for &(s, e, h) in exception_ranges {
+        if s >= e || e > code_len || h >= code_len {
+            return Err(R::BadShape);
+        }
+        if h >= header && h < back_edge_end {
+            return Err(R::HandlerInRegion);
+        }
+        let overlaps = s < back_edge_end && e > header;
+        let encloses = s <= header && e >= back_edge_end;
+        if overlaps && !encloses {
+            // Partially overlapping (including wholly inside): duplicating
+            // the region would need the range duplicated with it.
+            return Err(R::HandlerRangeStraddlesRegion);
+        }
+        ranges_out.push((shift(s), shift(e), shift(h)));
+    }
+
+    // ── Emit ──────────────────────────────────────────────────────────
+    let out_len = code_len + delta;
+    let mut out: Vec<u8> = Vec::with_capacity(out_len);
+    let mut bci_of: Vec<u32> = Vec::with_capacity(out_len);
+    let push_span = |from: usize, to: usize, out: &mut Vec<u8>, bci_of: &mut Vec<u32>| {
+        out.extend_from_slice(&code[from..to]);
+        for p in from..to {
+            // Cast: bounded by `code_len`, checked against u32::MAX above
+            bci_of.push(p as u32);
+        }
+    };
+    push_span(0, header, &mut out, &mut bci_of);
+    for _ in 0..extra {
+        push_span(header, back_edge, &mut out, &mut bci_of);
+    }
+    push_span(header, back_edge_end, &mut out, &mut bci_of);
+    push_span(back_edge_end, code_len, &mut out, &mut bci_of);
+    if out.len() != out_len || bci_of.len() != out_len {
+        return Err(R::BadShape);
+    }
+
+    let loop_entry = match kind {
+        LoopXformKind::Peel => header + extra * body_len,
+        LoopXformKind::Unroll => header,
+    };
+
+    // Spans of the output, as (out_base, orig_from, orig_to, copy_index).
+    // `out_pc = out_base + (orig_pc - orig_from)` inside each.
+    let mut spans: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(extra + 3);
+    spans.push((0, 0, header, 0));
+    for ci in 0..extra {
+        spans.push((header + ci * body_len, header, back_edge, ci));
+    }
+    spans.push((header + extra * body_len, header, back_edge_end, extra));
+    spans.push((back_edge_end + delta, back_edge_end, code_len, 0));
+
+    for &(out_base, from, to, ci) in &spans {
+        let mut pc = from;
+        while pc < to {
+            let len = bytecode_len_at(code, pc);
+            if len == 0 {
+                return Err(R::BadShape);
+            }
+            if matches!(code[pc], 0x99..=0xa7 | 0xc6 | 0xc7) {
+                if pc + 2 >= code_len {
+                    return Err(R::BadShape);
+                }
+                // Cast: signed branch displacement to isize
+                let boff = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+                // Cast: PC to isize for the signed target computation
+                let t = pc as isize + boff;
+                if t < 0 || t as usize >= code_len {
+                    return Err(R::BadShape);
+                }
+                // Cast: non-negative index to usize
+                let t = t as usize;
+                let internal = pc >= header && pc < back_edge_end;
+                let new_t = if internal && t == header {
+                    // A branch to the header from inside is "next iteration":
+                    // the next copy, and from the last copy the loop entry
+                    // (peel: the last copy itself; unroll: the first). The
+                    // back-edge `goto` is exactly this case with `ci == extra`.
+                    if ci < extra {
+                        header + (ci + 1) * body_len
+                    } else {
+                        loop_entry
+                    }
+                } else if t < header {
+                    t
+                } else if t < back_edge_end {
+                    // Into the region: an internal edge relocates into its own
+                    // copy; an external one can only be targeting the header
+                    // (every other case was refused as `ExternalEntry`), which
+                    // is copy 0's first byte and has not moved.
+                    if internal {
+                        t + ci * body_len
+                    } else {
+                        t
+                    }
+                } else {
+                    t + delta
+                };
+                let out_pc = out_base + (pc - from);
+                // Cast: PCs to isize for the signed offset
+                let new_off = new_t as isize - out_pc as isize;
+                // Widening: i16 bounds to isize
+                if new_off < i16::MIN as isize || new_off > i16::MAX as isize {
+                    return Err(R::OffsetOverflow);
+                }
+                // Cast: checked above to fit the 2-byte signed branch field
+                let enc = (new_off as i16).to_be_bytes();
+                if out_pc + 2 >= out.len() {
+                    return Err(R::BadShape);
+                }
+                out[out_pc + 1] = enc[0];
+                out[out_pc + 2] = enc[1];
+            }
+            pc += len;
+        }
+    }
+
+    // ── Prove it on the emitted bytes, do not argue it ────────────────
+    //
+    // The output must walk exactly, keep every branch target on an
+    // instruction boundary, and stay buildable as a CFG.
+    if MethodCfg::build(&out, out_len).is_none() {
+        return Err(R::BadShape);
+    }
+    // Every backward branch sits at a poll-bearing opcode ⇒ every cycle in
+    // the transformed method is polled (see the section header).
+    if !all_backward_edges_are_polled(&out, out_len) {
+        return Err(R::UnpolledBackEdge);
+    }
+    // …and the loop's own back edge is one of them.
+    let out_back_edge = header + (extra + 1) * body_len;
+    if !emits_safepoint_poll_at(&out, out_back_edge, out_len) {
+        return Err(R::UnpolledBackEdge);
+    }
+    let poll_free_bytes = body_len.saturating_mul(extra + 1);
+    if poll_free_bytes > LOOP_XFORM_MAX_POLL_FREE_BYTES {
+        return Err(R::TimeToSafepointBudget);
+    }
+
+    Ok(LoopXform {
+        kind,
+        code: out,
+        code_len: out_len,
+        bci_of,
+        exception_ranges: ranges_out,
+        header,
+        body_len,
+        copies: extra,
+        loop_entry,
+        poll_free_bytes,
+        orig_code_len: code_len,
+        orig_back_edge_end: back_edge_end,
+    })
+}
+
+// ── Loop transform tests ─────────────────────────────────────────────
+//
+// The equivalence tests run a reference interpreter over the original and the
+// transformed bytecode and compare the FULL `(original bci, locals)` step
+// sequence, not just the answer. That single comparison is the acceptance
+// criterion for three separate properties:
+//
+//  * same result on every trip count (the outcome is the last step),
+//  * unchanged exception order (a throw is a step with a bci),
+//  * a deopt into a transformed loop resolves its locals — at every output PC
+//    the frame is the one the interpreter had at `bci_of[pc]`.
+//
+// The one instruction the comparison filters out is the back-edge `goto`,
+// which peel/unroll elide in the copies. A `goto` has no data effect and
+// cannot throw, so eliding it cannot change the sequence above; its ONE
+// observable effect is the safepoint poll, and that is asserted separately
+// and quantitatively in `every_transform_preserves_the_backedge_poll`.
+
+#[cfg(test)]
+mod loop_xform_tests {
+    use super::super::{detect_loops, find_bypassable_loop_headers};
+    use super::*;
+
+    /// How a fixture run ended.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Outcome {
+        Return(i32),
+        Void,
+        /// Exception kind, and the ORIGINAL bci that threw.
+        Throw(&'static str, usize),
+        StepLimit,
+    }
+
+    /// One reference run.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Trace {
+        /// `(original bci, locals)` before every executed instruction.
+        steps: Vec<(usize, Vec<i32>)>,
+        outcome: Outcome,
+        heap: Vec<i32>,
+    }
+
+    /// Target PC of the 2-byte-offset branch at `pc`, or its fall-through.
+    fn branch_to(code: &[u8], pc: usize, taken: bool) -> usize {
+        if taken {
+            let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+            (pc as isize + off) as usize
+        } else {
+            pc + 3
+        }
+    }
+
+    /// Reference interpreter for the bytecode subset the fixtures use.
+    ///
+    /// `bci_of` maps an execution PC to the ORIGINAL bci (identity for an
+    /// untransformed run) so two runs can be compared step for step. Local 0
+    /// doubles as the fixtures' array reference: `aload_0` pushes a handle for
+    /// the single `heap` array.
+    fn interp(
+        code: &[u8],
+        code_len: usize,
+        bci_of: Option<&[u32]>,
+        locals_in: &[i32],
+        heap_in: &[i32],
+    ) -> Trace {
+        let mut locals = locals_in.to_vec();
+        let mut heap = heap_in.to_vec();
+        let mut stack: Vec<i32> = Vec::new();
+        let mut steps: Vec<(usize, Vec<i32>)> = Vec::new();
+        let mut pc = 0usize;
+        let mut budget = 200_000usize;
+        loop {
+            if budget == 0 {
+                return Trace {
+                    steps,
+                    outcome: Outcome::StepLimit,
+                    heap,
+                };
+            }
+            budget -= 1;
+            assert!(pc < code_len, "control ran off the end at pc {pc}");
+            let bci = match bci_of {
+                Some(m) => m[pc] as usize,
+                None => pc,
+            };
+            steps.push((bci, locals.clone()));
+            let op = code[pc];
+            match op {
+                // nop
+                0x00 => pc += 1,
+                // iconst_m1 .. iconst_5
+                0x02..=0x08 => {
+                    stack.push(op as i32 - 3);
+                    pc += 1;
+                }
+                // bipush
+                0x10 => {
+                    stack.push(code[pc + 1] as i8 as i32);
+                    pc += 2;
+                }
+                // sipush
+                0x11 => {
+                    stack.push(i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32);
+                    pc += 3;
+                }
+                // iload
+                0x15 => {
+                    stack.push(locals[code[pc + 1] as usize]);
+                    pc += 2;
+                }
+                // iload_0 .. iload_3
+                0x1a..=0x1d => {
+                    stack.push(locals[(op - 0x1a) as usize]);
+                    pc += 1;
+                }
+                // aload_0 — the fixtures' single array reference
+                0x2a => {
+                    stack.push(0);
+                    pc += 1;
+                }
+                // iaload
+                0x2e => {
+                    let idx = stack.pop().expect("iaload index");
+                    let _aref = stack.pop().expect("iaload arrayref");
+                    if idx < 0 || idx as usize >= heap.len() {
+                        return Trace {
+                            steps,
+                            outcome: Outcome::Throw("ArrayIndexOutOfBounds", bci),
+                            heap,
+                        };
+                    }
+                    stack.push(heap[idx as usize]);
+                    pc += 1;
+                }
+                // istore
+                0x36 => {
+                    let v = stack.pop().expect("istore value");
+                    locals[code[pc + 1] as usize] = v;
+                    pc += 2;
+                }
+                // istore_0 .. istore_3
+                0x3b..=0x3e => {
+                    let v = stack.pop().expect("istore_n value");
+                    locals[(op - 0x3b) as usize] = v;
+                    pc += 1;
+                }
+                // iastore
+                0x4f => {
+                    let v = stack.pop().expect("iastore value");
+                    let idx = stack.pop().expect("iastore index");
+                    let _aref = stack.pop().expect("iastore arrayref");
+                    if idx < 0 || idx as usize >= heap.len() {
+                        return Trace {
+                            steps,
+                            outcome: Outcome::Throw("ArrayIndexOutOfBounds", bci),
+                            heap,
+                        };
+                    }
+                    heap[idx as usize] = v;
+                    pc += 1;
+                }
+                // iadd / isub / imul
+                0x60 | 0x64 | 0x68 => {
+                    let b = stack.pop().expect("binop rhs");
+                    let a = stack.pop().expect("binop lhs");
+                    stack.push(match op {
+                        0x60 => a.wrapping_add(b),
+                        0x64 => a.wrapping_sub(b),
+                        _ => a.wrapping_mul(b),
+                    });
+                    pc += 1;
+                }
+                // idiv
+                0x6c => {
+                    let b = stack.pop().expect("idiv rhs");
+                    let a = stack.pop().expect("idiv lhs");
+                    if b == 0 {
+                        return Trace {
+                            steps,
+                            outcome: Outcome::Throw("ArithmeticException", bci),
+                            heap,
+                        };
+                    }
+                    stack.push(a.wrapping_div(b));
+                    pc += 1;
+                }
+                // iinc
+                0x84 => {
+                    let l = code[pc + 1] as usize;
+                    locals[l] = locals[l].wrapping_add(code[pc + 2] as i8 as i32);
+                    pc += 3;
+                }
+                // ifeq .. ifle
+                0x99..=0x9e => {
+                    let v = stack.pop().expect("if<cond> operand");
+                    let taken = match op {
+                        0x99 => v == 0,
+                        0x9a => v != 0,
+                        0x9b => v < 0,
+                        0x9c => v >= 0,
+                        0x9d => v > 0,
+                        _ => v <= 0,
+                    };
+                    pc = branch_to(code, pc, taken);
+                }
+                // if_icmpeq .. if_icmple
+                0x9f..=0xa4 => {
+                    let b = stack.pop().expect("if_icmp rhs");
+                    let a = stack.pop().expect("if_icmp lhs");
+                    let taken = match op {
+                        0x9f => a == b,
+                        0xa0 => a != b,
+                        0xa1 => a < b,
+                        0xa2 => a >= b,
+                        0xa3 => a > b,
+                        _ => a <= b,
+                    };
+                    pc = branch_to(code, pc, taken);
+                }
+                // goto
+                0xa7 => pc = branch_to(code, pc, true),
+                // ireturn
+                0xac => {
+                    let v = stack.pop().expect("ireturn value");
+                    return Trace {
+                        steps,
+                        outcome: Outcome::Return(v),
+                        heap,
+                    };
+                }
+                // return
+                0xb1 => {
+                    return Trace {
+                        steps,
+                        outcome: Outcome::Void,
+                        heap,
+                    }
+                }
+                _ => panic!("fixture uses an opcode the reference interpreter lacks: {op:#04x}"),
+            }
+        }
+    }
+
+    /// The step sequence with the back-edge `goto` removed (see the section
+    /// comment: it has no data effect and cannot throw).
+    fn steps_without_back_edge(t: &Trace, back_edge: usize) -> Vec<(usize, Vec<i32>)> {
+        t.steps
+            .iter()
+            .filter(|(b, _)| *b != back_edge)
+            .cloned()
+            .collect()
+    }
+
+    /// How many times the back edge — hence the safepoint poll — executed.
+    fn poll_count(t: &Trace, back_edge: usize) -> usize {
+        t.steps.iter().filter(|(b, _)| *b == back_edge).count()
+    }
+
+    /// Every PC whose instruction has a backward branch target.
+    fn backward_branch_pcs(code: &[u8], code_len: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut targets: Vec<usize> = Vec::new();
+        let mut pc = 0usize;
+        while pc < code_len {
+            targets.clear();
+            assert!(
+                branch_targets_at(code, pc, code_len, &mut targets),
+                "opaque control flow at {pc}"
+            );
+            if targets.iter().any(|&t| t <= pc) {
+                out.push(pc);
+            }
+            pc += bytecode_len_at(code, pc);
+        }
+        out
+    }
+
+    /// `int i = 0, sum = 0; while (i < n) { sum += i * 2; i++; } return sum;`
+    ///
+    /// locals: 0 = n, 1 = i, 2 = sum. Header 4, back edge 18, length 23.
+    /// This is javac's condition-at-top `while` shape.
+    fn shape_a() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1          i = 0
+            0x03, // 2: iconst_0
+            0x3d, // 3: istore_2          sum = 0
+            0x1b, // 4: iload_1           <- header
+            0x1a, // 5: iload_0
+            0xa2, 0x00, 0x0f, // 6: if_icmpge 21
+            0x1c, // 9: iload_2
+            0x1b, // 10: iload_1
+            0x05, // 11: iconst_2
+            0x68, // 12: imul
+            0x60, // 13: iadd
+            0x3d, // 14: istore_2
+            0x84, 0x01, 0x01, // 15: iinc 1, 1
+            0xa7, 0xff, 0xf2, // 18: goto 4      <- back edge
+            0x1c, // 21: iload_2
+            0xac, // 22: ireturn
+        ]
+    }
+
+    /// The pre-header-bypass shape: a branch from *before* the loop straight
+    /// into the header. This is `AttributesImpl.ensureCapacity`'s `goto` into
+    /// the `while` header — the witness the LICM pre-header bypass fix was
+    /// written for. Same loop as [`shape_a`], header 11, back edge 25,
+    /// length 30.
+    fn shape_b() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1          i = 0
+            0x03, // 2: iconst_0
+            0x3d, // 3: istore_2          sum = 0
+            0x1a, // 4: iload_0
+            0x9a, 0x00, 0x06, // 5: ifne 11      <- external edge INTO the header
+            0x03, // 8: iconst_0
+            0x3d, // 9: istore_2
+            0x00, // 10: nop
+            0x1b, // 11: iload_1          <- header
+            0x1a, // 12: iload_0
+            0xa2, 0x00, 0x0f, // 13: if_icmpge 28
+            0x1c, // 16: iload_2
+            0x1b, // 17: iload_1
+            0x05, // 18: iconst_2
+            0x68, // 19: imul
+            0x60, // 20: iadd
+            0x3d, // 21: istore_2
+            0x84, 0x01, 0x01, // 22: iinc 1, 1
+            0xa7, 0xff, 0xf2, // 25: goto 11     <- back edge
+            0x1c, // 28: iload_2
+            0xac, // 29: ireturn
+        ]
+    }
+
+    /// `for (i = 0; i < n; i++) a[i] = 100 / (i - 3);`
+    ///
+    /// Throws ArithmeticException at `i == 3`, after three stores, and
+    /// ArrayIndexOutOfBounds past the array end — two different exceptions at
+    /// two different bcis, so a transform that reorders effects is caught.
+    /// locals: 0 = array, 1 = n, 2 = i. Header 2, back edge 19, length 23.
+    fn shape_throws() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3d, // 1: istore_2          i = 0
+            0x1c, // 2: iload_2           <- header
+            0x1b, // 3: iload_1
+            0xa2, 0x00, 0x12, // 4: if_icmpge 22
+            0x2a, // 7: aload_0
+            0x1c, // 8: iload_2
+            0x10, 0x64, // 9: bipush 100
+            0x1c, // 11: iload_2
+            0x06, // 12: iconst_3
+            0x64, // 13: isub
+            0x6c, // 14: idiv
+            0x4f, // 15: iastore
+            0x84, 0x02, 0x01, // 16: iinc 2, 1
+            0xa7, 0xff, 0xef, // 19: goto 2       <- back edge
+            0xb1, // 22: return
+        ]
+    }
+
+    /// `do { i++; } while (i < n);` — the back edge is the exit test itself.
+    /// Header 2, back edge 7, length 12.
+    fn shape_do_while() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x84, 0x01, 0x01, // 2: iinc 1, 1     <- header
+            0x1b, // 5: iload_1
+            0x1a, // 6: iload_0
+            0xa1, 0xff, 0xfb, // 7: if_icmplt 2   <- conditional back edge
+            0x1b, // 10: iload_1
+            0xac, // 11: ireturn
+        ]
+    }
+
+    /// An irreducible loop: the cycle `L1 → L2 → L1` is entered at BOTH
+    /// blocks. Its back edge is a plain `goto`, so the transform gets past
+    /// every shape check and has to refuse on the entry/domination test.
+    /// Header 7, back edge 17, length 21.
+    fn shape_irreducible() -> Vec<u8> {
+        vec![
+            0x1a, // 0: iload_0
+            0x99, 0x00, 0x0c, // 1: ifeq 13       -> enters the cycle at L2
+            0xa7, 0x00, 0x03, // 4: goto 7        -> enters the cycle at L1
+            0x84, 0x01, 0x01, // 7: L1: iinc 1, 1
+            0xa7, 0x00, 0x03, // 10: goto 13
+            0x1b, // 13: L2: iload_1
+            0x99, 0x00, 0x06, // 14: ifeq 20
+            0xa7, 0xff, 0xf6, // 17: goto 7       <- back edge
+            0xb1, // 20: return
+        ]
+    }
+
+    /// A reducible outer loop whose BODY contains an irreducible two-entry
+    /// cycle (`A → B → A`, entered at both). The outer header dominates its
+    /// whole region and there is no external entry, so only the inner
+    /// reducibility test can catch this. Header 2, back edge 30, length 35.
+    fn shape_irreducible_inner() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x1b, // 2: iload_1            <- outer header
+            0x1a, // 3: iload_0
+            0xa2, 0x00, 0x1d, // 4: if_icmpge 33
+            0x1b, // 7: iload_1
+            0x99, 0x00, 0x0c, // 8: ifeq 20        -> enters the inner cycle at B
+            0xa7, 0x00, 0x03, // 11: goto 14       -> enters the inner cycle at A
+            0x84, 0x01, 0x01, // 14: A: iinc 1, 1
+            0xa7, 0x00, 0x03, // 17: goto 20
+            0x1b, // 20: B: iload_1
+            0x99, 0x00, 0x06, // 21: ifeq 27
+            0xa7, 0xff, 0xf6, // 24: goto 14       <- inner back edge
+            0x84, 0x01, 0x01, // 27: iinc 1, 1
+            0xa7, 0xff, 0xe4, // 30: goto 2        <- outer back edge
+            0x1b, // 33: iload_1
+            0xac, // 34: ireturn
+        ]
+    }
+
+    /// A one-instruction loop whose header is reached by a `goto_w`, the one
+    /// backward-capable branch the emitter never polls. Header 0, back edge 5.
+    fn shape_with_goto_w() -> Vec<u8> {
+        vec![
+            0xc8, 0x00, 0x00, 0x00, 0x05, // 0: goto_w 5
+            0xa7, 0xff, 0xfb, // 5: goto 0    <- back edge
+        ]
+    }
+
+    #[test]
+    fn fixtures_have_the_loops_the_tests_assume() {
+        assert_eq!(detect_loops(&shape_a(), 23), vec![(4, 18)]);
+        assert_eq!(detect_loops(&shape_b(), 30), vec![(11, 25)]);
+        assert_eq!(detect_loops(&shape_throws(), 23), vec![(2, 19)]);
+        assert_eq!(detect_loops(&shape_do_while(), 12), vec![(2, 7)]);
+        assert_eq!(detect_loops(&shape_irreducible(), 21), vec![(7, 17)]);
+        assert_eq!(
+            detect_loops(&shape_irreducible_inner(), 35),
+            vec![(14, 24), (2, 30)]
+        );
+    }
+
+    #[test]
+    fn a_transformed_loop_computes_the_same_result_on_every_trip_count() {
+        for (code, header, back_edge) in [(shape_a(), 4usize, 18usize), (shape_b(), 11, 25)] {
+            let len = code.len();
+            for k in 1..=3usize {
+                let peel = plan_loop_peel(&code, len, header, back_edge, k, &[])
+                    .expect("peel should be admitted");
+                let unroll = plan_loop_unroll(&code, len, header, back_edge, k, &[])
+                    .expect("unroll should be admitted");
+                // Trip counts 0 and 1 are the interesting ends: with 0 the
+                // first copy's exit test fires before any body effect, and
+                // with 1 the loop leaves from the middle of the copy group.
+                for n in 0..=6i32 {
+                    let locals = [n, 0, 0];
+                    let base = interp(&code, len, None, &locals, &[]);
+                    assert_eq!(
+                        base.outcome,
+                        Outcome::Return(n * (n - 1)),
+                        "fixture itself is wrong for n = {n}"
+                    );
+                    for x in [&peel, &unroll] {
+                        let t = interp(&x.code, x.code_len, Some(&x.bci_of), &locals, &[]);
+                        assert_eq!(t.outcome, base.outcome, "{:?} k = {k}, n = {n}", x.kind);
+                        assert_eq!(
+                            steps_without_back_edge(&t, back_edge),
+                            steps_without_back_edge(&base, back_edge),
+                            "{:?} k = {k}, n = {n}: executed sequence diverged",
+                            x.kind
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_transform_preserves_the_backedge_poll() {
+        let code = shape_a();
+        let len = code.len();
+        // The emitter polls at a backward branch and nowhere else, and the
+        // original loop's only backward branch is its back edge.
+        assert!(emits_safepoint_poll_at(&code, 18, len));
+        assert!(!emits_safepoint_poll_at(&code, 6, len));
+        assert!(all_backward_edges_are_polled(&code, len));
+        assert_eq!(backward_branch_pcs(&code, len), vec![18]);
+
+        for k in 1..=3usize {
+            for x in [
+                plan_loop_peel(&code, len, 4, 18, k, &[]).expect("peel"),
+                plan_loop_unroll(&code, len, 4, 18, k, &[]).expect("unroll"),
+            ] {
+                // Static half: every backward branch in the OUTPUT is at an
+                // opcode the emitter polls, and there is exactly one — the
+                // loop's own back edge. Since every cycle in a linear bytecode
+                // CFG contains a backward branch, every cycle is polled.
+                assert!(all_backward_edges_are_polled(&x.code, x.code_len));
+                assert_eq!(
+                    backward_branch_pcs(&x.code, x.code_len),
+                    vec![x.back_edge_pc()],
+                    "{:?} k = {k}",
+                    x.kind
+                );
+                assert!(emits_safepoint_poll_at(&x.code, x.back_edge_pc(), x.code_len));
+
+                // Time-to-safepoint: the polled cycle is one body long for
+                // peel (unchanged), k + 1 bodies for unroll (bounded).
+                let cycle = x.back_edge_pc() - x.steady_state_base();
+                match x.kind {
+                    LoopXformKind::Peel => assert_eq!(cycle, 14),
+                    LoopXformKind::Unroll => assert_eq!(cycle, 14 * (k + 1)),
+                }
+                assert_eq!(x.poll_free_bytes, 14 * (k + 1));
+                assert!(x.poll_free_bytes <= LOOP_XFORM_MAX_POLL_FREE_BYTES);
+
+                // Dynamic half: count the polls actually executed. Peeling
+                // moves k iterations out of the loop, so it drops exactly k
+                // polls, once, and the steady state still polls per iteration.
+                // Unrolling polls once per group, so the poll count falls by
+                // at most the factor — never to zero for a long-running loop,
+                // which is what "time to safepoint stays bounded" means.
+                for n in 0..=9i32 {
+                    let locals = [n, 0, 0];
+                    let t = interp(&x.code, x.code_len, Some(&x.bci_of), &locals, &[]);
+                    let polls = poll_count(&t, 18);
+                    // Widening: loop trip count is non-negative here
+                    let trips = n as usize;
+                    match x.kind {
+                        LoopXformKind::Peel => assert_eq!(polls, trips.saturating_sub(k)),
+                        LoopXformKind::Unroll => assert_eq!(polls, trips / (k + 1)),
+                    }
+                    assert!(
+                        trips <= polls * (k + 1) + 2 * (k + 1),
+                        "{:?} k = {k}, n = {n}: {trips} iterations for {polls} polls"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_backward_goto_w_is_an_unpolled_cycle_and_is_refused() {
+        // The model is not vacuous: `goto_w` is a branch the emitter has no
+        // poll for, so a backward one is a cycle that can never reach a
+        // safepoint. `jit_scan` rejects `goto_w` today; this pins the reason.
+        let spin = vec![0xc8, 0x00, 0x00, 0x00, 0x00, 0xb1];
+        assert!(!all_backward_edges_are_polled(&spin, spin.len()));
+        assert!(!poll_bearing_opcode(0xc8));
+
+        // A method containing one is refused outright rather than duplicated.
+        let code = shape_with_goto_w();
+        assert_eq!(
+            plan_loop_unroll(&code, code.len(), 0, 5, 1, &[]),
+            Err(LoopXformRefusal::OpaqueControlFlow)
+        );
+    }
+
+    #[test]
+    fn an_irreducible_loop_is_refused() {
+        let code = shape_irreducible();
+        let len = code.len();
+        // The second entry into the cycle IS the branch that breaks the
+        // header's domination of its own region, so the single-entry scan
+        // names it first. Both are refusals; neither transforms.
+        assert_eq!(
+            plan_loop_unroll(&code, len, 7, 17, 1, &[]),
+            Err(LoopXformRefusal::ExternalEntry)
+        );
+        assert_eq!(
+            plan_loop_peel(&code, len, 7, 17, 1, &[]),
+            Err(LoopXformRefusal::ExternalEntry)
+        );
+        // …and the dominator machinery agrees on why: the header does not
+        // dominate the other entry block.
+        let cfg = MethodCfg::build(&code, len).expect("cfg builds");
+        let h = cfg.node_of(7).expect("header node");
+        let l2 = cfg.node_of(13).expect("L2 node");
+        assert!(!cfg.dominates(h, l2));
+        // A reducible loop's header does dominate its region.
+        let a = shape_a();
+        let acfg = MethodCfg::build(&a, a.len()).expect("cfg builds");
+        let ah = acfg.node_of(4).expect("header node");
+        for &pc in acfg.nodes() {
+            if (4..21).contains(&pc) {
+                let n = acfg.node_of(pc).expect("region node");
+                assert!(acfg.dominates(ah, n), "header should dominate {pc}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_irreducible_inner_cycle_is_refused() {
+        let code = shape_irreducible_inner();
+        let len = code.len();
+        // The outer loop is single-entry and its header dominates the whole
+        // region, so only the inner reducibility test can reject this.
+        let cfg = MethodCfg::build(&code, len).expect("cfg builds");
+        let h = cfg.node_of(2).expect("outer header");
+        for &pc in cfg.nodes() {
+            if (2..33).contains(&pc) {
+                let n = cfg.node_of(pc).expect("region node");
+                assert!(cfg.dominates(h, n), "outer header should dominate {pc}");
+            }
+        }
+        assert_eq!(
+            plan_loop_unroll(&code, len, 2, 30, 1, &[]),
+            Err(LoopXformRefusal::IrreducibleInnerLoop)
+        );
+        assert_eq!(
+            plan_loop_peel(&code, len, 2, 30, 2, &[]),
+            Err(LoopXformRefusal::IrreducibleInnerLoop)
+        );
+    }
+
+    #[test]
+    fn exception_order_is_unchanged() {
+        let code = shape_throws();
+        let len = code.len();
+        let heap = vec![0i32; 6];
+        // The fixture throws where we think it does, after the stores that
+        // precede it.
+        let base = interp(&code, len, None, &[0, 6, 0], &heap);
+        assert_eq!(base.outcome, Outcome::Throw("ArithmeticException", 14));
+        assert_eq!(base.heap, vec![-33, -50, -100, 0, 0, 0]);
+
+        for k in 1..=3usize {
+            for x in [
+                plan_loop_peel(&code, len, 2, 19, k, &[]).expect("peel"),
+                plan_loop_unroll(&code, len, 2, 19, k, &[]).expect("unroll"),
+            ] {
+                // n = 0..3 completes; n >= 4 throws ArithmeticException at
+                // i == 3; n > 6 would throw ArrayIndexOutOfBounds first if the
+                // divide were reordered past the store.
+                for n in 0..=9i32 {
+                    let locals = [0, n, 0];
+                    let base = interp(&code, len, None, &locals, &heap);
+                    let t = interp(&x.code, x.code_len, Some(&x.bci_of), &locals, &heap);
+                    assert_eq!(t.outcome, base.outcome, "{:?} k = {k}, n = {n}", x.kind);
+                    assert_eq!(t.heap, base.heap, "{:?} k = {k}, n = {n}", x.kind);
+                    assert_eq!(
+                        steps_without_back_edge(&t, 19),
+                        steps_without_back_edge(&base, 19),
+                        "{:?} k = {k}, n = {n}",
+                        x.kind
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deopt_into_a_transformed_loop_resolves_its_locals() {
+        let code = shape_a();
+        let len = code.len();
+        let orig_starts = instruction_start_map(&code, len);
+        for k in 1..=3usize {
+            for x in [
+                plan_loop_peel(&code, len, 4, 18, k, &[]).expect("peel"),
+                plan_loop_unroll(&code, len, 4, 18, k, &[]).expect("unroll"),
+            ] {
+                // Provenance is TOTAL: every output byte names an original
+                // bci, so no output PC can deopt into a hole.
+                assert!(x.provenance_is_total());
+                let out_starts = instruction_start_map(&x.code, x.code_len);
+                for (p, &is_start) in out_starts.iter().enumerate() {
+                    if !is_start {
+                        continue;
+                    }
+                    let bci = x.bci_at(p).expect("provenance for an instruction start");
+                    assert!(
+                        orig_starts[bci],
+                        "{:?} k = {k}: output pc {p} maps to {bci}, not an instruction start",
+                        x.kind
+                    );
+                }
+                // …and the frame at that bci is the frame the interpreter
+                // would have had: the whole (bci, locals) sequence matches.
+                for n in 0..=5i32 {
+                    let locals = [n, 0, 0];
+                    let base = interp(&code, len, None, &locals, &[]);
+                    let t = interp(&x.code, x.code_len, Some(&x.bci_of), &locals, &[]);
+                    assert_eq!(
+                        steps_without_back_edge(&t, 18),
+                        steps_without_back_edge(&base, 18),
+                        "{:?} k = {k}, n = {n}",
+                        x.kind
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn osr_entry_targets_the_steady_state_copy() {
+        let code = shape_a();
+        let len = code.len();
+        let peel = plan_loop_peel(&code, len, 4, 18, 2, &[]).expect("peel");
+        // A bci inside the body has k + 1 images. Entering a PEELED copy from
+        // OSR would re-run the peeled iterations, so the answer must be the
+        // last copy — the one the back edge re-enters.
+        assert_eq!(peel.steady_state_base(), 4 + 2 * 14);
+        assert_eq!(peel.osr_entry_pc(4), Some(4 + 2 * 14));
+        assert_eq!(peel.osr_entry_pc(9), Some(9 + 2 * 14));
+        assert_eq!(peel.osr_entry_pc(0), Some(0));
+        assert_eq!(peel.osr_entry_pc(21), Some(21 + 2 * 14));
+        assert_eq!(peel.osr_entry_pc(23), None);
+
+        // For unroll every copy is a full iteration, so the first one — the
+        // back edge's target — is the right entry.
+        let unroll = plan_loop_unroll(&code, len, 4, 18, 2, &[]).expect("unroll");
+        assert_eq!(unroll.steady_state_base(), 4);
+        assert_eq!(unroll.osr_entry_pc(4), Some(4));
+        assert_eq!(unroll.osr_entry_pc(9), Some(9));
+        assert_eq!(unroll.osr_entry_pc(21), Some(21 + 2 * 14));
+
+        // Round trip: the OSR entry for a bci carries that bci.
+        for x in [&peel, &unroll] {
+            for bci in [0usize, 4, 9, 15, 21] {
+                let p = x.osr_entry_pc(bci).expect("osr entry");
+                assert_eq!(x.bci_at(p), Some(bci), "{:?} bci {bci}", x.kind);
+            }
+        }
+    }
+
+    #[test]
+    fn peeling_removes_the_preheader_bypass_from_the_steady_state_loop() {
+        let code = shape_b();
+        let len = code.len();
+        // The original is exactly the shape the pre-header bypass guard
+        // rejects: a branch from outside lands on the header, after the
+        // pre-header the emitter would have placed there.
+        let loops = detect_loops(&code, len);
+        assert!(find_bypassable_loop_headers(&code, len, &loops, &[]).contains(&11));
+
+        // Peeling moves the external entry onto the PEELED copy, so the
+        // steady-state loop has no entry but its own back edge and the
+        // fall-through: a hoist the guard had to drop is legal again.
+        let peel = plan_loop_peel(&code, len, 11, 25, 1, &[]).expect("peel");
+        let ploops = detect_loops(&peel.code, peel.code_len);
+        assert_eq!(ploops, vec![(peel.steady_state_base(), peel.back_edge_pc())]);
+        assert!(find_bypassable_loop_headers(&peel.code, peel.code_len, &ploops, &[]).is_empty());
+
+        // Unrolling does NOT: its first copy IS the header, so the external
+        // edge still lands on the loop. Stated so nobody assumes otherwise.
+        let unroll = plan_loop_unroll(&code, len, 11, 25, 1, &[]).expect("unroll");
+        let uloops = detect_loops(&unroll.code, unroll.code_len);
+        assert!(find_bypassable_loop_headers(&unroll.code, unroll.code_len, &uloops, &[])
+            .contains(&11));
+    }
+
+    #[test]
+    fn exception_ranges_are_refused_or_widened() {
+        let code = shape_a();
+        let len = code.len();
+        // A handler inside the region would need duplicating with it.
+        assert_eq!(
+            plan_loop_peel(&code, len, 4, 18, 1, &[(9, 15, 12)]),
+            Err(LoopXformRefusal::HandlerInRegion)
+        );
+        // A protected range that covers only part of the loop cannot be
+        // mapped onto the copies.
+        assert_eq!(
+            plan_loop_peel(&code, len, 4, 18, 1, &[(0, 10, 22)]),
+            Err(LoopXformRefusal::HandlerRangeStraddlesRegion)
+        );
+        // A range that encloses the loop is widened to cover every copy.
+        let x = plan_loop_peel(&code, len, 4, 18, 1, &[(0, 21, 21)]).expect("enclosing range");
+        assert_eq!(x.exception_ranges, vec![(0, 35, 35)]);
+        // A range entirely before the loop does not move.
+        let y = plan_loop_peel(&code, len, 4, 18, 1, &[(0, 4, 2)]).expect("range before the loop");
+        assert_eq!(y.exception_ranges, vec![(0, 4, 2)]);
+    }
+
+    #[test]
+    fn shapes_the_rewriter_refuses_to_guess_at() {
+        let code = shape_a();
+        let len = code.len();
+        // A `do { } while` back edge is the exit test: duplicating the body
+        // without it would run the body k + 1 times per test.
+        let dw = shape_do_while();
+        assert_eq!(
+            plan_loop_unroll(&dw, dw.len(), 2, 7, 1, &[]),
+            Err(LoopXformRefusal::ConditionalBackEdge)
+        );
+        // Copy-count bounds are what keeps time-to-safepoint bounded.
+        assert_eq!(
+            plan_loop_unroll(&code, len, 4, 18, 0, &[]),
+            Err(LoopXformRefusal::TooManyCopies)
+        );
+        assert_eq!(
+            plan_loop_unroll(&code, len, 4, 18, LOOP_XFORM_MAX_COPIES + 1, &[]),
+            Err(LoopXformRefusal::TooManyCopies)
+        );
+        // The pair must actually be a loop.
+        assert_eq!(
+            plan_loop_peel(&code, len, 4, 6, 1, &[]),
+            Err(LoopXformRefusal::ConditionalBackEdge)
+        );
+        assert_eq!(
+            plan_loop_peel(&code, len, 9, 18, 1, &[]),
+            Err(LoopXformRefusal::NotABackEdge)
+        );
+    }
+
+    #[test]
+    fn the_rewrite_is_layout_consistent() {
+        let code = shape_a();
+        let len = code.len();
+        for k in 1..=LOOP_XFORM_MAX_COPIES {
+            for x in [
+                plan_loop_peel(&code, len, 4, 18, k, &[]).expect("peel"),
+                plan_loop_unroll(&code, len, 4, 18, k, &[]).expect("unroll"),
+            ] {
+                assert_eq!(x.code_len, len + k * 14);
+                assert_eq!(x.code.len(), x.code_len);
+                assert_eq!(x.back_edge_pc(), 4 + (k + 1) * 14);
+                assert_eq!(x.code[x.back_edge_pc()], 0xa7);
+                // The prefix never moves, so the header PC is stable and the
+                // copies are byte-identical apart from their branch offsets.
+                assert_eq!(&x.code[..4], &code[..4]);
+                for ci in 0..=k {
+                    let base = 4 + ci * 14;
+                    assert_eq!(x.code[base], 0x1b, "copy {ci} must start at the header");
+                    assert_eq!(x.bci_at(base), Some(4));
+                }
+                // Every copy's exit branch leaves to the (shifted) exit.
+                for ci in 0..=k {
+                    let at = 4 + ci * 14 + 2;
+                    let off = i16::from_be_bytes([x.code[at + 1], x.code[at + 2]]) as isize;
+                    assert_eq!(at as isize + off, (21 + k * 14) as isize);
+                }
+            }
+        }
+    }
+}

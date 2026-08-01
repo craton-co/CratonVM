@@ -53,10 +53,49 @@
 //!
 //! # Soundness direction
 //!
-//! The lattice joins upward (`NoEscape < ArgEscape < GlobalEscape`), so every
-//! partial result *under*-estimates escape, and both live consumers act on
-//! `== NoEscape`. Anything that can terminate the fixed point early therefore
-//! has to fail closed — see [`escalate_all_to_global`].
+//! The lattice joins upward (`NoEscape < PartialEscape < ArgEscape <
+//! GlobalEscape`), so every partial result *under*-estimates escape, and both
+//! live consumers act on `== NoEscape`. Anything that can terminate the fixed
+//! point early therefore has to fail closed — see [`escalate_all_to_global`].
+//!
+//! # The three things this module proves before an object may be replaced
+//!
+//! Scalar replacement deletes a *heap object*. Three separate facts have to
+//! hold, and each is checked by its own machinery here:
+//!
+//! 1. **Reachability** — nobody outside this frame can reach the object.
+//!    That is [`EscapeState`], computed by [`propagate_escape_states`].
+//! 2. **Value** — every surviving read of a field must be answerable with the
+//!    value the object actually held *at that point*. That is the positional
+//!    store record ([`ScalarReplacementInfo::field_stores`]) and the per-load
+//!    answer ([`LoadResolution`]). A last-write-wins field map is **not**
+//!    enough: `Foo o = new Foo(); int a = o.x; o.x = 42;` must fold `a` to the
+//!    zero default, never to `42`. See [`ScalarReplacementInfo::load_values`].
+//! 3. **Identity** — nothing may observe the object's *address*. `==` on
+//!    references, an identity hash, and `monitorenter`/`monitorexit` all do.
+//!    An object with a live identity observation is refused outright; see
+//!    [`Op::RefCompare`], [`Op::IdentityHash`] and
+//!    [`EscapeAnalysisResult::identity_observations`].
+//!
+//! Facts 2 and 3 are *independent* of fact 1. An object can be perfectly
+//! `NoEscape` and still be unreplaceable because a load cannot be answered or
+//! its identity is observed. Conflating them is how the last miscompilation on
+//! this branch happened.
+//!
+//! # Why `dominance_proved` exists
+//!
+//! Answering "which store does this load see?" is a dominance question, and the
+//! EA graph cannot ask it: the bridge in `jit/src/lib.rs`
+//! (`escape_analysis_from_ir`) rewrites the production `Op::Load` / `Op::Store`
+//! into the compact `[holder, value]` layout, **dropping the control and memory
+//! edges**. Without them there is no CFG here to build a dominator tree from.
+//!
+//! So the analysis uses program order — ascending [`NodeId`], which is creation
+//! order — as a stand-in, and gates that stand-in on
+//! [`program_order_proves_dominance`]: it is only sound in a graph with no
+//! branch, no join and no multi-input φ. Everything else resolves to
+//! [`LoadResolution::Unknown`] and the object is refused. Recovering precision
+//! means giving the EA graph real control edges — see `docs/jit/escape-analysis.md`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -96,6 +135,29 @@ pub enum Op {
     MonitorEnter,
     MonitorExit,
     ArrayLength,
+    /// Reference **identity comparison** (`if_acmpeq` / `if_acmpne`, and the
+    /// `Objects.isNull`-style folds that lower to one).  Inputs: the compared
+    /// references, in any order.
+    ///
+    /// This is an *identity observation*, not an escape: the compared object
+    /// stays unreachable from outside the frame, but its address becomes
+    /// observable, so it may not be scalar-replaced while the comparison is
+    /// live.  See [`find_identity_observations`].
+    ///
+    /// NOTE: no producer emits this yet — `ir_op_to_ea_op` in `jit/src/lib.rs`
+    /// maps `ir::Op::Cmp(_)` to [`Op::Other`].  Until it is taught to emit
+    /// `RefCompare` for a `Cmp` on two `IrType::Ref` operands, an `acmp` on a
+    /// scalar-replacement candidate is invisible here.  It is *currently*
+    /// harmless only because `Op::Other` hits `find_scalar_replacements`'
+    /// catch-all and refuses the object anyway; this variant makes the refusal
+    /// intentional and reportable rather than incidental.
+    RefCompare,
+    /// Identity-hash observation (`System.identityHashCode`, or an
+    /// `Object.hashCode` that is not overridden).  Input `[obj]`.
+    ///
+    /// Same status as [`Op::RefCompare`]: an identity observation that blocks
+    /// scalar replacement, with no producer in the bridge yet.
+    IdentityHash,
     Dead,
     Other,
 }
@@ -112,6 +174,22 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     pub entry: NodeId,
     pub exit: NodeId,
+    /// Nodes the *producer* knows execute on a cold path — an exceptional or
+    /// profiled-never-taken branch, a slow-path helper call, a bail.
+    ///
+    /// This is the only cold-path input the analysis has, and it is **empty by
+    /// default**: with no producer filling it, no allocation is ever classified
+    /// [`EscapeState::PartialEscape`] and behaviour is exactly what it was
+    /// before partial escape existed. That is deliberate — a wrong guess about
+    /// coldness would report an object as "escapes only rarely" when it escapes
+    /// on every call, so the fail-closed default is "nothing is cold".
+    ///
+    /// A partial-escape *classification* is informational: it never enables an
+    /// optimisation on its own (see [`EscapeState::PartialEscape`]). It names
+    /// the objects a future partial-escape applier could sink past their cold
+    /// escape point, together with the materialization sites it would need
+    /// ([`PartialEscapeInfo::escape_sites`]).
+    pub cold_nodes: HashSet<NodeId>,
 }
 
 impl Graph {
@@ -131,7 +209,17 @@ impl Graph {
             nodes: vec![start, ret],
             entry: 0,
             exit: 1,
+            cold_nodes: HashSet::new(),
         }
+    }
+
+    /// Record that `node` executes only on a cold path.
+    ///
+    /// Additive and monotone: marking more nodes cold can only ever move an
+    /// allocation from `ArgEscape`/`GlobalEscape` to the *reported*
+    /// `PartialEscape`, which no consumer acts on.
+    pub fn mark_cold(&mut self, node: NodeId) {
+        self.cold_nodes.insert(node);
     }
 
     pub fn add_node(&mut self, op: Op, inputs: Vec<NodeId>) -> NodeId {
@@ -228,13 +316,128 @@ fn field_in_range(graph: &Graph, holder_allocs: &HashSet<NodeId>, field: usize) 
         })
 }
 
+// ── Program order as a dominance stand-in ───────────────────────────────
+
+/// Whether ascending [`NodeId`] is a sound stand-in for *dominance* in this
+/// graph — i.e. whether "store id < load id" really means "the store executed
+/// before the load, on every path that reaches the load".
+///
+/// # Why this is needed at all
+///
+/// The value-forwarding question ("which store does this load see?") is a
+/// dominance question. The EA graph cannot answer it directly: the bridge
+/// (`escape_analysis_from_ir` in `jit/src/lib.rs`) rewrites `Op::Load` /
+/// `Op::Store` into the compact `[holder, value]` / `[holder]` layout and drops
+/// input 0 (control) and input 1 (memory). There is therefore no CFG in this
+/// graph to dominate over.
+///
+/// Node ids are assigned by `Graph::add_node` in creation order, which the
+/// bridge derives from `ir::Graph` node order, which the builder derives from
+/// bytecode order. In a graph with **no control flow at all** that ordering is
+/// exactly execution order, so it *is* dominance. Add one branch and it is not:
+///
+/// ```text
+///   Foo o = new Foo();
+///   if (c) o.x = 1; else o.x = 2;   // ids 10 and 12
+///   int a = o.x;                    // id 15 — sees 1 or 2, unknowably
+/// ```
+///
+/// Both stores precede the load in id order and neither dominates it. A
+/// last-write-wins field map answers `2` and miscompiles the `c` path.
+///
+/// # The test
+///
+/// Refuse the moment any of these appears on a live node:
+///
+/// * [`Op::If`] — the only way control can diverge, and therefore also the only
+///   way a loop can be built (a loop with no exit branch does not terminate).
+///   Catching `If` is what closes the back-edge case, where a *higher*-id store
+///   in the loop body runs before a *lower*-id load on the second iteration.
+/// * [`Op::Merge`] — a forward join. Implied by `If` in a well-formed graph,
+///   checked separately because the bridge maps `ir::Op::Region` (the loop
+///   header) to [`Op::Other`], so `Merge` is the only join op that survives
+///   translation and a graph could in principle carry one without an `If`.
+/// * A [`Op::Phi`] with more than one input. A φ merging two or more values can
+///   only exist at a join. A *single*-input φ is a degenerate copy (the
+///   transparent-alias shape `find_scalar_replacements` accepts) and does not
+///   imply divergence.
+///
+/// # What is deliberately *not* on the list
+///
+/// **Exception edges.** A `catch`/`finally` handler body is never built into
+/// the IR at all: `ir::IrBuilder::build` skips handler bytecode outright
+/// (the "STUB-S8" skip in `ir::IrBuilder::build`), because a JIT frame never
+/// takes an exception edge —
+/// an exception makes the compiled body return the `i64::MIN` sentinel and the
+/// runtime re-runs or resumes the method in the interpreter. So a throw inside
+/// a compiled body *leaves the frame*; it cannot branch to a lower-id load.
+/// If that ever changes, this predicate must gain a `may_throw` term.
+///
+/// # Failure mode
+///
+/// `false` is not a bug, it is the fail-closed answer: every field that has at
+/// least one store then resolves to [`LoadResolution::Unknown`] and the object
+/// is refused. Fields with *no* store still resolve (to the zero default,
+/// which no control flow can change), and an object with stores but no loads is
+/// still replaceable — nothing has to be answered.
+pub fn program_order_proves_dominance(graph: &Graph) -> bool {
+    !graph.nodes.iter().any(|n| match &n.op {
+        Op::If | Op::Merge => true,
+        Op::Phi => n.inputs.len() > 1,
+        _ => false,
+    })
+}
+
 // ── Escape state ────────────────────────────────────────────────────────
 
 /// How far an allocated object escapes from its allocation site.
+///
+/// The order of the variants **is** the lattice order, and [`join`] is `max`:
+///
+/// ```text
+///   NoEscape  <  PartialEscape  <  ArgEscape  <  GlobalEscape
+///   ▲                                                       ▲
+///   bottom (optimisable)                       top (fail-closed answer)
+/// ```
+///
+/// # `PartialEscape` is not produced by the fixed point
+///
+/// The other three states are computed by [`propagate_escape_states`], which
+/// only ever joins *upward*, so every intermediate value is an under-estimate
+/// and the final value is a sound over-approximation of reality.
+///
+/// `PartialEscape` is different: it is a **path-sensitive refinement applied
+/// after the fixed point**, in [`analyze_escapes`], and it *lowers* an
+/// allocation's reported state from `ArgEscape`/`GlobalEscape` when every site
+/// at which the object escapes is in [`Graph::cold_nodes`]. Lowering a state is
+/// unsound in general, which is why it is fenced three ways:
+///
+/// * it is never written into the [`ConnectionGraph`], so it can never feed
+///   back into the join and weaken another node's state;
+/// * it only ever appears in [`EscapeAnalysisResult::escape_states`] and
+///   [`EscapeAnalysisStats`], both of which are informational;
+/// * every consumer that *acts* (scalar replacement, lock elision) tests
+///   `== NoEscape` against the connection graph, so a `PartialEscape` object is
+///   treated exactly like the `ArgEscape`/`GlobalEscape` object it really is
+///   until somebody writes a partial-escape applier that sinks the allocation
+///   past its cold escape point.
+///
+/// It sits *below* `ArgEscape` in the order because that is the direction a
+/// future applier would move it in, and because a consumer that (wrongly) tests
+/// `>= ArgEscape` for "escapes" is then the one that has to be fixed — a
+/// consumer that tests `!= NoEscape`, which is the documented predicate
+/// ([`EscapeState::may_escape`]), stays correct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EscapeState {
     /// Object does not escape the current method -- can be scalar-replaced.
     NoEscape,
+    /// Object escapes on *some* path only, and every such path is cold.
+    ///
+    /// Reported, never propagated — see the type-level documentation. Today it
+    /// enables nothing; it identifies the objects a partial-escape applier
+    /// would target, and it is *not* stack-allocatable (the hot path would pay
+    /// for a frame slot the cold path then has to copy to the heap anyway).
+    PartialEscape,
     /// Object escapes to a callee but not globally -- can be stack-allocated.
     ArgEscape,
     /// Object escapes globally -- must be heap-allocated.
@@ -245,6 +448,22 @@ impl EscapeState {
     /// Join two escape states (lattice meet = max).
     fn join(self, other: EscapeState) -> EscapeState {
         std::cmp::max(self, other)
+    }
+
+    /// True when the object may be observed outside the allocating frame on at
+    /// least one path.
+    ///
+    /// **This, not `>= ArgEscape`, is the predicate to test for "escapes".**
+    /// `PartialEscape` escapes — rarely, but it escapes — and it orders below
+    /// `ArgEscape`.
+    pub fn may_escape(self) -> bool {
+        self != EscapeState::NoEscape
+    }
+
+    /// True when the object is provably confined to this frame on **every**
+    /// path, which is the precondition for scalar replacement and lock elision.
+    pub fn is_confined(self) -> bool {
+        self == EscapeState::NoEscape
     }
 }
 
@@ -335,6 +554,38 @@ impl ConnectionGraph {
 
 // ── Scalar replacement info ─────────────────────────────────────────────
 
+/// One store into a scalar-replaced object's field, kept **positionally**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldStore {
+    /// The `Op::Store` node. Its id is its position in program order.
+    pub store: NodeId,
+    /// The value node written by this store.
+    pub value: NodeId,
+}
+
+/// What a replaced field load reads.
+///
+/// The whole point of this type is that it distinguishes *"reads the zero
+/// default"* from *"cannot be answered"*. Collapsing those two into one
+/// `Option<NodeId>` is how a load-before-store gets a value from its own
+/// future.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadResolution {
+    /// The load reads the value produced by this node.
+    Value(NodeId),
+    /// No store to this field dominates the load, so it reads the freshly
+    /// allocated object's zero default.
+    ///
+    /// Sound because the object is genuinely zero-initialised at allocation:
+    /// `Op::New` names a class whose instance fields start at `0`/`null`, and
+    /// the front end only admits allocations whose constructor sets no non-zero
+    /// field before the analysis sees it.
+    ZeroDefault,
+    /// Not provable. The caller **must** keep the load (and, since the object
+    /// it reads must then still exist, must not elide the allocation either).
+    Unknown,
+}
+
 /// Information for replacing an allocation with scalar values.
 pub struct ScalarReplacementInfo {
     /// The allocation node being replaced.
@@ -343,19 +594,86 @@ pub struct ScalarReplacementInfo {
     pub class_id: u32,
     /// Number of fields.
     pub num_fields: usize,
-    /// For each field: the node representing its value (or None if uninitialized).
+    /// For each field: the value of the **last** store to it in program order
+    /// (or `None` if the field is never stored).
+    ///
+    /// # This field alone is not a correct forwarding source
+    ///
+    /// It answers "what does the object hold when the method ends?", which is
+    /// the right question for a deopt recipe at the *end* of the object's live
+    /// range and the wrong question for a load in the middle of it. Forwarding
+    /// every replaced load to `field_values[f]` folded
+    /// `Foo o = new Foo(); int a = o.x; o.x = 42;` to `a == 42` — the
+    /// miscompilation this branch already paid for once.
+    ///
+    /// It is kept because it is the shape `ir_lower::VirtualObjectInfo` is built
+    /// from today (via `jit/src/lib.rs::virtual_object_info_for`). **For load
+    /// forwarding use [`Self::load_values`] / [`Self::load_value`].**
     pub field_values: Vec<Option<NodeId>>,
+    /// Per field, **every** store to it, ascending by node id = program order.
+    ///
+    /// This is the positional record that makes per-load resolution possible,
+    /// and it is also what a deopt producer needs to pick the store that
+    /// dominates a *particular* safepoint rather than bailing on "unproven
+    /// dominance" — see `docs/jit/escape-analysis.md`.
+    pub field_stores: Vec<Vec<FieldStore>>,
     /// Loads that were replaced with direct field value access.
     pub replaced_loads: Vec<NodeId>,
+    /// For each entry of [`Self::replaced_loads`], in the same order, the value
+    /// that load actually reads.
+    ///
+    /// **Invariant:** a candidate that reaches [`EscapeAnalysisResult`] never
+    /// contains [`LoadResolution::Unknown`] here —
+    /// [`find_scalar_replacements`] refuses the whole object instead. A
+    /// consumer may therefore treat `Unknown` as unreachable, but should still
+    /// fail closed on it rather than assume.
+    pub load_values: Vec<(NodeId, LoadResolution)>,
     /// Stores that were eliminated.
     pub eliminated_stores: Vec<NodeId>,
+    /// Whether program order was a sound dominance stand-in for this graph —
+    /// [`program_order_proves_dominance`]. Recorded per candidate so a consumer
+    /// can see *why* a field with stores resolved to `Unknown`.
+    pub dominance_proved: bool,
+}
+
+impl ScalarReplacementInfo {
+    /// The value `load` reads, or [`LoadResolution::Unknown`] if this candidate
+    /// does not describe that load at all.
+    ///
+    /// Fails closed on an unknown node: a caller that asks about a load this
+    /// object never owned gets `Unknown`, not a plausible-looking wrong value.
+    pub fn load_value(&self, load: NodeId) -> LoadResolution {
+        self.load_values
+            .iter()
+            .find(|&&(l, _)| l == load)
+            .map(|&(_, r)| r)
+            .unwrap_or(LoadResolution::Unknown)
+    }
 }
 
 // ── Analysis result ─────────────────────────────────────────────────────
 
+/// An allocation that escapes, but only on cold paths.
+#[derive(Debug, Clone)]
+pub struct PartialEscapeInfo {
+    /// The allocation node.
+    pub alloc_node: NodeId,
+    /// The state the fixed point computed, before the cold-path refinement.
+    /// This is the state every *acting* consumer still sees, because the
+    /// refinement never enters the connection graph.
+    pub without_refinement: EscapeState,
+    /// The cold nodes at which the object becomes visible outside the frame.
+    /// A partial-escape applier must materialize the object on the heap before
+    /// each of these, with the field values that hold at that point.
+    pub escape_sites: Vec<NodeId>,
+}
+
 /// Full result of escape analysis on a graph.
 pub struct EscapeAnalysisResult {
     /// Escape states for all allocation sites.
+    ///
+    /// May contain [`EscapeState::PartialEscape`], which the connection graph
+    /// never does — see that variant's documentation.
     pub escape_states: HashMap<NodeId, EscapeState>,
     /// Allocations that can be scalar-replaced (NoEscape).
     pub scalar_replaceable: Vec<ScalarReplacementInfo>,
@@ -363,6 +681,20 @@ pub struct EscapeAnalysisResult {
     pub stack_allocatable: Vec<NodeId>,
     /// Synchronized blocks on non-escaping objects (lock elision candidates).
     pub elide_locks: Vec<NodeId>,
+    /// Allocations whose every escape site is cold, with those sites.
+    /// Informational: nothing acts on it yet.
+    pub partial_escapes: Vec<PartialEscapeInfo>,
+    /// `(allocation, observing node)` pairs for every **live** observation of an
+    /// object's identity: `Op::RefCompare`, `Op::IdentityHash`,
+    /// `Op::MonitorEnter`, `Op::MonitorExit`. Sorted and deduplicated.
+    ///
+    /// Every allocation named here is excluded from
+    /// [`Self::scalar_replaceable`], whatever its escape state. Removing the
+    /// observation (marking the node `Op::Dead` — e.g. by applying lock elision)
+    /// and re-running the analysis makes the object eligible again; that
+    /// two-phase story is the *only* supported way to scalar-replace an object
+    /// whose identity is observed.
+    pub identity_observations: Vec<(NodeId, NodeId)>,
     /// Statistics.
     pub stats: EscapeAnalysisStats,
 }
@@ -372,11 +704,20 @@ pub struct EscapeAnalysisResult {
 pub struct EscapeAnalysisStats {
     pub total_allocations: usize,
     pub no_escape: usize,
+    /// Allocations reported [`EscapeState::PartialEscape`]. These are *not*
+    /// counted in `arg_escape`/`global_escape`, so the four state counters still
+    /// sum to `total_allocations`.
+    pub partial_escape: usize,
     pub arg_escape: usize,
     pub global_escape: usize,
     pub scalar_replaced: usize,
     pub stack_allocated: usize,
     pub locks_elided: usize,
+    /// `NoEscape` allocations refused scalar replacement *only* because their
+    /// identity is observed. The measurement that says how much an
+    /// identity-observation folder (acmp on a fresh object, elided monitors)
+    /// would be worth.
+    pub identity_blocked: usize,
 }
 
 // ── Materialization (partial escape analysis) ───────────────────────────
@@ -647,6 +988,28 @@ fn propagate_escape_states(cg: &mut ConnectionGraph, graph: &Graph) {
                         for &a in &obj_pts {
                             holder_escape = holder_escape.join(cg.get_escape(a));
                         }
+                        // UNKNOWN DESTINATION ⇒ GLOBAL ESCAPE.
+                        //
+                        // A holder that resolves to no allocation at all is a
+                        // write to somewhere this analysis cannot name: the
+                        // classic case is `putstatic`, whose base is a class /
+                        // static-area node, but it also covers a bridge gap
+                        // (a holder that mapped to `usize::MAX`) and any
+                        // opaque reference with no points-to entry.
+                        //
+                        // `get_escape` reports an unseen node as `NoEscape`, so
+                        // before this the rule below simply did not fire and a
+                        // value written into a *static field* stayed `NoEscape`
+                        // — scalar-replaceable, lock-elidable, and reachable by
+                        // every other thread in the VM. `Op::Param` holders were
+                        // already covered (the build phase marks them
+                        // `GlobalEscape`); nothing covered the rest.
+                        //
+                        // Fail closed: an unnameable destination is the global
+                        // heap until proven otherwise.
+                        if obj_pts.is_empty() {
+                            holder_escape = holder_escape.join(EscapeState::GlobalEscape);
+                        }
 
                         if holder_escape > EscapeState::NoEscape {
                             let val_escape = cg.get_escape(val);
@@ -703,11 +1066,107 @@ fn propagate_escape_states(cg: &mut ConnectionGraph, graph: &Graph) {
     }
 }
 
-// ── Phase 3: Find scalar replacement candidates ─────────────────────────
+// ── Phase 3a: Identity observations ─────────────────────────────────────
+
+/// Every **live** observation of an object's *identity*, as
+/// `(allocation, observing node)` pairs, sorted and deduplicated.
+///
+/// # Why identity is a separate question from escape
+///
+/// Scalar replacement deletes the object's address. Three JVM operations can
+/// see that address without the object escaping anywhere:
+///
+/// * `if_acmpeq` / `if_acmpne` — reference `==`. Two scalar-replaced objects
+///   with equal fields are indistinguishable; two heap objects are not.
+/// * `System.identityHashCode` (and a non-overridden `Object.hashCode`) — a
+///   stable per-object value derived from the header, which a bag of scalars
+///   does not have.
+/// * `monitorenter` / `monitorexit` — the monitor *is* the object header.
+///
+/// An object with any of these live cannot be scalar-replaced. The
+/// qualification in the review item — *"unless the observation is itself
+/// eliminated"* — is taken literally here: the observing node must be
+/// `Op::Dead`, i.e. some pass has already removed it. Anything weaker requires
+/// this module and its consumer to agree about a *future* elimination, and the
+/// consumer (`apply_ea_to_ir` in `jit/src/lib.rs`) can and does refuse elisions
+/// this module offers — for a lock naming a safepoint slot, for one whose
+/// memory chain cannot be spliced, for one whose value is still read. A monitor
+/// that survives on a scalar-replaced object is a `monitorenter` on a deleted
+/// reference.
+///
+/// So the supported way to scalar-replace a synchronized object is two-phase:
+/// run the analysis, [`apply_lock_elision`] the monitors it offers (they become
+/// `Op::Dead`), then run the analysis **again** on the mutated graph. The
+/// second run sees no live observation and replaces the object. This costs one
+/// extra pass and, unlike the coupled version, cannot desynchronise.
+///
+/// # Producer status
+///
+/// [`Op::RefCompare`] and [`Op::IdentityHash`] have no producer yet: the bridge
+/// maps `ir::Op::Cmp` to [`Op::Other`], and an identity-hash call to
+/// [`Op::Call`]. Both currently reach [`find_scalar_replacements`]' catch-all
+/// (`Other`) or escape the object (`Call`), so the *outcome* is already
+/// fail-closed — but it is incidental, unmeasurable and would silently become
+/// wrong if `Op::Other` were ever relaxed. Wiring the two variants is the
+/// out-of-scope edit recorded in `docs/jit/escape-analysis.md`.
+pub fn find_identity_observations(cg: &ConnectionGraph, graph: &Graph) -> Vec<(NodeId, NodeId)> {
+    let mut pairs: Vec<(NodeId, NodeId)> = Vec::new();
+
+    for (id, node) in graph.nodes.iter().enumerate() {
+        // The operands whose identity this node observes. `None` = not an
+        // identity observation at all.
+        let observed: &[NodeId] = match &node.op {
+            // The monitor is the object header of input 0 — the same operand
+            // `find_lock_elisions` reads, so the two agree about which object a
+            // monitor names.
+            Op::MonitorEnter | Op::MonitorExit | Op::IdentityHash => match node.inputs.first() {
+                Some(first) => std::slice::from_ref(first),
+                None => continue,
+            },
+            // Both sides of an `acmp` have their addresses compared.
+            Op::RefCompare => node.inputs.as_slice(),
+            _ => continue,
+        };
+        for &operand in observed {
+            // The operand itself may be the allocation (direct use), or a copy
+            // (φ / field load) that resolves to it.
+            let mut allocs = cg.resolve_points_to(operand);
+            if matches!(
+                graph.nodes.get(operand).map(|n| &n.op),
+                Some(Op::New { .. }) | Some(Op::NewArray { .. })
+            ) {
+                allocs.insert(operand);
+            }
+            for alloc in allocs {
+                pairs.push((alloc, id));
+            }
+        }
+    }
+
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
+}
+
+// ── Phase 3b: Find scalar replacement candidates ────────────────────────
 
 /// Identify allocations that can be decomposed into scalar field values.
 fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarReplacementInfo> {
     let mut results = Vec::new();
+
+    // Program order is only dominance in a branch-free graph; see
+    // `program_order_proves_dominance`. Computed once — it is a property of the
+    // graph, not of an object.
+    let dominance_proved = program_order_proves_dominance(graph);
+    // An allocation whose address is observed by a LIVE node may not be
+    // replaced, whatever its escape state.
+    let identity_observed: HashSet<NodeId> = find_identity_observations(cg, graph)
+        .into_iter()
+        .filter(|&(_, observer)| {
+            !matches!(graph.nodes.get(observer).map(|n| &n.op), Some(Op::Dead))
+        })
+        .map(|(alloc, _)| alloc)
+        .collect();
 
     for (id, node) in graph.nodes.iter().enumerate() {
         if let Op::New {
@@ -716,6 +1175,13 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
         } = &node.op
         {
             if cg.get_escape(id) != EscapeState::NoEscape {
+                continue;
+            }
+            // IDENTITY GATE. Checked before anything else so a `synchronized`
+            // or `==`-compared object is refused whole, not per-use — an
+            // observation reached through an alias this loop does not classify
+            // as transparent would otherwise slip past the use walk below.
+            if identity_observed.contains(&id) {
                 continue;
             }
 
@@ -727,7 +1193,13 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
             // order). `add_node` assigns ids in creation = program order, so a
             // larger store-node id is a later store.
             let mut field_value_store: Vec<Option<NodeId>> = vec![None; *num_fields];
+            // POSITIONAL RECORD: every store to each field, not just the last.
+            // Sorted by node id after the walk, because the worklist pops LIFO.
+            let mut field_stores: Vec<Vec<FieldStore>> = vec![Vec::new(); *num_fields];
             let mut replaced_loads = Vec::new();
+            // Parallel to `replaced_loads`: the field each one reads, kept so
+            // the per-load resolution below does not have to re-derive it.
+            let mut load_fields: Vec<usize> = Vec::new();
             let mut eliminated_stores = Vec::new();
             let mut can_replace = true;
 
@@ -816,6 +1288,14 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                                     field_values[*field_idx] = Some(stored_val);
                                     field_value_store[*field_idx] = Some(use_id);
                                 }
+                                // …and the POSITIONAL record keeps every store,
+                                // which is what lets a load see the store that
+                                // precedes *it* rather than the last one in the
+                                // method.
+                                field_stores[*field_idx].push(FieldStore {
+                                    store: use_id,
+                                    value: stored_val,
+                                });
                             }
                             // Both stores are eliminated regardless of which
                             // value wins — the heap object is gone, so every
@@ -839,6 +1319,7 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                         let is_holder = holder.is_some_and(|h| transparent.contains(&h));
                         if is_holder && *field_idx < *num_fields {
                             replaced_loads.push(use_id);
+                            load_fields.push(*field_idx);
                         } else {
                             can_replace = false;
                             break;
@@ -894,9 +1375,29 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                             break;
                         }
                     }
-                    // MonitorEnter/Exit on non-escaping objects are handled
-                    // separately by lock elision -- not a problem for SR.
-                    Op::MonitorEnter | Op::MonitorExit => {}
+                    // IDENTITY OBSERVATIONS.
+                    //
+                    // Previously `MonitorEnter`/`MonitorExit` were accepted
+                    // unconditionally, on the reasoning that lock elision would
+                    // remove them anyway. That coupling does not hold: this
+                    // module *offers* an elision, and `apply_ea_to_ir`
+                    // independently REFUSES it when a safepoint slot names the
+                    // monitor, when its memory chain cannot be spliced, or when
+                    // its value is still read (the `elide_locks` loop in
+                    // `jit/src/lib.rs::apply_ea_to_ir`). Each
+                    // refusal leaves a live `monitorenter` on an object this
+                    // pass just deleted.
+                    //
+                    // The identity gate above has already rejected the object,
+                    // so reaching here means the observation is `Op::Dead`
+                    // (handled by the `Op::Dead` arm) or the gate and this walk
+                    // disagree. Refuse either way — see
+                    // `find_identity_observations` for the two-phase story that
+                    // makes a synchronized object replaceable.
+                    Op::MonitorEnter | Op::MonitorExit | Op::RefCompare | Op::IdentityHash => {
+                        can_replace = false;
+                        break;
+                    }
                     // ArrayLength on a non-escaping object is fine -- the
                     // length is known statically. Other uses prevent SR.
                     Op::ArrayLength => {}
@@ -907,14 +1408,41 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                 }
             }
 
+            // ── Positional load resolution ───────────────────────────
+            //
+            // Now that every store is recorded with its position, answer each
+            // replaced load with the store that actually dominates it. A load we
+            // cannot answer refuses the WHOLE object: leaving it in the graph
+            // while eliding the allocation would make it read a deleted object,
+            // and leaving both means there was nothing to gain.
+            for stores in field_stores.iter_mut() {
+                stores.sort_unstable_by_key(|s| s.store);
+            }
+            let mut load_values: Vec<(NodeId, LoadResolution)> =
+                Vec::with_capacity(replaced_loads.len());
+            if can_replace {
+                for (&load, &field) in replaced_loads.iter().zip(load_fields.iter()) {
+                    let resolution =
+                        resolve_field_load(&field_stores[field], load, dominance_proved);
+                    if resolution == LoadResolution::Unknown {
+                        can_replace = false;
+                        break;
+                    }
+                    load_values.push((load, resolution));
+                }
+            }
+
             if can_replace {
                 results.push(ScalarReplacementInfo {
                     alloc_node: id,
                     class_id: *class_id,
                     num_fields: *num_fields,
                     field_values,
+                    field_stores,
                     replaced_loads,
+                    load_values,
                     eliminated_stores,
+                    dominance_proved,
                 });
             }
         }
@@ -923,9 +1451,58 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
     results
 }
 
+/// Resolve one field load against the field's positional store record.
+///
+/// `stores` must be sorted ascending by [`FieldStore::store`].
+/// `dominance_proved` is [`program_order_proves_dominance`] for the graph.
+///
+/// The three answers, and why each is sound:
+///
+/// * **no store to this field anywhere** ⇒ [`LoadResolution::ZeroDefault`].
+///   Sound *regardless of control flow*: if nothing in the method writes the
+///   field, every read of it sees the allocation's zero-initialised value on
+///   every path. This is the one case that survives a branchy graph.
+/// * **program order is dominance, and some store precedes the load** ⇒ the
+///   value of the latest such store. In a branch-free graph "precedes" is
+///   "executed before", and the latest one is the one still in the field.
+/// * **program order is dominance, and no store precedes the load** ⇒
+///   `ZeroDefault`. This is the load-before-store case
+///   (`Foo o = new Foo(); int a = o.x; o.x = 42;`): the later store is in the
+///   load's *future* and must not be forwarded to it. Answering `42` here was
+///   the miscompilation.
+///
+/// Everything else — a field with stores in a graph whose control flow we
+/// cannot see — is [`LoadResolution::Unknown`].
+fn resolve_field_load(
+    stores: &[FieldStore],
+    load: NodeId,
+    dominance_proved: bool,
+) -> LoadResolution {
+    if stores.is_empty() {
+        return LoadResolution::ZeroDefault;
+    }
+    if !dominance_proved {
+        return LoadResolution::Unknown;
+    }
+    match stores.iter().rev().find(|s| s.store < load) {
+        Some(s) => LoadResolution::Value(s.value),
+        None => LoadResolution::ZeroDefault,
+    }
+}
+
 // ── Phase 4: Find lock elision candidates ───────────────────────────────
 
 /// Identify MonitorEnter/MonitorExit nodes on non-escaping objects.
+///
+/// Sound on its own terms: no other thread can reach a `NoEscape` object, so
+/// its monitor is uncontended and the enter/exit pair is a no-op.
+///
+/// **This offer does not license scalar replacement of the locked object.** A
+/// live monitor is an identity observation, and the consumer may refuse the
+/// elision for reasons this module cannot see (`apply_ea_to_ir` refuses one
+/// whose safepoint slot or memory chain it cannot repair). The object is
+/// therefore excluded from `scalar_replaceable` while the monitor is live —
+/// see [`find_identity_observations`].
 fn find_lock_elisions(cg: &ConnectionGraph, graph: &Graph) -> Vec<NodeId> {
     let mut elide = Vec::new();
 
@@ -952,6 +1529,17 @@ fn find_lock_elisions(cg: &ConnectionGraph, graph: &Graph) -> Vec<NodeId> {
 // ── Partial escape analysis helpers ─────────────────────────────────────
 
 /// Check if an object escapes on only some control flow paths.
+///
+/// This is the *structural* heuristic — "some direct use escapes, some does
+/// not" — and it says nothing about how often the escaping path runs. It is
+/// kept because [`find_materialization_points`] is written against it.
+///
+/// The lattice-level answer is [`EscapeState::PartialEscape`], produced by
+/// [`analyze_escapes`] from [`Graph::cold_nodes`]. The two differ deliberately:
+/// this one is true for `new Foo(); o.x = 1; f(o);` (a local use and an
+/// escaping use) even though the object escapes on *every* execution, whereas
+/// the lattice classification requires the escape site itself to be cold. Only
+/// the latter is a basis for sinking an allocation.
 pub fn is_partial_escape(cg: &ConnectionGraph, graph: &Graph, alloc: NodeId) -> bool {
     let state = cg.get_escape(alloc);
     if state == EscapeState::NoEscape {
@@ -1052,6 +1640,69 @@ pub fn find_materialization_points(
     points
 }
 
+/// Every live node at which `alloc` becomes visible outside the allocating
+/// frame.
+///
+/// This is the *attribution* half of partial escape: [`EscapeState`] says an
+/// object escapes, this says **where**. An empty result for an escaping object
+/// means the escape could not be attributed to a site (it came from the
+/// fail-closed [`escalate_all_to_global`] path, or through an edge shape this
+/// walk does not model), and the caller must then keep the unrefined state.
+fn escape_sites_for(cg: &ConnectionGraph, graph: &Graph, alloc: NodeId) -> Vec<NodeId> {
+    let mut sites = Vec::new();
+    // Does `r` (a node used as a reference) carry `alloc`?
+    let carries = |cg: &ConnectionGraph, r: NodeId| -> bool {
+        r == alloc || cg.resolve_points_to(r).contains(&alloc)
+    };
+
+    for (id, node) in graph.nodes.iter().enumerate() {
+        match &node.op {
+            Op::Dead => {}
+            // Returning or passing the reference publishes it.
+            Op::Return | Op::Call => {
+                if node
+                    .inputs
+                    .iter()
+                    .any(|&inp| is_ref_producer(graph, inp) && carries(cg, inp))
+                {
+                    sites.push(id);
+                }
+            }
+            // Writing the reference into a field publishes it exactly when the
+            // holder is itself reachable from outside — the same rule the
+            // propagation uses, including "an unnameable holder is the global
+            // heap".
+            Op::Store(_) => {
+                let (obj, val) = match (store_holder(node), store_value(node)) {
+                    (Some(o), Some(v)) => (o, v),
+                    // A malformed store is an unattributable publication of its
+                    // value; propagation escalates it to GlobalEscape, so name
+                    // it as a site rather than pretend it is not one.
+                    (None, Some(v)) if carries(cg, v) => {
+                        sites.push(id);
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if !carries(cg, val) {
+                    continue;
+                }
+                let obj_pts = cg.resolve_points_to(obj);
+                let mut holder_escape = cg.get_escape(obj);
+                for &a in &obj_pts {
+                    holder_escape = holder_escape.join(cg.get_escape(a));
+                }
+                if obj_pts.is_empty() || holder_escape.may_escape() {
+                    sites.push(id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    sites
+}
+
 // ── Main entry point ────────────────────────────────────────────────────
 
 /// Run escape analysis on the IR graph.
@@ -1061,20 +1712,53 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
 
     let scalar_replaceable = find_scalar_replacements(&cg, graph);
     let lock_elisions = find_lock_elisions(&cg, graph);
+    let identity_observations = find_identity_observations(&cg, graph);
+    // Allocations whose identity a LIVE node observes. Used only to attribute
+    // the "would have been replaced but for its identity" statistic — the
+    // refusal itself already happened inside `find_scalar_replacements`.
+    let identity_live: HashSet<NodeId> = identity_observations
+        .iter()
+        .filter(|&&(_, observer)| {
+            !matches!(graph.nodes.get(observer).map(|n| &n.op), Some(Op::Dead))
+        })
+        .map(|&(alloc, _)| alloc)
+        .collect();
 
     // Classify allocations.
     let mut stats = EscapeAnalysisStats::default();
     let mut escape_states = HashMap::new();
     let mut stack_allocatable = Vec::new();
+    let mut partial_escapes = Vec::new();
 
     for (id, node) in graph.nodes.iter().enumerate() {
         if matches!(node.op, Op::New { .. } | Op::NewArray { .. }) {
             stats.total_allocations += 1;
-            let state = cg.get_escape(id);
+            let raw = cg.get_escape(id);
+            if raw.is_confined() && identity_live.contains(&id) {
+                stats.identity_blocked += 1;
+            }
+
+            // COLD-PATH REFINEMENT (reported only — see `EscapeState`).
+            // An escaping object whose every escape site is cold is reported
+            // `PartialEscape`. Both conditions fail closed: an unattributable
+            // escape (empty site list) and any hot site keep the raw state.
+            let mut state = raw;
+            if raw.may_escape() {
+                let sites = escape_sites_for(&cg, graph, id);
+                if !sites.is_empty() && sites.iter().all(|s| graph.cold_nodes.contains(s)) {
+                    partial_escapes.push(PartialEscapeInfo {
+                        alloc_node: id,
+                        without_refinement: raw,
+                        escape_sites: sites,
+                    });
+                    state = EscapeState::PartialEscape;
+                }
+            }
             escape_states.insert(id, state);
 
             match state {
                 EscapeState::NoEscape => stats.no_escape += 1,
+                EscapeState::PartialEscape => stats.partial_escape += 1,
                 EscapeState::ArgEscape => {
                     stats.arg_escape += 1;
                     stack_allocatable.push(id);
@@ -1093,6 +1777,8 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
         scalar_replaceable,
         stack_allocatable,
         elide_locks: lock_elisions,
+        partial_escapes,
+        identity_observations,
         stats,
     }
 }
@@ -1101,28 +1787,69 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
 
 /// Apply scalar replacement: replace allocation + load/store with direct
 /// value flow.  Marks eliminated nodes as `Op::Dead`.
+///
+/// # Which value each load gets
+///
+/// [`ScalarReplacementInfo::load_values`], **not** `field_values`. This
+/// function used to forward every load of field `f` to `field_values[f]`, the
+/// value of the *last* store to `f` anywhere in the method, which is a value
+/// from the load's future whenever a store to the same field follows it. That
+/// is the `Foo o = new Foo(); int a = o.x; o.x = 42;` ⇒ `a == 42`
+/// miscompilation, in this module rather than in `apply_ea_to_ir`.
+///
+/// # All-or-nothing
+///
+/// If any load cannot be resolved the graph is left **completely untouched**.
+/// A half-applied object — allocation killed, an unanswerable load still
+/// reading it — is worse than no optimisation.
 pub fn apply_scalar_replacement(graph: &mut Graph, info: &ScalarReplacementInfo) {
-    // Replace loads with the stored field value (or a zero constant).
+    // Refuse before mutating anything. `find_scalar_replacements` already
+    // guarantees no `Unknown` survives into a reported candidate, so this is the
+    // belt-and-braces check for a hand-built or future-produced info.
+    if info
+        .replaced_loads
+        .iter()
+        .any(|&l| info.load_value(l) == LoadResolution::Unknown)
+    {
+        return;
+    }
+
+    // Replace loads with the value that load actually reads.
+    let mut zero_default: Option<NodeId> = None;
     for &load_id in &info.replaced_loads {
         if load_id >= graph.nodes.len() {
             continue;
         }
-        if let Op::Load(field_idx) = graph.nodes[load_id].op {
-            if field_idx < info.num_fields {
-                if let Some(val) = info.field_values[field_idx] {
-                    // Redirect all uses of this load to the stored value.
-                    let load_uses: Vec<NodeId> = graph.nodes[load_id].uses.clone();
-                    for &u in &load_uses {
-                        if u < graph.nodes.len() {
-                            for inp in graph.nodes[u].inputs.iter_mut() {
-                                if *inp == load_id {
-                                    *inp = val;
-                                }
-                            }
-                            graph.nodes[val].uses.push(u);
-                        }
+        // A never-written field reads the allocation's zero value; materialise
+        // ONE shared `Const(0)` for all of them.
+        let val = match info.load_value(load_id) {
+            LoadResolution::Value(v) => Some(v),
+            LoadResolution::ZeroDefault => Some(match zero_default {
+                Some(z) => z,
+                None => {
+                    let z = graph.add_node(Op::Const(0), vec![]);
+                    zero_default = Some(z);
+                    z
+                }
+            }),
+            // Unreachable: the guard above returned. Keep the load alive rather
+            // than kill it with no replacement.
+            LoadResolution::Unknown => None,
+        };
+        let val = match val {
+            Some(v) if v < graph.nodes.len() => v,
+            _ => continue,
+        };
+        // Redirect all uses of this load to that value.
+        let load_uses: Vec<NodeId> = graph.nodes[load_id].uses.clone();
+        for &u in &load_uses {
+            if u < graph.nodes.len() {
+                for inp in graph.nodes[u].inputs.iter_mut() {
+                    if *inp == load_id {
+                        *inp = val;
                     }
                 }
+                graph.nodes[val].uses.push(u);
             }
         }
         graph.nodes[load_id].op = Op::Dead;
@@ -1684,8 +2411,11 @@ mod tests {
             class_id: 1,
             num_fields: 1,
             field_values: vec![Some(c10)],
+            field_stores: vec![vec![FieldStore { store, value: c10 }]],
             replaced_loads: vec![load],
+            load_values: vec![(load, LoadResolution::Value(c10))],
             eliminated_stores: vec![store],
+            dominance_proved: true,
         };
 
         apply_scalar_replacement(&mut g, &info);
@@ -1857,8 +2587,11 @@ mod tests {
             class_id: 1,
             num_fields: 1,
             field_values: vec![Some(c42)],
+            field_stores: vec![vec![FieldStore { store, value: c42 }]],
             replaced_loads: vec![load],
+            load_values: vec![(load, LoadResolution::Value(c42))],
             eliminated_stores: vec![store],
+            dominance_proved: true,
         };
 
         apply_scalar_replacement(&mut g, &info);
@@ -2481,6 +3214,741 @@ mod tests {
                 .iter()
                 .all(|sr| sr.alloc_node != obj),
             "an ArgEscape allocation is not scalar-replaceable"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Positional (dominance-aware) store tracking
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // The defect these fence: `field_values` records only the LAST store per
+    // field, and forwarding every load to it hands a load a value from its own
+    // future. `apply_ea_to_ir` currently *refuses* such an object; the analysis
+    // now answers it instead.
+
+    /// THE REGRESSION TEST. `Foo o = new Foo(); int a = o.x; o.x = 42;` must
+    /// fold `a` to the zero default. Folding it to `42` was the miscompilation.
+    #[test]
+    fn load_before_store_reads_the_zero_default_not_the_later_store() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        // `int a = o.x;` — BEFORE any store.
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+        let c42 = g.add_node(Op::Const(42), vec![]);
+        // `o.x = 42;` — after the read.
+        let store = g.add_node(Op::Store(0), vec![alloc, c42]);
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("a purely local object is still replaceable");
+
+        assert_eq!(
+            sr.load_value(load),
+            LoadResolution::ZeroDefault,
+            "a load that precedes every store to its field reads the freshly \
+             allocated object's zero value"
+        );
+        assert_ne!(
+            sr.load_value(load),
+            LoadResolution::Value(c42),
+            "forwarding the load to a store in its own future is THE \
+             miscompilation this test exists for"
+        );
+        // The last-write-wins map still says 42 — which is precisely why it is
+        // the wrong forwarding source and `load_values` exists.
+        assert_eq!(sr.field_values[0], Some(c42));
+        assert_eq!(sr.field_stores[0], vec![FieldStore { store, value: c42 }]);
+    }
+
+    /// The paired POSITIVE: a load after the store reads that store.
+    #[test]
+    fn load_after_store_reads_that_store() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c42 = g.add_node(Op::Const(42), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c42]);
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("must replace");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c42));
+        assert!(sr.dominance_proved);
+    }
+
+    /// Two stores straddling two loads: each load keeps the value that was in
+    /// the field when *it* ran. A single last-write-wins slot cannot express
+    /// this at all.
+    #[test]
+    fn interleaved_stores_and_loads_each_resolve_positionally() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let s1 = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let load_a = g.add_node(Op::Load(0), vec![alloc]);
+        let c2 = g.add_node(Op::Const(2), vec![]);
+        let s2 = g.add_node(Op::Store(0), vec![alloc, c2]);
+        let load_b = g.add_node(Op::Load(0), vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("must replace");
+        assert_eq!(sr.load_value(load_a), LoadResolution::Value(c1));
+        assert_eq!(sr.load_value(load_b), LoadResolution::Value(c2));
+        assert_eq!(
+            sr.field_stores[0],
+            vec![
+                FieldStore {
+                    store: s1,
+                    value: c1
+                },
+                FieldStore {
+                    store: s2,
+                    value: c2
+                }
+            ],
+            "the positional record keeps BOTH stores, in program order"
+        );
+        assert_eq!(
+            sr.field_values[0],
+            Some(c2),
+            "the legacy last-write-wins map is unchanged for its remaining \
+             consumer (the deopt recipe builder)"
+        );
+    }
+
+    /// End-to-end through the in-module applier: the rewritten graph must give
+    /// each consumer the value its own load read.
+    #[test]
+    fn apply_scalar_replacement_forwards_each_load_to_its_own_store() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _s1 = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let load_a = g.add_node(Op::Load(0), vec![alloc]);
+        let c2 = g.add_node(Op::Const(2), vec![]);
+        let _s2 = g.add_node(Op::Store(0), vec![alloc, c2]);
+        let load_b = g.add_node(Op::Load(0), vec![alloc]);
+        // `a + b` — the consumer that would observe the wrong fold.
+        let add = g.add_node(Op::Add, vec![load_a, load_b]);
+
+        let result = analyze_escapes(&g);
+        let info = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("must replace");
+        apply_scalar_replacement(&mut g, info);
+
+        assert_eq!(
+            g.nodes[add].inputs,
+            vec![c1, c2],
+            "forwarding both loads to `field_values[0]` would make this \
+             `[c2, c2]` — i.e. `a` folded to 2"
+        );
+    }
+
+    /// An unresolvable load must leave the graph completely untouched — no
+    /// half-applied object.
+    #[test]
+    fn apply_scalar_replacement_refuses_an_unresolvable_load() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+
+        let info = ScalarReplacementInfo {
+            alloc_node: alloc,
+            class_id: 1,
+            num_fields: 1,
+            field_values: vec![Some(c1)],
+            field_stores: vec![vec![FieldStore { store, value: c1 }]],
+            replaced_loads: vec![load],
+            load_values: vec![(load, LoadResolution::Unknown)],
+            eliminated_stores: vec![store],
+            dominance_proved: false,
+        };
+        apply_scalar_replacement(&mut g, &info);
+
+        assert!(
+            matches!(g.nodes[alloc].op, Op::New { .. }),
+            "the allocation must survive an unresolvable load"
+        );
+        assert!(matches!(g.nodes[load].op, Op::Load(_)));
+        assert!(matches!(g.nodes[store].op, Op::Store(_)));
+    }
+
+    // ── The dominance gate ────────────────────────────────────────────
+
+    /// `if (c) o.x = 1; else o.x = 2; int a = o.x;` — both stores precede the
+    /// load in program order and NEITHER dominates it. Program order is not
+    /// dominance here, so the object must be refused rather than folded to the
+    /// textually-last store.
+    #[test]
+    fn a_branch_makes_program_order_stop_proving_dominance() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let cond = g.add_node(Op::Const(0), vec![]);
+        let _iff = g.add_node(Op::If, vec![cond]);
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let c2 = g.add_node(Op::Const(2), vec![]);
+        let _s1 = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let _s2 = g.add_node(Op::Store(0), vec![alloc, c2]);
+        let _load = g.add_node(Op::Load(0), vec![alloc]);
+
+        assert!(!program_order_proves_dominance(&g));
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::NoEscape),
+            "the object still does not escape — this is a VALUE question, not \
+             a reachability one"
+        );
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "a load that could read either of two conditional stores must not \
+             be folded to one of them"
+        );
+    }
+
+    /// The paired POSITIVE for the gate: a field with **no** store anywhere
+    /// resolves even in a branchy graph — no control flow can change what a
+    /// never-written field holds.
+    #[test]
+    fn a_never_stored_field_resolves_even_without_dominance() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 2,
+            },
+            vec![],
+        );
+        let cond = g.add_node(Op::Const(0), vec![]);
+        let _iff = g.add_node(Op::If, vec![cond]);
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _s0 = g.add_node(Op::Store(0), vec![alloc, c1]);
+        // Field 1 is never stored, anywhere.
+        let load = g.add_node(Op::Load(1), vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("a never-stored field is answerable with or without a CFG");
+        assert!(!sr.dominance_proved);
+        assert_eq!(sr.load_value(load), LoadResolution::ZeroDefault);
+    }
+
+    /// The three shapes that retract the dominance stand-in, and the one that
+    /// does not (a single-input φ is a copy, not a join).
+    #[test]
+    fn program_order_dominance_predicate_shapes() {
+        let mut branch = Graph::new();
+        let c = branch.add_node(Op::Const(0), vec![]);
+        branch.add_node(Op::If, vec![c]);
+        assert!(!program_order_proves_dominance(&branch));
+
+        let mut join = Graph::new();
+        join.add_node(Op::Merge, vec![]);
+        assert!(!program_order_proves_dominance(&join));
+
+        let mut merge_phi = Graph::new();
+        let a = merge_phi.add_node(Op::Const(1), vec![]);
+        let b = merge_phi.add_node(Op::Const(2), vec![]);
+        merge_phi.add_node(Op::Phi, vec![a, b]);
+        assert!(!program_order_proves_dominance(&merge_phi));
+
+        let mut copy_phi = Graph::new();
+        let a = copy_phi.add_node(Op::Const(1), vec![]);
+        copy_phi.add_node(Op::Phi, vec![a]);
+        assert!(
+            program_order_proves_dominance(&copy_phi),
+            "a single-input φ is a degenerate copy and implies no divergence"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Identity sensitivity
+    // ══════════════════════════════════════════════════════════════════
+
+    /// An object whose reference is compared with `==` has its ADDRESS
+    /// observed. It does not escape, and it still may not be replaced.
+    #[test]
+    fn object_compared_by_identity_is_not_scalar_replaced() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let other = g.add_node(Op::Param(0), vec![]);
+        let cmp = g.add_node(Op::RefCompare, vec![alloc, other]);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::NoEscape),
+            "an acmp does not publish the object — escape and identity are \
+             different questions"
+        );
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "an object with a live identity comparison must not be replaced: \
+             a bag of scalars has no address to compare"
+        );
+        assert!(result.identity_observations.contains(&(alloc, cmp)));
+        assert_eq!(result.stats.identity_blocked, 1);
+    }
+
+    /// The paired POSITIVE: the same object without the comparison replaces.
+    #[test]
+    fn object_not_compared_by_identity_is_scalar_replaced() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("must replace");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c1));
+        assert!(result.identity_observations.is_empty());
+        assert_eq!(result.stats.identity_blocked, 0);
+    }
+
+    /// An identity hash is a header read: same rule as `==`.
+    #[test]
+    fn identity_hash_blocks_scalar_replacement() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let ihash = g.add_node(Op::IdentityHash, vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::NoEscape)
+        );
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "a scalar-replaced object has no header to hash"
+        );
+        assert!(result.identity_observations.contains(&(alloc, ihash)));
+    }
+
+    /// An identity observation reached through a transparent φ still counts —
+    /// the alias is the same address.
+    #[test]
+    fn identity_observed_through_a_phi_alias_blocks_replacement() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let phi = g.add_node(Op::Phi, vec![alloc]);
+        let _cmp = g.add_node(Op::RefCompare, vec![phi]);
+
+        let result = analyze_escapes(&g);
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "the φ resolves to this allocation, so comparing the φ compares \
+             this object's address"
+        );
+    }
+
+    /// SYNCHRONIZATION is an identity observation: the monitor *is* the object
+    /// header. A live `monitorenter` blocks replacement even though the lock is
+    /// simultaneously offered for elision — because the consumer may refuse
+    /// that elision (`apply_ea_to_ir` does, for a monitor a safepoint names).
+    ///
+    /// The paired POSITIVE is in the same test: once the monitors are actually
+    /// eliminated, a second run replaces the object. That two-phase order is
+    /// the supported way to get both.
+    #[test]
+    fn synchronized_object_is_not_replaced_until_the_monitor_is_eliminated() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c7 = g.add_node(Op::Const(7), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c7]);
+        let _enter = g.add_node(Op::MonitorEnter, vec![alloc]);
+        let _exit = g.add_node(Op::MonitorExit, vec![alloc]);
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+
+        let first = analyze_escapes(&g);
+        assert_eq!(
+            first.escape_states.get(&alloc),
+            Some(&EscapeState::NoEscape),
+            "locking a local object does not make it escape"
+        );
+        assert!(
+            first
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "MUST NOT: a live monitor observes the object's identity"
+        );
+        assert_eq!(
+            first.elide_locks.len(),
+            2,
+            "the elision is still OFFERED — it is sound on its own terms"
+        );
+        assert_eq!(first.stats.identity_blocked, 1);
+
+        // Phase two: actually eliminate the observation, then re-analyse.
+        apply_lock_elision(&mut g, &first.elide_locks);
+        let second = analyze_escapes(&g);
+        let sr = second
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("MUST: with the monitors dead, nothing observes the identity");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c7));
+        assert_eq!(second.stats.identity_blocked, 0);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // The lattice: partial escape and the global-escape rules
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn lattice_order_places_partial_between_no_escape_and_arg_escape() {
+        assert!(EscapeState::NoEscape < EscapeState::PartialEscape);
+        assert!(EscapeState::PartialEscape < EscapeState::ArgEscape);
+        assert!(EscapeState::ArgEscape < EscapeState::GlobalEscape);
+        // `may_escape`, not `>= ArgEscape`, is the "escapes" predicate.
+        assert!(!EscapeState::NoEscape.may_escape());
+        assert!(EscapeState::PartialEscape.may_escape());
+        assert!(EscapeState::NoEscape.is_confined());
+        assert!(!EscapeState::PartialEscape.is_confined());
+    }
+
+    /// An object that escapes only through a node the producer marked cold is
+    /// classified `PartialEscape` — and that classification licenses nothing.
+    #[test]
+    fn object_escaping_only_on_a_cold_path_is_classified_partial() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        // The only escape: a slow-path helper the producer knows is cold.
+        let cold_call = g.add_node(Op::Call, vec![alloc]);
+        g.mark_cold(cold_call);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::PartialEscape)
+        );
+        let pe = result
+            .partial_escapes
+            .iter()
+            .find(|p| p.alloc_node == alloc)
+            .expect("the refinement records what it refined");
+        assert_eq!(pe.without_refinement, EscapeState::ArgEscape);
+        assert_eq!(pe.escape_sites, vec![cold_call]);
+        assert_eq!(result.stats.partial_escape, 1);
+        assert_eq!(result.stats.arg_escape, 0);
+
+        // A refinement is NOT a licence. Nothing may act on it.
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc),
+            "a partially-escaping object is still not scalar-replaceable"
+        );
+        assert!(
+            !result.stack_allocatable.contains(&alloc),
+            "nor stack-allocatable — the cold path would have to copy it out"
+        );
+    }
+
+    /// The paired NEGATIVE control: the same escape on a HOT path stays
+    /// `ArgEscape`, and one hot site among cold ones is enough to keep it.
+    #[test]
+    fn a_single_hot_escape_site_defeats_the_partial_classification() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let cold_call = g.add_node(Op::Call, vec![alloc]);
+        let _hot_call = g.add_node(Op::Call, vec![alloc]);
+        g.mark_cold(cold_call);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::ArgEscape),
+            "one escape site that is not cold means the object escapes on the \
+             hot path"
+        );
+        assert!(result.partial_escapes.is_empty());
+        assert_eq!(result.stats.partial_escape, 0);
+        assert_eq!(result.stats.arg_escape, 1);
+    }
+
+    /// With no cold information at all — the default — the classification is
+    /// exactly what it was before partial escape existed.
+    #[test]
+    fn no_cold_information_means_no_partial_classification() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _call = g.add_node(Op::Call, vec![alloc]);
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::ArgEscape)
+        );
+        assert!(result.partial_escapes.is_empty());
+    }
+
+    /// A value written into a holder this analysis cannot NAME — a `putstatic`
+    /// base, or any opaque reference with no points-to entry — must escape
+    /// globally.
+    ///
+    /// Before this rule the store-escape check read the holder's state with
+    /// `get_escape`, which reports an unseen node as `NoEscape`, so the rule
+    /// simply did not fire: an object published into a **static field** stayed
+    /// `NoEscape`, hence scalar-replaceable and lock-elidable, while being
+    /// reachable from every thread in the VM.
+    #[test]
+    fn object_stored_into_an_unnameable_holder_is_global_escape() {
+        let mut g = Graph::new();
+        // The static-area base: not an allocation, not a Param — opaque.
+        let statics = g.add_node(Op::Other, vec![]);
+        let obj = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _putstatic = g.add_node(Op::Store(0), vec![statics, obj]);
+
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&obj),
+            Some(&EscapeState::GlobalEscape),
+            "a write to an unnameable destination is a write to the global heap"
+        );
+        assert!(result.scalar_replaceable.is_empty());
+        assert!(result.elide_locks.is_empty());
+    }
+
+    /// An object passed to an unknown call escapes. It is `ArgEscape`, not
+    /// `GlobalEscape` — that is what the middle lattice element is FOR (the
+    /// callee can reach it; the global heap cannot, unless the callee publishes
+    /// it, which is the callee's own analysis). Either way it is not
+    /// replaceable.
+    #[test]
+    fn object_passed_to_an_unknown_call_escapes_and_is_not_replaced() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let _call = g.add_node(Op::Call, vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        let state = *result.escape_states.get(&alloc).expect("classified");
+        assert!(state.may_escape());
+        assert_eq!(state, EscapeState::ArgEscape);
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|s| s.alloc_node != alloc)
+        );
+    }
+
+    /// The paired POSITIVE for both escape rules: an object that is neither
+    /// published nor passed anywhere stays confined and IS replaced.
+    #[test]
+    fn a_purely_local_object_stays_confined_and_is_replaced() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        let load = g.add_node(Op::Load(0), vec![alloc]);
+
+        let result = analyze_escapes(&g);
+        assert!(result.escape_states[&alloc].is_confined());
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("MUST replace");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c1));
+    }
+
+    /// The four state counters partition the allocations — a `PartialEscape`
+    /// object is counted once, in its own bucket.
+    #[test]
+    fn state_counters_partition_the_allocations() {
+        let mut g = Graph::new();
+        let local = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let arg = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let cold = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let global = g.add_node(
+            Op::New {
+                class_id: 4,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let _ = local;
+        let _arg_call = g.add_node(Op::Call, vec![arg]);
+        let cold_call = g.add_node(Op::Call, vec![cold]);
+        g.mark_cold(cold_call);
+        g.nodes[1].inputs.push(global); // Return
+        g.nodes[global].uses.push(1);
+
+        let s = analyze_escapes(&g).stats;
+        assert_eq!(s.total_allocations, 4);
+        assert_eq!(s.no_escape, 1);
+        assert_eq!(s.partial_escape, 1);
+        assert_eq!(s.arg_escape, 1);
+        assert_eq!(s.global_escape, 1);
+        assert_eq!(
+            s.no_escape + s.partial_escape + s.arg_escape + s.global_escape,
+            s.total_allocations
         );
     }
 }

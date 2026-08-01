@@ -1545,10 +1545,22 @@ pub struct CompiledMethod {
     /// by tests to assert backend routing (e.g. that a self-recursive long/FP
     /// method stays on single-pass, the fib44-regression guard). Not read by codegen.
     pub used_ir_backend: bool,
-    /// Methods that were inlined into this compiled method.
+    /// Methods that were inlined into this compiled method, and the receiver
+    /// types its guarded sites speculated on.
     /// Each entry is (class_name, method_name, descriptor).
     /// Used by invalidation: if the inlined method's class changes, this code must be evicted.
+    ///
+    /// Populated from [`InlinePlan::invalidation_triples`], so a SPECULATIVE
+    /// site contributes both its callee and the class it guarded on — see
+    /// [`InlineDependency`] for why the second entry is a retirement
+    /// obligation rather than a correctness one.
     pub inlined_methods: Vec<(String, String, String)>,
+    /// Per-compilation inlining decision totals. Introspection only — never
+    /// read by codegen. Present on every artifact (default-empty when nothing
+    /// was inlined) so `metrics::CompileRecorder::installed` can harvest it
+    /// from the artifact rather than needing a new thread through
+    /// `try_compile_inner`'s ~40 return paths.
+    pub inline_tally: InlineDecisionTally,
     /// Deoptimization points: native code offsets where deopt can occur.
     /// Used by the deopt framework to reconstruct interpreter state.
     pub deopt_points: Vec<deopt::DeoptimizationPoint>,
@@ -1810,6 +1822,7 @@ impl CompiledMethod {
             has_dispatch: false,
             used_ir_backend: false,
             inlined_methods: Vec::new(),
+            inline_tally: InlineDecisionTally::default(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
@@ -1876,6 +1889,7 @@ impl CompiledMethod {
             has_dispatch: false,
             used_ir_backend: false,
             inlined_methods: Vec::new(),
+            inline_tally: InlineDecisionTally::default(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
@@ -3313,6 +3327,1347 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
         MAX_INLINE_EXPANSION_COST
     };
     (cost <= cost_cap).then_some(cost)
+}
+
+// ---------------------------------------------------------------------------
+// Profile-guided inlining policy (C2-review P1)
+// ---------------------------------------------------------------------------
+//
+// Everything above this line decides ONE question — "is this callee small
+// enough?" — and the caller (`try_compile_inner`'s invoke loop) answered every
+// other question implicitly, by never asking it: no depth accounting, no
+// recursion accounting, no receiver-type profile, no record of WHY a candidate
+// was refused, and no dependency beyond the callee's own class name. This
+// section is the policy those decisions were missing. It does not replace the
+// size model; it wraps it.
+//
+// # What is admitted, and what is deliberately refused
+//
+// `plan_inline` is a pure function: it takes a resolved [`InlineSite`], the
+// site's profile evidence, the compilation's remaining budget and a
+// description of what the BACKEND can actually emit, and returns an
+// [`InlinePlan`]. It never resolves, allocates code, or mutates anything.
+//
+//   * A statically bound site (`invokestatic` / `invokespecial`) has exactly
+//     one possible target, so it is admitted on the pre-existing size/budget
+//     terms with no guard and no speculation. Every refusal added here for
+//     such a site is one that could not previously fire (see the per-variant
+//     notes on [`InlineRefusal`]), so an unprofiled compile inlines exactly as
+//     it did before.
+//   * A virtual/interface site is SPECULATIVE: the target is chosen from the
+//     receiver-type profile, so it is admitted only behind an exact receiver
+//     class-id guard AND only with a recorded invalidation dependency. Absent
+//     either, the plan refuses. That is the fail-closed rule for this task, and
+//     it is enforced in one place ([`plan_inline`]'s speculative arm) rather
+//     than at each call site.
+//
+// # Deopt safety with no caller scopes
+//
+// `deopt::FrameState::caller` exists but NO production site ever populates it
+// — every construction in `ir_lower.rs` and `x64.rs` passes `caller: None`, so
+// an inlined scope is not representable in deopt metadata. An inline that
+// needed to describe "we are inside callee C, called from caller M at bci N"
+// would therefore publish a frame naming M with C's bci: a silent wrong answer
+// of exactly the class this branch just closed.
+//
+// This policy does not rely on caller scopes, and does not need them, because
+// the single-pass inline emitter publishes NO deopt point inside a callee
+// body. `x64::try_emit_inline_body` (x64.rs:9772-11056) contains no
+// `snapshot_*`, no `build_and_record_deopt_point` and no `deopt_stubs` push;
+// every callee operation it cannot emit without one is a `return false` that
+// rolls the attempt back and falls through to a real call. The one construct
+// that could publish — `emit_post_invoke_exception_check` for an inlined
+// `<clinit>` helper — builds a reason-9 frame only when
+// `precise_exception_frames` is set, and `try_compile_inner` clears
+// `inline_sites` outright in that case (lib.rs, just above the backend call).
+// [`InlineRefusal::PreciseExceptionFrames`] states that interlock in the
+// policy as well, so the two cannot drift apart silently.
+//
+// The consequence, stated plainly: **an inlined body is only ever entered and
+// left within one frame that is described as the caller's own**. No deopt
+// point inside it is described at all, so there is no metadata that a missing
+// caller scope could make wrong. If a future emitter learns to publish deopt
+// points inside inlined callees, this policy must refuse until
+// `FrameState::caller` is populated — that is a hard precondition, not a
+// preference.
+
+/// Maximum nesting depth of inlined scopes. HotSpot's `MaxInlineLevel`.
+///
+/// The single-pass emitter cannot nest today (it bails on any callee invoke
+/// that is not a resolver-proven elidable super-`<init>`), so the wiring passes
+/// `depth = 1` and this never binds. It is enforced anyway so a nesting
+/// emitter inherits a limit instead of needing one added.
+pub const INLINE_MAX_DEPTH: usize = 9;
+
+/// Maximum number of copies of the SAME method allowed on one inline stack —
+/// HotSpot's `MaxRecursiveInlineLevel`. Counts ancestors, not siblings: a leaf
+/// called five times from one caller is five independent sites, each paying the
+/// per-method budget, and is not recursion.
+pub const INLINE_MAX_RECURSIVE_DEPTH: usize = 1;
+
+/// Receiver observations a virtual/interface site needs before its type
+/// profile may be speculated on at all.
+///
+/// Half of [`INLINE_HOT_SITE_OBSERVATIONS`]: a site can be worth SPECULATING on
+/// (the shape of its receiver distribution has stabilised) before it is hot
+/// enough to earn the `FreqInlineSize` allowance. Under this count the shape is
+/// reported as [`ReceiverShape::Cold`] and refused, so a site executed twice
+/// with one receiver is never mistaken for a monomorphic one.
+pub const INLINE_MIN_SPECULATION_OBSERVATIONS: u32 = 250;
+
+/// Share of observations the dominant receiver must hold for a site to count as
+/// monomorphic. Matches the `min_fraction_pct` convention of
+/// [`profile::dominant_receiver`], which the interpreter-side consumers already
+/// call with 80-90.
+pub const INLINE_MONOMORPHIC_SHARE_PCT: u32 = 90;
+
+/// Combined share the top TWO receivers must hold for a bimorphic split. Higher
+/// than the monomorphic threshold on purpose: a bimorphic site pays two guards,
+/// so the tail it may leave to the dispatch fallback has to be smaller for the
+/// second guard to earn its space.
+pub const INLINE_BIMORPHIC_SHARE_PCT: u32 = 92;
+
+/// Distinct receiver types above which a site is megamorphic regardless of how
+/// dominant its top type looks.
+///
+/// Twice the PIC cascade's four ways. A site with a 91%-dominant receiver and
+/// twenty tail types is not a devirtualisation opportunity: the guard hits, but
+/// the profile is describing a shape (a dispatch hub) that the next thousand
+/// calls are free to change, and every reshuffle costs a retire/recompile.
+pub const INLINE_MEGAMORPHIC_TYPE_CEILING: usize = 8;
+
+/// What a call site's receiver-type profile says about it.
+///
+/// Derived only from [`profile::MethodProfile::receivers`], which the
+/// interpreter really does feed (`record_receiver_borrowed`) for
+/// `invokevirtual` / `invokeinterface`. Statically bound sites have no
+/// receivers recorded and classify as [`ReceiverShape::Unprofiled`], which is
+/// correct and is why the statically bound arm of [`plan_inline`] never
+/// consults the shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReceiverShape {
+    /// No receiver observation at this bci: profiling was off, the site never
+    /// ran, or its invoke kind has no receiver. **Not** the same as "many
+    /// types" — see [`profile::CallSiteEvidence`] for the same distinction on
+    /// the count side.
+    Unprofiled,
+    /// Observed, but below [`INLINE_MIN_SPECULATION_OBSERVATIONS`].
+    Cold { observations: u32, types: usize },
+    /// One receiver class holds at least [`INLINE_MONOMORPHIC_SHARE_PCT`] of
+    /// the observations. A tail is allowed: the guard routes it to dispatch.
+    Monomorphic { class_id: u32, observations: u32 },
+    /// The top two classes together hold at least
+    /// [`INLINE_BIMORPHIC_SHARE_PCT`]. `class_ids` is ordered by descending
+    /// observation count, ties broken by ascending class id, so the same
+    /// profile always yields the same plan.
+    Bimorphic {
+        class_ids: [u32; 2],
+        observations: u32,
+    },
+    /// Too many types, or no sufficiently dominant one.
+    Megamorphic { types: usize, observations: u32 },
+}
+
+/// Why a candidate was not inlined. Every refusal is reported rather than
+/// silently dropped, because "the inliner did nothing" and "the inliner
+/// declined for a stated reason" are indistinguishable from the outside, and
+/// that is precisely the failure mode `docs/flag-census.md` tracks.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InlineRefusal {
+    /// The compilation requested precise exception frames. Mirrors the
+    /// unconditional `inline_sites.clear()` in `try_compile_inner`; stated here
+    /// so the policy and the interlock cannot drift.
+    PreciseExceptionFrames,
+    /// Inline nesting would exceed [`INLINE_MAX_DEPTH`].
+    DepthLimit { depth: usize },
+    /// The callee already appears [`INLINE_MAX_RECURSIVE_DEPTH`] times on this
+    /// inline stack.
+    RecursionLimit { copies: usize },
+    /// An invoke kind that has no inline lowering at all (`invokedynamic`).
+    UnsupportedInvokeKind { kind: u8 },
+    /// A virtual/interface site with no receiver observations.
+    NoProfileEvidence,
+    /// A virtual/interface site whose receiver profile is too thin to speculate
+    /// on.
+    ColdSite { observations: u32 },
+    /// A virtual/interface site with too many receiver types.
+    Megamorphic { types: usize },
+    /// A virtual/interface site whose top one or two receivers do not clear
+    /// their share thresholds.
+    ReceiverNotDominant { types: usize },
+    /// A SPECULATIVE site inside a protected range. The guard's miss edge is a
+    /// new control-flow edge in the middle of a `try` block, and the inlined
+    /// body publishes no exceptional frame of its own; statically bound sites
+    /// are unaffected and keep their existing behaviour.
+    SpeculationInsideProtectedRange,
+    /// The callee failed [`inline_site_expansion_cost_tiered`] — over its
+    /// tier's bytecode cap or its expansion cap.
+    CalleeTooLarge,
+    /// The per-method budget cannot pay for this site.
+    BudgetExhausted { cost: usize, remaining: usize },
+    /// The backend cannot emit the lowering this verdict requires. For a
+    /// speculative site this is today's production answer: the single-pass
+    /// backend consults `inline_sites` only at `invokestatic` (x64.rs:17274)
+    /// and `invokespecial` (x64.rs:19463), and its plain direct-call arm
+    /// (x64.rs:20716) emits no receiver guard at all. Fail closed.
+    GuardNotEmittable,
+    /// A speculative inline whose receiver class could not be named, so no
+    /// invalidation dependency could be recorded for it. Fail closed: a
+    /// speculation nothing can retire is worse than no speculation.
+    NoInvalidationDependency,
+}
+
+impl InlineRefusal {
+    /// Short stable category name, for metrics keys and log greps. Same
+    /// contract as [`bailout::BailoutReason::category`]: these strings are
+    /// consumed by dashboards and test assertions and must not be renamed with
+    /// the variants.
+    pub fn category(&self) -> &'static str {
+        match self {
+            InlineRefusal::PreciseExceptionFrames => "precise-exception-frames",
+            InlineRefusal::DepthLimit { .. } => "depth-limit",
+            InlineRefusal::RecursionLimit { .. } => "recursion-limit",
+            InlineRefusal::UnsupportedInvokeKind { .. } => "unsupported-invoke-kind",
+            InlineRefusal::NoProfileEvidence => "no-profile-evidence",
+            InlineRefusal::ColdSite { .. } => "cold-site",
+            InlineRefusal::Megamorphic { .. } => "megamorphic",
+            InlineRefusal::ReceiverNotDominant { .. } => "receiver-not-dominant",
+            InlineRefusal::SpeculationInsideProtectedRange => "speculation-in-protected-range",
+            InlineRefusal::CalleeTooLarge => "callee-too-large",
+            InlineRefusal::BudgetExhausted { .. } => "budget-exhausted",
+            InlineRefusal::GuardNotEmittable => "guard-not-emittable",
+            InlineRefusal::NoInvalidationDependency => "no-invalidation-dependency",
+        }
+    }
+}
+
+/// The lowering an admitted plan asks the backend for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InlineVerdict {
+    /// Statically bound callee — one possible target, no guard, no
+    /// speculation. This is the only verdict the single-pass backend can emit
+    /// today.
+    DirectBind,
+    /// Speculative: splice the callee body behind `CMP DWORD [recv+0],
+    /// guard_class_id` with the miss edge falling through to normal dispatch.
+    Monomorphic { guard_class_id: u32 },
+    /// Speculative: two guarded bodies, tried in descending profile order, with
+    /// the second miss edge falling through to normal dispatch.
+    Bimorphic { guard_class_ids: [u32; 2] },
+    /// Not inlined.
+    Refuse(InlineRefusal),
+}
+
+/// An assumption an inlined site makes about the world, and therefore a reason
+/// to retire the caller's code when the world changes.
+///
+/// Both variants flatten to the `(class, method, descriptor)` triple that
+/// [`CompiledMethod::inlined_methods`] already carries and that
+/// `JitCache::invalidate_for_class_change` / `invalidate_for_class` /
+/// `invalidate_unloaded_class` already scan — the dependency channel is the
+/// existing one, not a new one.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InlineDependency {
+    /// The callee body was spliced in. If its class is redefined, replaced or
+    /// unloaded, the caller's copy is stale.
+    InlinedCallee {
+        class_name: String,
+        method_name: String,
+        descriptor: String,
+    },
+    /// A receiver type was speculated on at a guarded site. Retiring on a
+    /// conflicting class load is a PERFORMANCE obligation, not a correctness
+    /// one — the exact class-id guard already routes every unexpected receiver
+    /// to dispatch — but without it a hierarchy change leaves the caller
+    /// paying a permanently-missing guard with no path back to a recompile.
+    SpeculatedReceiver {
+        class_name: String,
+        class_id: u32,
+        method_name: String,
+        descriptor: String,
+    },
+}
+
+impl InlineDependency {
+    /// The `(class, method, descriptor)` form the invalidation scans match on.
+    pub fn as_invalidation_triple(&self) -> (String, String, String) {
+        match self {
+            InlineDependency::InlinedCallee {
+                class_name,
+                method_name,
+                descriptor,
+            }
+            | InlineDependency::SpeculatedReceiver {
+                class_name,
+                method_name,
+                descriptor,
+                ..
+            } => (
+                class_name.clone(),
+                method_name.clone(),
+                descriptor.clone(),
+            ),
+        }
+    }
+}
+
+/// What the backend that will consume this plan is actually able to emit.
+///
+/// Passed in rather than probed, so the policy stays a pure function and so a
+/// test can exercise the speculative arm without the production backend
+/// silently deciding the answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InlineBackendCaps {
+    /// The backend splices callee bodies at statically bound sites.
+    pub inline_body_at_static_sites: bool,
+    /// The backend splices callee bodies at virtual/interface sites behind a
+    /// receiver class-id guard, with the miss edge falling through to normal
+    /// dispatch.
+    pub guarded_inline_body_at_virtual_sites: bool,
+}
+
+impl InlineBackendCaps {
+    /// What `x64::compile` can do TODAY, verified against the source:
+    ///
+    ///  * `invokestatic` consults `inline_sites` (x64.rs:17274) and
+    ///    `invokespecial` does too (x64.rs:19463, whose own comment reads
+    ///    "invokespecial only — virtual/interface not eligible"), so
+    ///    statically bound splicing is real;
+    ///  * the `0xb6 | 0xb7 | 0xb9` arm never consults `inline_sites` for
+    ///    `0xb6`/`0xb9`, and its plain direct-call path (x64.rs:20716) emits an
+    ///    unconditional `CALL` with no receiver test — the `guard_class_id`
+    ///    compare exists only inside the String and CRC32 intrinsic ladders.
+    ///
+    /// So a speculative plan has nowhere to be emitted and is refused. See
+    /// `docs/jit/profile-guided-inlining.md` for the exact backend edit that
+    /// would flip the second flag.
+    pub const fn single_pass_x64() -> InlineBackendCaps {
+        InlineBackendCaps {
+            inline_body_at_static_sites: true,
+            guarded_inline_body_at_virtual_sites: false,
+        }
+    }
+
+    /// A backend that can emit every lowering this policy knows how to plan.
+    /// No production caller: this exists so the speculative arm is testable
+    /// before the backend catches up.
+    pub const fn unrestricted() -> InlineBackendCaps {
+        InlineBackendCaps {
+            inline_body_at_static_sites: true,
+            guarded_inline_body_at_virtual_sites: true,
+        }
+    }
+}
+
+/// One inlining question, fully specified. Every field is evidence the caller
+/// already has; nothing here is resolved or computed by the policy.
+pub struct InlineRequest<'a> {
+    /// Caller bytecode pc of the invoke.
+    pub pc: usize,
+    /// `0` virtual, `1` special, `2` interface, `3` static — the same encoding
+    /// `try_compile_inner` and [`JitInvokeInfo`] use.
+    pub invoke_kind: u8,
+    /// The resolved callee.
+    pub site: &'a InlineSite,
+    /// Whether [`call_site_is_hot`] says this site earns the `FreqInlineSize`
+    /// tier.
+    pub site_is_hot: bool,
+    /// This bci's receiver-type profile, if any.
+    pub receivers: Option<&'a profile::ReceiverCounts>,
+    /// This bci's execution evidence, carried for metrics. Never used to
+    /// REFUSE a statically bound site: doing so would stop an unprofiled
+    /// compile from inlining anything, which is a regression, not a policy.
+    pub call_site_evidence: profile::CallSiteEvidence,
+    /// Nesting depth this inline would occupy; the outermost inline is `1`.
+    pub depth: usize,
+    /// How many copies of this callee are already on the inline stack
+    /// (ancestors only — siblings are not recursion).
+    pub recursive_copies: usize,
+    /// Per-method expansion budget still unspent.
+    pub budget_remaining: usize,
+    /// Whether `pc` lies inside one of the caller's protected ranges.
+    pub pc_in_protected_range: bool,
+    /// Whether this compilation requested precise exception frames.
+    pub precise_exception_frames: bool,
+    /// What the consuming backend can emit.
+    pub caps: InlineBackendCaps,
+    /// Resolves a receiver class id to its internal class name, so a
+    /// speculative plan can record a dependency the name-keyed invalidation
+    /// scans will match. `None` — or a `None` answer — refuses the
+    /// speculation.
+    pub receiver_class_namer: Option<&'a dyn Fn(u32) -> Option<String>>,
+}
+
+/// The decision, its price, and everything a metrics consumer or an
+/// invalidation registrar needs from it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct InlinePlan {
+    pub verdict: InlineVerdict,
+    /// What the receiver profile said. Reported even when the verdict ignored
+    /// it (statically bound sites), so a metrics consumer can tell a
+    /// devirtualised site from a naturally direct one.
+    pub shape: ReceiverShape,
+    /// Charge against the per-method budget. `0` for a refusal.
+    pub expansion_cost: usize,
+    /// Callee bytecodes this plan would splice. `0` for a refusal. This is the
+    /// "inlined bytecodes" figure the C2 review asks to be measured.
+    pub inlined_bytecodes: usize,
+    /// Observed executions of this call site, from whichever profile source
+    /// answered.
+    pub site_observations: u32,
+    /// Assumptions to record. Non-empty for every admitted plan — an admitted
+    /// plan with no dependency is unrepresentable, because the last check in
+    /// [`plan_inline`] converts that state into
+    /// [`InlineRefusal::NoInvalidationDependency`].
+    pub dependencies: Vec<InlineDependency>,
+}
+
+impl InlinePlan {
+    fn refuse(reason: InlineRefusal, shape: ReceiverShape, observations: u32) -> InlinePlan {
+        InlinePlan {
+            verdict: InlineVerdict::Refuse(reason),
+            shape,
+            expansion_cost: 0,
+            inlined_bytecodes: 0,
+            site_observations: observations,
+            dependencies: Vec::new(),
+        }
+    }
+
+    /// Whether the plan inlines.
+    pub fn is_admitted(&self) -> bool {
+        !matches!(self.verdict, InlineVerdict::Refuse(_))
+    }
+
+    /// Whether the plan rests on a profile speculation and therefore on a
+    /// guard.
+    pub fn is_speculative(&self) -> bool {
+        matches!(
+            self.verdict,
+            InlineVerdict::Monomorphic { .. } | InlineVerdict::Bimorphic { .. }
+        )
+    }
+
+    /// The refusal reason, if the plan refused.
+    pub fn refusal(&self) -> Option<&InlineRefusal> {
+        match &self.verdict {
+            InlineVerdict::Refuse(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Guard class ids this plan requires the backend to compare against.
+    /// Empty for [`InlineVerdict::DirectBind`]; an admitted SPECULATIVE plan
+    /// always returns at least one.
+    pub fn guard_class_ids(&self) -> Vec<u32> {
+        match &self.verdict {
+            InlineVerdict::Monomorphic { guard_class_id } => vec![*guard_class_id],
+            InlineVerdict::Bimorphic { guard_class_ids } => guard_class_ids.to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Dependencies in the `(class, method, descriptor)` form
+    /// [`CompiledMethod::inlined_methods`] carries.
+    pub fn invalidation_triples(&self) -> Vec<(String, String, String)> {
+        self.dependencies
+            .iter()
+            .map(InlineDependency::as_invalidation_triple)
+            .collect()
+    }
+}
+
+/// Classify a call site's receiver-type profile.
+///
+/// Ranking is deterministic — descending count, ties broken by ascending class
+/// id — because two runs over the same profile must produce the same artifact.
+/// An `FxHashMap` iteration order is not, which is exactly the kind of
+/// difference that makes a JIT bug irreproducible.
+pub fn classify_receiver_shape(counts: Option<&profile::ReceiverCounts>) -> ReceiverShape {
+    let Some(counts) = counts.filter(|c| !c.is_empty()) else {
+        return ReceiverShape::Unprofiled;
+    };
+    let mut ranked: Vec<(u32, u32)> = counts.iter().map(|(&cid, &n)| (cid, n)).collect();
+    ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let observations = ranked
+        .iter()
+        .map(|&(_, n)| n)
+        .fold(0u32, u32::saturating_add);
+    let types = ranked.len();
+    if observations == 0 {
+        return ReceiverShape::Unprofiled;
+    }
+    if observations < INLINE_MIN_SPECULATION_OBSERVATIONS {
+        return ReceiverShape::Cold {
+            observations,
+            types,
+        };
+    }
+    if types > INLINE_MEGAMORPHIC_TYPE_CEILING {
+        return ReceiverShape::Megamorphic {
+            types,
+            observations,
+        };
+    }
+    // u64 throughout: `count * 100` overflows u32 at 43M observations, which a
+    // long-running site reaches.
+    let total = u64::from(observations);
+    let top1 = u64::from(ranked[0].1);
+    if top1.saturating_mul(100) >= total.saturating_mul(u64::from(INLINE_MONOMORPHIC_SHARE_PCT)) {
+        return ReceiverShape::Monomorphic {
+            class_id: ranked[0].0,
+            observations,
+        };
+    }
+    if types >= 2 {
+        let top2 = top1.saturating_add(u64::from(ranked[1].1));
+        if top2.saturating_mul(100) >= total.saturating_mul(u64::from(INLINE_BIMORPHIC_SHARE_PCT)) {
+            return ReceiverShape::Bimorphic {
+                class_ids: [ranked[0].0, ranked[1].0],
+                observations,
+            };
+        }
+    }
+    ReceiverShape::Megamorphic {
+        types,
+        observations,
+    }
+}
+
+/// Whether `pc` lies inside any protected range of `exception_table`.
+///
+/// Same `[start_pc, end_pc)` test `precise_exception_frame_sites_supported`
+/// uses, factored out so the policy and that predicate cannot disagree about
+/// what "inside a `try` block" means.
+pub fn pc_in_protected_range(
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+    pc: usize,
+) -> bool {
+    exception_table
+        .iter()
+        .any(|entry| pc >= entry.start_pc as usize && pc < entry.end_pc as usize)
+}
+
+/// Decide one inline site.
+///
+/// Checks run cheapest-and-most-universal first, so the reported refusal is the
+/// most fundamental one rather than whichever fired last. The order is part of
+/// the contract the tests assert.
+pub fn plan_inline(req: &InlineRequest<'_>) -> InlinePlan {
+    let shape = classify_receiver_shape(req.receivers);
+    let observations = match shape {
+        ReceiverShape::Unprofiled => req.call_site_evidence.count_or_zero(),
+        ReceiverShape::Cold { observations, .. }
+        | ReceiverShape::Monomorphic { observations, .. }
+        | ReceiverShape::Bimorphic { observations, .. }
+        | ReceiverShape::Megamorphic { observations, .. } => observations,
+    };
+    let refuse = |reason: InlineRefusal| InlinePlan::refuse(reason, shape, observations);
+
+    // 1. The compilation-wide interlocks, which no per-site evidence can
+    //    override.
+    if req.precise_exception_frames {
+        return refuse(InlineRefusal::PreciseExceptionFrames);
+    }
+    if req.depth > INLINE_MAX_DEPTH {
+        return refuse(InlineRefusal::DepthLimit { depth: req.depth });
+    }
+    if req.recursive_copies > INLINE_MAX_RECURSIVE_DEPTH {
+        return refuse(InlineRefusal::RecursionLimit {
+            copies: req.recursive_copies,
+        });
+    }
+
+    // 2. Kind, and the speculation it does or does not require.
+    let mut dependencies = Vec::new();
+    let verdict = match req.invoke_kind {
+        1 | 3 => {
+            if !req.caps.inline_body_at_static_sites {
+                return refuse(InlineRefusal::GuardNotEmittable);
+            }
+            InlineVerdict::DirectBind
+        }
+        0 | 2 => {
+            let guard_ids: Vec<u32> = match shape {
+                ReceiverShape::Unprofiled => return refuse(InlineRefusal::NoProfileEvidence),
+                ReceiverShape::Cold { observations, .. } => {
+                    return refuse(InlineRefusal::ColdSite { observations })
+                }
+                ReceiverShape::Megamorphic { types, .. } => {
+                    // A type count over the ceiling is a genuinely polymorphic
+                    // dispatch hub; anything else that lands here failed the
+                    // share thresholds. Report them apart — they call for
+                    // different fixes (never speculate vs. wait for a longer
+                    // profile).
+                    return refuse(if types > INLINE_MEGAMORPHIC_TYPE_CEILING {
+                        InlineRefusal::Megamorphic { types }
+                    } else {
+                        InlineRefusal::ReceiverNotDominant { types }
+                    });
+                }
+                ReceiverShape::Monomorphic { class_id, .. } => vec![class_id],
+                ReceiverShape::Bimorphic { class_ids, .. } => class_ids.to_vec(),
+            };
+            if req.pc_in_protected_range {
+                return refuse(InlineRefusal::SpeculationInsideProtectedRange);
+            }
+            if !req.caps.guarded_inline_body_at_virtual_sites {
+                return refuse(InlineRefusal::GuardNotEmittable);
+            }
+            // Fail closed: a speculation whose receiver class cannot be NAMED
+            // cannot be recorded in the name-keyed invalidation channel, so
+            // nothing could ever retire it.
+            for &class_id in &guard_ids {
+                let Some(class_name) = req.receiver_class_namer.and_then(|f| f(class_id)) else {
+                    return refuse(InlineRefusal::NoInvalidationDependency);
+                };
+                if class_name.is_empty() {
+                    return refuse(InlineRefusal::NoInvalidationDependency);
+                }
+                dependencies.push(InlineDependency::SpeculatedReceiver {
+                    class_name,
+                    class_id,
+                    method_name: req.site.method_name.clone(),
+                    descriptor: req.site.descriptor.clone(),
+                });
+            }
+            if guard_ids.len() >= 2 {
+                InlineVerdict::Bimorphic {
+                    guard_class_ids: [guard_ids[0], guard_ids[1]],
+                }
+            } else {
+                InlineVerdict::Monomorphic {
+                    guard_class_id: guard_ids[0],
+                }
+            }
+        }
+        kind => return refuse(InlineRefusal::UnsupportedInvokeKind { kind }),
+    };
+
+    // 3. Price it. The size model is the pre-existing one; only the refusal
+    //    reporting is new.
+    let Some(cost) = inline_site_expansion_cost_tiered(req.site, req.site_is_hot) else {
+        return refuse(InlineRefusal::CalleeTooLarge);
+    };
+    if cost > req.budget_remaining {
+        return refuse(InlineRefusal::BudgetExhausted {
+            cost,
+            remaining: req.budget_remaining,
+        });
+    }
+
+    // 4. The callee body itself is always a dependency.
+    if req.site.class_name.is_empty() {
+        return refuse(InlineRefusal::NoInvalidationDependency);
+    }
+    dependencies.push(InlineDependency::InlinedCallee {
+        class_name: req.site.class_name.clone(),
+        method_name: req.site.method_name.clone(),
+        descriptor: req.site.descriptor.clone(),
+    });
+
+    InlinePlan {
+        verdict,
+        shape,
+        expansion_cost: cost,
+        inlined_bytecodes: req.site.callee_code_len,
+        site_observations: observations,
+        dependencies,
+    }
+}
+
+/// Per-compilation inlining totals — the "inlined bytecodes, call count,
+/// deopts, compile ms, code bytes" measurement the C2 review asks for, on the
+/// inlining side. Deopt count, wall time and code bytes are already recorded by
+/// [`metrics::CompilationReport`]; this supplies the three figures that report
+/// has no source for.
+///
+/// Carried on [`CompiledMethod::inline_tally`] so `metrics::CompileRecorder::
+/// installed` can harvest it from the artifact, the same way it already
+/// harvests `code_bytes` / `deopt_points` — no new plumbing through
+/// `try_compile_inner`'s forty return paths.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InlineDecisionTally {
+    /// Sites a resolver produced a candidate for.
+    pub candidates: u32,
+    /// Sites actually inlined.
+    pub inlined_sites: u32,
+    /// Of those, sites resting on a receiver-type speculation and a guard.
+    pub speculative_sites: u32,
+    /// Callee bytecodes spliced in total.
+    pub inlined_bytecodes: u32,
+    /// Budget spent.
+    pub expansion_cost: u32,
+    /// Summed profile-observed executions of the inlined sites — the "call
+    /// count" figure. Zero when the compile was unprofiled.
+    pub observed_calls_inlined: u64,
+    /// Refusals by [`InlineRefusal::category`], in first-seen order.
+    pub refusals: Vec<(&'static str, u32)>,
+}
+
+impl InlineDecisionTally {
+    /// Count one refusal without a plan behind it.
+    ///
+    /// Used for sites the compiler declines BEFORE paying for a resolver call
+    /// — chiefly virtual/interface sites, whose receiver shape is readable from
+    /// the profile alone. Without this the most interesting measurement of all
+    /// (how many hot virtual sites are actually monomorphic) would cost a full
+    /// callee resolution per site to obtain.
+    pub fn record_refusal(&mut self, reason: &InlineRefusal) {
+        self.candidates = self.candidates.saturating_add(1);
+        let category = reason.category();
+        match self.refusals.iter_mut().find(|(c, _)| *c == category) {
+            Some((_, n)) => *n = n.saturating_add(1),
+            None => self.refusals.push((category, 1)),
+        }
+    }
+
+    /// Fold one decision in.
+    pub fn record(&mut self, plan: &InlinePlan) {
+        match &plan.verdict {
+            InlineVerdict::Refuse(reason) => {
+                self.record_refusal(reason);
+            }
+            _ => {
+                self.candidates = self.candidates.saturating_add(1);
+                self.inlined_sites = self.inlined_sites.saturating_add(1);
+                if plan.is_speculative() {
+                    self.speculative_sites = self.speculative_sites.saturating_add(1);
+                }
+                self.inlined_bytecodes = self
+                    .inlined_bytecodes
+                    .saturating_add(plan.inlined_bytecodes.min(u32::MAX as usize) as u32);
+                self.expansion_cost = self
+                    .expansion_cost
+                    .saturating_add(plan.expansion_cost.min(u32::MAX as usize) as u32);
+                self.observed_calls_inlined = self
+                    .observed_calls_inlined
+                    .saturating_add(u64::from(plan.site_observations));
+            }
+        }
+    }
+
+    /// How many candidates were refused for `category`.
+    pub fn refusal_count(&self, category: &str) -> u32 {
+        self.refusals
+            .iter()
+            .find(|(c, _)| *c == category)
+            .map_or(0, |(_, n)| *n)
+    }
+}
+
+#[cfg(test)]
+mod profile_guided_inlining_tests {
+    use super::*;
+
+    /// A resolved leaf callee. `code_len` drives both the size tier and the
+    /// expansion estimate, which is what the budget tests turn.
+    fn leaf_site(class: &str, method: &str, code_len: usize) -> InlineSite {
+        InlineSite {
+            callee_code: vec![0; code_len.saturating_add(2)],
+            callee_code_len: code_len,
+            callee_max_locals: 1,
+            callee_num_args: 1,
+            callee_is_static: false,
+            return_type: b'I',
+            field_info: Vec::new(),
+            compact_field_info: Vec::new(),
+            static_field_info: Vec::new(),
+            ldc_info: Vec::new(),
+            ldc2w_info: Vec::new(),
+            needs_heap: false,
+            class_name: class.to_string(),
+            method_name: method.to_string(),
+            descriptor: "()I".to_string(),
+            elided_invoke_pcs: Vec::new(),
+        }
+    }
+
+    fn receivers(pairs: &[(u32, u32)]) -> profile::ReceiverCounts {
+        let mut counts = profile::ReceiverCounts::default();
+        for &(class_id, n) in pairs {
+            counts.insert(class_id, n);
+        }
+        counts
+    }
+
+    /// A request with every knob at its permissive setting, so each test turns
+    /// exactly one and the refusal it asserts is unambiguous. `caps` is
+    /// [`InlineBackendCaps::unrestricted`] — the production caps are asserted
+    /// separately, in `production_caps_refuse_every_speculative_site`.
+    fn request<'a>(site: &'a InlineSite, invoke_kind: u8) -> InlineRequest<'a> {
+        InlineRequest {
+            pc: 12,
+            invoke_kind,
+            site,
+            site_is_hot: true,
+            receivers: None,
+            call_site_evidence: profile::CallSiteEvidence::None,
+            depth: 1,
+            recursive_copies: 0,
+            budget_remaining: MAX_INLINE_BUDGET_HOT,
+            pc_in_protected_range: false,
+            precise_exception_frames: false,
+            caps: InlineBackendCaps::unrestricted(),
+            receiver_class_namer: None,
+        }
+    }
+
+    /// The VM's real invalidation reach on a class define, reproduced from
+    /// `vm/src/vm/vm_init.rs`'s `load_class`: it calls
+    /// `JitCache::invalidate_for_class_change` once for the newly loaded class
+    /// and once for its DIRECT superclass, and that scan matches a compiled
+    /// method when any recorded `inlined_methods` triple names the class.
+    fn class_load_evicts(
+        recorded: &[(String, String, String)],
+        loaded: &str,
+        direct_super: Option<&str>,
+    ) -> bool {
+        let names = |probe: &str| recorded.iter().any(|(class, _, _)| class == probe);
+        names(loaded) || direct_super.is_some_and(names)
+    }
+
+    // ── Receiver-shape classification ────────────────────────────────────
+
+    #[test]
+    fn receiver_shape_reads_the_live_profile() {
+        assert_eq!(classify_receiver_shape(None), ReceiverShape::Unprofiled);
+        assert_eq!(
+            classify_receiver_shape(Some(&receivers(&[]))),
+            ReceiverShape::Unprofiled,
+            "an empty map is 'no evidence', not 'zero types'"
+        );
+        // Below the speculation floor: one receiver, but only ten of them.
+        assert_eq!(
+            classify_receiver_shape(Some(&receivers(&[(7, 10)]))),
+            ReceiverShape::Cold {
+                observations: 10,
+                types: 1
+            }
+        );
+        // 950/1000 = 95% ≥ 90%: monomorphic, and the 5% tail is fine because
+        // the guard routes it to dispatch.
+        assert_eq!(
+            classify_receiver_shape(Some(&receivers(&[(7, 950), (9, 50)]))),
+            ReceiverShape::Monomorphic {
+                class_id: 7,
+                observations: 1000
+            }
+        );
+        // 60 + 35 = 95% ≥ 92%, ordered by descending count.
+        assert_eq!(
+            classify_receiver_shape(Some(&receivers(&[(9, 350), (7, 600), (3, 50)]))),
+            ReceiverShape::Bimorphic {
+                class_ids: [7, 9],
+                observations: 1000
+            }
+        );
+    }
+
+    /// Ties are broken by ascending class id so the same profile always plans
+    /// the same artifact — an `FxHashMap` iteration order would not.
+    #[test]
+    fn receiver_shape_ranking_is_deterministic() {
+        let counts = receivers(&[(31, 480), (4, 480), (12, 40)]);
+        for _ in 0..16 {
+            assert_eq!(
+                classify_receiver_shape(Some(&counts)),
+                ReceiverShape::Bimorphic {
+                    class_ids: [4, 31],
+                    observations: 1000
+                }
+            );
+        }
+    }
+
+    // ── The six behaviours the C2 review asks for ────────────────────────
+
+    /// A hot monomorphic virtual site inlines, and the plan carries the exact
+    /// receiver class-id guard the lowering must emit. Without the guard the
+    /// speculation would be a wrong-target bug for every other receiver.
+    #[test]
+    fn hot_monomorphic_virtual_site_inlines_behind_a_type_guard() {
+        let site = leaf_site("app/Circle", "area", 20);
+        let counts = receivers(&[(7, 980), (9, 20)]);
+        let namer = |id: u32| (id == 7).then(|| "app/Circle".to_string());
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+
+        let plan = plan_inline(&req);
+        assert_eq!(plan.verdict, InlineVerdict::Monomorphic { guard_class_id: 7 });
+        assert!(plan.is_speculative());
+        assert_eq!(plan.guard_class_ids(), vec![7]);
+        assert_eq!(plan.inlined_bytecodes, 20);
+        assert_eq!(plan.site_observations, 1000);
+        // Fail-closed invariant: an admitted speculative plan always carries
+        // both a guard and a dependency.
+        assert!(!plan.dependencies.is_empty());
+    }
+
+    /// The bimorphic split asks for two guards and records a dependency for
+    /// each speculated type.
+    #[test]
+    fn bimorphic_site_inlines_behind_two_guards() {
+        let site = leaf_site("app/Shape", "area", 12);
+        let counts = receivers(&[(7, 600), (9, 350), (3, 50)]);
+        let namer = |id: u32| match id {
+            7 => Some("app/Circle".to_string()),
+            9 => Some("app/Square".to_string()),
+            _ => None,
+        };
+        let mut req = request(&site, 2);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+
+        let plan = plan_inline(&req);
+        assert_eq!(
+            plan.verdict,
+            InlineVerdict::Bimorphic {
+                guard_class_ids: [7, 9]
+            }
+        );
+        let recorded = plan.invalidation_triples();
+        assert!(recorded.iter().any(|(c, _, _)| c == "app/Circle"));
+        assert!(recorded.iter().any(|(c, _, _)| c == "app/Square"));
+        assert!(recorded.iter().any(|(c, _, _)| c == "app/Shape"));
+    }
+
+    /// A megamorphic site is refused. Two distinct shapes reach this verdict
+    /// and they are reported apart, because they call for different responses:
+    /// "never speculate here" vs. "the profile has not settled".
+    #[test]
+    fn megamorphic_site_is_not_inlined() {
+        let site = leaf_site("app/Shape", "area", 12);
+        let namer = |_: u32| Some("app/Anything".to_string());
+
+        // Ten types: over the ceiling even though type 1 is 91% dominant.
+        let mut wide: Vec<(u32, u32)> = vec![(1, 9100)];
+        wide.extend((2..=10u32).map(|id| (id, 100)));
+        let counts = receivers(&wide);
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::Megamorphic { types: 10 })
+        );
+
+        // Four types, evenly spread: under the ceiling, but nothing dominates.
+        let counts = receivers(&[(1, 250), (2, 250), (3, 250), (4, 250)]);
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::ReceiverNotDominant { types: 4 })
+        );
+
+        // And a site with a settled receiver but too few observations is not
+        // "monomorphic" — it is unproven.
+        let counts = receivers(&[(1, INLINE_MIN_SPECULATION_OBSERVATIONS - 1)]);
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::ColdSite {
+                observations: INLINE_MIN_SPECULATION_OBSERVATIONS - 1
+            })
+        );
+    }
+
+    /// Recursion stops at the limit, and the limit counts ANCESTORS. A leaf
+    /// called many times from one caller is not recursion and must keep
+    /// inlining — that distinction is the whole reason the wiring passes an
+    /// ancestor count rather than the length of `inlined_methods`.
+    #[test]
+    fn recursion_stops_at_the_depth_limit() {
+        let site = leaf_site("app/Node", "walk", 20);
+
+        let mut req = request(&site, 3);
+        req.recursive_copies = INLINE_MAX_RECURSIVE_DEPTH;
+        assert_eq!(
+            plan_inline(&req).verdict,
+            InlineVerdict::DirectBind,
+            "one copy on the stack is within MaxRecursiveInlineLevel"
+        );
+
+        let mut req = request(&site, 3);
+        req.recursive_copies = INLINE_MAX_RECURSIVE_DEPTH + 1;
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::RecursionLimit {
+                copies: INLINE_MAX_RECURSIVE_DEPTH + 1
+            })
+        );
+
+        // Nesting depth is a separate limit with a separate reason.
+        let mut req = request(&site, 3);
+        req.depth = INLINE_MAX_DEPTH;
+        assert!(plan_inline(&req).is_admitted());
+        let mut req = request(&site, 3);
+        req.depth = INLINE_MAX_DEPTH + 1;
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::DepthLimit {
+                depth: INLINE_MAX_DEPTH + 1
+            })
+        );
+    }
+
+    /// The size budget is respected in both of its dimensions: the per-site
+    /// tier ceiling and the per-method running budget.
+    #[test]
+    fn size_budget_is_respected() {
+        // Per-site: 200 bytes clears `FreqInlineSize` at a hot site and fails
+        // `MaxInlineSize` at a cold one. Same decision `inline_site_expansion
+        // _cost_tiered` has always made — the policy only adds the reason.
+        let site = leaf_site("app/Big", "work", 200);
+        let mut req = request(&site, 3);
+        assert_eq!(plan_inline(&req).expansion_cost, 200);
+        req.site_is_hot = false;
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::CalleeTooLarge)
+        );
+
+        // Per-method: the running budget is what bounds committed code, so a
+        // site is refused once it no longer fits, and the refusal states both
+        // numbers.
+        let mut req = request(&site, 3);
+        req.budget_remaining = 199;
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::BudgetExhausted {
+                cost: 200,
+                remaining: 199
+            })
+        );
+        req.budget_remaining = 200;
+        assert!(plan_inline(&req).is_admitted(), "exactly-fits must be admitted");
+
+        // A budget walk: three 200-byte sites fit the hot budget many times
+        // over, and the tally reports what they cost.
+        let mut budget = MAX_INLINE_BUDGET;
+        let mut tally = InlineDecisionTally::default();
+        for _ in 0..5 {
+            let mut req = request(&site, 3);
+            req.budget_remaining = budget;
+            let plan = plan_inline(&req);
+            tally.record(&plan);
+            budget = budget.saturating_sub(plan.expansion_cost);
+        }
+        assert_eq!(tally.inlined_sites, 3, "750 / 200 = 3 sites, then refusals");
+        assert_eq!(tally.inlined_bytecodes, 600);
+        assert_eq!(tally.refusal_count("budget-exhausted"), 2);
+    }
+
+    /// Exception-path policy, stated in one place:
+    ///
+    ///  * a STATICALLY BOUND site inside a protected range is unchanged — it
+    ///    inlines exactly as it did before this policy existed, because the
+    ///    lowering it asks for is the one the backend has always emitted there;
+    ///  * a SPECULATIVE site inside a protected range is refused, because the
+    ///    guard's miss edge is a new control-flow edge in the middle of a `try`
+    ///    block and the inlined body publishes no exceptional frame of its own;
+    ///  * and when the compilation requested PRECISE exception frames, nothing
+    ///    inlines at all — the same interlock `try_compile_inner` enforces with
+    ///    `inline_sites.clear()`, restated here so the two cannot drift.
+    #[test]
+    fn exception_handler_sites_follow_the_stated_policy() {
+        let site = leaf_site("app/Helper", "clamp", 20);
+
+        let mut req = request(&site, 3);
+        req.pc_in_protected_range = true;
+        assert_eq!(
+            plan_inline(&req).verdict,
+            InlineVerdict::DirectBind,
+            "a statically bound site in a try block keeps its existing behaviour"
+        );
+
+        let counts = receivers(&[(7, 1000)]);
+        let namer = |_: u32| Some("app/Circle".to_string());
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+        assert!(plan_inline(&req).is_admitted());
+        req.pc_in_protected_range = true;
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::SpeculationInsideProtectedRange)
+        );
+
+        for kind in [0u8, 1, 2, 3] {
+            let mut req = request(&site, kind);
+            req.receivers = Some(&counts);
+            req.receiver_class_namer = Some(&namer);
+            req.precise_exception_frames = true;
+            assert_eq!(
+                plan_inline(&req).refusal(),
+                Some(&InlineRefusal::PreciseExceptionFrames),
+                "precise frames outrank every per-site consideration"
+            );
+        }
+    }
+
+    /// A speculative inline records a dependency, and a conflicting class load
+    /// reaches the code through it.
+    ///
+    /// The channel is the existing one: the plan's triples go into
+    /// `CompiledMethod::inlined_methods`, which `JitCache::
+    /// invalidate_for_class_change` scans on every class define. This test
+    /// reproduces the VM's real reach (`load_class` invalidates for the loaded
+    /// class AND its direct superclass) rather than asserting against a
+    /// convenient one — including the place where that reach falls short.
+    #[test]
+    fn speculative_inline_records_a_dependency_a_class_load_invalidates() {
+        let site = leaf_site("app/Circle", "area", 16);
+        let counts = receivers(&[(7, 1000)]);
+        let namer = |id: u32| (id == 7).then(|| "app/Circle".to_string());
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&namer);
+
+        let plan = plan_inline(&req);
+        assert!(plan.is_speculative());
+        let recorded = plan.invalidation_triples();
+        assert!(
+            plan.dependencies.iter().any(|d| matches!(
+                d,
+                InlineDependency::SpeculatedReceiver { class_id: 7, .. }
+            )),
+            "the speculated receiver type must be recorded, not just the callee"
+        );
+
+        // Loading a subclass of the speculated receiver retires the code: the
+        // VM invalidates for the new class AND for `app/Circle`, its direct
+        // superclass, which the dependency names.
+        assert!(class_load_evicts(
+            &recorded,
+            "app/SmallCircle",
+            Some("app/Circle")
+        ));
+        // Redefining the speculated class itself retires it too.
+        assert!(class_load_evicts(&recorded, "app/Circle", None));
+        // An unrelated class does not — invalidation must stay targeted, or
+        // every define would flush the code cache.
+        assert!(!class_load_evicts(
+            &recorded,
+            "app/Unrelated",
+            Some("java/lang/Object")
+        ));
+
+        // KNOWN COARSENESS, asserted so it cannot rot into a surprise: the VM
+        // walks only the DIRECT superclass, so loading a GRANDCHILD of the
+        // speculated class does not reach this dependency. That is survivable
+        // only because correctness here rests on the exact class-id guard, not
+        // on the dependency: an `app/Tiny` receiver fails the `CMP` and takes
+        // the dispatch path. The cost is a stale speculation nothing retires.
+        // See `docs/jit/profile-guided-inlining.md`.
+        assert!(!class_load_evicts(
+            &recorded,
+            "app/Tiny",
+            Some("app/SmallCircle")
+        ));
+    }
+
+    // ── Fail-closed ──────────────────────────────────────────────────────
+
+    /// The production single-pass backend cannot emit a guarded inline body at
+    /// a virtual site, so the policy refuses every speculative plan there —
+    /// however good the profile looks. This is the check that keeps a "landed"
+    /// capability from silently emitting an unguarded direct call.
+    #[test]
+    fn production_caps_refuse_every_speculative_site() {
+        let caps = InlineBackendCaps::single_pass_x64();
+        assert!(caps.inline_body_at_static_sites);
+        assert!(
+            !caps.guarded_inline_body_at_virtual_sites,
+            "x64::compile consults inline_sites only at 0xb8/0xb7, and its plain \
+             direct-call arm emits no receiver guard"
+        );
+
+        let site = leaf_site("app/Circle", "area", 16);
+        let counts = receivers(&[(7, 100_000)]);
+        let namer = |_: u32| Some("app/Circle".to_string());
+        for kind in [0u8, 2] {
+            let mut req = request(&site, kind);
+            req.caps = caps;
+            req.receivers = Some(&counts);
+            req.receiver_class_namer = Some(&namer);
+            assert_eq!(
+                plan_inline(&req).refusal(),
+                Some(&InlineRefusal::GuardNotEmittable)
+            );
+        }
+        // The statically bound path is unaffected — that is what the backend
+        // does support.
+        let mut req = request(&site, 3);
+        req.caps = caps;
+        assert_eq!(plan_inline(&req).verdict, InlineVerdict::DirectBind);
+    }
+
+    /// No speculative inline without a recorded invalidation dependency. A
+    /// receiver class the compiler cannot NAME cannot be recorded in the
+    /// name-keyed channel, so nothing could ever retire the speculation — and
+    /// an unretirable speculation is refused.
+    #[test]
+    fn speculation_without_a_nameable_receiver_is_refused() {
+        let site = leaf_site("app/Circle", "area", 16);
+        let counts = receivers(&[(7, 1000)]);
+
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::NoInvalidationDependency),
+            "no resolver at all"
+        );
+
+        let empty = |_: u32| Some(String::new());
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&empty);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::NoInvalidationDependency),
+            "an empty name matches nothing and would never fire"
+        );
+
+        let missing = |_: u32| -> Option<String> { None };
+        let mut req = request(&site, 0);
+        req.receivers = Some(&counts);
+        req.receiver_class_namer = Some(&missing);
+        assert_eq!(
+            plan_inline(&req).refusal(),
+            Some(&InlineRefusal::NoInvalidationDependency)
+        );
+    }
+
+    /// Every admitted plan carries a dependency, whatever the verdict. The
+    /// statically bound case rests on the callee's own class; that is the
+    /// entry `invalidate_for_class` and `invalidate_unloaded_class` have always
+    /// matched on.
+    #[test]
+    fn every_admitted_plan_records_at_least_one_dependency() {
+        let site = leaf_site("app/Helper", "clamp", 8);
+        let plan = plan_inline(&request(&site, 3));
+        assert_eq!(plan.verdict, InlineVerdict::DirectBind);
+        assert_eq!(
+            plan.invalidation_triples(),
+            vec![(
+                "app/Helper".to_string(),
+                "clamp".to_string(),
+                "()I".to_string()
+            )]
+        );
+
+        // A callee with no class name cannot be depended on, so it is refused
+        // rather than inlined blind.
+        let mut anonymous = leaf_site("", "clamp", 8);
+        anonymous.class_name = String::new();
+        assert_eq!(
+            plan_inline(&request(&anonymous, 3)).refusal(),
+            Some(&InlineRefusal::NoInvalidationDependency)
+        );
+    }
+
+    /// `invokedynamic` has no inline lowering at all and is named as such
+    /// rather than falling into a generic refusal.
+    #[test]
+    fn unsupported_invoke_kinds_are_named() {
+        let site = leaf_site("app/Helper", "clamp", 8);
+        assert_eq!(
+            plan_inline(&request(&site, 4)).refusal(),
+            Some(&InlineRefusal::UnsupportedInvokeKind { kind: 4 })
+        );
+    }
+
+    // ── Measurement ──────────────────────────────────────────────────────
+
+    /// The tally is the inlining half of the C2 review's measurement ask:
+    /// inlined bytecodes, inlined call count, and an attributed refusal
+    /// histogram. Deopt count, compile wall time and code bytes are already on
+    /// `metrics::CompilationReport`.
+    #[test]
+    fn tally_reports_inlined_bytecodes_calls_and_refusals() {
+        let small = leaf_site("app/Helper", "clamp", 20);
+        let huge = leaf_site("app/Helper", "parse", MAX_INLINE_BYTECODE_SIZE + 1);
+        let counts = receivers(&[(7, 4_000)]);
+        let namer = |_: u32| Some("app/Circle".to_string());
+
+        let mut tally = InlineDecisionTally::default();
+        tally.record(&plan_inline(&request(&small, 3)));
+        let mut speculative = request(&small, 0);
+        speculative.receivers = Some(&counts);
+        speculative.receiver_class_namer = Some(&namer);
+        tally.record(&plan_inline(&speculative));
+        tally.record(&plan_inline(&request(&huge, 3)));
+        let mut megamorphic = request(&small, 0);
+        let wide = receivers(&[(1, 300), (2, 300), (3, 300), (4, 300)]);
+        megamorphic.receivers = Some(&wide);
+        megamorphic.receiver_class_namer = Some(&namer);
+        tally.record(&plan_inline(&megamorphic));
+
+        assert_eq!(tally.candidates, 4);
+        assert_eq!(tally.inlined_sites, 2);
+        assert_eq!(tally.speculative_sites, 1);
+        assert_eq!(tally.inlined_bytecodes, 40);
+        assert_eq!(tally.expansion_cost, 40);
+        // Only the profiled site contributed a call count; the unprofiled one
+        // reports zero rather than pretending.
+        assert_eq!(tally.observed_calls_inlined, 4_000);
+        assert_eq!(tally.refusal_count("callee-too-large"), 1);
+        assert_eq!(tally.refusal_count("receiver-not-dominant"), 1);
+        assert_eq!(tally.refusal_count("megamorphic"), 0);
+    }
+
+    /// Refusal categories are an external contract (metrics keys, log greps),
+    /// so they are distinct and stable.
+    #[test]
+    fn refusal_categories_are_distinct() {
+        let all = [
+            InlineRefusal::PreciseExceptionFrames,
+            InlineRefusal::DepthLimit { depth: 1 },
+            InlineRefusal::RecursionLimit { copies: 1 },
+            InlineRefusal::UnsupportedInvokeKind { kind: 4 },
+            InlineRefusal::NoProfileEvidence,
+            InlineRefusal::ColdSite { observations: 1 },
+            InlineRefusal::Megamorphic { types: 9 },
+            InlineRefusal::ReceiverNotDominant { types: 4 },
+            InlineRefusal::SpeculationInsideProtectedRange,
+            InlineRefusal::CalleeTooLarge,
+            InlineRefusal::BudgetExhausted {
+                cost: 1,
+                remaining: 0,
+            },
+            InlineRefusal::GuardNotEmittable,
+            InlineRefusal::NoInvalidationDependency,
+        ];
+        let mut seen: Vec<&'static str> = all.iter().map(InlineRefusal::category).collect();
+        let total = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "two refusals share a category string");
+    }
+
+    /// The `pc_in_protected_range` helper agrees with the `[start, end)` test
+    /// `precise_exception_frame_sites_supported` uses.
+    #[test]
+    fn protected_range_membership_is_half_open() {
+        let table = vec![cratonvm_reader::attribute::ExceptionTableEntry {
+            start_pc: 8,
+            end_pc: 14,
+            handler_pc: 20,
+            catch_type: 0,
+        }];
+        assert!(!pc_in_protected_range(&table, 7));
+        assert!(pc_in_protected_range(&table, 8));
+        assert!(pc_in_protected_range(&table, 13));
+        assert!(!pc_in_protected_range(&table, 14));
+        assert!(!pc_in_protected_range(&[], 8));
+    }
 }
 
 #[cfg(test)]
@@ -10850,6 +12205,9 @@ fn try_compile_inner(
         MAX_INLINE_BUDGET_HOT
     };
     let mut inlined_methods: Vec<(String, String, String)> = Vec::new();
+    // C2-review P1 — inlining decision totals for the metrics report. Attached
+    // to the artifact at the end of this function.
+    let mut inline_tally = InlineDecisionTally::default();
     // `java/lang/String` field layout, resolved ONCE for the whole
     // compilation. `try_resolve_string_intrinsic` (in the invoke loop
     // below) uses it to decide whether a String intrinsic can be
@@ -10931,6 +12289,43 @@ fn try_compile_inner(
             // roots.  Route through the checked re-entrant bridge instead;
             // it installs a distinct JitEntryGuard for the actual callee.
             let direct_jit_callee_calls_enabled = direct_jit_callee_calls_enabled();
+            // C2-review P1 — virtual/interface sites are NOT admitted for
+            // inlining (the single-pass backend has no guarded inline lowering
+            // for them; see `InlineBackendCaps::single_pass_x64`), but their
+            // receiver shape is readable from the profile alone and is the
+            // evidence that decides whether that backend work is worth doing.
+            // Classify and tally, without paying for a callee resolution.
+            //
+            // Gated on `metrics::enabled()` because `classify_receiver_shape`
+            // ranks the receiver map, which allocates: this is a measurement,
+            // and a measurement must not tax the compile path it measures. Off
+            // (the process default) it is one relaxed atomic load per virtual
+            // site.
+            if matches!(invoke_kind, 0 | 2) && metrics::enabled() {
+                let refusal = match classify_receiver_shape(
+                    profile.and_then(|p| p.receivers.get(&pc)),
+                ) {
+                    ReceiverShape::Unprofiled => InlineRefusal::NoProfileEvidence,
+                    ReceiverShape::Cold { observations, .. } => {
+                        InlineRefusal::ColdSite { observations }
+                    }
+                    ReceiverShape::Megamorphic { types, .. } => {
+                        if types > INLINE_MEGAMORPHIC_TYPE_CEILING {
+                            InlineRefusal::Megamorphic { types }
+                        } else {
+                            InlineRefusal::ReceiverNotDominant { types }
+                        }
+                    }
+                    // A shape this policy WOULD speculate on, refused only
+                    // because the backend cannot emit the guard. This counter
+                    // is the whole point of the arm: it measures the size of
+                    // the opportunity currently being left on the table.
+                    ReceiverShape::Monomorphic { .. } | ReceiverShape::Bimorphic { .. } => {
+                        InlineRefusal::GuardNotEmittable
+                    }
+                };
+                inline_tally.record_refusal(&refusal);
+            }
             if !is_recursive_call && (invoke_kind == 3 || invoke_kind == 1) {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
@@ -10951,21 +12346,79 @@ fn try_compile_inner(
                             //    the single-pass backend reserves ~64 buffer
                             //    bytes and ~1 frame slot per inlined bytecode,
                             //    both linear in this total.
+                            //
+                            // C2-review P1: both dimensions now live in
+                            // `plan_inline`, together with the depth,
+                            // recursion, exception-range and dependency rules
+                            // this site had none of. For a statically bound
+                            // callee — the only kind that reaches here, see the
+                            // enclosing `invoke_kind` test — the admission
+                            // decision is the SAME size/expansion/budget
+                            // arithmetic as before, so an unprofiled compile
+                            // inlines exactly as it did; what is new is that a
+                            // refusal now says why, and that the dependencies
+                            // are taken from the plan rather than assumed.
                             let site_hot = call_site_is_hot(pc, &inline_hot_loops, profile);
-                            if let Some(expansion_cost) =
-                                inline_site_expansion_cost_tiered(&site, site_hot)
-                                    .filter(|cost| *cost <= inline_budget_remaining)
-                            {
+                            let callee_triple = (
+                                site.class_name.clone(),
+                                site.method_name.clone(),
+                                site.descriptor.clone(),
+                            );
+                            // Ancestors only. The single-pass emitter cannot
+                            // nest (`try_emit_inline_body` bails on any callee
+                            // invoke that is not a resolver-proven elidable
+                            // super-`<init>`), so the only inline stack that
+                            // exists is [caller, callee] and the only possible
+                            // recursion is callee == caller — which
+                            // `is_recursive_call` has already excluded above.
+                            // Computed rather than hard-coded to `0` so a
+                            // nesting emitter inherits a correct count.
+                            let recursive_copies = usize::from(
+                                callee_triple.0 == &*cached.class_name
+                                    && callee_triple.1 == &*cached.method_name
+                                    && callee_triple.2 == &*cached.method_descriptor,
+                            );
+                            let plan = plan_inline(&InlineRequest {
+                                pc,
+                                invoke_kind,
+                                site: &site,
+                                site_is_hot: site_hot,
+                                receivers: profile.and_then(|p| p.receivers.get(&pc)),
+                                call_site_evidence: profile
+                                    .map(|p| p.call_site_count(pc))
+                                    .unwrap_or(profile::CallSiteEvidence::None),
+                                depth: 1,
+                                recursive_copies,
+                                budget_remaining: inline_budget_remaining,
+                                pc_in_protected_range: pc_in_protected_range(
+                                    &cached.exception_table,
+                                    pc,
+                                ),
+                                precise_exception_frames,
+                                caps: InlineBackendCaps::single_pass_x64(),
+                                // No class-id → name resolver is threaded into
+                                // this function, so a speculative plan could
+                                // not record its receiver dependency anyway.
+                                // Moot today: the caps above already refuse
+                                // every speculative site.
+                                receiver_class_namer: None,
+                            });
+                            inline_tally.record(&plan);
+                            if plan.is_admitted() {
                                 inline_budget_remaining =
-                                    inline_budget_remaining.saturating_sub(expansion_cost);
+                                    inline_budget_remaining.saturating_sub(plan.expansion_cost);
                                 if site.needs_heap {
                                     needs_heap = true;
                                 }
-                                inlined_methods.push((
-                                    site.class_name.clone(),
-                                    site.method_name.clone(),
-                                    site.descriptor.clone(),
-                                ));
+                                // The invalidation channel. Deduplicated: the
+                                // scans are `.any()` predicates run on every
+                                // class define, so a repeated triple is pure
+                                // cost.
+                                for dependency in plan.invalidation_triples() {
+                                    if !inlined_methods.contains(&dependency) {
+                                        inlined_methods.push(dependency);
+                                    }
+                                }
                                 inline_sites.insert(pc, site);
                                 planned_inline = true;
                                 if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
@@ -10975,6 +12428,13 @@ fn try_compile_inner(
                                         "[cratonvm-jitc] inline-planned {class_name}.{method_name}{descriptor} @pc={pc}"
                                     );
                                 }
+                            } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                                .is_some()
+                            {
+                                eprintln!(
+                                    "[cratonvm-jitc] inline-refused {class_name}.{method_name}{descriptor} @pc={pc} reason={}",
+                                    plan.refusal().map_or("none", InlineRefusal::category)
+                                );
                             }
                         }
                     }
@@ -11812,6 +13272,12 @@ fn try_compile_inner(
     direct_callee_entries.dedup();
     compiled._direct_callee_entries = direct_callee_entries;
     compiled.inlined_methods = inlined_methods;
+    // C2-review P1 — publish the inlining decision totals on the artifact so
+    // `metrics::CompileRecorder::installed` can harvest them alongside
+    // `code_bytes` / `deopt_points` / `frame_bytes`. Empty unless something was
+    // actually considered, so it costs one moved `Vec` header on every other
+    // compilation.
+    compiled.inline_tally = inline_tally;
 
     if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_CODE") {
         let full = format!(

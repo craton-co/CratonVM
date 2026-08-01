@@ -35,6 +35,10 @@ pub mod jvmti;
 pub mod lambda_proxy;
 pub mod lock_order;
 pub mod lockfree_resolve;
+// C2 review P0 — the one method/field resolution API. Every new resolution
+// site goes through `resolve::MemberResolver`; `resolve::guard` is the
+// repository check that rejects new direct metadata-table bypasses.
+pub mod resolve;
 pub mod serialization;
 pub mod serviceability;
 pub mod shared_secrets;

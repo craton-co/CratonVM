@@ -19153,7 +19153,14 @@ pub use constants::*;
 // Moved to `interpreter/field_access.rs`. The `pub use` keeps every
 // existing path resolving; a glob re-export caps each item at its own
 // declared visibility, so nothing here became more public than it was.
-mod field_access;
+//
+// C2 P0 — the module declaration itself is `pub(crate)` (it was private) so
+// that `crate::runtime::resolve::MemberResolver` can name the field-resolution
+// core it delegates to. Nothing inside became more visible: the glob re-export
+// still caps each item at its own declared visibility, and only the one item
+// `resolve` calls was widened. Call `runtime::resolve`, not this module —
+// `runtime::resolve::guard` enforces it.
+pub(crate) mod field_access;
 pub use field_access::*;
 // ---------------------------------------------------------------------------
 // Helper: Method invocation
@@ -19162,7 +19169,11 @@ pub use field_access::*;
 // Moved to `interpreter/invoke.rs`. The `pub use` keeps every
 // existing path resolving; a glob re-export caps each item at its own
 // declared visibility, so nothing here became more public than it was.
-mod invoke;
+//
+// C2 P0 — `pub(crate)` for the same reason as `field_access` above: it is the
+// method-resolution core that `crate::runtime::resolve::MemberResolver`
+// delegates to. Only `resolve_method_metadata` was widened.
+pub(crate) mod invoke;
 pub use invoke::*;
 // ---------------------------------------------------------------------------
 // Utility functions
