@@ -44428,23 +44428,17 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Set;)Ljava/util/Set;",
         native_collections_unmodifiable_set,
     );
-    r.register(
-        c,
-        "unmodifiableSortedMap",
-        "(Ljava/util/SortedMap;)Ljava/util/SortedMap;",
-        native_collections_unmodifiable_map,
-    );
+    // Keep the real-JDK bytecode authoritative for the sorted/navigable map
+    // factories. The plain synthetic UnmodifiableMap stamp implements Map,
+    // not SortedMap/NavigableMap; routing these factories to the plain-map
+    // callback therefore violates their declared return type and makes
+    // Charset.availableCharsets() fail its checkcast. The JDK implementations
+    // create the correctly typed, read-only wrapper classes.
     r.register(
         c,
         "unmodifiableSortedSet",
         "(Ljava/util/SortedSet;)Ljava/util/SortedSet;",
         native_collections_unmodifiable_sorted_set,
-    );
-    r.register(
-        c,
-        "unmodifiableNavigableMap",
-        "(Ljava/util/NavigableMap;)Ljava/util/NavigableMap;",
-        native_collections_unmodifiable_map,
     );
     r.register(
         c,

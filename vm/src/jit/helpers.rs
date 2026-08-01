@@ -5232,6 +5232,73 @@ mod class_init_memo {
     }
 }
 
+/// Per-`ClassId` memo for "is this `java/lang/System`?".
+///
+/// `jit_getstatic` must answer that on every static read, to service the
+/// `System.out`/`err` bootstrap intercept. Answering it by NAME cost a
+/// `class_manager` read lock plus a string compare; answering it by resolving
+/// System's id once still costs that lock on every call whenever the name
+/// lookup fails to resolve, which is silent and indistinguishable from working.
+///
+/// Keyed on the class id instead, the question is asked at most once per class
+/// and answered thereafter by two bit tests. Class ids are stable for the life
+/// of the VM, so the memo never needs invalidating.
+mod system_class_memo {
+    use crate::classloading::ClassId;
+    use crate::vm::SharedVm;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const CAPACITY: usize = 1 << 17;
+    const WORDS: usize = CAPACITY / 64;
+
+    fn table() -> &'static (Box<[AtomicU64]>, Box<[AtomicU64]>) {
+        static T: std::sync::OnceLock<(Box<[AtomicU64]>, Box<[AtomicU64]>)> =
+            std::sync::OnceLock::new();
+        T.get_or_init(|| {
+            (
+                (0..WORDS).map(|_| AtomicU64::new(0)).collect(),
+                (0..WORDS).map(|_| AtomicU64::new(0)).collect(),
+            )
+        })
+    }
+
+    #[inline]
+    fn bit(words: &[AtomicU64], idx: usize) -> bool {
+        words[idx / 64].load(Ordering::Relaxed) & (1u64 << (idx % 64)) != 0
+    }
+
+    #[inline]
+    fn set_bit(words: &[AtomicU64], idx: usize) {
+        words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Relaxed);
+    }
+
+    pub fn is_system(vm: &SharedVm, class_id: ClassId) -> bool {
+        let idx = class_id.as_u32() as usize;
+        if idx >= CAPACITY {
+            // Unindexable id: fall back to the authoritative check.
+            return resolve(vm, class_id);
+        }
+        let (resolved, is_sys) = table();
+        if bit(resolved, idx) {
+            return bit(is_sys, idx);
+        }
+        let answer = resolve(vm, class_id);
+        if answer {
+            set_bit(is_sys, idx);
+        }
+        set_bit(resolved, idx);
+        answer
+    }
+
+    fn resolve(vm: &SharedVm, class_id: ClassId) -> bool {
+        vm.classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .is_some_and(|c| &*c.name == "java/lang/System")
+    }
+}
+
 /// `java/lang/System`'s `ClassId`, resolved once.
 ///
 /// `jit_getstatic` needs to know whether the field it is reading belongs to
@@ -5260,9 +5327,14 @@ fn system_class_id(vm: &SharedVm) -> Option<ClassId> {
 }
 
 pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
+    gs_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _gs_total = gs_prof::CycGuard::new(&gs_prof::CYC_TOTAL);
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
-    crate::jit::conservative_roots::note_jit_boundary();
+    {
+        let _g = gs_prof::CycGuard::new(&gs_prof::CYC_BOUNDARY);
+        crate::jit::conservative_roots::note_jit_boundary();
+    }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
@@ -5298,6 +5370,7 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // every static read from compiled code was a measurable part of
     // `getstatic`'s ~35 ns. Initialization is monotonic, so the memo never
     // needs invalidating. See `class_init_memo`.
+    let _gs_init = gs_prof::CycGuard::new(&gs_prof::CYC_INIT);
     if !class_init_memo::is_initialized(class_id_raw as u32) {
         if let Some((thread, _guard)) = jit_thread_mut() {
             if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
@@ -5347,18 +5420,25 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // and its id is stable for the life of the VM, so a one-shot cache is
     // sound; until it resolves we fall back to the id-less answer (`None`),
     // which is what a not-yet-loaded System would have produced anyway.
-    let field_name = if system_class_id(vm) == Some(class_id) {
-        vm.classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .and_then(|c| {
-                c.fields
-                    .get(field_index as usize)
-                    .map(|f| f.name.to_string())
-            })
-    } else {
-        None
+    drop(_gs_init);
+    // Scoped so the guard is DROPPED here rather than at end of function — an
+    // unscoped guard silently folded the read segment into this one and made
+    // `syscheck` look like the dominant cost.
+    let field_name = {
+        let _gs_sys = gs_prof::CycGuard::new(&gs_prof::CYC_SYSCHECK);
+        if system_class_memo::is_system(vm, class_id) {
+            vm.classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .and_then(|c| {
+                    c.fields
+                        .get(field_index as usize)
+                        .map(|f| f.name.to_string())
+                })
+        } else {
+            None
+        }
     };
     if let Some(ref fname) = field_name {
         if fname == "out" || fname == "err" {
@@ -5401,7 +5481,10 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
         }
     }
 
-    let val = crate::vm::get_static_shared(vm, class_id, field_index as usize);
+    let val = {
+        let _g = gs_prof::CycGuard::new(&gs_prof::CYC_READ);
+        crate::vm::get_static_shared(vm, class_id, field_index as usize)
+    };
     match val {
         Value::Int(i) => i as i64,
         Value::Long(l) => l,
@@ -5417,6 +5500,86 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
         }
         Value::Object(None) => 0,
         _ => 0,
+    }
+}
+
+/// Where does a `getstatic` actually spend its time?
+///
+/// The helper has four distinguishable segments and, measured from outside, they
+/// were indistinguishable — which is how a lock-free read path that turned out
+/// to change nothing got built on an assumption. Each segment is now timed with
+/// `rdtsc` under `CRATONVM_DBG_GETSTATIC_PROF=1`; the dump also reports whether
+/// the lock-free index is actually being HIT, so an inert lever cannot pass for
+/// an ineffective one.
+pub mod gs_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_BOUNDARY: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_INIT: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_SYSCHECK: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_READ: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETSTATIC_PROF").is_some()
+        })
+    }
+
+    #[inline]
+    pub fn now() -> u64 {
+        // SAFETY: rdtsc is unprivileged on x86-64.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    pub struct CycGuard<'a> {
+        start: u64,
+        sink: &'a AtomicU64,
+        armed: bool,
+    }
+
+    impl<'a> CycGuard<'a> {
+        #[inline]
+        pub fn new(sink: &'a AtomicU64) -> Self {
+            let armed = enabled();
+            Self {
+                start: if armed { now() } else { 0 },
+                sink,
+                armed,
+            }
+        }
+    }
+
+    impl Drop for CycGuard<'_> {
+        #[inline]
+        fn drop(&mut self) {
+            if self.armed {
+                self.sink
+                    .fetch_add(now().wrapping_sub(self.start), Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let calls = g(&CALLS).max(1);
+        eprintln!(
+            "[GS_PROF] calls={} cyc/call total={:.1} boundary={:.1} init={:.1} \
+             syscheck={:.1} read={:.1} | index_hit={} index_miss={}",
+            g(&CALLS),
+            g(&CYC_TOTAL) as f64 / calls as f64,
+            g(&CYC_BOUNDARY) as f64 / calls as f64,
+            g(&CYC_INIT) as f64 / calls as f64,
+            g(&CYC_SYSCHECK) as f64 / calls as f64,
+            g(&CYC_READ) as f64 / calls as f64,
+            crate::vm::statics_index_hits(),
+            crate::vm::statics_index_misses(),
+        );
     }
 }
 
