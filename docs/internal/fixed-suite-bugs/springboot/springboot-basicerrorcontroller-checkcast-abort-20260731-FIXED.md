@@ -161,10 +161,11 @@ was the only one that *could* clone, and did.
 | build | refused (of 100) | served after `close()` returned |
 |---|---:|---:|
 | HotSpot 25 | 100 | **0** |
-| `9fcd1b63f` (pre-fix) | 79 / 84 / 78 / 10 | **21 / 16 / 22 / 90** |
-| this fix | 100 / 100 / 100 / 100 | **0 / 0 / 0 / 0** |
+| `9fcd1b63f` (pre-fix) | 79 / 84 / 78 / 10 / 43 | **21 / 16 / 22 / 90 / 57** |
+| this fix, pre-merge | 100 ×4 | **0 ×4** |
+| this fix, merged to `dev` | 100 ×3 | **0 ×3** |
 
-The pre-fix arm's spread (21 → 90 served) is the load dependence itself: the
+The pre-fix arm's spread (16 → 90 served) is the load dependence itself: the
 window is one poll interval, so the busier the host, the more of it a
 connecting client fits inside. That is the same variable that decides whether
 the Jetty test fails, and it is why a standalone run of that test is not
