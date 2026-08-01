@@ -17519,6 +17519,9 @@ pub fn try_jit_compile_callee(
     // RBC.4 — short-circuit permanently-uncompilable methods before the
     // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
     if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
+        if callee_probe_dbg() {
+            callee_probe_note("BAIL-LISTED", class_name, method_name, descriptor);
+        }
         return None;
     }
     // This API hands a raw entry pointer to direct dispatchers. Even if the
@@ -17527,6 +17530,9 @@ pub fn try_jit_compile_callee(
     // Keep them on the generic invocation path; background tiering uses the
     // separate wrapped-entry helper below.
     if named_method_is_synchronized(shared, class_name, method_name, descriptor) {
+        if callee_probe_dbg() {
+            callee_probe_note("SYNCHRONIZED", class_name, method_name, descriptor);
+        }
         return None;
     }
     // JIT-cache probe. Deliberately BEFORE the negative cache so a method
@@ -17566,6 +17572,23 @@ pub fn try_jit_compile_callee(
             let needs_ctx = compiled.needs_context();
             return Some((compiled, entry, needs_ctx));
         }
+        // DIAG (`CRATONVM_DBG_CALLEE_PROBE=1`): the probe above requires an
+        // EXACT `declaring_class_id`. Report the miss UNCONDITIONALLY, with the
+        // exact strings — an empty `ids` list is as informative as a populated
+        // one (it separates "wrong id" from "the name never matches at all").
+        if callee_probe_dbg() {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 25 {
+                let ids = jit_cache.debug_ids_for(class_name, method_name, descriptor);
+                eprintln!(
+                    "[callee-probe] CACHE-MISS class={class_name:?} method={method_name:?} \
+                     desc={descriptor:?} probe_id={} ids_in_cache={:?}",
+                    probe_class_id.as_u32(),
+                    ids
+                );
+            }
+        }
     }
     let fp = callee_neg_fingerprint(class_name, method_name, descriptor);
     // Widening: small integer index -> usize (non-negative, fits in pointer width)
@@ -17587,6 +17610,9 @@ pub fn try_jit_compile_callee(
         &mut cache_negative,
         false,
     );
+    if res.is_none() && callee_probe_dbg() {
+        callee_probe_note("SLOW-PATH-NONE", class_name, method_name, descriptor);
+    }
     match res {
         None if cache_negative => slot.store(fp, Ordering::Relaxed),
         // A re-probe that succeeded — drop the stale negative entry.
@@ -17594,6 +17620,26 @@ pub fn try_jit_compile_callee(
         _ => {}
     }
     res
+}
+
+/// Is the callee-probe diagnostic on? (`CRATONVM_DBG_CALLEE_PROBE=1`)
+///
+/// `try_jit_compile_callee` has four independent ways to answer `None`, and
+/// they were indistinguishable from the outside — which is what made
+/// "`hit_entry=0` forever" unfalsifiable. Each now names itself.
+fn callee_probe_dbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CALLEE_PROBE").is_some()
+    })
+}
+
+fn callee_probe_note(why: &str, class_name: &str, method_name: &str, descriptor: &str) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 25 {
+        eprintln!("[callee-probe] {why} {class_name}.{method_name}{descriptor}");
+    }
 }
 
 pub(super) fn named_method_is_synchronized(
