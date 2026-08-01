@@ -1341,6 +1341,143 @@ pub fn clear_reports() {
     ring().lock().clear();
 }
 
+// ── Scheduling counters ──────────────────────────────────────────────
+//
+// Everything above this line describes a compilation that *ran*. These count
+// the compilations that never ran because the scheduler threw the request
+// away, which is the one class of event a per-compilation report structurally
+// cannot carry: there is no report, because there was no compile.
+//
+// That gap is why they exist. A request the tier manager drops silently is a
+// method that stays interpreted forever, and nothing downstream can tell it
+// apart from a method that was never hot — no bailout, no `Outcome`, no ring
+// entry, no log line. `docs/jit/broker-install-epoch.md` is the write-up.
+//
+// The design is a deliberate copy of [`crate::bailout`]'s: a fixed array of
+// `&'static str` names and a parallel array of relaxed counters, read back as
+// `Vec<(&'static str, u64)>` in a stable order including the zeroes. Two
+// consequences are load-bearing and match that module:
+//
+//   * The names are an **external contract** — a test or a dashboard keys on
+//     them — so they must not be renamed along with any field.
+//   * The counters are **not gated on [`enabled`]**. A dropped request is a
+//     correctness-adjacent event, not a measurement, and it has to be visible
+//     in a default production run where `CRATONVM_JIT_METRICS` is unset.
+
+/// Every scheduling event that discards a compilation request, in the fixed
+/// order [`scheduling_counts`] reports.
+pub const SCHEDULING_EVENTS: [&str; 4] = [
+    // A queued request was discarded at dispatch because the process-wide JIT
+    // install epoch (`crate::jit_install_epoch`) moved after it was queued —
+    // a JVMTI redefinition or a code-cache flush replaced the world the
+    // request was formed against. The method's in-flight slot is released, so
+    // the next invocation re-admits it against the bytecode that is loaded
+    // now. Non-zero is expected under an instrumenting agent and is not by
+    // itself a fault.
+    "queue_dropped_stale_install_epoch",
+    // A queued request was discarded because its class was invalidated —
+    // `TieredCompilationManager::invalidate_class`, which the VM's class-unload
+    // path calls. Unlike a stale-epoch drop this one is final: the class is
+    // gone, so there is no next invocation to re-admit the method. Counted
+    // separately for exactly that reason.
+    "queue_dropped_class_invalidated",
+    // The install epoch moved *while* a compile was running. The artifact is
+    // not lost here: `JitCache::put`/`put_osr` compare it against the owning
+    // cache's flush barrier and refuse it there (counted separately by
+    // `crate::stale_install_epoch_refusals`). This counts the wasted-work
+    // window that the dispatch-time drop cannot close, because the epoch had
+    // not moved yet when the request was dispatched.
+    "inflight_epoch_moved",
+    // Requests still queued when the background compiler was shut down. Only
+    // ever non-zero at VM teardown, where abandoning them is correct — but a
+    // non-zero value in the middle of a run means the worker was stopped with
+    // work outstanding, which is not.
+    "queue_shutdown_abandoned",
+];
+
+/// One relaxed counter per [`SCHEDULING_EVENTS`] entry. Fixed array, same
+/// reasoning as [`crate::bailout`]'s: the event set is closed, so this needs
+/// no allocation, no lock and no initialization order.
+static SCHEDULING_COUNTERS: [AtomicU64; SCHEDULING_EVENTS.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Index of `event` in [`SCHEDULING_EVENTS`], compared by content so a
+/// hand-built name also resolves.
+fn scheduling_index(event: &str) -> Option<usize> {
+    SCHEDULING_EVENTS.iter().position(|e| *e == event)
+}
+
+/// Count `n` occurrences of `event`.
+///
+/// Infallible, non-blocking, and independent of [`enabled`]. An unknown event
+/// name is ignored rather than panicking: this is called from the compile
+/// worker's drain loop, where a panic would take the only compiler thread in
+/// the process down.
+///
+/// Callers should prefer the `SCHEDULING_EVENTS` constants over string
+/// literals at the call site; see `crate::tiered`, which does.
+pub fn record_scheduling_events(event: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    if let Some(idx) = scheduling_index(event) {
+        SCHEDULING_COUNTERS[idx].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Count one occurrence of `event`.
+pub fn record_scheduling_event(event: &str) {
+    record_scheduling_events(event, 1);
+}
+
+/// Read every scheduling event's count.
+///
+/// Returns **all** events, including zero-valued ones, in the fixed
+/// [`SCHEDULING_EVENTS`] order — for the same reason
+/// [`crate::bailout::bailout_counts`] does: a sink wants a stable row set, and
+/// "this drop never happened" is itself information. Counts are relaxed loads
+/// and are therefore a sample, not an atomic snapshot.
+pub fn scheduling_counts() -> Vec<(&'static str, u64)> {
+    SCHEDULING_EVENTS
+        .iter()
+        .zip(SCHEDULING_COUNTERS.iter())
+        .map(|(name, counter)| (*name, counter.load(Ordering::Relaxed)))
+        .collect()
+}
+
+/// Read one event's count, or `None` if the name is not a known event.
+pub fn scheduling_count(event: &str) -> Option<u64> {
+    scheduling_index(event).map(|idx| SCHEDULING_COUNTERS[idx].load(Ordering::Relaxed))
+}
+
+/// Total requests discarded by the scheduler without a compile ever running.
+///
+/// The in-flight-epoch counter is deliberately excluded: that compile *ran*,
+/// and whether its artifact survived is the code cache's question, not the
+/// scheduler's.
+pub fn scheduling_dropped_total() -> u64 {
+    scheduling_count(SCHEDULING_EVENTS[0]).unwrap_or(0)
+        + scheduling_count(SCHEDULING_EVENTS[1]).unwrap_or(0)
+        + scheduling_count(SCHEDULING_EVENTS[3]).unwrap_or(0)
+}
+
+/// Zero every scheduling counter, so a test can assert on exact values without
+/// being perturbed by a sibling test in the same process.
+///
+/// `pub(crate)` and test-only: these counters are monotone by contract in a
+/// real run, and a production reset would make "how many requests has this
+/// process thrown away" unanswerable.
+#[cfg(test)]
+pub(crate) fn reset_scheduling_counts_for_test() {
+    for counter in SCHEDULING_COUNTERS.iter() {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
 // ── Summary ──────────────────────────────────────────────────────────
 
 /// Aggregate view over the retained reports plus the process-wide bailout
@@ -1373,6 +1510,14 @@ pub struct MetricsSummary {
     /// restricted to the retained reports, and fed by every `record_bailout`
     /// call site whether or not metrics are enabled.
     pub bailout_categories: Vec<(&'static str, u64)>,
+    /// [`scheduling_counts`] verbatim: compilation requests the *scheduler*
+    /// discarded, so they never became a report at all.
+    ///
+    /// Read this before concluding from `by_outcome` that a method was never
+    /// hot: a request dropped at dispatch produces no row anywhere else in
+    /// this summary. Same process-wide, metrics-flag-independent semantics as
+    /// `bailout_categories`.
+    pub scheduling: Vec<(&'static str, u64)>,
 }
 
 /// Aggregate the retained reports.
@@ -1431,6 +1576,7 @@ pub fn summary() -> MetricsSummary {
         phase_totals_ns,
         phase_runs,
         bailout_categories: crate::bailout::bailout_counts(),
+        scheduling: scheduling_counts(),
     }
 }
 
@@ -1470,6 +1616,7 @@ impl MetricsSummary {
             ",\"bailout_categories\":{}",
             pairs(&self.bailout_categories)
         );
+        let _ = write!(s, ",\"scheduling\":{}", pairs(&self.scheduling));
         s.push('}');
         s
     }
@@ -1482,8 +1629,8 @@ pub(crate) fn set_enabled_for_test(on: bool) {
     ENABLED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
 }
 
-/// Serializes every test that touches the process-wide enable flag or the
-/// report ring.
+/// Serializes every test that touches the process-wide enable flag, the
+/// report ring, or the [`SCHEDULING_COUNTERS`] table.
 ///
 /// Module-level and `pub(crate)` rather than private to `mod tests`, because the
 /// enable flag is one process-wide `AtomicU8`: `ir_lower`'s end-to-end wiring
@@ -2027,6 +2174,79 @@ mod tests {
         assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
         assert_eq!(json_escape("x\u{1}y"), "x\\u0001y");
         assert_eq!(json_escape("plain/name;()I"), "plain/name;()I");
+    }
+
+    // ── Scheduling counters ──────────────────────────────────────────
+
+    #[test]
+    fn scheduling_counts_report_every_event_in_a_fixed_order() {
+        let names: Vec<&str> = scheduling_counts().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, SCHEDULING_EVENTS.to_vec());
+        // The whole point of a fixed row set: an event that never fired still
+        // has a row, so "zero drops" and "nobody counts drops" are different
+        // readings.
+        assert_eq!(names.len(), SCHEDULING_EVENTS.len());
+    }
+
+    #[test]
+    fn scheduling_events_are_distinct_names() {
+        let mut sorted = SCHEDULING_EVENTS.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), before, "two events share a name: {sorted:?}");
+    }
+
+    #[test]
+    fn recording_a_scheduling_event_is_visible_without_metrics_enabled() {
+        let _guard = TEST_LOCK.lock();
+        // Explicitly OFF. A dropped compilation request must be countable in a
+        // default production run, where `CRATONVM_JIT_METRICS` is unset — this
+        // is the property that distinguishes these counters from the ring.
+        set_enabled_for_test(false);
+        reset_scheduling_counts_for_test();
+
+        record_scheduling_event(SCHEDULING_EVENTS[0]);
+        record_scheduling_events(SCHEDULING_EVENTS[0], 4);
+        record_scheduling_events(SCHEDULING_EVENTS[3], 2);
+        // A zero count must not advance anything.
+        record_scheduling_events(SCHEDULING_EVENTS[1], 0);
+        // An unknown name is ignored rather than panicking.
+        record_scheduling_event("not_an_event");
+
+        assert_eq!(scheduling_count(SCHEDULING_EVENTS[0]), Some(5));
+        assert_eq!(scheduling_count(SCHEDULING_EVENTS[1]), Some(0));
+        assert_eq!(scheduling_count(SCHEDULING_EVENTS[3]), Some(2));
+        assert_eq!(scheduling_count("not_an_event"), None);
+        // `inflight_epoch_moved` describes a compile that RAN, so it is not a
+        // drop and must stay out of the total.
+        record_scheduling_events(SCHEDULING_EVENTS[2], 9);
+        assert_eq!(scheduling_dropped_total(), 7);
+
+        reset_scheduling_counts_for_test();
+    }
+
+    #[test]
+    fn summary_carries_the_scheduling_table_and_json() {
+        let _guard = TEST_LOCK.lock();
+        set_enabled_for_test(false);
+        reset_scheduling_counts_for_test();
+        record_scheduling_events(SCHEDULING_EVENTS[0], 3);
+
+        let s = summary();
+        let names: Vec<&str> = s.scheduling.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, SCHEDULING_EVENTS.to_vec());
+        assert_eq!(
+            s.scheduling.iter().find(|(n, _)| *n == SCHEDULING_EVENTS[0]),
+            Some(&(SCHEDULING_EVENTS[0], 3))
+        );
+        let json = s.to_json();
+        assert!(
+            json.contains("\"scheduling\":{\"queue_dropped_stale_install_epoch\":3"),
+            "{json}"
+        );
+
+        reset_scheduling_counts_for_test();
     }
 
     #[test]

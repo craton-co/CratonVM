@@ -419,14 +419,52 @@ pub struct CompilationTask {
     pub osr_bci: Option<u32>,
 }
 
+/// A queued [`CompilationTask`] plus the install epoch it was queued at.
+///
+/// The stamp lives on the queue entry, not on the task, on purpose:
+/// [`CompilationTask`] is constructed by the VM (`vm/src/jit/helpers.rs`) as
+/// well as by this module, and an epoch a caller has to remember to fill in is
+/// an epoch that will eventually be filled in wrong — or, worse, filled in
+/// with a *later* epoch than the request really carries, which reads as fresh.
+/// [`CompilationQueue::enqueue`] stamps every request that enters the queue by
+/// any door, so "everything queued carries the epoch it was queued at" holds
+/// by construction rather than by convention.
+///
+/// See `docs/jit/broker-install-epoch.md` for which epoch this is and what it
+/// answers — it is deliberately NOT [`CompilationBroker`]'s per-class epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedRequest {
+    /// [`crate::jit_install_epoch`] as of the moment this request entered the
+    /// queue.
+    install_epoch: u64,
+    task: CompilationTask,
+}
+
+/// A queued request that will not be compiled, and why.
+///
+/// Carried *out* of the queue rather than acted on in place so the drop can be
+/// counted and the method's in-flight slot released after the queue lock has
+/// been dropped — see [`CompilerCore::retire_stale`] for the lock-order reason
+/// that makes this mandatory rather than tidy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleRequest {
+    task: CompilationTask,
+    /// The [`crate::metrics::SCHEDULING_EVENTS`] name this drop is counted
+    /// under.
+    event: &'static str,
+    /// Epoch the request was queued at, and the epoch now.
+    queued_epoch: u64,
+    current_epoch: u64,
+}
+
 /// Priority queue for compilation tasks.
 pub struct CompilationQueue {
     /// High priority: C2 recompilations.
-    high: VecDeque<CompilationTask>,
+    high: VecDeque<QueuedRequest>,
     /// Normal priority: C1 compilations.
-    normal: VecDeque<CompilationTask>,
+    normal: VecDeque<QueuedRequest>,
     /// Low priority: speculative compilations.
-    low: VecDeque<CompilationTask>,
+    low: VecDeque<QueuedRequest>,
     /// Total tasks processed.
     total_processed: u64,
 }
@@ -441,24 +479,70 @@ impl CompilationQueue {
         }
     }
 
-    fn enqueue(&mut self, task: CompilationTask) {
-        match task.priority {
-            CompilationPriority::High => self.high.push_back(task),
-            CompilationPriority::Normal => self.normal.push_back(task),
-            CompilationPriority::Low => self.low.push_back(task),
+    /// Push `task`, stamped with `install_epoch`.
+    fn enqueue(&mut self, task: CompilationTask, install_epoch: u64) {
+        let entry = QueuedRequest {
+            install_epoch,
+            task,
+        };
+        match entry.task.priority {
+            CompilationPriority::High => self.high.push_back(entry),
+            CompilationPriority::Normal => self.normal.push_back(entry),
+            CompilationPriority::Low => self.low.push_back(entry),
         }
     }
 
-    fn dequeue(&mut self) -> Option<CompilationTask> {
-        let task = self
+    /// Pop the highest-priority request **without** consulting its stamp.
+    ///
+    /// The raw form, kept for [`TieredCompilationManager::dequeue_compilation`]
+    /// — a manual/diagnostic drain that is not the compile pipeline. A caller
+    /// that is about to *compile* the result must use [`Self::dequeue_fresh`].
+    fn dequeue(&mut self) -> Option<QueuedRequest> {
+        let entry = self
             .high
             .pop_front()
             .or_else(|| self.normal.pop_front())
             .or_else(|| self.low.pop_front());
-        if task.is_some() {
+        if entry.is_some() {
             self.total_processed += 1;
         }
-        task
+        entry
+    }
+
+    /// Pop the highest-priority request that is still current at install epoch
+    /// `current`, pushing every request queued at an older epoch onto `stale`
+    /// on the way past.
+    ///
+    /// Returns `None` only when the queue is empty. A run of stale requests
+    /// therefore cannot starve a fresh one sitting behind them, and cannot
+    /// make the worker read an occupied queue as empty.
+    ///
+    /// Nothing is dropped silently: every request that leaves the queue leaves
+    /// through either the return value or `stale`, and the caller is required
+    /// to retire `stale`. That is the whole fail-closed contract — a request
+    /// that vanished here with no counter and no released slot would be a
+    /// method that never compiles again, with nothing anywhere to say so.
+    ///
+    /// `total_processed` counts stale entries too: it means "left the queue",
+    /// and a request that was dropped did leave. The drop-specific count is
+    /// `crate::metrics::SCHEDULING_EVENTS[0]`.
+    fn dequeue_fresh(
+        &mut self,
+        current: u64,
+        stale: &mut Vec<StaleRequest>,
+    ) -> Option<CompilationTask> {
+        while let Some(entry) = self.dequeue() {
+            if entry.install_epoch >= current {
+                return Some(entry.task);
+            }
+            stale.push(StaleRequest {
+                task: entry.task,
+                event: crate::metrics::SCHEDULING_EVENTS[0],
+                queued_epoch: entry.install_epoch,
+                current_epoch: current,
+            });
+        }
+        None
     }
 
     fn len(&self) -> usize {
@@ -467,6 +551,19 @@ impl CompilationQueue {
 
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Remove and return every queued request.
+    ///
+    /// Used at worker shutdown so abandonment is an event with a count rather
+    /// than a queue that quietly stopped being drained.
+    fn drain_all(&mut self) -> Vec<CompilationTask> {
+        self.high
+            .drain(..)
+            .chain(self.normal.drain(..))
+            .chain(self.low.drain(..))
+            .map(|entry| entry.task)
+            .collect()
     }
 }
 
@@ -500,12 +597,36 @@ struct CompilerCore {
     shutdown: AtomicBool,
     /// Number of tasks the worker has finished compiling (for tests/diagnostics).
     completed: AtomicU64,
+    /// Requests discarded at dispatch instead of compiled — the local mirror
+    /// of `crate::metrics::scheduling_dropped_total`, so a test can assert on
+    /// one manager's behaviour without reading a process-wide table shared
+    /// with every other manager and every sibling test.
+    dropped: AtomicU64,
+    /// Install epoch the in-flight compile was dispatched at, or `0` when the
+    /// worker is idle.
+    ///
+    /// The dispatch-time gate can only refuse a request whose epoch had
+    /// *already* moved. This records the epoch of the compile that is running
+    /// now, so the worker can tell afterwards whether the world moved
+    /// underneath it — the window that only the per-cache flush barrier in
+    /// `JitCache::put` can close, and the one this field makes visible.
+    inflight_epoch: AtomicU64,
+    /// Test seam: when set, the source of "the current install epoch" instead
+    /// of the process-wide [`crate::jit_install_epoch`].
+    ///
+    /// The scheduling rule under test is "a request queued before an
+    /// invalidation is not compiled after it", and that is a statement about
+    /// epoch *ordering*, not about wall-clock time or about any real
+    /// redefinition. Driving it from an injected counter makes the test
+    /// deterministic and hermetic; driving it from the global would make it
+    /// depend on whatever every other test in the process happened to flush.
+    install_epoch_source: Option<Arc<AtomicU64>>,
     /// Aggregate compilation statistics (shared so the worker can update them).
     stats: CompilationStats,
 }
 
 impl CompilerCore {
-    fn new() -> Self {
+    fn with_install_epoch_source(install_epoch_source: Option<Arc<AtomicU64>>) -> Self {
         Self {
             methods: Mutex::new(FxHashMap::default()),
             queue: Mutex::new(CompilationQueue::new()),
@@ -513,14 +634,115 @@ impl CompilerCore {
             active: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             completed: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            inflight_epoch: AtomicU64::new(0),
+            install_epoch_source,
             stats: CompilationStats::default(),
         }
     }
 
-    /// Push a task and wake the worker (if any).
+    /// The install epoch as of right now.
+    ///
+    /// One relaxed-ish atomic load on the default path — the same load
+    /// `crate::jit_install_epoch` performs, which is already on every
+    /// compilation's entry path.
+    fn current_install_epoch(&self) -> u64 {
+        match &self.install_epoch_source {
+            Some(cell) => cell.load(Ordering::Acquire),
+            None => crate::jit_install_epoch(),
+        }
+    }
+
+    /// Push a task, stamped with the install epoch it was queued at, and wake
+    /// the worker (if any).
+    ///
+    /// Every enqueue in the process funnels through here — the two policy
+    /// paths in [`TieredCompilationManager`], the OSR paths, the C1→C2
+    /// upgrade, and the VM's direct [`TieredCompilationManager::enqueue_compilation`]
+    /// — so no door into the queue can produce an unstamped request.
     fn enqueue(&self, task: CompilationTask) {
-        self.queue.lock().enqueue(task);
+        let epoch = self.current_install_epoch();
+        self.queue.lock().enqueue(task, epoch);
         self.wake.notify_one();
+    }
+
+    /// Release the in-flight slot of every dropped request, count the drop,
+    /// and trace it under `CRATONVM_DBG_TIER_ENQUEUE`.
+    ///
+    /// ## Lock order
+    ///
+    /// This takes `methods` and **must not** be called while `queue` is held.
+    /// The established order in this file is `methods` → `queue`:
+    /// `should_compile_inner` holds `methods` across `CompilerCore::enqueue`,
+    /// which takes `queue`. The worker discovers stale requests while holding
+    /// `queue`, so it collects them into a `Vec`, drops the queue guard, and
+    /// only then calls this. Taking `methods` under `queue` here would invert
+    /// the order and deadlock against any thread on the invocation hook.
+    ///
+    /// ## What is deliberately NOT touched
+    ///
+    /// `current_tier`, `tier_fail_count` and `ineligible` are all left alone.
+    /// A stale request is not a compile failure and not a policy decline —
+    /// nothing was compiled and nothing was decided. Routing this through
+    /// [`Self::complete_task`] with `success = false` would spend one of the
+    /// method's [`MAX_TIER_FAIL_RETRIES`], so three redefinitions during
+    /// warmup would leave a hot method permanently un-compilable with no
+    /// diagnostic — precisely the silent loss this whole path exists to
+    /// prevent. Clearing the queued flag is the entire state change, and it is
+    /// what lets the next invocation re-admit the method against the bytecode
+    /// that is actually loaded.
+    fn retire_stale(&self, stale: &[StaleRequest]) {
+        if stale.is_empty() {
+            return;
+        }
+        let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TIER_ENQUEUE").is_some();
+        {
+            let mut methods = self.methods.lock();
+            for request in stale {
+                if let Some(state) = methods.get_mut(&request.task.method_key) {
+                    state.queued_for_compilation = false;
+                    state.queued_tier = None;
+                }
+            }
+        }
+        for request in stale {
+            crate::metrics::record_scheduling_event(request.event);
+            if trace {
+                eprintln!(
+                    "[cratonvm-tier] drop {}.{}{} tier={:?}{} reason={} queued_epoch={} epoch={}",
+                    request.task.method_key.class_name,
+                    request.task.method_key.method_name,
+                    request.task.method_key.descriptor,
+                    request.task.target_tier,
+                    request
+                        .task
+                        .osr_bci
+                        .map(|b| format!(" osr_bci={b}"))
+                        .unwrap_or_default(),
+                    request.event,
+                    request.queued_epoch,
+                    request.current_epoch,
+                );
+            }
+        }
+        self.dropped
+            .fetch_add(stale.len() as u64, Ordering::Release);
+    }
+
+    /// Pop the next request that is still current, dropping and retiring any
+    /// stale ones ahead of it.
+    ///
+    /// Never blocks: `None` means the queue held nothing fresh, not that the
+    /// caller should assume there was nothing there.
+    fn take_fresh(&self) -> Option<CompilationTask> {
+        let mut stale: Vec<StaleRequest> = Vec::new();
+        let task = {
+            let current = self.current_install_epoch();
+            let mut queue = self.queue.lock();
+            queue.dequeue_fresh(current, &mut stale)
+        };
+        self.retire_stale(&stale);
+        task
     }
 
     /// C1→C2 supersede: enqueue a Low-priority C2 recompile for a method
@@ -555,8 +777,12 @@ impl CompilerCore {
     }
 
     /// Pop the highest-priority task, or `None` if the queue is empty.
+    ///
+    /// Stamp-blind — see [`CompilationQueue::dequeue`]. Backs the manual
+    /// [`TieredCompilationManager::dequeue_compilation`] drain only; the
+    /// compile pipeline goes through [`Self::take_fresh`].
     fn dequeue(&self) -> Option<CompilationTask> {
-        self.queue.lock().dequeue()
+        self.queue.lock().dequeue().map(|entry| entry.task)
     }
 
     /// Record that `key` finished a compile attempt at `tier`. Mirrors
@@ -780,6 +1006,31 @@ impl BackgroundCompiler {
             let _ = h.join();
         }
         self.core.active.store(false, Ordering::Release);
+        // Whatever was still queued is abandoned here. That is correct at
+        // teardown, but it is still a set of compilation requests that will
+        // never be serviced, so it is counted rather than left to be inferred
+        // from a queue that simply stopped moving. A non-zero
+        // `queue_shutdown_abandoned` in the middle of a run says the worker
+        // was stopped with work outstanding, which is a different — and worse
+        // — story than the same number at exit.
+        //
+        // Drained (not merely counted) so a restarted worker cannot resume
+        // requests stamped at a pre-teardown epoch, and so the count and the
+        // queue can never disagree. Joined first: the worker owns the queue
+        // until then.
+        let abandoned = self.core.queue.lock().drain_all();
+        if !abandoned.is_empty() {
+            let stale: Vec<StaleRequest> = abandoned
+                .into_iter()
+                .map(|task| StaleRequest {
+                    task,
+                    event: crate::metrics::SCHEDULING_EVENTS[3],
+                    queued_epoch: 0,
+                    current_epoch: 0,
+                })
+                .collect();
+            self.core.retire_stale(&stale);
+        }
     }
 }
 
@@ -1032,11 +1283,31 @@ const MAX_RECEIVER_TYPES: usize = 3;
 impl TieredCompilationManager {
     /// Create a new manager with the given policy.
     pub fn new(policy: CompilationPolicy) -> Self {
+        Self::with_install_epoch_source(policy, None)
+    }
+
+    /// [`Self::new`], but reading "the current install epoch" from `source`
+    /// instead of the process-wide [`crate::jit_install_epoch`].
+    ///
+    /// The seam that makes the stale-request drop testable without a clock,
+    /// without a sleep, and without a real class redefinition: the rule under
+    /// test is an ordering statement about epochs, so a test bumps the
+    /// injected counter exactly where a redefinition would have bumped the
+    /// global one and asserts on what the queue then does. Driving it from the
+    /// real global would make the test depend on every other test in the
+    /// process that happens to flush a `JitCache`.
+    ///
+    /// `None` is the production configuration and is what [`Self::new`] passes.
+    #[doc(hidden)]
+    pub fn with_install_epoch_source(
+        policy: CompilationPolicy,
+        install_epoch_source: Option<Arc<AtomicU64>>,
+    ) -> Self {
         // Seed the process-start timestamp as early as possible (this
         // manager is constructed during VM init) so `process_uptime_ms`
         // reports genuine process age, not "time since first compile".
         process_start();
-        let core = Arc::new(CompilerCore::new());
+        let core = Arc::new(CompilerCore::with_install_epoch_source(install_epoch_source));
         // Diagnostic-only: the VM constructs exactly one manager per process
         // (this is an embedded single-JVM-per-process binary, not a
         // multi-tenant host), so a "last one registered" global handle is
@@ -1051,21 +1322,36 @@ impl TieredCompilationManager {
     }
 
     /// Remove queued and historical tiering state for an unloaded class.
+    ///
+    /// Called from the VM's class-unload path (`vm/src/memory/gc.rs`). The
+    /// queued requests it removes are counted as drops — they are compilation
+    /// requests that will never be serviced, and "the class went away" is a
+    /// perfectly good reason that is still worth being able to see. It is also
+    /// the one drop reason that is genuinely final: unlike a stale-epoch drop,
+    /// there is no next invocation to re-admit the method.
     pub fn invalidate_class(&self, class_name: &str) {
         self.core
             .methods
             .lock()
             .retain(|key, _| key.class_name != class_name);
-        let mut queue = self.core.queue.lock();
-        queue
-            .high
-            .retain(|task| task.method_key.class_name != class_name);
-        queue
-            .normal
-            .retain(|task| task.method_key.class_name != class_name);
-        queue
-            .low
-            .retain(|task| task.method_key.class_name != class_name);
+        let dropped = {
+            let mut queue = self.core.queue.lock();
+            let before = queue.len();
+            queue
+                .high
+                .retain(|entry| entry.task.method_key.class_name != class_name);
+            queue
+                .normal
+                .retain(|entry| entry.task.method_key.class_name != class_name);
+            queue
+                .low
+                .retain(|entry| entry.task.method_key.class_name != class_name);
+            (before - queue.len()) as u64
+        };
+        if dropped > 0 {
+            crate::metrics::record_scheduling_events(crate::metrics::SCHEDULING_EVENTS[1], dropped);
+            self.core.dropped.fetch_add(dropped, Ordering::Release);
+        }
     }
 
     /// Create a new manager with the default policy.
@@ -1434,6 +1720,46 @@ impl TieredCompilationManager {
         self.core.queue.lock().len()
     }
 
+    /// Pop the next request that is still current at the install epoch,
+    /// dropping (and retiring) any stale ones ahead of it.
+    ///
+    /// This is the dispatch API the background worker uses. Exposed so the
+    /// dispatch rule can be exercised — and asserted on — without a thread, a
+    /// backend, or a clock: enqueue, bump the epoch, call this, read
+    /// [`Self::dropped_requests`].
+    ///
+    /// `None` means nothing fresh was queued. It does **not** mean nothing was
+    /// there: stale entries ahead of an empty tail are consumed and counted.
+    pub fn next_fresh_task(&self) -> Option<CompilationTask> {
+        self.core.take_fresh()
+    }
+
+    /// The install epoch this manager currently considers current.
+    ///
+    /// Equal to [`crate::jit_install_epoch`] in production. The accessor
+    /// exists so a diagnostic can print the number the dispatch gate is
+    /// actually comparing against, rather than a number that is usually the
+    /// same one.
+    pub fn install_epoch(&self) -> u64 {
+        self.core.current_install_epoch()
+    }
+
+    /// Install epoch of the compile running right now, or `0` when idle.
+    pub fn inflight_install_epoch(&self) -> u64 {
+        self.core.inflight_epoch.load(Ordering::Acquire)
+    }
+
+    /// Compilation requests this manager discarded without compiling them.
+    ///
+    /// The per-manager mirror of
+    /// [`crate::metrics::scheduling_dropped_total`], which is process-wide.
+    /// A steadily climbing value with a flat
+    /// [`Self::completed_compilations`] is the signature of a queue that is
+    /// being invalidated faster than it is being drained.
+    pub fn dropped_requests(&self) -> u64 {
+        self.core.dropped.load(Ordering::Acquire)
+    }
+
     /// Get all method states: (key, current_tier, invocation_count).
     pub fn method_states(&self) -> Vec<(MethodKey, CompilationTier, u64)> {
         self.core
@@ -1541,30 +1867,87 @@ impl TieredCompilationManager {
     /// effect: while the worker idles on `core.wake`, it holds no lock a mutator
     /// could need, so a mutator never stalls behind it and a concurrent STW
     /// completes promptly.
+    ///
+    /// ## Stale-request drop (install epoch)
+    ///
+    /// A request is dispatched only if the process-wide JIT install epoch is
+    /// still the one it was queued at. If a JVMTI redefinition or a code-cache
+    /// flush moved the epoch in between, the request describes a world that no
+    /// longer exists and is dropped HERE, before the backend is entered,
+    /// rather than after — the per-cache flush barrier in `JitCache::put`
+    /// would refuse the resulting body anyway, so compiling it is pure waste.
+    /// The drop is explicit: counted under
+    /// `crate::metrics::SCHEDULING_EVENTS[0]`, the method's in-flight slot
+    /// released, no retry spent. See [`CompilerCore::retire_stale`] and
+    /// `docs/jit/broker-install-epoch.md`.
     fn compiler_loop(core: &Arc<CompilerCore>, compile_fn: CompileFn) {
         loop {
-            // Pop one task while holding ONLY the jit-crate queue lock; block on
-            // the core's own condvar when empty so the worker idles instead of
-            // spinning. No VM lock is — or can be — held across this wait.
-            let task = {
-                let mut q = core.queue.lock();
-                loop {
-                    if core.shutdown.load(Ordering::Acquire) {
-                        return;
+            // Pop one FRESH task while holding ONLY the jit-crate queue lock;
+            // block on the core's own condvar when empty so the worker idles
+            // instead of spinning. No VM lock is — or can be — held across
+            // this wait.
+            //
+            // Stale requests found on the way are collected, not acted on:
+            // retiring one takes `core.methods`, and taking `methods` while
+            // holding `queue` would invert this file's `methods` → `queue`
+            // order (see `retire_stale`). So the queue guard is released
+            // first, `retire_stale` runs, and the loop re-enters — which is
+            // also why `stale` is re-created per iteration.
+            let task = loop {
+                let mut stale: Vec<StaleRequest> = Vec::new();
+                let mut shutting_down = false;
+                let popped = {
+                    let mut q = core.queue.lock();
+                    loop {
+                        if core.shutdown.load(Ordering::Acquire) {
+                            shutting_down = true;
+                            break None;
+                        }
+                        let current = core.current_install_epoch();
+                        match q.dequeue_fresh(current, &mut stale) {
+                            Some(task) => break Some(task),
+                            // Nothing fresh AND something to retire: give up
+                            // the queue lock so the slots can be released
+                            // under `methods`, then come back around.
+                            None if !stale.is_empty() => break None,
+                            // `parking_lot::Condvar::wait` releases `q` while parked and
+                            // re-acquires on wake; spurious wakeups re-check the loop.
+                            None => core.wake.wait(&mut q),
+                        }
                     }
-                    if let Some(task) = q.dequeue() {
-                        break task;
-                    }
-                    // `parking_lot::Condvar::wait` releases `q` while parked and
-                    // re-acquires on wake; spurious wakeups re-check the loop.
-                    core.wake.wait(&mut q);
+                };
+                // Guard released. Retire first — these requests are already
+                // out of the queue, so returning without retiring them (the
+                // shutdown path included) would lose them with no counter and
+                // leave their methods marked in-flight forever. Anything still
+                // IN the queue is `BackgroundCompiler::shutdown`'s to drain.
+                core.retire_stale(&stale);
+                if shutting_down {
+                    return;
+                }
+                if let Some(task) = popped {
+                    break task;
                 }
             };
 
             // Compile off the mutator thread with NO lock held by this frame
             // (`q` was dropped above), then publish completion. `compile_fn`
             // bounds its own VM-lock scopes internally.
+            //
+            // `dispatch_epoch` is the in-flight stamp: the dispatch gate above
+            // proved the epoch had not moved *yet*, and this is what lets the
+            // completion below notice that it moved *during* the compile. That
+            // window cannot be closed here — the artifact is already built —
+            // and it is not this loop's to close: `JitCache::put`/`put_osr`
+            // refuse a body stamped below the owning cache's flush barrier.
+            // Recording it makes the residual visible instead of invisible.
+            let dispatch_epoch = core.current_install_epoch();
+            core.inflight_epoch.store(dispatch_epoch, Ordering::Release);
             let outcome = compile_fn(&task);
+            core.inflight_epoch.store(0, Ordering::Release);
+            if core.current_install_epoch() != dispatch_epoch {
+                crate::metrics::record_scheduling_event(crate::metrics::SCHEDULING_EVENTS[2]);
+            }
             core.complete_task(
                 &task.method_key,
                 task.target_tier,
@@ -5346,6 +5729,289 @@ mod tests {
 
         drop(bg);
         assert!(!mgr.compiler_active(), "worker stopped after shutdown");
+    }
+
+    // ── Install-epoch stamping and the stale-request drop ────────────────
+    //
+    // Every test here drives a manager whose install epoch comes from an
+    // INJECTED `AtomicU64`, so a "redefinition" is one `store` and the
+    // scheduling rule is exercised with no thread, no backend, no clock and no
+    // sleep. Bumping the real `crate::JIT_INSTALL_EPOCH` would be both
+    // non-deterministic (every `JitCache::clear_all` anywhere in this test
+    // binary advances it) and untestable in the other direction — there is no
+    // way to hold it still.
+    //
+    // The scheduling counters are process-wide, so the tests that assert exact
+    // counts take `crate::metrics::METRICS_TEST_LOCK` and reset the table,
+    // exactly as the metrics tests do.
+
+    /// A manager reading its install epoch from `epoch` instead of the global.
+    fn epoch_driven_manager(epoch: &Arc<AtomicU64>) -> TieredCompilationManager {
+        TieredCompilationManager::with_install_epoch_source(
+            CompilationPolicy::default(),
+            Some(Arc::clone(epoch)),
+        )
+    }
+
+    fn epoch_key(name: &str) -> MethodKey {
+        MethodKey::new("craton/test/EpochSubject", name, "()V")
+    }
+
+    fn c1_task(key: &MethodKey) -> CompilationTask {
+        CompilationTask {
+            method_key: key.clone(),
+            target_tier: CompilationTier::C1,
+            priority: CompilationPriority::Normal,
+            enqueue_time_ms: 0,
+            osr_bci: None,
+        }
+    }
+
+    #[test]
+    fn a_request_queued_at_the_current_epoch_dispatches() {
+        let epoch = Arc::new(AtomicU64::new(7));
+        let mgr = epoch_driven_manager(&epoch);
+        let key = epoch_key("stillCurrent");
+        mgr.enqueue_compilation(c1_task(&key));
+
+        assert_eq!(mgr.install_epoch(), 7);
+        assert_eq!(mgr.next_fresh_task(), Some(c1_task(&key)));
+        assert_eq!(mgr.dropped_requests(), 0);
+        assert_eq!(mgr.queue_size(), 0);
+    }
+
+    #[test]
+    fn a_request_queued_before_an_epoch_bump_is_dropped_before_it_is_compiled() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let key = epoch_key("queuedThenRedefined");
+        mgr.enqueue_compilation(c1_task(&key));
+        assert!(
+            mgr.method_states()
+                .iter()
+                .any(|(k, _, _)| *k == key),
+            "enqueue tracks the method"
+        );
+
+        // A JVMTI redefinition / code-cache flush lands while the request sits
+        // in the queue.
+        epoch.store(2, Ordering::Release);
+
+        assert_eq!(
+            mgr.next_fresh_task(),
+            None,
+            "the stale request must not reach the backend"
+        );
+        assert_eq!(mgr.dropped_requests(), 1, "and must be counted, not lost");
+        assert_eq!(mgr.queue_size(), 0);
+    }
+
+    #[test]
+    fn a_dropped_request_releases_the_slot_without_spending_a_retry() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let key = epoch_key("reAdmitted");
+        mgr.enqueue_compilation(c1_task(&key));
+        epoch.store(2, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None);
+
+        // THE property. A stale drop is not a compile failure: the method's
+        // in-flight flag is cleared so the next invocation can re-admit it,
+        // and none of `current_tier` / `tier_fail_count` / `ineligible` moved.
+        // Routing the drop through `complete_task(success = false)` would burn
+        // one of MAX_TIER_FAIL_RETRIES, so three redefinitions during warmup
+        // would leave a hot method permanently interpreted.
+        {
+            let methods = mgr.core.methods.lock();
+            let state = methods.get(&key).expect("state survives a stale drop");
+            assert!(
+                !state.queued_for_compilation,
+                "the in-flight slot must be released so the method can re-admit"
+            );
+            assert_eq!(state.queued_tier, None);
+            assert_eq!(state.tier_fail_count, 0, "a stale drop is not a failure");
+            assert!(!state.ineligible, "a stale drop is not a policy decline");
+            assert_eq!(state.current_tier, CompilationTier::Interpreter);
+        }
+
+        // Re-admission works, at the new epoch, and now dispatches.
+        mgr.enqueue_compilation(c1_task(&key));
+        assert_eq!(mgr.next_fresh_task(), Some(c1_task(&key)));
+        assert_eq!(mgr.dropped_requests(), 1, "the re-admitted one was not dropped");
+    }
+
+    #[test]
+    fn stale_requests_do_not_starve_a_fresh_one_behind_them() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let stale_a = epoch_key("staleA");
+        let stale_b = epoch_key("staleB");
+        let fresh = epoch_key("fresh");
+        // Same band, so the order in the queue is exactly the enqueue order and
+        // the fresh request really is behind both stale ones.
+        mgr.enqueue_compilation(c1_task(&stale_a));
+        mgr.enqueue_compilation(c1_task(&stale_b));
+        epoch.store(2, Ordering::Release);
+        mgr.enqueue_compilation(c1_task(&fresh));
+
+        assert_eq!(
+            mgr.next_fresh_task(),
+            Some(c1_task(&fresh)),
+            "the drop loop must skip past stale entries, not stop at the first one"
+        );
+        assert_eq!(mgr.dropped_requests(), 2);
+        assert_eq!(mgr.queue_size(), 0);
+    }
+
+    #[test]
+    fn priority_order_survives_the_epoch_gate() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let low = epoch_key("low");
+        let high = epoch_key("high");
+        mgr.enqueue_compilation(CompilationTask {
+            priority: CompilationPriority::Low,
+            ..c1_task(&low)
+        });
+        mgr.enqueue_compilation(CompilationTask {
+            target_tier: CompilationTier::C2,
+            priority: CompilationPriority::High,
+            ..c1_task(&high)
+        });
+
+        // The gate filters; it does not reorder.
+        let first = mgr.next_fresh_task().expect("a fresh task");
+        assert_eq!(first.method_key, high);
+        let second = mgr.next_fresh_task().expect("a fresh task");
+        assert_eq!(second.method_key, low);
+        assert_eq!(mgr.dropped_requests(), 0);
+    }
+
+    #[test]
+    fn an_empty_queue_is_not_a_drop() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        assert_eq!(mgr.next_fresh_task(), None);
+        epoch.store(9, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None);
+        assert_eq!(mgr.dropped_requests(), 0);
+    }
+
+    #[test]
+    fn every_enqueue_door_stamps_the_epoch() {
+        // The stamp is applied by the queue, not by the caller, so a request
+        // that entered through the policy path (`on_method_invocation`) or the
+        // OSR path is gated identically to one the VM pushed directly. A
+        // per-caller stamp is what would eventually be forgotten on one door.
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            c2_threshold: 1_000_000,
+            osr_threshold: 1,
+            tiered_enabled: true,
+            c2_min_invocations: 1_000_000,
+            c1_profiling: false,
+        };
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr =
+            TieredCompilationManager::with_install_epoch_source(policy, Some(Arc::clone(&epoch)));
+
+        let invoked = epoch_key("viaInvocationHook");
+        assert_eq!(
+            mgr.on_method_invocation(&invoked),
+            Some(CompilationTier::C1),
+            "crossing c1_threshold=1 enqueues"
+        );
+        epoch.store(2, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None, "policy-path request is gated");
+        assert_eq!(mgr.dropped_requests(), 1);
+
+        let osr = epoch_key("viaOsrRequest");
+        assert!(mgr.request_osr(&osr, 12).is_some(), "OSR request enqueues");
+        epoch.store(3, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None, "OSR request is gated too");
+        assert_eq!(mgr.dropped_requests(), 2);
+    }
+
+    #[test]
+    fn drops_reach_the_process_wide_scheduling_counters() {
+        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
+        crate::metrics::reset_scheduling_counts_for_test();
+
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let key = epoch_key("counted");
+        mgr.enqueue_compilation(c1_task(&key));
+        epoch.store(2, Ordering::Release);
+        assert_eq!(mgr.next_fresh_task(), None);
+
+        assert_eq!(
+            crate::metrics::scheduling_count("queue_dropped_stale_install_epoch"),
+            Some(1),
+            "the drop must be visible in the metrics idiom, not only on the manager"
+        );
+        assert_eq!(crate::metrics::scheduling_dropped_total(), 1);
+
+        crate::metrics::reset_scheduling_counts_for_test();
+    }
+
+    #[test]
+    fn invalidate_class_counts_the_requests_it_discards() {
+        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
+        crate::metrics::reset_scheduling_counts_for_test();
+
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        let a = epoch_key("unloadedA");
+        let b = epoch_key("unloadedB");
+        let survivor = MethodKey::new("craton/test/OtherClass", "kept", "()V");
+        mgr.enqueue_compilation(c1_task(&a));
+        mgr.enqueue_compilation(CompilationTask {
+            priority: CompilationPriority::High,
+            ..c1_task(&b)
+        });
+        mgr.enqueue_compilation(c1_task(&survivor));
+
+        mgr.invalidate_class("craton/test/EpochSubject");
+
+        assert_eq!(mgr.queue_size(), 1, "only the unrelated class survives");
+        assert_eq!(
+            crate::metrics::scheduling_count("queue_dropped_class_invalidated"),
+            Some(2),
+        );
+        assert_eq!(mgr.dropped_requests(), 2);
+        // Still dispatchable: invalidating one class must not gate another.
+        assert_eq!(mgr.next_fresh_task(), Some(c1_task(&survivor)));
+
+        crate::metrics::reset_scheduling_counts_for_test();
+    }
+
+    #[test]
+    fn shutdown_counts_the_requests_it_abandons() {
+        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
+        crate::metrics::reset_scheduling_counts_for_test();
+
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mgr = epoch_driven_manager(&epoch);
+        // No worker is started, so nothing drains: the queue is exactly what
+        // teardown finds. Deterministic, and no thread to race.
+        mgr.enqueue_compilation(c1_task(&epoch_key("abandonedA")));
+        mgr.enqueue_compilation(c1_task(&epoch_key("abandonedB")));
+
+        let mut bg = BackgroundCompiler {
+            core: Arc::clone(&mgr.core),
+            handle: None,
+        };
+        bg.shutdown();
+
+        assert_eq!(mgr.queue_size(), 0, "shutdown drains rather than leaves");
+        assert_eq!(
+            crate::metrics::scheduling_count("queue_shutdown_abandoned"),
+            Some(2),
+            "abandoning work at teardown is correct, but it is still countable"
+        );
+        assert_eq!(mgr.dropped_requests(), 2);
+
+        crate::metrics::reset_scheduling_counts_for_test();
     }
 }
 
