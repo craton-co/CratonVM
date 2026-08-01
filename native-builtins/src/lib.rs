@@ -15543,15 +15543,29 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // `()Ljava/lang/String;` — must not surface a primitive tag. The
-            // old tail was `Ok(Some(ctx.get_field_by_name(this, "name")))`,
-            // which answers `Value::Int(0)` for an unwritten `name` slot
-            // because the by-name read is not descriptor-aware. `ref_field`
-            // resolves on the RECEIVER's class id (the `java/lang/Enum`
-            // name-keyed resolve above collapses under loader splits — see
-            // `resolve_field_index_by_class_id`'s doc) and degrades any
-            // non-reference tag to null.
-            Ok(Some(field_read::ref_field(ctx, this, "name")))
+            // Two hazards at once, and each fix undid the other until now.
+            //
+            // `()Ljava/lang/String;` must not surface a primitive tag: the
+            // original tail `ctx.get_field_by_name(this, "name")` answers
+            // `Value::Int(0)` for an unwritten slot because the by-name read is
+            // not descriptor-aware. `ref_field` fixed that — but it resolves on
+            // the RECEIVER's class, i.e. leaf-first, which reintroduced exactly
+            // the shadowing hazard the `<init>` registration above documents:
+            // `java.time.temporal.ChronoUnit` declares its own `name` holding
+            // the display form, so `name()` answered "Seconds" and
+            // `Enum.valueOf(ChronoUnit.class, "SECONDS")` matched nothing.
+            //
+            // `ref_field_declared_by` keeps both: it reads the slot
+            // `java.lang.Enum` itself declares (like `<init>`/`ordinal` do) and
+            // still degrades a non-reference tag to null, falling back to the
+            // receiver-scoped read only when the ancestor lookup cannot resolve
+            // (loader splits). `probes/EnumShadowedNameFieldProbe.java`.
+            Ok(Some(field_read::ref_field_declared_by(
+                ctx,
+                this,
+                "java/lang/Enum",
+                "name",
+            )))
         },
     );
     registry.register(
@@ -15563,8 +15577,16 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // See `Enum.name` immediately above: same descriptor, same hazard.
-            Ok(Some(field_read::ref_field(ctx, this, "name")))
+            // See `Enum.name` immediately above: same descriptor, same two
+            // hazards. (An enum that overrides `toString` — ChronoUnit does —
+            // never reaches this; `Enum.toString`'s own contract is to return
+            // the constant identifier.)
+            Ok(Some(field_read::ref_field_declared_by(
+                ctx,
+                this,
+                "java/lang/Enum",
+                "name",
+            )))
         },
     );
     registry.register(

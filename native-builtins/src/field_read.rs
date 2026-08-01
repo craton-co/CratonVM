@@ -114,6 +114,50 @@ pub(crate) fn ref_field(ctx: &dyn NativeContext, this: ObjectRef, field_name: &s
     }
 }
 
+/// [`ref_field`], but anchored to the slot a NAMED ANCESTOR declares — never a
+/// same-named field a subclass shadows.
+///
+/// Every other reader here resolves on the receiver's own class, which is
+/// leaf-first: a subclass field wins over an identically-named superclass one.
+/// That is right for reading "the object's `foo`" and wrong for reading "the
+/// field `Superclass.foo`", which is what a native standing in for a
+/// superclass's own accessor is doing — the bytecode it replaces holds a
+/// `getfield` naming the declaring class explicitly.
+///
+/// `java.lang.Enum.name` is the case that motivated this.
+/// `java.time.temporal.ChronoUnit` declares its own `private final String name`
+/// holding the DISPLAY form ("Seconds") while `Enum.name` holds the constant
+/// identifier ("SECONDS"), so a leaf-first `Enum.name()` answered "Seconds" and
+/// `Enum.valueOf(ChronoUnit.class, "SECONDS")` then matched nothing. Kafka's
+/// `Group$GroupType` has the identical shape (see the note on the
+/// `java/lang/Enum.<init>` registration).
+///
+/// Falls back to [`ref_field`] when the ancestor's slot cannot be resolved —
+/// `resolve_field_index` is a global by-name class lookup and answers `None`
+/// when several loaders define that name — so a loader-split run keeps exactly
+/// the receiver-scoped behaviour it had before.
+pub(crate) fn ref_field_declared_by(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    declaring_class: &str,
+    field_name: &str,
+) -> Value {
+    if let Some(index) = ctx.resolve_field_index(declaring_class, field_name) {
+        // Same fail-closed bound as `slot_of`: a synthetic stand-in allocated
+        // with fewer slots than the real class declares must not be indexed
+        // past its end.
+        if index < ctx.object_num_fields(this) {
+            let v = ctx.get_field(this, index);
+            return if matches!(v, Value::Object(_)) {
+                v
+            } else {
+                Value::Object(None)
+            };
+        }
+    }
+    ref_field(ctx, this, field_name)
+}
+
 /// [`ref_field`] as an `Option<ObjectRef>`: `None` for null, absent, or
 /// unwritten.
 pub(crate) fn ref_field_obj(
