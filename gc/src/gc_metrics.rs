@@ -667,6 +667,78 @@ impl DecisionSlot {
     }
 }
 
+/// Per-reason histogram of collector decisions across the whole run.
+///
+/// `last_collector_decision` only reports the MOST RECENT cycle, which is
+/// exactly the trap that made a corruption look like it belonged to the
+/// non-moving sweep when 153 of the run's 154 cycles had actually been
+/// moving. "Which collector ran" is a question about the distribution, not
+/// the last sample.
+#[cfg(not(test))]
+static DECISION_HISTOGRAM: [AtomicU64; decision_reason::COUNT as usize] =
+    [const { AtomicU64::new(0) }; decision_reason::COUNT as usize];
+
+#[cfg(test)]
+thread_local! {
+    static DECISION_HISTOGRAM: [AtomicU64; decision_reason::COUNT as usize] =
+        const { [const { AtomicU64::new(0) }; decision_reason::COUNT as usize] };
+}
+
+#[cfg(not(test))]
+fn bump_decision_histogram(reason: u8) {
+    if let Some(slot) = DECISION_HISTOGRAM.get(reason as usize) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn bump_decision_histogram(reason: u8) {
+    DECISION_HISTOGRAM.with(|h| {
+        if let Some(slot) = h.get(reason as usize) {
+            slot.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn read_decision_histogram() -> Vec<(u8, u64)> {
+    DECISION_HISTOGRAM
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as u8, s.load(Ordering::Relaxed)))
+        .collect()
+}
+
+#[cfg(test)]
+fn read_decision_histogram() -> Vec<(u8, u64)> {
+    DECISION_HISTOGRAM.with(|h| {
+        h.iter()
+            .enumerate()
+            .map(|(i, s)| (i as u8, s.load(Ordering::Relaxed)))
+            .collect()
+    })
+}
+
+/// `(moving_cycles, non_moving_cycles)` across the run, plus the per-reason
+/// breakdown. The distribution `last_collector_decision` cannot give.
+pub fn decision_histogram() -> (u64, u64, Vec<(&'static str, u64)>) {
+    let mut moving = 0u64;
+    let mut non_moving = 0u64;
+    let mut rows = Vec::new();
+    for (code, n) in read_decision_histogram() {
+        if n == 0 || code == decision_reason::UNRECORDED {
+            continue;
+        }
+        if decision_reason::is_moving(code) {
+            moving += n;
+        } else {
+            non_moving += n;
+        }
+        rows.push((decision_reason::label(code), n));
+    }
+    (moving, non_moving, rows)
+}
+
 #[cfg(not(test))]
 static DECISION: DecisionSlot = DecisionSlot::new();
 
@@ -716,6 +788,7 @@ fn backend_name(code: u8) -> &'static str {
 /// [`decision_reason::NON_MOVING_COVERAGE_INCOMPLETE`]; pass
 /// [`crate::gc_quiescence::incomplete_reason::NONE`] otherwise.
 pub fn record_collector_decision(backend: &str, reason: u8, incomplete_reason: usize) {
+    bump_decision_histogram(reason);
     let mut flags = 0u8;
     if crate::gc_quiescence::is_active() {
         flags |= FLAG_JIT_ACTIVE;
@@ -768,6 +841,18 @@ pub fn last_collector_decision() -> Option<CollectorDecision> {
 /// disagreement about whether young collections move — see
 /// `docs/gc/tlab-and-card-audit.md` §3.
 pub fn collector_decision_report() -> String {
+    // Distribution first: the last decision alone has repeatedly misled.
+    let (moving, non_moving, rows) = decision_histogram();
+    let mut hist = String::new();
+    if moving + non_moving > 0 {
+        hist.push_str(&format!(
+            "[GC] decision histogram: moving={moving} non_moving={non_moving}"
+        ));
+        for (label, n) in &rows {
+            hist.push_str(&format!(" {label}={n}"));
+        }
+        hist.push('\n');
+    }
     let mut s = match last_collector_decision() {
         None => format!(
             "[GC] decision: no collection has run yet (moving_young_requested={})",
@@ -785,6 +870,9 @@ pub fn collector_decision_report() -> String {
             s
         }
     };
+    if !hist.is_empty() {
+        s = format!("{}{s}", hist);
+    }
     // G1 states its own last cycle. Absent on a Generational/ZGC run, so the
     // report keeps its previous shape there byte-for-byte.
     if let Some(g1) = last_g1_cycle() {

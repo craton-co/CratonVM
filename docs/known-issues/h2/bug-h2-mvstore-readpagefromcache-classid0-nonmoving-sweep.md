@@ -1,7 +1,10 @@
 # `MVStore.readPageFromCache` — `java.lang.Object cannot be cast to Page` under sustained non-moving young sweeps
 
 ## Status
-**OPEN.** Pre-existing, reproducible, silent heap corruption. Not caused by
+**OPEN — not fixed.** Pre-existing silent heap corruption. See
+*Session 2* below: the top suspicion is refuted and the repro did NOT
+reproduce in 26 runs on 2026-08-01, including on the exact commit that
+failed 8/20 the day before. Not caused by
 — and not fixed by — the old-gen coalescing change committed alongside this
 doc (`7303483521`); measured explicitly, see *Not the coalescer* below.
 
@@ -79,6 +82,98 @@ coalescing-OFF pass, which looks alarming. It was small-sample noise:
 4/8 versus 4/10 across the full set (Fisher exact p ≈ 1.0), and the
 **pristine `origin/dev` binary, which contains none of the coalescing
 code, reproduces the identical signature**. The two are independent.
+
+## Session 2 (2026-08-01): top suspicion REFUTED, repro did not reproduce
+
+**Still OPEN. Not fixed.** What this session establishes is mostly negative,
+which is worth more than another guess.
+
+### The dropped-peer suspicion is wrong
+
+Suspicion 1 below (`xt_root_scan` silently dropping a peer that misses its
+20 ms deadline, leaving its JIT-frame oops out of the root set) is
+**refuted**. The takeover pass does drop such a peer — but it is not the
+last word. `interpreter.rs`'s STW entry runs
+
+```rust
+loop {
+    take_over_pass(...);                 // freeze what it can, excuse those from the barrier
+    if gc_barrier.wait_for_all_timeout(WAIT_SLICE) { break; }
+    ...
+}
+```
+
+The barrier still *expects* an unfrozen peer, so the loop iterates and
+retries until every counted mutator has either arrived cooperatively or
+been frozen. A `STATE_CANCELLED` peer is retried on the next round, not
+skipped, and the collection cannot begin while one is outstanding. This
+was measured, not just read: the new counter (below) shows unclassified
+peers occurring **1–2 per run**, in runs that pass.
+
+Do not spend time here again.
+
+### The repro is not reliable — 0/26 today
+
+| binary | runs | CCE failures |
+| --- | --- | --- |
+| current `dev` + instrumentation | 18 | **0** |
+| `0cc13efa37` — the EXACT commit that failed 8/20 yesterday | 6+ | **0** |
+
+Rebuilt yesterday's commit specifically to rule out "someone fixed it":
+only two JIT-perf commits had landed in between, and yesterday's binary
+passes today too. The variable is the **host**, not the code. Yesterday's
+failures came with 2000–3700 other logged-in users and load average
+300–379 from other tenants; today the box was quiet. Synthesising load
+with 24 CPU spinners (load average 33) did **not** reproduce it — so
+whatever the real trigger is, plain CPU contention is not it.
+
+Treat the "~40 % in 12–40 min" figure below as *observed once, under host
+conditions not reproducible on demand*, not as a recipe you can rely on.
+
+### Correction: read the DISTRIBUTION, not the last decision
+
+`[GC] decision #N: ... young=MOVING` reports only the **most recent**
+cycle. Reading it as the run's behaviour briefly made this look like a
+moving-collector bug. The new histogram shows the truth:
+
+| conditions | moving cycles | non-moving cycles |
+| --- | --- | --- |
+| recipe, quiet host | ~40 | ~215 (`nonmoving-conservative-jit-roots`) |
+| recipe, 24 CPU spinners | ~380 | ~75 |
+
+So the non-moving framing of this doc is right on a quiet host — but the
+mix **inverts** under CPU load, which is worth knowing before attributing
+anything measured under load.
+
+### Tooling added this session (all permanent, all default-quiet)
+
+* `[GC] decision histogram: moving=N non_moving=M <reason>=k …` — the
+  per-reason distribution across the whole run. This is what corrected the
+  misreading above.
+* `[GC] xt_peer_scan: unclassified_peers=N cycles_with_unclassified=M` —
+  peers the cross-thread scan could not classify. This is what refuted
+  suspicion 1.
+* `CRATONVM_XT_PEER_DEADLINE_MS` (default 20) — the peer deadline is now
+  tunable, so "is the 20 ms bet the problem?" is a one-flag experiment
+  rather than a rebuild. (Tested at 5000; made no difference.)
+* The **sweep-ring reporter is now wired to `checkcast`**. The
+  "zeroed-a-live-object" ring (`CRATONVM_DBG_SWEEP_ZERO`) already existed
+  and already had a consumer — but only on the stale-RECEIVER (invoke)
+  path. A reclaimed object surfaces here as a failed **cast** first, so
+  setting the flag and reproducing produced silence. On a ring hit the
+  checkcast now reports the victim's ORIGINAL class plus the sweep cycle,
+  GC reason, initiating thread and blocked-thread count — i.e. it names
+  the root-coverage gap.
+
+  It speaks **only** on a ring hit. `java.lang.Object` is `ClassId(0)`,
+  which is also an ordinary `new Object()`, and nothing on that path
+  distinguishes the two for free (`zero_forensics` and the sweep ring are
+  both gated), so it deliberately does not guess — verified silent on a
+  plain `(String) new Object()`.
+
+**So the next occurrence self-diagnoses**, provided it is run with
+`CRATONVM_DBG_SWEEP_ZERO=1`. That is the single highest-value thing to
+carry into the next attempt.
 
 ## Where to look
 
