@@ -15,7 +15,7 @@ JIT mode, 1 failure in 14 runs (2026-07-31, `cratonvm-antlrfix-20260731.exe`).
 | | runs | `ASTParserLoadingTest` | `ordinal parameters []` |
 | --- | --- | --- | --- |
 | baseline (dev tip) | 24 (22 valid) | **103/106 on every one** | 0 |
-| after the fix | 24 | **106/106 on 18**; 105/106 on the other 6 | 0 |
+| after the fix | 24 | **106/106 on 18**; 105/106 on 4; 2 killed at the 1200s cap | 0 |
 | after re-merging `dev` | 6 | **106/106 on every one** | 0 |
 
 HotSpot runs the class 106/106 in 18.8s, so 106 is the right target.
@@ -27,14 +27,28 @@ PASS over a `passed.txt` slice, 100 000 clean iterations of
 `FunctionalInterfaceHijackProbe`, and the `native-collections` unit tests. A
 107-class slice on the pre-merge binary was also clean.
 
-The six 105/106 runs were one round, all failing the *same* test
-(`testJpaTypeOperator`) with the *same* cause — JUnit's 120s per-test timeout —
-while a full `cargo build` saturated all 32 cores alongside six concurrent VMs.
-Those runs took 761s against ~600s for every other round, and the rounds before
-and after them were 6/6 clean on the same binary. That is host load, not a
-regression; the same round is the only place a rare
-`NoSuchMethodError: java/lang/Integer.getTypeName()` warning appeared (recovered,
-no test failed), and it too is absent from every unloaded round.
+The six non-106 runs are all one round, and the first version of this table got
+them wrong — it recorded all six as 105/106. They are not the same outcome:
+
+* **four** returned 105/106, each failing `testJpaTypeOperator` on JUnit's 120s
+  per-test timeout;
+* **two** returned nothing at all — `rc=124`, killed at the harness's 1200s cap.
+
+That round ran six concurrent VMs while a full `cargo build` saturated all 32
+cores; its completed runs took 761s against ~600s for every other round, and the
+rounds either side were 6/6 clean on the same binary. Host load is a sufficient
+explanation for the four timeouts.
+
+It is **not** a sufficient explanation for the two kills. Those two, and only
+those two, did 21 SessionFactory bootstraps (against 3-4 everywhere else) and
+emitted 32 `NoSuchMethodError: java/lang/Integer.getTypeName()` warnings each,
+in a bootstrap cascade with no test activity between rebuilds. The warning is a
+real wrong-receiver dispatch — a `Class` mirror resolving as the class it
+describes — and it is tracked separately, unreproduced, in
+`docs/known-issues/hibernate/gettypename-wrong-receiver-in-sessionfactory-rebuild-cascade-20260801.md`.
+It is independent of everything this document fixes: it appears on the *fixed*
+binary and never on the baseline, and 16 runs of the witness class on current
+`dev` do not reproduce it.
 
 ## Symptom as reported
 
