@@ -1,13 +1,58 @@
 # `BasicErrorControllerIntegrationTests` is NOT a usable acceptance gate right now
 
-**Status:** OPEN, measured 2026-07-31 against dev `f14b64379`.
+**Status: FIXED — 2026-08-01. The title is no longer true; the class IS a
+usable gate again.** Retired from `docs/known-issues/springboot/`.
 
-This is a narrow companion to the two existing reports on this class —
-[`../spring/springboot-basicerrorcontroller-checkcast-abort-20260731.md`](springboot-basicerrorcontroller-checkcast-abort-20260731.md)
-and
-[`../spring/basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md).
+This document was right about the important thing: the failure it recorded was
+neither the direct-call gate nor the `checkcast` abort its two companions
+described, and anyone running
+`jit/src/lib.rs::direct_jit_callee_calls_enabled()`'s stated acceptance would
+have concluded the reopened JIT-to-JIT edge was unsafe when it was not.
+
+Its two signatures —
+
+```
+NullPointerException: Cannot invoke "java.util.Iterator.hasNext()" because "<local5>" is null
+BindException: Failed to bind properties under 'spring.main.allow-bean-definition-overriding' to boolean
+```
+
+— were one defect: the JIT-to-JIT handler-resume sink seeding a handler frame
+with the callee's incoming arguments only, for a method the precise-handler-frame
+relaxation now admits. Fixed in `843b780baa`; full write-up in
+[`basicerrorcontroller-class-cluster-20260728-FIXED.md`](basicerrorcontroller-class-cluster-20260728-FIXED.md).
+
+Two items from this document did NOT close with it:
+
+* The `DeferredLogFactory.getLog(Class)` receiver mix-up recorded under
+  "Signature observed here" was last seen on a binary at `351218f44` and has
+  not been observed since `7f1b1f263`. It was never root-caused. If it returns,
+  it is a separate defect — do not assume the handler-frame fix covers it.
+* The code-buffer overflow flood is re-filed, with a corrected attribution
+  (it is the optimizing IR tier's estimate, not `x64.rs`'s), as
+  `docs/known-issues/jit-ir-tier-code-buffer-overflow-flood-20260801.md`.
+
+---
+
+*(The original report follows in full. Its own `Status:` line records the 2026-07-31 state and is superseded by the header above.)*
+
+# `BasicErrorControllerIntegrationTests` is NOT a usable acceptance gate right now
+
+**Status:** OPEN, measured 2026-07-31 against dev `f14b64379`; still present
+2026-08-01 (26 tests, 23 failed, JIT on).
+
+This is a narrow companion to the two other reports on this class —
+[`../../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md)
+(**FIXED 2026-08-01**, retired to the internal folder) and
+[`basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md).
 It does not re-file those. It records one fact they do not cover, which will
 otherwise cause a wrong conclusion about a different subsystem.
+
+**This is now the only thing keeping the class red.** The checkcast abort is
+closed. What remains is `IllegalStateException: Cannot bind to
+SpringApplication` -> `BindException` -> `NullPointerException` in
+`BindConverter.convert` (`Cannot invoke "java.util.Iterator.hasNext()" because
+"<local5>" is null`), which is JIT-only and unrelated to the
+collection-overlay GC mechanism that produced the abort.
 
 ## Why this needs saying
 

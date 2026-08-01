@@ -74,13 +74,22 @@ fn ensure_probe_compiled() -> bool {
         .arg("-d")
         .arg(&classes)
         .arg(&src)
-        .status();
+        .output();
     match status {
-        Ok(s) if s.success() => {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(_) => false,
+        // javac RAN and rejected the fixture: skipping here would make this
+        // test a permanent vacuous pass.
+        Ok(o) => {
+            assert!(
+                o.status.success(),
+                "[fjp_recursive] the checked-in probe fixture failed to compile — fix \
+                 the .java source. javac stderr:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
             classes.join("FjpProbe.class").exists()
                 && classes.join("FjpProbe$SumTask.class").exists()
         }
-        _ => false,
     }
 }
 

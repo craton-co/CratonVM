@@ -695,6 +695,78 @@ mod overlay_owner_liveness_tests {
         );
         clear_overlay_entries_for_key(key, new_addr);
     }
+
+    /// A `pointer_map` that contains both `A -> B` and `B -> C` must land A's
+    /// keys at B and B's at C — not sweep both to C.
+    ///
+    /// Old-gen sliding compaction routinely produces exactly that shape: it
+    /// hands one surviving object the address another surviving object just
+    /// vacated, so a single map legitimately holds a value that is also a key.
+    /// (The moving young phase alone cannot — its keys are from-space and its
+    /// values are to-space or old gen — which is why this only ever bites on a
+    /// compacting cycle.)
+    ///
+    /// The re-key used to relocate entries in place, one move at a time. Apply
+    /// `A -> B` first and A's keys sit at B; the later `B -> C` then carries
+    /// them onward with B's own, leaving the collection that really is at B
+    /// with no entry at its own address. `gc_overlay_roots_for_collection(B)`
+    /// answers "owns nothing", the non-moving young marker and `old_gen_gc`'s
+    /// mark BFS both skip its backing array, and it is freed while live.
+    /// Whether it fired depended on `HashMap` iteration order — applying the
+    /// moves in reverse happens to be harmless — so this uses a CHAIN of eight
+    /// hops rather than a single pair. In-place relocation survives that only
+    /// if every one of the eight lands in exactly reverse order, which the
+    /// randomly-seeded `HashMap` iteration will not do. A two-address version
+    /// of this test would pass half the time on the broken code.
+    #[test]
+    fn a_chained_pointer_map_does_not_sweep_one_owners_keys_onto_another() {
+        // A private address range, so the process-global index cannot make
+        // this pass or fail for a sibling test's reason.
+        const HOPS: usize = 8;
+        let addr = |i: usize| 0x5EAD_0A00_usize + i * 0x100;
+        let key = |i: usize| 0x5EAD_0A01_usize + i * 0x100;
+
+        // Owner i sits at addr(i) and moves to addr(i+1) — the address owner
+        // i+1 is simultaneously vacating. Old-gen sliding compaction produces
+        // exactly this: every live object slides down onto the space its
+        // neighbour just left. (The moving young phase alone cannot — its keys
+        // are from-space and its values are to-space or old gen — which is why
+        // this only ever bites on a compacting cycle.)
+        let mut pointer_map = StdHashMap::new();
+        for i in 0..HOPS {
+            register_overlay_owner_key(addr(i), key(i));
+            pointer_map.insert(addr(i), addr(i + 1));
+        }
+
+        gc_update_collection_overlay_refs(&pointer_map);
+
+        for i in 0..HOPS {
+            assert!(
+                overlay_owner_still_at(addr(i + 1), key(i)),
+                "owner {i} moved to 0x{:x} but its key is not recorded there — \
+                 a later hop in the same pointer_map carried it onward, so \
+                 every per-owner root walk now reports this collection as \
+                 owning nothing and frees its backing array while it is live",
+                addr(i + 1)
+            );
+            assert!(
+                !overlay_owner_still_at(addr(i), key(i)),
+                "owner {i}'s pre-move address must no longer name it"
+            );
+        }
+        // The tail address gained nothing but the last owner: keys must not
+        // have piled up at the end of the chain.
+        for i in 0..HOPS.saturating_sub(1) {
+            assert!(
+                !overlay_owner_still_at(addr(HOPS), key(i)),
+                "owner {i}'s key was swept to the end of the chain"
+            );
+        }
+
+        for i in 0..HOPS {
+            remove_overlay_owner_key(addr(i + 1), key(i));
+        }
+    }
 }
 
 /// Select the registry shard for an identity hash. Mixes with the 64-bit
@@ -35010,23 +35082,48 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
     // object-key registry. The marker uses this index on the next non-moving
     // cycle, so leaving even one pre-copy address here would silently drop a
     // live collection's overlay edge.
+    //
+    // Rebuild into a FRESH map rather than relocating entries in place. Every
+    // other remap in this file is a single-step lookup — each ref is rewritten
+    // exactly once, which is what `pointer_map` means (the collector has
+    // already composed young->promoted->compacted chains into one hop before
+    // handing it over). Relocating in place is not single-step: a `pointer_map`
+    // may legitimately contain both `A -> B` and `B -> C`, because old-gen
+    // sliding compaction hands one live object the address another live object
+    // just vacated. Applying `A -> B` first parks A's keys at B, and the later
+    // `B -> C` then sweeps them on to C along with B's own — so A's collection,
+    // which really is at B, ends up with NO entry at its own address.
+    //
+    // Nothing catches that afterwards. The side tables are keyed by the
+    // relocation-invariant identity hash, so the collection keeps reading its
+    // own state correctly; only the GC's "which refs does this collection own?"
+    // question breaks, and only on the paths that ask it per owner — the
+    // non-moving young marker and `old_gen_gc`'s mark BFS. Those then free a
+    // live backing array, which resurfaces as `checkcast: not an object
+    // reference` in whatever reads the collection next. The moving young path
+    // seeds from `external_roots_for_matching_owners(&|_| true)`, a union over
+    // every indexed address, so it survives a misplaced entry and cannot expose
+    // the bug — which is why this stayed invisible while the moving-young work
+    // was the thing under test.
+    //
+    // Iteration order of `moves` decided whether it fired, so it was silent,
+    // intermittent, and needed two overlay-backed collections in old gen plus a
+    // compacting cycle that slid one onto the other's address.
     let mut owners = overlay_owner_keys()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let moves: Vec<(usize, usize)> = owners
-        .keys()
-        .filter_map(|old| pointer_map.get(old).map(|new| (*old, *new)))
-        .collect();
-    for (old, new) in moves {
-        if let Some(keys) = owners.remove(&old) {
-            let target = owners.entry(new).or_default();
-            for key in keys {
-                if !target.contains(&key) {
-                    target.push(key);
-                }
+    let mut rebuilt: StdHashMap<usize, Vec<usize>> = StdHashMap::with_capacity(owners.len());
+    for (addr, keys) in owners.drain() {
+        // Absent from the map means "did not move" — keep the address as is.
+        let target_addr = pointer_map.get(&addr).copied().unwrap_or(addr);
+        let target = rebuilt.entry(target_addr).or_default();
+        for key in keys {
+            if !target.contains(&key) {
+                target.push(key);
             }
         }
     }
+    *owners = rebuilt;
 }
 
 /// Prune overlay/side-table entries whose backing collection object is no
@@ -35247,6 +35344,100 @@ fn ts_install_backing_array(
     let buf = ctx.read_native_pin(buf_pin, buf);
     ctx.unpin_native_roots(owner_pin);
     (owner, buf)
+}
+
+/// Owners already reported by [`report_short_overlay_backing`], so one
+/// corrupted collection logs once instead of once per read.
+fn reported_short_backings() -> &'static Mutex<std::collections::HashSet<(usize, usize)>> {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<(usize, usize)>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Name a TreeMap/TreeSet whose overlay `size` no longer fits its backing
+/// array, at the read that first observes it.
+///
+/// This is the invariant every indexed read of the array-mode backing store
+/// depends on and none of them check: `size` says N entries are live, so the
+/// array must be at least `N * slots_per_entry` long. When the collector
+/// reclaims the array out from under a still-live collection, what comes back
+/// is a zeroed header — `ClassId(0)`, `array_length == 0` — and the reads keep
+/// going, returning `Int(0)` where an element belongs. That `Int(0)` then
+/// travels: `TreeSet.contains` -> `ts_binary_search` -> `tree_compare` ->
+/// `comparator_compare` -> the real `String$CaseInsensitiveComparator.compare`,
+/// which dies on `checkcast: not an object reference` in a stack frame that
+/// names neither the collection nor the GC. Three separate investigations
+/// (2026-07-28, 07-31, 07-31 again) each had to re-derive that chain from the
+/// checkcast backwards, twice via a hand-added throwaway probe.
+///
+/// So this stays ON, unconditionally: it cannot fire unless the VM is already
+/// broken, and one line here replaces that whole derivation. It reports and
+/// returns — the caller's behaviour is unchanged, and the downstream failure
+/// still happens; the point is that the log now says what actually went wrong.
+/// De-duplicated per (owner address, side-table key) so a corrupted collection
+/// that is read in a loop does not drown the log.
+///
+/// Raw numbers only, never a `{:?}` of a decoded value: the whole premise is
+/// that these bytes are garbage, and formatting a `Value`/enum read out of a
+/// freed header is how a diagnostic turns a recoverable report into a SIGSEGV.
+fn report_short_overlay_backing(
+    ctx: &dyn NativeContext,
+    kind: &'static str,
+    owner: ObjectRef,
+    data: Option<ObjectRef>,
+    size: i32,
+    slots_per_entry: usize,
+) {
+    // Only an installed-but-too-short array is unambiguous. `data == None`
+    // with `size > 0` is a LEGITIMATE state: a fast-mode TreeMap keeps its
+    // entries in `tm_fast_table` and leaves the array slot empty, but still
+    // records the count in the array-state `size` slot so `native_tm_size` can
+    // read it (see `tm_materialize_deser_if_needed`). Reporting that shape
+    // would fire on every deserialized natural-order TreeMap in the process.
+    let data = match data {
+        Some(d) if size > 0 => d,
+        _ => return,
+    };
+    let needed = (size as usize).saturating_mul(slots_per_entry);
+    let arr_len = ctx.array_length(data);
+    if arr_len >= needed {
+        return;
+    }
+    let data_addr = data.as_ptr() as usize;
+    let owner_addr = owner.as_ptr() as usize;
+    let key = tm_obj_key(ctx, owner);
+    // A map that has BOTH an array and a fast-mode table is mid-conversion,
+    // not corrupt: the authoritative store is the table and the array slot is
+    // whatever the array path last left there.
+    if tm_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&key)
+    {
+        return;
+    }
+    {
+        let mut seen = reported_short_backings()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !seen.insert((owner_addr, key)) {
+            return;
+        }
+    }
+    // `class_id_of_object` on a zeroed header reports 0, which is also the real
+    // id of `java/lang/Object` — print the number and let the reader decide,
+    // rather than resolving it to a name that would read as a plausible class.
+    let data_cid = ctx.class_id_of_object(data).as_u32();
+    eprintln!(
+        "[overlay-backing] {kind} backing array is shorter than its size — the \
+         collector reclaimed or failed to remap it while the collection was \
+         still live. owner=0x{owner_addr:x} key=0x{key:x} size={size} \
+         needed={needed} array_length={arr_len} data=0x{data_addr:x} \
+         data_class_id={data_cid} (array_length=0 together with \
+         data_class_id=0 is a freed, zeroed object). Reads past the end \
+         return Int(0), which surfaces far away as \
+         'checkcast: not an object reference'."
+    );
 }
 
 /// TreeMap twin of [`ts_install_backing_array`] — same hazard, same contract.
@@ -35486,6 +35677,9 @@ fn tm_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
         Value::Int(v) => v,
         _ => 0,
     };
+    // TreeMap's array mode stores key/value pairs, so `size` entries occupy
+    // `2 * size` slots.
+    report_short_overlay_backing(ctx, "TreeMap", this, data, size, 2);
     let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
     (data, size, comparator)
 }
@@ -35612,6 +35806,7 @@ fn ts_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
         Value::Int(v) => v,
         _ => 0,
     };
+    report_short_overlay_backing(ctx, "TreeSet", this, data, size, 1);
     let comparator = ts_get_slot(ctx, this, TS_FIELD_COMPARATOR);
     (data, size, comparator)
 }

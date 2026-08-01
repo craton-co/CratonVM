@@ -56,11 +56,23 @@ fn compile_fixture(mode: &str) -> Option<(PathBuf, PathBuf)> {
         .arg(&output)
         .arg(fixture.join("LoaderUnloadPayload.java"))
         .arg(fixture.join("LoaderUnloadProbe.java"))
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
+        .output();
+    let status = match status {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[class_loader_unload_regression] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    // javac RAN and rejected the fixture: skipping here would make this test a
+    // permanent vacuous pass.
+    assert!(
+        status.status.success(),
+        "[class_loader_unload_regression] the checked-in probe fixture failed to compile \
+         — fix the .java source. javac stderr:\n{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
     let payload = output
         .join("unloadprobe")
         .join("LoaderUnloadPayload.class");

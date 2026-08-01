@@ -25923,7 +25923,22 @@ mod tests {
             Vec::new(),
         );
 
-        assert!(matches!(compiler.push_stack(), Some(StackSlot::Frame(_))));
+        // Fill the spill region rather than assuming a single push exhausts it.
+        // `spill_size` reserves `max_stack` slots PLUS the direct-call
+        // argument-service headroom, so the limit no longer sits at
+        // `max_stack`. What this test pins is the refusal AT the limit — and
+        // that the refusal leaves the cursor untouched — not where the limit
+        // happens to fall.
+        let mut pushes = 0;
+        while compiler.next_spill_offset < compiler.spill_limit_offset {
+            assert!(
+                matches!(compiler.push_stack(), Some(StackSlot::Frame(_))),
+                "push {pushes} is still inside the spill region and must succeed",
+            );
+            pushes += 1;
+            assert!(!compiler.failed, "push {pushes} must not have failed");
+        }
+        assert!(pushes > 0, "the spill region must hold at least one slot");
         assert_eq!(compiler.next_spill_offset, compiler.spill_limit_offset);
 
         let cursor = compiler.next_spill_offset;

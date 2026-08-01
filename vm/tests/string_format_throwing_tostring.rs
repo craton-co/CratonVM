@@ -60,17 +60,32 @@ fn binary() -> Option<PathBuf> {
 fn compile_probe(jdk: &Path) -> Option<tempfile::TempDir> {
     let temp = tempfile::tempdir().ok()?;
     let source = temp.path().join("StringFormatThrowingToString.java");
-    std::fs::write(&source, SOURCE).ok()?;
+    std::fs::write(&source, SOURCE).expect("write probe source");
     let javac = jdk
         .join("bin")
         .join(if cfg!(windows) { "javac.exe" } else { "javac" });
-    let status = Command::new(javac)
+    let out = match Command::new(javac)
         .arg("-d")
         .arg(temp.path())
         .arg(&source)
-        .status()
-        .ok()?;
-    status.success().then_some(temp)
+        .output()
+    {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[string_format_throwing_tostring] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    {
+        assert!(
+            out.status.success(),
+            "[string_format_throwing_tostring] the embedded probe failed to compile — fix the probe source. \
+             javac stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(temp)
+    }
 }
 
 fn run_mode(bin: &Path, jdk: &Path, classes: &Path, no_jit: bool) -> (String, String, bool) {

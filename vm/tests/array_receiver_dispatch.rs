@@ -136,18 +136,30 @@ fn compile_probe(javac: &Path) -> Option<PathBuf> {
     let dir = std::env::temp_dir().join("cratonvm-array-receiver-dispatch-probe");
     let _ = std::fs::create_dir_all(&dir);
     let src = dir.join("ArrayReceiverDispatchProbe.java");
-    std::fs::write(&src, PROBE_SRC).ok()?;
-    let status = Command::new(javac)
+    // Never let a stale .class from an earlier revision stand in for a source
+    // that no longer compiles.
+    let _ = std::fs::remove_file(dir.join("ArrayReceiverDispatchProbe.class"));
+    std::fs::write(&src, PROBE_SRC).expect("write probe source");
+    let out = match Command::new(javac)
         .args(["--release", "21", "-d"])
         .arg(&dir)
         .arg(&src)
-        .status()
-        .ok()?;
-    if status.success() && dir.join("ArrayReceiverDispatchProbe.class").exists() {
-        Some(dir)
-    } else {
-        None
-    }
+        .output()
+    {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[array_receiver_dispatch] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    assert!(
+        out.status.success() && dir.join("ArrayReceiverDispatchProbe.class").exists(),
+        "[array_receiver_dispatch] the embedded probe failed to compile — fix the probe source. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(dir)
 }
 
 fn run_probe(bin: &Path, jdk: &Path, classes: &Path, nojit: bool) -> (String, String) {

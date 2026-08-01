@@ -162,18 +162,30 @@ fn compile_probe(javac: &Path) -> Option<PathBuf> {
     let dir = std::env::temp_dir().join("cratonvm-native-oom-probe");
     let _ = std::fs::create_dir_all(&dir);
     let src = dir.join("NativeOomProbe.java");
-    std::fs::write(&src, PROBE_SRC).ok()?;
-    let status = Command::new(javac)
+    // Never let a stale .class from an earlier revision stand in for a source
+    // that no longer compiles.
+    let _ = std::fs::remove_file(dir.join("NativeOomProbe.class"));
+    std::fs::write(&src, PROBE_SRC).expect("write probe source");
+    let out = match Command::new(javac)
         .args(["--release", "21", "-d"])
         .arg(&dir)
         .arg(&src)
-        .status()
-        .ok()?;
-    if status.success() && dir.join("NativeOomProbe.class").exists() {
-        Some(dir)
-    } else {
-        None
-    }
+        .output()
+    {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[native_alloc_oom_catchable] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    assert!(
+        out.status.success() && dir.join("NativeOomProbe.class").exists(),
+        "[native_alloc_oom_catchable] the embedded probe failed to compile — fix the probe source. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(dir)
 }
 
 /// Run the probe once with the given extra VM arguments and assert the full

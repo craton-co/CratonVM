@@ -115,13 +115,15 @@ public class SingleLookup {{
         ])
         .output()
         .ok()?;
-    if !out.status.success() {
-        eprintln!(
-            "javac SingleLookup.java failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return None;
-    }
+    // javac RAN and rejected the source: the probe is broken, and returning
+    // None here reads to the caller as "javac unavailable, skip", which makes
+    // this test a permanent vacuous pass.
+    assert!(
+        out.status.success(),
+        "[wave1b_get_resource_consistency] the embedded probe failed to compile — fix the probe source. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let jar_path = dir.path().join("wave1b-resources.jar");
     let f = std::fs::File::create(&jar_path).ok()?;

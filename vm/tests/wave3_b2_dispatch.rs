@@ -124,14 +124,28 @@ fn compile_probe(jh: &Path, out_dir: &Path, name: &str, src: &str) -> bool {
     let javac = jh
         .join("bin")
         .join(if cfg!(windows) { "javac.exe" } else { "javac" });
-    let status = Command::new(&javac)
+    let compile = Command::new(&javac)
         .arg("--release")
         .arg("21")
         .arg("-d")
         .arg(out_dir)
         .arg(&java_file)
-        .status();
-    matches!(status, Ok(s) if s.success()) && out_dir.join(format!("{name}.class")).exists()
+        .output();
+    match compile {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(_) => false,
+        // javac RAN and rejected the fixture: skipping here would make this
+        // test a permanent vacuous pass.
+        Ok(o) => {
+            assert!(
+                o.status.success(),
+                "[wave3_b2_dispatch] the checked-in probe fixture failed to compile — fix the .java source. \
+             javac stderr:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            out_dir.join(format!("{name}.class")).exists()
+        }
+    }
 }
 
 fn run_probe(bin: &Path, jh: &Path, classes: &Path, name: &str) -> Option<(String, String)> {

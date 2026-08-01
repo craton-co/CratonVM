@@ -184,4 +184,80 @@ mod tests {
         assert!(bootstrap_count() >= before_b + 2);
         assert!(dispatch_count() >= before_d + 1);
     }
+    /// Guards the JDK's serializability rule for lambda proxies
+    /// (`SharedVm::lambda_proxy_serializability`).
+    ///
+    /// Before 2026-08-01 every lambda proxy was treated as `Serializable`:
+    /// `getDeclaredMethods()` reported a synthetic `writeReplace()` on all of
+    /// them and the `instanceof` fast path answered `true` for
+    /// `java.io.Serializable` unconditionally, so a plain
+    /// `Supplier<String> s = () -> "x"` looked serializable where real HotSpot
+    /// throws ClassCastException on `(Serializable) s`.
+    ///
+    /// This asserts the two arms a bare fixture can decide without a loaded
+    /// class hierarchy: the recorded `FLAG_SERIALIZABLE` alone must drive
+    /// `ByFlag` vs `NotSerializable`, and a `ClassId` that is not a registered
+    /// proxy at all must come back `NotSerializable` rather than defaulting to
+    /// serializable. (`ByInheritance` needs a real `Serializable`-extending
+    /// interface loaded, so the `LambdaSerProbe` differential probe against
+    /// jdk-25 covers that arm.)
+    ///
+    /// NB: the sibling lambda-proxy tests in `vm/src/vm.rs` live behind
+    /// `#[cfg(all(test, feature = "synthetic-jdk"))]` and do NOT run by
+    /// default -- this one is deliberately here so it actually executes.
+    #[test]
+    fn lambda_proxy_serializability_follows_the_recorded_flag() {
+        use crate::classloading::resolution::LambdaCallSite;
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        use cratonvm_native_api::LambdaSerializability;
+        use cratonvm_types::ClassId;
+        use std::sync::Arc;
+
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+
+        let register = |flag: bool| {
+            let id = shared.alloc_lambda_proxy_id();
+            shared.classes.lambda_proxies.write().insert(
+                id,
+                LambdaCallSite {
+                    functional_interface_id: None,
+                    // `Runnable` does not extend `Serializable`, so the
+                    // inheritance half of the rule is false either way and the
+                    // recorded flag is the only thing under test.
+                    functional_interface: std::sync::Arc::from("java/lang/Runnable"),
+                    sam_method_name: std::sync::Arc::from("run"),
+                    sam_descriptor: std::sync::Arc::from("()V"),
+                    impl_handle: mk_handle(MethodHandleKind::InvokeStatic),
+                    instantiated_descriptor: std::sync::Arc::from("()V"),
+                    capture_types: vec![],
+                    proxy_class_id: id,
+                    serializable_flag: flag,
+                },
+            );
+            id
+        };
+
+        let plain = register(false);
+        let ser = register(true);
+
+        assert_eq!(
+            shared.lambda_proxy_serializability(plain),
+            LambdaSerializability::NotSerializable,
+            "a plain metafactory lambda over a non-Serializable interface must not \
+             be serializable"
+        );
+        assert_eq!(
+            shared.lambda_proxy_serializability(ser),
+            LambdaSerializability::ByFlag,
+            "FLAG_SERIALIZABLE must make the lambda serializable AND earn it the \
+             added java.io.Serializable marker interface"
+        );
+        assert_eq!(
+            shared.lambda_proxy_serializability(ClassId::new(1)),
+            LambdaSerializability::NotSerializable,
+            "a ClassId that is not a registered lambda proxy must not be reported \
+             serializable"
+        );
+    }
 }
