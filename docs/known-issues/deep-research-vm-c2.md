@@ -61,7 +61,54 @@
 >
 > ---
 >
-> ### Wave 2 — 2026-07-31 (same branch): landed fixes, CI wiring, doc reconciliation
+> ### Wave 3 — the four deep integration items: exact remaining state
+>
+> These are the report items whose *analysis* is complete and tested but whose
+> production consumer is not wired. Recorded precisely so nobody re-derives it.
+>
+> **1. Lock elision/coarsening.** Analysis complete (`escape_analysis.rs`, 76
+> tests). Bridge wired. `ir::Op::MonitorEnter/MonitorExit` exist and are in the
+> memory-effect table. `jit_monitor_enter`/`jit_monitor_exit` existed already in
+> `vm/src/jit/helpers.rs` and are now exposed as `JitRuntimeHelpers` fields 60–61
+> (480 → 496 bytes; every ABI tripwire updated deliberately).
+> **Remaining:** (a) an `ir_lower` emission arm, and (b) an `IrBuilder`
+> `monitorenter`/`monitorexit` arm.
+> **(a) is not mechanical:** both ops carry `safepoint: true`, so the call site
+> must publish a correct oop map or the collector misses roots — the same silent
+> failure class as the G1 barrier and TLAB sweep bugs found on this branch. It
+> also needs the remapped-return store-back (a contended acquire can move the
+> object while parked) and a pending-exception check.
+> **Until then `ir_lower` REFUSES any graph containing a monitor op.** That
+> refusal is load-bearing: `lower_data_node`'s catch-all is `_ => {}`, so an
+> unguarded monitor compiles to *nothing* — a dropped lock and an unbalanced
+> `monitorexit`, which is worse than not compiling the method at all.
+>
+> **2. Loop rewriter → bytecode.** `plan_loop_peel`/`plan_loop_unroll`/
+> `rewrite_loop_copies` are complete with a proven poll-preservation property and
+> `bci_at` totality. Used today only as the native unroller's admission oracle;
+> the rewritten `Vec<u8>` is discarded. **Remaining:** compiling `xform.code`
+> requires replicating ~20 pc-keyed side tables per copy, three of which
+> (`invoke_info`, `mic_slots`, `pic_slots`) hold raw pointers to inline-cache
+> slots `try_compile` owns — replicated sites need freshly minted slots. Every
+> deopt/oop-map bci must also translate through `bci_at`. A missed table fails
+> silently.
+>
+> **3. Linear-scan RA.** Complete with `verify_allocation` (7 proofs) and
+> parallel-copy resolution; refs pinned to memory across safepoints because
+> `emit_safepoint_map` publishes frame slots only. **Remaining:** no production
+> call site — `ir_lower` still uses the slot colourer. Wiring it means replacing
+> a working allocator in the lowering path, and `metrics.rs`'s `spills`/`reloads`
+> stay `NotMeasured` until it lands.
+>
+> **4. Vectorization.** Admission gate only, by design — the report is explicit
+> that vector work before alias/range/deopt metadata are sound multiplies
+> wrong-code risk. 11 of 27 corpus loops admitted. **Remaining:** an emitter,
+> which additionally needs guard emission with a fallback edge, a vector register
+> class in `regalloc`, a remainder-loop CFG, and a reduction epilogue. A vector
+> store of oops bypasses the write barrier — the same family as the G1 UAF.
+>
+> ---
+>> ### Wave 2 — 2026-07-31 (same branch): landed fixes, CI wiring, doc reconciliation
 >
 > The workspace is green; **4,733 unit tests pass** (was 3,573).
 >
