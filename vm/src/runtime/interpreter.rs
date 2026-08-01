@@ -23103,6 +23103,7 @@ mod tests {
             instantiated_descriptor: Arc::from("()V"),
             capture_types: vec!['I', 'I', 'J'],
             proxy_class_id,
+            serializable_flag: false,
         };
         shared
             .classes

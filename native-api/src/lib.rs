@@ -50,6 +50,7 @@ pub use native_id::{NativeCallSite, NativeMethodId, NativeMethodKey};
 pub use registry::{
     dispatch_baos_event, install_baos_event_hook, AnnotationData, AnnotationElementValue,
     BaosEvent, BaosEventHook, DefineClassFull, FieldMetadata, LambdaSerialMetadata, MethodMetadata,
+    LambdaSerializability,
     NativeCallback, NativeCensusEntry, NativeClassAccess, NativeContext, NativeExceptionAccess,
     NativeGpuAccess, NativeHandle, NativeHandleScope, NativeHeapAccess, NativeInvokeAccess,
     NativeKind, NativeMethodRegistry, NativeSystemAccess, NativeThreadAccess, NativeThreadBlocker,

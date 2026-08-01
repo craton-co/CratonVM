@@ -3608,6 +3608,60 @@ impl SharedVm {
         ClassId::new(self.classes.next_lambda_id.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// The JDK's own serializability rule for a `LambdaMetafactory`-spun proxy,
+    /// and the single place it is decided.
+    ///
+    /// `AbstractValidatingLambdaMetafactory` treats a lambda as serializable when
+    /// its call site passed `FLAG_SERIALIZABLE` **or** its functional interface
+    /// already has `java.io.Serializable` as a supertype, and adds `Serializable`
+    /// to the spun class's interface list only in the first case
+    /// (`isSerializable && !foundSerializableSupertype`). So real HotSpot gives an
+    /// ordinary `Supplier<String> s = () -> "x"` no `writeReplace()`, no
+    /// `Serializable` interface, and a ClassCastException on `(Serializable) s` --
+    /// while `Comparator.comparing(..)` gets all three.
+    ///
+    /// Callers: the `instanceof`/`checkcast` fast path for lambda proxies, and the
+    /// reflective `Class` surfaces (`getDeclaredMethods`, `getInterfaces`,
+    /// `getGenericInterfaces`) via `NativeContext::lambda_proxy_serializability`.
+    /// Keep it that way -- re-deriving this rule per call site is how the two
+    /// halves drift apart.
+    pub fn lambda_proxy_serializability(
+        &self,
+        proxy_class_id: ClassId,
+    ) -> cratonvm_native_api::LambdaSerializability {
+        use cratonvm_native_api::LambdaSerializability as S;
+        let (flag, iface_name, iface_id) = {
+            let proxies = self.classes.lambda_proxies.read();
+            match proxies.get(&proxy_class_id) {
+                Some(cs) => (
+                    cs.serializable_flag,
+                    cs.functional_interface.clone(),
+                    cs.functional_interface_id,
+                ),
+                None => return S::NotSerializable,
+            }
+        };
+        // Inheritance half. Prefer the bootstrap-captured, loader-correct id;
+        // fall back to a load by name, the same order every other lambda-proxy
+        // consumer uses. A load failure only costs us the inheritance arm.
+        let iface_id = iface_id.or_else(|| self.load_class_concurrent(&iface_name).ok());
+        let inherits = iface_id
+            .map(|id| {
+                self.classes
+                    .class_manager
+                    .read()
+                    .is_assignable_to_name(id, "java/io/Serializable")
+            })
+            .unwrap_or(false);
+        if inherits {
+            S::ByInheritance
+        } else if flag {
+            S::ByFlag
+        } else {
+            S::NotSerializable
+        }
+    }
+
     /// Get an `Arc<SharedVm>` from the stored weak self-reference, or `None`
     /// when this `SharedVm` has no self-reference installed.
     ///

@@ -2609,6 +2609,7 @@ mod tests {
             instantiated_descriptor: "(I)I".into(),
             capture_types: vec![],
             proxy_class_id,
+            serializable_flag: false,
         };
         shared
             .classes
@@ -2666,6 +2667,7 @@ mod tests {
             instantiated_descriptor: "(I)I".into(),
             capture_types: vec!['I'],
             proxy_class_id,
+            serializable_flag: false,
         };
         shared
             .classes
@@ -2731,6 +2733,7 @@ mod tests {
             instantiated_descriptor: "(Ljava/lang/String;)V".into(),
             capture_types: vec!['L'],
             proxy_class_id,
+            serializable_flag: false,
         };
         shared
             .classes
@@ -2804,6 +2807,7 @@ mod tests {
             instantiated_descriptor: "()V".into(),
             capture_types: vec![],
             proxy_class_id,
+            serializable_flag: false,
         });
 
         shared
@@ -2865,6 +2869,7 @@ mod tests {
                 instantiated_descriptor: "()V".into(),
                 capture_types: vec![],
                 proxy_class_id: proxy1,
+                serializable_flag: false,
             },
         );
         shared.classes.lambda_proxies.write().insert(
@@ -2883,6 +2888,7 @@ mod tests {
                 instantiated_descriptor: "(I)Ljava/lang/String;".into(),
                 capture_types: vec!['I'],
                 proxy_class_id: proxy2,
+                serializable_flag: false,
             },
         );
 
@@ -7714,6 +7720,7 @@ mod tests {
             instantiated_descriptor: sam_desc.into(),
             capture_types: capture_types.clone(),
             proxy_class_id,
+            serializable_flag: false,
         };
         {
             let mut proxies = shared.classes.lambda_proxies.write();
@@ -68368,6 +68375,7 @@ mod tests {
                         instantiated_descriptor: "()V".into(),
                         capture_types: vec![],
                         proxy_class_id: cid,
+                        serializable_flag: false,
                     },
                 );
             }

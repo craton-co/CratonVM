@@ -8031,13 +8031,22 @@ fn declared_methods_with_synthetic(
                 });
             }
         }
-        if ctx.lambda_proxy_host(class_id).is_some()
+        // ...but ONLY for a lambda the JDK would actually have spun a
+        // `writeReplace()` onto. Real HotSpot generates one solely for
+        // serializable lambdas; an ordinary `Supplier<String> s = () -> "x"`
+        // declares just its SAM method, and `getDeclaredMethod("writeReplace")`
+        // throws NoSuchMethodException. Reporting it unconditionally made every
+        // CratonVM lambda look serializable to a reflective method scan.
+        if ctx.lambda_proxy_serializability(class_id)
+            != cratonvm_native_api::LambdaSerializability::NotSerializable
+            && ctx.lambda_proxy_host(class_id).is_some()
             && !methods.iter().any(|m| m.name == "writeReplace")
         {
             methods.push(MethodMetadata {
                 name: "writeReplace".to_string(),
                 descriptor: "()Ljava/lang/Object;".to_string(),
-                access_flags: 0x0002, // ACC_PRIVATE
+                // ACC_PRIVATE | ACC_FINAL, matching the real spun method.
+                access_flags: 0x0012,
                 declaring_class_id: class_id,
                 exceptions: Vec::new(),
             });
@@ -10390,18 +10399,32 @@ pub(crate) fn native_class_get_interfaces(
         if let Some(iface_id) =
             lambda_functional_interface_id_loader_aware(ctx, class_id, &iface_name)
         {
-            let mirror = ctx.get_class_mirror(iface_id);
-            let elem = ctx
-                .class_id_by_name("java/lang/Class")
-                .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
-            let arr = ctx.new_ref_array(elem, 1);
-            ctx.set_array_element(arr, 0, Value::Object(Some(mirror)));
+            // A lambda whose call site passed FLAG_SERIALIZABLE gets
+            // `java.io.Serializable` APPENDED to the spun class's interfaces by the
+            // real metafactory (`isSerializable && !foundSerializableSupertype`).
+            // One that is serializable only because its functional interface already
+            // extends Serializable does NOT -- it is reachable transitively.
+            let mut iface_ids = vec![iface_id];
+            if ctx.lambda_proxy_serializability(class_id)
+                == cratonvm_native_api::LambdaSerializability::ByFlag
+            {
+                if let Some(ser_id) = ctx.class_id_by_name("java/io/Serializable") {
+                    iface_ids.push(ser_id);
+                }
+            }
             if dbg_bb {
                 eprintln!(
-                    "[bb-dbg] getInterfaces({}) -> [{}] [lambda]",
-                    this_name, iface_name
+                    "[bb-dbg] getInterfaces({}) -> [{}] [lambda, {} iface(s)]",
+                    this_name,
+                    iface_name,
+                    iface_ids.len()
                 );
             }
+            // GC-safe mirror materialisation, as in the non-lambda path below.
+            let class_comp = class_component_id(ctx);
+            let arr = build_mirror_array_comp(ctx, class_comp, iface_ids.len(), |ctx, i| {
+                ctx.get_class_mirror(iface_ids[i])
+            });
             return Ok(Some(Value::Object(Some(arr))));
         }
     }
@@ -14148,12 +14171,21 @@ pub(crate) fn native_class_get_generic_interfaces(
             // `LambdaSafe.GenericTypeFilter` (which must NOT pre-filter a
             // lambda callback, so the deliberate erasure-driven
             // `ClassCastException` its javadoc exists to catch still happens).
-            let mirror = ctx.get_class_mirror(iface_id);
-            let elem = ctx
-                .class_id_by_name("java/lang/Class")
-                .unwrap_or_else(|| ClassId::new(0));
-            let arr = ctx.new_ref_array(elem, 1);
-            ctx.set_array_element(arr, 0, Value::Object(Some(mirror)));
+            // Same marker rule as `getInterfaces()` above: HotSpot returns the raw
+            // `Class` for each, plus `java.io.Serializable` when the call site set
+            // FLAG_SERIALIZABLE.
+            let mut iface_ids = vec![iface_id];
+            if ctx.lambda_proxy_serializability(class_id)
+                == cratonvm_native_api::LambdaSerializability::ByFlag
+            {
+                if let Some(ser_id) = ctx.class_id_by_name("java/io/Serializable") {
+                    iface_ids.push(ser_id);
+                }
+            }
+            let class_comp = class_component_id(ctx);
+            let arr = build_mirror_array_comp(ctx, class_comp, iface_ids.len(), |ctx, i| {
+                ctx.get_class_mirror(iface_ids[i])
+            });
             return Ok(Some(Value::Object(Some(arr))));
         }
     }

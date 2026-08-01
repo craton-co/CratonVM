@@ -311,6 +311,23 @@ pub struct LambdaCallSite {
     pub capture_types: Vec<char>,
     /// Synthetic proxy ClassId allocated for this lambda form.
     pub proxy_class_id: ClassId,
+    /// `true` when this lambda's `invokedynamic` bootstrap went through
+    /// `LambdaMetafactory.altMetafactory` with `FLAG_SERIALIZABLE` (0x1) set --
+    /// i.e. the source target type was `Serializable`-intersected, as in
+    /// `(Comparator<T> & Serializable)` (which is how every `Comparator.comparing*`
+    /// factory in the JDK is written).
+    ///
+    /// This is ONLY the explicit flag. The JDK's full rule
+    /// (`AbstractValidatingLambdaMetafactory`) is `FLAG_SERIALIZABLE ||
+    /// Serializable.isAssignableFrom(functionalInterface)`; the inheritance half
+    /// is evaluated lazily because the functional interface is not necessarily
+    /// loaded yet at bootstrap time. `SharedVm::lambda_proxy_serializability` is
+    /// the single owner of the combined rule -- do not re-derive it elsewhere.
+    ///
+    /// `false` for every proxy built outside the `invokedynamic` bootstrap that
+    /// has no flags to read (unit fixtures, deserialization); those still come
+    /// out serializable through the inheritance half when they should.
+    pub serializable_flag: bool,
     /// Loader-resolved `ClassId` of `functional_interface`, captured at
     /// bootstrap time through the HOST class's defining loader. Two loaders
     /// can define the same interface name (e.g. Spring's
@@ -1977,6 +1994,7 @@ mod tests {
                 instantiated_descriptor: Arc::from("()V"),
                 capture_types: vec![],
                 proxy_class_id: proxy_id,
+                serializable_flag: false,
             }),
         );
 
