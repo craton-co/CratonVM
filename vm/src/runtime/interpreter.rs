@@ -2298,11 +2298,12 @@ fn process_references_after_gc(
                 } else {
                     [0; 3]
                 };
+                let (old_alloc, young_surv, region) = shared.mem.heap.liveness_arms(addr);
                 eprintln!(
-                    "[overlay-prune] CONDEMNED 0x{addr:x} in_heap={in_heap} \
-                     in_pointer_map={} addr_live={} w0=0x{:016x} w1=0x{:016x} w2=0x{:016x}",
+                    "[overlay-prune] CONDEMNED 0x{addr:x} in_heap={in_heap} region={region} \
+                     in_pointer_map={} old_gen_allocated={old_alloc} young_survivor={young_surv} \
+                     w0=0x{:016x} w1=0x{:016x} w2=0x{:016x}",
                     pointer_map.contains_key(&addr),
-                    shared.mem.heap.is_addr_live(addr),
                     words[0],
                     words[1],
                     words[2],
