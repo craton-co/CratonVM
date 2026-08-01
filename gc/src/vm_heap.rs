@@ -1830,6 +1830,18 @@ impl VmHeap {
             // last collection saw. Cheap: two arena locks at shutdown.
             h.publish_gc_metrics_occupancy();
         }
+        // Old-gen free-list coalescing (the counterpart of the young sweep's
+        // post-sweep coalescer). A large `merged` with compaction never having
+        // run is the fragmentation regime this exists for; `calls>0 merged=0`
+        // says the free list was already maximally coalesced.
+        {
+            use std::sync::atomic::Ordering as O;
+            let calls = crate::old_gen::COALESCE_CALLS.load(O::Relaxed);
+            let merged = crate::old_gen::BLOCKS_MERGED.load(O::Relaxed);
+            if calls > 0 {
+                eprintln!("[GC] oldgen_coalesce: calls={calls} blocks_merged={merged}");
+            }
+        }
         // What the collector actually did on the last cycle and why. This is
         // the line that settles the `docs/GC.md` ("young collections run
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`

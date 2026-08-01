@@ -724,6 +724,14 @@ impl ConcurrentMarker {
             // is unmarked (unreachable), so freeing it is correct.
             unsafe { old_gen.free(ptr, size) };
         }
+        // Same amortised merge the in-place STW sweep does (see
+        // `OldGen::coalesce_free_blocks`): this reclaimer never compacts, and
+        // `free` alone leaves every reclaimed object as an isolated free
+        // block, so without it the generation fragments monotonically until a
+        // modest request OOMs on mostly-free storage.
+        if freed_count > 0 {
+            old_gen.coalesce_free_blocks();
+        }
 
         self.bitmap.clear();
         self.state.set_phase(ConcurrentGcPhase::Idle);

@@ -774,6 +774,11 @@ pub struct GcFlags {
     /// setting this reinstates the stale-address writes that fix repaired, so
     /// it is for A/B isolation only.
     pub no_exact_refproc_survival: bool,
+    /// `CRATONVM_NO_OLDGEN_COALESCE` — bisection escape hatch: never merge
+    /// adjacent old-gen free blocks outside `compact`, restoring the pre-fix
+    /// behaviour in which an in-place sweep fragments the generation
+    /// monotonically. See `OldGen::coalesce_free_blocks`.
+    pub no_oldgen_coalesce: bool,
     /// `CRATONVM_G1_DBG_HEADERS`
     pub g1_dbg_headers: bool,
     /// `CRATONVM_DBG_G1DIAG` — print region-type counts (free/eden/survivor/
@@ -877,6 +882,7 @@ impl GcFlags {
             dbg_zero_ranges: present(src, "CRATONVM_DBG_ZERO_RANGES"),
             diag_hib32: present(src, "CRATONVM_DIAG_HIB32"),
             no_exact_refproc_survival: present(src, "CRATONVM_NO_EXACT_REFPROC_SURVIVAL"),
+            no_oldgen_coalesce: present(src, "CRATONVM_NO_OLDGEN_COALESCE"),
             g1_dbg_headers: present(src, "CRATONVM_G1_DBG_HEADERS"),
             g1_dbg_diag: present(src, "CRATONVM_DBG_G1DIAG"),
             g1_dbg_pins: present(src, "CRATONVM_G1_DBG_PINS"),
