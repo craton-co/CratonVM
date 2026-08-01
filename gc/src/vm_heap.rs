@@ -1826,6 +1826,18 @@ impl VmHeap {
                 s.minor_gc_count, s.major_gc_count,
             );
         }
+        // Old-gen free-list coalescing (the counterpart of the young sweep's
+        // post-sweep coalescer). A large `merged` with compaction never having
+        // run is the fragmentation regime this exists for; `calls>0 merged=0`
+        // says the free list was already maximally coalesced.
+        {
+            use std::sync::atomic::Ordering as O;
+            let calls = crate::old_gen::COALESCE_CALLS.load(O::Relaxed);
+            let merged = crate::old_gen::BLOCKS_MERGED.load(O::Relaxed);
+            if calls > 0 {
+                eprintln!("[GC] oldgen_coalesce: calls={calls} blocks_merged={merged}");
+            }
+        }
         let fallbacks = crate::gc_quiescence::moving_young_coverage_fallback_count();
         if crate::gc_quiescence::moving_young_enabled() || fallbacks > 0 {
             // Both numbers, always. A correct answer while `cycles == 0` means

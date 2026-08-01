@@ -111,6 +111,14 @@ fn min_satisfying_bucket(size: usize) -> usize {
         .min(NUM_BUCKETS - 1)
 }
 
+/// How many times [`OldGen::coalesce_free_blocks`] ran, and how many free
+/// blocks it eliminated. Reported by `VmHeap::print_gc_summary` so "is the
+/// old-gen coalescer doing anything in this workload?" is answerable from a
+/// log instead of a debugger — the question that decides whether a
+/// fragmentation fix is load-bearing or an inert lever.
+pub static COALESCE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BLOCKS_MERGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Non-moving free-list allocator for the old generation.
 ///
 /// Objects are allocated from a size-segregated free list (round-5 #14
@@ -259,6 +267,90 @@ impl OldGen {
     /// (`HEADER_SIZE`-or-larger, 8-byte aligned) so every call returns
     /// a fresh, non-aliasing block.
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        if let Some(p) = self.alloc_from_buckets(size, align) {
+            return Some(p);
+        }
+        // FRAGMENTATION FIX (xt-helper-window OOM, 2026-07-31): the free list
+        // is size-segregated and `free` never looks at a block's neighbours,
+        // because coalescing was deferred to `compact`. When compaction cannot
+        // run — the old generation reclaimed IN PLACE by
+        // `old_gen_gc(compact = false)` under conservative JIT roots — that
+        // deferral never comes due, and the free list degenerates into one
+        // isolated block per dead object: the SUM of free bytes stays large
+        // while the LARGEST block shrinks toward a single object, so a modest
+        // array request fails on a generation that is mostly free. Before
+        // reporting failure, merge adjacent blocks once and retry. Costs
+        // nothing on the success path, and turns a spurious `OutOfMemoryError`
+        // into an allocation whenever the bytes are physically there.
+        if self.coalesce_free_blocks() > 0 {
+            return self.alloc_from_buckets(size, align);
+        }
+        None
+    }
+
+    /// Merge adjacent (and, defensively, overlapping) free blocks into maximal
+    /// runs and rebuild the size buckets. Returns how many blocks the merge
+    /// eliminated — `0` means the list was already maximally coalesced and a
+    /// retry cannot help.
+    ///
+    /// `compact` rebuilds the free list as a single trailing block and so has
+    /// never needed this; it exists for the paths that reclaim old-gen storage
+    /// WITHOUT compacting (`old_gen_gc(compact = false)`, reached whenever a
+    /// live JIT frame's roots are conservative and therefore un-rewritable).
+    ///
+    /// O(n log n) in the number of free blocks. Called once per in-place
+    /// old-gen sweep and once as a last-ditch step before `alloc` gives up, so
+    /// it is never on a hot path.
+    pub fn coalesce_free_blocks(&mut self) -> usize {
+        COALESCE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if crate::gc_flags().no_oldgen_coalesce {
+            return 0;
+        }
+        let before: usize = self.buckets.iter().map(|b| b.len()).sum();
+        if before < 2 {
+            return 0;
+        }
+        let mut blocks: Vec<FreeBlock> = self.buckets.iter().flatten().copied().collect();
+        blocks.sort_unstable_by_key(|b| b.offset);
+
+        let mut merged: Vec<FreeBlock> = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            match merged.last_mut() {
+                // STRICT adjacency only. The union of two touching free spans
+                // is provably free, so merging them can never hand out live
+                // memory. An OVERLAPPING pair is deliberately left alone: it
+                // means something already double-freed or over-freed a span,
+                // and silently collapsing it would both mask that bug and risk
+                // widening a block over a live object. `walk_objects` derives
+                // "allocated" as the GAPS between free blocks, so this
+                // conservative choice also leaves the object walk unchanged.
+                Some(last) if last.offset + last.size == b.offset => {
+                    last.size += b.size;
+                }
+                _ => merged.push(b),
+            }
+        }
+
+        if merged.len() == before {
+            // Nothing was adjacent — leave the buckets untouched so the caller
+            // knows a retry is pointless.
+            return 0;
+        }
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
+        for b in &merged {
+            self.buckets[bucket_for(b.size)].push(*b);
+        }
+        self.invalidate_sorted_free();
+        let eliminated = before - merged.len();
+        BLOCKS_MERGED.fetch_add(eliminated as u64, std::sync::atomic::Ordering::Relaxed);
+        eliminated
+    }
+
+    /// The size-segregated bucket walk. Split out of [`Self::alloc`] so the
+    /// coalesce-and-retry step can run it twice.
+    fn alloc_from_buckets(&mut self, size: usize, align: usize) -> Option<*mut u8> {
         // Round-9 gc CRIT-3: reserve at least HEADER_SIZE bytes (and
         // never less than 8 for alignment headroom) so an `alloc(0)`
         // can't alias an existing allocation.
@@ -956,6 +1048,23 @@ impl OldGen {
     }
 
     /// Returns the number of contiguous free blocks (fragmentation metric).
+    /// Total bytes on the free list, and the size of the LARGEST single
+    /// free block. The pair is what distinguishes "the generation is full"
+    /// from "the generation is mostly free but too fragmented to serve this
+    /// request" — the failure mode that produced a spurious
+    /// `OutOfMemoryError` before the free list learned to coalesce without
+    /// compaction. Walks every bucket, so it is a diagnostic-path helper, not
+    /// an allocator fast path.
+    pub fn free_bytes_and_largest(&self) -> (usize, usize) {
+        let mut total = 0usize;
+        let mut largest = 0usize;
+        for b in self.buckets.iter().flatten() {
+            total += b.size;
+            largest = largest.max(b.size);
+        }
+        (total, largest)
+    }
+
     pub fn free_block_count(&self) -> usize {
         // Round-5 #14: count across all size buckets.
         self.buckets.iter().map(|b| b.len()).sum()
@@ -1060,6 +1169,106 @@ mod tests {
         // Should be able to allocate again
         let p2 = og.alloc(64, 8).unwrap();
         assert!(!p2.is_null());
+    }
+
+    /// xt-helper-window OOM regression: with compaction unavailable, freeing
+    /// a run of adjacent blocks must not leave the generation unable to serve
+    /// a request that the run's COMBINED bytes cover. Before the fix the size
+    /// buckets held N isolated blocks of `S` bytes and an `S * 4` request
+    /// returned `None` even though `N * S` contiguous bytes were free.
+    ///
+    /// The trailing free space is deliberately consumed first: without that,
+    /// the request is served from the untouched tail and the test proves
+    /// nothing.
+    #[test]
+    fn adjacent_frees_are_coalesced_so_a_larger_request_still_fits() {
+        let mut og = OldGen::new(64 * 1024);
+        const S: usize = 256;
+        const N: usize = 16;
+
+        let mut ptrs = Vec::new();
+        for _ in 0..N {
+            ptrs.push(og.alloc(S, 8).expect("fresh old gen must serve S bytes"));
+        }
+        let tail = og.capacity() - og.used();
+        og.alloc(tail, 8).expect("the trailing free block must be allocatable");
+        assert_eq!(og.free_block_count(), 0, "no free space must remain");
+
+        for p in ptrs.drain(..) {
+            // SAFETY: each `p` came from `alloc(S, 8)` on this OldGen and is
+            // freed exactly once, with its own size.
+            unsafe { og.free(p, S) };
+        }
+        assert_eq!(og.free_block_count(), N, "N isolated blocks, all adjacent");
+
+        let big = S * 4;
+        assert!(
+            og.alloc(big, 8).is_some(),
+            "a {big}-byte request must be served out of {N} adjacent {S}-byte \
+             free blocks — this is the old-gen half of the xt-helper-window \
+             OutOfMemoryError (the free list never coalesces without compaction)"
+        );
+    }
+
+    /// The merge itself: adjacent blocks collapse, and a second call reports
+    /// `0` so `alloc`'s coalesce-and-retry cannot loop.
+    #[test]
+    fn coalesce_free_blocks_merges_adjacent_and_is_idempotent() {
+        let mut og = OldGen::new(64 * 1024);
+        const S: usize = 128;
+        let mut ptrs = Vec::new();
+        for _ in 0..8 {
+            ptrs.push(og.alloc(S, 8).unwrap());
+        }
+        for p in ptrs.drain(..) {
+            // SAFETY: see the test above.
+            unsafe { og.free(p, S) };
+        }
+        let before = og.free_block_count();
+        let merged = og.coalesce_free_blocks();
+        assert!(merged > 0, "8 adjacent frees must merge (before={before})");
+        assert!(
+            og.free_block_count() < before,
+            "the free-block count must drop ({before} -> {})",
+            og.free_block_count()
+        );
+        assert_eq!(
+            og.coalesce_free_blocks(),
+            0,
+            "a second merge must report no progress, so alloc's retry is one-shot"
+        );
+    }
+
+    /// Two holes separated by a LIVE object must stay separate — merging them
+    /// would hand out a span covering the live object.
+    #[test]
+    fn coalesce_free_blocks_never_merges_across_a_live_object() {
+        let mut og = OldGen::new(64 * 1024);
+        const S: usize = 128;
+        let a = og.alloc(S, 8).unwrap();
+        let live = og.alloc(S, 8).unwrap();
+        let c = og.alloc(S, 8).unwrap();
+        let tail = og.capacity() - og.used();
+        og.alloc(tail, 8).expect("the trailing free block must be allocatable");
+
+        // SAFETY: `a` and `c` each came from `alloc(S, 8)` and are freed once;
+        // `live` is deliberately left allocated between them.
+        unsafe {
+            og.free(a, S);
+            og.free(c, S);
+        }
+        assert_eq!(og.free_block_count(), 2);
+
+        og.coalesce_free_blocks();
+        assert!(
+            og.alloc(S * 2, 8).is_none(),
+            "two {S}-byte holes separated by a LIVE object must not satisfy a \
+             {}-byte request",
+            S * 2
+        );
+        // The live object is untouched and its own hole is still usable.
+        let _ = live;
+        assert!(og.alloc(S, 8).is_some(), "each individual hole still serves S");
     }
 
     #[test]
