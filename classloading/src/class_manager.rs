@@ -5374,6 +5374,82 @@ impl ClassManager {
             .0
     }
 
+    /// Re-point every already-built descendant's cached vtable descriptors at
+    /// `class_id`'s freshly-rebuilt slots.
+    ///
+    /// Called from [`Self::redefine_class`] step 6. `build_vtable_descriptors_
+    /// with_overrides` seeds a subclass's vec by `extend_from_slice`-ing its
+    /// superclass's, so each descendant owns a *copy* of the ancestor's slot
+    /// (bytecode snapshot included). Redefinition keeps the layout identical
+    /// but replaces the bodies, so those copies become stale the moment a class
+    /// anywhere above them is redefined.
+    ///
+    /// The VM's `VtableManager::install_vtable` performs the equivalent sweep
+    /// over its own installed tables, which is why in-flight dispatch normally
+    /// recovers. It is not enough on its own: `retransformClasses` receives its
+    /// argument array from a `HashSet` (Mockito's `InlineBytecodeGenerator`
+    /// .triggerRetransformation), so the per-class redefines arrive in an order
+    /// that varies run to run. When a superclass is redefined FIRST, the
+    /// descendant's own redefine then re-runs `build_vtable_descriptors` off
+    /// this stale copy and re-installs the ORIGINAL body over the VM-side
+    /// table the sweep had just fixed — an agent's woven advice silently stops
+    /// running for every call site that reaches the method through the vtable
+    /// fast path. Keeping the loader-side copies in lockstep here makes the
+    /// outcome order-independent, and also fixes a subclass linked *after* the
+    /// redefine (which would otherwise inherit the pre-redefinition snapshot).
+    ///
+    /// O(total cached slots) on the cold JVMTI path only, matching the cost
+    /// profile `install_vtable`'s sibling sweep already accepts.
+    fn refresh_inherited_vtable_descriptors(
+        &mut self,
+        class_id: ClassId,
+        new_entries: &[Option<VtableSlotDescriptor>],
+    ) {
+        let class_id_u32 = class_id.as_u32();
+        let mut replacements: FxHashMap<(Arc<str>, Arc<str>), &VtableSlotDescriptor> =
+            FxHashMap::with_capacity_and_hasher(new_entries.len(), Default::default());
+        for descriptor in new_entries.iter().flatten() {
+            if descriptor.declaring_class_id == class_id_u32 {
+                replacements.insert(
+                    (
+                        Arc::clone(&descriptor.method_name),
+                        Arc::clone(&descriptor.descriptor),
+                    ),
+                    descriptor,
+                );
+            }
+        }
+        if replacements.is_empty() {
+            return;
+        }
+        for (owner, entries) in self.vtable_descriptors.iter_mut() {
+            if *owner == class_id {
+                continue;
+            }
+            for slot in entries.iter_mut() {
+                let Some(existing) = slot.as_ref() else {
+                    continue;
+                };
+                if existing.declaring_class_id != class_id_u32 {
+                    continue;
+                }
+                let key = (
+                    Arc::clone(&existing.method_name),
+                    Arc::clone(&existing.descriptor),
+                );
+                match replacements.get(&key) {
+                    Some(fresh) => *slot = Some((*fresh).clone()),
+                    // JEP 109 forbids adding/removing methods, so a slot
+                    // attributed to this class must exist in its rebuilt vec.
+                    // Fail closed rather than keep a snapshot we know is stale
+                    // — `None` costs a slow-path resolution, a stale body is a
+                    // wrong answer. Mirrors `VtableManager::install_vtable`.
+                    None => *slot = None,
+                }
+            }
+        }
+    }
+
     /// T10.9.A — same as `build_vtable_descriptors` but also returns the
     /// list of super-class slots this class overrode. Each pair is
     /// `(super_class_id_u32, slot_index)`. Used by the class-link path
@@ -6979,6 +7055,18 @@ impl ClassManager {
         let new_entries = self.build_vtable_descriptors(class_id, class_super_id);
         self.vtable_descriptors
             .insert(class_id, new_entries.clone());
+        // A subclass's descriptor vec is seeded by COPYING its superclass's
+        // (`build_vtable_descriptors_with_overrides`'s `extend_from_slice`), so
+        // replacing only this class's own vec leaves every already-linked
+        // descendant holding pre-redefinition snapshots. The VM-side
+        // `VtableManager::install_vtable` sweeps its own tables for exactly
+        // those inherited entries, but nothing refreshed the class-loader-side
+        // copies that the NEXT `build_vtable_descriptors` reads from — so a
+        // descendant redefined later in the same `retransformClasses` batch
+        // rebuilt from the stale parent copy and re-installed the ORIGINAL
+        // body, silently undoing the sweep. See
+        // `refresh_inherited_vtable_descriptors`.
+        self.refresh_inherited_vtable_descriptors(class_id, &new_entries);
         fire_vtable_install_hook(class_id_u32, new_entries);
 
         // ---- Step 7: bump generation counter ----
@@ -8391,6 +8479,39 @@ impl ClassManager {
         // resolved against the stale layout. Mirrors the invalidation
         // `redefine_class` does for in-place bytecode replacement.
         fire_resolution_invalidate_hook(id.as_u32());
+
+        // NO vtable rebuild here, unlike `redefine_class` step 6 — and that is
+        // sound, not an oversight. Investigated 2026-08-01 off the back of the
+        // JEP 109 sibling bug (`refresh_inherited_vtable_descriptors`); the two
+        // properties that make it safe are pinned by
+        // `synthetic_stub_has_no_vtable_and_no_dispatchable_body`:
+        //
+        //   1. A compatibility stub NEVER has a vtable. Both mint paths
+        //      (`create_synthetic_stub` and `fabricate_class`) push straight
+        //      into `class_store` without calling `build_vtable_descriptors` or
+        //      firing the install hook, so `execute_invokevirtual_vtable_fast`
+        //      always answers `CacheMiss` for a stub receiver. There is no
+        //      stub-derived vtable entry this upgrade could leave stale.
+        //   2. A stub's methods are all `ACC_NATIVE` with no attributes
+        //      (`synthetic_stub_ctor_methods`), so they carry no Code — no
+        //      `Arc<CachedBytecodeMethod>` can be built from a stub body, and
+        //      therefore no stale *bytecode* snapshot can be sitting in a
+        //      thread's invoke cache or the promoted-invoke map either. That
+        //      matters because this path deliberately does NOT bump
+        //      `redefine_generations`, so `RedefineGate` would never evict one.
+        //
+        // What the missing rebuild costs is dispatch COVERAGE, never
+        // correctness: the upgraded class still has no vtable afterwards, and a
+        // subclass linked while its parent was a stub seeded its own descriptor
+        // vec from the parent's absent one. Both simply miss `lookup_slot` and
+        // fall to the (correct) slow path. Not worth a broad dispatch change on
+        // spec — a `CRATONVM_DBG_SYNUPGRADE` census over a Spring Boot JUnit
+        // class saw this branch's guard evaluated 6277 times and the upgrade
+        // itself taken ZERO times: every stub in the process is a VM-internal
+        // shape (`cratonvm/internal/*`, `java/util/HashMap$KeyItr`,
+        // `java/lang/annotation/AnnotationProxy`, `Proxy$Instance`, …) whose
+        // real bytes exist nowhere, so 3190 of 3205 stub-hits short-circuit on
+        // the known-absent memo and the remaining 15 scan and find nothing.
 
         // Cache the class bytes (FIFO-bounded helper).
         self.insert_class_bytes(id, bytes);
@@ -16178,6 +16299,142 @@ mod tests {
             "override must replace super's declaring_class_id",
         );
         assert_eq!(ts.method_index, 0, "subclass's own method_index");
+    }
+
+    /// A redefinition of a superclass must re-point every already-built
+    /// descendant's INHERITED descriptor at the freshly-rebuilt slot.
+    ///
+    /// Regression test for
+    /// `docs/internal/mockito-spy-outer-invokeinterface-call-not-recorded-
+    /// FIXED-20260801.md`: the descendant's vec is a copy of the
+    /// ancestor's, so leaving it stale let a descendant redefined LATER in the
+    /// same `retransformClasses` batch rebuild from the pre-redefinition
+    /// snapshot and re-install the ORIGINAL bytecode — the agent's woven
+    /// advice then never ran for calls dispatched through the vtable fast
+    /// path.
+    #[test]
+    fn redefine_refreshes_inherited_vtable_descriptors_in_descendants() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let super_id = add_stub_class(
+            &mut mgr,
+            "pkg/RedefSuper",
+            None,
+            vec![stub_method("greet", "()V", MethodAccessFlags::PUBLIC)],
+        );
+        let mid_id = add_stub_class(&mut mgr, "pkg/RedefMid", Some(super_id), vec![]);
+        let leaf_id = add_stub_class(
+            &mut mgr,
+            "pkg/RedefLeaf",
+            Some(mid_id),
+            vec![stub_method("own", "()V", MethodAccessFlags::PUBLIC)],
+        );
+        // An unrelated class that declares the same signature itself must NOT
+        // be touched — the sweep keys on the declaring class, not the name.
+        let unrelated_id = add_stub_class(
+            &mut mgr,
+            "pkg/RedefUnrelated",
+            None,
+            vec![stub_method("greet", "()V", MethodAccessFlags::PUBLIC)],
+        );
+
+        // Stand in for `redefine_class`'s step-6 rebuild: same slot, same
+        // declaring class, a distinguishable body snapshot.
+        let woven = VtableMethodSnapshot {
+            class_name: "pkg/RedefSuper".to_string(),
+            source_file: None,
+            code: Arc::from(vec![0xb1_u8, 0x00, 0x00].into_boxed_slice()),
+            exception_table: vec![],
+            max_stack: 1,
+            max_locals: 1,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: false,
+            is_native: false,
+        };
+        let rebuilt = vec![Some(VtableSlotDescriptor {
+            declaring_class_id: super_id.as_u32(),
+            method_index: 0,
+            method_name: Arc::from("greet"),
+            descriptor: Arc::from("()V"),
+            dispatch: Some(woven.clone()),
+        })];
+        mgr.vtable_descriptors.insert(super_id, rebuilt.clone());
+        mgr.refresh_inherited_vtable_descriptors(super_id, &rebuilt);
+
+        for (label, id) in [("mid", mid_id), ("leaf", leaf_id)] {
+            let inherited = mgr.vtable_descriptors_of(id).unwrap()[0]
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label}: inherited slot dropped"));
+            assert_eq!(inherited.declaring_class_id, super_id.as_u32());
+            assert_eq!(
+                inherited.dispatch.as_ref(),
+                Some(&woven),
+                "{label} must see the post-redefinition body, not its link-time copy",
+            );
+        }
+        // The leaf's own declaration is untouched.
+        let own = mgr.vtable_descriptors_of(leaf_id).unwrap()[1]
+            .as_ref()
+            .unwrap();
+        assert_eq!(own.declaring_class_id, leaf_id.as_u32());
+        assert_eq!(&*own.method_name, "own");
+        // Same-signature, different declaring class: left alone.
+        let unrelated = mgr.vtable_descriptors_of(unrelated_id).unwrap()[0]
+            .as_ref()
+            .unwrap();
+        assert_eq!(unrelated.declaring_class_id, unrelated_id.as_u32());
+        assert!(unrelated.dispatch.is_none());
+    }
+
+    /// The two properties that make `upgrade_synthetic_class`'s *absence* of a
+    /// vtable rebuild sound — asserted against the real mint path, not a
+    /// hand-built `Class`, so a future change to stub creation trips this test
+    /// rather than silently resurrecting the JEP 109 bug on the upgrade path.
+    ///
+    /// See the "NO vtable rebuild here" comment in `upgrade_synthetic_class`.
+    /// If either assertion starts failing, that path needs the rebuild (and,
+    /// because a synthetic upgrade may change the method set outright, a full
+    /// descendant re-derivation rather than
+    /// [`Self::refresh_inherited_vtable_descriptors`]'s slot-wise refresh).
+    #[test]
+    fn synthetic_stub_has_no_vtable_and_no_dispatchable_body() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let id = mgr.ensure_synthetic_class("java/lang/Throwable", 2);
+
+        assert!(
+            mgr.class_store
+                .get(id)
+                .is_some_and(|c| c.is_synthetic_stub),
+            "fixture must actually be a compatibility stub",
+        );
+
+        // 1. No vtable — so the upgrade has nothing stale to refresh, and
+        //    `execute_invokevirtual_vtable_fast` can only answer CacheMiss.
+        assert!(
+            mgr.vtable_descriptors_of(id).is_none(),
+            "a synthetic stub must never carry vtable descriptors; if it does, \
+             upgrade_synthetic_class must rebuild them",
+        );
+
+        // 2. No dispatchable body — so no `CachedBytecodeMethod` snapshot of a
+        //    stub can be cached anywhere and survive the upgrade (this path
+        //    does not bump `redefine_generations`, so `RedefineGate` would not
+        //    evict one). `java/lang/Throwable` is chosen because
+        //    `synthetic_stub_ctor_methods` gives it the richest stub method
+        //    table of any name, so the assertion has something to bite on.
+        let methods = &mgr.class_store.get(id).expect("stub present").methods;
+        assert!(
+            !methods.is_empty(),
+            "fixture must have stub methods for this assertion to mean anything",
+        );
+        for method in methods {
+            assert!(
+                method.code().is_none(),
+                "stub method {}{} must carry no Code attribute",
+                method.name,
+                method.descriptor,
+            );
+        }
     }
 
     /// T10.5 — install hook receives the freshly-built descriptor vec.
