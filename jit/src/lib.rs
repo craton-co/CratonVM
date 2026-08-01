@@ -11916,6 +11916,30 @@ thread_local! {
 /// own code reads a local (`a`) last assigned by the FIRST try's successful
 /// (non-exceptional) path. Without SOME such check, that method compiled
 /// and silently produced a wrong checksum.
+/// VM-side view of [`local_handler_reads_unsafe_local`]: does resuming one of
+/// this method's handlers require the locals a PRECISE exceptional frame
+/// carries, rather than the `this`-plus-declared-parameters reconstruction the
+/// interpreter can rebuild on its own?
+///
+/// The interpreter has two sinks that resume a compiled body at its own handler
+/// (`route_jit_signal_exception` and `run_jit_callee_handler`). Only the first
+/// consumes the reason-9 frame; the second rebuilds the frame from the incoming
+/// arguments alone. That is sound ONLY for a method this predicate answers
+/// `false` for — for a `true` one, every local beyond the parameters resumes as
+/// 0/null, which is a silent wrong answer, not a crash. Exported so the sinks
+/// can tell the two populations apart instead of assuming the compile gate kept
+/// the `true` ones out (it no longer does: `precise_handler_frames_enabled`
+/// admits them on the promise of a precise frame).
+pub fn handler_resume_requires_precise_locals(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+    method_descriptor: &str,
+    is_static: bool,
+) -> bool {
+    local_handler_reads_unsafe_local(code, code_len, exception_table, method_descriptor, is_static)
+}
+
 fn local_handler_reads_unsafe_local(
     code: &[u8],
     code_len: usize,
