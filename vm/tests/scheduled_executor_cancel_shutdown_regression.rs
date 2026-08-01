@@ -45,9 +45,14 @@ fn cancelled_delayed_task_does_not_block_scheduled_executor_shutdown() {
         .args(["--release", "21", "-d"])
         .arg(&output_dir)
         .arg(probe_source())
-        .status()
+        .output()
         .expect("run javac");
-    assert!(compiled.success(), "compile scheduled-executor probe");
+    assert!(
+        compiled.status.success(),
+        "[scheduled_executor_cancel_shutdown] the embedded probe failed to compile — \
+         fix the probe source. javac stderr:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
 
     let mut child = Command::new(binary)
         .args([

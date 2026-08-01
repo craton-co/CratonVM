@@ -93,9 +93,20 @@ fn ensure_probes_compiled() -> bool {
     for src in &sources {
         cmd.arg(src);
     }
-    match cmd.status() {
-        Ok(s) if s.success() => required.iter().all(|f| classes.join(f).exists()),
-        _ => false,
+    match cmd.output() {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(_) => false,
+        // javac RAN and rejected the fixture: skipping here would make this
+        // test a permanent vacuous pass.
+        Ok(o) => {
+            assert!(
+                o.status.success(),
+                "[vthread_probe_regression] the checked-in probe fixture failed to compile — fix the .java source. \
+             javac stderr:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            required.iter().all(|f| classes.join(f).exists())
+        }
     }
 }
 
