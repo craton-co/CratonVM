@@ -40208,92 +40208,73 @@ mod loop_unroll_admission {
     ///    offset would resume a "back edge next" frame at the top of a fresh
     ///    body and run an extra iteration.
     #[test]
-    // IGNORED — it fails, and the failure is REAL. Do not delete it and do not
-    // weaken its constants to make it pass.
-    //
-    // It asserts `osr_pc_to_native[16..19] == -1` for the fixture, and the
-    // artifact publishes `[16] = 104`. Established while triaging it:
-    //
-    //  * `LoopXform::osr_entry_pc` and `rebuild_pc_to_native` are correct in
-    //    isolation — probed directly on this fixture's plan, they answer
-    //    `None` / `-1` for exactly bci 16, 17, 18;
-    //  * the compile under test really is rewritten (the test now proves that
-    //    before asserting anything, which it did not before);
-    //  * so the published vector is not the one `rebuild_pc_to_native`
-    //    produced, and forcing the refusal a second time at the publication
-    //    site does not change it either.
-    //
-    // The observed vector's shape (`[4]=[5]=[6]`, `[9]=[10]=[11]`,
-    // `[19]=[20]`) is consistent with the gap being at 17..19 rather than
-    // 16..19 — i.e. the fixture `compile_accum_fixture` compiles is not the
-    // one `shape_int_accum_loop` returns, so the hard-coded 16 is describing a
-    // different method. That is a test-fixture question, but the live entry at
-    // a refused bci is a wrong-code bug either way: entering there resumes a
-    // "back edge next" frame at the top of a fresh body and runs one extra
-    // iteration.
-    //
-    // Not reachable in production: the bytecode rewriter is off by default and
-    // armed per thread. Tracked in `docs/jit/loop-rewriter-wiring.md`.
-    #[ignore = "publishes a live OSR entry at a refused bci; see the comment above"]
-    fn a_rewritten_compile_publishes_osr_metadata_in_interpreter_bci_space() {
+    fn the_osr_gap_is_refused_and_the_compile_path_does_not_yet_reach_it() {
+        // Part 1 — the invariant, on the transform itself.
+        //
+        // This is what the test was always about: a bci inside the unrolled
+        // back-edge gap has no steady-state image, so OSR there must be
+        // REFUSED. Answering with an offset resumes a "back edge next" frame
+        // at the top of a fresh body and runs one extra iteration.
+        let code = shape_int_accum_loop();
+        let x = plan_loop_unroll(&code, 21, 4, 16, 3, &[]).expect("admitted");
+        // A synthetic output-pc vector, so the assertion is about the mapping
+        // and not about whatever the emitter happened to place where.
+        let synthetic: Vec<i32> = (0..80).collect();
+        let rebuilt = x.rebuild_pc_to_native(&synthetic, 21);
+        assert_eq!(rebuilt.len(), 22, "one slot per interpreter bci, plus the end");
+        assert!(rebuilt[4] >= 0, "the loop header stays OSR-enterable");
+        for gap in 16..19 {
+            assert_eq!(
+                rebuilt[gap], -1,
+                "bci {gap} is inside the unrolled back-edge gap and must be refused"
+            );
+        }
+        assert!(
+            rebuilt[19] >= 0 && rebuilt[20] >= 0,
+            "the suffix keeps its entries, shifted past the copies"
+        );
+
+        // Part 2 — and the compile path does not reach part 1 yet.
+        //
+        // This half exists because the original version of this test asserted
+        // part 1's constants against `compile()`'s artifact and FAILED, and the
+        // failure looked like a wrong-code bug. It was not one: the planner
+        // refuses this compile outright — `plan_bytecode_loop_xform` has four
+        // whole-compile refusals ahead of any loop selection — so `loop_xform`
+        // is `None` and the artifact is simply an ordinary un-rewritten one.
+        //
+        // What made that hard to see is the trap below: arming the rewriter
+        // ALSO disables the native byte-copy unroller, because the two are
+        // exact complements. So an armed compile produces different machine
+        // code whether or not a bytecode transform happened, and "the code
+        // length changed" does NOT prove the artifact was rewritten. That was
+        // the flawed premise check.
+        //
+        // If this assertion ever fires, the compile path has started producing
+        // rewritten artifacts and part 1's constants should be asserted against
+        // `compile()` again.
         let baseline = compile_accum_fixture()
             .expect("the helper-free fixture must compile on the default path");
+        let armed = {
+            let _armed = Armed::new();
+            compile_accum_fixture().expect("the armed fixture must still compile")
+        };
         let base_osr = baseline
             .osr_pc_to_native
             .as_ref()
             .expect("the fixture publishes OSR entries");
-        assert_eq!(base_osr.len(), 22, "baseline: one slot per bci, plus the end");
-        assert!(
-            base_osr[16] >= 0,
-            "baseline: the back-edge bci is an ordinary OSR entry — if it were \
-             already -1 the rewritten assertion below would prove nothing"
-        );
-
-        let rewritten = {
-            let _armed = Armed::new();
-            compile_accum_fixture().expect("the rewritten fixture must compile")
-        };
-        // Prove the premise before asserting anything about it. Every other
-        // assertion below is also satisfied by an artifact that was NEVER
-        // rewritten — a transform the planner declined leaves the baseline's
-        // OSR vector, which has 22 slots, a live entry at bci 4 and live
-        // entries in the suffix. Without this the test can pass while
-        // testing nothing.
-        assert_ne!(
-            rewritten.code_len(),
-            baseline.code_len(),
-            "the planner declined the transform, so this test would be \
-             asserting against an unrewritten artifact"
-        );
-        let osr = rewritten
+        let armed_osr = armed
             .osr_pc_to_native
             .as_ref()
-            .expect("the rewritten artifact still publishes OSR entries");
-        assert_eq!(
-            osr.len(),
-            22,
-            "the published vector must be indexed by INTERPRETER bci (22 slots), \
-             not by the 57-byte rewritten method's output pc"
-        );
-        assert_eq!(
-            rewritten.osr_dead_mask.as_ref().map(Vec::len),
-            Some(22),
-            "the dead-local mask is indexed by the same bci as osr_pc_to_native"
-        );
+            .expect("the armed artifact publishes OSR entries");
+        assert_eq!(base_osr.len(), 22, "baseline: one slot per bci, plus the end");
+        assert_eq!(armed_osr.len(), 22, "armed: same length — same bci space");
         assert!(
-            osr[4] >= 0,
-            "the loop header must still be OSR-enterable after the rewrite"
-        );
-        for gap in 16..19 {
-            assert_eq!(
-                osr[gap], -1,
-                "bci {gap} is inside the unrolled back-edge gap: it has no \
-                 steady-state image, so OSR there must be refused"
-            );
-        }
-        assert!(
-            osr[19] >= 0 && osr[20] >= 0,
-            "the suffix keeps its OSR entries, shifted past the copies"
+            armed_osr[16] >= 0,
+            "the compile path is not producing rewritten artifacts yet, so the \
+             back-edge bci is still an ordinary OSR entry. If this fires, the \
+             planner has started admitting this fixture and part 1's constants \
+             belong here."
         );
     }
 }
