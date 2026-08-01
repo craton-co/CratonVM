@@ -22,14 +22,16 @@
 //!
 //! Surface under test:
 //!   * `cratonvm_reader::field_type::FieldType::{parse, parse_partial}`
-//!     (`reader/src/field_type.rs:34` / `:50`) — enforces
-//!     `MAX_ARRAY_DIMENSIONS = 255` at `reader/src/field_type.rs:87`.
+//!     (`reader/src/field_type.rs:34` / `:52`) — enforces
+//!     `MAX_ARRAY_DIMENSIONS = 255` at `reader/src/field_type.rs:89`
+//!     (canonical value in `reader/src/limits.rs`).
 //!   * `cratonvm_reader::method_descriptor::MethodDescriptor::parse`
 //!     (`reader/src/method_descriptor.rs:24`).
 //!   * `cratonvm_reader::signature::{parse_class_signature,
 //!     parse_method_signature, parse_field_signature}` and their
 //!     `_cached` twins (`reader/src/signature.rs:469`, `:476`, `:490`,
-//!     `:619`, `:652`, `:679`) — bounded by `MAX_SIG_DEPTH = 256`.
+//!     `:705`, `:743`, `:772`) — bounded by `MAX_SIG_DEPTH = 256`
+//!     (`reader/src/signature.rs:120`).
 //!
 //! The strongest oracle here is a **`Display` → `parse` round trip** on
 //! every successfully parsed type. A panic-only oracle cannot see a decoder

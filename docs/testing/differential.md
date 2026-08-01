@@ -221,6 +221,13 @@ list is a list of what somebody remembered, and it rots silently. `.java` seeds
 are compiled with the same `javac` the differential run uses, so the matrix
 describes the exact bytes that run executes.
 
+> A matrix is only as good as the corpus under it, and `difftest/seeds` is three
+> programs. `cratonvm-difftest gen-opcodes` emits one program per opcode so the
+> report has something to measure — see
+> [`docs/testing/opcode-coverage.md`](opcode-coverage.md) for the generator, the
+> five opcodes no Java source can produce, and the reconciliation step that keeps
+> the generator's declarations honest against the compiled bytes.
+
 ### Reading a row
 
 A row is keyed by `(opcode, operand form)`. The form is deliberately **bounded**
@@ -251,6 +258,23 @@ A **cell** is `(row × axis)` and is covered when **both** sides agree:
 Splitting the two is what makes a gap actionable: "`iaload` is not covered under
 `osr`" has two possible fixes — configure the mode, or write a seed that puts an
 `iaload` in a loop — and `axes_without_a_mode` in the JSON says which.
+
+A cell is **not a boolean**. `CellState` (`difftest/src/matrix.rs`) is tri-state,
+because a boolean cannot tell "nobody wrote a seed" from "nothing *can* write
+one", and `jsr`/`ret` are permanently the second — JVMS §4.9.1 forbids them in
+class files of version ≥ 50.0:
+
+| State | Meaning |
+|---|---|
+| `covered` | mode side and code side both agree |
+| `uncovered` | carries a `gap` (one of `no-mode-drives-axis`, `not-in-corpus-but-generated`, `no-generator`, `no-loop-site`, `no-handler-site`) and the `fix` text for it |
+| `unreachable-by-construction` | carries the `reason`, and is never mixed in with ordinary gaps — "write a seed" is the wrong advice for these |
+
+Corpus evidence outranks the declaration: a scanned `swap` beats an
+`unreachable-by-construction` claim, and the contradiction is reported in the
+JSON's `reconciliation` list rather than silently resolved either way. The
+precedence order and the reconciliation output are documented in
+[`opcode-coverage.md`](opcode-coverage.md) §5–§6.
 
 ### What the matrix deliberately does not claim
 
@@ -330,15 +354,25 @@ Honest list; each is a backlog item, not a claim of completeness.
 
 **Corpus**
 
-* The committed `seeds/` corpus is three programs. Run
-  `cratonvm-difftest matrix --show-gaps` for the current list; the great majority
-  of the 202 named opcodes are unexercised, and `unexercised_opcodes` in the JSON
-  names every one of them.
-* No seed declares a checksum yet, so the `checksum` dimension is present but
-  unexercised by the committed corpus. New seeds should declare one for any
-  quantity they compute.
-* No seed is written specifically to sit in a loop *and* under a handler, which
-  is what the `osr` × `exception` cells need.
+* The committed `seeds/` corpus is still three programs, and none of the three
+  declares a checksum or is written to sit in a loop *and* under a handler. Run
+  `cratonvm-difftest matrix --corpus difftest/seeds --show-gaps` for the current
+  list; the great majority of the 202 named opcodes are unexercised there, and
+  `unexercised_opcodes` in the JSON names every one of them.
+* The **generated** corpus closes both of those on the corpus side, and only on
+  the corpus side. `cratonvm-difftest gen-opcodes` emits 197 programs, every one
+  of which prints `##DIFFTEST-CHECKSUM## op<nnn>-<mnemonic> <hex>` and wraps its
+  focus code — and every generated helper method's body — in a loop inside a
+  `try` (`opcorpus.rs`, held by `programs_wrap_their_focus_in_a_loop_and_a_handler`
+  and `the_helper_builder_always_emits_a_loop_and_a_handler`). So the `checksum`
+  dimension and the `osr` × `exception` cells now have programs that exercise
+  them.
+* **What is still open is running them.** The CI step added to `difftest-gate`
+  *compiles* the generated corpus and reports the matrix; it does not diff it
+  against HotSpot. A differential run over the generated corpus is 197 programs ×
+  7 modes × two VMs, and is not wired anywhere. Until it is, the checksum
+  dimension is *exercisable* rather than exercised, and new hand-written seeds
+  should still declare a checksum for any quantity they compute.
 
 **Comparison**
 

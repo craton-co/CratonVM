@@ -1,18 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-/// Profile-Guided Optimization (PGO) data collected during interpreted execution.
-///
-/// During the interpreter warmup phase each method accumulates:
-/// - **Branch counts** — taken vs. not-taken at each conditional-branch bytecode.
-/// - **Receiver type counts** — receiver class frequency at each invokevirtual /
-///   invokeinterface site.
-///
-/// These profiles are consumed when the JIT compiles the method:
-/// - Branch counts guide code-layout decisions (prefer the hot direction as fall-through).
-/// - Receiver type counts pre-populate Monomorphic Inline Cache (MIC) slots so the
-///   common-case virtual dispatch is a direct call from the very first JIT execution.
-use std::collections::HashMap;
+//! Profile-Guided Optimization (PGO) data collected during interpreted execution.
+//!
+//! During the interpreter warmup phase each method accumulates:
+//! - **Branch counts** — taken vs. not-taken at each conditional-branch bytecode.
+//! - **Receiver type counts** — receiver class frequency at each invokevirtual /
+//!   invokeinterface site.
+//!
+//! These profiles are consumed when the JIT compiles the method:
+//! - Branch counts guide code-layout decisions (prefer the hot direction as fall-through).
+//! - Receiver type counts pre-populate Monomorphic Inline Cache (MIC) slots so the
+//!   common-case virtual dispatch is a direct call from the very first JIT execution.
+//!
+//! (These paragraphs were `///` on the `use` below, so they documented the
+//! import rather than the module and never appeared in the module's docs.)
+//!
+//! # Counter integrity — read this before treating a number here as a fact
+//!
+//! Every counter in this module is written by many real OS threads and read by
+//! a compiler thread that holds none of their locks. The consistency the
+//! readers actually get is:
+//!
+//! * **Within one method's [`MethodProfile`]** — [`ProfileStore::get_profile`]
+//!   and [`ProfileStore::snapshot_all`] clone the four maps while holding that
+//!   method's own `parking_lot::Mutex`, and every recorder takes the same
+//!   mutex. A snapshot is therefore a *point-in-time consistent* image: no
+//!   torn read, no half-applied increment, and successive snapshots of the
+//!   same method are monotone non-decreasing. This is asserted by
+//!   `concurrent_receiver_recording_is_lossless_and_monotone`.
+//! * **Across methods, and between a profile and its invocation counter** —
+//!   nothing. `snapshot_all` walks shard by shard and
+//!   [`ProfileStore::snapshot_invocation_counts`] reads `Relaxed` atomics, so
+//!   two methods in one snapshot may be from different instants.
+//! * **Freshness** — never guaranteed. The profile is a *lagging* image of a
+//!   running program at every read, and [`ProfileStore::invalidate_class`] can
+//!   drop a method's history entirely when its class unloads.
+//!
+//! The consequence for a consumer: a profile read is sound as a **heuristic**
+//! (which branch to lay out first, which class to seed a MIC with, which site
+//! to rank first) and is never sound as a **correctness input**. Any decision
+//! that would be wrong if the number were stale — a devirtualised call, an
+//! elided type check — must be paired with a runtime guard that re-checks the
+//! property, and the profile may only choose *which* guard to emit. See
+//! `docs/jit/pgo-inlining.md`.
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -86,19 +118,56 @@ pub struct BranchCounts {
     pub not_taken: u32,
 }
 
+/// Observations a branch needs before either direction may be called "usual".
+///
+/// Twenty is the value these predicates have always used, named here rather
+/// than repeated as a literal in two bodies. Its job is to stop a ratio taken
+/// from a handful of samples being read as a property of the program: at
+/// twenty, one further sample moves the ratio by five points, whereas at three
+/// it moves it by twenty-five. The consumers are code-layout hints, so an
+/// early wrong answer costs a mis-laid-out branch, not a wrong result.
+pub const BRANCH_BIAS_MIN_SAMPLES: u32 = 20;
+
 impl BranchCounts {
+    /// Total observations, saturating. Once this pins at `u32::MAX` the
+    /// profile has stopped counting and both predicates below describe a lower
+    /// bound rather than the program — see [`Self::is_saturated`].
+    pub fn total(&self) -> u32 {
+        self.taken.saturating_add(self.not_taken)
+    }
+
+    /// Whether either counter, or their sum, has pinned at `u32::MAX`.
+    ///
+    /// The counters saturate instead of wrapping (a wrap would invert a
+    /// branch's apparent direction, which is worse than losing precision), but
+    /// a pinned counter is no longer proportional to execution. Callers that
+    /// care about the *ratio* rather than the direction should check this.
+    pub fn is_saturated(&self) -> bool {
+        self.taken == u32::MAX
+            || self.not_taken == u32::MAX
+            || u64::from(self.taken) + u64::from(self.not_taken) > u64::from(u32::MAX)
+    }
+
     /// Returns `true` when the branch is overwhelmingly not-taken
-    /// (taken < 10 % of total observations with at least 20 samples).
+    /// (taken < 10 % of total observations with at least
+    /// [`BRANCH_BIAS_MIN_SAMPLES`] samples).
+    ///
+    /// The comparison runs in `u64`: `taken * 10` overflows `u32` at 429 496 730
+    /// observations of one branch, which a hot loop in a long-running server
+    /// passes. Before this, that overflow panicked in debug builds and silently
+    /// inverted the answer in release ones.
     pub fn is_usually_not_taken(&self) -> bool {
-        let total = self.taken.saturating_add(self.not_taken);
-        total >= 20 && self.taken * 10 < total
+        let total = self.total();
+        total >= BRANCH_BIAS_MIN_SAMPLES && u64::from(self.taken) * 10 < u64::from(total)
     }
 
     /// Returns `true` when the branch is overwhelmingly taken
-    /// (taken > 90 % of total observations with at least 20 samples).
+    /// (taken > 90 % of total observations with at least
+    /// [`BRANCH_BIAS_MIN_SAMPLES`] samples). `u64` for the same overflow reason
+    /// as [`Self::is_usually_not_taken`].
     pub fn is_usually_taken(&self) -> bool {
-        let total = self.taken.saturating_add(self.not_taken);
-        total >= 20 && self.taken * 10 > total * 9
+        let total = self.total();
+        total >= BRANCH_BIAS_MIN_SAMPLES && u64::from(self.taken) * 10 > u64::from(total) * 9
     }
 }
 
@@ -112,16 +181,146 @@ impl BranchCounts {
 /// interpreter warmup.
 pub type ReceiverCounts = FxHashMap<u32, u32>;
 
-/// Returns the dominant receiver class (most frequent) and its count if it
-/// exceeds `min_fraction_pct` percent of total observations.
-pub fn dominant_receiver(counts: &ReceiverCounts, min_fraction_pct: u32) -> Option<u32> {
-    let total: u32 = counts.values().copied().sum();
-    if total == 0 {
-        return None;
+/// Whether the counts backing a receiver profile are still exact.
+///
+/// **The live store does not cap the receiver type table.** Unlike
+/// `pgo::ReceiverTypeProfile` (which records at most 8 classes and drops the
+/// rest), [`MethodProfile::record_receiver`] inserts every distinct class it
+/// sees, so a live profile never loses a *type*: [`ReceiverProfileSummary::types`]
+/// is an exact count, and a one-type reading is genuinely one type rather than
+/// a full table that overflowed. That distinction matters because conflating
+/// "one type seen" with "one slot left after overflow" is a wrong-code bug the
+/// moment anything speculates on it.
+///
+/// The one way a live profile does stop being exact is *magnitude*: every
+/// counter is a `u32` that pins at `u32::MAX` rather than wrapping. Once a
+/// counter is pinned the recorded proportions are no longer the observed
+/// proportions, and a site can read as monomorphic because its majority class
+/// stopped counting rather than because the program settled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProfileFidelity {
+    /// No counter and no total has reached `u32::MAX`. Shares computed from
+    /// this profile are the observed shares.
+    Exact,
+    /// At least one counter, or the total, has pinned at `u32::MAX`. Every
+    /// share computed from it understates the pinned entries and overstates
+    /// the rest. Usable as a hint; never as a correctness input.
+    Saturated,
+}
+
+/// A deterministic, fidelity-aware view of one call site's receiver profile.
+///
+/// Produced by [`summarize_receivers`]. Ranking is descending count with ties
+/// broken by **ascending class id**: `FxHashMap` iteration order is not
+/// deterministic, and two compilations of the same profile must plan the same
+/// artifact. (`crate::classify_receiver_shape` uses the same ordering, for the
+/// same reason.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReceiverProfileSummary {
+    /// Saturating sum of every recorded count.
+    pub observations: u32,
+    /// Number of distinct receiver classes recorded. Exact — see
+    /// [`ProfileFidelity`] for why the live store cannot truncate this.
+    pub types: usize,
+    /// Whether the counts are still proportional to execution.
+    pub fidelity: ProfileFidelity,
+    /// Highest-count class and its count. `None` only for an empty profile.
+    pub top: Option<(u32, u32)>,
+    /// Second-highest class and its count, by the same ordering.
+    pub second: Option<(u32, u32)>,
+}
+
+impl ReceiverProfileSummary {
+    /// Whether the counts are still exact (see [`ProfileFidelity`]).
+    pub fn is_exact(&self) -> bool {
+        matches!(self.fidelity, ProfileFidelity::Exact)
     }
-    let (&dom_class, &dom_count) = counts.iter().max_by_key(|(_, &c)| c)?;
-    if dom_count * 100 >= total * min_fraction_pct {
-        Some(dom_class)
+
+    /// Whether `count` is at least `pct` percent of [`Self::observations`].
+    ///
+    /// Computed in `u64`. `count * 100` overflows `u32` at 42 949 673
+    /// observations — a threshold a hot virtual site reaches in seconds — and
+    /// the overflow panicked in debug builds and produced an arbitrary
+    /// yes/no in release ones.
+    pub fn holds_at_least_pct(&self, count: u32, pct: u32) -> bool {
+        if self.observations == 0 {
+            return false;
+        }
+        u64::from(count) * 100 >= u64::from(self.observations) * u64::from(pct)
+    }
+
+    /// Whether the top class alone holds at least `pct` percent.
+    pub fn top_holds_at_least_pct(&self, pct: u32) -> bool {
+        match self.top {
+            Some((_, n)) => self.holds_at_least_pct(n, pct),
+            None => false,
+        }
+    }
+}
+
+/// Summarise a call site's receiver counts deterministically.
+///
+/// Single pass, no allocation, no sort. An empty map yields
+/// `observations == 0`, `types == 0`, `top == None` — which callers must treat
+/// as *no evidence*, not as "zero receivers of some type", exactly as
+/// [`CallSiteEvidence::None`] is not a count of zero.
+pub fn summarize_receivers(counts: &ReceiverCounts) -> ReceiverProfileSummary {
+    // Both arguments are `(class_id, count)`. Orders by descending count, ties
+    // broken by ascending class id.
+    fn outranks(candidate: (u32, u32), incumbent: Option<(u32, u32)>) -> bool {
+        match incumbent {
+            None => true,
+            Some((inc_class, inc_count)) => {
+                candidate.1 > inc_count || (candidate.1 == inc_count && candidate.0 < inc_class)
+            }
+        }
+    }
+
+    let mut top: Option<(u32, u32)> = None;
+    let mut second: Option<(u32, u32)> = None;
+    let mut total: u64 = 0;
+    let mut any_pinned = false;
+    for (&class_id, &count) in counts.iter() {
+        total = total.saturating_add(u64::from(count));
+        any_pinned |= count == u32::MAX;
+        let candidate = (class_id, count);
+        if outranks(candidate, top) {
+            second = top;
+            top = Some(candidate);
+        } else if outranks(candidate, second) {
+            second = Some(candidate);
+        }
+    }
+    let saturated = any_pinned || total > u64::from(u32::MAX);
+    ReceiverProfileSummary {
+        observations: total.min(u64::from(u32::MAX)) as u32,
+        types: counts.len(),
+        fidelity: if saturated {
+            ProfileFidelity::Saturated
+        } else {
+            ProfileFidelity::Exact
+        },
+        top,
+        second,
+    }
+}
+
+/// Returns the dominant receiver class (most frequent) if it holds at least
+/// `min_fraction_pct` percent of total observations.
+///
+/// **Heuristic use only.** Two callers in `jit/src/lib.rs` use this to *seed* a
+/// monomorphic inline cache (`lib.rs:12803`, `lib.rs:14408`); the seeded class
+/// id is then re-checked by the cache's own `CMP` at every dispatch, so a stale
+/// or mis-ranked answer costs one miss and never mis-dispatches. A consumer
+/// that wants to know whether the underlying counts can be *believed* must ask
+/// [`summarize_receivers`] and check [`ReceiverProfileSummary::fidelity`] —
+/// this function answers from a saturated profile just as readily as from an
+/// exact one.
+pub fn dominant_receiver(counts: &ReceiverCounts, min_fraction_pct: u32) -> Option<u32> {
+    let summary = summarize_receivers(counts);
+    let (class_id, count) = summary.top?;
+    if summary.holds_at_least_pct(count, min_fraction_pct) {
+        Some(class_id)
     } else {
         None
     }
@@ -249,10 +448,20 @@ impl MethodProfile {
     }
 
     /// Record a receiver type observation at invoke `pc`.
+    ///
+    /// Saturating, like every other counter in this module. It was a plain
+    /// `+= 1`: at 2^32 observations of one receiver class — reachable at one
+    /// hot virtual site in a long-lived server — that panicked in debug builds
+    /// and **wrapped to zero** in release ones, which would have made the
+    /// program's majority receiver read as its rarest and inverted every
+    /// decision downstream of [`dominant_receiver`]. Pinning at `u32::MAX`
+    /// merely stops the profile improving, and [`ProfileFidelity`] reports
+    /// that it happened.
     #[inline]
     pub fn record_receiver(&mut self, pc: usize, class_id: u32) {
         let entry = self.receivers.entry(pc).or_default();
-        *entry.entry(class_id).or_insert(0) += 1;
+        let count = entry.entry(class_id).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     /// Record a back-edge execution at the given PC.
@@ -333,6 +542,18 @@ impl MethodProfile {
             ),
             None => CallSiteEvidence::None,
         }
+    }
+
+    /// Fidelity-aware summary of the receiver profile at invoke `pc`.
+    ///
+    /// `None` means *no receiver was ever recorded here* — profiling was off,
+    /// the site never ran, or its invoke kind has no receiver
+    /// (`invokestatic`/`invokespecial`/`invokedynamic` record none by
+    /// construction). It is emphatically **not** "zero types observed", and a
+    /// consumer that collapses the two would refuse to speculate at every
+    /// virtual site in a VM that happened to start with profiling off.
+    pub fn receiver_summary(&self, pc: usize) -> Option<ReceiverProfileSummary> {
+        self.receivers.get(&pc).map(summarize_receivers)
     }
 
     /// Every call site with observed evidence of at least `min_count`
@@ -1650,6 +1871,250 @@ mod tests {
                 store.get_profile(&key).is_none(),
                 "nothing may be recorded while profiling is disabled"
             );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Counter arithmetic: the regime where these numbers used to lie
+    // -----------------------------------------------------------------------
+
+    /// `dominant_receiver` computed `count * 100` in `u32`, which overflows at
+    /// 42 949 673 observations — a threshold one hot virtual site passes in
+    /// seconds. In a debug build that panicked inside the JIT's profile read;
+    /// in a release build it wrapped and answered arbitrarily.
+    #[test]
+    fn dominant_receiver_survives_counts_past_the_u32_multiply_overflow() {
+        let mut counts = ReceiverCounts::default();
+        counts.insert(1, 3_000_000_000);
+        counts.insert(2, 100);
+        assert_eq!(dominant_receiver(&counts, 80), Some(1));
+
+        // And the negative answer is still correct at that scale: a 50/50 split
+        // of four billion observations is not 80 % dominant.
+        let mut split = ReceiverCounts::default();
+        split.insert(1, 2_000_000_000);
+        split.insert(2, 2_000_000_000);
+        assert_eq!(dominant_receiver(&split, 80), None);
+    }
+
+    /// `max_by_key` over an `FxHashMap` returns whichever tied entry came last
+    /// in iteration order, so two compilations of the same profile could seed
+    /// different inline caches. Ties now break on ascending class id.
+    #[test]
+    fn dominant_receiver_tie_break_is_deterministic() {
+        let mut counts = ReceiverCounts::default();
+        counts.insert(31, 500);
+        counts.insert(4, 500);
+        counts.insert(12, 5);
+        for _ in 0..32 {
+            assert_eq!(dominant_receiver(&counts, 40), Some(4));
+        }
+    }
+
+    #[test]
+    fn dominant_receiver_of_an_all_zero_profile_is_none() {
+        let mut counts = ReceiverCounts::default();
+        counts.insert(1, 0);
+        assert_eq!(dominant_receiver(&counts, 1), None);
+    }
+
+    /// Receiver counts were the one counter here that did not saturate.
+    #[test]
+    fn receiver_counts_saturate_rather_than_wrap() {
+        let mut p = MethodProfile::default();
+        p.receivers.entry(3).or_default().insert(9, u32::MAX);
+        p.record_receiver(3, 9);
+        assert_eq!(p.receivers[&3][&9], u32::MAX, "must pin, not wrap to 0");
+
+        let summary = p.receiver_summary(3).expect("site was recorded");
+        assert_eq!(summary.fidelity, ProfileFidelity::Saturated);
+        assert!(!summary.is_exact());
+    }
+
+    /// Saturation is also reachable through the *total* with no single counter
+    /// pinned, so the summary checks both.
+    #[test]
+    fn summary_reports_saturation_from_the_total_alone() {
+        let mut counts = ReceiverCounts::default();
+        counts.insert(1, 3_000_000_000);
+        counts.insert(2, 3_000_000_000);
+        assert!(counts.values().all(|&n| n != u32::MAX));
+        let summary = summarize_receivers(&counts);
+        assert_eq!(summary.fidelity, ProfileFidelity::Saturated);
+        assert_eq!(summary.observations, u32::MAX);
+    }
+
+    /// `taken * 10` / `total * 9` overflow `u32` at ~430 M observations of one
+    /// branch, which a hot interpreted loop reaches.
+    #[test]
+    fn branch_bias_predicates_do_not_overflow_u32() {
+        let hot = BranchCounts {
+            taken: 1_000_000_000,
+            not_taken: 10,
+        };
+        assert!(hot.is_usually_taken());
+        assert!(!hot.is_usually_not_taken());
+        assert!(!hot.is_saturated());
+
+        let cold = BranchCounts {
+            taken: 10,
+            not_taken: 1_000_000_000,
+        };
+        assert!(cold.is_usually_not_taken());
+        assert!(!cold.is_usually_taken());
+
+        let pinned = BranchCounts {
+            taken: u32::MAX,
+            not_taken: 1,
+        };
+        assert!(
+            pinned.is_saturated(),
+            "a pinned counter is no longer proportional to execution"
+        );
+        // The floor is still a floor, and it is named.
+        let sparse = BranchCounts {
+            taken: BRANCH_BIAS_MIN_SAMPLES - 1,
+            not_taken: 0,
+        };
+        assert!(!sparse.is_usually_taken());
+    }
+
+    // -----------------------------------------------------------------------
+    // Receiver summary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_receivers_of_an_empty_profile_is_no_evidence() {
+        let summary = summarize_receivers(&ReceiverCounts::default());
+        assert_eq!(summary.observations, 0);
+        assert_eq!(summary.types, 0);
+        assert!(summary.top.is_none());
+        assert!(summary.second.is_none());
+        assert!(!summary.top_holds_at_least_pct(1));
+        assert!(summary.is_exact());
+
+        // A site with no receiver at all reports absence, not a zeroed profile.
+        let p = MethodProfile::default();
+        assert!(p.receiver_summary(7).is_none());
+    }
+
+    #[test]
+    fn summarize_receivers_ranks_top_two_deterministically() {
+        let mut counts = ReceiverCounts::default();
+        counts.insert(9, 350);
+        counts.insert(7, 600);
+        counts.insert(3, 50);
+        let summary = summarize_receivers(&counts);
+        assert_eq!(summary.observations, 1000);
+        assert_eq!(summary.types, 3);
+        assert_eq!(summary.top, Some((7, 600)));
+        assert_eq!(summary.second, Some((9, 350)));
+        assert!(summary.top_holds_at_least_pct(60));
+        assert!(!summary.top_holds_at_least_pct(61));
+
+        // Ties on count fall to the lower class id, in both slots, every time.
+        let mut tied = ReceiverCounts::default();
+        tied.insert(31, 480);
+        tied.insert(4, 480);
+        tied.insert(12, 40);
+        for _ in 0..32 {
+            let summary = summarize_receivers(&tied);
+            assert_eq!(summary.top, Some((4, 480)));
+            assert_eq!(summary.second, Some((31, 480)));
+        }
+    }
+
+    /// The type count is exact: the live store has no `TypeProfileWidth` cap,
+    /// so a one-type reading is one type and not an overflowed table. This is
+    /// the property `pgo::ReceiverTypeProfile` (cap 8) does *not* have, and the
+    /// reason the two must not be treated as interchangeable evidence.
+    #[test]
+    fn live_receiver_profile_records_every_type_it_sees() {
+        let mut p = MethodProfile::default();
+        for class_id in 0..64u32 {
+            p.record_receiver(5, class_id);
+        }
+        let summary = p.receiver_summary(5).expect("site recorded");
+        assert_eq!(summary.types, 64, "no type is dropped on overflow");
+        assert_eq!(summary.observations, 64);
+        assert!(summary.is_exact());
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency contract
+    // -----------------------------------------------------------------------
+
+    /// The consistency claim in the module docs, asserted:
+    ///
+    /// * no lost updates — every recorded observation survives, because the
+    ///   per-method `Mutex` serialises the read-modify-write that an atomic
+    ///   counter would not have made safe (these are hash-map entries);
+    /// * every snapshot is an image of a real instant — counts never move
+    ///   backwards between two reads, and a summary's total always equals the
+    ///   sum of its own parts, so a compiler never plans against a half-applied
+    ///   increment.
+    ///
+    /// No timing assumption: the polling loop is allowed to observe nothing at
+    /// all (its assertions hold vacuously from zero), so the test cannot flake
+    /// on a slow or fast machine.
+    #[test]
+    fn concurrent_receiver_recording_is_lossless_and_monotone() {
+        with_profiling_enabled(|| {
+            const THREADS: usize = 4;
+            const PER_THREAD: u32 = 2_000;
+            const PC: usize = 88;
+
+            let store = Arc::new(ProfileStore::new());
+            let key = make_key(4242);
+            let mut handles = Vec::new();
+            for t in 0..THREADS {
+                let store = Arc::clone(&store);
+                let key = key.clone();
+                handles.push(std::thread::spawn(move || {
+                    let class_id = (t as u32 % 2) + 1;
+                    for _ in 0..PER_THREAD {
+                        store.record_receiver(&key, PC, class_id);
+                    }
+                }));
+            }
+
+            let mut prev = (0u32, 0u32);
+            for _ in 0..256 {
+                let Some(p) = store.get_profile(&key) else {
+                    continue;
+                };
+                let Some(counts) = p.receivers.get(&PC) else {
+                    continue;
+                };
+                let a = counts.get(&1).copied().unwrap_or(0);
+                let b = counts.get(&2).copied().unwrap_or(0);
+                assert!(
+                    a >= prev.0 && b >= prev.1,
+                    "a snapshot moved backwards: {prev:?} -> {:?}",
+                    (a, b)
+                );
+                let summary = summarize_receivers(counts);
+                assert_eq!(
+                    summary.observations,
+                    a + b,
+                    "snapshot total disagrees with its own parts"
+                );
+                prev = (a, b);
+            }
+
+            for h in handles {
+                h.join().expect("recorder thread should not panic");
+            }
+
+            let p = store.get_profile(&key).expect("profile recorded");
+            let counts = &p.receivers[&PC];
+            let per_class = PER_THREAD * (THREADS as u32 / 2);
+            assert_eq!(counts[&1], per_class, "lost update on class 1");
+            assert_eq!(counts[&2], per_class, "lost update on class 2");
+            let summary = summarize_receivers(counts);
+            assert_eq!(summary.observations, PER_THREAD * THREADS as u32);
+            assert_eq!(summary.types, 2);
+            assert!(summary.is_exact());
         });
     }
 }

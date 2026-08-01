@@ -160,10 +160,22 @@ non-compacting** sweep (`compiled-frame-oop-not-published`,
 `unregistered-jit-frame-on-stack`, `missing-exact-rbp`,
 `active-safepoint-map-incomplete`) — the already-OPEN moving-young coverage gap,
 here showing up as a correctness failure rather than only a throughput tax.
-Filed as
-[`HIB-GCOVERHEAD-HALFFULL.1`](../../../known-issues/hibernate/gc-overhead-limit-spurious-oom-at-half-full-heap-20260731.md),
-cross-referenced to
+Filed as `HIB-GCOVERHEAD-HALFFULL.1`, cross-referenced to
 [`moving-young-inert-under-jit-throughput-tax-20260730.md`](../../../known-issues/hibernate/moving-young-inert-under-jit-throughput-tax-20260730.md).
+
+> **CORRECTION, 2026-07-31 (same day).** The clause above — "the already-OPEN
+> moving-young coverage gap, here showing up as a correctness failure" — is
+> **wrong**, and `HIB-GCOVERHEAD-HALFFULL.1` is now
+> [FIXED](gc-overhead-limit-spurious-oom-at-half-full-heap-20260731-FIXED.md).
+> The OOM was not downstream of the coverage gap. It was an independent
+> regression: the non-moving sweep's selective promotion — the young
+> generation's only young→old drain under a live JIT frame — was gated on the
+> coverage flag, whose meaning had changed underneath it, so young could never
+> drain at all. Running the non-moving sweep is a throughput tax; running it
+> *with its drain disabled* is what killed the process. With the drain restored
+> the class runs to completion (`ok=121 failed=0`) with **zero** forced GCs.
+> The moving-young gap remains open and remains a throughput tax — it is why the
+> class still takes 105 min against HotSpot's 120 s.
 
 ## Where that leaves the class
 

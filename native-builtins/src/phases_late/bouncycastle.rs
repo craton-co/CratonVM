@@ -6991,9 +6991,35 @@ pub(crate) fn bc_salsa20_process_bytes(
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
-    let rounds = match ctx.get_field_by_name(this, "rounds") {
-        Value::Int(v) => v,
-        _ => 20,
+    // SECURITY — do NOT restore the `_ => 20` default here.
+    //
+    // `rounds` is the only thing that makes the ChaCha/Salsa permutation a
+    // permutation: `chacha_core(0, ..)` / `salsa_core(0, ..)` is the identity,
+    // so the "keystream" is the engine state and the key is recoverable
+    // straight out of the ciphertext (see `check_rounds` in
+    // `native-builtins-crypto/src/bc_chacha.rs`, which names this call site as
+    // one of the two arms that validate nothing).
+    //
+    // The previous read was `match ctx.get_field_by_name(this, "rounds") {
+    // Value::Int(v) => v, _ => 20 }`. That looks like it defaults to 20, but it
+    // does not: `get_field_by_name` is not descriptor-aware, so an unwritten
+    // slot answers `Value::Int(0)` — which the FIRST arm accepts. The `_ => 20`
+    // fallback only ever fires when the field does not resolve at all. So the
+    // dangerous input (0) took the "valid value" path and the safe default was
+    // unreachable for it. `int_field_strict` reads by resolved index instead
+    // (descriptor-decoded) and returns `None` for an absent field, and we
+    // refuse outright rather than guess: a round count we cannot read is not a
+    // round count we may substitute.
+    let rounds = match crate::field_read::int_field_strict(ctx, this, "rounds") {
+        Some(v) if v > 0 && v % 2 == 0 => v,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Salsa20Engine.processBytes: refusing to generate a keystream with an \
+                          unreadable or illegal round count"
+                    .into(),
+            }
+            .into())
+        }
     };
     let engine_state_arr = match ctx.get_field_by_name(this, "engineState") {
         Value::Object(Some(o)) => o,
@@ -10377,9 +10403,22 @@ pub(crate) fn bc_pkcs12_read_state(
     bc_pkcs12_require_sha1(ctx, this)?;
     let password = bc_pkcs12_generator_bytes(ctx, this, "password");
     let salt = bc_pkcs12_generator_bytes(ctx, this, "salt");
-    let iteration_count = match ctx.get_field_by_name(this, "iterationCount") {
-        Value::Int(v) => v,
-        _ => 0,
+    // SECURITY — the sibling `bc_pkcs5s2_read_state` below already refuses a
+    // non-positive iteration count; this one accepted it. That mattered because
+    // `get_field_by_name` is not descriptor-aware and cannot distinguish "the
+    // generator was never `init`-ed" from "iterationCount is genuinely 0": an
+    // unwritten slot answers `Value::Int(0)`, which the first arm ACCEPTED, so
+    // the `_ => 0` fallback was not even the path that produced the zero. A
+    // PKCS#12 KDF run with zero iterations degenerates the derived key. Read by
+    // resolved index and refuse. See `docs/known-issues/by-name-field-reads.md`.
+    let iteration_count = match crate::field_read::int_field_strict(ctx, this, "iterationCount") {
+        Some(v) if v > 0 => v,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "iteration count must be at least 1.".into(),
+            }
+            .into())
+        }
     };
     Ok((password, salt, iteration_count))
 }

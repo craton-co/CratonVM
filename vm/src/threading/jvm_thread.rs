@@ -550,6 +550,36 @@ pub struct JvmThread {
     /// so a single `stop()` call delivers exactly once.
     pub pending_async_exception: Option<ObjectRef>,
 
+    /// The JIT's out-of-band **pending Java exception**, awaiting the
+    /// interpreter's post-JIT drain.
+    ///
+    /// A compiled method cannot return a throwable through the JIT ABI, so
+    /// every helper that raises one (`jit_alloc_oom`, the class-init guards,
+    /// `handle_jit_dispatch_error`, `jit_throw_exception`, the stack-overflow
+    /// guards, …) stashes it here and returns the `i64::MIN` deopt sentinel;
+    /// `take_all_jit_signals` / `take_jit_pending_exception` drain it and route
+    /// it through the method's exception table. The *non-reference* siblings of
+    /// this signal (`athrow_bci`, `aioobe`, `arithmetic`, `npe`, `npe_action`,
+    /// `deopt`) stay in the `JIT_SIGNALS` thread-local; only this one is a heap
+    /// reference, and that is why it lives here instead.
+    ///
+    /// **It is a `JvmThread` field for exactly one reason: GC reachability.**
+    /// It used to be `JitSignals::exception`, a `Cell<Option<ObjectRef>>`
+    /// inside a `thread_local!`. A collecting thread cannot reach another
+    /// thread's TLS, and the `VM_ROOT_SOURCES` callbacks all run on the
+    /// collector, so the stashed throwable was neither scanned nor remapped —
+    /// an unrooted live reference across a window that includes a *guaranteed*
+    /// collection in the `OutOfMemoryError` case (`jit_alloc_oom` stashes the
+    /// OOME precisely because the heap is exhausted). As a `JvmThread` field it
+    /// sits next to `pending_async_exception` in both halves of the root
+    /// machinery: `memory/roots.rs` §10 pushes it, `memory/gc.rs` §10 rewrites
+    /// it.
+    ///
+    /// A collection between the stash and the drain therefore keeps the
+    /// throwable alive and hands the drain its post-move address.
+    /// See `docs/known-issues/jit-signals-root-gap.md`.
+    pub jit_pending_exception: Option<ObjectRef>,
+
     /// T17.Δ.3 — JVMTI single-step enable for this thread.
     ///
     /// When set, the interpreter's per-instruction dispatch fires
@@ -676,6 +706,7 @@ impl JvmThread {
             tlab: cratonvm_gc::Tlab::empty(),
             shadow_stack: cratonvm_gc::shadow_stack::ShadowStack::empty(),
             pending_async_exception: None,
+            jit_pending_exception: None,
             single_step_enabled: AtomicBool::new(false),
             frame_pop_requests: Vec::new(),
         }

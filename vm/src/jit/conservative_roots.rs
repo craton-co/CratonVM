@@ -639,14 +639,14 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         n
     });
     GLOBAL_JIT_DEPTH.inc();
-    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
-    // this is the ONLY point at which a thread becomes
-    // `CompiledUninterruptible`. A nested entry re-records the same state,
-    // which the recorder treats as the counting event it is (self-edges are
-    // legal) rather than a transition.
-    thread_state::record_transition(
-        ThreadExecState::CompiledUninterruptible,
-        "jit::conservative_roots::push_entry_full",
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // this is the ONLY point at which a thread becomes
+    // `CompiledUninterruptible`. A nested entry re-records the same state,
+    // which the recorder treats as the counting event it is (self-edges are
+    // legal) rather than a transition.
+    thread_state::record_transition(
+        ThreadExecState::CompiledUninterruptible,
+        "jit::conservative_roots::push_entry_full",
     );
     cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
@@ -716,12 +716,22 @@ pub fn pop_jit_entry() -> Option<usize> {
     });
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.dec();
-        thread_state::record_transition(
-            leaving_compiled_state(remaining),
-            "jit::conservative_roots::pop_jit_entry",
+        thread_state::record_transition(
+            leaving_compiled_state(remaining),
+            "jit::conservative_roots::pop_jit_entry",
         );
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
+        // P1 code-cache retirement: leaving a compiled frame is one of the two
+        // moments `GLOBAL_JIT_DEPTH` can reach zero, and therefore one of the
+        // two moments an unpublished body can become reclaimable. The sweep
+        // asks the quiescence question itself (with the retirement queue lock
+        // held — see `code_cache_lifecycle`'s §1.2); all this site owes it is
+        // the wake-up. The gate is one relaxed load, and with nothing queued —
+        // the overwhelmingly common case — that is the whole cost.
+        if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
+            crate::jit::code_cache_lifecycle::sweep_if_quiescent();
+        }
         Some(entry.entry_sp)
     } else {
         None
@@ -812,6 +822,15 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
             pruned,
             scanner_sp,
         );
+        // P1 code-cache retirement: the self-heal is the OTHER way
+        // `GLOBAL_JIT_DEPTH` reaches zero. Without this wake-up a leaked
+        // `JitEntryGuard` would wedge the retirement queue exactly as it used
+        // to wedge the moving collector — and because retention is the
+        // fail-safe, that would show up as unbounded code-cache growth rather
+        // than as a crash. See `code_cache_lifecycle`'s §1.3.
+        if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
+            crate::jit::code_cache_lifecycle::sweep_if_quiescent();
+        }
     }
     pruned
 }
@@ -992,6 +1011,26 @@ struct JitScanCache {
     /// Generation the cached roots were scanned at (`u64::MAX` = never).
     filled_gen: u64,
     chain_len: usize,
+    /// Identity of the heap the cached `roots` were filtered against —
+    /// `heap as *const VmHeap as usize`, the same key
+    /// `memory/smuggled_longs.rs` uses and for the same reason (a raw heap
+    /// address is only meaningful against the heap that produced it, and this
+    /// scan path has a `&VmHeap` and nothing else in scope).
+    ///
+    /// Without it this thread-local was the one cache in `vm/src/jit/` that
+    /// holds raw heap addresses with no VM key at all. A thread that reaches
+    /// two VMs (JNI `AttachCurrentThread`, or a test thread reused across
+    /// `SharedVm`s) fills the cache from `heap_a.is_object_address` and, if
+    /// `(filled_gen, chain_len, collection_count)` happen to match on the
+    /// other side, hands VM A's object addresses to VM B's collector as
+    /// roots — the `oscache` failure mode from
+    /// `docs/known-issues/vm-process-global-state.md`, but pointed at the mark
+    /// phase. `collection_count` cannot stand in for this: it is
+    /// `heap.collection_count()`, a *different* counter per heap, so two young
+    /// heaps trivially agree on it.
+    ///
+    /// `usize::MAX` = never filled.
+    heap_id: usize,
     /// Heap collection count the roots were scanned at. The boundary
     /// generation tracks JIT *spill* mutation, but the cached `roots` are raw
     /// object ADDRESSES — a garbage collection (which does NOT bump the
@@ -1011,10 +1050,41 @@ impl JitScanCache {
         Self {
             filled_gen: u64::MAX,
             chain_len: usize::MAX,
+            heap_id: usize::MAX,
             collection_count: u64::MAX,
             roots: Vec::new(),
         }
     }
+
+    /// The complete cache-hit predicate. Every component must match; in
+    /// particular `heap_id`, without which this thread-local republishes one
+    /// heap's addresses into another heap's root set. Factored out of
+    /// `scan_active_jit_frames` so the keying is unit-testable without a live
+    /// VM, heap or JIT frame.
+    #[inline]
+    fn matches(&self, gen: u64, chain_len: usize, heap_id: usize, collection_count: u64) -> bool {
+        self.filled_gen == gen
+            && self.chain_len == chain_len
+            && self.heap_id == heap_id
+            && self.collection_count == collection_count
+    }
+}
+
+/// Identity of the heap a [`JitScanCache`] fill was filtered against.
+///
+/// `heap as *const VmHeap as usize` — the `heap_id` convention introduced by
+/// `memory/smuggled_longs.rs` in the round-1 process-global sweep. `VmHeap` is
+/// a by-value field of `HeapRealm` inside `Arc<SharedVm>`, so its address is
+/// stable for the VM's life and distinct from every other *live* heap's. The
+/// documented residual is the same one: an allocator that reuses a dropped
+/// `VmHeap`'s address for a new one. That is harmless here in a way it is not
+/// there — the recycled address can only produce a hit if `filled_gen`,
+/// `chain_len` AND `collection_count` also match, and a fresh heap's
+/// `collection_count` starts at 0 while the cache is only ever filled from a
+/// thread with a non-empty JIT chain.
+#[inline]
+fn jit_scan_cache_heap_id(heap: &VmHeap) -> usize {
+    heap as *const VmHeap as usize
 }
 
 /// Record a Rust↔JIT boundary crossing: called at every JIT runtime-helper
@@ -2527,13 +2597,12 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // full stats snapshot, and `scan_active_jit_frames` is a per-native-call hot
     // path, so we must not pay for it on the default cache-off path.
     let collection_count = if cache_on { heap.collection_count() } else { 0 };
+    // The cached roots are raw addresses in ONE heap. See `JitScanCache::heap_id`.
+    let heap_id = jit_scan_cache_heap_id(heap);
     if cache_on {
         let hit = JIT_SCAN_CACHE.with(|c| {
             let c = c.borrow();
-            if c.filled_gen == gen
-                && c.chain_len == chain_len
-                && c.collection_count == collection_count
-            {
+            if c.matches(gen, chain_len, heap_id, collection_count) {
                 out.extend_from_slice(&c.roots);
                 true
             } else {
@@ -2551,6 +2620,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
             let mut c = c.borrow_mut();
             c.filled_gen = gen;
             c.chain_len = chain_len;
+            c.heap_id = heap_id;
             c.collection_count = collection_count;
             c.roots.clear();
             c.roots.extend_from_slice(&out[scan_start..]);
@@ -3310,6 +3380,57 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // JIT-scan cache keying (docs/known-issues/vm-jit-cache-keying.md)
+    // -----------------------------------------------------------------------
+
+    fn filled_scan_cache(heap_id: usize) -> JitScanCache {
+        JitScanCache {
+            filled_gen: 7,
+            chain_len: 3,
+            heap_id,
+            collection_count: 0,
+            roots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scan_cache_hits_for_the_heap_it_was_filled_from() {
+        let c = filled_scan_cache(0x1000);
+        assert!(c.matches(7, 3, 0x1000, 0));
+    }
+
+    #[test]
+    fn scan_cache_does_not_hit_for_another_heap() {
+        // Everything else identical — same boundary generation, same chain
+        // depth, same collection count. Two young heaps trivially agree on
+        // `collection_count` because it is a per-heap counter, so before
+        // `heap_id` existed this WAS a hit, and VM A's raw object addresses
+        // were extended into VM B's root vector.
+        let c = filled_scan_cache(0x1000);
+        assert!(
+            !c.matches(7, 3, 0x2000, 0),
+            "a scan filtered through one heap must never be replayed for another"
+        );
+    }
+
+    #[test]
+    fn scan_cache_still_rejects_a_stale_generation_or_collection() {
+        let c = filled_scan_cache(0x1000);
+        assert!(!c.matches(8, 3, 0x1000, 0), "boundary crossing invalidates");
+        assert!(!c.matches(7, 4, 0x1000, 0), "chain depth change invalidates");
+        assert!(!c.matches(7, 3, 0x1000, 1), "a collection invalidates");
+    }
+
+    #[test]
+    fn empty_scan_cache_matches_nothing_plausible() {
+        let c = JitScanCache::empty();
+        assert!(!c.matches(0, 0, 0, 0));
+        // The sentinel row is only "equal" to itself, which no real call can
+        // produce: `heap_id` is a live `&VmHeap` address, never `usize::MAX`.
+        assert!(c.matches(u64::MAX, usize::MAX, usize::MAX, u64::MAX));
+    }
 
     #[test]
     fn empty_chain_is_quiescent() {

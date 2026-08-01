@@ -12,7 +12,7 @@
 //!
 //! Surface under test:
 //!   * `cratonvm_reader::read_class` → the private `read_constant_pool`
-//!     walker (`reader/src/class_reader.rs:251`), which is what decides
+//!     walker (`reader/src/class_reader.rs:300`), which is what decides
 //!     `constant_pool_count`, per-tag entry widths, the modified-UTF8
 //!     (CESU-8) decode plus its lone-surrogate `wide_utf8` recovery, and
 //!     the category-2 (`Long`/`Double`) two-slot rule.
