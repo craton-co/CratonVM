@@ -78,6 +78,19 @@
 //!  * `RecordingSettings::max_age` / `max_size` are **not enforced anywhere**;
 //!    see their declarations in [`recording`].
 //!
+//! ## Phase accounting
+//!
+//! [`phase`] partitions each thread's wall clock into named categories plus an
+//! explicit unattributed remainder, and is the answer to the C2 review's
+//! "separate startup, compilation, execution, and GC time" lane. Like
+//! [`jdk_only`] it shares none of the machinery above: it takes no event ring,
+//! registers no built-in event type, has its own flag, and does not consult
+//! [`is_enabled`] — a flight recording and a wall-clock partition are
+//! different questions. Its JFR sink is standalone (it builds its own registry
+//! and calls [`dump_to_file`] directly), so a phase report can be produced by
+//! a run that never started a recording — which, per the LIVENESS block above,
+//! is every run today.
+//!
 //! ## JDK-only mode telemetry
 //!
 //! [`jdk_only`] holds the aggregate counter set of
@@ -95,6 +108,7 @@ pub mod builtin;
 pub mod dump;
 pub mod event;
 pub mod jdk_only;
+pub mod phase;
 pub mod recording;
 pub mod repository;
 pub mod stream;
@@ -109,6 +123,16 @@ pub use event::*;
 pub use jdk_only::{
     ContractCounts, JdkOnlyCounters, JdkOnlyTelemetry, NativeCensusSample,
     JDK_ONLY_TELEMETRY_SCHEMA_VERSION,
+};
+// Phase accounting. Named re-exports for the same reason as `jdk_only`'s: the
+// module's own vocabulary (`enabled`, `level`, `report`, `enter`) is generic
+// enough to collide with the JFR recording surface above, and a caller should
+// reach those through `phase::` so it is obvious which subsystem is being
+// asked. The types are re-exported because a consumer that stores a
+// `PhaseReport` should not have to name the module to spell its own field.
+pub use phase::{
+    Anomalies, Category, Level, PhaseReport, PhaseSpan, ThreadPhases,
+    PHASE_ACCOUNTING_SCHEMA_VERSION,
 };
 pub use recording::*;
 pub use repository::*;

@@ -4079,6 +4079,12 @@ fn native_wildfly_security_manager_get_property_privileged(
     }
 }
 
+/// Per-call-site capability gates for this crate's native surface.
+///
+/// `grep capability_gate:: native-builtins/src` is the complete list of gated
+/// sites here; `docs/security/capability-wiring.md` records which of the audit
+/// rows in `docs/security/native-capabilities.md` they close.
+pub mod capability_gate;
 pub mod case_map;
 pub mod lang_class;
 pub mod lang_string;
@@ -4121,6 +4127,11 @@ pub mod t27_tls;
 pub mod t27_tls_cbc;
 pub mod t3_impl;
 pub mod tls;
+// Deny-by-default guard for the JSSE socket-factory surface: an
+// `SSLSocketFactory`/`SSLServerSocketFactory` overload with no TLS bridge must
+// raise rather than inherit `javax.net.{Socket,ServerSocket}Factory`'s
+// plaintext implementation. See `docs/security/tls-and-jca-failure-audit.md`.
+pub mod tls_deny;
 // Step 1 of the limb-based BigInteger rewrite (docs/biginteger-limb-rewrite-scope.md).
 // Additive only — nothing routes through it yet; later steps migrate the
 // BigInteger natives off the O(digits^2) decimal-string primitives onto this.
@@ -36355,6 +36366,15 @@ fn native_exception_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // this, a no-arg `new IllegalStateException()` thrown from bytecode had an
     // empty getStackTrace(). Same root cause as native_exception_init_msg.
     if let Some(Value::Object(Some(this))) = args.first() {
+        // Mirror the JDK field initializer `private Throwable cause = this;`,
+        // exactly as `lang_misc::native_exc_init_noargs` does. This native is
+        // registered LATER (see `register_exception_extras_natives`) and wins
+        // the registry slot for ~56 subclasses, so without the mirror those
+        // classes were the only ones whose `cause` slot stayed unwritten:
+        // real-JDK `initCause()` bytecode reads `cause != this` and refuses
+        // with "Can't overwrite cause", and serializing such a throwable emits
+        // a null `cause` where HotSpot emits the self back-reference.
+        crate::lang_misc::write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
         crate::lang_misc::capture_throwable_trace(ctx, *this);
     }
     Ok(None)
@@ -36391,6 +36411,14 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // `lang_misc::register_throwable_subclass_natives` and win the slot for
     // ~50 subclasses, so this path is the live one.
     crate::lang_misc::write_throwable_detail_message(ctx, this, msg);
+    // Mirror the JDK field initializer `private Throwable cause = this;`, as
+    // `lang_misc::native_exc_init_message` already does. Same omission story as
+    // `native_exception_init_empty` above: this native shadows `Throwable
+    // .<init>` for ~56 subclasses, so `new UnsupportedOperationException("x")`
+    // left `cause` unwritten while `new RuntimeException()` (not in that list)
+    // got the sentinel — a divergence visible through reflection, through
+    // real-JDK `initCause()` bytecode, and in the serialized form.
+    crate::lang_misc::write_throwable_cause(ctx, this, Value::Object(Some(this)));
     // Surefire bootstrap forensics: capture exact Java callsite for the
     // recurring `NullPointerException("Name is null")` blocker so we can
     // patch the true producer instead of masking symptoms.

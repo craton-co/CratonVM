@@ -101,7 +101,7 @@ pub fn ir_branchy_enabled() -> bool {
 // ── Affine strength reduction (reassociation) ────────────────────────
 //
 // An integer value is "affine in `root`" when it equals `k*root + c` for
-// compile-time constants `k`, `c` (with `root == NO_NODE` meaning a pure
+// compile-time constants `k`, `c` (with `root == None` meaning a pure
 // constant `c`). The pass computes this form for every integer Add/Sub/Mul/Neg
 // node in one forward pass (SSA data inputs precede their users in id order;
 // loop-carried φ back-edges read as opaque, which is conservative), then
@@ -113,10 +113,19 @@ pub fn ir_branchy_enabled() -> bool {
 // 2^n, where +, -, * are associative, commutative, and distributive, so the
 // reassociation is exact. Floating point (non-associative) is never touched.
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Affine {
-    /// Root value this expression is affine in; `NO_NODE` => pure constant.
-    root: NodeId,
+    /// Root value this expression is affine in; `None` => pure constant.
+    ///
+    /// Deliberately an `Option<NodeId>` and *not* the [`NO_NODE`] sentinel.
+    /// `NO_NODE` already carries one meaning — "this graph edge is absent" —
+    /// and reusing the same bit pattern here for a second, value-domain
+    /// meaning ("this expression has no root; it is a pure constant") made one
+    /// `u32::MAX` stand for two incompatible things. A missed test then does
+    /// not read as "absent", it reads as node `u32::MAX`, which is exactly the
+    /// `nodes[u32::MAX]` panic `ir.rs`'s `NO_NODE` deprecation note describes.
+    /// With an `Option` the compiler forces the case split at every read.
+    root: Option<NodeId>,
     k: i64,
     c: i64,
 }
@@ -171,13 +180,13 @@ fn is_int_arith(op: &Op) -> bool {
 fn combine_affine(op: &Op, is_int: bool, a: Affine, b: Affine, opaque: Affine) -> Affine {
     match op {
         Op::Add => {
-            if a.root == NO_NODE {
+            if a.root.is_none() {
                 Affine {
                     root: b.root,
                     k: b.k,
                     c: w_add(is_int, b.c, a.c),
                 }
-            } else if b.root == NO_NODE {
+            } else if b.root.is_none() {
                 Affine {
                     root: a.root,
                     k: a.k,
@@ -194,13 +203,13 @@ fn combine_affine(op: &Op, is_int: bool, a: Affine, b: Affine, opaque: Affine) -
             }
         }
         Op::Sub => {
-            if b.root == NO_NODE {
+            if b.root.is_none() {
                 Affine {
                     root: a.root,
                     k: a.k,
                     c: w_sub(is_int, a.c, b.c),
                 }
-            } else if a.root == NO_NODE {
+            } else if a.root.is_none() {
                 Affine {
                     root: b.root,
                     k: w_neg(is_int, b.k),
@@ -217,10 +226,10 @@ fn combine_affine(op: &Op, is_int: bool, a: Affine, b: Affine, opaque: Affine) -
             }
         }
         Op::Mul => {
-            if a.root == NO_NODE {
-                if b.root == NO_NODE {
+            if a.root.is_none() {
+                if b.root.is_none() {
                     Affine {
-                        root: NO_NODE,
+                        root: None,
                         k: 0,
                         c: w_mul(is_int, a.c, b.c),
                     }
@@ -231,7 +240,7 @@ fn combine_affine(op: &Op, is_int: bool, a: Affine, b: Affine, opaque: Affine) -
                         c: w_mul(is_int, b.c, a.c),
                     }
                 }
-            } else if b.root == NO_NODE {
+            } else if b.root.is_none() {
                 Affine {
                     root: a.root,
                     k: w_mul(is_int, a.k, b.c),
@@ -258,22 +267,35 @@ fn get_or_add_const(graph: &mut Graph, val: i64, ty: IrType) -> NodeId {
 }
 
 /// Materialize `k*root + c` as IR nodes, reusing `root` directly when possible.
-fn build_affine(graph: &mut Graph, root: NodeId, k: i64, c: i64, ty: IrType) -> NodeId {
+///
+/// `root` is `None` for a pure constant (`k == 0`, value `c`). A non-zero `k`
+/// with no root is not a representable value, so that combination yields
+/// `None` and the caller leaves the node alone — rather than fabricating an
+/// edge out of a sentinel, which is how a `Mul` with a `u32::MAX` input used to
+/// become reachable.
+fn build_affine(
+    graph: &mut Graph,
+    root: Option<NodeId>,
+    k: i64,
+    c: i64,
+    ty: IrType,
+) -> Option<NodeId> {
     if k == 0 {
-        return get_or_add_const(graph, c, ty);
+        return Some(get_or_add_const(graph, c, ty));
     }
+    let root = root?;
     let base = if k == 1 {
         root
     } else {
         let kc = get_or_add_const(graph, k, ty);
         graph.add(Op::Mul, ty, vec![root, kc], None)
     };
-    if c == 0 {
+    Some(if c == 0 {
         base
     } else {
         let cc = get_or_add_const(graph, c, ty);
         graph.add(Op::Add, ty, vec![base, cc], None)
-    }
+    })
 }
 
 fn reassociate_affine(graph: &mut Graph) {
@@ -292,7 +314,7 @@ fn reassociate_affine(graph: &mut Graph) {
             continue;
         }
         let opaque = Affine {
-            root: id as NodeId,
+            root: Some(id as NodeId),
             k: 1,
             c: 0,
         };
@@ -316,7 +338,7 @@ fn reassociate_affine(graph: &mut Graph) {
         };
         let res = match &node.op {
             Op::Const(v) => Affine {
-                root: NO_NODE,
+                root: None,
                 k: 0,
                 c: if is_int { (*v as i32) as i64 } else { *v },
             },
@@ -334,14 +356,20 @@ fn reassociate_affine(graph: &mut Graph) {
             },
             _ => opaque,
         };
-        // Decide materialization while original inputs are intact.
-        if is_int_arith(&node.op) && res.root != NO_NODE && res.root != id as NodeId {
-            let has_arith_operand = node.inputs.iter().any(|&j| {
-                (j as usize) < id
-                    && aff[j as usize].is_some_and(|fj| fj.root == res.root && fj.root != NO_NODE)
-                    && is_int_arith(&graph.nodes[j as usize].op)
-            });
-            materialize[id] = has_arith_operand;
+        // Decide materialization while original inputs are intact. A form with
+        // no root (`None` — a pure constant) has nothing to strength-reduce,
+        // and a form rooted at the node itself (`Some(id)` — opaque) has
+        // nothing to collapse; `filter` removes both without either case
+        // hiding behind a sentinel comparison.
+        if let Some(root) = res.root.filter(|&r| r != id as NodeId) {
+            if is_int_arith(&node.op) {
+                let has_arith_operand = node.inputs.iter().any(|&j| {
+                    (j as usize) < id
+                        && aff[j as usize].is_some_and(|fj| fj.root == Some(root))
+                        && is_int_arith(&graph.nodes[j as usize].op)
+                });
+                materialize[id] = has_arith_operand;
+            }
         }
         aff[id] = Some(res);
     }
@@ -355,7 +383,14 @@ fn reassociate_affine(graph: &mut Graph) {
             Some(a) => a,
             None => continue,
         };
-        let mat = build_affine(graph, a.root, a.k, a.c, ty);
+        // `None` here means the form was not materializable (a non-zero `k`
+        // with no root). `materialize[id]` is only set for a form with a real
+        // root, so this is unreachable today; leaving the node untouched is
+        // the safe answer if that ever stops holding.
+        let mat = match build_affine(graph, a.root, a.k, a.c, ty) {
+            Some(m) => m,
+            None => continue,
+        };
         if mat != id as NodeId {
             graph.replace_all_uses(id as NodeId, mat);
             graph.kill(id as NodeId);
@@ -1033,7 +1068,7 @@ fn is_loop_invariant_d(
     body: &FxHashSet<NodeId>,
     depth: u32,
 ) -> bool {
-    if id == NO_NODE || (id as usize) >= graph.nodes.len() {
+    if !graph.is_valid_id(id) {
         return false;
     }
     if depth > 64 {
@@ -1055,8 +1090,14 @@ fn is_loop_invariant_d(
         // *load* side: a base like `cond ? A : B` decided before the loop is a
         // hoistable invariant.
         Op::Phi => {
-            let anchor = node.inputs.first().copied().unwrap_or(NO_NODE);
-            if anchor == NO_NODE || body.contains(&anchor) {
+            // `input_opt` reads the control anchor as `None` when the slot is
+            // missing *or* holds the placeholder — the two cases this arm
+            // treats identically ("no anchor we can prove is outside").
+            let anchor = match node.input_opt(0) {
+                Some(a) => a,
+                None => return false,
+            };
+            if body.contains(&anchor) {
                 return false;
             }
             // Skip the control anchor (slot 0); every value input must be
@@ -1127,7 +1168,7 @@ fn resolve_ref_points_to(graph: &Graph, id: NodeId, depth: u32) -> RefPointsTo {
         allocs: None,
         has_pre: false,
     };
-    if id == NO_NODE || (id as usize) >= graph.nodes.len() || depth > 32 {
+    if !graph.is_valid_id(id) || depth > 32 {
         return unknown;
     }
     match &graph.nodes[id as usize].op {
@@ -1149,7 +1190,7 @@ fn resolve_ref_points_to(graph: &Graph, id: NodeId, depth: u32) -> RefPointsTo {
             let mut saw_value = false;
             // inputs are [control_anchor, value0, value1, …]; skip control.
             for &inp in &graph.nodes[id as usize].inputs {
-                if inp == NO_NODE || (inp as usize) >= graph.nodes.len() {
+                if !graph.is_valid_id(inp) {
                     continue;
                 }
                 if graph.nodes[inp as usize].op.is_control() {
@@ -1577,12 +1618,9 @@ fn load_base(graph: &Graph, load_id: NodeId) -> Option<NodeId> {
 /// True if `id` is a fresh allocation node in this method (provably local
 /// provenance — the only base we are willing to delete a store to).
 fn is_local_alloc(graph: &Graph, id: NodeId) -> bool {
-    if id == NO_NODE || (id as usize) >= graph.nodes.len() {
-        return false;
-    }
     matches!(
-        graph.nodes[id as usize].op,
-        Op::New { .. } | Op::NewArray { .. }
+        graph.node_opt(id),
+        Some(n) if matches!(n.op, Op::New { .. } | Op::NewArray { .. })
     )
 }
 
@@ -1605,6 +1643,157 @@ fn is_memory_barrier(op: &Op) -> bool {
         return false;
     }
     !matches!(op, Op::Store(_))
+}
+
+// ── Memory-token chain surgery ───────────────────────────────────────
+//
+// Every memory-effecting node carries an incoming *memory token* naming the
+// previous writer, and produces itself as the token for the next one. That
+// chain is the only ordering relation the IR has between two writes: the
+// scheduler is otherwise free to place them in either order.
+//
+// `Graph::kill` alone therefore cannot remove a node that sits in the chain.
+// It clears the killed node's own inputs but leaves every *consumer's* token
+// slot naming it, so the next memory operation's token points at an `Op::Dead`
+// node and has lost the transitive dependency on everything that wrote before
+// the deleted store. That is the defect `ir_verify`'s ordering lane reports as
+// "takes its memory token from removed node nN"; it is a wrong-code risk (a
+// hoisted store), not a tidiness complaint. The fix is to *splice*: rewire the
+// consumers to the killed node's own incoming token first, then kill.
+
+/// The input slot carrying `node`'s incoming memory token, or `None` when this
+/// op does not consume one.
+///
+/// This must agree with `ir_verify::is_memory_token_input`, which is the
+/// predicate the verifier's ordering lane uses to decide whether a slot
+/// pointing at a removed node is a broken chain: a splice that disagreed would
+/// leave exactly the edge the verifier checks pointing at a dead node.
+///
+/// The op → slot mapping is the `[ctrl, mem, …]` layout documented on
+/// `ir::Op`, so the token is always slot 1. The arity guard is what
+/// distinguishes that documented full form from the compact hand-built /
+/// EA-bridge layouts `store_operands` and `load_base` also accept (e.g. a
+/// compact `Store` is `[base, value]`, whose slot 1 is a *value*, not a
+/// token); each entry is the minimum input count of the full form.
+/// `Op::ArrayLength` is `[ctrl, mem, array_ref]` per `ir::Op` and is
+/// recognised here even though the verifier does not classify it — being the
+/// stricter of the two can only make this side *refuse* a splice, never
+/// perform a wrong one.
+pub(crate) fn memory_token_slot(node: &Node) -> Option<usize> {
+    let min_full_arity = match node.op {
+        Op::Load(_) => 3,          // [ctrl, mem, base]
+        Op::Store(_) => 4,         // [ctrl, mem, base, value]
+        Op::ArrayLoad(_) => 4,     // [ctrl, mem, array, index]
+        Op::ArrayStore(_) => 5,    // [ctrl, mem, array, index, value]
+        Op::ArrayLength => 3,      // [ctrl, mem, array_ref]
+        Op::New { .. } => 2,       // [ctrl, mem]
+        Op::NewArray { .. } => 3,  // [ctrl, mem, length]
+        Op::Call { .. } => 2,      // [ctrl, mem, args…]
+        Op::LambdaIntToDouble => 4, // [ctrl, mem, lambda, index]
+        _ => return None,
+    };
+    if node.inputs.len() >= min_full_arity {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// True when input `idx` of `node` is a memory *token* — an ordering edge
+/// naming the previous writer — rather than a value the node reads.
+///
+/// A memory-typed φ is the one op whose token edges are not a single slot:
+/// *every* value input (slots 1.., past the control anchor) is a token from
+/// one predecessor.
+pub(crate) fn is_memory_token_slot(node: &Node, idx: usize) -> bool {
+    if matches!(node.op, Op::Phi) {
+        return node.ty == IrType::Memory && idx >= 1;
+    }
+    memory_token_slot(node) == Some(idx)
+}
+
+/// Kill `store`, first splicing it out of the memory-token chain: every
+/// consumer that named it as a token is rewired to the store's *own* incoming
+/// token, so the chain closes over the hole instead of pointing into it.
+///
+/// Returns `false` — leaving the store **alive** — when the splice cannot be
+/// done safely:
+///
+/// * the store is in a compact (`[base, value]`) layout, so it has no incoming
+///   token to hand on, yet something names it;
+/// * its incoming token is absent, out of range, or itself already dead, so
+///   splicing would just relocate the break;
+/// * something names it in a slot that is *not* a memory token (a value input,
+///   a safepoint slot). A `Store` produces no value, so such a reference is
+///   already malformed — rewiring it to a memory token would replace one bug
+///   with a quieter one.
+///
+/// A store we fail to delete is a missed optimization. A store deleted out of a
+/// chain we could not repair is wrong code, so the bias is deliberate.
+fn kill_store_splicing_memory_chain(graph: &mut Graph, store: NodeId) -> bool {
+    let (is_store, token) = match graph.node_opt(store) {
+        Some(n) => (
+            matches!(n.op, Op::Store(_)),
+            memory_token_slot(n).and_then(|slot| n.input_opt(slot)),
+        ),
+        None => return false,
+    };
+    if !is_store {
+        return false;
+    }
+
+    // Who still names this store, and do they all name it as a token?
+    let mut has_consumer = false;
+    let mut spliceable = true;
+    for n in &graph.nodes {
+        if n.op == Op::Dead {
+            continue;
+        }
+        for (i, &inp) in n.inputs.iter().enumerate() {
+            if inp != store {
+                continue;
+            }
+            has_consumer = true;
+            if !is_memory_token_slot(n, i) {
+                spliceable = false;
+            }
+        }
+    }
+    for sp in &graph.safepoints {
+        if sp.locals.iter().chain(sp.stack.iter()).any(|&v| v == store) {
+            // A frame state naming a store is already nonsense — a store
+            // produces no value an interpreter frame can be rebuilt from — but
+            // it is not this pass's business to silently retarget it.
+            has_consumer = true;
+            spliceable = false;
+        }
+    }
+
+    // Nothing names it: the chain does not run through this node, so the plain
+    // kill is already correct (this is the common hand-built / compact case).
+    if !has_consumer {
+        graph.kill(store);
+        return true;
+    }
+    if !spliceable {
+        return false;
+    }
+    let token = match token {
+        Some(t) => t,
+        None => return false,
+    };
+    // Splicing onto an already-dead token would just move the break along the
+    // chain. (Cannot happen when this pass kills a run of chained stores in
+    // ascending id order — each splice rewrites the next one's token slot to a
+    // live node before we get there — but the check is cheap and the invariant
+    // is not local.)
+    if !matches!(graph.node_opt(token), Some(n) if n.op != Op::Dead) {
+        return false;
+    }
+
+    graph.replace_all_uses(store, token);
+    graph.kill(store);
+    true
 }
 
 /// Dead-store elimination: remove stores whose effect is never observed.
@@ -1697,8 +1886,18 @@ fn eliminate_dead_stores(graph: &mut Graph) {
         }
     }
 
+    // Splice each dead store out of the memory-token chain before killing it —
+    // a plain `Graph::kill` here would leave the *next* memory operation's
+    // token slot naming an `Op::Dead` node, which is how the surviving store
+    // loses its transitive ordering edges. Ascending id order so that when two
+    // stores in this batch are adjacent in the chain, the earlier one is
+    // spliced first and the later one's token slot already names a live node
+    // by the time we reach it. `sort`/`dedup`: the pending set is popped in
+    // location order, not id order, so the raw vector is neither.
+    to_kill.sort_unstable();
+    to_kill.dedup();
     for id in to_kill {
-        graph.kill(id);
+        kill_store_splicing_memory_chain(graph, id);
     }
 
     // ── Phase 2: write-only, never-read local allocations ──────────────
@@ -1804,17 +2003,51 @@ fn eliminate_write_only_stores(graph: &mut Graph) {
             }
         }
     }
+    // `uses[id] == 0` above already means nothing names these stores, so the
+    // splice is a no-op kill — except that `use_counts` does not see safepoint
+    // slots, and the splice helper does. Routing through it keeps the one
+    // reference class this phase cannot count from being severed silently.
     for id in to_kill {
-        graph.kill(id);
+        kill_store_splicing_memory_chain(graph, id);
     }
 }
 
 // ── Dead Node Elimination ────────────────────────────────────────────
 
-/// Remove nodes not reachable from the exit (Return).
+/// Remove nodes not reachable from the exit (Return), from any other
+/// side-effecting root, or from a safepoint snapshot.
 fn eliminate_dead_nodes(graph: &mut Graph) {
     if graph.exit == NO_NODE {
         return;
+    }
+
+    // ── Defensive normalisation of already-stale snapshot slots ────────
+    //
+    // A slot may name a node that some *earlier* pass removed without routing
+    // its safepoint references — historically this pass itself, which did not
+    // root snapshots at all, so every optimized graph accumulated them. Such a
+    // slot cannot be rescued: the value it named is already gone, and seeding
+    // it as a root below would only resurrect an `Op::Dead` node. Normalise it
+    // to `NO_NODE`, which the model already defines as "undefined at this bci"
+    // and which `ir_lower` resolves to `FrameValue::Undefined` — the same
+    // answer deopt would have reached anyway, but reached explicitly instead
+    // of by indexing a removed node.
+    //
+    // This is emphatically NOT the fix for the live case handled below: a
+    // value that is dead except for its snapshot reference is *kept*, never
+    // cleared. Clearing that one would silently lose an interpreter local.
+    if !graph.safepoints.is_empty() {
+        let node_is_live: Vec<bool> = graph.nodes.iter().map(|n| n.op != Op::Dead).collect();
+        for sp in &mut graph.safepoints {
+            for slot in sp.locals.iter_mut().chain(sp.stack.iter_mut()) {
+                if *slot == NO_NODE {
+                    continue;
+                }
+                if !node_is_live.get(*slot as usize).copied().unwrap_or(false) {
+                    *slot = NO_NODE;
+                }
+            }
+        }
     }
 
     let mut reachable: FxHashSet<NodeId> = FxHashSet::default();
@@ -1856,15 +2089,35 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
         worklist.push(graph.exit);
     }
 
-    // real-frame-deopt (#5): safepoint snapshots are NOT seeded as DCE roots.
-    // The builder records a snapshot at *every* bytecode boundary, so pinning
-    // every safepoint-referenced value would keep every transient operand
-    // alive and defeat DCE/reassociation/folding. Making safepoints DCE-safe
-    // needs the model to change first — record/pin only at real deopt sites
-    // (guard bcis, call returns), or recompute safepoint liveness AFTER
-    // optimization — rather than this build-time every-bci snapshot. Until
-    // then the deopt path is exercised on the un-optimized graph (see
-    // `ir_lower` tests); a value killed here resolves to `Undefined`.
+    // real-frame-deopt (#5): every value a safepoint snapshot names IS a DCE
+    // root. A snapshot slot is what deopt rebuilds an interpreter local or
+    // operand-stack entry from, so a slot naming a node this pass removed is a
+    // deoptimization correctness bug — the frame is reconstructed from a node
+    // that no longer computes anything — not untidiness. "Reachable from a
+    // Return" is the wrong liveness question for these values: a local that
+    // the compiled code never reads again is still live to the interpreter it
+    // may deopt back into.
+    //
+    // This deliberately reverses the previous policy ("snapshots are NOT
+    // seeded as DCE roots … a value killed here resolves to `Undefined`"). The
+    // cost that policy was buying is real and unchanged — the builder records
+    // a snapshot at *every* bytecode boundary, so this pins essentially every
+    // operand the method computes and DCE reclaims much less — but the cost of
+    // the alternative is a wrong interpreter frame, and code size is not
+    // tradeable against that. The way to get the reclamation back is the model
+    // change the old comment already named: record snapshots only at real
+    // deopt sites (guard bcis, call returns), or recompute snapshot liveness
+    // after optimization. Narrowing what is *recorded* is safe; dropping what
+    // is recorded but not rooted is not.
+    for sp in &graph.safepoints {
+        for &slot in sp.locals.iter().chain(sp.stack.iter()) {
+            // Stale slots were normalised to `NO_NODE` above, so anything that
+            // survives `is_valid_id` here names a real, live node.
+            if graph.is_valid_id(slot) {
+                worklist.push(slot);
+            }
+        }
+    }
 
     // Also keep all control nodes reachable from exit
     while let Some(id) = worklist.pop() {
@@ -1873,7 +2126,7 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
         }
         let node = &graph.nodes[id as usize];
         for &inp in &node.inputs {
-            if inp != NO_NODE && (inp as usize) < graph.nodes.len() {
+            if graph.is_valid_id(inp) {
                 worklist.push(inp);
             }
         }
@@ -1912,10 +2165,7 @@ const UNROLL_MAX_TRIP: i64 = 8;
 const UNROLL_MAX_BODY: usize = 48;
 
 fn const_i64(graph: &Graph, id: NodeId) -> Option<i64> {
-    if id == NO_NODE || id as usize >= graph.nodes.len() {
-        return None;
-    }
-    match graph.nodes[id as usize].op {
+    match graph.node_opt(id)?.op {
         Op::Const(c) => Some(c),
         _ => None,
     }
@@ -2620,6 +2870,105 @@ mod tests {
 
     // ── Affine strength reduction (reassociation) ───────────────────
 
+    /// The ops of every live node reachable from `root` through input edges —
+    /// i.e. the computation the method actually performs, as distinct from
+    /// what merely still occupies the arena.
+    ///
+    /// These are different questions now that `eliminate_dead_nodes` roots
+    /// safepoint snapshots: the builder records the operand stack at every
+    /// bci, so an intermediate no live computation reads can still be named by
+    /// a snapshot slot and is deliberately kept alive for deopt. A whole-arena
+    /// node count therefore measures "what DCE reclaimed", which is a
+    /// deopt-policy question, not "what the optimizer collapsed".
+    fn ops_reachable_from(graph: &Graph, root: NodeId) -> Vec<Op> {
+        let mut seen: FxHashSet<NodeId> = FxHashSet::default();
+        let mut stack = vec![root];
+        let mut out = Vec::new();
+        while let Some(id) = stack.pop() {
+            if !graph.is_valid_id(id) || !seen.insert(id) {
+                continue;
+            }
+            let n = &graph.nodes[id as usize];
+            if n.op == Op::Dead {
+                continue;
+            }
+            out.push(n.op.clone());
+            for &inp in &n.inputs {
+                stack.push(inp);
+            }
+        }
+        out
+    }
+
+    /// A pure constant's affine form has no root, and that absence is `None` —
+    /// not the [`NO_NODE`] sentinel doing double duty as a value-domain
+    /// "nothing". The whole point of the `Option` is that the case split
+    /// cannot be forgotten, and that a rootless form can never materialize an
+    /// edge out of `u32::MAX`.
+    #[test]
+    fn test_affine_pure_constant_round_trips_without_a_sentinel() {
+        let seven = Affine {
+            root: None,
+            k: 0,
+            c: 7,
+        };
+        let five = Affine {
+            root: None,
+            k: 0,
+            c: 5,
+        };
+        // The opaque form a real node would carry, for the `combine` calls.
+        let opaque = Affine {
+            root: Some(1),
+            k: 1,
+            c: 0,
+        };
+
+        // Combining two rootless forms stays rootless — no root is invented.
+        assert_eq!(
+            combine_affine(&Op::Add, true, seven, five, opaque),
+            Affine {
+                root: None,
+                k: 0,
+                c: 12
+            }
+        );
+        assert_eq!(
+            combine_affine(&Op::Sub, true, seven, five, opaque),
+            Affine {
+                root: None,
+                k: 0,
+                c: 2
+            }
+        );
+        assert_eq!(
+            combine_affine(&Op::Mul, true, seven, five, opaque),
+            Affine {
+                root: None,
+                k: 0,
+                c: 35
+            }
+        );
+
+        // …and it materializes back to a single `Const`, with no operand
+        // anywhere in the graph holding the placeholder.
+        let mut g = probe_graph();
+        let mat = build_affine(&mut g, seven.root, seven.k, seven.c, IrType::Int)
+            .expect("a rootless form with k == 0 is exactly a constant");
+        assert_eq!(g.nodes[mat as usize].op, Op::Const(7));
+        assert!(
+            g.nodes.iter().all(|n| !n.inputs.contains(&NO_NODE)),
+            "materializing a pure constant must not fabricate a NO_NODE operand"
+        );
+
+        // A non-zero `k` with no root is not a representable value: refuse,
+        // rather than emit `Mul(nodes[u32::MAX], k)`.
+        assert!(
+            build_affine(&mut g, None, 3, 0, IrType::Int).is_none(),
+            "a rootless form with k != 0 has nothing to multiply"
+        );
+    }
+
     fn build_and_reassociate(
         code: &[u8],
         code_len: usize,
@@ -2651,8 +3000,8 @@ mod tests {
             0x1a, 0x06, 0x68, 0x08, 0x60, 0x05, 0x68, 0x04, 0x60, 0xac, 0, 0,
         ];
         let graph = build_and_reassociate(&code, 10, 1, 1);
-        let ret = &graph.nodes[graph.exit as usize];
-        let val = &graph.nodes[ret.inputs[1] as usize];
+        let ret_val = graph.nodes[graph.exit as usize].inputs[1];
+        let val = &graph.nodes[ret_val as usize];
         assert_eq!(val.op, Op::Add, "top of folded chain should be Add(k*x, c)");
         // One input is the constant c=11, the other is Mul(x, 6).
         let (mul_id, c_id) = if graph.nodes[val.inputs[0] as usize].op == Op::Mul {
@@ -2678,9 +3027,27 @@ mod tests {
             Op::Const(6),
             "multiplicative constant"
         );
-        // The whole intermediate chain collapsed: exactly one Mul + one Add remain.
-        assert_eq!(graph.nodes.iter().filter(|n| n.op == Op::Mul).count(), 1);
-        assert_eq!(graph.nodes.iter().filter(|n| n.op == Op::Add).count(), 1);
+        // The whole intermediate chain collapsed: the returned value is
+        // computed by exactly one Mul and one Add.
+        //
+        // Measured over the nodes the *return value* reaches, not over the
+        // whole arena. The arena count stopped being the right question when
+        // `eliminate_dead_nodes` began rooting safepoint snapshots: the
+        // builder records the operand stack at every bci, so an intermediate
+        // like the original `x*3` is still named by the snapshot at the next
+        // bci and is deliberately kept for deopt even though no live
+        // computation reads it. See `ops_reachable_from`.
+        let reached = ops_reachable_from(&graph, ret_val);
+        assert_eq!(
+            reached.iter().filter(|o| **o == Op::Mul).count(),
+            1,
+            "the returned expression must be a single Mul: {reached:?}"
+        );
+        assert_eq!(
+            reached.iter().filter(|o| **o == Op::Add).count(),
+            1,
+            "…and a single Add: {reached:?}"
+        );
     }
 
     #[test]
@@ -2691,8 +3058,8 @@ mod tests {
             0x1a, 0x11, 0x00, 0xb5, 0x68, 0x11, 0x00, 0xb5, 0x68, 0xac, 0, 0,
         ];
         let graph = build_and_reassociate(&code, 10, 1, 1);
-        let ret = &graph.nodes[graph.exit as usize];
-        let val = &graph.nodes[ret.inputs[1] as usize];
+        let ret_val = graph.nodes[graph.exit as usize].inputs[1];
+        let val = &graph.nodes[ret_val as usize];
         assert_eq!(val.op, Op::Mul);
         let k_id = if graph.nodes[val.inputs[0] as usize].op == Op::Param(0) {
             val.inputs[1]
@@ -2704,7 +3071,16 @@ mod tests {
             Op::Const(32761),
             "181*181 folds to 32761"
         );
-        assert_eq!(graph.nodes.iter().filter(|n| n.op == Op::Mul).count(), 1);
+        // One Mul in the returned expression. Arena-wide counting no longer
+        // answers this question — the un-materialized `x*181` intermediate is
+        // still named by the operand-stack snapshot at the next bci, and
+        // snapshot slots are DCE roots now. See `ops_reachable_from`.
+        let reached = ops_reachable_from(&graph, ret_val);
+        assert_eq!(
+            reached.iter().filter(|o| **o == Op::Mul).count(),
+            1,
+            "the returned expression must be a single Mul: {reached:?}"
+        );
     }
 
     #[test]
@@ -2729,19 +3105,19 @@ mod tests {
         nodes.push(Node {
             op: Op::Const(a),
             ty,
-            inputs: vec![],
+            inputs: vec![].into(),
             bytecode_pc: None,
         });
         nodes.push(Node {
             op: Op::Const(b),
             ty,
-            inputs: vec![],
+            inputs: vec![].into(),
             bytecode_pc: None,
         });
         nodes.push(Node {
             op,
             ty,
-            inputs: vec![0, 1],
+            inputs: vec![0, 1].into(),
             bytecode_pc: None,
         });
         try_fold(&nodes, 2)
@@ -2752,13 +3128,13 @@ mod tests {
         nodes.push(Node {
             op: Op::Const(a),
             ty,
-            inputs: vec![],
+            inputs: vec![].into(),
             bytecode_pc: None,
         });
         nodes.push(Node {
             op,
             ty,
-            inputs: vec![0],
+            inputs: vec![0].into(),
             bytecode_pc: None,
         });
         try_fold(&nodes, 1)
@@ -2888,6 +3264,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Void, vec![], None);
         g.entry = start;
@@ -2933,6 +3310,88 @@ mod tests {
             g.nodes[neg1 as usize].op,
             Op::Dead,
             "the -1 value of the first return must survive"
+        );
+    }
+
+    #[test]
+    fn test_dce_keeps_value_live_only_via_safepoint_snapshot() {
+        // `int y = x + 1; return x;` — `y` is dead to the *compiled* code, but
+        // the safepoint snapshot names it, and deopt rebuilds interpreter local
+        // 1 out of that slot. "Reachable from a Return" is the wrong liveness
+        // question for a snapshot value: a local the compiled code never reads
+        // again is still live to the interpreter it may deopt back into.
+        // Removing it would leave the slot naming an `Op::Dead` node and the
+        // reconstructed frame built from nothing.
+        use crate::ir::SafepointSnapshot;
+        let mut g = probe_graph();
+        let x = g.add(Op::Param(0), IrType::Int, vec![], None);
+        let one = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let y = g.add(Op::Add, IrType::Int, vec![x, one], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, x], None);
+        g.exit = ret;
+        g.safepoints.push(SafepointSnapshot {
+            bci: 4,
+            locals: vec![x, y],
+            stack: vec![],
+        });
+
+        eliminate_dead_nodes(&mut g);
+
+        assert_ne!(
+            g.nodes[y as usize].op,
+            Op::Dead,
+            "a value live only through a safepoint snapshot must survive DCE"
+        );
+        assert_ne!(
+            g.nodes[one as usize].op,
+            Op::Dead,
+            "and so must everything it transitively needs"
+        );
+        assert_eq!(
+            g.safepoints[0].locals[1], y,
+            "the slot must still name the value — keeping it is the fix, \
+             clearing the slot would silently lose an interpreter local"
+        );
+    }
+
+    #[test]
+    fn test_dce_normalises_already_stale_snapshot_slot() {
+        // A slot naming a node some EARLIER pass removed cannot be rescued —
+        // the value it named is already gone, and seeding it as a root would
+        // only resurrect an `Op::Dead` node. It normalises to `NO_NODE`
+        // ("undefined at this bci"), which deopt resolves to `Undefined`:
+        // the same answer, reached explicitly instead of by naming a corpse.
+        use crate::ir::SafepointSnapshot;
+        let mut g = probe_graph();
+        let x = g.add(Op::Param(0), IrType::Int, vec![], None);
+        let one = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let stale = g.add(Op::Add, IrType::Int, vec![x, one], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, x], None);
+        g.exit = ret;
+        g.safepoints.push(SafepointSnapshot {
+            bci: 4,
+            locals: vec![x, stale],
+            stack: vec![NO_NODE],
+        });
+        // Stand in for the earlier pass that removed the node without routing
+        // its safepoint references.
+        g.kill(stale);
+
+        eliminate_dead_nodes(&mut g);
+
+        assert_eq!(
+            g.safepoints[0].locals[1], NO_NODE,
+            "an already-dead slot normalises to the undefined placeholder"
+        );
+        assert_eq!(g.safepoints[0].locals[0], x, "a live slot is untouched");
+        assert_eq!(
+            g.safepoints[0].stack[0], NO_NODE,
+            "an already-undefined slot stays undefined"
+        );
+        assert_eq!(
+            g.nodes[stale as usize].op,
+            Op::Dead,
+            "normalising the slot does not resurrect the node"
         );
     }
 
@@ -3224,6 +3683,151 @@ mod tests {
         );
     }
 
+    // ── DSE: memory-token chain integrity ───────────────────────────
+
+    #[test]
+    fn test_dse_overwritten_store_leaves_intact_memory_chain() {
+        // Full-form chain:  m0 → alloc → s1 → s2 → load
+        //
+        // `s1` is overwritten by `s2` with no reader in between, so DSE removes
+        // it. What this locks is *how*: a plain `Graph::kill` left `s2`'s token
+        // slot naming the removed `s1`, so `s2` lost its transitive ordering
+        // edge to `alloc` and to everything that wrote before it — and a
+        // scheduler reading that chain is then free to hoist `s2` above them.
+        // After the splice, `s2` must take its token from `s1`'s OWN incoming
+        // token, and no live node anywhere may read a token from a `Dead` node.
+        let mut g = probe_graph();
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![g.entry], None);
+        let m0 = g.add(Op::Proj(1), IrType::Memory, vec![g.entry], None);
+        let alloc = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![ctrl, m0],
+            None,
+        );
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
+        // `Op::New` is both the reference and the memory token it produces, so
+        // it appears in slot 1 (token) and slot 2 (base) of the first store.
+        let s1 = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![ctrl, alloc, alloc, off, c1],
+            None,
+        );
+        let s2 = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![ctrl, s1, alloc, off, c2],
+            None,
+        );
+        // A reader keeps the allocation "read" so the write-only phase does not
+        // also remove `s2` — this test is about the overwrite path only.
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, s2, alloc, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[s1 as usize].op,
+            Op::Dead,
+            "the overwritten store must still be eliminated"
+        );
+        assert_eq!(
+            g.nodes[s2 as usize].op,
+            Op::Store(MemKind::Int),
+            "the overwriting store survives"
+        );
+        assert_eq!(
+            g.nodes[s2 as usize].inputs[1], alloc,
+            "the surviving store must be spliced onto the removed store's own \
+             incoming memory token, not left naming the removed node"
+        );
+        assert_eq!(
+            g.nodes[load as usize].inputs[1], s2,
+            "the rest of the chain is untouched"
+        );
+
+        for (id, n) in g.nodes.iter().enumerate() {
+            if n.op == Op::Dead {
+                continue;
+            }
+            for (i, &inp) in n.inputs.iter().enumerate() {
+                if !is_memory_token_slot(n, i) {
+                    continue;
+                }
+                assert_ne!(
+                    g.nodes[inp as usize].op,
+                    Op::Dead,
+                    "n{id}:{:?} takes its memory token from removed n{inp}",
+                    n.op
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dse_keeps_store_it_cannot_splice_out_of_the_chain() {
+        // A store whose token consumer names it, but which has no incoming
+        // token of its own to hand on (the compact `[base, value]` layout).
+        // Deleting it would leave the consumer's token slot pointing at a
+        // removed node with nothing to repair it with, so the store is KEPT: a
+        // missed optimization, not a severed chain.
+        let mut g = probe_graph();
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![g.entry], None);
+        let m0 = g.add(Op::Proj(1), IrType::Memory, vec![g.entry], None);
+        let alloc = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![ctrl, m0],
+            None,
+        );
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
+        // Compact store — no token slot at all. Its location key is
+        // `(alloc, no-index, Int)`.
+        let s1 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
+        // …overwritten by a full-form no-index store `[ctrl, mem, base, value]`
+        // (the same location key) that also names `s1` as its memory token.
+        let s2 = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![ctrl, s1, alloc, c2],
+            None,
+        );
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, s2, alloc, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[s1 as usize].op,
+            Op::Store(MemKind::Int),
+            "a store that cannot be spliced out of the chain must be left alive"
+        );
+        assert_eq!(g.nodes[s2 as usize].inputs[1], s1, "the chain is unchanged");
+    }
+
     // ── SCEV-driven LICM ────────────────────────────────────────────
 
     /// Hand-build a minimal counted-loop graph and return
@@ -3253,6 +3857,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         g.entry = start;
@@ -3288,6 +3893,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         g.entry = start;
@@ -3409,11 +4015,26 @@ mod tests {
         // and must NOT be hoisted (its control input stays at the region).
         let (mut g, region, _preheader, iv) = loop_probe();
         let mem = 2;
-        // Use the induction variable itself as the address — variant.
+        // Use the induction variable itself as the BASE — that is what makes
+        // the load variant; the offset is an ordinary invariant constant.
+        //
+        // This fixture used to be built as `[ctrl, mem, iv, NO_NODE]`: the
+        // full four-input form, whose slot 3 the layout dispatcher reads as a
+        // real index operand, filled with the placeholder. That is not
+        // padding, it is a malformed graph. `ir_verify`'s always-on structural
+        // lane rejects `NO_NODE` in any slot that is not a φ value input or a
+        // safepoint slot, and it is the exact shape that panics
+        // `ir_lower::slot_of`, which indexes `node_slot` with `u32::MAX`. It
+        // only ever went unnoticed because the base is variant, so LICM bailed
+        // (`addr != NO_NODE &&` …) before it read the slot — the placeholder
+        // was load-bearing for nothing. A real `Const` offset expresses the
+        // same test (base variant ⇒ no hoist) with a graph that is valid. See
+        // `test_licm_variant_load_fixture_has_no_placeholder_operand`.
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
         let load = g.add(
             Op::Load(MemKind::Int),
             IrType::Int,
-            vec![region, mem, iv, NO_NODE],
+            vec![region, mem, iv, off],
             None,
         );
         let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
@@ -3424,6 +4045,48 @@ mod tests {
         assert_eq!(
             g.nodes[load as usize].inputs[0], region,
             "a loop-variant load must NOT be hoisted (control stays in the loop)"
+        );
+    }
+
+    /// Regression for the fixture above: no live node may carry `NO_NODE` in a
+    /// real operand slot. Only a φ value input (a local undefined on that
+    /// predecessor edge) and a safepoint slot may hold the placeholder — the
+    /// same rule `ir_verify::no_node_allowed` encodes for the always-on lane.
+    #[test]
+    fn test_licm_variant_load_fixture_has_no_placeholder_operand() {
+        let (mut g, region, _preheader, iv) = loop_probe();
+        let mem = 2;
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![region, mem, iv, off],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, load], None);
+        g.exit = ret;
+
+        let _ = licm(&mut g);
+
+        for (id, n) in g.nodes.iter().enumerate() {
+            if n.op == Op::Dead {
+                continue;
+            }
+            for (i, &inp) in n.inputs.iter().enumerate() {
+                let placeholder_ok = matches!(n.op, Op::Phi) && i >= 1;
+                assert!(
+                    inp != NO_NODE || placeholder_ok,
+                    "n{id}:{:?} input[{i}] is the NO_NODE placeholder in a real \
+                     operand slot — `ir_lower::slot_of` indexes node_slot with it",
+                    n.op
+                );
+            }
+        }
+        // …and the load kept the full four-input shape the arity lane wants.
+        assert_eq!(
+            g.nodes[load as usize].inputs.len(),
+            4,
+            "the full load form is [ctrl, mem, base, offset]"
         );
     }
 
@@ -3515,6 +4178,7 @@ mod tests {
             entry: 0,
             exit: 0,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         g.entry = start;

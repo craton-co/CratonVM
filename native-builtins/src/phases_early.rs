@@ -16134,14 +16134,33 @@ fn sig_finish_verify(
         .into());
     }
     let (algo, data) = sig_take_state(ctx, this);
+    // A verification API must never answer "did not verify" for a question it
+    // never asked. `false` here is reserved for a real cryptographic mismatch;
+    // every "we could not check" path raises the JDK-specified exception. A
+    // missing key is the clearest case: returning `false` reports a forgery
+    // against a signature nothing examined.
     let key_obj = match ctx.get_field(this, 2) {
         Value::Object(Some(k)) => k,
-        _ => return Ok(false),
+        _ => {
+            return Err(throw_jca_exc(
+                ctx,
+                "java/security/InvalidKeyException",
+                "Signature.verify called with no verification key",
+            ))
+        }
     };
     if let Some((alg_idx, key_id)) = sig_key_handle(ctx, key_obj) {
+        // `Some(false)` is a genuine mismatch and is preserved verbatim;
+        // `None` means the backend declined the algorithm or key, which is
+        // NOT a mismatch.
         if let Some(ok) = sig_backend_verify(&algo, alg_idx, key_id, &data, provided) {
             return Ok(ok);
         }
+        return Err(throw_jca_exc(
+            ctx,
+            "java/security/SignatureException",
+            &format!("Signature.verify: no backend supports algorithm {algo:?} for this key"),
+        ));
     }
     let expected = sig_surrogate(ctx, key_obj, &algo, &data);
     Ok(ct_eq(&expected, provided))

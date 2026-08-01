@@ -14,6 +14,12 @@ use clap::Parser;
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// Phase accounting (`docs/observability/phase-accounting.md`). Imported as the
+// module, not as bare functions: `enter` / `enabled` / `report` are generic
+// enough that a call site should say which subsystem it is asking. (The
+// `phase: &str` parameter on `trace_jdk_only_violations` is a *value* binding
+// and lives in a different namespace, so it does not shadow this path.)
+use cratonvm_jfr::phase;
 use cratonvm_vm::error::MethodCallFailed;
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::{
@@ -22,27 +28,67 @@ use cratonvm_vm::vm::{
 use cratonvm_vm::{ClassPath, VmConfig};
 use tracing::info;
 
-/// Claim and emit the process-wide JIT method summary once.
+/// Claim and emit the process-wide shutdown reports once.
 ///
-/// `System.exit` never unwinds Rust frames, so it calls this from the native
-/// pre-exit hook. A normal Java-main return calls it from the launcher thread.
-/// The atomic makes those paths safe to share and prevents future shutdown
-/// convergence from printing the summary twice.
-fn maybe_dump_jit_method_stats() {
+/// Two of them today: the JIT method summary (`CRATONVM_DBG_JIT_METHOD_STATS`)
+/// and the phase-accounting report (`CRATONVM_PHASE_ACCOUNTING`). They share
+/// one claim because they share both shutdown routes: `System.exit` never
+/// unwinds Rust frames, so it reaches here from the native pre-exit hook, while
+/// a normal Java-main return reaches here from the `main-vm` thread. The atomic
+/// makes those paths safe to share and prevents future shutdown convergence
+/// from printing either report twice.
+///
+/// The two reports are gated separately *inside* the claim. `jit.method_stats`
+/// used to gate the compare-exchange itself; leaving it there would have made
+/// the phase report require an unrelated JIT flag. See
+/// `docs/observability/phase-accounting.md` §10.3.
+fn maybe_dump_shutdown_reports() {
     static DUMPED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
-    if cratonvm_types::flags().jit.method_stats
-        && DUMPED
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
+    if DUMPED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
     {
+        return;
+    }
+
+    if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
+    }
+
+    // Phase accounting. Delegate the compile-phase breakdown rather than
+    // re-timing it (`docs/observability/phase-accounting.md` §1):
+    // `MetricsSummary::phase_totals_ns` is already `Vec<(&'static str, u64)>`,
+    // which is exactly `set_compilation_breakdown`'s argument shape, so the
+    // report carries `jit::metrics`' own numbers instead of a second set of
+    // timers that could disagree with them.
+    //
+    // The `enabled()` test is not redundant with `emit_configured_sinks`
+    // returning `None`: it also keeps a run with accounting off from paying for
+    // the `jit::metrics` ring walk that `summary()` performs.
+    if phase::enabled() {
+        let summary = cratonvm_jit::metrics::summary();
+        phase::set_compilation_breakdown(&summary.phase_totals_ns);
+        if let Some(outcome) = phase::emit_configured_sinks() {
+            // One integer-only line, in the shape
+            // `regression-suite/perf/run-cratonbench-gate.sh` already scrapes.
+            eprintln!("{}", outcome.report.summary_line());
+            // A sink whose path cannot be opened is reported, never raised: a
+            // diagnostic that failed a JVM shutdown because a directory is
+            // read-only would be a worse defect than the missing artefact.
+            if let Some((path, Err(e))) = &outcome.json {
+                eprintln!("[cratonvm] phase-accounting JSON sink {path:?} failed: {e}");
+            }
+            if let Some((path, Err(e))) = &outcome.jfr {
+                eprintln!("[cratonvm] phase-accounting JFR sink {path:?} failed: {e}");
+            }
+        }
     }
 }
 
@@ -358,6 +404,22 @@ struct Args {
     /// docs/feature-designs/jdk-only-mode.md §9.
     #[arg(long = "dump-native-registry", value_name = "FILE")]
     dump_native_registry: Option<String>,
+
+    /// Phase accounting: write the whole-run wall-clock partition (startup /
+    /// class load / compilation / GC / execution / shutdown, plus an explicit
+    /// unattributed remainder) to the given JSON file at shutdown, and print
+    /// the one-line `[PHASE-ACCOUNTING] …` summary to stderr. Sugar for
+    /// `CRATONVM_PHASE_ACCOUNTING=coarse CRATONVM_PHASE_ACCOUNTING_OUT=<FILE>`;
+    /// an explicitly-set `CRATONVM_PHASE_ACCOUNTING` (including the
+    /// `CRATONVM_DBG=phase-accounting=fine` token spelling) still chooses the
+    /// level, so this can be combined with `fine`. Schema and interpretation:
+    /// docs/observability/phase-accounting.md.
+    ///
+    /// The value is consumed by the launcher before the flag snapshot is
+    /// latched (see `launcher_phase_report_path`); this field exists so `clap`
+    /// accepts the option and `--help` documents it.
+    #[arg(long = "dump-phase-report", value_name = "FILE")]
+    dump_phase_report: Option<String>,
 
     /// Enable JDWP debug server on the given port (e.g., 5005).
     /// Equivalent to -agentlib:jdwp=transport=dt_socket,server=y,address=PORT
@@ -2361,7 +2423,52 @@ fn launcher_nojit_requested(argv: &[String]) -> bool {
         .any(|arg| arg == "--nojit")
 }
 
+/// The `--dump-phase-report <FILE>` path, scanned out of the launcher portion
+/// of the expanded argv.
+///
+/// Scanned here rather than read from the parsed [`Args`] because the three
+/// `CRATONVM_PHASE_ACCOUNTING*` names are **declared** flags:
+/// `flags::runtime_var_os` serves a declared name from the immutable snapshot
+/// that `install_flags` latches, and `phase::level()` latches its own answer on
+/// first read — both of which happen before `run()` parses anything. A
+/// `set_var` after the parse would be invisible. Injecting the value as a
+/// launcher override into `VmFlags::from_env_with_overrides` is the supported
+/// route, and the one `--nojit` above already uses.
+///
+/// Accepts both `--dump-phase-report FILE` and `--dump-phase-report=FILE`, and
+/// stops at the `--` separator so a Java program argument of the same spelling
+/// is never consumed.
+fn launcher_phase_report_path(argv: &[String]) -> Option<String> {
+    let end = argv.iter().position(|arg| arg == "--").unwrap_or(argv.len());
+    let launcher = &argv[..end];
+    for (i, arg) in launcher.iter().enumerate() {
+        if let Some(path) = arg.strip_prefix("--dump-phase-report=") {
+            return Some(path.to_string());
+        }
+        if arg == "--dump-phase-report" {
+            return launcher.get(i + 1).cloned();
+        }
+    }
+    None
+}
+
 fn run() -> Result<()> {
+    // Phase accounting: everything from here to the `main(String[])` call below
+    // is startup. That is wider than `Vm::new` alone, deliberately — the
+    // `vm_startup` category is defined as "everything before the application's
+    // `main` is entered", and the argument parse, classpath resolution,
+    // `-XX:` translation, `args_array` construction and any `-javaagent:`
+    // `premain` all happen on this thread before `main` runs. Charging them
+    // here is what keeps them out of `unattributed_ns`; the `class_load`,
+    // `gc_pause` and `compilation` spans wired inside those paths nest and
+    // subtract, so widening the span does not hide them.
+    //
+    // Closed explicitly with `.end()` immediately before the `main` invocation,
+    // not at end of scope. Every `?`/`bail!` between here and there drops it,
+    // which charges the startup that did happen and leaves the rest
+    // unattributed — the honest reading of "the VM failed to boot".
+    let phase_startup = phase::enter(phase::Category::VmStartup);
+
     // Install the pre-`std::process::exit` hook on `native_system_exit` /
     // `native_runtime_exit`. A silent `System.exit(N)` during real app boot
     // (e.g. Cassandra NodeTool's airline NPE catch path) otherwise tears the
@@ -2399,7 +2506,7 @@ fn run() -> Result<()> {
             eprintln!("=== CRATONVM_DBG_EXIT: System.exit({code}) — dispatch trace ===");
             cratonvm_vm::dispatch_trace::dump_to_stderr_unconditional("pre-system-exit");
         }
-        maybe_dump_jit_method_stats();
+        maybe_dump_shutdown_reports();
     });
 
     // `java`-launcher positional semantics: insert a `--` separator right
@@ -2449,6 +2556,19 @@ fn run() -> Result<()> {
     // non-standard spellings (`-XX:+Foo`, `-agentlib:`) don't confuse it.
     let (filtered_args, hotspot_flags) = extract_hotspot_flags(filtered_args);
     let mut args = Args::parse_from(filtered_args);
+
+    // `--dump-phase-report` was already consumed by the launcher — see
+    // `launcher_phase_report_path` for why it has to be read that early. What
+    // is left to do here is tell the operator when the two disagree: the
+    // option is present, but accounting still resolved to off (an explicit
+    // `CRATONVM_PHASE_ACCOUNTING=0`, or a `CRATONVM_DBG=-phase-accounting`),
+    // so the file they are waiting for will never appear.
+    if args.dump_phase_report.is_some() && !phase::enabled() {
+        eprintln!(
+            "[cratonvm] --dump-phase-report was given but phase accounting resolved to \
+             \"off\"; no report will be written"
+        );
+    }
 
     // Initialize tracing. B6: route WARN+ diagnostics to stderr so silent
     // swallow sites surface without polluting the program's stdout (which
@@ -3664,6 +3784,18 @@ fn run() -> Result<()> {
         }
     }
 
+    // Phase accounting: startup ends here, execution begins. This is the
+    // single span the `coarse` level's reconciliation rests on — every other
+    // category nests inside it and subtracts (see §10.5 of
+    // `docs/observability/phase-accounting.md`). At `fine` it records nothing
+    // and the `interpretation` / `jit_execution` spans carry the split instead,
+    // which is why it can be opened unconditionally.
+    //
+    // `catch_unwind` swallows a panic rather than unwinding through these, so
+    // both `.end()` calls below are reached on every path out of the invoke.
+    phase_startup.end();
+    let phase_exec = phase::enter(phase::Category::JavaExecution);
+
     // Invoke main(String[])
     let main_start = std::time::Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3675,6 +3807,12 @@ fn run() -> Result<()> {
         )
     }));
     let main_elapsed = main_start.elapsed();
+    phase_exec.end();
+    // Everything from here to the end of `run()` is teardown: the census
+    // dumps, the non-daemon-thread join, the exception renderer. Bound to a
+    // named guard held to end of scope so the `bail!` paths below charge it
+    // too.
+    let _phase_shutdown = phase::enter(phase::Category::VmShutdown);
     tracing::info!("main() completed in {:.2}s", main_elapsed.as_secs_f64());
     let result = match result {
         Ok(r) => r,
@@ -3794,6 +3932,10 @@ fn run() -> Result<()> {
     if args.verbose_gc || std::env::var_os("CRATONVM_GC_STATS").is_some() {
         vm.shared.mem.heap.print_gc_summary();
     }
+
+    // Per-segment `getstatic` cost, plus whether the lock-free statics index is
+    // actually being hit (`CRATONVM_DBG_GETSTATIC_PROF=1`).
+    cratonvm_vm::jit::helpers::gs_prof::dump();
 
     // T19.K1 — wait for non-daemon threads before exiting.
     //
@@ -4549,6 +4691,22 @@ fn main() {
     if launcher_nojit_requested(&early_argv) {
         flag_overrides = flag_overrides.with("CRATONVM_DISABLE_JIT", "1");
     }
+    // `--dump-phase-report <FILE>` is sugar for
+    // `CRATONVM_PHASE_ACCOUNTING=coarse CRATONVM_PHASE_ACCOUNTING_OUT=<FILE>`,
+    // applied here because a declared flag is served from the snapshot latched
+    // three lines below and is immutable afterwards. The level is only
+    // *defaulted*: an explicit `CRATONVM_PHASE_ACCOUNTING`, or a
+    // `CRATONVM_DBG=phase-accounting=fine` token, still chooses it, so the
+    // option composes with `fine` instead of silently downgrading it.
+    if let Some(path) = launcher_phase_report_path(&early_argv) {
+        flag_overrides = flag_overrides.with(phase::FLAG_JSON_OUT, &path);
+        let level_set_explicitly = std::env::var_os(phase::FLAG_ENABLE).is_some()
+            || std::env::var(cratonvm_types::flag_groups::Group::DBG.var())
+                .is_ok_and(|spec| spec.contains("phase-accounting"));
+        if !level_set_explicitly {
+            flag_overrides = flag_overrides.with(phase::FLAG_ENABLE, "coarse");
+        }
+    }
     let runtime_flags = cratonvm_types::VmFlags::from_env_with_overrides(flag_overrides);
     if cratonvm_types::install_flags(runtime_flags).is_err() {
         eprintln!("[cratonvm] runtime flags were read before launcher configuration");
@@ -4569,6 +4727,21 @@ fn main() {
     for t in &unknown_tokens {
         eprintln!("[cratonvm] unknown configuration token: {t}");
     }
+
+    // Seed the phase-accounting epoch. This is the earliest point it can go:
+    // `CRATONVM_PHASE_ACCOUNTING` is a `CRATONVM_DBG` token, so it is not
+    // readable until the group expansion immediately above has run, and
+    // `phase::level()` latches on first read. Everything before this line —
+    // the allocator init, `clap`'s argfile expansion, the flag install — is
+    // outside the epoch rather than unattributed inside it, which is
+    // deliberate and is item 2 of `docs/observability/phase-accounting.md`
+    // §11. A no-op (not even a clock read) when accounting is off.
+    //
+    // This also provisionally claims the launcher as the reconciliation basis;
+    // the `main-vm` thread takes that role back below, because the launcher
+    // spends the rest of the process blocked in `join`.
+    phase::mark_process_start();
+
     // `CRATONVM_DBG=-deprecations` expands to `CRATONVM_QUIET_DEPRECATIONS=1`,
     // which the call above has already written back, so this read sees it.
     if !legacy_direct.is_empty() && std::env::var_os("CRATONVM_QUIET_DEPRECATIONS").is_none() {
@@ -4819,6 +4992,15 @@ fn main() {
             // watchdog on THIS (main-vm) thread — the one that runs the
             // interpreter — not the launcher thread that just joins it.
             cratonvm_vm::runtime::stwhang_watch::arm_from_env();
+            // Phase accounting: move the reconciliation basis onto THIS thread.
+            // `mark_process_start` had to run on the launcher (it is the first
+            // point the `CRATONVM_DBG` token is readable), but the launcher does
+            // nothing after this spawn except block in `join` — leaving the
+            // basis there would make `reconciles` a verdict about a waiter, and
+            // every per-category value on the summary line would be zero. The
+            // epoch is untouched, so `process_wall_ns` still covers the
+            // launcher prologue even though `basis_wall_ns` starts here.
+            phase::claim_reconciliation_basis();
             // Diagnosability (Keycloak Gap 9): the boot can exit SILENTLY — `run()`
             // returns `Ok` (e.g. waitForExit returned / VM main finished) or an `Err`
             // whose `Display` ({e:#}) renders empty, so the prior `eprintln!("{e:#}")`
@@ -4827,9 +5009,16 @@ fn main() {
             // process is never invisible. Additive logging only — no behaviour change.
             use std::io::Write as _;
             let result = run();
+            // Everything past `run()` is teardown: report emission and outcome
+            // rendering. Charging it keeps the tail of the basis thread's
+            // timeline out of `unattributed_ns`. Held to the end of the
+            // closure, so the report below is taken from *inside* it — which is
+            // why `anomalies.open_spans == 1` is the expected reading and not a
+            // leak (`docs/observability/phase-accounting.md` §9).
+            let _phase_shutdown = phase::enter(phase::Category::VmShutdown);
             // A normal Java-main return never reaches the System.exit hook.
             // Flush controlled-exit diagnostics before rendering the outcome.
-            maybe_dump_jit_method_stats();
+            maybe_dump_shutdown_reports();
             match result {
                 Ok(()) => {
                     eprintln!("[cratonvm] main-vm run() returned Ok — VM main exiting normally");
@@ -5138,6 +5327,64 @@ mod tests {
             "--",
             "--nojit"
         ])));
+    }
+
+    /// The launcher-side scan for `--dump-phase-report`. It has to run before
+    /// the flag snapshot is latched, so it cannot go through clap; this pins
+    /// both accepted spellings and the `--` boundary that keeps a Java program
+    /// argument of the same name from being consumed.
+    #[test]
+    fn phase_report_scan_accepts_both_spellings_and_stops_at_the_separator() {
+        assert_eq!(
+            launcher_phase_report_path(&tokens(&[
+                "cratonvm",
+                "--dump-phase-report",
+                "/tmp/p.json",
+                "Main",
+                "--"
+            ])),
+            Some("/tmp/p.json".to_string())
+        );
+        assert_eq!(
+            launcher_phase_report_path(&tokens(&[
+                "cratonvm",
+                "--dump-phase-report=/tmp/p.json",
+                "Main",
+                "--"
+            ])),
+            Some("/tmp/p.json".to_string())
+        );
+        // Past the separator it is the Java program's argument, not ours.
+        assert_eq!(
+            launcher_phase_report_path(&tokens(&[
+                "cratonvm",
+                "Main",
+                "--",
+                "--dump-phase-report",
+                "/tmp/p.json"
+            ])),
+            None
+        );
+        // A trailing option with no value is not a panic and not a guess.
+        assert_eq!(
+            launcher_phase_report_path(&tokens(&["cratonvm", "--dump-phase-report"])),
+            None
+        );
+        assert_eq!(launcher_phase_report_path(&tokens(&["cratonvm", "Main"])), None);
+    }
+
+    /// The launcher consumes the option, but clap must still accept it or the
+    /// parse in `run()` would fail with "unexpected argument".
+    #[test]
+    fn clap_accepts_the_phase_report_option() {
+        let parsed = Args::try_parse_from(tokens(&[
+            "cratonvm",
+            "--dump-phase-report",
+            "/tmp/p.json",
+            "Main",
+        ]))
+        .expect("clap must accept --dump-phase-report");
+        assert_eq!(parsed.dump_phase_report.as_deref(), Some("/tmp/p.json"));
     }
 
     /// The whole point of routing version output through our own banner:

@@ -2391,6 +2391,196 @@ impl FileDescriptorTable {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Capability-checked openers
+// ---------------------------------------------------------------------------
+
+/// Why a capability-checked open failed.
+///
+/// The two causes are genuinely different and callers translate them
+/// differently: a [`Denied`](Self::Denied) must surface to Java as a
+/// `SecurityException` (the operation was refused *before* the syscall and
+/// must not be retried), an [`Io`](Self::Io) as the `IOException` the JDK
+/// method already documents.
+#[derive(Debug)]
+pub enum FdCapabilityError {
+    /// The VM's capability policy refused the operation. **No syscall was
+    /// issued**, no fd was allocated, and nothing on the filesystem or network
+    /// was touched.
+    Denied(crate::capability::CapabilityDenied),
+    /// The operation was permitted and the OS refused it.
+    Io(io::Error),
+}
+
+impl std::fmt::Display for FdCapabilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FdCapabilityError::Denied(d) => write!(f, "{d}"),
+            FdCapabilityError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for FdCapabilityError {}
+
+impl From<crate::capability::CapabilityDenied> for FdCapabilityError {
+    fn from(denied: crate::capability::CapabilityDenied) -> Self {
+        FdCapabilityError::Denied(denied)
+    }
+}
+
+impl From<io::Error> for FdCapabilityError {
+    fn from(error: io::Error) -> Self {
+        FdCapabilityError::Io(error)
+    }
+}
+
+impl From<FdCapabilityError> for io::Error {
+    /// Lossy fallback for the many call sites that can only produce an
+    /// `io::Error` today. A denial becomes `PermissionDenied`, which is what
+    /// those sites already map to the JDK's `AccessDeniedException` /
+    /// `FileSystemException`. Prefer matching on [`FdCapabilityError`]
+    /// directly so the denial can surface as a `SecurityException`.
+    fn from(error: FdCapabilityError) -> io::Error {
+        match error {
+            FdCapabilityError::Io(e) => e,
+            FdCapabilityError::Denied(d) => {
+                io::Error::new(io::ErrorKind::PermissionDenied, d.to_string())
+            }
+        }
+    }
+}
+
+impl From<FdCapabilityError> for cratonvm_types::error::MethodCallFailed {
+    fn from(error: FdCapabilityError) -> cratonvm_types::error::MethodCallFailed {
+        match error {
+            FdCapabilityError::Denied(d) => d.into(),
+            FdCapabilityError::Io(e) => cratonvm_types::error::RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into(),
+        }
+    }
+}
+
+/// Capability-checked wrappers around the raw openers.
+///
+/// # Why these are separate methods rather than a check inside `open_read`
+///
+/// [`FileDescriptorTable`] is `&self`-only and owns no VM identity — it cannot
+/// find a policy on its own, and giving it one would put a process-global
+/// lookup on the I/O path, which is the defect being fixed. The policy is
+/// therefore supplied by the caller, which is the native that knows which VM
+/// it is running for. Everything on the old, uncheck path keeps working
+/// unchanged; migrating a call site is a one-token edit plus threading
+/// `&CapabilitySet` in.
+///
+/// # Order of operations
+///
+/// The check happens **before the fd is reserved and before the syscall**, so
+/// a denial has no observable effect: no fd is consumed, no file is created,
+/// no connection is attempted.
+impl FileDescriptorTable {
+    /// [`open_read`](Self::open_read), gated on
+    /// [`Capability::FileRead`](crate::capability::Capability::FileRead).
+    #[track_caller]
+    pub fn open_read_checked(
+        &self,
+        caps: &crate::capability::CapabilitySet,
+        path: &str,
+    ) -> Result<FdId, FdCapabilityError> {
+        caps.check(crate::capability::Capability::file_read(path))?;
+        Ok(self.open_read(path)?)
+    }
+
+    /// [`open_write`](Self::open_write), gated on
+    /// [`Capability::FileWrite`](crate::capability::Capability::FileWrite).
+    #[track_caller]
+    pub fn open_write_checked(
+        &self,
+        caps: &crate::capability::CapabilitySet,
+        path: &str,
+        append: bool,
+    ) -> Result<FdId, FdCapabilityError> {
+        caps.check(crate::capability::Capability::file_write(path))?;
+        Ok(self.open_write(path, append)?)
+    }
+
+    /// [`open_read_write`](Self::open_read_write), gated on **both**
+    /// `FileRead` and `FileWrite` — the fd it returns can do either, so one
+    /// grant is not enough.
+    #[track_caller]
+    pub fn open_read_write_checked(
+        &self,
+        caps: &crate::capability::CapabilitySet,
+        path: &str,
+        create: bool,
+    ) -> Result<FdId, FdCapabilityError> {
+        caps.check(crate::capability::Capability::file_read(path))?;
+        caps.check(crate::capability::Capability::file_write(path))?;
+        Ok(self.open_read_write(path, create)?)
+    }
+
+    /// [`open_random_access`](Self::open_random_access), gated on `FileRead`
+    /// and — when `write` is set — additionally on `FileWrite`.
+    #[track_caller]
+    pub fn open_random_access_checked(
+        &self,
+        caps: &crate::capability::CapabilitySet,
+        path: &str,
+        write: bool,
+    ) -> Result<FdId, FdCapabilityError> {
+        caps.check(crate::capability::Capability::file_read(path))?;
+        if write {
+            caps.check(crate::capability::Capability::file_write(path))?;
+        }
+        Ok(self.open_random_access(path, write)?)
+    }
+
+    /// [`open_tcp_connect`](Self::open_tcp_connect), gated on
+    /// [`Capability::Network`](crate::capability::Capability::Network) for the
+    /// destination endpoint.
+    #[track_caller]
+    pub fn open_tcp_connect_checked(
+        &self,
+        caps: &crate::capability::CapabilitySet,
+        addr: &str,
+    ) -> Result<FdId, FdCapabilityError> {
+        caps.check(crate::capability::Capability::network(addr))?;
+        Ok(self.open_tcp_connect(addr)?)
+    }
+
+    /// [`open_tcp_listener`](Self::open_tcp_listener), gated on `Network` for
+    /// the *bind* endpoint. Binding is a capability in its own right: a listener
+    /// on `0.0.0.0:8080` exposes the host, it does not merely reach out from it.
+    #[track_caller]
+    pub fn open_tcp_listener_checked(
+        &self,
+        caps: &crate::capability::CapabilitySet,
+        addr: &str,
+    ) -> Result<FdId, FdCapabilityError> {
+        caps.check(crate::capability::Capability::network(addr))?;
+        Ok(self.open_tcp_listener(addr)?)
+    }
+
+    /// [`open_udp`](Self::open_udp), gated on `Network`. A `None` bind address
+    /// is checked as [`Scope::Any`](crate::capability::Scope::Any) — the call
+    /// site cannot name an endpoint, so only an unscoped grant admits it.
+    #[track_caller]
+    pub fn open_udp_checked(
+        &self,
+        caps: &crate::capability::CapabilitySet,
+        bind_addr: Option<&str>,
+    ) -> Result<FdId, FdCapabilityError> {
+        let scope = match bind_addr {
+            Some(addr) => crate::capability::Scope::endpoint_str(addr),
+            None => crate::capability::Scope::Any,
+        };
+        caps.check(crate::capability::Capability::Network(scope))?;
+        Ok(self.open_udp(bind_addr)?)
+    }
+}
+
 impl Default for FileDescriptorTable {
     fn default() -> Self {
         Self::new()
@@ -3126,5 +3316,153 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Capability-checked openers
+    // -----------------------------------------------------------------------
+
+    use crate::capability::{Capability, CapabilityMode, CapabilitySet, Scope, VmId};
+
+    fn caps(mode: CapabilityMode, grants: &str) -> CapabilitySet {
+        let mut set = CapabilitySet::new(VmId::from_raw(0xFD_0001), mode);
+        assert!(
+            set.grant_from_list(grants).is_empty(),
+            "test grant list must parse"
+        );
+        set
+    }
+
+    #[test]
+    fn permissive_checked_openers_behave_exactly_like_the_raw_ones() {
+        let path = temp_file_with("hello");
+        let table = FileDescriptorTable::new();
+        let policy = caps(CapabilityMode::Permissive, "");
+        let fd = table
+            .open_read_checked(&policy, &path)
+            .expect("permissive allows everything");
+        let mut buf = [0u8; 8];
+        let n = table.read_bytes(fd, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enforce_denies_an_ungranted_read_without_touching_the_filesystem() {
+        let path = temp_file_with("secret");
+        let table = FileDescriptorTable::new();
+        let policy = caps(CapabilityMode::Enforce, "file-read:/definitely/elsewhere");
+
+        let err = table
+            .open_read_checked(&policy, &path)
+            .expect_err("path is outside the grant");
+        match err {
+            FdCapabilityError::Denied(d) => {
+                assert_eq!(d.capability, crate::capability::CapabilityKind::FileRead);
+                assert_eq!(d.vm, VmId::from_raw(0xFD_0001));
+            }
+            FdCapabilityError::Io(e) => panic!("expected a denial, got io error {e}"),
+        }
+        // No fd was consumed by the refused open: the next successful open
+        // gets the very next descriptor after the reserved 0/1/2.
+        let permissive = caps(CapabilityMode::Permissive, "");
+        let fd = table.open_read_checked(&permissive, &path).unwrap();
+        assert_eq!(fd, 3, "a denied open must not reserve a descriptor");
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enforce_denies_a_write_that_would_have_created_the_file() {
+        let path = temp_path("cap_denied_create");
+        assert!(!std::path::Path::new(&path).exists());
+        let table = FileDescriptorTable::new();
+        let policy = caps(CapabilityMode::Enforce, "file-read:*");
+
+        assert!(matches!(
+            table.open_write_checked(&policy, &path, false),
+            Err(FdCapabilityError::Denied(_))
+        ));
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "a denied write must not create the file — the check runs before the syscall"
+        );
+    }
+
+    #[test]
+    fn a_granted_path_prefix_admits_files_under_it() {
+        let path = temp_file_with("granted");
+        let dir = std::env::temp_dir();
+        let table = FileDescriptorTable::new();
+        let mut policy = CapabilitySet::new(VmId::from_raw(0xFD_0002), CapabilityMode::Enforce);
+        policy.grant(Capability::FileRead(Scope::path(&dir.to_string_lossy())));
+
+        let fd = table
+            .open_read_checked(&policy, &path)
+            .expect("the temp dir prefix must admit a file inside it");
+        table.close(fd).unwrap();
+
+        // ...and a traversal out of it is refused even though it is spelled
+        // as a child of the granted prefix.
+        let escape = format!("{}/../etc/passwd", dir.to_string_lossy());
+        assert!(matches!(
+            table.open_read_checked(&policy, &escape),
+            Err(FdCapabilityError::Denied(_))
+        ));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_write_open_requires_both_capabilities() {
+        let path = temp_file_with("rw");
+        let table = FileDescriptorTable::new();
+        // Read-only grant: an fd that can also write must be refused.
+        let read_only = caps(CapabilityMode::Enforce, "file-read:*");
+        assert!(matches!(
+            table.open_read_write_checked(&read_only, &path, false),
+            Err(FdCapabilityError::Denied(_))
+        ));
+        let both = caps(CapabilityMode::Enforce, "file-read:*;file-write:*");
+        let fd = table
+            .open_read_write_checked(&both, &path, false)
+            .expect("both granted");
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn network_openers_are_gated_on_the_endpoint() {
+        let table = FileDescriptorTable::new();
+        let policy = caps(CapabilityMode::Enforce, "network:127.0.0.1:0-65535");
+        // Wrong host — refused before any connect is attempted, so this test
+        // does no I/O at all.
+        assert!(matches!(
+            table.open_tcp_connect_checked(&policy, "169.254.169.254:80"),
+            Err(FdCapabilityError::Denied(_))
+        ));
+        // A UDP socket with no bind address cannot name an endpoint, so the
+        // narrow grant must refuse it (fail closed).
+        assert!(matches!(
+            table.open_udp_checked(&policy, None),
+            Err(FdCapabilityError::Denied(_))
+        ));
+        // A loopback listener on an ephemeral port is inside the grant.
+        let fd = table
+            .open_tcp_listener_checked(&policy, "127.0.0.1:0")
+            .expect("granted endpoint");
+        table.close(fd).unwrap();
+    }
+
+    #[test]
+    fn a_denial_maps_to_permission_denied_for_io_only_call_sites() {
+        let table = FileDescriptorTable::new();
+        let policy = caps(CapabilityMode::Enforce, "");
+        let err = table
+            .open_read_checked(&policy, "/anything")
+            .expect_err("empty enforce set denies everything");
+        let as_io: io::Error = err.into();
+        assert_eq!(as_io.kind(), io::ErrorKind::PermissionDenied);
+        assert!(as_io.to_string().contains("file-read"), "{as_io}");
     }
 }

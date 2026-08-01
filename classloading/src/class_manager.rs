@@ -29,7 +29,9 @@ use cratonvm_reader::attribute::{force_decode_all, Attribute};
 use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags, MethodAccessFlags};
 use cratonvm_reader::class_file_version::ClassFileVersion;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+use cratonvm_reader::field::ClassFileField;
 use cratonvm_reader::method::ClassFileMethod;
+use cratonvm_native_api::VmId;
 use tracing::debug;
 
 use crate::class::{
@@ -39,6 +41,9 @@ use crate::class::{
 use crate::class_origin::{ClassOrigin, ClassOriginEntry};
 use crate::class_path::ClassPath;
 use crate::loader_flags;
+use crate::metadata_handle::{
+    ClassHandle, FieldHandle, MetadataKind, MetadataRealm, MethodHandle, StaleMetadata,
+};
 use crate::loaders::{
     ApplicationClassFinder, BootstrapClassFinder, ClassFinder, ExtensionClassFinder,
     BUILTIN_LOADER_DELEGATION_CHAIN,
@@ -1506,6 +1511,109 @@ fn fire_vtable_override_hook(super_class_id: u32, slot: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// C2 review P1 — VM-scoped vtable hooks
+// ---------------------------------------------------------------------------
+//
+// [`VtableInstallHook`] is `fn(u32, Vec<…>)`: a captureless function pointer
+// with no VM parameter. `vm/src/runtime/vtable.rs`'s adapter therefore writes
+// into a process-global `VtableManager` (`GLOBAL_VTABLE_MANAGER`,
+// `vm/src/runtime/vtable.rs:957`) keyed by a bare `ClassId`. Because `ClassId`s
+// are allocated per VM, a second VM's vtables land in the first VM's index
+// under colliding ids, and `resolve_virtual_slot` can hand a caller in VM B a
+// `CachedBytecodeMethod` built from VM A's class — silent wrong virtual
+// dispatch. That is item V1 in `docs/architecture/per-vm-state.md`, recorded
+// there as the single largest blocker to the "100 concurrent VMs" criterion,
+// and it is explicitly blocked on a signature change in *this* crate.
+//
+// Unlike the redefine / JIT-invalidation hooks, this one cannot be fixed by
+// fanning out to every live VM: invalidation is idempotent and safe to
+// over-apply, whereas a vtable *install* is a write of authoritative state.
+//
+// So: a second, VM-scoped hook family, installed the same way and taking a
+// [`ClassHandle`] instead of a `u32`. The handle carries the owning VM's
+// identity *and* the class's metadata generation, which is what lets the VM
+// side both (a) route the install into the right VM's manager and (b) tell
+// whether an install it is holding was superseded by a later redefine.
+//
+// The legacy `fn(u32, …)` hooks are untouched and remain the default. When a
+// scoped hook is installed it takes precedence and the legacy hook is NOT also
+// fired, so a migrated VM does not double-install. Migration is a one-file
+// change in `vm/src/runtime/vtable.rs` plus the two `install_*` calls in
+// `vm/src/vm/vm_init.rs`; see `docs/architecture/vm-metadata-handles.md` §4.
+
+/// VM-scoped counterpart of [`VtableInstallHook`].
+///
+/// Parameters: `(class_handle, entries)`. The handle names the VM, the class
+/// and the metadata generation the descriptor vec was built from. Same
+/// re-entrancy rule as [`VtableInstallHook`]: the hook MUST NOT re-enter the
+/// class manager.
+pub type VtableInstallHookScoped = fn(ClassHandle, Vec<Option<VtableSlotDescriptor>>);
+
+/// VM-scoped counterpart of [`VtableOverrideHook`].
+///
+/// Parameters: `(super_class_handle, slot_index)`.
+pub type VtableOverrideHookScoped = fn(ClassHandle, usize);
+
+static VTABLE_INSTALL_HOOK_SCOPED: OnceLock<VtableInstallHookScoped> = OnceLock::new();
+static VTABLE_OVERRIDE_HOOK_SCOPED: OnceLock<VtableOverrideHookScoped> = OnceLock::new();
+static VTABLE_SCOPED_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Install the VM-scoped vtable-install hook. Idempotent — only the first
+/// install wins, matching [`install_vtable_install_hook`].
+///
+/// Installing this **replaces** the legacy install hook for every class defined
+/// afterwards; do not install both from the same VM.
+pub fn install_vtable_install_hook_scoped(hook: VtableInstallHookScoped) {
+    if VTABLE_INSTALL_HOOK_SCOPED.set(hook).is_ok() {
+        VTABLE_SCOPED_HOOK_ACTIVE.store(true, Ordering::Release);
+    }
+}
+
+/// Install the VM-scoped vtable-override hook. Idempotent.
+pub fn install_vtable_override_hook_scoped(hook: VtableOverrideHookScoped) {
+    let _ = VTABLE_OVERRIDE_HOOK_SCOPED.set(hook);
+    VTABLE_SCOPED_HOOK_ACTIVE.store(true, Ordering::Release);
+}
+
+/// Fire the vtable-install hook for `class_id`, preferring the VM-scoped hook.
+///
+/// Falls back to the legacy `fn(u32, …)` hook when no scoped hook is installed,
+/// and also when `class_id`'s generation counter is exhausted (so a class that
+/// can no longer mint handles still gets its vtable installed rather than
+/// silently losing virtual dispatch).
+#[inline]
+fn fire_vtable_install_hook_for(
+    realm: &MetadataRealm,
+    class_id: ClassId,
+    entries: Vec<Option<VtableSlotDescriptor>>,
+) {
+    if VTABLE_SCOPED_HOOK_ACTIVE.load(Ordering::Acquire) {
+        if let Some(hook) = VTABLE_INSTALL_HOOK_SCOPED.get() {
+            if let Some(handle) = realm.mint_class(class_id) {
+                hook(handle, entries);
+                return;
+            }
+        }
+    }
+    fire_vtable_install_hook(class_id.as_u32(), entries);
+}
+
+/// Fire the vtable-override hook for `super_class_id`, preferring the VM-scoped
+/// hook. Same fallback rule as [`fire_vtable_install_hook_for`].
+#[inline]
+fn fire_vtable_override_hook_for(realm: &MetadataRealm, super_class_id: ClassId, slot: usize) {
+    if VTABLE_SCOPED_HOOK_ACTIVE.load(Ordering::Acquire) {
+        if let Some(hook) = VTABLE_OVERRIDE_HOOK_SCOPED.get() {
+            if let Some(handle) = realm.mint_class(super_class_id) {
+                hook(handle, slot);
+                return;
+            }
+        }
+    }
+    fire_vtable_override_hook(super_class_id.as_u32(), slot);
+}
+
+// ---------------------------------------------------------------------------
 // WP1.5 — built-in class-loader registration hook
 // ---------------------------------------------------------------------------
 
@@ -1943,6 +2051,22 @@ pub struct ClassManager {
     /// container). Without this the violation list would be dominated by
     /// repeats of a handful of names and would be useless as a backlog.
     origin_violations_seen: FxHashSet<String>,
+
+    /// C2 review P1 — VM identity + per-class metadata generation for the
+    /// generational handles in [`crate::metadata_handle`].
+    ///
+    /// This manager's class table is indexed by `ClassId`, and a `ClassId` is
+    /// meaningless outside the VM that allocated it (`ClassStore::next_id`
+    /// returns `self.classes.len()`, and every `SharedVm` owns its own store —
+    /// `docs/architecture/per-vm-state.md` §0, Fact 1). The realm is what makes
+    /// a long-lived reference to this table checkable: it records *whose* table
+    /// this is and *which definition* of each class is current, so a stale
+    /// index fails with a named error at the resolution boundary instead of
+    /// silently naming another VM's class or a pre-redefine method table.
+    ///
+    /// Unbound until [`Self::bind_vm_id`] runs; see that method for the
+    /// ordering requirement.
+    metadata_realm: MetadataRealm,
 }
 
 /// Metadata released when a user-defined class loader is unloaded.
@@ -2325,6 +2449,10 @@ impl ClassManager {
             compatibility_mode: CompatibilityMode::Compatible,
             origin_violations: Vec::new(),
             origin_violations_seen: FxHashSet::default(),
+            // Unbound: `ClassManager::new` runs before the owning `SharedVm`
+            // exists, so it has no `vm_identity` to record yet. `vm_init` calls
+            // `bind_vm_id` as soon as it does.
+            metadata_realm: MetadataRealm::new(),
         }
     }
 
@@ -5183,14 +5311,18 @@ impl ClassManager {
         // the Class object, and constructors are never virtual.
         let (entries, overrides) = self.build_vtable_descriptors_with_overrides(id, superclass_id);
         self.vtable_descriptors.insert(id, entries.clone());
-        fire_vtable_install_hook(class_id_for_hook, entries);
+        // C2 review P1: route through the VM-scoped dispatcher so a migrated
+        // VM receives a `ClassHandle` (VM identity + generation) instead of a
+        // bare `u32` that aliases across VMs. Falls back to the legacy hook
+        // when no scoped hook is installed — single-VM behaviour is unchanged.
+        fire_vtable_install_hook_for(&self.metadata_realm, id, entries);
         // T10.9.A — fire CHA override signals for each super-class slot
         // that this class replaced. The VM-side listener calls
         // `VtableManager::invalidate_for_override` so stale cached
         // dispatch entries (thread-local invoke_cache or promoted
         // shared-resolution entries) get re-resolved on next hit.
         for (super_id, slot) in overrides {
-            fire_vtable_override_hook(super_id, slot);
+            fire_vtable_override_hook_for(&self.metadata_realm, ClassId::new(super_id), slot);
         }
 
         // T6.3.1 — Queue the JVMTI ClassLoad/ClassPrepare events (obsaudit
@@ -5615,6 +5747,16 @@ impl ClassManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|id, _| !ids.contains(id));
         self.init_states.write().retain(|id, _| !ids.contains(id));
+        // C2 review P1: unloading is an identity-invalidating event, so bump
+        // the metadata generation of every class in the dead set. The tombstone
+        // that `ClassStore::remove` leaves already makes a stale handle fail
+        // (as `StaleMetadata::Unloaded`), but the generation is what survives
+        // if a slot is ever revived, and it is deliberately NOT dropped from
+        // the realm here for that reason — unlike `redefine_generations` above,
+        // whose entry is only a cache-eviction gate for a live class. One u32
+        // per unloaded class is the same order of residue as the tombstone slot
+        // itself, which is likewise never reclaimed.
+        self.metadata_realm.bump_generations(ids.iter().copied());
 
         for id in &ids {
             if let Some(bytes) = self.class_bytes_cache.remove(id) {
@@ -5745,6 +5887,175 @@ impl ClassManager {
     /// model.  Default `false` — every other class is verified.
     pub fn class_skip_bytecode_verification(&self, class_id: ClassId) -> bool {
         self.skip_bytecode_verification.contains(&class_id)
+    }
+
+    // -------------------------------------------------------------------
+    // C2 review P1 — generational metadata handles
+    //
+    // See `crate::metadata_handle` for the model and
+    // `docs/architecture/vm-metadata-handles.md` for the migration plan.
+    // Everything here is additive: `ClassId` keeps working unchanged, and a
+    // handle is what you mint when a reference is about to outlive the borrow
+    // that produced it.
+    // -------------------------------------------------------------------
+
+    /// This manager's metadata realm — VM identity plus per-class generation.
+    pub fn metadata_realm(&self) -> &MetadataRealm {
+        &self.metadata_realm
+    }
+
+    /// The VM this manager's `ClassId`s are meaningful in, or
+    /// [`UNBOUND_VM`](crate::metadata_handle::UNBOUND_VM) before binding.
+    pub fn vm_id(&self) -> VmId {
+        self.metadata_realm.vm()
+    }
+
+    /// Record which VM owns this manager.
+    ///
+    /// **Ordering:** call this immediately after the owning `SharedVm` has been
+    /// assigned its `vm_identity` and *before* any handle is minted. Handles
+    /// minted from an unbound manager carry
+    /// [`UNBOUND_VM`](crate::metadata_handle::UNBOUND_VM) and are rejected with
+    /// [`StaleMetadata::WrongVm`] once binding happens — the fail-closed
+    /// direction, but still a rejection the VM would rather not have to
+    /// explain.
+    ///
+    /// Takes `&self` (the realm's identity is an atomic) so it can be called
+    /// through the `class_manager.read()` guard that `vm_init` already holds.
+    ///
+    /// Idempotent for the same [`VmId`]. Returns `Err(current)` if a
+    /// *different* VM already claimed this manager: that means two `SharedVm`s
+    /// share one `ClassManager`, under which every `ClassId` in the store is
+    /// ambiguous, and the caller must fail rather than pick a winner.
+    pub fn bind_vm_id(&self, vm: VmId) -> Result<(), VmId> {
+        self.metadata_realm.bind_vm(vm)
+    }
+
+    /// Mint a handle for a **live** class. `None` if `class_id` names no loaded
+    /// class in this manager (never loaded, or unloaded).
+    ///
+    /// The handle records the current VM identity and the class's current
+    /// metadata generation, so it can be stored indefinitely and checked later
+    /// with [`Self::resolve_class_handle`].
+    pub fn class_handle(&self, class_id: ClassId) -> Option<ClassHandle> {
+        if self.class_store.get(class_id).is_none() {
+            return None;
+        }
+        self.metadata_realm.mint_class(class_id)
+    }
+
+    /// Check `handle` and return the `ClassId` it names.
+    ///
+    /// Every rejection is named — see [`StaleMetadata`]. This is the *only*
+    /// sanctioned way to turn a stored handle back into an index.
+    pub fn resolve_class_id(&self, handle: ClassHandle) -> Result<ClassId, StaleMetadata> {
+        // `slot_count`, not `len`: unloaded classes leave tombstones, and an
+        // index that lands on a tombstone must report `Unloaded` rather than
+        // `OutOfRange`.
+        let slots = self.class_store.slot_count() as u32;
+        let live = self.class_store.get(handle.class_id_unchecked()).is_some();
+        self.metadata_realm.resolve_class(handle, slots, live)
+    }
+
+    /// Check `handle` and borrow the class it names.
+    pub fn resolve_class_handle(&self, handle: ClassHandle) -> Result<&Class, StaleMetadata> {
+        let id = self.resolve_class_id(handle)?;
+        // `resolve_class_id` already established that the slot is live; the
+        // `ok_or` is for the borrow checker's benefit, not a second check.
+        self.class_store
+            .get(id)
+            .ok_or(StaleMetadata::Unloaded { class: id })
+    }
+
+    /// Mint a handle for one method of a live class. `None` if the class is not
+    /// loaded or `method_index` is past the end of its `methods` vec.
+    pub fn method_handle(&self, class_id: ClassId, method_index: usize) -> Option<MethodHandle> {
+        let class = self.class_store.get(class_id)?;
+        if method_index >= class.methods.len() {
+            return None;
+        }
+        let class_handle = self.metadata_realm.mint_class(class_id)?;
+        Some(MethodHandle::from_parts(class_handle, method_index as u32))
+    }
+
+    /// Check `handle` and borrow the method it names.
+    ///
+    /// The class check runs first: a `RedefineClasses` replaces the whole
+    /// `methods` vec, so a method index that is still *in range* after a
+    /// redefine usually names a different method. That is precisely the silent
+    /// failure the generation exists to catch.
+    pub fn resolve_method_handle(
+        &self,
+        handle: MethodHandle,
+    ) -> Result<&ClassFileMethod, StaleMetadata> {
+        let class = self.resolve_class_handle(handle.class())?;
+        let index = handle.index_unchecked();
+        class
+            .methods
+            .get(index as usize)
+            .ok_or(StaleMetadata::OutOfRange {
+                kind: MetadataKind::Method,
+                class: class.id,
+                index,
+                len: class.methods.len() as u32,
+            })
+    }
+
+    /// Mint a handle for one declared field of a live class. `None` if the
+    /// class is not loaded or `field_index` is past the end of its `fields`
+    /// vec.
+    ///
+    /// `field_index` indexes the class's **own** `fields` vec, not the absolute
+    /// instance-slot number — the latter shifts under
+    /// `recompute_subclass_layouts` and is exactly what the generation guards.
+    pub fn field_handle(&self, class_id: ClassId, field_index: usize) -> Option<FieldHandle> {
+        let class = self.class_store.get(class_id)?;
+        if field_index >= class.fields.len() {
+            return None;
+        }
+        let class_handle = self.metadata_realm.mint_class(class_id)?;
+        Some(FieldHandle::from_parts(class_handle, field_index as u32))
+    }
+
+    /// Check `handle` and borrow the field it names.
+    pub fn resolve_field_handle(
+        &self,
+        handle: FieldHandle,
+    ) -> Result<&ClassFileField, StaleMetadata> {
+        let class = self.resolve_class_handle(handle.class())?;
+        let index = handle.index_unchecked();
+        class
+            .fields
+            .get(index as usize)
+            .ok_or(StaleMetadata::OutOfRange {
+                kind: MetadataKind::Field,
+                class: class.id,
+                index,
+                len: class.fields.len() as u32,
+            })
+    }
+
+    /// Current metadata generation of `class_id` — the value a freshly minted
+    /// handle would carry. Zero for a class that has never been redefined,
+    /// unloaded, or re-laid-out.
+    ///
+    /// Distinct from [`Self::class_redefine_generation`], which counts only
+    /// JVMTI redefinitions and is what the per-thread invoke cache already
+    /// gates on. This one additionally counts unloads and the synthetic-stub
+    /// layout upgrade that renumbers fields.
+    pub fn class_metadata_generation(&self, class_id: ClassId) -> u32 {
+        self.metadata_realm.generation(class_id)
+    }
+
+    /// Advance `class_id`'s metadata generation, retiring every handle already
+    /// minted for it.
+    ///
+    /// The class manager calls this itself on redefine, unload and layout
+    /// upgrade. It is `pub` so a VM-side event that this crate cannot see (a
+    /// mirror swap, an agent-driven metadata patch) can join the same
+    /// invalidation protocol rather than inventing a parallel one.
+    pub fn invalidate_class_metadata(&self, class_id: ClassId) -> u32 {
+        self.metadata_realm.bump_generation(class_id)
     }
 
     // -------------------------------------------------------------------
@@ -6682,6 +6993,14 @@ impl ClassManager {
         // the explicit Release pairs cleanly with cross-thread
         // Acquire reads of the counter).
         let new_gen = counter.fetch_add(1, Ordering::Release) + 1;
+        // C2 review P1: bump the metadata realm's generation in the same step.
+        // Every `ClassHandle` / `MethodHandle` / `FieldHandle` minted against
+        // the pre-redefine class is now stale, and must fail with a named
+        // `StaleMetadata::StaleGeneration` rather than resolving into the
+        // freshly-replaced `methods` vec at an index that means something else.
+        // Separate from the counter above on purpose — see
+        // `class_metadata_generation` for why the two are not yet unified.
+        self.metadata_realm.bump_generation(class_id);
         // Arm the global fast-path flag so the interpreter's native/intrinsic
         // shadowing guards start consulting per-class redefine generations.
         ANY_CLASS_REDEFINED.store(true, Ordering::Release);
@@ -8057,6 +8376,15 @@ impl ClassManager {
         // same hook.
         fire_jit_invalidate_hook(id.as_u32());
 
+        // C2 review P1: this is the *other* identity-invalidating event, and
+        // it is strictly worse than a JEP 109 redefine — the stub's methods,
+        // constant pool AND instance-field layout are all replaced, so a
+        // memoized `(class_id, method_index)` or `(class_id, field_index)`
+        // pair now names something else. `redefine_generations` is NOT bumped
+        // on this path (it counts JVMTI redefinitions only), which is exactly
+        // why the realm keeps its own counter.
+        self.metadata_realm.bump_generation(id);
+
         // The upgrade replaced the constant pool and may have shifted
         // field indices for this class and its subclasses; drop any
         // cached `(referring-class, cp-index) -> ResolvedField` entries
@@ -8166,6 +8494,11 @@ impl ClassManager {
         // recompilation of any method that baked the stale offset).
         for cid in changed_descendants {
             fire_resolution_invalidate_hook(cid);
+            // C2 review P1: the descendant's `first_field_index` just moved,
+            // so every field handle minted against it is stale. Same reasoning
+            // as the parent bump in `upgrade_synthetic_class`, applied to each
+            // class the shift propagated to.
+            self.metadata_realm.bump_generation(ClassId::new(cid));
             // Compact ref-field layout: the descendant's field offsets / oop-map
             // shifted with its parent's growth — rebuild + re-register it.
             self.class_store

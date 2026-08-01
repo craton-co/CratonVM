@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::{Condvar, Mutex};
 
 use crate::threading::jvm_thread::ThreadId;
+use crate::threading::thread_state::{self, ThreadExecState};
 
 /// Coordinates stop-the-world pauses for garbage collection.
 ///
@@ -321,6 +322,13 @@ impl GcBarrier {
         self.threads_blocked.fetch_add(1, Ordering::AcqRel);
         let pre_stw = self.stw_requested.load(Ordering::Acquire);
         drop(inner);
+        // P1 shadow record. Deliberately after the lock drop: the shadow
+        // registry's own lock must never be taken inside this critical
+        // section's remaining span. See `threading::thread_state`.
+        thread_state::record_transition(
+            ThreadExecState::NativeBlocked,
+            "gc_barrier::enter_blocked",
+        );
         BlockedGuard {
             barrier: self,
             pre_stw,
@@ -341,6 +349,17 @@ impl GcBarrier {
         self.threads_blocked.fetch_add(1, Ordering::AcqRel);
         let pre_stw = self.stw_requested.load(Ordering::Acquire);
         drop(inner);
+        // P1 shadow record. NOTE: unlike every `NativeContextImpl` caller,
+        // `jni::host_thread_enter_native` (`vm/src/native/jni.rs:623`) reaches
+        // here WITHOUT a preceding `deposit_root_snapshot`, so it raises the
+        // anonymous counter without raising `in_blocked_region`. The shadow
+        // state follows this counter, which is the superset — see
+        // `docs/threading/thread-transition-states.md`, §"Unsound or
+        // unmodelled transitions", item 1.
+        thread_state::record_transition(
+            ThreadExecState::NativeBlocked,
+            "gc_barrier::mark_blocked_region_enter",
+        );
         pre_stw
     }
 
@@ -412,10 +431,21 @@ impl GcBarrier {
         if !stw_requested.load(Ordering::Acquire) {
             return;
         }
+        // P1 shadow record: this is a genuine parked window — the caller is
+        // still counted blocked, executes no code, and its frames are
+        // maintained by `fold_pointer_map_into_blocked`. Restore whatever the
+        // caller was in afterwards rather than guessing, so the recorder never
+        // invents a transition the code does not perform.
+        let resume_state = thread_state::current_state();
+        thread_state::record_transition(
+            ThreadExecState::SafepointParked,
+            "gc_barrier::wait_out_pause_locked",
+        );
         let gen = gc_generation.load(Ordering::Acquire);
         while gc_generation.load(Ordering::Acquire) == gen {
             gc_complete.wait(inner);
         }
+        thread_state::record_transition(resume_state, "gc_barrier::wait_out_pause_locked:resume");
     }
 
     /// Number of threads currently parked in a blocking native. Used by
@@ -463,10 +493,26 @@ impl GcBarrier {
         tid: ThreadId,
         flag: &std::sync::atomic::AtomicBool,
     ) {
+        // P1 shadow record: this entry is always self-called for the caller's
+        // own `tid` (the `initiator == Some(tid)` short-circuit below only
+        // makes sense that way), so it is a safe binding point for a thread
+        // that has not yet named itself to the recorder.
+        thread_state::bind_current_thread(tid.0);
         let mut inner = self.inner.lock();
         loop {
             if !self.stw_requested.load(Ordering::Acquire) || inner.initiator == Some(tid) {
                 flag.store(false, Ordering::Release);
+                // This is the authoritative blocked -> running edge: the
+                // identity flag drops under the same lock hold that proved no
+                // pause is active. Recorded as `JavaRunning`; a caller that is
+                // really resuming inside a native (`end_blocking_region_refs`)
+                // records `NativeRunning` at its own next transition, and
+                // `JavaRunning -> NativeRunning` is itself a tabled edge, so
+                // the approximation cannot cascade into a false violation.
+                thread_state::record_transition(
+                    ThreadExecState::JavaRunning,
+                    "gc_barrier::leave_blocked_region_flagged",
+                );
                 return;
             }
             // A pause is active. Arrive for it exactly once if its census
@@ -485,9 +531,19 @@ impl GcBarrier {
                     self.all_arrived.notify_all();
                 }
             }
+            // P1 shadow record: still flagged blocked, but genuinely parked
+            // for the duration of this pause.
+            thread_state::record_transition(
+                ThreadExecState::SafepointParked,
+                "gc_barrier::leave_blocked_region_flagged:drain",
+            );
             while self.gc_generation.load(Ordering::Acquire) == arrival_gen {
                 self.gc_complete.wait(&mut inner);
             }
+            thread_state::record_transition(
+                ThreadExecState::NativeBlocked,
+                "gc_barrier::leave_blocked_region_flagged:drained",
+            );
             // Lock reacquired by the condvar — reclassify from the top.
         }
     }
@@ -614,11 +670,21 @@ impl GcBarrier {
     /// read under the same lock `request_stw_counted_locked` populated it
     /// under, which is race-free by construction.
     fn arrive_and_wait_inner(&self, tid: ThreadId, mode: Option<bool>) -> HashMap<usize, usize> {
+        // P1 shadow record: always self-called for the caller's own `tid`
+        // (see the initiator short-circuit below), so this is the primary
+        // binding point for the recorder.
+        thread_state::bind_current_thread(tid.0);
         let mut inner = self.inner.lock();
         // If this is the initiator or STW is not active, return immediately
         if !self.stw_requested.load(Ordering::Acquire) || inner.initiator == Some(tid) {
             return HashMap::new();
         }
+        // The state to restore when this pause ends. The barrier cannot know
+        // whether the caller reached here from the interpreter poll, a
+        // blocking-region entry, a startup retry loop or compiled code, so it
+        // records the parked window and puts the caller back where it was
+        // instead of inventing an edge.
+        let resume_state = thread_state::current_state();
         let participating = mode.unwrap_or_else(|| !inner.excluded_blocked.contains(&tid.0));
         // Capture the generation of the STW we are arriving for (under the lock,
         // so `complete_gc` — which bumps the generation under the same lock —
@@ -653,11 +719,20 @@ impl GcBarrier {
                 self.all_arrived.notify_all();
             }
         }
+        thread_state::record_transition(
+            ThreadExecState::SafepointParked,
+            if participating {
+                "gc_barrier::arrive_and_wait_inner:participating"
+            } else {
+                "gc_barrier::arrive_and_wait_inner:excluded"
+            },
+        );
         // Wait until THIS pause completes (its generation is published by
         // `complete_gc`), not merely until `stw_requested` clears — see above.
         while self.gc_generation.load(Ordering::Acquire) == arrival_gen {
             self.gc_complete.wait(&mut inner);
         }
+        thread_state::record_transition(resume_state, "gc_barrier::arrive_and_wait_inner:resume");
         inner.pointer_map.clone()
     }
 

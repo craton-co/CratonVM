@@ -6,6 +6,7 @@
 //! Provides the NativeContext trait, NativeMethodRegistry, FFI types,
 //! and FileDescriptorTable used by all native method crates.
 
+pub mod capability;
 pub mod charset;
 pub mod fd_table;
 pub mod ffi;
@@ -28,6 +29,16 @@ pub mod socket_input_stream_read;
 #[cfg(any(test, feature = "test-mock"))]
 pub mod test_mock;
 
+/// Per-VM capability gate for native and foreign (FFM) operations.
+///
+/// See `capability` for the model, the three modes, and why the default is
+/// permissive. `docs/security/native-capabilities.md` carries the audit
+/// inventory and the ordered plan to reach default-deny.
+pub use capability::{
+    capabilities_for, capability_audit, install_capabilities, uninstall_capabilities, Capability,
+    CapabilityAuditReport, CapabilityCheck, CapabilityDenied, CapabilityKind, CapabilityMode,
+    CapabilitySet, CapabilityUse, PortSpec, Scope, VmId,
+};
 pub use intrinsic::InterpIntrinsic;
 /// Native-dispatch call-site memoization: resolve once, then index.
 ///

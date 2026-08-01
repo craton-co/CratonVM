@@ -501,8 +501,32 @@ fn cipher_init_record(
             .map(|s| s.algorithm.clone())
             .unwrap_or_default()
     });
+    // P0: `.unwrap_or_default()` here recorded an EMPTY modulus/exponent as
+    // this cipher's key state — a `Cipher.init` that reported success while
+    // installing no key at all. `cipher_do_final_impl` does catch the empty
+    // pair, but only at `doFinal` time and as an `IllegalStateException`,
+    // which is neither where nor what the JDK specifies: `Cipher.init`
+    // declares `InvalidKeyException` precisely so a key the provider cannot
+    // use is rejected at init. Reject it here, naming the key.
+    //
+    // Only RSA transformations are affected: for every other transformation
+    // the pair is legitimately empty and unused.
     let (rsa_n, rsa_exp) = if is_rsa_transformation(&algo) {
-        rsa_key_components(ctx, key, mode).unwrap_or_default()
+        match rsa_key_components(ctx, key, mode) {
+            Some(pair) if !pair.0.is_empty() && !pair.1.is_empty() => pair,
+            _ => {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/InvalidKeyException",
+                    &format!(
+                        "Cipher.init({algo}): the supplied key exposes no usable RSA \
+                         modulus/exponent (neither getModulus()/get*Exponent() nor a \
+                         crypto_impl key handle). Refusing to initialise a cipher with \
+                         no key — an empty key is not a key."
+                    ),
+                ));
+            }
+        }
     } else {
         (Vec::new(), Vec::new())
     };
@@ -1867,7 +1891,23 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         let res = cipher_do_final_impl(ctx, this);
         let out_bytes = match res {
             Ok(Some(Value::Object(Some(a)))) => read_bytes(ctx, a),
-            Ok(_) => Vec::new(),
+            // P0: this used to be `Ok(_) => Vec::new()`, which wrote nothing
+            // into the caller's buffer and returned 0 — "the cipher produced
+            // zero bytes", indistinguishable from a legitimate empty result.
+            // `cipher_do_final_impl` only ever returns `Err` or a real byte[],
+            // so reaching here means an unexpected shape, not an empty
+            // ciphertext. Refuse rather than report a successful zero-length
+            // encryption.
+            Ok(other) => {
+                ctx.unpin_native_roots(opin);
+                return Err(RuntimeError::IllegalStateException {
+                    message: format!(
+                        "Cipher.doFinal produced no output buffer ({other:?}); \
+                         refusing to report 0 bytes written as success"
+                    ),
+                }
+                .into());
+            }
             Err(e) => {
                 ctx.unpin_native_roots(opin);
                 return Err(e);
@@ -2323,5 +2363,112 @@ mod tests {
         assert_eq!(cipher, "AES");
         assert_eq!(mode, "ECB");
         assert!(pad);
+    }
+
+    // -----------------------------------------------------------------------
+    // P0 — `Cipher.init` must reject a key it cannot use.
+    //
+    // The "must raise" case has a "must still work" twin with a real RSA key,
+    // and a third case proving the guard is scoped to RSA transformations
+    // only (an AES init with no RSA components is legitimate and unaffected).
+    // -----------------------------------------------------------------------
+
+    /// Set up a synthetic `Cipher` whose recorded transformation is `algo`.
+    fn cipher_for(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        algo: &str,
+    ) -> cratonvm_types::ObjectRef {
+        let cid = ctx.ensure_class_initialized("javax/crypto/Cipher").unwrap();
+        let obj = ctx.alloc_object(cid, 8);
+        let tkey = obj_key(ctx, obj);
+        with_table_write(|t| {
+            t.entry(tkey).or_default().algorithm = algo.to_string();
+        });
+        obj
+    }
+
+    /// A synthetic `Key` carrying `key_id` in slot 3 (0 = "no handle").
+    fn key_with_handle(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        key_id: u64,
+    ) -> cratonvm_types::ObjectRef {
+        let cid = ctx.ensure_class_initialized("java/security/Key").unwrap();
+        let key = ctx.alloc_object(cid, 8);
+        ctx.set_field(key, 3, Value::Long(key_id as i64));
+        key
+    }
+
+    // MUST RAISE.
+    #[test]
+    fn rsa_cipher_init_with_an_unusable_key_raises_invalid_key() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cipher_obj = cipher_for(&mut ctx, "RSA/ECB/PKCS1Padding");
+        // No `getModulus()` behaviour in the mock and no crypto_impl handle:
+        // `rsa_key_components` returns `None`.
+        let key = key_with_handle(&mut ctx, 0);
+        let err = cipher_init_record(&mut ctx, cipher_obj, 1, key, Vec::new())
+            .expect_err("init must reject a key with no usable RSA components");
+        use cratonvm_types::error::MethodCallFailed;
+        match err {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                let cid = ctx.class_id_of_object(exc);
+                assert_eq!(
+                    ctx.class_name_of_id(cid).as_deref(),
+                    Some("java/security/InvalidKeyException"),
+                    "Cipher.init declares InvalidKeyException for exactly this"
+                );
+            }
+            // `throw_jca_exc`'s fallback — still loud, still not a success.
+            MethodCallFailed::InternalError(e) => {
+                let text = format!("{e}");
+                assert!(
+                    text.contains("IllegalArgumentException"),
+                    "unexpected fallback: {text}"
+                );
+            }
+        }
+        // And the cipher must NOT have been left holding an empty key.
+        let tkey = obj_key(&mut ctx, cipher_obj);
+        let recorded = with_table_read(|t| t.get(&tkey).map(|s| s.mode).unwrap_or(0));
+        assert_eq!(recorded, 0, "a refused init must not record a mode");
+    }
+
+    // MUST STILL WORK — the twin.
+    #[test]
+    fn rsa_cipher_init_with_a_real_key_succeeds() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let (public_key, private_key) = crate::crypto_impl::Rsa::generate_keypair(1024);
+        let id = crate::crypto_impl::rsa_key_next_id();
+        crate::crypto_impl::rsa_key_store(
+            id,
+            crate::crypto_impl::RsaKeyPairData {
+                public_key,
+                private_key,
+            },
+        );
+        let cipher_obj = cipher_for(&mut ctx, "RSA/ECB/PKCS1Padding");
+        let key = key_with_handle(&mut ctx, id);
+        cipher_init_record(&mut ctx, cipher_obj, 1, key, Vec::new())
+            .expect("a registered RSA key must initialise the cipher");
+        let tkey = obj_key(&mut ctx, cipher_obj);
+        let (mode, n_len, e_len) = with_table_read(|t| {
+            let s = t.get(&tkey).expect("state recorded");
+            (s.mode, s.rsa_n.len(), s.rsa_exp.len())
+        });
+        assert_eq!(mode, 1);
+        assert!(n_len > 0 && e_len > 0, "the real key components are recorded");
+    }
+
+    // MUST STILL WORK — the guard is RSA-scoped; a symmetric init has no RSA
+    // components by design and must not be refused.
+    #[test]
+    fn non_rsa_cipher_init_is_unaffected_by_the_rsa_key_guard() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cipher_obj = cipher_for(&mut ctx, "AES/GCM/NoPadding");
+        let key = key_with_handle(&mut ctx, 0);
+        cipher_init_record(&mut ctx, cipher_obj, 1, key, vec![0u8; 12])
+            .expect("an AES init must not be caught by the RSA key guard");
+        let tkey = obj_key(&mut ctx, cipher_obj);
+        assert_eq!(with_table_read(|t| t.get(&tkey).map(|s| s.mode)), Some(1));
     }
 }

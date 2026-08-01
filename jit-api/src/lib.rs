@@ -983,6 +983,39 @@ pub struct JitRuntimeHelpers {
     /// num_args: i64) -> i64` — returns the resumed call result, or `i64::MIN`
     /// unchanged when the sentinel must keep propagating.
     pub service_callee_deopt: usize,
+    /// Constant-pool-indexed `new` (0xbb) slow path — `extern "C"
+    /// fn(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64`.
+    ///
+    /// The ordinary [`Self::new_object`] path takes an already-resolved
+    /// `(class_id, num_fields)` pair, which the compiler can only supply when
+    /// the `new`'s target class is ALREADY LOADED. A hot method whose only
+    /// un-taken branch does `throw new SomeException(...)` therefore failed to
+    /// compile at all — `resolve_jit_new_site` returned `None` and the whole
+    /// compile bailed, permanently after `MAX_TIER_FAIL_RETRIES`
+    /// (docs/internal/jit-compile-bail-unresolved-new-cold-class.md).
+    ///
+    /// This helper moves resolution to run time: the compiler bakes the
+    /// *referencing* class id and the CP index, and the helper resolves +
+    /// initialises the target exactly like the interpreter's 0xbb handler
+    /// (same thread, same program point) before falling into
+    /// `jit_new_object`'s body. Sound because it is what the interpreter
+    /// already does; free on the hot path because a `new` whose class IS
+    /// loaded at compile time still takes the inline-TLAB/`new_object` path.
+    ///
+    /// `0` = not wired (hand-built test tables) → the backend refuses the
+    /// deferred site and bails the compile, i.e. the pre-fix behaviour.
+    /// Appended at the END of the struct so all prior golden offsets stay
+    /// stable.
+    pub new_object_cp: usize,
+    /// Constant-pool-indexed `anewarray` (0xbd) slow path — `extern "C"
+    /// fn(vm_ptr: i64, holder_class_id: i64, cp_idx: i64, length: i64) -> i64`.
+    ///
+    /// The `anewarray` sibling of [`Self::new_object_cp`]: same root cause
+    /// (the component class is not loaded yet, so the compile-time resolver
+    /// cannot name a class id), same runtime-resolution answer. `0` = not
+    /// wired → the deferred site bails the compile. Appended at the END of
+    /// the struct so all prior golden offsets stay stable.
+    pub anewarray_object_cp: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1145,6 +1178,11 @@ helper_fields! {
     // Optional: a hand-built test helpers table leaves it 0, and the codegen
     // then emits no sentinel check — the pre-existing behaviour.
     (service_callee_deopt,           FieldKind::OptionalPtr),
+    // Optional: a hand-built test helpers table leaves these 0, and the
+    // backend then refuses a deferred (not-yet-loaded) `new`/`anewarray`
+    // site and bails the compile — the pre-existing behaviour.
+    (new_object_cp,                  FieldKind::OptionalPtr),
+    (anewarray_object_cp,            FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1170,7 +1208,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 58,
+    JitRuntimeHelpers::NUM_FIELDS == 60,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1557,6 +1595,8 @@ mod tests {
             jit_card_old_end: 0x1180,
             set_throw_bci: 0x1188,
             service_callee_deopt: 0x1190,
+            new_object_cp: 0x1198,
+            anewarray_object_cp: 0x11A0,
         }
     }
 
@@ -1787,6 +1827,8 @@ mod tests {
             jit_card_old_end: 0,
             set_throw_bci: 0,
             service_callee_deopt: 0,
+            new_object_cp: 0,
+            anewarray_object_cp: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -1962,8 +2004,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 58.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 58);
+        // And the macro-driven count is the canonical 60.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 60);
     }
 
     #[test]
@@ -2251,6 +2293,16 @@ mod tests {
                 "service_callee_deopt",
                 std::mem::offset_of!(JitRuntimeHelpers, service_callee_deopt),
             ),
+            (
+                58,
+                "new_object_cp",
+                std::mem::offset_of!(JitRuntimeHelpers, new_object_cp),
+            ),
+            (
+                59,
+                "anewarray_object_cp",
+                std::mem::offset_of!(JitRuntimeHelpers, anewarray_object_cp),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2288,7 +2340,7 @@ mod tests {
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
         // The macro must classify every field.
-        // 42 RequiredPtr + 7 OptionalPtr + 9 Offset = 58. A new
+        // 42 RequiredPtr + 9 OptionalPtr + 9 Offset = 60. A new
         // field whose classification is omitted will fail to compile (the
         // macro requires both arms); this test pins the *counts* so a
         // reclassification (e.g. demoting a RequiredPtr to OptionalPtr) is
@@ -2305,7 +2357,7 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 42, "required-pointer count drifted");
-        assert_eq!(opt, 7, "optional-pointer count drifted");
+        assert_eq!(opt, 9, "optional-pointer count drifted");
         assert_eq!(off, 9, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }

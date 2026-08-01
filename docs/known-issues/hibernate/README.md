@@ -67,11 +67,20 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
     120 s. That part *is* the
     [moving-young-inert-under-JIT](moving-young-inert-under-jit-throughput-tax-20260730.md)
     throughput tax, and it stays there.
-  - `--nojit` — [SIGSEGV from stale chain cursors in `map_resize_inner`](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md)
-    at ~20 min. Note this **inverts** the 2026-07-22 advice to force `--nojit`
-    for this class: `--nojit` is now the worse mode. A second corrupt writer in
+  - `--nojit` — [the collector leaves reference fields UN-FORWARDED](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md).
+    The SIGSEGV is **fixed** (the class now completes, `rc=0` @ 5110 s, where it
+    crashed at 2103–2611 s), but it still does not match HotSpot: `found=99` vs
+    `132`, with JUnit `TestPlan` losing identifiers. That doc's original
+    `map_resize_inner` attribution is RETRACTED. A second corrupt writer in
     the same runs (`HIB-WEAKREF-RECYCLE.1`, post-GC weak/phantom referent
     restore) was root-caused and **fixed** on the same branch.
+
+    Worth a re-measure on this branch before further investigation: "`found=N`
+    below 132, with `TestPlan` losing identifiers" is *exactly* the face the JIT
+    lane showed (`found=121`), and there it turned out to be one symptom of a
+    stale reference in a frame, cured by the movable-JIT-root bound above. The
+    `--nojit` lane runs the same non-moving sweep and the same selective
+    promotion, so the fix applies to it too and this number predates it.
 
   The class's `MutableBigInteger` AIOOBE quarantine (`41cdfdf94`) is untouched
   and not in question.
@@ -140,31 +149,41 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   (~29 functions) were fixed on the way through. Full write-up:
   `docs/internal/fixed-suite-bugs/hibernate/antlr-native-roots-moving-young-hql-misparse-20260730-FIXED.md`.
 
+- **A user lambda could be routed to the collector natives under the JIT** — FIXED
+  2026-07-31, closing the HQL ordinal-parameter report. `Collector.accumulator()` and its
+  siblings return synthetic objects whose class name IS the SAM interface, so the natives
+  serving them are registered on `java/util/function/{Supplier.get, BiConsumer.accept,
+  Function.apply, BinaryOperator.apply}`. A lambda proxy has no class of its own in the class
+  store, so the JIT's by-name dispatch bails resolved it as its functional interface and ran
+  those natives instead of the lambda: `Supplier.get` returned an empty `ArrayList`,
+  `Function.apply` returned its argument, `BiConsumer.accept(a,b)` called `a.add(b)`. Three of
+  the four are silent; the fourth is the `NoSuchMethodError: ....add(Ljava/lang/Object;)Z` that
+  failed three `ASTParserLoadingTest` tests on **every** JIT run. Needs the site compiled
+  (the interpreter resolves proxies through the registry first) and megamorphic. A shared
+  `try_lambda_proxy_sam_dispatch` now guards both bails.
+  `FunctionalInterfaceHijackProbe.java` is the reduced witness. The report that prompted the
+  hunt — a one-in-fourteen `ordinal parameters []` — never reproduced and is **not** attributed
+  to this; read the write-up's "What is and is not proven" before citing it.
+  Full write-up: `docs/internal/fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`.
+
 ## Open
 
-- [HQL ordinal parameter silently dropped — `ordinal parameters []` under JIT](hql-ordinal-parameter-dropped-under-jit-20260731.md)
-  (OPEN; observed once, cause not located) — `ASTParserLoadingTest#testComponentNullnessChecks`
-  failed 1 run in 14 under JIT with `No parameter labelled '?1' in query with ordinal parameters []`
-  and has not recurred (a follow-up 8-run interleaved A/B was clean on both binaries).
-  The query parses without a syntax error but its ordinal parameter never reaches
-  `ParameterMetadataImpl`, so this is a *missing production*, not the rejected-parse shape of the
-  (now fixed) ANTLR moving-young root defect — zero `SyntaxException`s appeared in any of the
-  twelve witness runs. `HqlParseStress` now asserts that every parameter marker survives into
-  `statement().getText()`; 3500 parses per arm across jit/nojit x default/GC-stress reproduce
-  nothing on either binary, so the defect is likely downstream of the parse tree.
-
-- [`map_resize_inner` publishes stale chain heads into the resized bucket array](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md)
-  (OPEN; root cause located, fix not landed) — `HIB-MAPRESIZE-STALE.1`. The JDK-style
-  split walk holds `old_b`/`new_buckets`/`node_val` and all four lo/hi head/tail cursors
-  as bare Rust locals across two REFERENCE-typed `set_field` stores, each of which can
-  allocate a remembered-set entry through the write barrier and therefore complete a
-  moving young GC. The stale `lo_head`/`hi_head` are then published into `new_buckets`,
-  so the map permanently holds dangling chain heads and every later put walks freed
-  memory. SIGSEGV at ~17-20 min, three for three. Same class of bug — and the same fix
-  shape — as the ANTLR root defect retired above (which converted its whole module to
-  `NativeHandleScope` rather than patching sites one at a time) and as
-  `native_map_put_evict_pinned`'s own existing pin discipline a few hundred lines away in
-  the same file.
+- [Old-generation header corruption kills `DefaultCatalogAndSchemaTest` under `--nojit`](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md)
+  (NARROWED, still OPEN) — `HIB-MAPRESIZE-STALE.1`. **The `map_resize_inner` attribution
+  this entry used to carry is retracted**: a reference-typed store is not a GC point at
+  all (`gen_heap::write_barrier` never allocates from the Java heap), which is why the
+  pin refactor that premise called for landed and changed nothing. Three defects were
+  tangled here. Two are fixed — a whole class of collection natives holding heap refs
+  across their own allocations and Java callbacks (`fix/hib-mapresize-put-stale-20260731`,
+  ~40 sites behind a new `rooted_across` helper, caught deterministically in ~90 s by the
+  new `RMapGcStress`), and the corrupt-header diagnostic that `Debug`-formatted an invalid
+  `ObjectKind` and walked a wild pointer in `core::fmt` (`22107d512`). The residual is
+  what makes an old-gen header garbage in the first place: arm C logs 48 rejected headers
+  with `kind=0x3a` (ASCII `':'` — text written over a header) and then SIGSEGVs on a heap
+  address. Crash time has moved 2103 s → 2312 s → 2611 s across the three arms. The one
+  lead is a `CRATONVM_DBG_STALE_OBJREF` hit in a native reached from
+  `ClassLoaderServiceImpl.classForName` — the same bug shape, in the class-loading
+  natives.
 
 - ~~Spurious `OutOfMemoryError` with 570 MB free~~ — `HIB-GCOVERHEAD-HALFFULL.1`,
   **FIXED 2026-07-31**, retired to

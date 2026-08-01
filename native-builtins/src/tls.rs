@@ -215,6 +215,137 @@ fn alloc_ssl_engine_result(ctx: &mut dyn NativeContext, status: i32, hs_status: 
     obj
 }
 
+// ---------------------------------------------------------------------------
+// Refusal helpers
+// ---------------------------------------------------------------------------
+
+/// Throw `java.security.NoSuchAlgorithmException(msg)`.
+///
+/// The JDK-specified failure for `SSLContext.getInstance` with an unsupported
+/// protocol. Same construct-or-fall-back shape as
+/// `phases_early::throw_jca_exc` (the mechanism documented in
+/// `docs/security/crypto-failure-contract.md`); the fallback is an
+/// `IllegalArgumentException` rather than a value, so an absent exception
+/// class still cannot turn a refusal into a working context.
+fn throw_tls_algorithm_exc(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/security/NoSuchAlgorithmException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+        message: msg.to_string(),
+    }
+    .into()
+}
+
+/// Refuse a factory request from an `SSLContext` that was never `init()`ed.
+///
+/// Real JSSE (`sun.security.ssl.SSLContextImpl.engineGetSocketFactory`) throws
+/// `IllegalStateException("SSLContext is not initialized")`. This module used
+/// to hand out a factory regardless, so a caller that skipped `init()` — or
+/// whose `init()` threw and was swallowed — got a factory whose key and trust
+/// managers were never installed, and no signal that anything was missing.
+fn require_initialized_context(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    method: &str,
+) -> Result<(), MethodCallFailed> {
+    if matches!(ctx.get_field(this, CTX_INITIALIZED), Value::Int(1)) {
+        return Ok(());
+    }
+    Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+        message: format!(
+            "SSLContext is not initialized; call SSLContext.init(KeyManager[], \
+             TrustManager[], SecureRandom) before {method}. Refusing to return a \
+             factory with no key or trust managers installed."
+        ),
+    }
+    .into())
+}
+
+// ---------------------------------------------------------------------------
+// The non-cryptographic synthetic SSLEngine
+// ---------------------------------------------------------------------------
+
+/// Tri-state cache for the [`noncrypto_engine_allowed`] opt-in:
+/// `0` = not yet read, `1` = deny (the default), `2` = allow.
+static NONCRYPTO_ENGINE_OPT_IN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether the caller has explicitly opted in to this module's
+/// non-cryptographic `javax/net/ssl/SSLEngine`.
+///
+/// **Default: deny.** This engine's `wrap`/`unwrap` perform no cryptography
+/// whatsoever — they move no bytes, emit no records, and drive a hand-written
+/// state machine that reaches `HandshakeStatus.FINISHED` and a session
+/// reporting `TLSv1.3` / `TLS_AES_256_GCM_SHA384`. An application that wraps
+/// plaintext and writes the (untouched) destination buffer to a socket sends
+/// cleartext while every JSSE status it can observe says the handshake
+/// completed. That is precisely "unsupported TLS mistaken for transport
+/// security".
+///
+/// No working path is lost by refusing: the engine never produced TLS bytes,
+/// so anything driving it was already failing further downstream (`lib.rs`'s
+/// note on this stub records the symptom as "unexpected EOF"). Refusing turns
+/// a confusing downstream failure into an accurate local one.
+///
+/// `CRATONVM_ALLOW_NONCRYPTO_SSLENGINE=1` restores the legacy behaviour for
+/// debugging and regression bisecting. The real, rustls-backed engine is
+/// `t27_tls::register_sslengine_real` on `sun/security/ssl/SSLEngineImpl` and
+/// is unaffected by this gate.
+fn noncrypto_engine_allowed() -> bool {
+    use std::sync::atomic::Ordering;
+    match NONCRYPTO_ENGINE_OPT_IN.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let allowed = std::env::var("CRATONVM_ALLOW_NONCRYPTO_SSLENGINE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            NONCRYPTO_ENGINE_OPT_IN.store(if allowed { 2 } else { 1 }, Ordering::Relaxed);
+            allowed
+        }
+    }
+}
+
+/// Test-only override, so the deny path and the opt-in path can both be
+/// exercised without depending on process environment (which latches).
+#[cfg(test)]
+fn set_noncrypto_engine_opt_in(allowed: bool) {
+    use std::sync::atomic::Ordering;
+    NONCRYPTO_ENGINE_OPT_IN.store(if allowed { 2 } else { 1 }, Ordering::Relaxed);
+}
+
+/// Refuse an operation on the non-cryptographic synthetic engine.
+///
+/// `javax.net.ssl.SSLException` is a subclass of `IOException`, which
+/// `SSLEngine.wrap`/`unwrap` already declare, so an existing
+/// `catch (SSLException)` / `catch (IOException)` in a handshake loop handles
+/// it. Falls back to a bare `IOException` — never to a result object.
+fn throw_noncrypto_engine_exc(ctx: &mut dyn NativeContext, op: &str) -> MethodCallFailed {
+    let msg = format!(
+        "SSLEngine.{op} is not implemented in this VM: the synthetic \
+         javax.net.ssl.SSLEngine performs no cryptography and would report a \
+         completed TLSv1.3 handshake for data it never protected. Refusing to \
+         return a success status for a connection that is not secured. Use the \
+         rustls-backed engine (sun.security.ssl.SSLEngineImpl), or set \
+         CRATONVM_ALLOW_NONCRYPTO_SSLENGINE=1 to restore the legacy no-op \
+         behaviour for debugging."
+    );
+    let detail = ctx.create_string(&msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "javax/net/ssl/SSLException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    cratonvm_types::error::RuntimeError::IOException { message: msg }.into()
+}
+
 /// Build a Java String[] from a Rust slice of &str.
 fn build_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef {
     let arr = ctx.new_ref_array(ClassId::new(0), items.len());
@@ -254,20 +385,58 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
     });
 
     // getInstance(String protocol) -> SSLContext
+    //
+    // DENY-BY-DEFAULT (P1, "unsupported TLS must be impossible to mistake for
+    // transport security"): an unrecognised protocol string used to fall out
+    // of a `_ => 0` arm and produce a perfectly ordinary "TLS" context. So
+    // `SSLContext.getInstance("SSLv2")`, `getInstance("NoSuchThing")` and a
+    // typo'd bundle protocol all succeeded, and `getProtocol()` then reported
+    // "TLS" — an answer to a question nobody asked. The JDK contract is
+    // `NoSuchAlgorithmException`, and the real-JDK-mode registrations already
+    // enforce it (`net_phase_e::register_re6_ssl_context`,
+    // `phases_late::ssl_security::register_p68_ssl`); this synthetic-JDK
+    // registration was the odd one out.
+    //
+    // The accepted set matches `register_p68_ssl`'s, plus `SSLv3`, and is
+    // matched case-insensitively because JCA algorithm lookup is. Each name
+    // gets its OWN index so `getProtocol()` echoes back what was requested
+    // rather than collapsing to "TLS".
     r.register(
         cls,
         "getInstance",
         "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;",
         |ctx, args| {
-            let protocol_idx = match args.get(0) {
-                Some(Value::Object(Some(s))) => match ctx.read_string(*s).as_deref() {
-                    Some("TLS") => 0,
-                    Some("TLSv1.2") => 1,
-                    Some("TLSv1.3") => 2,
-                    Some("SSL") => 3,
-                    _ => 0,
-                },
-                _ => 0,
+            let requested = match args.first() {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s),
+                // Real JDK: `getInstance(null)` throws NullPointerException.
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: Some("SSLContext.getInstance: protocol is null".into()),
+                    }
+                    .into());
+                }
+            };
+            let requested = requested.unwrap_or_default();
+            let protocol_idx = match requested.to_ascii_uppercase().as_str() {
+                "TLS" | "DEFAULT" => 0,
+                "TLSV1.2" => 1,
+                "TLSV1.3" => 2,
+                "SSL" => 3,
+                "TLSV1" => 4,
+                "TLSV1.1" => 5,
+                "SSLV3" => 6,
+                _ => {
+                    return Err(throw_tls_algorithm_exc(
+                        ctx,
+                        &format!(
+                            "{requested} SSLContext not available: this VM implements \
+                             TLS, TLSv1, TLSv1.1, TLSv1.2, TLSv1.3, SSL, SSLv3 and Default. \
+                             Refusing to substitute a different protocol — an SSLContext \
+                             for a protocol you did not ask for is not the protection you \
+                             asked for."
+                        ),
+                    ));
+                }
             };
             let obj = alloc_ssl_context(ctx, protocol_idx);
             Ok(Some(Value::Object(Some(obj))))
@@ -343,11 +512,17 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
     );
 
     // getSocketFactory() -> SSLSocketFactory
+    //
+    // Gated on `init()` — see `require_initialized_context`. `getDefault()`
+    // above marks its context initialized, so the JDK's own pre-initialised
+    // default context path is unaffected.
     r.register(
         cls,
         "getSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
-        |ctx, _args| {
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            require_initialized_context(ctx, this, "getSocketFactory()")?;
             let sf = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 2);
             Ok(Some(Value::Object(Some(sf))))
         },
@@ -358,7 +533,9 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         cls,
         "getServerSocketFactory",
         "()Ljavax/net/ssl/SSLServerSocketFactory;",
-        |ctx, _args| {
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            require_initialized_context(ctx, this, "getServerSocketFactory()")?;
             let ssf = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 2);
             Ok(Some(Value::Object(Some(ssf))))
         },
@@ -393,16 +570,29 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
             Value::Int(i) => i,
             _ => 0,
         };
-        let proto = match idx {
-            1 => "TLSv1.2",
-            2 => "TLSv1.3",
-            3 => "SSL",
-            _ => "TLS",
-        };
-        let s = ctx.create_string(proto);
+        let s = ctx.create_string(ctx_protocol_name(idx));
         Ok(Some(Value::Object(Some(s))))
     });
     r.set_category(__prev_cat);
+}
+
+/// Protocol name for a `CTX_PROTOCOL_IDX` slot value.
+///
+/// Indices 4/5/6 were added with the `getInstance` deny-by-default fix so an
+/// accepted-but-previously-unmapped name (`TLSv1`, `TLSv1.1`, `SSLv3`) is
+/// echoed back verbatim instead of collapsing to "TLS". The `_` arm is now
+/// only reachable for index 0 (`TLS`/`Default`) and for a slot that was never
+/// written, which is the same state a freshly-allocated context is in.
+fn ctx_protocol_name(idx: i32) -> &'static str {
+    match idx {
+        1 => "TLSv1.2",
+        2 => "TLSv1.3",
+        3 => "SSL",
+        4 => "TLSv1",
+        5 => "TLSv1.1",
+        6 => "SSLv3",
+        _ => "TLS",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,8 +629,17 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             if outbound_done != 0 {
+                // PRESERVED NEGATIVE: `CLOSED` is a real, correct answer —
+                // `closeOutbound()` was called and there is genuinely nothing
+                // more to send. It claims no protection, so it stays a value.
                 let result = alloc_ssl_engine_result(ctx, STATUS_CLOSED, HS_NOT_HANDSHAKING);
                 return Ok(Some(Value::Object(Some(result))));
+            }
+            // DENY-BY-DEFAULT: everything below fabricates a successful
+            // handshake without any cryptography. See
+            // `noncrypto_engine_allowed`.
+            if !noncrypto_engine_allowed() {
+                return Err(throw_noncrypto_engine_exc(ctx, "wrap"));
             }
             // Advance handshake state machine
             let hs_status = match ctx.get_field(this, ENG_HANDSHAKE_STATUS) {
@@ -469,8 +668,15 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             if inbound_done != 0 {
+                // PRESERVED NEGATIVE — see the matching comment in `wrap`.
                 let result = alloc_ssl_engine_result(ctx, STATUS_CLOSED, HS_NOT_HANDSHAKING);
                 return Ok(Some(Value::Object(Some(result))));
+            }
+            // DENY-BY-DEFAULT: the arms below can report `HS_FINISHED` — a
+            // completed TLS handshake that never happened. See
+            // `noncrypto_engine_allowed`.
+            if !noncrypto_engine_allowed() {
+                return Err(throw_noncrypto_engine_exc(ctx, "unwrap"));
             }
             // Advance handshake state machine
             let hs_status = match ctx.get_field(this, ENG_HANDSHAKE_STATUS) {
@@ -2918,7 +3124,307 @@ mod tls_tests {
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::NativeMethodRegistry;
+
+    // --- TLS deny-by-default -------------------------------------------------
+    //
+    // Every "must raise" case below has a "must still work" twin, so the suite
+    // cannot be satisfied by rejecting everything.
+
+    fn tls_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_tls_natives(&mut r);
+        r
+    }
+
+    /// `SSLContext.getInstance(name)` → the returned context, or the failure.
+    fn get_instance(
+        r: &NativeMethodRegistry,
+        ctx: &mut MockNativeContext,
+        name: &str,
+    ) -> MethodCallResult {
+        let f = r
+            .find(
+                "javax/net/ssl/SSLContext",
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;",
+            )
+            .expect("getInstance registered");
+        let arg = ctx.create_string(name);
+        f(ctx, &[Value::Object(Some(arg))])
+    }
+
+    fn protocol_of(
+        r: &NativeMethodRegistry,
+        ctx: &mut MockNativeContext,
+        context: ObjectRef,
+    ) -> String {
+        let f = r
+            .find("javax/net/ssl/SSLContext", "getProtocol", "()Ljava/lang/String;")
+            .expect("getProtocol registered");
+        match f(ctx, &[Value::Object(Some(context))]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            other => panic!("getProtocol returned {other:?}"),
+        }
+    }
+
+    // MUST STILL WORK.
+    #[test]
+    fn ssl_context_get_instance_accepts_every_supported_protocol_and_echoes_it_back() {
+        let r = tls_registry();
+        let mut ctx = MockNativeContext::new();
+        // (requested name, name `getProtocol()` must report)
+        for (requested, expected) in [
+            ("TLS", "TLS"),
+            ("Default", "TLS"),
+            ("TLSv1.2", "TLSv1.2"),
+            ("TLSv1.3", "TLSv1.3"),
+            ("SSL", "SSL"),
+            ("TLSv1", "TLSv1"),
+            ("TLSv1.1", "TLSv1.1"),
+            ("SSLv3", "SSLv3"),
+        ] {
+            let context = match get_instance(&r, &mut ctx, requested) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                other => panic!("getInstance({requested}) failed: {other:?}"),
+            };
+            assert_eq!(
+                protocol_of(&r, &mut ctx, context),
+                expected,
+                "getInstance({requested}) must not silently substitute a protocol"
+            );
+        }
+    }
+
+    // MUST STILL WORK — JCA algorithm lookup is case-insensitive.
+    #[test]
+    fn ssl_context_get_instance_is_case_insensitive() {
+        let r = tls_registry();
+        let mut ctx = MockNativeContext::new();
+        for name in ["tls", "TLSV1.3", "tlsv1.2", "ssl"] {
+            assert!(
+                matches!(
+                    get_instance(&r, &mut ctx, name),
+                    Ok(Some(Value::Object(Some(_))))
+                ),
+                "getInstance({name}) must be accepted"
+            );
+        }
+    }
+
+    // MUST RAISE.
+    #[test]
+    fn ssl_context_get_instance_refuses_an_unsupported_protocol() {
+        let r = tls_registry();
+        let mut ctx = MockNativeContext::new();
+        for name in ["SSLv2", "NoSuchThing", "TLSv1.4", "", "TLS "] {
+            let result = get_instance(&r, &mut ctx, name);
+            assert!(
+                result.is_err(),
+                "getInstance({name:?}) must raise, not substitute a TLS context"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unsupported_protocol_refusal_is_a_no_such_algorithm_exception() {
+        let r = tls_registry();
+        let mut ctx = MockNativeContext::new();
+        let err = get_instance(&r, &mut ctx, "SSLv2").expect_err("must raise");
+        match err {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                let cid = ctx.class_id_of_object(exc);
+                assert_eq!(
+                    ctx.class_name_of_id(cid).as_deref(),
+                    Some("java/security/NoSuchAlgorithmException")
+                );
+            }
+            // Fallback arm: still an exception, never a context.
+            MethodCallFailed::InternalError(e) => {
+                let text = format!("{e}");
+                assert!(
+                    text.contains("IllegalArgumentException"),
+                    "unexpected fallback: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ssl_context_get_instance_of_null_is_a_null_pointer_exception() {
+        let r = tls_registry();
+        let mut ctx = MockNativeContext::new();
+        let f = r
+            .find(
+                "javax/net/ssl/SSLContext",
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;",
+            )
+            .unwrap();
+        assert!(f(&mut ctx, &[Value::Object(None)]).is_err());
+    }
+
+    // --- SSLContext factory surface requires init() --------------------------
+
+    fn socket_factory_of(
+        r: &NativeMethodRegistry,
+        ctx: &mut MockNativeContext,
+        context: ObjectRef,
+    ) -> MethodCallResult {
+        let f = r
+            .find(
+                "javax/net/ssl/SSLContext",
+                "getSocketFactory",
+                "()Ljavax/net/ssl/SSLSocketFactory;",
+            )
+            .expect("getSocketFactory registered");
+        f(ctx, &[Value::Object(Some(context))])
+    }
+
+    // MUST RAISE: a factory from an un-`init()`ed context carries neither key
+    // nor trust managers, and nothing about the returned object says so.
+    #[test]
+    fn get_socket_factory_on_an_uninitialized_context_raises() {
+        let r = tls_registry();
+        let mut ctx = MockNativeContext::new();
+        let context = match get_instance(&r, &mut ctx, "TLSv1.3") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("getInstance failed: {other:?}"),
+        };
+        assert!(socket_factory_of(&r, &mut ctx, context).is_err());
+
+        let g = r
+            .find(
+                "javax/net/ssl/SSLContext",
+                "getServerSocketFactory",
+                "()Ljavax/net/ssl/SSLServerSocketFactory;",
+            )
+            .unwrap();
+        assert!(g(&mut ctx, &[Value::Object(Some(context))]).is_err());
+    }
+
+    // MUST STILL WORK — the twin: after `init()` the same call succeeds.
+    #[test]
+    fn get_socket_factory_after_init_succeeds() {
+        let r = tls_registry();
+        let mut ctx = MockNativeContext::new();
+        let context = match get_instance(&r, &mut ctx, "TLSv1.3") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("getInstance failed: {other:?}"),
+        };
+        let init = r
+            .find(
+                "javax/net/ssl/SSLContext",
+                "init",
+                "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
+            )
+            .unwrap();
+        init(
+            &mut ctx,
+            &[
+                Value::Object(Some(context)),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+            ],
+        )
+        .expect("init");
+        assert!(matches!(
+            socket_factory_of(&r, &mut ctx, context),
+            Ok(Some(Value::Object(Some(_))))
+        ));
+    }
+
+    // MUST STILL WORK — `getDefault()` hands back a pre-initialised context,
+    // so the init gate must not break the JDK's documented default path.
+    #[test]
+    fn get_default_context_can_still_hand_out_a_socket_factory() {
+        let r = tls_registry();
+        let mut ctx = MockNativeContext::new();
+        let f = r
+            .find(
+                "javax/net/ssl/SSLContext",
+                "getDefault",
+                "()Ljavax/net/ssl/SSLContext;",
+            )
+            .unwrap();
+        let context = match f(&mut ctx, &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("getDefault failed: {other:?}"),
+        };
+        assert!(matches!(
+            socket_factory_of(&r, &mut ctx, context),
+            Ok(Some(Value::Object(Some(_))))
+        ));
+    }
+
+    // --- The non-cryptographic SSLEngine ------------------------------------
+
+    /// All three engine cases live in ONE test: they share the process-wide
+    /// opt-in flag, so running them as separate `#[test]`s would race under
+    /// the default parallel test harness.
+    #[test]
+    fn noncrypto_engine_denies_by_default_works_when_opted_in_and_still_reports_closed() {
+        let r = tls_registry();
+        let mut ctx = MockNativeContext::new();
+        let wrap = r
+            .find(
+                "javax/net/ssl/SSLEngine",
+                "wrap",
+                "([Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)Ljavax/net/ssl/SSLEngineResult;",
+            )
+            .expect("wrap registered");
+        let unwrap = r
+            .find(
+                "javax/net/ssl/SSLEngine",
+                "unwrap",
+                "(Ljava/nio/ByteBuffer;[Ljava/nio/ByteBuffer;)Ljavax/net/ssl/SSLEngineResult;",
+            )
+            .expect("unwrap registered");
+
+        // MUST RAISE (default): no cryptography happened, so no OK status.
+        set_noncrypto_engine_opt_in(false);
+        let engine = alloc_ssl_engine(&mut ctx);
+        let args = [Value::Object(Some(engine))];
+        assert!(
+            wrap(&mut ctx, &args).is_err(),
+            "wrap must not report success for an unprotected connection"
+        );
+        assert!(
+            unwrap(&mut ctx, &args).is_err(),
+            "unwrap must not report a finished handshake that never happened"
+        );
+
+        // PRESERVED NEGATIVE: `CLOSED` after `closeOutbound()` is a real,
+        // correct answer and must stay a value, not become an exception.
+        ctx.set_field(engine, ENG_OUTBOUND_DONE, Value::Int(1));
+        ctx.set_field(engine, ENG_INBOUND_DONE, Value::Int(1));
+        for f in [wrap, unwrap] {
+            match f(&mut ctx, &args) {
+                Ok(Some(Value::Object(Some(result)))) => {
+                    assert_eq!(ctx.get_field(result, 0), Value::Int(STATUS_CLOSED));
+                }
+                other => panic!("closed engine must still report CLOSED, got {other:?}"),
+            }
+        }
+
+        // MUST STILL WORK: the explicit opt-in restores the legacy behaviour.
+        set_noncrypto_engine_opt_in(true);
+        let legacy = alloc_ssl_engine(&mut ctx);
+        let legacy_args = [Value::Object(Some(legacy))];
+        assert!(matches!(
+            wrap(&mut ctx, &legacy_args),
+            Ok(Some(Value::Object(Some(_))))
+        ));
+        assert!(matches!(
+            unwrap(&mut ctx, &legacy_args),
+            Ok(Some(Value::Object(Some(_))))
+        ));
+
+        // Leave the process in the secure state for any later test.
+        set_noncrypto_engine_opt_in(false);
+    }
 
     // --- SSLEngineResult int-code convention translation ---------------------
 

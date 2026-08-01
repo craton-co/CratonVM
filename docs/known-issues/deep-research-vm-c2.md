@@ -1,5 +1,64 @@
 # CratonVM Code Review: Prioritized Parallel TODO Plan
 
+> ## Remediation status — 2026-07-31, branch `feat/c2-review-remediation`
+>
+> This report was implemented by a parallel agent campaign. **30 of ~40
+> decomposed items landed** (39 commits, 176 files). The workspace checks
+> clean with `--all-targets` and **3,573 unit tests pass** across every crate
+> touched. `evidence/` is produced by `scripts/evidence/collect.sh` (P0 step 1).
+>
+> **Read this first: the report's premises were not all correct.** Agents were
+> instructed to verify each claim before acting, and several were disproved:
+>
+> | Report claim | Finding |
+> |---|---|
+> | Certification-path validation is absent | Present — per-link verification, anchor matching, validity windows, BasicConstraints, KeyUsage, EKU. Genuinely missing: revocation, name constraints, multi-`SignerInfo`. |
+> | SATB pre-write barrier may have a JIT blind spot | It does not; the JIT emits a real SATB pre-barrier. The blind spot was in the *post*-write barrier (see G1-1 below). |
+> | `JitRuntimeHelpers` has ~46 fields | 58 fields, 464 bytes. |
+> | Fix the `nio_file` opener list (7 sites) | 10 sites; two were spelled inside `.or_else(..)` and one whole `RandomAccessFile` overload was missed. |
+> | The undeclared-flag set is the ~14 this branch added | 74 undeclared, including one that weakens a security control. |
+>
+> **Defects found that this report does not describe.** These were the campaign's
+> highest-value output and are unrelated to the roadmap items that surfaced them:
+>
+> - **G1 never stamped `GC_FLAG_OLD_GEN` on promotion**, so the JIT inline
+>   reference store read every promoted object as young and skipped the
+>   remembered-set barrier. The rset rebuild repairs this only for the *next*
+>   pause — a use-after-free in the current one.
+> - **`jit_tlab_skip_offsets` published overlapping spans** while both consumers
+>   required ascending+disjoint, letting the sweep cursor resync twice and
+>   swallow every object between them.
+> - **Escape analysis folded a field load to a later store's value**
+>   (`int a = o.x; o.x = 42;` yielded `a == 42`): it records only the last store
+>   per field but forwarded every replaced load to it.
+> - **`SSLServerSocketFactory.createServerSocket()` returned a plaintext socket**,
+>   inheriting the abstract base's working cleartext body.
+> - **VM shutdown mid-GPU-submission wedged the collector permanently** — the
+>   critical counter stuck at >=1 for the life of the process.
+> - **`RedefineClasses` silently did nothing in any second VM** (a single
+>   `Weak<SharedVm>`), breaking sequential embedding, not just concurrency.
+> - **The new IR verifier poisoned its own pipeline**: a stub graph from an
+>   abandoned build set a sticky bail that dropped a later *successful* build
+>   out of the optimizing tier. Found only by running the tests.
+>
+> **Deliberate behaviour changes, for anyone measuring:**
+> allocation elision no longer fires for allocations named by a safepoint slot
+> (correctness over optimization; recovery documented in `docs/jit/deopt-metadata.md`);
+> G1 loses the inline store on the fresh-ctor pattern (`docs/gc/g1-audit.md` §10);
+> Panama upcalls without `--enable-native-access` now throw.
+> Frame bytes fell 82–97% and the optimizing-tier node ceiling rose 4,086 → 20,000.
+>
+> **Not validated.** Nothing here has run under the stress harness, sanitizers,
+> Loom/Shuttle, a real fuzzing campaign, or a benchmark A/B. Capability
+> enforcement is staged permissive and inert until VM init wires it. Phase
+> accounting is 100% unattributed until its 29 call sites land.
+>
+> **Remaining ~10 items are the report's own multi-month lanes** — HIR/LIR/MIR,
+> instruction selection, linear-scan RA, range analysis, profile-guided inlining,
+> OSR, loop transforms, vectorization, the compilation broker, and the
+> `x64.rs`/`invoke.rs` seam splits. The report scopes these at 180–360
+> engineer-days each and the whole roadmap at 24–36 months for one engineer.
+
 ## Executive summary
 
 **Evidence boundary and estimation rule:** Treat this report as a static-analysis and repository-history review of the public `main` branch as visible on July 31, 2026. The exact reviewed commit SHA is **unspecified** because a local clone could not be completed in the review environment; the first action below therefore freezes the revision before implementation. Build, test, sanitizer, fuzzing, and profiling results are **not claimed as executed** here. Effort estimates are engineering estimates for one experienced contributor working an eight-hour day, excluding review and CI queue time. Performance impacts are hypotheses that must be accepted only after controlled A/B measurements.

@@ -23,6 +23,7 @@ use crate::runtime::redefine_state::{
     named_class_was_redefined,
 };
 use crate::threading::jvm_thread::JvmThread;
+use crate::threading::thread_state::{self, ThreadExecState};
 use crate::vm::SharedVm;
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
 
@@ -145,6 +146,20 @@ pub mod mic_prof {
     pub static DISP_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static CYC_DISP_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+    /// Why an entryless MIC hit failed to leave a callable entry behind.
+    /// `hit_entry == 0` while `hit_noentry` climbs means the slot never learns
+    /// a target, so every call re-pays the compile probe. These three separate
+    /// the candidate causes instead of leaving them to inference:
+    ///   * `probe_none`  — `try_jit_compile_callee` handed back nothing;
+    ///   * `barred`      — an exception-table / indy-trap callee, deliberately
+    ///                     kept on the helper path;
+    ///   * `published`   — `mic.update` was actually called with an entry, so a
+    ///                     still-zero `hit_entry` means the entry was
+    ///                     downgraded inside `jit_entry_publishable`.
+    pub static PUB_PROBE_NONE: AtomicU64 = AtomicU64::new(0);
+    pub static PUB_BARRED: AtomicU64 = AtomicU64::new(0);
+    pub static PUB_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some())
@@ -214,7 +229,8 @@ pub mod mic_prof {
         eprintln!(
             "[MIC_PROF] quiesce_depth={} mic_calls={} hit_entry={} hit_noentry={} miss={} lambda={} \
              cyc_mic_total={} cyc_hit_entry_call={} cyc_invoke={} cyc_compile_probe={} \
-             disp_calls={} cyc_disp_total={}",
+             disp_calls={} cyc_disp_total={} \
+             pub_probe_none={} pub_barred={} pub_published={} ic_refusals={} ic_unowned_pub={}",
             cratonvm_gc::gc_quiescence::depth(),
             g(&MIC_CALLS),
             g(&MIC_HIT_ENTRY),
@@ -227,6 +243,11 @@ pub mod mic_prof {
             g(&CYC_COMPILE_PROBE),
             g(&DISP_CALLS),
             g(&CYC_DISP_TOTAL),
+            g(&PUB_PROBE_NONE),
+            g(&PUB_BARRED),
+            g(&PUB_PUBLISHED),
+            cratonvm_jit::unowned_ic_entry_refusals(),
+            cratonvm_jit::unowned_ic_entry_publishes(),
         );
     }
 }
@@ -884,6 +905,21 @@ pub(crate) fn stash_jit_pending_npe_action(code: u8) {
 #[inline]
 pub(crate) fn set_jit_deopt_pending() {
     JIT_SIGNALS.with(|s| s.deopt.set(true));
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // the deopt trap is the `CompiledUninterruptible -> Deoptimizing` edge —
+    // the only tabled way into that state. From here until the interpreter has
+    // materialised the frames, the thread holds `FrameValue` buffers that are
+    // in neither the compiled frame's oop map nor a not-yet-built interpreter
+    // frame, which is exactly what makes the window its own state.
+    //
+    // The window is closed by whichever comes first: the JIT entry pop
+    // (`conservative_roots::leaving_compiled_state`, which resolves
+    // `Deoptimizing` to `JavaRunning` rather than manufacturing an untabled
+    // edge) or the interpreter's own resume sites.
+    thread_state::record_transition(
+        ThreadExecState::Deoptimizing,
+        "jit::helpers::set_jit_deopt_pending",
+    );
 }
 
 /// Read+clear the out-of-band deopt/exception signal. The interpreter's
@@ -1345,6 +1381,24 @@ unsafe fn bail_to_interpreter(
     info: &JitInvokeInfo,
     args: &[Value],
 ) -> i64 {
+    // This bail resolves the callee from a class NAME, and a lambda-proxy
+    // receiver has no name of its own: it resolves as its functional interface,
+    // which for four of them runs a collector native in place of the lambda
+    // body. Same hazard as the dispatch slow path — see
+    // `try_lambda_proxy_sam_dispatch`, which declines everything that is not a
+    // proxy's SAM, so the routing below is unchanged for every other call.
+    if let Some(result) = try_lambda_proxy_sam_dispatch(vm, thread, info, args) {
+        return match result {
+            Ok(Some(Value::Int(v))) => v as i64,
+            Ok(Some(Value::Long(v))) => v,
+            Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+            Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+            Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+            Ok(Some(Value::Object(None)) | None) => 0,
+            Ok(_) => 0,
+            Err(error) => handle_jit_dispatch_error(vm, thread, error, info),
+        };
+    }
     // invokespecial (kind=1) must NOT virtually re-target onto the receiver's
     // runtime class — same rationale as the kind=1 arm of the dispatch slow
     // path below. `invoke_or_native` → `invoke_on_class_shared` applies the
@@ -1412,6 +1466,79 @@ unsafe fn bail_to_interpreter(
         Ok(Some(Value::Object(None))) | Ok(None) => 0,
         Ok(_) => 0,
         Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
+    }
+}
+
+/// Dispatch a SAM call on a lambda-proxy receiver through the proxy registry.
+/// `None` means "not that" — not a virtual/interface call, not a lambda-proxy
+/// receiver, or not the proxy's SAM — and the caller proceeds unchanged.
+///
+/// Every JIT path that resolves a callee BY NAME needs this in front of it. A
+/// lambda proxy's class id is synthetic and absent from the class store, so
+/// name resolution falls back to the constant-pool class — the FUNCTIONAL
+/// INTERFACE — and CratonVM registers natives on four of those
+/// (`java/util/function/Supplier.get`, `BiConsumer.accept`, `Function.apply`,
+/// `BinaryOperator.apply`) to serve the synthetic objects
+/// `Collector.accumulator()` and its siblings hand out. Those natives cannot
+/// decline: with no collector tag in field 0 they take their catch-all arm, so
+/// an ordinary user lambda routed to them has its body skipped entirely —
+/// `Supplier.get` returns an empty `ArrayList`, `Function.apply` returns its
+/// argument, `BiConsumer.accept(a, b)` calls `a.add(b)`, and
+/// `BinaryOperator.apply(a, b)` calls `a.addAll(b)`. Three of those four are
+/// SILENT.
+///
+/// The interpreter never had the problem — `try_lambda_dispatch` runs before
+/// native resolution there — so the failure is JIT-only, and it additionally
+/// needs the call site to be megamorphic, since a site that only ever sees one
+/// proxy class stays on a cached path. That combination is why it took
+/// Hibernate's `forEachSubInitializer(BiConsumer, ..)` — invoked with
+/// `Initializer::startLoading`, `::resolveKey` and `::initializeInstance` — to
+/// surface it, as `NoSuchMethodError: <sub-initializer>.add(Ljava/lang/Object;)Z`,
+/// three failures in every full-class run of `ASTParserLoadingTest`.
+/// `apps/hib-suite-runner/FunctionalInterfaceHijackProbe.java` is the reduced
+/// witness for all four interfaces; `docs/internal/fixed-suite-bugs/hibernate/
+/// hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
+///
+/// Kept as one helper rather than repeated at each bail so a third by-name
+/// dispatch path added later inherits the guard instead of re-opening the hole.
+///
+/// SAFETY: same contract as the callers — a live `SharedVm` and a current
+/// `JvmThread`, since the SAM body may resume interpretation.
+fn try_lambda_proxy_sam_dispatch(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    values: &[Value],
+) -> Option<Result<Option<Value>, crate::error::MethodCallFailed>> {
+    if !matches!(info.invoke_kind, 0 | 2) {
+        return None;
+    }
+    let Some(Value::Object(Some(receiver))) = values.first().copied() else {
+        return None;
+    };
+    let receiver_class_id = vm.mem.heap.class_id_of(receiver);
+    if !vm
+        .classes
+        .lambda_proxies
+        .read()
+        .contains_key(&receiver_class_id)
+    {
+        return None;
+    }
+    match crate::runtime::interpreter::try_lambda_dispatch(
+        vm,
+        thread,
+        receiver,
+        receiver_class_id,
+        info.method_name,
+        info.descriptor,
+        &values[1..],
+    ) {
+        Ok(Some(result)) => Some(Ok(result)),
+        // Not the proxy's SAM (a default method on the functional interface,
+        // say) — fall through to the caller's ordinary path, unchanged.
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
     }
 }
 
@@ -3501,6 +3628,278 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     obj_ref.as_ptr() as i64
 }
 
+/// Stash `msg` as a `java/lang/InternalError` on the JIT pending-exception
+/// channel and return the `0`/null allocation sentinel.
+///
+/// Shared by the two CP-indexed allocation helpers below for the failures that
+/// are not a Java-level `MethodCallFailed` (a missing referencing class, a CP
+/// entry that is not a class reference). Same convention as `jit_alloc_oom`:
+/// the caller's `emit_post_alloc_oom_check()` sees the 0 and routes the stashed
+/// exception through the method's exception table.
+///
+/// # Safety
+/// Calls [`jit_thread_mut`]: same contract — invoke only from a JIT helper on
+/// the thread that installed `JIT_THREAD`, with no other `&mut JvmThread` (and
+/// no live `JitThreadGuard`) outstanding, and with NO class-manager lock held
+/// (constructing the exception re-enters the class manager).
+unsafe fn jit_cp_alloc_internal_error(vm: &SharedVm, msg: &str) -> i64 {
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/InternalError",
+            Some(msg),
+        ) {
+            set_jit_pending_exception(exc);
+        }
+    }
+    0
+}
+
+/// Stash a `MethodCallFailed` on the JIT pending-exception channel and return
+/// the `0`/null allocation sentinel. Mirrors `jit_new_object`'s `<clinit>`
+/// failure arm exactly (a thrown Java exception passes through unchanged; an
+/// internal error is reported as `java/lang/InternalError`).
+fn jit_cp_alloc_stash_failure(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    err: crate::error::MethodCallFailed,
+    context: &str,
+) -> i64 {
+    use crate::error::MethodCallFailed;
+    match err {
+        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(exc),
+        MethodCallFailed::InternalError(vm_err) => {
+            let msg = format!("{context}: {vm_err}");
+            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/InternalError",
+                Some(&msg),
+            ) {
+                set_jit_pending_exception(exc);
+            }
+        }
+    }
+    0
+}
+
+/// Resolve a `new`/`anewarray` constant-pool site at RUN TIME and return the
+/// resolved class id, or `None` after stashing the appropriate pending
+/// exception (the caller then returns the `0`/null allocation sentinel).
+///
+/// This is the run-time half of the cold-`new` fix. The compile-time resolver
+/// (`resolve_jit_new_site`) deliberately never loads a class — running a user
+/// `ClassLoader.loadClass` from inside the compile path is a
+/// deadlock/reentrancy hazard and would load classes the program never would.
+/// So a `new` whose target class had not been loaded yet used to bail the whole
+/// compile, permanently, leaving hot methods carrying a cold
+/// `throw new SomeException(...)` in the interpreter forever
+/// (`docs/internal/jit-compile-bail-unresolved-new-cold-class.md`).
+///
+/// Doing the same resolution HERE is sound for the reason the doc gives: it is
+/// exactly what the interpreter's own `0xbb`/`0xbd` handler does — same thread,
+/// same program point, same loader-faithful resolver, same access check. And it
+/// costs nothing on the hot path: a site whose class IS loaded at compile time
+/// never reaches this helper at all, and even here the second and later
+/// executions take the `find_class_by_name_for_class` fast path with no Java on
+/// the stack.
+///
+/// # Safety
+/// Calls [`jit_thread_mut`]: invoke only from a JIT helper on the thread that
+/// installed `JIT_THREAD`, with no other `&mut JvmThread` live.
+unsafe fn jit_resolve_cp_class(
+    vm: &SharedVm,
+    holder_cid: ClassId,
+    cp_index: u16,
+    check_access: bool,
+) -> Result<ClassId, i64> {
+    // (1) CP text → binary name, plus the already-loaded fast path under one
+    //     read lock. After the first execution of this site the class is loaded,
+    //     so this is all that runs.
+    //
+    //     Every exit from this block DROPS the read lock first and only then
+    //     builds an exception: `create_exception_object` re-enters the class
+    //     manager, and a nested read while a writer is queued deadlocks (see
+    //     the ClassManager nested-read reentrancy pattern). Hence the
+    //     "compute a reason, report after the lock" shape rather than an early
+    //     `return` from inside the block.
+    let resolved_name: Result<(String, Option<ClassId>), String> = {
+        let cm = vm.classes.class_manager.read();
+        match cm.get_class(holder_cid) {
+            None => Err(format!(
+                "JIT CP allocation: referencing class id {} not found",
+                holder_cid.as_u32()
+            )),
+            Some(class) => match class.constant_pool.get_class_name(cp_index) {
+                None => Err(format!(
+                    "JIT CP allocation: invalid class ref at cp#{cp_index} of class id {}",
+                    holder_cid.as_u32()
+                )),
+                Some(name) => {
+                    let name = name.to_string();
+                    let already = cm.find_class_by_name_for_class(&name, holder_cid);
+                    Ok((name, already))
+                }
+            },
+        }
+    };
+    let (class_name, already_loaded) = match resolved_name {
+        Ok(v) => v,
+        Err(msg) => return Err(jit_cp_alloc_internal_error(vm, &msg)),
+    };
+
+    // (2) Not loaded yet — drive the same loader-faithful resolution the
+    //     interpreter's `Instruction::New` does. `emit_post_alloc_oom_check`
+    //     forces `has_dispatch` on every site that can reach here, so
+    //     `JIT_THREAD` is set; the `None` arm is purely defensive.
+    let target_id = match already_loaded {
+        Some(id) => id,
+        None => {
+            let Some((thread, _guard)) = jit_thread_mut() else {
+                return Err(jit_cp_alloc_internal_error(
+                    vm,
+                    &format!("JIT CP allocation: no live JIT thread to resolve {class_name}"),
+                ));
+            };
+            match crate::runtime::interpreter::resolve_class_loader_aware(
+                vm,
+                thread,
+                holder_cid,
+                &class_name,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    let converted = crate::runtime::exceptions::convert_class_not_found(
+                        vm,
+                        thread,
+                        &class_name,
+                        e,
+                    );
+                    return Err(jit_cp_alloc_stash_failure(
+                        vm,
+                        thread,
+                        converted,
+                        &format!("JIT CP allocation: cannot resolve {class_name}"),
+                    ));
+                }
+            }
+        }
+    };
+
+    // (3) JVMS 6.5 `new` / 5.4.4 access check — the interpreter's `new` handler
+    //     runs it, so a `new` compiled through this helper must too. (The
+    //     `anewarray` handler does not, hence the flag.)
+    if check_access {
+        let denied = {
+            let cm = vm.classes.class_manager.read();
+            match (cm.get_class(holder_cid), cm.get_class(target_id)) {
+                (Some(accessor), Some(target)) => {
+                    crate::classloading::access_control::check_class_access(accessor, target)
+                        .err()
+                        .map(|e| e.to_string())
+                }
+                // Defensive: don't invent a denial when either class is missing.
+                _ => None,
+            }
+        };
+        if let Some(message) = denied {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                    vm,
+                    thread,
+                    "java/lang/IllegalAccessError",
+                    Some(&message),
+                ) {
+                    set_jit_pending_exception(exc);
+                }
+            }
+            return Err(0);
+        }
+    }
+
+    Ok(target_id)
+}
+
+/// CP-indexed `new` (0xbb) slow path — see [`jit_resolve_cp_class`] for why
+/// this exists and `jit_api::JitRuntimeHelpers::new_object_cp` for the ABI.
+///
+/// Resolves + access-checks the target class, then falls into
+/// [`jit_new_object`], which owns `<clinit>`, the TLAB/GC retry ladder and the
+/// `0`-on-failure convention. Splitting it this way means the deferred site
+/// behaves identically to a resolved one from the allocation onwards.
+///
+/// SAFETY: called from JIT-compiled code; `vm_ptr` must be a valid `SharedVm`
+/// pointer and `holder_class_id`/`cp_idx` must be the compile-time-baked
+/// referencing class and constant-pool index of this `new` site.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_new_object_cp(
+    vm_ptr: i64,
+    holder_class_id: i64,
+    cp_idx: i64,
+) -> i64 {
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // Cross the Rust<->JIT boundary BEFORE resolving, not just before
+    // allocating: resolution can run a user `ClassLoader.loadClass`, i.e.
+    // arbitrary Java that can itself GC. `jit_new_object` does both of these
+    // too, but it only runs after resolution — leaving the per-thread JIT-scan
+    // cache stale, and the SATB buffer unflushed, for the whole classloader
+    // call.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code that received it from the
+    // interpreter's SharedVm reference (same contract as `jit_new_object`).
+    let vm = &*(vm_ptr as *const SharedVm);
+    let holder_cid = ClassId::new(holder_class_id as u32);
+    let target_id = match jit_resolve_cp_class(vm, holder_cid, cp_idx as u16, true) {
+        Ok(id) => id,
+        Err(sentinel) => return sentinel,
+    };
+    let num_fields = vm
+        .classes
+        .class_manager
+        .read()
+        .get_class(target_id)
+        .map(|c| c.num_total_fields)
+        .unwrap_or(0);
+    jit_new_object(vm_ptr, i64::from(target_id.as_u32()), num_fields as i64)
+}
+
+/// CP-indexed `anewarray` (0xbd) slow path — the `anewarray` sibling of
+/// [`jit_new_object_cp`]. Resolves the COMPONENT class at run time and then
+/// falls into [`jit_anewarray_object`], which owns the negative-length and
+/// OOM conventions.
+///
+/// SAFETY: as [`jit_new_object_cp`], plus `length` is the JVM `int` array
+/// length already on the operand stack.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_anewarray_object_cp(
+    vm_ptr: i64,
+    holder_class_id: i64,
+    cp_idx: i64,
+    length: i64,
+) -> i64 {
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // See `jit_new_object_cp`: resolution can run Java, so cross the boundary
+    // before it, not just before the allocation.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: see `jit_new_object_cp`.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let holder_cid = ClassId::new(holder_class_id as u32);
+    // JVMS §anewarray resolves the component class but performs no `new`-style
+    // access check (that belongs to `new`), matching `Instruction::Anewarray`.
+    let component_id = match jit_resolve_cp_class(vm, holder_cid, cp_idx as u16, false) {
+        Ok(id) => id,
+        Err(sentinel) => return sentinel,
+    };
+    jit_anewarray_object(vm_ptr, i64::from(component_id.as_u32()), length)
+}
+
 /// Post-allocation init shared by the three JIT slow-path allocation arms:
 /// primitive-field default values + JLS §12.6 finalizer registration.
 ///
@@ -3983,6 +4382,11 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *mut i32;
     *elem_ptr = val as i32;
+    // Phase 10 #2: the host just wrote this array, so a GPU input-cache
+    // entry mirroring it is stale. Costs one relaxed load when nothing is
+    // cached, which is every run that never submits a kernel.
+    #[cfg(feature = "gpu-offload")]
+    crate::runtime::offload::input_cache::invalidate(cratonvm_types::ObjectRef::from_raw(ptr));
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
@@ -4783,10 +5187,154 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // class_id_raw and field_index were resolved at JIT compile time and refer to a valid static field.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// Lock-free "this class is already initialized" memo for the JIT static-field
+/// helpers.
+///
+/// `ensure_class_initialized_shared` already has an atomic fast path, but
+/// reaching that atomic still costs a `class_manager.read()` acquisition — per
+/// `getstatic`, in compiled code. Class initialization is **monotonic** (JVMS
+/// §5.5: a class that has completed initialization never returns to an
+/// uninitialized state, and redefinition does not re-run `<clinit>`), so once
+/// the answer is "initialized" it can be memoized forever without invalidation.
+///
+/// A dense bitmap indexed by `ClassId` makes the steady-state check one relaxed
+/// load plus a bit test. Ids outside the bitmap simply take the slow path, so
+/// the capacity bound is a performance choice, not a correctness one.
+mod class_init_memo {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Covers class ids `[0, 1 << 20)` in 128 KiB, allocated on first use.
+    const CAPACITY: usize = 1 << 20;
+    const WORDS: usize = CAPACITY / 64;
+
+    fn bits() -> &'static [AtomicU64] {
+        static BITS: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+        BITS.get_or_init(|| (0..WORDS).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    #[inline]
+    pub fn is_initialized(class_id: u32) -> bool {
+        let idx = class_id as usize;
+        if idx >= CAPACITY {
+            return false;
+        }
+        let w = bits()[idx / 64].load(Ordering::Relaxed);
+        w & (1u64 << (idx % 64)) != 0
+    }
+
+    #[inline]
+    pub fn mark_initialized(class_id: u32) {
+        let idx = class_id as usize;
+        if idx >= CAPACITY {
+            return;
+        }
+        bits()[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Relaxed);
+    }
+}
+
+/// Per-`ClassId` memo for "is this `java/lang/System`?".
+///
+/// `jit_getstatic` must answer that on every static read, to service the
+/// `System.out`/`err` bootstrap intercept. Answering it by NAME cost a
+/// `class_manager` read lock plus a string compare; answering it by resolving
+/// System's id once still costs that lock on every call whenever the name
+/// lookup fails to resolve, which is silent and indistinguishable from working.
+///
+/// Keyed on the class id instead, the question is asked at most once per class
+/// and answered thereafter by two bit tests. Class ids are stable for the life
+/// of the VM, so the memo never needs invalidating.
+mod system_class_memo {
+    use crate::classloading::ClassId;
+    use crate::vm::SharedVm;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const CAPACITY: usize = 1 << 17;
+    const WORDS: usize = CAPACITY / 64;
+
+    fn table() -> &'static (Box<[AtomicU64]>, Box<[AtomicU64]>) {
+        static T: std::sync::OnceLock<(Box<[AtomicU64]>, Box<[AtomicU64]>)> =
+            std::sync::OnceLock::new();
+        T.get_or_init(|| {
+            (
+                (0..WORDS).map(|_| AtomicU64::new(0)).collect(),
+                (0..WORDS).map(|_| AtomicU64::new(0)).collect(),
+            )
+        })
+    }
+
+    #[inline]
+    fn bit(words: &[AtomicU64], idx: usize) -> bool {
+        words[idx / 64].load(Ordering::Relaxed) & (1u64 << (idx % 64)) != 0
+    }
+
+    #[inline]
+    fn set_bit(words: &[AtomicU64], idx: usize) {
+        words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Relaxed);
+    }
+
+    pub fn is_system(vm: &SharedVm, class_id: ClassId) -> bool {
+        let idx = class_id.as_u32() as usize;
+        if idx >= CAPACITY {
+            // Unindexable id: fall back to the authoritative check.
+            return resolve(vm, class_id);
+        }
+        let (resolved, is_sys) = table();
+        if bit(resolved, idx) {
+            return bit(is_sys, idx);
+        }
+        let answer = resolve(vm, class_id);
+        if answer {
+            set_bit(is_sys, idx);
+        }
+        set_bit(resolved, idx);
+        answer
+    }
+
+    fn resolve(vm: &SharedVm, class_id: ClassId) -> bool {
+        vm.classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .is_some_and(|c| &*c.name == "java/lang/System")
+    }
+}
+
+/// `java/lang/System`'s `ClassId`, resolved once.
+///
+/// `jit_getstatic` needs to know whether the field it is reading belongs to
+/// `java/lang/System` (the `out`/`err` bootstrap intercept). Asking that
+/// question by name meant a `class_manager` read lock plus a string compare on
+/// every static read from compiled code. The id is assigned during bootstrap
+/// and never changes, so it is cached after the first successful resolution.
+///
+/// Returns `None` until `java/lang/System` is loaded — before that there is no
+/// id that could match, so the caller's intercept correctly does not fire.
+fn system_class_id(vm: &SharedVm) -> Option<ClassId> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    /// `u32::MAX` = "not resolved yet"; any other value is the cached id.
+    static CACHED: AtomicU32 = AtomicU32::new(u32::MAX);
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != u32::MAX {
+        return Some(ClassId::new(cached));
+    }
+    let id = vm
+        .classes
+        .class_manager
+        .read()
+        .get_loaded_class_id("java/lang/System")?;
+    CACHED.store(id.as_u32(), Ordering::Relaxed);
+    Some(id)
+}
+
 pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
+    gs_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _gs_total = gs_prof::CycGuard::new(&gs_prof::CYC_TOTAL);
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
-    crate::jit::conservative_roots::note_jit_boundary();
+    {
+        let _g = gs_prof::CycGuard::new(&gs_prof::CYC_BOUNDARY);
+        crate::jit::conservative_roots::note_jit_boundary();
+    }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
@@ -4815,28 +5363,43 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // caller's `emit_post_invoke_exception_check` (added alongside this
     // fix in `jit/src/x64.rs`'s `0xb2` getstatic codegen) routes it through
     // the method's exception table instead of pushing a bogus value.
-    if let Some((thread, _guard)) = jit_thread_mut() {
-        if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
-            use crate::error::MethodCallFailed;
-            match err {
-                MethodCallFailed::ExceptionThrown(exc) => {
-                    set_jit_pending_exception(exc);
-                }
-                MethodCallFailed::InternalError(vm_err) => {
-                    let msg = format!(
-                        "JIT getstatic class_id {class_id_raw} field_index {field_index} failed to initialize: {vm_err}"
-                    );
-                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
-                        vm,
-                        thread,
-                        "java/lang/InternalError",
-                        Some(&msg),
-                    ) {
+    //
+    // Steady state costs one relaxed load and a bit test, no lock at all:
+    // `ensure_class_initialized_shared`'s own fast path still needs a
+    // `class_manager.read()` to reach the per-class atomic, and paying that on
+    // every static read from compiled code was a measurable part of
+    // `getstatic`'s ~35 ns. Initialization is monotonic, so the memo never
+    // needs invalidating. See `class_init_memo`.
+    let _gs_init = gs_prof::CycGuard::new(&gs_prof::CYC_INIT);
+    if !class_init_memo::is_initialized(class_id_raw as u32) {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
+                use crate::error::MethodCallFailed;
+                match err {
+                    MethodCallFailed::ExceptionThrown(exc) => {
                         set_jit_pending_exception(exc);
                     }
+                    MethodCallFailed::InternalError(vm_err) => {
+                        let msg = format!(
+                            "JIT getstatic class_id {class_id_raw} field_index {field_index} failed to initialize: {vm_err}"
+                        );
+                        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                            vm,
+                            thread,
+                            "java/lang/InternalError",
+                            Some(&msg),
+                        ) {
+                            set_jit_pending_exception(exc);
+                        }
+                    }
                 }
+                return i64::MIN;
             }
-            return i64::MIN;
+            // Only memoize a CONFIRMED success. A failed `<clinit>` must be
+            // re-attempted per JVMS (the class enters the erroneous state and
+            // subsequent attempts throw NoClassDefFoundError from the real
+            // check, not from a stale memo).
+            class_init_memo::mark_initialized(class_id_raw as u32);
         }
     }
 
@@ -4845,20 +5408,38 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // pre-built synthetic streams for these three fields. The JIT must do the same,
     // or jit_getstatic falls through to get_static_shared → Object(None) → null
     // receiver → println silently no-ops (arg0=0x0 in jit_invoke_dispatch).
-    let field_name = vm
-        .classes
-        .class_manager
-        .read()
-        .get_class(class_id)
-        .and_then(|c| {
-            if &*c.name == "java/lang/System" {
-                c.fields
-                    .get(field_index as usize)
-                    .map(|f| f.name.to_string())
-            } else {
-                None
-            }
-        });
+    // The intercept concerns exactly ONE class, but the probe for it used to
+    // run on EVERY `getstatic`: a `class_manager.read()` acquisition, a
+    // `get_class`, and a string compare of the class name — per static field
+    // read, in compiled code. Measured on `probes/StaticFieldProbe.java`, a
+    // `getstatic` cost ~35 ns against HotSpot's ~1, and this was part of it.
+    //
+    // Resolve `java/lang/System`'s ClassId once and compare integers instead.
+    // Every other class now answers with a relaxed atomic load and an `==`,
+    // touching no lock at all. `java/lang/System` is loaded during bootstrap
+    // and its id is stable for the life of the VM, so a one-shot cache is
+    // sound; until it resolves we fall back to the id-less answer (`None`),
+    // which is what a not-yet-loaded System would have produced anyway.
+    drop(_gs_init);
+    // Scoped so the guard is DROPPED here rather than at end of function — an
+    // unscoped guard silently folded the read segment into this one and made
+    // `syscheck` look like the dominant cost.
+    let field_name = {
+        let _gs_sys = gs_prof::CycGuard::new(&gs_prof::CYC_SYSCHECK);
+        if system_class_memo::is_system(vm, class_id) {
+            vm.classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .and_then(|c| {
+                    c.fields
+                        .get(field_index as usize)
+                        .map(|f| f.name.to_string())
+                })
+        } else {
+            None
+        }
+    };
     if let Some(ref fname) = field_name {
         if fname == "out" || fname == "err" {
             // Honor System.setOut/setErr: if the static field was explicitly set
@@ -4900,7 +5481,10 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
         }
     }
 
-    let val = crate::vm::get_static_shared(vm, class_id, field_index as usize);
+    let val = {
+        let _g = gs_prof::CycGuard::new(&gs_prof::CYC_READ);
+        crate::vm::get_static_shared(vm, class_id, field_index as usize)
+    };
     match val {
         Value::Int(i) => i as i64,
         Value::Long(l) => l,
@@ -4916,6 +5500,86 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
         }
         Value::Object(None) => 0,
         _ => 0,
+    }
+}
+
+/// Where does a `getstatic` actually spend its time?
+///
+/// The helper has four distinguishable segments and, measured from outside, they
+/// were indistinguishable — which is how a lock-free read path that turned out
+/// to change nothing got built on an assumption. Each segment is now timed with
+/// `rdtsc` under `CRATONVM_DBG_GETSTATIC_PROF=1`; the dump also reports whether
+/// the lock-free index is actually being HIT, so an inert lever cannot pass for
+/// an ineffective one.
+pub mod gs_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_BOUNDARY: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_INIT: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_SYSCHECK: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_READ: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GETSTATIC_PROF").is_some()
+        })
+    }
+
+    #[inline]
+    pub fn now() -> u64 {
+        // SAFETY: rdtsc is unprivileged on x86-64.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    pub struct CycGuard<'a> {
+        start: u64,
+        sink: &'a AtomicU64,
+        armed: bool,
+    }
+
+    impl<'a> CycGuard<'a> {
+        #[inline]
+        pub fn new(sink: &'a AtomicU64) -> Self {
+            let armed = enabled();
+            Self {
+                start: if armed { now() } else { 0 },
+                sink,
+                armed,
+            }
+        }
+    }
+
+    impl Drop for CycGuard<'_> {
+        #[inline]
+        fn drop(&mut self) {
+            if self.armed {
+                self.sink
+                    .fetch_add(now().wrapping_sub(self.start), Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let calls = g(&CALLS).max(1);
+        eprintln!(
+            "[GS_PROF] calls={} cyc/call total={:.1} boundary={:.1} init={:.1} \
+             syscheck={:.1} read={:.1} | index_hit={} index_miss={}",
+            g(&CALLS),
+            g(&CYC_TOTAL) as f64 / calls as f64,
+            g(&CYC_BOUNDARY) as f64 / calls as f64,
+            g(&CYC_INIT) as f64 / calls as f64,
+            g(&CYC_SYSCHECK) as f64 / calls as f64,
+            g(&CYC_READ) as f64 / calls as f64,
+            crate::vm::statics_index_hits(),
+            crate::vm::statics_index_misses(),
+        );
     }
 }
 
@@ -7486,6 +8150,22 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 // null — keep the defensive 0 bail (does not mask a real NPE).
                 _ => return 0,
             };
+            // A lambda-proxy receiver must be dispatched through the proxy
+            // registry, never by name — see `try_lambda_proxy_sam_dispatch`
+            // for what resolving one by its functional-interface name runs
+            // instead of the lambda body.
+            if let Some(result) = try_lambda_proxy_sam_dispatch(vm, thread, info, &values) {
+                return match result {
+                    Ok(Some(Value::Int(v))) => v as i64,
+                    Ok(Some(Value::Long(v))) => v,
+                    Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+                    Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+                    Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+                    Ok(Some(Value::Object(None)) | None) => 0,
+                    Ok(_) => 0,
+                    Err(error) => handle_jit_dispatch_error(vm, thread, error, info),
+                };
+            }
             // Match the register-overflow bail path: `NativeContext::invoke_virtual`
             // resolves solely from the heap object's class id. That is insufficient
             // for a synthetic/ClassId(0) receiver (common for Lucene iterator
@@ -9795,6 +10475,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // Keep handler-bearing methods on the helper path. A raw compiled
         // entry can leave a pending exceptional frame that the caller cannot
         // safely resume while the HTTP request is still active.
+        if compile_res.is_none() {
+            mic_prof::bump(&mic_prof::PUB_PROBE_NONE);
+        }
         if let Some((_callee_pin, entry_ptr, needs_ctx)) = compile_res {
             // `_callee_pin` holds the callee artifact across the publications
             // below: `update`/`install` take their own keep-alive by resolving
@@ -9816,7 +10499,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             {
                 publish_mic_rust_cached_entry(info_ptr, receiver_cid, entry_ptr, needs_ctx);
             }
+            if callee_barred_by_table || callee_has_indy_trap {
+                mic_prof::bump(&mic_prof::PUB_BARRED);
+            }
             if !callee_barred_by_table && !callee_has_indy_trap {
+                mic_prof::bump(&mic_prof::PUB_PUBLISHED);
                 // Publish through `update`, never with a raw store: `update` is
                 // the only writer that also resolves and RETAINS the callee's
                 // `Arc<CompiledMethod>` in the slot's `compiled_owner`.
@@ -11954,6 +12641,12 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,
         new_object: jit_new_object as *const () as usize,
         anewarray_object: jit_anewarray_object as *const () as usize,
+        // Cold-`new` fix: the CP-indexed variants, used for a `new`/`anewarray`
+        // whose target class was not loaded when the method compiled. Always
+        // wired in production — the OptionalPtr classification exists only so
+        // hand-built test tables can leave them 0.
+        new_object_cp: jit_new_object_cp as *const () as usize,
+        anewarray_object_cp: jit_anewarray_object_cp as *const () as usize,
         baload: jit_baload as *const () as usize,
         bastore: jit_bastore as *const () as usize,
         iaload: jit_iaload as *const () as usize,
