@@ -158,17 +158,64 @@ was the only one that *could* clone, and did.
 `accept()`, a `close()` from another thread, then a connect. Interleaved arms,
 25 rounds each, 4 connect attempts per round:
 
-| build | refused | served after `close()` returned |
+| build | refused (of 100) | served after `close()` returned |
 |---|---:|---:|
 | HotSpot 25 | 100 | **0** |
-| `9fcd1b63f` (pre-fix) | 79 / 84 | **21 / 16** |
-| this fix | 100 / 100 | **0 / 0** |
+| `9fcd1b63f` (pre-fix) | 79 / 84 / 78 / 10 | **21 / 16 / 22 / 90** |
+| this fix | 100 / 100 / 100 / 100 | **0 / 0 / 0 / 0** |
+
+The pre-fix arm's spread (21 → 90 served) is the load dependence itself: the
+window is one poll interval, so the busier the host, the more of it a
+connecting client fits inside. That is the same variable that decides whether
+the Jetty test fails, and it is why a standalone run of that test is not
+evidence either way.
 
 Also pinned by
 `socket_channel::tests::closing_the_registry_entry_closes_the_listening_port`,
 which asserts the OS-visible property — a connect to the port must fail —
 rather than the internal one, because the internal state was already correct
 while the socket stayed open.
+
+### End-to-end, on the fixed binary
+
+`JettyServletWebServerFactoryTests` — the class that carried this doc's second
+corroboration (`HttpCookie.from` -> the same `NoSuchMethodError`-then-fatal
+signature on a worker thread) and its graceful-shutdown residual:
+
+| | 2026-07-31 (`a9ead67a1`) | 2026-08-01 (this fix) |
+|---|---|---|
+| tests | 113 | 113 |
+| failed | 2 | **1** |
+| `whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade` | FAIL (404, not refused) | **PASS** |
+| `sessionCookieSameSiteAttribute…[2]` | FAIL (`SocketTimeoutException` — the server thread that would have answered was killed by the fatal error) | **PASS** |
+| `checkcast: not an object reference` / `terminated with error` in the logs | present | **0 occurrences** |
+| `[overlay-backing]` (the new detector) | n/a | **0 occurrences** |
+
+`BasicErrorControllerIntegrationTests`: 26 tests, 23 failed, **no abort and no
+crash** — see "Out of scope" below for what those 23 are. Six Tomcat boots per
+run, so the class still reaches the state this doc's abort needed.
+
+The one remaining Jetty failure, `localeCharsetMappingsAreConfigured`, is
+**not** this doc's defect and **not** caused by the fixes here — it is a
+separate regression that landed on `dev` in the same window. Three-binary A/B
+on the single method, plus a reduced probe:
+
+| build | `localeCharsetMappingsAreConfigured` | `Locale.GERMAN.toString()` |
+|---|---|---|
+| HotSpot 25 | PASS | `"de"` |
+| `9fcd1b63f` | PASS | `"de"` |
+| dev `7899b462b` (no changes of mine) | FAIL | `""` |
+| dev + this fix | FAIL | `""` |
+
+`Locale.toString()` returns the empty string for every real-JDK-created
+`Locale`, so Jetty's `_localeEncodingMap` — keyed by `locale.toString()` —
+collapses every locale onto the `""` key and `getLocaleEncoding(ITALIAN)`
+returns the charset registered for `GERMAN`. Commit `6f4522350` registers a
+native at `java/util/Locale.toString()`, which shadows the class's real
+bytecode at every dispatch site, and that native reads a side table filled only
+by the *synthetic* `Locale` constructors. Filed separately; it is the same
+family as the already-documented "a native registered on a public functional
+interface hijacks user lambdas" trap.
 
 ### Out of scope, still open
 
