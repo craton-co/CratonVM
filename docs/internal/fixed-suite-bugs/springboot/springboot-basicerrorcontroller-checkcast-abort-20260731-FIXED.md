@@ -1,5 +1,38 @@
 # `BasicErrorControllerIntegrationTests` aborts with `checkcast: not an object reference`
 
+**Status: FIXED — 2026-08-01.** Retired from `docs/known-issues/springboot/`.
+The closing evidence, and the second defect that was hiding behind the same
+class, are in
+[`basicerrorcontroller-class-cluster-20260728-FIXED.md`](basicerrorcontroller-class-cluster-20260728-FIXED.md);
+read that first. This file is kept for its root-cause analysis, which is still
+the reference description of the collection-overlay rooting bug.
+
+Two things below are now known to be wrong, and are left in place deliberately
+because the reasoning that produced them is instructive:
+
+* The "Regression note (2026-07-31)" reads as this document's own fix
+  (`3211b8c74`) failing. It did not fail — it was incomplete, and the rest was
+  closed by `c3dbb011a`, `0b18f15eb` and `19cb55343`, none of which were in the
+  binaries those reruns used (`9fcd1b63f`, `a9ead67a1`). Explanation (1) in that
+  note is the correct one.
+* That note also suggests reproducing under "the exact residual-round harness
+  conditions (49-class sequential run ... rather than an isolated repeated
+  single-class run)" on the theory that many classes share one process's
+  generational spaces. **They do not.** The suite runner starts one process per
+  class (`New-ProcessRecord`), so there is no cumulative cross-class GC
+  pressure; what differs between the two harnesses is machine-level load and
+  timing, which an isolated repeat under a loaded box reproduces just as well.
+
+The `whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade`
+residual recorded near the end of this file was NOT fixed. It is re-filed as
+`docs/known-issues/springboot/jetty-graceful-shutdown-accepts-new-connections-20260801.md`.
+
+---
+
+*(The original report follows in full. Its own `Status:` line records the 2026-07-31 state and is superseded by the header above.)*
+
+# `BasicErrorControllerIntegrationTests` aborts with `checkcast: not an object reference`
+
 **Status: OPEN — REGRESSED 2026-07-31 (same day as the fix below).** Two
 independent GC bugs were fixed (`3211b8c74`): the moving young collector never
 rooted collection-overlay side-table references, and several TreeSet/TreeMap
