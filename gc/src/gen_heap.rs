@@ -5666,6 +5666,39 @@ impl GenerationalHeap {
             // watched object that stayed put, so `compact_map` membership is
             // the exact replacement proof.
             crate::gc_quiescence::set_old_gen_reclaimed(true);
+            // Publish THIS cycle's young relocation to the external-root
+            // providers BEFORE the major GC consults them.
+            //
+            // Phase 1a above forwarded every overlay-held young object, but it
+            // deliberately left the side tables themselves pointing at the
+            // PRE-copy addresses — the VM's post-GC `remap_external_roots`
+            // repoints them once the collector returns. That is too late when a
+            // major GC runs in the SAME collector call, because `old_gen_gc`
+            // seeds its mark worklist from exactly those side tables:
+            //
+            //   * `external_roots_for_matching_owners(|o| young_from.contains(o))`
+            //     tests a pre-copy address against the POST-swap from-space, so
+            //     it matches nothing and that owner's refs are never seeded;
+            //   * `external_roots_for_owner(..)` in the BFS hands back pre-copy
+            //     addresses for an object this cycle just PROMOTED, so the
+            //     promoted copy is never marked and the compaction frees it
+            //     while the overlay still holds the only reference to it.
+            //
+            // The reclaimed collection then reads its own state back through
+            // the relocation-invariant identity-hash key and gets a zeroed
+            // header (`ClassId(0)`, `num_slots == 0`) — surfacing as an
+            // out-of-bounds field read on a `java/lang/Object` receiver, a
+            // "Stale pointer detected in invokevirtual receiver" fallback, or
+            // an `old-gen mark: rejecting external-overlay(BFS owner)` warning
+            // when the stale address happens to land inside old gen's range.
+            //
+            // `run_non_moving_young_cycle` already publishes at this same
+            // boundary for this same reason; this is that call on the moving
+            // path. Idempotent with the VM's later pass: `pointer_map` here
+            // holds only young→to-space / young→old-gen entries, whose keys and
+            // values live in disjoint arenas, so a ref this remaps can never be
+            // remapped a second time.
+            crate::external_roots::remap_external_roots(&pointer_map);
             let compact_map = Self::major_gc(roots, &young_from, &mut old_gen);
             // CRITICAL FIX (heavy binary-trees GC corruption):
             //
@@ -14399,6 +14432,200 @@ mod tests {
         );
         // Outside the arena entirely.
         assert!(!og.is_allocated_addr(std::ptr::null()));
+    }
+
+    /// A test [`crate::external_roots::ExternalRootProvider`] standing in for
+    /// the collection overlays: it owns the ONLY reference to a payload object
+    /// (a `LinkedHashMap`'s backing array is the real-world case — it lives in
+    /// a process-global Rust side table, so neither a root slot nor a dirty
+    /// card can describe the edge).
+    ///
+    /// Registration is process-global and permanent, which is safe for the
+    /// other tests in this binary: while disarmed every callback returns
+    /// nothing, and while armed it hands back addresses from THIS test's heap,
+    /// which every consumer screens against its own arenas before use.
+    mod overlay_provider {
+        use cratonvm_types::ObjectRef;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static OWNER: AtomicUsize = AtomicUsize::new(0);
+        static HELD: AtomicUsize = AtomicUsize::new(0);
+
+        fn held() -> Vec<ObjectRef> {
+            match HELD.load(Ordering::Relaxed) {
+                0 => Vec::new(),
+                // SAFETY: armed only with a live object address from the
+                // arming test's own heap.
+                addr => vec![unsafe { ObjectRef::from_raw(addr as *mut u8) }],
+            }
+        }
+
+        fn scan(out: &mut Vec<ObjectRef>) {
+            out.extend(held());
+        }
+
+        fn owner_addrs() -> Option<HashSet<usize>> {
+            match OWNER.load(Ordering::Relaxed) {
+                0 => None,
+                owner => Some(HashSet::from([owner])),
+            }
+        }
+
+        fn roots_for_owner(owner_addr: usize) -> Vec<ObjectRef> {
+            let owner = OWNER.load(Ordering::Relaxed);
+            if owner != 0 && owner == owner_addr {
+                held()
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn roots_for_matching_owners(
+            owner_matches: &crate::external_roots::OwnerPredicate<'_>,
+        ) -> Vec<ObjectRef> {
+            let owner = OWNER.load(Ordering::Relaxed);
+            if owner != 0 && owner_matches(owner) {
+                held()
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn remap(pointer_map: &HashMap<usize, usize>) {
+            for slot in [&OWNER, &HELD] {
+                let addr = slot.load(Ordering::Relaxed);
+                if addr != 0 {
+                    if let Some(&new_addr) = pointer_map.get(&addr) {
+                        slot.store(new_addr, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        fn prune(_is_live: &crate::external_roots::OwnerPredicate<'_>) {}
+
+        pub(super) fn arm(owner: ObjectRef, payload: ObjectRef) {
+            crate::external_roots::register_external_root_provider(
+                crate::external_roots::ExternalRootProvider {
+                    name: "test-overlay-promotion-guard",
+                    scan,
+                    owner_addrs,
+                    roots_for_owner,
+                    roots_for_matching_owners,
+                    remap,
+                    prune,
+                },
+            );
+            OWNER.store(owner.as_ptr() as usize, Ordering::Relaxed);
+            HELD.store(payload.as_ptr() as usize, Ordering::Relaxed);
+        }
+
+        pub(super) fn disarm() {
+            OWNER.store(0, Ordering::Relaxed);
+            HELD.store(0, Ordering::Relaxed);
+        }
+
+        /// The payload address the provider currently believes in — the only
+        /// handle the test has on it, exactly as for a real overlay.
+        pub(super) fn payload() -> ObjectRef {
+            let addr = HELD.load(Ordering::Relaxed);
+            assert_ne!(addr, 0, "provider was disarmed");
+            // SAFETY: as `held`.
+            unsafe { ObjectRef::from_raw(addr as *mut u8) }
+        }
+    }
+
+    /// A moving young cycle that also runs a major GC must publish its
+    /// relocation to the external-root providers BEFORE the major GC consults
+    /// them.
+    ///
+    /// Phase 1a forwards (and here PROMOTES) every overlay-held young object,
+    /// but leaves the side tables pointing at the pre-copy address for the
+    /// VM's post-GC remap to fix. `old_gen_gc` seeds its mark worklist from
+    /// those very side tables, so without an in-cycle publish it looks up a
+    /// young from-space address, finds nothing in old gen, never marks the
+    /// promoted copy — and the compaction frees an object the overlay holds
+    /// the only reference to. `run_non_moving_young_cycle` has always
+    /// published at this boundary; this is the moving path's version.
+    ///
+    /// Fails before the fix with the freed payload reading back as a zeroed
+    /// header (`ClassId(0)`, `num_slots == 0`) — the shape that reached
+    /// Hibernate's `DefaultCatalogAndSchemaTest` as JUnit `TestPlan` entries
+    /// vanishing mid-run.
+    #[test]
+    fn moving_cycle_publishes_relocation_to_external_roots_before_major_gc() {
+        let heap = GenerationalHeap::with_sizes(512 * 1024, 64 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Emulate the VM's post-GC remap pass, which the gc crate never calls
+        // itself. Everything below drives the collector exactly as the VM does.
+        let cycle = |roots: &mut Vec<ObjectRef>| {
+            let result = heap.collect_garbage(&stw(), roots, &monitors);
+            crate::external_roots::remap_external_roots(&result.pointer_map);
+        };
+
+        // Push old gen past the 75% major-GC threshold with live, rooted
+        // objects, so the cycles below run a major GC in the SAME collector
+        // call that promotes the payload. Deterministic, and it avoids the
+        // process-global `System.gc()` request flag that a concurrently
+        // running test could consume.
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        let mut occupancy_percent = 0usize;
+        for _round in 0..16 {
+            for _ in 0..24 {
+                roots.push(heap.alloc_object(ClassId::new(0), 8));
+            }
+            for _ in 0..PROMOTION_AGE {
+                cycle(&mut roots);
+            }
+            let old_gen = heap.old_gen.lock();
+            occupancy_percent = old_gen.used() * 100 / old_gen.capacity();
+            drop(old_gen);
+            if occupancy_percent >= 75 {
+                break;
+            }
+        }
+        assert!(
+            occupancy_percent >= 75,
+            "precondition: old gen must be over the major-GC threshold for the \
+             promoting cycle to also compact (reached {occupancy_percent}%) — \
+             without that this test cannot express the bug",
+        );
+
+        // The owner is an ordinary root; the payload is reachable ONLY through
+        // the provider.
+        let owner = heap.alloc_object(ClassId::new(0), 1);
+        let payload = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(payload, 0, Value::Int(0x5AFE));
+        overlay_provider::arm(owner, payload);
+        roots.push(owner);
+
+        for _ in 0..=PROMOTION_AGE {
+            cycle(&mut roots);
+        }
+
+        let held = overlay_provider::payload();
+        overlay_provider::disarm();
+
+        assert!(
+            heap.is_in_old(held.as_ptr()),
+            "precondition: the payload must have been PROMOTED for the major \
+             GC's old-gen marker to be the thing under test",
+        );
+        {
+            let old_gen = heap.old_gen.lock();
+            assert!(
+                old_gen.is_allocated_addr(held.as_ptr()),
+                "the major GC returned to the free list an object the \
+                 external-root provider holds the only reference to",
+            );
+        }
+        assert_eq!(
+            heap.get_field(held, 0).as_int(),
+            Some(0x5AFE),
+            "the overlay-held payload was reclaimed and its storage reused",
+        );
     }
 
     #[test]

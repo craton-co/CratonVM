@@ -1207,13 +1207,30 @@ pub fn verify_heap_object_fields(
     };
     let mut reported = 0usize;
     const CAP: usize = 40;
+    // Recycled-destination filter — the same ambiguity `verify_no_stale_refs`
+    // documents at length, which this pass was missing.
+    //
+    // An address that is BOTH a key and a value in `pointer_map` was vacated by
+    // one object and handed out again as the DESTINATION of another. A slot the
+    // remap rewrote correctly then points at a map KEY, so the `contains_key`
+    // test below reports it as UN-FORWARDED even though it is a fresh, correct
+    // reference to that address's NEW occupant.
+    //
+    // On the major-GC path this is not a rare corner: `pointer_map` is the
+    // composition of the young map with `OldGen::compact`'s, and a SLIDING
+    // compactor moves survivors DOWN into space its predecessors just vacated —
+    // so key∩value overlap is the normal case, not the exception. Reporting it
+    // manufactured a "the collector leaves reference fields un-forwarded"
+    // finding out of a correctly-collected heap. Build the destination set once
+    // (this whole pass is already an opt-in full heap walk).
+    let destinations: std::collections::HashSet<usize> = pointer_map.values().copied().collect();
     // Classify a reference target. Returns Some(reason) if it is dangling
     // (un-forwarded / off-heap / zeroed = wrongly reclaimed by the sweep).
     let classify = |addr: usize| -> Option<&'static str> {
         if addr == 0 {
             return None;
         }
-        if pointer_map.contains_key(&addr) {
+        if pointer_map.contains_key(&addr) && !destinations.contains(&addr) {
             return Some("UN-FORWARDED");
         }
         if heap.is_heap_addr(addr).is_none() {
