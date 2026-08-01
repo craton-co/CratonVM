@@ -1027,23 +1027,44 @@ fn loop_body(
     }
 
     // Pinned-node sweep: any non-pure data / memory node whose control or
-    // memory input is a body control node, or which is a Phi anchored at the
-    // region, belongs to the body. Pure nodes are intentionally *not* pinned
-    // (they float); their invariance is decided per use in `is_loop_invariant`.
-    for (id, node) in graph.nodes.iter().enumerate() {
-        if node.op == Op::Dead || node.op.is_pure() {
-            continue;
-        }
-        if node.op == Op::Phi {
-            // Loop-carried phi: anchored at the region (input slot 0).
-            if node.inputs.first().copied() == Some(region) {
+    // memory input is a body node, or which is a Phi anchored at the region,
+    // belongs to the body. Pure nodes are intentionally *not* pinned (they
+    // float); their invariance is decided per use in `is_loop_invariant`.
+    //
+    // Run to a FIXED POINT rather than in one arena pass. A single pass is only
+    // complete when every node's inputs have lower ids than the node itself:
+    // node `X` pinned only through node `Y` is missed whenever `Y` sorts after
+    // `X`. That ordering holds for the builder's forward-flowing control and
+    // memory edges, but it is a *premise about the producer*, not a property of
+    // the IR — a back-patched loop-carried edge breaks it, and so does any
+    // future pass that rewires an input.
+    //
+    // The cost of being wrong is asymmetric and this is the expensive side. An
+    // over-large body only loses hoists (more nodes look variant). A body that
+    // MISSES a node is a body `loop_has_hard_barrier` and `loop_store_clobber`
+    // never see — an unnoticed in-loop `Call` or `Store`, and a load hoisted
+    // across it. Iterating removes the premise for one extra arena pass.
+    loop {
+        let before = body.len();
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if node.op == Op::Dead || node.op.is_pure() {
+                continue;
+            }
+            if node.op == Op::Phi {
+                // Loop-carried phi: anchored at the region (input slot 0).
+                if node.inputs.first().copied() == Some(region) {
+                    body.insert(id as NodeId);
+                }
+                continue;
+            }
+            // Loads / stores / calls / allocations: pinned to a control/mem
+            // input, or to another node already pinned into the body.
+            if node.inputs.iter().any(|&inp| body.contains(&inp)) {
                 body.insert(id as NodeId);
             }
-            continue;
         }
-        // Loads / stores / calls / allocations: pinned to a control/mem input.
-        if node.inputs.iter().any(|&inp| body.contains(&inp)) {
-            body.insert(id as NodeId);
+        if body.len() == before {
+            break;
         }
     }
     body
@@ -1516,12 +1537,21 @@ pub fn licm_scev_corroborates(code: &[u8], code_len: usize) -> bool {
 //     coarse: it fires on the common straight-line "init then overwrite" and
 //     "write-only scratch field" shapes without needing a real alias oracle.
 //
-//   * The location key uses the *base node id*, the *index/offset node id*
-//     (or a sentinel for plain field stores with no index operand), and the
-//     `MemKind`.  Two stores match only when all three are structurally
-//     identical.  Because the base is a single SSA allocation node, equal
-//     base ids are the same object; differing `MemKind`/idx are different
-//     slots and never matched.
+//   * The location key uses the *base node id*, the *index/offset node id*,
+//     and the `MemKind`.  Two stores match only when all three are
+//     structurally identical.  Because the base is a single SSA allocation
+//     node, equal base ids are the same object; differing `MemKind`/idx are
+//     different slots and never matched.
+//
+//     A store whose layout carries NO offset operand (`idx == NO_NODE`) does
+//     not name a field at all, and is therefore not matchable in either
+//     direction — see `store_matchable_location`.  `MemKind` is an access
+//     *width*, not a field index: two distinct `int` fields of the same object
+//     share it, so keying on it alone conflates them.  The single exception is
+//     an allocation with exactly one field, where "the object's storage" IS
+//     that field.  This is the may-alias/must-alias distinction: the memory
+//     model calls the no-offset case `ir::AccessOffset::Absent` and defines it
+//     as a MAY-alias, and a deletion needs a MUST-alias.
 //
 // WIDENED CASE — WRITE-ONLY, NEVER-READ (Increment 2):
 //
@@ -1622,6 +1652,48 @@ fn is_local_alloc(graph: &Graph, id: NodeId) -> bool {
         graph.node_opt(id),
         Some(n) if matches!(n.op, Op::New { .. } | Op::NewArray { .. })
     )
+}
+
+/// True if `id` allocates an object with exactly **one** instance field.
+///
+/// This is the one shape in which a store carrying *no offset operand* still
+/// names a definite cell: with a single field, "the object's storage" and
+/// "field 0" are the same location, so two such stores to the same base must
+/// alias. See [`store_matchable_location`].
+///
+/// `Op::NewArray` never qualifies — an element count is not a field count, and
+/// an absent index names no element.
+fn alloc_has_single_field(graph: &Graph, id: NodeId) -> bool {
+    matches!(
+        graph.node_opt(id),
+        Some(n) if matches!(n.op, Op::New { num_fields: 1, .. })
+    )
+}
+
+/// True when a store's `(base, idx)` pair names a cell precisely enough that a
+/// later store to the *same key* is a proved overwrite — a **must**-alias, not
+/// a may-alias.
+///
+/// Deleting a store needs the strong direction. The offset operand is what
+/// carries the field identity, and two of the three `Op::Store` layouts
+/// `store_operands` accepts do not have one:
+///
+/// * compact `[base, value]` (EA-bridge / hand-built), and
+/// * full-without-offset `[ctrl, mem, base, value]`
+///
+/// both yield `idx == NO_NODE`. `ir::AccessOffset::Absent` — the memory model's
+/// name for exactly this — is documented as *"the object's storage … never
+/// disjoint from another access to the same base"*, i.e. a **may**-alias. Two
+/// such stores into **different fields** of the same object nonetheless share
+/// the location key `(base, NO_NODE, kind)` whenever their `MemKind` widths
+/// agree, and `o.x = 1; o.y = 2;` would delete the live `o.x = 1`.
+///
+/// The production builder always emits the 5-input `[ctrl, mem, base, offset,
+/// value]` form with a distinct `Const(field_index)` offset (`ir.rs`, the
+/// `putfield` arm), so this refusal costs nothing today; it removes the
+/// premise, which is the part that was not established.
+fn store_matchable_location(graph: &Graph, base: NodeId, idx: NodeId) -> bool {
+    idx != NO_NODE || alloc_has_single_field(graph, base)
 }
 
 /// True if a node could read memory or otherwise observe a pending store, so
@@ -1831,6 +1903,16 @@ fn eliminate_dead_stores(graph: &mut Graph) {
                     // Non-local store: it both may be observed AND may alias
                     // pending locals (we cannot prove otherwise), so flush.
                     pending.clear();
+                    continue;
+                }
+
+                // MUST-ALIAS, NOT MAY-ALIAS. A layout with no offset operand
+                // does not name a field, so two such stores to the same base
+                // may be two DIFFERENT cells (see `store_matchable_location`).
+                // Such a store neither matches a pending store nor becomes one
+                // — but it is NOT a barrier either: a store observes nothing,
+                // so it cannot make an earlier pending store live.
+                if !store_matchable_location(graph, base, idx) {
                     continue;
                 }
 
@@ -3429,6 +3511,12 @@ mod tests {
         // A local object whose field 0 is written twice with no read in
         // between: the first store is dead and must be removed; the second
         // (live) store and the allocation survive.
+        //
+        // The compact layout carries no offset operand, so the overwrite match
+        // rests on `num_fields == 1` — with one field, "the object's storage"
+        // and "field 0" are the same cell (`store_matchable_location`). Raise
+        // `num_fields` and the two stores must stop matching; that is
+        // `test_dse_absent_offset_stores_to_a_multi_field_object_are_not_matched`.
         let mut g = probe_graph();
         let alloc = g.add(
             Op::New {
@@ -3538,7 +3626,12 @@ mod tests {
         );
         let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
         let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
-        // Different MemKind → different location key (Int vs Long slot).
+        // Different MemKind → different location key. NOTE that this is an
+        // access *width* difference, not a field-identity one: it happens to
+        // separate these two stores, but two `int` fields share their MemKind.
+        // The width is not what makes the pass field-safe — see
+        // `test_dse_absent_offset_stores_to_a_multi_field_object_are_not_matched`
+        // for the same-width case.
         let s1 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
         let s2 = g.add(
             Op::Store(MemKind::Long),
@@ -3855,6 +3948,187 @@ mod tests {
             "a store that cannot be spliced out of the chain must be left alive"
         );
         assert_eq!(g.nodes[s2 as usize].inputs[1], s1, "the chain is unchanged");
+    }
+
+    // ── Alias-analysis audit (wave: alias soundness) ────────────────
+
+    #[test]
+    fn test_dse_absent_offset_stores_to_a_multi_field_object_are_not_matched() {
+        // `o.x = 1; o.y = 2;` where `x` and `y` are two `int` fields of the
+        // SAME object, written through a layout that carries no offset operand.
+        //
+        // The location key is `(base, idx, MemKind)`. Both stores have
+        // `idx == NO_NODE` and `MemKind::Int`, so the key is identical — yet
+        // they name different cells, and matching them deletes the live
+        // `o.x = 1`. `MemKind` is an access *width*, not a field index; two
+        // `int` fields share it. The memory model calls a missing offset
+        // `ir::AccessOffset::Absent` and defines it as a MAY-alias, and a
+        // deletion needs a MUST-alias.
+        //
+        // (Contrast `test_dse_removes_overwritten_store`, where the object has
+        // exactly ONE field and the absence of an offset therefore still names
+        // a definite cell.)
+        let mut g = probe_graph();
+        let alloc = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 2,
+            },
+            IrType::Ref,
+            vec![g.entry],
+            None,
+        );
+        let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let s1 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
+        let s2 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c2], None);
+        // Read the object back so the write-only phase (which keys on the base
+        // alone and is field-independent) does not also fire — this test is
+        // about the overwrite phase.
+        let load = g.add(Op::Load(MemKind::Int), IrType::Int, vec![alloc], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, load], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[s1 as usize].op,
+            Op::Store(MemKind::Int),
+            "nothing proves these two stores hit the same cell: with no offset \
+             operand the layout cannot tell field x from field y, and the \
+             matching MemKind is a width, not an identity"
+        );
+        assert_eq!(g.nodes[s2 as usize].op, Op::Store(MemKind::Int));
+    }
+
+    #[test]
+    fn test_dse_offset_distinguished_stores_still_match_and_still_separate() {
+        // The production layout `[ctrl, mem, base, offset, value]`: two stores
+        // to the SAME constant offset still match (the optimization survives),
+        // and two stores to DIFFERENT constant offsets still do not.
+        let mut g = probe_graph();
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![g.entry], None);
+        let m0 = g.add(Op::Proj(1), IrType::Memory, vec![g.entry], None);
+        let alloc = g.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 2,
+            },
+            IrType::Ref,
+            vec![ctrl, m0],
+            None,
+        );
+        let off0 = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let off1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let c3 = g.add(Op::Const(3), IrType::Int, vec![], None);
+        // f0 = 1 ; f1 = 2 ; f0 = 3   →  only the first is overwritten.
+        let s_f0_a = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![ctrl, alloc, alloc, off0, c1],
+            None,
+        );
+        let s_f1 = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![ctrl, s_f0_a, alloc, off1, c2],
+            None,
+        );
+        let s_f0_b = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Void,
+            vec![ctrl, s_f1, alloc, off0, c3],
+            None,
+        );
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, s_f0_b, alloc, off0],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[s_f0_a as usize].op,
+            Op::Dead,
+            "two stores at the same constant offset are a proved overwrite"
+        );
+        assert_eq!(
+            g.nodes[s_f1 as usize].op,
+            Op::Store(MemKind::Int),
+            "the store to the OTHER field is not overwritten by either"
+        );
+        assert_eq!(g.nodes[s_f0_b as usize].op, Op::Store(MemKind::Int));
+        // …and the chain closed over the hole rather than naming a dead node.
+        for (id, n) in g.nodes.iter().enumerate() {
+            if n.op == Op::Dead {
+                continue;
+            }
+            for (i, &inp) in n.inputs.iter().enumerate() {
+                if !is_memory_token_slot(n, i) {
+                    continue;
+                }
+                assert_ne!(
+                    g.nodes[inp as usize].op,
+                    Op::Dead,
+                    "n{id}:{:?} takes its memory token from removed n{inp}",
+                    n.op
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_loop_body_pins_a_node_whose_only_link_sorts_after_it() {
+        // The loop-body sweep must reach a fixed point. `call` is created
+        // BEFORE the node that pins it into the body, so a single arena pass in
+        // id order misses it — and a missed `Op::Call` is a hard barrier
+        // `loop_has_hard_barrier` never sees, which is how a load gets hoisted
+        // across a call that may write the very field it reads.
+        let mut g = probe_graph();
+        let pre = g.add(Op::Proj(0), IrType::Control, vec![g.entry], None);
+        let region = g.add(Op::Region, IrType::Control, vec![pre, NO_NODE], None);
+        // Created here, patched below: its memory operand does not exist yet.
+        let call = g.add(
+            Op::Call { info_ptr: 0 },
+            IrType::Int,
+            vec![pre, NO_NODE],
+            None,
+        );
+        let back = g.add(Op::Proj(0), IrType::Control, vec![region], None);
+        let mid = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![back, NO_NODE, pre],
+            None,
+        );
+        g.nodes[region as usize].inputs[1] = back;
+        g.nodes[call as usize].inputs[1] = mid;
+
+        let body = loop_body(&g, region, pre, &[back]);
+
+        assert!(
+            body.contains(&mid),
+            "the load is pinned directly to a body control node"
+        );
+        assert!(
+            body.contains(&call),
+            "the call is pinned to the body THROUGH the load, whose id sorts \
+             after it — one arena pass in id order misses this"
+        );
+        assert!(
+            loop_has_hard_barrier(&g, &body),
+            "a call in the body must disqualify the loop for hoisting"
+        );
+        assert!(
+            !body.contains(&pre),
+            "the pre-header must stay out of the body"
+        );
     }
 
     // ── SCEV-driven LICM ────────────────────────────────────────────

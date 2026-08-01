@@ -948,6 +948,44 @@ fn build_connection_graph(graph: &Graph) -> ConnectionGraph {
                 }
             }
 
+            // UNMODELLED NODE ⇒ its reference operands escape globally.
+            //
+            // `Op::Other` is not "a node that does nothing"; it is the bridge's
+            // catch-all. `jit/src/lib.rs::ir_op_to_ea_op` funnels every
+            // `ir::Op` this module has no variant for into it, and two of those
+            // publish or republish a reference:
+            //
+            //   * `ir::Op::LambdaIntToDouble` — `MemAccess::Opaque`,
+            //     `MemEffect::OPAQUE`, a safepoint, and it *invokes the lambda
+            //     it is handed*. It is a call in everything but name.
+            //   * `ir::Op::Guard` — a deoptimization point. Taking it rebuilds
+            //     an interpreter frame from the references the frame state
+            //     names, which republishes them outside the compiled frame.
+            //
+            // Leaving these contributing nothing was fail-OPEN, and the two
+            // consumers disagreed about it. `find_scalar_replacements` walks
+            // the allocation's uses and refuses an `Op::Other` use at its
+            // catch-all arm, so scalar replacement was already safe. **Lock
+            // elision walks no uses at all** — `find_lock_elision_plans`' E2 is
+            // `cg.get_escape(object).is_confined()` — so an object handed to an
+            // unmodelled node still looked confined and had its monitors
+            // deleted, dropping a `hb` edge the JMM argument in §4 assumes
+            // cannot exist.
+            //
+            // `GlobalEscape` rather than `ArgEscape`: we do not know that the
+            // destination is a callee, and `stack_allocatable` (which collects
+            // `ArgEscape`) should not fill up with objects whose fate is simply
+            // unknown. This costs scalar replacement nothing — the use walk
+            // refused these objects already — and costs lock elision only where
+            // it was unsound.
+            Op::Other => {
+                for &inp in &node.inputs {
+                    if is_ref_producer(graph, inp) {
+                        cg.set_escape(inp, EscapeState::GlobalEscape);
+                    }
+                }
+            }
+
             _ => {}
         }
     }
@@ -1534,6 +1572,40 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                     _ => {
                         can_replace = false;
                         break;
+                    }
+                }
+            }
+
+            // ── SELF-REFERENCE GATE ──────────────────────────────────
+            //
+            // The use walk above only ever visits uses of the allocation itself
+            // and of the transparent φ copies it accepted. A reference to the
+            // object that is recovered by **loading it back out of its own
+            // field** is reachable through neither, so every use made through
+            // that recovered reference is invisible to this loop:
+            //
+            //     o.next = o;          // recorded as a field store, fine
+            //     Foo p = o.next;      // `p` IS `o`, but `p` is a Load node
+            //     p.x = 5;             // holder is the LOAD — never visited
+            //
+            // `can_replace` stays true, `apply_scalar_replacement` deletes the
+            // allocation, and `p.x = 5` is left writing through an `Op::Dead`
+            // reference. That is the same *class* of defect as forwarding a
+            // load to a later store: an alias the analysis never proved absent.
+            //
+            // Refuse whenever a value written into one of our fields may BE
+            // this allocation. Asking `resolve_points_to` rather than testing
+            // `value == id` also catches the φ-aliased spelling
+            // (`o.next = (c ? o : o)`), and it is order-independent — unlike
+            // the `is_value` role test in the walk above, which the `is_holder`
+            // arm wins in exactly the self-store case.
+            if can_replace {
+                'self_ref: for stores in field_stores.iter() {
+                    for fs in stores {
+                        if fs.value == id || cg.resolve_points_to(fs.value).contains(&id) {
+                            can_replace = false;
+                            break 'self_ref;
+                        }
                     }
                 }
             }
@@ -2490,8 +2562,14 @@ fn escape_sites_for(cg: &ConnectionGraph, graph: &Graph, alloc: NodeId) -> Vec<N
     for (id, node) in graph.nodes.iter().enumerate() {
         match &node.op {
             Op::Dead => {}
-            // Returning, throwing or passing the reference publishes it.
-            Op::Return | Op::Throw | Op::Call => {
+            // Returning, throwing or passing the reference publishes it. So
+            // does handing it to a node this module cannot model: `Op::Other`
+            // is the bridge's catch-all, and `build_connection_graph` escapes
+            // its reference operands for the reasons recorded there. Naming the
+            // site here keeps the attribution and the lattice agreeing — an
+            // unattributed escape would otherwise look like the fail-closed
+            // `escalate_all_to_global` path.
+            Op::Return | Op::Throw | Op::Call | Op::Other => {
                 if node
                     .inputs
                     .iter()
@@ -5764,5 +5842,117 @@ mod tests {
         assert_eq!(r.stats.locks_refused, 1);
         assert_eq!(r.stats.locks_elided, 0);
         assert_eq!(r.stats.locks_coarsened, 0);
+    }
+
+    // ── Alias-analysis audit (wave: alias soundness) ──────────────────
+
+    /// SELF-REFERENCE. `o.f0 = o;` makes the allocation recoverable by loading
+    /// its own field, and the use walk in `find_scalar_replacements` never
+    /// visits uses made through that recovered reference — it only walks the
+    /// allocation's own uses and the transparent φ copies it accepts.
+    ///
+    /// Before the self-reference gate this object was reported replaceable:
+    /// `apply_scalar_replacement` would delete the allocation and leave
+    /// `p.f1 = 7` writing through an `Op::Dead` holder.
+    #[test]
+    fn an_object_stored_into_its_own_field_is_not_scalar_replaced() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 2);
+        let c7 = g.add_node(Op::Const(7), vec![]);
+        // o.f0 = o
+        let _self_store = g.add_node(Op::Store(0), vec![o, o]);
+        // p = o.f0   — `p` is `o`, but it is a Load node, not a use of `o`
+        let p = g.add_node(Op::Load(0), vec![o]);
+        // p.f1 = 7   — a real store into the object, invisible to the walk
+        let _via_p = g.add_node(Op::Store(1), vec![p, c7]);
+
+        let r = analyze_escapes(&g);
+        assert_eq!(
+            r.escape_states.get(&o),
+            Some(&EscapeState::NoEscape),
+            "the object genuinely does not escape — this is an ALIAS question, \
+             not a reachability one, which is why the escape lattice alone \
+             cannot refuse it"
+        );
+        assert!(
+            r.scalar_replaceable.iter().all(|s| s.alloc_node != o),
+            "a reference to the object is recoverable from its own field, so \
+             there are uses of it this analysis never saw"
+        );
+    }
+
+    /// The paired NEGATIVE control: an allocation stored into a *different*
+    /// object's field is still refused (it is published), and an allocation
+    /// whose fields hold only non-references is still replaced. The gate must
+    /// not have swallowed the ordinary case.
+    #[test]
+    fn the_self_reference_gate_does_not_refuse_an_ordinary_object() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let c9 = g.add_node(Op::Const(9), vec![]);
+        let _st = g.add_node(Op::Store(0), vec![o, c9]);
+        let load = g.add_node(Op::Load(0), vec![o]);
+
+        let r = analyze_escapes(&g);
+        let sr = r
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == o)
+            .expect("a field holding a constant is not a self-reference");
+        assert_eq!(sr.load_value(load), LoadResolution::Value(c9));
+    }
+
+    /// UNMODELLED USE. `Op::Other` is the bridge's catch-all, and two of the
+    /// `ir::Op`s that land in it — `LambdaIntToDouble` and `Guard` — publish or
+    /// republish the reference they are handed.
+    ///
+    /// `find_scalar_replacements` refuses such an object at its use-walk
+    /// catch-all, but `find_lock_elision_plans` walks no uses: its E2 test is
+    /// `get_escape(object).is_confined()`. Before this rule the object looked
+    /// confined and both monitors were elided.
+    #[test]
+    fn an_unmodelled_use_blocks_lock_elision() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 0);
+        let _opaque = g.add_node(Op::Other, vec![o]);
+        let _enter = g.add_node(Op::MonitorEnter, vec![o]);
+        let _exit = g.add_node(Op::MonitorExit, vec![o]);
+
+        let r = analyze_escapes(&g);
+        assert!(
+            r.escape_states
+                .get(&o)
+                .copied()
+                .unwrap_or(EscapeState::NoEscape)
+                .may_escape(),
+            "a reference handed to a node this module cannot model must not be \
+             reported confined"
+        );
+        assert!(
+            r.elide_locks.is_empty(),
+            "eliding every monitor on an object an unmodelled node may have \
+             published drops a happens-before edge the JMM argument assumes \
+             cannot exist"
+        );
+        assert!(r.scalar_replaceable.iter().all(|s| s.alloc_node != o));
+    }
+
+    /// The `Op::Other` rule must key off the *reference* operands only: an
+    /// unmodelled node with no reference input (the static-area base shape) is
+    /// unchanged, and a node an earlier pass already killed observes nothing.
+    #[test]
+    fn the_unmodelled_use_rule_ignores_dead_and_referenceless_nodes() {
+        let mut g = Graph::new();
+        let o = alloc(&mut g, 1, 1);
+        let c = g.add_node(Op::Const(3), vec![]);
+        let _st = g.add_node(Op::Store(0), vec![o, c]);
+        // A referenceless unmodelled node, and a stale dead use-edge.
+        let _bare = g.add_node(Op::Other, vec![c]);
+        let stale = g.add_node(Op::Other, vec![o]);
+        g.nodes[stale].op = Op::Dead;
+
+        let r = analyze_escapes(&g);
+        assert_eq!(r.escape_states.get(&o), Some(&EscapeState::NoEscape));
+        assert!(r.scalar_replaceable.iter().any(|s| s.alloc_node == o));
     }
 }
