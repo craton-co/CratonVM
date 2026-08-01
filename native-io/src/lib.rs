@@ -16874,6 +16874,22 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
         native_wk_poll_events,
     );
 
+    // WatchKey.watchable() → the registered directory, as a Path.
+    //
+    // `WatchKey` is an interface, so leaving this unregistered is not a silent
+    // no-op: the call raises `AbstractMethodError`. Spring Boot's
+    // `FileWatcher.accumulate` opens with
+    // `Path directory = (Path) key.watchable();` and its watcher thread catches
+    // only InterruptedException/ClosedWatchServiceException, so the error killed
+    // the thread through the uncaught handler and every watch test then timed
+    // out waiting for a change that could no longer be reported.
+    r.register(
+        "java/nio/file/WatchKey",
+        "watchable",
+        "()Ljava/nio/file/Watchable;",
+        native_wk_watchable,
+    );
+
     // WatchKey.reset() → boolean
     r.register("java/nio/file/WatchKey", "reset", "()Z", native_wk_reset);
 
@@ -17399,6 +17415,24 @@ fn native_wk_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         ctx.set_field(this, WK_FIELD_PENDING, Value::Object(Some(pending)));
     }
     Ok(Some(Value::Int(if valid { 1 } else { 0 })))
+}
+
+fn native_wk_watchable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let path_str = match ctx.get_field(this, WK_FIELD_PATH) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    // 2 fields: [0] = path String, [1] = owning FileSystem (left null; the
+    // default filesystem is what `Path.getFileSystem()` falls back to). Same
+    // layout `native_ws_poll` builds an event's context path with.
+    let path_obj = alloc_synthetic(ctx, "java/nio/file/Path", 2);
+    let path_pin = ctx.pin_native_root(path_obj);
+    let s = ctx.create_string(&path_str);
+    let path_obj = ctx.read_native_pin(path_pin, path_obj);
+    ctx.set_field(path_obj, 0, Value::Object(Some(s)));
+    ctx.unpin_native_roots(path_pin);
+    Ok(Some(Value::Object(Some(path_obj))))
 }
 
 fn native_wk_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
