@@ -16759,10 +16759,24 @@ fn classify_event_kind(kind: &EventKind) -> Option<i32> {
 
 /// Pull every currently-available event out of the notify receiver and
 /// partition it into the per-path queues. Called lazily on `poll`/`take`.
+/// `CRATONVM_DBG_WATCH=1` traces the WatchService pipeline end to end:
+/// registration (path + decoded event mask), every event the platform watcher
+/// delivers and how it is attributed, and each poll's verdict. The pipeline has
+/// four independent places an event can silently vanish (unmatched kind,
+/// unmatched watched path, zero event mask, closed/unknown service), and
+/// "nothing happened" looks identical from Java at all four.
+fn watch_dbg() -> bool {
+    static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DBG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_WATCH").is_some())
+}
+
 fn drain_into_queues(state: &mut WatchServiceState) {
     loop {
         match state.rx.try_recv() {
             Ok(Ok(event)) => {
+                if watch_dbg() {
+                    eprintln!("[watch] raw event {:?} paths={:?}", event.kind, event.paths);
+                }
                 let kind = match classify_event_kind(&event.kind) {
                     Some(k) => k,
                     None => continue,
@@ -16788,7 +16802,15 @@ fn drain_into_queues(state: &mut WatchServiceState) {
                             .file_name()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_default();
+                        if watch_dbg() {
+                            eprintln!("[watch]   queued kind={kind} under {t:?} name={name}");
+                        }
                         state.queued.entry(t).or_default().push((kind, name));
+                    } else if watch_dbg() {
+                        eprintln!(
+                            "[watch]   DROPPED (no registration matches) path={path:?} registered={:?}",
+                            state.registered
+                        );
                     }
                 }
             }
@@ -17075,6 +17097,10 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
 
+    if watch_dbg() {
+        eprintln!("[watch] register path={canonical:?} mask={event_mask}");
+    }
+
     // Create WatchKey. We store the *canonicalized* path so lookups in
     // the poll path find the matching entry irrespective of how the
     // caller wrote the path.
@@ -17130,6 +17156,12 @@ fn detect_events(
     };
     drain_into_queues(state);
     let raw = state.queued.remove(&canonical).unwrap_or_default();
+    if watch_dbg() {
+        eprintln!(
+            "[watch] detect_events key={canonical:?} mask={event_mask} raw={raw:?} queuedKeys={:?}",
+            state.queued.keys().collect::<Vec<_>>()
+        );
+    }
     raw.into_iter()
         .filter(|(k, _)| k & event_mask != 0)
         .collect()
@@ -17150,8 +17182,16 @@ fn native_ws_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let regs = match ctx.get_field(this, WS_FIELD_REGS) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            if watch_dbg() {
+                eprintln!("[watch] poll: no regs array on the service");
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
+    if watch_dbg() {
+        eprintln!("[watch] poll: {count} registration(s)");
+    }
 
     // Check each registered key for events
     for i in 0..count {
