@@ -1,8 +1,8 @@
-# The in-place old-gen sweep frees LIVE promoted objects — `DefaultCatalogAndSchemaTest` still loses a quarter of its tests
+# The in-place old-gen sweep frees LIVE promoted objects — `DefaultCatalogAndSchemaTest` still short of HotSpot
 
 | | |
 |---|---|
-| **Status** | 🟠 **Three defects fixed, the class still does not match HotSpot.** No crash (`rc=0`, 2 runs), but `found=99..110` against HotSpot's `132`. The newest fix is real and seconds-reproducible — the in-place old-gen sweep returned a LIVE promoted object's block to the free list (defect 4) — but it does not close the gap on this class. **Two earlier framings in this doc are RETRACTED: the `UN-FORWARDED` collector hypothesis (a verifier artefact) and `map_resize_inner` (a false premise about write barriers).** |
+| **Status** | 🟠 **Four defects fixed; the class still does not match HotSpot.** Best observed `found=128` against HotSpot's `132`, typical `99`, and an intermittent SIGSEGV remains whose rate **tracks host load** (~1 in 3 on a quiet box, ~4 in 5 under heavy concurrent load) and which is present with every fix here reverted. Defect 4 — the in-place old-gen sweep freeing LIVE promoted objects — is fixed and settled by an 8-pair interleaved A/B. **Two earlier framings are RETRACTED: the `UN-FORWARDED` collector hypothesis (a verifier artefact) and `map_resize_inner` (a false premise about write barriers).** |
 | **ID** | `HIB-MAPRESIZE-STALE.1` |
 | **Found** | 2026-07-31, validating the `DefaultCatalogAndSchemaTest` runner accommodation ([`../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md)). |
 | **Repro** | [`probes/hib-mapresize-repro-20260731.sh`](../../../probes/hib-mapresize-repro-20260731.sh) — `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`, `--nojit`, `--Xmx 1500m`, real JDK, `-Dcraton.batch=1`. |
@@ -499,7 +499,7 @@ call.
 
 ¹ the third M run had `CRATONVM_OLD_SWEEP_JIT=0`.
 
-### …and then the baseline moved, which invalidates the comparison above
+### …and then the baseline moved, which invalidated that comparison
 
 **P and Q are functionally identical to G** — the fixup is reverted in both, and
 everything else added since is gated off by default. G crashed 0 times in 3
@@ -513,6 +513,41 @@ collector is not worth shipping — but it should not be read as evidence that t
 fixup is harmful.** Settling that needs a properly powered comparison, on the
 order of eight runs per arm, ideally paired on the same host so background load
 cannot skew one arm (the G-vs-M runs were not paired, and the load differed).
+
+### Settled properly: 8 pairs, interleaved — the fix is NOT a regression
+
+Run with [`probes/hib-paired-ab-20260801.sh`](../../../probes/hib-paired-ab-20260801.sh),
+which alternates the arms run by run so a shift in background load cannot land
+on one side:
+
+```
+baseQ (baseline): 6/8 crashed  [0 139 139 139 139 0 139 139]
+fixR  (the fix):  4/8 non-zero [0 139 139 139 0 0 1 0]
+```
+
+| | baseline | fix |
+|---|---|---|
+| SIGSEGV (`rc=139`) | 6/8 | **3/8** |
+| runs that completed | 2 | **5** |
+| best `found` (HotSpot: 132) | 99 | **128** |
+
+The one `rc=1` is not a crash: that run completed with
+`found=128 started=118 ok=99 failed=19`. More of the test plan survived, so real
+test failures surfaced instead of tests silently vanishing — which is the
+correct behaviour appearing, not a new problem.
+
+Nothing here is significant on its own (Fisher ≈ 0.15), but the direction is
+consistent on every axis, and the claim the revert rested on — that the fix
+makes this class worse — is refuted. The fix is restored.
+
+**The crash rate tracks HOST LOAD.** Early runs took ~1000–1400 s and crashed
+about 1 in 3; these took ~1800–2500 s under heavy concurrent load from other
+agents and crashed 4 in 5, in BOTH arms. That is the whole explanation for the
+false signal: arm G was measured on a quiet host and arm M on a busy one, and an
+unpaired design cannot tell that apart from a code difference. It also says
+something about the residual SIGSEGV itself — a fault whose probability rises
+sharply with machine load is timing- or concurrency-sensitive, which is the
+first thing the next investigation should exploit.
 
 Anyone re-attempting defect 4 should start there rather than trusting the table
 above.
