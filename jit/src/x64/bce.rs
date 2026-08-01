@@ -1546,13 +1546,19 @@ fn locate_exit_test(
 /// This is the single call that replaces steps 1-3d of the old
 /// `analyze_bounds_elimination` (induction variable, loop bound, modified
 /// locals, arraylength provenance, non-negative start, step provenance).
-fn recognise_loop(code: &[u8], code_len: usize, header: usize, back_edge: usize) -> Option<RecognisedLoop> {
+fn recognise_loop(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+) -> Option<RecognisedLoop> {
     let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
     if back_edge_end > code_len {
         return None;
     }
     let test = locate_exit_test(code, code_len, header, back_edge, back_edge_end)?;
-    let mut counted = analyze_counted_loop(code, code_len, header, back_edge, test.form, &|_| None)?;
+    let mut counted =
+        analyze_counted_loop(code, code_len, header, back_edge, test.form, &|_| None)?;
     // `analyze_counted_loop` decodes the FIRST `iload x; <limit>; if_icmp*`
     // triple in the body and maps the opcode straight through
     // `ExitCmp::from_opcode`, without checking that the branch leaves the loop.
@@ -1773,9 +1779,9 @@ pub(super) fn analyze_bounds_elimination(
         // later exit test admit an index past the guarded length. (For an
         // `ArrayLength` limit `BoundSource::is_invariant` already covers the
         // array local; this covers the local the emitter actually reads.)
-        let bound_local = rl.bound_local.filter(|bl| {
-            *bl < 64 && (loop_.modified_locals & (1u64 << *bl)) == 0
-        });
+        let bound_local = rl
+            .bound_local
+            .filter(|bl| *bl < 64 && (loop_.modified_locals & (1u64 << *bl)) == 0);
 
         let env = match enclosing[li].and_then(|pi| recognised[pi].as_ref()) {
             Some(outer) => RangeEnv::new().with_loop_iv(&outer.counted),

@@ -3187,7 +3187,7 @@ impl Graph {
     /// The node-level spelling of `AliasClass::ArrayElem::elem`, for a caller
     /// that holds a `NodeId` and not a class — `x64::simd_analysis`'s
     /// `vector_gate` builds its body descriptions from node ids before it ever
-    /// reaches an alias class. Both read [`array_elem_kind`], so a consumer
+    /// reaches an alias class. Both read `array_elem_kind`, so a consumer
     /// cannot get a different answer here than the memory model uses.
     pub fn element_kind(&self, id: NodeId) -> Option<MemKind> {
         array_elem_kind(&self.node_opt(id)?.op)

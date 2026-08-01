@@ -1395,7 +1395,8 @@ impl SharedVm {
             cratonvm_native_api::VmId::from_raw(vm_identity),
         ));
         native_methods.set_capabilities(Arc::clone(&capabilities));
-        cratonvm_native_api::install_capabilities(Arc::clone(&capabilities));
+        // `None` — a fresh `vm_identity` can never displace an existing entry.
+        let _displaced = cratonvm_native_api::install_capabilities(Arc::clone(&capabilities));
 
         // ── Native policy, installed before ANY `register_*` pass ──────────
         //
