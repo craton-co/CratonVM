@@ -40,8 +40,18 @@
 //! This module is retained as a design sketch for the richer profile the tiered
 //! pipeline eventually wants. Do not delete it silently, and do not wire a new
 //! optimisation to it without first giving it a recorder.
-
-use std::collections::HashMap;
+//!
+//! # The one difference from [`crate::profile`] that is not cosmetic
+//!
+//! [`ReceiverTypeProfile`] records at most [`ReceiverTypeProfile::MAX_ENTRIES`]
+//! distinct receiver classes and then **silently drops** every further type
+//! while still counting the call in `total_calls`. `crate::profile` has no such
+//! cap. So a shape question answered from this module ("is this site
+//! monomorphic?") is answerable only together with "and was the table full when
+//! you asked?" — a site that overflowed its slots is not monomorphic, it is
+//! *unknown*, and conflating the two is a wrong-code bug the moment anything
+//! speculates on the answer. Every predicate below is therefore truncation-aware
+//! and fails closed; see [`ReceiverTypeProfile::is_truncated`].
 
 use rustc_hash::FxHashMap;
 
@@ -132,7 +142,15 @@ pub struct ReceiverTypeProfile {
 }
 
 impl ReceiverTypeProfile {
-    const MAX_ENTRIES: usize = 8;
+    /// Distinct receiver classes one call site may record.
+    ///
+    /// Public because it is not an implementation detail: a consumer cannot
+    /// interpret [`Self::type_count`] without knowing the cap, and lowering
+    /// this value (HotSpot's `TypeProfileWidth` default is 2, not 8) changes
+    /// which sites can be truncated. The predicates below are written against
+    /// [`Self::is_truncated`] rather than against this number, so they stay
+    /// correct at any cap.
+    pub const MAX_ENTRIES: usize = 8;
 
     pub fn new(call_site_bci: u32) -> Self {
         Self {
@@ -167,34 +185,94 @@ impl ReceiverTypeProfile {
         }
     }
 
+    /// Calls attributable to a *recorded* entry.
+    pub fn recorded_calls(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|e| e.count)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Calls whose receiver class was observed but **not** recorded, because
+    /// the table was already full when they arrived.
+    ///
+    /// [`Self::add_receiver`] bumps `total_calls` unconditionally and only
+    /// appends an entry while there is room, so this difference is exactly the
+    /// number of observations the profile threw away. [`PgoRepository::merge`]
+    /// drops entries the same way and is covered by the same accounting.
+    pub fn unrecorded_calls(&self) -> u64 {
+        self.total_calls.saturating_sub(self.recorded_calls())
+    }
+
+    /// Whether this profile lost at least one observation to the entry cap.
+    ///
+    /// Derived from [`Self::unrecorded_calls`] rather than from
+    /// `entries.len() == MAX_ENTRIES`, so it stays correct if the cap changes
+    /// and it also catches loss introduced by [`PgoRepository::merge`].
+    ///
+    /// A truncated profile is **not** a description of the call site: the
+    /// classes it does not name may collectively outweigh the ones it does.
+    /// Treat it as "unknown shape", never as "the shape I can see".
+    pub fn is_truncated(&self) -> bool {
+        self.unrecorded_calls() > 0
+    }
+
     /// Returns the `class_id` that accounts for >90 % of all observed calls,
     /// if any.
+    ///
+    /// Safe under truncation *by construction*: the share is measured against
+    /// `total_calls`, which counts the dropped observations too, so an
+    /// overflowing site's recorded entries are diluted rather than flattered.
+    /// Computed from the counts directly instead of the cached
+    /// [`TypeProfileEntry::ratio`] field, which is only refreshed by
+    /// `add_receiver` and is stale on any profile assembled by hand, by
+    /// deserialisation, or by a future partial merge.
     pub fn dominant_type(&self) -> Option<u32> {
         if self.total_calls == 0 {
             return None;
         }
         self.entries
             .iter()
-            .find(|e| e.ratio > 0.9)
+            .find(|e| u128::from(e.count) * 10 > u128::from(self.total_calls) * 9)
             .map(|e| e.class_id)
     }
 
-    /// True iff exactly one concrete type has been observed.
+    /// True iff exactly one concrete type has been observed **and the profile
+    /// recorded every call it counted**.
+    ///
+    /// The second clause is the whole point. Without it, a site whose table
+    /// filled and overflowed reports the shape of its surviving entries, and a
+    /// caller that speculates on the answer emits a guard for a class that may
+    /// be a minority of real receivers. Today `MAX_ENTRIES` is 8, so a
+    /// one-entry table cannot itself have overflowed and the clause is a no-op;
+    /// it becomes load-bearing the moment the cap is lowered towards HotSpot's
+    /// `TypeProfileWidth = 2`, which is precisely when nobody would think to
+    /// revisit this predicate.
     pub fn is_monomorphic(&self) -> bool {
-        self.entries.len() == 1
+        self.entries.len() == 1 && !self.is_truncated()
     }
 
-    /// True iff exactly two concrete types have been observed.
+    /// True iff exactly two concrete types have been observed and nothing was
+    /// dropped. Same fail-closed rule as [`Self::is_monomorphic`].
     pub fn is_bimorphic(&self) -> bool {
-        self.entries.len() == 2
+        self.entries.len() == 2 && !self.is_truncated()
     }
 
-    /// True iff more than four concrete types have been observed.
+    /// True iff more than four concrete types have been observed, **or** the
+    /// profile is truncated.
+    ///
+    /// Truncation implies "at least one more type than we could record", so a
+    /// truncated site is at least as polymorphic as it looks. Erring towards
+    /// megamorphic costs a devirtualisation opportunity; erring the other way
+    /// costs a wrong speculation.
     pub fn is_megamorphic(&self) -> bool {
-        self.entries.len() > 4
+        self.entries.len() > 4 || self.is_truncated()
     }
 
-    /// Number of distinct types recorded so far.
+    /// Number of distinct types **recorded** so far.
+    ///
+    /// A lower bound on the number observed whenever [`Self::is_truncated`] is
+    /// true. Callers that need the distinction must ask for it.
     pub fn type_count(&self) -> usize {
         self.entries.len()
     }
@@ -1408,6 +1486,174 @@ mod tests {
         }
         assert!(tp.entries.len() <= 8);
         assert!(tp.total_calls >= 12);
+    }
+
+    // ---- ReceiverTypeProfile: truncation ------------------------------------
+
+    /// The distinction the whole module turns on: a profile that recorded
+    /// every call it counted describes the site; one that dropped observations
+    /// does not, however few entries it happens to hold.
+    #[test]
+    fn truncated_profile_is_never_reported_as_a_settled_shape() {
+        // Hand-built: one recorded entry, but the counter says 1000 calls
+        // arrived. 900 of them had a class this table never named.
+        let lying = ReceiverTypeProfile {
+            call_site_bci: 4,
+            entries: vec![TypeProfileEntry {
+                class_id: 7,
+                method_id: 70,
+                count: 100,
+                ratio: 1.0, // stale on purpose — see below
+            }],
+            total_calls: 1000,
+        };
+        assert!(lying.is_truncated());
+        assert_eq!(lying.unrecorded_calls(), 900);
+        assert!(
+            !lying.is_monomorphic(),
+            "one surviving entry is not a monomorphic site"
+        );
+        assert!(lying.is_megamorphic(), "unknown shape must fail closed");
+        assert_eq!(
+            lying.dominant_type(),
+            None,
+            "10 % of the calls cannot dominate, whatever the cached ratio says"
+        );
+
+        // Two entries, still short of the total: not bimorphic either.
+        let two = ReceiverTypeProfile {
+            call_site_bci: 4,
+            entries: vec![
+                TypeProfileEntry {
+                    class_id: 1,
+                    method_id: 10,
+                    count: 60,
+                    ratio: 0.6,
+                },
+                TypeProfileEntry {
+                    class_id: 2,
+                    method_id: 20,
+                    count: 30,
+                    ratio: 0.3,
+                },
+            ],
+            total_calls: 100,
+        };
+        assert!(two.is_truncated());
+        assert!(!two.is_bimorphic());
+    }
+
+    /// Truncation is detected from the call accounting, so it does not depend
+    /// on the entry cap's current value.
+    #[test]
+    fn overflowing_the_entry_table_marks_the_profile_truncated() {
+        let mut tp = ReceiverTypeProfile::new(0);
+        for i in 0..12u32 {
+            tp.add_receiver(i, i as u64);
+        }
+        assert_eq!(tp.type_count(), ReceiverTypeProfile::MAX_ENTRIES);
+        assert_eq!(tp.total_calls, 12);
+        assert_eq!(tp.recorded_calls(), ReceiverTypeProfile::MAX_ENTRIES as u64);
+        assert_eq!(tp.unrecorded_calls(), 4);
+        assert!(tp.is_truncated());
+        assert!(tp.is_megamorphic());
+    }
+
+    /// The common case must not be pessimised: a site that never overflowed
+    /// accounts for every call and keeps its settled shape.
+    #[test]
+    fn untruncated_profile_accounts_for_every_call() {
+        let mut tp = ReceiverTypeProfile::new(0);
+        for _ in 0..10 {
+            tp.add_receiver(42, 1001);
+        }
+        assert_eq!(tp.recorded_calls(), tp.total_calls);
+        assert_eq!(tp.unrecorded_calls(), 0);
+        assert!(!tp.is_truncated());
+        assert!(tp.is_monomorphic());
+        assert!(!tp.is_megamorphic());
+    }
+
+    /// `dominant_type` reads the counts, not the cached `ratio` field, which
+    /// only `add_receiver` refreshes.
+    #[test]
+    fn dominant_type_ignores_a_stale_cached_ratio() {
+        let tp = ReceiverTypeProfile {
+            call_site_bci: 0,
+            entries: vec![TypeProfileEntry {
+                class_id: 5,
+                method_id: 50,
+                count: 95,
+                ratio: 0.0, // never recomputed
+            }],
+            total_calls: 100,
+        };
+        assert!(!tp.is_truncated());
+        assert_eq!(tp.dominant_type(), Some(5));
+    }
+
+    /// `merge` drops entries once the destination table is full while still
+    /// accumulating `total_calls`; the same accounting catches it.
+    #[test]
+    fn merge_induced_entry_loss_is_reported_as_truncation() {
+        let mut r1 = PgoRepository::new();
+        {
+            let p = r1.get_or_create(1, "A", "m", "()V");
+            for i in 0..ReceiverTypeProfile::MAX_ENTRIES as u32 {
+                p.record_receiver(0, i, i as u64);
+            }
+            assert!(!p.type_profiles[&0].is_truncated());
+        }
+        let mut r2 = PgoRepository::new();
+        {
+            let p = r2.get_or_create(1, "A", "m", "()V");
+            for _ in 0..500 {
+                p.record_receiver(0, 999, 9990);
+            }
+        }
+        r1.merge(r2);
+        let tp = &r1.get(1).unwrap().type_profiles[&0];
+        assert_eq!(tp.type_count(), ReceiverTypeProfile::MAX_ENTRIES);
+        assert_eq!(tp.unrecorded_calls(), 500, "the merged class was dropped");
+        assert!(tp.is_truncated());
+        assert!(tp.is_megamorphic());
+    }
+
+    /// A truncated site is refused by the policy rather than inlined on the
+    /// strength of the entries that happened to fit.
+    #[test]
+    fn inlining_policy_refuses_a_truncated_site() {
+        let policy = InliningPolicy::default();
+        let mut mp = MethodProfile::new(1, "A", "m", "()V");
+        for _ in 0..500 {
+            mp.record_call(0, 1);
+        }
+        mp.type_profiles.insert(
+            0,
+            ReceiverTypeProfile {
+                call_site_bci: 0,
+                entries: vec![TypeProfileEntry {
+                    class_id: 7,
+                    method_id: 1,
+                    count: 100,
+                    ratio: 1.0,
+                }],
+                total_calls: 5_000,
+            },
+        );
+        let cand = InlineCandidate {
+            call_site_bci: 0,
+            callee_method_id: 1,
+            callee_class: "B".into(),
+            callee_name: "n".into(),
+            estimated_benefit: 100.0,
+            callee_size: 4,
+        };
+        assert_eq!(
+            policy.should_inline(&cand, &mp),
+            InlineDecision::Megamorphic,
+            "a site whose profile lost observations is not an inline candidate"
+        );
     }
 
     #[test]
