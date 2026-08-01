@@ -18644,9 +18644,22 @@ fn execute_instruction(
                 let comp_brackets = total_array_depth - d - 1;
                 let cid = if comp_brackets > 0 {
                     // Component is itself an array class — resolve `[…`.
+                    //
+                    // JVMS §5.3.3: that inner array class is defined by the
+                    // defining loader of ITS component, so it must be resolved
+                    // loader-faithfully. This `ClassId` is stamped into the
+                    // allocated array object's header and is what a later
+                    // `getClass()` / `getComponentType()` reads back, so
+                    // collapsing two loaders' `[Lp/X;` here would make
+                    // `new p.X[2][2]` report the wrong loader's element type.
                     let comp_desc = format!("{}{}", "[".repeat(comp_brackets), leaf_desc);
-                    resolve_class_loader_aware(shared, thread, referencing_class_id, &comp_desc)
-                        .unwrap_or(ClassId::new(0))
+                    resolve_class_or_array_loader_aware(
+                        shared,
+                        thread,
+                        referencing_class_id,
+                        &comp_desc,
+                    )
+                    .unwrap_or(ClassId::new(0))
                 } else if leaf_desc.starts_with('L') && leaf_desc.ends_with(';') {
                     // Reference leaf — component is the element class itself.
                     let comp_name = &leaf_desc[1..leaf_desc.len() - 1];
@@ -19671,6 +19684,131 @@ pub use field_access::*;
 // delegates to. Only `resolve_method_metadata` was widened.
 pub(crate) mod invoke;
 pub use invoke::*;
+
+// ---------------------------------------------------------------------------
+// Helper: loader-faithful ARRAY class resolution (JVMS §5.3.3)
+// ---------------------------------------------------------------------------
+
+/// Resolve the array class `name` the way JVMS §5.3.3 requires, from the
+/// perspective of `referencing_class_id`'s defining loader.
+///
+/// > If the component type is a `reference` type, the Java Virtual Machine
+/// > marks C to have the defining loader of the component type as its defining
+/// > loader. Otherwise, the Java Virtual Machine marks C to have the bootstrap
+/// > class loader as its defining loader.
+/// >
+/// > — JVMS SE 21 §5.3.3, step 2
+///
+/// So `[Lp/X;` referenced from a class defined by loader A is a *different*
+/// runtime class from `[Lp/X;` referenced from loader B whenever A and B each
+/// define their own `p/X`. Collapsing the two is type confusion: array class
+/// identity is what `checkcast`/`instanceof` on an array type, the verifier's
+/// array-assignability rules and `Class.getComponentType()` all read.
+///
+/// Returns `None` — meaning "no loader-faithful answer, use the ordinary global
+/// resolution" — for a non-array name, for a referencing class whose defining
+/// loader is built-in, or when the class manager cannot synthesise the array.
+/// It can therefore only ever return a *more* precise answer, never fail a
+/// resolution that the global path would have answered.
+///
+/// Locking: the O(1) exact-key probe runs under the class-manager **read**
+/// lock, and the write lock is taken only on the cold "this loader has never
+/// resolved this array descriptor" path — at most once per
+/// `(loader, array descriptor)` pair. Same discipline as
+/// `SharedVm::load_class_concurrent`; each guard is bound to a `let` so it is
+/// dropped at the semicolon rather than being held across the next acquisition
+/// (`parking_lot::RwLock` is not reentrant — see the note in
+/// `typecheck::array_is_assignable_to_impl`).
+pub(crate) fn resolve_array_class_loader_aware(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+    name: &str,
+) -> Option<ClassId> {
+    if !name.starts_with('[') {
+        return None;
+    }
+    let requesting_loader = {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_loader_id(referencing_class_id)
+    }?;
+    // Only a user-defined component loader can produce a non-bootstrap array
+    // class (see `ClassManager::array_defining_loader` for why the three
+    // built-in loaders are deliberately collapsed onto `Bootstrap`), so for a
+    // built-in referencing class this path has nothing to add and must not pay
+    // for the probe.
+    if !matches!(
+        requesting_loader,
+        cratonvm_types::ClassLoaderId::UserDefined(_)
+    ) {
+        return None;
+    }
+    // Fast path. Exact key only: a delegating probe would hand back another
+    // loader's array class, which is the whole bug.
+    //
+    // Probing under `requesting_loader` is sound even though the array's key is
+    // its *component's* loader — a hit means an array class named `name` is
+    // filed under this loader, which by construction (the key is derived from
+    // the component) means its component was defined by this loader.
+    let cached = {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .loaded_class_under_exact_key(name, requesting_loader)
+    };
+    if let Some(id) = cached {
+        return Some(id);
+    }
+    // §5.3.3 step 1: "the algorithm of this section is applied recursively
+    // **using L** in order to load and thereby create the component type".
+    // `ClassManager` cannot invoke a Java `loadClass`, so drive the component
+    // through this loader here, before deriving the array's defining loader
+    // from it. Without this the component would fall back to the flat global
+    // store and the array would come out bootstrap-keyed again.
+    if let Some(component) = array_component_class_name(name) {
+        let known = {
+            shared
+                .classes
+                .class_manager
+                .read()
+                .find_class_by_name_for_loader(component, requesting_loader)
+        };
+        if known.is_none() {
+            let _ = drive_defining_loader_load(shared, thread, referencing_class_id, component);
+        }
+    }
+    shared
+        .classes
+        .class_manager
+        .write()
+        .load_array_class_for_loader(name, requesting_loader)
+        .ok()
+}
+
+/// [`resolve_array_class_loader_aware`] with the ordinary
+/// [`resolve_class_loader_aware`] as its fallback — the drop-in replacement for
+/// a `CONSTANT_Class` resolution site that may be handed either an array
+/// descriptor or a plain class name.
+pub(crate) fn resolve_class_or_array_loader_aware(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+    name: &str,
+) -> Result<ClassId, MethodCallFailed> {
+    if name.starts_with('[') {
+        let loader_faithful =
+            resolve_array_class_loader_aware(shared, thread, referencing_class_id, name);
+        if let Some(id) = loader_faithful {
+            return Ok(id);
+        }
+    }
+    resolve_class_loader_aware(shared, thread, referencing_class_id, name)
+}
+
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------

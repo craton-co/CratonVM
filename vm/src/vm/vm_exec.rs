@@ -5209,10 +5209,65 @@ impl<'a> NativeContextImpl<'a> {
         }
         None
     }
+
+    /// The `ClassId` a native call should resolve *array* descriptors against:
+    /// the innermost Java frame that is not part of the reflection plumbing
+    /// that got us here.
+    ///
+    /// `Class.forName` / `Array.newInstance` / `Class.arrayType` are all
+    /// caller-sensitive, and their own declaring classes are bootstrap-defined,
+    /// so taking `frames.last()` blindly would always answer "bootstrap" and
+    /// defeat the whole point. Mirrors the frame walk
+    /// `lang_class::class_for_name_one_arg_caller_loader` already does for the
+    /// one-argument `Class.forName` overload; only the innermost non-plumbing
+    /// frame is consulted, because walking further out crosses loader
+    /// namespaces.
+    fn array_resolution_referencing_class(&self) -> Option<ClassId> {
+        const REFLECTION_PLUMBING: &[&str] = &[
+            "java/lang/Class",
+            "java/lang/reflect/Array",
+            "java/lang/invoke/MethodType",
+        ];
+        let cm = self.shared.classes.class_manager.read();
+        self.thread.frames.iter().rev().find_map(|frame| {
+            let cid = frame.class_id;
+            let class = cm.get_class(cid)?;
+            if REFLECTION_PLUMBING.contains(&&*class.name) {
+                None
+            } else {
+                Some(cid)
+            }
+        })
+    }
 }
 
 impl<'a> NativeClassAccess for NativeContextImpl<'a> {
     fn load_class(&mut self, name: &str) -> MethodCallResult {
+        // JVMS §5.3.3: an array class is defined by the defining loader of its
+        // component type. `resolve_class_loader_faithful` below cannot express
+        // that — it resolves the array descriptor as a flat global name, so
+        // `[Lp/X;` came out bootstrap-keyed and two isolating loaders' arrays
+        // collapsed onto one runtime class. Try the loader-faithful array path
+        // first; it returns `None` for every non-array name and for a
+        // built-in calling loader, so this is strictly additive.
+        if name.starts_with('[') {
+            // Bind before the `if let`: an `if let` scrutinee's temporaries
+            // (here the autoref `&*self`) live for the whole body, which would
+            // collide with the `&mut self` reborrows inside it.
+            let referencing = self.array_resolution_referencing_class();
+            if let Some(referencing_class_id) = referencing {
+                let resolved = crate::runtime::interpreter::resolve_array_class_loader_aware(
+                    self.shared,
+                    self.thread,
+                    referencing_class_id,
+                    name,
+                );
+                if let Some(class_id) = resolved {
+                    let mirror = super::get_or_create_class_mirror(self.shared, class_id);
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+            }
+        }
         // See `class_via_caller_loader_before_stub`: a name that would only
         // resolve to a fabricated synthetic stub must first be offered to the
         // calling class's own ClassLoader, before the stub is minted and
@@ -5559,7 +5614,12 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         referencing_class_id: ClassId,
         name: &str,
     ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
-        crate::runtime::interpreter::resolve_class_loader_aware(
+        // `resolve_class_or_array_loader_aware`, not the plain variant: an
+        // array descriptor arriving here (`Class.forName("[Lp/X;")`,
+        // `Array.newInstance`, generic-signature parsing) must be keyed on its
+        // component's defining loader per JVMS §5.3.3, and the plain resolver
+        // explicitly declines `[` names.
+        crate::runtime::interpreter::resolve_class_or_array_loader_aware(
             self.shared,
             self.thread,
             referencing_class_id,
