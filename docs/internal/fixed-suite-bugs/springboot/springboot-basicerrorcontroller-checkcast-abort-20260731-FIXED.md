@@ -196,8 +196,11 @@ signature on a worker thread) and its graceful-shutdown residual:
 crash** — see "Out of scope" below for what those 23 are. Six Tomcat boots per
 run, so the class still reaches the state this doc's abort needed.
 
-Two rounds of both classes, identical results in each; the greps above are
-against all four logs.
+Two rounds of both classes before merging `dev` forward and more after, with
+identical results in every round; the greps above are against all of those
+logs. `dev` moved 111 commits during this work, so the post-merge rounds are
+the ones that count — the pre-merge ones only show the result did not change
+under them.
 
 The one remaining Jetty failure, `localeCharsetMappingsAreConfigured`, is
 **not** this doc's defect and **not** caused by the fixes here — it is a
