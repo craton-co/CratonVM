@@ -3403,6 +3403,38 @@ impl LoopXform {
         out
     }
 
+    /// Rewrite one pc-keyed side table into the rewritten bytecode's PC space.
+    ///
+    /// `compile_with_param_slots` takes 21 of these. Every one must go through
+    /// THIS function when the rewritten bytes are compiled, because replicating
+    /// some and not others is silent: the affected copy loses a field
+    /// resolution or an inline cache and takes a different lowering path than
+    /// its siblings, with nothing to fail on.
+    ///
+    /// An entry whose PC has several images is duplicated once per image and
+    /// the payload is CLONED, so a table carrying a raw pointer (`mic_slots`,
+    /// `pic_slots`, `invoke_info`, `ldc_string_info`, `typecheck_info`) shares
+    /// one target across copies. That is correct rather than a compromise: an
+    /// inline cache keyed on a call site sees the same receiver distribution in
+    /// every copy, exactly as it does today when a non-unrolled loop runs many
+    /// times.
+    ///
+    /// Entries outside the rewritten region carry through their single image,
+    /// so a table needs no "before"/"after" special-casing. An entry whose PC
+    /// has no image is dropped: its instruction is not in the output at all.
+    ///
+    /// Sorted by PC, which is what every consumer of these tables assumes.
+    pub(super) fn replicate_pc_keyed<T: Clone>(&self, table: &[(usize, T)]) -> Vec<(usize, T)> {
+        let mut out: Vec<(usize, T)> = Vec::with_capacity(table.len());
+        for (pc, payload) in table {
+            for image in self.outputs_for_bci(*pc) {
+                out.push((image, payload.clone()));
+            }
+        }
+        out.sort_by_key(|(pc, _)| *pc);
+        out
+    }
+
     /// Output PC an OSR entry for `bci` must use, or `None` when `bci` has no
     /// steady-state image and OSR there must be REFUSED.
     ///
@@ -5059,6 +5091,58 @@ mod loop_xform_tests {
                         !x.outputs_for_bci(header).is_empty(),
                         "{name} k={k}: the header must have an image"
                     );
+                }
+            }
+        }
+    }
+    /// Every entry of a replicated table lands on a PC that maps back to the
+    /// entry's original bci, and a body entry appears once per copy.
+    ///
+    /// The count property is the one that matters: a copy missing its entry
+    /// is silent — it loses a field resolution or an inline cache and takes a
+    /// different lowering path than its siblings, with nothing to fail on.
+    #[test]
+    fn a_replicated_side_table_covers_every_copy() {
+        for (name, code, header, back_edge) in admissible_fixtures() {
+            let len = code.len();
+            for k in 1..=LOOP_XFORM_MAX_COPIES {
+                for planned in [
+                    plan_loop_peel(&code, len, header, back_edge, k, &[]),
+                    plan_loop_unroll(&code, len, header, back_edge, k, &[]),
+                ] {
+                    let Ok(x) = planned else { continue };
+                    // One entry per original instruction start, payload = its bci.
+                    let table: Vec<(usize, usize)> =
+                        (0..len).filter(|&pc| x.bci_at(pc).is_some() || pc < len)
+                            .map(|pc| (pc, pc))
+                            .collect();
+                    let rep = x.replicate_pc_keyed(&table);
+
+                    // Sorted, as every consumer assumes.
+                    assert!(
+                        rep.windows(2).all(|w| w[0].0 <= w[1].0),
+                        "{name} k={k}: replicated table is not sorted by pc"
+                    );
+
+                    // Every replicated entry sits on a PC that maps back to it.
+                    for (pc, orig) in &rep {
+                        assert_eq!(
+                            x.bci_at(*pc),
+                            Some(*orig),
+                            "{name} k={k}: entry moved to {pc}, which is not an image of {orig}"
+                        );
+                    }
+
+                    // A body entry appears exactly once per image — the count
+                    // property a missed replication would break.
+                    for (pc, _) in &table {
+                        let images = x.outputs_for_bci(*pc).len();
+                        let landed = rep.iter().filter(|(_, o)| o == pc).count();
+                        assert_eq!(
+                            landed, images,
+                            "{name} k={k}: bci {pc} has {images} images but {landed} entries"
+                        );
+                    }
                 }
             }
         }
