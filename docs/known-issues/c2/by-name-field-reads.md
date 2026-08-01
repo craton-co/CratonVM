@@ -11,6 +11,29 @@ This is the defect class behind two already-fixed bugs on this branch: the
 BouncyCastle stream-cipher round count (a recoverable key) and `Enum.toString`
 returning a primitive from a `()Ljava/lang/String;` method.
 
+> **⚠️ The `Enum.toString` fix caused a worse regression, now reverted (2026-08-01).**
+> `5bc7458e4` fixed it by resolving `"name"` on the RECEIVER's class
+> (`declares_field` + `ref_field`) instead of reading `java.lang.Enum`'s slot 0.
+> But by-name resolution returns the **most-derived** declaration — §6.2 below
+> says so — and an enum may declare its own field called `name`. Spring Boot's
+> `WebEndpointTest.Infrastructure` does (`JERSEY("Jersey")`), so `Enum.name()`
+> answered `"Jersey"` instead of `"JERSEY"`; `Enum.valueOf` matches on `name()`
+> and threw `No enum constant JERSEY`; the enum-valued annotation attribute
+> resolved to nothing; and JUnit rejected every `@TestTemplate` class keyed on
+> such an enum with `displayName must not be null or blank` — zero tests run,
+> in 1.2 s, before any Spring context started. `native_enum_name` now reads
+> `Enum`'s own slot again and keeps only the primitive-tag degrade, which is
+> the part that was actually needed. Pinned by
+> `lang_misc::tests::enum_name_reads_enums_own_slot_not_a_shadowing_subclass_field`
+> and `probes/EnumShadowedNameProbe.java`.
+>
+> **The lesson for the rest of this doc: `ref_field` is only safe where the
+> field name cannot be shadowed.** For a field declared by a SUPER-class —
+> which is every `java.lang.*` base-class field a native reads — by-name
+> resolution addresses the wrong slot the moment an application subclass reuses
+> the name. Prefer the known index there, and use §6.2's descriptor-qualified
+> resolver once it exists.
+
 ---
 
 ## 1. The two readers disagree

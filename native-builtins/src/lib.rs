@@ -15543,15 +15543,16 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // `()Ljava/lang/String;` — must not surface a primitive tag. The
-            // old tail was `Ok(Some(ctx.get_field_by_name(this, "name")))`,
-            // which answers `Value::Int(0)` for an unwritten `name` slot
-            // because the by-name read is not descriptor-aware. `ref_field`
-            // resolves on the RECEIVER's class id (the `java/lang/Enum`
-            // name-keyed resolve above collapses under loader splits — see
-            // `resolve_field_index_by_class_id`'s doc) and degrades any
-            // non-reference tag to null.
-            Ok(Some(field_read::ref_field(ctx, this, "name")))
+            // Scoped to `java/lang/Enum`, exactly like the `ordinal` native
+            // above — NEVER to the receiver's class. `ref_field` does the
+            // latter, and `resolve_field_index_by_class_id` returns the
+            // MOST-DERIVED declaration, so an enum that declares its own field
+            // called `name` got that one instead: Spring Boot's
+            // `WebEndpointTest.Infrastructure` (`JERSEY("Jersey")`) made
+            // `name()` answer "Jersey" rather than "JERSEY". See
+            // `lang_misc::enum_constant_name` for the full trail. The
+            // primitive-tag degrade the descriptor-safety pass added is kept.
+            Ok(Some(lang_misc::enum_constant_name(ctx, this)))
         },
     );
     registry.register(
@@ -15564,7 +15565,7 @@ pub fn register_essential_natives_with_shims(
                 _ => return Ok(Some(Value::Object(None))),
             };
             // See `Enum.name` immediately above: same descriptor, same hazard.
-            Ok(Some(field_read::ref_field(ctx, this, "name")))
+            Ok(Some(lang_misc::enum_constant_name(ctx, this)))
         },
     );
     registry.register(
