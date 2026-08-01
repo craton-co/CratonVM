@@ -4921,6 +4921,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // TestFileSystem.testMoveTo's move-onto-existing-file case
             // through instead of rejecting it (docs/known-issues/h2-suite-bugs/
             // bug-h2-files-setposixfilepermissions-FIXED.md residual chain).
+            // ATOMIC_MOVE also implies replacement: it is specified as a single
+            // filesystem operation, which on every platform CratonVM targets is
+            // `rename(2)` / `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` — the target
+            // is replaced, not rejected. Treating it as "no replace" made
+            // Spring Boot's Kubernetes ConfigMap atomic-swap case
+            // (`FileWatcherTests.shouldTriggerOnConfigMapAtomicMoveUpdates`,
+            // which moves a fresh `..data` symlink over the live one) fail with
+            // `FileAlreadyExistsException`.
             let mut replace_existing = false;
             if let Some(Value::Object(Some(opts))) = args.get(2) {
                 let len = ctx.array_length(*opts);
@@ -4929,11 +4937,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         if let Ok(Some(Value::Object(Some(s)))) =
                             ctx.invoke_virtual(opt, "toString", "()Ljava/lang/String;", &[])
                         {
-                            if ctx
-                                .read_string(s)
-                                .unwrap_or_default()
-                                .contains("REPLACE_EXISTING")
-                            {
+                            let name = ctx.read_string(s).unwrap_or_default();
+                            if name.contains("REPLACE_EXISTING") || name.contains("ATOMIC_MOVE") {
                                 replace_existing = true;
                             }
                         }

@@ -16954,6 +16954,52 @@ fn native_ws_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(Some(ws))))
 }
 
+/// Map one `WatchEvent.Kind` argument onto the `EVENT_*` bit it selects.
+///
+/// `StandardWatchEventKinds.ENTRY_CREATE` and friends are static **fields**, so
+/// under real-JDK bytecode a caller hands us a genuine `StdWatchEventKind`
+/// object whose slot 0 is its `name` String — not the `Int` tag the synthetic
+/// `WatchEvent$Kind` carries. Reading slot 0 as an `Int` therefore contributed
+/// nothing, every registration ended up with an event mask of 0, and
+/// `detect_events`' `k & event_mask != 0` filter dropped every event the
+/// platform watcher delivered: `Path.register` succeeded, the watcher ran, and
+/// the caller waited forever ("Timeout while waiting for changes" across
+/// `FileWatcherTests`).
+///
+/// Ask the kind for its name — which both the real class and any synthetic
+/// stand-in can answer — and fall back to the legacy `Int`-in-slot-0 form.
+fn watch_event_kind_mask(ctx: &mut dyn NativeContext, kind: ObjectRef) -> i32 {
+    let name = ctx
+        .invoke_virtual(kind, "name", "()Ljava/lang/String;", &[])
+        .ok()
+        .flatten()
+        .and_then(|v| match v {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .or_else(|| {
+            ctx.invoke_virtual(kind, "toString", "()Ljava/lang/String;", &[])
+                .ok()
+                .flatten()
+                .and_then(|v| match v {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                })
+        });
+    match name.as_deref() {
+        Some("ENTRY_CREATE") => return EVENT_CREATE,
+        Some("ENTRY_DELETE") => return EVENT_DELETE,
+        Some("ENTRY_MODIFY") => return EVENT_MODIFY,
+        // OVERFLOW selects no filesystem event.
+        Some("OVERFLOW") => return 0,
+        _ => {}
+    }
+    match ctx.get_field(kind, 0) {
+        Value::Int(k) => k,
+        _ => 0,
+    }
+}
+
 fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path_obj = obj_arg92(args, 0)?;
     let watcher = obj_arg92(args, 1)?;
@@ -16988,16 +17034,22 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         .into());
     }
 
-    // Read event kind bitmask
+    // Read event kind bitmask. `watch_event_kind_mask` calls back into
+    // `Kind.name()` bytecode, which can allocate, so both the array being
+    // iterated and the `watcher` used after the loop are pinned across it
+    // (native stale-local family).
+    let watcher_pin = ctx.pin_native_root(watcher);
+    let kinds_pin = ctx.pin_native_root(kinds_arr);
     let kinds_len = ctx.array_length(kinds_arr);
     let mut event_mask = 0i32;
     for i in 0..kinds_len {
-        if let Value::Object(Some(kind)) = ctx.get_array_element(kinds_arr, i) {
-            if let Value::Int(k) = ctx.get_field(kind, 0) {
-                event_mask |= k;
-            }
+        let kinds_now = ctx.read_native_pin(kinds_pin, kinds_arr);
+        if let Value::Object(Some(kind)) = ctx.get_array_element(kinds_now, i) {
+            event_mask |= watch_event_kind_mask(ctx, kind);
         }
     }
+    let watcher = ctx.read_native_pin(watcher_pin, watcher);
+    ctx.unpin_native_roots(watcher_pin);
 
     // Install the OS-level watch on the real path. Non-recursive matches
     // java.nio.file.Path.register's documented semantics (the JDK's
