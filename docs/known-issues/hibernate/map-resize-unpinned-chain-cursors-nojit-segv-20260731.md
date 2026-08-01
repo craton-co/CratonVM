@@ -23,6 +23,7 @@ Same command, same host, same fixture.
 | B collections fix | A + `fix/hib-mapresize-put-stale-20260731` | SIGSEGV rc=139 @ **2312 s** | `0x16707D9`, same site | 22 |
 | C merged | B + `origin/dev` (incl. `22107d512`) | SIGSEGV rc=139 @ **2611 s** | `0x2B55C3`, reading a **heap** address | 48 |
 | **F** | C + `origin/dev` (incl. **`c3dbb011a`**) | **rc=0 @ 5110 s**, `found=99 started=97 ok=97 failed=0` | — | 0 |
+| F again (`CRATONVM_DBG_HEAP_STALE=1`) | same binary | **rc=0 @ 4724 s**, `found=99 started=96 ok=96 failed=0` | — | 0 |
 
 A and B die in the same place for the same reason (defect 2). C survives that,
 logs 48 corrupt headers, re-syncs, runs five minutes longer, and then dies
@@ -52,6 +53,10 @@ referrer shapes as on C.
 So `c3dbb011a` removed the crash, not the corruption. Defect 3 is unchanged and
 is now a **silent wrong answer** — a third of the class's tests quietly vanish —
 which is the worse failure mode of the two.
+
+Two independent F runs agree on `found=99` and on 6 drops, so the discovery gap
+is stable, not run-to-run noise (which for this reproducer is otherwise large —
+see the cautions). Both completed; neither crashed.
 
 ## The original diagnosis was wrong, which is why the first fix changed nothing
 
