@@ -15740,7 +15740,10 @@ const WK_FIELD_PATH: usize = 0;
 const WK_FIELD_EVENTS: usize = 1;
 const WK_FIELD_VALID: usize = 2;
 const WK_FIELD_PENDING: usize = 3;
-const WK_NUM_FIELDS: usize = 4;
+/// The caller's own `Path` object, as handed to `Path.register`. `watchable()`
+/// must return exactly that — see the note in `native_ws_register`.
+const WK_FIELD_WATCHABLE: usize = 4;
+const WK_NUM_FIELDS: usize = 5;
 
 /// WatchEvent layout: 2 fields
 /// [0] = kind (Int — 1=CREATE, 2=DELETE, 4=MODIFY)
@@ -17117,20 +17120,39 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         eprintln!("[watch] register path={canonical:?} mask={event_mask}");
     }
 
-    // Create WatchKey. We store the *canonicalized* path so lookups in
-    // the poll path find the matching entry irrespective of how the
-    // caller wrote the path.
+    // Create WatchKey. `WK_FIELD_PATH` holds the *canonicalized* path so
+    // lookups in the poll path find the matching entry irrespective of how the
+    // caller wrote it; `WK_FIELD_WATCHABLE` holds the caller's own `Path`
+    // OBJECT, which is what `watchable()` must hand back.
+    //
+    // The distinction is load-bearing, not cosmetic. Spring Boot's FileWatcher
+    // registers a letsencrypt-style path verbatim —
+    // `live/certname/../../archive/certname` — and then matches events with
+    // `key.watchable().resolve(event.context())` against that same unnormalised
+    // string. Returning the canonical directory made every such match fail
+    // (`FileWatcherTests.shouldFollowRelativePathSymlinks`). The JDK returns the
+    // exact Path that was registered, so we do too.
     let wk = alloc_synthetic(ctx, "java/nio/file/WatchKey", WK_NUM_FIELDS);
+    // `wk`, the caller's Path and the service all have to survive the string
+    // and array allocations below (native stale-local family).
+    let wk_pin = ctx.pin_native_root(wk);
+    let path_obj_pin = ctx.pin_native_root(path_obj);
+    let watcher_pin2 = ctx.pin_native_root(watcher);
     let canonical_str = canonical.to_string_lossy().into_owned();
     let path_s = ctx.create_string(&canonical_str);
+    let wk = ctx.read_native_pin(wk_pin, wk);
     ctx.set_field(wk, WK_FIELD_PATH, Value::Object(Some(path_s)));
     ctx.set_field(wk, WK_FIELD_EVENTS, Value::Int(event_mask));
     ctx.set_field(wk, WK_FIELD_VALID, Value::Int(1));
+    let path_obj = ctx.read_native_pin(path_obj_pin, path_obj);
+    ctx.set_field(wk, WK_FIELD_WATCHABLE, Value::Object(Some(path_obj)));
     // Length 0, not 64: the array's length IS the event count.
     let pending = ctx.new_array(ArrayElementType::Reference, 0);
+    let wk = ctx.read_native_pin(wk_pin, wk);
     ctx.set_field(wk, WK_FIELD_PENDING, Value::Object(Some(pending)));
 
     // Attach to the service's Java-side registration array.
+    let watcher = ctx.read_native_pin(watcher_pin2, watcher);
     let count = match ctx.get_field(watcher, WS_FIELD_COUNT) {
         Value::Int(n) => n as usize,
         _ => 0,
@@ -17141,6 +17163,8 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             ctx.set_field(watcher, WS_FIELD_COUNT, Value::Int((count + 1) as i32));
         }
     }
+    let wk = ctx.read_native_pin(wk_pin, wk);
+    ctx.unpin_native_roots(wk_pin);
 
     Ok(Some(Value::Object(Some(wk))))
 }
@@ -17419,6 +17443,10 @@ fn native_wk_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn native_wk_watchable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
+    // The registered Path object itself, when we have it.
+    if let Value::Object(Some(p)) = ctx.get_field(this, WK_FIELD_WATCHABLE) {
+        return Ok(Some(Value::Object(Some(p))));
+    }
     let path_str = match ctx.get_field(this, WK_FIELD_PATH) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
