@@ -13252,13 +13252,33 @@ pub(crate) fn find_jit_exception_handler(
 /// (`docs/known-issues/repros/jitban-remaining-20260726/`).
 ///
 /// Resuming at the handler keeps the compiled prefix's single execution and
-/// runs only the cleanup the compiled body skipped. Locals are the callee's
-/// incoming arguments, which is the same verifier-consistent state
-/// `route_jit_exception_through_method` uses and is sound for exactly the same
-/// reason: a compiled method whose handler reads a local first assigned inside
-/// the try never passes the `local_handler_reads_unsafe_local` compile gate.
+/// runs only the cleanup the compiled body skipped.
 ///
-/// Returns `None` when no handler in `cached` covers `throw_pc`, leaving the
+/// Locals come from the callee's own reason-9 exceptional frame when it
+/// published one, and only otherwise from its incoming arguments. Preferring
+/// the precise frame is not an optimisation — the params-only reconstruction is
+/// *unsound* for the population `precise_handler_frames_enabled` admits.
+/// `route_jit_signal_exception` already made that choice on the interpreter's
+/// drain path; this route, reached when the compiled callee was entered
+/// directly from compiled code, kept using params-only and silently zeroed
+/// every non-parameter local.
+///
+/// Witness: `BindConverter.convert` (Spring Boot) holds the enhanced-for
+/// iterator in a compiler-generated local assigned before its protected range,
+/// and its handler falls through to the loop head that reads it again. A
+/// delegate throwing a `ConversionException` resumed the handler with that
+/// local zeroed, so the loop head NPE'd —
+/// `Cannot invoke "java.util.Iterator.hasNext()" because "<local5>" is null` —
+/// which surfaced as a `ConfigurationPropertiesBindException` binding
+/// `spring.datasource.hikari.validation-timeout` and failed
+/// `DevToolsPooledDataSourceAutoConfigurationTests.inMemoryDerbyIsShutdown`.
+/// `probes/BindConverterJitProbe.java` reproduces it in ~500 iterations
+/// (199,491 of 200,000 calls wrong before this fix, 0 after).
+///
+/// The params-only fallback is retained for a callee that published no frame:
+/// that is the pre-existing population, where the compile gate does hold.
+///
+/// Returns `None` when no handler in `cached` covers the throw pc, leaving the
 /// caller to propagate the exception unchanged.
 pub(crate) fn run_jit_callee_handler(
     shared: &SharedVm,
@@ -13268,6 +13288,37 @@ pub(crate) fn run_jit_callee_handler(
     exc: ObjectRef,
     incoming_args: &[Value],
 ) -> Option<MethodCallResult> {
+    // Use a frame that names this method; leave anything else exactly as it was
+    // found. This route previously never touched the stash, so re-stashing a
+    // foreign frame (rather than dropping it, as `route_jit_signal_exception`
+    // does) keeps every other consumer's behaviour unchanged — including the
+    // OSR-bail case `drop_own_exceptional_frame` documents, where a frame
+    // naming a callee is still in flight. An unmappable frame fails closed: the
+    // `?` propagates the exception unchanged rather than entering a handler
+    // with zeroed non-parameter locals, which is the miscompile at issue.
+    let precise = match cratonvm_jit::deopt::take_exceptional_frame() {
+        Some(rframe)
+            if deopt_frame_matches_method(
+                &rframe,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            ) =>
+        {
+            let bci = rframe.bci as usize;
+            let locals = ir_deopt_locals(&rframe.locals)?;
+            Some((bci, locals))
+        }
+        Some(foreign) => {
+            cratonvm_jit::deopt::restash_exceptional_frame(foreign);
+            None
+        }
+        None => None,
+    };
+    let (throw_pc, incoming_args) = match precise.as_ref() {
+        Some((bci, locals)) => (*bci, locals.as_slice()),
+        None => (throw_pc, incoming_args),
+    };
     let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
     let mut synchronized_args = cached.is_synchronized.then(|| incoming_args.to_vec());
     let synchronized_monitor = match synchronized_args.as_mut() {
@@ -13310,8 +13361,13 @@ pub(crate) fn run_jit_callee_handler(
     }
     if crate::jit::helpers::rbc6_dbg() {
         eprintln!(
-            "[rbc6-dbg] run_jit_callee_handler {}.{}{} throw_pc={} handler_pc={}",
-            cached.class_name, cached.method_name, cached.method_descriptor, throw_pc, handler_pc,
+            "[rbc6-dbg] run_jit_callee_handler {}.{}{} throw_pc={} handler_pc={} precise={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            throw_pc,
+            handler_pc,
+            precise.is_some(),
         );
     }
     Some(execute_prebuilt_frame(shared, thread, frame))
