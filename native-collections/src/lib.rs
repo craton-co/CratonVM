@@ -29242,6 +29242,15 @@ fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>>
 /// collection churn (e.g. `WebXml.orderWebFragments` over 720 input
 /// permutations). `gc_scan_collection_overlay_roots` consults this set and
 /// skips rooting heap-backed entries; the remap path still repoints them.
+/// `CRATONVM_LHM_ROOT_ALL=1` — measurement lever; see the call site in
+/// [`for_each_overlay_ref`]. Cached, because the root scan runs on every GC.
+fn lhm_root_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_LHM_ROOT_ALL").is_some()
+    })
+}
+
 fn lhm_heap_backed() -> &'static Mutex<std::collections::HashSet<usize>> {
     static HB: std::sync::OnceLock<Mutex<std::collections::HashSet<usize>>> =
         std::sync::OnceLock::new();
@@ -34475,7 +34484,21 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&'static str, &mut 
             // never taken while lhm_overlay is held elsewhere — `lhm_set` locks them
             // sequentially, not nested — so this order can't deadlock). Recover the
             // guard on poison too, for the same reason as the outer tables.
-            let hb = if for_rooting {
+            // A/B LEVER (`CRATONVM_LHM_ROOT_ALL=1`): root EVERY LinkedHashMap
+            // overlay ref, i.e. ignore `lhm_heap_backed`.
+            //
+            // `lhm-overlay` is the only table the post-GC audit reports
+            // dangling refs from (600 `ZEROED(reclaimed)` reports over 68
+            // distinct addresses in one `DefaultCatalogAndSchemaTest` run), and
+            // it is also the only table whose refs the ROOT scan conditionally
+            // SKIPS. The skip's premise is that a heap-backed LHM's
+            // `head`/`tail`/`table` are mirrored into real heap fields and so
+            // stay alive by ordinary field tracing. This flag tests that
+            // premise directly instead of arguing about it: with the skip off,
+            // the audit count must go to zero. It is a measurement lever, not a
+            // fix — removing the skip outright reintroduces the unbounded
+            // pinning of dead LHMs/LHSs it was added to stop.
+            let hb = if for_rooting && !lhm_root_all() {
                 Some(lhm_heap_backed().lock().unwrap_or_else(|e| e.into_inner()))
             } else {
                 None
@@ -34486,9 +34509,20 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&'static str, &mut 
                         continue;
                     }
                 }
-                for v in inner.values_mut() {
+                for (name, v) in inner.iter_mut() {
                     if let Value::Object(Some(r)) = v {
-                        f("lhm-overlay", r);
+                        // Name the slot, not just the table: which of
+                        // `head`/`tail`/`table` dangles says whether the mirror
+                        // is missing or merely stale.
+                        f(
+                            match name.as_str() {
+                                "head" => "lhm-overlay/head",
+                                "tail" => "lhm-overlay/tail",
+                                "table" => "lhm-overlay/table",
+                                _ => "lhm-overlay/other",
+                            },
+                            r,
+                        );
                     }
                 }
             }
