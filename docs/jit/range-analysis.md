@@ -1,283 +1,308 @@
 # Integer range analysis for bounds-check elimination
 
 Deep-research report P1, *"Add range analysis before specialized loop
-kernels"*: the repository attributes prior sieve cost to bounds-check
-elimination refusing inclusive loops and non-`array.length` limits, and a
-specialized change closed most of that gap. This note describes the general
-proof that replaces the specialized patterns.
+kernels"*, claims the JIT has no range analysis. **That claim was already false
+when it was written, and is more false now.** This note records what exists,
+what was added, and what each part is allowed to prove.
 
-Status: **analysis only**. `jit/src/scev.rs` and `jit/src/loop_analysis.rs`
-carry the analysis and its tests; `jit/src/x64/bce.rs` is unchanged and still
-runs its own pattern set. The consumer change is specified in
-[What `bce.rs` must change](#what-bcers-must-change) and is deliberately a
-separate step — every guard the analysis returns has to be *emitted* before any
-check may be dropped on its authority.
+## Status, by piece
 
-## The pieces
-
-### Lattice — `scev::IntRange`
-
-An interval over the JVM `int` domain.
-
-| element | meaning |
-|---|---|
-| `Empty` | bottom: no value. A contradiction, or a provably zero-trip loop. |
-| `Range { lo, hi }` | the inclusive interval, `lo <= hi` by construction. |
-| `unknown()` = `Range { i32::MIN, i32::MAX }` | top: proves nothing. |
-
-There is no "probably" element. Anything unproven is top, and top never
-discharges an obligation. `join` is the interval hull (control-flow merge,
-and the post-tested loop's untested first iteration); `meet` is intersection
-(two facts about one value), and a contradiction becomes `Empty` rather than a
-choice between the two.
-
-Arithmetic comes in two flavours, and they are never interchanged:
-
-* `add_no_wrap` / `sub_no_wrap` / `scale_no_wrap` / `offset_no_wrap` /
-  `neg_no_wrap` evaluate in `i64` and answer `None` when the exact result is
-  not representable as an `int`. A proof that hits `None` refuses.
-* `add` models `iadd` and falls back to `unknown()` on wrap. Sound — a wrapped
-  `int` is still an `int` — and useless for a bounds proof, which is the point.
-
-`min_with` / `max_with` are elementwise, giving `Math.min` / `Math.max` limits
-for free. `array_length()` is `[0, i32::MAX]`.
-
-### Induction variable — `scev::AffineIv`
-
-`iv(k) = init + stride * k` for iteration `k = 0, 1, 2, …`.
-
-* `init: IntRange` — the entry value. `unknown()` when it is a runtime
-  quantity; the proof then asks for a pre-header guard on the local instead of
-  inventing a start value.
-* `stride: Stride` — `Const(i32)` (unit, non-unit, or negative) or
-  `Variable(local)` for `iv += step` where the step's sign is a runtime fact.
-* `direction()` follows the stride's sign; `Variable` is `Direction::Unknown`.
-
-**Monotonicity is not a consequence of the stride's sign alone.** It follows
-from the sign *and* the no-wrap obligation below. Nothing in the analysis
-asserts monotone behaviour without having discharged that obligation.
-
-### Limit — `scev::BoundSource`
-
-`Const` | `Local` | `ArrayLength` | `Field { cp_index, receiver_local }` |
-`Min(a, b)` | `Max(a, b)`.
-
-`range_in(env)` gives whatever is statically known (an `arraylength` is
-non-negative; `Min`/`Max` fold through the lattice; a bare local or a field is
-top). `is_invariant(modified_locals, heap_stable)` is the staleness check: a
-pre-header guard is evaluated once, so a limit the body can raise would let a
-later iteration's exit test admit an index past the guarded length.
-
-### Loop — `scev::CountedLoop`
-
-IV + `ExitCmp` + limit + `LoopForm` + `modified_locals` + `heap_stable`.
-
-`ExitCmp` keeps `if_icmp*` (exit-when-true) polarity, so `bound_addend()`
-converts the limit into the extreme value an executed iteration can hold:
-
-| continue test | opcode | extreme executed value | addend |
+| piece | file | consumed by | state |
 |---|---|---|---|
-| `iv <  n` | `if_icmpge` | `n - 1` | `-1` |
-| `iv <= n` | `if_icmpgt` | `n`     | `0`  |
-| `iv >  n` | `if_icmple` | `n + 1` | `+1` |
-| `iv >= n` | `if_icmplt` | `n`     | `0`  |
+| `IntRange` — `int` interval lattice | `jit/src/scev.rs` | the counted-loop proof engine | landed, tested |
+| `AffineIv` / `CountedLoop` / `prove_index_in_bounds_of` | `jit/src/scev.rs` | `x64/bce.rs` | landed, tested |
+| bytecode → `CountedLoop` recognition | `jit/src/loop_analysis.rs` | `x64/bce.rs` | landed, tested |
+| counted-loop BCE | `x64/bce.rs::analyze_counted_loop_bce` | `x64.rs::emit_bounds_check` | **live in production** |
+| `Range` — width-carrying machine-integer lattice | `jit/src/range_analysis.rs` | below | landed, tested |
+| sea-of-nodes node ranges | `jit/src/range_analysis.rs::analyze_graph` | nothing yet | landed, tested |
+| guard-dominated BCE | `x64/bce.rs::range_safe_pcs` | `analyze_bounds_elimination_with_handlers` | landed, tested, **not yet wired** — see [Owed cross-file change](#owed-cross-file-change) |
 
-That single number is the whole inclusive-vs-exclusive question. `bce.rs`
-spells it twice — as "refuse inclusive loops" on the static path and as "emit
-`JBE` instead of `JB`" on the speculative one.
+The two BCE reasons are independent, independently gated, and answer different
+questions. Keeping them separate is deliberate: a bounds-check regression must
+be attributable to one of them without a rebuild.
 
-`LoopForm` records whether the exit test dominates the body. It cannot be
-derived from a `(header, back_edge)` pair — javac's `goto cond` rotation makes
-a back-branching test pre-tested — so it is an input, and `PostTested` is the
-conservative answer. A post-tested loop folds its untested first iteration
-into the span and is refused outright when the entry value is unbounded.
-
-## Overflow model
-
-Java `int` arithmetic wraps silently (JVMS 2.11.3). Every proof states its
-assumption as `OverflowModel`:
-
-* `NoWrapProven` — shown representable from compile-time facts alone.
-* `NoWrapGuarded` — holds **provided the returned pre-header guards pass**.
-
-There is no third option, and in particular no "assume it does not wrap".
-
-The dangerous step is the IV's own advance. For an increasing loop the last
-executed value is at most `bound + addend`; the step that follows it must not
-carry the IV past `i32::MAX`, or it reappears at the bottom of the range with
-the exit test still passing and every elided index walks below the array base.
-The obligation is discharged in one of three ways:
-
-1. statically, when `bound_range.hi + addend + stride <= i32::MAX`;
-2. as `PreheaderGuard::AtMost { term: bound, limit: i32::MAX - addend - stride }`;
-3. refused (`RefusalReason::IvMayWrap`) when even the smallest admissible limit
-   wraps, so no runtime guard could ever pass.
-
-For unit-stride inclusive loops case 2 evaluates to `bound <= i32::MAX - 1`,
-i.e. exactly the `bound != Integer.MAX_VALUE` check `bce.rs` hard-codes. For
-unit-stride exclusive loops it evaluates to "always true" and no guard is
-emitted — also matching `bce.rs`. Decreasing loops are symmetric at
-`i32::MIN` (`PreheaderGuard::AtLeast`).
-
-Two further wrap sites:
-
-* the index expression `scale * iv + offset` is evaluated through
-  `scale_no_wrap`/`offset_no_wrap` and refuses (`IndexMayWrap`) rather than
-  producing a wrapped range;
-* the *guard* `length >= base + addend` is specified to be evaluated in 64-bit
-  so materialising the endpoint cannot itself wrap. On x86-64 that is a
-  sign-extended compare, not extra work.
-
-A `Variable` stride carries both hazards in one obligation:
-`PreheaderGuard::StrideInRange { local, headroom }` means
-`0 <= step && step <= i32::MAX - headroom`. The lower half stops the IV walking
-backwards below the array base; the upper half stops it wrapping past the exit
-test. A runtime stride under a *decreasing* test, or in a post-tested loop, is
-refused — there is no guard shape that covers those.
-
-## Proof outputs
-
-`CountedLoop::iv_span` / `index_span` return an `IvSpan`:
-
-* `numeric: IntRange` — a sound hull, possibly top.
-* `max_terms: Vec<SymBound>` — every executed value is `<= max(max_terms)`.
-* `min_terms: Vec<SymBound>` — every executed value is `>= min(min_terms)`.
-
-A `SymBound` is `base + addend` where `base` is a constant, the loop's limit,
-or `IvEntry(local)` (the IV's value read in the pre-header — the term behind
-`bce.rs`'s `iv >= 0` header check). A known-constant entry value collapses to
-`Const` so the consumer can discharge it without emitting anything.
-
-The witness lists are **sets**, not single endpoints: proving `index < L`
-requires `L > t` for *every* `t` in `max_terms`. That is what makes a
-post-tested loop expressible (`max(entry, bound + addend)`) without weakening
-the pre-tested case.
-
-`CountedLoop::prove_index_in_bounds[_of]` answers:
-
-* `Static` — no check, no guard, no deopt;
-* `Guarded(Vec<PreheaderGuard>)` — in range once every guard is discharged;
-* `Refused(RefusalReason)` — keep the per-element check.
-
-`prove_index_in_bounds_of` additionally takes the indexed array's local. When
-the limit *is* that array's length, `length >= a.length` is a tautology and the
-access needs nothing — this is `bce.rs`'s whole-method
-`find_bound_arraylength_provenance` result, obtained from the limit's own shape.
-Naming a *different* array changes nothing, which is exactly the multi-array
-out-of-bounds store that provenance pass exists to prevent.
-
-`CountedLoop::trip_count` bounds executions as a `{min, max}` pair (exact when
-they coincide, `max == 0` for a provable zero-trip loop). Constant stride and
-`PreTested` only.
-
-## Recognition
-
-`loop_analysis::analyze_counted_loop` turns bytecode into the claim above.
-
-* `decode_bound_expr` accepts a constant push, `iload`, `aload;arraylength`,
-  `aload;getfield` / `getstatic`, and `Math.min`/`Math.max` of any of those.
-  The `Math` call is identified through a caller-supplied resolver
-  (`&dyn Fn(u16) -> Option<MinMax>`), because this module carries no constant
-  pool; a resolver that answers `None` loses the min/max shape rather than
-  mis-decoding it.
-* `find_iv_stride` accepts `iinc iv, c` for any `c`, and the compound forms
-  `iload iv; <const>; iadd|isub; istore iv` and `iload iv; iload s; iadd;
-  istore iv`. Two modifications in one body, the commuted `step + iv`, or any
-  `wide`-indexed alias of the IV refuse the loop.
-* `modified_locals_strict` refuses when the body writes a local `>= 64` instead
-  of silently dropping it from the `u64` set, and marks `long`/`double` high
-  halves.
-* `body_is_heap_stable` is blunt on purpose: any store, call, allocation or
-  monitor operation makes a `Field` limit unusable.
-* `constant_iv_init` proves the entry value only from a single dominating
-  constant store outside the body, with no branch landing on it. `None` means
-  *unknown*, never zero.
-* `loop_parents` gives the nesting; `RangeEnv::with_loop_iv` binds an enclosing
-  loop's proven IV range so an inner limit that mentions the outer IV inherits
-  it. That is not cosmetic: for `for (i…) for (j = 0; j <= i; j++)`, knowing
-  `i ∈ [0, MAX-1]` discharges the inclusive loop's wrap obligation statically,
-  where the bare inner loop needs a runtime guard.
-
-## Patterns this subsumes in `x64/bce.rs`
-
-| `bce.rs` | what it does | replaced by |
+| | counted-loop reason | guard-dominated reason |
 |---|---|---|
-| `LoopBoundsInfo::inclusive` doc, `bce.rs:71-78` | states inclusive loops are refused | `bound_addend()` — inclusivity is a `-1`/`0`/`+1` |
-| `find_safe_array_accesses`, `bce.rs:1046-1056` | early-returns for every inclusive loop | inclusive loops prove with `addend = 0` and a `length >= n+1` guard |
-| `inclusive_spec_bce_enabled`, `bce.rs:27-53` | off-by-default env flag gating inclusive speculative BCE | no longer a correctness switch; keep it, if at all, as a performance switch |
-| `SpeculativeBCEGuard::inclusive`, `bce.rs:110-117` | `JBE`-vs-`JB` plus a `bound != MAX_VALUE` check | `LengthAtLeast(bound + addend + 1)` and `AtMost { bound, MAX - addend - stride }` |
-| `find_induction_variable`, `bce.rs:686-709` | `iinc +1` only, or an unidentified `iadd;istore` | `find_iv_stride` — any constant stride, plus the identified variable step |
-| `find_iv_step_provenance` / `IvStep`, `bce.rs:131-223` | the two canonical step shapes | same, generalised to non-unit and negative constants and `isub` |
-| `analyze_loop_bound`, `bce.rs:771-780` | limit must be `iload <local>` | `decode_bound_expr` — const, local, `arraylength`, field, `Math.min`/`max` |
-| `find_bound_arraylength_provenance`, `bce.rs:1177-1249` | whole-method proof that the limit *is* `A.length` | `BoundSource::ArrayLength` + `prove_index_in_bounds_of` |
-| `find_iv_nonneg_start`, `bce.rs:1261-1312` | whole-method proof of a non-negative constant start | `constant_iv_init` (any constant) or `PreheaderGuard::NonNegative(IvEntry)` |
-| `find_safe_array_accesses`, `bce.rs:1066-1071` + `analyze_bounds_elimination`, `bce.rs:1428-1433` | bound-local invariance via a `modified` bitmask | `BoundSource::is_invariant`, which also covers field and `min`/`max` limits |
-| `analyze_bounds_elimination`, `bce.rs:1423-1427` | `step_guard` for a variable stride | `PreheaderGuard::StrideInRange` |
-| `find_speculative_array_accesses`, `bce.rs:1500` | index must be exactly the IV local | `IndexExpr { scale, offset }` |
+| question | "is this index the IV of a loop whose exit test bounds it?" | "does a dominating comparison prove `0 <= i < a.length` here?" |
+| kill switch | `CRATONVM_JIT_NO_SPEC_BCE=1` (speculative half only) | `CRATONVM_JIT_NO_RANGE_BCE=1` |
+| both | `CRATONVM_JIT_NO_BCE=1` | |
+| needs the exception table | no | **yes** |
 
-**Not subsumed, and still needed:** `analyze_array_access_operands`
-(`bce.rs:854-1012`) — the operand-stack producer walk that soundly identifies
-`(array_local, index_local)` for each access. It is the *producer* of
-`IndexExpr`, not a competitor to it, and its STOP-on-anything-unmodelled
-discipline stays load-bearing.
+## The lattices
 
-## What `bce.rs` must change
+### `scev::IntRange` — the `int` interval
 
-1. Build a `scev::CountedLoop` per loop via
-   `loop_analysis::analyze_counted_loop`, supplying a `LoopForm` it can justify.
-   `analyze_bounds_elimination` (`bce.rs:1317`) is the natural seam: steps 1-3d
-   collapse into that one call.
-2. Establish `LoopForm` honestly. `analyze_loop_bound`'s "Pattern A" (exit test
-   at the header, `bce.rs:795`) is pre-tested. "Pattern B" (`bce.rs:809`, the
-   `if_icmplt` continue-branch) is pre-tested **only** because javac reaches it
-   through a `goto cond`; the current code does not check that, and a hand-built
-   `do { } while` with the same shape is post-tested. Until that entry edge is
-   verified, Pattern B must be reported `PostTested`.
-3. Feed each access from `analyze_array_access_operands` into
-   `prove_index_in_bounds_of(idx, Some(array_local), IntRange::array_length(),
-   env)`, and act on the verdict: `Static` → add to `bounds_safe_pcs`;
-   `Guarded` → emit **every** guard and then add; `Refused` → keep the check.
-   A partially-emitted guard set proves nothing.
-4. Emit the four guard forms in the pre-header:
-   * `NonNegative(term)` — for `IvEntry(l)` this is today's `iv >= 0` header
-     check; for a symbolic limit it is a new `n >= 0` compare.
-   * `LengthAtLeast(term)` — today's length compare, with the `addend`
-     selecting `JB` vs `JBE`. **Must be evaluated in 64-bit** (sign-extend both
-     operands) so `base + addend` cannot wrap.
-   * `AtMost { term, limit }` / `AtLeast { term, limit }` — today's
-     `bound != Integer.MAX_VALUE` check, generalised.
-   * `StrideInRange { local, headroom }` — today's `0 <= step <= MAX - bound`.
-5. Keep guards per array. The analysis is array-agnostic; a `LengthAtLeast`
-   discharged against `a.length` says nothing about `out.length`. The existing
-   one-guard-per-distinct-array-local structure and `covered_pcs` de-spec
-   bookkeeping stay exactly as they are.
-6. A `Field` limit additionally needs the loop body to be heap-stable
-   (`body_is_heap_stable`) *and* the pre-header guard to reload the field, since
-   the guarded value must be the value the exit test will read.
+`Empty` (bottom) or `Range { lo, hi }` with `lo <= hi`; top is
+`[i32::MIN, i32::MAX]`. `join` is the hull, `meet` the intersection, and a
+contradiction is `Empty` rather than a choice between the two facts. Arithmetic
+comes in two flavours that are never interchanged: `*_no_wrap` answers `None`
+when the exact result is unrepresentable, and `add` falls back to top. There is
+no "probably" element.
 
-## To reconcile
+### `range_analysis::Range` — the machine-integer lattice
 
-* **`LoopForm` for Pattern B** is the one place where adopting this analysis
-  could *change* today's behaviour rather than extend it. `bce.rs` currently
-  treats the continue-branch shape as if the test always dominates the body. If
-  that assumption is wrong for any admitted method, it is wrong today too — the
-  analysis makes the assumption explicit and refusable instead of implicit.
-* **Index-vs-test IV value.** The proof assumes the index uses the IV value the
-  exit test compared. `bce.rs` inherits the same assumption from
-  `find_speculative_array_accesses`; the difference is that `IndexExpr::offset`
-  can now express an in-body advance rather than requiring the two to coincide.
-* **`inclusive_spec_bce_enabled` default.** The flag is documented off because
-  inclusive elision measured as a *net loss* on the Sieve OSR artifact
-  (`bce.rs:30-38`) — a code-layout effect, not a correctness one. Generalising
-  the proof does not change that measurement; whether to enable it stays a
-  performance decision, and should be re-measured against register-homed loop
-  bodies rather than inferred from the proof getting stronger.
-* **Locals `>= 64`.** `modified_locals_strict` refuses them where
-  `modified_locals_in_range` (and `bce.rs`'s `find_modified_locals`) silently
-  drop them. `bce.rs` compensates with scattered `local < 64` checks at each use
-  site; consolidating on the strict version removes a class of "forgot one call
-  site" bugs, at the cost of refusing methods with very wide frames.
+The wider sibling. Same shape, plus:
+
+* it carries an **`IntWidth`** (`W32` for `int`/`boolean`/`byte`/`char`/`short`,
+  `W64` for `long`), so a 64-bit interval can never be silently read as an
+  `int` one. A cross-width `join` or arithmetic op degrades to top; a
+  cross-width `meet` narrows nothing; `to_scev` on a `W64` range answers `None`
+  rather than truncating;
+* `mul` / `div` / `rem` / `and` / `or` / `xor` / `shl` / `shr` / `ushr`, and the
+  JVMS narrowing conversions `i2b` / `i2c` / `i2s` / `i2l` / `l2i`;
+* `widen`, the operator an iterating fixpoint needs.
+
+`Range::from_scev` / `Range::to_scev` convert, so the two never become
+divergent notions of "unknown".
+
+## The overflow argument
+
+This is the whole reason the module exists, so it is stated first and tested
+first (`range_analysis::tests::add_one_to_top_is_top_not_a_shifted_interval`).
+
+Java `int` arithmetic wraps silently (JVMS 2.11.3). An analysis that reasons in
+mathematical integers concludes `i + 1 > i`. That is false exactly once — at
+`Integer.MAX_VALUE` — and that single wrong inequality is enough to delete a
+real bounds check and turn an array store into an out-of-bounds heap write.
+
+Every binary transfer function therefore:
+
+1. computes the **exact** result interval in `i128` (wide enough that no
+   intermediate can itself overflow: the extreme product of two `i64`
+   endpoints is `2^126`);
+2. narrows it back to the declared width — **exactly** if it fits, **top** if
+   it does not, because the machine operation wraps and a wrapped value can be
+   anything in the width.
+
+Top is sound (a wrapped `int` is still an `int`) and useless for a proof, which
+is the intent. `add_no_wrap` / `sub_no_wrap` / `neg_no_wrap` / `offset_no_wrap`
+expose the same computation but answer `None`, for callers that must *refuse*
+rather than degrade.
+
+Specific traps the tests pin:
+
+* `unknown + 1` is top, and it **admits `Integer.MIN_VALUE`** — the value the
+  wrap actually produces.
+* `-Integer.MIN_VALUE` is `Integer.MIN_VALUE`; `neg_no_wrap` refuses it.
+* `Integer.MIN_VALUE / -1` overflows (top); `Integer.MIN_VALUE % -1` is `0`
+  and does not.
+* `x << 32` shifts an `int` by **0**, not 32 — JVMS masks the shift count to
+  the low 5 (`int`) / 6 (`long`) bits. Getting this wrong is not a precision
+  bug.
+* `(-1) >>> 1` is `0x7FFFFFFF`, so `ushr` of a possibly-negative value is
+  non-negative — but only for a *known* count, since count `0` is the identity.
+* `i2b` **truncates**, it does not intersect: `(byte) 300` is `44`, so a source
+  range of `[0, 300]` converts to the whole of `[-128, 127]` and not to
+  `[0, 127]`.
+
+The counted-loop engine states its own assumption as an `OverflowModel`
+(`NoWrapProven` or `NoWrapGuarded`, with no third option), and discharges the
+IV's advance either statically, or as
+`PreheaderGuard::AtMost { bound, i32::MAX - addend - stride }`, or by refusing
+with `RefusalReason::IvMayWrap`. For unit-stride inclusive loops that guard
+evaluates to `bound <= i32::MAX - 1`, i.e. exactly the
+`bound != Integer.MAX_VALUE` check the emitter has always hard-coded.
+
+## Facts the guard-dominated pass collects
+
+`x64/bce.rs::range_safe_pcs` runs a flow-sensitive analysis over the method.
+Its abstract state has two halves, and **both are required**:
+
+* a `Range` per JVM local — the numeric half;
+* a set of *symbolic* facts `i < a.length` — the half an interval cannot
+  express, because `a.length` is a runtime value.
+
+`i >= 0` alone proves nothing (the emitted check is an *unsigned* compare, so
+it already catches negatives). `i < a.length` alone permits a negative index,
+which is an access *below* the array base — strictly worse than the overrun the
+check normally catches.
+
+Facts enter the state from:
+
+| source | example | what it yields |
+|---|---|---|
+| a dominating length comparison | `iload i; aload a; arraylength; if_icmpge L` | `i < a.length` on the fall-through edge |
+| the reversed spelling | `aload a; arraylength; iload i; if_icmple L` | the same fact on the fall-through edge |
+| a dominating constant comparison | `iload i; iflt L` | `i ∈ [0, MAX]` on the fall-through edge |
+| a constant store | `iconst_0; istore i` | `i ∈ [0, 0]` |
+| `iinc` | `iinc i, -1` | `add_no_wrap`; the `< length` fact survives a **non-positive** step and dies on a positive one |
+| `arraylength` itself | — | `[0, Integer.MAX_VALUE]` |
+
+Facts leave the state on any write to either local they mention, on an `iinc`
+whose step cannot be proved not to wrap, and at every control-flow merge where
+some predecessor does not carry them (merge is **intersection** for facts and
+**hull** for ranges).
+
+Operand decoding is positional, not stack-simulating: a run of contiguous
+single-push instructions ending at a comparison or an array access leaves
+exactly those values on top of whatever the stack already held. That is only
+valid if no branch can land inside the run, which `range_span_is_atomic`
+checks against `collect_i16_branch_targets`.
+
+### Fail-closed rules
+
+Every one of these returns the **empty** set, never a partial answer:
+
+* unmodelled control flow anywhere in the method — `tableswitch`,
+  `lookupswitch`, `jsr`/`ret`, `goto_w`, `jsr_w`. Their successors are not
+  walked, so a fact could survive an edge the pass never saw;
+* a frame wider than 64 locals, a method longer than 8192 bytes, or a decode
+  that does not advance;
+* an exhausted iteration budget (`code_len * 64 + 64` worklist pops). A partial
+  fixpoint of a *must*-analysis claims facts it has not finished intersecting
+  away, so it is worse than no answer.
+
+Termination is by widening: after three merges into a PC, any range endpoint
+that moves outward is thrown to the extreme of the width, so each endpoint can
+move at most twice more. The fact set only ever shrinks. The budget is a
+backstop, not the mechanism — an unbounded interval walk would pin the compiler
+thread, which this VM's watchdog reports as a *VM hang* rather than as a
+compiler bug.
+
+### Exception handlers, and why the pass refuses without the table
+
+A flow-sensitive fact is a claim about **every** way control can arrive at a
+program point. An exception edge is one of those ways: it can originate at any
+throwing instruction inside a protected range, and it lands at `handler_pc`
+with the operand stack reset to `[throwable]`.
+
+The pass therefore seeds every `handler_pc` with the top state (no facts), so
+the handler and everything downstream of it inherit nothing a guard did not
+re-establish.
+
+`analyze_bounds_elimination` — the signature `x64.rs` calls today — has no
+exception table, and the range reason is **switched off entirely** on that
+path. It is not recoverable from the bytecode:
+
+* a handler entry need not be a branch target;
+* its only structural signature is "entry stack depth exactly one, holding a
+  reference", and by the verifier's stack-map consistency rule any normal-flow
+  entry to that PC has the same shape — which is also the shape of the middle
+  of every ordinary two-operand expression (`aload a; ← here; iload i; iaload`).
+  Treating every depth-one PC as a possible handler kills the facts at exactly
+  the points the analysis needs them.
+
+**The old note that handler-bearing methods are never JIT-compiled is stale.**
+`jit/src/lib.rs` (the `!cached.exception_table.is_empty()` block, ~12169)
+relaxed that gate: such methods now compile through the single-pass backend
+unless `local_handler_reads_unsafe_local` refuses them. The exception edges are
+real.
+
+## What BCE now proves
+
+### Counted-loop reason (live)
+
+`analyze_counted_loop_bce` recognises each loop once
+(`recognise_loop` → `loop_analysis::analyze_counted_loop`) and proves each
+access once (`CountedLoop::prove_index_in_bounds_of`). Verdicts map onto the
+existing output exactly: `Static` → the PC joins `safe_pcs` with no guard;
+`Guarded` → **every** returned `PreheaderGuard` must be covered by
+`GuardShape::covers` or the whole proof is refused; `Refused` → the per-element
+check stays.
+
+`GuardShape::covers` is the explicit statement of the pre-header emitter's
+fixed repertoire (`iv >= 0`; `bound != Integer.MAX_VALUE`;
+`0 <= step <= MAX - bound`; one `array.length` compare per guarded array). An
+elision resting on an obligation nobody discharges is a silent out-of-bounds
+access, so a partially-emitted guard set proves nothing.
+
+Guards stay attributed **per array**. `LengthAtLeast` names no array by
+contract, so three arrays produce three identical-looking guards and merging
+them would discharge the shortest array's obligation with the longest array's
+length — the multi-array out-of-bounds store of
+`docs/known-issues/jit-bce-multi-array-oob-store-20260711.md`.
+
+### Guard-dominated reason (landed, unwired)
+
+Eliminates the per-element check at an array **load or store** when, on every
+path reaching it:
+
+* the array and index operands are bare locals in the positional pattern
+  `aload a; iload i; xaload` (or `aload a; iload i; <one push>; xastore`);
+* `i`'s range is non-empty and non-negative; **and**
+* the fact `i < a.length` holds, for **that** array local.
+
+It contributes no guards and no deopts — it only ever adds PCs to
+`bounds_safe_pcs`, which the existing per-bci de-spec bookkeeping leaves alone
+(a PC proven by both reasons is dropped from the set if the speculative guard
+is later de-spec'd; that is conservative, and costs an elision rather than
+soundness).
+
+### Sea-of-nodes node ranges (landed, unconsumed)
+
+`range_analysis::analyze_graph` assigns a `Range` to every `Int`/`Long`-typed
+node of an `ir::Graph`: constants, `ArrayLength` (`[0, MAX]`), sub-word
+`Load`/`ArrayLoad` (`byte`/`char`/`short` narrow), all the integer arithmetic
+and bitwise ops, the conversions, `Cmp` (`[0, 1]`), `LCmp`/`FCmp` (`[-1, 1]`),
+and `Phi` (join). Everything else is top. Cycles run only through `Phi`, which
+widens from round 4; if the fixpoint has not settled by round 16 **every entry
+is reset to top** and `converged()` answers `false`, because a partial
+ascending fixpoint has nodes still at bottom claiming "this value cannot
+occur".
+
+Nothing consumes it yet — the IR path has no bounds-check node of its own
+(`Op::ArrayLoad`/`ArrayStore` carry the check implicitly and `ir_lower` emits
+it). It is the substrate for an IR-level BCE, which is the successor to the
+bytecode pass, not a competitor to it.
+
+## Owed cross-file change
+
+One line, in `jit/src/x64.rs` (~23567):
+
+```rust
+// today
+analyze_bounds_elimination(code, code_len, &loops)
+// wanted
+analyze_bounds_elimination_with_handlers(code, code_len, &loops, Some(&exception_ranges))
+```
+
+`exception_ranges` is already in scope at that point (bound at ~23367 from
+`PENDING_EXCEPTION_RANGES`), and this is the same "bce.rs function takes the
+handler table, x64.rs passes it" shape `refine_ambiguous_local_kinds` already
+uses. Until it lands the guard-dominated reason is inert in production, by
+design: `None` refuses rather than assuming the method has no handlers.
+
+## What remains unvalidated
+
+* **No end-to-end measurement.** The guard-dominated reason has unit tests and
+  no benchmark. Whether removing a predicted-never-taken branch and a
+  cache-hit length load is a *win* on the memory-homed template bodies this
+  backend emits is an open question — the inclusive counted-loop elision
+  measured a ~2x **net loss** on the Sieve OSR artifact for exactly that
+  reason, which is why `CRATONVM_JIT_INCLUSIVE_BCE` is still default-off.
+  Expect the same question here, and answer it with a measurement.
+* **No differential run.** The pass has not been exercised against the Spring /
+  H2 / Tomcat suites, nor against a `CRATONVM_JIT_NO_RANGE_BCE=1` control.
+* **`analyze_graph` has no consumer**, so its transfer functions are validated
+  only by their own unit tests and not by any downstream proof.
+* **The positional operand decode is narrower than the loop path's.**
+  `analyze_array_access_operands` simulates the operand stack and handles
+  patterns the positional decode refuses; the two have not been reconciled.
+* **Derived indices are not proved by either reason.** The counted-loop path
+  still passes `IndexExpr::identity` (`x64/bce.rs`, the `idx_local !=
+  loop_.iv.local` refusal) even though `prove_index_in_bounds_of` accepts a
+  `scale`/`offset`; the guard-dominated path only reads bare locals. `a[i+1]`
+  and `a[2*i]` keep their checks.
 * **`x64::detect_loops` vs `loop_analysis::detect_loops`** remain two
-  implementations of the same thing (noted in `loop_analysis.rs`'s own doc).
-  The counted-loop entry point takes a `(header, back_edge)` pair so it works
-  with either, but the convergence is still owed.
+  implementations of the same thing. The convergence is still owed.
+
+## Patterns the counted-loop engine subsumed in `x64/bce.rs`
+
+Retained for the record; the superseded helpers are still present because the
+x64 test suite pins them as reference decodings.
+
+| superseded helper | what it did | replaced by |
+|---|---|---|
+| `LoopBoundsInfo::inclusive` | states inclusive loops are refused | `bound_addend()` — inclusivity is a `-1`/`0`/`+1` |
+| `find_induction_variable` | `iinc +1` only, or an unidentified `iadd;istore` | `find_iv_stride` — any constant stride, plus an identified variable step |
+| `find_iv_step_provenance` / `IvStep` | the two canonical step shapes | same, generalised to non-unit/negative constants and `isub` |
+| `analyze_loop_bound` | limit must be `iload <local>` | `decode_bound_expr` — const, local, `arraylength`, field, `Math.min`/`max` |
+| `find_bound_arraylength_provenance` | whole-method proof that the limit *is* `A.length` | `BoundSource::ArrayLength` + `prove_index_in_bounds_of` |
+| `find_iv_nonneg_start` | whole-method proof of a non-negative constant start | `constant_iv_init`, or `PreheaderGuard::NonNegative(IvEntry)` |
+
+**Not subsumed, still load-bearing:** `analyze_array_access_operands` — the
+operand-stack producer walk that soundly identifies `(array_local,
+index_local)` for each in-loop access. It is the *producer* of an `IndexExpr`,
+not a competitor to it, and its STOP-on-anything-unmodelled discipline is what
+prevents the scatter-store misattribution that
+`docs/known-issues/jit-bce-multi-array-oob-store-20260711.md` records.

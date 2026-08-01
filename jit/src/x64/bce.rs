@@ -1736,7 +1736,60 @@ fn innermost_enclosing(code: &[u8], loops: &[(usize, usize)]) -> Vec<Option<usiz
 /// must NOT be merged: discharging the shortest array's obligation with the
 /// longest array's length is the multi-array out-of-bounds store
 /// (docs/known-issues/jit-bce-multi-array-oob-store-20260711.md).
+///
+/// This is the **counted-loop** reason and the only one this entry point can
+/// run. The second, independent reason — the guard-dominated range analysis —
+/// needs the method's exception table to be sound and is therefore only
+/// available through [`analyze_bounds_elimination_with_handlers`]; see that
+/// function's doc comment for why, and `docs/jit/range-analysis.md` for the
+/// argument in full.
 pub(super) fn analyze_bounds_elimination(
+    code: &[u8],
+    code_len: usize,
+    loops: &[(usize, usize)],
+) -> (FxHashSet<usize>, Vec<SpeculativeBCEGuard>) {
+    analyze_bounds_elimination_with_handlers(code, code_len, loops, None)
+}
+
+/// [`analyze_bounds_elimination`] plus the **guard-dominated range** reason.
+///
+/// `handlers` is the method's exception table as `(start_pc, end_pc,
+/// handler_pc)`, exactly the shape `refine_ambiguous_local_kinds` already
+/// takes. `None` means "this caller does not know the table", and the range
+/// reason is then **switched off entirely** rather than run on an assumption:
+///
+/// > A flow-sensitive fact ("local `i` is non-negative and below
+/// > `a.length` here") is a claim about every way control can arrive at a
+/// > program point. An exception edge is one of those ways, it can originate
+/// > at *any* throwing instruction in a protected range, and it lands with the
+/// > operand stack reset to `[throwable]`. Without the table the analysis
+/// > cannot see those edges, and a fact that is true on every edge it *can*
+/// > see is simply not a fact. `None` therefore refuses.
+///
+/// It is not possible to recover the table from the bytecode: a handler entry
+/// need not be a branch target, and the only structural signature it leaves —
+/// entry stack depth exactly one, holding a reference — is shared by the
+/// middle of every ordinary two-operand expression.
+pub(super) fn analyze_bounds_elimination_with_handlers(
+    code: &[u8],
+    code_len: usize,
+    loops: &[(usize, usize)],
+    handlers: Option<&[(usize, usize, usize)]>,
+) -> (FxHashSet<usize>, Vec<SpeculativeBCEGuard>) {
+    let (mut safe_pcs, guards) = analyze_counted_loop_bce(code, code_len, loops);
+    if let Some(h) = handlers {
+        if range_bce_enabled() {
+            for pc in range_safe_pcs(code, code_len, h) {
+                safe_pcs.insert(pc);
+            }
+        }
+    }
+    (safe_pcs, guards)
+}
+
+/// The counted-loop reason, unchanged. See
+/// [`analyze_bounds_elimination`] for the contract.
+fn analyze_counted_loop_bce(
     code: &[u8],
     code_len: usize,
     loops: &[(usize, usize)],
@@ -1900,6 +1953,1252 @@ pub(super) fn analyze_bounds_elimination(
     }
 
     (safe_pcs, speculative_guards)
+}
+
+// ===========================================================================
+// Guard-dominated bounds-check elimination — the range-analysis reason
+//
+// The counted-loop reason above answers exactly one question: "is this index
+// the induction variable of a loop whose exit test bounds it?". Everything
+// else keeps its per-element check, including the single commonest guarded
+// access in Java:
+//
+//     if (i >= 0 && i < a.length) { … a[i] … }
+//
+// This pass is the second, independent reason. It runs a small flow-sensitive
+// analysis over the method whose abstract state is
+//
+//   * a `range_analysis::Range` per JVM local — the numeric half, carrying the
+//     machine-integer overflow discipline (`iinc i, 1` on an unbounded `i`
+//     yields TOP, never a shifted interval); and
+//   * a set of *symbolic* facts `i < a.length` — the half a numeric interval
+//     cannot express, because `a.length` is a runtime value.
+//
+// Both halves are required. `i >= 0` alone proves nothing (the unsigned
+// bounds compare `emit_bounds_check` emits catches negatives, so the range
+// half is not even the interesting one); `i < a.length` alone permits a
+// negative index straight below the array base.
+//
+// Every design decision here is fail-closed:
+//
+//   * unmodelled control flow (`tableswitch`, `lookupswitch`, `jsr`/`ret`,
+//     `goto_w`) refuses the WHOLE method — the same rule
+//     `collect_i16_branch_targets` already enforces;
+//   * an exception-handler entry is seeded TOP-with-no-facts, so nothing
+//     downstream of a handler inherits a fact the exception edge did not
+//     establish;
+//   * the iteration is bounded and widened, and exhausting the budget reports
+//     NOTHING rather than a partial fixpoint;
+//   * a fact is killed by any write to either local it mentions, and an
+//     `iinc` that cannot be proved not to wrap kills it too.
+//
+// It deliberately proves less than it could: only accesses whose array and
+// index are bare locals, and only where the guard is a literal comparison
+// against `a.length` or a constant. Widening that repertoire is a follow-up;
+// widening it wrongly is an out-of-bounds heap write.
+// ===========================================================================
+
+use crate::range_analysis::{IntWidth, Range};
+
+thread_local! {
+    /// Test-only override of the [`range_bce_enabled`] gate, mirroring
+    /// [`INCLUSIVE_SPEC_BCE_TEST_OVERRIDE`].
+    pub(super) static RANGE_BCE_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only override for [`range_bce_enabled`].
+pub fn __set_range_bce_override(v: Option<bool>) {
+    RANGE_BCE_TEST_OVERRIDE.with(|c| c.set(v));
+}
+
+/// Whether the guard-dominated range reason may contribute PCs.
+///
+/// **Default ON**, disabled by `CRATONVM_JIT_NO_RANGE_BCE=1` — the same
+/// polarity and the same bisection role as `CRATONVM_JIT_NO_SPEC_BCE`
+/// ([`jit_no_spec_bce`]). The two reasons are independently switchable
+/// precisely so a bounds-check regression can be attributed to one of them
+/// without rebuilding: `CRATONVM_JIT_NO_BCE` kills both, and each of the two
+/// narrower switches kills exactly one.
+pub(super) fn range_bce_enabled() -> bool {
+    if let Some(v) = RANGE_BCE_TEST_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_RANGE_BCE").is_none())
+}
+
+/// Largest method this pass will analyse, in bytecode bytes.
+///
+/// The state is one `Range` per local per reached instruction; the cap bounds
+/// both compile time and the peak allocation (at the limits below,
+/// ~8 K instructions x 64 locals x 16 bytes = 8 MB worst case, and in practice
+/// far less because only reached instruction starts hold a state).
+const RANGE_MAX_CODE_LEN: usize = 8192;
+
+/// Largest local slot index the pass will model. A method with a wider frame
+/// is refused outright rather than analysed with some locals invisible.
+const RANGE_MAX_LOCALS: usize = 64;
+
+/// Most `i < a.length` facts one state carries. A state that would exceed it
+/// drops the new fact — sound, because a missing fact only costs an elision.
+const RANGE_MAX_FACTS: usize = 64;
+
+/// Merges into one PC before its numeric ranges start widening.
+const RANGE_WIDEN_AFTER: u32 = 3;
+
+/// Sentinel for "no instruction start here" in the `prev`/`next` tables.
+const NO_START: usize = usize::MAX;
+
+/// The abstract state on entry to one bytecode PC.
+#[derive(Clone, PartialEq, Debug)]
+struct RangeState {
+    /// One `int`-width range per JVM local slot. A slot holding a reference or
+    /// a `long` simply carries a range nobody reads.
+    locals: Vec<Range>,
+    /// `(index_local, array_local)` pairs proven `index < array.length` on
+    /// every path reaching this PC. Sorted and deduplicated so the merge is a
+    /// linear intersection.
+    lt_len: Vec<(u16, u16)>,
+}
+
+impl RangeState {
+    /// The state that proves nothing: every local unknown, no facts. Also the
+    /// seed for method entry and for every exception-handler entry.
+    fn top(n_locals: usize) -> RangeState {
+        RangeState {
+            locals: vec![Range::top(IntWidth::W32); n_locals],
+            lt_len: Vec::new(),
+        }
+    }
+
+    /// Merge `other` in as an additional predecessor. Ranges join (hull),
+    /// facts intersect (a fact must hold on *every* path). Returns whether
+    /// anything changed.
+    ///
+    /// `widen` throws outward-moving range endpoints to the extremes; it is
+    /// what makes a loop's merge reach a fixpoint in a bounded number of
+    /// visits instead of crawling one integer at a time.
+    fn merge(&mut self, other: &RangeState, widen: bool) -> bool {
+        let mut changed = false;
+        for (i, r) in self.locals.iter_mut().enumerate() {
+            let o = match other.locals.get(i) {
+                Some(o) => *o,
+                None => Range::top(IntWidth::W32),
+            };
+            let joined = r.join(o);
+            let next = if widen { r.widen(joined) } else { joined };
+            if next != *r {
+                *r = next;
+                changed = true;
+            }
+        }
+        let before = self.lt_len.len();
+        self.lt_len.retain(|f| other.lt_len.binary_search(f).is_ok());
+        if self.lt_len.len() != before {
+            changed = true;
+        }
+        changed
+    }
+
+    /// Record `index_local < array_local.length`.
+    fn add_lt_len(&mut self, index_local: usize, array_local: usize) {
+        if index_local >= RANGE_MAX_LOCALS
+            || array_local >= RANGE_MAX_LOCALS
+            || self.lt_len.len() >= RANGE_MAX_FACTS
+        {
+            return;
+        }
+        // Cast: both indexes are below `RANGE_MAX_LOCALS`.
+        let f = (index_local as u16, array_local as u16);
+        if let Err(at) = self.lt_len.binary_search(&f) {
+            self.lt_len.insert(at, f);
+        }
+    }
+
+    /// Forget everything that mentions local `slot` — it has just been
+    /// overwritten, so neither its range nor any fact naming it survives.
+    fn kill(&mut self, slot: usize) {
+        if let Some(r) = self.locals.get_mut(slot) {
+            *r = Range::top(IntWidth::W32);
+        }
+        // Cast: slot indexes are below `RANGE_MAX_LOCALS` by construction.
+        let s = slot.min(u16::MAX as usize) as u16;
+        self.lt_len.retain(|&(i, a)| i != s && a != s);
+    }
+
+    /// Forget only the facts in which `slot` is the *index* — used when the
+    /// local's value is known to have moved but not to have been replaced.
+    fn kill_index_facts(&mut self, slot: usize) {
+        // Cast: as in `kill`.
+        let s = slot.min(u16::MAX as usize) as u16;
+        self.lt_len.retain(|&(i, _)| i != s);
+    }
+
+    /// Whether `index_local < array_local.length` is proven here.
+    fn proves_lt_len(&self, index_local: usize, array_local: usize) -> bool {
+        if index_local >= RANGE_MAX_LOCALS || array_local >= RANGE_MAX_LOCALS {
+            return false;
+        }
+        // Cast: bounds-checked immediately above.
+        let f = (index_local as u16, array_local as u16);
+        self.lt_len.binary_search(&f).is_ok()
+    }
+}
+
+/// An operand of a comparison, as far as this pass can read it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Operand {
+    /// The current value of an `int` local.
+    Local(usize),
+    /// `a.length` for array local `a`.
+    Len(usize),
+    /// A compile-time constant.
+    Const(i64),
+}
+
+/// A comparison, in **taken-branch** polarity: the branch is taken iff
+/// `lhs REL rhs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rel {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// The relation that holds when `rel` does not — i.e. on the fall-through
+/// edge of a branch whose taken edge is `rel`.
+fn negate_rel(rel: Rel) -> Rel {
+    match rel {
+        Rel::Eq => Rel::Ne,
+        Rel::Ne => Rel::Eq,
+        Rel::Lt => Rel::Ge,
+        Rel::Ge => Rel::Lt,
+        Rel::Gt => Rel::Le,
+        Rel::Le => Rel::Gt,
+    }
+}
+
+/// `a REL b` restated as `b SWAP(REL) a`.
+fn swap_rel(rel: Rel) -> Rel {
+    match rel {
+        Rel::Eq => Rel::Eq,
+        Rel::Ne => Rel::Ne,
+        Rel::Lt => Rel::Gt,
+        Rel::Gt => Rel::Lt,
+        Rel::Le => Rel::Ge,
+        Rel::Ge => Rel::Le,
+    }
+}
+
+/// The `(arity, taken-relation)` of a conditional branch opcode, or `None`
+/// when the opcode is not an integer comparison (`if_acmp*`, `ifnull`,
+/// `ifnonnull`, anything else).
+fn branch_relation(op: u8) -> Option<(u8, Rel)> {
+    Some(match op {
+        0x99 => (1, Rel::Eq),
+        0x9a => (1, Rel::Ne),
+        0x9b => (1, Rel::Lt),
+        0x9c => (1, Rel::Ge),
+        0x9d => (1, Rel::Gt),
+        0x9e => (1, Rel::Le),
+        0x9f => (2, Rel::Eq),
+        0xa0 => (2, Rel::Ne),
+        0xa1 => (2, Rel::Lt),
+        0xa2 => (2, Rel::Ge),
+        0xa3 => (2, Rel::Gt),
+        0xa4 => (2, Rel::Le),
+        _ => return None,
+    })
+}
+
+/// Narrow `r` by the fact `value REL c`.
+///
+/// The `c - 1` / `c + 1` endpoints are computed in `i64` so `c == i32::MIN`
+/// (`x < Integer.MIN_VALUE`, impossible) collapses to bottom rather than
+/// wrapping to a range that admits everything.
+fn narrow_by(r: Range, rel: Rel, c: i64) -> Range {
+    let w = IntWidth::W32;
+    // Widening: the i32 endpoints into the i64 interval domain.
+    let (min, max) = (i32::MIN as i64, i32::MAX as i64);
+    let bound = match rel {
+        Rel::Eq => return r.meet(Range::constant(w, c)),
+        // An interval lattice cannot express "everything but c".
+        Rel::Ne => return r,
+        Rel::Lt => Range::exact(w, min, c - 1),
+        Rel::Le => Range::exact(w, min, c),
+        Rel::Gt => Range::exact(w, c + 1, max),
+        Rel::Ge => Range::exact(w, c, max),
+    };
+    r.meet(bound)
+}
+
+/// A constant push, decoded to its value. `ldc` is excluded — this module
+/// carries no constant pool.
+fn range_const_push(code: &[u8], pc: usize) -> Option<i64> {
+    let op = *code.get(pc)?;
+    match op {
+        // Widening: the opcode-relative constant into i64.
+        0x02 => Some(-1),
+        0x03..=0x08 => Some((op - 0x03) as i64),
+        // Cast: the bipush operand is a signed byte.
+        0x10 => code.get(pc + 1).map(|&b| b as i8 as i64),
+        // Widening: the sipush operand is a signed 16-bit immediate.
+        0x11 => Some(i16::from_be_bytes([*code.get(pc + 1)?, *code.get(pc + 2)?]) as i64),
+        _ => None,
+    }
+}
+
+/// True for an opcode that pushes exactly one operand-stack entry and pops
+/// none: the constants, the `ldc` family and every `*load`.
+///
+/// Used to recognise the *value* operand of an array store without simulating
+/// the operand stack. It is the same contiguity argument the comparison decode
+/// uses: three consecutive single-push instructions followed by an `xastore`
+/// leave exactly those three values on top, whatever is beneath them.
+fn is_single_push(op: u8) -> bool {
+    matches!(op, 0x01..=0x14 | 0x15..=0x19 | 0x1a..=0x2d)
+}
+
+/// A write to a JVM local.
+#[derive(Clone, Copy, Debug)]
+enum RangeWrite {
+    /// `*store` — the slot's value is replaced. `wide` marks a `long`/`double`
+    /// store, which also clobbers the following slot.
+    Store { slot: usize, wide: bool },
+    /// `iinc slot, delta`.
+    Iinc { slot: usize, delta: i64 },
+}
+
+/// The local write performed by the instruction at `pc`, if any.
+///
+/// Deliberately independent of [`local_access_at`], which answers a different
+/// question (it reports *loads* too, and it does not carry the `iinc` delta or
+/// the cat-2 clobber). The overlap is one match arm per opcode family; the
+/// alternative — teaching `local_access_at` to answer both — would make the
+/// deopt-snapshot classifier depend on this pass's needs.
+fn range_local_write(code: &[u8], code_len: usize, pc: usize) -> Option<RangeWrite> {
+    if pc >= code_len {
+        return None;
+    }
+    let op = *code.get(pc)?;
+    // Widening: every operand/opcode-relative local index fits a usize.
+    Some(match op {
+        // istore / fstore / astore (wide index)
+        0x36 | 0x38 | 0x3a => RangeWrite::Store {
+            slot: *code.get(pc + 1)? as usize,
+            wide: false,
+        },
+        // lstore / dstore (wide index)
+        0x37 | 0x39 => RangeWrite::Store {
+            slot: *code.get(pc + 1)? as usize,
+            wide: true,
+        },
+        0x3b..=0x3e => RangeWrite::Store {
+            slot: (op - 0x3b) as usize,
+            wide: false,
+        },
+        0x3f..=0x42 => RangeWrite::Store {
+            slot: (op - 0x3f) as usize,
+            wide: true,
+        },
+        0x43..=0x46 => RangeWrite::Store {
+            slot: (op - 0x43) as usize,
+            wide: false,
+        },
+        0x47..=0x4a => RangeWrite::Store {
+            slot: (op - 0x47) as usize,
+            wide: true,
+        },
+        0x4b..=0x4e => RangeWrite::Store {
+            slot: (op - 0x4b) as usize,
+            wide: false,
+        },
+        // Cast: the iinc delta is a signed byte.
+        0x84 => RangeWrite::Iinc {
+            slot: *code.get(pc + 1)? as usize,
+            delta: *code.get(pc + 2)? as i8 as i64,
+        },
+        0xc4 => {
+            let real = *code.get(pc + 1)?;
+            let idx = ((*code.get(pc + 2)? as usize) << 8) | *code.get(pc + 3)? as usize;
+            match real {
+                0x36 | 0x38 | 0x3a => RangeWrite::Store {
+                    slot: idx,
+                    wide: false,
+                },
+                0x37 | 0x39 => RangeWrite::Store {
+                    slot: idx,
+                    wide: true,
+                },
+                // Widening: the wide-iinc delta is a signed 16-bit immediate.
+                0x84 => RangeWrite::Iinc {
+                    slot: idx,
+                    delta: i16::from_be_bytes([*code.get(pc + 4)?, *code.get(pc + 5)?]) as i64,
+                },
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Instruction-start tables for one method: `prev[pc]` / `next[pc]` are the
+/// linearly adjacent instruction starts ([`NO_START`] at the ends), and
+/// `is_start[pc]` marks a decoded boundary.
+struct StartTables {
+    prev: Vec<usize>,
+    next: Vec<usize>,
+    is_start: Vec<bool>,
+}
+
+/// Decode `code` linearly into [`StartTables`]. `None` when the decode does
+/// not make progress, which would otherwise loop forever.
+fn range_start_tables(code: &[u8], code_len: usize) -> Option<StartTables> {
+    let mut t = StartTables {
+        prev: vec![NO_START; code_len],
+        next: vec![NO_START; code_len],
+        is_start: vec![false; code_len],
+    };
+    let mut pc = 0usize;
+    let mut prev = NO_START;
+    while pc < code_len {
+        t.is_start[pc] = true;
+        t.prev[pc] = prev;
+        let len = bytecode_len_at(code, pc);
+        if len == 0 {
+            return None;
+        }
+        let nxt = pc + len;
+        if nxt < code_len {
+            t.next[pc] = nxt;
+        }
+        prev = pc;
+        pc = nxt;
+    }
+    Some(t)
+}
+
+/// Whether every instruction start strictly after `start` and no later than
+/// `end` is free of branch targets.
+///
+/// This is what licenses reading a multi-instruction pattern as one atom: a
+/// branch landing in the middle of `iload i; aload a; arraylength; if_icmplt`
+/// would deliver *different* values to the comparison. Landing on `start`
+/// itself is harmless — the whole pattern then re-executes.
+fn range_span_is_atomic(
+    t: &StartTables,
+    branch_targets: &FxHashSet<usize>,
+    start: usize,
+    end: usize,
+) -> bool {
+    let mut s = start;
+    while s < end {
+        let nxt = t.next.get(s).copied().unwrap_or(NO_START);
+        if nxt == NO_START || nxt > end {
+            return false;
+        }
+        if branch_targets.contains(&nxt) {
+            return false;
+        }
+        s = nxt;
+    }
+    s == end
+}
+
+/// Decode the operand whose producer *ends* at instruction `p`, returning it
+/// with the PC its producer *starts* at.
+fn decode_operand_ending_at(code: &[u8], t: &StartTables, p: usize) -> Option<(Operand, usize)> {
+    let op = *code.get(p)?;
+    // `aload a; arraylength` — two instructions, one operand.
+    if op == 0xbe {
+        let q = *t.prev.get(p)?;
+        if q == NO_START {
+            return None;
+        }
+        let a = extract_aload_local(code, q)?;
+        return Some((Operand::Len(a), q));
+    }
+    if let Some(l) = extract_iload_local(code, p) {
+        return Some((Operand::Local(l), p));
+    }
+    if let Some(c) = range_const_push(code, p) {
+        return Some((Operand::Const(c), p));
+    }
+    None
+}
+
+/// Decode the comparison performed by the conditional branch at `pc`, in
+/// taken-branch polarity.
+///
+/// Returns `None` unless the operands are a contiguous, branch-target-free run
+/// of instructions ending at `pc` — see [`range_span_is_atomic`].
+fn decode_compare(
+    code: &[u8],
+    t: &StartTables,
+    branch_targets: &FxHashSet<usize>,
+    pc: usize,
+) -> Option<(Operand, Operand, Rel)> {
+    let (arity, rel) = branch_relation(*code.get(pc)?)?;
+    let p1 = *t.prev.get(pc)?;
+    if p1 == NO_START {
+        return None;
+    }
+    if arity == 1 {
+        let (lhs, start) = decode_operand_ending_at(code, t, p1)?;
+        if !range_span_is_atomic(t, branch_targets, start, pc) {
+            return None;
+        }
+        return Some((lhs, Operand::Const(0), rel));
+    }
+    let (rhs, rhs_start) = decode_operand_ending_at(code, t, p1)?;
+    let p2 = *t.prev.get(rhs_start)?;
+    if p2 == NO_START {
+        return None;
+    }
+    let (lhs, lhs_start) = decode_operand_ending_at(code, t, p2)?;
+    if !range_span_is_atomic(t, branch_targets, lhs_start, pc) {
+        return None;
+    }
+    Some((lhs, rhs, rel))
+}
+
+/// Apply `lhs REL rhs` to `st`.
+///
+/// Two independent refinements, both optional: a numeric narrowing when one
+/// side is a constant, and the symbolic `< length` fact when the comparison is
+/// literally an index against an array length.
+fn apply_rel(st: &mut RangeState, lhs: Operand, rhs: Operand, rel: Rel) {
+    match (lhs, rhs) {
+        (Operand::Local(l), Operand::Const(c)) => {
+            if let Some(r) = st.locals.get_mut(l) {
+                *r = narrow_by(*r, rel, c);
+            }
+        }
+        (Operand::Const(c), Operand::Local(l)) => {
+            if let Some(r) = st.locals.get_mut(l) {
+                *r = narrow_by(*r, swap_rel(rel), c);
+            }
+        }
+        _ => {}
+    }
+    match (lhs, rhs, rel) {
+        // `i < a.length`
+        (Operand::Local(l), Operand::Len(a), Rel::Lt) => st.add_lt_len(l, a),
+        // `a.length > i` — the same fact, written the other way round.
+        (Operand::Len(a), Operand::Local(l), Rel::Gt) => st.add_lt_len(l, a),
+        _ => {}
+    }
+}
+
+/// The array-element access at `pc`, as `(array_local, index_local)`.
+///
+/// Recognised without simulating the operand stack, by the contiguity argument
+/// spelled out on [`is_single_push`]: `aload a; iload i; xaload` (and
+/// `aload a; iload i; <one push>; xastore`) put exactly those values on top of
+/// whatever the stack already held. `range_span_is_atomic` rejects a pattern a
+/// branch can enter part-way through.
+fn decode_array_access(
+    code: &[u8],
+    t: &StartTables,
+    branch_targets: &FxHashSet<usize>,
+    pc: usize,
+) -> Option<(usize, usize)> {
+    let op = *code.get(pc)?;
+    let idx_pc = match op {
+        // xaload: [array, index] -> [value]
+        0x2e..=0x35 => *t.prev.get(pc)?,
+        // xastore: [array, index, value] -> []
+        0x4f..=0x56 => {
+            let value_pc = *t.prev.get(pc)?;
+            if value_pc == NO_START || !is_single_push(*code.get(value_pc)?) {
+                return None;
+            }
+            *t.prev.get(value_pc)?
+        }
+        _ => return None,
+    };
+    if idx_pc == NO_START {
+        return None;
+    }
+    let index_local = extract_iload_local(code, idx_pc)?;
+    let arr_pc = *t.prev.get(idx_pc)?;
+    if arr_pc == NO_START {
+        return None;
+    }
+    let array_local = extract_aload_local(code, arr_pc)?;
+    if !range_span_is_atomic(t, branch_targets, arr_pc, pc) {
+        return None;
+    }
+    Some((array_local, index_local))
+}
+
+/// The number of local slots to model, or `None` when the method's frame is
+/// wider than [`RANGE_MAX_LOCALS`] (refused rather than partially modelled).
+fn range_num_locals(code: &[u8], code_len: usize, t: &StartTables) -> Option<usize> {
+    let mut max_slot = 0usize;
+    let mut pc = 0usize;
+    while pc < code_len {
+        if t.is_start[pc] {
+            if let Some((_, slot)) = local_access_at(code, code_len, pc) {
+                if slot >= RANGE_MAX_LOCALS {
+                    return None;
+                }
+                max_slot = max_slot.max(slot);
+            }
+        }
+        pc += 1;
+    }
+    // +2 so a cat-2 store at the highest slot still has its clobbered high
+    // half inside the vector.
+    Some((max_slot + 2).min(RANGE_MAX_LOCALS))
+}
+
+/// Merge `s` into the state on entry to `succ` and re-queue it if that changed
+/// anything.
+///
+/// `visits` counts merges per PC; past [`RANGE_WIDEN_AFTER`] the merge widens,
+/// which is what bounds the number of times a loop header's state can move up
+/// the lattice. Without it the walk is a `2^32`-tall descent that pins the
+/// compiler thread — reported by this VM's watchdog as a *VM hang*.
+fn range_push_to(
+    t: &StartTables,
+    code_len: usize,
+    visits: &mut [u32],
+    state: &mut [Option<RangeState>],
+    work: &mut Vec<usize>,
+    succ: usize,
+    s: RangeState,
+) {
+    if succ >= code_len || !t.is_start[succ] {
+        return;
+    }
+    visits[succ] = visits[succ].saturating_add(1);
+    let widen = visits[succ] > RANGE_WIDEN_AFTER;
+    if state[succ].is_none() {
+        state[succ] = Some(s);
+        work.push(succ);
+        return;
+    }
+    if let Some(cur) = state[succ].as_mut() {
+        if cur.merge(&s, widen) {
+            work.push(succ);
+        }
+    }
+}
+
+/// Bytecode PCs whose array bounds check is discharged by a *dominating guard*
+/// rather than by a counted loop.
+///
+/// Returns an empty set — never a partial answer — whenever anything about the
+/// method cannot be modelled: unmodelled control flow, an over-wide frame, an
+/// over-long method, a decode that does not advance, or an exhausted iteration
+/// budget.
+pub(super) fn range_safe_pcs(
+    code: &[u8],
+    code_len: usize,
+    handlers: &[(usize, usize, usize)],
+) -> FxHashSet<usize> {
+    if code_len == 0 || code_len > RANGE_MAX_CODE_LEN || code_len > code.len() {
+        return FxHashSet::default();
+    }
+    // Refuses `tableswitch`/`lookupswitch`/`jsr`/`ret`/`goto_w`/`jsr_w`: their
+    // successors are not modelled, so a fact could survive an edge this pass
+    // never walked.
+    let Some(branch_targets) = collect_i16_branch_targets(code, code_len) else {
+        return FxHashSet::default();
+    };
+    let Some(t) = range_start_tables(code, code_len) else {
+        return FxHashSet::default();
+    };
+    let Some(n_locals) = range_num_locals(code, code_len, &t) else {
+        return FxHashSet::default();
+    };
+    // Every branch must land inside the method, on a decoded instruction
+    // start. `collect_i16_branch_targets` silently DROPS a target that does
+    // not — which for this walk would be an edge whose state never reaches the
+    // join, leaving a fact standing that the unfollowed path would have
+    // killed. Re-derive the targets and refuse instead.
+    {
+        let mut pc = 0usize;
+        while pc < code_len {
+            if t.is_start[pc] && matches!(code[pc], 0x99..=0xa7 | 0xc6 | 0xc7) {
+                if pc + 2 >= code_len {
+                    return FxHashSet::default();
+                }
+                // Cast: branch displacement arithmetic.
+                let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                let target = pc as i32 + off;
+                // Cast: bounds-checked immediately.
+                if target < 0 || target as usize >= code_len || !t.is_start[target as usize] {
+                    return FxHashSet::default();
+                }
+            }
+            pc += 1;
+        }
+    }
+
+    let mut state: Vec<Option<RangeState>> = vec![None; code_len];
+    let mut visits: Vec<u32> = vec![0; code_len];
+    let mut work: Vec<usize> = Vec::new();
+
+    // Method entry, and every handler entry. A handler is reachable from ANY
+    // throwing instruction in its protected range, with the operand stack
+    // reset — so it starts from the state that proves nothing, and everything
+    // downstream of it inherits that until a real guard re-establishes a fact.
+    let top = RangeState::top(n_locals);
+    range_push_to(&t, code_len, &mut visits, &mut state, &mut work, 0, top.clone());
+    for &(_start, _end, handler_pc) in handlers {
+        range_push_to(
+            &t,
+            code_len,
+            &mut visits,
+            &mut state,
+            &mut work,
+            handler_pc,
+            top.clone(),
+        );
+    }
+
+    // Bounded exactly as `refine_ambiguous_local_kinds` bounds its own
+    // worklist. Exhausting it reports nothing: a partial fixpoint of a
+    // must-analysis claims facts it has not finished intersecting away.
+    let mut budget = code_len.saturating_mul(64).saturating_add(64);
+
+    while let Some(pc) = work.pop() {
+        budget = budget.saturating_sub(1);
+        if budget == 0 {
+            return FxHashSet::default();
+        }
+        let Some(here) = state[pc].clone() else {
+            continue;
+        };
+        let op = match code.get(pc) {
+            Some(&op) => op,
+            None => continue,
+        };
+
+        // The instruction's own effect on the state.
+        let mut out = here;
+        if let Some(w) = range_local_write(code, code_len, pc) {
+            match w {
+                RangeWrite::Store { slot, wide } => {
+                    out.kill(slot);
+                    if wide {
+                        out.kill(slot + 1);
+                    }
+                    // `<const>; istore l` is the one store whose value this
+                    // pass can read without simulating the stack.
+                    let src = t.prev.get(pc).copied().unwrap_or(NO_START);
+                    if src != NO_START
+                        && !branch_targets.contains(&pc)
+                        && matches!(op, 0x36 | 0x3b..=0x3e)
+                    {
+                        if let Some(c) = range_const_push(code, src) {
+                            if let Some(r) = out.locals.get_mut(slot) {
+                                *r = Range::constant(IntWidth::W32, c);
+                            }
+                        }
+                    }
+                }
+                RangeWrite::Iinc { slot, delta } => {
+                    let cur = out.locals.get(slot).copied();
+                    match cur.and_then(|r| r.add_no_wrap(Range::constant(IntWidth::W32, delta))) {
+                        // The advance provably does not wrap. A non-positive
+                        // delta cannot invalidate `slot < a.length`; a positive
+                        // one can, so its facts go.
+                        Some(next) => {
+                            if let Some(r) = out.locals.get_mut(slot) {
+                                *r = next;
+                            }
+                            if delta > 0 {
+                                out.kill_index_facts(slot);
+                            }
+                        }
+                        // Unproven wrap: `slot` could reappear anywhere.
+                        None => out.kill(slot),
+                    }
+                }
+            }
+        }
+
+        let fall = t.next.get(pc).copied().unwrap_or(NO_START);
+        // A branch whose 16-bit displacement is truncated by `code_len` cannot
+        // be decoded; treat it as having no successors at all rather than
+        // reading past the method.
+        let branch_target = if matches!(op, 0x99..=0xa7 | 0xc6 | 0xc7) {
+            if pc + 2 >= code_len {
+                None
+            } else {
+                // Cast: branch displacement arithmetic.
+                let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                let target = pc as i32 + off;
+                // Cast: non-negative branch target to usize.
+                if target >= 0 {
+                    Some(target as usize)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        match op {
+            // goto — one successor, no fall-through.
+            0xa7 => {
+                if let Some(target) = branch_target {
+                    range_push_to(
+                        &t, code_len, &mut visits, &mut state, &mut work, target, out,
+                    );
+                }
+            }
+            // *return / athrow — no successor inside the method.
+            0xac..=0xb1 | 0xbf => {}
+            // Conditional branches: two edges, refined independently.
+            0x99..=0xa6 | 0xc6 | 0xc7 => {
+                let (mut taken, mut not_taken) = (out.clone(), out);
+                if let Some((lhs, rhs, rel)) = decode_compare(code, &t, &branch_targets, pc) {
+                    apply_rel(&mut taken, lhs, rhs, rel);
+                    apply_rel(&mut not_taken, lhs, rhs, negate_rel(rel));
+                }
+                if let Some(target) = branch_target {
+                    range_push_to(
+                        &t, code_len, &mut visits, &mut state, &mut work, target, taken,
+                    );
+                }
+                range_push_to(
+                    &t, code_len, &mut visits, &mut state, &mut work, fall, not_taken,
+                );
+            }
+            _ => range_push_to(&t, code_len, &mut visits, &mut state, &mut work, fall, out),
+        }
+    }
+
+    // Harvest. An access is discharged only when BOTH halves hold: the index
+    // is provably non-negative AND provably below THIS array's length.
+    let mut safe = FxHashSet::default();
+    let mut pc = 0usize;
+    while pc < code_len {
+        if !t.is_start[pc] {
+            pc += 1;
+            continue;
+        }
+        if let Some((array_local, index_local)) = decode_array_access(code, &t, &branch_targets, pc)
+        {
+            if let Some(st) = state[pc].as_ref() {
+                let idx_range = st
+                    .locals
+                    .get(index_local)
+                    .copied()
+                    .unwrap_or_else(|| Range::top(IntWidth::W32));
+                let non_negative = !idx_range.is_empty() && idx_range.is_non_negative();
+                if non_negative && st.proves_lt_len(index_local, array_local) {
+                    safe.insert(pc);
+                }
+            }
+        }
+        pc += 1;
+    }
+    safe
+}
+
+#[cfg(test)]
+mod range_analysis_bce_tests {
+    use super::*;
+
+    /// Run the guard-dominated pass on a handler-free method.
+    fn run(code: &[u8]) -> Vec<usize> {
+        let mut v: Vec<usize> = range_safe_pcs(code, code.len(), &[]).into_iter().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// `int f(int[] a, int i) { if (i >= 0 && i < a.length) return a[i]; return -1; }`
+    ///
+    /// The canonical guarded access, and the one the counted-loop reason
+    /// cannot touch at all: there is no loop.
+    ///
+    /// ```text
+    ///  0: iload_1            (i)
+    ///  1: iflt   +14 -> 15
+    ///  4: iload_1
+    ///  5: aload_0
+    ///  6: arraylength
+    ///  7: if_icmpge +8 -> 15
+    /// 10: aload_0
+    /// 11: iload_1
+    /// 12: iaload             <-- the access
+    /// 13: ireturn
+    /// 15: iconst_m1
+    /// 16: ireturn
+    /// ```
+    fn guarded_load() -> Vec<u8> {
+        vec![
+            0x1b, 0x9b, 0x00, 0x0e, 0x1b, 0x2a, 0xbe, 0xa2, 0x00, 0x08, 0x2a, 0x1b, 0x2e, 0xac,
+            0x02, 0xac,
+        ]
+    }
+
+    #[test]
+    fn both_halves_of_the_guard_eliminate_the_check() {
+        assert_eq!(run(&guarded_load()), vec![12]);
+    }
+
+    /// MUST REFUSE: drop the `i >= 0` half. `i < a.length` alone admits a
+    /// negative index, which is an access *below* the array base — strictly
+    /// worse than the overrun the check normally catches.
+    #[test]
+    fn upper_bound_alone_is_not_enough() {
+        // Same as `guarded_load` with the `iflt` replaced by two `nop`s plus a
+        // `pop` of the loaded `i`, so the length guard still dominates.
+        //  0: iload_1 ; 1: pop ; 2: nop ; 3: nop
+        //  4: iload_1 ; 5: aload_0 ; 6: arraylength ; 7: if_icmpge +8 -> 15
+        // 10: aload_0 ; 11: iload_1 ; 12: iaload ; 13: ireturn
+        // 15: iconst_m1 ; 16: ireturn
+        let code: Vec<u8> = vec![
+            0x1b, 0x57, 0x00, 0x00, 0x1b, 0x2a, 0xbe, 0xa2, 0x00, 0x08, 0x2a, 0x1b, 0x2e, 0xac,
+            0x02, 0xac,
+        ];
+        assert!(
+            run(&code).is_empty(),
+            "an unbounded-below index must keep its check"
+        );
+    }
+
+    /// MUST REFUSE: drop the length half, keep `i >= 0`.
+    #[test]
+    fn lower_bound_alone_is_not_enough() {
+        //  0: iload_1 ; 1: iflt +12 -> 13
+        //  4: aload_0 ; 5: iload_1 ; 6: iaload ; 7: ireturn
+        //  ... padding so the branch target is a real instruction start
+        let code: Vec<u8> = vec![
+            0x1b, 0x9b, 0x00, 0x0c, 0x2a, 0x1b, 0x2e, 0xac, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0xac,
+        ];
+        assert!(run(&code).is_empty(), "no upper bound, no elision");
+    }
+
+    /// MUST REFUSE: the guard names a DIFFERENT array from the access. This is
+    /// the multi-array out-of-bounds store
+    /// (docs/known-issues/jit-bce-multi-array-oob-store-20260711.md) in its
+    /// guard-dominated spelling — `a.length` says nothing about `b.length`.
+    #[test]
+    fn a_guard_on_another_array_proves_nothing() {
+        // locals: 0=a 1=b 2=i
+        //  0: iload_2 ; 1: iflt +15 -> 16
+        //  4: iload_2 ; 5: aload_0 ; 6: arraylength ; 7: if_icmpge +9 -> 16
+        // 10: aload_1 ; 11: iload_2 ; 12: iaload ; 13: pop ; 14: nop ; 15: nop
+        // 16: return
+        let code: Vec<u8> = vec![
+            0x1c, 0x9b, 0x00, 0x0f, 0x1c, 0x2a, 0xbe, 0xa2, 0x00, 0x09, 0x2b, 0x1c, 0x2e, 0x57,
+            0x00, 0x00, 0xb1,
+        ];
+        assert!(
+            run(&code).is_empty(),
+            "b[i] under a guard on a.length must keep its check"
+        );
+        // …and the SAME method with the access on `a` does eliminate, so the
+        // refusal above is about the array identity and not about the shape.
+        let mut on_a = code.clone();
+        on_a[10] = 0x2a; // aload_1 -> aload_0
+        assert_eq!(run(&on_a), vec![12]);
+    }
+
+    /// MUST REFUSE: the guard is *after* the access.
+    #[test]
+    fn a_guard_that_does_not_dominate_proves_nothing() {
+        //  0: aload_0 ; 1: iload_1 ; 2: iaload ; 3: pop      (unguarded access)
+        //  4: iload_1 ; 5: aload_0 ; 6: arraylength ; 7: if_icmpge +4 -> 11
+        // 10: nop ; 11: return
+        let code: Vec<u8> = vec![
+            0x2a, 0x1b, 0x2e, 0x57, 0x1b, 0x2a, 0xbe, 0xa2, 0x00, 0x04, 0x00, 0xb1,
+        ];
+        assert!(run(&code).is_empty());
+    }
+
+    /// MUST REFUSE: the index is reassigned between the guard and the access.
+    #[test]
+    fn a_write_to_the_index_kills_the_fact() {
+        //  0: iload_1 ; 1: iflt +16 -> 17
+        //  4: iload_1 ; 5: aload_0 ; 6: arraylength ; 7: if_icmpge +10 -> 17
+        // 10: sipush 9999 ; 13: istore_1          <-- i is now anything
+        // 14: aload_0 ; 15: iload_1 ; 16: iaload
+        // 17: return
+        let code: Vec<u8> = vec![
+            0x1b, 0x9b, 0x00, 0x10, 0x1b, 0x2a, 0xbe, 0xa2, 0x00, 0x0a, 0x11, 0x27, 0x0f, 0x3c,
+            0x2a, 0x1b, 0x2e, 0xb1,
+        ];
+        assert!(
+            run(&code).is_empty(),
+            "the guarded value is gone; so is the guard"
+        );
+    }
+
+    /// MUST REFUSE: the ARRAY local is reassigned between the guard and the
+    /// access. The fact was about the object `a` referred to then.
+    #[test]
+    fn a_write_to_the_array_kills_the_fact() {
+        // locals: 0=a 1=i 2=other
+        //  0: iload_1 ; 1: iflt +14 -> 15
+        //  4: iload_1 ; 5: aload_0 ; 6: arraylength ; 7: if_icmpge +8 -> 15
+        // 10: aload_2 ; 11: astore_0                <-- a := other
+        // 12: aload_0 ; 13: iload_1 ; 14: iaload
+        // 15: return
+        let code: Vec<u8> = vec![
+            0x1b, 0x9b, 0x00, 0x0f, 0x1b, 0x2a, 0xbe, 0xa2, 0x00, 0x09, 0x2c, 0x4b, 0x2a, 0x1b,
+            0x2e, 0x00, 0xb1,
+        ];
+        assert!(run(&code).is_empty());
+    }
+
+    /// `iinc` is where the machine-integer discipline earns its keep.
+    ///
+    /// `i++` after the guard invalidates `i < a.length`; `i--` does not (the
+    /// value only moved down, and `add_no_wrap` proved the step representable),
+    /// but it *can* break `i >= 0`, so the numeric half has to catch it.
+    /// Either way the access must keep its check — the point of the test is
+    /// that both halves are consulted, and neither is assumed.
+    #[test]
+    fn an_increment_after_the_guard_invalidates_it() {
+        //  0: iload_1 ; 1: iflt +15 -> 16
+        //  4: iload_1 ; 5: aload_0 ; 6: arraylength ; 7: if_icmpge +9 -> 16
+        // 10: iinc 1,<d>
+        // 13: aload_0 ; 14: iload_1 ; 15: iaload
+        // 16: return
+        let mk = |d: u8| -> Vec<u8> {
+            vec![
+                0x1b, 0x9b, 0x00, 0x0f, 0x1b, 0x2a, 0xbe, 0xa2, 0x00, 0x09, 0x84, 0x01, d, 0x2a,
+                0x1b, 0x2e, 0xb1,
+            ]
+        };
+        assert!(
+            run(&mk(1)).is_empty(),
+            "i++ can walk off the end: the upper-bound fact is dead"
+        );
+        // Cast: 0xff is `-1` as the signed iinc delta.
+        assert!(
+            run(&mk(0xff)).is_empty(),
+            "i-- can walk below zero: the lower-bound fact is dead"
+        );
+    }
+
+    /// A constant index needs no `< length` fact of its own — but it does not
+    /// GET one either, so it keeps its check. Pinned so a future "constants are
+    /// obviously fine" shortcut cannot be added without a length proof.
+    #[test]
+    fn a_constant_index_without_a_length_proof_is_refused() {
+        // 0: aload_0 ; 1: iconst_0 ; 2: iaload ; 3: pop ; 4: return
+        let code: Vec<u8> = vec![0x2a, 0x03, 0x2e, 0x57, 0xb1];
+        assert!(run(&code).is_empty());
+    }
+
+    /// An array STORE is eliminated on the same evidence — with the extra
+    /// requirement that the stored value comes from a single pushing
+    /// instruction, since anything longer would desynchronise the positional
+    /// operand decode.
+    #[test]
+    fn a_guarded_store_eliminates_but_a_computed_value_does_not() {
+        // locals: 0=a 1=i 2=v
+        //  0: iload_1 ; 1: iflt +14 -> 15
+        //  4: iload_1 ; 5: aload_0 ; 6: arraylength ; 7: if_icmpge +8 -> 15
+        // 10: aload_0 ; 11: iload_1 ; 12: iload_2 ; 13: iastore
+        // 15: return   (14 is a nop)
+        let simple: Vec<u8> = vec![
+            0x1b, 0x9b, 0x00, 0x0e, 0x1b, 0x2a, 0xbe, 0xa2, 0x00, 0x08, 0x2a, 0x1b, 0x1c, 0x4f,
+            0x00, 0xb1,
+        ];
+        assert_eq!(run(&simple), vec![13]);
+
+        // The same store with a two-instruction value expression (`v + v`):
+        // the instruction before `iastore` is now `iadd`, so the positional
+        // decode refuses rather than guessing.
+        //  0: iload_1 ; 1: iflt +16 -> 17
+        //  4: iload_1 ; 5: aload_0 ; 6: arraylength ; 7: if_icmpge +10 -> 17
+        // 10: aload_0 ; 11: iload_1 ; 12: iload_2 ; 13: iload_2 ; 14: iadd
+        // 15: iastore ; 16: nop ; 17: return
+        let computed: Vec<u8> = vec![
+            0x1b, 0x9b, 0x00, 0x10, 0x1b, 0x2a, 0xbe, 0xa2, 0x00, 0x0a, 0x2a, 0x1b, 0x1c, 0x1c,
+            0x60, 0x4f, 0x00, 0xb1,
+        ];
+        assert!(run(&computed).is_empty());
+    }
+
+    /// An exception-handler entry resets the analysis. The handler here starts
+    /// *inside* the guarded region, so control can arrive at the access having
+    /// skipped the guard entirely — the fact must not survive.
+    #[test]
+    fn a_handler_entry_inside_the_guarded_region_kills_the_facts() {
+        let code = guarded_load();
+        // No handlers: eliminated (the control test).
+        assert_eq!(run(&code), vec![12]);
+        // A handler landing on pc 10 (the `aload_0` of the access) means
+        // control can reach pc 12 without ever running either guard.
+        let with_handler = range_safe_pcs(&code, code.len(), &[(0, 10, 10)]);
+        assert!(
+            with_handler.is_empty(),
+            "a handler entry ahead of the access invalidates the guard, got {with_handler:?}"
+        );
+        // A handler landing after the access does not.
+        let after = range_safe_pcs(&code, code.len(), &[(0, 16, 15)]);
+        assert_eq!(after.into_iter().collect::<Vec<_>>(), vec![12]);
+    }
+
+    /// Unmodelled control flow refuses the whole method rather than the one
+    /// construct: a `tableswitch`'s successors are not walked, so a fact could
+    /// survive an edge this pass never saw.
+    #[test]
+    fn unmodelled_control_flow_refuses_the_method() {
+        let mut code = guarded_load();
+        // Overwrite the trailing `iconst_m1; ireturn` with a `lookupswitch`
+        // opcode. The decode never reaches it, but the whole-method scan does.
+        let n = code.len();
+        code[n - 2] = 0xab;
+        assert!(run(&code).is_empty());
+    }
+
+    /// The pass refuses an over-long method outright, so the analysis can
+    /// never become the compile-time outlier.
+    #[test]
+    fn an_over_long_method_is_refused() {
+        let mut code = guarded_load();
+        code.resize(RANGE_MAX_CODE_LEN + 1, 0x00);
+        assert!(range_safe_pcs(&code, code.len(), &[]).is_empty());
+    }
+
+    /// The gate is a real switch in both directions, and it is the ONLY thing
+    /// that decides whether the range reason contributes.
+    #[test]
+    fn the_gate_switches_the_range_reason_only() {
+        let code = guarded_load();
+        let loops = super::super::detect_loops(&code, code.len());
+
+        __set_range_bce_override(Some(true));
+        let (on, _) = analyze_bounds_elimination_with_handlers(&code, code.len(), &loops, Some(&[]));
+        __set_range_bce_override(Some(false));
+        let (off, _) =
+            analyze_bounds_elimination_with_handlers(&code, code.len(), &loops, Some(&[]));
+        // The handler-blind entry point never runs the range reason at all.
+        __set_range_bce_override(Some(true));
+        let (blind, _) = analyze_bounds_elimination(&code, code.len(), &loops);
+        __set_range_bce_override(None);
+
+        assert!(on.contains(&12));
+        assert!(!off.contains(&12));
+        assert!(
+            !blind.contains(&12),
+            "an unknown exception table must refuse, not assume there is none"
+        );
+    }
+
+    /// The counted-loop reason is untouched by any of this: the same fixture
+    /// the loop tests use must still produce the same verdict through the new
+    /// handler-aware entry point.
+    #[test]
+    fn the_counted_loop_reason_is_unchanged() {
+        // `for (i = 0; i < a.length; i++) a[i];` — see
+        // `range_bce_tests::inline_arraylength_limit_eliminates_statically`.
+        let code: Vec<u8> = vec![
+            0x03, 0x3c, 0x1b, 0x2a, 0xbe, 0xa2, 0x00, 0x0d, 0x2a, 0x1b, 0x2e, 0x57, 0x84, 0x01,
+            0x01, 0xa7, 0xff, 0xf3, 0xb1,
+        ];
+        let loops = super::super::detect_loops(&code, code.len());
+        __set_range_bce_override(Some(false));
+        let (safe, guards) =
+            analyze_bounds_elimination_with_handlers(&code, code.len(), &loops, Some(&[]));
+        __set_range_bce_override(None);
+        let mut safe: Vec<usize> = safe.into_iter().collect();
+        safe.sort_unstable();
+        assert_eq!(safe, vec![10]);
+        assert!(guards.is_empty());
+    }
+
+    // ---- the state lattice itself ----------------------------------------
+
+    #[test]
+    fn merge_intersects_facts_and_hulls_ranges() {
+        let mut a = RangeState::top(4);
+        a.locals[1] = Range::exact(IntWidth::W32, 0, 10);
+        a.add_lt_len(1, 0);
+        a.add_lt_len(2, 0);
+        let mut b = RangeState::top(4);
+        b.locals[1] = Range::exact(IntWidth::W32, 20, 30);
+        b.add_lt_len(1, 0);
+
+        assert!(a.merge(&b, false));
+        assert_eq!(a.locals[1], Range::exact(IntWidth::W32, 0, 30));
+        assert!(a.proves_lt_len(1, 0), "held on both paths");
+        assert!(!a.proves_lt_len(2, 0), "held on only one path");
+        // Idempotent: merging the same state again changes nothing.
+        let snapshot = a.clone();
+        assert!(!a.merge(&snapshot, false));
+    }
+
+    #[test]
+    fn merge_widens_once_asked_to() {
+        let mut a = RangeState::top(2);
+        a.locals[0] = Range::exact(IntWidth::W32, 0, 10);
+        let mut b = RangeState::top(2);
+        b.locals[0] = Range::exact(IntWidth::W32, 0, 11);
+        a.merge(&b, true);
+        assert_eq!(
+            a.locals[0],
+            // Widening: the i32 endpoints into the i64 interval domain.
+            Range::exact(IntWidth::W32, 0, i32::MAX as i64),
+            "an outward-moving endpoint goes straight to the extreme"
+        );
+    }
+
+    #[test]
+    fn kill_removes_the_range_and_every_fact_naming_the_slot() {
+        let mut s = RangeState::top(4);
+        s.locals[1] = Range::exact(IntWidth::W32, 0, 5);
+        s.add_lt_len(1, 0); // i=1 indexes a=0
+        s.add_lt_len(2, 1); // j=2 indexes a=1
+        s.kill(1);
+        assert!(s.locals[1].is_top());
+        assert!(!s.proves_lt_len(1, 0), "killed as the index");
+        assert!(!s.proves_lt_len(2, 1), "killed as the array");
+    }
+
+    #[test]
+    fn narrow_by_handles_the_endpoints_without_wrapping() {
+        let top = Range::top(IntWidth::W32);
+        // Widening: the i32 endpoints into the i64 interval domain.
+        let (min, max) = (i32::MIN as i64, i32::MAX as i64);
+        assert_eq!(narrow_by(top, Rel::Ge, 0), Range::exact(IntWidth::W32, 0, max));
+        assert_eq!(
+            narrow_by(top, Rel::Lt, 10),
+            Range::exact(IntWidth::W32, min, 9)
+        );
+        // `x < Integer.MIN_VALUE` is impossible — bottom, not a wrapped range.
+        assert!(narrow_by(top, Rel::Lt, min).is_empty());
+        // `x > Integer.MAX_VALUE` likewise.
+        assert!(narrow_by(top, Rel::Gt, max).is_empty());
+        // `!=` cannot be expressed by an interval, so it must narrow nothing.
+        assert_eq!(narrow_by(top, Rel::Ne, 5), top);
+    }
+
+    #[test]
+    fn relation_algebra() {
+        for r in [Rel::Eq, Rel::Ne, Rel::Lt, Rel::Le, Rel::Gt, Rel::Ge] {
+            assert_eq!(negate_rel(negate_rel(r)), r);
+            assert_eq!(swap_rel(swap_rel(r)), r);
+        }
+        assert_eq!(negate_rel(Rel::Lt), Rel::Ge);
+        assert_eq!(swap_rel(Rel::Lt), Rel::Gt);
+        // `if_icmpge` not taken means `<`, which is where the fall-through
+        // edge of javac's guard gets its fact.
+        assert_eq!(branch_relation(0xa2), Some((2, Rel::Ge)));
+        assert_eq!(negate_rel(Rel::Ge), Rel::Lt);
+        // `if_acmpeq` / `ifnull` carry no integer relation.
+        assert_eq!(branch_relation(0xa5), None);
+        assert_eq!(branch_relation(0xc6), None);
+    }
 }
 
 #[cfg(test)]
