@@ -351,6 +351,25 @@ pub struct ExecutableBuffer {
     /// bail is indistinguishable from a method the JIT declined for any other
     /// reason. See [`wanted`](Self::wanted).
     wanted: usize,
+    /// Suppress the per-patch overflow warnings on this buffer.
+    ///
+    /// An overflow is only newsworthy where it ENDS a compile. The optimizing
+    /// tier's first attempt re-runs at the size it just measured, so its
+    /// overflow is a measurement, not a failure — and it is not a rare one: a
+    /// single Spring Boot suite class emitted 8072 of these lines from that one
+    /// attempt, drowning every other warning in the run and reading, to whoever
+    /// found them, like a defect. The retry leaves this clear, so a buffer that
+    /// overflows even at its measured size still says so.
+    quiet_overflow: bool,
+    /// Which sizing heuristic allocated this buffer, for the overflow warning.
+    ///
+    /// Four independent estimates allocate executable buffers, and the warning
+    /// named none of them — so an overflow flood was attributed by arithmetic
+    /// on the printed `len`, and got attributed to the WRONG one
+    /// (`docs/internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md`
+    /// blamed the single-pass backend's estimate for a flood that was entirely
+    /// the optimizing tier's).
+    tag: &'static str,
 }
 
 // Safety: ExecutableBuffer is effectively a unique owned allocation, like Vec<u8>.
@@ -378,7 +397,24 @@ impl ExecutableBuffer {
             capacity,
             overflowed: false,
             wanted: 0,
+            quiet_overflow: false,
+            tag: "untagged",
         })
+    }
+
+    /// Suppress this buffer's overflow warnings. See [`quiet_overflow`].
+    ///
+    /// [`quiet_overflow`]: Self::quiet_overflow
+    #[inline]
+    pub fn set_quiet_overflow(&mut self, quiet: bool) {
+        self.quiet_overflow = quiet;
+    }
+
+    /// Name the sizing heuristic that allocated this buffer. Shown by the
+    /// overflow warnings, which otherwise cannot say which estimate was short.
+    #[inline]
+    pub fn set_tag(&mut self, tag: &'static str) {
+        self.tag = tag;
     }
 
     /// Write bytes into the buffer at the current position.
@@ -514,11 +550,16 @@ impl ExecutableBuffer {
     pub fn try_patch_i32(&mut self, offset: usize, value: i32) -> Result<(), CompileError> {
         if offset.checked_add(4).map_or(true, |end| end > self.len) {
             self.overflowed = true;
-            tracing::warn!(
-                offset = offset,
-                len = self.len,
-                "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
-            );
+            if !self.quiet_overflow {
+                tracing::warn!(
+                    offset = offset,
+                    len = self.len,
+                    capacity = self.capacity,
+                    wanted = self.wanted,
+                    buffer = self.tag,
+                    "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
+                );
+            }
             return Err(CompileError::PatchFailed {
                 kind: "i32",
                 offset,
@@ -541,11 +582,16 @@ impl ExecutableBuffer {
     pub fn try_patch_byte(&mut self, offset: usize, value: u8) -> Result<(), CompileError> {
         if offset >= self.len {
             self.overflowed = true;
-            tracing::warn!(
-                offset = offset,
-                len = self.len,
-                "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
-            );
+            if !self.quiet_overflow {
+                tracing::warn!(
+                    offset = offset,
+                    len = self.len,
+                    capacity = self.capacity,
+                    wanted = self.wanted,
+                    buffer = self.tag,
+                    "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
+                );
+            }
             return Err(CompileError::PatchFailed {
                 kind: "byte",
                 offset,
@@ -664,6 +710,12 @@ pub fn jit_code_cache_cap_bytes() -> usize {
 /// Diagnostic only.
 pub fn jit_code_cache_cap_refusals() -> u64 {
     JIT_CODE_CACHE_CAP_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of times the optimizing tier re-ran a lowering because its code-buffer
+/// estimate was short. Diagnostic only; see `ir_lower::lower_inner`.
+pub fn ir_code_buffer_retries() -> u64 {
+    ir_lower::IR_CODE_BUFFER_RETRIES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Returns `true` if retained JIT code has reached the configured cap, meaning
@@ -2474,6 +2526,7 @@ unsafe fn emit_osr_trampoline(
 
     let trampoline_size = 1024 + num_locals * 32;
     let mut tramp = ExecutableBuffer::new(trampoline_size)?;
+    tramp.set_tag("osr-trampoline");
 
     // === JIT Prologue ===
     tramp.emit_byte(0x55); // push rbp
@@ -8399,6 +8452,22 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
     // Acceptance: `BasicErrorControllerIntegrationTests`, default flags,
     // 14 consecutive clean runs, plus a same-binary gate-closed control.
     //
+    // RUN 2026-08-01: 14 clean runs on default flags and 2 of 2 clean
+    // gate-closed controls — but out of 17 default-flag attempts, not 14
+    // consecutive ones. The three losses were two stalls and one client-side
+    // HTTP timeout, all at external load >100 on the shared host, none of them
+    // this gate; they are filed as
+    // docs/known-issues/springboot/onclasscondition-join-never-returns-20260801.md.
+    // Both arms clean is what settles the question this gate asks.
+    // It could not be run before that date, and not because of this gate: the
+    // class failed 23 of 26 tests under JIT with the gate OPEN and with
+    // `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` alike, on a defect with nothing to
+    // do with direct calls (`run_jit_callee_handler` rebuilt a compiled
+    // callee's handler frame from its incoming arguments and lost every other
+    // local). Anyone reading a failure of this class as evidence against this
+    // gate between 2026-07-31 and 2026-08-01 was reading the wrong defect; see
+    // docs/internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md.
+    //
     // The OPTIMIZING-TIER gate stays scoped as
     // `moving_young_relocates_compiled_frames()` — that one protects frames
     // which DO carry a guard. These two gates ask different questions and must
@@ -8985,6 +9054,26 @@ fn local_handler_reads_unsafe_local(
     false
 }
 
+/// Public form of [`local_handler_reads_unsafe_local`], for the runtime side of
+/// the same contract.
+///
+/// The compile gate and the handler-frame RECONSTRUCTION have to agree about
+/// which methods need precise locals, and until now only the gate could ask.
+/// `interpreter::run_jit_callee_handler` rebuilds a compiled callee's handler
+/// frame from that callee's incoming arguments alone; that is sound only for a
+/// method this returns `false` for. Once [`precise_handler_frames_enabled`]
+/// stopped refusing the `true` population, the reconstruction needed the same
+/// predicate to know when its params-only frame is not good enough.
+pub fn handler_reads_non_param_local(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+    method_descriptor: &str,
+    is_static: bool,
+) -> bool {
+    local_handler_reads_unsafe_local(code, code_len, exception_table, method_descriptor, is_static)
+}
+
 /// Whether the precise-handler-frame relaxation of the RBC.6 gate is enabled.
 ///
 /// The relaxation compiles a method whose exception handler (or code reachable
@@ -9330,6 +9419,7 @@ fn try_compile_inner(
         if result.success {
             if let Some(machine_code) = aarch64_backend::emit_machine_code(&result) {
                 if let Some(mut buf) = ExecutableBuffer::new(machine_code.len().max(4096)) {
+                    buf.set_tag("aarch64-backend");
                     buf.emit(&machine_code);
                     return Some(CompiledMethod::new(buf));
                 }
@@ -17581,6 +17671,106 @@ mod tests {
             is_jit_compatible(&code, code.len(), "()I"),
             "monitorenter/exit must be accepted so synchronized methods can JIT"
         );
+    }
+
+    /// A handler that falls THROUGH to a loop back edge reads every local that
+    /// edge reads. `run_jit_callee_handler` asks exactly this question (through
+    /// the public [`handler_reads_non_param_local`]) before it is willing to
+    /// rebuild a compiled callee's handler frame from the callee's incoming
+    /// arguments alone, so a `false` here is a null local at runtime.
+    ///
+    /// The shape is Spring Boot's
+    /// `BindConverter.convert(Object, TypeDescriptor, TypeDescriptor)`:
+    /// `for (ConversionService d : this.delegates) { try { … } catch (…) { … } }`,
+    /// whose catch block ends by continuing the loop. Local 2 here is the
+    /// enhanced-for's synthetic iterator — assigned before the try, read by the
+    /// back edge, and reachable from the handler only through its trailing
+    /// `goto`.
+    #[test]
+    fn handler_falling_through_to_a_loop_back_edge_reads_the_iterator_local() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        let code = vec![
+            0x03, // 0:  iconst_0
+            0x3c, // 1:  istore_1              n = 0
+            0x2a, // 2:  aload_0               the List parameter
+            0xb9, 0x00, 0x01, 0x01, 0x00, // 3:  invokeinterface List.iterator
+            0x4d, // 8:  astore_2              the synthetic iterator
+            0x2c, // 9:  aload_2               <- loop head
+            0xb9, 0x00, 0x02, 0x01, 0x00, // 10: invokeinterface Iterator.hasNext
+            0x99, 0x00, 0x11, // 15: ifeq -> 32
+            0x2c, // 18: aload_2               <- protected range starts
+            0xb9, 0x00, 0x03, 0x01, 0x00, // 19: invokeinterface Iterator.next
+            0x57, // 24: pop
+            0xa7, 0xff, 0xf0, // 25: goto -> 9 (back edge)
+            0x4e, // 28: astore_3              <- handler: catch (…) e
+            0xa7, 0xff, 0xec, // 29: goto -> 9 (handler CONTINUES the loop)
+            0x1b, // 32: iload_1
+            0xac, // 33: ireturn
+        ];
+        let table = vec![ExceptionTableEntry {
+            start_pc: 18,
+            end_pc: 28,
+            handler_pc: 28,
+            catch_type: 0,
+        }];
+        assert!(
+            handler_reads_non_param_local(&code, code.len(), &table, "(Ljava/util/List;)I", true),
+            "the handler's trailing goto reaches `aload_2`, the iterator local"
+        );
+        // And it is a shape the precise-frame relaxation admits — which is why
+        // it COMPILES instead of staying interpreted, and therefore why the
+        // reconstruction question arises at all.
+        assert!(precise_exception_frame_sites_supported(
+            &code,
+            code.len(),
+            &table
+        ));
+    }
+
+    /// Negative control for the test above: the same loop, but the handler
+    /// RETURNS. Nothing it reaches reads a non-parameter local, so the
+    /// params-only reconstruction is sound and must not be refused — the
+    /// `iload_1` at pc 32 is past the handler's own `ireturn` and must not be
+    /// scanned into (an earlier raw-pc-order version of this dataflow did
+    /// exactly that and over-rejected).
+    #[test]
+    fn handler_that_returns_does_not_read_a_non_param_local() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        let code = vec![
+            0x03, // 0:  iconst_0
+            0x3c, // 1:  istore_1
+            0x2a, // 2:  aload_0
+            0xb9, 0x00, 0x01, 0x01, 0x00, // 3:  invokeinterface List.iterator
+            0x4d, // 8:  astore_2
+            0x2c, // 9:  aload_2
+            0xb9, 0x00, 0x02, 0x01, 0x00, // 10: invokeinterface Iterator.hasNext
+            0x99, 0x00, 0x11, // 15: ifeq -> 32
+            0x2c, // 18: aload_2
+            0xb9, 0x00, 0x03, 0x01, 0x00, // 19: invokeinterface Iterator.next
+            0x57, // 24: pop
+            0xa7, 0xff, 0xf0, // 25: goto -> 9
+            0x4e, // 28: astore_3           <- handler
+            0x03, // 29: iconst_0
+            0xac, // 30: ireturn
+            0x00, // 31: nop (padding so 32 is the ifeq target)
+            0x1b, // 32: iload_1
+            0xac, // 33: ireturn
+        ];
+        let table = vec![ExceptionTableEntry {
+            start_pc: 18,
+            end_pc: 28,
+            handler_pc: 28,
+            catch_type: 0,
+        }];
+        assert!(!handler_reads_non_param_local(
+            &code,
+            code.len(),
+            &table,
+            "(Ljava/util/List;)I",
+            true
+        ));
     }
 
     #[cfg(target_arch = "x86_64")]

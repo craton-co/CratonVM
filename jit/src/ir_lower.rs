@@ -5593,12 +5593,122 @@ pub fn lower_with_scalar_deopt(
     )
 }
 
+thread_local! {
+    /// Set by [`lower_inner_sized`] when it refuses because the code buffer ran
+    /// out: the exact byte count codegen asked to emit. Read once by
+    /// [`lower_inner`], which retries at that size.
+    ///
+    /// One-shot, and cleared before each attempt, so a refusal for any OTHER
+    /// reason cannot leave a stale size behind to trigger a pointless retry of
+    /// an unrelated later method on this worker thread.
+    static IR_CODE_BUFFER_WANTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times [`lower_inner`] has re-run the lowering at a measured size.
+///
+/// Without this the retry is unfalsifiable: a retry that never fires and a
+/// retry that fires and succeeds produce the SAME log — the first attempt's
+/// (quiet) overflow and nothing else.
+pub static IR_CODE_BUFFER_RETRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Hard ceiling on a retry. A method whose body genuinely needs more than this
+/// is better left to the single-pass backend than handed several megabytes of
+/// committed executable memory — `COMMITTED_JIT_CODE_BYTES` (the code-cache
+/// cap) counts every byte reserved here, not just the bytes emitted.
+const IR_CODE_BUFFER_RETRY_CAP: usize = 4 * 1024 * 1024;
+
 /// Shared lowering body: profile-guided branch hints, the optional
 /// guard-surviving scalar-replacement map, and the two per-call-site lowering
 /// tables all flow in here. `pub(crate)` so the production compile path
 /// (`lib.rs`) can supply all of them at once.
+///
+/// **Sizes the code buffer by retrying, not by guessing harder.** The estimate
+/// below (`nodes * 32 + calls * 448 + 1024`) budgets one number for a call site
+/// whose real cost swings by several hundred bytes depending on which lowering
+/// it selects — a MIC + 4-way-PIC dual-ABI inline cache is the expensive end,
+/// and widening the PIC's inter-slot branch from `rel8` to `rel32` pushed it
+/// past the budget. The result was a silent de-optimization: `emit` drops the
+/// write, sets the sticky `overflowed` flag, and the method quietly stays
+/// interpreted forever. A single Spring Boot suite class produced **8072** such
+/// warnings in one run, every one of them from this estimate (the report that
+/// first noticed the flood,
+/// `docs/internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md`,
+/// attributed them to the single-pass backend's estimate — that one accounted
+/// for 10).
+///
+/// `ExecutableBuffer::wanted()` counts every byte codegen asked for, including
+/// the writes dropped after the overflow, so one retry at that size is exact
+/// rather than another guess. Raising the constant instead would have to
+/// over-reserve every ordinary method to cover the worst one, and every
+/// reserved byte counts against the code-cache cap.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_inner(
+    graph: &Graph,
+    schedule: &Schedule,
+    num_params: usize,
+    num_locals: usize,
+    helpers: &JitRuntimeHelpers,
+    branch_hints: &HashMap<usize, bool>,
+    sr_map: Option<&ScalarReplacementMap>,
+    direct_calls: &HashMap<usize, (usize, bool)>,
+    ic_slots: &HashMap<usize, (usize, usize)>,
+    compact_fields: &HashMap<usize, (u32, bool, u8)>,
+) -> Option<CompiledMethod> {
+    IR_CODE_BUFFER_WANTED.with(|c| c.set(0));
+    let first = lower_inner_sized(
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        branch_hints,
+        sr_map,
+        direct_calls,
+        ic_slots,
+        compact_fields,
+        0,
+    );
+    if first.is_some() {
+        return first;
+    }
+    let wanted = IR_CODE_BUFFER_WANTED.with(|c| c.replace(0));
+    // Any other refusal leaves this at 0 — no retry, byte-for-byte the old
+    // behaviour.
+    if wanted == 0 || wanted > IR_CODE_BUFFER_RETRY_CAP {
+        return None;
+    }
+    // `wanted` is a lower bound on its own terms (`rewind_to` does not take
+    // bytes back off it, so it can also over-count); the eighth is headroom for
+    // the encodings that widen once the displacements they patch get further
+    // apart in the larger buffer.
+    let retry = wanted
+        .saturating_add(wanted / 8)
+        .saturating_add(256)
+        .min(IR_CODE_BUFFER_RETRY_CAP);
+    IR_CODE_BUFFER_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some() {
+        eprintln!("[ir] code-buffer retry: estimate short, re-lowering at {retry} bytes");
+    }
+    lower_inner_sized(
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        branch_hints,
+        sr_map,
+        direct_calls,
+        ic_slots,
+        compact_fields,
+        retry,
+    )
+}
+
+/// [`lower_inner`]'s body, with an explicit code-buffer floor so the retry can
+/// re-run it at a size the first attempt measured.
+#[allow(clippy::too_many_arguments)]
+fn lower_inner_sized(
     graph: &Graph,
     schedule: &Schedule,
     num_params: usize,
@@ -5618,6 +5728,9 @@ pub(crate) fn lower_inner(
     // descriptor tag)` for every resolved compact instance field. Empty ⇒ every
     // `Op::Load` takes the checked helper, as it always did.
     compact_fields: &HashMap<usize, (u32, bool, u8)>,
+    // Code-buffer floor. 0 on the first attempt (the estimate below decides);
+    // the size the first attempt measured on a retry. See [`lower_inner`].
+    min_capacity: usize,
 ) -> Option<CompiledMethod> {
     // A live object allocation is now supported by the common allocation
     // stub. A zero helper pointer is only possible in synthetic unit-test
@@ -5731,7 +5844,12 @@ pub(crate) fn lower_inner(
         .saturating_mul(32)
         .saturating_add(call_nodes.saturating_mul(448))
         .saturating_add(1024);
-    let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
+    let capacity = estimated_size.max(4096).max(min_capacity);
+    let mut buf = ExecutableBuffer::new(capacity)?;
+    buf.set_tag("ir-lower");
+    // The first attempt's overflow is a measurement the retry consumes, not a
+    // failure; only a retry that ALSO overflows is worth a warning.
+    buf.set_quiet_overflow(min_capacity == 0);
 
     let mut lowerer = Lowerer::new(
         graph,
@@ -5949,9 +6067,15 @@ pub(crate) fn lower_inner(
     // estimate materially harder, so check it here and let the caller fall back
     // to single-pass, exactly like the unallocated-slot latch above.
     if buf.overflowed() {
+        // `pos()` FREEZES at the first dropped write, so it reports how far
+        // emission got, not how much room the body needs — measured
+        // understatements of more than 2x. `wanted()` counts every byte codegen
+        // asked for, dropped writes included, which is both the honest figure
+        // for the bailout record and the exact size [`lower_inner`] retries at.
+        IR_CODE_BUFFER_WANTED.with(|c| c.set(buf.wanted()));
         return refuse(Bailout::new(BailoutReason::CodeBufferExhausted {
-            needed: buf.pos(),
-            capacity: estimated_size.max(4096),
+            needed: buf.wanted(),
+            capacity,
         }));
     }
     let _code_size = buf.pos();

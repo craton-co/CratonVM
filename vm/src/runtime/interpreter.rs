@@ -13107,11 +13107,17 @@ pub(crate) fn find_jit_exception_handler(
 /// (`docs/known-issues/repros/jitban-remaining-20260726/`).
 ///
 /// Resuming at the handler keeps the compiled prefix's single execution and
-/// runs only the cleanup the compiled body skipped. Locals are the callee's
-/// incoming arguments, which is the same verifier-consistent state
-/// `route_jit_exception_through_method` uses and is sound for exactly the same
-/// reason: a compiled method whose handler reads a local first assigned inside
-/// the try never passes the `local_handler_reads_unsafe_local` compile gate.
+/// runs only the cleanup the compiled body skipped.
+///
+/// Locals come from the precise exceptional frame the compiled callee published
+/// when it unwound, and fall back to that callee's incoming arguments — the same
+/// verifier-consistent state `route_jit_exception_through_method` uses — only
+/// when no such frame is available. The fallback is sound only for a method
+/// whose handler reads nothing but `this`/parameters, which is exactly
+/// `cratonvm_jit::handler_reads_non_param_local`. It used to be sound
+/// unconditionally, because `local_handler_reads_unsafe_local` refused to
+/// compile anything else; the precise-handler-frame relaxation retired that
+/// refusal and this path was never updated with it.
 ///
 /// Returns `None` when no handler in `cached` covers `throw_pc`, leaving the
 /// caller to propagate the exception unchanged.
@@ -13123,16 +13129,74 @@ pub(crate) fn run_jit_callee_handler(
     exc: ObjectRef,
     incoming_args: &[Value],
 ) -> Option<MethodCallResult> {
-    let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
-    let mut synchronized_args = cached.is_synchronized.then(|| incoming_args.to_vec());
-    let synchronized_monitor = match synchronized_args.as_mut() {
-        Some(args) => match JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args) {
-            Ok(monitor) => Some(monitor),
-            Err(error) => return Some(Err(error)),
-        },
+    // Prefer the precise exceptional frame the compiled callee published as it
+    // unwound. `route_jit_signal_exception` has always consumed it; this path —
+    // the JIT-to-JIT dispatch resume — did not, and so rebuilt the handler frame
+    // with every non-parameter local zeroed.
+    //
+    // Witness: Spring Boot's
+    // `BindConverter.convert(Object, TypeDescriptor, TypeDescriptor)` catches
+    // `ConversionException` inside `for (ConversionService delegate :
+    // this.delegates)`. Its handler falls through to the loop back-edge, which
+    // reloads the enhanced-for iterator from local 5 — reconstructed as null
+    // here, so every Spring Boot context boot died with `NullPointerException:
+    // Cannot invoke "java.util.Iterator.hasNext()" because "<local5>" is null`,
+    // surfacing as `BindException: Failed to bind properties under
+    // 'spring.main.allow-bean-definition-overriding' to boolean`. 23 of 26
+    // `BasicErrorControllerIntegrationTests` tests failed under JIT and passed
+    // under `--nojit`.
+    let precise = match cratonvm_jit::deopt::take_exceptional_frame() {
+        Some(rframe)
+            if deopt_frame_matches_method(
+                &rframe,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            ) =>
+        {
+            ir_deopt_locals(&rframe.locals).map(|locals| (rframe.bci as usize, locals))
+        }
+        // A frame naming some OTHER method is still in flight for whoever owns
+        // it; put it back exactly as found rather than consume it here.
+        Some(foreign) => {
+            cratonvm_jit::deopt::restash_exceptional_frame(foreign);
+            None
+        }
         None => None,
     };
-    let incoming_args = synchronized_args.as_deref().unwrap_or(incoming_args);
+    // No precise frame, and this method's handler can read a local the
+    // params-only reconstruction cannot recover: refuse, leaving the caller to
+    // re-run the callee from its entry. That re-run replays the pre-throw prefix
+    // (the `finally`-counter leak this function exists to avoid), but it
+    // recovers every local by actually computing it. Silently substituting
+    // null/zero for a live local is the worse of the two.
+    if precise.is_none() {
+        // `cached.code` carries 2 bytes of speculative-read padding.
+        let code_len = cached.code.len().saturating_sub(2);
+        if cratonvm_jit::handler_reads_non_param_local(
+            &cached.code,
+            code_len,
+            &cached.exception_table,
+            &cached.method_descriptor,
+            cached.is_static,
+        ) {
+            return None;
+        }
+    }
+    let (throw_pc, mut handler_locals) = match precise {
+        Some((bci, locals)) => (bci, locals),
+        None => (throw_pc, incoming_args.to_vec()),
+    };
+    let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
+    let synchronized_monitor = if cached.is_synchronized {
+        match JitSynchronizedMonitorGuard::acquire(shared, thread, cached, &mut handler_locals) {
+            Ok(monitor) => Some(monitor),
+            Err(error) => return Some(Err(error)),
+        }
+    } else {
+        None
+    };
+    let incoming_args: &[Value] = &handler_locals;
     thread.refill_pools_from_shared(
         &shared.mem.operand_stack_pool,
         &shared.mem.tag_pool,
