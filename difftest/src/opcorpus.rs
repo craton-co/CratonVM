@@ -117,7 +117,7 @@ impl OpcodeSupport {
     pub fn reason(&self) -> Option<&'static str> {
         match self {
             OpcodeSupport::Generated => None,
-            OpcodeSupport::UnreachableFromSource(r) | OpcodeSupport::Skipped(r) => Some(r),
+            OpcodeSupport::UnreachableFromSource(r) | OpcodeSupport::Skipped(r) => Some(*r),
         }
     }
 }

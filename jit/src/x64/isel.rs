@@ -66,8 +66,8 @@
 //! Inherited from the parent module: no panics, no `unwrap`/`expect` outside
 //! `#[cfg(test)]`. Every fallible operation returns [`SelError`].
 
-use super::{base_requires_sib, Disp, DispOutOfRange};
-use super::{RAX, RCX, RDX, RSP};
+use super::{base_requires_sib, is_extended, rex, Disp, DispOutOfRange};
+use super::{GPR64_NAMES, RAX, RCX, RDX, RSP, XMM_NAMES};
 
 // ---------------------------------------------------------------------------
 // Operations, types and operand kinds
@@ -946,27 +946,25 @@ impl Pattern {
             ),
         };
 
-        let mut rex = 0x40u8;
-        if self.enc.rex_w {
-            rex |= 0x08;
-        }
-        if !matches!(self.enc.reg, RegF::Ext(_)) && reg_num >= 8 {
-            rex |= 0x04;
-        }
-        if index_num >= 8 {
-            rex |= 0x02;
-        }
-        if rm_num >= 8 {
-            rex |= 0x01;
-        }
+        // An opcode extension `/n` occupies the ModRM `reg` field but is not a
+        // register, so it never contributes REX.R.
+        let rex_r = !matches!(self.enc.reg, RegF::Ext(_)) && is_extended(reg_num);
+        let rex_byte = rex(
+            self.enc.rex_w,
+            rex_r,
+            is_extended(index_num),
+            is_extended(rm_num),
+        );
         match self.enc.rex {
             RexMode::Never => {}
             RexMode::OnDemand => {
-                if rex != 0x40 {
-                    out.bytes.push(rex);
+                // 0x40 carries no information; the hand-written emitters omit
+                // it and so must the table.
+                if rex_byte != 0x40 {
+                    out.bytes.push(rex_byte);
                 }
             }
-            RexMode::Always => out.bytes.push(rex),
+            RexMode::Always => out.bytes.push(rex_byte),
         }
 
         match self.enc.opcode {
@@ -3666,6 +3664,15 @@ mod tests {
         let short = select(&gpr_imm(Op::Add, Ty::I64, RAX, 127)).expect("127");
         let long = select(&gpr_imm(Op::Add, Ty::I64, RAX, 128)).expect("128");
         assert_eq!(short.encoded.bytes.len() + 3, long.encoded.bytes.len());
+
+        // The zeroing idiom is NOT flag-neutral. `emit_mov_imm64` substitutes
+        // it unconditionally and so does the selector, which is faithful — but
+        // the table records the difference, so a future caller that needs the
+        // flags preserved across the move has something to consult instead of
+        // reading the emitter.
+        assert!(pattern("mov_r64_imm0_xor").expect("row").flags.writes);
+        assert!(!pattern("mov_r64_imm32").expect("row").flags.writes);
+        assert!(!pattern("mov_r64_imm64").expect("row").flags.writes);
     }
 
     /// The smallest-form and forced-width memory rows are different answers
