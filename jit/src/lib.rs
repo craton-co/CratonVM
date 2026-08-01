@@ -9296,6 +9296,14 @@ fn escape_analysis_from_ir(
         }
     }
 
+    // IR nodes this bridge classified as `escape_analysis::Op::IdentityHash`.
+    // Recorded in the first pass and consulted in the second, so the op choice
+    // and the operand re-packing can never disagree about which calls are
+    // intrinsics (an `IdentityHash` whose input 0 is the CONTROL edge would
+    // attribute the observation to the wrong node — or to none).
+    let mut identity_hash_calls: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+
     // First pass: create EA nodes for everything except entry/exit.
     for i in 0..ir_node_count {
         let ir_id = i as ir::NodeId;
@@ -9319,6 +9327,28 @@ fn escape_analysis_from_ir(
                 Some(f) => escape_analysis::Op::Store(f),
                 None => ir_op_to_ea_op(&ir_node.op),
             },
+            // ── Identity observations (docs/jit/escape-analysis.md §4, §6.2) ──
+            //
+            // Both arms below were previously fail-closed *by accident*: an
+            // `ir::Op::Cmp` hit `ir_op_to_ea_op`'s `Op::Other` catch-all and an
+            // identity-hash call hit `EaOp::Call`, whose rule escapes every
+            // reference argument. The outcome was right and the reason was not
+            // — it was unmeasurable, and it would silently become WRONG if
+            // `Op::Other` were relaxed or `Op::Call` ever gained an "inlined
+            // intrinsic, does not escape" arm.
+            //
+            // `EaOp::RefCompare` observes ALL its inputs and `EaOp::IdentityHash`
+            // observes input 0 (`escape_analysis::find_identity_observations`),
+            // and neither escapes anything — so misclassifying a node INTO
+            // either variant would be a relaxation. Both predicates are
+            // therefore written to fire only on a shape that provably is one.
+            ir::Op::Cmp(_) if ir_cmp_is_ref_compare(ir_graph, ir_node) => {
+                escape_analysis::Op::RefCompare
+            }
+            ir::Op::Call { info_ptr } if ir_call_is_identity_hash(ir_node, *info_ptr) => {
+                identity_hash_calls.insert(i);
+                escape_analysis::Op::IdentityHash
+            }
             _ => ir_op_to_ea_op(&ir_node.op),
         };
         // Don't wire inputs yet — we need all id_map entries populated.
@@ -9348,6 +9378,19 @@ fn escape_analysis_from_ir(
                 vec![map_id(ir_node.inputs[2]), map_id(ir_node.inputs[4])]
             }
             ir::Op::Load(_) if ir_node.inputs.len() >= 3 => vec![map_id(ir_node.inputs[2])],
+            // `escape_analysis::Op::IdentityHash` reads the observed reference
+            // at input 0 — the same slot `Op::MonitorEnter` uses, so the two
+            // agree about which object a header read names. The IR call carries
+            // `[ctrl, mem, args…]`, so the observed reference is input 2.
+            // Forwarding verbatim would attribute the observation to the
+            // CONTROL edge and let the real receiver slip through unobserved.
+            // `ir_call_is_identity_hash` already required the arity.
+            ir::Op::Call { .. } if identity_hash_calls.contains(&i) => {
+                vec![map_id(ir_node.inputs[2])]
+            }
+            // `Op::Cmp` → `Op::RefCompare` needs NO re-packing: the IR node's
+            // inputs are `[left, right]` and `find_identity_observations` reads
+            // every input of a `RefCompare`.
             _ => ir_node.inputs.iter().map(|&inp| map_id(inp)).collect(),
         };
         ea.nodes[ea_id].inputs = ea_inputs.clone();
@@ -9361,6 +9404,123 @@ fn escape_analysis_from_ir(
 
     (ea, id_map)
 }
+
+/// True when `node` (an `ir::Op::Cmp`) is an `if_acmpeq`/`if_acmpne` — a
+/// comparison of two object *addresses*, which is one of the three ways the JVM
+/// observes an object's identity without publishing it.
+///
+/// Two shapes are deliberately excluded, because neither observes an address:
+///
+/// * a comparison with a non-`Ref` operand — an `if_icmp*` or a `lcmp`/`fcmp`
+///   result test, which never sees a reference at all;
+/// * **`ifnull` / `ifnonnull`**. The builder lowers those to the same
+///   `Op::Cmp` against `aconst_null`, which is an `Op::Const(0)` typed
+///   `IrType::Ref` — so a pure "both operands are `Ref`" test would classify
+///   every null check in the program as an identity observation and refuse
+///   scalar replacement for every object that is ever null-checked. A fresh
+///   allocation is non-null by construction, so `o == null` reads no address;
+///   it is answerable without the object existing. Only the *null literal* is
+///   excluded, not `Op::Const` in general — an interned constant oop, if one is
+///   ever introduced, must keep being treated as a real reference.
+fn ir_cmp_is_ref_compare(ir_graph: &ir::Graph, node: &ir::Node) -> bool {
+    if node.inputs.len() < 2 {
+        return false;
+    }
+    node.inputs[..2].iter().all(|&inp| {
+        ir_graph
+            .nodes
+            .get(inp as usize)
+            .is_some_and(|n| n.ty == ir::IrType::Ref && n.op != ir::Op::Const(0))
+    })
+}
+
+/// True when an `ir::Op::Call` is a **resolved** identity-hash intrinsic, whose
+/// argument's address is therefore observed.
+///
+/// This is a *relaxation* — it stops the call escaping its reference arguments
+/// through the `escape_analysis::Op::Call` rule — so it fires only where the
+/// target is provably `Object`'s header-derived hash, never on a virtual call
+/// that could dispatch to an override:
+///
+/// * `System.identityHashCode` is `static`: its answer is the header hash of
+///   whatever it is handed, whatever that object's class does with `hashCode`.
+/// * `Object.hashCode()` is accepted **only for `invokespecial`**
+///   (`invoke_kind == 1`, i.e. a `super.hashCode()` call), which is
+///   non-virtual and so provably lands on `Object`'s implementation. A
+///   *virtual* `hashCode()` on a receiver declared `java/lang/Object` can still
+///   dispatch to any override, and this bridge has no class hierarchy to prove
+///   otherwise — so it keeps the fail-closed `EaOp::Call` mapping.
+///
+/// The arity check is load-bearing: the second pass re-packs the observed
+/// reference from input 2 into `EaOp::IdentityHash`'s input 0, and an
+/// `IdentityHash` with no input observes *nothing* while also no longer
+/// escaping the receiver.
+///
+/// SAFETY / contract: `info_ptr` is the address of a `JitInvokeInfo` kept alive
+/// for the whole compile by the `CompiledMethod`'s `_jit_invoke_infos` arena —
+/// the same contract `ir_lower`'s `Op::Call` arm relies on when it reads
+/// `invoke_kind`. A hand-built test graph that wants an `Op::Call` must use
+/// `info_ptr: 0` (rejected here without a dereference) or a real interned info.
+fn ir_call_is_identity_hash(node: &ir::Node, info_ptr: usize) -> bool {
+    // `[ctrl, mem, arg0]` — the observed reference is arg0.
+    if info_ptr == 0 || node.inputs.len() < 3 {
+        return false;
+    }
+    let info = unsafe { &*(info_ptr as *const JitInvokeInfo) };
+    match (info.class_name, info.method_name, info.descriptor) {
+        // invoke_kind 3 = static.
+        ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I") => info.invoke_kind == 3,
+        // invoke_kind 1 = special (non-virtual).
+        ("java/lang/Object", "hashCode", "()I") => info.invoke_kind == 1,
+        _ => false,
+    }
+}
+
+// ── The monitor half of the bridge (docs/jit/lock-elimination.md §6.2) ──
+//
+// NOT WIRED, and not for want of an arm here: **`ir::Op` has no
+// `MonitorEnter`/`MonitorExit` variant at all.** `ir::MemEffect::monitor_enter`
+// / `monitor_exit` exist and classify a monitor as `MemOrder::Acquire`/`Release`
+// with `safepoint: true`, but their own doc says `monitorenter` has no IR
+// lowering, so a synchronized method bails to the single-pass backend before it
+// ever reaches this bridge. That bail — not this file — is the gate on lock
+// elision and lock coarsening running in production.
+//
+// When the variants land, add to `escape_analysis_from_ir`'s FIRST-pass
+// `match &ir_node.op` (op choice):
+//
+//     ir::Op::MonitorEnter => escape_analysis::Op::MonitorEnter,
+//     ir::Op::MonitorExit  => escape_analysis::Op::MonitorExit,
+//
+// and to its SECOND-pass `match &ir_node.op` (operand re-packing) — this half
+// is the one that is easy to get wrong:
+//
+//     ir::Op::MonitorEnter | ir::Op::MonitorExit if ir_node.inputs.len() >= 3 => {
+//         // EA layout contract: the locked reference is input 0. The IR node
+//         // carries `[ctrl, mem, obj]`, exactly like `Load`/`Store`. Forwarding
+//         // verbatim attributes the monitor to the MEMORY TOKEN.
+//         vec![map_id(ir_node.inputs[2])]
+//     }
+//
+// `apply_ea_to_ir`'s elision loop is already all-or-nothing per object, which
+// is the precondition `docs/jit/lock-elimination.md` §6.1 requires to be in
+// place *before* this block is uncommented.
+//
+// `Object.wait`/`notify`/`notifyAll` ⇒ `EaOp::MonitorWait`/`MonitorNotify` are
+// deliberately NOT wired ahead of the variants either. Those mappings are
+// relaxations (they stop escaping the receiver through the `Op::Call` rule),
+// and with no `MonitorEnter` in the graph they would buy nothing: their only
+// consumers are the `E3` refusal (`waits_or_notifies_on`) and the identity
+// gate, both of which need monitors to exist before they can decide anything.
+// Wire them in the same change as the variants, not before.
+//
+// `athrow` ⇒ `EaOp::Throw` cannot be wired at all: `ir::Op` has no throw and
+// `ir::IrBuilder` rejects the whole method when `scan.has_athrow` (there is no
+// athrow lowering — see the `ir_reject("scan.has_athrow")` gate). So no IR
+// graph reaching this bridge contains a throw, and `EaOp::Throw` stays
+// producerless until handler bodies are compiled. Note for whoever does that:
+// `escape_analysis::program_order_proves_dominance` explicitly assumes the
+// absence of exception control flow and must gain a `may_throw` term then.
 
 /// Map a single `ir::Op` variant to its `escape_analysis::Op` counterpart.
 fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
@@ -9432,6 +9592,158 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
 // names — whereas an eliminated `Op::New` must KEEP being named by its snapshot
 // slots, because that slot is the virtual-object descriptor
 // `ir_lower::resolve_frame_state` resolves through `ScalarReplacementMap`.
+
+// ---------------------------------------------------------------------------
+// Escape analysis: cold-path information
+// ---------------------------------------------------------------------------
+
+/// The control-flow predecessors of `node`, as input indices.
+///
+/// DE-DUPLICATION NOTE: this is `ir_verify::control_input_indices`
+/// (ir_verify.rs:482), which is private to that module. Making that declaration
+/// `pub(crate) fn` lets this one be deleted and the original imported instead;
+/// the two must stay in step because a control edge this function does not see
+/// is a path `ea_cold_control_nodes` will not consider when deciding a merge is
+/// cold.
+fn ea_control_preds(node: &ir::Node) -> &[ir::NodeId] {
+    match node.op {
+        // A merge takes one control edge per predecessor.
+        ir::Op::Merge | ir::Op::Region => node.inputs.as_slice(),
+        // Everything else pins control at input 0 (when it has one at all).
+        ir::Op::Return
+        | ir::Op::If
+        | ir::Op::Proj(_)
+        | ir::Op::Guard { .. }
+        | ir::Op::Load(_)
+        | ir::Op::Store(_)
+        | ir::Op::ArrayLoad(_)
+        | ir::Op::ArrayStore(_)
+        | ir::Op::New { .. }
+        | ir::Op::NewArray { .. }
+        | ir::Op::Call { .. }
+        | ir::Op::LambdaIntToDouble => &node.inputs[..node.inputs.len().min(1)],
+        // Start, and every floating pure node (Const, Add, Cmp, Phi, …). A node
+        // with no control input has no fixed position, so it is never cold.
+        _ => &[],
+    }
+}
+
+/// Every IR node that executes only on a profiled-cold path.
+///
+/// This is the producer `escape_analysis::Graph::cold_nodes` never had. Without
+/// it `EscapeAnalysisResult::partial_escapes` is always empty and the
+/// `EscapeState::PartialEscape` lattice level is dead code — see
+/// `docs/jit/escape-analysis.md` §2 and §6.3.
+///
+/// # What "cold" means here, exactly
+///
+/// `hints` is the `ir_branch_hints` map: keyed by a conditional branch's
+/// bytecode PC (`Node::bytecode_pc` on the `Op::If`), value `true` = usually
+/// TAKEN, `false` = usually NOT taken. The builder gives `Op::If` a `Proj(0)`
+/// true edge that goes to the branch target and a `Proj(1)` false edge that
+/// falls through, so the *cold* projection is `Proj(1)` for a usually-taken
+/// branch and `Proj(0)` for a usually-not-taken one.
+///
+/// `profile::BranchCounts` decides "usually" at 90/10 with ≥ 20 samples, so this
+/// is a **bias, not a proof of never**. That is why it may only ever feed the
+/// reported-only `PartialEscape` classification: an object reported partial has
+/// still escaped for real, and every *acting* consumer (`find_scalar_replacements`,
+/// `find_lock_elisions`) tests the connection graph's unrefined state. A future
+/// partial-escape applier that actually sinks an allocation should tighten this
+/// source to a never-observed edge before relying on it.
+///
+/// # Why over-marking is safe and under-marking is the default
+///
+/// `Graph::mark_cold` is additive and monotone: more cold nodes can only move
+/// an allocation from `ArgEscape`/`GlobalEscape` to the reported
+/// `PartialEscape`, which no consumer acts on. The propagation below is
+/// nevertheless deliberately conservative in the *under*-marking direction:
+///
+/// * a `Merge`/`Region` is cold only when EVERY predecessor is cold;
+/// * consequently a loop whose header is entered coldly never converges to
+///   cold, because its back edge is only cold once the header is — a precision
+///   loss, not a soundness one;
+/// * a node with no control input (a floating `Const`/`Add`/`Phi`) is never
+///   cold, because it has no fixed position to be cold at.
+fn ea_cold_control_nodes(
+    ir_graph: &ir::Graph,
+    hints: &HashMap<usize, bool>,
+) -> std::collections::HashSet<ir::NodeId> {
+    let mut cold: std::collections::HashSet<ir::NodeId> = std::collections::HashSet::new();
+    if hints.is_empty() {
+        return cold;
+    }
+
+    // Seed: the never-taken projection of each profiled `Op::If`.
+    for (idx, n) in ir_graph.nodes.iter().enumerate() {
+        if n.op != ir::Op::If {
+            continue;
+        }
+        let usually_taken = match n.bytecode_pc.and_then(|pc| hints.get(&pc)) {
+            Some(&t) => t,
+            None => continue, // inconclusive profile — nothing is cold here
+        };
+        let cold_proj = if usually_taken { 1u8 } else { 0u8 };
+        let if_id = idx as ir::NodeId;
+        for (pidx, p) in ir_graph.nodes.iter().enumerate() {
+            if p.op == ir::Op::Proj(cold_proj) && p.inputs.first() == Some(&if_id) {
+                cold.insert(pidx as ir::NodeId);
+            }
+        }
+    }
+    if cold.is_empty() {
+        return cold;
+    }
+
+    // Forward closure. Bounded by the node count: each round adds at least one
+    // node or stops, and a node is never removed.
+    for _ in 0..ir_graph.nodes.len() {
+        let mut changed = false;
+        for (idx, n) in ir_graph.nodes.iter().enumerate() {
+            let id = idx as ir::NodeId;
+            if n.op == ir::Op::Dead || cold.contains(&id) {
+                continue;
+            }
+            let preds = ea_control_preds(n);
+            if preds.is_empty() {
+                continue;
+            }
+            if preds.iter().all(|p| cold.contains(p)) {
+                cold.insert(id);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    cold
+}
+
+/// Feed the profiled cold paths into an EA graph built by
+/// [`escape_analysis_from_ir`], translating IR ids through the same `id_map`
+/// the results are read back through.
+///
+/// Call it between the bridge and `escape_analysis::analyze_escapes`; with an
+/// empty `hints` map (profiling off — the default) it marks nothing and the
+/// analysis is byte-identical to what it was before.
+fn ea_mark_cold_from_branch_hints(
+    ea: &mut escape_analysis::Graph,
+    ir_graph: &ir::Graph,
+    id_map: &[escape_analysis::NodeId],
+    hints: &HashMap<usize, bool>,
+) {
+    for ir_id in ea_cold_control_nodes(ir_graph, hints) {
+        // A node the bridge did not translate (`usize::MAX`) names nothing in
+        // the EA graph; skipping it only under-marks, which is the safe way to
+        // be wrong here.
+        if let Some(&ea_id) = id_map.get(ir_id as usize) {
+            if ea_id != usize::MAX {
+                ea.mark_cold(ea_id);
+            }
+        }
+    }
+}
 
 /// The input slot carrying `node`'s incoming memory token, or `None` when this
 /// op does not consume one.
@@ -9557,7 +9869,10 @@ fn plan_scalar_replacement(
         }
     };
 
-    let mut loads: Vec<(ir::NodeId, usize)> = Vec::new();
+    // Each load is kept with the EA node it came from, because the per-load
+    // answer below is keyed by EA id — no forward `id_map` lookup is needed,
+    // the EA id is already in hand here.
+    let mut loads: Vec<(ir::NodeId, escape_analysis::NodeId)> = Vec::new();
     for &ea_load in &info.replaced_loads {
         // An EA node with no IR counterpart names nothing we can kill.
         let l = match reverse_map.get(&ea_load) {
@@ -9567,9 +9882,16 @@ fn plan_scalar_replacement(
         if !matches!(ir_graph.node_opt(l)?.op, ir::Op::Load(_)) {
             return None;
         }
-        loads.push((l, field_index(l)?));
+        // Bridge/analysis agreement check. The index itself is no longer used
+        // to pick the forwarded value (`info.load_value` answers that), but a
+        // node whose field index cannot be recovered is one the bridge and the
+        // analysis disagree about — refuse rather than guess.
+        if field_index(l).is_none() {
+            return None;
+        }
+        loads.push((l, ea_load));
     }
-    let mut stores: Vec<(ir::NodeId, usize)> = Vec::new();
+    let mut stores: Vec<ir::NodeId> = Vec::new();
     for &ea_store in &info.eliminated_stores {
         let s = match reverse_map.get(&ea_store) {
             Some(&s) => s,
@@ -9578,44 +9900,53 @@ fn plan_scalar_replacement(
         if !matches!(ir_graph.node_opt(s)?.op, ir::Op::Store(_)) {
             return None;
         }
-        stores.push((s, field_index(s)?));
-    }
-
-    // LAST-WRITE-WINS HAZARD. `info.field_values[f]` records the value of the
-    // LAST store to field `f` in program order, and this pass forwards *every*
-    // replaced load of `f` to it — including a load that runs BEFORE that store
-    // and therefore reads a value the object does not hold yet (`Foo o = new
-    // Foo(); int a = o.x; o.x = 42;` would fold `a` to 42). Node ids are
-    // assigned in creation = program order, the same ordering
-    // `escape_analysis::find_scalar_replacements` itself uses to pick the
-    // winning store, so a store id above a load id means the store is later.
-    // Refuse the object rather than forward a value from its future.
-    for &(l, lf) in &loads {
-        if stores.iter().any(|&(s, sf)| sf == lf && s > l) {
+        if field_index(s).is_none() {
             return None;
         }
+        stores.push(s);
     }
 
+    // ── Per-load resolution (NOT `field_values`) ─────────────────────
+    //
+    // `info.field_values[f]` is the value of the LAST store to `f` in program
+    // order. Forwarding *every* replaced load of `f` to it folds
+    // `Foo o = new Foo(); int a = o.x; o.x = 42;` to `a == 42` — a value from
+    // the load's own future. This pass used to do exactly that, and guarded it
+    // with an id-comparison refusal ("refuse the object if any store to the
+    // loaded field has a higher node id than the load"). That guard was correct
+    // but pessimistic, and it did nothing for the branchy variant
+    // (`if (c) o.x = 1; else o.x = 2; int a = o.x;`), where no store has a
+    // higher id than the load yet `field_values[f]` is still the wrong answer
+    // on one path.
+    //
+    // `escape_analysis::ScalarReplacementInfo::load_value` replaces both. It is
+    // three-valued on purpose — collapsing `ZeroDefault` and `Unknown` into one
+    // `Option<NodeId>` is precisely how a load-before-store gets a value from
+    // its future — and it is gated on
+    // `escape_analysis::program_order_proves_dominance`, so the branchy graph
+    // above answers `Unknown` and is refused here rather than mis-forwarded.
+    // See `docs/jit/escape-analysis.md` §3 and §6.1.
     let mut load_plans: Vec<(ir::NodeId, Option<ir::NodeId>)> = Vec::with_capacity(loads.len());
-    for &(l, f) in &loads {
-        // The value the load resolves to: the stored field value, or — when the
-        // field was never stored — the freshly-allocated object's zero default
-        // (`None` here; the caller materialises one shared `Const(0)`).
-        // Soundness of that default rests on the object being genuinely
-        // zero-initialised: the front end only admits allocations whose
-        // constructor sets no non-zero field.
-        let value = match info.field_values.get(f) {
-            Some(Some(ea_val)) => match reverse_map.get(ea_val) {
+    for &(l, ea_load) in &loads {
+        let value = match info.load_value(ea_load) {
+            escape_analysis::LoadResolution::Value(ea_val) => match reverse_map.get(&ea_val) {
                 Some(&v) if ir_graph.node_opt(v).is_some_and(|n| n.op != ir::Op::Dead) => Some(v),
                 // The stored value has no live IR node, so this load cannot be
                 // described. REFUSE — the previous code killed the load anyway
                 // and left its consumers reading an `Op::Dead` node.
                 _ => return None,
             },
-            Some(None) => None,
-            // Field index outside the object's field vector: the bridge and the
-            // analysis disagree about this access. Refuse rather than guess.
-            None => return None,
+            // No store precedes the load: it reads the freshly-allocated
+            // object's zero default (`None` here; the caller materialises one
+            // shared `Const(0)`). Soundness rests on the object being genuinely
+            // zero-initialised — the front end only admits allocations whose
+            // constructor sets no non-zero field.
+            escape_analysis::LoadResolution::ZeroDefault => None,
+            // Not provable (a branchy graph, or a load this candidate does not
+            // describe at all). The analysis already refuses such an object
+            // outright, so this is unreachable — but it is the one answer that
+            // must never be guessed at, so fail closed rather than assume.
+            escape_analysis::LoadResolution::Unknown => return None,
         };
         load_plans.push((l, value));
     }
@@ -9643,7 +9974,7 @@ fn plan_scalar_replacement(
     // resolves the ordinary way (`StackSlotRef`), and the load forwarding above
     // still applies: this costs the elided allocation, not the optimization.
     let mut elide_alloc = true;
-    if stores.iter().any(|&(s, _)| ea_snapshot_names(ir_graph, s)) {
+    if stores.iter().any(|&s| ea_snapshot_names(ir_graph, s)) {
         // A snapshot naming a `Store` is already malformed — a store produces no
         // value a frame can be rebuilt from — but it is not this pass's business
         // to silently retarget it.
@@ -9656,9 +9987,7 @@ fn plan_scalar_replacement(
         elide_alloc = false;
     }
     if !ea_splice_feasible(ir_graph, new_node)
-        || stores
-            .iter()
-            .any(|&(s, _)| !ea_splice_feasible(ir_graph, s))
+        || stores.iter().any(|&s| !ea_splice_feasible(ir_graph, s))
     {
         elide_alloc = false;
     }
@@ -9671,13 +10000,13 @@ fn plan_scalar_replacement(
             let id = idx as ir::NodeId;
             if n.op == ir::Op::Dead
                 || id == new_node
-                || stores.iter().any(|&(s, _)| s == id)
+                || stores.contains(&id)
                 || load_plans.iter().any(|&(l, _)| l == id)
             {
                 continue;
             }
             for (i, &inp) in n.inputs.iter().enumerate() {
-                let names_victim = inp == new_node || stores.iter().any(|&(s, _)| s == inp);
+                let names_victim = inp == new_node || stores.contains(&inp);
                 if names_victim && !ea_is_memory_token_slot(n, i) {
                     elide_alloc = false;
                     break 'outer;
@@ -9692,7 +10021,7 @@ fn plan_scalar_replacement(
     Some(EaScalarPlan {
         loads: load_plans,
         new_node,
-        stores: stores.into_iter().map(|(s, _)| s).collect(),
+        stores,
         elide_alloc,
     })
 }
@@ -9788,35 +10117,66 @@ fn apply_ea_to_ir(
         }
     }
 
-    // Lock elision. `escape_analysis_from_ir` never produces
-    // `escape_analysis::Op::MonitorEnter` / `MonitorExit` (`ir_op_to_ea_op` has
-    // no arm that can), so `elide_locks` is empty for every IR-derived graph and
-    // this loop is a no-op today. It is kept — and now routed through the same
-    // splice and the same reference checks — so it cannot become the next chain
-    // break if a monitor op is added to the bridge. A monitor node that a
-    // snapshot slot or a value input still names is left ALIVE:
-    // `deopt::EliminationCause::ElidedLock` has no representation in a
-    // `SafepointSnapshot`, so the elision would be undescribable.
-    for &ea_lock in &ea_result.elide_locks {
-        let ir_lock = match reverse_map.get(&ea_lock) {
-            Some(&id) => id,
-            None => continue,
-        };
-        if ir_graph.node_opt(ir_lock).is_none()
-            || ea_snapshot_names(ir_graph, ir_lock)
-            || !ea_splice_feasible(ir_graph, ir_lock)
-        {
-            continue;
+    // ── Lock elision: ALL-OR-NOTHING PER OBJECT ──────────────────────
+    //
+    // This reads `ea_result.lock_elisions` (grouped per object), NOT the flat
+    // `ea_result.elide_locks`. The two carry the same monitors, but only the
+    // grouped view is *correct*: a monitor sequence is balanced as a whole, so
+    // dropping one node out of it leaves a `monitorexit` whose `monitorenter`
+    // was elided (`IllegalMonitorStateException`) or a monitor held past the end
+    // of the frame. The previous per-node loop applied exactly that partial
+    // filter — see `docs/jit/lock-elimination.md` §4 and §6.1.
+    //
+    // Each of the three refusals below is per NODE but decides the whole GROUP:
+    //
+    //   * a safepoint snapshot slot names the monitor —
+    //     `deopt::EliminationCause::ElidedLock` has no representation in a
+    //     `SafepointSnapshot`, so the elision would be undescribable;
+    //   * its memory-token chain cannot be spliced;
+    //   * some non-token input still reads its value.
+    //
+    // `escape_analysis_from_ir` still produces no `escape_analysis::Op::
+    // MonitorEnter` / `MonitorExit` (`ir::Op` has no monitor variant at all —
+    // see the ready-to-uncomment block in `escape_analysis_from_ir`), so
+    // `lock_elisions` is empty for every IR-derived graph and this loop is a
+    // no-op today. It is written correctly *first*, deliberately: bridging
+    // monitor ops while a per-node filter was in place is what would turn a
+    // latent hazard into a thrown `IllegalMonitorStateException`.
+    for plan in &ea_result.lock_elisions {
+        let mut group: Vec<ir::NodeId> = Vec::with_capacity(plan.monitors.len());
+        let mut ok = true;
+        for &ea_lock in &plan.monitors {
+            let ir_lock = match reverse_map.get(&ea_lock) {
+                Some(&id) => id,
+                // A monitor with no IR counterpart cannot be killed, and the
+                // group is only sound applied whole — so refuse the object.
+                None => {
+                    ok = false;
+                    break;
+                }
+            };
+            if ir_graph.node_opt(ir_lock).is_none()
+                || ea_snapshot_names(ir_graph, ir_lock)
+                || !ea_splice_feasible(ir_graph, ir_lock)
+            {
+                ok = false;
+                break;
+            }
+            let value_used = ir_graph.nodes.iter().any(|n| {
+                n.op != ir::Op::Dead
+                    && n.inputs
+                        .iter()
+                        .enumerate()
+                        .any(|(i, &inp)| inp == ir_lock && !ea_is_memory_token_slot(n, i))
+            });
+            if value_used {
+                ok = false;
+                break;
+            }
+            group.push(ir_lock);
         }
-        let value_used = ir_graph.nodes.iter().any(|n| {
-            n.op != ir::Op::Dead
-                && n.inputs
-                    .iter()
-                    .enumerate()
-                    .any(|(i, &inp)| inp == ir_lock && !ea_is_memory_token_slot(n, i))
-        });
-        if !value_used {
-            victims.push((ir_lock, EaVictimKind::Eliminated));
+        if ok {
+            victims.extend(group.into_iter().map(|id| (id, EaVictimKind::Eliminated)));
         }
     }
 
@@ -12615,6 +12975,38 @@ fn try_compile_inner(
                 // are both on; otherwise stays `None` ⇒ byte-identical lowering.
                 let mut sr_map: Option<ir_lower::ScalarReplacementMap> = None;
 
+                // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
+                // optimizing IR (C2) lowerer the profiled branch bias so it can
+                // pick each `Op::If`'s fall-through edge from the C1/interpreter
+                // profile — the IR analogue of the single-pass backend's
+                // `branch_hints`. Keyed by the branch instruction's bytecode PC
+                // (matching `Op::If::bytecode_pc` and the interpreter's
+                // `record_branch` PC). Empty when there is no profile (profiling
+                // off, the default) → byte-identical codegen.
+                //
+                // HOISTED above escape analysis (it used to be computed just
+                // before `lower_inner`) because EA is its second consumer: it is
+                // the cold-path producer `escape_analysis::Graph::cold_nodes`
+                // never had — see `ea_cold_control_nodes`. Same expression, same
+                // value; only the position moved, and it reads nothing the
+                // passes below mutate (`profile` is a parameter).
+                let ir_branch_hints: std::collections::HashMap<usize, bool> = profile
+                    .map(|prof| {
+                        prof.branches
+                            .iter()
+                            .filter_map(|(&pc, counts)| {
+                                if counts.is_usually_taken() {
+                                    Some((pc, true))
+                                } else if counts.is_usually_not_taken() {
+                                    Some((pc, false))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 // --- Escape analysis (Phase 41 + G46 wiring) ---
                 // Convert IR graph to escape analysis graph, run analysis,
                 // and apply scalar replacement / lock elision to the IR graph.
@@ -12626,7 +13018,19 @@ fn try_compile_inner(
                     // is still EA-only work.
                     let metrics_ea = metrics.phase(metrics::Phase::EscapeAnalysis);
                     let metrics_nodes_before_ea = graph.nodes.len();
-                    let (ea_graph, id_map) = escape_analysis_from_ir(&graph);
+                    let (mut ea_graph, id_map) = escape_analysis_from_ir(&graph);
+                    // Cold-path information (docs/jit/escape-analysis.md §6.3).
+                    // Without this `EscapeAnalysisResult::partial_escapes` is
+                    // always empty and `EscapeState::PartialEscape` is dead. It
+                    // is additive and reported-only: no acting consumer reads a
+                    // refined state, so an empty `ir_branch_hints` (profiling
+                    // off, the default) leaves the analysis byte-identical.
+                    ea_mark_cold_from_branch_hints(
+                        &mut ea_graph,
+                        &graph,
+                        &id_map,
+                        &ir_branch_hints,
+                    );
                     let ea_result = escape_analysis::analyze_escapes(&ea_graph);
                     // Live-fire soak diagnostic (CRATONVM_DBG_SCALAR_NEW): for an
                     // allocation-bearing method, report how many of its `new`s
@@ -12654,7 +13058,12 @@ fn try_compile_inner(
                             );
                         }
                     }
-                    if !ea_result.scalar_replaceable.is_empty() || !ea_result.elide_locks.is_empty()
+                    // Gated on `lock_elisions`, not the flat `elide_locks`, for
+                    // the same reason `apply_ea_to_ir` reads the grouped view:
+                    // one source of truth. The two are the same offers (the flat
+                    // list is their union), so this is not a behaviour change.
+                    if !ea_result.scalar_replaceable.is_empty()
+                        || !ea_result.lock_elisions.is_empty()
                     {
                         // Capture guard-surviving-SR metadata (gated) BEFORE
                         // `apply_ea_to_ir` marks the News/stores dead and clears
@@ -12747,30 +13156,6 @@ fn try_compile_inner(
                     let metrics_schedule = metrics.phase(metrics::Phase::Schedule);
                     let schedule = ir_schedule::schedule(&graph);
                     drop(metrics_schedule);
-                    // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
-                    // optimizing IR (C2) lowerer the profiled branch bias so it can
-                    // pick each `Op::If`'s fall-through edge from the C1/interpreter
-                    // profile — the IR analogue of the single-pass backend's
-                    // `branch_hints`. Keyed by the branch instruction's bytecode PC
-                    // (matching `Op::If::bytecode_pc` and the interpreter's
-                    // `record_branch` PC). Empty when there is no profile (profiling
-                    // off, the default) → byte-identical codegen.
-                    let ir_branch_hints: std::collections::HashMap<usize, bool> = profile
-                        .map(|prof| {
-                            prof.branches
-                                .iter()
-                                .filter_map(|(&pc, counts)| {
-                                    if counts.is_usually_taken() {
-                                        Some((pc, true))
-                                    } else if counts.is_usually_not_taken() {
-                                        Some((pc, false))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
                     // Supply BOTH the profiled branch hints (Step 4) and the
                     // guard-surviving scalar-replacement map (Front 3.2) to the
                     // shared lowering body. `sr_map` is `None` unless
@@ -16060,6 +16445,447 @@ mod tests {
             "a memory token must never be rewritten to a data replacement"
         );
         assert_memory_chain_intact(&f.g);
+    }
+
+    // ── Wiring the finished escape-analysis work ─────────────────────────
+    //
+    // `docs/jit/escape-analysis.md` §6 and `docs/jit/lock-elimination.md` §6
+    // list four consumer-side edits. The tests below pin the three that changed
+    // behaviour here (all-or-nothing lock elision, per-load forwarding, the
+    // identity bridge) plus the cold-path producer that makes
+    // `EscapeState::PartialEscape` reachable at all.
+
+    /// `[ctrl, mem, obj, off, val]` full-layout graph with a *stand-in* monitor
+    /// pair on a returned (therefore escaping) object, and a deopt snapshot
+    /// naming the second of the pair. Returns `(graph, obj, m_enter, m_exit)`.
+    ///
+    /// `ir::Op` has no `MonitorEnter`/`MonitorExit` variant (see the
+    /// ready-to-uncomment block next to `ir_call_is_identity_hash`), so real
+    /// monitor nodes cannot be built. Nothing is lost: `apply_ea_to_ir`'s lock
+    /// loop asks three questions of a monitor — is it snapshot-named, is its
+    /// memory token spliceable, is its value still read — and none of the three
+    /// is monitor-specific. Two ordinary `Op::Store`s answer them the same way.
+    fn ea_lock_group_fixture() -> (
+        crate::ir::Graph,
+        crate::ir::NodeId,
+        crate::ir::NodeId,
+        crate::ir::NodeId,
+    ) {
+        use crate::ir::{Graph, IrType, MemKind, Op, SafepointSnapshot, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        // The stand-in monitor pair. `m_enter` passes every check
+        // `apply_ea_to_ir` makes (its token is `mem`, and `m_exit` names it only
+        // in a TOKEN slot, so it has no value use); `m_exit` fails exactly one,
+        // `ea_snapshot_names`.
+        let m_enter = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, val],
+            None,
+        );
+        let m_exit = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, m_enter, newobj, off, val],
+            None,
+        );
+        // Publishing the object keeps scalar replacement out of this test: only
+        // the lock path can touch these nodes.
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, newobj], None);
+        g.entry = start;
+        g.exit = ret;
+        g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![m_exit],
+        });
+        (g, newobj, m_enter, m_exit)
+    }
+
+    // A lock group is ALL-OR-NOTHING PER OBJECT.
+    //
+    // `apply_ea_to_ir` used to filter the flat `elide_locks` list per NODE: a
+    // monitor a safepoint slot named was skipped and its siblings were killed
+    // anyway. That is how a balanced monitor sequence becomes a `monitorexit`
+    // whose `monitorenter` is gone — `IllegalMonitorStateException` — or a
+    // monitor held past the end of the frame. It now reads the grouped
+    // `lock_elisions`, where one refusal refuses the whole object.
+    //
+    // This is the edit `docs/jit/lock-elimination.md` §6.1 requires to land
+    // BEFORE monitor ops are bridged.
+    #[test]
+    fn ea_a_partially_refusable_lock_group_is_refused_whole() {
+        use crate::ir::Op;
+
+        let (mut g, newobj, m_enter, m_exit) = ea_lock_group_fixture();
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let mut result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            result.scalar_replaceable.is_empty(),
+            "precondition: the returned object escapes, so scalar replacement \
+             cannot be what kills (or spares) these nodes"
+        );
+
+        // The offer the analysis would make once monitors exist: both nodes,
+        // grouped under one object.
+        let ea_enter = id_map[m_enter as usize];
+        let ea_exit = id_map[m_exit as usize];
+        result.lock_elisions = vec![escape_analysis::LockElisionPlan {
+            object: id_map[newobj as usize],
+            monitors: vec![ea_enter, ea_exit],
+        }];
+        result.elide_locks = vec![ea_enter, ea_exit];
+
+        apply_ea_to_ir(&mut g, &id_map, &result);
+
+        assert_ne!(
+            g.nodes[m_exit as usize].op,
+            Op::Dead,
+            "the snapshot-named monitor is refused (unchanged behaviour)"
+        );
+        assert_ne!(
+            g.nodes[m_enter as usize].op,
+            Op::Dead,
+            "THE REGRESSION THIS PINS: its sibling must be refused too. Killing \
+             it alone leaves an unbalanced monitor sequence."
+        );
+        assert_memory_chain_intact(&g);
+    }
+
+    // The flat `elide_locks` list is no longer what drives the applier — it
+    // stays on `EscapeAnalysisResult` for diagnostics only. A result that offers
+    // monitors ONLY through the flat list must change nothing, because a flat
+    // list cannot express "these two go together".
+    #[test]
+    fn ea_the_flat_elide_locks_list_no_longer_drives_the_applier() {
+        use crate::ir::Op;
+
+        let (mut g, _newobj, m_enter, m_exit) = ea_lock_group_fixture();
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let mut result = escape_analysis::analyze_escapes(&ea);
+        result.lock_elisions.clear();
+        result.elide_locks = vec![id_map[m_enter as usize], id_map[m_exit as usize]];
+
+        apply_ea_to_ir(&mut g, &id_map, &result);
+
+        assert_ne!(g.nodes[m_enter as usize].op, Op::Dead);
+        assert_ne!(g.nodes[m_exit as usize].op, Op::Dead);
+    }
+
+    // POSITIONAL LOAD FORWARDING. `Foo o = new Foo(); o.x = 7; int a = o.x;
+    // o.x = 42; return a;` must return 7.
+    //
+    // `info.field_values[0]` is 42 (the LAST store), and forwarding it here is
+    // the miscompilation this branch already paid for once. The applier used to
+    // guard against it with its own id-comparison heuristic — "refuse the object
+    // if any store to the loaded field has a higher node id than the load" —
+    // which is correct but refuses the optimization outright. It now asks
+    // `escape_analysis::ScalarReplacementInfo::load_value`, which answers the
+    // store that actually precedes THIS load, so the object is replaced *and*
+    // the load reads 7.
+    #[test]
+    fn ea_load_before_a_later_store_forwards_the_pre_store_value() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let seven = g.add(Op::Const(7), IrType::Int, vec![], None);
+        let forty_two = g.add(Op::Const(42), IrType::Int, vec![], None);
+        // Node ids are creation order = program order, which is what the
+        // analysis's dominance stand-in reads: store(7) < load < store(42).
+        let store7 = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, seven],
+            None,
+        );
+        let load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, store7, newobj, off],
+            None,
+        );
+        // A load consumes a memory token but produces none, so the second store
+        // chains onto `store7`.
+        let store42 = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, store7, newobj, off, forty_two],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, load], None);
+        g.entry = start;
+        g.exit = ret;
+
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        let info = result
+            .scalar_replaceable
+            .first()
+            .expect("the non-escaping object is scalar-replaceable");
+        assert!(
+            info.dominance_proved,
+            "precondition: a branch-free graph, so program order IS dominance"
+        );
+        assert_eq!(
+            info.field_values[0],
+            Some(id_map[forty_two as usize]),
+            "precondition: `field_values` — the source the applier used to read \
+             — names the LAST store's value, which is the wrong answer here"
+        );
+
+        apply_ea_to_ir(&mut g, &id_map, &result);
+
+        let retval = g.nodes[ret as usize].inputs[1];
+        assert_eq!(
+            g.nodes[retval as usize].op,
+            Op::Const(7),
+            "the load must read the value the field held AT THE LOAD (7), not \
+             the value it ends up holding (42)"
+        );
+        assert_eq!(g.nodes[load as usize].op, Op::Dead, "Load forwarded");
+        assert_eq!(g.nodes[store7 as usize].op, Op::Dead, "Store(7) killed");
+        assert_eq!(g.nodes[store42 as usize].op, Op::Dead, "Store(42) killed");
+        assert_eq!(g.nodes[newobj as usize].op, Op::Dead, "New killed");
+        assert_memory_chain_intact(&g);
+    }
+
+    // IDENTITY SENSITIVITY. An `if_acmpeq` on a fresh object observes its
+    // ADDRESS, so the object may not be scalar-replaced — two replaced objects
+    // with equal fields are indistinguishable, two heap objects are not.
+    //
+    // The outcome was already fail-closed before the bridge emitted
+    // `Op::RefCompare` (an `ir::Op::Cmp` hit `ir_op_to_ea_op`'s `Op::Other`
+    // catch-all, and the use walk refuses `Op::Other`), but it was invisible.
+    // `stats.identity_blocked` and `identity_observations` are what make the
+    // refusal reportable, and they are only populated when the observation is
+    // named for what it is.
+    #[test]
+    fn ea_an_identity_compared_object_is_not_replaced() {
+        use crate::ir::{CmpOp, Graph, IrType, MemKind, Op, NO_NODE};
+
+        // `null_rhs`: compare against `aconst_null` (an `ifnull`) instead of
+        // against another reference.
+        let build = |null_rhs: bool| -> (Graph, crate::ir::NodeId) {
+            let mut g = Graph {
+                nodes: Vec::new(),
+                entry: 0,
+                exit: NO_NODE,
+                safepoints: Vec::new(),
+                uses: Default::default(),
+            };
+            let start = g.add(Op::Start, IrType::Control, vec![], None);
+            let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+            let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+            let newobj = g.add(
+                Op::New {
+                    class_id: 7,
+                    num_fields: 1,
+                },
+                IrType::Ref,
+                vec![ctrl, mem],
+                None,
+            );
+            let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+            let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+            let _store = g.add(
+                Op::Store(MemKind::Int),
+                IrType::Memory,
+                vec![ctrl, mem, newobj, off, val],
+                None,
+            );
+            let rhs = if null_rhs {
+                // `IrBuilder::aconst_null` — an `Op::Const(0)` typed `Ref`.
+                g.add(Op::Const(0), IrType::Ref, vec![], None)
+            } else {
+                g.add(Op::Param(0), IrType::Ref, vec![], None)
+            };
+            let cmp = g.add(Op::Cmp(CmpOp::Eq), IrType::Int, vec![newobj, rhs], None);
+            let ret = g.add(Op::Return, IrType::Void, vec![ctrl, cmp], None);
+            g.entry = start;
+            g.exit = ret;
+            (g, newobj)
+        };
+
+        // (a) `o == p` — a real address comparison.
+        let (g, newobj) = build(false);
+        let (ea, id_map) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            result.scalar_replaceable.is_empty(),
+            "an identity-compared object must not be scalar-replaced"
+        );
+        assert_eq!(
+            result.stats.identity_blocked, 1,
+            "and the refusal must be ATTRIBUTED to identity: this counts only \
+             CONFINED objects refused for that reason, so it also proves the \
+             object was otherwise replaceable (a non-vacuous test)"
+        );
+        assert!(
+            result
+                .identity_observations
+                .iter()
+                .any(|&(alloc, _)| alloc == id_map[newobj as usize]),
+            "the observation is reported, not merely acted on"
+        );
+
+        // (b) `o == null` — an `ifnull`, which the builder lowers to the SAME
+        // `Op::Cmp` with two `Ref`-typed operands. A fresh allocation is
+        // non-null by construction, so this reads no address; classifying it as
+        // an identity observation would refuse every null-checked object in the
+        // program.
+        let (g, _) = build(true);
+        let (ea, _) = escape_analysis_from_ir(&g);
+        let result = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            result.identity_observations.is_empty(),
+            "a null check is not an identity observation"
+        );
+        assert_eq!(result.stats.identity_blocked, 0);
+    }
+
+    // COLD-PATH CLASSIFICATION. An object whose only escape site is on a
+    // profiled never-taken branch is reported `EscapeState::PartialEscape`.
+    //
+    // `escape_analysis::Graph::cold_nodes` had no producer, so `partial_escapes`
+    // was always empty and the whole lattice level was dead code. The producer
+    // is `ea_cold_control_nodes`, fed from the `ir_branch_hints` map
+    // `try_compile_inner` already computes for the lowerer.
+    #[test]
+    fn ea_a_cold_path_escape_is_classified_partial() {
+        use crate::ir::{Graph, IrType, MemKind, Op, NO_NODE};
+        use std::collections::HashMap;
+
+        // Foo o = new Foo(); o.x = 42; if (c) escape(o);   — with `c` profiled
+        // as never taken, so the call that publishes `o` is cold.
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let newobj = g.add(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            None,
+        );
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let val = g.add(Op::Const(42), IrType::Int, vec![], None);
+        let store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, newobj, off, val],
+            None,
+        );
+        let cond = g.add(Op::Param(0), IrType::Int, vec![], None);
+        // bci 10 is the key `ir_branch_hints` is looked up by.
+        let iff = g.add(Op::If, IrType::Control, vec![ctrl, cond], Some(10));
+        let t_edge = g.add(Op::Proj(0), IrType::Control, vec![iff], Some(10));
+        let f_edge = g.add(Op::Proj(1), IrType::Control, vec![iff], Some(10));
+        // The publication, on the TRUE edge. `info_ptr: 0` is rejected by
+        // `ir_call_is_identity_hash` without a dereference, so this stays a
+        // plain `escape_analysis::Op::Call`.
+        let call = g.add(
+            Op::Call { info_ptr: 0 },
+            IrType::Void,
+            vec![t_edge, store, newobj],
+            Some(10),
+        );
+        let merge = g.add(Op::Merge, IrType::Control, vec![t_edge, f_edge], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![merge], None);
+        g.entry = start;
+        g.exit = ret;
+
+        // (a) No profile — the historical behaviour, byte for byte.
+        let (ea, _) = escape_analysis_from_ir(&g);
+        let unprofiled = escape_analysis::analyze_escapes(&ea);
+        assert!(
+            unprofiled.partial_escapes.is_empty(),
+            "with no cold-path producer the classification is unreachable"
+        );
+
+        // (b) The branch is profiled usually-NOT-taken, so its `Proj(0)` (the
+        // branch target) is the cold edge and the call on it is cold.
+        let hints: HashMap<usize, bool> = [(10usize, false)].into_iter().collect();
+        let cold = ea_cold_control_nodes(&g, &hints);
+        assert!(cold.contains(&t_edge), "the never-taken edge is cold");
+        assert!(cold.contains(&call), "and so is everything pinned to it");
+        assert!(
+            !cold.contains(&f_edge) && !cold.contains(&merge) && !cold.contains(&ret),
+            "a merge is cold only when EVERY predecessor is"
+        );
+
+        let (mut ea, id_map) = escape_analysis_from_ir(&g);
+        ea_mark_cold_from_branch_hints(&mut ea, &g, &id_map, &hints);
+        let result = escape_analysis::analyze_escapes(&ea);
+        let pe = result
+            .partial_escapes
+            .first()
+            .expect("the object escapes only on the cold path");
+        assert_eq!(pe.alloc_node, id_map[newobj as usize]);
+        assert_eq!(
+            pe.without_refinement,
+            escape_analysis::EscapeState::ArgEscape,
+            "the unrefined state the connection graph keeps — every ACTING \
+             consumer still sees this one"
+        );
+        assert_eq!(pe.escape_sites, vec![id_map[call as usize]]);
+        assert_eq!(
+            result.escape_states.get(&id_map[newobj as usize]),
+            Some(&escape_analysis::EscapeState::PartialEscape)
+        );
+        assert!(
+            result.scalar_replaceable.is_empty(),
+            "PartialEscape is a REPORT and must not enable anything: the object \
+             is still offered to no acting consumer"
+        );
     }
 
     // ── Op::New emission + scalar replacement, end-to-end via the builder ──

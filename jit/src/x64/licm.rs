@@ -2653,11 +2653,36 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
 //     ([`LoopXformRefusal::OpaqueControlFlow`]): the first two have
 //     successors that are not statically known, and `goto_w` is a backward
 //     branch the emitter does **not** poll (see the poll argument below).
-//  6. No `tableswitch` / `lookupswitch` anywhere in the method
-//     ([`LoopXformRefusal::SwitchInMethod`]). Their 4-byte operand alignment
-//     is a function of their own PC, so shifting code changes their *length*,
-//     not just their offsets. Conservative and documented; lifting it means
-//     re-padding and re-encoding every switch, which is a separate change.
+//  6. Every `tableswitch` / `lookupswitch` in the method survives the shift
+//     byte-identically ([`LoopXformRefusal::SwitchInMethod`]). Two things
+//     about a switch are PC-relative and neither is re-encoded here:
+//
+//       * its operands are aligned to the METHOD's code base (JVMS §6.5), so
+//         moving it can change its *length*, not merely its offsets; and
+//       * its jump offsets are 4-byte fields, and the rewriter rewrites
+//         2-byte branch offsets only (`0x99..=0xa7 | 0xc6 | 0xc7`).
+//
+//     So the rule is not "no switch anywhere" but "no switch the rewrite
+//     would disturb". A switch is admitted exactly when
+//
+//       * it is not inside the region — a switch there is DUPLICATED, and the
+//         copies sit at different alignments and would each need their own
+//         relocated targets;
+//       * `switch_pad(shift(pc)) == switch_pad(pc)` — the padding recomputed
+//         at the shifted PC is unchanged. A switch before the header does not
+//         move, so this is free; one after the region moves by `delta`, so it
+//         holds iff `delta % 4 == 0`; and
+//       * every target keeps its displacement:
+//         `shift(t) - shift(pc) == t - pc`, so the un-rewritten 4-byte offset
+//         still names the same instruction.
+//
+//     A switch entirely before the loop that branches only before the loop
+//     (or to the header, which does not move) is therefore admitted, where
+//     the earlier rule refused the whole method for it. Re-padding and
+//     re-encoding the 4-byte offsets — which would admit the rest, including
+//     switches inside the body — is still a separate change: it would change
+//     the output's *length*, which every other computation here (`out_len`,
+//     the span table, `bci_of`) takes to be `code_len + delta`.
 //  7. No branch inside the region targets the back-edge instruction itself
 //     ([`LoopXformRefusal::BranchToBackEdge`]) — the back edge exists in the
 //     last copy only, so such an edge has no image in copies `0..k-1`.
@@ -2743,6 +2768,21 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
 // pre-header bypass (an entry edge that lands on the wrong side of
 // duplicated code), so it is answered here explicitly rather than left to
 // the consumer.
+//
+// It is one-to-many for the body, but one-to-**zero** for the back edge under
+// unroll: the back-edge `goto` is emitted in the LAST copy only, so its bytes
+// have no image in copy `0`, which is unroll's steady state. `osr_entry_pc`
+// answers `None` for `bci in back_edge..back_edge_end` when
+// `kind == Unroll` — the alternative, `Some(bci)`, is not a conservative
+// answer but a WRONG one: output pc `back_edge` is `header + body_len`, the
+// first byte of copy 1, so the entry would resume the interpreter's "about to
+// execute the back edge" frame at the top of a fresh body and run one whole
+// iteration too many. Peel has no such gap: its steady-state copy is the last
+// one, which carries the back edge, so every bci in the region round-trips.
+// The consumer's rule is therefore uniform for both kinds and needs no
+// special case: an OSR request whose `osr_entry_pc` is `None` is refused, and
+// the interpreter keeps running until it reaches a bci that has one (the very
+// next one it reaches is the header, which always does).
 //
 // ## Composition with LICM and the pre-header bypass fix
 //
@@ -3326,27 +3366,54 @@ impl LoopXform {
         self.bci_of.get(pc).map(|&b| b as usize)
     }
 
-    /// Output PC an OSR entry for `bci` must use.
+    /// Original PC of the back-edge instruction (`header + body_len`).
+    pub(super) fn orig_back_edge_pc(&self) -> usize {
+        self.header + self.body_len
+    }
+
+    /// Output PC an OSR entry for `bci` must use, or `None` when `bci` has no
+    /// steady-state image and OSR there must be REFUSED.
     ///
     /// The reverse of [`Self::bci_at`] is one-to-many inside the region, and
     /// picking the wrong image is a real bug, not a missed optimisation:
     /// entering a *peeled* copy re-runs the peeled iterations, so the loop
     /// executes `k` times too many. This always answers with the
-    /// steady-state copy.
+    /// steady-state copy — copy `k` for peel, copy `0` for unroll.
+    ///
+    /// `None` for two reasons, and a caller must treat both the same way (do
+    /// not enter compiled code; keep interpreting):
+    ///
+    ///  * `bci` is not a bci of this method at all; or
+    ///  * `kind == Unroll` and `bci` is one of the back-edge instruction's own
+    ///    bytes. The back edge is emitted in the LAST copy only, and unroll's
+    ///    steady state is copy `0`, which ends just before it — those bytes
+    ///    have no steady-state image. Answering `Some(bci)` (which is what
+    ///    this did before) names `header + body_len`, the first byte of copy
+    ///    1, i.e. the HEADER: the entry would resume a "back edge next" frame
+    ///    at the top of a fresh body and run an extra iteration. Peel's
+    ///    steady-state copy carries the back edge, so it has no such gap.
+    ///
+    /// Refusing costs nothing: the interpreter's very next bci after the back
+    /// edge is the header, which always has an entry.
     pub(super) fn osr_entry_pc(&self, bci: usize) -> Option<usize> {
         if bci >= self.orig_code_len {
             return None;
         }
         if bci < self.header {
-            Some(bci)
-        } else if bci < self.orig_back_edge_end {
-            let steady = match self.kind {
-                LoopXformKind::Peel => self.copies,
-                LoopXformKind::Unroll => 0,
-            };
-            Some(bci + steady * self.body_len)
-        } else {
-            Some(bci + self.copies * self.body_len)
+            // Prefix: the rewrite never moves it.
+            return Some(bci);
+        }
+        if bci >= self.orig_back_edge_end {
+            // Suffix: shifted past every copy.
+            return Some(bci + self.copies * self.body_len);
+        }
+        match self.kind {
+            // Peel's steady state is the last copy, which is a full image of
+            // the region, back edge included.
+            LoopXformKind::Peel => Some(bci + self.copies * self.body_len),
+            // Unroll's steady state is copy 0, which stops at the back edge.
+            LoopXformKind::Unroll if bci >= self.orig_back_edge_pc() => None,
+            LoopXformKind::Unroll => Some(bci),
         }
     }
 
@@ -3421,6 +3488,28 @@ pub(super) fn plan_loop_unroll(
     )
 }
 
+/// Number of alignment pad bytes a `tableswitch`/`lookupswitch` at `pc`
+/// carries: its operands start at `pc + 1 + switch_pad(pc)`.
+///
+/// JVMS §6.5 aligns switch operands to a 4-byte boundary measured from the
+/// START of the method's code, so the count is a function of the switch's own
+/// PC. That is the whole reason moving a switch can change its LENGTH and not
+/// merely its offsets, and it is why [`rewrite_loop_copies`] recomputes this
+/// at the shifted PC instead of assuming a uniform shift.
+///
+/// Transcribed from the `let mut p = pc + 1; while p % 4 != 0 { p += 1 }`
+/// walks in [`bytecode_len_at`] and [`branch_targets_at`] — keep the three in
+/// step, and note that all three measure from index 0 of the `code` slice,
+/// i.e. the slice must start at the method's first bytecode.
+#[allow(dead_code)]
+pub(super) fn switch_pad(pc: usize) -> usize {
+    let mut p = pc + 1;
+    while p % 4 != 0 {
+        p += 1;
+    }
+    p - (pc + 1)
+}
+
 /// The shared peel/unroll rewriter. See the section header.
 fn rewrite_loop_copies(
     code: &[u8],
@@ -3460,6 +3549,19 @@ fn rewrite_loop_copies(
     let back_edge_end = back_edge + 3;
     let delta = extra * body_len;
 
+    // Where an ORIGINAL pc outside the region ends up in the output. The
+    // prefix `[0, header)` and the region itself keep their PCs — the region's
+    // image here is copy 0, whose first byte is still `header` — and
+    // everything from `back_edge_end` on shifts past the extra copies. Used
+    // for the switch check and for the exception ranges below.
+    let shift = |p: usize| -> usize {
+        if p >= back_edge_end {
+            p + delta
+        } else {
+            p
+        }
+    };
+
     // ── Structural admission ──────────────────────────────────────────
     let cfg = MethodCfg::build(code, code_len).ok_or(R::OpaqueControlFlow)?;
     let hnode = cfg.node_of(header).ok_or(R::BadShape)?;
@@ -3467,11 +3569,48 @@ fn rewrite_loop_copies(
         return Err(R::BadShape);
     }
 
-    // Switches anywhere: their operand padding depends on their own PC, so
-    // shifting them changes their length and the whole layout below.
+    // Switches: admitted only when the rewrite disturbs neither their
+    // PC-dependent operand padding nor their 4-byte jump offsets, neither of
+    // which is re-encoded below. See precondition 6 in the section header for
+    // the argument; this is that argument, per switch.
+    let mut targets: Vec<usize> = Vec::new();
     for &at in cfg.nodes() {
         if matches!(code[at], 0xaa | 0xab) {
-            return Err(R::SwitchInMethod);
+            // Inside the region the switch is DUPLICATED: each copy lands at
+            // `at + ci * body_len`, so the copies disagree on their padding
+            // unless `body_len % 4 == 0`, and each copy's targets would have
+            // to be relocated into that copy — in a 4-byte field the rewriter
+            // does not touch. Refuse.
+            if at >= header && at < back_edge_end {
+                return Err(R::SwitchInMethod);
+            }
+            // Outside the region, the switch's bytes are copied verbatim to
+            // `shift(at)`. That is a faithful encoding only if the padding
+            // recomputed there is the same — otherwise the operands land at a
+            // different offset from the opcode and the instruction changes
+            // LENGTH, which would invalidate `out_len`, the span table and
+            // every PC below.
+            let new_at = shift(at);
+            if switch_pad(new_at) != switch_pad(at) {
+                return Err(R::SwitchInMethod);
+            }
+            // …and its jump offsets are copied verbatim too, so every target
+            // must keep the same displacement from the switch. A target
+            // strictly inside the region other than the header is a separate
+            // refusal (`ExternalEntry`, below) and is not admitted by this
+            // arm passing.
+            targets.clear();
+            if !branch_targets_at(code, at, code_len, &mut targets) {
+                return Err(R::OpaqueControlFlow);
+            }
+            for &t in &targets {
+                // Cast: PCs to isize for the signed displacement comparison
+                let old_off = t as isize - at as isize;
+                let new_off = shift(t) as isize - new_at as isize;
+                if new_off != old_off {
+                    return Err(R::SwitchInMethod);
+                }
+            }
         }
         // `jsr`/`ret`/`jsr_w` already fail `MethodCfg::build`; `goto_w` does
         // not, and it is the one backward branch the emitter never polls, so
@@ -3483,7 +3622,6 @@ fn rewrite_loop_copies(
     }
 
     // Single-entry, and no branch to the back edge itself.
-    let mut targets: Vec<usize> = Vec::new();
     for &at in cfg.nodes() {
         targets.clear();
         if !branch_targets_at(code, at, code_len, &mut targets) {
@@ -3538,13 +3676,9 @@ fn rewrite_loop_copies(
     }
 
     // ── Exception ranges ──────────────────────────────────────────────
-    let shift = |p: usize| -> usize {
-        if p >= back_edge_end {
-            p + delta
-        } else {
-            p
-        }
-    };
+    // `shift` is defined with the region bounds above; a range that encloses
+    // the region has `s <= header` and `e >= back_edge_end`, so shifting its
+    // end alone widens it over every copy.
     let mut ranges_out: Vec<(usize, usize, usize)> = Vec::with_capacity(exception_ranges.len());
     for &(s, e, h) in exception_ranges {
         if s >= e || e > code_len || h >= code_len {
@@ -4537,6 +4671,498 @@ mod loop_xform_tests {
                     assert_eq!(at as isize + off, (21 + k * 14) as isize);
                 }
             }
+        }
+    }
+
+    // ── Switch fixtures ──────────────────────────────────────────────
+    //
+    // Four positions for one `lookupswitch` (zero pairs, so it is 8 operand
+    // bytes plus its padding), chosen to separate the two PC-relative facts
+    // precondition 6 is about: the padding, which depends on the switch's own
+    // PC, and the 4-byte jump offsets, which this rewriter never re-encodes.
+    // The reference interpreter does not implement `lookupswitch`, so these
+    // are used by the STATIC tests only — the step-sequence equivalence tests
+    // keep running on the switch-free shapes.
+
+    /// A `lookupswitch` before the loop whose only target is the loop header.
+    /// Neither the switch nor its target moves, so the rewrite leaves it
+    /// byte-identical and it is admitted. Header 12, back edge 26, length 31 —
+    /// the same 14-byte body as [`shape_a`].
+    fn shape_switch_before_loop() -> Vec<u8> {
+        vec![
+            0xab, // 0: lookupswitch
+            0x00, 0x00, 0x00, // 1: padding to the 4-byte boundary
+            0x00, 0x00, 0x00, 0x0c, // 4: default = +12 -> 12 (the header)
+            0x00, 0x00, 0x00, 0x00, // 8: npairs = 0
+            0x1b, // 12: iload_1          <- header
+            0x1a, // 13: iload_0
+            0xa2, 0x00, 0x0f, // 14: if_icmpge 29
+            0x1c, // 17: iload_2
+            0x1b, // 18: iload_1
+            0x05, // 19: iconst_2
+            0x68, // 20: imul
+            0x60, // 21: iadd
+            0x3d, // 22: istore_2
+            0x84, 0x01, 0x01, // 23: iinc 1, 1
+            0xa7, 0xff, 0xf2, // 26: goto 12     <- back edge
+            0x1c, // 29: iload_2
+            0xac, // 30: ireturn
+        ]
+    }
+
+    /// A `lookupswitch` AFTER the loop, at a PC that is already 4-byte aligned
+    /// (`switch_pad(19) == 0`). It shifts by `delta = k * 14`, so its padding
+    /// survives only when `k` is even — the case the old "no switch anywhere"
+    /// rule could not distinguish. Header 2, back edge 16, length 29.
+    fn shape_switch_after_loop() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x1b, // 2: iload_1           <- header
+            0x1a, // 3: iload_0
+            0xa2, 0x00, 0x0f, // 4: if_icmpge 19
+            0x84, 0x01, 0x01, // 7: iinc 1, 1
+            0x84, 0x01, 0x01, // 10: iinc 1, 1
+            0x00, // 13: nop
+            0x00, // 14: nop
+            0x00, // 15: nop
+            0xa7, 0xff, 0xf2, // 16: goto 2      <- back edge
+            0xab, // 19: lookupswitch (no padding — 20 is already aligned)
+            0x00, 0x00, 0x00, 0x09, // 20: default = +9 -> 28
+            0x00, 0x00, 0x00, 0x00, // 24: npairs = 0
+            0xb1, // 28: return
+        ]
+    }
+
+    /// A `lookupswitch` INSIDE the loop body. Every copy would sit at a
+    /// different PC, so the copies do not agree on their padding, and each
+    /// copy's targets would have to be relocated in a 4-byte field the
+    /// rewriter does not touch. Header 2, back edge 19, length 23.
+    fn shape_switch_in_body() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x1b, // 2: iload_1           <- header
+            0x1a, // 3: iload_0
+            0xa2, 0x00, 0x12, // 4: if_icmpge 22
+            0xab, // 7: lookupswitch (no padding — 8 is already aligned)
+            0x00, 0x00, 0x00, 0x09, // 8: default = +9 -> 16
+            0x00, 0x00, 0x00, 0x00, // 12: npairs = 0
+            0x84, 0x01, 0x01, // 16: iinc 1, 1
+            0xa7, 0xff, 0xef, // 19: goto 2       <- back edge
+            0xb1, // 22: return
+        ]
+    }
+
+    /// A `lookupswitch` before the loop that branches ACROSS it. The switch
+    /// does not move but its target does, so its un-rewritten 4-byte offset
+    /// would name the wrong instruction. Header 16, back edge 27, length 32.
+    /// Everything else about this method is admissible, which is what makes it
+    /// a test of the displacement rule specifically.
+    fn shape_switch_over_the_loop() -> Vec<u8> {
+        vec![
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x1a, // 2: iload_0
+            0x99, 0x00, 0x0d, // 3: ifeq 16      -> the header
+            0xab, // 6: lookupswitch
+            0x00, // 7: padding to the 4-byte boundary
+            0x00, 0x00, 0x00, 0x18, // 8: default = +24 -> 30 (past the loop)
+            0x00, 0x00, 0x00, 0x00, // 12: npairs = 0
+            0x1b, // 16: iload_1          <- header
+            0x1a, // 17: iload_0
+            0xa2, 0x00, 0x0c, // 18: if_icmpge 30
+            0x84, 0x01, 0x01, // 21: iinc 1, 1
+            0x00, // 24: nop
+            0x00, // 25: nop
+            0x00, // 26: nop
+            0xa7, 0xff, 0xf5, // 27: goto 16     <- back edge
+            0x1b, // 30: iload_1
+            0xac, // 31: ireturn
+        ]
+    }
+
+    /// Byte offset of the low byte of `shape_switch_over_the_loop`'s default
+    /// offset, so a test can retarget it without re-spelling the fixture.
+    const SWITCH_OVER_DEFAULT_LOW_BYTE: usize = 11;
+
+    /// Every fixture the rewriter is expected to admit, as
+    /// `(name, code, header, back_edge)`.
+    fn admissible_fixtures() -> Vec<(&'static str, Vec<u8>, usize, usize)> {
+        vec![
+            ("shape_a", shape_a(), 4, 18),
+            ("shape_b", shape_b(), 11, 25),
+            ("shape_throws", shape_throws(), 2, 19),
+            (
+                "shape_switch_before_loop",
+                shape_switch_before_loop(),
+                12,
+                26,
+            ),
+            // Admitted at even `k` only — see the fixture's doc comment.
+            ("shape_switch_after_loop", shape_switch_after_loop(), 2, 16),
+        ]
+    }
+
+    /// The hand-assembled switch fixtures decode the way every test below
+    /// assumes: the walk lands exactly on the end, the switch is where and as
+    /// long as claimed, its targets are the claimed ones, and the method is a
+    /// buildable CFG with one loop and every cycle polled. Without this, a
+    /// mis-typed padding byte would silently turn a refusal test into a test
+    /// of a malformed method.
+    #[test]
+    fn the_switch_fixtures_decode_the_way_these_tests_assume() {
+        for (name, code, header, back_edge, sw, sw_len, sw_targets) in [
+            (
+                "before",
+                shape_switch_before_loop(),
+                12usize,
+                26usize,
+                0usize,
+                12usize,
+                vec![12usize],
+            ),
+            ("after", shape_switch_after_loop(), 2, 16, 19, 9, vec![28]),
+            ("in body", shape_switch_in_body(), 2, 19, 7, 9, vec![16]),
+            (
+                "over",
+                shape_switch_over_the_loop(),
+                16,
+                27,
+                6,
+                10,
+                vec![30],
+            ),
+        ] {
+            let len = code.len();
+            let starts = instruction_start_map(&code, len);
+            let mut pc = 0usize;
+            while pc < len {
+                assert!(starts[pc], "{name}: {pc} is not an instruction start");
+                let l = bytecode_len_at(&code, pc);
+                assert!(l > 0, "{name}: zero-length instruction at {pc}");
+                pc += l;
+            }
+            assert_eq!(pc, len, "{name}: the walk overran the fixture");
+
+            assert!(matches!(code[sw], 0xaa | 0xab), "{name}: no switch at {sw}");
+            assert_eq!(bytecode_len_at(&code, sw), sw_len, "{name}: switch length");
+            let mut t: Vec<usize> = Vec::new();
+            assert!(
+                branch_targets_at(&code, sw, len, &mut t),
+                "{name}: switch does not decode"
+            );
+            assert_eq!(t, sw_targets, "{name}: switch targets");
+
+            assert_eq!(
+                detect_loops(&code, len),
+                vec![(header, back_edge)],
+                "{name}"
+            );
+            assert_eq!(code[back_edge], 0xa7, "{name}: back edge is not a goto");
+            assert!(MethodCfg::build(&code, len).is_some(), "{name}: cfg builds");
+            assert!(all_backward_edges_are_polled(&code, len), "{name}");
+        }
+    }
+
+    /// `bci_at` is TOTAL, and what it answers is a real instruction of the
+    /// original method.
+    ///
+    /// This is the safety property the whole rewrite rests on. Every deopt
+    /// bci, every oop-map `bytecode_pc` and every exception range recorded by
+    /// a compiled method has to translate through this map; a pc it cannot
+    /// answer for, or answers with a byte that is not an instruction start,
+    /// is a frame the interpreter cannot resume and an oop-map the GC cannot
+    /// match. Proved here over every admissible fixture, both kinds and every
+    /// legal factor, not just `shape_a` at `k <= 3`.
+    #[test]
+    fn bci_at_is_total_over_every_fixture_and_factor() {
+        let mut admitted_total = 0usize;
+        for (name, code, header, back_edge) in admissible_fixtures() {
+            let len = code.len();
+            let orig_starts = instruction_start_map(&code, len);
+            let mut admitted_here = 0usize;
+            for k in 1..=LOOP_XFORM_MAX_COPIES {
+                for planned in [
+                    plan_loop_peel(&code, len, header, back_edge, k, &[]),
+                    plan_loop_unroll(&code, len, header, back_edge, k, &[]),
+                ] {
+                    // A refusal publishes no map, so there is nothing for the
+                    // property to hold over. `shape_switch_after_loop` refuses
+                    // at odd `k`; see
+                    // `a_switch_outside_the_rewritten_region_no_longer_refuses`.
+                    let x = match planned {
+                        Ok(x) => x,
+                        Err(_) => continue,
+                    };
+                    admitted_here += 1;
+                    admitted_total += 1;
+                    let what = format!("{name} {:?} k={k}", x.kind);
+
+                    // 1. The map covers the output byte for byte.
+                    assert!(x.provenance_is_total(), "{what}");
+                    assert_eq!(x.code.len(), x.code_len, "{what}");
+                    assert_eq!(x.bci_of.len(), x.code_len, "{what}");
+
+                    // 2. THE PROPERTY: every output pc that begins an
+                    //    instruction resolves, and resolves to a bci that
+                    //    begins an instruction in the ORIGINAL.
+                    let out_starts = instruction_start_map(&x.code, x.code_len);
+                    for (p, &is_start) in out_starts.iter().enumerate() {
+                        if !is_start {
+                            continue;
+                        }
+                        assert!(
+                            x.bci_at(p).is_some(),
+                            "{what}: no provenance for instruction start {p}"
+                        );
+                        let bci = x.bci_at(p).unwrap_or(usize::MAX);
+                        assert!(bci < len, "{what}: pc {p} maps to {bci}, past the original");
+                        assert!(
+                            orig_starts[bci],
+                            "{what}: pc {p} maps to {bci}, which is mid-instruction"
+                        );
+                    }
+
+                    // 3. …and the instruction found there is the SAME
+                    //    instruction: same opcode, same length, and every
+                    //    interior byte maps to the matching interior byte. So
+                    //    a pc that is NOT an instruction start cannot resolve
+                    //    to a plausible-looking bci of some other instruction.
+                    let mut pc = 0usize;
+                    while pc < x.code_len {
+                        let bci = x.bci_at(pc).unwrap_or(usize::MAX);
+                        assert!(bci < len, "{what}: pc {pc} has no provenance");
+                        assert_eq!(x.code[pc], code[bci], "{what}: pc {pc} vs bci {bci}");
+                        let l = bytecode_len_at(&x.code, pc);
+                        assert!(l > 0, "{what}: zero-length instruction at {pc}");
+                        assert_eq!(
+                            l,
+                            bytecode_len_at(&code, bci),
+                            "{what}: pc {pc} and bci {bci} disagree on length"
+                        );
+                        for d in 0..l {
+                            assert_eq!(x.bci_at(pc + d), Some(bci + d), "{what}: pc {pc} + {d}");
+                        }
+                        pc += l;
+                    }
+                    assert_eq!(pc, x.code_len, "{what}: the output walk overran");
+
+                    // 4. The poll proof, re-checked on this output too — every
+                    //    fixture and factor, not just `shape_a`.
+                    assert!(all_backward_edges_are_polled(&x.code, x.code_len), "{what}");
+                    assert!(
+                        emits_safepoint_poll_at(&x.code, x.back_edge_pc(), x.code_len),
+                        "{what}: the back edge lost its poll"
+                    );
+
+                    // 5. `osr_entry_pc` is a partial INVERSE of `bci_at`
+                    //    wherever it answers at all — including at bytes that
+                    //    are not instruction starts.
+                    for bci in 0..len {
+                        if let Some(entry) = x.osr_entry_pc(bci) {
+                            assert!(
+                                entry < x.code_len,
+                                "{what}: osr {bci} -> {entry}, past the end"
+                            );
+                            assert_eq!(x.bci_at(entry), Some(bci), "{what}: osr {bci} -> {entry}");
+                        }
+                    }
+                }
+            }
+            assert!(
+                admitted_here > 0,
+                "{name}: never admitted, so the property held vacuously"
+            );
+        }
+        // Three fixtures are admitted for both kinds at every factor, so the
+        // property was exercised, not skipped.
+        assert!(
+            admitted_total >= 6 * LOOP_XFORM_MAX_COPIES,
+            "only {admitted_total} plans checked"
+        );
+    }
+
+    /// OSR must REFUSE the unrolled back-edge gap, not answer it.
+    ///
+    /// The back-edge `goto` is emitted in the last copy only, and unroll's
+    /// steady state is copy 0, which stops just before it. The old answer,
+    /// `Some(bci)`, named output pc `header + body_len` — the first byte of
+    /// copy 1, i.e. the header — so an OSR entry there resumed a "back edge
+    /// next" frame at the top of a fresh body and ran an extra iteration.
+    #[test]
+    fn osr_refuses_the_unrolled_back_edge_gap_and_answers_the_steady_state_elsewhere() {
+        let code = shape_a();
+        let len = code.len();
+        let (header, back_edge, body_len) = (4usize, 18usize, 14usize);
+        let back_edge_end = back_edge + 3;
+        for k in 1..=LOOP_XFORM_MAX_COPIES {
+            let peel = plan_loop_peel(&code, len, header, back_edge, k, &[]).expect("peel");
+            let unroll = plan_loop_unroll(&code, len, header, back_edge, k, &[]).expect("unroll");
+            assert_eq!(unroll.orig_back_edge_pc(), back_edge, "k={k}");
+            assert_eq!(peel.orig_back_edge_pc(), back_edge, "k={k}");
+
+            for bci in back_edge..back_edge_end {
+                assert_eq!(unroll.osr_entry_pc(bci), None, "k={k} bci={bci}");
+                // Why: the pc the old code answered carries a DIFFERENT
+                // instruction's provenance.
+                assert_ne!(unroll.bci_at(bci), Some(bci), "k={k} bci={bci}");
+                // Peel's steady-state copy carries the back edge, so it keeps
+                // an entry there and that entry round-trips.
+                let p = peel.osr_entry_pc(bci).expect("peel has no gap");
+                assert_eq!(p, bci + k * body_len, "k={k} bci={bci}");
+                assert_eq!(peel.bci_at(p), Some(bci), "k={k} bci={bci}");
+            }
+            assert_eq!(unroll.bci_at(back_edge), Some(header), "k={k}");
+            assert_eq!(peel.bci_at(peel.back_edge_pc()), Some(back_edge), "k={k}");
+
+            // The gap is the ONLY refusal inside the method …
+            for bci in 0..len {
+                if unroll.osr_entry_pc(bci).is_none() {
+                    assert!(
+                        (back_edge..back_edge_end).contains(&bci),
+                        "k={k}: bci {bci} refused outside the back-edge gap"
+                    );
+                }
+                assert!(
+                    peel.osr_entry_pc(bci).is_some(),
+                    "k={k}: peel refused {bci}"
+                );
+            }
+            // … and everywhere else the answer is the steady-state copy,
+            // exactly as before this fix.
+            for bci in header..back_edge {
+                assert_eq!(unroll.osr_entry_pc(bci), Some(bci), "k={k} bci={bci}");
+                assert_eq!(
+                    peel.osr_entry_pc(bci),
+                    Some(bci + k * body_len),
+                    "k={k} bci={bci}"
+                );
+                let entry = unroll.osr_entry_pc(bci).unwrap_or(usize::MAX);
+                assert!(
+                    entry >= unroll.steady_state_base()
+                        && entry < unroll.steady_state_base() + body_len,
+                    "k={k} bci={bci}: {entry} is outside unroll's steady-state copy"
+                );
+            }
+            assert_eq!(unroll.osr_entry_pc(0), Some(0), "k={k}");
+            assert_eq!(peel.osr_entry_pc(0), Some(0), "k={k}");
+            assert_eq!(unroll.osr_entry_pc(21), Some(21 + k * body_len), "k={k}");
+            assert_eq!(unroll.osr_entry_pc(len), None, "k={k}");
+        }
+    }
+
+    /// `SwitchInMethod` is now a per-switch question, not a per-method one: a
+    /// switch the rewrite does not disturb is admitted. See precondition 6.
+    #[test]
+    fn a_switch_outside_the_rewritten_region_no_longer_refuses() {
+        // (a) Before the loop, branching to the header. Neither the switch nor
+        // its target moves, so its bytes are still a faithful encoding.
+        let before = shape_switch_before_loop();
+        let blen = before.len();
+        assert_eq!(switch_pad(0), 3);
+        for k in 1..=3usize {
+            for x in [
+                plan_loop_peel(&before, blen, 12, 26, k, &[]).expect("switch before the loop"),
+                plan_loop_unroll(&before, blen, 12, 26, k, &[]).expect("switch before the loop"),
+            ] {
+                assert_eq!(&x.code[..12], &before[..12], "{:?} k={k}", x.kind);
+                assert_eq!(bytecode_len_at(&x.code, 0), 12, "{:?} k={k}", x.kind);
+                let mut t: Vec<usize> = Vec::new();
+                assert!(branch_targets_at(&x.code, 0, x.code_len, &mut t));
+                assert_eq!(
+                    t,
+                    vec![12],
+                    "{:?} k={k}: the switch must still enter the header",
+                    x.kind
+                );
+                assert_eq!(x.bci_at(12), Some(12), "{:?} k={k}", x.kind);
+                assert!(all_backward_edges_are_polled(&x.code, x.code_len));
+            }
+        }
+
+        // (b) After the loop it moves by `delta = 14k`, so it survives exactly
+        // when the padding RECOMPUTED at the shifted pc is unchanged — which
+        // for this fixture means even `k`. This is the case a "does it move at
+        // all" rule cannot decide and the reason the check recomputes padding.
+        let after = shape_switch_after_loop();
+        let alen = after.len();
+        assert_eq!(switch_pad(19), 0);
+        for k in 1..=4usize {
+            let planned = plan_loop_unroll(&after, alen, 2, 16, k, &[]);
+            if k % 2 == 0 {
+                let x = planned.expect("even k preserves the padding");
+                let sw = 19 + k * 14;
+                assert_eq!(switch_pad(sw), switch_pad(19), "k={k}");
+                assert_eq!(x.code[sw], 0xab, "k={k}");
+                assert_eq!(bytecode_len_at(&x.code, sw), 9, "k={k}");
+                assert_eq!(x.bci_at(sw), Some(19), "k={k}");
+                let mut t: Vec<usize> = Vec::new();
+                assert!(branch_targets_at(&x.code, sw, x.code_len, &mut t));
+                assert_eq!(
+                    t,
+                    vec![28 + k * 14],
+                    "k={k}: the default must follow the shift"
+                );
+                // The same verdict for peel — the rule is kind-independent.
+                assert!(plan_loop_peel(&after, alen, 2, 16, k, &[]).is_ok(), "k={k}");
+            } else {
+                assert_eq!(
+                    planned.unwrap_err(),
+                    LoopXformRefusal::SwitchInMethod,
+                    "k={k}: shifting by {} changes the padding, hence the length",
+                    14 * k
+                );
+                assert_eq!(
+                    plan_loop_peel(&after, alen, 2, 16, k, &[]).unwrap_err(),
+                    LoopXformRefusal::SwitchInMethod,
+                    "k={k}"
+                );
+            }
+        }
+
+        // (c) Inside the region it is duplicated: the copies do not agree on
+        // their padding and their targets would need relocating in a field
+        // this rewriter does not touch. Still refused.
+        let inside = shape_switch_in_body();
+        let ilen = inside.len();
+        for k in 1..=3usize {
+            assert_eq!(
+                plan_loop_peel(&inside, ilen, 2, 19, k, &[]).unwrap_err(),
+                LoopXformRefusal::SwitchInMethod,
+                "k={k}"
+            );
+            assert_eq!(
+                plan_loop_unroll(&inside, ilen, 2, 19, k, &[]).unwrap_err(),
+                LoopXformRefusal::SwitchInMethod,
+                "k={k}"
+            );
+        }
+
+        // (d) Outside the region but branching ACROSS it: the switch does not
+        // move and its target does, so its 4-byte offset would name the wrong
+        // instruction. Refused — and the SAME fixture with the default
+        // retargeted at the header (which does not move) is admitted, so the
+        // displacement is demonstrably the only thing being refused.
+        let over = shape_switch_over_the_loop();
+        let olen = over.len();
+        for k in 1..=3usize {
+            assert_eq!(
+                plan_loop_unroll(&over, olen, 16, 27, k, &[]).unwrap_err(),
+                LoopXformRefusal::SwitchInMethod,
+                "k={k}"
+            );
+        }
+        let mut retargeted = over.clone();
+        retargeted[SWITCH_OVER_DEFAULT_LOW_BYTE] = 0x0a; // +24 (past the loop) -> +10 (the header)
+        let mut t: Vec<usize> = Vec::new();
+        assert!(branch_targets_at(&retargeted, 6, olen, &mut t));
+        assert_eq!(t, vec![16], "the retarget must name the header");
+        for k in 1..=3usize {
+            let x = plan_loop_unroll(&retargeted, olen, 16, 27, k, &[])
+                .expect("a switch that branches to the header is admitted");
+            assert_eq!(&x.code[..16], &retargeted[..16], "k={k}");
+            assert!(all_backward_edges_are_polled(&x.code, x.code_len), "k={k}");
         }
     }
 }

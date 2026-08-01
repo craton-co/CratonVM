@@ -220,27 +220,66 @@ Two smaller caveats inherited from the mode axis:
 
 ## 8. CI
 
-Add to the `difftest-gate` job in `.github/workflows/ci.yml`, after the existing
-gate step (it needs the same JDK 25 and the same build):
+**Wired.** Two steps in the `difftest-gate` job of `.github/workflows/ci.yml`,
+after the existing gate step — that job already provisions the JDK 25 and the
+build both need, and `matrix` must compile with the *same* `javac` the
+differential run uses or the grid describes bytes nobody executes.
+
+The generate step is a shell block rather than the two bare `cargo run` lines,
+for one reason: GitHub Actions fails a step on any non-zero exit, so a literal
+transcription would turn the documented **non-fatal exit 3** into a red build the
+first time a runner came up without `javac`. The block accepts 0 and 3, and
+passes every other code through unchanged. `if-no-files-found: warn` on the
+upload is the same argument on the artifact side — the exit-3 path legitimately
+produces no matrix file.
 
 ```yaml
       - name: Generate the opcode corpus and the coverage matrix
+        shell: bash
         run: |
+          set -uo pipefail
+          status=0
           cargo run -p cratonvm-difftest --bin cratonvm-difftest -- \
-            gen-opcodes --out target/difftest-opcodes
+            gen-opcodes --out target/difftest-opcodes || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "::notice title=opcode corpus::gen-opcodes bootstrapped (exit 3); nothing to measure."
+            exit 0
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          status=0
           cargo run -p cratonvm-difftest --bin cratonvm-difftest -- \
             matrix --corpus target/difftest-opcodes --show-gaps \
-            --out target/coverage-matrix.json
+            --out target/coverage-matrix.json || status=$?
+          if [ "$status" -eq 3 ]; then
+            echo "::notice title=coverage matrix::matrix bootstrapped (exit 3); no corpus or no javac."
+            exit 0
+          fi
+          exit "$status"
 
       - name: Upload the coverage matrix
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: opcode-coverage-matrix
           path: target/coverage-matrix.json
+          if-no-files-found: warn
 ```
 
-It exits 3 (non-fatal) if the corpus is empty or `javac` is unavailable, and 0
-otherwise, so the step can be adopted before anyone commits to a coverage
-ratchet. Turning it into a ratchet later means comparing `cells.covered` against
-a committed baseline — the schema is versioned (`schema_version`) precisely so
-that comparison stays meaningful across changes.
+`matrix` exits 3 (non-fatal) if the corpus is empty or `javac` is unavailable,
+and 0 otherwise — including on a corpus full of gaps — so the step is adoptable
+before anyone commits to a coverage ratchet. Turning it into a ratchet later
+means comparing `cells.covered` against a committed baseline; the schema is
+versioned (`schema_version`) precisely so that comparison stays meaningful across
+changes.
+
+The corpus is written under `target/`, which the root `.gitignore` already
+covers; `difftest/.gitignore` covers the default in-crate locations
+(`/corpus-opcodes/`, `/coverage-matrix.json`) for local runs, and
+`difftest/Cargo.toml`'s `exclude` keeps `corpus-opcodes/**` out of
+`cargo package`.
+
+**What this step does not do:** it compiles the generated corpus and reports the
+grid. It does not run it differentially against HotSpot (197 programs × 7 modes ×
+two VMs). The `checksum` dimension therefore has programs that declare one, but
+no CI job that compares them — see `docs/testing/differential.md` §8.

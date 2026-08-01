@@ -489,11 +489,25 @@ pub fn bytecode_len(code: &[u8], pc: usize, code_len: usize) -> usize {
 //                         of those. Not just `array.length`.
 //   * [`CountedLoop`]   — IV + comparator + bound + loop form, and the proofs
 //                         [`CountedLoop::iv_span`], [`CountedLoop::index_span`],
-//                         [`CountedLoop::prove_index_in_bounds`] and
-//                         [`CountedLoop::trip_count`].
+//                         [`CountedLoop::prove_index_in_bounds`],
+//                         [`CountedLoop::trip_count`] and
+//                         [`CountedLoop::prove_trip_count_at_least`].
 //   * [`PreheaderGuard`]— the residual runtime obligations a proof needs. A
 //                         consumer that cannot emit one must treat the proof
 //                         as refused.
+//
+// ## Compile-time facts vs. runtime checks
+//
+// Every proof here has two ways to succeed and they are kept distinct. A fact
+// established at compile time costs nothing and is reported as
+// [`BoundsProof::Static`] / [`TripCountProof::Static`]; a fact that only a
+// runtime test can settle becomes a [`PreheaderGuard`] the consumer must emit,
+// and the verdict says so. The failure mode this structure exists to prevent is
+// the third answer — a refusal where one pre-header compare would have done —
+// and [`PreheaderGuard::TripCountAtLeast`] closes the largest instance of it:
+// `for (i = 0; i < n; i++)` has a compile-time trip-count minimum of zero, so
+// every profitability floor (vector lanes, unroll factor, peel count) refused
+// it before that shape existed.
 //
 // ## Overflow model
 //
@@ -1167,6 +1181,52 @@ pub enum PreheaderGuard {
         /// step must not carry it past `i32::MAX`.
         headroom: SymBound,
     },
+    /// `term >= minimum`, evaluated in 64-bit — the loop body executes at
+    /// least `minimum` times.
+    ///
+    /// This is the shape every "the transform only pays off above N
+    /// iterations" gate needs and none of the others express: unrolling,
+    /// peeling and vectorization all have a minimum below which the
+    /// transformed loop is a pessimisation, and `for (i = 0; i < n; i++)` with
+    /// a runtime `n` has a compile-time `trip.min` of zero, so without a
+    /// runtime check the answer is always "refuse".
+    ///
+    /// `term` is a **trip-count witness**: a runtime expression the pre-header
+    /// evaluates that is a *lower bound* on the number of executed iterations.
+    /// It is self-contained — a consumer evaluates `term` and compares it
+    /// against `minimum` knowing nothing about the loop's entry value or
+    /// stride, because [`CountedLoop::prove_trip_count_at_least`] has already
+    /// folded both into the addend. Evaluate in 64-bit: `base + addend` must
+    /// not be materialised as a wrapping `int` add.
+    ///
+    /// Never emitted by [`CountedLoop::iv_span`] or the bounds proofs — a
+    /// minimum trip count is not needed to prove an index in range, and
+    /// attaching one there would silently make every existing proof
+    /// conditional on a fact it does not use.
+    TripCountAtLeast {
+        /// Runtime lower bound on the executed-iteration count.
+        term: SymBound,
+        /// Iterations the loop must be shown to run.
+        minimum: u64,
+    },
+}
+
+/// The verdict on "this loop's body executes at least `minimum` times".
+///
+/// Deliberately shaped like [`BoundsProof`]: `Static` is "proved with nothing
+/// to emit", `Guarded` is "proved provided the pre-header discharges these",
+/// and `Refused` means the caller must assume the loop may run fewer times.
+/// A consumer that cannot emit the guards must treat the whole verdict as
+/// [`TripCountProof::Refused`]; a partially-emitted guard set proves nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TripCountProof {
+    /// The minimum holds from compile-time facts alone.
+    Static,
+    /// The minimum holds provided every listed guard is discharged in the
+    /// pre-header.
+    Guarded(Vec<PreheaderGuard>),
+    /// Not proved. The loop may run fewer than `minimum` times.
+    Refused(RefusalReason),
 }
 
 /// The proven extent of an integer expression over every executed iteration.
@@ -1638,6 +1698,41 @@ impl CountedLoop {
         length: IntRange,
         env: &RangeEnv,
     ) -> BoundsProof {
+        let denoted = array_local.map(BoundSource::ArrayLength);
+        self.prove_index_in_bounds_of_array(idx, denoted.as_ref(), length, env)
+    }
+
+    /// [`CountedLoop::prove_index_in_bounds_of`], keyed on the *expression*
+    /// that denotes the guarded array's length rather than on a JVM local slot.
+    ///
+    /// Two callers need this and neither can use the slot-keyed form:
+    ///
+    /// * an **IR-level** caller holds a `NodeId`, not a slot. It cannot pass
+    ///   `array_local`, because `array_local` is not opaque — scev feeds the
+    ///   same `usize` to [`BoundSource::is_invariant`] (a `modified_locals`
+    ///   bit, so anything `>= 64` refuses every proof) and to
+    ///   [`RangeEnv::array_length`]. Passing a `NodeId` there would not merely
+    ///   miss the shortcut, it would corrupt the invariance test. Passing the
+    ///   `BoundSource` the producer already built for
+    ///   [`CountedLoop::bound`] has neither problem.
+    /// * a caller whose limit is this array's length *spelled differently* —
+    ///   a local that provably holds `a.length`, or a cached length field.
+    ///   `bce.rs`'s `find_bound_arraylength_provenance` is a whole-method pass
+    ///   that establishes exactly this; its answer can now be handed over
+    ///   instead of re-derived.
+    ///
+    /// **Caller obligation:** `array_length` must denote the length of the
+    /// array `idx` indexes, on every path that reaches the loop. Naming a
+    /// *different* array's length is the multi-array out-of-bounds store the
+    /// provenance pass exists to prevent — scev cannot check this and does not
+    /// try. `None` is always safe and costs one guard.
+    pub fn prove_index_in_bounds_of_array(
+        &self,
+        idx: &IndexExpr,
+        array_length: Option<&BoundSource>,
+        length: IntRange,
+        env: &RangeEnv,
+    ) -> BoundsProof {
         let proven = match self.index_span(idx, env) {
             Ok(p) => p,
             Err(r) => return BoundsProof::Refused(r),
@@ -1692,9 +1787,9 @@ impl CountedLoop {
                 };
                 // `a.length >= a.length + k` for `k <= 0` is a tautology: the
                 // limit IS the guarded array's length.
-                if let Some(a) = array_local {
+                if let Some(denoted) = array_length {
                     if needed.addend <= 0
-                        && needed.base == BoundTerm::Bound(BoundSource::ArrayLength(a))
+                        && matches!(&needed.base, BoundTerm::Bound(b) if b == denoted)
                     {
                         continue;
                     }
@@ -1790,6 +1885,126 @@ impl CountedLoop {
             min: min.min(max),
             max,
         })
+    }
+
+    /// Prove that the body executes at least `minimum` times, emitting a
+    /// pre-header check when compile-time facts alone do not settle it.
+    ///
+    /// [`CountedLoop::trip_count`] answers with a compile-time interval, and
+    /// for the commonest loop in Java — `for (i = 0; i < n; i++)` with a
+    /// runtime `n` — that interval is `[0, i32::MAX]`. Every consumer with a
+    /// profitability floor (a vector lane count, an unroll factor, a peel
+    /// count) therefore sees `min == 0` and refuses, even though a single
+    /// pre-header compare would settle it. This is the method that returns
+    /// that compare instead of a refusal.
+    ///
+    /// ## What is proved
+    ///
+    /// With a unit stride the executed values are exactly
+    /// `entry, entry+1, …, bound + addend`, so the count is
+    /// `bound + addend - entry + 1`. The entry value is a *range*, so the
+    /// witness uses its highest admissible value — the fewest iterations the
+    /// loop can run — and the guard is therefore conservative, never
+    /// optimistic, when the entry value is only partly known.
+    ///
+    /// The result does **not** depend on the no-wrap obligations
+    /// [`CountedLoop::iv_span`] mints, and deliberately does not carry them: a
+    /// wrapping IV makes the loop run *longer*, never shorter, so a lower
+    /// bound on the trip count survives a wrap. A caller that also needs the
+    /// index proved in range must still take those guards from the bounds
+    /// proof.
+    ///
+    /// ## What is refused
+    ///
+    /// * anything [`CountedLoop::trip_count`] refuses (a post-tested loop, a
+    ///   runtime or zero stride, a direction mismatch, a limit the body can
+    ///   change), with the same [`RefusalReason`] the other proofs use;
+    /// * `|stride| != 1`, because the count is then
+    ///   `floor((bound + addend - entry) / stride) + 1` and [`SymBound`] has no
+    ///   division — the witness would not be trip-count-valued;
+    /// * a decreasing loop, because its count is `entry - (bound + addend) + 1`
+    ///   and [`SymBound`] cannot negate its base term;
+    /// * an unbounded entry value, and any demand no admissible limit could
+    ///   meet — the module's standing rule that a guard which can never pass is
+    ///   a refusal, not an obligation.
+    ///
+    /// `minimum == 0` is [`TripCountProof::Static`] for every loop, counted or
+    /// not: "runs at least zero times" is not a claim about the loop.
+    pub fn prove_trip_count_at_least(&self, minimum: u64, env: &RangeEnv) -> TripCountProof {
+        if minimum == 0 {
+            return TripCountProof::Static;
+        }
+        // A trip count is bounded by the `int` range the IV walks, so a demand
+        // beyond that is unsatisfiable rather than merely unproven.
+        if minimum > u32::MAX as u64 {
+            return TripCountProof::Refused(RefusalReason::UnusableBound);
+        }
+        // Preconditions in the same order, and with the same verdicts, as
+        // `iv_span` — the two proofs must never disagree about *why* a loop is
+        // unusable.
+        if !self.bound.is_invariant(self.modified_locals, self.heap_stable) {
+            return TripCountProof::Refused(RefusalReason::BoundNotInvariant);
+        }
+        if self.form != LoopForm::PreTested {
+            // A post-tested loop's first iteration is unconditional; its count
+            // is the producer's business, exactly as in `trip_count`.
+            return TripCountProof::Refused(RefusalReason::UnsupportedLoopForm);
+        }
+        let increasing = self.cmp.is_increasing();
+        let stride = match self.iv.stride {
+            Stride::Const(0) => return TripCountProof::Refused(RefusalReason::ZeroStride),
+            Stride::Const(s) => {
+                if (s > 0) != increasing {
+                    return TripCountProof::Refused(RefusalReason::DirectionMismatch);
+                }
+                s
+            }
+            Stride::Variable(_) => return TripCountProof::Refused(RefusalReason::UnknownStride),
+        };
+        let bound_range = self.bound_range_in(env);
+        if bound_range.is_empty() || self.iv.init.is_empty() {
+            return TripCountProof::Refused(RefusalReason::UnusableBound);
+        }
+        // Already proven: emit nothing. This is the branch that keeps a loop
+        // with a compile-time trip count from acquiring a pre-header compare it
+        // does not need.
+        if let Some(t) = self.trip_count(env) {
+            if t.min >= minimum {
+                return TripCountProof::Static;
+            }
+        }
+        // Only `+1` yields a trip-count-valued witness; see the doc comment.
+        if stride != 1 {
+            return TripCountProof::Refused(RefusalReason::UnsupportedLoopForm);
+        }
+        if self.iv.init.is_unknown() {
+            return TripCountProof::Refused(RefusalReason::UnboundedEntry);
+        }
+        let entry_hi = match self.iv.init.hi() {
+            Some(h) => h as i64,
+            None => return TripCountProof::Refused(RefusalReason::UnboundedEntry),
+        };
+        // count = (bound + addend) - entry + 1, with the worst-case entry.
+        let witness_addend = self.bound_addend() as i64 - entry_hi + 1;
+        if !(i32::MIN as i64..=i32::MAX as i64).contains(&witness_addend) {
+            return TripCountProof::Refused(RefusalReason::UnboundedEntry);
+        }
+        // Refuse rather than hand back an obligation no admissible limit could
+        // ever satisfy.
+        let bound_hi = match bound_range.hi() {
+            Some(h) => h as i64,
+            None => return TripCountProof::Refused(RefusalReason::UnusableBound),
+        };
+        if bound_hi + witness_addend < minimum as i64 {
+            return TripCountProof::Refused(RefusalReason::UnusableBound);
+        }
+        TripCountProof::Guarded(vec![PreheaderGuard::TripCountAtLeast {
+            term: SymBound {
+                base: BoundTerm::Bound(self.bound.clone()),
+                addend: witness_addend as i32,
+            },
+            minimum,
+        }])
     }
 }
 
@@ -2946,6 +3161,408 @@ mod range_tests {
                 &env
             ),
             BoundsProof::Static
+        );
+    }
+
+    // -- minimum trip count -------------------------------------------------
+
+    fn tc_guards(p: &TripCountProof) -> Vec<PreheaderGuard> {
+        match p {
+            TripCountProof::Guarded(g) => g.clone(),
+            other => panic!("expected Guarded, got {other:?}"),
+        }
+    }
+
+    fn tc_refusal(p: &TripCountProof) -> RefusalReason {
+        match p {
+            TripCountProof::Refused(r) => *r,
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_limit_yields_a_trip_count_guard_instead_of_a_refusal() {
+        // for (i = 0; i < n; i++) — the commonest loop in Java, and the one
+        // the vectorization gate reported as its single largest refusal source.
+        let env = RangeEnv::new();
+        let l = mk(
+            IntRange::constant(0),
+            Stride::Const(1),
+            ExitCmp::Ge,
+            BoundSource::Local(N),
+        );
+        // The fact that made every profitability floor refuse: nothing at
+        // compile time rules out a zero-trip loop.
+        assert_eq!(l.trip_count(&env).unwrap().min, 0);
+
+        // `trip >= 4` is now one pre-header compare: `n >= 4`. The exclusive
+        // comparator's -1 and the "+1 because the entry value is itself an
+        // executed iteration" cancel exactly, so the witness is bare `n`.
+        assert_eq!(
+            tc_guards(&l.prove_trip_count_at_least(4, &env)),
+            [PreheaderGuard::TripCountAtLeast {
+                term: bound_term(BoundSource::Local(N), 0),
+                minimum: 4,
+            }]
+        );
+
+        // The witness folds in the entry value and the comparator, so a
+        // consumer never has to know either. `for (i = 3; i <= n; i++)` runs
+        // `n - 2` times, so `trip >= 4` is `n - 2 >= 4`.
+        let shifted = mk(
+            IntRange::constant(3),
+            Stride::Const(1),
+            ExitCmp::Gt,
+            BoundSource::Local(N),
+        );
+        assert_eq!(
+            tc_guards(&shifted.prove_trip_count_at_least(4, &env)),
+            [PreheaderGuard::TripCountAtLeast {
+                term: bound_term(BoundSource::Local(N), -2),
+                minimum: 4,
+            }]
+        );
+
+        // A partly-known entry value uses its HIGHEST admissible value — the
+        // fewest iterations the loop can run. Conservative, never optimistic.
+        let ranged = mk(
+            IntRange::new(0, 5),
+            Stride::Const(1),
+            ExitCmp::Ge,
+            BoundSource::Local(N),
+        );
+        assert_eq!(
+            tc_guards(&ranged.prove_trip_count_at_least(2, &env)),
+            [PreheaderGuard::TripCountAtLeast {
+                term: bound_term(BoundSource::Local(N), -5),
+                minimum: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_provable_trip_count_emits_no_guard_at_all() {
+        let env = RangeEnv::new();
+        // for (i = 0; i < 16; i++) — 16 trips, known at compile time.
+        let l = mk(
+            IntRange::constant(0),
+            Stride::Const(1),
+            ExitCmp::Ge,
+            BoundSource::Const(16),
+        );
+        assert_eq!(l.trip_count(&env).and_then(|t| t.exact()), Some(16));
+        for minimum in [0u64, 1, 2, 4, 8, 16] {
+            assert_eq!(
+                l.prove_trip_count_at_least(minimum, &env),
+                TripCountProof::Static,
+                "trip >= {minimum} is a compile-time fact here"
+            );
+        }
+        // MUST REFUSE twin: a demand the loop provably cannot meet is a
+        // refusal, not a guard that always fails.
+        assert_eq!(
+            tc_refusal(&l.prove_trip_count_at_least(17, &env)),
+            RefusalReason::UnusableBound
+        );
+
+        // A runtime limit whose range is known also settles statically.
+        let mut ranged = mk(
+            IntRange::constant(0),
+            Stride::Const(1),
+            ExitCmp::Ge,
+            BoundSource::Local(N),
+        );
+        ranged.bound_range = IntRange::new(8, 10);
+        assert_eq!(
+            ranged.prove_trip_count_at_least(8, &env),
+            TripCountProof::Static
+        );
+        // One more than the proven floor, and it becomes a runtime question.
+        assert_eq!(
+            tc_guards(&ranged.prove_trip_count_at_least(9, &env)),
+            [PreheaderGuard::TripCountAtLeast {
+                term: bound_term(BoundSource::Local(N), 0),
+                minimum: 9,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_trip_count_minimum_is_refused_where_no_witness_is_expressible() {
+        let env = RangeEnv::new();
+
+        // Non-unit stride: the count needs a division `SymBound` cannot spell.
+        assert_eq!(
+            tc_refusal(
+                &mk(
+                    IntRange::constant(0),
+                    Stride::Const(4),
+                    ExitCmp::Ge,
+                    BoundSource::Local(N),
+                )
+                .prove_trip_count_at_least(4, &env)
+            ),
+            RefusalReason::UnsupportedLoopForm
+        );
+        // Decreasing: the count is `entry - limit + 1`, and `SymBound` cannot
+        // negate its base term.
+        assert_eq!(
+            tc_refusal(
+                &mk(
+                    IntRange::constant(100),
+                    Stride::Const(-1),
+                    ExitCmp::Le,
+                    BoundSource::Local(N),
+                )
+                .prove_trip_count_at_least(4, &env)
+            ),
+            RefusalReason::UnsupportedLoopForm
+        );
+        // Unknown entry value: nothing to subtract the limit from.
+        assert_eq!(
+            tc_refusal(
+                &mk(
+                    IntRange::unknown(),
+                    Stride::Const(1),
+                    ExitCmp::Ge,
+                    BoundSource::Local(N),
+                )
+                .prove_trip_count_at_least(4, &env)
+            ),
+            RefusalReason::UnboundedEntry
+        );
+        // Runtime stride, zero stride, direction mismatch — the same verdicts
+        // `iv_span` gives, so the two proofs never disagree about the cause.
+        assert_eq!(
+            tc_refusal(
+                &mk(
+                    IntRange::constant(0),
+                    Stride::Variable(4),
+                    ExitCmp::Ge,
+                    BoundSource::Local(N),
+                )
+                .prove_trip_count_at_least(4, &env)
+            ),
+            RefusalReason::UnknownStride
+        );
+        assert_eq!(
+            tc_refusal(
+                &mk(
+                    IntRange::constant(0),
+                    Stride::Const(0),
+                    ExitCmp::Ge,
+                    BoundSource::Local(N),
+                )
+                .prove_trip_count_at_least(4, &env)
+            ),
+            RefusalReason::ZeroStride
+        );
+        assert_eq!(
+            tc_refusal(
+                &mk(
+                    IntRange::constant(0),
+                    Stride::Const(-1),
+                    ExitCmp::Ge,
+                    BoundSource::Local(N),
+                )
+                .prove_trip_count_at_least(4, &env)
+            ),
+            RefusalReason::DirectionMismatch
+        );
+        // A post-tested loop's first iteration is unconditional; `trip_count`
+        // refuses it and so does this.
+        let mut post = mk(
+            IntRange::constant(0),
+            Stride::Const(1),
+            ExitCmp::Ge,
+            BoundSource::Local(N),
+        );
+        post.form = LoopForm::PostTested;
+        assert_eq!(
+            tc_refusal(&post.prove_trip_count_at_least(4, &env)),
+            RefusalReason::UnsupportedLoopForm
+        );
+        // A limit the body can change would make the pre-header check stale.
+        let mut mutable_bound = mk(
+            IntRange::constant(0),
+            Stride::Const(1),
+            ExitCmp::Ge,
+            BoundSource::Local(N),
+        );
+        mutable_bound.modified_locals |= 1u64 << N;
+        assert_eq!(
+            tc_refusal(&mutable_bound.prove_trip_count_at_least(4, &env)),
+            RefusalReason::BoundNotInvariant
+        );
+        // "At least zero times" is not a claim about a loop, so it holds even
+        // for the ones every other verdict refuses.
+        assert_eq!(
+            post.prove_trip_count_at_least(0, &env),
+            TripCountProof::Static
+        );
+        // A demand no `int` trip count could reach.
+        assert_eq!(
+            tc_refusal(
+                &mk(
+                    IntRange::constant(0),
+                    Stride::Const(1),
+                    ExitCmp::Ge,
+                    BoundSource::Local(N),
+                )
+                .prove_trip_count_at_least(u64::from(u32::MAX) + 1, &env)
+            ),
+            RefusalReason::UnusableBound
+        );
+    }
+
+    #[test]
+    fn the_new_guard_shape_never_leaks_into_an_existing_proof() {
+        // The whole point of adding a variant is that no existing guard list
+        // changes. These are the exact lists the bounds/span tests above
+        // assert, restated here so a future producer that starts attaching a
+        // trip-count obligation to `iv_span` fails one focused test.
+        let env = RangeEnv::new();
+        let unknown_entry = mk(
+            IntRange::unknown(),
+            Stride::Const(1),
+            ExitCmp::Ge,
+            BoundSource::Local(N),
+        );
+        let p = unknown_entry.prove_index_in_bounds(
+            &IndexExpr::identity(IV),
+            IntRange::array_length(),
+            &env,
+        );
+        assert_eq!(
+            guards(&p),
+            [
+                PreheaderGuard::NonNegative(entry_term(0)),
+                PreheaderGuard::LengthAtLeast(bound_term(BoundSource::Local(N), 0)),
+            ]
+        );
+
+        let inclusive = mk(
+            IntRange::constant(0),
+            Stride::Const(1),
+            ExitCmp::Gt,
+            BoundSource::Local(N),
+        );
+        assert_eq!(
+            inclusive.iv_span(&env).unwrap().guards,
+            [PreheaderGuard::AtMost {
+                term: bound_term(BoundSource::Local(N), 0),
+                limit: i32::MAX - 1,
+            }]
+        );
+
+        let variable_stride = mk(
+            IntRange::constant(0),
+            Stride::Variable(4),
+            ExitCmp::Ge,
+            BoundSource::Local(N),
+        );
+        assert_eq!(
+            variable_stride.iv_span(&env).unwrap().guards,
+            [PreheaderGuard::StrideInRange {
+                local: 4,
+                headroom: bound_term(BoundSource::Local(N), -1),
+            }]
+        );
+
+        // No proof in this module mints the new shape; only the explicit
+        // trip-count request does.
+        for l in [&unknown_entry, &inclusive, &variable_stride] {
+            let mut every: Vec<PreheaderGuard> =
+                l.iv_span(&env).map(|p| p.guards).unwrap_or_default();
+            if let BoundsProof::Guarded(g) =
+                l.prove_index_in_bounds(&IndexExpr::identity(IV), IntRange::array_length(), &env)
+            {
+                every.extend(g);
+            }
+            assert!(
+                !every
+                    .iter()
+                    .any(|g| matches!(g, PreheaderGuard::TripCountAtLeast { .. })),
+                "a bounds/span proof minted a trip-count guard: {every:?}"
+            );
+        }
+    }
+
+    // -- naming the guarded array -------------------------------------------
+
+    #[test]
+    fn an_array_length_expression_discharges_the_same_tautology_as_a_slot() {
+        let env = RangeEnv::new();
+        // for (i = 0; i < a.length; i++) a[i], with `a` in local 0.
+        let l = mk(
+            IntRange::constant(0),
+            Stride::Const(1),
+            ExitCmp::Ge,
+            BoundSource::ArrayLength(0),
+        );
+        let idx = IndexExpr::identity(IV);
+        // The slot-keyed form is exactly the expression-keyed form applied to
+        // `ArrayLength(slot)` — including the `None` case, which is what keeps
+        // every existing caller byte-identical.
+        for slot in [None, Some(0usize), Some(5usize)] {
+            let denoted = slot.map(BoundSource::ArrayLength);
+            assert_eq!(
+                l.prove_index_in_bounds_of(&idx, slot, IntRange::array_length(), &env),
+                l.prove_index_in_bounds_of_array(
+                    &idx,
+                    denoted.as_ref(),
+                    IntRange::array_length(),
+                    &env
+                ),
+                "slot {slot:?} must delegate unchanged"
+            );
+        }
+
+        // The reason the overload exists: a limit that IS this array's length
+        // but is spelled as something other than `ArrayLength(slot)` — a local
+        // the caller has proven holds `a.length`, or an IR node. The slot form
+        // cannot express it and pays a guard; the expression form discharges it.
+        let via_local = mk(
+            IntRange::constant(0),
+            Stride::Const(1),
+            ExitCmp::Ge,
+            BoundSource::Local(N),
+        );
+        assert_eq!(
+            guards(&via_local.prove_index_in_bounds_of(
+                &idx,
+                Some(0),
+                IntRange::array_length(),
+                &env
+            )),
+            [PreheaderGuard::LengthAtLeast(bound_term(
+                BoundSource::Local(N),
+                0
+            ))]
+        );
+        assert_eq!(
+            via_local.prove_index_in_bounds_of_array(
+                &idx,
+                Some(&BoundSource::Local(N)),
+                IntRange::array_length(),
+                &env
+            ),
+            BoundsProof::Static
+        );
+        // MUST NOT generalise: naming a limit that is *not* this array's
+        // length keeps the guard, which is the multi-array out-of-bounds store
+        // the whole shortcut is fenced against.
+        assert_eq!(
+            guards(&via_local.prove_index_in_bounds_of_array(
+                &idx,
+                Some(&BoundSource::Local(N + 1)),
+                IntRange::array_length(),
+                &env
+            )),
+            [PreheaderGuard::LengthAtLeast(bound_term(
+                BoundSource::Local(N),
+                0
+            ))]
         );
     }
 }

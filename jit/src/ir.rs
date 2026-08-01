@@ -372,6 +372,33 @@ pub enum Op {
     /// Scalar TDigest lambda adapter. Inputs: [ctrl, mem, lambda, index].
     LambdaIntToDouble,
 
+    // ── Synchronization ──────────────────────────────────────────────
+    /// `monitorenter` on an object. Inputs: `[ctrl, mem, obj]`.
+    ///
+    /// Like `Op::Store` the node **is** the new memory token: it consumes the
+    /// prior one at slot 1 and every later access chains off it. Its effect is
+    /// [`MemEffect::monitor_enter`] — a read *and* a write of
+    /// [`AliasClass::Monitor`], a safepoint, and a JMM **acquire**, so nothing
+    /// after it may move above it.
+    ///
+    /// Impure and **not** removable by a liveness sweep. A monitor is
+    /// observable in three ways no value consumer witnesses: an unbalanced
+    /// pair throws `IllegalMonitorStateException`, the lock is a
+    /// happens-before edge for other threads, and a live monitor is an
+    /// identity observation that blocks scalar replacement. The only pass
+    /// licensed to delete one is `escape_analysis`'s lock elision, and only by
+    /// applying a whole balanced plan at once — see
+    /// `docs/jit/lock-elimination.md` §4 and §6.1.
+    MonitorEnter,
+
+    /// `monitorexit` on an object. Inputs: `[ctrl, mem, obj]`.
+    ///
+    /// The release half of [`Op::MonitorEnter`]: nothing before it may move
+    /// below it. Everything that variant says about token threading and about
+    /// deletion applies here unchanged — the two are only ever removed as a
+    /// balanced pair.
+    MonitorExit,
+
     // ── Speculation guard (real-frame-deopt) ─────────────────────────
     /// Speculative guard. Inputs: `[ctrl, cond]`. If `cond` is zero at
     /// runtime the guard fails and control transfers to the deopt
@@ -2313,6 +2340,24 @@ pub enum AliasClass {
         array: NodeId,
         /// The element index — usually [`AccessOffset::Dynamic`].
         index: AccessOffset,
+        /// The element **type**, read off the accessing op itself
+        /// (`Op::ArrayLoad` / `Op::ArrayStore` each carry their [`MemKind`])
+        /// by [`access_location`]. A layout that does not yield one degrades
+        /// the whole class to [`AliasClass::Any`].
+        ///
+        /// It lives in the class rather than alongside it because a consumer
+        /// that carries its own copy is trusting its *producer* for a fact the
+        /// memory model already knows. `x64::simd_analysis`'s `vector_gate`
+        /// refuses a vector access to [`MemKind::Ref`] elements, because a
+        /// vector store of oops bypasses the GC write barrier; while that
+        /// refusal read a caller-supplied `MemKind`, the barrier elision was
+        /// only as sound as whoever filled the field in. Reading it here makes
+        /// the refusal unforgeable.
+        ///
+        /// It also buys precision: a Java array's component type is fixed at
+        /// allocation, so two accesses at *different* element kinds cannot be
+        /// the same object — see [`Graph::may_alias`].
+        elem: MemKind,
     },
     /// An array's length word. `Op::ArrayLength`.
     ///
@@ -2339,7 +2384,8 @@ pub enum AliasClass {
         /// Field index within the class's static storage.
         field: u32,
     },
-    /// An object's monitor (lock word). `monitorenter` / `monitorexit`.
+    /// An object's monitor (lock word). [`Op::MonitorEnter`] /
+    /// [`Op::MonitorExit`].
     ///
     /// Aliasing is only half the story for a monitor: its *ordering* comes
     /// from [`MemOrder`], not from this class. Two monitor operations on
@@ -2541,33 +2587,59 @@ impl MemEffect {
 
     /// `monitorenter` on `obj` — an **acquire**.
     ///
-    /// No op produces this yet (`monitorenter` has no IR lowering, so a
-    /// synchronized method bails to the single-pass backend). The constructor
-    /// exists so the lowering lands with a classification, and so the ordering
-    /// discipline can be stated and tested now rather than discovered later.
+    /// [`Op::MonitorEnter`] is the producing op, and [`effect_of_node`]
+    /// reaches this through [`MemEffect::monitor_enter_of`] after reading the
+    /// locked reference out of the node's `[ctrl, mem, obj]` edge list. This
+    /// entry point stays because a caller holding a reference and no node —
+    /// a test, or a pass reasoning about an effect it has not built yet — is
+    /// the case the ordering discipline was first stated for.
+    ///
+    /// Both halves of the effect are deliberate. It **reads and writes** the
+    /// monitor, so two enters of the same object never commute. It is a
+    /// **safepoint**, because the runtime may block here and an interpreter
+    /// frame may be rebuilt from it — which is also why a coarsened lock
+    /// region moves deopt points (`docs/jit/lock-elimination.md` §3).
     pub fn monitor_enter(obj: NodeId) -> MemEffect {
+        MemEffect::monitor_enter_of(AliasClass::Monitor { obj })
+    }
+
+    /// `monitorexit` on `obj` — a **release**. See [`MemEffect::monitor_enter`].
+    pub fn monitor_exit(obj: NodeId) -> MemEffect {
+        MemEffect::monitor_exit_of(AliasClass::Monitor { obj })
+    }
+
+    /// [`MemEffect::monitor_enter`] over an already-built class.
+    ///
+    /// [`effect_of_node`] resolves the locked reference out of the edge list
+    /// and hands the class straight over, so an unreadable layout arrives here
+    /// as [`AliasClass::Any`] — the refusing direction — instead of being
+    /// silently rebuilt around a wrong node id.
+    pub fn monitor_enter_of(class: AliasClass) -> MemEffect {
         MemEffect {
-            reads: AliasClass::Monitor { obj },
-            writes: AliasClass::Monitor { obj },
+            reads: class,
+            writes: class,
             order: MemOrder::Acquire,
             safepoint: true,
             allocates: false,
         }
     }
 
-    /// `monitorexit` on `obj` — a **release**. See [`MemEffect::monitor_enter`].
-    pub fn monitor_exit(obj: NodeId) -> MemEffect {
+    /// [`MemEffect::monitor_exit`] over an already-built class. See
+    /// [`MemEffect::monitor_enter_of`].
+    pub fn monitor_exit_of(class: AliasClass) -> MemEffect {
         MemEffect {
-            reads: AliasClass::Monitor { obj },
-            writes: AliasClass::Monitor { obj },
+            reads: class,
+            writes: class,
             order: MemOrder::Release,
             safepoint: true,
             allocates: false,
         }
     }
 
-    /// A volatile read of `class` — an **acquire**. See
-    /// [`MemEffect::monitor_enter`] for why this has no producing op yet.
+    /// A volatile read of `class` — an **acquire**. Volatile field access
+    /// still has no producing op (unlike the monitors, which now have
+    /// [`Op::MonitorEnter`] / [`Op::MonitorExit`]), so this constructor is the
+    /// only way to state its ordering.
     pub fn volatile_read(class: AliasClass) -> MemEffect {
         MemEffect {
             reads: class,
@@ -2625,6 +2697,10 @@ pub enum MemAccess {
     LengthRead,
     /// Allocates fresh storage.
     Allocate,
+    /// Enters an object's monitor — an acquire, and a safepoint.
+    MonitorEnter,
+    /// Exits an object's monitor — a release, and a safepoint.
+    MonitorExit,
     /// Reads and writes anything.
     Opaque,
 }
@@ -2680,6 +2756,8 @@ impl Op {
             Op::NewArray { .. } => (3, MemAccess::Allocate), // [ctrl, mem, length]
             Op::Call { .. } => (2, MemAccess::Opaque), // [ctrl, mem, args…]
             Op::LambdaIntToDouble => (4, MemAccess::Opaque), // [ctrl, mem, lambda, index]
+            Op::MonitorEnter => (3, MemAccess::MonitorEnter), // [ctrl, mem, obj]
+            Op::MonitorExit => (3, MemAccess::MonitorExit), // [ctrl, mem, obj]
             _ => return None,
         };
         Some(OpMemoryShape {
@@ -2774,15 +2852,20 @@ fn access_location(node: &Node, access: MemAccess) -> AliasClass {
             },
             _ => AliasClass::Any,
         },
-        // `[ctrl, mem, array, index]` — the only documented form.
+        // `[ctrl, mem, array, index]` — the only documented form. The element
+        // kind comes from the op, never from the layout: `array_elem_kind` is
+        // what makes the class unforgeable by a consumer (see
+        // `AliasClass::ArrayElem::elem`). An op that reached here without one
+        // is a shape-table entry nobody taught the kind reader about, and it
+        // degrades to `Any` rather than guessing an element type.
         MemAccess::ArrayRead | MemAccess::ArrayWrite => {
-            if inputs.len() >= 4 {
-                AliasClass::ArrayElem {
+            match (inputs.len() >= 4, array_elem_kind(&node.op)) {
+                (true, Some(elem)) => AliasClass::ArrayElem {
                     array: inputs[2],
                     index: dyn_at(3),
-                }
-            } else {
-                AliasClass::Any
+                    elem,
+                },
+                _ => AliasClass::Any,
             }
         }
         // `[ctrl, mem, array_ref]`, or the hand-built `[array]`. The arity
@@ -2793,7 +2876,31 @@ fn access_location(node: &Node, access: MemAccess) -> AliasClass {
             _ => AliasClass::Any,
         },
         MemAccess::Allocate => AliasClass::None,
+        // `[ctrl, mem, obj]` — the only form. A monitor is addressed by the
+        // locked reference and by nothing else: there is no offset operand, so
+        // two monitors on the same object are always a must-alias.
+        MemAccess::MonitorEnter | MemAccess::MonitorExit => {
+            if inputs.len() >= 3 {
+                AliasClass::Monitor { obj: inputs[2] }
+            } else {
+                AliasClass::Any
+            }
+        }
         MemAccess::Opaque => AliasClass::Any,
+    }
+}
+
+/// The element type an array-element access reads or writes, taken from the op
+/// itself.
+///
+/// The one authority for `AliasClass::ArrayElem::elem`. `Op::ArrayLoad` and
+/// `Op::ArrayStore` each carry their [`MemKind`] as a type tag, so the element
+/// type of an access is a property of the *node*, not of whoever is asking —
+/// which is the whole point of moving it into the alias class.
+fn array_elem_kind(op: &Op) -> Option<MemKind> {
+    match op {
+        Op::ArrayLoad(kind) | Op::ArrayStore(kind) => Some(*kind),
+        _ => None,
     }
 }
 
@@ -2822,6 +2929,11 @@ fn access_location(node: &Node, access: MemAccess) -> AliasClass {
 ///   parameters, `Op::Phi` on data) is inert. `Op::Div` / `Op::Rem` throw on a
 ///   zero divisor, which is an exception-ordering question, not a memory one —
 ///   see the section header.
+///
+/// `Op::MonitorEnter` / `Op::MonitorExit` do have a shape, so they come out of
+/// the table like any other memory op — but they are the one family whose
+/// effect is neither a read nor a write alone: each reads *and* writes
+/// [`AliasClass::Monitor`], is a safepoint, and carries half a JMM fence.
 pub fn effect_of_node(node: &Node) -> MemEffect {
     match &node.op {
         Op::Phi => {
@@ -2846,6 +2958,8 @@ pub fn effect_of_node(node: &Node) -> MemEffect {
                     }
                     MemAccess::FieldWrite | MemAccess::ArrayWrite => MemEffect::write(class),
                     MemAccess::Allocate => MemEffect::allocation(),
+                    MemAccess::MonitorEnter => MemEffect::monitor_enter_of(class),
+                    MemAccess::MonitorExit => MemEffect::monitor_exit_of(class),
                     MemAccess::Opaque => MemEffect::OPAQUE,
                 }
             }
@@ -3053,12 +3167,30 @@ impl Graph {
                 base,
                 offset: fold(offset),
             },
-            AliasClass::ArrayElem { array, index } => AliasClass::ArrayElem {
+            AliasClass::ArrayElem {
+                array,
+                index,
+                elem,
+            } => AliasClass::ArrayElem {
                 array,
                 index: fold(index),
+                elem,
             },
             other => other,
         }
+    }
+
+    /// The element type node `id` accesses, when it is an array-element access
+    /// (`Op::ArrayLoad` / `Op::ArrayStore`); `None` for every other node, and
+    /// for an id that names nothing.
+    ///
+    /// The node-level spelling of `AliasClass::ArrayElem::elem`, for a caller
+    /// that holds a `NodeId` and not a class — `x64::simd_analysis`'s
+    /// `vector_gate` builds its body descriptions from node ids before it ever
+    /// reaches an alias class. Both read [`array_elem_kind`], so a consumer
+    /// cannot get a different answer here than the memory model uses.
+    pub fn element_kind(&self, id: NodeId) -> Option<MemKind> {
+        array_elem_kind(&self.node_opt(id)?.op)
     }
 
     /// What reference `id` may point to, following `Op::Phi` merges.
@@ -3145,6 +3277,13 @@ impl Graph {
     ///   different compile-time constants ([`AccessOffset::provably_distinct`]).
     /// * **Same kind, different base:** disjoint only when the bases are
     ///   provably different objects ([`Graph::refs_may_alias`]).
+    /// * **Two array elements at different element types never overlap.** A
+    ///   Java array's component type is fixed at allocation and
+    ///   `AliasClass::ArrayElem::elem` is read off the accessing op, so an
+    ///   `int[]` element and a reference element are two different objects
+    ///   even when neither reference's provenance is known. This is the one
+    ///   premise here that a *wrong* element tag could break, which is exactly
+    ///   why the tag is not caller-supplied.
     ///
     /// Aliasing alone does not decide reordering — see
     /// [`Graph::may_reorder_effects`], which also applies the JMM fences and
@@ -3159,8 +3298,28 @@ impl Graph {
             (C::Field { base: x, offset: i }, C::Field { base: y, offset: j }) => {
                 !i.provably_distinct(j) && self.refs_may_alias(x, y)
             }
-            (C::ArrayElem { array: x, index: i }, C::ArrayElem { array: y, index: j }) => {
-                !i.provably_distinct(j) && self.refs_may_alias(x, y)
+            (
+                C::ArrayElem {
+                    array: x,
+                    index: i,
+                    elem: ke,
+                },
+                C::ArrayElem {
+                    array: y,
+                    index: j,
+                    elem: kf,
+                },
+            ) => {
+                // A Java array's component type is fixed at allocation, so two
+                // accesses at different element kinds cannot be reading the
+                // same object — an `int[]` cell is never an `Object[]` cell.
+                // The `x != y` guard keeps that from becoming an *invented*
+                // disjointness on an ill-typed graph where one array node is
+                // accessed at two kinds: there the references must-alias, and
+                // the model has to keep saying so rather than trusting the two
+                // type tags to be consistent.
+                let kinds_disjoint = x != y && ke != kf;
+                !kinds_disjoint && !i.provably_distinct(j) && self.refs_may_alias(x, y)
             }
             (C::ArrayLength { array: x }, C::ArrayLength { array: y }) => self.refs_may_alias(x, y),
             (C::Static { class_id: c, field: i }, C::Static { class_id: d, field: j }) => {
@@ -3213,11 +3372,13 @@ impl Graph {
     /// [`Graph::may_reorder`] over two effects directly, for a caller holding
     /// an effect that no node produces yet.
     ///
-    /// That is not a hypothetical: `monitorenter` / `monitorexit` and volatile
-    /// field access have no `Op` variant (a synchronized method bails to the
-    /// single-pass backend today), so [`MemEffect::monitor_enter`],
-    /// [`MemEffect::volatile_write`] and friends are the only way to state
-    /// their ordering — and the only way to test it before the ops land.
+    /// That is not a hypothetical: volatile field access still has no `Op`
+    /// variant, so [`MemEffect::volatile_read`] / [`MemEffect::volatile_write`]
+    /// are the only way to state its ordering — and the only way to test it
+    /// before the op lands. The monitors were in that position too until
+    /// [`Op::MonitorEnter`] / [`Op::MonitorExit`] landed; they now reach these
+    /// rules through [`Graph::may_reorder`] like any other node, and
+    /// [`MemEffect::monitor_enter`] is kept as the node-free entry point.
     ///
     /// The rules, in the order they are applied:
     ///
@@ -7626,5 +7787,359 @@ mod tests {
             assert_eq!(t.snapshot_scope(i), Some(s));
         }
         assert_eq!(t.snapshot_scope(8), None);
+    }
+
+    // ── Memory model: monitors, and the element type in the alias class ──
+
+    /// The `(ctrl, mem)` projections off a `Start`, the preamble every
+    /// memory-op fixture below needs.
+    fn start_preamble(g: &mut Graph) -> (NodeId, NodeId) {
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        (ctrl, mem)
+    }
+
+    /// A reference of *unknown* provenance. Two of them may be the same object
+    /// (`f(x, x)`), so nothing separates two accesses through them except the
+    /// facts the alias classes carry.
+    fn ref_param(g: &mut Graph, i: u16) -> NodeId {
+        g.add(Op::Param(i), IrType::Ref, vec![], None)
+    }
+
+    /// A runtime subscript. Two accesses at the *same* node are a must-alias
+    /// on the offset, so every pair below reaches the interesting test.
+    fn subscript(g: &mut Graph) -> NodeId {
+        g.add(Op::Add, IrType::Int, vec![], None)
+    }
+
+    /// Both monitor ops are in the single memory-shape table, at the same
+    /// token slot as every other memory op, and their third input is the
+    /// locked object rather than a token.
+    #[test]
+    fn monitor_ops_take_their_memory_token_at_the_documented_slot() {
+        let mut g = empty_graph();
+        let (ctrl, mem) = start_preamble(&mut g);
+        let obj = ref_param(&mut g, 0);
+
+        for (op, access) in [
+            (Op::MonitorEnter, MemAccess::MonitorEnter),
+            (Op::MonitorExit, MemAccess::MonitorExit),
+        ] {
+            assert_eq!(
+                op.memory_shape(),
+                Some(OpMemoryShape {
+                    token_slot: 1,
+                    min_full_arity: 3,
+                    access,
+                }),
+                "{op:?} must be registered in the single memory-shape table",
+            );
+
+            let id = g.add(op.clone(), IrType::Memory, vec![ctrl, mem, obj], None);
+            let node = g.node_opt(id).expect("just added");
+            assert_eq!(memory_token_slot(node), Some(1), "{op:?}");
+            assert!(!is_memory_token_slot(node, 0), "{op:?}: slot 0 is control");
+            assert!(is_memory_token_slot(node, 1), "{op:?}: slot 1 is the token");
+            assert!(
+                !is_memory_token_slot(node, 2),
+                "{op:?}: slot 2 is the locked object, a value the node reads",
+            );
+
+            // Below the documented arity there is no token at all — the same
+            // rule the compact hand-built `Store`/`Load` forms live under.
+            let short = g.add(op.clone(), IrType::Memory, vec![ctrl, mem], None);
+            assert_eq!(
+                memory_token_slot(g.node_opt(short).expect("just added")),
+                None,
+                "{op:?} below its full arity has no token slot",
+            );
+        }
+    }
+
+    /// The ops produce exactly the effect the constructors state: a read *and*
+    /// a write of the monitor, a safepoint, and half a JMM fence each.
+    #[test]
+    fn monitor_ops_carry_the_documented_memory_effect() {
+        let mut g = empty_graph();
+        let (ctrl, mem) = start_preamble(&mut g);
+        let obj = ref_param(&mut g, 0);
+        let enter = g.add(Op::MonitorEnter, IrType::Memory, vec![ctrl, mem, obj], None);
+        let exit = g.add(Op::MonitorExit, IrType::Memory, vec![ctrl, enter, obj], None);
+
+        assert_eq!(g.memory_effect(enter), MemEffect::monitor_enter(obj));
+        assert_eq!(g.memory_effect(exit), MemEffect::monitor_exit(obj));
+
+        let e = g.memory_effect(enter);
+        assert_eq!(e.reads, AliasClass::Monitor { obj });
+        assert_eq!(e.writes, AliasClass::Monitor { obj });
+        assert_eq!(e.order, MemOrder::Acquire);
+        assert!(e.safepoint, "a monitor is a deopt point");
+        assert!(!e.allocates);
+
+        let x = g.memory_effect(exit);
+        assert_eq!(x.order, MemOrder::Release);
+        assert!(x.safepoint);
+
+        // Neither is control and neither is pure, so no GVN or liveness sweep
+        // may treat one as a value it can drop.
+        for op in [Op::MonitorEnter, Op::MonitorExit] {
+            assert!(!op.is_control(), "{op:?}");
+            assert!(!op.is_pure(), "{op:?}");
+        }
+    }
+
+    /// The roach motel, both walls of it: nothing after a `MonitorEnter` may
+    /// move above it, nothing before a `MonitorExit` may move below it — and
+    /// an access *outside* the region may still sink into it.
+    #[test]
+    fn a_monitor_pair_is_a_barrier_in_both_directions() {
+        let mut g = empty_graph();
+        let (ctrl, mem) = start_preamble(&mut g);
+        let obj = ref_param(&mut g, 0);
+        let base = ref_param(&mut g, 1);
+        let off = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let val = g.add(Op::Const(7), IrType::Int, vec![], None);
+
+        let pre = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, mem, base, off],
+            None,
+        );
+        let enter = g.add(Op::MonitorEnter, IrType::Memory, vec![ctrl, mem, obj], None);
+        let inner_load = g.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, enter, base, off],
+            None,
+        );
+        let inner_store = g.add(
+            Op::Store(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, enter, base, off, val],
+            None,
+        );
+        let exit = g.add(
+            Op::MonitorExit,
+            IrType::Memory,
+            vec![ctrl, inner_store, obj],
+            None,
+        );
+
+        // Wall 1 — the acquire. Note the *reason*: the token edge from `enter`
+        // to the two inner accesses is deliberately not a `DataDependence`, so
+        // an `Acquire` answer proves the fence is what refused, not the chain.
+        assert_eq!(
+            g.may_reorder(enter, inner_load),
+            Reorder::Blocked(ReorderBlock::Acquire),
+        );
+        assert_eq!(
+            g.may_reorder(enter, inner_store),
+            Reorder::Blocked(ReorderBlock::Acquire),
+        );
+
+        // Wall 2 — the release.
+        assert_eq!(
+            g.may_reorder(inner_load, exit),
+            Reorder::Blocked(ReorderBlock::Release),
+        );
+        assert_eq!(
+            g.may_reorder(inner_store, exit),
+            Reorder::Blocked(ReorderBlock::Release),
+        );
+
+        // …and the asymmetry that makes it a roach motel rather than two full
+        // fences: a read from before the region may move *into* it. A monitor
+        // is not the same storage kind as a field cell, so nothing aliases —
+        // and the proof is `DisjointLocations` rather than `ReadOnly` because
+        // the enter itself writes the lock word.
+        assert_eq!(
+            g.may_reorder(pre, enter),
+            Reorder::Allowed(ReorderProof::DisjointLocations),
+        );
+    }
+
+    /// Two monitors on provably distinct objects do not alias — and still do
+    /// not commute. This is the claim `AliasClass::Monitor`'s doc makes, and
+    /// it is the one a purely alias-based model would get wrong.
+    #[test]
+    fn monitors_on_distinct_objects_do_not_alias_but_still_do_not_commute() {
+        let mut g = empty_graph();
+        let (ctrl, mem) = start_preamble(&mut g);
+        // `value(_, Ref)` is an `Op::New`, so the two are fresh in-method
+        // allocations and provably different objects.
+        let a = value(&mut g, IrType::Ref);
+        let b = value(&mut g, IrType::Ref);
+        assert!(!g.refs_may_alias(a, b), "two fresh allocations are distinct");
+        assert!(!g.may_alias(AliasClass::Monitor { obj: a }, AliasClass::Monitor { obj: b }));
+
+        let enter_a = g.add(Op::MonitorEnter, IrType::Memory, vec![ctrl, mem, a], None);
+        let enter_b = g.add(
+            Op::MonitorEnter,
+            IrType::Memory,
+            vec![ctrl, enter_a, b],
+            None,
+        );
+        assert_eq!(
+            g.may_reorder(enter_a, enter_b),
+            Reorder::Blocked(ReorderBlock::Acquire),
+            "disjoint locks still order against each other",
+        );
+    }
+
+    /// The element type is read off the op and lives in the alias class, so
+    /// the model — not a producer — decides that a reference element and a
+    /// primitive one are different memory.
+    #[test]
+    fn may_alias_distinguishes_a_reference_array_element_from_a_primitive_one() {
+        let mut g = empty_graph();
+        let (ctrl, mem) = start_preamble(&mut g);
+        let a = ref_param(&mut g, 0);
+        let b = ref_param(&mut g, 1);
+        let idx = subscript(&mut g);
+        let val = g.add(Op::Const(1), IrType::Int, vec![], None);
+        assert!(
+            g.refs_may_alias(a, b),
+            "two parameters may be the same array — provenance separates nothing here",
+        );
+
+        let ref_load = g.add(
+            Op::ArrayLoad(MemKind::Ref),
+            IrType::Ref,
+            vec![ctrl, mem, a, idx],
+            None,
+        );
+        let int_store = g.add(
+            Op::ArrayStore(MemKind::Int),
+            IrType::Memory,
+            vec![ctrl, mem, b, idx, val],
+            None,
+        );
+        let ref_store = g.add(
+            Op::ArrayStore(MemKind::Ref),
+            IrType::Memory,
+            vec![ctrl, mem, b, idx, val],
+            None,
+        );
+
+        // Unforgeable: the kind comes from the node, and a non-access has none.
+        assert_eq!(g.element_kind(ref_load), Some(MemKind::Ref));
+        assert_eq!(g.element_kind(int_store), Some(MemKind::Int));
+        assert_eq!(g.element_kind(idx), None);
+
+        let ref_read = g.memory_effect(ref_load).reads;
+        let int_write = g.memory_effect(int_store).writes;
+        let ref_write = g.memory_effect(ref_store).writes;
+        assert!(
+            matches!(
+                ref_read,
+                AliasClass::ArrayElem {
+                    elem: MemKind::Ref,
+                    ..
+                }
+            ),
+            "the class carries the element type: {ref_read:?}",
+        );
+
+        assert!(
+            !g.may_alias(ref_read, int_write),
+            "an int[] cell is never an Object[] cell",
+        );
+        assert!(
+            g.may_alias(ref_read, ref_write),
+            "two reference arrays may be the same array",
+        );
+
+        // The whole query agrees, which is what the vectorization gate reads.
+        assert!(g.may_reorder(int_store, ref_load).is_allowed());
+        assert_eq!(
+            g.may_reorder(ref_store, ref_load),
+            Reorder::Blocked(ReorderBlock::MayAlias),
+        );
+    }
+
+    /// One array node accessed at two element kinds is an ill-typed graph, and
+    /// the model must keep saying "may alias" rather than reading the two type
+    /// tags as a proof of disjointness.
+    #[test]
+    fn one_array_at_two_element_kinds_is_still_a_must_alias() {
+        let mut g = empty_graph();
+        let (ctrl, mem) = start_preamble(&mut g);
+        let a = ref_param(&mut g, 0);
+        let idx = subscript(&mut g);
+        let load_int = g.add(
+            Op::ArrayLoad(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, mem, a, idx],
+            None,
+        );
+        let load_ref = g.add(
+            Op::ArrayLoad(MemKind::Ref),
+            IrType::Ref,
+            vec![ctrl, mem, a, idx],
+            None,
+        );
+        assert!(g.may_alias(
+            g.memory_effect(load_int).reads,
+            g.memory_effect(load_ref).reads,
+        ));
+    }
+
+    /// The shape table for every op that had one before the monitors landed is
+    /// byte-for-byte what it was, and every op that had none still has none.
+    /// The memory-chain lane in `ir_verify` and the three private copies of
+    /// `memory_token_slot` all read these numbers.
+    #[test]
+    fn the_memory_shape_table_is_unchanged_for_every_pre_existing_op() {
+        let with_shape: &[(Op, usize, MemAccess)] = &[
+            (Op::Load(MemKind::Int), 3, MemAccess::FieldRead),
+            (Op::Store(MemKind::Int), 4, MemAccess::FieldWrite),
+            (Op::ArrayLoad(MemKind::Int), 4, MemAccess::ArrayRead),
+            (Op::ArrayStore(MemKind::Int), 5, MemAccess::ArrayWrite),
+            (Op::ArrayLength, 3, MemAccess::LengthRead),
+            (
+                Op::New {
+                    class_id: 1,
+                    num_fields: 0,
+                },
+                2,
+                MemAccess::Allocate,
+            ),
+            (Op::NewArray { element_type: 10 }, 3, MemAccess::Allocate),
+            (Op::Call { info_ptr: 0 }, 2, MemAccess::Opaque),
+            (Op::LambdaIntToDouble, 4, MemAccess::Opaque),
+            (Op::MonitorEnter, 3, MemAccess::MonitorEnter),
+            (Op::MonitorExit, 3, MemAccess::MonitorExit),
+        ];
+        for (op, min_full_arity, access) in with_shape {
+            assert_eq!(
+                op.memory_shape(),
+                Some(OpMemoryShape {
+                    token_slot: 1,
+                    min_full_arity: *min_full_arity,
+                    access: *access,
+                }),
+                "{op:?}",
+            );
+        }
+
+        for op in [
+            Op::Start,
+            Op::Return,
+            Op::If,
+            Op::Merge,
+            Op::Region,
+            Op::Proj(0),
+            Op::Const(0),
+            Op::ConstF(0),
+            Op::Param(0),
+            Op::Phi,
+            Op::Add,
+            Op::Guard { bci: 0 },
+            Op::Dead,
+        ] {
+            assert_eq!(op.memory_shape(), None, "{op:?}");
+        }
     }
 }

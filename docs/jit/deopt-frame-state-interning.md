@@ -105,10 +105,12 @@ handle**.
 
 ### The reexecute flag
 
-`ResumeSemantics { reexecute, rethrow_exception }` replaces the prose
-convention `deopt-metadata.md` §1 records as an outright gap ("Reexecute flag —
-absent / absent. No field exists."). Two independent flags, as in a real scope
-descriptor:
+`ResumeSemantics { reexecute, rethrow_exception }` replaces the prose convention
+that `deopt-metadata.md` §1 used to record as an outright gap ("Reexecute flag —
+absent / absent. No field exists."). That row now reads *emitted, unread*: the
+field reached `DeoptimizationPoint` (§5.2) and every producer stamps it; the VM
+resume sink is the consumer still to switch. Two independent flags, as in a real
+scope descriptor:
 
 | | `reexecute` | `rethrow_exception` | meaning |
 | --- | --- | --- | --- |
@@ -151,8 +153,12 @@ Producers are not edited in this pass, so both directions are explicit:
 and gives every caller scope `for_caller_scope()` semantics.
 
 `materialize` rebuilds the owned `FrameState` including the caller chain. It
-**drops** `ResumeSemantics`, because the owned type has no room for it — which
-is exactly the gap §5 asks producers to close.
+still **drops** `ResumeSemantics`, because the owned `FrameState` has no room
+for it — but `materialize_point` does not: `DeoptimizationPoint` now carries a
+`semantics` field, so the point round-trips, falling back to
+`ResumeSemantics::for_reason(point.reason)` only for a handle the interner never
+issued. Per-*caller-scope* semantics are still lost by a `FrameState`-level
+materialization; only the innermost scope's survive (§5.2).
 
 The install-time verifier gained `DeoptVerifier::violations_interned` /
 `verify_interned`. They are deliberately **not** a second implementation of the
@@ -236,40 +242,52 @@ call it protects) now cost one state.
 
 ---
 
-## 5. Producer edits required (files this pass does not own)
+## 5. Producer edits (status)
 
-Nothing below was changed here. Each item is the exact edit needed.
+This section listed edits that were **not** made in the pass that wrote this
+doc. Two of the three have since landed, in part. Each item now states what is
+done, what is not, and what is left.
 
-### 5.1 Populate the caller chain
+### 5.1 Populate the caller chain — *machinery landed, no producer*
 
-`FrameState::caller` is hard-coded `None` at four producer sites:
+**Done.** The scope record and the lowerer's consumer both exist:
 
-| file:line | site |
-| --- | --- |
-| `jit/src/ir_lower.rs:3840` | `resolve_frame_state_for_bci`, the no-snapshot fallback frame |
-| `jit/src/ir_lower.rs:4164` | `resolve_frame_state`, the scalar-replacement path |
-| `jit/src/ir_lower.rs:4173` | `resolve_frame_state`, the ordinary path |
-| `jit/src/x64.rs:2632` | `build_and_record_deopt_point` |
+* `jit/src/ir.rs` — `InlineScopeTable` holds `(method_key, caller_bci, parent)`
+  scopes plus a snapshot-index → scope binding (`bind_snapshot`,
+  `bind_snapshot_range`, `snapshot_scope`). It is deliberately a **side table**
+  rather than a field on `SafepointSnapshot`, which is unchanged
+  (`{ bci, locals, stack }`). `push_scope` refuses a foreign/forward parent and
+  anything past `MAX_INLINE_SCOPE_DEPTH`, so a malformed chain cannot be built.
+* `jit/src/ir_lower.rs` — `Lowerer::resolve_frame_state` fills `caller` from
+  `Lowerer::caller_chain_for(index)`, where `index` is the snapshot's position
+  in `Graph::safepoints` (which is why the by-bci lookup is now a `position`
+  rather than a `find`). `lower_inner_with_scopes` takes the table;
+  `lower_inner` passes an empty one, which is byte-identical to the old
+  behaviour.
+* Undescribed caller frames fail closed: a scope with no resolvable snapshot
+  lowers to `[FrameValue::Unsupported]`, not to a plausible-looking empty frame.
 
-The blocker is upstream of all four: **nothing records which inlined scope a
-safepoint belongs to.**
+**Not done — nothing populates the table.** `push_scope` has no caller outside
+`ir_lower.rs`'s and `ir.rs`'s own tests, and the production compile path
+(`jit/src/lib.rs`, phase 7) calls `lower_inner`. So `FrameState::caller` is
+`None` in every artifact this VM installs today, exactly as before.
 
-* `jit/src/ir.rs:884` — `SafepointSnapshot { bci, locals, stack }` has no
-  inline-scope field. It needs one, e.g.
-  `inline_scope: Option<InlineScopeId>`, plus a per-graph table of
-  `(method_key, caller_bci, parent)` scopes. The IR path cannot build a chain
-  before this exists.
-* `jit/src/lib.rs:12192` — `inline_sites: HashMap<usize, InlineSite>` is keyed
-  by the **caller pc**, and `InlineSite` (lib.rs:3226) carries
-  `class_name` / `method_name` / `descriptor`. So the caller bci and the callee
-  key are both available at the splice point; what is missing is threading them
-  into the snapshot that the splice emits.
-* `jit/src/x64.rs:2612` — the single-pass backend builds the snapshot from
-  `local_oop_masks` / `local_kinds` for the *enclosing* method only. It needs
-  the same scope stack, pushed at the splice and popped at the callee's return.
+The remaining edits:
 
-Once a scope stack exists, the producer edit is mechanical and cheap because
-the caller scope is interned once:
+* `jit/src/lib.rs` — `inline_sites: HashMap<usize, InlineSite>` is keyed by the
+  **caller pc** and `InlineSite` carries `class_name`/`method_name`/`descriptor`,
+  so the caller bci and the callee key are both available at the splice point.
+  What is missing is calling `push_scope` there, `bind_snapshot_range` over the
+  contiguous run of snapshots the splice appends, and then
+  `lower_inner_with_scopes` instead of `lower_inner`.
+* `jit/src/x64.rs` — `build_and_record_deopt_point` still hard-codes
+  `caller: None`. The single-pass backend builds its snapshot from
+  `local_oop_masks` / `local_kinds` for the *enclosing* method only and has no
+  scope stack at all; it needs one pushed at the splice and popped at the
+  callee's return.
+
+Once a producer exists, the interned form makes the edit cheap because the
+caller scope is interned once:
 
 ```rust
 let caller = interner.intern_scope(caller_key, caller_bci, &caller_locals,
@@ -285,31 +303,31 @@ let state = interner.intern_scope(callee_key, bci, &locals, &stack, &monitors,
 `reconstruct_frame_from_machine_state` already flattens them into
 `ReconstructedFrame::caller_frames`, so the consumer side needs no change.
 
-### 5.2 Populate the reexecute flag
+### 5.2 Populate the reexecute flag — *field landed, consumer not switched*
 
-`ResumeSemantics` currently reaches only the interned form; the owned
-`DeoptimizationPoint` still has no field for it, so `materialize` drops it. To
-make it end-to-end, `DeoptimizationPoint` needs a `semantics: ResumeSemantics`
-field (or a `reexecute: bool` + `rethrow_exception: bool` pair), which touches
-every construction site:
+**Done.** `DeoptimizationPoint` now carries
+`semantics: ResumeSemantics` (`jit/src/deopt.rs`, alongside `frame_state`), and
+every construction site stamps it:
 
-| file:line | site | value to pass |
-| --- | --- | --- |
-| `jit/src/ir_lower.rs:3079` | inline-callee deopt service point | `ResumeSemantics::for_reason(reason)` |
-| `jit/src/ir_lower.rs:3970` | boxed guard point | `ResumeSemantics::for_reason(reason)` |
-| `jit/src/ir_lower.rs:4377` | `build_deopt_points` | `ResumeSemantics::for_reason(reason)` |
-| `jit/src/x64.rs:2605` | `build_and_record_deopt_point` | `ResumeSemantics::for_reason(reason)` |
-| `vm/src/vm.rs:74958`, `74980` | test/bootstrap points | `ResumeSemantics::REEXECUTE` |
-| `vm/src/runtime/interpreter.rs:14826` | resume-side synthetic point | `ResumeSemantics::REEXECUTE` |
+| site | value |
+| --- | --- |
+| `jit/src/ir_lower.rs` — inline-callee deopt service point, boxed guard point, `build_deopt_points` | `ResumeSemantics::for_reason(reason)` |
+| `jit/src/x64.rs` — `build_and_record_deopt_point` | `ResumeSemantics::for_reason(reason)` |
+| `vm/src/vm.rs`, `vm/src/runtime/interpreter.rs` — test/bootstrap and resume-side synthetic points | `ResumeSemantics::REEXECUTE` |
 
-`for_reason` is the drop-in that keeps behaviour byte-identical to today's
-convention; each producer should then override it where it knows better (a
-caller scope, or a point whose bci is a genuine post-call resume).
+`for_reason` is exactly today's per-`DeoptReason` prose convention, so nothing
+changed behaviourally — what changed is that the convention now lives in one
+place and `FrameStateInterner::materialize_point` round-trips it instead of
+dropping it.
 
-The consumer that must read it is the VM resume sink
-(`vm/src/runtime/interpreter.rs`, around the `fv_to_value` frame build): today
-it infers re-execute-vs-resume from `DeoptReason`, and every new reason has to
-re-learn the convention.
+**Not done — the VM resume sink still ignores the field.**
+`vm/src/runtime/interpreter.rs` (around the `fv_to_value` frame build) continues
+to infer re-execute-vs-resume from `DeoptReason`. Until it reads
+`point.semantics`, a producer that knows better — a caller scope parked
+mid-`invoke`, or a genuine post-call resume point — still cannot say so in a way
+that changes what the interpreter does. That is the one edit left for this item,
+and it is the one that makes §5.1's caller scopes correct rather than merely
+present.
 
 ### 5.3 Switching producers onto the interned form
 
@@ -327,24 +345,33 @@ outlive the artifact exactly as the boxes do today.
 
 ## 6. To reconcile
 
-* **`docs/jit/deopt-metadata.md` §6, last paragraph is stale.** It says
-  "Until then `deopt_metadata_bailout` reuses `BailoutReason::IrVerification`
-  with a `phase=deopt-metadata` context." That is no longer true:
-  `BailoutReason::DeoptMetadata(String)` exists (`jit/src/bailout.rs:131`, with
-  category `"deopt_metadata"` at `:154`) and `deopt_metadata_bailout` uses it
-  with context `phase=install`. The doc comment on `deopt_metadata_bailout` in
-  `deopt.rs` carries the same stale claim and should be corrected in the same
-  pass that owns it.
-* **`deopt-metadata.md` §1 "Reexecute flag" and §5.3** should be updated once
-  the field reaches `DeoptimizationPoint`; until then the flag exists only on
-  the interned side, which the completeness table does not yet mention.
-* **`MAX_SCOPE_CHAIN` truncation.** A caller chain deeper than 256 is silently
-  truncated by `intern`/`materialize`. That is far beyond any inline depth the
-  planner can produce (`MAX_INLINE_BYTECODE_SIZE` budgeting bounds it long
-  before), but if a future inliner can exceed it, the truncation must become a
-  `Bailout` rather than a shorter chain.
-* **`is_resumable` vs `chain_is_resumable`.** The owned
-  `frame_state_is_resumable` only inspects the innermost scope, which is
-  correct today only because no producer builds a chain. Once §5.1 lands, the
-  resume sinks must switch to the chain-wide predicate, or a caller scope
-  holding a `MaterializationRequired` slot will resume as if it were clean.
+* ~~**`docs/jit/deopt-metadata.md` §6, last paragraph is stale.**~~ **Fixed.**
+  That section no longer claims `deopt_metadata_bailout` reuses
+  `BailoutReason::IrVerification` with a `phase=deopt-metadata` context. The
+  facts, verified: `BailoutReason::DeoptMetadata(String)` exists
+  (`jit/src/bailout.rs:131`, category `"deopt_metadata"` at `:154`, in
+  `all_reasons()` at `:376`), and `deopt_metadata_bailout`
+  (`jit/src/deopt.rs:4046`) uses it with context **`phase=install`**.
+  `bailout.rs`'s own `deopt_metadata_is_its_own_category_and_counter` test pins
+  that it is a distinct bucket, not an alias.
+* ~~**`deopt-metadata.md` §1 "Reexecute flag" and §5.3**~~ **Fixed.**
+  `DeoptimizationPoint::semantics` landed, so the completeness table's row now
+  reads *emitted, unread* and names the one consumer left (§5.2).
+* **STILL OPEN — the single-pass install site.** `deopt-metadata.md` §6's second
+  bullet: `jit/src/x64.rs` still installs its deopt metadata without running
+  `DeoptVerifier`. The IR lowerer's install-time check is wired; this one is not.
+* **`MAX_SCOPE_CHAIN` truncation.** Unchanged, and still open. A caller chain
+  deeper than 256 is silently truncated by `intern`/`materialize`. That is far
+  beyond any inline depth the planner can produce
+  (`MAX_INLINE_BYTECODE_SIZE` budgeting bounds it long before), but if a future
+  inliner can exceed it, the truncation must become a `Bailout` rather than a
+  shorter chain. Note this is a *different* bound from
+  `MAX_INLINE_SCOPE_DEPTH`, which `InlineScopeTable::push_scope` enforces by
+  refusing the scope outright.
+* ~~**`is_resumable` vs `chain_is_resumable`.**~~ **Fixed on the owned side.**
+  `frame_state_is_resumable` now follows `caller`, pinned by
+  `resumability_follows_the_whole_caller_chain`. Its two callers — `x64.rs`'s
+  unresumable-indy-trap bail and `CompiledMethod::osr_exit_policy` — therefore
+  answer "no" for an artifact whose trap sits under a caller frame nobody can
+  describe, instead of being admitted by a clean innermost scope. This mattered
+  before §5.1's producer lands, not after.

@@ -13921,7 +13921,22 @@ fn resume_real_ir_deopt(
 ///
 /// Returns `Some(())` on a clean transfer (the caller then returns `None` from
 /// `try_osr`, so the interpreter resumes THIS mutated frame), or `None` for an
-/// out-of-scope / unmappable frame so the caller falls back to the safe reject.
+/// out-of-scope / unmappable frame.
+///
+/// **A `None` here is NOT a safe reject.** By the time this runs the OSR'd body
+/// has committed iterations, so "continue interpreting THIS frame from where it
+/// was" re-executes every one of them. `artifact` + `plan` are the validated
+/// entry (`CompiledMethod::validate_osr_entry`, spent by `osr_enter_planned`);
+/// its `osr_exit_policy` walked every deopt point of the artifact at ADMISSION
+/// and refused the entry outright (`osr-entry-unresumable-exit`) when any of
+/// them could reconstruct a frame this transfer would reject. That is what makes
+/// the refusal path unreachable after a committed body rather than merely rare —
+/// discovering it here would be useless, because the only remaining options are
+/// to replay the committed iterations or to lose them. See
+/// `docs/jit/on-stack-replacement.md` §4.
+///
+/// `plan.resume_after_exit` — not `rframe.bci` — names the pc the live frame is
+/// parked at; see the call site below for what it re-checks.
 ///
 /// GC-safety. The reconstructed oops were read in-stub (`x64_deopt_entry`) as raw
 /// heap words. The OSR-exit snapshot's provenance is Register / StackSlot /
@@ -13939,28 +13954,66 @@ fn transfer_osr_exit_into_live_frame(
     thread: &mut JvmThread,
     frame_idx: usize,
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    artifact: &cratonvm_jit::CompiledMethod,
+    plan: &cratonvm_jit::OsrEntryPlan,
 ) -> Option<()> {
+    match transfer_osr_exit_into_live_frame_checked(
+        shared, thread, frame_idx, rframe, artifact, plan,
+    ) {
+        Ok(()) => Some(()),
+        Err(why) => {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] OSR-exit transfer reject ({why}) at bci={}",
+                    rframe.bci
+                );
+            }
+            None
+        }
+    }
+}
+
+/// The body of [`transfer_osr_exit_into_live_frame`], returning the refusal
+/// *reason* instead of a bare `None`.
+///
+/// Split out so every refusal has a name a test can assert on. The bare
+/// `Option` the caller sees discards the reason (and traces it under
+/// `CRATONVM_DBG_DEOPT`), which is exactly how a `MaterializationRequired`
+/// slot used to be reported as the generic "unmappable local" — see the guard
+/// below.
+///
+/// **Fail-closed contract.** Every check that can refuse runs BEFORE the first
+/// write to the live frame, so a refusal can never half-write it. That includes
+/// the resume-bci decision: [`cratonvm_jit::OsrEntryPlan::resume_after_exit`]
+/// is consulted before the locals/stack are overwritten, not after.
+fn transfer_osr_exit_into_live_frame_checked(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    artifact: &cratonvm_jit::CompiledMethod,
+    plan: &cratonvm_jit::OsrEntryPlan,
+) -> Result<(), String> {
     use cratonvm_jit::deopt::FrameValue;
     let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some();
-    let bail = |why: &str| -> Option<()> {
-        if trace {
-            eprintln!(
-                "[cratonvm-deopt] OSR-exit transfer reject ({why}) at bci={}",
-                rframe.bci
-            );
-        }
-        None
-    };
 
     // Phase-A scope (mirror `build_deopt_frame_inner`): a single non-inlined frame,
     // no held monitors, no virtual (scalar-replaced) slots. The OSR-exit snapshot
     // never emits virtuals; if a future emitter does, reject until the elided-
     // monitor handling that gates `build_deopt_frame_inner` is wired here too.
+    //
+    // The `caller_frames` refusal is deliberate and unchanged: the in-place
+    // transfer is single-frame, so even a *described* caller chain cannot be
+    // resumed here (`docs/jit/deopt-frame-state-interning.md`, and the sibling
+    // sinks at `resume_from_ir_deopt` / `build_deopt_frame_inner`). The
+    // `MaterializationRequired` guard added below is orthogonal to it — it is a
+    // per-SLOT verdict and says nothing about scope depth, so the caller-chain
+    // rule keeps exactly the meaning it had.
     if !rframe.caller_frames.is_empty() {
-        return bail("inlined caller chain");
+        return Err("inlined caller chain".to_string());
     }
     if !rframe.monitors.is_empty() {
-        return bail("held monitors");
+        return Err("held monitors".to_string());
     }
     if rframe.locals.iter().chain(rframe.stack.iter()).any(|v| {
         matches!(
@@ -13968,7 +14021,40 @@ fn transfer_osr_exit_into_live_frame(
             FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
         )
     }) {
-        return bail("virtual-object slot");
+        return Err("virtual-object slot".to_string());
+    }
+    // `MaterializationRequired` is NOT `Unsupported`, and the difference is the
+    // whole reason `jit/src/deopt.rs` split the variant out: `Unsupported` means
+    // "the coarse whole-method classifier cannot name this slot's kind" (tolerated
+    // below — the live frame's current value is provably safe to leave in place),
+    // whereas `MaterializationRequired` means an optimization DELETED a value that
+    // *was* live and left no rebuild recipe. The live frame's stale pre-entry word
+    // is then genuinely WRONG, not merely unread, and reconstructing it as a silent
+    // null/zero is precisely what the variant exists to make impossible.
+    //
+    // Without this arm the refusal still happened — the variant falls through
+    // `fv_to_value`'s catch-all `None` — but it was reported as "unmappable local",
+    // naming the wrong cause, and only for LOCALS (a stack slot went to
+    // "unmappable stack slot"). Naming it here also makes it a *scope* verdict,
+    // decided before any mapping, alongside the other Phase-A refusals.
+    //
+    // Belt and braces: `deopt::frame_state_is_resumable` makes the same call on the
+    // jit side, so `validate_osr_entry` refuses such an artifact at ENTRY
+    // (`osr-entry-unresumable-exit`) and this transfer should never see one.
+    if let Some(what) = rframe
+        .locals
+        .iter()
+        .enumerate()
+        .map(|(i, v)| ("local", i, v))
+        .chain(rframe.stack.iter().enumerate().map(|(i, v)| ("stack", i, v)))
+        .find_map(|(region, i, v)| match v {
+            FrameValue::MaterializationRequired(ev) => {
+                Some(format!("materialization required ({region} {i}: {ev})"))
+            }
+            _ => None,
+        })
+    {
+        return Err(what);
     }
 
     // CRATONVM_DEOPT_VERIFY: structural + oop-plausibility checks before mutating
@@ -13990,7 +14076,7 @@ fn transfer_osr_exit_into_live_frame(
                  — forcing safe reject",
                 rframe.bci
             );
-            return None;
+            return Err(format!("deopt-verify: {why}"));
         }
     }
 
@@ -14000,7 +14086,7 @@ fn transfer_osr_exit_into_live_frame(
         let frame = &thread.frames[frame_idx];
         if rframe.locals.len() > frame.locals_len() || rframe.stack.len() > frame.max_stack as usize
         {
-            return bail("slot overflow");
+            return Err("slot overflow".to_string());
         }
     }
 
@@ -14041,20 +14127,45 @@ fn transfer_osr_exit_into_live_frame(
     // re-committing) every iteration since OSR entry. See
     // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md.
     let mut locals: Vec<Option<Value>> = Vec::with_capacity(rframe.locals.len());
-    for v in &rframe.locals {
+    for (i, v) in rframe.locals.iter().enumerate() {
         if matches!(v, cratonvm_jit::deopt::FrameValue::Unsupported) {
             locals.push(None);
         } else {
             match fv_to_value(v) {
                 Some(val) => locals.push(Some(val)),
-                None => return bail("unmappable local"),
+                // Reachable only for a variant `fv_to_value` cannot type. The
+                // `MaterializationRequired` case — historically the confusing
+                // occupant of this arm — is named by its own guard above, so this
+                // label no longer stands in for it.
+                None => return Err(format!("unmappable local ({i}: {v:?})")),
             }
         }
     }
     let stack_vals = match ir_deopt_frame_values(&rframe.stack) {
         Some(s) => s,
-        None => return bail("unmappable stack slot"),
+        None => return Err("unmappable stack slot".to_string()),
     };
+
+    // The exact bci to park the live frame at. This is the ONLY sanctioned resume
+    // point once compiled code has run: `resume_after_exit` re-checks that
+    // `rframe.bci` is a deopt point THIS artifact recorded and that its
+    // `ResumeSemantics` is `REEXECUTE` (i.e. the bytecode there has not taken
+    // effect), and returns the reconstructed frame's own bci — never the OSR entry
+    // bci. The bare `frame.pc = rframe.bci` it replaces trusted a bci that could be
+    // a mis-routed stash, or a `RESUME`/`RETHROW` point that must not be re-executed
+    // (the same double-execution defect this whole path exists to prevent, one
+    // bytecode instead of one loop iteration).
+    //
+    // Decided BEFORE the writes below so a refusal leaves the frame untouched. A
+    // refusal here means the OSR'd body committed work the interpreter cannot be
+    // resumed after — the caller must NOT safe-reject; see the exit sink in
+    // `try_osr`. `validate_osr_entry`'s `osr_exit_policy` walks every deopt point
+    // of the artifact at admission and refuses the entry outright
+    // (`osr-entry-unresumable-exit`) when one of them could land here, which is
+    // what makes this branch unreachable rather than merely rare.
+    let resume_bci = plan
+        .resume_after_exit(artifact, rframe)
+        .map_err(|b| format!("unresumable exit: {b}"))?;
 
     // Overwrite the live frame IN PLACE. No Java allocation here, so the
     // reconstructed oops remain valid and are rooted by the frame's slots the moment
@@ -14072,18 +14183,19 @@ fn transfer_osr_exit_into_live_frame(
     for v in &stack_vals {
         frame.stack.push_unchecked(*v);
     }
-    // Cast: bytecode index (non-negative, fits) → usize pc.
-    frame.pc = rframe.bci as usize;
+    // The plan-validated resume point (see above), not the raw `rframe.bci`.
+    frame.pc = resume_bci;
 
     if trace {
         eprintln!(
-            "[cratonvm-deopt] OSR-exit TRANSFER into live frame: resume bci={} ({} locals, {} stack)",
-            rframe.bci,
+            "[cratonvm-deopt] OSR-exit TRANSFER into live frame: resume bci={resume_bci} \
+             ({} locals, {} stack, entry_pc={})",
             locals.len(),
             stack_vals.len(),
+            plan.entry_pc,
         );
     }
-    Some(())
+    Ok(())
 }
 
 /// deopt-osr Step 9 — stamp a freshly compiled artifact with the method's
@@ -15190,6 +15302,32 @@ mod deopt_step3_tests {
         assert_eq!(thread.frames.len(), 1);
     }
 
+    /// A validated OSR-entry plan plus the artifact it was validated against —
+    /// the two arguments the in-place transfer now needs.
+    ///
+    /// The artifact records ONE `REEXECUTE` deopt point at `exit_bci`, which is
+    /// what `OsrEntryPlan::resume_after_exit` requires before it will name that
+    /// bci as an exact resume point; `entry_pc` is the loop header the entry was
+    /// taken at. The plan is built by hand rather than through
+    /// `validate_osr_entry` so these tests stay about the transfer — the
+    /// validator has its own coverage in `jit/src/lib.rs`.
+    fn osr_plan_for(
+        entry_pc: usize,
+        exit_bci: u32,
+    ) -> (cratonvm_jit::CompiledMethod, cratonvm_jit::OsrEntryPlan) {
+        let cm = cm_with_deopt_point(0, exit_bci);
+        let plan = cratonvm_jit::OsrEntryPlan {
+            entry_pc,
+            resume_bci: entry_pc,
+            native_offset: 0,
+            dead_mask: 0,
+            contract: cratonvm_jit::OsrContractSource::RegisterHomes,
+            exit_policy: cratonvm_jit::OsrExitPolicy::ExactTransfer,
+            expected_locals: Vec::new(),
+        };
+        (cm, plan)
+    }
+
     /// The core P4 invariant: the JIT-advanced loop state OVERWRITES the live
     /// frame's locals + operand stack IN PLACE and re-points pc, WITHOUT pushing a
     /// new frame — so the interpreter resumes the loop body from where the OSR'd
@@ -15214,8 +15352,10 @@ mod deopt_step3_tests {
         // The OSR'd code advanced 5 iterations (i=105, acc=5460) and left the
         // operand stack empty at the loop header.
         let advanced = rframe(vec![FrameValue::Int(105), FrameValue::Int(5460)], vec![], 7);
+        let (cm, plan) = osr_plan_for(7, 7);
         assert!(
-            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some(),
             "clean int frame must transfer"
         );
 
@@ -15258,8 +15398,10 @@ mod deopt_step3_tests {
             vec![FrameValue::Double(std::f64::consts::PI.to_bits())],
             3,
         );
+        let (cm, plan) = osr_plan_for(0, 3);
         assert!(
-            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some(),
             "cat-2/FP frame must transfer (no longer rejected)"
         );
         let frame = &thread.frames[0];
@@ -15307,7 +15449,11 @@ mod deopt_step3_tests {
             vec![FrameValue::Int(3), FrameValue::Int(4)],
             2,
         );
-        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some());
+        let (cm, plan) = osr_plan_for(0, 2);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some()
+        );
         let frame = &thread.frames[0];
         assert_eq!(frame.pc, 2);
         assert_eq!(frame.stack.len(), 2);
@@ -15345,7 +15491,11 @@ mod deopt_step3_tests {
             vec![],
             3,
         );
-        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some());
+        let (cm, plan) = osr_plan_for(0, 3);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some()
+        );
 
         // No Java allocation between in-stub capture and the in-place write, so the
         // raw address was valid; the frame slot now roots it. Force a GC — it must
@@ -15397,8 +15547,10 @@ mod deopt_step3_tests {
             vec![],
             8,
         );
+        let (cm, plan) = osr_plan_for(5, 8);
         assert!(
-            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some(),
             "an Unsupported LOCAL must not block the transfer"
         );
 
@@ -15442,7 +15594,10 @@ mod deopt_step3_tests {
             vec![FrameValue::Unsupported],
             8,
         );
-        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
+        let (cm, plan) = osr_plan_for(5, 8);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad, &cm, &plan).is_none()
+        );
 
         // Frame fully intact.
         let frame = &thread.frames[0];
@@ -15471,7 +15626,10 @@ mod deopt_step3_tests {
         );
 
         let bad = rframe(vec![vobj(0, 5, vec![FrameValue::Int(1)])], vec![], 0);
-        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
+        let (cm, plan) = osr_plan_for(0, 0);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad, &cm, &plan).is_none()
+        );
         assert_eq!(thread.frames[0].get_local(0), Value::Int(1));
     }
 
@@ -15492,8 +15650,236 @@ mod deopt_step3_tests {
 
         let mut inlined = rframe(vec![FrameValue::Int(2)], vec![], 0);
         inlined.caller_frames.push(rframe(vec![], vec![], 0));
-        assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &inlined).is_none());
+        let (cm, plan) = osr_plan_for(0, 0);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &inlined, &cm, &plan)
+                .is_none()
+        );
         assert_eq!(thread.frames[0].get_local(0), Value::Int(1));
+    }
+
+    // ---------------------------------------------------------------------
+    // C2-review — the `MaterializationRequired` refusal, and the validated
+    // resume point that replaced the bare `frame.pc = rframe.bci`.
+    // ---------------------------------------------------------------------
+
+    /// The refusal reason for `rframe` against a plan whose artifact records a
+    /// `REEXECUTE` deopt point at the frame's own bci — i.e. everything except
+    /// the slot in question is in order.
+    fn transfer_refusal(
+        shared: &SharedVm,
+        thread: &mut JvmThread,
+        rframe: &ReconstructedFrame,
+    ) -> String {
+        // Cast: bci (u16-range in these fixtures) → usize entry pc.
+        let (cm, plan) = osr_plan_for(rframe.bci as usize, rframe.bci);
+        transfer_osr_exit_into_live_frame_checked(shared, thread, 0, rframe, &cm, &plan)
+            .expect_err("this fixture must refuse")
+    }
+
+    /// A `MaterializationRequired` local names ITS OWN cause. Before the guard it
+    /// fell through `fv_to_value`'s catch-all `None` and was reported as the
+    /// generic "unmappable local" — which is what the variant was split out of
+    /// `Unsupported` to stop happening. The refusal itself is not new; the name is.
+    #[test]
+    fn osr_exit_transfer_names_materialization_required_local() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(11), FrameValue::Int(22)],
+            vec![],
+            7,
+        );
+
+        let deleted = rframe(
+            vec![
+                FrameValue::Int(99),
+                FrameValue::MaterializationRequired(cratonvm_jit::deopt::EliminatedValue::new(
+                    7,
+                    cratonvm_jit::deopt::EliminationCause::EliminatedStore,
+                )),
+            ],
+            vec![],
+            7,
+        );
+        let why = transfer_refusal(&shared, &mut thread, &deleted);
+        assert!(
+            why.starts_with("materialization required"),
+            "must name the real cause, got {why:?}"
+        );
+        assert!(
+            !why.contains("unmappable local"),
+            "must NOT be reported as the generic unmappable-local bail, got {why:?}"
+        );
+        assert!(
+            why.contains("local 1"),
+            "must name the offending slot, got {why:?}"
+        );
+
+        // Fail closed: the live frame is untouched, exactly as for every other
+        // pre-mutation refusal.
+        let frame = &thread.frames[0];
+        assert_eq!(frame.get_local(0), Value::Int(11));
+        assert_eq!(frame.get_local(1), Value::Int(22));
+        assert_eq!(frame.pc, 7);
+    }
+
+    /// The same marker on the operand STACK is named too — it used to reach the
+    /// unrelated "unmappable stack slot" label.
+    #[test]
+    fn osr_exit_transfer_names_materialization_required_stack_slot() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 3);
+
+        let deleted = rframe(
+            vec![FrameValue::Int(2)],
+            vec![FrameValue::MaterializationRequired(
+                cratonvm_jit::deopt::EliminatedValue::unknown(
+                    cratonvm_jit::deopt::EliminationCause::Unclassified,
+                ),
+            )],
+            3,
+        );
+        let why = transfer_refusal(&shared, &mut thread, &deleted);
+        assert!(
+            why.starts_with("materialization required") && why.contains("stack 0"),
+            "must name the stack slot, got {why:?}"
+        );
+    }
+
+    /// `Unsupported` and `MaterializationRequired` are NOT the same verdict: the
+    /// first is tolerated (coarse-classifier noise, the live value stays), the
+    /// second refuses. That asymmetry is the entire reason for the split variant.
+    #[test]
+    fn unsupported_is_tolerated_where_materialization_required_refuses() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 4);
+
+        let (cm, plan) = osr_plan_for(4, 4);
+        let tolerated = rframe(vec![FrameValue::Int(2), FrameValue::Unsupported], vec![], 4);
+        assert!(
+            transfer_osr_exit_into_live_frame_checked(
+                &shared,
+                &mut thread,
+                0,
+                &tolerated,
+                &cm,
+                &plan
+            )
+            .is_ok(),
+            "an Unsupported local is coarse-classifier noise, not a deleted value"
+        );
+
+        let refused = rframe(
+            vec![
+                FrameValue::Int(3),
+                FrameValue::MaterializationRequired(
+                    cratonvm_jit::deopt::EliminatedValue::unknown(
+                        cratonvm_jit::deopt::EliminationCause::EliminatedStore,
+                    ),
+                ),
+            ],
+            vec![],
+            4,
+        );
+        assert!(transfer_refusal(&shared, &mut thread, &refused)
+            .starts_with("materialization required"));
+    }
+
+    /// The resume point comes from `OsrEntryPlan::resume_after_exit`, not from the
+    /// raw `rframe.bci`: a bci the artifact never recorded a deopt point for is a
+    /// mis-routed stash, and parking the interpreter there is a guess. It refuses,
+    /// and the frame is left untouched — the entry gate is what makes this
+    /// unreachable after a committed body.
+    #[test]
+    fn osr_exit_transfer_refuses_a_bci_the_artifact_never_recorded() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 2);
+
+        // The artifact's only deopt point is at bci 2; the stash names bci 9.
+        let (cm, plan) = osr_plan_for(2, 2);
+        let stray = rframe(vec![FrameValue::Int(7)], vec![], 9);
+        let why = transfer_osr_exit_into_live_frame_checked(
+            &shared, &mut thread, 0, &stray, &cm, &plan,
+        )
+        .expect_err("a bci from nowhere is not a resume point");
+        assert!(why.contains("unresumable exit"), "got {why:?}");
+
+        let frame = &thread.frames[0];
+        assert_eq!(frame.pc, 2, "a refused transfer must not move the pc");
+        assert_eq!(frame.get_local(0), Value::Int(1), "nor write a local");
+    }
+
+    /// A validated transfer parks the frame at the RECONSTRUCTED frame's own bci —
+    /// where the OSR'd body actually stopped — and never at the entry pc. Resuming
+    /// at the entry pc is the `jit-osr-bail-reruns-loop-iterations` defect: every
+    /// iteration the compiled body committed would run a second time.
+    #[test]
+    fn validated_resume_lands_where_the_body_stopped_not_at_the_entry_pc() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        // Entered at the loop header (bci 2) with i=0; the body committed 50
+        // iterations and bailed at bci 9.
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(0)], vec![], 2);
+
+        let cm = cm_with_deopt_point(0, 9);
+        let plan = cratonvm_jit::OsrEntryPlan {
+            entry_pc: 2,
+            resume_bci: 2,
+            native_offset: 0,
+            dead_mask: 0,
+            contract: cratonvm_jit::OsrContractSource::RegisterHomes,
+            exit_policy: cratonvm_jit::OsrExitPolicy::ExactTransfer,
+            expected_locals: Vec::new(),
+        };
+        let advanced = rframe(vec![FrameValue::Int(50)], vec![], 9);
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced, &cm, &plan)
+                .is_some()
+        );
+
+        let frame = &thread.frames[0];
+        assert_eq!(
+            frame.pc, 9,
+            "resume at the bail's own bci, so the committed iterations are not replayed"
+        );
+        assert_ne!(frame.pc, plan.entry_pc, "never fall back to the entry pc");
+        assert_eq!(
+            frame.get_local(0),
+            Value::Int(50),
+            "the JIT-advanced induction variable must survive"
+        );
+    }
+
+    /// The `caller_frames` rule is unchanged by the new variant: a
+    /// `MaterializationRequired` slot is a per-SLOT verdict and says nothing about
+    /// scope depth, so an inlined chain still refuses on its own (older) reason
+    /// even when every slot is describable. (`docs/jit/deopt-frame-state-interning.md`
+    /// records that all three resume sinks refuse a non-empty `caller_frames`.)
+    #[test]
+    fn materialization_guard_does_not_disturb_the_caller_chain_rule() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 0);
+
+        let mut inlined = rframe(vec![FrameValue::Int(2)], vec![], 0);
+        inlined.caller_frames.push(rframe(vec![], vec![], 0));
+        assert_eq!(
+            transfer_refusal(&shared, &mut thread, &inlined),
+            "inlined caller chain"
+        );
     }
 }
 

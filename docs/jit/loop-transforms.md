@@ -144,26 +144,47 @@ the guard previously had to drop becomes legal again. Unrolling does **not**
 have that property — its copy 0 *is* the header — and the test says so
 explicitly, so nobody assumes otherwise.
 
-## Wiring (not done — out of scope for the file set this landed in)
+## Wiring (partially done — the verdict is consumed, the bytes are not)
+
+Full status lives in [`loop-transform-wiring.md`](loop-transform-wiring.md).
+The short version: **the transform is no longer analysis-only.**
 
 To consume this, `compile_with_param_slots` (`jit/src/x64.rs`) would:
 
 1. after `detect_loops` and before the LICM/BCE/SIMD analyses, pick a loop
-   and call `plan_loop_peel` / `plan_loop_unroll`;
+   and call `plan_loop_peel` / `plan_loop_unroll`; — **DONE**, as
+   `plan_native_unroll`, which gates every entry reaching
+   `compiler.unroll_loops`. `bypassable_headers` is consulted first, and the
+   two unrollers are held mutually exclusive by
+   `bytecode_loop_xform_rewrites_bytecode()` / `native_unroller_enabled()`.
 2. on `Ok`, compile `xform.code` instead of `code`, and use
-   `xform.exception_ranges` for handler dispatch;
+   `xform.exception_ranges` for handler dispatch; — **NOT DONE.** The rewritten
+   `Vec<u8>` is discarded; only the verdict is used.
 3. map every deopt/oop-map bci through `xform.bci_at(pc)` when recording
    frame state, and every OSR entry request through `xform.osr_entry_pc(bci)`;
-4. on `Err`, compile the original — every refusal is safe to ignore.
+   — **NOT DONE, and vacuous while step 2 is not.** Because the emitter still
+   compiles the caller's original bytecode, every pc it handles *is* an
+   interpreter bci, so both maps would be the identity. The OSR-entry site in
+   `x64.rs` carries the contract in a comment, keyed on
+   `bytecode_loop_xform_rewrites_bytecode() == false`, so the day step 2 lands
+   the requirement is stated where it must be honoured.
+4. on `Err`, compile the original — every refusal is safe to ignore. — **DONE**
+   (fail-closed, including on a malformed-input `BadShape`).
 
-Step 3 is the load-bearing one: without it the compiled method records
-transformed PCs as interpreter bcis. Until the wiring exists, the transforms
-are analysis-only and nothing in the emitter calls them.
+Step 3 is still the load-bearing one: without it a rewritten method would record
+transformed PCs as interpreter bcis. Step 2 is not a local change — 
+`compile_with_param_slots` takes ~15 caller-owned side tables keyed by bytecode
+pc, three of which (`invoke_info`, `mic_slots`, `pic_slots`) carry raw pointers
+to per-call-site slots owned by `jit/src/lib.rs`, and a table missed in the
+re-keying sweep fails *silently*. That is why it was left unwired rather than
+half-wired; the reasoning is written out in `loop-transform-wiring.md`.
 
 The existing native-code unroller (`unroll_loops`) and this transform must
-not both fire on the same loop; the natural end state is for the bytecode
-transform to replace it, since its admission test is strictly stronger (the
-native one checks only `code[back_edge] == 0xa7` and a body-size bound — no
-reducibility test, no single-entry test, and it does not consult
-`bypassable_headers` even though the LICM and FP hoists immediately below it
-do).
+not both fire on the same loop. That is now enforced rather than merely
+intended, and the immediate benefit already landed: the native unroller's old
+gate was `code[back_edge] == 0xa7` plus a body-size band — no reducibility
+test, no single-entry test, no inner-cycle test, no handler-containment test
+and no `bypassable_headers` consult, even though the LICM and FP hoists
+immediately below it all apply that filter. It now asks this transform instead,
+whose admission test is strictly stronger and is proved with real dominators
+over an instruction-granularity CFG.

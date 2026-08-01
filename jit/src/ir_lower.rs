@@ -25,6 +25,7 @@ use crate::deopt::{
     EliminationCause, FrameState, FrameValue, MethodFrameLimits, OopCoverage, ResumeSemantics,
     VirtualObjectState,
 };
+use crate::regalloc::{resolve_parallel_copy, CopyOp, ValueLoc};
 use cratonvm_types::{ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
 
 // ── Header-offset emission sites (arch-2026-07-26 `layout-constant-hazards`) ──
@@ -307,6 +308,23 @@ struct Lowerer<'a> {
     /// Shadow `top` captured at method entry; restored by every exit. See the
     /// layout comment in `Lowerer::new`.
     shadow_savetop_slot_off: i32,
+    /// The one reserved frame word [`Lowerer::emit_phi_copies`] parks a value in
+    /// to break a cycle in an edge's parallel copy ([`CopyOp::Save`] /
+    /// [`CopyOp::Restore`]).
+    ///
+    /// RAX is already the *move* temporary — every `Move` reads through it — so
+    /// breaking a cycle needs a second location that survives the intervening
+    /// move, and a frame word is the one thing this backend always has. It is a
+    /// bookkeeping reservation like the four above it, so it sits BELOW
+    /// `first_spill` and can never collide with a colour [`plan_slots`] hands
+    /// out.
+    ///
+    /// Deliberately not zeroed in the prologue and never named by an oop map: a
+    /// `Save` always precedes its matching `Restore` within one straight-line
+    /// copy sequence (no safepoint, no branch, no call in between), so the word
+    /// is never read before it is written and never holds a live reference
+    /// across a point the collector can observe.
+    phi_copy_scratch_slot_off: i32,
     /// `get_current_thread` helper; `0` when unwired (the JIT unit tests' stub
     /// table). Every shadow site is gated on it — dereferencing a thread
     /// pointer that was never fetched would read stack garbage.
@@ -353,7 +371,8 @@ struct Lowerer<'a> {
     /// Byte size of the Java-locals region, for the published `FrameLayout`.
     locals_size: i32,
     /// First operand-spill offset, i.e. the exclusive top of the reserved
-    /// locals region (locals + context + sp-id).
+    /// locals region (locals + context + the five bookkeeping words: sp-id,
+    /// cached thread, shadow save-base, shadow save-top, phi-copy scratch).
     first_spill: i32,
     /// Per-safepoint oop maps published for the moving-young relocation
     /// contract. An empty vector means "no precise coverage", which
@@ -494,18 +513,21 @@ impl<'a> Lowerer<'a> {
         let needs_context = needs.needs_context;
         let max_call_args = needs.max_call_args;
 
-        // Frame layout (rbp downward): locals, [context slot], spills, [args
-        // staging], 16-byte stack-arg reserve, 32-byte shadow. Reserve slots for
+        // Frame layout (rbp downward): locals, [context slot], five bookkeeping
+        // words, spills, [args staging], 16-byte stack-arg reserve, 32-byte
+        // shadow. Reserve slots for
         // locals + one per COLOUR + shadow. The 16-byte tail above the shadow
         // region holds in-frame stack args for any helper called without
         // `emit_stack_arg_setup`; see the matching comment in `x64.rs`
         // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
         let locals_size = (num_locals as i32) * 8;
         let context_size = if needs_context { 8 } else { 0 };
-        // Four extra reserved slots: the safepoint id, the cached
-        // `*mut JvmThread`, the shadow stack's base `top` for this push, and
-        // the shadow `top` watermark captured at method entry.
-        let sp_id_size = 8i32 * 4;
+        // Five extra reserved slots: the safepoint id, the cached
+        // `*mut JvmThread`, the shadow stack's base `top` for this push, the
+        // shadow `top` watermark captured at method entry, and the phi
+        // parallel-copy scratch word (`emit_phi_copies`, which needs a location
+        // other than RAX to park a value in while it unwinds a cycle).
+        let bookkeeping_size = 8i32 * 5;
         // Liveness-based slot reuse: one 8-byte slot per *colour*, not per
         // graph node. [`plan_slots`] has already packed every value whose live
         // range does not overlap another's into a shared slot, so this term is
@@ -529,7 +551,7 @@ impl<'a> Lowerer<'a> {
             frame_size,
             ((locals_size
                 + context_size
-                + sp_id_size
+                + bookkeeping_size
                 + spill_size
                 + args_stage_size
                 + shadow
@@ -594,7 +616,22 @@ impl<'a> Lowerer<'a> {
         // unguarded push stored past the mapping. See
         // `x64.rs::Compiler::emit_epilogue` for the mechanism this mirrors.
         let shadow_savetop_slot_off = (base + 3) * 8;
-        let first_spill = (base + 4) * 8;
+        // One word for the phi parallel copy's `Save`/`Restore` scratch. Every
+        // phi has its OWN frame word (`prealloc_phi_slots`), so an edge whose
+        // copies form a cycle — the swap loop, whose two loop-header phis are
+        // each other's back-edge value — cannot be sequentialised through RAX
+        // alone: RAX is the move temporary and is dead the instant the next
+        // `Move` loads through it. Parking one element of the cycle here frees
+        // its predecessor and the rest unwinds with plain moves
+        // (`regalloc::resolve_parallel_copy`). One word, once per method,
+        // whether or not any edge ever needs it — the alternative was refusing
+        // the compile and dropping a tier on every swap-shaped loop.
+        //
+        // It is a BOOKKEEPING word, below `first_spill`, so `plan_slots` can
+        // never colour a value onto it and `verify_slot_colouring` /
+        // `verify_data_locations` see an unchanged spill band.
+        let phi_copy_scratch_slot_off = (base + 4) * 8;
+        let first_spill = (base + 5) * 8;
         let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
         let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
 
@@ -633,6 +670,7 @@ impl<'a> Lowerer<'a> {
             ref_param_homes,
             shadow_savebase_slot_off,
             shadow_savetop_slot_off,
+            phi_copy_scratch_slot_off,
             get_current_thread: helpers.get_current_thread,
             shadow_off_in_thread: helpers.shadow_stack_offset_in_thread as i32,
             pending_shadow: Vec::new(),
@@ -1042,10 +1080,13 @@ fn reloc_emit_enabled() -> bool {
     ///
     /// Each copy loads the incoming SSA value (already spilled by the
     /// predecessor block, which is lowered before its terminator) into RAX
-    /// and stores it into the phi's reserved slot. The phi value sources
-    /// are predecessor-side snapshots, never this merge's own phis, so the
-    /// copies have no read-after-write cycle and a single scratch register
-    /// is sufficient.
+    /// and stores it into the phi's reserved slot.
+    ///
+    /// The copies are a PARALLEL assignment: every source is read as it was
+    /// *before* any destination is written. They are therefore sequentialised
+    /// by [`resolve_parallel_copy`] rather than emitted in gather order, and a
+    /// cycle among them is broken through [`Lowerer::phi_copy_scratch_slot_off`].
+    /// See the doc comment on the emission loop below for what was wrong before.
     fn emit_phi_copies(&mut self, pred_block: usize, succ_block: usize) {
         let merge_ctrl = self.schedule.blocks[succ_block].ctrl;
         // Only Merge/Region blocks carry phis tied to incoming edges.
@@ -1091,41 +1132,72 @@ fn reloc_emit_enabled() -> bool {
         //
         // `prealloc_phi_slots` gives every phi its own frame word, so a loop
         // that swaps two locals makes each phi the other's back-edge value and
-        // this list becomes a cycle (`a <- b, b <- a`). Emitted in order through
-        // RAX, the second copy reads the word the first just overwrote and both
-        // locals end up holding `b`.
+        // this list becomes a cycle (`a <- b, b <- a`). Emitted in gather order
+        // through RAX, the second copy reads the word the first just overwrote
+        // and both locals end up holding `b` — a wrong-code bug, not a missed
+        // optimisation.
         //
-        // Emit any copy whose destination is not still needed as a source, and
-        // repeat. What can remain is exactly a set of cycles, which needs a
-        // scratch location to break; RAX is already the move temporary and no
-        // spare frame word is reserved here, so a residual cycle refuses the
-        // compile and the method runs in a lower tier — correct and rare rather
-        // than silently wrong. `regalloc::resolve_parallel_copy` implements the
-        // scratch-based break; wiring it needs a `ValueLoc` view of these slots
-        // plus one reserved word.
-        let mut pending: Vec<(i32, i32)> = copies.into_iter().filter(|(d, s)| d != s).collect();
-        while !pending.is_empty() {
-            let ready = pending
-                .iter()
-                .position(|(dst, _)| !pending.iter().any(|(_, src)| src == dst));
-            match ready {
-                Some(i) => {
-                    let (dst_slot, src_slot) = pending.remove(i);
-                    self.load_to_rax(src_slot);
-                    self.store_rax(dst_slot);
-                }
-                None => {
-                    self.latch_bailout(Bailout::with_context(
-                        BailoutReason::UnsupportedShape("cyclic phi parallel copy"),
-                        format!(
-                            "block {pred_block} -> {succ_block}: {} copies form a cycle",
-                            pending.len()
-                        ),
-                    ));
-                    return;
-                }
+        // `resolve_parallel_copy` orders the copies so that every read still
+        // sees the pre-copy value: destinations nothing else reads go first,
+        // and when only cycles remain one element is parked in the scratch,
+        // which frees its predecessor and unwinds the rest of the cycle. The
+        // acyclic majority — every merge that is not a permutation — pays
+        // exactly the same one load + one store per copy it always did, and
+        // touches the scratch word not at all.
+        //
+        // An intermediate state of this fix REFUSED a residual cycle
+        // (`UnsupportedShape("cyclic phi parallel copy")`) because no scratch
+        // location was reserved. That was correct but dropped every swap-shaped
+        // loop to a lower tier; `phi_copy_scratch_slot_off` is the reserved word
+        // that makes the refusal unnecessary.
+        let ops = match phi_copy_sequence(&copies) {
+            Ok(ops) => ops,
+            Err(bailout) => {
+                let Bailout { reason, context } = bailout;
+                let edge = format!("phi parallel copy on block {pred_block} -> {succ_block}");
+                self.latch_bailout(Bailout::with_context(
+                    reason,
+                    match context {
+                        Some(c) => format!("{edge}: {c}"),
+                        None => edge,
+                    },
+                ));
+                return;
+            }
+        };
+        for op in ops {
+            if let Err(bailout) = self.emit_copy_op(op) {
+                self.latch_bailout(bailout);
+                return;
             }
         }
+    }
+
+    /// Emit one sequentialised [`CopyOp`], routed through RAX (the move
+    /// temporary) and, for `Save`/`Restore`, the reserved scratch frame word.
+    ///
+    /// `Save` and `Restore` are *not* a push/pop pair: `resolve_parallel_copy`
+    /// emits at most one live save at a time and always consumes it before
+    /// starting another cycle, so a single word suffices no matter how many
+    /// disjoint cycles the edge contains.
+    fn emit_copy_op(&mut self, op: CopyOp) -> CompileResult<()> {
+        let scratch = self.phi_copy_scratch_slot_off;
+        let (src, dst) = match op {
+            CopyOp::Move { from, to } => (frame_word_off(from)?, frame_word_off(to)?),
+            CopyOp::Save { from } => (frame_word_off(from)?, scratch),
+            CopyOp::Restore { to } => (scratch, frame_word_off(to)?),
+        };
+        // The scratch is a reserved bookkeeping word placed by `Lowerer::new`;
+        // a zero here would encode `[rbp - 0]`, the saved caller RBP.
+        if src <= 0 || dst <= 0 {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal("ir_lower: a phi copy names frame offset 0"),
+                format!("[rbp - {dst}] <- [rbp - {src}]"),
+            ));
+        }
+        self.load_to_rax(src);
+        self.store_rax(dst);
+        Ok(())
     }
 
     // ── Code emission helpers ────────────────────────────────────────
@@ -4595,7 +4667,7 @@ fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
 /// `needs`.
 ///
 /// Mirrors [`Lowerer::new`]'s layout exactly — locals, optional context slot,
-/// the four reserved bookkeeping slots, the spill reservation, the outgoing
+/// the five reserved bookkeeping slots, the spill reservation, the outgoing
 /// argument staging area, the 16-byte stack-argument reserve and the 32-byte
 /// ABI shadow space, rounded up to the 16-byte stack alignment — but in
 /// saturating `usize` arithmetic, so a graph big enough to overflow the
@@ -4614,8 +4686,10 @@ fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
 fn estimate_frame_bytes(num_locals: usize, spill_slots: usize, needs: &FrameNeeds) -> usize {
     let locals = num_locals.saturating_mul(8);
     let context = if needs.needs_context { 8 } else { 0 };
-    // safepoint id, cached thread pointer, shadow save-base, shadow save-top.
-    let bookkeeping = 8usize * 4;
+    // safepoint id, cached thread pointer, shadow save-base, shadow save-top,
+    // phi parallel-copy scratch. Mirrors `bookkeeping_size` in `Lowerer::new`;
+    // the `debug_assert_eq!` there is what keeps the two counts equal.
+    let bookkeeping = 8usize * 5;
     let spills = spill_slots.saturating_mul(8);
     let args_stage = needs.max_call_args.saturating_mul(8);
     let shadow = 32usize;
@@ -4661,6 +4735,77 @@ fn check_frame_size(frame_bytes: usize, limit: usize) -> CompileResult<()> {
         }));
     }
     Ok(())
+}
+
+// ── Phi parallel copy: the `ValueLoc` view of a frame word ───────────
+
+/// The [`ValueLoc`] this backend uses for the frame word at `[rbp - off]`.
+///
+/// [`resolve_parallel_copy`] only ever *compares* locations — it never
+/// dereferences one, and the scratch is deliberately unnamed in [`CopyOp`] — so
+/// the payload has to be an injective token for "this frame word" and nothing
+/// more. The rbp-relative byte offset is exactly that: it is what
+/// [`Lowerer::slot_of`] hands out, it is positive and bounded by
+/// [`DEFAULT_MAX_FRAME_BYTES`], and no arithmetic is done to it on the way in or
+/// out.
+///
+/// Deliberately NOT `off / 8`, even though every offset this file produces is on
+/// the 8-byte grid. A division would map two distinct offsets onto one location
+/// the moment that ever stopped being true, and `resolve_parallel_copy` DROPS a
+/// copy whose destination and source are the same location — so the aliasing
+/// would silently delete a real move, which is the same class of wrong-code bug
+/// as the sequential emission this replaces.
+fn frame_word_loc(off: i32) -> CompileResult<ValueLoc> {
+    u32::try_from(off)
+        .ok()
+        .filter(|&o| o != 0)
+        .map(ValueLoc::Slot)
+        .ok_or_else(|| {
+            Bailout::with_context(
+                BailoutReason::Internal("ir_lower: a phi copy names a non-frame location"),
+                format!("offset {off}"),
+            )
+        })
+}
+
+/// Inverse of [`frame_word_loc`].
+///
+/// A [`ValueLoc::Reg`] is unreachable from this backend — it keeps every value
+/// in its home frame word and has no register allocation to disagree with — but
+/// it is representable in the shared type, so it is refused rather than
+/// mis-emitted as an offset.
+fn frame_word_off(loc: ValueLoc) -> CompileResult<i32> {
+    match loc {
+        ValueLoc::Slot(off) => i32::try_from(off).map_err(|_| {
+            Bailout::with_context(
+                BailoutReason::Internal("ir_lower: a phi copy offset does not fit the frame"),
+                format!("{loc:?}"),
+            )
+        }),
+        ValueLoc::Reg(_) => Err(Bailout::with_context(
+            BailoutReason::Internal(
+                "ir_lower: a phi copy names a register; this backend keeps every value in a \
+                 frame word",
+            ),
+            format!("{loc:?}"),
+        )),
+    }
+}
+
+/// Sequentialise one edge's `(phi slot, source slot)` parallel copy.
+///
+/// The gathered pairs are simultaneous — every source is read as it was before
+/// any destination is written — so they go through
+/// [`resolve_parallel_copy`], which returns an order preserving that semantics
+/// and breaks any cycle with one [`CopyOp::Save`] / [`CopyOp::Restore`] pair.
+/// Self-copies are dropped by the resolver, so the acyclic majority emits
+/// exactly one load + one store per surviving pair, as it always did.
+fn phi_copy_sequence(copies: &[(i32, i32)]) -> CompileResult<Vec<CopyOp>> {
+    let mut pairs: Vec<(ValueLoc, ValueLoc)> = Vec::with_capacity(copies.len());
+    for &(dst, src) in copies {
+        pairs.push((frame_word_loc(dst)?, frame_word_loc(src)?));
+    }
+    resolve_parallel_copy(&pairs)
 }
 
 // ── Pre-emission location verification ───────────────────────────────
@@ -6166,8 +6311,13 @@ pub(crate) fn lower_inner_with_scopes(
     //
     // The frame the lowerer builds, from `rbp` downward:
     //
-    //     locals | [context] | sp-id | spills … | arg staging | argrsv | shadow
-    //     ^0       ^locals    ^       ^first_spill            ^spill_cap_off
+    //     locals | [context] | bookkeeping ×5 | spills … | arg staging | argrsv | shadow
+    //     ^0       ^locals    ^                 ^first_spill           ^spill_cap_off
+    //
+    // The five bookkeeping words are the safepoint id, the cached thread
+    // pointer, the shadow save-base, the shadow save-top and the phi
+    // parallel-copy scratch. They are all below `first_spill`, so the spill
+    // band the maps and the deopt verifier describe is unchanged by them.
     //
     // `callee_saved_lo` names the start of the region the verifier must NOT
     // inspect. The IR prologue saves no callee-saved registers (it uses only
@@ -8612,6 +8762,398 @@ mod tests {
         let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a 5 000-node method lowers");
         assert_eq!(unsafe { cm.try_call(&[0]) }, Ok(5_000));
         assert_eq!(unsafe { cm.try_call(&[42]) }, Ok(5_042));
+    }
+
+    // ── Phi parallel copy (the swap-loop wrong-code fix) ─────────────────
+    //
+    // `prealloc_phi_slots` gives every phi its OWN frame word, so the copies on
+    // one CFG edge are a parallel assignment over distinct words. Emitted in
+    // gather order through RAX — which is what this file did — a loop that
+    // swaps two locals makes each phi the other's back-edge value, the second
+    // copy reads the word the first just overwrote, and both locals end up
+    // holding the same value. These tests execute the emitted bytes, because
+    // that bug is invisible to any assertion about the copy *list*.
+
+    /// Value seeded into the reserved scratch word before every harness run, so
+    /// a test can prove an acyclic copy never touched it.
+    const SCRATCH_SENTINEL: i64 = 0x0BAD_5C7A_0000_1234;
+
+    /// Emit `push rbp; mov rbp,rsp; sub rsp,frame`, seed the named frame words
+    /// (plus the scratch, with [`SCRATCH_SENTINEL`]), run `copies` through the
+    /// REAL sequencer and the REAL emitter, load one word into RAX and return.
+    /// Then execute it.
+    ///
+    /// `read_back == None` reads the reserved scratch word itself.
+    ///
+    /// The frame is a genuine `Lowerer` frame (so the offsets, the scratch
+    /// reservation and `frame_size` are the ones production uses); only the
+    /// prologue/epilogue are hand-rolled, because the real ones fetch a thread
+    /// and touch the shadow stack that this fixture has no helpers for.
+    fn parallel_copy_harness(
+        seed: &[(i32, i64)],
+        copies: &[(i32, i32)],
+        read_back: Option<i32>,
+    ) -> (i64, Vec<CopyOp>) {
+        // Eight locals so the harness has plenty of frame words BELOW the
+        // bookkeeping reservation to use as stand-in phi slots.
+        const HARNESS_LOCALS: usize = 8;
+
+        let (graph, schedule) = add_one_graph();
+        let plan = plan_slots(&graph, &schedule, None);
+        let empty: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_scopes = InlineScopeTable::new();
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let helpers = no_helpers();
+        let mut lowerer = Lowerer::new(
+            &graph,
+            &schedule,
+            buf,
+            0,
+            HARNESS_LOCALS,
+            &plan,
+            &helpers,
+            &empty,
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact,
+            &no_scopes,
+        );
+        let scratch = lowerer.phi_copy_scratch_slot_off;
+        let frame = lowerer.frame_size;
+        for &(off, _) in seed {
+            assert!(
+                off > 0 && off < frame && off != scratch,
+                "the fixture must name a real frame word other than the scratch: {off}",
+            );
+        }
+
+        // push rbp ; mov rbp, rsp ; sub rsp, frame_size
+        lowerer.buf.emit_byte(0x55);
+        lowerer.buf.emit(&[0x48, 0x89, 0xE5]);
+        lowerer.buf.emit(&[0x48, 0x81, 0xEC]);
+        lowerer.buf.emit(&frame.to_le_bytes());
+
+        let scratch_seed = [(scratch, SCRATCH_SENTINEL)];
+        for &(off, val) in seed.iter().chain(scratch_seed.iter()) {
+            lowerer.emit_mov_reg_imm64(RAX, val as u64);
+            lowerer.store_rax(off);
+        }
+
+        let ops = phi_copy_sequence(copies).expect("the fixture's copies sequentialise");
+        for op in ops.iter().copied() {
+            lowerer
+                .emit_copy_op(op)
+                .expect("every location in this backend is a frame word");
+        }
+
+        lowerer.load_to_rax(read_back.unwrap_or(scratch));
+        // add rsp, frame_size ; pop rbp ; ret
+        lowerer.buf.emit(&[0x48, 0x81, 0xC4]);
+        lowerer.buf.emit(&frame.to_le_bytes());
+        lowerer.buf.emit_byte(0x5D);
+        lowerer.buf.emit_byte(0xC3);
+        assert!(!lowerer.buf.overflowed(), "the harness body must fit");
+
+        let cm = CompiledMethod::new(lowerer.buf);
+        // SAFETY: the emitted body takes no arguments, reads only its own
+        // frame, calls nothing and returns an i64 in RAX.
+        let value = unsafe { cm.try_call(&[]) }.expect("the harness body runs");
+        (value, ops)
+    }
+
+    fn count_kind(ops: &[CopyOp], f: impl Fn(&CopyOp) -> bool) -> usize {
+        ops.iter().copied().filter(|o| f(o)).count()
+    }
+
+    /// The swap loop's back edge, at the machine level: `a <- b, b <- a`.
+    ///
+    /// Sequential emission through RAX put `b`'s value in BOTH words. This is
+    /// the wrong-code witness, asserted by running the bytes.
+    #[test]
+    fn a_two_element_phi_cycle_really_swaps_the_two_frame_words() {
+        let (a, b) = (8i32, 16i32);
+        let seed = [(a, 0x1111_1111i64), (b, 0x2222_2222i64)];
+        let copies = [(a, b), (b, a)];
+
+        let (got_a, ops) = parallel_copy_harness(&seed, &copies, Some(a));
+        let (got_b, _) = parallel_copy_harness(&seed, &copies, Some(b));
+        assert_eq!(got_a, 0x2222_2222, "a must receive b's PRE-copy value");
+        assert_eq!(
+            got_b, 0x1111_1111,
+            "b must receive a's PRE-copy value — 0x22222222 here is the old \
+             sequential-emission bug, in which both words ended up holding b",
+        );
+
+        // One save/restore pair breaks the cycle; the third op is the move.
+        assert_eq!(ops.len(), 3, "{ops:?}");
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Save { .. })), 1);
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Restore { .. })), 1);
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Move { .. })), 1);
+
+        // …and the scratch word really is where the parked value went.
+        let (scratch_after, _) = parallel_copy_harness(&seed, &copies, None);
+        assert_ne!(
+            scratch_after, SCRATCH_SENTINEL,
+            "a cycle must go through the reserved scratch word",
+        );
+    }
+
+    /// A three-element cycle rotates; the last move IS the restore, so it costs
+    /// one save, two moves and one restore.
+    #[test]
+    fn a_three_element_phi_cycle_rotates_the_frame_words() {
+        let (a, b, c) = (8i32, 16i32, 24i32);
+        let seed = [(a, 1i64), (b, 2i64), (c, 3i64)];
+        // a <- b, b <- c, c <- a
+        let copies = [(a, b), (b, c), (c, a)];
+
+        let (got_a, ops) = parallel_copy_harness(&seed, &copies, Some(a));
+        let (got_b, _) = parallel_copy_harness(&seed, &copies, Some(b));
+        let (got_c, _) = parallel_copy_harness(&seed, &copies, Some(c));
+        assert_eq!((got_a, got_b, got_c), (2, 3, 1), "{ops:?}");
+
+        assert_eq!(ops.len(), 4, "one save, two moves, one restore: {ops:?}");
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Save { .. })), 1);
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Restore { .. })), 1);
+    }
+
+    /// The acyclic majority — every merge that is not a permutation — must be
+    /// unchanged: one load + one store per copy, and the scratch word untouched.
+    #[test]
+    fn an_acyclic_phi_chain_emits_the_minimal_moves_and_no_scratch() {
+        let (a, b, c) = (8i32, 16i32, 24i32);
+        let seed = [(a, 1i64), (b, 2i64), (c, 3i64)];
+        // b <- a, c <- b. Gather order would overwrite b before c reads it.
+        let copies = [(b, a), (c, b)];
+
+        let (got_b, ops) = parallel_copy_harness(&seed, &copies, Some(b));
+        let (got_c, _) = parallel_copy_harness(&seed, &copies, Some(c));
+        assert_eq!(got_b, 1, "b <- a");
+        assert_eq!(got_c, 2, "c must read b's PRE-copy value: {ops:?}");
+
+        assert_eq!(
+            ops,
+            vec![
+                CopyOp::Move {
+                    from: frame_word_loc(b).expect("a frame word"),
+                    to: frame_word_loc(c).expect("a frame word"),
+                },
+                CopyOp::Move {
+                    from: frame_word_loc(a).expect("a frame word"),
+                    to: frame_word_loc(b).expect("a frame word"),
+                },
+            ],
+            "an acyclic web must cost exactly one move per copy",
+        );
+
+        let (scratch_after, _) = parallel_copy_harness(&seed, &copies, None);
+        assert_eq!(
+            scratch_after, SCRATCH_SENTINEL,
+            "an acyclic web must not touch the reserved scratch word",
+        );
+    }
+
+    /// A copy to itself is not a move: it must emit nothing at all, so a merge
+    /// whose phi already lives in its source's word costs zero instructions.
+    #[test]
+    fn a_self_copy_emits_nothing() {
+        let ops = phi_copy_sequence(&[(8, 8), (16, 16)]).expect("sequentialises");
+        assert!(ops.is_empty(), "{ops:?}");
+    }
+
+    /// ONE scratch word is enough however many cycles an edge contains: the
+    /// sequencer always consumes a save before it starts the next cycle. If
+    /// that ever stopped being true the saves would nest and the single
+    /// reserved word would be clobbered, so pin it here — this file's frame
+    /// reservation is what depends on it.
+    #[test]
+    fn disjoint_phi_cycles_never_nest_their_saves() {
+        let (a, b, c, d) = (8i32, 16i32, 24i32, 32i32);
+        let seed = [(a, 1i64), (b, 2i64), (c, 3i64), (d, 4i64)];
+        let copies = [(a, b), (b, a), (c, d), (d, c)];
+
+        let mut saved = false;
+        let (got_a, ops) = parallel_copy_harness(&seed, &copies, Some(a));
+        for op in &ops {
+            match op {
+                CopyOp::Save { .. } => {
+                    assert!(!saved, "a second save before the first restore: {ops:?}");
+                    saved = true;
+                }
+                CopyOp::Restore { .. } => {
+                    assert!(saved, "a restore with nothing saved: {ops:?}");
+                    saved = false;
+                }
+                CopyOp::Move { .. } => {}
+            }
+        }
+        assert!(!saved, "an unconsumed save: {ops:?}");
+        assert_eq!(count_kind(&ops, |o| matches!(o, CopyOp::Save { .. })), 2);
+
+        let (got_b, _) = parallel_copy_harness(&seed, &copies, Some(b));
+        let (got_c, _) = parallel_copy_harness(&seed, &copies, Some(c));
+        let (got_d, _) = parallel_copy_harness(&seed, &copies, Some(d));
+        assert_eq!((got_a, got_b, got_c, got_d), (2, 1, 4, 3));
+    }
+
+    /// A register is representable in the shared `ValueLoc` but unreachable
+    /// here — this backend keeps every value in its home frame word. Refused,
+    /// not mis-emitted as an offset.
+    #[test]
+    fn a_register_location_is_refused_rather_than_emitted_as_an_offset() {
+        let err = frame_word_off(ValueLoc::Reg(crate::regalloc::PhysReg::gp(3)))
+            .expect_err("a register is not a frame word");
+        assert!(
+            matches!(err.reason, BailoutReason::Internal(_)),
+            "{err:?}",
+        );
+        // …and offset 0 (`[rbp - 0]` is the saved caller RBP) is not a location.
+        assert!(frame_word_loc(0).is_err());
+        assert!(frame_word_loc(-8).is_err());
+    }
+
+    /// The scratch is a BOOKKEEPING word: it sits below `first_spill`, so no
+    /// colour `plan_slots` hands out can ever land on it, and the five reserved
+    /// words are contiguous with no gap for a coloured slot to hide in.
+    ///
+    /// Also the frame arithmetic: `estimate_frame_bytes` (which `lower_inner`
+    /// bounds against) must still equal the frame `Lowerer::new` lays out. The
+    /// constructor pins that with a `debug_assert_eq!`; this asserts it in a
+    /// release build too, and from the published offsets rather than from a
+    /// repetition of the same sum.
+    #[test]
+    fn the_phi_scratch_word_is_reserved_below_the_spill_band() {
+        for &num_locals in &[0usize, 1, 8] {
+            let (graph, schedule) = add_one_graph();
+            let plan = plan_slots(&graph, &schedule, None);
+            let empty: HashMap<usize, bool> = HashMap::new();
+            let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+            let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+            let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+            let no_scopes = InlineScopeTable::new();
+            let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+            let helpers = no_helpers();
+            let lowerer = Lowerer::new(
+                &graph,
+                &schedule,
+                buf,
+                0,
+                num_locals,
+                &plan,
+                &helpers,
+                &empty,
+                None,
+                &no_direct,
+                &no_ic,
+                &no_compact,
+                &no_scopes,
+            );
+
+            // The five bookkeeping words are contiguous and end at first_spill.
+            assert_eq!(lowerer.shadow_thread_slot_off, lowerer.sp_id_slot_off + 8);
+            assert_eq!(
+                lowerer.shadow_savebase_slot_off,
+                lowerer.shadow_thread_slot_off + 8
+            );
+            assert_eq!(
+                lowerer.shadow_savetop_slot_off,
+                lowerer.shadow_savebase_slot_off + 8
+            );
+            assert_eq!(
+                lowerer.phi_copy_scratch_slot_off,
+                lowerer.shadow_savetop_slot_off + 8,
+                "the scratch is the fifth reserved word",
+            );
+            assert_eq!(
+                lowerer.first_spill,
+                lowerer.phi_copy_scratch_slot_off + 8,
+                "the spill band starts one word above the scratch",
+            );
+
+            // No coloured slot can collide with it.
+            for color in 0..plan.slots as i32 {
+                assert_ne!(
+                    lowerer.first_spill + color * 8,
+                    lowerer.phi_copy_scratch_slot_off,
+                );
+            }
+            assert!(lowerer.first_spill <= lowerer.spill_cap_off);
+
+            // The estimate `lower_inner` bounds against is the frame that got
+            // built — including the fifth reserved word.
+            let needs = scan_frame_needs(&graph, &helpers);
+            assert_eq!(
+                lowerer.frame_size,
+                estimate_frame_bytes(num_locals, plan.slots, &needs) as i32,
+            );
+            // …and that number really does account for locals + 5 bookkeeping
+            // words + the spill band + the 16-byte stack-arg reserve + the
+            // 32-byte ABI shadow. `add_one_graph` needs no context slot and
+            // stages no call arguments.
+            let locals_size = (num_locals as i32) * 8;
+            let bookkeeping = 8 * 5;
+            let tail = 32 + 16;
+            assert_eq!(
+                lowerer.frame_size,
+                ((locals_size + bookkeeping + (plan.slots as i32) * 8 + tail) + 15) & !15,
+            );
+            assert_eq!(lowerer.spill_cap_off, lowerer.frame_size - tail);
+            // Offsets are 1-based — `[rbp - 0]` is the saved caller RBP — so the
+            // first spill word sits one word past the locals + bookkeeping bytes.
+            assert_eq!(lowerer.first_spill, locals_size + bookkeeping + 8);
+        }
+    }
+
+    /// End to end, on the shape the fix exists for.
+    ///
+    /// ```java
+    /// static int f(int a, int b, int n) {
+    ///     for (int i = 0; i < n; i++) { int t = a; a = b; b = t; }
+    ///     return a - b;
+    /// }
+    /// ```
+    ///
+    /// The two loop-header phis are each other's back-edge value, so the back
+    /// edge's parallel copy is a two-element cycle. Before the scratch word this
+    /// method REFUSED to compile (`UnsupportedShape("cyclic phi parallel
+    /// copy")`) and dropped to a lower tier; before that it compiled to wrong
+    /// code. `a - b` is the sharp readout: `0` is what both duplication bugs
+    /// (both words ending up with `a`, or both with `b`) produce.
+    #[test]
+    fn the_swap_loop_compiles_and_swaps() {
+        //  0: iconst_0     03
+        //  1: istore_3     3e          i = 0
+        //  2: iload_3      1d      ← loop header
+        //  3: iload_2      1c
+        //  4: if_icmpge 17 a2 00 0d
+        //  7: iload_1      1b          swap through the operand stack:
+        //  8: iload_0      1a          stack = [b, a]
+        //  9: istore_1     3c          b = a
+        // 10: istore_0     3b          a = b
+        // 11: iinc 3,1     84 03 01
+        // 14: goto 2       a7 ff f4
+        // 17: iload_0      1a
+        // 18: iload_1      1b
+        // 19: isub         64
+        // 20: ireturn      ac
+        let code = [
+            0x03, 0x3e, 0x1d, 0x1c, 0xa2, 0x00, 0x0d, 0x1b, 0x1a, 0x3c, 0x3b, 0x84, 0x03, 0x01,
+            0xa7, 0xff, 0xf4, 0x1a, 0x1b, 0x64, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 21, 3, 4).expect(
+            "the swap loop must COMPILE — a None here is the cyclic-parallel-copy \
+             refusal coming back, which drops the method a tier",
+        );
+        let f = |a: i64, b: i64, n: i64| unsafe { cm.try_call(&[a, b, n]).expect("call") };
+        assert_eq!(f(3, 7, 0), -4, "no iterations: 3 - 7");
+        assert_eq!(f(3, 7, 1), 4, "one swap: 7 - 3 (0 would mean a == b)");
+        assert_eq!(f(3, 7, 2), -4, "two swaps: back to 3 - 7");
+        assert_eq!(f(3, 7, 3), 4, "three swaps");
+        assert_eq!(f(-9, 5, 1), 14, "5 - (-9)");
     }
 
     // ── Inlined caller scopes → `FrameState::caller` ─────────────────────

@@ -583,6 +583,186 @@ pub fn dispatch_policy(shared: &SharedVm) -> cratonvm_types::compat::ExecutionPo
     shared.config.execution_policy()
 }
 
+/// Dispatch-side capability gate: the coarse safety net under the per-call-site
+/// gates in `native-builtins` / `native-io`.
+///
+/// # Why it exists
+///
+/// The per-call-site gates cover the natives someone has edited. This one
+/// covers every native whose `(class, method)` is in
+/// [`classify_native`](cratonvm_native_api::capability::classify_native) —
+/// `ProcessBuilder.start`, `Runtime.exec`, `System.load*`, `Unsafe.*`, the FFM
+/// `Linker`, the `java.io` file streams, the `java.net` sockets — *including the
+/// ones whose implementation still has no gate of its own*. It can only ever
+/// report [`Scope::Any`](cratonvm_native_api::Scope::Any): the arguments have
+/// not been decoded here, so there is no path or host to name. An `Enforce`
+/// deployment therefore has to hold the unscoped grant (`process-spawn:*`) for
+/// a class of native to dispatch at all, and the per-call-site gate then makes
+/// the scoped decision.
+///
+/// # Cost, on the path every native dispatch in the VM takes
+///
+/// Three early-outs, in this order:
+///
+/// 1. `capabilities()` — one `Option` discriminant test on a registry field.
+///    This is the *only* cost when no policy is installed (an embedder that
+///    builds its registry by hand, and every `NativeMethodRegistry::new`).
+/// 2. `classify_native(class, method)` — a `match` on `class_name`, which
+///    rustc lowers to a length switch plus a handful of `memcmp`s and answers
+///    `None` for the ~3,100 natives that are not capability-relevant. This is
+///    the *whole* cost of the installed-but-`Permissive` default for all but a
+///    few dozen triples.
+/// 3. For those few dozen, under `Permissive` only, a thread-local memo (see
+///    below). `Audit` and `Enforce` skip it and take the full check every time.
+///
+/// No allocation, no lock, no atomic and no hashing on any of the three. In
+/// particular there is no `NativeMethodId` resolution on the common path, which
+/// is deliberate: `NativeMethodRegistry::check_dispatch_capability` wants an id,
+/// these three dispatch sites reach their callback through `find_with_kind`,
+/// which does not return one, and re-deriving it with `resolve_id` would pay a
+/// *second* full 128-bit `(class, method, descriptor)` hash per dispatch — the
+/// exact duplicate-hash cost `find_with_kind` was introduced to remove (see its
+/// doc comment and the H2 `TestFileSystem.testConcurrent` profile). The id is
+/// resolved only after step 2 has said this native is capability-relevant, in
+/// the `#[cold]` half.
+///
+/// A `find_with_kind`-shaped registry lookup that also returned the
+/// `NativeMethodId` would let step 2 collapse into the precomputed
+/// `sensitive_slots` lookup; that is a `native-api` edit and is reported
+/// separately.
+///
+/// # Why `Permissive` is memoized and what that trades away
+///
+/// `classify_native` maps **all** of `jdk/internal/misc/Unsafe` to
+/// `RawMemory` — every `compareAndSetInt`, `getReferenceVolatile`, `park`,
+/// every AQS and every j.u.c collection operation that lands in a native.
+/// `CapabilitySet::check` takes a `parking_lot::Mutex` on the audit map, and
+/// that map is **shared by every thread of the VM**. Recording per call would
+/// put a single VM-wide mutex on the hottest native path in the interpreter —
+/// not a per-call instruction cost but a serialization point, which is how a
+/// throughput regression becomes a hang.
+///
+/// So under `Permissive` (and only under `Permissive`, which cannot refuse
+/// anything) the first dispatch of each `CapabilityKind` for each policy on
+/// each thread takes the full check, and later ones are a thread-local load, two
+/// `usize` compares and a bit test. The trade is the same one
+/// `native-builtins`' `gate_raw_memory` already documents and accepts
+/// (`docs/security/capability-wiring.md` §4.4): the report still names the
+/// capability, its scope and its first call site, and **under-reports `count`**.
+/// `count` is the one number a least-privilege grant set does not depend on,
+/// and `Audit` — the mode that exists to price an `Enforce` flip — counts every
+/// call exactly.
+///
+/// The memo is keyed on `(vm_identity, policy address)`, so swapping a VM's
+/// policy or creating a second VM invalidates it rather than inheriting a
+/// neighbour's answer.
+#[inline]
+fn check_native_dispatch_capability(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    let registry = &shared.natives.native_methods;
+    let Some(caps) = registry.capabilities() else {
+        return Ok(());
+    };
+    let Some(kind) = cratonvm_native_api::capability::classify_native(class_name, method_name)
+    else {
+        return Ok(());
+    };
+    if caps.mode() == cratonvm_native_api::CapabilityMode::Permissive
+        && permissive_dispatch_already_recorded(shared.vm_identity, caps, kind)
+    {
+        return Ok(());
+    }
+    check_native_dispatch_capability_cold(registry, kind, class_name, method_name, descriptor)
+}
+
+std::thread_local! {
+    /// `(vm_identity, policy address, kinds already recorded)` for this thread.
+    ///
+    /// A `Cell` of a `Copy` payload: no `RefCell` borrow flag, no `Arc` clone,
+    /// no allocation. `vm_identity` is never 0 (`NEXT_VM_IDENTITY` starts at 1),
+    /// so the all-zero initial value cannot collide with a real VM.
+    static PERMISSIVE_DISPATCH_MEMO: std::cell::Cell<(usize, usize, u16)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Whether this thread has already recorded `kind` for this VM's current
+/// policy — and mark it recorded if not.
+///
+/// Only ever consulted under [`CapabilityMode::Permissive`], where the answer
+/// can only suppress a *counter*, never an authorization decision.
+#[inline]
+fn permissive_dispatch_already_recorded(
+    vm_identity: usize,
+    caps: &Arc<cratonvm_native_api::CapabilitySet>,
+    kind: cratonvm_native_api::CapabilityKind,
+) -> bool {
+    // `CapabilityKind` is `#[repr(u8)]` with 9 fieldless variants, so the
+    // discriminant is a shift amount in 0..9 and the mask fits a `u16`.
+    let bit = 1u16 << (kind as u8);
+    let policy = Arc::as_ptr(caps) as usize;
+    PERMISSIVE_DISPATCH_MEMO.with(|memo| {
+        let (memo_vm, memo_policy, mask) = memo.get();
+        if memo_vm == vm_identity && memo_policy == policy {
+            if mask & bit != 0 {
+                return true;
+            }
+            memo.set((vm_identity, policy, mask | bit));
+        } else {
+            // Different VM, or this VM's policy was replaced: start over rather
+            // than inherit the other one's answer.
+            memo.set((vm_identity, policy, bit));
+        }
+        false
+    })
+}
+
+/// Drop this thread's [`PERMISSIVE_DISPATCH_MEMO`], so the next dispatch of
+/// every kind is recorded again. For tests that install a policy after boot.
+#[cfg(test)]
+fn reset_permissive_dispatch_memo() {
+    PERMISSIVE_DISPATCH_MEMO.with(|memo| memo.set((0, 0, 0)));
+}
+
+/// The ~35-native half of [`check_native_dispatch_capability`]. Out of line so
+/// the hot path is two predicted-not-taken branches and nothing else.
+#[cold]
+#[inline(never)]
+fn check_native_dispatch_capability_cold(
+    registry: &crate::native::registry::NativeMethodRegistry,
+    kind: cratonvm_native_api::CapabilityKind,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Result<(), MethodCallFailed> {
+    // Preferred route: the registry's own gate, reading the classification it
+    // precomputed for this slot at registration time. Costs one `resolve_id`
+    // (a triple hash) — irrelevant next to spawning a process or opening a file.
+    if let Some(id) = registry.resolve_id(class_name, method_name, descriptor) {
+        if registry.capability_of_id(id).is_some() {
+            return registry.check_dispatch_capability(id).map_err(Into::into);
+        }
+    }
+    // Fallback: the slot carries no classification. That happens when the
+    // registration predates the policy (an embedder that calls
+    // `set_capabilities` after its own `register_*` pass), or when the
+    // descriptor-quirk path resolved to a slot registered under a different
+    // descriptor. `classify_native` already answered for this `(class, method)`,
+    // so check that answer directly rather than let the gate vanish.
+    match registry.capabilities() {
+        Some(caps) => caps
+            .check(cratonvm_native_api::Capability::of(
+                kind,
+                cratonvm_native_api::Scope::Any,
+            ))
+            .map_err(Into::into),
+        None => Ok(()),
+    }
+}
+
 /// §4 census hook: count one native dispatch for the `(class, method,
 /// descriptor)` triple.
 ///
@@ -14111,6 +14291,17 @@ pub fn invoke_or_native(
             }
             Some(decision) => {
                 if let Some(callback) = decision.native_callback() {
+                    // CAPABILITY GATE, dispatch site 1 of 3. Deliberately here
+                    // and not up at the `find_with_kind` hit: this is the last
+                    // point before the native actually runs, and the arms above
+                    // can still route the call to real bytecode instead. A
+                    // capability is only exercised by a native that executes.
+                    check_native_dispatch_capability(
+                        shared,
+                        effective_class,
+                        method_name,
+                        descriptor,
+                    )?;
                     return safe_native_call(shared, thread, callback, args)
                         .map(|v| coerce_native_return(v, descriptor));
                 }
@@ -21887,6 +22078,17 @@ fn invoke_on_class_shared_inner(
                     }
                     Some(decision) => {
                         if let Some(callback) = decision.native_callback() {
+                            // CAPABILITY GATE, dispatch site 2 of 3 — the
+                            // "force the registered native in front of real JDK
+                            // bytecode" path. Same placement rule as site 1:
+                            // immediately before the call, after routing has
+                            // committed to the native.
+                            check_native_dispatch_capability(
+                                shared,
+                                &class_name_for_force,
+                                method_name,
+                                descriptor,
+                            )?;
                             return safe_native_call(shared, thread, callback, args);
                         }
                     }
@@ -22026,8 +22228,19 @@ fn invoke_on_class_shared_inner(
             || class_name.starts_with("io/netty/internal/tcnative/");
 
         if let Some(callback) = registry_native {
-            // Fast path: Rust NativeCallback registered in the built-in registry.
-            safe_native_call(shared, thread, callback, args)
+            // CAPABILITY GATE, dispatch site 3 of 3 — the general
+            // `is_native` dispatch every ACC_NATIVE method reaches. Chained
+            // rather than sequenced so the arm still evaluates to the
+            // `MethodCallResult` the surrounding `let result = if …` expects; a
+            // refusal short-circuits and the native never runs.
+            //
+            // The JNI-function-pointer and bytecode arms below are NOT gated
+            // here: a JNI native registered by a host library is not in
+            // `classify_native`'s table, so the gate would be a guaranteed
+            // `None`. Covering host-registered JNI needs `RegisterNatives`
+            // itself to be gated, which is a separate row.
+            check_native_dispatch_capability(shared, &class_name, method_name, descriptor)
+                .and_then(|()| safe_native_call(shared, thread, callback, args))
         } else if let Some(fn_ptr) = if skip_jni_incompatible_host_lib {
             None
         } else {
@@ -24483,5 +24696,202 @@ mod tests {
             .thread_registry
             .frame_trace_of_resolved(ThreadId(0xDEAD), &store)
             .is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispatch-side capability gate
+    // -----------------------------------------------------------------------
+    //
+    // Every test here builds its own VM, so it works under its own `VmId` and
+    // the process-global `VmId -> CapabilitySet` index cannot leak a policy
+    // into a concurrently-running test. Dropping the `SharedVm` uninstalls it
+    // (`impl Drop for SharedVm`).
+
+    use cratonvm_native_api::{
+        capabilities_for, install_capabilities, Capability, CapabilityMode, CapabilitySet, VmId,
+    };
+
+    /// A native that `classify_native` maps to a capability…
+    const SENSITIVE: (&str, &str, &str) = (
+        "java/lang/ProcessBuilder",
+        "start",
+        "()Ljava/lang/Process;",
+    );
+    /// …and one it does not, which is the answer for ~3,100 of the ~3,100.
+    const BENIGN: (&str, &str, &str) = ("java/lang/Object", "hashCode", "()I");
+
+    /// Replace this VM's boot policy with one in `mode`, in both places the
+    /// install path puts it: the registry (dispatch + registration gate) and
+    /// the process index (per-call-site gates reached through `NativeContext`).
+    /// The same `Arc` in both, so there is one audit log.
+    fn vm_in_mode(mode: CapabilityMode) -> (SharedVm, Arc<CapabilitySet>) {
+        let mut shared = SharedVm::new(VmConfig::default());
+        let caps = Arc::new(CapabilitySet::new(
+            VmId::from_raw(shared.vm_identity),
+            mode,
+        ));
+        shared
+            .natives
+            .native_methods
+            .set_capabilities(Arc::clone(&caps));
+        install_capabilities(Arc::clone(&caps));
+        (shared, caps)
+    }
+
+    fn gate(shared: &SharedVm, triple: (&str, &str, &str)) -> Result<(), MethodCallFailed> {
+        check_native_dispatch_capability(shared, triple.0, triple.1, triple.2)
+    }
+
+    /// The default a VM boots with. Nothing is refused, and the use is counted
+    /// so `capability_audit(vm)` can derive a grant set from a real run.
+    #[test]
+    fn permissive_dispatch_allows_and_records() {
+        let (shared, caps) = vm_in_mode(CapabilityMode::Permissive);
+        assert!(gate(&shared, SENSITIVE).is_ok());
+
+        let report = caps.audit_report();
+        assert_eq!(
+            report.total_checks(),
+            1,
+            "the dispatch gate must record exactly one use:\n{report}"
+        );
+        assert_eq!(
+            report.uses[0].capability.kind(),
+            cratonvm_native_api::CapabilityKind::ProcessSpawn
+        );
+        assert_eq!(
+            report.total_ungranted(),
+            1,
+            "Permissive still prices the flip; it just does not act on it"
+        );
+    }
+
+    /// The `Permissive` gate is behaviour-identical to having no policy: it
+    /// never refuses, for a classified native or an unclassified one, and it
+    /// touches the audit log only for the classified one — so the ~3,100
+    /// non-capability natives pay a discriminant test and a `match` on the
+    /// class name, and nothing else.
+    #[test]
+    fn permissive_dispatch_is_behaviour_identical_to_no_policy() {
+        // Reference: a registry with no policy at all answers `Ok` for
+        // everything, which is the behaviour that must not change.
+        let bare = crate::native::registry::NativeMethodRegistry::new();
+        assert!(bare.capabilities().is_none());
+
+        let (shared, caps) = vm_in_mode(CapabilityMode::Permissive);
+        for triple in [SENSITIVE, BENIGN] {
+            assert!(
+                gate(&shared, triple).is_ok(),
+                "Permissive must never refuse {triple:?}"
+            );
+        }
+        let report = caps.audit_report();
+        assert_eq!(
+            report.uses.len(),
+            1,
+            "only the classified native may reach the audit log:\n{report}"
+        );
+    }
+
+    /// `Audit` is the mode a deployment runs its suite in before flipping:
+    /// everything is still allowed, and the ungranted uses are tallied so the
+    /// cost of `Enforce` is a number rather than a guess.
+    #[test]
+    fn audit_dispatch_records_without_denying() {
+        let (shared, caps) = vm_in_mode(CapabilityMode::Audit);
+        assert!(
+            gate(&shared, SENSITIVE).is_ok(),
+            "Audit must not deny — that is what Enforce is for"
+        );
+        assert!(gate(&shared, SENSITIVE).is_ok());
+
+        let report = caps.audit_report();
+        assert_eq!(report.total_checks(), 2, "{report}");
+        assert_eq!(
+            report.total_ungranted(),
+            2,
+            "with no grants, an Enforce flip would have refused both:\n{report}"
+        );
+        assert_eq!(
+            report.suggested_grants(),
+            "process-spawn:*",
+            "the report must hand back the grant that would fix it"
+        );
+    }
+
+    /// The point of the whole exercise: under `Enforce` a native that is not
+    /// covered by a grant does not run.
+    #[test]
+    fn enforce_denies_an_ungranted_dispatch() {
+        let (shared, _caps) = vm_in_mode(CapabilityMode::Enforce);
+
+        let denied = gate(&shared, SENSITIVE).expect_err("ProcessSpawn is not granted");
+        let text = denied.to_string();
+        assert!(
+            text.contains("SecurityException"),
+            "a refusal must surface as SecurityException, not as an I/O or \
+             internal error: {text}"
+        );
+        assert!(
+            text.contains("process-spawn"),
+            "the refusal must name the capability so it is actionable: {text}"
+        );
+
+        // A native that exercises no capability is untouched even under
+        // Enforce — the gate is not a global switch.
+        assert!(gate(&shared, BENIGN).is_ok());
+    }
+
+    /// The unscoped grant the dispatch gate needs. It cannot name a program (no
+    /// arguments have been decoded yet), so `Scope::Any` is the only request it
+    /// can make and only an unscoped grant admits it — the per-call-site gate
+    /// in `native-io` then makes the scoped decision.
+    #[test]
+    fn enforce_admits_a_dispatch_covered_by_an_unscoped_grant() {
+        let mut shared = SharedVm::new(VmConfig::default());
+        let mut set = CapabilitySet::new(
+            VmId::from_raw(shared.vm_identity),
+            CapabilityMode::Enforce,
+        );
+        set.grant(Capability::parse_grant("process-spawn:*").unwrap());
+        let caps = Arc::new(set);
+        shared
+            .natives
+            .native_methods
+            .set_capabilities(Arc::clone(&caps));
+        install_capabilities(Arc::clone(&caps));
+
+        assert!(gate(&shared, SENSITIVE).is_ok());
+        // A *scoped* grant does not admit it: the gate's request is
+        // `Scope::Any`, and fail-closed means a narrow grant refuses it.
+        let mut narrow = CapabilitySet::new(
+            VmId::from_raw(shared.vm_identity),
+            CapabilityMode::Enforce,
+        );
+        narrow.grant(Capability::parse_grant("process-spawn:/bin/sh").unwrap());
+        let narrow = Arc::new(narrow);
+        shared
+            .natives
+            .native_methods
+            .set_capabilities(Arc::clone(&narrow));
+        install_capabilities(narrow);
+        assert!(gate(&shared, SENSITIVE).is_err());
+    }
+
+    /// Two VMs in one process must not be able to change each other's answer —
+    /// the cross-VM policy interference the capability model exists to remove.
+    #[test]
+    fn two_vms_gate_independently() {
+        let (strict, _s) = vm_in_mode(CapabilityMode::Enforce);
+        let (lax, _l) = vm_in_mode(CapabilityMode::Permissive);
+
+        assert!(gate(&strict, SENSITIVE).is_err());
+        assert!(
+            gate(&lax, SENSITIVE).is_ok(),
+            "an Enforce VM must not make its neighbour deny"
+        );
+        assert_ne!(strict.vm_identity, lax.vm_identity);
+        assert!(capabilities_for(VmId::from_raw(strict.vm_identity)).is_some());
+        assert!(capabilities_for(VmId::from_raw(lax.vm_identity)).is_some());
     }
 }

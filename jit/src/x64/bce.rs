@@ -9,6 +9,11 @@
 
 use super::*;
 
+use crate::loop_analysis::{analyze_counted_loop, decode_bound_expr, MinMax};
+use crate::scev::{
+    BoundSource, BoundTerm, BoundsProof, CountedLoop, ExitCmp, IndexExpr, IntRange, LoopForm,
+    PreheaderGuard, RangeEnv, RefusalReason, Stride,
+};
 
 /// Whether speculative (runtime-guarded) BCE is disabled via
 /// `CRATONVM_JIT_NO_SPEC_BCE`. Cached in a `OnceLock` like the other env gates
@@ -59,6 +64,12 @@ pub(super) fn jit_no_spec_bce() -> bool {
 }
 
 /// Info about a loop's induction variable and bounds.
+///
+/// SUPERSEDED by [`crate::scev::CountedLoop`] — `analyze_bounds_elimination`
+/// no longer builds one. Kept because `analyze_loop_bound` (which returns it)
+/// is still exercised by the x64 test suite as the reference decoding of the
+/// two comparator shapes; nothing in the elision path reads it.
+#[allow(dead_code)]
 pub(super) struct LoopBoundsInfo {
     /// The local variable that serves as the induction variable (incremented by iinc +1).
     pub(super) induction_var: usize,
@@ -128,6 +139,11 @@ pub(super) struct SpeculativeBCEGuard {
 /// How a loop's induction variable advances — the step provenance the
 /// speculative BCE guard needs to bound every elided index from below (no
 /// negative step) and above (no int wrap past the exit test).
+///
+/// SUPERSEDED by [`crate::scev::Stride`], which additionally carries non-unit
+/// and negative constant strides and the `isub` spelling. Retained only as the
+/// reference decoding the x64 test suite pins.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum IvStep {
     /// Canonical `iinc iv, 1`.
@@ -146,6 +162,9 @@ pub(super) enum IvStep {
 /// elision for the loop (`find_induction_variable` alone admits `iadd;istore`
 /// IVs without identifying the step operand, which is not enough to reason
 /// about sign or wrap).
+///
+/// SUPERSEDED by [`crate::loop_analysis::find_iv_stride`].
+#[allow(dead_code)]
 pub(super) fn find_iv_step_provenance(
     code: &[u8],
     header: usize,
@@ -718,6 +737,13 @@ pub(super) fn find_induction_variable(code: &[u8], header: usize, back_edge_end:
 /// - `iload iv; arraylength; if_icmpge exit` → bound is array length (implicit)
 ///
 /// Returns LoopBoundsInfo if the pattern is recognized.
+///
+/// SUPERSEDED by [`locate_exit_test`] + [`crate::loop_analysis::decode_bound_expr`],
+/// which accept a constant / `arraylength` / field / `Math.min`-`max` limit as
+/// well as a bare local, and — unlike this function — *verify* that the branch
+/// they decode is really the loop's exit or back edge. Retained because the
+/// x64 test suite pins its inclusive/exclusive classification.
+#[allow(dead_code)]
 pub(super) fn analyze_loop_bound(
     code: &[u8],
     header: usize,
@@ -1011,80 +1037,6 @@ pub(super) fn analyze_array_access_operands(
     out
 }
 
-/// Find array accesses in a loop that are STATICALLY provably safe — no
-/// runtime guard needed. Returns the set of such bytecode PCs.
-///
-/// The proof (SECURITY FIX: per-array, see
-/// docs/known-issues/jit-bce-multi-array-oob-store-20260711.md): the access
-/// `arr[iv]` under an exclusive loop test `iv < bound` is in range iff
-/// `0 <= iv < bound <= arr.length` at every execution. This function
-/// therefore requires ALL of:
-///   1. `bound_from_array == Some(arr_local)` — whole-method arraylength
-///      provenance (`find_bound_arraylength_provenance`) proving the bound IS
-///      this very array's length. The loop guard `iv < a.length` bounds ONLY
-///      accesses into `a`; any other array indexed by the same IV (the `out`
-///      store of `out[i] = a[i] + b[i]`) gets NO static elision and falls to
-///      the speculative per-array header guard instead.
-///   2. `iv_start_nonneg` — whole-method proof the IV can never be negative
-///      (`find_iv_nonneg_start`).
-///   3. The IV is the access index and is only stepped +1
-///      (`find_induction_variable`), the loop comparator is exclusive, and
-///      both the array local and the bound local are loop-invariant.
-///
-/// Operand identification is delegated to `analyze_array_access_operands`
-/// (sound producer-stack tracking); `operands` maps each analysable array
-/// access PC to its `(array_local, index_local)`.
-pub(super) fn find_safe_array_accesses(
-    bounds: &LoopBoundsInfo,
-    modified: u64,
-    operands: &FxHashMap<usize, (usize, usize)>,
-    bound_from_array: Option<usize>,
-    iv_start_nonneg: bool,
-) -> FxHashSet<usize> {
-    let mut safe_pcs = FxHashSet::default();
-
-    // SECURITY FIX (V17): an inclusive comparator (`if_icmpgt` exit /
-    // `if_icmple` continue) lets the induction variable reach `bound` itself, so
-    // the maximum index accessed is `bound`, requiring `array.length >= bound +
-    // 1`. Provenance only proves `array.length == bound`, which is off-by-one
-    // for `index == bound` (an OOB heap read/write one element past the end).
-    // Refuse to mark any access safe for inclusive loops so the per-element
-    // check is always kept.
-    if bounds.inclusive {
-        return safe_pcs;
-    }
-
-    // Static elision needs the arraylength provenance and the non-negative IV
-    // start; anything unproven is left for the speculative guard path.
-    let bound_arr = match bound_from_array {
-        Some(a) if iv_start_nonneg => a,
-        _ => return safe_pcs,
-    };
-
-    // Loop-invariance of the bound: if the body raised `bound` after entry,
-    // the per-iteration exit test `iv < bound` could admit `iv >= array.length`
-    // on a later trip (SECURITY FIX V16). Provenance's single-store rule
-    // already implies this; kept as defense in depth.
-    match bounds.bound_local {
-        Some(bl) if bl < 64 && (modified & (1u64 << bl)) == 0 => {}
-        _ => return safe_pcs,
-    }
-
-    for (&pc, &(arr_local, idx_local)) in operands {
-        // Index must be the induction variable; the array must be THE array
-        // whose length the bound was taken from, and loop-invariant.
-        if idx_local == bounds.induction_var
-            && arr_local == bound_arr
-            && arr_local < 64
-            && (modified & (1u64 << arr_local)) == 0
-        {
-            safe_pcs.insert(pc);
-        }
-    }
-
-    safe_pcs
-}
-
 /// Extract the local variable index from an iload instruction at `pc`.
 pub(super) fn extract_iload_local(code: &[u8], pc: usize) -> Option<usize> {
     match *code.get(pc)? {
@@ -1311,9 +1263,463 @@ pub(super) fn find_iv_nonneg_start(code: &[u8], code_len: usize, iv_local: usize
     nonneg_const && !branch_targets.contains(&store_pc)
 }
 
+// ===========================================================================
+// Range-analysis-backed bounds-check elimination
+//
+// `analyze_bounds_elimination` used to be a stack of one-off bytecode
+// patterns: `find_induction_variable` (+1 only), `analyze_loop_bound` (limit
+// must be a bare `iload`), `find_iv_step_provenance` (two step shapes),
+// `find_bound_arraylength_provenance` / `find_iv_nonneg_start` (whole-method
+// proofs), plus a hard refusal of every inclusive loop. Those are now one
+// call into `loop_analysis::analyze_counted_loop` and one call per access into
+// `CountedLoop::prove_index_in_bounds_of` — see `docs/jit/range-analysis.md`
+// for the subsumption table and `docs/jit/bce-range-integration.md` for what
+// this consumer can and cannot discharge.
+//
+// The load-bearing rule here is the one the proof engine states and cannot
+// enforce: **a consumer that cannot emit every returned `PreheaderGuard` must
+// treat the whole proof as refused.** The pre-header emitter in `x64.rs`
+// (`compile_op`, the "Speculative BCE" block) has a FIXED repertoire — an
+// `iv >= 0` test, a `bound != Integer.MAX_VALUE` test, a
+// `0 <= step <= MAX - bound` pair, and one `array.length` vs `bound` compare
+// per guarded array. [`GuardShape::covers`] is the explicit statement of what
+// that repertoire proves; anything outside it refuses rather than silently
+// eliding on an obligation nobody discharges.
+// ===========================================================================
+
+/// A loop's exit test, located and *verified* here rather than taken on trust.
+///
+/// [`crate::loop_analysis::analyze_counted_loop`] accepts the first
+/// `iload x; <limit>; if_icmp*` triple it meets inside the loop and never
+/// checks that the branch actually leaves the loop, so an ordinary in-body
+/// `if (i >= limit)` would be read as the loop's exit condition — which would
+/// let the proof claim every executed iteration satisfies `i < limit`. This
+/// struct is produced only from a branch that provably is the loop's exit
+/// (Pattern A) or its back edge (Pattern B).
+struct LoopExitTest {
+    /// The local the test compares.
+    iv_local: usize,
+    /// The limit it is compared against.
+    bound: BoundSource,
+    /// The comparison in `if_icmp*` **exit-when-true** polarity, which is what
+    /// [`ExitCmp`] means. A continue-branch (Pattern B) is negated into it.
+    cmp: ExitCmp,
+    /// Whether that test dominates the body.
+    form: LoopForm,
+}
+
+/// A recognised loop plus the JVM local a pre-header guard has to load to
+/// evaluate the limit at runtime.
+struct RecognisedLoop {
+    /// The claim the range analysis reasons about.
+    counted: CountedLoop,
+    /// `Some(bl)` when the exit test read its limit out of local `bl`.
+    /// `None` when the limit has no local home — an inline `a.length`, a
+    /// constant, a field, a `Math.min`. Such a loop can still take STATIC
+    /// elisions, but never a guarded one: [`SpeculativeBCEGuard`] carries a
+    /// `bound_local` and the emitter has nothing else to load.
+    bound_local: Option<usize>,
+}
+
+/// The exit-when-true comparison of the negation of `cmp`.
+///
+/// Pattern B's branch is taken to *continue*, so the loop's exit condition is
+/// the complement of the opcode's own test.
+fn negate_exit_cmp(cmp: ExitCmp) -> ExitCmp {
+    match cmp {
+        ExitCmp::Lt => ExitCmp::Ge,
+        ExitCmp::Ge => ExitCmp::Lt,
+        ExitCmp::Gt => ExitCmp::Le,
+        ExitCmp::Le => ExitCmp::Gt,
+    }
+}
+
+/// Every `(source, target)` branch edge in the method, or `None` when the
+/// method contains control flow this scan does not model (`tableswitch`,
+/// `lookupswitch`, `jsr`/`ret`, `goto_w`/`jsr_w`). Sibling of
+/// [`collect_i16_branch_targets`], which keeps only the targets; the entry-edge
+/// question below needs to know where an edge came *from*.
+fn branch_edges(code: &[u8], code_len: usize) -> Option<Vec<(usize, usize)>> {
+    let mut edges = Vec::new();
+    let code_len = code_len.min(code.len());
+    let mut pc = 0usize;
+    while pc < code_len {
+        match code[pc] {
+            0xaa | 0xab | 0xa8 | 0xa9 | 0xc8 | 0xc9 => return None,
+            op if matches!(op, 0x99..=0xa7 | 0xc6 | 0xc7) && pc + 2 < code_len => {
+                // Cast: value to i32 (branch displacement arithmetic)
+                let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                let target = pc as i32 + off; // Cast: value to i32
+                if target >= 0 && (target as usize) < code_len {
+                    // Cast: non-negative index to usize
+                    edges.push((pc, target as usize));
+                }
+            }
+            _ => {}
+        }
+        pc += bytecode_len_at(code, pc);
+    }
+    Some(edges)
+}
+
+/// Whether control can fall through into `header` from the instruction that
+/// linearly precedes it. Answers `true` — the pessimistic answer — for a
+/// header at pc 0 and for any decode that does not land exactly on `header`.
+fn falls_through_into(code: &[u8], code_len: usize, header: usize) -> bool {
+    let code_len = code_len.min(code.len());
+    let mut prev: Option<usize> = None;
+    let mut pc = 0usize;
+    while pc < header && pc < code_len {
+        prev = Some(pc);
+        pc += bytecode_len_at(code, pc);
+    }
+    if pc != header {
+        return true; // desynchronised decode: assume the entry exists
+    }
+    match prev {
+        None => true,
+        // goto / jsr / switches / *return / athrow / goto_w / jsr_w do not
+        // fall through; everything else does.
+        Some(p) => !matches!(
+            code[p],
+            0xa7 | 0xa8 | 0xaa | 0xab | 0xac..=0xb1 | 0xbf | 0xc8 | 0xc9
+        ),
+    }
+}
+
+/// Whether `[from, to)` contains any array load or store opcode.
+fn range_contains_array_access(code: &[u8], from: usize, to: usize) -> bool {
+    let mut pc = from;
+    while pc < to && pc < code.len() {
+        if matches!(code[pc], 0x2e..=0x35 | 0x4f..=0x56) {
+            return true;
+        }
+        pc += bytecode_len_at(code, pc);
+    }
+    false
+}
+
+/// Decide whether a Pattern-B loop (exit test AT the back edge) is pre-tested.
+///
+/// This is the one place adopting the range analysis could *change* today's
+/// behaviour rather than extend it: `analyze_loop_bound` treats the
+/// `if_icmplt <body>` continue-branch as though the test always dominated the
+/// body, which is true for javac's / ecj's `goto cond` rotation and false for a
+/// hand-built `do { } while` with the same shape. The assumption was never
+/// checked. It is checked here.
+///
+/// The criterion is not "was the loop rotated" but the weaker fact the elision
+/// actually needs: **no array access can execute before the first test**. Every
+/// edge that enters `[header, back_edge_end)` from outside is enumerated; the
+/// loop is pre-tested when each of them lands at or after the comparison's
+/// first instruction, or lands earlier but with no array access between the
+/// landing point and the comparison. A `do { } while` fails that immediately
+/// (its entry is the header, and its accesses precede the test), so it is
+/// correctly reported [`LoopForm::PostTested`] and the proof folds the untested
+/// first iteration into the span.
+///
+/// Fail-closed: unmodelled control flow answers [`LoopForm::PostTested`].
+fn pattern_b_loop_form(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge_end: usize,
+    cmp_start: usize,
+) -> LoopForm {
+    let Some(edges) = branch_edges(code, code_len) else {
+        return LoopForm::PostTested;
+    };
+    let mut entries: Vec<usize> = Vec::new();
+    for (src, target) in edges {
+        let target_inside = target >= header && target < back_edge_end;
+        let src_inside = src >= header && src < back_edge_end;
+        if target_inside && !src_inside {
+            entries.push(target);
+        }
+    }
+    if falls_through_into(code, code_len, header) {
+        entries.push(header);
+    }
+    for t in entries {
+        if t >= cmp_start {
+            continue; // enters at or after the test: the test still runs first
+        }
+        if range_contains_array_access(code, t, cmp_start) {
+            return LoopForm::PostTested;
+        }
+    }
+    LoopForm::PreTested
+}
+
+/// Locate and verify the loop's exit test.
+///
+/// Two shapes, and only two:
+///
+/// * **Pattern A** — the test is the FIRST instruction at the header and its
+///   branch leaves `[header, back_edge_end)`. Because the header dominates the
+///   loop body, a test sitting on it dominates every access, so the loop is
+///   [`LoopForm::PreTested`] with no entry-edge question to answer. (The old
+///   `analyze_loop_bound` accepted a Pattern-A-shaped compare *anywhere* in the
+///   body, which admitted a loop whose accesses run before its test.)
+/// * **Pattern B** — the back edge itself is the comparison, branching back
+///   into the loop to continue. The comparison is negated into exit polarity
+///   and the loop form is settled by [`pattern_b_loop_form`].
+///
+/// The limit is decoded by [`crate::loop_analysis::decode_bound_expr`], which
+/// accepts a constant, a local, an inline `a.length`, a field, or a
+/// `Math.min`/`Math.max`. The `Math` resolver answers `None` here: this module
+/// carries no constant pool, so a min/max limit simply is not recognised
+/// (losing the shape, never mis-decoding it).
+fn locate_exit_test(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+    back_edge_end: usize,
+) -> Option<LoopExitTest> {
+    let no_math = |_: u16| -> Option<MinMax> { None };
+    if header >= code_len || back_edge >= code_len || back_edge_end > code_len {
+        return None;
+    }
+
+    // ---- Pattern A: the test is the header ------------------------------
+    if let Some(iv) = extract_iload_local(code, header) {
+        let after = header + if code[header] == 0x15 { 2 } else { 1 };
+        if let Some((bound, q)) = decode_bound_expr(code, after, back_edge_end, &no_math) {
+            if q + 2 < code_len {
+                if let Some(cmp) = ExitCmp::from_opcode(code[q]) {
+                    // Cast: value to i32 (branch displacement arithmetic)
+                    let off = i16::from_be_bytes([code[q + 1], code[q + 2]]) as i32;
+                    let target = q as i32 + off; // Cast: value to i32
+                    if target < header as i32 || target >= back_edge_end as i32 {
+                        return Some(LoopExitTest {
+                            iv_local: iv,
+                            bound,
+                            cmp,
+                            form: LoopForm::PreTested,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Pattern B: the back edge is the test ---------------------------
+    let cmp = ExitCmp::from_opcode(code[back_edge])?;
+    if back_edge + 2 >= code_len {
+        return None;
+    }
+    // Cast: value to i32 (branch displacement arithmetic)
+    let off = i16::from_be_bytes([code[back_edge + 1], code[back_edge + 2]]) as i32;
+    let target = back_edge as i32 + off; // Cast: value to i32
+    if target < header as i32 || target >= back_edge_end as i32 {
+        return None; // not a continue-branch into this loop
+    }
+    // The comparison's operands are the last `iload iv; <limit>` pair that ends
+    // exactly at the back edge. Scanned instruction-aligned from the header so
+    // a byte-misaligned coincidence cannot be mistaken for the real operands.
+    let mut found: Option<(usize, usize, BoundSource)> = None;
+    let mut s = header;
+    while s < back_edge {
+        if let Some(iv) = extract_iload_local(code, s) {
+            let after = s + if code[s] == 0x15 { 2 } else { 1 };
+            if let Some((bound, q)) = decode_bound_expr(code, after, back_edge_end, &no_math) {
+                if q == back_edge {
+                    found = Some((s, iv, bound));
+                }
+            }
+        }
+        s += bytecode_len_at(code, s);
+    }
+    let (cmp_start, iv, bound) = found?;
+    Some(LoopExitTest {
+        iv_local: iv,
+        bound,
+        cmp: negate_exit_cmp(cmp),
+        form: pattern_b_loop_form(code, code_len, header, back_edge_end, cmp_start),
+    })
+}
+
+/// Recognise `(header, back_edge)` as a [`CountedLoop`] the range analysis can
+/// reason about, with a verified comparator and loop form.
+///
+/// This is the single call that replaces steps 1-3d of the old
+/// `analyze_bounds_elimination` (induction variable, loop bound, modified
+/// locals, arraylength provenance, non-negative start, step provenance).
+fn recognise_loop(code: &[u8], code_len: usize, header: usize, back_edge: usize) -> Option<RecognisedLoop> {
+    let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
+    if back_edge_end > code_len {
+        return None;
+    }
+    let test = locate_exit_test(code, code_len, header, back_edge, back_edge_end)?;
+    let mut counted = analyze_counted_loop(code, code_len, header, back_edge, test.form, &|_| None)?;
+    // `analyze_counted_loop` decodes the FIRST `iload x; <limit>; if_icmp*`
+    // triple in the body and maps the opcode straight through
+    // `ExitCmp::from_opcode`, without checking that the branch leaves the loop.
+    // Accept its answer only when it describes the same `(iv, limit)` the
+    // verified exit test does, and take the polarity and the loop form from the
+    // verified test — a Pattern-B continue-branch decodes to the OPPOSITE
+    // comparison under `from_opcode`'s exit-when-true convention.
+    if counted.iv.local != test.iv_local || counted.bound != test.bound {
+        return None;
+    }
+    counted.cmp = test.cmp;
+    counted.form = test.form;
+
+    let bound_local = match &counted.bound {
+        BoundSource::Local(bl) => Some(*bl),
+        _ => None,
+    };
+    // Whole-method arraylength provenance, expressed in the limit itself rather
+    // than as a separate per-access side condition: when the limit local
+    // provably holds `A.length`, `prove_index_in_bounds_of` discharges `A[iv]`
+    // against the `length >= A.length` tautology and needs no guard at all.
+    // Naming a DIFFERENT array changes nothing — which is exactly the
+    // multi-array out-of-bounds store this provenance pass exists to prevent
+    // (docs/known-issues/jit-bce-multi-array-oob-store-20260711.md).
+    if let Some(bl) = bound_local {
+        if let Some(a) = find_bound_arraylength_provenance(code, code_len, bl) {
+            counted.bound = BoundSource::ArrayLength(a);
+        }
+    }
+    Some(RecognisedLoop {
+        counted,
+        bound_local,
+    })
+}
+
+/// What the loop-header pre-header emitter in `x64.rs` can actually prove.
+///
+/// The emitter's repertoire is fixed and per-header (see the "Speculative BCE"
+/// block in `x64.rs`, and [`SpeculativeBCEGuard`]):
+///
+/// | emitted | proves |
+/// |---|---|
+/// | `TEST iv,iv; JS deopt` | `iv_entry >= 0` |
+/// | `CMP bound, MAX; JE deopt` (inclusive only) | `bound <= i32::MAX - 1` |
+/// | `TEST step,step; JS` + `CMP step, MAX-bound; JG` | `0 <= step <= MAX - bound` |
+/// | `CMP a.length, bound; JB`/`JBE` (per array) | `a.length >= bound + addend + 1` |
+///
+/// [`Self::covers`] is the statement of which [`PreheaderGuard`] each of those
+/// discharges. A guard that is not covered means the whole proof is refused:
+/// a partially-emitted guard set proves nothing, and an elision resting on an
+/// obligation nobody discharged is a silent out-of-bounds access.
+struct GuardShape {
+    /// Local holding the induction variable (the `iv >= 0` test's operand).
+    iv_local: usize,
+    /// Local the emitter loads to materialise the limit. `None` refuses every
+    /// guarded elision for this loop.
+    bound_local: Option<usize>,
+    /// The limit as the proof spells it, so a returned guard's term can be
+    /// checked to be *this* limit rather than some other runtime value.
+    bound_term: BoundTerm,
+    /// [`CountedLoop::bound_addend`] — `-1` exclusive, `0` inclusive. Selects
+    /// `JB` vs `JBE`, and gates the `bound != Integer.MAX_VALUE` test.
+    addend: i32,
+    /// Local holding a runtime stride, when there is one.
+    step_local: Option<usize>,
+}
+
+impl GuardShape {
+    /// Whether the emitted pre-header proves `g`.
+    fn covers(&self, g: &PreheaderGuard) -> bool {
+        match g {
+            // The `iv >= 0` header test, and nothing else. A non-negativity
+            // obligation on any other term (a symbolic limit, a decreasing
+            // loop's `bound + 1` endpoint) has no emitter.
+            PreheaderGuard::NonNegative(t) => {
+                t.base == BoundTerm::IvEntry(self.iv_local) && t.addend == 0
+            }
+            // The per-array length compare proves `length >= bound + addend + 1`
+            // (`JB` for `addend == -1`, `JBE` for `addend == 0`), so it
+            // discharges any demand no stronger than that.
+            //
+            // NOTE — 64-bit endpoint. The emitted compare is currently a 32-bit
+            // *unsigned* one, which is sound for the two addends above (the
+            // endpoint is never materialised: `JBE` expresses `>= bound + 1`
+            // without computing it, and a negative bound reads as a huge
+            // unsigned and deopts). `PreheaderGuard::LengthAtLeast` is
+            // nevertheless specified to be evaluated in 64 bits so
+            // `base + addend` cannot wrap for any other addend; see
+            // `docs/jit/bce-range-integration.md` for the exact x64.rs edit that
+            // makes the compare a sign-extended 64-bit one. Until it lands,
+            // this arm admits only the addends the current encoding proves.
+            PreheaderGuard::LengthAtLeast(t) => {
+                self.bound_local.is_some()
+                    && t.base == self.bound_term
+                    && (t.addend as i64) <= self.addend as i64 + 1
+            }
+            // The `bound != Integer.MAX_VALUE` entry test, emitted only for the
+            // inclusive comparator. It proves `bound <= i32::MAX - 1`, hence
+            // `bound + t.addend <= i32::MAX - 1 + t.addend`.
+            PreheaderGuard::AtMost { term, limit } => {
+                self.addend == 0
+                    && self.bound_local.is_some()
+                    && term.base == self.bound_term
+                    && (i32::MAX as i64 - 1) + term.addend as i64 <= *limit as i64
+            }
+            // A decreasing loop's `i32::MIN` obligation has no emitter at all.
+            PreheaderGuard::AtLeast { .. } => false,
+            // `0 <= step` and `step <= MAX - bound`. The proof asks for
+            // `step <= MAX - (bound + addend)`; with `addend <= 0` the emitted
+            // form is the stricter of the two, so it discharges the demand.
+            PreheaderGuard::StrideInRange { local, headroom } => {
+                self.step_local == Some(*local)
+                    && self.bound_local.is_some()
+                    && headroom.base == self.bound_term
+                    && headroom.addend <= 0
+            }
+        }
+    }
+}
+
+/// For each loop, the innermost other loop whose PC extent strictly contains
+/// it — the nesting an inner limit that mentions the outer induction variable
+/// needs (`RangeEnv::with_loop_iv`).
+fn innermost_enclosing(code: &[u8], loops: &[(usize, usize)]) -> Vec<Option<usize>> {
+    let spans: Vec<(usize, usize)> = loops
+        .iter()
+        .map(|&(h, b)| (h, b + bytecode_len_at(code, b)))
+        .collect();
+    (0..loops.len())
+        .map(|i| {
+            let (s, e) = spans[i];
+            let mut best: Option<usize> = None;
+            for (j, &(js, je)) in spans.iter().enumerate() {
+                if i == j || (js, je) == (s, e) {
+                    continue;
+                }
+                if js <= s && e <= je {
+                    best = Some(match best {
+                        Some(b) if spans[b].0 >= js => b,
+                        _ => j,
+                    });
+                }
+            }
+            best
+        })
+        .collect()
+}
+
 /// Perform bounds check elimination analysis for all loops in the method.
 /// Returns a set of bytecode PCs where bounds checks can be safely skipped,
 /// and a list of speculative BCE guards to emit at loop headers.
+///
+/// Each loop is recognised once ([`recognise_loop`]) and each array access
+/// proved once ([`CountedLoop::prove_index_in_bounds_of`]). The verdicts map
+/// onto the existing output exactly as they did before:
+///
+/// * [`BoundsProof::Static`] → the PC joins `safe_pcs` with no guard;
+/// * [`BoundsProof::Guarded`] → **every** guard must be covered by
+///   [`GuardShape::covers`], and the PC then joins `safe_pcs` and its array's
+///   `covered_pcs`;
+/// * [`BoundsProof::Refused`] → the per-element check stays.
+///
+/// Guards stay attributed per array. `LengthAtLeast` names no array by
+/// contract, so three arrays produce three identical-looking guards and they
+/// must NOT be merged: discharging the shortest array's obligation with the
+/// longest array's length is the multi-array out-of-bounds store
+/// (docs/known-issues/jit-bce-multi-array-oob-store-20260711.md).
 pub(super) fn analyze_bounds_elimination(
     code: &[u8],
     code_len: usize,
@@ -1321,154 +1727,160 @@ pub(super) fn analyze_bounds_elimination(
 ) -> (FxHashSet<usize>, Vec<SpeculativeBCEGuard>) {
     let mut safe_pcs = FxHashSet::default();
     let mut speculative_guards: Vec<SpeculativeBCEGuard> = Vec::new();
+    // DBG (env-gated): CRATONVM_JIT_NO_SPEC_BCE disables ONLY the speculative
+    // (runtime-guarded) BCE, keeping the statically-proven elisions — to
+    // isolate whether the speculative guard is the unsound corruptor.
+    // Cached in a OnceLock so the env lookup is paid once, not per loop.
+    let no_spec_bce = jit_no_spec_bce();
 
-    for &(header, back_edge) in loops {
+    // Recognise every loop up front so an inner loop can be proved in an
+    // environment that already knows its enclosing loop's IV range.
+    let recognised: Vec<Option<RecognisedLoop>> = loops
+        .iter()
+        .map(|&(header, back_edge)| recognise_loop(code, code_len, header, back_edge))
+        .collect();
+    let enclosing = innermost_enclosing(code, loops);
+
+    for (li, &(header, back_edge)) in loops.iter().enumerate() {
+        let Some(rl) = recognised[li].as_ref() else {
+            continue;
+        };
+        let loop_ = &rl.counted;
         let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
-        if back_edge_end > code_len {
+
+        // The inclusive comparator is no longer a CORRECTNESS refusal — the
+        // proof handles it as `bound_addend() == 0`, a `length >= bound + 1`
+        // guard and a `bound <= MAX - 1` entry test. It stays gated on
+        // `inclusive_spec_bce_enabled` (default OFF) because inclusive elision
+        // measured a ~2x NET LOSS on the Sieve OSR artifact — a code-layout
+        // effect that generalising the proof does not change. See the flag's
+        // own doc comment.
+        if loop_.is_inclusive() && !inclusive_spec_bce_enabled() {
             continue;
         }
 
-        // Step 1: Find the induction variable
-        let induction_var = match find_induction_variable(code, header, back_edge_end) {
-            Some(iv) => iv,
-            None => continue,
+        // Producer obligation the proof engine states but cannot check: a
+        // runtime stride's pre-header guard is evaluated once, so the step
+        // local must be loop-invariant (and representable in `modified_locals`)
+        // or the guard goes stale on the iteration that changes it.
+        if let Stride::Variable(s) = loop_.iv.stride {
+            if s >= 64 || (loop_.modified_locals & (1u64 << s)) != 0 {
+                continue;
+            }
+        }
+        // Same obligation for the limit's own local: the emitter re-loads
+        // `bound_local` in the pre-header, so a body that raises it would let a
+        // later exit test admit an index past the guarded length. (For an
+        // `ArrayLength` limit `BoundSource::is_invariant` already covers the
+        // array local; this covers the local the emitter actually reads.)
+        let bound_local = rl.bound_local.filter(|bl| {
+            *bl < 64 && (loop_.modified_locals & (1u64 << *bl)) == 0
+        });
+
+        let env = match enclosing[li].and_then(|pi| recognised[pi].as_ref()) {
+            Some(outer) => RangeEnv::new().with_loop_iv(&outer.counted),
+            None => RangeEnv::new(),
         };
 
-        // Step 2: Analyze the loop bound
-        let bounds = match analyze_loop_bound(code, header, back_edge, back_edge_end, induction_var)
-        {
-            Some(b) => b,
-            None => continue,
-        };
-
-        // Step 3: Find modified locals in loop body
-        let modified = find_modified_locals(code, header, back_edge_end);
-
-        // Step 3b: Soundly identify the (array_local, index_local) consumed by
-        // each analysable array access via operand-stack producer tracking.
-        // Both the static and speculative passes below consult this map instead
-        // of the old positional heuristics that mis-identified scatter stores.
+        // Soundly identify the (array_local, index_local) consumed by each
+        // analysable array access via operand-stack producer tracking. NOT
+        // subsumed by the range analysis: this is the *producer* of the index
+        // expression, and its STOP-on-anything-unmodelled discipline stays
+        // load-bearing.
         let operands = analyze_array_access_operands(code, header, back_edge_end);
+        // `operands` is a hash map, so its iteration order is nondeterministic;
+        // sort so guard emission order (and thus codegen) is reproducible.
+        let mut accesses: Vec<(usize, usize, usize)> = operands
+            .iter()
+            .map(|(&pc, &(arr, idx))| (pc, arr, idx))
+            .collect();
+        accesses.sort_unstable();
 
-        // Step 3c: Whole-method provenance facts for the static (guard-less)
-        // path — which array's length the bound provably IS, and whether the
-        // IV provably starts non-negative. Static elision of `arr[iv]` is
-        // per-array: it requires `bound == arr.length` for THAT array
-        // (docs/known-issues/jit-bce-multi-array-oob-store-20260711.md).
-        let bound_from_array = bounds
-            .bound_local
-            .and_then(|bl| find_bound_arraylength_provenance(code, code_len, bl));
-        let iv_start_nonneg = find_iv_nonneg_start(code, code_len, induction_var);
-        // Step 3d: step provenance. `find_induction_variable` admits
-        // `iadd;istore` IVs (the Sieve `j += i` inner loop) without naming the
-        // step operand; every elision below needs the step's identity (to
-        // guard its sign/magnitude) or the `iinc +1` proof. An unprovable
-        // step refuses the loop entirely.
-        let iv_step = find_iv_step_provenance(code, header, back_edge_end, induction_var);
-
-        // Step 4: Find safe array accesses (statically proven). Only the
-        // canonical +1 step qualifies: the static proof has no step-sign /
-        // no-wrap guard, so a variable-stride IV (whose runtime step could be
-        // negative) must go through the guarded speculative path below.
-        let loop_safe = if matches!(iv_step, Some(IvStep::UnitInc)) {
-            find_safe_array_accesses(
-                &bounds,
-                modified,
-                &operands,
-                bound_from_array,
-                iv_start_nonneg,
-            )
-        } else {
-            FxHashSet::default()
+        let addend = loop_.bound_addend();
+        let step_local = match loop_.iv.stride {
+            Stride::Variable(s) => Some(s),
+            Stride::Const(_) => None,
         };
-        safe_pcs.extend(&loop_safe);
-
-        // Step 5: Speculative BCE — for counted loops with IV from 0..N step 1,
-        // find array accesses using IV as index that weren't already proven safe.
-        // For these, we emit a single range guard at the loop header and mark
-        // all such accesses as safe.
-        //
-        // SECURITY FIX (V16) SOUNDNESS INVARIANT: the header guard proves
-        // `array.length >= bound_local` exactly ONCE on loop entry, then every
-        // per-element bounds check is elided. For that single guard to keep
-        // every elided access in range, three locals must be loop-invariant
-        // *after* the guard:
-        //   1. the IV is `0..bound` step 1 — enforced by
-        //      `find_induction_variable` (modified only by one canonical
-        //      iinc/iadd-istore, no conflicting xstore).
-        //   2. the array local is not reassigned — enforced inside
-        //      `find_speculative_array_accesses` (`modified & (1<<al)==0`).
-        //   3. the BOUND local is not raised inside the loop. If it were, a
-        //      later iteration's exit test `iv < bound` could pass with
-        //      `iv >= array.length` — an OOB access past the stale guard.
-        // (1) and (2) were already checked; (3) was NOT. Enforce it here so the
-        // speculative guard is only installed when `bound_local` is invariant.
-        //
-        // SECURITY FIX (V17), sound-guard form (2026-07-18): an inclusive
-        // comparator reaches `index == bound`, which a `array.length >= bound`
-        // header guard does NOT cover. Instead of refusing the loop, the
-        // guard emission now proves `array.length > bound` (JBE deopt) plus
-        // `bound != Integer.MAX_VALUE` for inclusive loops — see
-        // `SpeculativeBCEGuard::inclusive`. (`find_safe_array_accesses` still
-        // refuses the guard-less STATIC elisions for inclusive loops.)
-        //
-        // Step-provenance guard (2026-07-18): a variable-stride IV is only
-        // admitted when the step local is identified, loop-invariant, and
-        // < 64 (representable in `modified`); the preheader then proves
-        // `0 <= step <= Integer.MAX_VALUE - bound` at runtime. `None` (an
-        // unprovable step shape) refuses the speculative path entirely —
-        // `find_induction_variable`'s `iadd;istore` admission alone said
-        // nothing about the step's sign, so a runtime-negative step could
-        // walk an elided index below the array base.
-        let step_guard: Option<Option<usize>> = match iv_step {
-            Some(IvStep::UnitInc) => Some(None),
-            Some(IvStep::VarAdd(sl)) if sl < 64 && (modified & (1u64 << sl)) == 0 => Some(Some(sl)),
-            _ => None,
+        let shape = GuardShape {
+            iv_local: loop_.iv.local,
+            bound_local,
+            bound_term: BoundTerm::Bound(loop_.bound.clone()),
+            addend,
+            step_local,
         };
-        let bound_invariant = (!bounds.inclusive || inclusive_spec_bce_enabled())
-            && step_guard.is_some()
-            && bounds
-                .bound_local
-                .map(|bl| bl < 64 && (modified & (1u64 << bl)) == 0)
-                .unwrap_or(false);
-        // DBG (env-gated): CRATONVM_JIT_NO_SPEC_BCE disables ONLY the speculative
-        // (runtime-guarded) BCE, keeping the statically-proven elisions — to
-        // isolate whether the speculative guard is the unsound corruptor.
-        // Cached in a OnceLock so the env lookup is paid once, not per loop.
-        let no_spec_bce = jit_no_spec_bce();
-        if let Some(bound_local) = bounds
-            .bound_local
-            .filter(|_| bound_invariant && !no_spec_bce)
-        {
-            let mut speculative_accesses =
-                find_speculative_array_accesses(&bounds, modified, &loop_safe, &operands);
-            // `operands` is a hash map, so the access order is nondeterministic;
-            // sort so guard emission order (and thus codegen) is reproducible.
-            speculative_accesses.sort_unstable();
-            if !speculative_accesses.is_empty() {
-                // One guard per DISTINCT array local: each guard proves
-                // `its_array.length >= bound` for its own array only, and
-                // records which access PCs its pass justifies (`covered_pcs`)
-                // so a later de-spec can restore exactly those checks.
-                let mut guard_arrays: Vec<(usize, Vec<usize>)> = Vec::new();
-                for &(access_pc, arr_local) in &speculative_accesses {
-                    safe_pcs.insert(access_pc);
+
+        // One guard per DISTINCT array local, recording which access PCs its
+        // pass justifies (`covered_pcs`) so a later de-spec restores exactly
+        // those checks.
+        let mut guard_arrays: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (pc, arr_local, idx_local) in accesses {
+            // The index must be this loop's induction variable. There is no
+            // producer for a non-identity `IndexExpr` yet — `scale`/`offset`
+            // are available in the proof but nothing computes them here — so a
+            // derived index keeps its per-element check.
+            if idx_local != loop_.iv.local {
+                continue;
+            }
+            // Array-local invariance. `< 64` is load-bearing, not just a
+            // bitmask bound: a local the `u64` cannot represent is refused
+            // rather than assumed unmodified.
+            if arr_local >= 64 || (loop_.modified_locals & (1u64 << arr_local)) != 0 {
+                continue;
+            }
+            let idx = IndexExpr::identity(loop_.iv.local);
+            let mut proof =
+                loop_.prove_index_in_bounds_of(&idx, Some(arr_local), IntRange::array_length(), &env);
+            // A statically-known NEGATIVE entry value is a refusal for the
+            // proof (it can show the first index is out of range) but not for
+            // this consumer: the emitted `iv >= 0` header test re-checks the
+            // entry value at runtime and deopts, which discharges the same
+            // obligation without trusting the constant. Retry once with the
+            // entry value widened to unknown — a strictly weaker assumption,
+            // so the retry can only prove less.
+            if matches!(proof, BoundsProof::Refused(RefusalReason::IndexMayBeNegative)) {
+                let mut widened = loop_.clone();
+                widened.iv.init = IntRange::unknown();
+                proof = widened.prove_index_in_bounds_of(
+                    &idx,
+                    Some(arr_local),
+                    IntRange::array_length(),
+                    &env,
+                );
+            }
+            match proof {
+                BoundsProof::Static => {
+                    safe_pcs.insert(pc);
+                }
+                BoundsProof::Guarded(guards) => {
+                    if no_spec_bce || bound_local.is_none() {
+                        continue;
+                    }
+                    // ALL or NOTHING. One guard this emitter cannot discharge
+                    // makes the whole proof worthless.
+                    if !guards.iter().all(|g| shape.covers(g)) {
+                        continue;
+                    }
+                    safe_pcs.insert(pc);
                     match guard_arrays.iter_mut().find(|(a, _)| *a == arr_local) {
-                        Some((_, pcs)) => pcs.push(access_pc),
-                        None => guard_arrays.push((arr_local, vec![access_pc])),
+                        Some((_, pcs)) => pcs.push(pc),
+                        None => guard_arrays.push((arr_local, vec![pc])),
                     }
                 }
-                for (arr_local, covered_pcs) in guard_arrays {
-                    speculative_guards.push(SpeculativeBCEGuard {
-                        loop_header: header,
-                        array_local: arr_local,
-                        bound_local,
-                        iv_local: induction_var,
-                        covered_pcs,
-                        inclusive: bounds.inclusive,
-                        step_local: step_guard.flatten(),
-                    });
-                }
+                BoundsProof::Refused(_) => {}
+            }
+        }
+
+        if let Some(bl) = bound_local {
+            for (arr_local, covered_pcs) in guard_arrays {
+                speculative_guards.push(SpeculativeBCEGuard {
+                    loop_header: header,
+                    array_local: arr_local,
+                    bound_local: bl,
+                    iv_local: loop_.iv.local,
+                    covered_pcs,
+                    inclusive: addend == 0,
+                    step_local,
+                });
             }
         }
     }
@@ -1476,41 +1888,3 @@ pub(super) fn analyze_bounds_elimination(
     (safe_pcs, speculative_guards)
 }
 
-/// Find array accesses in a counted loop that use the IV as index but were NOT
-/// already proven safe by `find_safe_array_accesses`. These are candidates for
-/// speculative BCE with a deopt guard at the loop header.
-///
-/// Returns vec of (bytecode_pc_of_access, array_local).
-///
-/// Operand identification comes from `analyze_array_access_operands` via the
-/// `operands` map (sound producer-stack tracking) — the old positional
-/// heuristics mis-identified scatter stores and elided the wrong array's
-/// bounds check.
-pub(super) fn find_speculative_array_accesses(
-    bounds: &LoopBoundsInfo,
-    modified: u64,
-    already_safe: &FxHashSet<usize>,
-    operands: &FxHashMap<usize, (usize, usize)>,
-) -> Vec<(usize, usize)> {
-    let mut result = Vec::new();
-    for (&pc, &(arr_local, idx_local)) in operands {
-        if already_safe.contains(&pc) {
-            continue;
-        }
-        if idx_local == bounds.induction_var {
-            // SECURITY FIX (V16): array-local invariance. `al < 64` is
-            // load-bearing, not just a bitmask bound: locals >= 64 cannot be
-            // represented in the `modified` u64, so we conservatively refuse to
-            // elide their checks. A modified array local is likewise rejected,
-            // so the header guard's `array.length` cannot go stale via
-            // reassignment. IV invariance is guaranteed by
-            // `find_induction_variable`; bound-local invariance is enforced by
-            // the caller (`analyze_bounds_elimination`) before this function is
-            // invoked.
-            if arr_local < 64 && (modified & (1u64 << arr_local)) == 0 {
-                result.push((pc, arr_local));
-            }
-        }
-    }
-    result
-}

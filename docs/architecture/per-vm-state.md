@@ -44,15 +44,16 @@ VM-identity notion. Everything below reuses it. Do not introduce a second one.
 
 ---
 
-## 1. The security-manager finding — CONFIRMED
+## 1. The security-manager finding — CONFIRMED, and now **FIXED**
 
 ### Where it actually lives
 
 The review brief located it at `vm/src/native/security_manager.rs`. That path
 does not exist. The real file is **`native-builtins/src/security_manager.rs`**,
-which is outside this pass's edit scope; the required edit is specified in §5.
+which was outside the edit scope of the pass that found this; the edit
+specified in §5 has since landed there.
 
-### The bug
+### The bug (as found)
 
 ```rust
 // native-builtins/src/security_manager.rs:117

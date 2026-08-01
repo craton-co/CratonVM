@@ -32,17 +32,28 @@
 //!
 //! ## Measured vs. not measured
 //!
-//! Several quantities the review names are not obtainable without changing
-//! modules this task does not own (`regalloc.rs`). Reporting them as `0` would
-//! be worse than useless — a reader cannot tell "this method spilled nothing"
-//! from "nobody counts spills". Every numeric field is therefore a
-//! [`Measured<T>`], which renders as JSON `null` when no call site has supplied
-//! it. The uninstrumented fields today are [`CompilationReport::spills`] and
-//! [`CompilationReport::reloads`]; their setters exist and are wired to
-//! nothing, so a future `regalloc` change is a one-line addition rather than a
-//! schema change. [`CompilationReport::peak_live_values`] left that list once
-//! `ir_lower` gained liveness-based frame-slot colouring: its slot planner
-//! computes the peak, and [`note_current_peak_live_values`] carries it here.
+//! Reporting an unmeasured quantity as `0` would be worse than useless — a
+//! reader cannot tell "this method spilled nothing" from "nobody counts
+//! spills". Every numeric field is therefore a [`Measured<T>`], which renders
+//! as JSON `null` when no call site has supplied it, and that distinction is
+//! load-bearing for the fields whose *producer* exists but whose *call site*
+//! does not yet:
+//!
+//! * [`CompilationReport::peak_live_values`] is fed: `ir_lower`'s
+//!   liveness-based frame-slot colouring computes the peak and
+//!   [`note_current_peak_live_values`] carries it here.
+//! * [`CompilationReport::spills`] / [`CompilationReport::reloads`] have a
+//!   producer — `regalloc::Allocation` counts both, and
+//!   `regalloc::record_allocation_metrics` publishes them to a recorder —
+//!   but `regalloc::allocate_linear_scan` has no production caller yet, so on
+//!   a real compile they stay `NotMeasured`. [`note_current_spills`] /
+//!   [`note_current_reloads`] are the ambient form, for the day the allocator
+//!   runs inside `ir_lower::lower_inner`, whose signature is pinned.
+//! * the inlining tallies ([`CompilationReport::inline_candidates`] and
+//!   friends) are harvested from `CompiledMethod::inline_tally` in
+//!   [`CompileRecorder::installed`], so they are measured on every installed
+//!   body and absent on every bailout — which is the truth, not a gap.
+//!
 //! `docs/jit/compiler-metrics.md` keeps the current inventory.
 //!
 //! Likewise [`Phase::Encode`] and [`Phase::Install`] always report
@@ -493,18 +504,46 @@ pub struct CompilationReport {
     /// [`note_current_peak_live_values`]. Optimizing path only; the single-pass
     /// backend computes no live ranges and leaves this unmeasured.
     pub peak_live_values: Measured<u32>,
-    /// Values spilled to the frame. **Not measured** — `regalloc` computes live
-    /// ranges but publishes no spill/reload counts, and this task does not own
-    /// that file.
+    /// Register → memory transitions the allocator emitted
+    /// (`regalloc::Allocation::spills`). Supplied by
+    /// `regalloc::record_allocation_metrics` when a caller holds a recorder, or
+    /// by [`note_current_spills`] from a pinned signature. `NotMeasured` on the
+    /// paths that allocate no registers — which today is every production path,
+    /// because `regalloc::allocate_linear_scan` has no production call site yet.
     pub spills: Measured<u32>,
-    /// Reloads from the frame. **Not measured** — see
-    /// [`spills`](Self::spills).
+    /// Memory → register transitions (`regalloc::Allocation::reloads`). See
+    /// [`spills`](Self::spills) for who supplies it.
     pub reloads: Measured<u32>,
     /// `CompiledMethod::frame_layout.frame_size` — bytes subtracted from RSP.
     pub frame_bytes: Measured<u32>,
     /// Emitted machine-code bytes (`CompiledMethod::code_bytes().len()`), i.e.
     /// the buffer's write position, not its mapped capacity.
     pub code_bytes: Measured<u32>,
+    /// Call sites the inliner considered — `crate::InlineDecisionTally::
+    /// candidates`. Harvested from the artifact in
+    /// [`CompileRecorder::installed`], so it is `NotMeasured` on every report
+    /// that produced no body. Note the tally's own caveat: a site the invoke
+    /// loop short-circuits once the expansion budget is exhausted is never
+    /// counted, so this is "sites the resolver was asked about".
+    pub inline_candidates: Measured<u32>,
+    /// Sites actually inlined (`InlineDecisionTally::inlined_sites`).
+    pub inlined_sites: Measured<u32>,
+    /// Of [`inlined_sites`](Self::inlined_sites), those resting on a receiver-type
+    /// speculation and its guard (`InlineDecisionTally::speculative_sites`).
+    pub speculative_inlined_sites: Measured<u32>,
+    /// Callee bytecodes spliced into this body — the review's "inlined
+    /// bytecodes" (`InlineDecisionTally::inlined_bytecodes`).
+    pub inlined_bytecodes: Measured<u32>,
+    /// Summed profile-observed executions of the inlined sites — the review's
+    /// "call count" (`InlineDecisionTally::observed_calls_inlined`). A measured
+    /// `0` here means "inlined, but the compile was unprofiled", which is a
+    /// different claim from `null` ("nothing harvested a tally").
+    pub inlined_call_count: Measured<u64>,
+    /// Refusals by `crate::InlineRefusal::category`, in the tally's first-seen
+    /// order. Empty is *not* the same as absent: check
+    /// [`inline_candidates`](Self::inline_candidates) to tell "no site was
+    /// refused" from "no tally was harvested".
+    pub inline_refusals: Vec<(String, u32)>,
     /// `graph.safepoints.len()` at lowering — the builder's snapshot count.
     /// Optimizing path only.
     pub ir_safepoints: Measured<u32>,
@@ -551,6 +590,12 @@ impl CompilationReport {
             reloads: Measured::NotMeasured,
             frame_bytes: Measured::NotMeasured,
             code_bytes: Measured::NotMeasured,
+            inline_candidates: Measured::NotMeasured,
+            inlined_sites: Measured::NotMeasured,
+            speculative_inlined_sites: Measured::NotMeasured,
+            inlined_bytecodes: Measured::NotMeasured,
+            inlined_call_count: Measured::NotMeasured,
+            inline_refusals: Vec::new(),
             ir_safepoints: Measured::NotMeasured,
             oop_maps: Measured::NotMeasured,
             deopt_points: Measured::NotMeasured,
@@ -649,6 +694,31 @@ impl CompilationReport {
             self.deopt_metadata_bytes.json(),
             self.code_cache_bytes_at_install.json(),
         );
+        let _ = write!(
+            s,
+            ",\"inline_candidates\":{},\"inlined_sites\":{},\"speculative_inlined_sites\":{}",
+            self.inline_candidates.json(),
+            self.inlined_sites.json(),
+            self.speculative_inlined_sites.json(),
+        );
+        let _ = write!(
+            s,
+            ",\"inlined_bytecodes\":{},\"inlined_call_count\":{}",
+            self.inlined_bytecodes.json(),
+            self.inlined_call_count.json(),
+        );
+        // A nested object rather than an array of pairs: the categories are a
+        // fixed vocabulary (`InlineRefusal::category`), so a consumer keys on
+        // them directly. Emitted even when empty, so `inline_refusals` is never
+        // a missing key.
+        s.push_str(",\"inline_refusals\":{");
+        for (i, (category, count)) in self.inline_refusals.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(s, "\"{}\":{}", json_escape(category), count);
+        }
+        s.push('}');
         let _ = write!(s, ",\"total_wall_ns\":{}", self.total_wall_ns.json());
         s.push('}');
         s
@@ -807,6 +877,46 @@ pub fn note_current_peak_live_values(n: usize) {
     // otherwise run after `state`; the trailing semicolon ends its scope first.
     if let Ok(mut report) = state.report.try_borrow_mut() {
         report.peak_live_values = Measured::Value(n.min(u32::MAX as usize) as u32);
+    };
+}
+
+/// Record the allocator's spill count against the innermost in-flight
+/// compilation on this thread.
+///
+/// The producer is `regalloc::Allocation::spills`. There are two ways to get it
+/// here and they exist for different callers:
+///
+/// * `regalloc::record_allocation_metrics(&recorder, &alloc)` — for a caller
+///   that holds a [`CompileRecorder`];
+/// * this function — for a caller that does not, because its signature is
+///   pinned. `ir_lower::lower_inner` is that caller: it takes no recorder and
+///   already reports [`note_current_peak_live_values`] the same way, so wiring
+///   the allocator into it must not widen its parameter list.
+///
+/// Same shape and same reason as [`note_current_bailout`]. A no-op when metrics
+/// are off, and a no-op when no compilation is in flight — so an allocator run
+/// from a unit test records nothing.
+pub fn note_current_spills(n: usize) {
+    let Some(state) = current() else {
+        return;
+    };
+    // The `Result<RefMut<..>, _>` scrutinee is a temporary whose drop would
+    // otherwise run after `state`; the trailing semicolon ends its scope first.
+    if let Ok(mut report) = state.report.try_borrow_mut() {
+        report.spills = Measured::Value(n.min(u32::MAX as usize) as u32);
+    };
+}
+
+/// Record the allocator's reload count against the innermost in-flight
+/// compilation on this thread. See [`note_current_spills`].
+pub fn note_current_reloads(n: usize) {
+    let Some(state) = current() else {
+        return;
+    };
+    // The `Result<RefMut<..>, _>` scrutinee is a temporary whose drop would
+    // otherwise run after `state`; the trailing semicolon ends its scope first.
+    if let Ok(mut report) = state.report.try_borrow_mut() {
+        report.reloads = Measured::Value(n.min(u32::MAX as usize) as u32);
     };
 }
 
@@ -970,13 +1080,15 @@ impl CompileRecorder {
         });
     }
 
-    /// Spill count. No call site yet — see
+    /// Spill count, recorded against *this* recorder — the form
+    /// `regalloc::record_allocation_metrics` uses. A caller whose signature
+    /// cannot carry a recorder uses [`note_current_spills`] instead. See
     /// [`CompilationReport::spills`].
     pub fn set_spills(&self, n: usize) {
         self.with_report(|r| r.spills = Measured::Value(n.min(u32::MAX as usize) as u32));
     }
 
-    /// Reload count. No call site yet — see
+    /// Reload count. Same two forms as [`set_spills`](Self::set_spills); see
     /// [`CompilationReport::spills`].
     pub fn set_reloads(&self, n: usize) {
         self.with_report(|r| r.reloads = Measured::Value(n.min(u32::MAX as usize) as u32));
@@ -1011,6 +1123,14 @@ impl CompileRecorder {
         let cache_bytes =
             crate::COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed) as u64;
         let used_ir = cm.used_ir_backend;
+        // The inlining tallies ride on the artifact for exactly this reason:
+        // harvesting them here costs nothing on the ~40 `return None` paths
+        // through `try_compile_inner` and cannot go stale, because it is the
+        // installed body's own record of what was spliced into it. Borrowed
+        // rather than cloned up front: the refusal histogram is the only
+        // allocation in this method, and `with_report` never runs the closure
+        // when metrics are off.
+        let tally = &cm.inline_tally;
         self.with_report(|r| {
             r.outcome = Outcome::Installed;
             r.path = if used_ir {
@@ -1024,6 +1144,16 @@ impl CompileRecorder {
             r.deopt_points = Measured::Value(deopt_points.min(u32::MAX as usize) as u32);
             r.deopt_metadata_bytes = Measured::Value(deopt_bytes);
             r.code_cache_bytes_at_install = Measured::Value(cache_bytes);
+            r.inline_candidates = Measured::Value(tally.candidates);
+            r.inlined_sites = Measured::Value(tally.inlined_sites);
+            r.speculative_inlined_sites = Measured::Value(tally.speculative_sites);
+            r.inlined_bytecodes = Measured::Value(tally.inlined_bytecodes);
+            r.inlined_call_count = Measured::Value(tally.observed_calls_inlined);
+            r.inline_refusals = tally
+                .refusals
+                .iter()
+                .map(|(c, n)| ((*c).to_string(), *n))
+                .collect();
         });
     }
 
@@ -1620,6 +1750,9 @@ mod tests {
             assert!(!t.is_measuring());
             drop(t);
             note_current_bailout(&Bailout::new(BailoutReason::RegisterPressure), "verify");
+            note_current_peak_live_values(4);
+            note_current_spills(3);
+            note_current_reloads(2);
             drop(rec); // Drop must not publish.
         }
 
@@ -1753,6 +1886,116 @@ mod tests {
         let r = last_compilation_report(Some("metrics/Flood")).expect("published");
         assert!(r.bailouts.len() <= 16, "got {}", r.bailouts.len());
         assert!(!r.bailouts.is_empty());
+        clear_reports();
+        set_enabled_for_test(false);
+    }
+
+    #[test]
+    fn spill_reload_and_inline_fields_round_trip_through_to_json() {
+        let mut r = CompilationReport::new("inl/Probe", "hot", "(I)I", true);
+        r.spills = Measured::Value(7);
+        r.reloads = Measured::Value(4);
+        r.peak_live_values = Measured::Value(11);
+        r.inline_candidates = Measured::Value(9);
+        r.inlined_sites = Measured::Value(3);
+        r.speculative_inlined_sites = Measured::Value(1);
+        r.inlined_bytecodes = Measured::Value(214);
+        r.inlined_call_count = Measured::Value(4_000_000_000);
+        r.inline_refusals = vec![
+            ("guard-not-emittable".to_string(), 5),
+            ("budget-exhausted".to_string(), 1),
+        ];
+
+        let json = r.to_json();
+        assert!(!json.contains('\n'), "JSON lines must be one line: {json}");
+        assert!(json.contains("\"spills\":7"), "{json}");
+        assert!(json.contains("\"reloads\":4"), "{json}");
+        assert!(json.contains("\"peak_live_values\":11"), "{json}");
+        assert!(json.contains("\"inline_candidates\":9"), "{json}");
+        assert!(json.contains("\"inlined_sites\":3"), "{json}");
+        assert!(json.contains("\"speculative_inlined_sites\":1"), "{json}");
+        assert!(json.contains("\"inlined_bytecodes\":214"), "{json}");
+        // A u64 that does not fit an i32/u32, so a narrowing regression shows.
+        assert!(json.contains("\"inlined_call_count\":4000000000"), "{json}");
+        // The refusal histogram nests as an object keyed by category, in the
+        // tally's first-seen order.
+        assert!(
+            json.contains("\"inline_refusals\":{\"guard-not-emittable\":5,\"budget-exhausted\":1}"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn inline_and_allocation_fields_stay_distinguishable_from_zero() {
+        let fresh = CompilationReport::new("inl/Fresh", "m", "()V", true);
+        for (name, m) in [
+            ("inline_candidates", fresh.inline_candidates),
+            ("inlined_sites", fresh.inlined_sites),
+            ("speculative_inlined_sites", fresh.speculative_inlined_sites),
+            ("inlined_bytecodes", fresh.inlined_bytecodes),
+            ("spills", fresh.spills),
+            ("reloads", fresh.reloads),
+        ] {
+            assert_eq!(m, Measured::NotMeasured, "{name}");
+            assert!(
+                fresh.to_json().contains(&format!("\"{name}\":null")),
+                "{name} must render null: {}",
+                fresh.to_json()
+            );
+        }
+        assert_eq!(fresh.inlined_call_count, Measured::NotMeasured);
+        assert!(fresh.to_json().contains("\"inlined_call_count\":null"));
+        // An empty histogram is an empty object, never a missing key — and it
+        // is a different claim from "no tally was harvested", which the
+        // `inline_candidates: null` above carries.
+        assert!(fresh.inline_refusals.is_empty());
+        assert!(fresh.to_json().contains("\"inline_refusals\":{}"));
+
+        // A method the inliner looked at and declined everywhere reports
+        // measured zeros, and the two encodings differ.
+        let mut none_inlined = fresh.clone();
+        none_inlined.inline_candidates = Measured::Value(4);
+        none_inlined.inlined_sites = Measured::Value(0);
+        none_inlined.inlined_bytecodes = Measured::Value(0);
+        none_inlined.inlined_call_count = Measured::Value(0);
+        none_inlined.spills = Measured::Value(0);
+        none_inlined.reloads = Measured::Value(0);
+        let json = none_inlined.to_json();
+        assert!(json.contains("\"inlined_sites\":0"), "{json}");
+        assert!(json.contains("\"inlined_call_count\":0"), "{json}");
+        assert!(json.contains("\"spills\":0"), "{json}");
+        assert!(json.contains("\"reloads\":0"), "{json}");
+        assert_ne!(fresh.to_json(), json);
+    }
+
+    #[test]
+    fn ambient_spill_and_reload_hooks_reach_the_innermost_compilation() {
+        let _guard = TEST_LOCK.lock();
+        set_enabled_for_test(true);
+        clear_reports();
+        {
+            let outer = CompileRecorder::begin("metrics/AllocOuter", "m", "()V", true);
+            {
+                let _inner = CompileRecorder::begin("metrics/AllocInner", "m", "()V", true);
+                // `callee_compiler` nests compilations; an allocator run for the
+                // callee must not be billed to the caller.
+                note_current_spills(6);
+                note_current_reloads(2);
+            }
+            note_current_spills(0);
+            drop(outer);
+        }
+        let inner = last_compilation_report(Some("metrics/AllocInner")).expect("inner published");
+        let outer = last_compilation_report(Some("metrics/AllocOuter")).expect("outer published");
+        assert_eq!(inner.spills, Measured::Value(6));
+        assert_eq!(inner.reloads, Measured::Value(2));
+        // The outer compilation measured zero spills and never measured
+        // reloads at all — two different facts, and the report keeps them apart.
+        assert_eq!(outer.spills, Measured::Value(0));
+        assert_eq!(outer.reloads, Measured::NotMeasured);
+        let json = outer.to_json();
+        assert!(json.contains("\"spills\":0"), "{json}");
+        assert!(json.contains("\"reloads\":null"), "{json}");
         clear_reports();
         set_enabled_for_test(false);
     }

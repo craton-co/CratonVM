@@ -15334,19 +15334,113 @@ pub(super) fn try_osr(
         entry_pc,
     )?;
 
-    // Convert interpreter locals to i64 for JIT frame (raw u64 → i64 reinterpret)
+    // Convert interpreter locals to i64 for JIT frame (raw u64 → i64 reinterpret),
+    // reading each slot's VTAG byte from the SAME snapshot as its word.
+    // `Frame::get_local_tag` exists precisely "for JIT/OSR interop"
+    // (`vm/src/runtime/frame.rs`) and was never actually passed to the JIT: until
+    // the validated entry landed, `osr_enter` took raw words with no types
+    // attached, so nothing compared the interpreter's idea of a slot against the
+    // compiled entry's. A `double` seeded into a GPR home, or a `long` seeded
+    // where the compiled body reads a reference, is a silent miscompile.
+    //
+    // Both halves must come from one uninterrupted read of the live frame, BEFORE
+    // `set_jit_thread`, so no intervening safepoint can retype a slot between its
+    // word and its tag. That is an invariant of the validated entry, not an
+    // accident of this call site — see `docs/jit/on-stack-replacement.md` §6.
     let frame = &thread.frames[frame_idx];
     let num_locals = frame.locals_len();
     let mut jit_locals = Vec::with_capacity(num_locals);
+    let mut jit_local_tags = Vec::with_capacity(num_locals);
     for i in 0..num_locals {
         jit_locals.push(frame.get_local_raw(i) as i64); // Cast: JIT ABI -- i64 register convention
+        jit_local_tags.push(frame.get_local_tag(i));
+    }
+    // The other invariant of §6: `OsrEntryState::pc` is the frame's CURRENT pc.
+    // Every back-edge site captures `entry_pc = frame.pc` after the branch was
+    // taken (`interpreter.rs`, 14 sites) and nothing between there and here moves
+    // it, so the entry bci and the "nothing ran" fallback bci are the same value —
+    // which is what makes a refusal cost no replay. Check it instead of trusting
+    // it: a future trigger passing some other pc must be refused, not silently
+    // entered at a bci the interpreter is not standing on.
+    if entry_pc != frame.pc {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
+            eprintln!(
+                "[cratonvm-osr] REFUSE {}.{}{} entry_pc={} != frame.pc={} \
+                 (OsrEntryState::pc must be the frame's current pc)",
+                &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, frame.pc
+            );
+        }
+        return None;
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
         eprintln!(
-            "[cratonvm-osr] enter {}.{}{} entry_pc={} num_locals={} locals={:?}",
-            &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, num_locals, jit_locals
+            "[cratonvm-osr] enter {}.{}{} entry_pc={} num_locals={} locals={:?} tags={:?}",
+            &*class_name_arc,
+            &*method_name_arc,
+            &*descriptor_arc,
+            entry_pc,
+            num_locals,
+            jit_locals,
+            jit_local_tags
         );
     }
+
+    // The interpreter's offer. The operand stack at a taken back-edge is empty by
+    // construction (the branch already consumed its operands); pass it explicitly
+    // so a future trigger at a bci with live operands is REFUSED
+    // (`osr-entry-operand-stack`) rather than silently truncated — `osr_trampoline`
+    // seeds locals only and has no stack-seeding path.
+    let osr_state = cratonvm_jit::OsrEntryState {
+        pc: entry_pc,
+        locals: &jit_locals,
+        local_tags: &jit_local_tags,
+        stack: &[],
+        stack_tags: &[],
+    };
+
+    // ADMISSION. `validate_osr_entry` type-checks every offered slot against the
+    // compiled entry's contract and — the part that matters for correctness —
+    // walks every deopt point the artifact can exit through, refusing the entry
+    // outright (`osr-entry-unresumable-exit`) when one of them reconstructs a
+    // frame the in-place transfer could not resume. Discovering that AFTER
+    // entering is useless: by then the body has committed iterations, and the only
+    // remaining options are to replay them (the recorded
+    // `jit-osr-bail-reruns-loop-iterations` defect) or to lose them.
+    //
+    // A refusal is free of side effects — the check reads metadata and these two
+    // slices, allocates one `Vec`, and never enters compiled code — so falling
+    // back to `entry_pc`, where the interpreter already is, replays nothing.
+    let plan = match compiled.validate_osr_entry(&osr_state) {
+        Ok(plan) => plan,
+        Err(b) => {
+            // Only an ARTIFACT-level verdict may be memoed: it is a pure function
+            // of a deterministic compile, so it reproduces for every future
+            // back-edge over this pc and re-running the pipeline can only reach it
+            // again. A state-dependent refusal (a slot's type, the local count,
+            // live operands) must NOT be memoed — the next trip over the back-edge
+            // carries different locals and may well be admissible.
+            let permanent = cratonvm_jit::osr_refusal_is_permanent(&b);
+            if permanent {
+                crate::jit::mark_osr_entry_rejected(
+                    &class_name,
+                    &method_name,
+                    &method_descriptor,
+                    entry_pc,
+                );
+            }
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] OSR-refuse {}.{}{} entry_pc={entry_pc} {b}{}",
+                    &*class_name_arc,
+                    &*method_name_arc,
+                    &*descriptor_arc,
+                    if permanent { " (memoed)" } else { "" }
+                );
+            }
+            // Nothing ran: keep interpreting THIS frame at `entry_pc`.
+            return None;
+        }
+    };
 
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
@@ -15366,8 +15460,12 @@ pub(super) fn try_osr(
         let _jit_root_guard =
             crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; jit_locals match the method's local variable layout at the OSR entry point.
-            unsafe { compiled.osr_enter(vm_ptr, &jit_locals, entry_pc, thread_ptr) }
+            // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point
+            // was validated; `plan` is the proof, obtained from
+            // `validate_osr_entry` on THIS artifact with THIS state just above, so
+            // every seeded slot's JVM type has been checked against the compiled
+            // entry's contract and `osr_state.locals` matches `osr_num_locals`.
+            unsafe { compiled.osr_enter_planned(vm_ptr, &osr_state, &plan, thread_ptr) }
         }));
         // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
         // that did not pop). Before this site's own guard drops, depth should be
@@ -15676,8 +15774,17 @@ pub(super) fn try_osr(
             // trap on the corruption-prone "safe reject" path in default builds
             // (`CRATONVM_OSR_EXIT_TRANSFER` unset). Dropped in favor of
             // `can_osr_exit` alone.
+            // `plan` is the validated entry (see the admission block above). The
+            // transfer spends it on `OsrEntryPlan::resume_after_exit`, which names
+            // the EXACT bci the OSR'd body stopped at — a recorded deopt point of
+            // this artifact whose `ResumeSemantics` is `REEXECUTE` — instead of
+            // trusting `rframe.bci` verbatim. It is the only sanctioned resume
+            // point once compiled code has run.
             if compiled.can_osr_exit
-                && transfer_osr_exit_into_live_frame(shared, thread, frame_idx, &rframe).is_some()
+                && transfer_osr_exit_into_live_frame(
+                    shared, thread, frame_idx, &rframe, &compiled, &plan,
+                )
+                .is_some()
             {
                 if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                     eprintln!(
@@ -15687,8 +15794,30 @@ pub(super) fn try_osr(
                 }
                 return None;
             }
-            // Safe reject: gate off, method not OSR-exit-capable, or an
-            // out-of-scope/unmappable reconstructed frame.
+            // Safe reject: the method is not OSR-exit-capable (`can_osr_exit`
+            // false ⇒ this artifact recorded no exit map, so no compiled
+            // iteration was committed through one), or the reconstructed frame
+            // was out of scope / unmappable.
+            //
+            // The second case is the one that used to be a correctness bug:
+            // "continue interpreting THIS frame from where it was" is correct
+            // only when the bail precedes any committed iteration, and a
+            // mid-loop transfer failure does not. It is now closed at ADMISSION
+            // rather than here — `validate_osr_entry` refuses
+            // (`osr-entry-unresumable-exit`, permanent, memoed) any artifact
+            // whose deopt points include one that reconstructs an unresumable
+            // frame, which is exactly the set this branch could receive:
+            // `MaterializationRequired` / `Unsupported` slots
+            // (`deopt::frame_state_is_resumable`), held monitors, an inlined
+            // caller scope, or non-`REEXECUTE` semantics. An admitted entry is
+            // therefore `OsrExitPolicy::ExactTransfer`, under which every exit
+            // this body can take transfers cleanly; and `can_osr_exit` implies
+            // a non-empty `deopt_points`, so the `PropagateOnly` artifacts never
+            // reach the transfer at all.
+            //
+            // Reaching here after a committed body would mean that invariant
+            // broke. Do not add a resume path for it — the fix belongs at
+            // admission, where nothing has run yet.
             if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] OSR-exit bail rejected (continue interpreting) {}.{}{} entry_pc={}",
