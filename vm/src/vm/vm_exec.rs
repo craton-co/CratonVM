@@ -1829,7 +1829,7 @@ fn safe_native_call_impl(
     // flipped to a non-zero `<0x1000` value was corrupted by THIS native.
     // Gated separately (expensive: O(watch-list) per native).
     if crate::runtime::ec_watch::native_enabled() {
-        let hits = crate::runtime::ec_watch::detect();
+        let hits = crate::runtime::ec_watch::detect(shared.vm_identity);
         if !hits.is_empty() {
             let native = cratonvm_native_api::native_ring::name_of(callback as usize)
                 .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));

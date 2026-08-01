@@ -328,14 +328,75 @@ static PROCESS_VM: parking_lot::Mutex<Option<Weak<SharedVm>>> = parking_lot::Mut
 /// — a later create (e.g. a test that builds a second `Vm` in-process) replaces
 /// the cell; the previous `Weak` simply stops upgrading once its `Arc` is gone.
 pub fn set_process_vm(shared: &Arc<SharedVm>) {
-    *PROCESS_VM.lock() = Some(Arc::downgrade(shared));
+    let mut cell = PROCESS_VM.lock();
+    *cell = Some(Arc::downgrade(shared));
+    drop(cell);
+    let mut reg = VM_REGISTRY.lock();
+    reg.retain(|w| w.strong_count() > 0);
+    if !reg.iter().any(|w| w.ptr_eq(&Arc::downgrade(shared))) {
+        reg.push(Arc::downgrade(shared));
+    }
+}
+
+/// Every live VM in the process, not just the most recently published one.
+///
+/// `PROCESS_VM` is a single cell that `Vm::new` overwrites unconditionally, so
+/// on its own it cannot answer "is there more than one VM here?" — and every
+/// caller of [`process_vm`] was silently getting whichever VM happened to be
+/// created last. This registry exists so that question is answerable, and so
+/// the callers that must not guess can refuse instead.
+static VM_REGISTRY: parking_lot::Mutex<Vec<Weak<SharedVm>>> = parking_lot::Mutex::new(Vec::new());
+
+/// Number of live VMs in this process.
+pub fn live_vm_count() -> usize {
+    let mut reg = VM_REGISTRY.lock();
+    reg.retain(|w| w.strong_count() > 0);
+    reg.len()
+}
+
+/// How many times [`process_vm`] answered while more than one VM was live.
+///
+/// Non-zero means some caller took the most-recently-created VM when the
+/// correct one was not determinable. It is a diagnostic, not a gate — see
+/// [`process_vm_strict`] for the callers that refuse instead.
+pub fn ambiguous_process_vm_resolutions() -> u64 {
+    AMBIGUOUS_RESOLUTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static AMBIGUOUS_RESOLUTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// [`process_vm`], but `None` when the answer is ambiguous.
+///
+/// Use this wherever picking the wrong VM is worse than doing nothing. The JIT
+/// safepoint slow path is the motivating case: parking against another VM's
+/// stop-the-world barrier is a hang or worse, while declining to park merely
+/// leaves this poll ineffective.
+pub fn process_vm_strict() -> Option<Arc<SharedVm>> {
+    let mut reg = VM_REGISTRY.lock();
+    reg.retain(|w| w.strong_count() > 0);
+    if reg.len() != 1 {
+        return None;
+    }
+    reg[0].upgrade()
 }
 
 /// Resolve the live process-global VM, if one was published and is still alive.
 /// Returns an owning `Arc` (keeps the VM alive for the duration of the caller's
 /// use) or `None` if no VM was created or it has been dropped.
 pub fn process_vm() -> Option<Arc<SharedVm>> {
-    PROCESS_VM.lock().as_ref().and_then(Weak::upgrade)
+    let resolved = PROCESS_VM.lock().as_ref().and_then(Weak::upgrade);
+    if resolved.is_some() && live_vm_count() > 1 {
+        // Answering at all is a guess: this cell holds whichever VM was created
+        // LAST, and nothing here knows which one the caller belongs to. Kept
+        // rather than made fail-closed because the JNI attach surface has no
+        // way to say — a `JavaVM` handle points at one process-global invoke
+        // table shared by every VM, which is why `AttachCurrentThread` ignores
+        // its own argument. Counted so the guess is visible instead of silent;
+        // `process_vm_strict` is the spelling for callers that must not guess.
+        AMBIGUOUS_RESOLUTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    resolved
 }
 
 // ---------------------------------------------------------------------------
