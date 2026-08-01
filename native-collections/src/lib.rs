@@ -48194,7 +48194,6 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     // constant here would overwrite that stateful implementation.
 
     // --- ThreadPoolExecutor stat methods ---
-    let pool = "java/util/concurrent/ForkJoinPool";
     let tp = "java/util/concurrent/ThreadPoolExecutor";
     r.register(tp, "getPoolSize", "()I", |ctx, args| {
         let this = tp_arg0(args);
@@ -48296,25 +48295,37 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         native_tp_shutdown_now,
     );
 
-    // --- ForkJoinPool.invoke that actually calls compute ---
-    r.register(
-        pool,
-        "invoke",
-        "(Ljava/util/concurrent/ForkJoinTask;)Ljava/lang/Object;",
-        native_fjp_invoke,
-    );
-
-    // --- ForkJoinTask.invoke that calls compute ---
-    let fjt = "java/util/concurrent/ForkJoinTask";
-    r.register(fjt, "invoke", "()Ljava/lang/Object;", native_fjt_invoke);
-
-    // --- RecursiveTask.invoke that calls compute ---
-    let rt = "java/util/concurrent/RecursiveTask";
-    r.register(rt, "invoke", "()Ljava/lang/Object;", native_rt_invoke);
-
-    // --- RecursiveAction.invoke that calls compute ---
-    let ra = "java/util/concurrent/RecursiveAction";
-    r.register(ra, "invoke", "()Ljava/lang/Object;", native_ra_invoke);
+    // DELIBERATELY NOT REGISTERED HERE: `ForkJoinPool.invoke(ForkJoinTask)`,
+    // `ForkJoinTask.invoke()`, `RecursiveTask.invoke()`,
+    // `RecursiveAction.invoke()`.
+    //
+    // This module used to register all four. Because the registry is
+    // last-write-wins and this registrar runs after
+    // `phases_early::register_real_jdk_forkjoin_essentials`, those four
+    // registrations OVERWROTE the correct implementations (confirmed via
+    // `--dump-native-registry`: `registered_by
+    // native-collections/src/lib.rs`, `overwrote bridge`, in BOTH
+    // `compatible` and `jdk-only` mode). The copies here were wrong in two
+    // independent ways:
+    //
+    //  1. TYPE-CONFUSED HEAP WRITE. They memoised the task result with
+    //     `ctx.set_field(task, 0, val)`. Instance field 0 of a real
+    //     `java.util.concurrent.ForkJoinTask` is `volatile int status`
+    //     (`javap -p -s`), so every `pool.invoke(task)` stored an object
+    //     reference into an int slot. Observable on JDK 25: after
+    //     `pool.invoke()` of a `RecursiveTask`, HotSpot reads
+    //     `status == -2147483648` (the DONE bit) while CratonVM read back a
+    //     raw heap-pointer word.
+    //  2. NO `()V` SHAPE. `native_fjp_invoke` invoked
+    //     `compute()Ljava/lang/Object;` unconditionally and swallowed the
+    //     resulting `NoSuchMethodError`, so every `RecursiveAction` passed
+    //     to `pool.invoke()` silently never ran.
+    //
+    // The `phases_early` implementations dispatch through `fjt_entry_point`,
+    // which picks `compute()Ljava/lang/Object;` / `compute()V` / `exec()Z`
+    // from the receiver's runtime class, pin the task across the call, and
+    // memoise into a GC-remapped side table instead of a guessed field index.
+    // Do not re-add invoke natives here.
     r.set_category(__prev_cat);
 }
 
@@ -49791,63 +49802,13 @@ fn native_tp_shutdown_now(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Object(Some(list))))
 }
 
-// --- ForkJoinPool / ForkJoinTask invoke that calls compute ---
-
-fn native_fjp_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // pool.invoke(task) — call task.compute() and return result
-    let task = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let result = ctx.invoke_virtual(task, "compute", "()Ljava/lang/Object;", &[]);
-    match result {
-        Ok(Some(val)) => {
-            // Store result in task field 0 for subsequent join/get calls
-            ctx.set_field(task, 0, val.clone());
-            Ok(Some(val))
-        }
-        Ok(None) => {
-            ctx.set_field(task, 0, Value::Object(None));
-            Ok(Some(Value::Object(None)))
-        }
-        Err(_) => {
-            // If compute is not found, fall back to reading field 0
-            Ok(Some(ctx.get_field(task, 0)))
-        }
-    }
-}
-
-fn native_fjt_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let result = ctx.invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[]);
-    match result {
-        Ok(Some(val)) => {
-            ctx.set_field(this, 0, val.clone());
-            Ok(Some(val))
-        }
-        Ok(None) => {
-            ctx.set_field(this, 0, Value::Object(None));
-            Ok(Some(Value::Object(None)))
-        }
-        Err(_) => Ok(Some(ctx.get_field(this, 0))),
-    }
-}
-
-fn native_rt_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_fjt_invoke(ctx, args)
-}
-
-fn native_ra_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let _ = ctx.invoke_virtual(this, "compute", "()V", &[]);
-    Ok(Some(Value::Object(None)))
-}
+// ForkJoinPool / ForkJoinTask / RecursiveTask / RecursiveAction `invoke`
+// natives used to live here. They are gone: they wrote an object reference
+// into `ForkJoinTask.status` (an `int`) and had no `compute()V` shape. The
+// live implementations are in
+// `native-builtins/src/phases_early.rs::register_real_jdk_forkjoin_essentials`.
+// See the note at the deleted registration site in
+// `register_concurrent_completeness_natives`.
 
 // ===========================================================================
 // Test hooks — exposed so the GC-relocation integration harness in
@@ -50401,7 +50362,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_join_pool_invoke_registered_and_quiescence_left_to_native_builtins() {
+    fn fork_join_pool_invoke_and_quiescence_left_to_native_builtins() {
         let r = build_registry();
         let pool = "java/util/concurrent/ForkJoinPool";
         // `awaitQuiescence` deliberately does NOT live here: `native-builtins`
@@ -50418,37 +50379,42 @@ mod tests {
             .is_none(),
             "FJP awaitQuiescence must stay owned by native-builtins"
         );
+        // `invoke` deliberately does NOT live here either, for the same
+        // last-write-wins reason: this registrar runs after
+        // `phases_early::register_real_jdk_forkjoin_essentials`, so a local
+        // copy would overwrite the shape-aware implementation. See the note
+        // at the registration site.
         assert!(
             r.find(
                 pool,
                 "invoke",
                 "(Ljava/util/concurrent/ForkJoinTask;)Ljava/lang/Object;"
             )
-            .is_some(),
-            "FJP invoke"
+            .is_none(),
+            "FJP invoke must stay owned by native-builtins"
         );
     }
 
+    /// The `invoke` natives for the ForkJoinTask family must NOT be registered
+    /// by this crate. The copies that used to live here wrote an object
+    /// reference into `ForkJoinTask.status` (field 0, an `int`) and dispatched
+    /// `compute()Ljava/lang/Object;` unconditionally, so every
+    /// `RecursiveAction` handed to `pool.invoke()` silently never ran. Because
+    /// this registrar runs last, they overwrote the correct
+    /// `phases_early` implementations. Keep this crate out of the family.
     #[test]
-    fn fork_join_task_methods_registered() {
+    fn fork_join_task_invoke_left_to_native_builtins() {
         let r = build_registry();
-        let fjt = "java/util/concurrent/ForkJoinTask";
-        assert!(
-            r.find(fjt, "invoke", "()Ljava/lang/Object;").is_some(),
-            "FJT invoke"
-        );
-
-        let rt = "java/util/concurrent/RecursiveTask";
-        assert!(
-            r.find(rt, "invoke", "()Ljava/lang/Object;").is_some(),
-            "RT invoke"
-        );
-
-        let ra = "java/util/concurrent/RecursiveAction";
-        assert!(
-            r.find(ra, "invoke", "()Ljava/lang/Object;").is_some(),
-            "RA invoke"
-        );
+        for cls in [
+            "java/util/concurrent/ForkJoinTask",
+            "java/util/concurrent/RecursiveTask",
+            "java/util/concurrent/RecursiveAction",
+        ] {
+            assert!(
+                r.find(cls, "invoke", "()Ljava/lang/Object;").is_none(),
+                "{cls}.invoke must stay owned by native-builtins"
+            );
+        }
     }
 
     #[test]
