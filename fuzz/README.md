@@ -161,7 +161,7 @@ It exits non-zero when
   coverage-guided campaign near-useless, and it is much easier to prevent
   than to notice. `ALLOW_EMPTY_CORPUS="<target> …"` exempts a target; every
   exemption needs a matching entry in
-  `docs/known-issues/fuzzing-state.md`.
+  `docs/known-issues/c2/fuzzing-state.md`.
 
 ## Corpora
 

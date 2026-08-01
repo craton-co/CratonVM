@@ -249,7 +249,7 @@
 >   scaffolding around a campaign that has not happened. Biggest uncovered surface,
 >   and not on any lane's list: the raw HTTP request parser, which reads straight
 >   off a socket and is strictly more attacker-reachable than jimage.
->   (`docs/known-issues/fuzzing-state.md`)
+>   (`docs/known-issues/c2/fuzzing-state.md`)
 > - **Nothing in the aarch64 work has executed on aarch64 hardware.**
 > - **One test is committed `#[ignore]`d because it fails and the failure is real** —
 >   `jit/src/x64.rs`, "publishes a live OSR entry at a refused bci". The triage is

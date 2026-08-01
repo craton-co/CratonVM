@@ -5,7 +5,7 @@ bottom of `jit/src/regalloc.rs` (the top of that file is the older,
 bytecode-local graph-colouring allocator; the two are independent).
 
 **Why this exists.** The C2 review
-(`docs/known-issues/deep-research-vm-c2.md`) has a P0 lane *"Implement
+(`docs/known-issues/c2/deep-research-vm-c2.md`) has a P0 lane *"Implement
 linear-scan register allocation"*. Before this, `ir_lower.rs` gave every IR
 value a frame slot and every operand a load: a `+` on two locals is three memory
 accesses, and the only thing that ever reached a register was a bytecode local

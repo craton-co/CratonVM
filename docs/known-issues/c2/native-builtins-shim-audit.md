@@ -510,7 +510,7 @@ precisely why *Fix 4* is a curated table rather than a metadata query.
 
 ## Related
 
-* `docs/known-issues/classloading-identity-audit.md` — *Open 2* is the
+* `docs/known-issues/c2/classloading-identity-audit.md` — *Open 2* is the
   handed-over item 1 above; *Confirmed 3*'s caveat is the handed-over item 2.
 * `docs/internal/stub-ratchet.md` — the sibling ratchet this gate is modelled
   on.

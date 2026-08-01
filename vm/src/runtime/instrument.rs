@@ -119,7 +119,7 @@ pub struct TransformerEntry {
 ///     loads in VM B;
 ///   * `reset_transformer_chain()` in one VM wiped another's chain.
 ///
-/// See `docs/known-issues/vm-process-global-state-round-2.md`.
+/// See `docs/known-issues/c2/vm-process-global-state-round-2.md`.
 type TransformerChains = HashMap<usize, Vec<TransformerEntry>>;
 
 fn transformer_chains() -> &'static RwLock<TransformerChains> {

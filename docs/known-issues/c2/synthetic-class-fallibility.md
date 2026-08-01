@@ -7,8 +7,8 @@ implements it. The ~34 native call sites still use the infallible spelling;
 they are listed below with the exact edit each needs. Nothing in
 `native-builtins/`, `native-io/` or `native-collections/` was touched.
 
-This closes *Open 2* of `docs/known-issues/classloading-identity-audit.md` and
-unblocks the item `docs/known-issues/native-builtins-shim-audit.md` recorded as
+This closes *Open 2* of `docs/known-issues/c2/classloading-identity-audit.md` and
+unblocks the item `docs/known-issues/c2/native-builtins-shim-audit.md` recorded as
 "cannot be done from this end".
 
 ## The bug this removes
@@ -302,6 +302,6 @@ own wave.
 
 ## Related
 
-* `docs/known-issues/classloading-identity-audit.md` — *Open 2* is this
+* `docs/known-issues/c2/classloading-identity-audit.md` — *Open 2* is this
   document; *Open 1*, *3*, *4*, *5* remain.
-* `docs/known-issues/native-builtins-shim-audit.md` — the call-site end.
+* `docs/known-issues/c2/native-builtins-shim-audit.md` — the call-site end.

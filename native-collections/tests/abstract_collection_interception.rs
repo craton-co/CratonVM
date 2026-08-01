@@ -26,7 +26,7 @@
 //! subclass need expose no readable element storage at all — so these tests
 //! drive exactly that receiver.
 //!
-//! See `docs/known-issues/collections-interception.md`.
+//! See `docs/known-issues/c2/collections-interception.md`.
 
 mod common;
 
@@ -440,7 +440,7 @@ fn abstract_collection_carries_exactly_the_three_audited_natives() {
             reg.find(base, method, desc).is_some(),
             "{base}.{method}{desc} is load-bearing (EnumSet.toArray, \
              Spring Boot Launcher's toArray(new URL[0])) — do not drop it without \
-             updating docs/known-issues/collections-interception.md"
+             updating docs/known-issues/c2/collections-interception.md"
         );
     }
     // `java/util/AbstractSet` carries exactly one: `hashCode`. Its sibling
@@ -475,7 +475,7 @@ fn abstract_collection_carries_exactly_the_three_audited_natives() {
             assert!(
                 reg.find(base, method, desc).is_none(),
                 "{base}.{method}{desc} is a new inheritance-wide interception — \
-                 add it to docs/known-issues/collections-interception.md first"
+                 add it to docs/known-issues/c2/collections-interception.md first"
             );
         }
     }
