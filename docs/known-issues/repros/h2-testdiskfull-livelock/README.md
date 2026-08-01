@@ -66,7 +66,12 @@ threads).
 
 ## Extra note
 
-`EXTRA=--nojit` reproduces the livelock as well — it is not a JIT bug. The
-CratonVM heap-corruption symptoms this class used to show (`class_id=ClassId(0)`
-guard burst, `SIGSEGV`, `ClassCastException`) did not occur once in 265 runs of
-this harness on `dev@c8a3ba181d`.
+`EXTRA=--nojit` reproduces the livelock as well — it is not a JIT bug.
+
+The CratonVM heap-corruption symptoms this class used to show
+(`class_id=ClassId(0)` guard burst, `ClassCastException`) did not occur once in
+265 runs of this harness, nor in 330 runs of the **stock** class, on
+`dev@c8a3ba181d` — while a `dev` build from immediately before the post-GC
+reference-processing fix reproduces them in 2 of 42 stock runs. Use the stock
+class, not this overlay, for that A/B: the overlay bounds the iteration count and
+therefore the exposure.

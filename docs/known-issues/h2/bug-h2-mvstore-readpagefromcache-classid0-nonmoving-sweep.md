@@ -212,3 +212,33 @@ correlates with the failing runs. `CRATONVM_DBG_XT_JIT_ROOTS` prints it.
   rewritten); it should not be weakened to avoid this bug.
 - `7303483521` fixes the old-gen **fragmentation** consequence of the same
   regime. Unrelated cause, unrelated fix.
+
+## Possible cheaper handle: `TestDiskFull` (2026-08-01, unconfirmed)
+
+While closing out the `TestDiskFull` corruption report, one run in **330** stock
+`org.h2.test.synth.TestDiskFull` runs on `dev@c8a3ba181d` died with a `SIGSEGV`
+whose registers carry this family's shape:
+
+```
+#  SIGSEGV at pc=0x7e65e95ad765, addr=0x0
+#  maps: fault pc IS MAPPED - perms are on the `here` line   (r-xp)
+#  slot[r10]: 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0        r10=0x2003a0dd800
+```
+
+`addr=0x0` with a mapped executable `pc` is a *data* fault inside compiled code,
+and `r10` points at eight zero words — an all-zero object header, i.e. a
+reference into a span the sweep zeroed. The run showed **zero**
+`gen_heap::set_field`/`get_field` guard hits and zero `corrupt Value cell`
+reports, which is this doc's "silent" signature and not the (now fixed)
+reference-processing one.
+
+Why this might matter: `TestDiskFull` runs in ~40–110 s, against 12–40 min for
+`TestMVStoreCachePerformance`. Against that, the rate here is **1 in 330** and it
+did **not** recur: 203 further runs armed with `CRATONVM_DBG_SWEEP_ZERO=1`
+produced neither a second crash nor a ring hit. So this is a single sample and a
+lead, not a repro. Note also that most `TestDiskFull` runs wedge or time out for
+a completely unrelated, non-VM reason — see
+`h2-testdiskfull-upstream-transaction-recovery-livelock.md` — so a `TIMEOUT` row
+for that class is not evidence of this bug.
+
+Harness: `docs/known-issues/repros/h2-testdiskfull-livelock/`.

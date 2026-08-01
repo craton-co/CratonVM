@@ -1,58 +1,96 @@
 # `TestDiskFull` — `class_id=ClassId(0)`/`num_slots=0` guard burst, `SIGSEGV`, `ClassCastException`, and the "hang"
 
 ## Status
-**✅ RESOLVED / RETIRED (2026-08-01).** All three symptoms this report filed are
-closed, two of them as *fixed* and one as *not a CratonVM defect*:
+**✅ RESOLVED / RETIRED (2026-08-01).** The three symptoms this report filed are
+closed:
 
 | symptom | disposition |
 | --- | --- |
-| 1 — `gen_heap::set_field` guard burst then `SIGSEGV` | **FIXED** on `dev` by the post-GC reference-processing fix (`c0d09e2451` + `b86945eafe`), which landed **after** this report was written. Not reproducible in 265 runs. |
-| 2 — `cratonvm.synthetic.AnonymousObject$3` cast to `[Ljava/lang/String;` | **Not reproducible** in the same 265 runs (0 `ClassCastException`, 0 `AnonymousObject`, 0 `corrupt Value cell`). Same guard, same cause as (1). |
-| 3 — >300 s "hang" | **Root-caused, and it is not a CratonVM bug.** An upstream H2 transaction-recovery livelock, reached far more often on CratonVM because CratonVM issues ~3.5× more file write operations for the same logical work. Recorded, with the controls, in `docs/known-issues/h2/h2-testdiskfull-upstream-transaction-recovery-livelock.md`. |
+| 1 — `gen_heap::set_field`/`get_field` guard burst, `class_id=ClassId(0)` | **FIXED.** Reproduces 2 runs in 42 on a `dev` build from immediately *before* the post-GC reference-processing fix; **0 runs in 330** on current `dev`. |
+| 2 — `cratonvm.synthetic.AnonymousObject$3` cast to `[Ljava/lang/String;` | **Not reproducible** anywhere in the same census (0 `ClassCastException`, 0 `AnonymousObject`, 0 `corrupt Value cell`, 0 `AbstractMethodError` — on either build). |
+| 3 — >300 s "hang" | **Root-caused, and it is not a CratonVM defect.** An upstream H2 transaction-recovery livelock, reached far more often on CratonVM because CratonVM issues ~3.5× more file write operations for the same logical work. See `docs/known-issues/h2/h2-testdiskfull-upstream-transaction-recovery-livelock.md`. |
+
+One residual is **handed over, not closed**: a single `SIGSEGV` in those 330
+runs, with a different signature from this report's (see below). It is handed to
+`docs/known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`.
 
 The `Chunk N not found` failures this report already attributed to upstream H2
-fault-injection flakiness are confirmed again here: stock HotSpot JDK 25 hit
-them in 58 of 150 runs under the same settings.
+fault-injection flakiness are confirmed again: stock HotSpot JDK 25 hit them in
+58 of 150 runs under the same settings.
 
 ---
 
-## Symptoms 1 and 2 — gone
+## Symptoms 1 and 2 — the A/B
 
 The measurements in the original report were taken on 2026-07-31 with a binary
 built from `dev` plus the `TestGetGeneratedKeys` wrapper-`equals` fix. The two
-commits that actually fix this guard signature were authored at 15:51 and 17:21
-UTC that day and merged into `dev` at **17:49 UTC** — i.e. *after* the runs
-recorded here (this file was committed at 16:53 UTC). The report's arms
-therefore never contained the fix.
+commits that fix this guard signature — `c0d09e2451` ("post-GC reference
+processing wrote through stale old-gen addresses") and `b86945eafe` ("the refproc
+staleness guard had the same old-gen blind spot") — reached `dev` **after** that,
+so the report's arms never contained them.
 
-Re-measured on `dev@c8a3ba181d` (2026-08-01), release build, JDK 25,
-`--Xmx 1g`, Azure host:
+Both builds run the **stock, unmodified** `org.h2.test.synth.TestDiskFull` (no
+overlay), `--Xmx 1g`, JDK 25, fresh scratch CWD per run, Azure host,
+2026-08-01:
 
-| | runs | `set_field`/`get_field` OOB guard hits | `SIGSEGV` (rc=139) | `ClassCastException` | `corrupt Value cell` | `AbstractMethodError` |
-| --- | --- | --- | --- | --- | --- | --- |
-| CratonVM, JIT on and `--nojit`, with and without the diagnosis overlay | **265** | **0** | **0** | **0** | **0** | **0** |
+| build | runs | runs with `gen_heap` OOB guard hits | guard hits | runs reporting an all-zero-header stale pointer | `SIGSEGV` |
+| --- | --- | --- | --- | --- | --- |
+| `dev@22107d5122` — the last `dev` state **before** the reference-processing fix | 42 | **2** | 14 | **3** | 0 |
+| `dev@c8a3ba181d` — current | **330** | **0** | **0** | **0** | 1 (different signature, below) |
 
-Exit-code census over those 265 runs: 160×0, 20×1 (`Chunk N not found`),
-61×137 (killed at the harness timeout — see symptom 3), 24×134. All 24 of the
-`134`s are `SIGABRT` raised **by our own watchdog** (`CRATONVM_DEFAULT_WATCHDOG_SEC=240`,
-set deliberately in three arms to dump stacks on the livelock); the fatal-error
-banner appears in exactly those 24 logs and nowhere else. There was no
-spontaneous crash of any kind.
+The pre-fix build reproduces the reported shape verbatim, including the
+consequence:
 
-Both fixes are described in the retired
-`bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family` write-up: post-GC
-reference processing was writing referent pointers through **stale old-generation
-addresses**, which is precisely the "receiver reads back as a bare
-`java/lang/Object` with zero fields" shape reported here (`index=0`,
-`num_slots=0`, `class_id=ClassId(0)`, value an `ObjectRef` a fixed distance
-below the receiver — a `Reference` and its referent allocated back to back).
-That also disposes of this report's third "suggested next step": the constant
-`0xe0` delta was the referent/reference pair spacing, not a miscomputed field
-offset.
+```
+gen_heap::get_field: out-of-bounds field read dropped … num_slots=0 class_id=ClassId(0)
+Stale pointer detected in invokevirtual receiver (ptr=0x200102130e0, all-zero header)
+Thread Thread-610 terminated with error: ExceptionThrown(…)
+```
+
+Strictly, other commits also landed in the window between those two builds; what
+the A/B establishes is that the signature was fixed *in that window*, and the
+reference-processing fix is the change in it whose documented cause is exactly
+this signature (`Reference` and referent allocated back to back is also where the
+report's constant `0xe0` receiver-to-value delta comes from — it is the pair
+spacing, not a miscomputed field offset, which disposes of the report's third
+"suggested next step").
+
+A further **265 runs** of a bounded-iteration overlay form of the same class on
+current `dev` (JIT and `--nojit`) produced 0 guard hits, 0 `SIGSEGV`, 0
+`ClassCastException`, 0 `corrupt Value cell`. In that census the 24 `SIGABRT`s
+are all our own `CRATONVM_DEFAULT_WATCHDOG_SEC` aborts, deliberately armed in
+three arms to dump stacks on the livelock; the fatal-error banner appears in
+exactly those 24 logs and nowhere else.
 
 The `AbstractMethodError` this report explicitly declined to carry forward
-(`org/h2/value/Value.getValueType()I has no Code attribute`) did not appear
-either.
+(`org/h2/value/Value.getValueType()I has no Code attribute`) did not appear on
+either build.
+
+## The one residual crash — handed over
+
+One run in 330 on current `dev` died with:
+
+```
+#  SIGSEGV at pc=0x7e65e95ad765, addr=0x0, pid=930353
+#  fault pc is inside a RECENTLY FREED code buffer: … active_jit_executions_at_free=0x0
+#  fault pc is inside a LIVE registered code buffer: base=0x7e65e95ad000 cap=0x3240
+#  maps: fault pc IS MAPPED - perms are on the `here` line   (r-xp)
+#  slot[r10]: 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0        r10=0x2003a0dd800
+```
+
+This is **not** this report's symptom 1: `oob=0` for that run, no guard burst, no
+`corrupt Value cell`. `addr=0x0` with a mapped executable `pc` is a *data* fault
+inside compiled code, not an instruction fetch off unmapped code, so the
+freed/live code-buffer lines are the recycled-address artefact the crash handler
+warns about, not a use-after-free. What is suspicious is `r10` pointing at eight
+zero words — an **all-zero object header**, the premature-reclamation shape.
+
+Not root-caused: it is one unreproduced sample, and 203 further runs armed with
+`CRATONVM_DBG_SWEEP_ZERO=1` (the reclaimed-live-object ring, which self-diagnoses
+on a hit) produced no second occurrence and no ring hit. Recorded in
+`bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`, which owns that
+family; `TestDiskFull` at ~73 s per run may be a cheaper handle on it than
+`TestMVStoreCachePerformance` at 12–40 min, if the rate holds up.
 
 ---
 
@@ -114,12 +152,13 @@ rewrite.
   on HotSpot and did not finish in 2400 s on CratonVM. The rest are the hard
   livelock above, which makes *any* timeout value expire.
 * **"`SIGSEGV`, the 300 s hangs and the `ClassCastException` are CratonVM-only."**
-  True of the crashes (now fixed). Not true of the livelock's underlying defect,
-  which is upstream and which HotSpot demonstrably also walks into.
+  True of the crashes. Not true of the livelock's underlying defect, which is
+  upstream and which HotSpot demonstrably also walks into.
 
 ## Reproducer
 
 The harness used for all of the above — the overlay `TestDiskFull` with bounded
 iteration count and per-iteration timing, the two H2 instrumentation patches, and
 the arm runner — is committed under
-`docs/known-issues/repros/h2-testdiskfull-livelock/`.
+`docs/known-issues/repros/h2-testdiskfull-livelock/`. The A/B in this document
+used the **stock** class, not the overlay.
