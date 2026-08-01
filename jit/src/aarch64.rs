@@ -1312,6 +1312,48 @@ impl Aarch64Emitter {
         self.emit_u32(inst);
     }
 
+    // -- Unscaled FP load/store (LDUR/STUR, FP variants) --------------------
+    //
+    // Bug-fix (aarch64 parity audit 2026-08-01): the scaled unsigned-offset
+    // forms above (`ldr_fp_d` … `str_fp_s`) take a `u16` byte offset and cannot
+    // express a NEGATIVE displacement. Every frame slot on this backend is at a
+    // negative offset from FP, so the FP spill/reload path was handing them
+    // `offset as u16`, which reinterprets e.g. −24 as 65512 and then scales it
+    // — a load/store 64 KiB *above* FP, deep inside the caller's frame.
+    //
+    // This is the FP twin of "ARM64 BUG #1", which was fixed for the GPR
+    // `Ldr`/`Str` lowering (see `ldur`/`stur` above) and left unfixed here.
+    // These four emitters are the unscaled, non-writeback (`imm9`, −256..=255)
+    // forms the fix routes negative offsets through.
+
+    /// LDUR Dt, [Xn, #simm9]  (FP 64-bit, unscaled signed offset, no writeback).
+    pub fn ldur_fp_d(&mut self, rt: FpReg, rn: Reg, simm9: i16) {
+        // size=11, V=1, opc=01
+        let inst = ldst_unscaled_imm(0b11, 1, 0b01, simm9, rn, rt.enc());
+        self.emit_u32(inst);
+    }
+
+    /// STUR Dt, [Xn, #simm9]  (FP 64-bit, unscaled signed offset, no writeback).
+    pub fn stur_fp_d(&mut self, rt: FpReg, rn: Reg, simm9: i16) {
+        // size=11, V=1, opc=00
+        let inst = ldst_unscaled_imm(0b11, 1, 0b00, simm9, rn, rt.enc());
+        self.emit_u32(inst);
+    }
+
+    /// LDUR St, [Xn, #simm9]  (FP 32-bit, unscaled signed offset, no writeback).
+    pub fn ldur_fp_s(&mut self, rt: FpReg, rn: Reg, simm9: i16) {
+        // size=10, V=1, opc=01
+        let inst = ldst_unscaled_imm(0b10, 1, 0b01, simm9, rn, rt.enc());
+        self.emit_u32(inst);
+    }
+
+    /// STUR St, [Xn, #simm9]  (FP 32-bit, unscaled signed offset, no writeback).
+    pub fn stur_fp_s(&mut self, rt: FpReg, rn: Reg, simm9: i16) {
+        // size=10, V=1, opc=00
+        let inst = ldst_unscaled_imm(0b10, 1, 0b00, simm9, rn, rt.enc());
+        self.emit_u32(inst);
+    }
+
     // -----------------------------------------------------------------------
     // NEON basics (i32x4)
     // -----------------------------------------------------------------------
@@ -1999,6 +2041,85 @@ mod tests {
             0,
             "LDUR/STUR is not the scaled unsigned-offset form"
         );
+    }
+
+    /// Unscaled FP load/store — the encodings the negative-frame-offset FP
+    /// spill path depends on.
+    ///
+    /// Each expected word is the GPR LDUR/STUR word from
+    /// `test_ldur_stur_unscaled` with bit 26 (V) set, which is exactly what
+    /// the ARM ARM "Load/store register (unscaled immediate)" table says
+    /// distinguishes the SIMD&FP variant from the general-purpose one.
+    #[test]
+    fn test_ldur_stur_fp_unscaled() {
+        let mut e = Aarch64Emitter::new();
+
+        // LDUR D0, [X1, #-8] = 0xFC5F8020 (GPR form 0xF85F8020 | V bit)
+        e.ldur_fp_d(FpReg::D0, Reg::X1, -8);
+        assert_eq!(last_inst(&e), 0xFC5F_8020);
+
+        // STUR D2, [SP, #-16] = 0xFC1F03E2 (GPR form 0xF81F03E2 | V bit)
+        e.stur_fp_d(FpReg::D2, Reg::SP, -16);
+        assert_eq!(last_inst(&e), 0xFC1F_03E2);
+
+        // LDUR S0, [X1, #-4] = 0xBC5FC020
+        e.ldur_fp_s(FpReg::D0, Reg::X1, -4);
+        assert_eq!(last_inst(&e), 0xBC5F_C020);
+
+        // STUR S3, [X29, #-4] = 0xBC1FC3A3
+        e.stur_fp_s(FpReg::D3, Reg::X29, -4);
+        assert_eq!(last_inst(&e), 0xBC1F_C3A3);
+    }
+
+    /// The unscaled FP forms must not set the index/writeback bit — if bit 10
+    /// were 1 the instruction would become pre/post-index and would MUTATE the
+    /// base register, corrupting FP on every FP spill (the exact shape of
+    /// ARM64 BUG #1 on the GPR side).
+    #[test]
+    fn test_fp_unscaled_has_no_writeback() {
+        for i in 0..4u32 {
+            let mut e = Aarch64Emitter::new();
+            match i {
+                0 => e.ldur_fp_d(FpReg::D5, Reg::X29, -32),
+                1 => e.stur_fp_d(FpReg::D5, Reg::X29, -32),
+                2 => e.ldur_fp_s(FpReg::D5, Reg::X29, -32),
+                _ => e.stur_fp_s(FpReg::D5, Reg::X29, -32),
+            }
+            let inst = last_inst(&e);
+            assert_eq!(
+                (inst >> 10) & 0x3,
+                0b00,
+                "FP LDUR/STUR variant {i} must be unscaled/non-writeback"
+            );
+            assert_eq!((inst >> 26) & 1, 1, "variant {i} must set the V (SIMD&FP) bit");
+            assert_eq!((inst >> 24) & 1, 0, "variant {i} is not the scaled form");
+        }
+    }
+
+    /// Barrier encodings, checked against the ARM ARM's `CRm` option table.
+    ///
+    /// These are the primitives any future aarch64 publication/volatile/monitor
+    /// lowering has to reach for — nothing in the backend emits them today (see
+    /// `docs/jit/aarch64-parity.md`), so pinning their bytes now is the cheapest
+    /// way to keep them trustworthy until something does.
+    #[test]
+    fn test_barrier_encodings() {
+        let mut e = Aarch64Emitter::new();
+
+        e.dsb(0b1111); // DSB SY
+        assert_eq!(last_inst(&e), 0xD503_3F9F);
+        e.dsb(0b1011); // DSB ISH
+        assert_eq!(last_inst(&e), 0xD503_3B9F);
+
+        e.dmb(0b1111); // DMB SY
+        assert_eq!(last_inst(&e), 0xD503_3FBF);
+        e.dmb(0b1011); // DMB ISH
+        assert_eq!(last_inst(&e), 0xD503_33BF);
+        e.dmb(0b1010); // DMB ISHST
+        assert_eq!(last_inst(&e), 0xD503_32BF);
+
+        e.isb(); // ISB SY
+        assert_eq!(last_inst(&e), 0xD503_3FDF);
     }
 
     #[test]
