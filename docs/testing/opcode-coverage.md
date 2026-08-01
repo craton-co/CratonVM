@@ -258,7 +258,6 @@ produces no matrix file.
           exit "$status"
 
       - name: Upload the coverage matrix
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: opcode-coverage-matrix

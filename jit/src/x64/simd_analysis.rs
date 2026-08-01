@@ -2090,6 +2090,9 @@ pub mod vector_gate {
             AliasClass::ArrayElem {
                 array,
                 index: AccessOffset::Dynamic(index),
+                // These fixtures are the int-array dependence cases; the
+                // reference-element refusal has its own fixtures.
+                elem: MemKind::Int,
             }
         }
 

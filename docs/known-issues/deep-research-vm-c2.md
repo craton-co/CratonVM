@@ -58,6 +58,61 @@
 > OSR, loop transforms, vectorization, the compilation broker, and the
 > `x64.rs`/`invoke.rs` seam splits. The report scopes these at 180–360
 > engineer-days each and the whole roadmap at 24–36 months for one engineer.
+>
+> ---
+>
+> ### Wave 2 — 2026-07-31 (same branch): landed fixes, CI wiring, doc reconciliation
+>
+> The workspace is green; **4,733 unit tests pass** (was 3,573).
+>
+> **Closed since the banner above.**
+>
+> | Item | What changed |
+> |---|---|
+> | G1-8 — "undead" remembered-set entry | An rset entry is now `(source, generation)`, not a bare source index. `G1Region::recycled_in_generation` + `rset_cache_epoch`-as-clock make the sharper test available to both the scan side (`live_rset_sources`) and `cleanup` (`retain_sources_in_generation`), so a recycled-**and-retyped** source no longer survives forever. Fail-safe by construction: un-stamped entries get `RSET_GENERATION_PINNED`, and the staleness test is a strict `<`. |
+> | T-3 — moving cycle with published TLAB tails | Escalated from a rate-limited warn to a **refusal**: the young collection is skipped (over-retain, spill to old gen, retry). Not a heuristic — the tails are already clipped to this from-space, so a non-empty set *is* the hazard. Expected unreachable on a correct transition graph. Deliberately does **not** divert to the non-moving sweep, which on the precise-root path reclaims live young objects. |
+> | `System.setSecurityManager` cross-VM finding (use-after-move) | **Fixed.** Three process-global `(identity_key, ObjectRef)` singletons replaced by a `vm_identity`-keyed index (`SECURITY_STATE`), plus a real GC root source (`"security-manager"` in `vm/src/memory/native_roots.rs`). The keying closes the sandbox-disarm hole; the root source closes the use-after-move — per-VM keying alone would not have. Six tests next to the fix. |
+> | Deopt reexecute flag | `DeoptimizationPoint::semantics: ResumeSemantics` landed; **every** producer stamps `ResumeSemantics::for_reason`. The prose convention now lives in one place. |
+> | Deopt-metadata verifier | Wired at the **IR** install site (`ir_lower.rs`, before the artifact becomes a `CompiledMethod`), with a dedicated `BailoutReason::DeoptMetadata` and context `phase=install`. |
+> | Opcode / execution-path coverage | `gen-opcodes` (197 programs, each with a declared checksum and its focus code inside a loop inside a `try`) + `matrix` (tri-state cells, reconciliation) now run in CI's `difftest-gate` job and upload `opcode-coverage-matrix`. Report, not a gate: exit 0 or the non-fatal exit 3 pass, anything else fails. |
+> | Performance gate | `.github/workflows/performance.yml` passed `--reps 5` while the gate's reliability preflight requires `--min-samples 7` — that job would have exited **12 [SAMPLE-COUNT]** before taking a single measurement. Now `--reps 7`. |
+>
+> **Half-closed — analysis or infrastructure landed, the consumer did not.** Read
+> these as *open*, not done:
+>
+> - **Inlined deopt scope chains.** The IR lowerer can build a caller chain
+>   (`caller_chain_for` + `InlineScopeTable`) and the verifier has always walked
+>   one — but `push_scope` has no non-test caller and the production path calls
+>   `lower_inner` with an empty table, so `FrameState::caller` is `None` in every
+>   installed artifact. The single-pass backend has no scope stack at all.
+> - **The reexecute flag.** Recorded by every producer; the VM resume sink still
+>   infers re-execute-vs-resume from `DeoptReason`.
+> - **The deopt-metadata verifier in the single-pass backend.** Still installs
+>   unverified metadata.
+> - **The bytecode loop rewriter.** Consumed only as the *native* unroller's
+>   admission oracle — a real improvement, since the old gate was one opcode
+>   compare plus a size band — but `xform.code` is discarded and the emitter
+>   still compiles the caller's bytecode.
+> - **The generated opcode corpus is compiled, not run.** CI reports the matrix;
+>   nothing diffs 197 programs × 7 modes against HotSpot. The `checksum`
+>   comparison dimension is *exercisable*, not exercised.
+> - **G1-9** (parallel young evacuator corruption). One real serial/parallel
+>   divergence was found and fixed — the parallel source set omitted JIT-pinned
+>   regions, which are reachable **only** as remembered-set sources — and it
+>   reproduces in the same `--nojit` configuration as the corruption. **It is not
+>   confirmed as the root cause.** The flag stays opt-in and mixed GC stays
+>   serial.
+>
+> **Complete, tested, and with no production consumer at all.** These are done as
+> *components* and must not be read as capabilities the VM has:
+> **lock elision and lock coarsening** (`escape_analysis_from_ir` in
+> `jit/src/lib.rs` has no arm producing a `MonitorEnter`, so both offer lists are
+> always empty), **the vectorization admission gate** (analysis only; nothing
+> emits a vector instruction — distinct from the older, wired int/double-array
+> SIMD paths in `x64.rs`), **linear-scan register allocation**
+> (`allocate_linear_scan` has no production call site, which is why its
+> `spills`/`reloads` metrics read zero), and **the bytecode loop rewriter**
+> above.
 
 ## Executive summary
 

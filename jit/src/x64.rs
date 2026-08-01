@@ -39227,14 +39227,13 @@ mod loop_unroll_admission {
             assert_eq!(unroll.osr_entry_pc(22), Some(22 + k * body_len));
             assert_eq!(peel.osr_entry_pc(len), None);
 
-            // KNOWN GAP, asserted so it stays visible rather than latent: for
-            // Unroll the back-edge bci has no image in copy 0 (the back edge
-            // exists in the LAST copy only), and `osr_entry_pc` still answers
-            // `bci`, which in the output is the first byte of copy 1 — i.e.
-            // the header, not the back edge. A consumer of the rewriter must
-            // refuse OSR at `back_edge..back_edge_end` for an unrolled method.
-            // See `docs/jit/loop-transform-wiring.md`.
-            assert_eq!(unroll.osr_entry_pc(back_edge), Some(back_edge));
+            // The rewriter now refuses OSR across the unrolled back-edge gap
+            // itself, so no consumer has to know about it. For Unroll the
+            // back-edge bci has no image in copy 0 (the back edge exists in the
+            // LAST copy only); output pc `back_edge` is the first byte of copy
+            // 1, i.e. the header — which is exactly what `bci_at` reports below,
+            // and why entering there would re-run iterations.
+            assert_eq!(unroll.osr_entry_pc(back_edge), None);
             assert_eq!(unroll.bci_at(back_edge), Some(header));
             // Peel has no such gap: its steady-state copy carries the back edge.
             assert_eq!(peel.osr_entry_pc(back_edge), Some(peel.back_edge_pc()));

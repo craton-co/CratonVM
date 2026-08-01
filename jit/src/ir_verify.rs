@@ -675,6 +675,8 @@ fn expected_arity(op: &Op) -> (usize, usize) {
         Op::LambdaIntToDouble => (4, 4),
         // [ctrl, cond]
         Op::Guard { .. } => (2, 2),
+        // [ctrl, mem, obj]
+        Op::MonitorEnter | Op::MonitorExit => (3, 3),
         Op::Dead => (0, 0),
     }
 }

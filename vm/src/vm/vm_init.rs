@@ -14311,14 +14311,14 @@ mod tests {
              natives registered",
             vm.natives.native_methods.len()
         );
-        // A native that definitionally exercises a capability is registered and
-        // classified, so the dispatch gate has something to gate.
+        // …and a specific, well-known one, so the assertion above cannot pass on
+        // a registry that accepted a thousand natives and dropped the rest.
         assert!(
             vm.natives
                 .native_methods
                 .find("java/lang/Object", "hashCode", "()I")
                 .is_some(),
-            "a well-known boot native must survive the registration gate"
+            "java/lang/Object.hashCode must survive the registration gate"
         );
     }
 

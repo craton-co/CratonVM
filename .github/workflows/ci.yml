@@ -514,7 +514,6 @@ jobs:
       # if-no-files-found: warn, not error — the generate step legitimately
       # produces no matrix on the exit-3 bootstrap path above.
       - name: Upload the coverage matrix
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: opcode-coverage-matrix
