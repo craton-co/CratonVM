@@ -3424,6 +3424,41 @@ impl LoopXform {
     /// has no image is dropped: its instruction is not in the output at all.
     ///
     /// Sorted by PC, which is what every consumer of these tables assumes.
+    /// Rebuild a `pc_to_native`-shaped vector from output-PC space back into
+    /// original-bytecode space.
+    ///
+    /// The emitter records `pc_to_native[pc] = buf.pos()` once per emitted PC,
+    /// so compiling the rewritten bytes yields a vector indexed by OUTPUT pc.
+    /// Its consumers — OSR entry and the deopt-by-bci lookup — index it by
+    /// ORIGINAL bci, so it cannot simply be handed over.
+    ///
+    /// A bci with several images has several native offsets, and picking the
+    /// wrong one re-runs iterations. [`Self::osr_entry_pc`] already answers
+    /// exactly that question — which image an entry at this bci should target —
+    /// including `None` across the unrolled back-edge gap, where entering is
+    /// not valid at all. This is that choice applied pointwise; a bci with no
+    /// valid image keeps the vector's existing `-1` sentinel rather than
+    /// inventing an offset.
+    ///
+    /// `out_pc_to_native` is indexed by output PC; the result is indexed by
+    /// original bci and is `orig_code_len + 1` long, matching what the emitter
+    /// allocates today.
+    pub(super) fn rebuild_pc_to_native(
+        &self,
+        out_pc_to_native: &[i32],
+        orig_code_len: usize,
+    ) -> Vec<i32> {
+        let mut rebuilt = vec![-1i32; orig_code_len + 1];
+        for (bci, slot) in rebuilt.iter_mut().enumerate() {
+            let Some(image) = self.osr_entry_pc(bci) else {
+                continue;
+            };
+            if let Some(&native) = out_pc_to_native.get(image) {
+                *slot = native;
+            }
+        }
+        rebuilt
+    }
     pub(super) fn replicate_pc_keyed<T: Clone>(&self, table: &[(usize, T)]) -> Vec<(usize, T)> {
         let mut out: Vec<(usize, T)> = Vec::with_capacity(table.len());
         for (pc, payload) in table {
@@ -5141,6 +5176,55 @@ mod loop_xform_tests {
                         assert_eq!(
                             landed, images,
                             "{name} k={k}: bci {pc} has {images} images but {landed} entries"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    /// The rebuilt `pc_to_native` sends every original bci to a native offset
+    /// belonging to the image OSR would enter, and marks the unrolled
+    /// back-edge gap unmapped.
+    ///
+    /// Picking any other image would re-run iterations, which is the exact bug
+    /// `osr_entry_pc` was fixed for; this asserts the rebuild inherits that
+    /// choice rather than making its own.
+    #[test]
+    fn rebuilt_pc_to_native_follows_the_osr_entry_image() {
+        for (name, code, header, back_edge) in admissible_fixtures() {
+            let len = code.len();
+            for k in 1..=LOOP_XFORM_MAX_COPIES {
+                for planned in [
+                    plan_loop_peel(&code, len, header, back_edge, k, &[]),
+                    plan_loop_unroll(&code, len, header, back_edge, k, &[]),
+                ] {
+                    let Ok(x) = planned else { continue };
+                    // Synthetic: native offset = output pc * 4, so a wrong
+                    // image is visible as a wrong number rather than a crash.
+                    let out: Vec<i32> =
+                        (0..x.code.len()).map(|pc| (pc as i32) * 4).collect();
+                    let rebuilt = x.rebuild_pc_to_native(&out, len);
+                    assert_eq!(rebuilt.len(), len + 1, "{name} k={k}: length");
+                    for bci in 0..=len {
+                        match x.osr_entry_pc(bci) {
+                            Some(image) if image < out.len() => assert_eq!(
+                                rebuilt[bci], out[image],
+                                "{name} k={k}: bci {bci} must use image {image}"
+                            ),
+                            _ => assert_eq!(
+                                rebuilt[bci], -1,
+                                "{name} k={k}: bci {bci} has no valid entry image and \
+                                 must stay unmapped"
+                            ),
+                        }
+                    }
+                    // The unrolled back-edge gap is unmapped, not mapped to
+                    // the header — entering there would re-run iterations.
+                    if matches!(x.kind, LoopXformKind::Unroll) {
+                        assert_eq!(
+                            rebuilt[x.orig_back_edge_pc()],
+                            -1,
+                            "{name} k={k}: the unrolled back-edge gap must be unmapped"
                         );
                     }
                 }
