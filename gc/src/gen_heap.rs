@@ -4013,47 +4013,6 @@ impl GenerationalHeap {
         // function returns remains intentionally idempotent and still covers
         // every non-provider root owner.
         crate::external_roots::remap_external_roots(&result.0.pointer_map);
-        // ...and publish it to the ROOT SLICE, for the same reason and at the
-        // same boundary.
-        //
-        // `sweep_young_non_moving` above commits selective promotions
-        // (young→old), recording each in `result.0.pointer_map`, but leaves
-        // every root still holding the PRE-promotion young address. The
-        // in-place old sweep below marks from exactly this slice, and its seed
-        // loop rejects anything `old_gen.contains()` says is not old-gen — so a
-        // stale young address seeds NOTHING, the object at its new old-gen home
-        // is never marked, and `sweep_old_gen_non_moving` returns a LIVE
-        // object's block to the free list.
-        //
-        // The gate's own comment predicted this exactly: "the young sweep
-        // survives an imperfect root set via conservative over-marking and
-        // side-mark containment, but this old sweep frees purely on
-        // GC_FLAG_MARKED, so any root-set gap frees a LIVE promoted object."
-        // The gap was self-inflicted, one statement earlier in this function.
-        //
-        // Measured with `ROverlaySystemGcStress` (JIT on, real JDK,
-        // `System.gc()` per round): the sweep frees the five collection objects
-        // of each of the two oldest bundles — `[oldsweep] FREEING overlay owner
-        // 0x… class_id=121 num_slots=23` — while Java still holds them in a
-        // live `ArrayList`. They then read back as empty (their side-table
-        // state is dropped once `is_allocated_addr` reports the block free) and
-        // eventually as `ClassCastException: class java.lang.Object cannot be
-        // cast to Bundle` once the block is handed to another allocation.
-        // `CRATONVM_OLD_SWEEP_JIT=0` — which skips that sweep entirely — makes
-        // the probe pass, which is what localised it here.
-        //
-        // The moving path performs the equivalent root fixup after `major_gc`
-        // (through `compact_map`); this is that fixup for the non-moving path.
-        if !result.0.pointer_map.is_empty() {
-            for root in roots.iter_mut() {
-                if let Some(&new_addr) = result.0.pointer_map.get(&(root.as_ptr() as usize)) {
-                    debug_assert!(new_addr != 0, "promotion map contains a null destination");
-                    // SAFETY: `new_addr` is a destination recorded by selective
-                    // promotion, i.e. a live old-gen object this cycle wrote.
-                    *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-                }
-            }
-        }
         // OOM-INVESTIGATE (dohead-oom, 2026-07-19): track young-arena usage
         // across cycles to find where reclaimed bytes stop coming back as
         // usable free space. Gated so normal runs pay nothing.
@@ -4102,7 +4061,8 @@ impl GenerationalHeap {
             && old_capacity > 0
             && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
         {
-            let (old_freed, old_survivors) = self.sweep_old_gen_non_moving(roots);
+            let (old_freed, old_survivors) =
+                self.sweep_old_gen_non_moving(roots, &result.0.pointer_map);
             // This cycle DID reclaim old-gen storage: a freed block is back on
             // the free list, so an old-gen address is no longer self-evidently
             // live. `old_survivors` carries the identity entries that make
@@ -8746,11 +8706,41 @@ impl GenerationalHeap {
     fn sweep_old_gen_non_moving(
         &self,
         roots: &[ObjectRef],
+        promotions: &HashMap<usize, usize>,
     ) -> (usize, HashMap<usize, usize>) {
         let young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
         let mut root_shadow = roots.to_vec();
+        // Apply this cycle's selective promotions to the SHADOW ONLY.
+        //
+        // `sweep_young_non_moving` commits promotions (young→old) and records
+        // them in `promotions`, but leaves the caller's roots on their PRE-
+        // promotion young addresses. This sweep marks from those roots, and
+        // `old_gen_gc`'s seed loop drops anything `old_gen.contains()` rejects,
+        // so a stale young address seeds NOTHING, the object at its new old-gen
+        // home is never marked, and the sweep hands a LIVE object's block back
+        // to the free list — measured, as `[oldsweep] FREEING overlay owner`,
+        // on collections Java still holds in a live `ArrayList`.
+        //
+        // Corrected HERE and not in the caller. Rewriting the caller's slice
+        // instead — which is what the first version of this fix did — made
+        // `DefaultCatalogAndSchemaTest` SIGSEGV 3 runs out of 3 against 2 of 2
+        // clean without it: that slice is the VM's root snapshot and outlives
+        // this call, so mutating it changed what every LATER consumer saw. The
+        // sweep is the only thing that needs post-promotion addresses, and
+        // `root_shadow` already exists precisely because this mode must not
+        // disturb the caller's roots.
+        if !promotions.is_empty() {
+            for root in root_shadow.iter_mut() {
+                if let Some(&new_addr) = promotions.get(&(root.as_ptr() as usize)) {
+                    debug_assert!(new_addr != 0, "promotion map contains a null destination");
+                    // SAFETY: `new_addr` is a destination recorded by selective
+                    // promotion, i.e. a live old-gen object this cycle wrote.
+                    *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
         let survivors = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
         (before.saturating_sub(old_gen.used()), survivors)
     }
@@ -13653,7 +13643,7 @@ mod tests {
         // Keep the first half; the second half's storage is one adjacent run.
         let live: Vec<ObjectRef> = roots[..N / 2].to_vec();
         let blocks_before = heap.old_gen_lock().free_block_count();
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live);
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
         assert!(reclaimed > 0, "the dropped half must be reclaimed");
 
         let og = heap.old_gen_lock();
@@ -13699,7 +13689,7 @@ mod tests {
         assert!(heap.is_in_old(roots[1].as_ptr()));
 
         let old_used_before = heap.old_gen_used();
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old]);
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old], &HashMap::new());
 
         assert!(
             reclaimed > 0,
@@ -13745,7 +13735,7 @@ mod tests {
         // Both addresses are watched — exactly what the VM publishes for every
         // address the reference processor holds.
         crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
-        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]]);
+        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]], &HashMap::new());
         crate::gc_quiescence::set_watched_referents(&[]);
 
         assert!(reclaimed > 0, "the unreachable promotion must be reclaimed");
@@ -14378,7 +14368,7 @@ mod tests {
         let doomed_addr = roots[1].as_ptr() as usize;
 
         let live = vec![keep];
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live);
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
         assert!(
             reclaimed > 0,
             "the sweep must actually have reclaimed the dropped object in place",
