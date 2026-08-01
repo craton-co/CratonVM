@@ -524,6 +524,14 @@ fn mock_undertow_exchange_field_slot(class_name: Option<&str>, name: &str) -> Op
         (Some("io/undertow/server/HttpServerExchange"), "requestMethod") => Some(19),
         (Some("io/undertow/server/HttpServerExchange"), "requestURI") => Some(21),
         (Some("io/undertow/server/HttpServerExchange"), "sender") => Some(30),
+        // An enum that declares its OWN field called `name`, shadowing
+        // `java.lang.Enum.name`. The real resolver returns the MOST-DERIVED
+        // declaration, so it answers the subclass slot (2), not `Enum`'s own
+        // slot 0 — exactly the trap `native_enum_name` must not fall into.
+        // Spring Boot's `WebEndpointTest.Infrastructure` is the real instance.
+        // See `lang_misc`'s
+        // `enum_name_reads_enums_own_slot_not_a_shadowing_subclass_field`.
+        (Some("test/ShadowedNameEnum"), "name") => Some(2),
         _ => None,
     }
 }

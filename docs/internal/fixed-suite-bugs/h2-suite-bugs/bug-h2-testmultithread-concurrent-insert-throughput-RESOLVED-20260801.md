@@ -152,20 +152,47 @@ Also ruled out, each with a one-variable experiment:
 
 The note appended to
 `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`
-recorded one 25x1000 run in which all 25 threads failed on `COMMIT`. Re-run on
-the release binary: **`failed=0` in 6 of 6 runs** (3 with the default moving
-young gen, 3 with `CRATONVM_NO_MOVING_YOUNG=1`), all with
-`CRATONVM_DBG_SWEEP_ZERO=1` armed, wall 72-109 s.
+recorded one 25x1000 run in which all 25 threads failed on `COMMIT`.
 
-This is **not** a claim that it is fixed — no positive control was run to prove
-the probe's error path still fires on this binary, and a silent canary and a
-clean run look identical. It is a rare event that stayed rare, consistent with
-the original note (25x200 clean, the real `TestMultiThread` clean, one
-occurrence at 25x1000). If it recurs, the most likely home is the open
-premature-reclamation bug in the non-moving young sweep —
-`docs/known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`
-— whose signature (a live object's header reading back as something else) is the
-same family.
+**Round 1 of this re-run is VOID, and the reason is worth reading.** Six clean
+runs (`failed=0`) were obtained with `CRATONVM_DBG_SWEEP_ZERO=1` armed —
+following the sibling doc's own recommended recipe, so "the next occurrence
+self-diagnoses". But that flag sets `retain_dead_objects` in
+`gen_heap.rs::sweep_young_non_moving`, which **switches the young sweep from the
+8-worker anchored parallel walk to the sequential walk and stops dead spans
+being coalesced**. That is a semantics-level change to the exact code under
+suspicion, so those runs never exercised the sweep the failing run used. A
+"clean" result there means nothing.
+
+> Any `CRATONVM_DBG_SWEEP_ZERO` / `DBG_A2` / `DBG_SWEEP_CENSUS` /
+> `DBG_WATCHREF` run is testing a DIFFERENT young sweep. Reproduce first with no
+> flags; only then instrument. This is also a live candidate for why
+> `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md` went from ~40%
+> reproduction to 0/18 "the next day on current dev + instrumentation" and
+> concluded the host had changed.
+
+**Round 2, uninstrumented — `failed=0` in 8 of 8** runs of the exact shape that
+produced it (25 threads x 1000 rows, release binary, `--Xmx 1g`, **no debug
+flags at all**), wall 43.7-130.2 s, host load falling 63 -> 16 across the set.
+This one does exercise the real 8-worker parallel sweep, so unlike round 1 it is
+a valid negative.
+
+It is still **not** a claim that the bug is fixed. The original was ONE
+occurrence in one run; eight clean runs of a rare event is weak evidence of
+absence, and no positive control was run to prove the probe's error path still
+fires on this binary — a silent canary and a clean run look identical
+(the probe does print `first error:` plus a stack, and did so on the original
+occurrence, but that is not the same as demonstrating it on THIS build).
+
+The residual belongs to the array-receiver dispatch family tracked on
+`bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`,
+not to this page's throughput subject — it was only ever noted here in passing.
+If it recurs, the most likely home is the open premature-reclamation bug in the
+non-moving young sweep
+(`docs/known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`),
+whose signature — a live object's header reading back as something else — is the
+same family. **Reproduce it with no flags first**; the diagnostic that page
+recommends is the one that voided round 1 here.
 
 ## Bugs found while investigating
 
