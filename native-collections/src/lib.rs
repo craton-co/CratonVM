@@ -3858,7 +3858,20 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // Family-1 fix (cce0079): pin the snapshot vector's elements — a GC
         // triggered by any iteration's `equals()` leaves the LATER raw
         // `Vec` slots stale.
-        let elems = collect_collection_elements(ctx, this);
+        //
+        // 2026-08-01 (collections-interception audit): use the wrapper, not the
+        // bare `collect_collection_elements`. This native is registered on
+        // `java/util/AbstractCollection.contains`, and `AbstractCollection` is
+        // the base whose *documented* minimal subclass contract is "implement
+        // `iterator()` and `size()`" — i.e. exactly the receivers whose layout
+        // no heuristic here models. The bare collector returns an empty `Vec`
+        // for those, so `contains` answered a flat `false` for every element of
+        // such a collection: not a crash, a plausible wrong answer. The wrapper
+        // asks the receiver's own `size()` and falls back to its real
+        // `iterator()`. No recursion risk: the `iterator()` native snapshots
+        // through `collect_collection_elements`, which never drives
+        // `iterator()`, and never calls `contains`.
+        let elems = al_or_collection_elements(ctx, this);
         let (pin_base, handles) = pin_value_slice(ctx, &elems);
         let th = pin_value(ctx, target);
         let mut target = target;
@@ -3944,36 +3957,18 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let mut elems = al_or_collection_elements(ctx, this);
-    if heuristic_snapshot_is_suspect(ctx, this, &elems) {
-        // Null holes from a foreign non-List backing array (see
-        // `heuristic_snapshot_is_suspect`). `toArray` is not on the iterator
-        // native's path, so the real `iterator()` is safe to drive here.
-        let real = collect_via_real_iterator_once(ctx, this);
-        if !real.is_empty() {
-            elems = real;
-        }
-    }
-    if elems.is_empty() {
-        // `collect_collection_elements` only knows fixed collection layouts and
-        // returns empty for any other Collection — but this native is also
-        // registered on `AbstractCollection.toArray()`, so it intercepts
-        // *every* Collection, including custom user/library subclasses (e.g.
-        // ByteBuddy's `TypeList$Generic$Explicit`, which backs the interface
-        // list of every generated class). For those, `toArray()` must honour
-        // the real `Collection` contract — drive the real `iterator()`. Unlike
-        // `collect_collection_elements` (called BY the iterator native, hence
-        // can't iterate without recursing), `toArray` is not on the iterator
-        // native's path, so this is safe. Guard on a non-zero real `size()` so
-        // genuinely-empty collections skip the extra invokes.
-        let real_size = match ctx.invoke_virtual(this, "size", "()I", &[]) {
-            Ok(Some(Value::Int(n))) => n,
-            _ => 0,
-        };
-        if real_size > 0 {
-            elems = collect_via_real_iterator(ctx, this);
-        }
-    }
+    // `collect_collection_elements` only knows fixed collection layouts and
+    // returns empty for any other Collection — but this native is also
+    // registered on `AbstractCollection.toArray()`, so it intercepts *every*
+    // Collection, including custom user/library subclasses (e.g. ByteBuddy's
+    // `TypeList$Generic$Explicit`, which backs the interface list of every
+    // generated class). For those, `toArray()` must honour the real
+    // `Collection` contract — drive the real `iterator()`. That fallback, and
+    // the null-hole guard that used to be inlined here, now live in
+    // `al_or_collection_elements` so the `toArray(T[])`, `toArray(IntFunction)`,
+    // `forEach` and `stream` natives — which are intercepting the very same
+    // receivers — get them too.
+    let elems = al_or_collection_elements(ctx, this);
     // GC-SAFETY: `elems` contains bare object refs collected before the
     // result array allocation. `alloc_ref_array` can trigger a moving GC;
     // pin and refresh every object element before storing it into the new
@@ -4077,16 +4072,71 @@ fn heuristic_snapshot_is_suspect(
     !obj_is_instance_of(ctx, coll, "java/util/List")
 }
 
-/// Read elements for the `toArray` / `forEach` natives. These are registered on
-/// `AbstractCollection`, so they also intercept non-ArrayList collections
-/// (EnumSet/TreeSet/...). `al_state` cannot be trusted to return `None` for
-/// those — for a `RegularEnumSet` it reports an empty ArrayList (size 0), which
-/// made `EnumSet.allOf(...).toArray()`/`forEach`/`new ArrayList<>(enumSet)` all
-/// see zero elements. Delegate to `collect_collection_elements`, whose
-/// ArrayList-layout heuristics handle the fast path and whose iterator fallback
-/// materialises everything else through the real `iterator()`.
+/// Read elements for the `toArray` / `forEach` / `stream` natives. These are
+/// registered on `java/util/AbstractCollection` (and on the `Collection` /
+/// `List` interfaces), so they intercept **every** Collection that does not
+/// declare its own override — JDK, third-party and user subclasses alike.
+/// `al_state` cannot be trusted to return `None` for those: for a
+/// `RegularEnumSet` it reports an empty ArrayList (size 0), which made
+/// `EnumSet.allOf(...).toArray()`/`forEach`/`new ArrayList<>(enumSet)` all see
+/// zero elements.
+///
+/// [`collect_collection_elements`] alone is NOT enough, and its own closing
+/// comment says so: it must never drive `iterator()`, because the
+/// `Iterable`/`Collection` `iterator()` native snapshots *through* it and would
+/// recurse — so a layout it does not hand-model materialises as an EMPTY `Vec`
+/// there, and "empty" is indistinguishable from "genuinely empty". Supplying
+/// the fallback is this wrapper's job. Every caller of this wrapper
+/// (`toArray()`, `toArray(T[])`, `toArray(IntFunction)`, `forEach`, `stream`)
+/// is off the iterator native's path, so driving the receiver's real
+/// `iterator()` from here is safe.
+///
+/// **2026-08-01 (collections-interception audit).** Until this change the
+/// fallback lived inside `native_al_to_array` only. The zero-arg `toArray()`
+/// therefore answered correctly for an unmodelled receiver while
+/// `toArray(T[])`, `toArray(IntFunction)`, `forEach` and `stream` silently
+/// answered EMPTY for the *same* receiver — e.g. `coll.toArray(new T[0])` over
+/// a user `class X extends AbstractCollection` (which only has to implement
+/// `iterator()` and `size()`) returned a zero-length array rather than the
+/// elements, and `x.forEach(...)` visited nothing. The doc comments on
+/// `native_al_to_array_typed`, `native_al_for_each` and `native_al_stream`
+/// already claimed this fallback existed; now it does.
+///
+/// Ordering mirrors what `native_al_to_array` did, so the zero-arg path keeps
+/// its exact behaviour:
+/// 1. heuristic snapshot; if it looks suspect (null holes in a non-`List`),
+///    prefer a re-entrancy-guarded real-iterator walk;
+/// 2. if the heuristics found nothing, ask the receiver's own `size()` — it is
+///    not shadowed on `AbstractCollection` (`size()` is abstract there, so the
+///    dispatch walk stops at the subclass's own bytecode) — and only pay for a
+///    real-iterator walk when it reports a non-empty collection.
 fn al_or_collection_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
-    collect_collection_elements(ctx, this)
+    // GC-safety: every step below can run arbitrary Java (`invoke_virtual`),
+    // which may complete a moving young collection and leave `this` stale.
+    let this_pin = ctx.pin_native_root(this);
+    let mut elems = collect_collection_elements(ctx, this);
+    let this = ctx.read_native_pin(this_pin, this);
+    if !elems.is_empty() {
+        if heuristic_snapshot_is_suspect(ctx, this, &elems) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let real = collect_via_real_iterator_once(ctx, this);
+            if !real.is_empty() {
+                elems = real;
+            }
+        }
+        ctx.unpin_native_roots(this_pin);
+        return elems;
+    }
+    let real_size = match ctx.invoke_virtual(this, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n,
+        _ => 0,
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    if real_size > 0 {
+        elems = collect_via_real_iterator(ctx, this);
+    }
+    ctx.unpin_native_roots(this_pin);
+    elems
 }
 
 /// `ArrayList.toArray(T[])` / `AbstractCollection.toArray(T[])` —
@@ -13262,6 +13312,9 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Use the generic helper so non-ArrayList collections (EnumSet/TreeSet/…)
     // routed here through the AbstractCollection/Iterable interface natives are
     // materialised via their real iterator instead of seeing an empty backing.
+    // (Before 2026-08-01 the helper had no such fallback — this comment
+    // described `native_al_to_array`'s inlined copy of it, not what `forEach`
+    // actually did, so an unmodelled receiver's `forEach` visited nothing.)
     let elems = al_or_collection_elements(ctx, this);
     // GC-safety: each `accept()` body runs arbitrary Java bytecode via
     // invoke_virtual and can allocate → moving young GC relocates `action` and
@@ -17472,7 +17525,9 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // non-ArrayList collection like RegularEnumSet, so the old `Some` branch
     // produced an empty stream for `enumSet.stream()`. Use the generic helper,
     // whose ArrayList heuristics keep the fast path and whose iterator fallback
-    // walks EnumSet/TreeSet/foreign collections.
+    // walks EnumSet/TreeSet/foreign collections. (That iterator fallback only
+    // became real on 2026-08-01 — see `al_or_collection_elements`; until then
+    // `stream()` over an unmodelled foreign collection was silently empty.)
     // As for HashSet.stream(), never carry an unrooted Rust snapshot across
     // stream/array allocation: a moving GC may forward every list element and
     // turn the stale refs into unrelated Objects. This is particularly visible
@@ -19409,7 +19464,25 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     // Some real-JDK interface dispatch paths can arrive with a tagged
     // synthetic Collector whose runtime class has collapsed to Object. Keep
     // the standard Collector contract methods available under Object as a
-    // defensive bridge; the callbacks still validate the receiver layout/tag.
+    // defensive bridge.
+    //
+    // CAVEAT (collections-interception audit, 2026-08-01) — this comment used
+    // to end "…; the callbacks still validate the receiver layout/tag", and
+    // that is NOT true of these four: `make_collector_fn` wraps whatever
+    // receiver it is handed, unconditionally. `java/lang/Object` is the
+    // universal base, so the dispatch walk reaches these for ANY receiver that
+    // is sent `supplier()`/`accumulator()`/`finisher()`/`combiner()` and whose
+    // own class and every superclass leave it undeclared — including a receiver
+    // whose implementation is an interface DEFAULT method, which the walk has
+    // not consulted yet. Validation does happen, but one call later and only
+    // partially: the SAM natives (`native_collfn_supplier_get` and friends)
+    // check `collector_tag_of` and degrade to an empty list/map rather than
+    // failing. See `docs/known-issues/collections-interception.md`, Residual 1.
+    // Left as-is deliberately: there is no way for a native to decline a call
+    // (`MethodCallResult` has no "not handled" arm), so the only fail-closed
+    // options are to throw — which would break any legitimate default-method
+    // receiver — or to drop these four registrations, which needs the
+    // collapsed-to-Object Collector path re-tested first.
     r.register(
         "java/lang/Object",
         "supplier",
@@ -32429,10 +32502,17 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
 /// methods), which the vintage engine relies on for discovery.
 ///
 /// Driving `toArray()` (not `iterator()`) keeps this recursion-safe: the only
-/// native `toArray()` can reach is `native_al_to_array`, which calls
-/// `collect_collection_elements` — NOT this wrapper — so there is no cycle.
-/// The `size() > 0` guard means a genuinely empty (or unrecognised-and-empty)
+/// native `toArray()` can reach is `native_al_to_array`, which since
+/// 2026-08-01 collects through the *other* wrapper, `al_or_collection_elements`
+/// — never through this one — so there is still no cycle, only one more
+/// virtual call on the deepest path (`toArray()` → `iterator()`). The
+/// `size() > 0` guard means a genuinely empty (or unrecognised-and-empty)
 /// collection never triggers the extra virtual calls.
+///
+/// Callers: the copy constructors, `addAll`, `removeAll`, `retainAll`,
+/// `containsAll` and `AbstractSet.hashCode`. All read a collection passed as an
+/// ARGUMENT, never the receiver of an element-reading native, which is why
+/// driving the argument's own `toArray()` from here cannot re-enter.
 fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
     let elems = collect_collection_elements(ctx, coll);
     if !elems.is_empty() {
@@ -33038,7 +33118,13 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let coll_elems = collect_collection_elements(ctx, coll);
+    // `_or_real`, not the bare heuristic reader: `coll` is an arbitrary
+    // caller-supplied Collection, and the bare reader answers EMPTY for any
+    // layout it does not hand-model — which made `removeAll(foreignCollection)`
+    // a silent no-op that still reported `false`. (The wrapper's own doc listed
+    // `removeAll`/`retainAll` as callers before they were; fixed 2026-08-01
+    // with the `AbstractCollection` interception audit.)
+    let coll_elems = collect_collection_elements_or_real(ctx, coll);
     let (data, size) = al_state(ctx, this);
     let buf = match data {
         Some(b) => b,
@@ -33128,7 +33214,10 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // ANY Map's values() view, not just Properties') found 2026-07-26 while
     // auditing Properties.values() liveness. See properties-keyset-view-not-live.md.
     let view_src = values_view_source(ctx, this);
-    let coll_elems = collect_collection_elements(ctx, coll);
+    // `_or_real` — see `native_al_remove_all`. A `retainAll` that reads the
+    // argument as empty is worse than a no-op: it retains nothing and clears
+    // the receiver.
+    let coll_elems = collect_collection_elements_or_real(ctx, coll);
     let (data, size) = al_state(ctx, this);
     let buf = match data {
         Some(b) => b,
@@ -33358,7 +33447,10 @@ fn native_ll_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elems = collect_collection_elements(ctx, coll);
+    // `_or_real` — see `native_al_remove_all`. `native_al_add_all` already used
+    // it; this sibling did not, so `linkedList.addAll(foreignCollection)` added
+    // nothing and reported `false`.
+    let elems = collect_collection_elements_or_real(ctx, coll);
     if elems.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
@@ -33386,7 +33478,9 @@ fn native_ad_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elems = collect_collection_elements(ctx, coll);
+    // `_or_real` — see `native_al_remove_all`. Same gap as `native_ll_add_all`:
+    // `arrayDeque.addAll(foreignCollection)` added nothing.
+    let elems = collect_collection_elements_or_real(ctx, coll);
     if elems.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
