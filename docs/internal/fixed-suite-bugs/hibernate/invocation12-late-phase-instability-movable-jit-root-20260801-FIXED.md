@@ -2,7 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **FIXED** 2026-08-01 — `fix/hib-gcoverhead-halffull-20260731`, commit `404270d2e`. Verified 3 runs for 3 at `132/132 failed=0`, matching HotSpot exactly. |
+| **Status** | ✅ **The relocation hazard below is FIXED** 2026-08-01 — `fix/hib-gcoverhead-halffull-20260731`, commit `404270d2e`. Verified 3 runs for 3 at `132/132 failed=0` against base `32f9db9a2`. |
+| **⚠️ Caveat** | That 3-for-3 does **not** hold against the `origin/dev` tip of 2026-08-01, and neither does any other arm's — see [Residual](#residual-the-class-is-intermittently-unstable-in-every-arm). The class is intermittently unstable there whatever the collector does. The hazard fixed here is real and independently argued; it is **not** the whole of that instability. |
 | **ID** | `HIB-ANNOTATEDELEMENT-NOCODE.1` (filed under that name when only one of its four faces had been seen) |
 | **Found** | 2026-07-31, in the first CratonVM run of the class that ever reached its own end — which only became possible once `HIB-GCOVERHEAD-HALFFULL.1` was fixed. |
 
@@ -109,6 +110,42 @@ not the diagnostic — running the same class with `CRATONVM_NO_SELECTIVE_PROMOT
 to ask "does this survive the collector change?", which answered *no, it predates
 it*, and pointed the search at what selective promotion is allowed to move rather
 than at annotation dispatch.
+
+## Residual: the class is intermittently unstable in every arm
+
+Re-verifying after merging `origin/dev` @ `cc8167f94` showed the 3-for-3 above
+does not survive that tip — and, importantly, **nothing else does either**:
+
+| arm | runs | outcome |
+|---|---|---|
+| pure `origin/dev` (old gate, so no promotion) | 5 | 4 clean; 1 × `ServiceConfigurationError` at inv#5, run aborted at 50 tests |
+| merged + `CRATONVM_NO_SELECTIVE_PROMOTE=1` | 3 | 1 clean; 1 × **6** failures at 54 tests; 1 × 1 failure at 11 tests |
+| merged + the fixes on this branch | 4 | 2 × clean `132/132`; 1 × `132/132 failed=0` then SIGSEGV in teardown; 1 × early `capacity overflow` panic |
+| base `32f9db9a2` + the fixes on this branch | 3 | 3 × clean `132/132` |
+
+Read the rows against each other, not individually:
+
+* The instability is **in every arm**, including collectors that never promote at
+  all. It is therefore not caused by restoring the drain, and not caused by the
+  movable-root bound.
+* The promotion-ON arm is the only one where **every run that completed its plan
+  reported all 132 tests passing**. Both promotion-OFF arms produced real test
+  failures and truncated runs. On outcomes, the fixes help.
+* The two promotion-ON crashes are in the *tail*: one after all 132 tests had
+  passed (during teardown, before `testPlanExecutionFinished`), one early and
+  never reproduced in 6 further runs of the same binary.
+
+So: the specific hazard this document describes is fixed and the argument for
+fixing it stands on its own (relocating a root on the word of a proof that just
+failed is wrong regardless). But the class-level "it passes now" claim is
+retracted for the `dev` tip. The remaining instability is a **separate, older,
+still-open** fault whose faces include `ServiceConfigurationError` on
+`BytecodeProviderImpl`, truncated test counts, and teardown segfaults, and which
+predates this branch.
+
+Do not use this class as a regression gate for any of it — see the warning in
+`../../../known-issues/hibernate/README.md`. Use `probes/GcPromoteProbe.java`
+and the gc unit tests.
 
 ## Lesson
 

@@ -39,12 +39,15 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   force-added past the blanket `apps/` ignore, LF-pinned, self-reporting
   `overrides=N (loaded)`) — retired to
   `../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`.
-  **The class now PASSES on the JIT lane** — `132/132 failed=0`, 3 runs for 3,
-  identical to the HotSpot control — as of 2026-08-01. Getting there took three
-  VM fixes, because running it to completion for the first time disproved the
-  inherited "clean but slow, just needs a bigger timeout" premise: HotSpot does
-  it in 119.7 s on the same `-Xmx1500m`, while CratonVM failed in both modes,
-  for reasons now tracked on their own.
+  **Three real VM defects were found and fixed here**, and the class reached
+  `132/132 failed=0` three runs for three against base `32f9db9a2` — but it is
+  **not green on the `dev` tip**, and neither is any other collector arm. A
+  fourth, older fault remains: the class is
+  [intermittently unstable in every arm](defaultcatalogandschema-late-phase-instability-20260801.md),
+  including on `dev` with no local changes at all. Running it to completion for
+  the first time disproved the inherited "clean but slow, just needs a bigger
+  timeout" premise: HotSpot does it in 119.7 s on the same `-Xmx1500m`, while
+  CratonVM failed in both modes, for reasons now tracked on their own.
 
   ⚠️ **Do not use this class to re-check any of those fixes.** It has stopped
   discriminating: it also passes `132/132` on a `dev` tip that still carries the
@@ -68,11 +71,12 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
     "movable" precise-JIT roots on cycles whose coverage proof had *failed*.
     Also **FIXED**, retired to
     [`../../internal/fixed-suite-bugs/hibernate/invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/invocation12-late-phase-instability-movable-jit-root-20260801-FIXED.md).
-    With both fixes the class runs **`132/132 failed=0`, 3 runs for 3** —
-    identical to the HotSpot control.
+    With both fixes the class reaches **`132/132 failed=0`, 3 runs for 3**
+    against base `32f9db9a2` — but see the late-phase instability doc above
+    before treating that as green on the `dev` tip.
 
-    One residual, unchanged and not a regression: ~35–50 min against HotSpot's
-    120 s. That part *is* the
+    A throughput residual, unchanged and not a regression: ~35–50 min against
+    HotSpot's 120 s. That part *is* the
     [moving-young-inert-under-JIT](moving-young-inert-under-jit-throughput-tax-20260730.md)
     throughput tax, and it stays there.
   - `--nojit` — [the collector leaves reference fields UN-FORWARDED](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md).
