@@ -13633,7 +13633,11 @@ pub extern "C" fn jit_ldc_string(vm_ptr: i64, bytes: *const u8, len: usize) -> i
 pub unsafe extern "C" fn jit_safepoint_slow_path() {
     static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     crate::jit::conservative_roots::note_jit_boundary();
-    let Some(vm) = crate::native::jni::process_vm() else {
+    // STRICT: parking against another VM's stop-the-world barrier is a hang
+    // or worse, while declining to park only leaves this one poll
+    // ineffective. With a single VM — every production configuration
+    // today — this resolves exactly as it always did.
+    let Some(vm) = crate::native::jni::process_vm_strict() else {
         return;
     };
     if let Some((thread, _guard)) = jit_thread_mut() {
