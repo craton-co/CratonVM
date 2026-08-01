@@ -104,12 +104,26 @@ public class ROverlaySystemGcStress {
         // the same path `--nojit` application code takes.
         final boolean explicitGc = args.length <= 2 || !"0".equals(args[2]);
         final int churnPerRound = explicitGc ? 512 : 20000;
+        // Retained ballast, in 4 KiB blocks. A minor GC alone cannot express the
+        // same-cycle-major-GC defect this probe exists for: Phase 5 only
+        // compacts once old gen crosses 75 % occupancy, and at any ordinary heap
+        // size the bundles above never get old gen anywhere near that
+        // (`CRATONVM_DBG_MIRRORPIN=1` reports `will_run_major=false` for every
+        // cycle). Default 0 so the suite run stays quick; pass a count with a
+        // small -Xmx to actually reach a compacting cycle.
+        final int ballastBlocks = args.length > 3 ? Integer.parseInt(args[3]) : 0;
 
         // Every bundle stays reachable for the whole run, so each explicit
         // collection ages it one step closer to promotion — the promoting
         // cycle is the one that matters, and it has to also be a System.gc().
         List<Bundle> live = new ArrayList<>();
-        long churn = 0;
+        List<byte[]> ballast = new ArrayList<>();
+        for (int i = 0; i < ballastBlocks; i++) {
+            byte[] block = new byte[4096];
+            block[0] = (byte) i;
+            ballast.add(block);
+        }
+        long churn = ballast.size();
         for (int r = 0; r < rounds; r++) {
             live.add(new Bundle(r, width));
 
@@ -131,7 +145,8 @@ public class ROverlaySystemGcStress {
         }
 
         System.out.println("CK rounds=" + rounds + " width=" + width
-                + " bundles=" + live.size() + " churn=" + (churn > 0));
+                + " bundles=" + live.size() + " ballast=" + ballast.size()
+                + " churn=" + (churn > 0));
         System.out.println("PASS ROverlaySystemGcStress (" + checks + " checks)");
     }
 }
