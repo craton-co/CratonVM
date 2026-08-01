@@ -867,6 +867,21 @@ fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     //    the first object seen for this hash: allocate a fresh, never-recycled
     //    generation (NOT `slots.len()`, which could re-issue a generation a live
     //    or just-pruned slot still owns) so the newcomer never aliases an entry.
+    //
+    // DIAGNOSTIC (`CRATONVM_DBG_OBJKEY=1`): reaching here for an object that is
+    // NOT new hands it a fresh, EMPTY overlay — a populated collection silently
+    // reads back as size 0, with no dangling pointer and nothing for the
+    // heap/overlay verifiers to find. Distinguishing that from a premature free
+    // is the first fork in diagnosing any "collection lost its contents"
+    // report, so log the inputs that decide it.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OBJKEY").is_some() && !slots.is_empty() {
+        eprintln!(
+            "[objkey] FRESH generation for hash=0x{hash:x} ptr=0x{ptr:x} class_id={class_id} \
+             — {} existing slot(s), none matched (mine={mine_count}); \
+             any overlay state under the old key is now unreachable",
+            slots.len(),
+        );
+    }
     let generation = next_generation(slots);
     slots.push(ObjKeyEntry {
         last_ptr: ptr,

@@ -2270,6 +2270,11 @@ fn process_references_after_gc(
         // is correct; the later `gc_update_collection_overlay_refs` remap
         // pass in `update_all_roots` only touches whatever prune left behind.
         cratonvm_gc::external_roots::prune_external_roots(&is_marked);
+        // Opt-in audit of what prune left behind: an overlay ref pointing at a
+        // reclaimed object. Here rather than in `update_all_roots` because that
+        // early-returns on an empty `pointer_map`, i.e. never runs on the
+        // non-moving sweep — the path a `System.gc()` takes.
+        crate::memory::gc::audit_overlay_refs(shared);
         // Companion reconciliation for the class-mirror cache — see
         // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6. Same
         // "before the no_refproc short-circuit" rationale: the cache must
