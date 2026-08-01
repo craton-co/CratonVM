@@ -170,8 +170,8 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     {
         let statics = shared.classes.statics.read();
         for (&class_id, fields) in statics.iter() {
-            for val in fields {
-                if let Value::Object(Some(obj_ref)) = val {
+            for val in fields.iter() {
+                if let Value::Object(Some(obj_ref)) = *val {
                     if conditional_metadata
                         && shared
                             .mem
@@ -188,7 +188,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                             continue;
                         }
                     }
-                    roots.push(*obj_ref);
+                    roots.push(obj_ref);
                 }
             }
         }
@@ -1008,7 +1008,10 @@ mod tests {
             let mut statics = shared.classes.statics.write();
             statics.insert(
                 ClassId::new(1),
-                vec![Value::Object(Some(obj)), Value::Int(0)],
+                crate::vm::realms::class_realm::StaticsBlock::from_values(vec![
+                    Value::Object(Some(obj)),
+                    Value::Int(0),
+                ]),
             );
         }
 

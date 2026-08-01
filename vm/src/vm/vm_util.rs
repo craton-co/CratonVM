@@ -2193,7 +2193,12 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
         }
     }
 
-    shared.classes.statics.write().insert(class_id, statics);
+    // Publish to the lock-free index BEFORE inserting into the map, so a
+    // concurrent reader either sees nothing (and takes the locked path, which
+    // blocks on the write below) or sees a fully-populated block.
+    let block = crate::vm::realms::class_realm::StaticsBlock::from_values(statics);
+    shared.classes.statics_index.publish(class_id, &block);
+    shared.classes.statics.write().insert(class_id, block);
     Ok(())
 }
 
