@@ -1060,15 +1060,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(list))))
         },
     );
-    r.register(
-        fs_class,
-        "newWatchService",
-        "()Ljava/nio/file/WatchService;",
-        |ctx, _args| {
-            let ws = alloc_concurrent_synthetic(ctx, "java/nio/file/WatchService", 1);
-            Ok(Some(Value::Object(Some(ws))))
-        },
-    );
+    // NOTE: `FileSystem.newWatchService()` is registered ONCE, in
+    // `native-io`'s `register_watch_service` (`native_ws_new`) — the only
+    // implementation that allocates the 3-field receiver the WatchService
+    // natives read (regs / count / open) AND starts a platform watcher. Two
+    // stubs used to be registered here as well, one handing back a 1-field and
+    // one a 0-field bare object; whichever registered last won, so the live
+    // receiver had no `open` slot at all. Every `poll`/`register` on it then
+    // read out of bounds (the GC guard dropped the read) and reported
+    // "WatchService is closed" — the cascade behind the whole
+    // `FileWatcherTests` failure set. Do not re-add a stub here.
 
     r.register(
         fs_class,
@@ -6545,15 +6546,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     // --- FileSystem additional methods ---
     let fsys = "java/nio/file/FileSystem";
-    r.register(
-        fsys,
-        "newWatchService",
-        "()Ljava/nio/file/WatchService;",
-        |ctx, _args| {
-            let ws = alloc_concurrent_synthetic(ctx, "java/nio/file/WatchService", 0);
-            Ok(Some(Value::Object(Some(ws))))
-        },
-    );
+    // `newWatchService` deliberately NOT registered here — see the note at the
+    // other `fs_class` registration block above; `native_ws_new` in native-io
+    // is the single implementation.
 
     r.register(
         fsys,
