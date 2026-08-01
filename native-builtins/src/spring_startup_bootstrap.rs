@@ -1022,8 +1022,14 @@ fn cache_get_configuration_property_names(
         Some(Value::Object(Some(o))) => Some(*o),
         _ => None,
     };
+    // `data` is a reference field, so `matches!(.., Value::Object(None))` is
+    // NOT a null test: `get_field_by_name` is not descriptor-aware and answers
+    // `Value::Int(0)` for an unwritten reference slot, which fails that match
+    // and so reports the field as non-null. `ref_field_is_null` reads by
+    // resolved index and covers null, unwritten and absent alike.
+    // See `docs/known-issues/by-name-field-reads.md`.
     let data_is_null = match this {
-        Some(t) => matches!(ctx.get_field_by_name(t, "data"), Value::Object(None)),
+        Some(t) => crate::field_read::ref_field_is_null(ctx, t, "data"),
         None => true,
     };
     if data_is_null {

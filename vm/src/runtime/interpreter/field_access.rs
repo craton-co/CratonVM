@@ -10,7 +10,16 @@
 use super::*;
 
 
-pub(super) fn resolve_field_ref(
+/// Resolve a constant-pool field reference.
+///
+/// **This is the resolution core, not the public entry point.** New callers
+/// outside `crate::runtime::interpreter` go through
+/// [`crate::runtime::resolve::MemberResolver::field_ref`], which tags the
+/// answer with the VM that produced it and converts failures into the
+/// structured [`crate::runtime::resolve::ResolveError`]. It is `pub(crate)`
+/// only so that `MemberResolver` can delegate here; `runtime::resolve::guard`
+/// fails the build if anything else names it.
+pub(crate) fn resolve_field_ref(
     shared: &SharedVm,
     current_class_id: ClassId,
     cp_index: u16,
@@ -280,117 +289,43 @@ pub(super) fn resolve_field_in_class(
     // `resolve_method_ref` already documents and follows this rule
     // ("Drop the read lock before acquiring write lock"); mirror it here:
     // resolve under `cm`, DROP it at block end, then cache + return.
-    let own_resolved = {
+    //
+    // C2 P0 — the own-fields scan, the superclass/superinterface walk, the JPMS
+    // access check and both FIELD-TRACE diagnostics that used to be written out
+    // twice here now live in `runtime::resolve::MemberResolver::locate_field`.
+    // The trace moved with them because only `locate_field` knows which of the
+    // two search paths produced the answer; keeping the second trace here would
+    // have had to guess from `declaring_class_id`, and would have guessed wrong
+    // for a field the recursive walk finds on the owner itself. Both messages,
+    // and the conditions that emit them, are unchanged.
+    //
+    // This function keeps the parts that are genuinely its own: the `cm` guard
+    // (so the lock order at this call site is unchanged — `locate_field`
+    // borrows the guard rather than taking its own) and the
+    // `(current_class_id, cp_index)` cache write, which must happen with `cm`
+    // DROPPED per the ABBA note above.
+    //
+    // `AccessPolicy::ModuleOnly` is exactly what the two inlined checks did:
+    // `check_module_access_by_id` and nothing else. Member access (private /
+    // protected / package-private) is still not enforced on the bytecode path
+    // — see `classloading::access_control`'s module docs. Naming the policy
+    // does not change it.
+    let resolved = {
         let cm = shared.classes.class_manager.read();
-        let mut found: Option<ResolvedField> = None;
-        if let Some(class) = cm.get_class(field_class_id) {
-            let mut static_idx = 0usize;
-            let mut instance_idx = 0usize;
-            for f in &class.fields {
-                if &*f.name == field_name.as_str() {
-                    let (declaring_id, index, is_static) = if f.is_static() {
-                        (field_class_id, static_idx, true)
-                    } else {
-                        (
-                            field_class_id,
-                            class.first_field_index + instance_idx,
-                            false,
-                        )
-                    };
-                    // Module access check (JPMS §5.4.4)
-                    crate::classloading::access_control::check_module_access_by_id(
-                        current_class_id,
-                        declaring_id,
-                        &cm,
-                    )?;
-
-                    let is_ref = f.descriptor.starts_with('L') || f.descriptor.starts_with('[');
-                    if cratonvm_types::flags::runtime_var("CRATON_FIELD_TRACE").is_ok()
-                        && !is_static
-                        && index >= class.num_total_fields
-                    {
-                        eprintln!("[FIELD-TRACE] OOB resolve(own): decl={} field={} field_index={} num_total_fields={} first_field_index={}",
-                            class.name, field_name, index, class.num_total_fields, class.first_field_index);
-                    }
-                    found = Some(ResolvedField {
-                        declaring_class_id: declaring_id,
-                        field_index: index,
-                        is_static,
-                        is_volatile: f.is_volatile(),
-                        is_reference: is_ref,
-                        desc_byte: f.descriptor.as_bytes().first().copied().unwrap_or(0),
-                    });
-                    break;
-                }
-                if f.is_static() {
-                    static_idx += 1;
-                } else {
-                    instance_idx += 1;
-                }
-            }
-        }
-        found
-    };
-    if let Some(resolved) = own_resolved {
-        shared.classes.resolution_cache.write().put_field(
-            current_class_id,
-            cp_index,
-            resolved.clone(),
-        );
-        return Ok(resolved);
-    }
-
-    // Walk the superclass chain for inherited fields
-    let (idx, is_static, is_volatile, declaring_id, is_ref, desc_byte) = {
-        let cm = shared.classes.class_manager.read();
-        let (field_idx, field, decl_id) =
-            find_field_recursive(field_class_id, &field_name, &cm.class_store).ok_or_else(
-                || {
-                    VmError::Linkage(LinkageError::NoSuchFieldError {
-                        class_name: field_class_name,
-                        field_name: field_name.clone(),
-                    })
-                },
-            )?;
-
-        // Module access check (JPMS §5.4.4)
-        crate::classloading::access_control::check_module_access_by_id(
-            current_class_id,
-            decl_id,
+        let resolver = crate::runtime::resolve::MemberResolver::new(shared);
+        let accessor = resolver.scope(current_class_id);
+        let owner = resolver.scope(field_class_id);
+        let scoped = resolver.locate_field(
             &cm,
+            accessor,
+            owner,
+            &field_class_name,
+            &field_name,
+            crate::runtime::resolve::AccessPolicy::ModuleOnly,
         )?;
-
-        // Extract what we need before dropping the lock
-        let is_ref = field.descriptor.starts_with('L') || field.descriptor.starts_with('[');
-        let desc_byte = field.descriptor.as_bytes().first().copied().unwrap_or(0);
-        (
-            field_idx,
-            field.is_static(),
-            field.is_volatile(),
-            decl_id,
-            is_ref,
-            desc_byte,
-        )
+        resolver.adopt(scoped)?
     };
 
-    let resolved = ResolvedField {
-        declaring_class_id: declaring_id,
-        field_index: idx,
-        is_static,
-        is_volatile,
-        is_reference: is_ref,
-        desc_byte,
-    };
-    if cratonvm_types::flags::runtime_var("CRATON_FIELD_TRACE").is_ok() && !is_static {
-        let cm = shared.classes.class_manager.read();
-        let decl = cm.get_class(declaring_id);
-        let ntf = decl.map(|c| c.num_total_fields).unwrap_or(0);
-        let ffi = decl.map(|c| c.first_field_index).unwrap_or(0);
-        let dname = decl.map(|c| c.name.to_string()).unwrap_or_default();
-        if idx >= ntf {
-            eprintln!("[FIELD-TRACE] OOB resolve: decl={dname} field_index={idx} num_total_fields={ntf} first_field_index={ffi}");
-        }
-    }
     shared
         .classes
         .resolution_cache

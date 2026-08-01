@@ -3207,9 +3207,29 @@ pub(super) fn try_lambda_default_method_dispatch(
     .map(Some)
 }
 
+/// Key for the two thread-local dispatch caches below:
+/// `(vm_identity, proxy ClassId, receiver ClassId)`.
+///
+/// The `vm_identity` component is load-bearing, not decoration. A `ClassId` is
+/// unique only *within* one VM, and one OS thread can run bytecode in two VMs
+/// (the inline test modules build a `SharedVm` per test on one thread; a host
+/// thread can be attached to two `Vm`s). Keyed on the two `ClassId`s alone, a
+/// lookup in VM B hit VM A's entry for the numerically-equal ids and dispatched
+/// VM A's cached method body — or VM A's cached field index — against VM B's
+/// classes.
+///
+/// The `RedefineGate` does NOT catch that. Its staleness handle comes from the
+/// class manager of whichever VM populated the entry, so consulted from VM B it
+/// reports VM A's (unchanged) redefine generation and answers "fresh". The gate
+/// guards against redefinition, not against identity collision; only the key
+/// can do the latter.
+///
+/// See `docs/known-issues/vm-process-global-state-round-2.md`.
+type VmScopedClassPairKey = (usize, u32, u32);
+
 thread_local! {
     pub(super) static LAMBDA_IMPL_BYTECODE_CACHE: std::cell::RefCell<
-        rustc_hash::FxHashMap<(u32, u32), (Arc<CachedBytecodeMethod>, RedefineGate)>
+        rustc_hash::FxHashMap<VmScopedClassPairKey, (Arc<CachedBytecodeMethod>, RedefineGate)>
     > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
@@ -3220,7 +3240,7 @@ thread_local! {
 // lambda/accessor continues through the normal dispatch path.
 thread_local! {
     pub(super) static TDIGEST_DOUBLE_GET_FIELD_CACHE: std::cell::RefCell<
-        rustc_hash::FxHashMap<(u32, u32), (usize, RedefineGate)>
+        rustc_hash::FxHashMap<VmScopedClassPairKey, (usize, RedefineGate)>
     > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
@@ -3250,7 +3270,11 @@ pub(super) fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef,
         _ => return None,
     };
     let receiver_class_id = shared.mem.heap.class_id_of(receiver);
-    let key = (proxy_class_id.as_u32(), receiver_class_id.as_u32());
+    let key = (
+        shared.vm_identity,
+        proxy_class_id.as_u32(),
+        receiver_class_id.as_u32(),
+    );
     let field_index = TDIGEST_DOUBLE_GET_FIELD_CACHE
         .with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -3324,7 +3348,11 @@ pub(super) fn try_invoke_cached_lambda_impl(
     descriptor: &str,
     args: &[Value],
 ) -> Result<Option<Option<Value>>, MethodCallFailed> {
-    let key = (proxy_class_id.as_u32(), receiver_class_id.as_u32());
+    let key = (
+        shared.vm_identity,
+        proxy_class_id.as_u32(),
+        receiver_class_id.as_u32(),
+    );
     let cached = LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         match cache.get(&key) {
@@ -6470,6 +6498,48 @@ pub(crate) fn is_file_channel_impl_open_native_override(
         )
 }
 
+/// `FileSystemProvider`'s three link operations —
+/// `createSymbolicLink`/`createLink`/`readSymbolicLink`.
+///
+/// Same shape as the `newFileChannel` exemption further down this file: the
+/// real-JDK base class gives each of these a CONCRETE body that unconditionally
+/// throws `UnsupportedOperationException` (a concrete subclass is expected to
+/// override it). CratonVM's default provider is the synthetic instance stamped
+/// as the literal `java/nio/file/spi/FileSystemProvider` class, so there is no
+/// subclass to override anything and "real class bytes are authoritative" runs
+/// the throw. Without this exemption the natives registered in
+/// `native-builtins/src/phases_late/nio_file.rs` are unreachable and every
+/// `Files.createSymbolicLink` in the VM dies with a bare
+/// `UnsupportedOperationException` — see
+/// `docs/internal/fixed-suite-bugs/springboot/files-createsymboliclink-unsupported-FIXED.md`.
+///
+/// The real `sun.nio.fs.*` provider names are listed alongside the base for the
+/// same reason `newFileChannel` lists them: a cached dispatch site can carry a
+/// concrete receiver class name while the callback lives under the base name.
+///
+/// This is the single source of truth for the exemption: it is consulted by
+/// BOTH dispatch gates — [`force_native_over_real_jdk_bytecode`] and the
+/// `check_override` predicate in `vm_exec.rs::invoke_on_class_shared_inner`.
+pub(crate) fn is_file_system_provider_link_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "java/nio/file/spi/FileSystemProvider"
+            | "sun/nio/fs/WindowsFileSystemProvider"
+            | "sun/nio/fs/UnixFileSystemProvider"
+    ) && matches!(
+        (method_name, descriptor),
+        (
+            "createSymbolicLink",
+            "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)V"
+        ) | ("createLink", "(Ljava/nio/file/Path;Ljava/nio/file/Path;)V")
+            | ("readSymbolicLink", "(Ljava/nio/file/Path;)Ljava/nio/file/Path;")
+    )
+}
+
 pub(crate) fn is_input_stream_transfer_to_native_override(
     class_name: &str,
     method_name: &str,
@@ -8897,6 +8967,9 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     if is_file_channel_impl_open_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    if is_file_system_provider_link_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     if is_input_stream_transfer_to_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -9993,7 +10066,10 @@ pub(super) fn intercept_force_registered_native(
     // the forced call to that base registration explicitly so a cached
     // runtime receiver name cannot bypass it and run the JDK's deliberate
     // UnsupportedOperationException stub.
-    if method_name == "newFileChannel"
+    //
+    // `createSymbolicLink`/`createLink`/`readSymbolicLink` ride the same route
+    // for the same reason — see `is_file_system_provider_link_native_override`.
+    if (method_name == "newFileChannel"
         && method_descriptor
             == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;"
         && matches!(
@@ -10001,6 +10077,11 @@ pub(super) fn intercept_force_registered_native(
             "java/nio/file/spi/FileSystemProvider"
                 | "sun/nio/fs/WindowsFileSystemProvider"
                 | "sun/nio/fs/UnixFileSystemProvider"
+        ))
+        || is_file_system_provider_link_native_override(
+            class_name,
+            method_name,
+            method_descriptor,
         )
     {
         let cb = shared.natives.native_methods.find(
@@ -12202,7 +12283,7 @@ pub(super) fn try_stackless_invoke(
             frame.method_descriptor()
         );
     }
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
 
     Ok(CachedCallResult::FramePushed)
 }
@@ -13751,7 +13832,7 @@ pub(super) fn execute_invokestatic_cached(
                     frame.method_descriptor()
                 );
             }
-            push_frame_and_fire_entry(thread, frame);
+            push_frame_and_fire_entry(shared.vm_identity, thread, frame);
             Ok(CachedCallResult::FramePushed)
         }
         _ => Ok(CachedCallResult::CacheMiss),
@@ -15217,7 +15298,7 @@ pub(super) fn compile_osr_artifact(
                 + if osr_method_is_static { 0 } else { 1 };
             let (param_jvm_slots, param_slot_span) =
                 crate::jit::compute_param_jvm_slots(&method_descriptor, osr_method_is_static);
-            let helpers = crate::jit::helpers::build_helpers();
+            let helpers = crate::jit::helpers::build_helpers_for(shared);
             // HIB-CV-20 — seed the local-oop dataflow with this method's reference
             // PARAMETERS, exactly as the hot-path `jit::try_compile` does. The
             // legacy `x64::compile` wrapper hardcodes `param_oop_mask = 0`, so an
@@ -15257,6 +15338,12 @@ pub(super) fn compile_osr_artifact(
             // previously ran memory-homed. Opt out:
             // `CRATONVM_JIT_KERNEL_REG_OSR=0`.
             crate::jit::x64::set_kernel_reg_homes_osr_request(true);
+            // Stamp this artifact's install epoch from HERE, not from the
+            // `put_osr` below. This path calls the backend directly instead of
+            // going through `try_compile`, so without the witness it is stamped
+            // at finalize and a redefine that lands mid-compile would not be
+            // caught by the install barrier.
+            let _compile_epoch = cratonvm_jit::open_compile_epoch_witness();
             let mut cm = crate::jit::x64::compile_with_param_slots(
                 &code,
                 code_len,
@@ -15458,19 +15545,113 @@ pub(super) fn try_osr(
         entry_pc,
     )?;
 
-    // Convert interpreter locals to i64 for JIT frame (raw u64 → i64 reinterpret)
+    // Convert interpreter locals to i64 for JIT frame (raw u64 → i64 reinterpret),
+    // reading each slot's VTAG byte from the SAME snapshot as its word.
+    // `Frame::get_local_tag` exists precisely "for JIT/OSR interop"
+    // (`vm/src/runtime/frame.rs`) and was never actually passed to the JIT: until
+    // the validated entry landed, `osr_enter` took raw words with no types
+    // attached, so nothing compared the interpreter's idea of a slot against the
+    // compiled entry's. A `double` seeded into a GPR home, or a `long` seeded
+    // where the compiled body reads a reference, is a silent miscompile.
+    //
+    // Both halves must come from one uninterrupted read of the live frame, BEFORE
+    // `set_jit_thread`, so no intervening safepoint can retype a slot between its
+    // word and its tag. That is an invariant of the validated entry, not an
+    // accident of this call site — see `docs/jit/on-stack-replacement.md` §6.
     let frame = &thread.frames[frame_idx];
     let num_locals = frame.locals_len();
     let mut jit_locals = Vec::with_capacity(num_locals);
+    let mut jit_local_tags = Vec::with_capacity(num_locals);
     for i in 0..num_locals {
         jit_locals.push(frame.get_local_raw(i) as i64); // Cast: JIT ABI -- i64 register convention
+        jit_local_tags.push(frame.get_local_tag(i));
+    }
+    // The other invariant of §6: `OsrEntryState::pc` is the frame's CURRENT pc.
+    // Every back-edge site captures `entry_pc = frame.pc` after the branch was
+    // taken (`interpreter.rs`, 14 sites) and nothing between there and here moves
+    // it, so the entry bci and the "nothing ran" fallback bci are the same value —
+    // which is what makes a refusal cost no replay. Check it instead of trusting
+    // it: a future trigger passing some other pc must be refused, not silently
+    // entered at a bci the interpreter is not standing on.
+    if entry_pc != frame.pc {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
+            eprintln!(
+                "[cratonvm-osr] REFUSE {}.{}{} entry_pc={} != frame.pc={} \
+                 (OsrEntryState::pc must be the frame's current pc)",
+                &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, frame.pc
+            );
+        }
+        return None;
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
         eprintln!(
-            "[cratonvm-osr] enter {}.{}{} entry_pc={} num_locals={} locals={:?}",
-            &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, num_locals, jit_locals
+            "[cratonvm-osr] enter {}.{}{} entry_pc={} num_locals={} locals={:?} tags={:?}",
+            &*class_name_arc,
+            &*method_name_arc,
+            &*descriptor_arc,
+            entry_pc,
+            num_locals,
+            jit_locals,
+            jit_local_tags
         );
     }
+
+    // The interpreter's offer. The operand stack at a taken back-edge is empty by
+    // construction (the branch already consumed its operands); pass it explicitly
+    // so a future trigger at a bci with live operands is REFUSED
+    // (`osr-entry-operand-stack`) rather than silently truncated — `osr_trampoline`
+    // seeds locals only and has no stack-seeding path.
+    let osr_state = cratonvm_jit::OsrEntryState {
+        pc: entry_pc,
+        locals: &jit_locals,
+        local_tags: &jit_local_tags,
+        stack: &[],
+        stack_tags: &[],
+    };
+
+    // ADMISSION. `validate_osr_entry` type-checks every offered slot against the
+    // compiled entry's contract and — the part that matters for correctness —
+    // walks every deopt point the artifact can exit through, refusing the entry
+    // outright (`osr-entry-unresumable-exit`) when one of them reconstructs a
+    // frame the in-place transfer could not resume. Discovering that AFTER
+    // entering is useless: by then the body has committed iterations, and the only
+    // remaining options are to replay them (the recorded
+    // `jit-osr-bail-reruns-loop-iterations` defect) or to lose them.
+    //
+    // A refusal is free of side effects — the check reads metadata and these two
+    // slices, allocates one `Vec`, and never enters compiled code — so falling
+    // back to `entry_pc`, where the interpreter already is, replays nothing.
+    let plan = match compiled.validate_osr_entry(&osr_state) {
+        Ok(plan) => plan,
+        Err(b) => {
+            // Only an ARTIFACT-level verdict may be memoed: it is a pure function
+            // of a deterministic compile, so it reproduces for every future
+            // back-edge over this pc and re-running the pipeline can only reach it
+            // again. A state-dependent refusal (a slot's type, the local count,
+            // live operands) must NOT be memoed — the next trip over the back-edge
+            // carries different locals and may well be admissible.
+            let permanent = cratonvm_jit::osr_refusal_is_permanent(&b);
+            if permanent {
+                crate::jit::mark_osr_entry_rejected(
+                    &class_name,
+                    &method_name,
+                    &method_descriptor,
+                    entry_pc,
+                );
+            }
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] OSR-refuse {}.{}{} entry_pc={entry_pc} {b}{}",
+                    &*class_name_arc,
+                    &*method_name_arc,
+                    &*descriptor_arc,
+                    if permanent { " (memoed)" } else { "" }
+                );
+            }
+            // Nothing ran: keep interpreting THIS frame at `entry_pc`.
+            return None;
+        }
+    };
 
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
@@ -15490,8 +15671,12 @@ pub(super) fn try_osr(
         let _jit_root_guard =
             crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; jit_locals match the method's local variable layout at the OSR entry point.
-            unsafe { compiled.osr_enter(vm_ptr, &jit_locals, entry_pc, thread_ptr) }
+            // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point
+            // was validated; `plan` is the proof, obtained from
+            // `validate_osr_entry` on THIS artifact with THIS state just above, so
+            // every seeded slot's JVM type has been checked against the compiled
+            // entry's contract and `osr_state.locals` matches `osr_num_locals`.
+            unsafe { compiled.osr_enter_planned(vm_ptr, &osr_state, &plan, thread_ptr) }
         }));
         // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
         // that did not pop). Before this site's own guard drops, depth should be
@@ -15550,7 +15735,7 @@ pub(super) fn try_osr(
     // ~12696). Re-stashing preserves the exception across the
     // OSR→interpreter handoff without expanding the OSR signature
     // (`Option<Option<Value>>`, no error channel).
-    if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+    if let Some(exc) = crate::jit::helpers::take_jit_pending_exception(thread) {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
             let cid = shared.mem.heap.class_id_of(exc);
             let cname = shared
@@ -15594,7 +15779,7 @@ pub(super) fn try_osr(
         if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
             return None;
         }
-        crate::jit::helpers::stash_jit_pending_exception(exc);
+        crate::jit::helpers::stash_jit_pending_exception(thread, exc);
         return None;
     }
     if crate::jit::helpers::take_jit_pending_npe() {
@@ -15627,7 +15812,7 @@ pub(super) fn try_osr(
                     frame.stack.clear();
                     let _ = frame.stack.push(Value::Object(Some(exc_ref)));
                     frame.pc = handler_pc;
-                    fire_jvmti_exception_catch(frame, handler_pc);
+                    fire_jvmti_exception_catch(shared.vm_identity, frame, handler_pc);
                     return None;
                 }
                 // No in-frame handler. Propagate out of the OSR'd frame
@@ -15639,7 +15824,7 @@ pub(super) fn try_osr(
                 }
                 // Historical fallback (unreachable while RBC.6b holds): keep
                 // the NPE alive across the OSR→interpreter handoff.
-                crate::jit::helpers::stash_jit_pending_exception(exc);
+                crate::jit::helpers::stash_jit_pending_exception(thread, exc);
             }
             _ => {
                 // Couldn't construct a Java NPE object (e.g. rt.jar not
@@ -15677,7 +15862,7 @@ pub(super) fn try_osr(
                     frame.stack.clear();
                     let _ = frame.stack.push(Value::Object(Some(exc_ref)));
                     frame.pc = handler_pc;
-                    fire_jvmti_exception_catch(frame, handler_pc);
+                    fire_jvmti_exception_catch(shared.vm_identity, frame, handler_pc);
                     return None;
                 }
                 // No in-frame handler. Propagate out of the OSR'd frame
@@ -15720,7 +15905,7 @@ pub(super) fn try_osr(
                     frame.stack.clear();
                     let _ = frame.stack.push(Value::Object(Some(exc_ref)));
                     frame.pc = handler_pc;
-                    fire_jvmti_exception_catch(frame, handler_pc);
+                    fire_jvmti_exception_catch(shared.vm_identity, frame, handler_pc);
                     return None;
                 }
                 // No in-frame handler. Propagate out of the OSR'd frame
@@ -15800,8 +15985,17 @@ pub(super) fn try_osr(
             // trap on the corruption-prone "safe reject" path in default builds
             // (`CRATONVM_OSR_EXIT_TRANSFER` unset). Dropped in favor of
             // `can_osr_exit` alone.
+            // `plan` is the validated entry (see the admission block above). The
+            // transfer spends it on `OsrEntryPlan::resume_after_exit`, which names
+            // the EXACT bci the OSR'd body stopped at — a recorded deopt point of
+            // this artifact whose `ResumeSemantics` is `REEXECUTE` — instead of
+            // trusting `rframe.bci` verbatim. It is the only sanctioned resume
+            // point once compiled code has run.
             if compiled.can_osr_exit
-                && transfer_osr_exit_into_live_frame(shared, thread, frame_idx, &rframe).is_some()
+                && transfer_osr_exit_into_live_frame(
+                    shared, thread, frame_idx, &rframe, &compiled, &plan,
+                )
+                .is_some()
             {
                 if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                     eprintln!(
@@ -15811,8 +16005,30 @@ pub(super) fn try_osr(
                 }
                 return None;
             }
-            // Safe reject: gate off, method not OSR-exit-capable, or an
-            // out-of-scope/unmappable reconstructed frame.
+            // Safe reject: the method is not OSR-exit-capable (`can_osr_exit`
+            // false ⇒ this artifact recorded no exit map, so no compiled
+            // iteration was committed through one), or the reconstructed frame
+            // was out of scope / unmappable.
+            //
+            // The second case is the one that used to be a correctness bug:
+            // "continue interpreting THIS frame from where it was" is correct
+            // only when the bail precedes any committed iteration, and a
+            // mid-loop transfer failure does not. It is now closed at ADMISSION
+            // rather than here — `validate_osr_entry` refuses
+            // (`osr-entry-unresumable-exit`, permanent, memoed) any artifact
+            // whose deopt points include one that reconstructs an unresumable
+            // frame, which is exactly the set this branch could receive:
+            // `MaterializationRequired` / `Unsupported` slots
+            // (`deopt::frame_state_is_resumable`), held monitors, an inlined
+            // caller scope, or non-`REEXECUTE` semantics. An admitted entry is
+            // therefore `OsrExitPolicy::ExactTransfer`, under which every exit
+            // this body can take transfers cleanly; and `can_osr_exit` implies
+            // a non-empty `deopt_points`, so the `PropagateOnly` artifacts never
+            // reach the transfer at all.
+            //
+            // Reaching here after a committed body would mean that invariant
+            // broke. Do not add a resume path for it — the fix belongs at
+            // admission, where nothing has run yet.
             if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] OSR-exit bail rejected (continue interpreting) {}.{}{} entry_pc={}",
@@ -17282,7 +17498,7 @@ pub(super) fn try_jit_upgrade_with_gate(
                 };
                 shared.jit.profile_store.get_profile(&profile_key)
             };
-            let c_helpers = crate::jit::helpers::build_helpers();
+            let c_helpers = crate::jit::helpers::build_helpers_for(shared);
             let c_string_layout_resolver = || resolve_string_field_layout(shared);
             crate::jit::set_self_call_identity_stable(self_call_identity_stable(
                 shared,
@@ -17404,7 +17620,7 @@ pub(super) fn try_jit_upgrade_with_gate(
         };
         shared.jit.profile_store.get_profile(&profile_key)
     };
-    let helpers = crate::jit::helpers::build_helpers();
+    let helpers = crate::jit::helpers::build_helpers_for(shared);
     // Small-method inlining for the main tier-up compile. Without it, even a
     // trivial leaf like `static int add(int,int){return a+b;}` compiled to a
     // CALL per use, so call-heavy JDK-internal code (xalan/xerces DTM walks:
@@ -18321,7 +18537,7 @@ pub(super) fn try_jit_compile_callee_slow(
         };
         shared.jit.profile_store.get_profile(&profile_key)
     };
-    let helpers = crate::jit::helpers::build_helpers();
+    let helpers = crate::jit::helpers::build_helpers_for(shared);
 
     // Build inline resolver for method inlining (Session 31)
     let inline_resolver = |callee_class: &str,
@@ -19878,7 +20094,7 @@ pub(super) fn execute_jit_call(
                 }
             }
         };
-        let sig = crate::jit::helpers::take_all_jit_signals();
+        let sig = crate::jit::helpers::take_all_jit_signals(thread);
         match fast_result {
             Ok(v) => (v, sig),
             Err(jit_err) => {
@@ -19925,7 +20141,7 @@ pub(super) fn execute_jit_call(
         // The routing function still skips catch-all (`finally`) entries
         // when the pc is unknown, so they cannot spuriously swallow
         // exceptions thrown outside their protected region.
-        let mut sig = crate::jit::helpers::take_all_jit_signals();
+        let mut sig = crate::jit::helpers::take_all_jit_signals(thread);
         if let Some(exc) = sig.exception.take() {
             // The exception consumes the deopt — the one-shot drain above
             // already cleared the out-of-band deopt signal (MEDIUM
@@ -19999,6 +20215,12 @@ pub(super) fn execute_jit_call(
     // (which can't safely match without a known PC) but still matches
     // typed handlers by exception class.
     if sig.npe {
+        // These three arms synthesize a FRESH exception and route it; none of
+        // them consumes the stashed deopt frame. Draining it here bounds the
+        // window in which that frame holds raw heap addresses nothing scans —
+        // and stops a later drain for the same method claiming it, since the
+        // match compares method names only.
+        let _ = cratonvm_jit::deopt::take_last_deopt();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -20038,6 +20260,12 @@ pub(super) fn execute_jit_call(
     // observes the throw. `usize::MAX` for `throw_pc` mirrors the NPE path
     // (skip catch-all `finally` entries, still match typed handlers).
     if let Some((index, length)) = sig.aioobe {
+        // These three arms synthesize a FRESH exception and route it; none of
+        // them consumes the stashed deopt frame. Draining it here bounds the
+        // window in which that frame holds raw heap addresses nothing scans —
+        // and stops a later drain for the same method claiming it, since the
+        // match compares method names only.
+        let _ = cratonvm_jit::deopt::take_last_deopt();
         let msg = format!("Index {index} out of bounds for length {length}");
         match crate::runtime::exceptions::create_exception_object(
             shared,
@@ -20074,6 +20302,12 @@ pub(super) fn execute_jit_call(
     // divergence). `usize::MAX` throw_pc mirrors the NPE/AIOOBE blocks (match
     // typed handlers by class, skip catch-all `finally`).
     if sig.arithmetic {
+        // These three arms synthesize a FRESH exception and route it; none of
+        // them consumes the stashed deopt frame. Draining it here bounds the
+        // window in which that frame holds raw heap addresses nothing scans —
+        // and stops a later drain for the same method claiming it, since the
+        // match compares method names only.
+        let _ = cratonvm_jit::deopt::take_last_deopt();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -20394,7 +20628,7 @@ pub(super) fn execute_jit_call_decoded(
                 }
             }
         };
-        let sig = crate::jit::helpers::take_all_jit_signals();
+        let sig = crate::jit::helpers::take_all_jit_signals(thread);
         match fast_result {
             Ok(v) => (v, sig),
             Err(jit_err) => {
@@ -20420,7 +20654,7 @@ pub(super) fn execute_jit_call_decoded(
             }))
         };
         crate::jit::helpers::restore_jit_thread(saved_jit_thread);
-        let mut sig = crate::jit::helpers::take_all_jit_signals();
+        let mut sig = crate::jit::helpers::take_all_jit_signals(thread);
         if let Some(exc) = sig.exception.take() {
             // The one-shot drain already cleared the out-of-band deopt signal
             // (MEDIUM `i64::MIN`-collision fix) so it cannot leak to the next
@@ -21536,7 +21770,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
         &mut thread.stacks_pool,
     );
     frame.monitor_on_exit = monitor_obj;
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
 
     // Populate invoke_cache so subsequent sibling-class misses from this
     // caller class take the cheaper thread-local path next time.
@@ -22737,7 +22971,7 @@ pub(super) fn execute_invokevirtual_cached(
                             frame.method_descriptor()
                         );
                     }
-                    push_frame_and_fire_entry(thread, frame);
+                    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
                     Ok(CachedCallResult::FramePushed)
                 }
                 Value::Object(None) => {
@@ -23283,7 +23517,7 @@ pub(super) fn execute_invokevirtual_cached(
                     frame.method_descriptor()
                 );
             }
-            push_frame_and_fire_entry(thread, frame);
+            push_frame_and_fire_entry(shared.vm_identity, thread, frame);
             Ok(CachedCallResult::FramePushed)
         }
         CachedInvokeTarget::Native {
@@ -24210,7 +24444,15 @@ pub(super) fn adapt_isin_seen() -> bool {
 /// Besides the symbolic names and parameter count, this stores the exact
 /// native callback/category for the symbolic owner. The registry hash is paid
 /// once per resolved CP entry, not once per call site that consumes it.
-pub(super) fn resolve_method_metadata(
+///
+/// **This is the resolution core, not the public entry point.** New callers
+/// outside `crate::runtime::interpreter` go through
+/// [`crate::runtime::resolve::MemberResolver::method_ref`], which tags the
+/// answer with the VM that produced it and converts failures into the
+/// structured [`crate::runtime::resolve::ResolveError`]. It is `pub(crate)`
+/// only so that `MemberResolver` can delegate here; `runtime::resolve::guard`
+/// fails the build if anything else names it.
+pub(crate) fn resolve_method_metadata(
     shared: &SharedVm,
     current_class_id: ClassId,
     cp_index: u16,
@@ -24283,12 +24525,27 @@ pub(super) fn resolve_method_metadata(
         ADAPT_ISIN_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Module access check (JPMS §5.4.4): verify accessor can reach the target class's module.
+    // Module access check (JPMS §5.4.4): verify accessor can reach the target
+    // class's module.
+    //
+    // C2 P0 — routed through `runtime::resolve::MemberResolver`, the one
+    // access-control entry point in `vm/src/runtime/`. `MemberFlags::OwnerOnly`
+    // + `AccessPolicy::ModuleOnly` is the exact shape of what this call has
+    // always been: at this point the hierarchy walk has not happened, so there
+    // is no declaring method and no method flags to check — only the owner
+    // class the constant pool names. That is also why the member half of JVMS
+    // §5.4.4 is not enforced on this path; see
+    // `classloading::access_control`'s module docs. Unchanged behaviour,
+    // named policy.
     if let Some(target_id) = cm.get_loaded_class_id(&class_name) {
-        crate::classloading::access_control::check_module_access_by_id(
-            current_class_id,
-            target_id,
+        let resolver = crate::runtime::resolve::MemberResolver::new(shared);
+        let _grant = resolver.check_member_access(
             &cm,
+            resolver.scope(current_class_id),
+            resolver.scope(target_id),
+            crate::runtime::resolve::MemberFlags::OwnerOnly,
+            None,
+            crate::runtime::resolve::AccessPolicy::ModuleOnly,
         )?;
     }
 

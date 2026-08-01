@@ -400,7 +400,33 @@ pub struct ConcurrentMarker {
     /// unfiltered sweep freed it. Empty ⇒ remark never ran this cycle ⇒
     /// the sweep frees nothing (abort-safe conservative default).
     sweep_eligible: Mutex<HashSet<usize>>,
+    /// GCAUD-4 — `OldGen::reclaim_epoch` as of the remark that produced
+    /// `sweep_eligible`, or `None` when no snapshot is outstanding.
+    ///
+    /// `sweep_eligible` and `bitmap` are both keyed on a bare old-gen ADDRESS,
+    /// and `concurrent_sweep` runs OUTSIDE any stop-the-world: between remark
+    /// and the sweep's `old_gen` lock acquisition, another thread's young GC
+    /// can run a full `old_gen_gc` — either the sliding `compact` (every
+    /// survivor's address changes) or the in-place sweep (blocks return to the
+    /// free list and the next `alloc` re-issues those addresses to NEW
+    /// objects). Either way an address in `sweep_eligible` stops naming the
+    /// object it named at remark, while the bitmap bit at that address still
+    /// describes the OLD occupant.
+    ///
+    /// The TAMS filter reads "existed at remark AND unmarked ⇒ free it", so a
+    /// live object that inherited a dead object's address satisfies both
+    /// halves and is freed — a use-after-free manufactured by two collectors
+    /// that individually behave correctly. The epoch is the identity the bare
+    /// address lacks; on a mismatch the sweep frees nothing.
+    sweep_eligible_epoch: Mutex<Option<u64>>,
 }
+
+/// GCAUD-4: how many concurrent sweeps were abandoned because old-gen storage
+/// was reclaimed or relocated between remark and the sweep. Non-zero means the
+/// two old-gen collectors are interleaving; the cycle reclaimed nothing, which
+/// is the safe half of that race.
+pub static SWEEP_EPOCH_ABORTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 impl ConcurrentMarker {
     /// Create a new concurrent marker for a heap region with PRIVATE SATB
@@ -431,6 +457,7 @@ impl ConcurrentMarker {
             satb_queue,
             state,
             sweep_eligible: Mutex::new(HashSet::new()),
+            sweep_eligible_epoch: Mutex::new(None),
         }
     }
 
@@ -446,6 +473,7 @@ impl ConcurrentMarker {
         // No sweep will run for this cycle; make sure a later cycle's sweep
         // can never consume this cycle's stale eligibility snapshot.
         self.sweep_eligible.lock().clear();
+        *self.sweep_eligible_epoch.lock() = None;
         self.state.set_phase(ConcurrentGcPhase::Idle);
     }
 
@@ -518,6 +546,10 @@ impl ConcurrentMarker {
         // TAMS (G1MARK-3): everything the sweep is allowed to free must
         // have existed AT REMARK — record the snapshot for concurrent_sweep.
         *self.sweep_eligible.lock() = object_starts.clone();
+        // GCAUD-4: and the snapshot's addresses only mean what they meant here
+        // for as long as no other collector reclaims or relocates old-gen
+        // storage. Stamp the epoch the snapshot was taken under.
+        *self.sweep_eligible_epoch.lock() = Some(old_gen.reclaim_epoch());
 
         // Process SATB entries: these are old reference values that were
         // overwritten during concurrent marking. We must mark them to
@@ -705,7 +737,35 @@ impl ConcurrentMarker {
         // implicitly live for this cycle. An empty snapshot (remark never
         // ran) frees nothing.
         let eligible = std::mem::take(&mut *self.sweep_eligible.lock());
+        let snapshot_epoch = self.sweep_eligible_epoch.lock().take();
         if eligible.is_empty() {
+            self.bitmap.clear();
+            self.state.set_phase(ConcurrentGcPhase::Idle);
+            return 0;
+        }
+
+        // GCAUD-4: `eligible` and `bitmap` are keyed on bare old-gen
+        // addresses, and this sweep is the one phase of the cycle that runs
+        // outside a stop-the-world. If any other collector freed or relocated
+        // old-gen storage since remark, an address in `eligible` may now name
+        // a DIFFERENT object — a live one, whose bit is clear only because the
+        // bit describes its predecessor. Both halves of the TAMS filter would
+        // then be satisfied by a live object and the sweep would free it.
+        //
+        // Fail closed: reclaim nothing this cycle. The next `old_gen_needs_gc`
+        // trigger starts a fresh cycle against the current layout, so the
+        // garbage is collected one cycle later rather than the live object
+        // being collected now.
+        if snapshot_epoch != Some(old_gen.reclaim_epoch()) {
+            SWEEP_EPOCH_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(
+                snapshot_epoch = ?snapshot_epoch,
+                current_epoch = old_gen.reclaim_epoch(),
+                eligible = eligible.len(),
+                "concurrent sweep abandoned: old-gen storage was reclaimed or \
+                 relocated since remark, so the address-keyed mark bitmap and \
+                 eligibility snapshot no longer identify the same objects",
+            );
             self.bitmap.clear();
             self.state.set_phase(ConcurrentGcPhase::Idle);
             return 0;
@@ -1184,6 +1244,91 @@ mod tests {
         let (_marked, swept) = marker.full_cycle(&[live_ptr], &mut og);
         assert_eq!(swept, 1); // dead_ptr should be freed
         assert!(og.used() < used_before);
+    }
+
+    /// GCAUD-4 — the concurrent sweep must not act on an address-keyed
+    /// snapshot another old-gen collection has invalidated.
+    ///
+    /// `concurrent_sweep` is the one phase of the cycle that runs outside a
+    /// stop-the-world. Its liveness test is "the address existed at remark
+    /// (`sweep_eligible`) AND its bit is clear (`bitmap`)" — two tables keyed
+    /// on a bare old-gen address. Between remark and the sweep's lock
+    /// acquisition, another thread's young GC can run `old_gen_gc`: the
+    /// in-place arm hands blocks back to the free list, and the very next
+    /// promotion re-issues those addresses to NEW, fully live objects. Such an
+    /// object satisfies BOTH halves of the test — it inherited a dead object's
+    /// address, so it is "eligible", and its bit is clear because the bit
+    /// describes its predecessor — and the sweep frees it while it is live.
+    ///
+    /// This test drives exactly that sequence: remark, then free a dead block
+    /// and let the allocator re-issue the same address to a live object. The
+    /// sweep must reclaim nothing.
+    #[test]
+    fn concurrent_sweep_refuses_a_snapshot_invalidated_by_another_old_gen_collection() {
+        let mut og = OldGen::new(65536);
+        let size = HEADER_SIZE + SLOT_SIZE;
+        let init = |ptr: *mut u8, cid: u32| {
+            // SAFETY: `ptr` is a live `size`-byte old-gen block.
+            unsafe {
+                let h = &mut *(ptr as *mut ObjectHeader);
+                h.class_id = ClassId::new(cid);
+                h.kind = ObjectKind::Object;
+                h.element_type = ArrayElementType::Byte;
+                h.set_num_slots(1);
+                h.gc_flags = 0x01; // GC_FLAG_OLD_GEN
+            }
+        };
+
+        let live = og.alloc(size, 8).unwrap();
+        init(live, 1);
+        let dead = og.alloc(size, 8).unwrap();
+        init(dead, 2);
+        // A third block, recycled below. It is unreachable at remark, so its
+        // address enters `sweep_eligible` with its bit clear.
+        let recycled = og.alloc(size, 8).unwrap();
+        init(recycled, 3);
+
+        let marker = ConcurrentMarker::new(og.base_ptr() as usize, og.capacity());
+        marker.initial_mark(&[live], &og);
+        marker.concurrent_mark(&og);
+        marker.remark(&[live], &og);
+
+        // --- another old-gen collection interleaves here -------------------
+        // SAFETY: `(recycled, size)` is exactly the pair `alloc` handed out.
+        unsafe { og.free(recycled, size) };
+        let resurrected = og
+            .alloc(size, 8)
+            .expect("the just-freed block must be reusable");
+        assert_eq!(
+            resurrected, recycled,
+            "precondition: the allocator must re-issue the freed address, which \
+             is what makes the snapshot's address ambiguous",
+        );
+        init(resurrected, 4);
+        // -------------------------------------------------------------------
+
+        let used_before_sweep = og.used();
+        let aborts_before = SWEEP_EPOCH_ABORTS.load(std::sync::atomic::Ordering::Relaxed);
+        let swept = marker.concurrent_sweep(&mut og);
+
+        assert_eq!(
+            swept, 0,
+            "a sweep whose address-keyed snapshot was invalidated must reclaim \
+             nothing — one of the eligible addresses now names a LIVE object",
+        );
+        assert!(
+            SWEEP_EPOCH_ABORTS.load(std::sync::atomic::Ordering::Relaxed) > aborts_before,
+            "the abandoned sweep must be counted, not silent",
+        );
+        assert_eq!(og.used(), used_before_sweep);
+        assert!(
+            og.is_allocated_addr(resurrected),
+            "the resurrected (live) object must still be allocated after the sweep",
+        );
+        assert!(
+            og.is_allocated_addr(dead),
+            "and nothing else may be reclaimed on the abandoned path either",
+        );
     }
 
     #[test]

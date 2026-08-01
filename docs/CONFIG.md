@@ -368,6 +368,10 @@ is where the grouped-variable syntax came from.
 | `-intrinsics` | Prevent the interpreter from installing `Intrinsic` inline-cache entries, forcing ordinary native/bytecode dispatch (differential-test off-switch). | on |
 | `-precise-jit-maps` | Opt **out** of precise JIT oop maps (revert to the older conservative stack scan). For diagnosing GC-root coverage under JIT. | precise maps on |
 | `-bce`, `-licm`, `-unroll`, `-reassoc`, `-scalar-new` | Turn off an individual optimisation pass. | on |
+| `vectorize` | Emit AVX2 vector loops for the shapes the vector gate admits. Off by default: vector work multiplies wrong-code risk, so nothing is emitted unless it is asked for by name. | Off |
+| `range-bce` | Admit the *guard-dominated range* reason for deleting a bounds check, on top of the reasons `bce` already applies. Off by default and deliberately opt-in: the reason has no differential run behind it, and a wrong elision is an out-of-bounds heap write. `-bce` still kills every reason including this one. | Off |
+| `ir-linear-scan` | Run the linear-scan register allocator and use its result as a register read cache. FP values only. | Off |
+| `-shadow-end-guard` | Opt **out** of the overflow bound both backends emit ahead of a shadow-stack push, so an overrunning push writes on through the allocator arena. Bisection only — it exists to confirm that a given failure *is* the overflow. | guard on |
 
 > Before this consolidation, five of those tokens had **no working spelling**:
 > `CRATONVM_PRECISE_JIT_MAPS`, `CRATONVM_JIT_INLINE_PUTFIELD`,

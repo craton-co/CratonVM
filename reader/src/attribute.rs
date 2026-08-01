@@ -26,7 +26,11 @@
 //! * `Code` — `code_length` must be in `1..=65535` (JVMS §4.7.3) and
 //!   the body must hold a well-shaped exception table + nested
 //!   attribute table within the declared `attribute_length`. Nested
-//!   attributes are recursively shape-validated.
+//!   attributes are recursively shape-validated. Each `exception_table`
+//!   entry's `start_pc` / `end_pc` / `handler_pc` is range-checked
+//!   against `code_length` (see [`validate_exception_range`]); the
+//!   entry's `catch_type` needs the constant pool, so it is checked in
+//!   [`decode_attribute`] instead.
 //!
 //! These checks duplicate the logic that the lazy decoder runs later,
 //! but they're tiny — a `u16`/`u32` read, a bounds comparison, no
@@ -753,6 +757,120 @@ pub fn force_decode_all(
 /// benefit from it. For `Code` the walk recurses into nested attributes
 /// (since their shape is part of the `Code` body's well-formedness) but
 /// still only performs the same shallow per-kind checks.
+/// Validate one `exception_table` entry's program counters against JVMS
+/// §4.7.3.
+///
+/// The spec constrains the three PCs in an `exception_table` entry:
+///
+/// * "The value of the `start_pc` item must be a valid index into the
+///   `code` array of the opcode of an instruction."  → `start_pc <
+///   code_length`.
+/// * "The value of the `end_pc` item either must be a valid index into the
+///   `code` array of the opcode of an instruction, or must be equal to
+///   `code_length`."  → `end_pc <= code_length`.
+/// * "The value of `start_pc` must be less than the value of `end_pc`."
+/// * "The value of the `handler_pc` item ... must be a valid index into the
+///   `code` array and must be the index of the opcode of an instruction."
+///   → `handler_pc < code_length`.
+///
+/// This is the same set HotSpot's `ClassFileParser::parse_exception_table`
+/// enforces, and it is enforced there for the same reason: `handler_pc` is
+/// a *jump target*. The JIT reads it straight out of this table (see
+/// `jit/src/lib.rs`, `local_handler_reads_unsafe_local` — `let handler_pc =
+/// entry.handler_pc as usize;` fed into a code walk) and the interpreter
+/// uses it to reposition `pc` when an exception unwinds. An unchecked
+/// `handler_pc` of `0xFFFF` in a 4-byte method is therefore an
+/// attacker-chosen out-of-range bytecode index reaching code that has every
+/// right to assume the reader already rejected it.
+///
+/// # What this deliberately does NOT check
+///
+/// The spec's stronger requirement — that each PC be the index of an
+/// **opcode**, not the middle of a multi-byte instruction — needs the
+/// bytecode to be decoded first. The reader stores `code` as an
+/// undecoded [`ByteView`]; instruction boundaries are established later by
+/// `crate::quickened` (which builds the pc→index table) and checked by the
+/// bytecode verifier. Enforcing boundary alignment here would mean
+/// decoding every method body at parse time, which is precisely the cost
+/// the lazy/quickened split exists to avoid. The range checks below are
+/// the part that can be done for free, and they are what turn an
+/// out-of-bounds index into a parse error instead of a downstream
+/// assumption violation.
+fn validate_exception_range(
+    entry_index: usize,
+    start_pc: u16,
+    end_pc: u16,
+    handler_pc: u16,
+    code_length: usize,
+) -> Result<(), ClassReaderError> {
+    let (start, end, handler) = (start_pc as usize, end_pc as usize, handler_pc as usize);
+    if start >= code_length {
+        return Err(ClassReaderError::InvalidClassData {
+            message: format!(
+                "Code exception_table[{entry_index}]: start_pc {start} is not a valid index into a code array of length {code_length} (JVMS §4.7.3)"
+            ),
+        });
+    }
+    if end > code_length {
+        return Err(ClassReaderError::InvalidClassData {
+            message: format!(
+                "Code exception_table[{entry_index}]: end_pc {end} exceeds code_length {code_length} (JVMS §4.7.3)"
+            ),
+        });
+    }
+    if start >= end {
+        return Err(ClassReaderError::InvalidClassData {
+            message: format!(
+                "Code exception_table[{entry_index}]: start_pc {start} must be less than end_pc {end} (JVMS §4.7.3)"
+            ),
+        });
+    }
+    if handler >= code_length {
+        return Err(ClassReaderError::InvalidClassData {
+            message: format!(
+                "Code exception_table[{entry_index}]: handler_pc {handler} is not a valid index into a code array of length {code_length} (JVMS §4.7.3)"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate an `exception_table` entry's `catch_type` against JVMS §4.7.3.
+///
+/// "If the value of the `catch_type` item is nonzero, it must be a valid
+/// index into the `constant_pool` table. The `constant_pool` entry at that
+/// index must be a `CONSTANT_Class_info` structure representing a class of
+/// exceptions." A zero `catch_type` is the `finally` / `any` handler and is
+/// legal.
+///
+/// Checking this at parse time also closes the two constant-pool index
+/// hazards for this field at once: index `0` is the reserved sentinel (a
+/// [`ConstantPoolEntry::Tombstone`]) and so is the *second slot* of a
+/// `CONSTANT_Long` / `CONSTANT_Double`. Both are stored as `Tombstone`, so
+/// the "must be a `ClassReference`" test rejects them without needing a
+/// separate case.
+///
+/// [`ConstantPoolEntry::Tombstone`]: crate::constant_pool::ConstantPoolEntry::Tombstone
+fn validate_catch_type(
+    entry_index: usize,
+    catch_type: u16,
+    cp: &ConstantPool,
+) -> Result<(), ClassReaderError> {
+    if catch_type == 0 {
+        // The `finally` / catch-any handler.
+        return Ok(());
+    }
+    match cp.get(catch_type) {
+        Some(crate::constant_pool::ConstantPoolEntry::ClassReference { .. }) => Ok(()),
+        _ => Err(ClassReaderError::InvalidConstantPool {
+            index: catch_type,
+            message: format!(
+                "Code exception_table[{entry_index}]: catch_type must be zero or reference a CONSTANT_Class entry (JVMS §4.7.3)"
+            ),
+        }),
+    }
+}
+
 pub fn validate_attribute_shape(name: &str, body: &[u8]) -> Result<(), ClassReaderError> {
     match name {
         // Fixed-size 2-byte cp-index attributes (JVMS §4.7.2 / §4.7.27 /
@@ -809,7 +927,23 @@ pub fn validate_attribute_shape(name: &str, body: &[u8]) -> Result<(), ClassRead
             const ET_ENTRY_SIZE: usize = EXCEPTION_TABLE_ENTRY_SIZE;
             let et_span =
                 checked_span("Code exception_table", exception_table_length, ET_ENTRY_SIZE)?;
-            let _ = buf.read_bytes(et_span)?;
+            let et_bytes = buf.read_bytes(et_span)?;
+            // JVMS §4.7.3 program-counter ranges. This walk has no constant
+            // pool, so `catch_type` is checked later in `decode_code_body`;
+            // the three PCs are checkable here and are the ones that become
+            // jump targets downstream. Doing it in the eager shape walk is
+            // what makes a hostile `handler_pc` fail at `read_class` time
+            // rather than at whatever downstream call site first decodes the
+            // method. See `validate_exception_range`.
+            for (entry_index, chunk) in et_bytes.chunks_exact(ET_ENTRY_SIZE).enumerate() {
+                validate_exception_range(
+                    entry_index,
+                    u16::from_be_bytes([chunk[0], chunk[1]]),
+                    u16::from_be_bytes([chunk[2], chunk[3]]),
+                    u16::from_be_bytes([chunk[4], chunk[5]]),
+                    code_length,
+                )?;
+            }
             // Nested attributes — walk the headers and recurse for shape.
             let attributes_count = buf.read_u16()? as usize;
             for _ in 0..attributes_count {
@@ -1707,13 +1841,29 @@ fn decode_code_body(
     let et_capacity = bounded_capacity(exception_table_length, ET_ENTRY_SIZE, buf.remaining());
     let et_bytes = buf.read_bytes(et_span)?;
     let mut exception_table = Vec::with_capacity(et_capacity);
-    for chunk in et_bytes.chunks_exact(ET_ENTRY_SIZE) {
-        exception_table.push(ExceptionTableEntry {
+    for (entry_index, chunk) in et_bytes.chunks_exact(ET_ENTRY_SIZE).enumerate() {
+        let entry = ExceptionTableEntry {
             start_pc: u16::from_be_bytes([chunk[0], chunk[1]]),
             end_pc: u16::from_be_bytes([chunk[2], chunk[3]]),
             handler_pc: u16::from_be_bytes([chunk[4], chunk[5]]),
             catch_type: u16::from_be_bytes([chunk[6], chunk[7]]),
-        });
+        };
+        // JVMS §4.7.3. `validate_attribute_shape` already ran the PC range
+        // checks on the eager path, but `decode_attribute` is also reachable
+        // directly (it is `pub`, and the lazy decoder calls it for bodies
+        // that never went through the eager walk — e.g. a `Code` nested
+        // inside another attribute), so the authoritative check lives here
+        // too. `catch_type` can only be checked here: the eager shape walk
+        // has no constant pool.
+        validate_exception_range(
+            entry_index,
+            entry.start_pc,
+            entry.end_pc,
+            entry.handler_pc,
+            code_length,
+        )?;
+        validate_catch_type(entry_index, entry.catch_type, cp)?;
+        exception_table.push(entry);
     }
 
     // `body_offset` is the absolute source offset of buf-position 0

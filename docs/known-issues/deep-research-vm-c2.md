@@ -1,25 +1,107 @@
 # CratonVM Code Review: Prioritized Parallel TODO Plan
 
-> ## Remediation status — 2026-07-31, branch `feat/c2-review-remediation`
+> ## Remediation status — 2026-08-01, branch `feat/c2-review-remediation`
 >
-> This report was implemented by a parallel agent campaign. **30 of ~40
-> decomposed items landed** (39 commits, 176 files). The workspace checks
-> clean with `--all-targets` and **3,573 unit tests pass** across every crate
-> touched. `evidence/` is produced by `scripts/evidence/collect.sh` (P0 step 1).
+> Implemented by two waves of parallel agent lanes: **64 non-merge commits,
+> 211 files** against `origin/dev`, 36 of those commits in the second wave.
+> `evidence/` is produced by `scripts/evidence/collect.sh` (P0 step 1). No test
+> or check counts are restated here — none was run when this banner was written,
+> and the earlier banner's figures are stale.
 >
-> **Read this first: the report's premises were not all correct.** Agents were
-> instructed to verify each claim before acting, and several were disproved:
+> **Read this first: the report's premises were not all correct.** Every lane
+> was told to verify before acting. Roughly one premise in three did not hold:
 >
 > | Report claim | Finding |
 > |---|---|
-> | Certification-path validation is absent | Present — per-link verification, anchor matching, validity windows, BasicConstraints, KeyUsage, EKU. Genuinely missing: revocation, name constraints, multi-`SignerInfo`. |
+> | Certification-path validation is absent | Present — per-link verification, anchor matching, validity windows, BasicConstraints, KeyUsage, EKU. Name constraints are not a silent skip either: the extension is absent from the recognised-critical set and any unrecognised critical extension is refused, and RFC 5280 requires it critical. Genuinely missing: revocation, and multi-`SignerInfo` — the parser takes the first and reports nothing. (`09d26d746`) |
 > | SATB pre-write barrier may have a JIT blind spot | It does not; the JIT emits a real SATB pre-barrier. The blind spot was in the *post*-write barrier (see G1-1 below). |
-> | `JitRuntimeHelpers` has ~46 fields | 58 fields, 464 bytes. |
+> | `JitRuntimeHelpers` has ~46 fields | 58 fields / 464 bytes at the time; 62 / 496 now, after the monitor helpers were appended as fields 60–61. |
 > | Fix the `nio_file` opener list (7 sites) | 10 sites; two were spelled inside `.or_else(..)` and one whole `RandomAccessFile` overload was missed. |
-> | The undeclared-flag set is the ~14 this branch added | 74 undeclared, including one that weakens a security control. |
+> | The JIT bakes each helper slot's **byte offset** into RWX code as `CALL [helpers + disp32]`, so a struct reorder mis-targets a call | **False — and the claim came from the module's own doc.** The compiler holds the table by value or reference and reads slots by Rust field name; `emit_call_absolute` bakes the helper's *absolute* address. Grepping `jit/` and `vm/` for a helpers pointer, an `offset_of!` on the struct, or a `[helpers + ..]` addressing form returns nothing. That false claim was hiding the real hazard, which is the **signature**: the backend loads N argument registers by hand and jumps to a bare address, and nothing tied that to the callee's declared arity, widths, or whether it returns. Closed with `HELPER_FN_SIGS`, 62 literal `GOLDEN_HELPER_OFFSETS` rows (the only check a *coordinated* reorder cannot satisfy), and an armed runtime validator — which had zero callers outside its own crate. (`da7154ab8`) |
+> | 74 undeclared flags, one of them weakening a security control | The count is **not reproducible as stated** — no enumeration exists in the tree, and the guard's own docs said 63 when it was written. The guard had **27** offenders; 26 were declared and it now has 0. The security-relevant one is real: `CRATONVM_SHADOW_NO_END_GUARD` suppresses the shadow-stack overflow guard both backends emit, i.e. deliberately restores an out-of-bounds write as a bisection aid, and undeclared it was invisible to the launcher, to `-XX:` and to test overrides. Two requested rows were refused for having no consumer at all. (`b24eee75d`) |
+> | The aarch64 backend diverges from x64 on write barriers, SATB, inline caches, deopt metadata and implicit null checks | It has **no object model at all** — it refuses every field, array, allocation, dispatch, type-check, monitor and athrow opcode, and `emit_invoke` fails unconditionally. Several census rows are therefore **N/A by construction, not divergent**; the G1 `GC_FLAG_OLD_GEN` hazard has no aarch64 analogue. (`8f2c76db4`) |
+> | Range analysis is absent | Not absent. `scev.rs` already carried an int interval lattice with an explicit `OverflowModel`, and `bce.rs` already had a range-backed section; the doc's Status line claiming otherwise was stale. Genuinely missing: any range analysis over the sea-of-nodes IR, a 64-bit domain, bitwise/shift/rem/div narrowings, a widening operator, and **non-loop** bounds-check elimination. (`0bc87e3fc`) |
+> | A compilation broker must be built | One already existed, landed unfinished with **zero tests**, its own doc comments referencing four tests and a design doc that existed nowhere in the tree. (`44aa4d9a3`) |
+> | A monomorphic-looking call site may have overflowed its receiver-type slots | Not for the profile the JIT reads — `MethodProfile::record_receiver` inserts into an uncapped map. True only of the unwired `pgo::ReceiverTypeProfile` (`MAX_ENTRIES = 8`). (`0eb3439cb`) |
+> | `fuzz/` has 18 libfuzzer targets, not wired into CI | **17**, and they *are* wired: `fuzz-smoke` in `.github/workflows/ci.yml` is a blocking job that builds all 17 on every commit. 6 of 17 had a seed corpus. (`d0abf2324`) |
+> | `jit/src/x64/isel.rs` is an instruction-selection pass that needs extending | It **had never been compiled**. No `mod isel;` existed anywhere in the crate, so a 3,941-line pattern table and its ~1,480 lines of tests had never been seen by a compiler. It is also not an IR-level matcher: it operates on operands that are already registers. (`db64b3dfe`) |
+>
+> **Now wired — the four deep integration items, plus one that had never been
+> compiled.** An earlier banner listed all of these as analysis-only. That is no
+> longer true; the exact state of each:
+>
+> - **Lock elision/coarsening — wired end to end.** `IrBuilder` emits
+>   `MonitorEnter`/`MonitorExit` advancing the memory token (both are JMM
+>   acquire/release barriers and safepoints), and `ir_lower` emits the helper call
+>   through the pre-existing `runtime_lowering::emit_monitor_stub`. The safepoint
+>   map is published before `alloc_slot` (the `Op::Call` contract), and the
+>   helper's remapped return is stored back over the object's slot — idempotent
+>   with the collector's own rewrite, because `remap_one_jit_frame` keys on the
+>   slot's *current* value. It still refuses when the helper table has no monitor
+>   entry: a backend that cannot lower these must decline the method rather than
+>   emit nothing and drop the lock. Separately, a monitor-bearing graph is refused
+>   **precise deopt resume** — every `FrameState` this lowerer builds hard-codes
+>   `monitors: Vec::new()`, which *defeats* the interpreter sink's
+>   holds-a-monitor guard rather than tripping it; such methods fall back to the
+>   whole-method re-run. (`833ae0310`, `dfe49f921`, `0f07ab7db`)
+> - **Loop rewriter → bytecode — wired, atomically, behind an opt-in.** All 21
+>   pc-keyed side tables are replicated in one destructuring `let`, so a 22nd
+>   parameter is an arity error rather than a silent miscompile. Fail-closed: a
+>   structured refusal falls back to the original bytecode, and a transform with
+>   non-empty `deopt_points` discards the method rather than publish an output PC
+>   as a resume bci. Armed per thread via `set_bytecode_loop_rewriter_armed`
+>   (`jit/src/x64.rs`); off process-wide, no env read, and arming it turns the
+>   native unroller off in the same motion. Two of the recorded design premises
+>   were wrong: the metadata translation is **not** a post-pass over
+>   `CompiledMethod` — the bci is baked as a `MOV R8, imm64` by `emit_deopt_stubs`
+>   long before a `CompiledMethod` exists, so it is one accessor
+>   (`Compiler::orig_bci`) at 4 sites — and there are **four** bci-baking sites,
+>   not three; the fourth is the athrow lowering, which untranslated would have
+>   mis-routed `finally` blocks in every rewritten method. `OopMapEntry::bytecode_pc`
+>   must *not* be translated. (`6e84a5e12`)
+> - **Linear-scan RA — has a production call site.** Behind
+>   `CRATONVM_JIT_IR_LINEAR_SCAN`, off by default, `ir_lower` runs the allocator,
+>   verifies it, cross-checks it against the slot colourer, and uses the result as
+>   a **write-through register read cache**. Every value is still stored to its
+>   home word, so `emit_safepoint_map`, `build_deopt_points` and `emit_phi_copies`
+>   are untouched and the oop map is byte-identical to the colourer path's. The
+>   file is XMM-only because `emit_prologue` saves no callee-saved register, so
+>   widening it is a prologue change, not an allocator change. Found on the way
+>   in: `regalloc::ir_op_is_call` was **not** a superset of the calls `ir_lower`
+>   emits — it emits a returning CALL for FP `Op::Rem`, `Op::Load` and `Op::Store`,
+>   so with a caller-saved file a value held across any of them was silent wrong
+>   code; and the allocator was **inert on every real method**, because
+>   `IrBuilder` pushes a safepoint snapshot at every bci and the live model pinned
+>   essentially the whole value set. `spills`/`reloads` are now measured on this
+>   path and count what was *emitted*; the colourer path stays `NotMeasured`
+>   rather than report a zero it cannot justify. (`39d5b1426`)
+> - **Vectorization — the emitter exists, with no call site, deliberately.**
+>   `jit/src/x64/vec_emit.rs` exposes `emit_vector_loop` and a test harness;
+>   nothing calls it, because its call site lives in `x64.rs`, owned by a
+>   different lane that wave. Fail-closed at both the entry point and the opcode
+>   selectors, so bypassing the entry point does not help: reference elements (a
+>   vector store of oops bypasses the write barrier — the same family as the G1
+>   UAF below), byte/char/short, int div/rem, FP min/max, long multiply, and/mul
+>   reductions, *all* FP reductions, strict-alignment ISAs, non-AVX2 hosts, and
+>   register spilling. VEX encodings were cross-checked byte-for-byte against the
+>   already-shipping emitters. Three documented prerequisites before it may be
+>   wired: unify the XMM0–5 pool with `regalloc.rs` or a scalar FP value living
+>   there is silently destroyed; patch every `fallback_sites` rel32 at the caller;
+>   give the vector loop a back-edge safepoint poll. (`e734be64e`)
+> - **`jit/src/x64/isel.rs` is compiled for the first time.** Adding
+>   `pub mod isel;` put a 3,941-line pattern table and ~1,480 lines of tests in
+>   front of a compiler — including the byte-for-byte equivalence sweep against
+>   the hand-written emitters, which is the *entire* basis for trusting the table
+>   and had never run. 68 of 68 isel tests pass; the first run found a real
+>   cost-model tie-break bug (`p + 24` selected an LEA). An existing doc listed
+>   adding that line as a prerequisite "before wave 1"; it was never done. A
+>   genuine IR-level tiler and a memory-order validator for the scheduler landed
+>   alongside it, with no unanchored pattern rows — every row names the
+>   hand-written code it reproduces byte-for-byte. (`db64b3dfe`, `13f3b5a46`)
 >
 > **Defects found that this report does not describe.** These were the campaign's
-> highest-value output and are unrelated to the roadmap items that surfaced them:
+> highest-value output and are unrelated to the roadmap items that surfaced them.
+> Wave 1:
 >
 > - **G1 never stamped `GC_FLAG_OLD_GEN` on promotion**, so the JIT inline
 >   reference store read every promoted object as young and skipped the
@@ -41,23 +123,255 @@
 >   abandoned build set a sticky bail that dropped a later *successful* build
 >   out of the optimizing tier. Found only by running the tests.
 >
-> **Deliberate behaviour changes, for anyone measuring:**
-> allocation elision no longer fires for allocations named by a safepoint slot
+> Wave 2, each verified from the commit that closed it:
+>
+> - **Use-after-free in the concurrent old-gen sweep** (GCAUD-4). `concurrent_sweep`
+>   is the only phase of the concurrent old cycle that runs outside STW, and its
+>   liveness test is two tables keyed on a bare old-gen address. Between remark and
+>   the sweep's lock acquisition, another thread's young GC can run `old_gen_gc`;
+>   the in-place arm frees blocks and the next promotion **re-issues those
+>   addresses** to new live objects. Such an object satisfies both halves of the
+>   TAMS filter — "existed at remark" (its address did) and "bit clear" (the bit
+>   describes its predecessor) — and is freed while live. Closed with an old-gen
+>   reclaim epoch: a mismatched snapshot reclaims nothing. (`071afa11e`)
+> - **The compactor manufactures a dangling pointer** (GCAUD-2). Phase 0 assumes
+>   the object walk yields every old-gen object, but a freed block is invisible to
+>   it — allocated extents are the *gaps* between free blocks. For such a referent,
+>   phase 0 OR-ed the mark bit into an unvalidated address, phase 1 gave it no
+>   forwarding address, and phase 3 slid a different object onto it. It now refuses
+>   the write and abandons the whole compaction. (`071afa11e`)
+> - **A ChaCha/Salsa round count of zero made the permutation the identity.** The
+>   previous wave's guard checked **parity only**; BouncyCastle's own constructor
+>   rejects `rounds <= 0 || (rounds & 1) != 0`. With zero rounds the core emits
+>   `x[i] = 2 * input[i]` — a "keystream" that is an invertible function of the
+>   engine state, and the engine state *is* the key. That makes the SPHINCS hash
+>   forgeable. Zero is reachable because the round count is read **by name**, and a
+>   by-name read of an unwritten int slot yields `Int(0)`. Same commit: the sunec
+>   non-canonical-scalar branch answered *every* `s >= n` with the identity — a
+>   plausible, well-formed point, on a private-key operand. (`09d26d746`)
+> - **Every JIT dispatch memo was keyed on an address identical in every VM.** Six
+>   **process-global** `static JitInvokeInfo`s are passed as `info_ptr` to
+>   `jit_invoke_dispatch`, so that address is the same in every VM — a guaranteed
+>   collision, not a recycling hazard. The partial mitigation that existed was
+>   insufficient: two caches were flushed only because a second VM's bootstrap
+>   accidentally over-flushed process-global generation counters, and the object and
+>   integer native dispatch caches had no `clear()` anywhere in the file.
+>   `class_init_memo` and `system_class_memo` were unqualified process-global
+>   bitmaps indexed by raw `ClassId` and consulted from `jit_getstatic`.
+>   (`aa3c737e0`)
+> - **The exception table was entirely unvalidated.** `start_pc`, `end_pc`,
+>   `handler_pc` and `catch_type` were parsed as four raw `u16`s and stored
+>   verbatim, never compared against `code_length` or the constant pool, though
+>   JVMS 4.7.3 constrains all four and HotSpot enforces all four. That is
+>   exploitable because **`handler_pc` is a jump target**: `jit/src/lib.rs` takes
+>   `entry.handler_pc as usize` and feeds it into a code walk, so `0xFFFF` in a
+>   4-byte method was an attacker-chosen out-of-range bytecode index handed to code
+>   entitled to assume the parser had rejected it. Closed with HotSpot's exact rule
+>   set, called from both entry points because `decode_attribute` is `pub` and
+>   independently reachable, plus a 2,819-mutant deterministic harness driven past
+>   `read_class`. (`a146b78f0`)
+> - **Escape analysis deleted the monitors on an object it wrongly believed
+>   confined.** `build_connection_graph` had no `Op::Other` arm, and two ops land
+>   there while publishing a reference — `LambdaIntToDouble`, which invokes the
+>   lambda it is handed, and `Guard`, a deopt point. Scalar replacement was safe by
+>   accident (its use walk refuses `Op::Other`), but **lock elision walks no uses at
+>   all**: it asks only `get_escape(object).is_confined()`. Two siblings in the same
+>   commit, same may-alias-used-as-must-alias shape: a self-referential alias
+>   (`o.next = o; Foo p = o.next; p.x = 5`) left a store writing through an
+>   `Op::Dead` holder after the allocation was deleted, and DSE deleted a live store
+>   on a may-alias key because `MemKind` is an access **width**, not a field index,
+>   so `o.x = 1; o.y = 2;` matched. (`3a04f6fdc`)
+>
+> Also found, same wave, in brief: **six unchecked deopt-metadata invariants, three
+> fail-open** — nothing checked frame-slot offsets at all (`off == 0` is `[rbp]`,
+> the saved caller FP that `poison_slot` exists to make unnameable), one frame word
+> could be `ref` in one slot and `int` in another, a monitor whose object is an
+> `Int` passed verification, and `chain_is_resumable` returned `true` for a chain it
+> had not finished walking while being consulted by two compile-time admission gates
+> (`86b613c3f`); **no publication path had any install-age check**, so a compilation
+> could be installed after the redefine or cache flush that invalidated it —
+> `CompiledMethod::compilation_epoch` is not that check, it is the debug-gated
+> deopt-osr speculation epoch (`66f0b6039`, `da666127a`); **the JIT pending exception
+> lived in a `thread_local` `Cell` with no root provider**, neither scan nor remap,
+> which TLS cannot have — a root source runs on the collecting thread and cannot see
+> a parked peer's TLS, so the storage moved onto `JvmThread` (`f64f14ffa`); **every
+> `OscCache` published a raw pointer to its own map into a process-global vector**,
+> so every VM's root scan handed its collector other VMs' heap addresses and every
+> VM's post-move fixup rewrote other VMs' entries — its own doc recorded 5 SIGSEGVs
+> and 2 hangs in 1500 runs (`cb0c0a6f4`); **JVMTI's real-agent bridge was a
+> first-writer-wins `OnceLock`** described in-tree as last-writer-wins, so a second
+> VM's `-agentpath:` agent received zero bridged events for the life of the process
+> (`8ebe8e604`); **`DIRECT_BUFFERS` was keyed on the buffer's raw heap address**,
+> never remapped, never swept, and consulted before the field read, so a recycled
+> address handed native code the previous buffer's malloc pointer — and it was
+> masking a second bug, since the documented "authoritative" fallback reads slot 0 as
+> a `Long` which is only correct for the fabricated stub class (`64e6d61b4`); **array
+> classes were given the bootstrap loader** contrary to JVMS 5.3.3, live enough that
+> two hand-rolled workarounds for it already existed in native-builtins
+> (`78a5c3024`); **four unsafe aarch64 rows** — Windows-on-ARM never flushed the
+> I-cache, negative FP spill offsets went through the *scaled* unsigned form so
+> `-24` became `65512 * 8` and every spilled float read and wrote ~64 KiB above FP
+> inside the caller's frame, `ARM64_LOCAL_FPS` is D8–D15 which AAPCS64 makes
+> callee-saved while the prologue saved only GPRs, and an unencodable SP adjustment
+> emitted `BRK #0` and reported **success** (`8f2c76db4`); **`dominant_receiver`
+> overflowed `u32` at ~43M observations at one call site** — the function that seeds
+> the inline caches — and its `max_by_key` tie-break over an `FxHashMap` made two
+> compiles of one profile seed different caches (`0eb3439cb`); and **two native
+> shims on abstract classes that intercept every subclass**, one of which
+> (`AbstractMap.hashCode`) returned the receiver's **raw heap address**, which moves
+> under a moving young collection (`585787262`).
+>
+> **Deliberate behaviour changes, for anyone measuring.**
+> Allocation elision no longer fires for allocations named by a safepoint slot
 > (correctness over optimization; recovery documented in `docs/jit/deopt-metadata.md`);
 > G1 loses the inline store on the fresh-ctor pattern (`docs/gc/g1-audit.md` §10);
 > Panama upcalls without `--enable-native-access` now throw.
 > Frame bytes fell 82–97% and the optimizing-tier node ceiling rose 4,086 → 20,000.
+> The sharpest one is GCAUD-2's fail-closed response: **while a workload is in the
+> state where a live object references a freed old-gen block, major GC reclaims
+> nothing** — silent corruption traded for eventual OOM. That is the required
+> direction, and `COMPACT_ESCAPE_HITS` is the number that says whether it is
+> happening. Guard-dominated BCE landed opt-**out** and was flipped to default-off
+> (`CRATONVM_JIT_RANGE_BCE=1` to arm): it is a brand-new reason for *deleting* a
+> bounds check, has never been benchmarked or differentially tested, and a wrong
+> elision is an out-of-bounds heap write. (`1078030f2`)
 >
-> **Not validated.** Nothing here has run under the stress harness, sanitizers,
-> Loom/Shuttle, a real fuzzing campaign, or a benchmark A/B. Capability
-> enforcement is staged permissive and inert until VM init wires it. Phase
-> accounting is 100% unattributed until its 29 call sites land.
+> **Not validated. Read this literally.**
 >
-> **Remaining ~10 items are the report's own multi-month lanes** — HIR/LIR/MIR,
-> instruction selection, linear-scan RA, range analysis, profile-guided inlining,
-> OSR, loop transforms, vectorization, the compilation broker, and the
-> `x64.rs`/`invoke.rs` seam splits. The report scopes these at 180–360
-> engineer-days each and the whole roadmap at 24–36 months for one engineer.
+> - **No stress harness, no sanitizer run, no Loom/Shuttle, and no benchmark A/B
+>   has ever been run against any of it.** Every performance figure in this banner
+>   is a static or emitted-code count, not a measurement.
+> - **No fuzzing campaign has ever been run.** 17 targets, every one reaching a real
+>   parser, all built by the blocking `fuzz-smoke` CI job on every commit,
+>   **executed never** — not one input, no `fuzz/artifacts/` has ever existed, no
+>   coverage report exists anywhere in the tree, and no document records a run. All
+>   17 now have committed seeds, pinned byte-identical across runs; that is
+>   scaffolding around a campaign that has not happened. Biggest uncovered surface,
+>   and not on any lane's list: the raw HTTP request parser, which reads straight
+>   off a socket and is strictly more attacker-reachable than jimage.
+>   (`docs/known-issues/fuzzing-state.md`)
+> - **Nothing in the aarch64 work has executed on aarch64 hardware.**
+> - **One test is committed `#[ignore]`d because it fails and the failure is real** —
+>   `jit/src/x64.rs`, "publishes a live OSR entry at a refused bci". The triage is
+>   in the commit: `osr_entry_pc` and `rebuild_pc_to_native` are correct in
+>   isolation on that fixture's own plan, the compile under test really is rewritten
+>   (the test now proves that before asserting anything), yet the published vector
+>   still carries a live entry at bci 16, and forcing the refusal again at
+>   publication does not change it. Not reachable in production — the rewriter is
+>   off by default and armed per thread — but a live entry at a refused bci is a
+>   wrong-code bug either way: entering there resumes a "back edge next" frame at
+>   the top of a fresh body and runs one extra iteration. (`e3824ee07`)
+> - The generated **197-opcode corpus is compiled, not run**. CI reports the matrix;
+>   nothing diffs 197 programs × 7 modes against HotSpot. The `checksum` comparison
+>   dimension is *exercisable*, not exercised.
+> - Capability enforcement is now **live at runtime but permissive**
+>   (`CapabilityMode::Permissive`): `install_capabilities` is called from
+>   `SharedVm::new` before the `register_*` pass, so the ~35 per-call-site gates
+>   resolve and `capability_audit(vm)` answers — and nothing is denied by default.
+>   (`docs/security/capability-runtime-install.md`)
+> - The **compilation broker is entirely unwired**, and its class epoch has no
+>   producer until the VM's redefine/unload sites call `invalidate`; a missed call
+>   site there would be a silent wrong-code hole. Three defects in the *live*
+>   manager were reported and deliberately **not** fixed, each being a behaviour
+>   change with no flag to gate it: `on_deoptimization`/`on_c2_bailout` clear
+>   `queued_for_compilation` without removing the queued task, `enqueue_compilation`
+>   deduplicates not at all, and there is no invalidation for a redefined class's
+>   queued or in-flight requests. (`44aa4d9a3`)
+> - **Inlined deopt scope chains are still not produced.** `push_scope` has no
+>   non-test caller anywhere in the workspace, so `FrameState::caller` is `None` in
+>   every installed artifact, and the single-pass backend has no scope stack at all.
+> - **`DeoptimizationPoint::semantics` is stamped by every producer and read by no
+>   consumer** — `vm/src` never inspects the field; the resume sink still infers
+>   re-execute-vs-resume from `DeoptReason`.
+>
+> **Still open — go to the lane doc, not to this banner.** Each lane left a
+> document rather than a summary line here.
+> `docs/jit/`: `aarch64-parity.md` (32-bit int width is a deliberate non-fix; the
+> exact SXTW/shift-mask encodings are recorded), `instruction-selection.md` and
+> `instruction-patterns.md` (32-bit LEA refused rather than guessed — the biggest
+> missing win, since most Java arithmetic is int), `vectorization-emitter.md` (the
+> three wiring prerequisites), `linear-scan-wiring.md`, `loop-rewriter-wiring.md`,
+> `compilation-broker.md`, `deopt-inline-scopes.md`, `deopt-metadata-audit.md`,
+> `alias-analysis.md` (`Graph::may_alias`/`may_reorder` pinned as the one oracle,
+> with its contract and six premises written down), `range-analysis.md`,
+> `code-cache-lifecycle.md`.
+> `docs/gc/`: `gc-crate-audit.md` (GCAUD-5 **decided, not fixed** — and the earlier
+> "degradation only" verdict is corrected there: an un-retired reserved tail of 8,
+> 16 or 24 bytes sizes as a zeroed header and the walk strides *into* the next
+> object, a desync rather than a precision loss), `old-sweep-liveness.md`,
+> `g1-audit.md` (G1-9 parallel young evacuation is **not** confirmed root-caused;
+> the flag stays opt-in and mixed GC stays serial), `tlab-and-card-audit.md`.
+> `docs/known-issues/`: `classloading-identity-audit.md` (JVMS 5.3.4 loader
+> constraints are unimplemented workspace-wide. Two of that doc's open items
+> have since been CLOSED without it being updated: `fabricate_class` now refuses
+> an ambiguous name instead of minting a stub that outranked both real classes
+> (`synthetic-class-fallibility.md`), and an array class now takes its
+> component's defining loader per JVMS 5.3.3
+> (`array-class-defining-loader.md`). Read it for the residue, not for those),
+> `vm-process-global-state.md` and `-round-2.md` (a 467-static / 58-`thread_local`
+> census of `vm/src`: ~400 benign, 4 per-VM leaks, 6 dangerous — 2 fixed, 2 already
+> correct, 2 open with recipes), `native-builtins-shim-audit.md`,
+> `native-collections-root-audit.md`, `crypto-failure-mode-audit.md`,
+> `flag-declaration-audit.md`, `fuzzing-state.md`, `class-file-parser-hardening.md`.
+>
+> **The report's own multi-month lanes remain multi-month lanes.** HIR/LIR/MIR,
+> profile-guided inlining, OSR, loop transforms, and the `x64.rs`/`invoke.rs` seam
+> splits are untouched in scope; instruction selection, linear-scan RA, range
+> analysis, vectorization and the broker now have a first increment each, not a
+> finished lane. The report scopes these at 180–360 engineer-days each and the whole
+> roadmap at 24–36 months for one engineer, and nothing above changes that.
+>
+> ---
+>
+> ### Superseded: the "four deep integration items: exact remaining state" section
+>
+> That section recorded all four as analysis-complete with no production
+> consumer. All four now have one (or, for vectorization, a deliberate
+> non-consumer); see **Now wired** above. Two of its recorded conclusions were
+> disproved when the work was actually done — the loop-rewriter metadata
+> translation is not a `CompiledMethod` post-pass and there are four bci-baking
+> sites rather than three — and both corrections are in
+> `docs/jit/loop-rewriter-wiring.md`. The rest of the section is preserved only in
+> git history (`ee504fdec`, `734a3995f`, `7254f8475`).
+>
+> One figure from it is worth keeping: the vectorization admission gate still
+> admits **11 of 27** corpus loops, and that number was deliberately not moved by
+> the emitter work.
+>
+> ---
+>
+> ### Earlier wave — landed fixes, CI wiring, doc reconciliation
+>
+> Kept because these are closures the sections above do not repeat. The unit-test
+> count that used to head this section is removed: it was not re-measured.
+>
+> | Item | What changed |
+> |---|---|
+> | G1-8 — "undead" remembered-set entry | An rset entry is now `(source, generation)`, not a bare source index. `G1Region::recycled_in_generation` + `rset_cache_epoch`-as-clock make the sharper test available to both the scan side (`live_rset_sources`) and `cleanup` (`retain_sources_in_generation`), so a recycled-**and-retyped** source no longer survives forever. Fail-safe by construction: un-stamped entries get `RSET_GENERATION_PINNED`, and the staleness test is a strict `<`. |
+> | T-3 — moving cycle with published TLAB tails | Escalated from a rate-limited warn to a **refusal**: the young collection is skipped (over-retain, spill to old gen, retry). Not a heuristic — the tails are already clipped to this from-space, so a non-empty set *is* the hazard. Expected unreachable on a correct transition graph. Deliberately does **not** divert to the non-moving sweep, which on the precise-root path reclaims live young objects. |
+> | `System.setSecurityManager` cross-VM finding (use-after-move) | **Fixed.** Three process-global `(identity_key, ObjectRef)` singletons replaced by a `vm_identity`-keyed index (`SECURITY_STATE`), plus a real GC root source (`"security-manager"` in `vm/src/memory/native_roots.rs`). The keying closes the sandbox-disarm hole; the root source closes the use-after-move — per-VM keying alone would not have. Six tests next to the fix. |
+> | Deopt reexecute flag | `DeoptimizationPoint::semantics: ResumeSemantics` landed; **every** producer stamps `ResumeSemantics::for_reason`. The prose convention now lives in one place. |
+> | Deopt-metadata verifier | Wired at the **IR** install site (`ir_lower.rs`, before the artifact becomes a `CompiledMethod`), with a dedicated `BailoutReason::DeoptMetadata` and context `phase=install`. |
+> | Opcode / execution-path coverage | `gen-opcodes` (197 programs, each with a declared checksum and its focus code inside a loop inside a `try`) + `matrix` (tri-state cells, reconciliation) now run in CI's `difftest-gate` job and upload `opcode-coverage-matrix`. Report, not a gate: exit 0 or the non-fatal exit 3 pass, anything else fails. |
+> | Performance gate | `.github/workflows/performance.yml` passed `--reps 5` while the gate's reliability preflight requires `--min-samples 7` — that job would have exited **12 [SAMPLE-COUNT]** before taking a single measurement. Now `--reps 7`. |
+>
+> **Half-closed, as of this wave.** Inlined deopt scope chains, the reexecute
+> flag, the deopt-metadata verifier in the single-pass backend, the uncompiled
+> opcode corpus and G1-9 are all still open and are described under **Not
+> validated** and **Still open** above. G1-9 specifically: one real
+> serial/parallel divergence was found and fixed — the parallel source set
+> omitted JIT-pinned regions, reachable **only** as remembered-set sources, and
+> it reproduces in the same `--nojit` configuration as the corruption — but it is
+> **not confirmed as the root cause**, the flag stays opt-in and mixed GC stays
+> serial.
+>
+> This section previously listed lock elision/coarsening, the vectorization gate,
+> linear-scan RA and the bytecode loop rewriter as "complete, tested, and with no
+> production consumer at all". **That list is now wrong in every row except
+> vectorization** — see **Now wired** above. In particular `IrBuilder` does have
+> `monitorenter`/`monitorexit` arms (opcodes `0xc2`/`0xc3` in `jit/src/ir.rs`), so
+> the escape-analysis offer lists are no longer empty by construction. The
+> vectorization *emitter* exists too; what it lacks is a call site.
 
 ## Executive summary
 
