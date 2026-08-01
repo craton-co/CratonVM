@@ -6532,14 +6532,41 @@ impl GenerationalHeap {
             let sweep_used = young_from.used();
 
             // (1) Pin set: every root / finalizer value that lands in young.
-            // (1) Pin set: every root / finalizer value that lands in young.
+            //
             // Stage B (precise oop maps, B-K relocation track): EXCLUDE addresses
-            // published as movable precise-JIT roots — empty unless precise
-            // relocation is engaged, so byte-identical on the default path.
+            // published as movable precise-JIT roots, so the sweep can drain a
+            // shadow-published oop instead of pinning it. A "movable" root is a
+            // CLAIM that something will rewrite the frame's copy after the move —
+            // the shadow-stack remap plus the JIT's post-safepoint reload.
+            //
+            // That claim is only good on a cycle that PROVED complete
+            // moving-young coverage, so the exclusion is now conditioned on the
+            // proof (`honour_movable`). The original code applied it
+            // unconditionally, above a comment asserting the movable set is
+            // "empty unless precise relocation is engaged, so byte-identical on
+            // the default path". That was true when it was written and is FALSE
+            // now: `conservative_roots::shadow_stack_enabled()` lost its
+            // `moving_young_enabled() &&` term on 2026-07-31 and defaults to
+            // TRUE, so `roots.rs` publishes every shadow-stack oop as movable on
+            // EVERY collection.
+            //
+            // Left unconditional it is an active corruption hazard, and
+            // specifically one that HIB-GCOVERHEAD-HALFFULL.1's fix would have
+            // armed: that fix re-enables selective promotion on
+            // coverage-INCOMPLETE cycles, which are exactly the cycles where a
+            // frame could not prove it publishes and can rewrite all of its
+            // oops. Evacuating a root on the word of a proof that just failed
+            // inverts the sweep's whole safety argument — pin-by-value, which
+            // over-retains and can never dangle.
+            //
+            // Pinning a root for one cycle costs nothing but a deferred
+            // promotion: it is a root, so it is not the interior heap object the
+            // drain is actually for. The bt18-critical drain is unaffected.
+            let honour_movable = !crate::gc_quiescence::moving_young_coverage_incomplete();
             let mut pinned: FxHashSet<usize> = FxHashSet::default();
             for r in roots.iter() {
                 let a = r.as_ptr() as usize;
-                if is_y(a) && !crate::gc_quiescence::is_movable_jit_root(a) {
+                if is_y(a) && !(honour_movable && crate::gc_quiescence::is_movable_jit_root(a)) {
                     pinned.insert(a);
                 }
             }
@@ -13588,6 +13615,80 @@ mod tests {
             "a forcibly-frozen in-JIT peer MUST still suppress promotion: its \
              registers can hold a derived/interior pointer whose base \
              pin-by-value does not protect (xt-hardening 2026-07-03)",
+        );
+    }
+
+    /// A root published as a MOVABLE precise-JIT root may be evacuated only on a
+    /// cycle that proved complete moving-young coverage.
+    ///
+    /// "Movable" is a claim that the shadow-stack remap plus the JIT's
+    /// post-safepoint reload will rewrite the frame's copy after the move. An
+    /// incomplete coverage proof is precisely the statement that the frame could
+    /// not show it publishes and can rewrite all of its oops, so on such a cycle
+    /// the claim is worthless and the root must be pinned.
+    ///
+    /// This pairs with
+    /// `selective_promotion_runs_under_an_unproven_frame_map_but_not_a_frozen_peer`:
+    /// that test restores the drain on unproven cycles, and this one bounds it.
+    /// Without the bound, restoring the drain would ARM a corruption hazard that
+    /// had been dormant only because promotion was (wrongly) off — the movable
+    /// exclusion was written when `shadow_stack_enabled()` implied moving-young
+    /// and the movable set was empty by construction on the default path, which
+    /// stopped being true on 2026-07-31.
+    #[test]
+    fn a_movable_jit_root_is_pinned_when_the_coverage_proof_failed() {
+        // -> was the root still at its original address after the sweep?
+        fn root_stayed_put(coverage_complete: bool) -> bool {
+            let heap = small_gen_heap();
+            let monitors = NoOpMonitors;
+
+            let obj_a = heap.alloc_object(ClassId::new(1), 1);
+            heap.set_field(obj_a, 0, Value::Int(4242));
+
+            crate::gc_quiescence::publish_moving_young_enabled(true);
+            crate::gc_quiescence::clear_force_non_moving_jit_roots();
+            crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+            crate::gc_quiescence::enter();
+
+            let mut roots = vec![obj_a];
+            for _ in 0..(PROMOTION_AGE as usize + 4) {
+                crate::gc_quiescence::begin_moving_young_coverage_cycle();
+                // Republish every cycle: both the movable set and the coverage
+                // verdict are per-cycle state.
+                crate::gc_quiescence::clear_movable_jit_roots();
+                crate::gc_quiescence::add_movable_jit_root(roots[0].as_ptr() as usize);
+                if !coverage_complete {
+                    crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                        crate::gc_quiescence::incomplete_reason::UNPUBLISHED_FRAME_OOP,
+                    );
+                }
+                heap.collect_garbage(&stw(), &mut roots, &monitors);
+            }
+
+            crate::gc_quiescence::leave();
+            crate::gc_quiescence::clear_movable_jit_roots();
+            crate::gc_quiescence::begin_moving_young_coverage_cycle();
+            crate::gc_quiescence::publish_moving_young_enabled(false);
+
+            assert_eq!(
+                heap.get_field(roots[0], 0).as_int(),
+                Some(4242),
+                "the object must survive intact either way",
+            );
+            heap.is_in_young(roots[0].as_ptr())
+        }
+
+        assert!(
+            root_stayed_put(false),
+            "on a cycle whose coverage proof FAILED, a movable-published root \
+             must be pinned: nothing on that cycle is known to be able to \
+             rewrite the frame slot holding it, so evacuating it leaves the JIT \
+             frame pointing at freed, re-served young memory",
+        );
+        assert!(
+            !root_stayed_put(true),
+            "…but on a PROVEN cycle the exclusion must still apply, or the \
+             shadow-stack drain this mechanism exists for is dead code",
         );
     }
 
