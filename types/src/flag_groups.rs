@@ -633,6 +633,13 @@ pub const INVENTORY: &[E] = &[
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
     E { group: Group::JIT, token: "ir-reloc-emit", on_key: Some("CRATONVM_JIT_IR_RELOC_EMIT"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "ir-selfrec-direct", on_key: Some("CRATONVM_JIT_IR_SELFREC_DIRECT"), off_key: None, off_word: None },
+    // Default-ON, `"0"` turns it off — same polarity as `ir-reloc-emit`, and
+    // the row must spell it that way round. The consumer refuses to install a
+    // compilation stamped older than the last cache flush; setting this to `0`
+    // restores publish-anyway for bisection, which is an unsafe-on-purpose
+    // lever. Added a wave after the declaration sweep closed at zero
+    // offenders, which is exactly how the count creeps back up.
+    E { group: Group::JIT, token: "strict-install-epoch", on_key: Some("CRATONVM_JIT_STRICT_INSTALL_EPOCH"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "kernel-reg-locals", on_key: Some("CRATONVM_JIT_KERNEL_REG_LOCALS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "kernel-reg-osr", on_key: Some("CRATONVM_JIT_KERNEL_REG_OSR"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "leak-code", on_key: Some("CRATONVM_JIT_LEAK_CODE"), off_key: None, off_word: None },

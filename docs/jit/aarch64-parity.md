@@ -121,9 +121,16 @@ here as a cross-file finding; see §6.
 
 The barrier *encoders* exist and are now pinned by exact-byte tests
 (`aarch64::tests::test_barrier_encodings`): `DSB SY` `0xD5033F9F`, `DSB ISH`
-`0xD5033B9F`, `DMB SY` `0xD5033FBF`, `DMB ISH` `0xD50333BF`, `DMB ISHST`
-`0xD50332BF`, `ISB SY` `0xD5033FDF`. **Nothing in the backend emits any of
+`0xD5033B9F`, `DMB SY` `0xD5033FBF`, `DMB ISH` `0xD5033BBF`, `DMB ISHST`
+`0xD5033ABF`, `ISB SY` `0xD5033FDF`. **Nothing in the backend emits any of
 them.** That is correct today (nothing needs one) and is a trap tomorrow.
+
+The `DMB ISH` and `ISHST` values above read `0xD50333BF`/`0xD50332BF` when
+this doc was written, and the test carried the same two wrong literals until
+the suite was first run against it. The encoding is `base | CRm << 8`, so
+`CRm` lands in the third hex digit from the right. Both were written from one
+mistaken reading, which is precisely why this doc is the wrong thing to check
+the test against — check both against the ARM ARM.
 
 ---
 

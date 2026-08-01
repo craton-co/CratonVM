@@ -40193,6 +40193,29 @@ mod loop_unroll_admission {
         );
     }
 
+    /// The fixture's loop, pinned independently of the planner.
+    ///
+    /// Restored after being deleted by accident while probing the OSR test
+    /// below. It is the control that makes that test's constants meaningful:
+    /// without it, a change to `shape_int_accum_loop` silently moves the
+    /// header and back edge and every hard-coded bci in this module starts
+    /// describing a different method.
+    #[test]
+    fn the_fixture_loop_is_what_the_planner_is_offered() {
+        let code = shape_int_accum_loop();
+        assert_eq!(code.len(), 21);
+        assert_eq!(detect_loops(&code, 21), vec![(4usize, 16usize)]);
+        assert!(
+            !find_bypassable_loop_headers(&code, 21, &[(4, 16)], &[]).contains(&4),
+            "the fixture header must be reachable only by fall-through and its \
+             own back edge, or the planner would refuse it for the wrong reason"
+        );
+        // The rewrite the planner should choose, stated independently of it.
+        let x = plan_loop_unroll(&code, 21, 4, 16, 3, &[]).expect("admitted");
+        assert_eq!(x.code_len, 21 + 3 * 12);
+        assert!(x.provenance_is_total());
+    }
+
     /// End to end: with the rewriter armed the emitter really compiles the
     /// rewritten bytes, and the OSR metadata the artifact publishes is back in
     /// INTERPRETER-bci space.

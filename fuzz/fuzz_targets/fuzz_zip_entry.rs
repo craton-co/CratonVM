@@ -167,13 +167,25 @@ fn staging_path() -> &'static PathBuf {
     })
 }
 
-/// Force the `read()` archive path instead of `mmap`. `loader_flags()`
-/// latches on first read, so this must run before the first `ClassPath` is
-/// built — hence the `Once` rather than a per-iteration `set_var`.
+/// Force the `read()` archive path instead of `mmap`.
+///
+/// This used to `set_var`, which does not work for a DECLARED flag: the
+/// snapshot latches on first read, so an environment write only takes effect
+/// if it wins the race to initialise it. `flag_env_mutation_guard` fails over
+/// exactly that. Installing the snapshot is the supported way to say "for the
+/// rest of this process", and the `Once` still matters, because `install`
+/// refuses a second attempt and this must land before the first `ClassPath`.
 fn disable_jar_mmap_once() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        std::env::set_var("CRATONVM_DISABLE_JAR_MMAP", "1");
+        let cfg = cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+            "CRATONVM_DISABLE_JAR_MMAP",
+            Some("1"),
+        )]);
+        // An error here only means something already latched the snapshot, in
+        // which case there is nothing to do and the mmap path is what gets
+        // fuzzed — which is worth fuzzing too.
+        let _ = cratonvm_types::flags::install(cfg);
     });
 }
 

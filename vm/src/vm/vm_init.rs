@@ -3280,15 +3280,27 @@ impl SharedVm {
         // all core subsystems are up.
         //
         // Per-VM, not process-wide: a single global manager sent VM B's events
-        // to VM A's callbacks and dropped VM B's own manager on the floor. The
-        // unattributed fallback means this is safe to land before the
-        // interpreter's delivery sites are threaded through.
+        // to VM A's callbacks and dropped VM B's own manager on the floor.
         crate::runtime::jvmti::install_manager_for_vm(
             vm.vm_identity,
             std::sync::Arc::new(crate::runtime::jvmti::JvmtiEventManager::new_for_vm(
                 vm.vm_identity,
             )),
         );
+        // AND the unattributed row, which is NOT redundant. Six delivery sites
+        // — VMInit, VMDeath, ClassLoad, ClassPrepare, GCStart, GCFinish —
+        // still resolve through `global_manager()`, which is an EXACT lookup
+        // of row 0 with no fallback. Installing only the per-VM row above left
+        // row 0 uninhabited in production, so every one of those events
+        // resolved `None` and was silently dropped. The per-VM lane's note
+        // that "their events land on the unattributed manager, which is
+        // exactly where they land today" was true only while this call site
+        // still populated row 0 — so it has to keep populating it until those
+        // sites are attributed. The test that should have caught this installs
+        // the row itself first, and so passes vacuously.
+        crate::runtime::jvmti::install_global_manager(std::sync::Arc::new(
+            crate::runtime::jvmti::JvmtiEventManager::new(),
+        ));
 
         // Bridge the classloading crate's JVMTI hooks to the runtime JVMTI
         // manager. `classloading` cannot depend on `vm`, so it exposes a
