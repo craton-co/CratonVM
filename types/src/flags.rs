@@ -669,6 +669,12 @@ pub struct GcFlags {
     // ── Pure diagnostics ──────────────────────────────────────────────────
     /// `CRATONVM_DBG_A2`
     pub dbg_a2: bool,
+    /// `CRATONVM_DBG_SWEEP_LIVENESS` — presence gate for the old-gen sweep's
+    /// freed-while-referenced assertion. [`parse::present`].
+    pub dbg_sweep_liveness: bool,
+    /// `CRATONVM_DBG_SWEEP_LIVENESS` — the value, so `=rescue` selects the
+    /// retain-instead-of-free differential mode; any other value reports only.
+    pub dbg_sweep_liveness_value: Option<String>,
     /// `CRATONVM_DBG_BADREF`
     pub dbg_badref: bool,
     /// `CRATONVM_DBG_CELLCORRUPT`
@@ -803,6 +809,8 @@ impl GcFlags {
             gc_array_guard_bt: present(src, "CRATONVM_GC_ARRAY_GUARD_BT"),
 
             dbg_a2: present(src, "CRATONVM_DBG_A2"),
+            dbg_sweep_liveness: present(src, "CRATONVM_DBG_SWEEP_LIVENESS"),
+            dbg_sweep_liveness_value: utf8(src, "CRATONVM_DBG_SWEEP_LIVENESS"),
             dbg_badref: present(src, "CRATONVM_DBG_BADREF"),
             dbg_cellcorrupt: present(src, "CRATONVM_DBG_CELLCORRUPT"),
             dbg_desctrace: present(src, "CRATONVM_DBG_DESCTRACE"),

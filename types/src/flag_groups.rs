@@ -168,6 +168,7 @@ pub struct E {
 #[rustfmt::skip]
 pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "a2", on_key: Some("CRATONVM_DBG_A2"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "sweep-liveness", on_key: Some("CRATONVM_DBG_SWEEP_LIVENESS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "access", on_key: Some("CRATONVM_DBG_ACCESS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "active-profiles-identity-trace", on_key: Some("CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "aio", on_key: Some("CRATONVM_DBG_AIO"), off_key: None, off_word: None },
