@@ -871,7 +871,7 @@ impl OldGen {
         // cycle starts clean), touch neither the free list nor `used_bytes`,
         // and return an empty map so the caller runs no fixups. Nothing is
         // reclaimed this cycle; over-retention is the only safe response.
-        if Self::close_live_set_over_old_gen(&objects, &self.data) {
+        if Self::close_live_set_over_old_gen(&objects, &self.data).1 {
             let n = COMPACT_ESCAPE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 8 {
                 tracing::warn!(
@@ -1109,8 +1109,14 @@ impl OldGen {
     /// the entire old generation for one cycle is the fail-safe answer to "I
     /// cannot relocate this heap without leaving a dangling slot".
     ///
-    /// Returns `true` when the closure escaped `objects`.
-    fn close_live_set_over_old_gen(objects: &[(*mut u8, usize)], data: &[u8]) -> bool {
+    /// Returns `(objects_promoted, escaped)`. `escaped` is `true` when the
+    /// closure ran off `objects`; `objects_promoted` counts the under-marked
+    /// objects this pass rescued and is the signal that the marker missed a
+    /// push site (it is `0` on every healthy cycle).
+    fn close_live_set_over_old_gen(
+        objects: &[(*mut u8, usize)],
+        data: &[u8],
+    ) -> (usize, bool) {
         // `walk_objects` yields ascending object starts, so a binary search
         // over the same slice is an exact membership test with no extra
         // allocation. Assert the ordering rather than assume it: this is the
@@ -1123,6 +1129,7 @@ impl OldGen {
             |addr: usize| objects.binary_search_by_key(&addr, |&(p, _)| p as usize).is_ok();
 
         let mut escaped = false;
+        let mut promoted_total = 0usize;
         // Fixpoint: keep re-scanning marked objects until a pass promotes
         // nothing. `objects` is finite and each pass can only flip flags
         // from 0→1, so this terminates in at most `objects.len()` passes.
@@ -1158,6 +1165,7 @@ impl OldGen {
                     if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
                         ref_header.gc_flags |= GC_FLAG_MARKED;
                         promoted_any = true;
+                        promoted_total += 1;
                     }
                 });
             }
@@ -1165,7 +1173,48 @@ impl OldGen {
                 break;
             }
         }
-        escaped
+        (promoted_total, escaped)
+    }
+
+    /// Close the marked set over "referenced by a live old-gen object" **in
+    /// place**, without relocating anything.
+    ///
+    /// This is the same fixpoint [`Self::compact`]'s Phase 0 runs
+    /// ([`Self::close_live_set_over_old_gen`]), exposed for the *other* old-gen
+    /// reclaimer: the in-place sweep in
+    /// `GenerationalHeap::old_gen_gc(compact = false)`, which is the collector
+    /// that runs whenever a live JIT frame makes the root set conservative.
+    ///
+    /// # Why the in-place sweep needs it (GCAUD-8)
+    ///
+    /// That sweep decides "free this block" from `GC_FLAG_MARKED == 0` and
+    /// nothing else, and its mark has eight push sites, each of which can fail
+    /// *open* — dropping a genuine reference instead of over-retaining. When
+    /// one does, the sweep hands a still-referenced block back to the free
+    /// list. The compactor has been closed against exactly that under-marking
+    /// since Phase 0 was written ("the compactor must not corrupt the heap when
+    /// the marker under-marks"); the sweep was not, even though it is the arm
+    /// that *creates* the freed-but-referenced block the compactor then refuses
+    /// to relocate (`COMPACT_ESCAPE_HITS`).
+    ///
+    /// Running the closure before the free loop makes the two arms agree: an
+    /// unmarked object that a marked object still points at is promoted to
+    /// live and retained for one more cycle, transitively. Genuine garbage —
+    /// unmarked and unreferenced — is untouched by the closure and is still
+    /// freed, which is what the positive controls pin.
+    ///
+    /// `objects` must be the `walk_objects()` output for THIS old gen, taken
+    /// under the same lock and with nothing allocated or freed since: the
+    /// closure's admission proof is membership in that slice, so a stale slice
+    /// would authorise a mark-bit write into a recycled address.
+    ///
+    /// Returns `(objects_promoted, escaped)`. `escaped` has the same meaning as
+    /// in Phase 0 — a live referrer named an in-old-gen address the walk did
+    /// not yield, i.e. a block that is *already* on the free list (or behind a
+    /// `scan_region` anomaly). The sweep cannot un-free such a block, so it
+    /// reports rather than aborts; see the call site.
+    pub fn close_live_set(&self, objects: &[(*mut u8, usize)]) -> (usize, bool) {
+        Self::close_live_set_over_old_gen(objects, &self.data)
     }
 
     /// Update reference slots within a single live old-gen object so they point
@@ -1807,5 +1856,120 @@ mod tests {
             !map.contains_key(&(b as usize)),
             "unwatched stationary survivor must NOT get a pointer_map entry (bounded cost)"
         );
+    }
+
+    /// GCAUD-8 — [`OldGen::close_live_set`] is the in-place sweep's half of the
+    /// guard the compactor has had since Phase 0 was written.
+    ///
+    /// Both halves must hold at once, so both are asserted here:
+    ///
+    /// * **the fix** — an UNMARKED object that a MARKED object still references
+    ///   is promoted to live, so the sweep that runs next cannot free it under
+    ///   a live pointer;
+    /// * **the positive control** — an object that is unmarked *and*
+    ///   unreferenced is left exactly as it was. A closure that promoted
+    ///   everything would satisfy the first assertion and reclaim nothing ever
+    ///   again, which is the failure mode this pairing exists to catch.
+    #[test]
+    fn close_live_set_promotes_a_referenced_target_and_leaves_real_garbage_dead() {
+        let mut og = OldGen::new(4096);
+
+        // A: live referrer.
+        let a = og.alloc(HEADER_SIZE + SLOT_SIZE, 8).unwrap();
+        // B: A's target, deliberately left unmarked — the object a mark-phase
+        // gap loses and the sweep would otherwise free.
+        let b = og.alloc(HEADER_SIZE + SLOT_SIZE, 8).unwrap();
+        // C: unmarked AND unreferenced — genuine garbage, the control.
+        let c = og.alloc(HEADER_SIZE + SLOT_SIZE, 8).unwrap();
+
+        // SAFETY: all three are live blocks of this OldGen, each sized for a
+        // header plus the single slot written below.
+        unsafe {
+            let a_hdr = &mut *(a as *mut ObjectHeader);
+            a_hdr.set_num_slots(1);
+            a_hdr.gc_flags |= GC_FLAG_MARKED;
+            std::ptr::write(
+                a.add(HEADER_SIZE) as *mut Value,
+                Value::Object(Some(ObjectRef::from_raw(b))),
+            );
+            (*(b as *mut ObjectHeader)).set_num_slots(1);
+            (*(c as *mut ObjectHeader)).set_num_slots(1);
+        }
+
+        let objects = og.walk_objects();
+        let (rescued, escaped) = og.close_live_set(&objects);
+
+        assert_eq!(
+            rescued, 1,
+            "exactly the one referenced-but-unmarked object must be promoted",
+        );
+        assert!(
+            !escaped,
+            "every referent here is a walked base — nothing escaped the grid",
+        );
+
+        // SAFETY: nothing moved; both pointers still name their object.
+        unsafe {
+            assert_ne!(
+                (*(b as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED,
+                0,
+                "an unmarked object a LIVE object references must be retained",
+            );
+            assert_eq!(
+                (*(c as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED,
+                0,
+                "POSITIVE CONTROL: unreferenced garbage must stay dead, or the \
+                 sweep this feeds would stop reclaiming anything at all",
+            );
+        }
+
+        // Idempotent: a second run has nothing left to do.
+        let (rescued_again, _) = og.close_live_set(&objects);
+        assert_eq!(rescued_again, 0, "the closure must reach a fixpoint");
+    }
+
+    /// GCAUD-8 — the closure must also report the escape the in-place sweep
+    /// cannot repair: a live object pointing at a block that is ALREADY on the
+    /// free list. It must not write a mark bit through that address (it is
+    /// unallocated memory the allocator may reissue at any moment) and it must
+    /// not promote it into the walked set.
+    #[test]
+    fn close_live_set_reports_a_referent_that_is_already_freed() {
+        let mut og = OldGen::new(4096);
+
+        let a = og.alloc(HEADER_SIZE + SLOT_SIZE, 8).unwrap();
+        let b_size = HEADER_SIZE + SLOT_SIZE;
+        let b = og.alloc(b_size, 8).unwrap();
+
+        // SAFETY: both are live blocks of this OldGen.
+        unsafe {
+            let a_hdr = &mut *(a as *mut ObjectHeader);
+            a_hdr.set_num_slots(1);
+            a_hdr.gc_flags |= GC_FLAG_MARKED;
+            std::ptr::write(
+                a.add(HEADER_SIZE) as *mut Value,
+                Value::Object(Some(ObjectRef::from_raw(b))),
+            );
+            (*(b as *mut ObjectHeader)).set_num_slots(1);
+        }
+
+        // The state an under-marking sweep leaves behind: B freed, A still
+        // naming it, B's bytes not zeroed.
+        // SAFETY: `(b, b_size)` is exactly the pair `alloc` handed out.
+        unsafe { og.free(b, b_size) };
+
+        let objects = og.walk_objects();
+        let (rescued, escaped) = og.close_live_set(&objects);
+
+        assert!(escaped, "a referent outside the object walk must be reported");
+        assert_eq!(rescued, 0, "nothing in the walked set needed promoting");
+        // SAFETY: `b`'s block is unallocated but still mapped inside `og`.
+        unsafe {
+            assert_eq!(
+                (*(b as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED,
+                0,
+                "the closure must NOT write a mark bit into a free block",
+            );
+        }
     }
 }

@@ -329,6 +329,40 @@ pub static OLDMARK_BAD_KIND_HITS: AtomicU64 = AtomicU64::new(0);
 /// whatever occupied that address.
 pub static OLDMARK_REJECTED_CANDIDATES: AtomicU64 = AtomicU64::new(0);
 
+/// GCAUD-8 — old-gen mark candidates that [`old_gen_mark_candidate_plausible`]
+/// rejected but that `OldGen::walk_objects()` had just yielded as an object
+/// BASE, so they were admitted anyway.
+///
+/// The plausibility screen was written for *conservative* register/stack
+/// guesses, where a reject costs nothing because a failing candidate was never
+/// an object. At a **precise** push site — a reference slot, an overlay owner,
+/// a loader/mirror/metadata pin — its own doc says the opposite: "at a precise
+/// site a false reject IS a premature free". The screen is a set of heuristics
+/// about a header's bytes; walk membership is a *derivation* of the object grid
+/// from the free list. Where the two disagree about an address the walk
+/// produced, the walk wins and the object is retained.
+///
+/// Non-zero here means the screen would have dropped a live edge. It is the
+/// counter to read together with `old_gen::COMPACT_ESCAPE_HITS`.
+pub static OLDMARK_RESCUED_BY_WALK: AtomicU64 = AtomicU64::new(0);
+
+/// GCAUD-8 — objects the in-place old-gen sweep's live-set closure promoted:
+/// unmarked blocks that a MARKED old-gen object still referenced, i.e. blocks
+/// the mark phase missed and this sweep would otherwise have freed while live.
+///
+/// Zero on every healthy cycle (a transitively correct marker leaves the
+/// closure nothing to do). Non-zero names a real mark-phase gap and is the
+/// number to watch when `old_gen::COMPACT_ESCAPE_HITS` stops climbing.
+pub static OLD_SWEEP_CLOSURE_RESCUES: AtomicU64 = AtomicU64::new(0);
+
+/// GCAUD-8 — in-place old-gen sweeps that observed a live old-gen object
+/// referencing an in-old-gen address the object walk did not yield: a block
+/// that is *already* on the free list, or one behind a `scan_region` header
+/// anomaly. Unlike the compactor, this sweep cannot repair it (it never had the
+/// block) and does not abort on it — it only refuses to write a mark bit
+/// through the address, and reports.
+pub static OLD_SWEEP_ESCAPE_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// Conservative root candidates may be interior heap addresses.  Only the
 /// opt-in A2 forensic mode reports rejected candidates; normal collection
 /// silently discards an address that is not an object start.
@@ -8939,6 +8973,33 @@ impl GenerationalHeap {
 
         let mut worklist: Vec<*mut u8> = Vec::new();
 
+        // GCAUD-8: derive the old-gen object grid ONCE, up front, and use it as
+        // the mark phase's fail-closed admission oracle.
+        //
+        // `walk_objects` does not guess at headers the way
+        // `old_gen_mark_candidate_plausible` does: it derives allocated extents
+        // as the gaps between free blocks and strides header-by-header, so an
+        // address it yields is an object BASE by construction. That is a
+        // strictly stronger proof than the byte-plausibility screen, and it is
+        // the proof `mark_young_to_old_refs`'s conservative fallback has always
+        // used for exactly this purpose (its conservative word scan). Hoisted
+        // here so every precise push site can use it too, and so the `!compact`
+        // arm below does not walk a second time.
+        //
+        // Stability: nothing between here and the free loop allocates or frees
+        // in old gen, and the only header bytes the mark writes are
+        // `GC_FLAG_MARKED` — which no sizing path reads (`gen_object_total_size`
+        // and `scan_region` look at `kind`, `shape`, `element_type`,
+        // `class_id`, and `GC_FLAG_COMPACT`). So this grid stays exact for the
+        // whole phase. It must NOT outlive the old-gen lock: admitting a mark
+        // through a stale base is the corruption this oracle exists to prevent.
+        let walked_objects = old_gen.walk_objects();
+        let walked_bases: Vec<usize> = walked_objects.iter().map(|&(p, _)| p as usize).collect();
+        debug_assert!(
+            walked_bases.windows(2).all(|w| w[0] < w[1]),
+            "walk_objects must yield ascending object starts — the mark oracle binary-searches it",
+        );
+
         // Seed: root ObjectRefs that point into old gen.
         //
         // xt-hardening follow-up (2026-07-03): `roots` includes CONSERVATIVE
@@ -8993,9 +9054,23 @@ impl GenerationalHeap {
             // so they also need the zero-word0 neighbour disambiguation. The
             // rest of the screen is the same one every other push site now
             // uses — see `old_gen_mark_candidate_plausible`.
-            if old_gen_mark_candidate_plausible(ptr, old_gen, true) {
+            // GCAUD-8: `walked_bases` overrides a screen reject. The
+            // `conservative` clause above adds `victim8_neighbor_explains_zero_prefix`,
+            // a heuristic about a zero first header word — and this slice mixes
+            // PRECISE roots (JNI globals, statics, pins: see
+            // `vm/src/memory/roots.rs`) with conservative stack guesses, with no
+            // way to tell them apart here. A precise root whose referent the
+            // heuristic rejects is a live object nobody else may name, and this
+            // sweep would free it. The oracle is safe for the conservative half
+            // too: a walked base IS an object, so admitting one can only
+            // over-retain, which is what conservative marking does anyway.
+            if old_gen_mark_candidate_plausible(ptr, old_gen, true)
+                || rescue_mark_candidate_by_walk(ptr, old_gen, &walked_bases)
+            {
                 // SAFETY: the screen verified 8-alignment, old-gen containment
-                // and a header whose claimed extent fits inside old gen.
+                // and a header whose claimed extent fits inside old gen; on the
+                // rescue path `walk_objects` yielded `ptr` as an object base,
+                // which implies all three.
                 let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
                 if header.gc_flags & GC_FLAG_MARKED == 0 {
                     header.gc_flags |= GC_FLAG_MARKED;
@@ -9005,7 +9080,7 @@ impl GenerationalHeap {
         }
 
         // Seed: young from-space references into old gen
-        Self::mark_young_to_old_refs(young_from, old_gen, &mut worklist);
+        Self::mark_young_to_old_refs(young_from, old_gen, &walked_bases, &mut worklist);
 
         // `mark_young_to_old_refs` walks only real Java heap fields. Follow
         // the equivalent out-of-heap edges for all current young owners too;
@@ -9019,6 +9094,7 @@ impl GenerationalHeap {
             mark_and_push_old_gen(
                 overlay_ref.as_ptr(),
                 old_gen,
+                &walked_bases,
                 &mut worklist,
                 "external-overlay(young owner)",
             );
@@ -9031,7 +9107,7 @@ impl GenerationalHeap {
         // old-gen loader case (young loaders are already live as major-GC roots).
         let loader_pin_on = cratonvm_types::loader_pin::loader_pinning_enabled();
         while let Some(obj_ptr) = worklist.pop() {
-            Self::scan_object_for_old_refs(obj_ptr, old_gen, &mut worklist);
+            Self::scan_object_for_old_refs(obj_ptr, old_gen, &walked_bases, &mut worklist);
             // Same owner→overlay propagation as the young non-moving marker
             // above. Major GC also uses stable pre-compaction addresses, so it
             // can reclaim an unreachable old collection and its side-table
@@ -9042,6 +9118,7 @@ impl GenerationalHeap {
                 mark_and_push_old_gen(
                     overlay_ref.as_ptr(),
                     old_gen,
+                    &walked_bases,
                     &mut worklist,
                     "external-overlay(BFS owner)",
                 );
@@ -9055,6 +9132,7 @@ impl GenerationalHeap {
                     mark_and_push_old_gen(
                         loader_addr as *mut u8,
                         old_gen,
+                        &walked_bases,
                         &mut worklist,
                         "loader_pin",
                     );
@@ -9077,6 +9155,7 @@ impl GenerationalHeap {
                     mark_and_push_old_gen(
                         mirror_addr as *mut u8,
                         old_gen,
+                        &walked_bases,
                         &mut worklist,
                         "mirror_pin",
                     );
@@ -9089,6 +9168,7 @@ impl GenerationalHeap {
                     mark_and_push_old_gen(
                         metadata_addr as *mut u8,
                         old_gen,
+                        &walked_bases,
                         &mut worklist,
                         "metadata_pin",
                     );
@@ -9116,11 +9196,23 @@ impl GenerationalHeap {
             // does for watched objects that happen not to move.
             let watched = crate::gc_quiescence::watched_referents_snapshot();
             let mut watched_survivors: HashMap<usize, usize> = HashMap::new();
-            let objects = old_gen.walk_objects();
+            // GCAUD-8: the grid derived before the mark. Nothing since then has
+            // allocated or freed in old gen, so re-walking would return the
+            // same slice; the mark oracle above and the free loop below now
+            // decide against ONE view of the generation rather than two.
+            let objects = walked_objects;
 
             // ---- CRATONVM_DBG_SWEEP_LIVENESS: freed-while-referenced assertion ----
             //
-            // This sweep decides liveness purely from `GC_FLAG_MARKED`, and the
+            // GCAUD-8 (2026-08-01): this block is now a DIAGNOSTIC ONLY. It
+            // runs BEFORE `OldGen::close_live_set` below, so it still reports
+            // what the mark phase actually missed — but the closure then
+            // retains those blocks unconditionally, and `=rescue` is no longer
+            // the only thing standing between a mark gap and a use-after-free.
+            // The paragraphs below describe the world before that change and
+            // are kept because they name the failure the counters look for.
+            //
+            // This sweep decided liveness purely from `GC_FLAG_MARKED`, and the
             // mark that set it has NINE worklist push sites of which only two
             // validate their input (see
             // docs/known-issues/gc-old-gen-mark-accepts-unvalidated-addresses.md).
@@ -9197,7 +9289,66 @@ impl GenerationalHeap {
                 }
             }
 
-            for (obj_ptr, total_size) in objects {
+            // ---- GCAUD-8: close the live set before deciding what is dead ----
+            //
+            // `GC_FLAG_MARKED == 0` is the whole liveness test below, and it
+            // asserts that the mark phase found every live object. That is an
+            // assumption about eight push sites, not a check, and every one of
+            // them fails OPEN: a screen reject, an extent bail in
+            // `scan_object_for_old_refs`, a young-walk desync, or a root the
+            // caller left on a pre-promotion address all drop a live edge
+            // rather than over-retain. The block then goes back on the free
+            // list while a live object still points at it.
+            //
+            // `OldGen::compact` has been closed against exactly this since
+            // Phase 0 was written: "the compactor must not corrupt the heap when
+            // the marker under-marks". This arm — the one that actually creates
+            // the freed-but-referenced block the compactor later refuses to
+            // relocate (`COMPACT_ESCAPE_HITS`) — had no such guard. Run the same
+            // fixpoint here, using the grid walk as the admission proof, and an
+            // unmarked object that a marked object still references is retained
+            // for another cycle instead of freed under a live pointer.
+            //
+            // This does NOT retain everything: an object that is unmarked and
+            // unreferenced is untouched by the closure and is still freed by the
+            // loop below. That is what the positive controls pin.
+            //
+            // Cost: one extra pass over the live objects' reference slots per
+            // in-place major sweep (the fixpoint's second pass only runs when
+            // the first actually promoted something, i.e. only when the mark was
+            // wrong). Same shape and order as the compactor's Phase 0.
+            let (rescued, escaped) = old_gen.close_live_set(&objects);
+            if rescued > 0 {
+                OLD_SWEEP_CLOSURE_RESCUES.fetch_add(rescued as u64, Ordering::Relaxed);
+                tracing::warn!(
+                    "in-place old-gen sweep: the mark phase missed {} of {} walked block(s) \
+                     that a LIVE old-gen object still references; retaining them. This is a \
+                     mark push-site gap, not floating garbage — see \
+                     docs/gc/old-sweep-liveness.md.",
+                    rescued,
+                    objects.len(),
+                );
+            }
+            if escaped {
+                // Distinct from `rescued`: the referent is not in `objects` at
+                // all, so it is already on the free list (or behind a
+                // `scan_region` anomaly). Freeing nothing this cycle would not
+                // bring it back, so unlike `compact` this arm reports and
+                // carries on — every decision it goes on to make is still
+                // backed by the closure above.
+                let n = OLD_SWEEP_ESCAPE_HITS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    tracing::warn!(
+                        "in-place old-gen sweep ({} walked objects): a live old-gen object \
+                         references an in-old-gen address the object walk did not yield — an \
+                         EARLIER reclamation already freed a live block. See \
+                         `old_gen::COMPACT_ESCAPE_HITS` and docs/gc/old-sweep-liveness.md.",
+                        objects.len(),
+                    );
+                }
+            }
+
+            for &(obj_ptr, total_size) in &objects {
                 // SAFETY: `walk_objects` returns valid old-gen object starts.
                 // Marked objects remain at their current address; every other
                 // object was unreachable from the complete precise +
@@ -9308,7 +9459,12 @@ impl GenerationalHeap {
     }
 
     /// Scan young from-space for references into old gen and mark them.
-    fn mark_young_to_old_refs(young_from: &Arena, old_gen: &OldGen, worklist: &mut Vec<*mut u8>) {
+    fn mark_young_to_old_refs(
+        young_from: &Arena,
+        old_gen: &OldGen,
+        walked_bases: &[usize],
+        worklist: &mut Vec<*mut u8>,
+    ) {
         // Skip the zeroed holes the non-moving sweep leaves in from-space.
         // Without this, this linear walk strides into a reclaimed hole, decodes
         // its zeroed bytes as a `num_slots=0` (40-byte) object, and desyncs off
@@ -9333,9 +9489,13 @@ impl GenerationalHeap {
         // safe; base validation is mandatory (`OldGen::contains` is a raw
         // range check, so an interior/colliding word would otherwise get a
         // mark-bit write into a live object's payload and feed a garbage
-        // "header" into the BFS). The sorted base list is built lazily — only
-        // sweeps that actually hit an unparseable stretch pay for it.
-        let mut old_bases: Option<Vec<usize>> = None;
+        // "header" into the BFS).
+        //
+        // GCAUD-8: the sorted base list used to be built lazily here, so only
+        // sweeps that actually hit an unparseable stretch paid for it.
+        // `old_gen_gc` now derives the same list once, before the mark, because
+        // every precise push site needs it as a fail-closed admission oracle —
+        // so it is passed in, and this walk shares it instead of re-walking.
         while cursor < used {
             if skip_free_blocks(&mut cursor, &mut free_iter).0 {
                 continue;
@@ -9384,20 +9544,11 @@ impl GenerationalHeap {
                 let stretch_lo = cursor;
                 let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
                 let stretch_hi = if resynced { cursor } else { used };
-                let bases = old_bases.get_or_insert_with(|| {
-                    let mut v: Vec<usize> = old_gen
-                        .walk_objects()
-                        .into_iter()
-                        .map(|(p, _)| p as usize)
-                        .collect();
-                    v.sort_unstable();
-                    v
-                });
                 let mut w = stretch_lo & !7;
                 while w + 8 <= stretch_hi {
                     // SAFETY: `[base+w, base+w+8)` is mapped from-space memory.
                     let word = unsafe { *((base + w) as *const u64) } as usize;
-                    if bases.binary_search(&word).is_ok() {
+                    if walked_bases.binary_search(&word).is_ok() {
                         // SAFETY: `word` is a verified old-gen object BASE;
                         // its header is valid and mutable for marking.
                         let ref_header = unsafe { &mut *(word as *mut ObjectHeader) };
@@ -9419,7 +9570,13 @@ impl GenerationalHeap {
             // SAFETY: `obj_ptr`/`header` are a valid live young-from object.
             unsafe {
                 for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                    mark_and_push_old_gen(ref_ptr, old_gen, worklist, "young->old ref slot");
+                    mark_and_push_old_gen(
+                        ref_ptr,
+                        old_gen,
+                        walked_bases,
+                        worklist,
+                        "young->old ref slot",
+                    );
                 });
             }
 
@@ -9428,7 +9585,12 @@ impl GenerationalHeap {
     }
 
     /// Scan a single object's reference slots for old-gen pointers and mark them.
-    fn scan_object_for_old_refs(obj_ptr: *mut u8, old_gen: &OldGen, worklist: &mut Vec<*mut u8>) {
+    fn scan_object_for_old_refs(
+        obj_ptr: *mut u8,
+        old_gen: &OldGen,
+        walked_bases: &[usize],
+        worklist: &mut Vec<*mut u8>,
+    ) {
         // A worklist entry whose `kind` byte is not a valid discriminant was
         // never an object base: some push site handed us a dangling or interior
         // address. Counted (not rejected) here — rejecting is the FIX, which is
@@ -9446,6 +9608,15 @@ impl GenerationalHeap {
         // header whose `array_length` was pointer bytes; scanning that count
         // of slots runs off the mapped region (SIGSEGV). An old object whose
         // extent leaves old gen is definitionally corrupt: skip the scan.
+        //
+        // GCAUD-8: this bail is itself a fail-OPEN mark source — every referent
+        // of this object goes unmarked, and the in-place sweep would then free
+        // them. It stays (scanning a corrupt extent is a SIGSEGV, and the
+        // walk-base oracle cannot supply a slot count) because it is no longer
+        // the last word: `OldGen::close_live_set`, which runs over the walked
+        // grid before the free loop and does not consult the header's extent,
+        // promotes anything this object still points at. Same repair the
+        // compactor's Phase 0 has always made.
         let total = gen_object_total_size(header);
         // SAFETY: `total >= HEADER_SIZE` here (first disjunct is false), so `obj_ptr.add(total - 1)` is the
         // object's last-byte address; it is only range-checked by `contains`, never dereferenced.
@@ -9469,7 +9640,13 @@ impl GenerationalHeap {
         // SAFETY: `obj_ptr`/`header` are a valid live object.
         unsafe {
             for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                mark_and_push_old_gen(ref_ptr, old_gen, worklist, "old-gen ref slot");
+                mark_and_push_old_gen(
+                    ref_ptr,
+                    old_gen,
+                    walked_bases,
+                    worklist,
+                    "old-gen ref slot",
+                );
             });
         }
     }
@@ -11379,6 +11556,63 @@ fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative
     total >= HEADER_SIZE && old_gen.contains(unsafe { ptr.add(total - 1) })
 }
 
+/// GCAUD-8 — the fail-closed second opinion on a rejected mark candidate.
+///
+/// `walked_bases` is the ascending list of object starts
+/// [`OldGen::walk_objects`] yielded for THIS collection pause. Membership in it
+/// is a derivation, not a heuristic: the walk computes allocated extents as the
+/// gaps between free blocks and then strides header-by-header through each one,
+/// so every address in the list is an object base whose extent fits inside its
+/// allocated region. That subsumes every clause of
+/// [`old_gen_mark_candidate_plausible`] that is about *being an object*
+/// (alignment, containment, a sane kind byte, an in-bounds extent) and is
+/// unaffected by the clauses that are about a header *looking* untouched
+/// (`_padding` / `_gc_reserved` / undefined `gc_flags` bits) — which is exactly
+/// where a real object can be rejected by accident.
+///
+/// Returns `true` if the candidate may be marked anyway. `false` keeps the
+/// existing reject.
+///
+/// The list MUST be from the current pause and the current old gen; a stale one
+/// would authorise a mark-bit write into a recycled address, which is the
+/// corruption family the screen was introduced to stop. `old_gen_gc` builds it
+/// under the same old-gen lock it marks and sweeps under.
+#[inline]
+fn rescue_mark_candidate_by_walk(ptr: *mut u8, old_gen: &OldGen, walked_bases: &[usize]) -> bool {
+    // Cheap gates first: a base is 8-aligned and inside old gen by
+    // construction, so an address failing either can never be in the list and
+    // the binary search is pure cost.
+    if (ptr as usize) & 0x7 != 0 || !old_gen.contains(ptr) {
+        return false;
+    }
+    walked_bases.binary_search(&(ptr as usize)).is_ok()
+}
+
+/// Cold reporter for a mark candidate the walk rescued from the plausibility
+/// screen. Separate from [`note_rejected_old_mark_candidate`] because the two
+/// mean opposite things: a reject says a side table holds a non-base address, a
+/// rescue says the screen was about to drop a real object.
+#[cold]
+#[inline(never)]
+fn note_rescued_old_mark_candidate(ptr: *mut u8, site: &'static str) {
+    let n = OLDMARK_RESCUED_BY_WALK.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        // SAFETY: `walk_objects` yielded `ptr` as an object base, so its header
+        // is mapped and readable.
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        tracing::warn!(
+            "old-gen mark [{site}]: candidate {ptr:p} FAILED the plausibility screen but IS an \
+             object base the walk yielded (class_id={}, kind={}, shape={}, gc_flags={:#04x}) — \
+             marking it. Without this the in-place sweep would free a live object; see \
+             docs/gc/old-sweep-liveness.md.",
+            header.class_id.as_u32(),
+            header.kind as u8,
+            header.num_slots(),
+            header.gc_flags,
+        );
+    }
+}
+
 /// Mark `ptr` and push it onto the old-gen mark worklist — but only if it is a
 /// plausible old-gen object BASE. See [`old_gen_mark_candidate_plausible`].
 ///
@@ -11386,9 +11620,30 @@ fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative
 /// generation's business). An address INSIDE old gen that fails the screen is
 /// counted and reported: it means a reference slot or a side table is holding
 /// something that is not an object base.
+///
+/// # GCAUD-8 — `walked_bases` is the fail-closed override
+///
+/// Every caller of this function is a **precise** site: a reference slot of a
+/// live object, a registered overlay owner, a loader/mirror/metadata pin. None
+/// of them is a guess. [`old_gen_mark_candidate_plausible`]'s own doc states
+/// the consequence — "at a precise site a false reject IS a premature free" —
+/// and then relies on the screen never false-rejecting a real object, which is
+/// a property maintained by convention (`_padding`/`_gc_reserved` stay zero, no
+/// fourth `gc_flags` bit is ever defined, no class has 2^24 fields) and checked
+/// by nothing.
+///
+/// `walked_bases` turns that convention into a check. It is
+/// `OldGen::walk_objects()`' output for this very pause: the object grid
+/// *derived* from the free list and strided header-by-header, not inferred from
+/// one header's bytes. When the heuristic and the derivation disagree about an
+/// address the derivation produced, the derivation wins and the object is
+/// marked. The cost of being wrong in this direction is one cycle of retained
+/// garbage; the cost of being wrong in the other direction is the in-place
+/// sweep freeing it under a live pointer.
 fn mark_and_push_old_gen(
     ptr: *mut u8,
     old_gen: &OldGen,
+    walked_bases: &[usize],
     worklist: &mut Vec<*mut u8>,
     site: &'static str,
 ) {
@@ -11396,8 +11651,11 @@ fn mark_and_push_old_gen(
         return;
     }
     if !old_gen_mark_candidate_plausible(ptr, old_gen, false) {
-        note_rejected_old_mark_candidate(ptr, site);
-        return;
+        if !rescue_mark_candidate_by_walk(ptr, old_gen, walked_bases) {
+            note_rejected_old_mark_candidate(ptr, site);
+            return;
+        }
+        note_rescued_old_mark_candidate(ptr, site);
     }
     // SAFETY: the screen verified 8-alignment, old-gen containment and a
     // header whose claimed extent fits inside old gen.
@@ -15025,6 +15283,161 @@ mod tests {
         );
         // Outside the arena entirely.
         assert!(!og.is_allocated_addr(std::ptr::null()));
+    }
+
+    /// GCAUD-8 — at a PRECISE push site the plausibility screen must not have
+    /// the last word.
+    ///
+    /// [`old_gen_mark_candidate_plausible`] is a set of heuristics about a
+    /// header's bytes, written for conservative register/stack guesses. Its own
+    /// doc records what a false reject costs at a precise site — "a false
+    /// reject IS a premature free" — and then leaves that risk covered by a
+    /// convention (`_padding`/`_gc_reserved` stay zero, `gc_flags` never grows
+    /// a fourth bit) that nothing checks. `walk_objects` *derives* the object
+    /// grid instead of guessing at it, so when the two disagree about an
+    /// address the walk produced, the walk wins.
+    ///
+    /// Three cases, because the override must be exactly as wide as the proof:
+    /// the screen alone drops the object; the screen plus the oracle keeps it;
+    /// and the oracle does NOT admit an in-old-gen address that is not a base.
+    #[test]
+    fn mark_and_push_rescues_a_walked_base_the_plausibility_screen_rejects() {
+        let mut og = OldGen::new(64 * 1024);
+        let obj = og.alloc(HEADER_SIZE + 2 * SLOT_SIZE, 8).expect("alloc");
+        // SAFETY: `obj` is a live block of this OldGen with room for a header.
+        unsafe {
+            let h = &mut *(obj as *mut ObjectHeader);
+            h.set_num_slots(2);
+            // An undefined `gc_flags` bit: the exact shape
+            // `header_reserved_fields_plausible` rejects, and one that leaves
+            // every SIZING path (`kind`, `shape`, `GC_FLAG_COMPACT`) untouched,
+            // so the object walk still yields this address as a base.
+            h.gc_flags |= 0x08;
+        }
+
+        let bases: Vec<usize> = og.walk_objects().iter().map(|&(p, _)| p as usize).collect();
+        assert!(
+            bases.contains(&(obj as usize)),
+            "precondition: the walk must still see this as an object base",
+        );
+        assert!(
+            !old_gen_mark_candidate_plausible(obj, &og, false),
+            "precondition: the plausibility screen must reject it",
+        );
+
+        // Without the oracle: dropped — the pre-fix behaviour, and a premature
+        // free for whatever the in-place sweep does next.
+        let mut worklist: Vec<*mut u8> = Vec::new();
+        mark_and_push_old_gen(obj, &og, &[], &mut worklist, "test(no oracle)");
+        assert!(
+            worklist.is_empty(),
+            "control: with no walked-base list the screen still decides alone",
+        );
+        // SAFETY: `obj` is a live block; reading its header is in-bounds.
+        assert_eq!(
+            unsafe { (*(obj as *const ObjectHeader)).gc_flags } & GC_FLAG_MARKED,
+            0,
+        );
+
+        // With the oracle: marked and pushed.
+        mark_and_push_old_gen(obj, &og, &bases, &mut worklist, "test(oracle)");
+        assert_eq!(
+            worklist,
+            vec![obj],
+            "an address the object walk yielded as a base must be marked even \
+             when the byte-plausibility screen rejects it",
+        );
+        // SAFETY: as above.
+        assert_ne!(
+            unsafe { (*(obj as *const ObjectHeader)).gc_flags } & GC_FLAG_MARKED,
+            0,
+        );
+
+        // NEGATIVE CONTROL — the override is membership in the base list, not
+        // "inside old gen". An interior address must still be rejected: marking
+        // one writes a mark bit into a live object's payload, which is the
+        // corruption the screen was added to stop.
+        let mut worklist2: Vec<*mut u8> = Vec::new();
+        // SAFETY: `obj + 8` is inside the object's own allocation.
+        let interior = unsafe { obj.add(8) };
+        assert!(og.contains(interior));
+        mark_and_push_old_gen(interior, &og, &bases, &mut worklist2, "test(interior)");
+        assert!(
+            worklist2.is_empty(),
+            "an interior address is not a walked base and must stay rejected",
+        );
+    }
+
+    /// GCAUD-8, end to end — the in-place old-gen sweep must not free a block
+    /// that a live old-gen object still points at, and must still free the one
+    /// nothing points at.
+    ///
+    /// The mark gap is induced the way the real ones behave: B's header carries
+    /// a byte the plausibility screen calls implausible, so
+    /// `mark_and_push_old_gen` used to drop A's precise reference to it. B was
+    /// then unmarked, and the free loop — whose entire liveness test is
+    /// `GC_FLAG_MARKED == 0` — returned a live object's storage to the free
+    /// list. C is the positive control in the same run: unmarked and
+    /// unreferenced, it must still be reclaimed, or the fix has simply turned
+    /// the sweep off.
+    #[test]
+    fn in_place_old_sweep_retains_a_live_referent_the_mark_lost() {
+        let heap = GenerationalHeap::with_sizes(4 * 1024, 64 * 1024);
+        let monitors = NoOpMonitors;
+
+        let a = heap.alloc_object(ClassId::new(1), 1);
+        let b = heap.alloc_object(ClassId::new(2), 1);
+        let c = heap.alloc_object(ClassId::new(3), 1);
+        heap.set_field(a, 0, Value::Object(Some(b)));
+
+        // Age all three into old gen through the ordinary moving path, so A's
+        // slot is forwarded to B's promoted address by the collector itself.
+        let mut roots = vec![a, b, c];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let (a, b, c) = (roots[0], roots[1], roots[2]);
+        assert!(heap.is_in_old(a.as_ptr()) && heap.is_in_old(b.as_ptr()));
+        assert!(heap.is_in_old(c.as_ptr()));
+        let Value::Object(Some(a_target)) = heap.get_field(a, 0) else {
+            panic!("precondition: A must still reference B after promotion");
+        };
+        assert_eq!(
+            a_target.as_ptr(),
+            b.as_ptr(),
+            "precondition: A's slot must name B's promoted address",
+        );
+
+        // Induce the mark gap.
+        // SAFETY: `b` is a live old-gen object; its header is mapped.
+        unsafe {
+            (*(b.as_ptr() as *mut ObjectHeader)).gc_flags |= 0x08;
+        }
+
+        // Only A is rooted. B is reachable ONLY through A's reference slot —
+        // exactly the edge the screen used to drop.
+        let (b_addr, c_addr) = (b.as_ptr() as usize, c.as_ptr() as usize);
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[a], &HashMap::new());
+
+        let bases: Vec<usize> = heap
+            .old_gen_lock()
+            .walk_objects()
+            .iter()
+            .map(|&(p, _)| p as usize)
+            .collect();
+        assert!(
+            bases.contains(&b_addr),
+            "the sweep freed a block a LIVE old-gen object still references \
+             (b=0x{b_addr:x}) — this is the use-after-free the closure exists \
+             to prevent",
+        );
+        assert!(
+            !bases.contains(&c_addr),
+            "POSITIVE CONTROL: unreachable garbage (c=0x{c_addr:x}) must still \
+             be reclaimed — a sweep that retains everything passes every \
+             negative test",
+        );
+        assert!(reclaimed > 0, "the sweep must still reclaim real garbage");
     }
 
     /// A test [`crate::external_roots::ExternalRootProvider`] standing in for
