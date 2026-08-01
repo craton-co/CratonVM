@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🟠 **NARROWED, still OPEN.** Two of the three tangled defects are fixed and the crash has moved twice; the class still SIGSEGVs. The residual is old-gen header corruption of unidentified origin. |
+| **Status** | 🟠 **NARROWED, still OPEN.** Three of four tangled defects are fixed and the crash has moved twice; the class still SIGSEGVs. The residual is now **identified**: the collector leaves old-to-young reference fields UN-FORWARDED (see defect 3). |
 | **ID** | `HIB-MAPRESIZE-STALE.1` |
 | **Found** | 2026-07-31, validating the `DefaultCatalogAndSchemaTest` runner accommodation ([`../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md)). |
 | **Repro** | [`probes/hib-mapresize-repro-20260731.sh`](../../../probes/hib-mapresize-repro-20260731.sh) — `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`, `--nojit`, `--Xmx 1500m`, real JDK, `-Dcraton.batch=1`. |
@@ -123,7 +123,7 @@ pointer. Fixed on `dev` by `22107d512`
 inherited here by merge. That commit deliberately did not answer *why* such a
 header exists — which is defect 3.
 
-## Defect 3 — old-gen headers acquire garbage — OPEN, this is the residual
+## Defect 3 — the collector leaves reference fields UN-FORWARDED — OPEN, this is the residual
 
 Arm C logs 48 of these before dying:
 
@@ -137,7 +137,51 @@ bytes look like **text written over an old-generation object header**, not a
 relocated or zeroed one. (Arm B's kinds were varied garbage; arm C's are
 consistently `0x3a`. One run settles nothing here — see the variance caution.)
 
-The one concrete lead: with `CRATONVM_DBG_STALE_OBJREF=1
+### The corruptor is an UN-FORWARDED old-to-young edge
+
+`CRATONVM_DBG_HEAP_STALE=1` (the deep post-GC verifier: walks every live object
+and classifies each reference field) fires on this reproducer. In one major
+collection:
+
+```
+[heap-stale] UN-FORWARDED OBJ org/hibernate/metamodel/model/domain/internal/SingularAttributeImpl$NumericIdentifierAttributeImpl field[2] -> 0x23d68482738
+[heap-stale] UN-FORWARDED OBJ org/hibernate/metamodel/model/domain/internal/ListAttributeImpl field[3] -> 0x23d684cd5c8
+[heap-stale] UN-FORWARDED OBJ org/hibernate/metamodel/model/domain/internal/EntityTypeImpl field[19] -> 0x23d6847d6d8
+[heap-stale] UN-FORWARDED OBJ org/hibernate/type/descriptor/sql/internal/DdlTypeImpl field[4] -> …
+[heap-stale] UN-FORWARDED OBJ org/assertj/core/api/ObjectArrayAssert field[7] -> …
+[heap-stale] UN-FORWARDED OBJ cratonvm/synthetic/AnonymousObject$4 field[2] -> …
+[heap-stale] ^ 40 stale field(s) this GC (pointer_map size=3436289)
+```
+
+**`UN-FORWARDED` is the verifier's most actionable class**: the target address is
+still a KEY in the collector's own `pointer_map`, i.e. the object *was* moved and
+this referrer's field was never rewritten. Not a native local, not a missing
+root — a **missed referrer edge in the collector**.
+
+That closes the causal chain end to end: an un-forwarded field keeps pointing at
+the pre-move address; once that young space is reused the address holds
+arbitrary bytes; a later old-gen scan reads those bytes as an object header and
+gets `kind=0x3a` (ASCII, i.e. text) — the corrupt headers above — and eventually
+a dereference lands on unmapped memory.
+
+Two details worth keeping:
+
+- The 17 `NumericIdentifierAttributeImpl field[2]` lines are 17 **distinct
+  referrer objects all pointing at the same un-forwarded target**, and likewise
+  for `ListAttributeImpl field[3]`. One moved object, many referrers, none
+  updated — so this is a scan gap over a *set* of referrers, not a one-off.
+- `pointer_map size=3436289` — 3.4 M objects moved in that cycle. Whatever the
+  gap is, it survives a full compaction.
+
+Next question for whoever continues: are those 40 referrers in old-gen with a
+clean card (a missing write barrier on the store that created the edge), or in a
+region the mark/forward pass does not visit at all? `CRATONVM_DBG_GCWRITE` and
+the pre-GC remembered-set audit already in `gen_heap.rs` (search
+"pre-GC remembered-set audit") are the next instruments.
+
+### The class-loading lead (separate, and fixed)
+
+With `CRATONVM_DBG_STALE_OBJREF=1
 CRATONVM_DBG_STALE_OBJREF_CYCLES=4` the canary hard-panics at 1952 s on a genuine
 stale `ObjectRef` — `NO heap holder found — the stale copy lived only in a
 frame/register/native local` — in a native invoked from
@@ -154,18 +198,23 @@ targets the obvious candidate — `native_class_for_name`'s
 allocates so the dispatch is guaranteed to span a collection — and it **passes**,
 so the stale local is elsewhere on that path.
 
+Step 3 below was done: `cl_load_class_base_delegation_inner` (synthetic) and
+`cl_real_load_class_base` (real-JDK — the one this workload takes, since the
+repro passes `--java-home`) both dispatched the parent's `loadClass` and the
+receiver's `findClass` override and then kept using the pre-dispatch `this` /
+name. Hibernate's `AggregatedClassLoader` is `super(null)` and overrides
+`findClass` to iterate its scoped child loaders, so that arm is the hot one here.
+Both are rooted now. Whether that was the canary's exact site is unconfirmed —
+it is the same defect shape on the named path, found by audit, not by a red test.
+
 ### Next steps
 
-1. Symbolized build (`RUSTFLAGS="-Cdebuginfo=2 -Cforce-frame-pointers=yes"`,
-   separate `CARGO_TARGET_DIR`) + the canary run, to name the frame. The release
-   binary carries no symbols and every frame in the canary's backtrace prints
-   `<unknown>`.
-2. `CRATONVM_DBG_HEAP_STALE=1` — the deep post-GC verifier walks every live
-   object and reports the **referrer** class and field index of any dangling
-   reference, which names the missing barrier/root edge rather than a stack. It
-   is the documented proven method for this bug class.
-3. Audit `native-builtins`' class-loading natives with
-   `probes/audit-unpinned-across-gc.py`, the way `native-collections` was.
+1. Chase the `UN-FORWARDED` edge above — that is the actual corruptor, and it is
+   a collector bug, not a native-rooting one.
+2. Symbolized build (`RUSTFLAGS="-Cdebuginfo=2 -Cforce-frame-pointers=yes"`,
+   separate `CARGO_TARGET_DIR`) + the canary run, to name the remaining stale
+   frame outright. The release binary carries no symbols and every frame in the
+   canary's backtrace prints `<unknown>`.
 
 ### Cautions for whoever picks this up
 
