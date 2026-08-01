@@ -1440,6 +1440,20 @@ mod tests {
             presence_vars.len()
         );
 
+        // `include_str!` embeds the file's RAW bytes, and this repository is
+        // checked out with CRLF on Windows. Every `,\n` boundary search below
+        // would then match nothing (the bytes are `,\r\n`): `initializer_around`
+        // would run from the last `{` in the whole file to EOF, hand back a
+        // ~60 KB slab that trivially contains `||`, and report a long list of
+        // "compound" offenders that are nothing of the sort — the first being
+        // `CRATONVM_IAE_TRACE`, whose initializer is a plain
+        // `present(src, ..)`. Normalise once so this gate asks the SAME
+        // question on a CRLF and an LF checkout. (Only `flags.rs` needs it:
+        // `str::lines()` already strips a trailing `\r` from the env-cache
+        // scan above.)
+        let flags_src = FLAGS_SRC.replace("\r\n", "\n");
+        let flags_src = flags_src.as_str();
+
         // The flags.rs field initializer that resolves a given variable: from
         // just after the previous initializer's `,` up to this one's.
         fn initializer_around(src: &str, idx: usize) -> &str {
@@ -1455,10 +1469,10 @@ mod tests {
         for var in &presence_vars {
             let needle = format!("present(src, \"{var}\")");
             let mut from = 0;
-            while let Some(rel) = FLAGS_SRC[from..].find(&needle) {
+            while let Some(rel) = flags_src[from..].find(&needle) {
                 let idx = from + rel;
                 from = idx + needle.len();
-                let init = initializer_around(FLAGS_SRC, idx);
+                let init = initializer_around(flags_src, idx);
                 // A default that can be true with the variable unset always
                 // reaches for another term: `||`, `&&`, or a negated presence.
                 if init.contains("||") || init.contains("&&") || init.contains("!present") {

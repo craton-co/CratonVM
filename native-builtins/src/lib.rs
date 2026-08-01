@@ -16900,6 +16900,17 @@ pub fn register_essential_natives_with_shims(
                 args.get(2).copied().unwrap_or(Value::Object(None)),
             );
             ctx.set_field_by_name(this, "needToInferCaller", Value::Int(0));
+            // A SYNTHETIC LogRecord has no field names, so both writes above
+            // silently no-opped and the record came out empty. Mirror them
+            // into the synthetic layout (level = 0, message = 1) when the name
+            // does not resolve; `native_jul_log_record_get_message` reads the
+            // same slots as its last fallback.
+            if !matches!(ctx.get_field_by_name(this, "message"), Value::Object(Some(_)))
+                && ctx.object_num_fields(this) > 1
+            {
+                ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+                ctx.set_field(this, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
+            }
             // Real JDK stamps the constructing thread's id into
             // threadID/longThreadID. Without it, records report
             // getLongThreadID() == 0 and Tomcat JULI's OneLineFormatter feeds
@@ -19438,6 +19449,58 @@ pub fn register_essential_natives_with_shims(
     }
     register_tzdb_offset_natives_for(registry, "sun/util/calendar/ZoneInfo");
     register_tzdb_offset_natives_for(registry, "java/util/SimpleTimeZone");
+    // The abstract base too. Only the two concrete subclasses above carried the
+    // offset family, so anything holding a `TimeZone`-typed reference — which
+    // is how the API is normally used — had no `getRawOffset`. A subclass
+    // receiver still resolves its own exact-class registration first; this is
+    // the fallback for the base.
+    register_tzdb_offset_natives_for(registry, "java/util/TimeZone");
+
+    // `TimeZone.getID()` reads the `ID` field, exactly as the real base-class
+    // method does, so it is faithful for every subclass that inherits it.
+    registry.register(
+        "java/util/TimeZone",
+        "getID",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "ID") {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+            // Synthetic TimeZones built by `getDefault` below keep the id in
+            // slot 0; a real one that never had `ID` populated reports UTC
+            // rather than null, which callers concatenate into messages.
+            if ctx.object_num_fields(this) > 0 {
+                if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
+                    return Ok(Some(Value::Object(Some(s))));
+                }
+            }
+            Ok(Some(Value::Object(Some(ctx.create_string("UTC")))))
+        },
+    );
+
+    // `TimeZone.getDefault()` — the VM runs on UTC unless the embedder says
+    // otherwise (`user.timezone`), and returning null here made every
+    // `TimeZone.getDefault().getID()` NPE.
+    registry.register(
+        "java/util/TimeZone",
+        "getDefault",
+        "()Ljava/util/TimeZone;",
+        |ctx, _args| {
+            let id = cratonvm_types::flags::runtime_var("user.timezone")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "UTC".to_string());
+            let tz = alloc_concurrent_synthetic(ctx, "java/util/TimeZone", 1);
+            let s = ctx.create_string(&id);
+            ctx.set_field(tz, 0, Value::Object(Some(s)));
+            let _ = ctx.set_field_by_name(tz, "ID", Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(tz))))
+        },
+    );
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
         "getZoneInfo",
@@ -36311,10 +36374,23 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // `backtrace`, which `capture_throwable_trace` (called below) sets to the
     // self-reference marker that `getOurStackTrace()` keys on. Writing the
     // String message there would clobber the backtrace marker and re-break
-    // getStackTrace(). The named-field write above is the correct, layout-aware
-    // path; the only objects without a named `detailMessage` are synthetic
-    // stubs, which the no-stubs build does not produce.
-    ctx.set_field_by_name(this, "detailMessage", msg);
+    // getStackTrace(). The named-field write is the correct, layout-aware path.
+    //
+    // FIX (synthetic receiver): the bare `set_field_by_name` this used to be
+    // ALSO silently dropped the message whenever the receiver's class declares
+    // no field names at all — which is every `ensure_synthetic_class` stub, and
+    // therefore every exception in synthetic-JDK mode. `getMessage()` (both
+    // `native_exception_get_message` here and
+    // `lang_misc::native_throwable_get_message`) then falls back to raw slot 0
+    // and finds nothing, so `new IllegalArgumentException("x").getMessage()`
+    // answered null. Route through the shared helper, which writes by name for
+    // a real-JDK layout and falls back to `synthetic_throwable_slot`
+    // (detailMessage = slot 0) only when the by-name write did not take — the
+    // exact slot both readers probe, so writer and reader cannot disagree.
+    // These ctors are registered LATER than
+    // `lang_misc::register_throwable_subclass_natives` and win the slot for
+    // ~50 subclasses, so this path is the live one.
+    crate::lang_misc::write_throwable_detail_message(ctx, this, msg);
     // Surefire bootstrap forensics: capture exact Java callsite for the
     // recurring `NullPointerException("Name is null")` blocker so we can
     // patch the true producer instead of masking symptoms.
@@ -37296,17 +37372,72 @@ fn native_synthetic_instant_is_after(
     )))
 }
 
+/// Civil date from a days-since-epoch count (Howard Hinnant's `civil_from_days`).
+///
+/// This lives here, ungated, on purpose. `util_time` is
+/// `#[cfg(feature = "synthetic-jdk")]` because it registers synthetic natives,
+/// but this function is pure calendar arithmetic with no VM dependency, and
+/// `iso_instant_string` below needs it in EVERY build. Calling
+/// `crate::util_time::epoch_day_to_ymd` from ungated code broke the
+/// default-feature build — which is what the blocking `cargo test --workspace`
+/// CI job runs, while every check in this module's own CI job passes
+/// `--features synthetic-jdk` and so never saw it.
+pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> (i32, i32, i32) {
+    let z = epoch_day + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as i32, d as i32)
+}
+
+/// `Instant.toString()` — ISO-8601, per `DateTimeFormatter.ISO_INSTANT`.
+///
+/// This used to emit Rust's debug shape, `Instant(0.042000000)`, which is not
+/// a format any Java caller can parse and which leaked straight through
+/// `FileTime.toString()` (it delegates here). The JDK prints
+/// `1970-01-01T00:00:00.042Z`: the UTC date-time, with the fraction rendered
+/// in whole groups of three digits — milliseconds, microseconds or
+/// nanoseconds — and omitted entirely when zero.
+fn iso_instant_string(sec: i64, nano: i32) -> String {
+    // Floor division so pre-epoch instants borrow correctly into the previous
+    // day rather than truncating toward zero.
+    let days = sec.div_euclid(86_400);
+    let secs_of_day = sec.rem_euclid(86_400);
+    let (y, m, d) = epoch_day_to_ymd(days);
+    let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    // Years outside 0..=9999 take an explicit sign, as ISO-8601 requires.
+    let mut s = if (0..=9999).contains(&y) {
+        format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
+    } else {
+        format!("{y:+05}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
+    };
+    if nano != 0 {
+        let nano = nano.unsigned_abs();
+        if nano % 1_000_000 == 0 {
+            s.push_str(&format!(".{:03}", nano / 1_000_000));
+        } else if nano % 1_000 == 0 {
+            s.push_str(&format!(".{:06}", nano / 1_000));
+        } else {
+            s.push_str(&format!(".{nano:09}"));
+        }
+    }
+    s.push('Z');
+    s
+}
+
 fn native_synthetic_instant_to_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let (sec, nano) = synthetic_instant_parts(ctx, this);
-    let s = if nano == 0 {
-        format!("Instant({sec})")
-    } else {
-        format!("Instant({sec}.{nano:09})")
-    };
+    let s = iso_instant_string(sec, nano);
     Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
 }
 

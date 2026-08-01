@@ -91,6 +91,55 @@ fn debug_assert_aligned(ptr: *mut u8) {
     );
 }
 
+/// Debug-only re-check of the two invariants an `ObjectRef` is *constructed*
+/// with, applied again at every point the raw address is handed back out
+/// (`as_ptr` / `as_nonnull` — the sole gateways to a dereference).
+///
+/// Why re-check what the constructors already assert: `ObjectRef` is `Copy`,
+/// pointer-sized and niche-optimized, so it is routinely produced by
+/// `transmute`, by raw slot decode (`decode_value`), by JIT-emitted stores into
+/// `Value` slots, and by pointer-map rewrites — paths that do not all funnel
+/// through `from_raw`. This catches a corrupted or fabricated ref at the frame
+/// *before* the deref faults, which is the difference between a named assertion
+/// and an unattributable SIGSEGV in collector or JIT code.
+///
+/// Deliberately NOT checked here: [`plausible_heap_pointer`]'s 47-bit /
+/// null-guard-page range. `types` cannot see a heap, and the workspace
+/// legitimately constructs sentinel `ObjectRef`s outside that range in tests
+/// and synthetic-object paths (e.g. `0xdead_beef_0000_0100`), so a hard assert
+/// on the range would fire on correct code. Callers that genuinely require the
+/// range invariant should use [`ObjectRef::is_plausible_heap_pointer`], which
+/// reports rather than panics. See
+/// `docs/threading/objectref-concurrency-contract.md` §7.
+///
+/// Behaviour note for reviewers: the alignment check can, in principle, turn a
+/// silently-degrading corruption into a debug-build panic. The bypass path is
+/// `read_value_atomic` / `read_value_checked_atomic`, which validate the
+/// 16-byte slot's *discriminant* but not the object payload — so a slot holding
+/// `{disc = Object, payload = misaligned}` can reach here without ever crossing
+/// `from_raw`. That is a genuine defect, and a named assertion beats the
+/// SIGSEGV it otherwise becomes, which is why the check is here. If it ever
+/// needs to be stood down, drop the alignment `debug_assert!` and keep the
+/// null one.
+#[cfg(debug_assertions)]
+#[inline]
+fn debug_check_deref_invariants(ptr: *mut u8) {
+    debug_assert!(
+        !ptr.is_null(),
+        "ObjectRef holds a null pointer (NonNull niche violated — likely a \
+         transmute or a torn 16-byte Value slot)"
+    );
+    debug_assert!(
+        (ptr as usize) % 8 == 0,
+        "ObjectRef pointer not 8-byte aligned at deref: {ptr:p}"
+    );
+}
+
+/// Release-build no-op counterpart to [`debug_check_deref_invariants`].
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn debug_check_deref_invariants(_ptr: *mut u8) {}
+
 // ---------------------------------------------------------------------------
 // MED (full-review-2026-06-20 #row "ObjectRef Send+Sync sound only by accident
 // of the single-threaded scheduler"): single-OS-thread invariant tripwire.
@@ -99,9 +148,13 @@ fn debug_assert_aligned(ptr: *mut u8) {
 // HISTORICAL NOTE — this tripwire was added when the VM ran every Java thread on
 // one OS thread under cooperative scheduling, to fail loudly if a future
 // threading change ever violated that assumption. **The assumption no longer
-// holds**: `Thread.start` spawns a real OS thread per Java thread (see soundness
-// argument point (4) below, which has been corrected). Any multithreaded Java
-// program now trips this guard by design.
+// holds**: `Thread.start` spawns a real OS thread per Java thread. Any
+// multithreaded Java program now trips this guard by design.
+//
+// It is also NOT a soundness guard for `unsafe impl Send/Sync for ObjectRef`.
+// Those impls hold under real OS-level parallelism for reasons that have
+// nothing to do with the thread count — see the SAFETY block above the impls
+// and `docs/threading/objectref-concurrency-contract.md` §6.
 //
 // It therefore survives only as a narrow diagnostic: arming it confirms that a
 // particular workload really is single-OS-threaded, which is occasionally useful
@@ -383,22 +436,28 @@ fn check_single_thread_against(guard: &AtomicU64, token: u64) -> Result<(), u64>
     }
 }
 
-/// Assert the single-OS-thread invariant the `Send`/`Sync` impls rely on, if
-/// the tripwire is enabled. Cold and never-inlined so the enabled-check stays
-/// a cheap predictable branch on the hot path.
+/// Report a violation of the *opt-in* single-OS-thread diagnostic. Cold and
+/// never-inlined so the enabled-check stays a cheap predictable branch on the
+/// hot path.
+///
+/// This is NOT a soundness failure: `Send`/`Sync` for `ObjectRef` hold under
+/// real OS-level parallelism (see the SAFETY block above the impls, and
+/// `docs/threading/objectref-concurrency-contract.md` §6). It means only that
+/// the workload under investigation is genuinely multithreaded.
 #[cold]
 #[inline(never)]
 fn single_thread_guard_violation(recorded: u64, token: u64) -> ! {
     panic!(
         "ObjectRef constructed on a second OS thread (recorded={recorded:#x}, \
-         current={token:#x}). The `unsafe impl Send/Sync for ObjectRef` is sound \
-         only under single-OS-thread Java execution; multi-OS-thread execution \
-         requires re-deriving Send/Sync (handle indirection or per-thread \
-         transfer barriers). See the soundness note in types/src/value.rs."
+         current={token:#x}). CRATONVM_ASSERT_SINGLE_OS_THREAD is a diagnostic, \
+         not a soundness guard: it reports that this workload is genuinely \
+         multi-OS-threaded. Multi-OS-thread execution is the VM's normal mode \
+         and does not invalidate `unsafe impl Send/Sync for ObjectRef`. See \
+         docs/threading/objectref-concurrency-contract.md."
     );
 }
 
-/// Hot-path entry: enforce the single-OS-thread invariant when the tripwire is
+/// Hot-path entry: enforce the single-OS-thread diagnostic when the tripwire is
 /// armed. A no-op (single relaxed load) otherwise.
 ///
 /// `inline(always)` with the armed branch outlined: the intent has always been
@@ -453,8 +512,9 @@ impl ObjectRef {
         // assertion text and check site are identical.
         // SAFETY: callers guarantee `ptr` is non-null and 8-byte aligned.
         debug_assert_aligned(ptr);
-        // MED tripwire: assert the single-OS-thread invariant the Send/Sync
-        // impls rely on (opt-in via CRATONVM_ASSERT_SINGLE_OS_THREAD).
+        // Opt-in single-OS-thread DIAGNOSTIC (CRATONVM_ASSERT_SINGLE_OS_THREAD).
+        // Not a Send/Sync soundness guard — see the SAFETY block above the
+        // impls and docs/threading/objectref-concurrency-contract.md §6.
         enforce_single_os_thread();
         record_object_ref_payload(ptr);
         Self {
@@ -478,95 +538,150 @@ impl ObjectRef {
         // via the shared `debug_assert_aligned` helper for consistency with
         // `from_raw`.
         debug_assert_aligned(ptr.as_ptr());
-        // MED tripwire: assert the single-OS-thread invariant the Send/Sync
-        // impls rely on (opt-in via CRATONVM_ASSERT_SINGLE_OS_THREAD).
+        // Opt-in single-OS-thread DIAGNOSTIC (CRATONVM_ASSERT_SINGLE_OS_THREAD).
+        // Not a Send/Sync soundness guard — see the SAFETY block above the
+        // impls and docs/threading/objectref-concurrency-contract.md §6.
         enforce_single_os_thread();
         record_object_ref_payload(ptr.as_ptr());
         Self { ptr }
     }
 
+    /// Hand back the raw object-header address.
+    ///
+    /// This (and [`Self::as_nonnull`]) is the only gateway from an `ObjectRef`
+    /// to a dereference, so the construction-time invariants are re-checked
+    /// here in debug builds — see [`debug_check_deref_invariants`]. Zero cost
+    /// in release.
+    ///
+    /// Returning the address asserts **nothing** about the pointee. The
+    /// obligations a caller takes on by dereferencing it (root coverage,
+    /// permitted GC phase, staleness across safepoints and blocking regions)
+    /// are tabulated in `docs/threading/objectref-concurrency-contract.md` §5.
+    #[inline]
     pub fn as_ptr(&self) -> *mut u8 {
-        self.ptr.as_ptr()
+        let p = self.ptr.as_ptr();
+        debug_check_deref_invariants(p);
+        p
     }
 
     /// Return the underlying `NonNull<u8>` without going through a raw pointer round-trip.
+    ///
+    /// Same debug-only invariant check and same caller obligations as
+    /// [`Self::as_ptr`].
+    #[inline]
     pub fn as_nonnull(&self) -> NonNull<u8> {
+        debug_check_deref_invariants(self.ptr.as_ptr());
         self.ptr
+    }
+
+    /// Whether this reference's address satisfies the cheap, context-free
+    /// heap-pointer plausibility test ([`plausible_heap_pointer`]): non-null,
+    /// 8-byte aligned, above the null-guard page, and within 47 bits.
+    ///
+    /// Reports rather than panics, because the workspace legitimately mints
+    /// out-of-range sentinel refs (tests, synthetic-object identities). Use it
+    /// where the range invariant is genuinely required — it is the local half
+    /// of the "is this reference plausible?" question; the load-bearing half is
+    /// a live-heap probe (`VmHeap::is_object_address`), which this crate cannot
+    /// see.
+    #[inline]
+    pub fn is_plausible_heap_pointer(&self) -> bool {
+        plausible_heap_pointer(self.ptr.as_ptr() as u64)
     }
 }
 
-// SAFETY: ObjectRef implements Send and Sync.
+// SAFETY: `ObjectRef` is `Send` and `Sync`.
 //
-// `NonNull<u8>` is `!Send + !Sync` by default (same as `*mut u8`), so the
-// `unsafe impl`s below are still required after the A4 switch from
-// `*mut u8` to `NonNull<u8>` — the niche optimization is a layout change,
-// not an auto-trait change.
+// Full derivation, the real threading model, and the per-operation contract
+// table: `docs/threading/objectref-concurrency-contract.md`. Read that before
+// changing anything here. What follows is the short form.
 //
-// Soundness argument:
+// `NonNull<u8>` is `!Send + !Sync` by default (same as `*mut u8`), so these
+// `unsafe impl`s are required — the A4 switch from `*mut u8` to `NonNull<u8>`
+// was a layout change (the niche for `Option<ObjectRef>`), not an auto-trait
+// change.
 //
-// 1. **Lifetime guarantee** — The pointer refers to a GC-managed heap object.
-//    The collector will not free an object while any root (thread stack, global
-//    root set) holds an ObjectRef to it. Roots are scanned at safepoints.
+// WHAT IS BEING ASSERTED
 //
-// 2. **Mutation protocol** — All field reads/writes go through the VM's
-//    field-access helpers (`get_field` / `set_field` on `NativeContext`), which
-//    hold the appropriate monitor lock or use atomic operations for volatile
-//    fields. Direct pointer mutation is never performed outside the GC.
+// Exactly two things about *values of this type*, and nothing about the
+// pointee:
 //
-// 3. **Compaction safety** — GC stop-the-world pauses ensure no thread
-//    observes a half-moved object during relocation. Pointer updates happen
-//    atomically from each thread's perspective.
+//   Send — an `ObjectRef` value may be moved/copied to another OS thread.
+//   Sync — a `&ObjectRef` may be shared across OS threads.
 //
-// 4. **Current execution model** — one OS thread per Java thread. `Thread.start`
-//    spawns a real `std::thread::Builder` worker (see `thread_start` in
-//    `vm/src/vm/vm_exec.rs`, the `std::thread::Builder::new()` call around line
-//    6781); virtual threads are multiplexed over those carriers by
-//    `threading/virtual_scheduler.rs`. Java code therefore runs with genuine
-//    preemptive OS-level parallelism, and (1)-(3) must hold concurrently.
+// WHY THIS HOLDS UNDER REAL OS THREADS
 //
-// !!! THE RE-AUDIT THIS BLOCK DEMANDS IS OVERDUE — READ BEFORE TRUSTING (1)-(3) !!!
+// 1. `ObjectRef` is `#[derive(Copy)]` over a single `NonNull<u8>` field, has
+//    no `Drop` impl, and has no interior mutability. Sending it transfers a
+//    bit pattern; nothing is deallocated, unshared or invalidated by the
+//    transfer.
+// 2. `Sync` needs `&ObjectRef` to be race-free to share. The one field is
+//    written at construction and never mutated, so a shared reference grants
+//    read-only access to an immutable word. No data race on `ObjectRef`
+//    itself is expressible.
+// 3. The `NonNull` default is conservative about *ownership* semantics the
+//    standard library cannot see. `ObjectRef` has none — the collector owns
+//    the pointee. The correct comparison is `usize` (which is `Send + Sync`),
+//    not `Box<u8>`.
+// 4. Multi-OS-thread Java execution (`Thread.start` spawns a real
+//    `std::thread::Builder` worker per Java thread — `thread_start` in
+//    `vm/src/vm/vm_exec.rs`; virtual threads are multiplexed over those
+//    carriers) changes nothing in (1)-(3). It changes a great deal for
+//    *dereferencing*, which is a property of the deref sites and is already
+//    `unsafe` at each of them.
 //
-// This note previously stated that the VM executed all Java threads on a single
-// OS thread under cooperative scheduling, and that these `unsafe impl`s were
-// "sound by accident of the single-threaded scheduler" — with an explicit
-// instruction to re-derive the `Send`/`Sync` claim from first principles "once
-// `threading/jvm_thread.rs` spawns Java threads on multiple OS threads".
+// THIS IS DELIBERATELY NARROWER THAN THE ARGUMENT IT REPLACES
 //
-// **That trigger has already fired.** Multi-OS-thread Java execution is the
-// current, default behaviour (point (4) above), and the stated re-audit does not
-// appear to have happened — the premise simply went stale in place. Corrected
-// here so the next reader is not misled into thinking the single-thread
-// assumption still holds.
+// The previous note derived `Send`/`Sync` from three whole-VM properties
+// (root coverage, a claimed monitor/atomic field-access protocol, and
+// atomically-observed compaction) and from a since-falsified
+// "single-OS-thread, cooperatively scheduled" premise. That coupling was the
+// bug: it tied two auto-trait impls to the entire GC design, so the impls
+// looked unsound the moment the scheduler changed. They were not. Two of the
+// three properties were also misstated — plain (non-volatile) field access
+// takes NO lock (safety comes from per-word `AtomicU64` access, see
+// `read_value_atomic`/`write_value_atomic` below), and the JIT's inline
+// `jit_putfield_*` helpers DO write slots directly outside the GC.
 //
-// What this correction does NOT do: it does not certify (1)-(3) as sound under
-// parallelism, and it does not claim they are broken. Neither conclusion has been
-// established. `ObjectRef` remains a bare, non-atomic, GC-unmanaged raw pointer
-// with no lifetime tracking, and the three properties it depends on are exactly
-// the ones that need a real concurrent audit:
-//   - GC roots are scanned at safepoints across ALL OS threads (no thread can
-//     hide an `ObjectRef` from the collector);
-//   - every field access genuinely routes through the monitor/atomic helpers
-//     in (2) — no raw pointer dereference escapes that protocol;
-//   - relocation during compaction is observed atomically by every thread.
-// The plausible reason these hold in practice is that the safepoint/STW protocol
-// (`threading/gc_barrier.rs`) serialises relocation against every mutator, so no
-// thread observes a moving object — but "plausible" is not the audit. Until that
-// audit is written down, treat this `unsafe impl` as load-bearing and
-// under-justified. If any property cannot be established, the fix is a handle
-// indirection or an explicit `!Send` marker plus per-thread transfer barriers.
+// INVARIANTS THE REST OF THE VM MUST UPHOLD
 //
-// Knock-on: the object-reference provenance bitmap earlier in this file justifies
-// its `Ordering::Relaxed` accesses partly on the same now-false single-OS-thread
-// premise. Those orderings need re-deriving alongside this argument.
+// These are real and load-bearing — they are just not obligations of *these
+// impls*. An `ObjectRef` is a value, not a capability: holding one asserts
+// nothing about the pointee's validity, on any thread including the one that
+// created it. Dereferencing one requires, per §5 and §7 of the doc:
+//
+//   * the ref is reachable from the GC root set for the dereferencing thread
+//     (frame slot, `native_pin_roots`, `handle_slots`, deposited root
+//     snapshot, JNI local/global table, or a registered `ExternalRootProvider`);
+//   * relocation happens only under stop-the-world (witnessed by
+//     `StopTheWorldToken`), and EVERY holder of the address is rewritten
+//     through the collection's pointer map — or, where a holder cannot be
+//     rewritten (conservative JIT roots), the collection does not move at all;
+//   * an `ObjectRef` kept in a Rust local across a safepoint poll, a blocking
+//     region, or an allocation is NOT rewritten by any of those paths and is
+//     stale afterwards;
+//   * `Hash`/`Eq` are address-based, so `ObjectRef` identity is NOT stable
+//     across a moving collection: any `HashMap<ObjectRef, _>` needs a paired
+//     remap in `update_all_roots`.
+//
+// None of these are enforced by types or assertions today; §7 of the doc
+// lists them as follow-up work.
+//
+// Knock-on, now discharged: the provenance bitmap earlier in this file used to
+// justify its `Ordering::Relaxed` accesses partly on the same single-OS-thread
+// premise. That clause is gone; the surviving argument is the
+// self-carrying-happens-before-edge one, whose failure mode is a conservative
+// reject (degrade to `Object(None)`), never a fabricated pointer.
 //
 // TRIPWIRE: `enforce_single_os_thread()` in `ObjectRef::from_raw` /
-// `from_raw_nonnull`, opt-in via `CRATONVM_ASSERT_SINGLE_OS_THREAD`, aborts if a
-// second OS thread ever constructs an `ObjectRef`. Note what this means now that
-// point (4) has changed: it is no longer a guard against a *future* regression —
-// any multithreaded Java program trips it by design. It survives only as a
-// diagnostic for confirming that a specific workload really is single-threaded
-// (e.g. when bisecting whether a bug needs parallelism to reproduce). Do not
-// enable it in a multithreaded run and do not read a trip as evidence of a bug.
+// `from_raw_nonnull`, opt-in via `CRATONVM_ASSERT_SINGLE_OS_THREAD`, aborts if
+// a second OS thread ever constructs an `ObjectRef`. It is NOT a soundness
+// guard for these impls (see above — they hold under parallelism). Any
+// multithreaded Java program trips it by design. It survives only as a
+// diagnostic for confirming that a specific workload really is
+// single-OS-threaded, e.g. when bisecting whether a bug needs parallelism to
+// reproduce. Do not enable it in a multithreaded run and do not read a trip as
+// evidence of a bug.
 unsafe impl Send for ObjectRef {}
 unsafe impl Sync for ObjectRef {}
 
@@ -1230,6 +1345,23 @@ const _: () = assert!(
 const _: () = assert!(
     std::mem::size_of::<ObjectRef>() == std::mem::size_of::<*mut u8>(),
     "ObjectRef must be pointer-sized"
+);
+// Alignment half of the same invariant. Size alone does not pin the layout:
+// adding `#[repr(align(16))]`, or swapping the field for a type with a
+// stricter alignment, keeps the size at 8 while silently changing how
+// `ObjectRef` packs inside `Value`, inside `[ObjectRef]` root vectors, and
+// inside the JIT's 16-byte slots. Pinned here so a layout change is a compile
+// error rather than a runtime mystery. See
+// `docs/threading/objectref-concurrency-contract.md` §2.
+const _: () = assert!(
+    std::mem::align_of::<ObjectRef>() == std::mem::align_of::<*mut u8>(),
+    "ObjectRef must have pointer alignment"
+);
+// `Option<ObjectRef>` must not gain alignment either — `Value::Object` embeds
+// it, and `Value`'s own align <= 8 assert above depends on this staying true.
+const _: () = assert!(
+    std::mem::align_of::<Option<ObjectRef>>() == std::mem::align_of::<*mut u8>(),
+    "Option<ObjectRef> must have pointer alignment"
 );
 // A4: confirm the NonNull niche optimization — Option<ObjectRef> must be
 // pointer-sized (no discriminant tag) because `null` is the niche for the
@@ -2090,5 +2222,186 @@ mod tests {
         );
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ObjectRef>();
+    }
+
+    // -----------------------------------------------------------------------
+    // `ObjectRef` concurrency contract
+    // (docs/threading/objectref-concurrency-contract.md)
+    //
+    // These pin the parts of the contract that are checkable from inside
+    // `types`. The parts that are NOT — root coverage, permitted GC phase,
+    // staleness across safepoints and blocking regions — live in `vm`/`gc` and
+    // are listed as unenforced invariants in §7 of the doc.
+    // -----------------------------------------------------------------------
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    /// §6 of the contract: `Send` and `Sync` are asserted separately, and they
+    /// must survive the compositions the VM actually relies on to move roots
+    /// between OS threads (`Arc<Mutex<Vec<ObjectRef>>>` is literally
+    /// `ThreadRegistry`'s `root_snapshot`).
+    #[test]
+    fn objectref_send_and_sync_bounds_hold_for_the_shapes_the_vm_uses() {
+        assert_send::<ObjectRef>();
+        assert_sync::<ObjectRef>();
+        assert_send::<Option<ObjectRef>>();
+        assert_sync::<Option<ObjectRef>>();
+        assert_send::<Value>();
+        assert_sync::<Value>();
+        assert_send::<Vec<ObjectRef>>();
+        assert_sync::<Vec<ObjectRef>>();
+        // The cross-thread root-publication shape.
+        assert_send::<std::sync::Arc<std::sync::Mutex<Vec<ObjectRef>>>>();
+        assert_sync::<std::sync::Arc<std::sync::Mutex<Vec<ObjectRef>>>>();
+        // The pointer-map rewrite shape.
+        assert_send::<std::collections::HashMap<ObjectRef, usize>>();
+    }
+
+    /// §2: copying an `ObjectRef` is a bit copy. Both copies name the same
+    /// address, compare equal, hash equal, and neither is invalidated by the
+    /// other — which is exactly why `Send` is sound (nothing is transferred,
+    /// unshared or dropped).
+    #[test]
+    fn objectref_copy_semantics_are_a_pure_bit_copy() {
+        let addr = 0x0000_5555_7777_9000usize;
+        // SAFETY: aligned, non-null sentinel address; never dereferenced here.
+        let a = unsafe { ObjectRef::from_raw(addr as *mut u8) };
+        let b = a; // Copy, not a move-out.
+        assert_eq!(a, b);
+        assert_eq!(a.as_ptr(), b.as_ptr());
+        assert_eq!(a.as_nonnull(), b.as_nonnull());
+        assert_eq!(a.as_ptr() as usize, addr);
+        // `a` is still usable after `b` was created — no move occurred.
+        assert_eq!(a.as_ptr() as usize, addr);
+
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let hash_of = |r: ObjectRef| {
+            let mut h = DefaultHasher::new();
+            r.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_of(a), hash_of(b), "Hash must follow address equality");
+
+        // Address identity, not object identity: a DIFFERENT address is a
+        // different `ObjectRef` even if a moving collection would call them
+        // the same object. This is unenforced-invariant #3 in the doc.
+        // SAFETY: aligned, non-null sentinel address; never dereferenced.
+        let moved = unsafe { ObjectRef::from_raw((addr + 0x1000) as *mut u8) };
+        assert_ne!(a, moved);
+        assert_ne!(hash_of(a), hash_of(moved));
+    }
+
+    /// §2: `None` is the all-zero niche. This is what lets `Value` stay 16
+    /// bytes, and it is why a torn/zeroed 16-byte slot decodes as `Int(0)`
+    /// rather than as a null reference (see `read_slot`'s R-niche rule in
+    /// `gc/src/heap.rs`).
+    #[test]
+    fn objectref_none_is_the_all_zero_niche() {
+        assert_eq!(
+            std::mem::size_of::<Option<ObjectRef>>(),
+            std::mem::size_of::<ObjectRef>()
+        );
+        // SAFETY: both types are pointer-sized (asserted above and at compile
+        // time); reading `None`'s own initialized bytes as a `usize`.
+        let none_bits: usize = unsafe { std::mem::transmute(None::<ObjectRef>) };
+        assert_eq!(none_bits, 0, "None must be the zero bit pattern");
+
+        // SAFETY: aligned, non-null sentinel address; never dereferenced.
+        let some = Some(unsafe { ObjectRef::from_raw(0x0000_5555_7777_A000usize as *mut u8) });
+        // SAFETY: same size/validity argument as above.
+        let some_bits: usize = unsafe { std::mem::transmute(some) };
+        assert_eq!(some_bits, 0x0000_5555_7777_A000);
+
+        assert!(Value::Object(None).is_null());
+        assert!(!Value::Object(some).is_null());
+    }
+
+    /// The local half of "is this reference plausible?". Reports rather than
+    /// panics precisely because the workspace mints out-of-range sentinel refs
+    /// — pinning that behaviour so a future hard assert in `as_ptr` is a
+    /// deliberate decision, not an accident.
+    #[test]
+    fn objectref_plausibility_reports_and_does_not_panic() {
+        // A realistic heap address.
+        // SAFETY: aligned, non-null; never dereferenced.
+        let ok = unsafe { ObjectRef::from_raw(0x0000_5555_7777_B000usize as *mut u8) };
+        assert!(ok.is_plausible_heap_pointer());
+
+        // A sentinel above the 47-bit user-address window, of the shape the
+        // workspace actually uses for synthetic identities. `as_ptr` must NOT
+        // panic on it (debug builds included) — only the report says "no".
+        let sentinel = 0xdead_beef_0000_0100usize;
+        assert_eq!(sentinel % 8, 0, "sentinel must still be 8-byte aligned");
+        // SAFETY: aligned, non-null; never dereferenced.
+        let odd = unsafe { ObjectRef::from_raw(sentinel as *mut u8) };
+        assert_eq!(odd.as_ptr() as usize, sentinel);
+        assert!(!odd.is_plausible_heap_pointer());
+
+        // And the null-guard page is rejected by the same predicate.
+        assert!(!plausible_heap_pointer(0x8));
+        assert!(!plausible_heap_pointer(0));
+    }
+
+    /// §2 layout invariant, checked at runtime as well as at compile time so a
+    /// `cfg`-dependent field addition cannot slip past the `const _` asserts on
+    /// one target only.
+    #[test]
+    fn objectref_layout_is_pinned_for_size_and_alignment() {
+        assert_eq!(
+            std::mem::size_of::<ObjectRef>(),
+            std::mem::size_of::<*mut u8>()
+        );
+        assert_eq!(
+            std::mem::align_of::<ObjectRef>(),
+            std::mem::align_of::<*mut u8>()
+        );
+        assert_eq!(
+            std::mem::align_of::<Option<ObjectRef>>(),
+            std::mem::align_of::<*mut u8>()
+        );
+        assert_eq!(std::mem::size_of::<Value>(), 16);
+        assert!(std::mem::align_of::<Value>() <= 8);
+    }
+
+    /// §6 (1): `ObjectRef` must stay `Drop`-free. A `Drop` impl would make the
+    /// `Send` argument ("sending transfers a bit pattern; nothing is
+    /// deallocated") false, and would also break `Copy`.
+    #[test]
+    fn objectref_has_no_drop_glue() {
+        assert!(
+            !std::mem::needs_drop::<ObjectRef>(),
+            "ObjectRef must have no drop glue — see contract doc §6(1)"
+        );
+        assert!(!std::mem::needs_drop::<Option<ObjectRef>>());
+        assert!(!std::mem::needs_drop::<Value>());
+    }
+
+    /// The contract explicitly permits copying an `ObjectRef` to another OS
+    /// thread and reading it there. Exercised for real (not just via trait
+    /// bounds) so the `Send`/`Sync` claim is checked by execution too.
+    #[test]
+    fn objectref_survives_a_real_cross_thread_transfer() {
+        let addr = 0x0000_5555_7777_C000usize;
+        // SAFETY: aligned, non-null sentinel address; never dereferenced.
+        let r = unsafe { ObjectRef::from_raw(addr as *mut u8) };
+
+        // Send: move a copy into another OS thread.
+        let moved = std::thread::spawn(move || r.as_ptr() as usize)
+            .join()
+            .expect("worker thread panicked");
+        assert_eq!(moved, addr);
+
+        // Sync: share `&ObjectRef` across threads.
+        let shared = std::sync::Arc::new(r);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let s = std::sync::Arc::clone(&shared);
+            handles.push(std::thread::spawn(move || s.as_ptr() as usize));
+        }
+        for h in handles {
+            assert_eq!(h.join().expect("worker thread panicked"), addr);
+        }
     }
 }

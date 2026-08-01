@@ -379,6 +379,15 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
 
+    // `DecimalFormat.toPattern()` — the pattern the constructors above already
+    // store in `DF_FIELD_PATTERN`. Only `MessageFormat` had one, so a
+    // `DecimalFormat("#0.00")` could be built and applied but never asked what
+    // pattern it was using.
+    r.register(df, "toPattern", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, DF_FIELD_PATTERN)))
+    });
+
     // MessageFormat.format(String, Object...) — static
     r.register(
         mf,

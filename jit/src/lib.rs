@@ -82,12 +82,14 @@
 
 pub mod aarch64;
 pub mod aarch64_backend;
+pub mod bailout;
 pub mod deopt;
 pub mod escape_analysis;
 pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
 pub mod ir_schedule;
+pub mod ir_verify;
 pub mod loop_analysis;
 pub mod null_check_elim;
 pub mod pgo;
@@ -3517,6 +3519,55 @@ mod inline_selection_tests {
 pub enum JitLdcConstant {
     Immediate(i64),
     String(String),
+}
+
+/// Compile-time resolution of a `new` (0xbb) / `anewarray` (0xbd)
+/// constant-pool site, as reported by `cp_new_resolver`.
+///
+/// # Why this is an enum and not just `Option<(class_id, …)>`
+///
+/// The resolver can only name a `class_id` for a class that is ALREADY
+/// LOADED — it deliberately does not run `ClassLoader.loadClass` (arbitrary
+/// Java code from inside the compile path, with the class-manager lock in
+/// play, loading classes the program itself never would). Before this enum
+/// existed, "not loaded yet" and "this CP entry can never be a class"
+/// collapsed into the same `None`, which bailed the WHOLE compile.
+///
+/// That made any hot method whose only un-taken branch does
+/// `throw new SomeException(...)` permanently uncompilable: `SomeException`
+/// is never loaded while nothing throws, so the resolver missed, the compile
+/// bailed, and after `MAX_TIER_FAIL_RETRIES` the method interpreted forever
+/// (json-smart's `JSONParserBase.readMain` — 293,940 interpreted invocations
+/// of a workload's hottest method; see
+/// `docs/internal/jit-compile-bail-unresolved-new-cold-class.md`).
+///
+/// [`JitNewSite::Deferred`] separates the two: the site compiles, and the
+/// class is resolved at RUN TIME by the `new_object_cp` /
+/// `anewarray_object_cp` helper — on the same thread, at the same program
+/// point, and by the same code path the interpreter's own `0xbb`/`0xbd`
+/// handler uses. A `None` return is now reserved for a genuinely malformed
+/// site (the holder class is gone, or the CP entry is not a class
+/// reference), which stays a permanent bail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JitNewSite {
+    /// The target class is loaded and its layout is known.
+    ///
+    /// `has_prim_init` / `has_finalizer` feed the inline-TLAB fast path,
+    /// which skips the `jit_post_tlab_init` helper call when BOTH are false.
+    /// A resolver that cannot compute them must report `true, true` so the
+    /// helper call stays in place.
+    Resolved {
+        class_id: u32,
+        num_fields: usize,
+        has_prim_init: bool,
+        has_finalizer: bool,
+    },
+    /// The target class is not loaded yet. Compile the site to the
+    /// CP-indexed slow-path helper, which resolves + initialises it on first
+    /// execution. `holder_class_id` is the class whose constant pool
+    /// `cp_idx` indexes — i.e. the *referencing* class, which also supplies
+    /// the initiating loader.
+    Deferred { holder_class_id: u32, cp_idx: u16 },
 }
 
 /// Compile-time resolved field layout of `java/lang/String`, for the
@@ -7232,6 +7283,42 @@ fn build_scalar_replacement_map(
     ir_lower::ScalarReplacementMap { objects }
 }
 
+/// Verify `graph` and, on failure, record a structured bailout.
+///
+/// Returns `true` when the graph must **not** be lowered. The caller's
+/// response to `true` is to do nothing — the IR pipeline's failure path is
+/// "fall out of the `if let Some(graph)` arm and let the single-pass backend
+/// below compile the method", which is always semantically valid because the
+/// optimizing tier is an optimization, never a requirement.
+///
+/// This is the adapter the P0 "JIT correctness" lane of
+/// `docs/known-issues/deep-research-vm-c2.md` asks for: `verify_graph` returns
+/// `Result`, the compile path returns `Option`, and rather than change the
+/// signature of anything already in the pipeline the conversion happens here,
+/// at the call site. The bailout is *counted* (`bailout::bailout_counts`) so
+/// "how often does the verifier reject a graph, and for what?" is answerable
+/// without parsing debug logs — the review's "measure compilation quality"
+/// item. It is only *printed* under the existing `ir_stage_reporting()` flag,
+/// because a bailout is a quality signal, not a fault.
+fn ir_verify_reject(
+    graph: &ir::Graph,
+    phase: &str,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    match ir_verify::verify_graph(graph, phase, ir_verify::VerifyOptions::from_env()) {
+        Ok(()) => false,
+        Err(b) => {
+            bailout::record_bailout(&b);
+            if ir_stage_reporting() {
+                eprintln!("[ir] verifier rejected {class_name}.{method_name}{descriptor}: {b}");
+            }
+            true
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compilation entry point
 // ---------------------------------------------------------------------------
@@ -7962,7 +8049,7 @@ pub fn try_compile(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>,
     profile: Option<&profile::MethodProfile>,
@@ -8037,11 +8124,14 @@ pub fn try_compile_with_invokespecial_resolver(
     // `classloading::invokespecial_selection_start` for the algorithm.
     cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    // CRIT-2 — returns (class_id, num_fields, has_nonzero_tag_primitive_init,
-    // has_finalizer). The two flags feed the inline-TLAB `new` fast path;
-    // resolvers that cannot compute them must return `(_, _, true, true)`
-    // so the post-init helper call stays in place.
-    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
+    // CRIT-2 / cold-`new` fix — see [`JitNewSite`]. `Resolved` carries
+    // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer);
+    // the two flags feed the inline-TLAB `new` fast path and a resolver that
+    // cannot compute them must report `true, true` so the post-init helper
+    // call stays in place. `Deferred` means "class not loaded yet" and
+    // compiles to the CP-indexed runtime-resolving helper; only `None` (a
+    // malformed site) still bails the compile.
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
     profile: Option<&profile::MethodProfile>,
@@ -8638,7 +8728,7 @@ fn try_compile_inner(
     cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
-    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<JitNewSite>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>, // inc 35: (bits, is_double)
     profile: Option<&profile::MethodProfile>,
@@ -9212,7 +9302,18 @@ fn try_compile_inner(
             if !scan.new_ops.is_empty() {
                 let mut new_info_map = std::collections::HashMap::with_capacity(scan.new_ops.len());
                 for &(pc, cp_idx) in &scan.new_ops {
-                    if let Some((class_id, num_fields, _hp, _hf)) = new_resolver(cp_idx) {
+                    // A `Deferred` site has no compile-time class id or field
+                    // count, so it gets no map entry: the IR builder's 0xbb arm
+                    // then bails this method to the single-pass backend, which
+                    // DOES compile the site (through the CP-indexed helper).
+                    // That is strictly better than the pre-fix behaviour, where
+                    // the site bailed BOTH backends.
+                    if let Some(JitNewSite::Resolved {
+                        class_id,
+                        num_fields,
+                        ..
+                    }) = new_resolver(cp_idx)
+                    {
                         new_info_map.insert(pc, (class_id, num_fields));
                     }
                 }
@@ -9644,7 +9745,26 @@ fn try_compile_inner(
                 // Branchy-IR explicitly disabled (CRATONVM_NO_IR_BRANCHY) and
                 // reassoc off → fall through to the single-pass backend below.
             } else {
+                // P0 "JIT correctness" (docs/known-issues/deep-research-vm-c2.md):
+                // the IR verifier runs after every mutating pass when
+                // `ir_verify::verify_enabled()` (debug builds, or
+                // `CRATONVM_JIT_VERIFY_IR=1`), and unconditionally immediately
+                // before lowering. `ir_verify_bail` latches the first rejection
+                // and steers the method down the pipeline's existing failure
+                // path — falling through to the single-pass backend below.
+                // Nothing on the success path changes.
+                let mut ir_verify_bail = false;
+
                 ir_optimize::optimize(&mut graph);
+                if ir_verify::verify_enabled() {
+                    ir_verify_bail |= ir_verify_reject(
+                        &graph,
+                        "post-optimize",
+                        &cached.class_name,
+                        &cached.method_name,
+                        &cached.method_descriptor,
+                    );
+                }
 
                 // Guard-surviving scalar replacement (Front 3.2): metadata for
                 // scalar-replaced objects so the IR lowerer can emit a
@@ -9698,6 +9818,19 @@ fn try_compile_inner(
                                 Some(build_scalar_replacement_map(&graph, &id_map, &ea_result));
                         }
                         apply_ea_to_ir(&mut graph, &id_map, &ea_result);
+                        // `apply_ea_to_ir` is a mutating pass: it kills the
+                        // scalar-replaced allocation, its stores and its loads,
+                        // and rewires their consumers. Verify the result under
+                        // the same per-pass gate as `ir_optimize`.
+                        if ir_verify::verify_enabled() {
+                            ir_verify_bail |= ir_verify_reject(
+                                &graph,
+                                "post-escape-analysis",
+                                &cached.class_name,
+                                &cached.method_name,
+                                &cached.method_descriptor,
+                            );
+                        }
                     }
                 }
 
@@ -9715,7 +9848,26 @@ fn try_compile_inner(
                         cached.class_name, cached.method_name
                     );
                 }
-                if !has_live_new_array {
+                // Unconditional pre-lowering verification. This is the gate the
+                // review's exit criterion names: "invalid IR or ABI state
+                // causes a deterministic compilation bailout, never silent
+                // wrong code, panic, or native crash". It runs BEFORE
+                // `ir_schedule::schedule`, not just before `lower_inner`,
+                // because the scheduler indexes `graph.nodes` by raw `NodeId`
+                // and would itself panic on the dangling edge the verifier is
+                // there to catch. `CRATONVM_JIT_VERIFY_IR=0` is the kill switch
+                // — see `ir_verify::pre_lower_verify_disabled`.
+                if !has_live_new_array && !ir_verify_bail && !ir_verify::pre_lower_verify_disabled()
+                {
+                    ir_verify_bail |= ir_verify_reject(
+                        &graph,
+                        "pre-lower",
+                        &cached.class_name,
+                        &cached.method_name,
+                        &cached.method_descriptor,
+                    );
+                }
+                if !has_live_new_array && !ir_verify_bail {
                     let schedule = ir_schedule::schedule(&graph);
                     // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
                     // optimizing IR (C2) lowerer the profiled branch bias so it can
@@ -9952,24 +10104,67 @@ fn try_compile_inner(
     // resolver computes the real flags from class metadata; a resolver
     // that cannot determine them must return `(true, true)` so the
     // helper call stays in place.
+    //
+    // A `JitNewSite::Deferred` site (target class not loaded yet) goes into
+    // the parallel `new_deferred_info` / `anewarray_deferred_info` lists
+    // instead: those compile to the CP-indexed helper, which resolves the
+    // class on first execution. Before that existed, a `Deferred` site was
+    // indistinguishable from a malformed one and bailed the WHOLE compile —
+    // permanently, after `MAX_TIER_FAIL_RETRIES` — which is what left every
+    // hot method carrying a cold `throw new SomeException(...)` in the
+    // interpreter forever. `None` (malformed CP entry / missing holder) is
+    // still a bail: no runtime resolution can rescue it.
+    //
+    // The `new_object_cp` / `anewarray_object_cp` helpers are optional in the
+    // ABI (a hand-built test table leaves them 0), so an unwired helper falls
+    // back to the historical whole-compile bail rather than emitting a CALL
+    // to address 0.
     let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
     let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
+    let mut new_deferred_info: Vec<(usize, u32, u16)> = Vec::new();
+    let mut anewarray_deferred_info: Vec<(usize, u32, u16)> = Vec::new();
     if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() {
         let Some(resolver) = cp_new_resolver else {
             jitc_bail!("cp_new_resolver")
         };
         for &(pc, cp_idx) in &scan.new_ops {
-            let Some((class_id_raw, num_fields, has_prim_init, has_finalizer)) = resolver(cp_idx)
-            else {
-                jitc_bail!("new_resolve")
-            };
-            new_info.push((pc, class_id_raw, num_fields, has_prim_init, has_finalizer));
+            match resolver(cp_idx) {
+                Some(JitNewSite::Resolved {
+                    class_id,
+                    num_fields,
+                    has_prim_init,
+                    has_finalizer,
+                }) => {
+                    new_info.push((pc, class_id, num_fields, has_prim_init, has_finalizer));
+                }
+                Some(JitNewSite::Deferred {
+                    holder_class_id,
+                    cp_idx,
+                }) => {
+                    if helpers.new_object_cp == 0 {
+                        jitc_bail!("new_resolve_deferred_unwired")
+                    }
+                    new_deferred_info.push((pc, holder_class_id, cp_idx));
+                }
+                None => jitc_bail!("new_resolve"),
+            }
         }
         for &(pc, cp_idx) in &scan.anewarray_ops {
-            let Some((class_id_raw, ..)) = resolver(cp_idx) else {
-                jitc_bail!("anewarray_resolve")
-            };
-            anewarray_info.push((pc, class_id_raw));
+            match resolver(cp_idx) {
+                Some(JitNewSite::Resolved { class_id, .. }) => {
+                    anewarray_info.push((pc, class_id));
+                }
+                Some(JitNewSite::Deferred {
+                    holder_class_id,
+                    cp_idx,
+                }) => {
+                    if helpers.anewarray_object_cp == 0 {
+                        jitc_bail!("anewarray_resolve_deferred_unwired")
+                    }
+                    anewarray_deferred_info.push((pc, holder_class_id, cp_idx));
+                }
+                None => jitc_bail!("anewarray_resolve"),
+            }
         }
     }
 
@@ -10997,7 +11192,9 @@ fn try_compile_inner(
         typecheck_info,
         static_field_info,
         new_info,
+        new_deferred_info,
         anewarray_info,
+        anewarray_deferred_info,
         invoke_info,
         direct_calls,
         mic_slots,
@@ -12800,9 +12997,14 @@ mod tests {
             quickened: std::sync::OnceLock::new(),
         };
         let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
-        let new_resolver = |cp: u16| -> Option<(u32, usize, bool, bool)> {
+        let new_resolver = |cp: u16| -> Option<JitNewSite> {
             if cp == 1 {
-                Some((7, 1, false, false))
+                Some(JitNewSite::Resolved {
+                    class_id: 7,
+                    num_fields: 1,
+                    has_prim_init: false,
+                    has_finalizer: false,
+                })
             } else {
                 None
             }
@@ -12886,6 +13088,98 @@ mod tests {
             IR_LOWER_COMPILES.with(|c| c.get()),
             0,
             "without the elidable resolver, `new` must NOT take the IR pipeline"
+        );
+    }
+
+    // ── cold-`new` fix: a `new` of a NOT-YET-LOADED class must still compile ──
+    //
+    // The gap this guards (docs/internal/jit-compile-bail-unresolved-new-cold-class.md):
+    // `resolve_jit_new_site` only sees already-loaded classes, so a hot method
+    // whose only un-taken branch does `throw new SomeException(...)` reported
+    // `None`, `try_compile_inner` bailed the WHOLE compile at the `new_resolve`
+    // site, and after `MAX_TIER_FAIL_RETRIES` the method interpreted forever
+    // (json-smart's `JSONParserBase.readMain`: 293,940 interpreted invocations).
+    //
+    // Differential, so it cannot pass vacuously: the SAME bytecode is compiled
+    // three ways. `Resolved` proves the shape is compilable at all; `Deferred`
+    // with the CP helper wired must ALSO compile (the fix); `Deferred` with the
+    // helper unwired must still bail (a hand-built test table must never get a
+    // CALL to address 0).
+    #[test]
+    fn deferred_new_site_compiles_when_cp_helper_is_wired() {
+        use std::sync::Arc;
+        // `static int f() { new Cold(); pop; return 0; }`
+        //   new #1; pop; iconst_0; ireturn
+        let mk = |name: &str| CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/ColdNew"),
+            method_name: Arc::from(name),
+            method_descriptor: Arc::from("()I"),
+            source_file: None,
+            code: Arc::from([0xbb, 0x00, 0x01, 0x57, 0x03, 0xac, 0x00, 0x00].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 2,
+            max_locals: 1,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        };
+
+        // Non-null placeholders: this test only compiles, never executes, so the
+        // backend just needs the slots to read as "wired".
+        let mut wired: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        wired.new_object = 0x1000;
+        wired.new_object_cp = 0x2000;
+        let mut unwired = wired;
+        unwired.new_object_cp = 0;
+
+        let resolved = |cp: u16| -> Option<JitNewSite> {
+            (cp == 1).then_some(JitNewSite::Resolved {
+                class_id: 7,
+                num_fields: 1,
+                has_prim_init: true,
+                has_finalizer: true,
+            })
+        };
+        let deferred = |cp: u16| -> Option<JitNewSite> {
+            (cp == 1).then_some(JitNewSite::Deferred {
+                holder_class_id: 1,
+                cp_idx: cp,
+            })
+        };
+
+        let compile = |cached: &CachedBytecodeMethod,
+                       helpers: &JitRuntimeHelpers,
+                       r: &dyn Fn(u16) -> Option<JitNewSite>| {
+            try_compile(
+                cached, None, None, None, None, None,
+                Some(r),
+                None, None, None, helpers, None, None, None, None,
+                // Single-pass backend: this is about the CP-resolution
+                // pre-pass, not the IR tier.
+                false, false, false, false, false, false, None,
+            )
+        };
+
+        assert!(
+            compile(&mk("resolved"), &wired, &resolved).is_some(),
+            "control arm: a resolved `new` of this shape must compile — if it \
+             does not, the two Deferred assertions below prove nothing"
+        );
+        assert!(
+            compile(&mk("deferred"), &wired, &deferred).is_some(),
+            "THE FIX: a `new` whose class is not loaded yet must compile to the \
+             CP-indexed helper instead of bailing the whole method"
+        );
+        assert!(
+            compile(&mk("deferred_unwired"), &unwired, &deferred).is_none(),
+            "with `new_object_cp` unwired (hand-built test tables) a deferred \
+             site must keep the historical bail, never emit a CALL to 0"
         );
     }
 

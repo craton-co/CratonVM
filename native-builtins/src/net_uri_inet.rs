@@ -561,11 +561,20 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
         return;
     }
 
-    // Parse: protocol://host[:port][/path][?query]
+    // Parse: protocol://host[:port][/path][?query][#ref]
     let (protocol, rest) = if let Some(pos) = url_str.find("://") {
         (&url_str[..pos], &url_str[pos + 3..])
     } else {
         ("", url_str)
+    };
+    // Split the fragment off FIRST, exactly as the `file:` fast path above
+    // already does. Without this the `#ref` stayed glued to the end of the
+    // path/query, so `getPath()` on `http://h/p#sec` answered `"/p#sec"` and
+    // `getRef()` had nothing to read.
+    let (rest, ref_part) = if let Some(pos) = rest.find('#') {
+        (&rest[..pos], Some(&rest[pos + 1..]))
+    } else {
+        (rest, None)
     };
     let (host_port, path_query) = if let Some(pos) = rest.find('/') {
         (&rest[..pos], &rest[pos..])
@@ -603,6 +612,9 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
         Some(ctx.create_string(query))
     };
     let full_obj = ctx.create_string(url_str);
+    let ref_obj = ref_part
+        .filter(|fragment| !fragment.is_empty())
+        .map(|fragment| ctx.create_string(fragment));
 
     ctx.set_field(this, URL_FIELD_PROTOCOL, Value::Object(Some(proto_obj)));
     ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_obj)));
@@ -613,6 +625,11 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
     ctx.set_field_by_name(this, "file", Value::Object(Some(file_obj)));
     ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
     ctx.set_field_by_name(this, "query", Value::Object(query_obj));
+    // Only meaningful on a layout with a named `ref` field (a real
+    // `java.net.URL`); the no-name synthetic stubs recover the fragment from
+    // the cached full URL in `net_phase_e`'s `getRef`. There is no free raw
+    // slot for it in the 6-slot synthetic layout.
+    ctx.set_field_by_name(this, "ref", Value::Object(ref_obj));
 }
 
 fn native_url_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

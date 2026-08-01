@@ -81,6 +81,13 @@ fn encode(mut x: BigUint) -> [i64; NUM_LIMBS] {
     let mask = BigUint::from(LIMB_MASK);
     let mut out = [0i64; NUM_LIMBS];
     for slot in out.iter_mut() {
+        // AUDITED (crypto-failure-contract.md): this `unwrap_or(0)` is **not**
+        // an error being swallowed. `BigUint` stores zero as an empty digit
+        // vector, so `iter_u64_digits().next()` is `None` for exactly one
+        // value — zero — and `0` is that value. There is no input for which
+        // this substitutes a default for a failure. Verified by
+        // `tests::mult_matches_jdk_byte_for_byte`, whose first vector is
+        // `0 · x` and whose expected output is all-zero limbs.
         let lo = (&x & &mask).iter_u64_digits().next().unwrap_or(0);
         *slot = lo as i64;
         x >>= BITS;

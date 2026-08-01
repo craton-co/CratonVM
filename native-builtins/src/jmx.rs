@@ -3911,7 +3911,28 @@ fn alloc_memory_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     // MemoryImpl's inherited listener implementation. The concrete class's
     // registered `getMemoryUsage0` bridge still supplies live heap values.
     let obj = alloc_concurrent_synthetic(ctx, "sun/management/MemoryImpl", 1);
-    init_notification_emitter_support(ctx, obj)
+    let obj = init_notification_emitter_support(ctx, obj);
+    // Slot 0 = heapUsed, the same snapshot the `MemoryMXBean` *interface*
+    // `<init>` native writes to ITS slot 0 (see `register_memory_mxbean`).
+    // Without this the bean handed back by `ManagementFactory.getMemoryMXBean`
+    // carried an untyped default in slot 0 — a reader by index got `Int(0)`
+    // where every other path in this module produces a `Long` of real bytes
+    // (the classic write-by-name / read-by-slot mismatch: the only writes this
+    // bean received were `init_notification_emitter_support`'s
+    // `set_field_by_name` calls, which are silent no-ops on a synthetic stamp
+    // because `ensure_synthetic_class` mints fields with NO names).
+    //
+    // Guarded on the class actually being a synthetic stamp: in real-JDK mode
+    // `sun/management/MemoryImpl` is loaded from real bytes and slot 0 is a
+    // genuine declared reference field (the NotificationBroadcasterSupport
+    // state above), which a raw `Long` write would corrupt. There, nothing
+    // reads a heap snapshot out of a slot anyway — `getMemoryUsage0` and the
+    // real bytecode answer from the live accessors.
+    if ctx.is_class_synthetic_stub("sun/management/MemoryImpl") {
+        let heap_used = ctx.heap_allocated_bytes() as i64;
+        ctx.set_field(obj, 0, Value::Long(heap_used));
+    }
+    obj
 }
 
 fn alloc_memory_usage(

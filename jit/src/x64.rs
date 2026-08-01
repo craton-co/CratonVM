@@ -105,6 +105,22 @@ pub use switch_validation::*;
 mod reg_encoding;
 pub use reg_encoding::*;
 // ---------------------------------------------------------------------------
+// Checked memory-operand displacement encoding
+// ---------------------------------------------------------------------------
+//
+// Every ModRM/SIB displacement this file emits should be built by
+// `disp::Disp` rather than by narrowing an offset into a literal byte:
+// `x as u8` on a value the CPU reads back as a SIGNED disp8 addresses memory
+// BEFORE the base register the moment `x` exceeds 127, with no fault and no
+// assembler complaint. See `x64/disp.rs` for the hazard, the RBP/R13 and
+// RSP/R12 addressing special cases, and the boundary tests.
+//
+// Declared `pub mod` (not `mod` + glob re-export like its siblings) so the
+// fully-qualified `disp::Disp` path stays available to the other backends;
+// the named re-export below keeps `Disp` spellable bare inside this file.
+pub mod disp;
+pub use disp::{base_requires_displacement, base_requires_sib, disp8_const, Disp, DispOutOfRange};
+// ---------------------------------------------------------------------------
 // SIMD loop analysis and vectorization
 // ---------------------------------------------------------------------------
 //
@@ -461,8 +477,22 @@ struct Compiler {
     /// inlines the header completion (identity-hash + num_slots) and
     /// skips the helper call entirely. See `emit_inline_tlab_new`.
     new_info: Vec<(usize, u32, usize, bool, bool)>,
+    /// DEFERRED `new` (0xbb) sites: `(bytecode_pc, holder_class_id, cp_idx)`.
+    ///
+    /// A `new` whose target class was not loaded when this method was
+    /// compiled. There is no class id or field count to bake, so the site
+    /// compiles to a `new_object_cp` helper call carrying the *referencing*
+    /// class id + the constant-pool index; the helper resolves, initialises
+    /// and allocates on first execution, exactly like the interpreter's 0xbb
+    /// handler. Disjoint from `new_info` by construction (a pc is in exactly
+    /// one of the two). See `jit_api::JitRuntimeHelpers::new_object_cp`.
+    new_deferred_info: Vec<(usize, u32, u16)>,
     /// Resolved `anewarray` (0xbd) metadata: (bytecode_pc, component_class_id_raw).
     anewarray_info: Vec<(usize, u32)>,
+    /// DEFERRED `anewarray` (0xbd) sites: `(bytecode_pc, holder_class_id,
+    /// cp_idx)` — the `anewarray` sibling of `new_deferred_info`, served by
+    /// the `anewarray_object_cp` helper.
+    anewarray_deferred_info: Vec<(usize, u32, u16)>,
     /// Invoke dispatch info: (bytecode_pc, pointer to leaked JitInvokeInfo).
     invoke_info: Vec<(usize, *const JitInvokeInfo)>,
     /// Resolved `invokedynamic` (0xba) call-site info, needed ONLY for
@@ -957,7 +987,9 @@ struct Compiler {
     mic_slots_idx: FxHashMap<usize, usize>,
     pic_slots_idx: FxHashMap<usize, usize>,
     new_info_idx: FxHashMap<usize, usize>,
+    new_deferred_idx: FxHashMap<usize, usize>,
     anewarray_info_idx: FxHashMap<usize, usize>,
+    anewarray_deferred_idx: FxHashMap<usize, usize>,
     typecheck_info_idx: FxHashMap<usize, usize>,
     ldc_info_idx: FxHashMap<usize, usize>,
     ldc_string_info_idx: FxHashMap<usize, usize>,
@@ -1900,7 +1932,9 @@ impl Compiler {
             speculative_bce_guards: Vec::new(),
             speculative_bce_guards_by_header: FxHashMap::default(),
             new_info: Vec::new(),
+            new_deferred_info: Vec::new(),
             anewarray_info: Vec::new(),
+            anewarray_deferred_info: Vec::new(),
             invoke_info: Vec::new(),
             indy_info: Vec::new(),
             direct_calls: Vec::new(),
@@ -1990,7 +2024,9 @@ impl Compiler {
             mic_slots_idx: FxHashMap::default(),
             pic_slots_idx: FxHashMap::default(),
             new_info_idx: FxHashMap::default(),
+            new_deferred_idx: FxHashMap::default(),
             anewarray_info_idx: FxHashMap::default(),
+            anewarray_deferred_idx: FxHashMap::default(),
             typecheck_info_idx: FxHashMap::default(),
             ldc_info_idx: FxHashMap::default(),
             ldc_string_info_idx: FxHashMap::default(),
@@ -2062,10 +2098,21 @@ impl Compiler {
         for (i, e) in self.new_info.iter().enumerate() {
             self.new_info_idx.insert(e.0, i);
         }
+        self.new_deferred_idx.clear();
+        self.new_deferred_idx.reserve(self.new_deferred_info.len());
+        for (i, e) in self.new_deferred_info.iter().enumerate() {
+            self.new_deferred_idx.insert(e.0, i);
+        }
         self.anewarray_info_idx.clear();
         self.anewarray_info_idx.reserve(self.anewarray_info.len());
         for (i, e) in self.anewarray_info.iter().enumerate() {
             self.anewarray_info_idx.insert(e.0, i);
+        }
+        self.anewarray_deferred_idx.clear();
+        self.anewarray_deferred_idx
+            .reserve(self.anewarray_deferred_info.len());
+        for (i, e) in self.anewarray_deferred_info.iter().enumerate() {
+            self.anewarray_deferred_idx.insert(e.0, i);
         }
         self.typecheck_info_idx.clear();
         self.typecheck_info_idx.reserve(self.typecheck_info.len());
@@ -4213,16 +4260,26 @@ impl Compiler {
     /// The old check `(-128..=127)` was off-by-one: it wasted 3 bytes on
     /// the common depth-128 spill and would mis-encode disp=-128 as 0x80
     /// garbage (round-8 jit #4).
+    ///
+    /// That hand-written range test is now [`Disp::encode_for_base`]: it picks
+    /// the same disp8/disp32 split, keeps the `mod` field and the emitted
+    /// width in lock-step, and applies the RBP rule (no `mod=00` form — a
+    /// zero displacement must still emit an explicit `disp8` of 0, which the
+    /// `(-127..=128)` range happened to cover only by including 0). The
+    /// negation is widened to `i64` first so a `disp` of `i32::MIN` cannot
+    /// overflow before it is range-checked.
+    ///
+    /// A depth that does not fit disp32 has no encoding at all; `mark_overflowed`
+    /// is the existing "codegen invariant broken, discard the method" channel
+    /// for emitters that cannot return a `Result`.
     fn modrm_rbp_disp(&mut self, reg: u8, disp: i32) {
-        if (-127..=128).contains(&disp) {
-            // mod=01, r/m=101 (rbp), disp8
-            self.buf.emit_byte(0x45 | ((reg & 7) << 3));
-            self.buf.emit_byte((-disp) as u8); // negate because we store as positive offset // Cast: x86-64 immediate encoding
-        } else {
-            // mod=10, r/m=101 (rbp), disp32
-            self.buf.emit_byte(0x85 | ((reg & 7) << 3));
-            self.buf.emit(&(-disp).to_le_bytes());
-        }
+        let Ok(d) = Disp::encode_for_base(-(disp as i64), RBP) else {
+            self.buf.mark_overflowed();
+            return;
+        };
+        self.buf.emit_byte(d.modrm(reg, RBP));
+        let (bytes, len) = d.bytes();
+        self.buf.emit(&bytes[..len]);
     }
 
     /// Return the callee-saved register for local `idx`, if register-mapped.
@@ -4287,7 +4344,18 @@ impl Compiler {
     /// disp is the signed offset from RBP; callers pass `offset` as a
     /// positive frame depth (matching `emit_store_local`'s convention),
     /// so we encode `-offset`.
+    ///
+    /// Round-9 LOW fix: this used to carry its own copy of the
+    /// `(-127..=128)` guard (and before that an off-by-one `(-128..=127)`
+    /// one). Both are now [`Disp::encode_for_base`], the single checked
+    /// encoder — see `modrm_rbp_disp`. The displacement is resolved *before*
+    /// any byte is emitted so an unencodable depth bails without leaving a
+    /// truncated instruction behind.
     fn emit_movq_mem_rbp_from_xmm(&mut self, offset: i32, xmm: u8) {
+        let Ok(d) = Disp::encode_for_base(-(offset as i64), RBP) else {
+            self.buf.mark_overflowed();
+            return;
+        };
         self.buf.emit_byte(0x66);
         if xmm >= 8 {
             // REX.R only (no .W, no .B — RBP is the base, low 3 bits).
@@ -4296,22 +4364,9 @@ impl Compiler {
         self.buf.emit_byte(0x0F);
         self.buf.emit_byte(0xD6);
         // ModRM r/m=101 (RBP), reg=xmm&7.
-        let reg = xmm & 7;
-        // Round-9 LOW fix: mirror the `(-127..=128)` guard from
-        // `modrm_rbp_disp`. `offset` is the positive depth-from-RBP;
-        // the disp byte stores `-offset` as i8, so we need
-        // `-offset` in `-128..=127`, i.e. `offset` in `-127..=128`.
-        // The prior `(-128..=127)` was off-by-one (round-8 fixed it
-        // in modrm_rbp_disp but missed these MOVQ helpers).
-        if (-127..=128).contains(&offset) {
-            // mod=01, disp8.  (Matches modrm_rbp_disp encoding semantics.)
-            self.buf.emit_byte(0x45 | (reg << 3));
-            self.buf.emit_byte((-offset) as u8); // Cast: x86-64 immediate encoding
-        } else {
-            // mod=10, disp32.
-            self.buf.emit_byte(0x85 | (reg << 3));
-            self.buf.emit(&(-offset).to_le_bytes());
-        }
+        self.buf.emit_byte(d.modrm(xmm, RBP));
+        let (bytes, len) = d.bytes();
+        self.buf.emit(&bytes[..len]);
     }
 
     /// MOVQ XMMn, [rbp - offset] — direct 64-bit load from a frame slot
@@ -4323,22 +4378,21 @@ impl Compiler {
     ///   - REX.R is set when `xmm >= 8`.
     ///   - REX.B is NOT required (base is RBP).
     fn emit_movq_xmm_from_mem_rbp(&mut self, xmm: u8, offset: i32) {
+        // Round-9 LOW fix: see `emit_movq_mem_rbp_from_xmm` — the hand-written
+        // `(-127..=128)` guard is now the shared checked encoder.
+        let Ok(d) = Disp::encode_for_base(-(offset as i64), RBP) else {
+            self.buf.mark_overflowed();
+            return;
+        };
         self.buf.emit_byte(0xF3);
         if xmm >= 8 {
             self.buf.emit_byte(0x44);
         }
         self.buf.emit_byte(0x0F);
         self.buf.emit_byte(0x7E);
-        let reg = xmm & 7;
-        // Round-9 LOW fix: see `emit_movq_mem_rbp_from_xmm` —
-        // mirrors the `(-127..=128)` guard from `modrm_rbp_disp`.
-        if (-127..=128).contains(&offset) {
-            self.buf.emit_byte(0x45 | (reg << 3));
-            self.buf.emit_byte((-offset) as u8); // Cast: x86-64 immediate encoding
-        } else {
-            self.buf.emit_byte(0x85 | (reg << 3));
-            self.buf.emit(&(-offset).to_le_bytes());
-        }
+        self.buf.emit_byte(d.modrm(xmm, RBP));
+        let (bytes, len) = d.bytes();
+        self.buf.emit(&bytes[..len]);
     }
 
     /// MOVSD XMMdst, XMMsrc — move scalar double between XMM registers.
@@ -4709,18 +4763,20 @@ impl Compiler {
     /// `positive_disp` is the byte offset above rbp.
     fn emit_load_caller_arg(&mut self, reg: u8, positive_disp: i32) {
         debug_assert!(positive_disp > 0, "caller arg disp must be positive");
+        // ModRM r/m=101 (RBP) with positive displacement, through the checked
+        // encoder: the old inline `(-128..=127)` test narrowed with `as u8`,
+        // so a shadow-space/stack-arg displacement of 128 or more (reachable
+        // with enough stack-passed args) would have encoded as a NEGATIVE
+        // disp8 and read the callee's own frame instead of the caller's.
+        let Ok(d) = Disp::encode_for_base(positive_disp as i64, RBP) else {
+            self.buf.mark_overflowed();
+            return;
+        };
         self.rex_w_r(reg);
         self.buf.emit_byte(0x8B); // MOV r64, r/m64
-                                  // ModRM r/m=101 (RBP) with positive displacement.
-        if (-128..=127).contains(&positive_disp) {
-            // mod=01, disp8
-            self.buf.emit_byte(0x45 | ((reg & 7) << 3));
-            self.buf.emit_byte(positive_disp as u8); // Cast: x86-64 immediate encoding
-        } else {
-            // mod=10, disp32
-            self.buf.emit_byte(0x85 | ((reg & 7) << 3));
-            self.buf.emit(&positive_disp.to_le_bytes());
-        }
+        self.buf.emit_byte(d.modrm(reg, RBP));
+        let (bytes, len) = d.bytes();
+        self.buf.emit(&bytes[..len]);
     }
 
     /// MOV [rbp - offset], reg
@@ -4962,25 +5018,25 @@ impl Compiler {
     /// Used to materialize stack-passed args after `sub rsp, N`.
     fn emit_mov_rsp_disp_from_reg(&mut self, disp: i32, reg: u8) {
         // Encoding: REX.W [+R] 89 /r SIB
-        // [rsp + disp] requires a SIB byte (rm field = 100b means SIB follows).
+        // [rsp + disp] requires a SIB byte (rm field = 100b means SIB follows);
+        // `base_requires_sib(RSP)` is that rule, asserted rather than assumed.
         // SIB: scale=00, index=100b (none), base=100b (rsp).
+        //
+        // The three-way `disp == 0` / `(-128..=127)` / else split is exactly
+        // what `Disp::encode` computes, so it is no longer restated here.
+        // RSP is not an RBP/R13-class base: SIB base=100 is a real base, so
+        // the displacement-free mod=00 form stays legal at disp == 0.
+        debug_assert!(base_requires_sib(RSP));
+        let Ok(d) = Disp::encode(disp as i64) else {
+            self.buf.mark_overflowed();
+            return;
+        };
         self.rex_w_r(reg);
         self.buf.emit_byte(0x89); // MOV r/m64, r64
-        if disp == 0 {
-            // mod=00, reg, r/m=100 (SIB)
-            self.buf.emit_byte(0x04 | ((reg & 7) << 3));
-            self.buf.emit_byte(0x24); // SIB: scale=00, index=100 (none), base=100 (rsp)
-        } else if (-128..=127).contains(&disp) {
-            // mod=01, reg, r/m=100 (SIB), disp8
-            self.buf.emit_byte(0x44 | ((reg & 7) << 3));
-            self.buf.emit_byte(0x24);
-            self.buf.emit_byte(disp as u8); // Cast: x86-64 immediate encoding
-        } else {
-            // mod=10, reg, r/m=100 (SIB), disp32
-            self.buf.emit_byte(0x84 | ((reg & 7) << 3));
-            self.buf.emit_byte(0x24);
-            self.buf.emit(&disp.to_le_bytes());
-        }
+        self.buf.emit_byte(d.modrm(reg, 0b100)); // r/m=100 → SIB follows
+        self.buf.emit_byte(0x24); // SIB: scale=00, index=100 (none), base=100 (rsp)
+        let (bytes, len) = d.bytes();
+        self.buf.emit(&bytes[..len]);
     }
 
     /// Compute the total bytes to subtract from RSP for a direct-call
@@ -6532,6 +6588,22 @@ impl Compiler {
         let b_disp = HEADER_SIZE as i32
             + index_delta * if narrow_oops_enabled() { 4 } else { 8 };
         let a_disp = HEADER_SIZE as i32 + index_delta * 4;
+        // Both displacements are baked under a hard-coded `mod=01` ModRM byte
+        // AND grow with the unroll index — the only computed disp8s left in
+        // this file. With the batch of 8 the widest is `HEADER_SIZE + 7*8`
+        // (88 today), comfortably inside the byte; a wider unroll or a larger
+        // object header walks them past 127, where the previous `as u8` would
+        // have silently addressed memory BEFORE the array. Require the disp8
+        // form explicitly and discard the method otherwise. Neither value can
+        // be zero (both are at least `HEADER_SIZE`), so `Disp::None` — which
+        // would need a mod=00 ModRM byte this emitter does not write — cannot
+        // arise here.
+        let b_disp8 = Disp::encode(b_disp as i64).ok().and_then(Disp::as_disp8);
+        let a_disp8 = Disp::encode(a_disp as i64).ok().and_then(Disp::as_disp8);
+        let (Some(b_disp8), Some(a_disp8)) = (b_disp8, a_disp8) else {
+            self.buf.mark_overflowed();
+            return;
+        };
         if narrow_oops_enabled() {
             // EAX = narrow b[k], then decode it with the loop-invariant heap
             // base already in R11. A zero encoding is null -> scalar fallback.
@@ -6540,7 +6612,7 @@ impl Compiler {
                 0x8B,
                 0x44,
                 0x95,
-                b_disp as u8,
+                b_disp8 as u8, // Cast: range-checked disp8 above, reinterpreted signed
             ]); // MOV EAX,[R13+R10*4+H]
             self.buf.emit(&[0x48, 0xC1, 0xE0, 0x03]); // SHL RAX,3
             scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
@@ -6551,7 +6623,7 @@ impl Compiler {
                 0x8B,
                 0x44,
                 0xD5,
-                b_disp as u8,
+                b_disp8 as u8, // Cast: range-checked disp8 above, reinterpreted signed
             ]); // MOV RAX,[R13+R10*8+H]
             self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
             scalar_fallbacks.push(self.emit_jcc_rel32_patch(0x84)); // JZ
@@ -6570,7 +6642,7 @@ impl Compiler {
             0x8B,
             0x54,
             0x94,
-            a_disp as u8,
+            a_disp8 as u8, // Cast: range-checked disp8 above, reinterpreted signed
         ]); // MOV EDX,[R12+R10*4+H]
         self.buf.emit(&[
             0x42,
@@ -8341,15 +8413,49 @@ impl Compiler {
         self.patch_rel32_to_here(done);
     }
 
-    /// `TEST BYTE [base+disp8], imm8` -- checks a per-object header flag byte
+    /// `TEST BYTE [base+disp], imm8` -- checks a per-object header flag byte
     /// (e.g. `GC_FLAG_COMPACT`) without needing any scratch register: the
     /// memory operand is read and discarded by the CPU, `base` and the
     /// flags register are the only things touched.
-    fn emit_test_mem8_imm8(&mut self, base: u8, disp8: i32, imm8: u8) {
+    ///
+    /// The displacement was previously narrowed with a bare `disp as u8` under
+    /// a hard-coded `mod=01` ModRM byte. Every caller passes a header-field
+    /// offset that is small today, but the cast is the P0 hazard: at 128 the
+    /// operand silently becomes `[base - 128]`. It now goes through
+    /// [`Disp::encode_for_base`], which widens to disp32 instead of wrapping
+    /// and applies the RBP/R13 zero-displacement rule (`emit_safepoint_poll`
+    /// calls this with `disp == 0`, and would mis-encode as RIP-relative if
+    /// the flag address ever landed in RBP/R13).
+    fn emit_test_mem8_imm8(&mut self, base: u8, disp: i32, imm8: u8) {
+        // r/m == 100 means "a SIB byte follows"; this form emits none, so an
+        // RSP/R12 base has no encoding here. No caller uses one (RAX and R11
+        // today) — bail rather than emit an instruction addressing via a
+        // fabricated SIB.
+        if base_requires_sib(base) {
+            self.buf.mark_overflowed();
+            return;
+        }
+        let Ok(d) = Disp::encode_for_base(disp as i64, base) else {
+            self.buf.mark_overflowed();
+            return;
+        };
+        // This form has always emitted an explicit displacement byte, including
+        // for `disp == 0` (the safepoint-flag poll). Keep the `mod=01` shape
+        // there rather than shrinking to `mod=00`, so the conversion to the
+        // checked encoder is byte-for-byte identical at every existing call
+        // site and no instruction length moves under the branch patcher.
+        let d = if matches!(d, Disp::None) {
+            Disp::Disp8(0)
+        } else {
+            d
+        };
         if base >= 8 {
             self.buf.emit(&[0x41]); // REX.B (extend ModRM.rm to r8-r15)
         }
-        self.buf.emit(&[0xF6, 0x40 | (base & 7), disp8 as u8, imm8]);
+        self.buf.emit(&[0xF6, d.modrm(0, base)]); // 0xF6 /0 = TEST r/m8, imm8
+        let (bytes, len) = d.bytes();
+        self.buf.emit(&bytes[..len]);
+        self.buf.emit_byte(imm8);
     }
 
     /// Load a String receiver's `value` field (the backing `byte[]`/`char[]`
@@ -21992,7 +22098,47 @@ impl Compiler {
                             match resolved {
                                 Some(info) => info,
                                 None => {
-                                    return false;
+                                    // Not compile-time resolvable: the target
+                                    // class was not loaded when this method was
+                                    // compiled (the cold `throw new
+                                    // SomeException(...)` shape). Emit the
+                                    // CP-indexed helper, which resolves +
+                                    // initialises + allocates at run time, the
+                                    // way the interpreter's 0xbb handler does.
+                                    // No compile-time class knowledge exists
+                                    // here, so neither the inline TLAB bump nor
+                                    // scalar replacement applies — this site is
+                                    // always the helper call, which is exactly
+                                    // right for a branch that is (by hypothesis)
+                                    // cold.
+                                    let Some(&i) = self.new_deferred_idx.get(&pc) else {
+                                        return false;
+                                    };
+                                    let (_, holder_class_id, cp_idx) = self.new_deferred_info[i];
+                                    if self.helpers.new_object_cp == 0 || !self.needs_heap {
+                                        return false;
+                                    }
+                                    self.emit_pre_safepoint_spill();
+                                    crate::runtime_lowering::emit_new_object_cp_stub(
+                                        &mut self.buf,
+                                        self.heap_local_offset,
+                                        self.helpers.new_object_cp,
+                                        holder_class_id,
+                                        cp_idx,
+                                        self.helpers.frame_record,
+                                    );
+                                    // Same post-call contract as the resolved
+                                    // arm below: GC-triggering safepoint, then
+                                    // the 0/null sentinel guard (the helper
+                                    // reports a failed class resolution,
+                                    // `<clinit>` failure or OOM by stashing a
+                                    // pending exception and returning 0).
+                                    self.emit_oop_map_for_safepoint();
+                                    self.emit_post_alloc_oom_check();
+                                    self.push_from_rax();
+                                    self.mark_top_as_oop();
+                                    pc += 3;
+                                    continue;
                                 }
                             };
 
@@ -22122,7 +22268,42 @@ impl Compiler {
                         .map(|&i| self.anewarray_info[i]);
                     let (_, component_class_id_raw) = match resolved {
                         Some(info) => info,
-                        None => return false, // unresolved — bail to interpreter
+                        None => {
+                            // Component class not loaded at compile time — the
+                            // `anewarray` sibling of the deferred `new` arm
+                            // above. Emit the CP-indexed helper, which resolves
+                            // the component class at run time and then does
+                            // exactly what `jit_anewarray_object` does.
+                            let Some(&i) = self.anewarray_deferred_idx.get(&pc) else {
+                                return false; // genuinely unresolvable — bail
+                            };
+                            let (_, holder_class_id, cp_idx) = self.anewarray_deferred_info[i];
+                            if self.helpers.anewarray_object_cp == 0 || !self.needs_heap {
+                                return false;
+                            }
+                            let count_slot = self.pop_stack();
+                            // jit_anewarray_object_cp(vm, holder_class_id, cp_idx, length)
+                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                            self.emit_mov_imm32_sx(ARG_REGS[1], holder_class_id as i32); // Cast: x86-64 immediate encoding
+                            self.emit_mov_imm32_sx(ARG_REGS[2], cp_idx as i32); // Cast: x86-64 immediate encoding
+                            self.load_slot_to_reg(ARG_REGS[3], count_slot);
+                            self.emit_pre_safepoint_spill();
+                            self.emit_call_absolute(self.helpers.anewarray_object_cp);
+                            // Resolution can run a user `ClassLoader.loadClass`,
+                            // i.e. arbitrary Java on this thread — republish the
+                            // frame afterwards exactly as `emit_new_object_stub`
+                            // does for the `new` side.
+                            crate::runtime_lowering::emit_post_call_frame_republish(
+                                &mut self.buf,
+                                self.helpers.frame_record,
+                            );
+                            self.emit_oop_map_for_safepoint();
+                            self.emit_post_alloc_oom_check();
+                            self.push_from_rax();
+                            self.mark_top_as_oop();
+                            pc += 3;
+                            continue;
+                        }
                     };
                     let count_slot = self.pop_stack();
                     // jit_anewarray_object(heap, component_class_id_raw, length) → i64 array ptr
@@ -22726,7 +22907,11 @@ pub fn compile(
         typecheck_info,
         static_field_info,
         new_info,
+        // Deferred (not-yet-loaded) `new`/`anewarray` sites: the legacy/test
+        // wrapper has no constant pool to defer against, so never any.
+        Vec::new(),
         anewarray_info,
+        Vec::new(),
         invoke_info,
         direct_calls,
         mic_slots,
@@ -22772,7 +22957,9 @@ fn gc_inert_selfrec_candidate(
     code_len: usize,
     field_info: &[(usize, usize, u8)],
     new_info: &[(usize, u32, usize, bool, bool)],
+    new_deferred_info: &[(usize, u32, u16)],
     anewarray_info: &[(usize, u32)],
+    anewarray_deferred_info: &[(usize, u32, u16)],
     invoke_info: &[(usize, *const JitInvokeInfo)],
     direct_calls: &[(usize, super::JitDirectCall)],
     mic_slots: &[(usize, *const super::JitMICSlot)],
@@ -22781,7 +22968,13 @@ fn gc_inert_selfrec_candidate(
 ) -> bool {
     if !gc_inert_selfrec_enabled()
         || !new_info.is_empty()
+        // A deferred `new`/`anewarray` allocates too — the opcode whitelist
+        // below already excludes 0xbb/0xbd, but keep the metadata gate
+        // symmetric with the resolved lists so a future whitelist change
+        // cannot silently admit an allocating body here.
+        || !new_deferred_info.is_empty()
         || !anewarray_info.is_empty()
+        || !anewarray_deferred_info.is_empty()
         || !invoke_info.is_empty()
         || !direct_calls.is_empty()
         || !mic_slots.is_empty()
@@ -22847,7 +23040,13 @@ pub fn compile_with_param_slots(
     static_field_info: Vec<(usize, u32, usize, u8, bool)>,
     // CRIT-2 — see `new_info` field doc on the compiler struct.
     new_info: Vec<(usize, u32, usize, bool, bool)>,
+    // Cold-`new` fix — see `new_deferred_info` on the compiler struct. Sites
+    // whose target class was not loaded at compile time; served by the
+    // CP-indexed `new_object_cp` helper. Disjoint from `new_info`.
+    new_deferred_info: Vec<(usize, u32, u16)>,
     anewarray_info: Vec<(usize, u32)>,
+    // `anewarray` sibling of `new_deferred_info`.
+    anewarray_deferred_info: Vec<(usize, u32, u16)>,
     invoke_info: Vec<(usize, *const JitInvokeInfo)>,
     direct_calls: Vec<(usize, super::JitDirectCall)>,
     mic_slots: Vec<(usize, *const super::JitMICSlot)>,
@@ -22910,7 +23109,9 @@ pub fn compile_with_param_slots(
         code_len,
         &field_info,
         &new_info,
+        &new_deferred_info,
         &anewarray_info,
+        &anewarray_deferred_info,
         &invoke_info,
         &direct_calls,
         &mic_slots,
@@ -23363,7 +23564,9 @@ pub fn compile_with_param_slots(
         && field_info.is_empty()
         && static_field_info.is_empty()
         && new_info.is_empty()
+        && new_deferred_info.is_empty()
         && anewarray_info.is_empty()
+        && anewarray_deferred_info.is_empty()
         && multianewarray_info.is_empty()
         && typecheck_info.is_empty()
         && compact_field_info.is_empty()
@@ -23727,7 +23930,9 @@ pub fn compile_with_param_slots(
         .map(|(pc, off, is_ref)| (pc, (off, is_ref)))
         .collect();
     compiler.new_info = new_info;
+    compiler.new_deferred_info = new_deferred_info;
     compiler.anewarray_info = anewarray_info;
+    compiler.anewarray_deferred_info = anewarray_deferred_info;
     compiler.invoke_info = invoke_info;
     compiler.indy_info = indy_info;
     compiler.direct_calls = direct_calls;
@@ -24052,7 +24257,14 @@ pub fn compile_with_param_slots(
         // the same treatment for the identical reason on the `jit_new_object`
         // side.
         || !compiler.static_field_info.is_empty()
-        || !compiler.new_info.is_empty();
+        || !compiler.new_info.is_empty()
+        // `jit_new_object_cp` / `jit_anewarray_object_cp` need `jit_thread_mut()`
+        // for even more than the resolved helpers do: class RESOLUTION itself
+        // (a possible user `ClassLoader.loadClass`) runs on that thread, not
+        // just `<clinit>`. A null thread there would leave the site unable to
+        // resolve at all.
+        || !compiler.new_deferred_info.is_empty()
+        || !compiler.anewarray_deferred_info.is_empty();
     // Snapshot the frame partition and the label BEFORE `compiler.buf` is moved
     // into the artifact (which partially moves `compiler`).
     let frame_layout = compiler.frame_layout();
@@ -24615,8 +24827,10 @@ mod tests {
             &pure,
             pure.len(),
             &fields,
-            &[],
-            &[],
+            &[], // new_info
+            &[], // new_deferred_info
+            &[], // anewarray_info
+            &[], // anewarray_deferred_info
             &[],
             &[],
             &[],
@@ -24630,8 +24844,10 @@ mod tests {
             &allocates,
             allocates.len(),
             &fields,
-            &[(9, 1, 0, false, false)],
-            &[],
+            &[(9, 1, 0, false, false)], // new_info
+            &[],                        // new_deferred_info
+            &[],                        // anewarray_info
+            &[],                        // anewarray_deferred_info
             &[],
             &[],
             &[],
@@ -24645,8 +24861,10 @@ mod tests {
             &loops,
             loops.len(),
             &fields,
-            &[],
-            &[],
+            &[], // new_info
+            &[], // new_deferred_info
+            &[], // anewarray_info
+            &[], // anewarray_deferred_info
             &[],
             &[],
             &[],
@@ -24957,6 +25175,11 @@ mod tests {
             jit_card_table_addr: 0,
             jit_card_old_base: 0,
             jit_card_old_end: 0,
+            // Unwired (0) — these tests never build a deferred (not-yet-loaded)
+            // `new`/`anewarray` site, and 0 makes the backend refuse one rather
+            // than emit a null CALL, so the tests stay byte-identical.
+            new_object_cp: 0,
+            anewarray_object_cp: 0,
         }
     }
 
@@ -25088,12 +25311,14 @@ mod tests {
             1,
             1,
             false,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            Vec::new(), // multianewarray_info
+            Vec::new(), // field_info
+            Vec::new(), // typecheck_info
+            Vec::new(), // static_field_info
+            Vec::new(), // new_info
+            Vec::new(), // new_deferred_info
+            Vec::new(), // anewarray_info
+            Vec::new(), // anewarray_deferred_info
             Vec::new(),
             Vec::new(),
             Vec::new(),

@@ -7218,6 +7218,18 @@ pub fn execute(
                     // extract the real flags from class metadata to enable the skip path.
                     let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
                     let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
+                    // Cold-`new` fix - sites this path cannot resolve at compile
+                    // time. Previously baked as the nonsense sentinel entry
+                    // `(pc, class_id 0, 0 fields, true, true)`, which did NOT
+                    // "make the JIT skip this site and defer to the interpreter"
+                    // as the comment below claimed: the codegen found an entry at
+                    // that pc and compiled an allocation against class id 0. They
+                    // now compile to the CP-indexed helper, which performs the
+                    // real loader-faithful resolution, the JVMS 5.4.4 access
+                    // check and `<clinit>` at the actual program point - the same
+                    // work `Instruction::New` does.
+                    let mut new_deferred_info: Vec<(usize, u32, u16)> = Vec::new();
+                    let mut anewarray_deferred_info: Vec<(usize, u32, u16)> = Vec::new();
                     let is_real_class = shared
                         .classes.class_manager
                         .read()
@@ -7227,7 +7239,7 @@ pub fn execute(
                     if is_real_class && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty())
                     {
                         // Collect class names from constant pool (read lock)
-                        let new_class_names: Vec<(usize, Option<String>)> = {
+                        let new_class_names: Vec<(usize, u16, Option<String>)> = {
                             let cm_lock = shared.classes.class_manager.read();
                             if let Some(class) = cm_lock.get_class(class_id) {
                                 scan.new_ops
@@ -7235,6 +7247,7 @@ pub fn execute(
                                     .map(|&(pc_new, cp_idx)| {
                                         (
                                             pc_new,
+                                            cp_idx,
                                             class
                                                 .constant_pool
                                                 .get_class_name(cp_idx)
@@ -7246,7 +7259,7 @@ pub fn execute(
                                 Vec::new()
                             }
                         };
-                        let arr_class_names: Vec<(usize, Option<String>)> = {
+                        let arr_class_names: Vec<(usize, u16, Option<String>)> = {
                             let cm_lock = shared.classes.class_manager.read();
                             if let Some(class) = cm_lock.get_class(class_id) {
                                 scan.anewarray_ops
@@ -7254,6 +7267,7 @@ pub fn execute(
                                     .map(|&(pc_arr, cp_idx)| {
                                         (
                                             pc_arr,
+                                            cp_idx,
                                             class
                                                 .constant_pool
                                                 .get_class_name(cp_idx)
@@ -7266,7 +7280,7 @@ pub fn execute(
                             }
                         };
                         // Resolve class names to ClassIds (write lock for loading)
-                        for (pc_new, name_opt) in new_class_names {
+                        for (pc_new, cp_idx_new, name_opt) in new_class_names {
                             if let Some(name) = name_opt {
                                 let load_result = shared.load_class_concurrent(&name);
                                 if let Ok(target_id) = load_result {
@@ -7311,19 +7325,21 @@ pub fn execute(
                                             true,
                                         ));
                                     } else {
-                                        new_info.push((pc_new, 0, 0, true, true));
+                                        new_deferred_info
+                                            .push((pc_new, class_id.as_u32(), cp_idx_new));
                                     }
                                 } else {
-                                    new_info.push((pc_new, 0, 0, true, true));
+                                    new_deferred_info.push((pc_new, class_id.as_u32(), cp_idx_new));
                                 }
                             }
                         }
-                        for (pc_arr, name_opt) in arr_class_names {
+                        for (pc_arr, cp_idx_arr, name_opt) in arr_class_names {
                             if let Some(name) = name_opt {
                                 if let Ok(target_id) = shared.load_class_concurrent(&name) {
                                     anewarray_info.push((pc_arr, target_id.as_u32()));
                                 } else {
-                                    anewarray_info.push((pc_arr, 0));
+                                    anewarray_deferred_info
+                                        .push((pc_arr, class_id.as_u32(), cp_idx_arr));
                                 }
                             }
                         }
@@ -7574,7 +7590,9 @@ pub fn execute(
                         typecheck_info,
                         static_field_info,
                         new_info,
+                        new_deferred_info,
                         anewarray_info,
+                        anewarray_deferred_info,
                         invoke_info,
                         direct_calls_early,
                         mic_slots_early,
@@ -15780,6 +15798,10 @@ fn execute_instruction(
                     }
                     RuntimeError::ArrayIndexOutOfBoundsException { index: i }
                 })?;
+            // Phase 10 #2: the host just wrote this array, so any device
+            // buffer mirroring it is stale.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
         // WP4.3 fix: long[] / double[] store must use typed pop so that the
         // CompactValue type-erasure (raw long bits decoding as Value::Double via
@@ -15835,6 +15857,9 @@ fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Long(v))
                 .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
+            // Phase 10 #2 — see the `Iastore` arm.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
         Instruction::Dastore => {
             let d = thread.frames[frame_idx].stack.pop_double()?;
@@ -15874,6 +15899,9 @@ fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Double(d))
                 .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
+            // Phase 10 #2 — see the `Iastore` arm.
+            #[cfg(feature = "gpu-offload")]
+            crate::runtime::offload::input_cache::invalidate(array_ref);
         }
 
         // -- Stack manipulation (T10.9.D direct CompactValue path) --
@@ -22601,6 +22629,27 @@ mod tests {
             );
         }
 
+        // Per-FILE exceptions inside the strict-zero submodule dirs. Kept
+        // separate from the directory budget above on purpose: raising that
+        // budget would hand the same allowance to every file in the
+        // directory, which is exactly what the comment above refuses to do.
+        //
+        // `disp.rs` earns one because `disp8_const` is a `const fn` whose
+        // `panic!` IS the const-evaluation failure mechanism — const context
+        // has no `Result`, so this is how a layout constant that would not fit
+        // a signed disp8 becomes a BUILD failure instead of an instruction
+        // that addresses memory backwards from the base register. It already
+        // carries `#[allow(clippy::panic)]` and documents that it must only be
+        // called in const context. Note this is a per-file allowance, not a
+        // blanket "const fn panics are fine" rule: a `const fn` called at run
+        // time panics like any other function, which is why the scanner is not
+        // taught to skip them wholesale.
+        for (path, max_allowed) in targets.iter_mut() {
+            if path.replace('\\', "/").ends_with("jit/src/x64/disp.rs") {
+                *max_allowed = 1;
+            }
+        }
+
         for (path, max_allowed) in &targets {
             let (hits, scanned) = scan_production_section(path, &needles);
 
@@ -22609,19 +22658,37 @@ mod tests {
             // logic ever regresses to the old `find("#[cfg(test)]")`
             // doc-comment anchor, `scanned` collapses to the header and this
             // trips before the (now-vacuous) panic assertion can pass
-            // silently. Expressed as a fraction of the file rather than a flat
-            // line count, so it stays meaningful for a 49-line split-out
-            // module as well as a 24,000-line parent.
-            let total = std::fs::read_to_string(path)
-                .unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+            // silently.
+            //
+            // Anchored on the FIRST real `#[cfg(test)]` attribute rather than
+            // on a fraction of the file. Every line above that attribute is
+            // unambiguously production, so the scan must have covered at
+            // least that many — a property that holds whatever the
+            // production/test ratio is. The previous form asserted
+            // `scanned * 2 >= total`, i.e. "production is at least half the
+            // file", which is not the property being tested and which a small
+            // utility with thorough tests legitimately fails:
+            // `jit/src/x64/disp.rs` is 327 production lines and 406 test
+            // lines, so the scan was exactly right and the gate still fired.
+            let src = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+            let total = src.lines().count();
+            // Same "is this a real attribute, not a comment mentioning one"
+            // test `scan_production_section` applies.
+            let production_prefix = src
                 .lines()
-                .count();
+                .position(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with('*')) && t.starts_with("#[cfg(test)]")
+                })
+                .unwrap_or(total);
             assert!(
-                scanned * 2 >= total,
-                "B3 regression: scan of {path} covered only {scanned} of \
-                 {total} lines — the production body was not scanned. The \
-                 `#[cfg(test)]` boundary detection in \
-                 scan_production_section is broken.",
+                scanned >= production_prefix,
+                "B3 regression: scan of {path} covered only {scanned} lines, \
+                 but {production_prefix} lines precede the first \
+                 `#[cfg(test)]` attribute (file is {total} lines) — the \
+                 production body was not scanned. The `#[cfg(test)]` boundary \
+                 detection in scan_production_section is broken.",
             );
 
             assert!(

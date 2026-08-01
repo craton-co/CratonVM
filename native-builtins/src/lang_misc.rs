@@ -85,6 +85,59 @@ fn cached_throwable_field_index(
 /// back to name-based lookup if the cached index is stale (object has
 /// fewer slots than expected — synthetic-stub layout).
 #[inline]
+/// Slot fallback for a SYNTHETIC `Throwable`.
+///
+/// `Throwable`'s fields are addressed by name, which is right for a real-JDK
+/// receiver. A synthetically-allocated one has no field names at all
+/// (`ensure_synthetic_class` mints unnamed slots), so both the write and the
+/// read silently no-op and e.g. `initCause` followed by `getCause` yields null.
+///
+/// There is no declared layout for a synthetic Throwable, so this defines one.
+/// It is consulted ONLY when the by-name lookup fails, so a real receiver is
+/// untouched and the two paths can never disagree about the same object.
+fn synthetic_throwable_slot(field_name: &str) -> Option<usize> {
+    match field_name {
+        "detailMessage" => Some(0),
+        "cause" => Some(1),
+        "suppressedExceptions" => Some(2),
+        _ => None,
+    }
+}
+
+/// Write a Throwable field by name, falling back to
+/// [`synthetic_throwable_slot`] when the receiver has no field names.
+/// Companion to [`read_throwable_field`].
+fn write_throwable_field(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+    value: Value,
+) {
+    ctx.set_field_by_name(this, field_name, value);
+    if ctx.get_field_by_name(this, field_name) != value {
+        if let Some(slot) = synthetic_throwable_slot(field_name) {
+            if slot < ctx.object_num_fields(this) {
+                ctx.set_field(this, slot, value);
+            }
+        }
+    }
+}
+
+/// Read a Throwable field by name, falling back to
+/// [`synthetic_throwable_slot`] when the receiver has no field names.
+fn read_throwable_field(ctx: &mut dyn NativeContext, this: ObjectRef, field_name: &str) -> Value {
+    let by_name = ctx.get_field_by_name(this, field_name);
+    if !matches!(by_name, Value::Object(None)) {
+        return by_name;
+    }
+    if let Some(slot) = synthetic_throwable_slot(field_name) {
+        if slot < ctx.object_num_fields(this) {
+            return ctx.get_field(this, slot);
+        }
+    }
+    by_name
+}
+
 fn write_throwable_field_cached(
     ctx: &mut dyn NativeContext,
     cache: &AtomicUsize,
@@ -99,6 +152,15 @@ fn write_throwable_field_cached(
         }
     }
     ctx.set_field_by_name(this, field_name, value);
+    // A synthetic receiver resolves neither the cached index nor the name, so
+    // the write above was a no-op. See `synthetic_throwable_slot`.
+    if ctx.get_field_by_name(this, field_name) != value {
+        if let Some(slot) = synthetic_throwable_slot(field_name) {
+            if slot < ctx.object_num_fields(this) {
+                ctx.set_field(this, slot, value);
+            }
+        }
+    }
 }
 
 /// Resolve & cache the `java/lang/StackTraceElement` class id. Falls back
@@ -365,7 +427,7 @@ fn init_suppressed_sentinel(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // `fillInStackTrace()` also funnels through `capture_throwable_trace`).
     // An unset reference slot reads back as `Int(0)`, not `Object(None)`, so
     // skip ONLY when the field already holds a non-null object reference.
-    if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "suppressedExceptions") {
+    if let Value::Object(Some(_)) = read_throwable_field(ctx, this, "suppressedExceptions") {
         return;
     }
     let sentinel = ctx.class_id_by_name("java/lang/Throwable").and_then(|cid| {
@@ -904,7 +966,7 @@ pub(crate) fn native_throwable_get_cause(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let by_name_cause = ctx.get_field_by_name(this, "cause");
+    let by_name_cause = read_throwable_field(ctx, this, "cause");
     if let Value::Object(Some(cause_obj)) = by_name_cause {
         // JDK sentinel: cause==this means "uninitialized cause"; report null.
         if cause_obj == this {
@@ -1357,7 +1419,7 @@ pub(crate) fn native_throwable_add_suppressed(
         return Ok(None);
     }
     // Get existing suppressed array (or the SUPPRESSED_SENTINEL / null).
-    let existing = ctx.get_field_by_name(this, "suppressedExceptions");
+    let existing = read_throwable_field(ctx, this, "suppressedExceptions");
     match existing {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == cratonvm_types::ObjectKind::Array => {
             // Grow the array: copy old elements + append new one
@@ -1368,14 +1430,24 @@ pub(crate) fn native_throwable_add_suppressed(
                 ctx.set_array_element(new_arr, i, elem);
             }
             ctx.set_array_element(new_arr, old_len, Value::Object(Some(suppressed)));
-            ctx.set_field_by_name(this, "suppressedExceptions", Value::Object(Some(new_arr)));
+            write_throwable_field(
+                ctx,
+                this,
+                "suppressedExceptions",
+                Value::Object(Some(new_arr)),
+            );
         }
         _ => {
             // No existing array (null, or still the SUPPRESSED_SENTINEL list)
             // — create one with a single element.
             let new_arr = ctx.new_ref_array(ClassId::new(0), 1);
             ctx.set_array_element(new_arr, 0, Value::Object(Some(suppressed)));
-            ctx.set_field_by_name(this, "suppressedExceptions", Value::Object(Some(new_arr)));
+            write_throwable_field(
+                ctx,
+                this,
+                "suppressedExceptions",
+                Value::Object(Some(new_arr)),
+            );
         }
     }
     Ok(None)
@@ -1397,7 +1469,7 @@ pub(crate) fn native_throwable_get_suppressed(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "suppressedExceptions") {
+    if let Value::Object(Some(arr)) = read_throwable_field(ctx, this, "suppressedExceptions") {
         if ctx.heap_kind_of(arr) == cratonvm_types::ObjectKind::Array {
             return Ok(Some(Value::Object(Some(arr))));
         }

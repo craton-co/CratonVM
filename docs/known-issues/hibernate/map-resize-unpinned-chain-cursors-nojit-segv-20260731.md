@@ -230,6 +230,61 @@ it is the same defect shape on the named path, found by audit, not by a red test
 - **Do not close this doc on the strength of a fix that has not run the class to
   completion.** That mistake has now been made twice.
 
+## Follow-up 2 — 2026-07-31: relocation is RULED OUT as the mechanism
+
+Went after `native_map_put_evict_pinned` as this doc directed. The most useful
+result is a **negative** one, and it invalidates the framing used above.
+
+**The corrupt receiver is `tail_node`.** Every drop from this site reports
+`index=3`, and `NODE_FIELD_NEXT == 3`, so the failing store is the tail-append
+`set_field(t, NODE_FIELD_NEXT, Some(new_node))` — `t` is the `tail_node` the
+chain walk produced.
+
+**But `tail_node` is not stale.** A full failing run (`CRATONVM_DBG_BLOCKGC=1`,
+SIGSEGV rc=139, 93/132 tests) recorded **zero** `[blockgc] PIN-STALE` hits.
+That canary fires whenever *any* `pin_native_root` receives an already-forwarded
+address — precisely the "pinned a stale value, so the pin preserved the
+staleness" failure hypothesised above. Not one fired, anywhere in the process,
+across the whole run.
+
+That rules out the entire stale-`ObjectRef` family for this crash:
+
+- `tail_node` is pinned before `alloc_object` and re-read from that pin
+  immediately before the store, and `native_pin_roots` is a genuine GC root, so
+  it cannot be collected *after* the pin either.
+- With no forwarding recorded anywhere, it was not silently pre-stale when
+  pinned.
+
+**So `tail_node` was already a dead, zeroed node when the walk read it out of
+the chain.** `native_map_put_evict_pinned` is a *victim* site, not the source:
+something reclaims a node that is still linked into a live bucket chain, and
+this store is merely where the damage first becomes visible. Chasing this
+function further is chasing a symptom.
+
+**Where to look next.** The source is a *rooting/liveness* defect, not a
+staleness one, so the tooling has to change:
+
+- `CRATONVM_DBG_BLOCKGC`'s pin-time canary only sees relocation — wrong
+  detector.
+- A `CRATONVM_DBG_GC_STRESS` probe is also wrong unless moving-young actually
+  engages: one built for this reported `moving_young: cycles=0
+  coverage_fallbacks=0`, i.e. the mechanism never ran, so its passing on an
+  *unfixed* binary proved nothing (kept as `regression-suite/src/RMapResizeGc.java`
+  for its HotSpot-diffed coverage, but it is NOT a reproducer).
+- What is wanted is a liveness/ownership assertion: mark nodes at link time and
+  check at sweep time that nothing reachable from a live bucket array is being
+  reclaimed.
+
+**Also landed (hardening, NOT the fix): `HIB-MAPPUT-PINORDER.1`.**
+`native_map_put_evict` and `native_hashmap_put_exact` copy `key_val`/`value` out
+of `args` into bare locals, then call `materialize_hm_int_fast` — which re-puts
+every side-stored entry through `native_map_put_evict_pinned`, allocating a node
+each, so it can collect — and only pin them *afterwards*. Pinning after a
+collection roots an already-stale address. Given the canary result this is
+**latent, not live** on the collector that actually runs today, but it becomes
+live the moment moving-young engages (its own open doc). Fixed by pinning across
+the materialisation and re-reading after it.
+
 ## Related
 
 - `docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md` — defect
