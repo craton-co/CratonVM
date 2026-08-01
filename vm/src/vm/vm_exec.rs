@@ -1858,6 +1858,22 @@ fn safe_native_call_impl(
         }
     };
 
+    // `CRATONVM_DBG_LINKAGE=1` — a native that returns a `VmError::Linkage`
+    // hands its caller something that is only catchable if the caller's
+    // dispatch arm converts it. Name the native and the Java call site here,
+    // at the boundary, so the routing can be followed from its origin.
+    if crate::runtime::interpreter::dbg_linkage() {
+        if let Err(MethodCallFailed::InternalError(VmError::Linkage(l))) = &out {
+            let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+            crate::runtime::interpreter::dbg_linkage_dump(
+                thread,
+                "native return",
+                &format!("{callee} -> {l:?}"),
+            );
+        }
+    }
+
     thread.native_pending_return = None;
     match &mut out {
         Ok(Some(v)) => {
