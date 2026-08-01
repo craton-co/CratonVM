@@ -2330,6 +2330,890 @@ impl CompiledMethod {
 }
 
 // ---------------------------------------------------------------------------
+// Validated OSR entry (C2 review P1 — "Add on-stack replacement")
+// ---------------------------------------------------------------------------
+//
+// What was already here before this section, and is NOT re-implemented:
+//
+//   * `CompiledMethod::osr_pc_to_native` — the per-bci entry table, built from
+//     `x64::Compiler::osr_entry_native` (which points *before* a LICM-hoisted
+//     preheader, and `-1` for a pc strictly inside a hoisted body).
+//   * `can_osr_enter` / `can_osr_enter_with` — "is there a native offset here,
+//     and is the dead-local mask acceptable".
+//   * `osr_enter` + `osr_trampoline` — the machine-level transition: seed
+//     locals into their register/frame homes, build the frame, jump.
+//   * `osr_dead_mask` + `osr_dead_local_entry_allowed` — the coalesced-register
+//     hazard and its kill switch.
+//   * `is_osr_entry_rejected` / `mark_osr_entry_rejected` — the per-(method,pc)
+//     negative memo so a permanent refusal is decided once.
+//   * `deopt_points` / `osr_exit_points` / `can_osr_exit` — the OSR-*exit*
+//     snapshots the VM's in-place transfer consumes.
+//
+// What this section adds is the part the acceptance criterion ("long-running
+// loops tier up without restarting and survive forced deopt") needs and that
+// none of the above does: a **typed admission check**. `osr_enter` takes
+// `jit_locals: &[i64]` — raw words with no types attached — so nothing ever
+// compared the interpreter's idea of a slot against the compiled entry's. A
+// `double` local seeded into a GPR home, or a `long` seeded where the compiled
+// body reads a reference, is a silent miscompile, not a refusal.
+//
+// The three rules this section is built around:
+//
+// 1. **Refuse, never guess.** Every rejection is a `bailout::Bailout` carrying
+//    a `BailoutReason::UnsupportedShape` tag from the closed taxonomy below,
+//    counted through `bailout::record_bailout`. No panics, no `Option::None`
+//    with the reason thrown away.
+//
+// 2. **The resume bci is exact, or there is no entry.** `OsrEntryPlan` is
+//    derived from `OsrEntryState::pc` — the interpreter's *current* pc, which
+//    at a taken back-edge is the loop header with zero bytes of the new
+//    iteration executed. There is no separate "entry pc" argument that could
+//    disagree with it. See [`OsrEntryPlan::resume_bci`].
+//
+// 3. **Only a validation that ran BEFORE entry may resume at the entry bci.**
+//    That is the whole of the known "an OSR bail re-runs loop iterations"
+//    defect: once compiled code has committed iterations, resuming the
+//    interpreter at the header replays them. `validate_osr_entry` failing is
+//    the only path that leaves the interpreter at `entry_pc`; after entry the
+//    only sanctioned resume is [`OsrEntryPlan::resume_after_exit`], which
+//    returns the *reconstructed frame's own* bci or refuses outright.
+
+/// The JVM value kind of one interpreter slot, as the OSR entry contract sees
+/// it.
+///
+/// Deliberately coarser than `deopt::FrameValue` (which also encodes *where*
+/// the value lives) and coarser than the verifier's type lattice (no class
+/// identity): the only question an OSR entry has to answer is "will the
+/// compiled body read this slot's 64 bits as the same kind of thing the
+/// interpreter wrote into it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsrSlotType {
+    /// Cat-1 `int` family (`int`/`short`/`char`/`byte`/`boolean`).
+    Int,
+    /// Cat-2 `long`.
+    Long,
+    /// Cat-1 `float`.
+    Float,
+    /// Cat-2 `double`.
+    Double,
+    /// Object or array reference (including `null`).
+    Ref,
+    /// No value: an uninitialized local, or the reserved upper half of a cat-2
+    /// pair. The JVM verification lattice's `top`.
+    Top,
+}
+
+impl OsrSlotType {
+    /// Stable short name, used in refusal context strings and test assertions.
+    pub fn name(self) -> &'static str {
+        match self {
+            OsrSlotType::Int => "int",
+            OsrSlotType::Long => "long",
+            OsrSlotType::Float => "float",
+            OsrSlotType::Double => "double",
+            OsrSlotType::Ref => "ref",
+            OsrSlotType::Top => "top",
+        }
+    }
+
+    /// The interpreter's side: map a `cratonvm_types` compact value tag.
+    ///
+    /// `None` for `VTAG_RETADDR` (a `jsr` return address, which has no JIT
+    /// representation at all) and for any tag this build does not know — both
+    /// route to a refusal rather than to a guess.
+    pub fn from_vtag(tag: u8) -> Option<OsrSlotType> {
+        Some(match tag {
+            cratonvm_types::VTAG_INT => OsrSlotType::Int,
+            cratonvm_types::VTAG_LONG => OsrSlotType::Long,
+            cratonvm_types::VTAG_FLOAT => OsrSlotType::Float,
+            cratonvm_types::VTAG_DOUBLE => OsrSlotType::Double,
+            // A `null` slot is still reference-*typed*; the compiled body will
+            // read it as a pointer, and 0 is the correct pointer.
+            cratonvm_types::VTAG_OBJECT | cratonvm_types::VTAG_NULL => OsrSlotType::Ref,
+            cratonvm_types::VTAG_UNINIT => OsrSlotType::Top,
+            _ => return None,
+        })
+    }
+
+    /// The compiled side: map a deopt-metadata `FrameValue`.
+    ///
+    /// `None` means **undescribable** — the artifact says something lives in
+    /// this slot but cannot say what. That covers
+    /// [`deopt::FrameValue::Unsupported`] (unknown width),
+    /// [`deopt::FrameValue::MaterializationRequired`] (an optimization deleted
+    /// the value and left no rebuild recipe), and the scalar-replacement
+    /// variants (which would need a heap allocation this crate cannot perform).
+    // The trailing `_` arm is redundant *today* — the arms before it name every
+    // `FrameValue` variant — and is kept deliberately so that a variant added to
+    // `deopt.rs` (a file this change does not own) lands on "undescribable ⇒
+    // refuse" instead of breaking this crate's build.
+    #[allow(unreachable_patterns)]
+    pub fn from_frame_value(v: &deopt::FrameValue) -> Option<OsrSlotType> {
+        use deopt::FrameValue as FV;
+        Some(match v {
+            FV::Int(_) | FV::Register(_) | FV::StackSlot(_) => OsrSlotType::Int,
+            FV::Long(_) | FV::RegisterLong(_) | FV::StackSlotLong(_) => OsrSlotType::Long,
+            FV::Float(_) | FV::XmmFloat(_) | FV::StackSlotFloat(_) => OsrSlotType::Float,
+            FV::Double(_) | FV::XmmDouble(_) | FV::StackSlotDouble(_) => OsrSlotType::Double,
+            FV::Object(_) | FV::RegisterRef(_) | FV::StackSlotRef(_) => OsrSlotType::Ref,
+            FV::Undefined => OsrSlotType::Top,
+            FV::Unsupported
+            | FV::MaterializationRequired(_)
+            | FV::VirtualObject(_)
+            | FV::VirtualObjectRef(_) => return None,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for OsrSlotType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// What the compiled OSR entry expects to find in one slot.
+///
+/// Two contract strengths, because two very different artifacts exist. An
+/// artifact compiled with `CRATONVM_DEOPT_REAL` carries a `FrameState` at the
+/// loop bci and therefore knows each slot's exact JVM type — that is
+/// [`OsrSlotExpectation::Exact`]. A production artifact carries no deopt
+/// metadata at all, and the only per-slot typing left is the register-home
+/// map: an XMM home can only ever hold FP, a GPR home can only ever hold an
+/// integral/reference word. Those are [`OsrSlotExpectation::FloatingPoint`]
+/// and [`OsrSlotExpectation::Integral`], and they are still enough to catch the
+/// class of mismatch that silently corrupts a frame (an FP value seeded into a
+/// GPR home is read back as an integer, and vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsrSlotExpectation {
+    /// Exactly this type, from a precise `FrameState` at the entry bci.
+    Exact(OsrSlotType),
+    /// A general-purpose register home: `int`, `long` or a reference.
+    Integral,
+    /// An XMM register home: `float` or `double`.
+    FloatingPoint,
+    /// Memory-homed with no precise type available — nothing to check.
+    Unconstrained,
+    /// The trampoline does not seed this slot at all (its `osr_dead_mask` bit
+    /// is set, so loading it would clobber the live owner of a coalesced
+    /// register). Whatever the interpreter holds is irrelevant.
+    NotSeeded,
+}
+
+impl OsrSlotExpectation {
+    /// Would seeding a slot of type `got` into this expectation be sound?
+    ///
+    /// `Exact(Top)` accepts anything: the precise contract says nothing reads
+    /// the slot at this bci. The converse is *not* true — an incoming `Top`
+    /// against an `Exact` live type is a refusal, because the compiled body
+    /// will read a slot the interpreter says has never been written.
+    ///
+    /// Under the inferred (register-home) contract an incoming `Top` **is**
+    /// accepted: the dead mask only names the *hazardous* dead locals (those
+    /// sharing a register with a live one), so a harmlessly-dead local reaches
+    /// here unmasked and legitimately uninitialized. Refusing those is what the
+    /// pre-2026-07-27 blanket dead-mask refusal did, and it cost H2's hottest
+    /// method every one of its OSR entries.
+    pub fn accepts(self, got: OsrSlotType) -> bool {
+        match self {
+            OsrSlotExpectation::Exact(OsrSlotType::Top) => true,
+            OsrSlotExpectation::Exact(want) => want == got,
+            OsrSlotExpectation::Integral => matches!(
+                got,
+                OsrSlotType::Int | OsrSlotType::Long | OsrSlotType::Ref | OsrSlotType::Top
+            ),
+            OsrSlotExpectation::FloatingPoint => matches!(
+                got,
+                OsrSlotType::Float | OsrSlotType::Double | OsrSlotType::Top
+            ),
+            OsrSlotExpectation::Unconstrained | OsrSlotExpectation::NotSeeded => true,
+        }
+    }
+}
+
+impl std::fmt::Display for OsrSlotExpectation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OsrSlotExpectation::Exact(t) => write!(f, "exactly {t}"),
+            OsrSlotExpectation::Integral => f.write_str("a gpr-homed int/long/ref"),
+            OsrSlotExpectation::FloatingPoint => f.write_str("an xmm-homed float/double"),
+            OsrSlotExpectation::Unconstrained => f.write_str("anything (memory-homed)"),
+            OsrSlotExpectation::NotSeeded => f.write_str("nothing (not seeded)"),
+        }
+    }
+}
+
+// ── Refusal taxonomy ─────────────────────────────────────────────────
+//
+// Each tag is the `&'static str` payload of a
+// `bailout::BailoutReason::UnsupportedShape`, so every OSR refusal lands in the
+// existing `unsupported_shape` bailout counter and prints through the existing
+// `Bailout: Display`. The strings are an external contract (tests and log greps
+// key on them) and must not be renamed with the code that raises them.
+
+/// The artifact publishes no OSR entry table at all (`osr_pc_to_native` is
+/// `None`) — it was never compiled for trampoline entry.
+pub const OSR_REFUSE_NO_ENTRY_TABLE: &str = "osr-entry-no-table";
+/// The table has no enterable native offset for this bci: past the end, or the
+/// `-1` the codegen writes for a pc strictly inside a LICM-hoisted loop body
+/// (whose preheader an entry here would skip).
+pub const OSR_REFUSE_PC_NOT_AN_ENTRY: &str = "osr-entry-pc-not-an-entry";
+/// A non-zero `osr_dead_mask` at this bci with `CRATONVM_JIT_OSR_DEAD_LOCALS=0`
+/// (the kill switch that restores the historical blanket refusal).
+pub const OSR_REFUSE_DEAD_LOCAL_MASK: &str = "osr-entry-dead-local-mask";
+/// The interpreter's local/tag (or stack/tag) slices disagree in length, or the
+/// local count does not match the compiled frame's `osr_num_locals`.
+pub const OSR_REFUSE_LOCAL_COUNT: &str = "osr-entry-local-count";
+/// The incoming operand stack is non-empty, or does not match the depth the
+/// compiled entry expects. The trampoline seeds **locals only**, so a
+/// non-empty stack would be silently dropped.
+pub const OSR_REFUSE_OPERAND_STACK: &str = "osr-entry-operand-stack";
+/// An incoming slot's JVM type is not one the compiled entry can accept there.
+pub const OSR_REFUSE_SLOT_TYPE: &str = "osr-entry-slot-type-mismatch";
+/// The compiled entry's own contract cannot describe a slot: `Unsupported`,
+/// `MaterializationRequired`, or a scalar-replaced object.
+pub const OSR_REFUSE_UNDESCRIBABLE_SLOT: &str = "osr-entry-undescribable-slot";
+/// An incoming slot holds a `jsr` return address, which has no JIT
+/// representation.
+pub const OSR_REFUSE_RETURNADDRESS: &str = "osr-entry-returnaddress-slot";
+/// The entry could land in — or exit from — an inlined scope that the deopt
+/// metadata cannot describe (`FrameState::caller` is still `None` at every
+/// producer).
+pub const OSR_REFUSE_INLINED_SCOPE: &str = "osr-entry-inlined-scope";
+/// The artifact contains an unconditional uncommon trap (`has_indy_trap`): it
+/// bails on every execution reaching that site, so entering it buys nothing and
+/// costs a bail whose resume may not be describable.
+pub const OSR_REFUSE_UNCONDITIONAL_TRAP: &str = "osr-entry-unconditional-trap";
+/// The artifact can take a frame-deopt exit whose reconstructed state is not
+/// resumable. Entering would commit loop iterations that a bail could then only
+/// discard — the replay this whole section exists to prevent.
+pub const OSR_REFUSE_UNRESUMABLE_EXIT: &str = "osr-entry-unresumable-exit";
+/// Post-entry: the reconstructed frame cannot name an exact resume point, so
+/// the interpreter must NOT be resumed (least of all at the entry bci).
+pub const OSR_REFUSE_EXIT_REPLAY: &str = "osr-exit-replay-refused";
+
+/// Every refusal tag, in taxonomy order. A new refusal must be added here; the
+/// tests assert the list is complete and duplicate-free.
+pub const OSR_REFUSAL_TAGS: [&str; 12] = [
+    OSR_REFUSE_NO_ENTRY_TABLE,
+    OSR_REFUSE_PC_NOT_AN_ENTRY,
+    OSR_REFUSE_DEAD_LOCAL_MASK,
+    OSR_REFUSE_LOCAL_COUNT,
+    OSR_REFUSE_OPERAND_STACK,
+    OSR_REFUSE_SLOT_TYPE,
+    OSR_REFUSE_UNDESCRIBABLE_SLOT,
+    OSR_REFUSE_RETURNADDRESS,
+    OSR_REFUSE_INLINED_SCOPE,
+    OSR_REFUSE_UNCONDITIONAL_TRAP,
+    OSR_REFUSE_UNRESUMABLE_EXIT,
+    OSR_REFUSE_EXIT_REPLAY,
+];
+
+/// Build (and count) an OSR refusal.
+///
+/// Counting here rather than at each call site is deliberate: a refusal that is
+/// not counted is invisible to the compiler report the review asks for, and
+/// there is exactly one constructor so none can be missed.
+fn osr_refusal(tag: &'static str, context: impl Into<String>) -> bailout::Bailout {
+    let b = bailout::Bailout::with_context(bailout::BailoutReason::UnsupportedShape(tag), context);
+    bailout::record_bailout(&b);
+    b
+}
+
+/// Is this refusal a pure function of the *artifact* (as opposed to the
+/// incoming interpreter state)?
+///
+/// A permanent refusal will reproduce for every future back-edge over the same
+/// pc, so the caller should memo it through [`mark_osr_entry_rejected`] instead
+/// of re-running the whole pipeline. A state-dependent one must not be memoed:
+/// the next trip over the back-edge carries different locals.
+pub fn osr_refusal_is_permanent(b: &bailout::Bailout) -> bool {
+    match &b.reason {
+        bailout::BailoutReason::UnsupportedShape(tag) => matches!(
+            *tag,
+            OSR_REFUSE_NO_ENTRY_TABLE
+                | OSR_REFUSE_PC_NOT_AN_ENTRY
+                | OSR_REFUSE_DEAD_LOCAL_MASK
+                | OSR_REFUSE_UNDESCRIBABLE_SLOT
+                | OSR_REFUSE_INLINED_SCOPE
+                | OSR_REFUSE_UNCONDITIONAL_TRAP
+                | OSR_REFUSE_UNRESUMABLE_EXIT
+        ),
+        _ => false,
+    }
+}
+
+/// Where an [`OsrEntryPlan`]'s per-slot expectations came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsrContractSource {
+    /// A `FrameState` recorded at the entry bci (an `OsrExit`-tagged deopt
+    /// point, or any deopt point there): every slot's exact JVM type is known.
+    PreciseFrameState,
+    /// No deopt metadata at the entry bci — the production case. Expectations
+    /// are inferred from `osr_local_assignments` / `osr_xmm_assignments`.
+    RegisterHomes,
+}
+
+/// What a mid-loop bail out of the OSR'd body is allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsrExitPolicy {
+    /// Every frame-deopt exit this artifact can take reconstructs a resumable
+    /// frame in this method's own scope, so a bail transfers the JIT-advanced
+    /// loop state into the live frame and resumes at the bail's own bci.
+    ExactTransfer,
+    /// The artifact has no frame-deopt exits at all (the production case:
+    /// `deopt_points` is empty unless `CRATONVM_DEOPT_REAL` was on at compile).
+    /// Control can only leave the body by returning or by the exception routes,
+    /// which propagate out of the frame. The interpreter must never "resume"
+    /// this frame at the entry bci.
+    PropagateOnly,
+}
+
+/// The interpreter state offered to an OSR entry.
+///
+/// `locals` are the raw 64-bit words in JVM local-slot order (`Frame::
+/// get_local_raw`), `local_tags` the matching compact value tags (`Frame::
+/// get_local_tag`, which exists precisely "for JIT/OSR interop"). The two
+/// slices must be the same length.
+///
+/// `pc` is the interpreter's **current** pc. At a taken back-edge that is the
+/// loop header with zero bytes of the new iteration executed, which is exactly
+/// the invariant the exact-resume guarantee rests on — see
+/// [`OsrEntryPlan::resume_bci`]. There is no separate `entry_pc` parameter to
+/// disagree with it.
+#[derive(Debug, Clone, Copy)]
+pub struct OsrEntryState<'a> {
+    /// The interpreter's current pc; both the entry bci and the resume bci.
+    pub pc: usize,
+    /// Raw local words, JVM-slot-indexed.
+    pub locals: &'a [i64],
+    /// Compact value tag per local slot (`cratonvm_types::VTAG_*`).
+    pub local_tags: &'a [u8],
+    /// Raw operand-stack words, bottom-first.
+    pub stack: &'a [i64],
+    /// Compact value tag per operand-stack entry.
+    pub stack_tags: &'a [u8],
+}
+
+impl<'a> OsrEntryState<'a> {
+    /// The common back-edge shape: a loop header with an empty operand stack.
+    pub fn at(pc: usize, locals: &'a [i64], local_tags: &'a [u8]) -> Self {
+        OsrEntryState {
+            pc,
+            locals,
+            local_tags,
+            stack: &[],
+            stack_tags: &[],
+        }
+    }
+}
+
+/// A validated OSR entry: everything the transition needs, and nothing that
+/// could still be refused.
+///
+/// Obtained only from [`CompiledMethod::validate_osr_entry`]. Holding one is
+/// the proof that every incoming slot was type-checked against the compiled
+/// entry's contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsrEntryPlan {
+    /// The bci the compiled body starts executing at.
+    pub entry_pc: usize,
+    /// The bci the interpreter resumes at **if the entry never happens**.
+    ///
+    /// Equal to `entry_pc` by construction, and that equality is the exact-
+    /// resume guarantee: `entry_pc` is `OsrEntryState::pc`, the pc at which the
+    /// interpreter has executed nothing, so falling back to it repeats no work.
+    /// After the transition this field is *not* a resume point — use
+    /// [`resume_after_exit`](Self::resume_after_exit).
+    pub resume_bci: usize,
+    /// Offset of the entry point within the artifact's code buffer.
+    pub native_offset: u32,
+    /// The `osr_dead_mask` bits in force at `entry_pc`.
+    pub dead_mask: u64,
+    /// How the per-slot expectations were derived.
+    pub contract: OsrContractSource,
+    /// What a mid-loop bail may do.
+    pub exit_policy: OsrExitPolicy,
+    /// The validated per-local expectation, indexed by JVM local slot.
+    pub expected_locals: Vec<OsrSlotExpectation>,
+}
+
+impl OsrEntryPlan {
+    /// The exact bci to resume the (already mutated, already advanced)
+    /// interpreter frame at after the OSR'd body bailed with `rframe`.
+    ///
+    /// **This is the only sanctioned resume point once compiled code has run.**
+    /// It returns the reconstructed frame's own bci — never `entry_pc` unless
+    /// the bail genuinely landed back on the loop header having completed a
+    /// whole number of iterations, which is what a loop-boundary OSR-exit map
+    /// means. An `Err` means "this frame cannot name where it is": the caller
+    /// must propagate/unwind, and must **not** fall back to `entry_pc`, because
+    /// every iteration the compiled body committed would then run a second
+    /// time (the recorded `jit-osr-bail-reruns-loop-iterations` defect).
+    ///
+    /// The checks, in order:
+    ///
+    ///  * `caller_frames` non-empty → the bail is inside an inlined callee and
+    ///    `FrameState::caller` cannot describe the outer scope. Refuse.
+    ///  * held monitors → the in-place transfer has no re-lock path. Refuse.
+    ///  * `bci` must be one this artifact actually recorded a deopt point for.
+    ///    A bci from nowhere is a mis-routed stash, not a resume point.
+    ///  * every operand-stack slot must be describable.
+    ///  * every local must be describable, with one deliberate exception,
+    ///    below.
+    ///
+    /// **`Unsupported` vs `MaterializationRequired` in a local.** An
+    /// `Unsupported` local is tolerated: the 1-pass backend's
+    /// `classify_local_kinds` is a coarse whole-method scan that marks a slot
+    /// `Ambiguous` at *every* bci if it is accessed as two kinds *anywhere*, and
+    /// the already-verified bytecode guarantees such a slot is either dead or
+    /// re-stored before it is read — so leaving the live frame's current value
+    /// in place is safe. This mirrors the VM-side in-place transfer, which
+    /// makes the same call for the same reason.
+    /// `MaterializationRequired` is **not** tolerated: it means a value that
+    /// *was* live got deleted by an optimization with no rebuild recipe, so the
+    /// live frame's stale pre-entry word is genuinely wrong, not merely
+    /// unread. Guessing it is exactly what `FrameValue::MaterializationRequired`
+    /// was introduced to make impossible.
+    pub fn resume_after_exit(
+        &self,
+        artifact: &CompiledMethod,
+        rframe: &deopt::ReconstructedFrame,
+    ) -> Result<usize, bailout::Bailout> {
+        use deopt::FrameValue as FV;
+        if !rframe.caller_frames.is_empty() {
+            return Err(osr_refusal(
+                OSR_REFUSE_INLINED_SCOPE,
+                format!(
+                    "exit at bci {} carries {} inlined caller frame(s)",
+                    rframe.bci,
+                    rframe.caller_frames.len()
+                ),
+            ));
+        }
+        if !rframe.monitors.is_empty() {
+            return Err(osr_refusal(
+                OSR_REFUSE_EXIT_REPLAY,
+                format!(
+                    "exit at bci {} holds {} monitor(s)",
+                    rframe.bci,
+                    rframe.monitors.len()
+                ),
+            ));
+        }
+        if !artifact.deopt_points.iter().any(|p| p.bci == rframe.bci) {
+            return Err(osr_refusal(
+                OSR_REFUSE_EXIT_REPLAY,
+                format!(
+                    "exit bci {} is not a recorded deopt point of this artifact",
+                    rframe.bci
+                ),
+            ));
+        }
+        for (i, v) in rframe.stack.iter().enumerate() {
+            if OsrSlotType::from_frame_value(v).is_none() {
+                return Err(osr_refusal(
+                    OSR_REFUSE_EXIT_REPLAY,
+                    format!("exit at bci {}: stack slot {i} is {v:?}", rframe.bci),
+                ));
+            }
+        }
+        for (i, v) in rframe.locals.iter().enumerate() {
+            match v {
+                // See the doc comment: coarse-classifier noise, provably safe
+                // to leave at the live frame's current value.
+                FV::Unsupported => {}
+                FV::MaterializationRequired(ev) => {
+                    return Err(osr_refusal(
+                        OSR_REFUSE_EXIT_REPLAY,
+                        format!(
+                            "exit at bci {}: local {i} needs materialization ({ev})",
+                            rframe.bci
+                        ),
+                    ));
+                }
+                other => {
+                    if OsrSlotType::from_frame_value(other).is_none() {
+                        return Err(osr_refusal(
+                            OSR_REFUSE_EXIT_REPLAY,
+                            format!("exit at bci {}: local {i} is {other:?}", rframe.bci),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(rframe.bci as usize)
+    }
+}
+
+impl CompiledMethod {
+    /// The precise entry contract at `entry_pc`, if this artifact has one.
+    ///
+    /// Prefers the `OsrExit`-tagged point (that IS the loop-boundary snapshot
+    /// for this header) and falls back to any deopt point at the same bci. Both
+    /// describe the same program point's live state, which is what makes the
+    /// *exit* map usable as the *entry* contract — the symmetry the acceptance
+    /// criterion ("survive forced deopt") is asking for.
+    fn osr_entry_frame_state(&self, entry_pc: usize) -> Option<&deopt::FrameState> {
+        let bci = u32::try_from(entry_pc).ok()?;
+        self.deopt_points
+            .iter()
+            .find(|p| p.bci == bci && p.reason == deopt::DeoptReason::OsrExit)
+            .or_else(|| self.deopt_points.iter().find(|p| p.bci == bci))
+            .map(|p| &p.frame_state)
+    }
+
+    /// Classify what a mid-loop bail out of this artifact may do, refusing the
+    /// entry outright when some reachable exit could not be resumed.
+    ///
+    /// This is the "make the re-entry point exact, or refuse" rule applied at
+    /// admission time. Checking it *after* entering is useless: by then the
+    /// compiled body has committed iterations, and the only remaining options
+    /// are to replay them or to lose them.
+    fn osr_exit_policy(&self) -> Result<OsrExitPolicy, bailout::Bailout> {
+        if self.deopt_points.is_empty() {
+            return Ok(OsrExitPolicy::PropagateOnly);
+        }
+        for p in &self.deopt_points {
+            let fs = &p.frame_state;
+            if fs.caller.is_some() {
+                return Err(osr_refusal(
+                    OSR_REFUSE_INLINED_SCOPE,
+                    format!("deopt point at bci {} has an inlined caller scope", p.bci),
+                ));
+            }
+            if !fs.monitors.is_empty() {
+                return Err(osr_refusal(
+                    OSR_REFUSE_UNRESUMABLE_EXIT,
+                    format!("deopt point at bci {} holds monitors", p.bci),
+                ));
+            }
+            if !deopt::frame_state_is_resumable(fs) {
+                return Err(osr_refusal(
+                    OSR_REFUSE_UNRESUMABLE_EXIT,
+                    format!(
+                        "deopt point at bci {} ({:?}) reconstructs an unresumable frame",
+                        p.bci, p.reason
+                    ),
+                ));
+            }
+        }
+        Ok(OsrExitPolicy::ExactTransfer)
+    }
+
+    /// The register-home-inferred expectation for local `i`, used when the
+    /// artifact carries no precise `FrameState` at the entry bci.
+    fn osr_inferred_local_expectation(&self, i: usize, dead_mask: u64) -> OsrSlotExpectation {
+        if i < 64 && (dead_mask >> i) & 1 == 1 {
+            return OsrSlotExpectation::NotSeeded;
+        }
+        if self
+            .osr_xmm_assignments
+            .as_ref()
+            .and_then(|m| m.get(i))
+            .is_some_and(|a| a.is_some())
+        {
+            return OsrSlotExpectation::FloatingPoint;
+        }
+        if self
+            .osr_local_assignments
+            .as_ref()
+            .and_then(|m| m.get(i))
+            .is_some_and(|a| a.is_some())
+        {
+            return OsrSlotExpectation::Integral;
+        }
+        OsrSlotExpectation::Unconstrained
+    }
+
+    /// Type-check an offered interpreter state against this artifact's OSR
+    /// entry contract at `state.pc`, producing an [`OsrEntryPlan`] or a
+    /// structured refusal.
+    ///
+    /// Pure: it inspects metadata and the caller's slices only, allocates one
+    /// `Vec` for the plan, and never enters compiled code. That is what makes
+    /// a refusal free of side effects — the interpreter continues at
+    /// `state.pc` having executed nothing, so nothing can be replayed.
+    ///
+    /// Refusals are ordered cheapest-and-most-permanent first, so the memoable
+    /// artifact-level answers ([`osr_refusal_is_permanent`]) are reached before
+    /// the per-entry state checks.
+    #[must_use = "an OSR entry must not be taken without its validated plan"]
+    pub fn validate_osr_entry(
+        &self,
+        state: &OsrEntryState<'_>,
+    ) -> Result<OsrEntryPlan, bailout::Bailout> {
+        let entry_pc = state.pc;
+        let label = || {
+            if self.method_label.is_empty() {
+                format!("bci {entry_pc}")
+            } else {
+                format!("{} bci {entry_pc}", self.method_label)
+            }
+        };
+
+        // ── 1. Is there an entry here at all? ──────────────────────
+        let Some(table) = self.osr_pc_to_native.as_ref() else {
+            return Err(osr_refusal(OSR_REFUSE_NO_ENTRY_TABLE, label()));
+        };
+        let native_offset = match table.get(entry_pc) {
+            Some(&off) if off >= 0 => off as u32,
+            Some(_) => {
+                return Err(osr_refusal(
+                    OSR_REFUSE_PC_NOT_AN_ENTRY,
+                    format!("{}: native offset is -1", label()),
+                ))
+            }
+            None => {
+                return Err(osr_refusal(
+                    OSR_REFUSE_PC_NOT_AN_ENTRY,
+                    format!("{}: past the end of a {}-entry table", label(), table.len()),
+                ))
+            }
+        };
+
+        // ── 2. Coalesced-register hazard (and its kill switch) ─────
+        let dead_mask = self
+            .osr_dead_mask
+            .as_ref()
+            .and_then(|m| m.get(entry_pc).copied())
+            .unwrap_or(0);
+        if dead_mask != 0 && !osr_dead_local_entry_allowed() {
+            return Err(osr_refusal(
+                OSR_REFUSE_DEAD_LOCAL_MASK,
+                format!("{}: mask {dead_mask:#x} with CRATONVM_JIT_OSR_DEAD_LOCALS=0", label()),
+            ));
+        }
+
+        // ── 3. Artifact-level disqualifications ────────────────────
+        if self.has_indy_trap {
+            return Err(osr_refusal(
+                OSR_REFUSE_UNCONDITIONAL_TRAP,
+                format!("{}: artifact carries an unconditional uncommon trap", label()),
+            ));
+        }
+        // `FrameState::caller` is `None` at every producer, so an artifact that
+        // inlined anything AND can take a frame-deopt exit cannot tell an
+        // outer-scope exit from one inside an inlined callee: both arrive under
+        // the outer method's key, and the callee's bci would be resumed as if
+        // it were an outer bci. Refuse rather than land the interpreter at a
+        // bogus pc. (Entry itself is safe — `osr_pc_to_native` is indexed by
+        // the outer method's code array, so an entry pc is always an
+        // outer-scope block start — the hazard is the exit.)
+        if !self.inlined_methods.is_empty() && !self.deopt_points.is_empty() {
+            return Err(osr_refusal(
+                OSR_REFUSE_INLINED_SCOPE,
+                format!(
+                    "{}: {} inlined method(s) with {} deopt point(s) and no caller chain",
+                    label(),
+                    self.inlined_methods.len(),
+                    self.deopt_points.len()
+                ),
+            ));
+        }
+
+        // ── 4. Shape of the offered state ──────────────────────────
+        if state.locals.len() != state.local_tags.len() {
+            return Err(osr_refusal(
+                OSR_REFUSE_LOCAL_COUNT,
+                format!(
+                    "{}: {} local words but {} tags",
+                    label(),
+                    state.locals.len(),
+                    state.local_tags.len()
+                ),
+            ));
+        }
+        if state.stack.len() != state.stack_tags.len() {
+            return Err(osr_refusal(
+                OSR_REFUSE_OPERAND_STACK,
+                format!(
+                    "{}: {} stack words but {} tags",
+                    label(),
+                    state.stack.len(),
+                    state.stack_tags.len()
+                ),
+            ));
+        }
+        if state.locals.len() != self.osr_num_locals {
+            return Err(osr_refusal(
+                OSR_REFUSE_LOCAL_COUNT,
+                format!(
+                    "{}: interpreter offers {} locals, compiled frame has {}",
+                    label(),
+                    state.locals.len(),
+                    self.osr_num_locals
+                ),
+            ));
+        }
+
+        // ── 5. Build the contract, then check every slot ───────────
+        let frame_state = self.osr_entry_frame_state(entry_pc);
+        if let Some(fs) = frame_state {
+            if fs.caller.is_some() {
+                return Err(osr_refusal(
+                    OSR_REFUSE_INLINED_SCOPE,
+                    format!("{}: entry contract has an inlined caller scope", label()),
+                ));
+            }
+            if !fs.monitors.is_empty() {
+                return Err(osr_refusal(
+                    OSR_REFUSE_UNRESUMABLE_EXIT,
+                    format!("{}: entry contract holds monitors", label()),
+                ));
+            }
+        }
+        let contract = match frame_state {
+            Some(_) => OsrContractSource::PreciseFrameState,
+            None => OsrContractSource::RegisterHomes,
+        };
+
+        let mut expected_locals = Vec::with_capacity(self.osr_num_locals);
+        for i in 0..self.osr_num_locals {
+            let expectation = if i < 64 && (dead_mask >> i) & 1 == 1 {
+                // The trampoline skips this slot entirely; nothing to check.
+                OsrSlotExpectation::NotSeeded
+            } else {
+                match frame_state.and_then(|fs| fs.locals.get(i)) {
+                    Some(v) => match OsrSlotType::from_frame_value(v) {
+                        Some(t) => OsrSlotExpectation::Exact(t),
+                        None => {
+                            return Err(osr_refusal(
+                                OSR_REFUSE_UNDESCRIBABLE_SLOT,
+                                format!("{}: local {i} is {v:?}", label()),
+                            ))
+                        }
+                    },
+                    // Either there is no precise contract (production), or the
+                    // snapshot is shorter than the compiled frame — in which
+                    // case the trailing slots are simply not described.
+                    None => self.osr_inferred_local_expectation(i, dead_mask),
+                }
+            };
+            let tag = state.local_tags[i];
+            let Some(got) = OsrSlotType::from_vtag(tag) else {
+                return Err(osr_refusal(
+                    OSR_REFUSE_RETURNADDRESS,
+                    format!("{}: local {i} carries vtag {tag}", label()),
+                ));
+            };
+            if !expectation.accepts(got) {
+                return Err(osr_refusal(
+                    OSR_REFUSE_SLOT_TYPE,
+                    format!(
+                        "{}: local {i} — compiled entry expects {expectation}, interpreter has {got}",
+                        label()
+                    ),
+                ));
+            }
+            expected_locals.push(expectation);
+        }
+
+        // ── 6. Operand stack ───────────────────────────────────────
+        // Type-check the described overlap first, so a genuine type error is
+        // reported as one rather than as the blanket "stack not seeded" below.
+        let expected_stack = frame_state.map(|fs| fs.stack.as_slice()).unwrap_or(&[]);
+        for (i, want) in expected_stack.iter().enumerate() {
+            let Some(&tag) = state.stack_tags.get(i) else {
+                break;
+            };
+            let Some(want) = OsrSlotType::from_frame_value(want) else {
+                return Err(osr_refusal(
+                    OSR_REFUSE_UNDESCRIBABLE_SLOT,
+                    format!("{}: stack slot {i} is {:?}", label(), expected_stack[i]),
+                ));
+            };
+            let Some(got) = OsrSlotType::from_vtag(tag) else {
+                return Err(osr_refusal(
+                    OSR_REFUSE_RETURNADDRESS,
+                    format!("{}: stack slot {i} carries vtag {tag}", label()),
+                ));
+            };
+            if want != got && want != OsrSlotType::Top {
+                return Err(osr_refusal(
+                    OSR_REFUSE_SLOT_TYPE,
+                    format!(
+                        "{}: stack slot {i} — compiled entry expects {want}, interpreter has {got}",
+                        label()
+                    ),
+                ));
+            }
+        }
+        if state.stack.len() != expected_stack.len() {
+            return Err(osr_refusal(
+                OSR_REFUSE_OPERAND_STACK,
+                format!(
+                    "{}: interpreter offers {} operand(s), entry contract describes {}",
+                    label(),
+                    state.stack.len(),
+                    expected_stack.len()
+                ),
+            ));
+        }
+        // The trampoline (`osr_trampoline`) seeds locals into their register /
+        // frame homes and nothing else — it has no operand-stack seeding path.
+        // A non-empty stack would therefore be silently dropped. Back-edge
+        // entries are the empty-stack case by construction (the branch already
+        // consumed its operands), so this costs nothing today and fails closed
+        // if a future trigger fires somewhere else.
+        if !state.stack.is_empty() {
+            return Err(osr_refusal(
+                OSR_REFUSE_OPERAND_STACK,
+                format!(
+                    "{}: {} operand(s) live; the OSR trampoline seeds locals only",
+                    label(),
+                    state.stack.len()
+                ),
+            ));
+        }
+
+        // ── 7. Can every exit this body may take name its own bci? ─
+        // Deliberately last of the artifact-level checks: an undescribable slot
+        // in the *entry* contract also makes that point's frame unresumable, and
+        // the per-slot refusal above names the offending slot, which is strictly
+        // more actionable than the whole-artifact answer here. Reaching this
+        // means the entry contract itself is clean and some *other* deopt point
+        // is the problem.
+        let exit_policy = self.osr_exit_policy()?;
+
+        Ok(OsrEntryPlan {
+            entry_pc,
+            resume_bci: entry_pc,
+            native_offset,
+            dead_mask,
+            contract,
+            exit_policy,
+            expected_locals,
+        })
+    }
+
+    /// Take a validated OSR entry.
+    ///
+    /// A thin, deliberate wrapper over the existing [`osr_enter`](Self::
+    /// osr_enter): the plan carries the proof that every incoming slot was
+    /// type-checked, and this is the only place that proof is spent. Returns
+    /// what `osr_enter` returns (`None` when the machine-level entry itself
+    /// declined; `Some(word)` — possibly the `i64::MIN` deopt sentinel — when
+    /// the body ran).
+    ///
+    /// # Safety
+    /// Same requirements as [`osr_enter`](Self::osr_enter), and additionally
+    /// `plan` must have come from [`validate_osr_entry`](Self::
+    /// validate_osr_entry) on **this** artifact with **this** `state`.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub unsafe fn osr_enter_planned(
+        &self,
+        vm_ptr: i64,
+        state: &OsrEntryState<'_>,
+        plan: &OsrEntryPlan,
+        thread_ptr: i64,
+    ) -> Option<i64> {
+        self.osr_enter(vm_ptr, state.locals, plan.entry_pc, thread_ptr)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OSR (On-Stack Replacement) trampoline
 // ---------------------------------------------------------------------------
 
@@ -16560,6 +17444,709 @@ mod tests {
                 "CRATONVM_JIT_OSR_DEAD_LOCALS=0 must still bail before the trampoline"
             );
         }
+    }
+
+    // ── Validated OSR entry (C2 review P1, "Add on-stack replacement") ──
+    //
+    // The loop these tests model, with javac's bcis:
+    //
+    //     0: iconst_0                  // int i = 0
+    //     1: istore_1
+    //     2: goto 8
+    //     5: <body>                    // sum += a[i]; i++
+    //     8: iload_1                   // <-- LOOP HEADER = the OSR entry bci
+    //     9: … if_icmplt 5             // the back-edge targets bci 8
+    //
+    // Locals: 0 = `int[] a` (ref), 1 = `int i`, 2 = `int sum`.
+    //
+    // Every assertion below is on the *pure* validator and on the pure
+    // post-exit resume decision. Neither enters compiled code: these fixtures
+    // carry OSR metadata over a bare `RET` body, and actually entering such a
+    // stub through the trampoline access-violates (see
+    // `test_osr_enter_refuses_dead_mask_under_the_kill_switch` for the history).
+
+    /// The loop-header bci used by every fixture in this group.
+    const OSR_T_HEADER: usize = 8;
+
+    /// An artifact that publishes exactly one OSR entry, at [`OSR_T_HEADER`],
+    /// with `num_locals` memory-homed locals and no deopt metadata (the
+    /// production shape: `deopt_points` is empty unless `CRATONVM_DEOPT_REAL`
+    /// was on at compile time).
+    fn osr_t_artifact(num_locals: usize) -> CompiledMethod {
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET — metadata-only fixture, never executed.
+        let mut cm = CompiledMethod::new(buf);
+        cm.method_label = "craton/probe/OsrEntry.sum([I)I".to_string();
+        let mut table = vec![-1i32; OSR_T_HEADER + 2];
+        table[OSR_T_HEADER] = 0;
+        cm.osr_pc_to_native = Some(table);
+        cm.osr_num_locals = num_locals;
+        cm.osr_local_assignments = Some(vec![None; num_locals]);
+        cm.osr_xmm_assignments = Some(vec![None; num_locals]);
+        cm
+    }
+
+    /// An `OsrExit`-tagged deopt point at `bci` — the loop-boundary snapshot
+    /// that doubles as the *entry* contract at the same bci.
+    fn osr_t_exit_point(
+        bci: u32,
+        locals: Vec<deopt::FrameValue>,
+        stack: Vec<deopt::FrameValue>,
+    ) -> deopt::DeoptimizationPoint {
+        deopt::DeoptimizationPoint {
+            native_offset: 0,
+            bci,
+            reason: deopt::DeoptReason::OsrExit,
+            action: deopt::DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: deopt::FrameState {
+                method_key: "craton/probe/OsrEntry.sum:([I)I".to_string(),
+                bci,
+                locals,
+                stack,
+                monitors: Vec::new(),
+                caller: None,
+            },
+        }
+    }
+
+    /// The interpreter tags for `[int[] a, int i, int sum]`.
+    const OSR_T_TAGS: [u8; 3] = [
+        cratonvm_types::VTAG_OBJECT,
+        cratonvm_types::VTAG_INT,
+        cratonvm_types::VTAG_INT,
+    ];
+
+    /// The refusal tag carried by a bailout, or `None` if it is not an OSR
+    /// refusal at all.
+    fn osr_t_tag(b: &bailout::Bailout) -> Option<&'static str> {
+        match &b.reason {
+            bailout::BailoutReason::UnsupportedShape(tag) => Some(*tag),
+            _ => None,
+        }
+    }
+
+    /// The taxonomy is a closed set with no duplicates, and every tag routes to
+    /// the `unsupported_shape` bailout counter (never a panic, never a bare
+    /// `None`).
+    #[test]
+    fn osr_refusal_taxonomy_is_closed_and_counted() {
+        let mut seen: Vec<&str> = Vec::new();
+        for tag in OSR_REFUSAL_TAGS {
+            assert!(!seen.contains(&tag), "duplicate OSR refusal tag {tag}");
+            assert!(
+                tag.starts_with("osr-entry-") || tag.starts_with("osr-exit-"),
+                "{tag} does not name its phase"
+            );
+            seen.push(tag);
+        }
+        let before = bailout::bailout_count("unsupported_shape").expect("registered category");
+        let b = osr_refusal(OSR_REFUSE_SLOT_TYPE, "probe");
+        assert_eq!(b.category(), "unsupported_shape");
+        assert!(b.to_string().contains(OSR_REFUSE_SLOT_TYPE), "{b}");
+        assert!(
+            bailout::bailout_count("unsupported_shape").unwrap() > before,
+            "every OSR refusal must be counted"
+        );
+        // Permanence splits the taxonomy: artifact-only answers may be memoed
+        // through `mark_osr_entry_rejected`; state-dependent ones may not.
+        assert!(osr_refusal_is_permanent(&osr_refusal(
+            OSR_REFUSE_PC_NOT_AN_ENTRY,
+            "probe"
+        )));
+        assert!(!osr_refusal_is_permanent(&osr_refusal(
+            OSR_REFUSE_SLOT_TYPE,
+            "probe"
+        )));
+    }
+
+    /// A long-running loop must request an OSR compile at its back-edge — and a
+    /// short one must not. The request has to name the loop header, because the
+    /// entry bci is what the compiled artifact publishes a native offset for.
+    #[test]
+    fn a_long_running_loop_requests_osr_at_the_backedge() {
+        use tiered::{CompilationPolicy, CompilationTier, MethodKey, TieredCompilationManager};
+        // A manager of our own, and a method key no other test names, so this
+        // shares no state with the process-global OSR deny list or the
+        // per-method tables (which is why it does NOT clear them: another
+        // test's manager may be mid-run).
+        let policy = CompilationPolicy {
+            osr_threshold: 64,
+            ..CompilationPolicy::default()
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = MethodKey::new("craton/probe/OsrEntry", "sum", "([I)I");
+        let bci = OSR_T_HEADER as u32;
+
+        for i in 0..63 {
+            assert!(
+                mgr.on_backedge(&key, bci).is_none(),
+                "back-edge {i} is below the OSR threshold and must not tier up"
+            );
+        }
+        let task = mgr
+            .on_backedge(&key, bci)
+            .expect("the 64th back-edge crosses osr_threshold and must request an OSR compile");
+        assert_eq!(
+            task.osr_bci,
+            Some(bci),
+            "the request must name the loop header, not the method entry"
+        );
+        assert_eq!(task.target_tier, CompilationTier::C2);
+        assert_eq!(task.method_key, key);
+        // The loop keeps running while the compile is queued; it must not
+        // enqueue a task per iteration.
+        assert!(
+            mgr.on_backedge(&key, bci).is_none(),
+            "an already-queued OSR request must not be re-enqueued"
+        );
+    }
+
+    /// The happy path, on the production artifact shape (no deopt metadata):
+    /// the plan's resume bci IS the entry bci, which is the interpreter's own
+    /// pc — so a refusal repeats no work.
+    #[test]
+    fn a_validated_osr_entry_resumes_at_the_interpreters_own_pc() {
+        let cm = osr_t_artifact(3);
+        let locals = [0x1234_5678i64, 200, 4950];
+        let state = OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS);
+
+        let plan = cm.validate_osr_entry(&state).expect("clean entry");
+        assert_eq!(plan.entry_pc, OSR_T_HEADER);
+        assert_eq!(
+            plan.resume_bci, state.pc,
+            "the fallback resume point must be the pc the interpreter is already at"
+        );
+        assert_eq!(plan.native_offset, 0);
+        assert_eq!(plan.contract, OsrContractSource::RegisterHomes);
+        assert_eq!(
+            plan.exit_policy,
+            OsrExitPolicy::PropagateOnly,
+            "an artifact with no deopt points has no frame-deopt exit to transfer through"
+        );
+        assert_eq!(plan.expected_locals.len(), 3);
+        assert!(plan
+            .expected_locals
+            .iter()
+            .all(|e| *e == OsrSlotExpectation::Unconstrained));
+
+        // A pc the artifact published no entry for is refused, not guessed at.
+        let at_body = OsrEntryState::at(5, &locals, &OSR_T_TAGS);
+        assert_eq!(
+            osr_t_tag(&cm.validate_osr_entry(&at_body).unwrap_err()),
+            Some(OSR_REFUSE_PC_NOT_AN_ENTRY)
+        );
+    }
+
+    /// A type mismatch in an incoming slot refuses with a named reason, under
+    /// both contract strengths.
+    ///
+    /// Inferred (register-home) contract: an XMM-homed local can only hold FP,
+    /// so an incoming `int` there would be seeded into an XMM register and read
+    /// back as a double — a silent miscompile, which is what this check exists
+    /// to turn into a refusal.
+    ///
+    /// Precise (`FrameState`) contract: the exact JVM type is known, so an
+    /// `int` offered where the compiled body reads a reference is caught even
+    /// though both are GPR-homed 64-bit words.
+    #[test]
+    fn an_incoming_slot_type_mismatch_refuses_with_a_named_reason() {
+        // --- inferred contract ---
+        let mut cm = osr_t_artifact(3);
+        // Local 2 is XMM-homed: the compiled body treats it as a double.
+        cm.osr_xmm_assignments = Some(vec![None, None, Some(3)]);
+        let locals = [0x1234_5678i64, 200, 4950];
+
+        let ok_tags = [
+            cratonvm_types::VTAG_OBJECT,
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_DOUBLE,
+        ];
+        assert!(cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &ok_tags))
+            .is_ok());
+
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("an int offered to an xmm-homed slot must be refused");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_SLOT_TYPE));
+        let msg = err.to_string();
+        assert!(msg.contains("local 2"), "{msg}");
+        assert!(msg.contains("xmm-homed"), "{msg}");
+        assert!(msg.contains("int"), "{msg}");
+
+        // --- precise contract ---
+        let mut cm = osr_t_artifact(3);
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            vec![
+                deopt::FrameValue::StackSlotRef(-16),
+                deopt::FrameValue::Register(0),
+                deopt::FrameValue::Register(1),
+            ],
+            Vec::new(),
+        )];
+        assert!(cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .is_ok());
+
+        let ref_as_int = [
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_INT,
+        ];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &ref_as_int))
+            .expect_err("an int offered where the body reads a reference must be refused");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_SLOT_TYPE));
+        assert!(err.to_string().contains("local 0"), "{err}");
+
+        // A `jsr` return address has no JIT representation at all.
+        let retaddr = [
+            cratonvm_types::VTAG_RETADDR,
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_INT,
+        ];
+        assert_eq!(
+            osr_t_tag(
+                &cm.validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &retaddr))
+                    .unwrap_err()
+            ),
+            Some(OSR_REFUSE_RETURNADDRESS)
+        );
+    }
+
+    /// An OSR entry whose contract contains a slot the compiled frame cannot
+    /// describe refuses — it never guesses a value.
+    ///
+    /// `MaterializationRequired` is the case that matters: it means an
+    /// optimization deleted a value that WAS live and left no rebuild recipe.
+    /// Reconstructing it as `Undefined`/zero would be a silent
+    /// wrong-reconstruction, which is precisely why that variant exists as a
+    /// separate marker from `Undefined`.
+    #[test]
+    fn an_undescribable_slot_refuses_the_osr_entry() {
+        let locals = [0x1234_5678i64, 200, 4950];
+
+        for (slot_value, what) in [
+            (
+                deopt::FrameValue::MaterializationRequired(deopt::EliminatedValue::allocation(
+                    17,
+                    42,
+                    deopt::EliminationCause::ScalarReplacedObject,
+                )),
+                "MaterializationRequired",
+            ),
+            (deopt::FrameValue::Unsupported, "Unsupported"),
+            (
+                deopt::FrameValue::VirtualObjectRef(0),
+                "VirtualObjectRef (needs a heap allocation to rebuild)",
+            ),
+        ] {
+            let mut cm = osr_t_artifact(3);
+            cm.deopt_points = vec![osr_t_exit_point(
+                OSR_T_HEADER as u32,
+                vec![
+                    slot_value,
+                    deopt::FrameValue::Register(0),
+                    deopt::FrameValue::Register(1),
+                ],
+                Vec::new(),
+            )];
+            let result = cm.validate_osr_entry(&OsrEntryState::at(
+                OSR_T_HEADER,
+                &locals,
+                &OSR_T_TAGS,
+            ));
+            let err = match result {
+                Ok(plan) => panic!("{what} must refuse the entry, got {plan:?}"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                osr_t_tag(&err),
+                Some(OSR_REFUSE_UNDESCRIBABLE_SLOT),
+                "{what} refused with the wrong reason: {err}"
+            );
+        }
+    }
+
+    /// The refusal names the offending slot, is permanent (so the caller may
+    /// memo it), and is distinct from the whole-artifact "some other exit is
+    /// unresumable" answer.
+    #[test]
+    fn an_undescribable_slot_names_the_slot_it_refused() {
+        let locals = [0x1234_5678i64, 200, 4950];
+        let mut cm = osr_t_artifact(3);
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            vec![
+                deopt::FrameValue::MaterializationRequired(deopt::EliminatedValue::allocation(
+                    17,
+                    42,
+                    deopt::EliminationCause::ScalarReplacedObject,
+                )),
+                deopt::FrameValue::Register(0),
+                deopt::FrameValue::Register(1),
+            ],
+            Vec::new(),
+        )];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("a MaterializationRequired slot in the entry contract must refuse");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_UNDESCRIBABLE_SLOT));
+        assert!(err.to_string().contains("local 0"), "{err}");
+        assert!(osr_refusal_is_permanent(&err));
+
+        // An unresumable slot at some OTHER deopt point is a different, still
+        // pre-entry, refusal: entering would commit iterations that the bail
+        // could then only discard.
+        let mut cm = osr_t_artifact(3);
+        cm.deopt_points = vec![
+            osr_t_exit_point(
+                OSR_T_HEADER as u32,
+                vec![
+                    deopt::FrameValue::StackSlotRef(-16),
+                    deopt::FrameValue::Register(0),
+                    deopt::FrameValue::Register(1),
+                ],
+                Vec::new(),
+            ),
+            osr_t_exit_point(5, vec![deopt::FrameValue::Unsupported], Vec::new()),
+        ];
+        let err = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("an unresumable exit anywhere in the body must refuse the entry");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_UNRESUMABLE_EXIT));
+    }
+
+    /// The trampoline seeds locals only, so a live operand stack is refused
+    /// rather than silently dropped — and an inlined scope, which
+    /// `FrameState::caller` still cannot describe, is refused too.
+    #[test]
+    fn unrepresentable_entry_shapes_are_refused() {
+        let cm = osr_t_artifact(3);
+        let locals = [0x1234_5678i64, 200, 4950];
+        let stack = [7i64];
+        let stack_tags = [cratonvm_types::VTAG_INT];
+        let with_stack = OsrEntryState {
+            pc: OSR_T_HEADER,
+            locals: &locals,
+            local_tags: &OSR_T_TAGS,
+            stack: &stack,
+            stack_tags: &stack_tags,
+        };
+        assert_eq!(
+            osr_t_tag(&cm.validate_osr_entry(&with_stack).unwrap_err()),
+            Some(OSR_REFUSE_OPERAND_STACK)
+        );
+
+        // Local count must match the compiled frame exactly.
+        let short = [0x1234_5678i64, 200];
+        assert_eq!(
+            osr_t_tag(
+                &cm.validate_osr_entry(&OsrEntryState::at(
+                    OSR_T_HEADER,
+                    &short,
+                    &OSR_T_TAGS[..2]
+                ))
+                .unwrap_err()
+            ),
+            Some(OSR_REFUSE_LOCAL_COUNT)
+        );
+
+        // Inlined scope: `FrameState::caller` is `None` at every producer, so an
+        // artifact that inlined something and can also take a frame-deopt exit
+        // cannot tell an outer-scope bail from one inside the callee.
+        let mut inlined = osr_t_artifact(3);
+        inlined.inlined_methods = vec![(
+            "craton/probe/OsrEntry".to_string(),
+            "helper".to_string(),
+            "(I)I".to_string(),
+        )];
+        inlined.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            vec![
+                deopt::FrameValue::StackSlotRef(-16),
+                deopt::FrameValue::Register(0),
+                deopt::FrameValue::Register(1),
+            ],
+            Vec::new(),
+        )];
+        let err = inlined
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect_err("an inlined region the deopt metadata cannot describe must refuse");
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_INLINED_SCOPE));
+        assert!(osr_refusal_is_permanent(&err));
+
+        // An artifact with an unconditional uncommon trap is never worth
+        // entering: it bails on every execution reaching that site.
+        let mut trapping = osr_t_artifact(3);
+        trapping.has_indy_trap = true;
+        assert_eq!(
+            osr_t_tag(
+                &trapping
+                    .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+                    .unwrap_err()
+            ),
+            Some(OSR_REFUSE_UNCONDITIONAL_TRAP)
+        );
+    }
+
+    /// Entry, then a forced deopt at the loop boundary: the resume lands on the
+    /// SAME bci the entry used, carrying the same local layout — with the
+    /// JIT-advanced values, not the pre-entry ones.
+    #[test]
+    fn a_forced_deopt_returns_to_the_same_bci_with_the_same_locals() {
+        let mut cm = osr_t_artifact(3);
+        let contract_locals = vec![
+            deopt::FrameValue::StackSlotRef(-16),
+            deopt::FrameValue::Register(0),
+            deopt::FrameValue::Register(1),
+        ];
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            contract_locals.clone(),
+            Vec::new(),
+        )];
+
+        let array = 0x1234_5678i64;
+        let entry_locals = [array, 200, 4950];
+        let plan = cm
+            .validate_osr_entry(&OsrEntryState::at(
+                OSR_T_HEADER,
+                &entry_locals,
+                &OSR_T_TAGS,
+            ))
+            .expect("clean entry");
+        assert_eq!(plan.contract, OsrContractSource::PreciseFrameState);
+        assert_eq!(
+            plan.exit_policy,
+            OsrExitPolicy::ExactTransfer,
+            "every exit of this artifact reconstructs a resumable frame"
+        );
+
+        // The forced deopt: the OSR'd body ran to the loop boundary again with
+        // i = 700, sum = 244_650, and reconstructed its frame there.
+        let rframe = deopt::ReconstructedFrame {
+            method_key: "craton/probe/OsrEntry.sum:([I)I".to_string(),
+            bci: OSR_T_HEADER as u32,
+            locals: vec![
+                deopt::FrameValue::Object(array as u64),
+                deopt::FrameValue::Int(700),
+                deopt::FrameValue::Int(244_650),
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        };
+        let resume = plan
+            .resume_after_exit(&cm, &rframe)
+            .expect("a loop-boundary exit must resume exactly");
+        assert_eq!(
+            resume, OSR_T_HEADER,
+            "the resume bci is the loop header the entry used"
+        );
+        assert_eq!(resume, plan.entry_pc);
+
+        // Same slot layout, same per-slot types as the entry contract…
+        assert_eq!(rframe.locals.len(), plan.expected_locals.len());
+        for (i, want) in contract_locals.iter().enumerate() {
+            assert_eq!(
+                OsrSlotType::from_frame_value(&rframe.locals[i]),
+                OsrSlotType::from_frame_value(want),
+                "local {i} changed JVM type across the OSR transition"
+            );
+        }
+        // …but the induction variable carries the JIT's advanced value.
+        assert_eq!(rframe.locals[1], deopt::FrameValue::Int(700));
+        assert_ne!(rframe.locals[1], deopt::FrameValue::Int(entry_locals[1] as i64));
+    }
+
+    /// No iteration executes twice across the transition.
+    ///
+    /// The recorded defect ("an OSR bail re-runs loop iterations") is: compiled
+    /// code commits N iterations, then bails, and the interpreter resumes at the
+    /// *entry* bci from its own stale locals — replaying all N. This test
+    /// executes the whole trip through the API and asserts every iteration index
+    /// is executed exactly once, in order.
+    ///
+    /// The structural guarantee behind it: `resume_bci` (== the entry bci) is
+    /// only reachable when `validate_osr_entry` FAILED, i.e. before compiled
+    /// code ran; after entry the only sanctioned resume point is
+    /// `resume_after_exit`, which returns the reconstructed frame's own bci or
+    /// refuses.
+    #[test]
+    fn no_iteration_executes_twice_across_the_osr_transition() {
+        const TRIP: usize = 1000;
+        let mut executed: Vec<usize> = Vec::with_capacity(TRIP);
+
+        let mut cm = osr_t_artifact(3);
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            vec![
+                deopt::FrameValue::StackSlotRef(-16),
+                deopt::FrameValue::Register(0),
+                deopt::FrameValue::Register(1),
+            ],
+            Vec::new(),
+        )];
+
+        // Phase 1 — interpreted warm-up. `i` is the interpreter's local 1.
+        let mut i = 0usize;
+        while i < 200 {
+            executed.push(i);
+            i += 1;
+        }
+
+        // A refused entry must leave the interpreter exactly where it was: it
+        // resumes at `resume_bci` == its own pc, having executed nothing. Model
+        // that with a deliberately mistyped slot.
+        let bad_tags = [
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_INT,
+            cratonvm_types::VTAG_INT,
+        ];
+        let locals = [0x1234_5678i64, i as i64, 0];
+        let refused = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &bad_tags))
+            .unwrap_err();
+        assert_eq!(osr_t_tag(&refused), Some(OSR_REFUSE_SLOT_TYPE));
+        assert_eq!(executed.len(), 200, "a refusal must execute nothing");
+
+        // Phase 2 — the entry actually validates.
+        let plan = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("clean entry");
+        assert_eq!(plan.resume_bci, OSR_T_HEADER);
+
+        // Phase 3 — compiled code runs iterations [200, 700) and is then forced
+        // to deopt at the loop boundary.
+        let jit_start = i;
+        while i < 700 {
+            executed.push(i);
+            i += 1;
+        }
+        assert!(i > jit_start, "the JIT must have committed real iterations");
+        let rframe = deopt::ReconstructedFrame {
+            method_key: "craton/probe/OsrEntry.sum:([I)I".to_string(),
+            bci: OSR_T_HEADER as u32,
+            locals: vec![
+                deopt::FrameValue::Object(0x1234_5678),
+                deopt::FrameValue::Int(i as i64),
+                deopt::FrameValue::Int(0),
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        };
+
+        // Phase 4 — the resume. The interpreter's induction variable comes from
+        // the RECONSTRUCTED frame, never from its own pre-entry copy.
+        let resume_bci = plan
+            .resume_after_exit(&cm, &rframe)
+            .expect("a loop-boundary exit must resume exactly");
+        assert_eq!(resume_bci, OSR_T_HEADER);
+        let resumed_i = match rframe.locals[1] {
+            deopt::FrameValue::Int(v) => v as usize,
+            ref other => panic!("induction variable came back as {other:?}"),
+        };
+        assert_eq!(
+            resumed_i, i,
+            "the resumed frame must carry the JIT's advanced counter, not the pre-entry one"
+        );
+        i = resumed_i;
+        while i < TRIP {
+            executed.push(i);
+            i += 1;
+        }
+
+        assert_eq!(
+            executed,
+            (0..TRIP).collect::<Vec<_>>(),
+            "every iteration must execute exactly once, in order"
+        );
+    }
+
+    /// A bail the artifact cannot describe must NOT hand back a resume point.
+    ///
+    /// This is the other half of the no-replay guarantee: when the frame is
+    /// unresumable the API refuses, so the caller has no sanctioned way to fall
+    /// back to the entry bci (which would replay every committed iteration).
+    #[test]
+    fn an_undescribable_exit_refuses_to_name_a_resume_point() {
+        let mut cm = osr_t_artifact(3);
+        cm.deopt_points = vec![osr_t_exit_point(
+            OSR_T_HEADER as u32,
+            vec![
+                deopt::FrameValue::StackSlotRef(-16),
+                deopt::FrameValue::Register(0),
+                deopt::FrameValue::Register(1),
+            ],
+            Vec::new(),
+        )];
+        let locals = [0x1234_5678i64, 200, 4950];
+        let plan = cm
+            .validate_osr_entry(&OsrEntryState::at(OSR_T_HEADER, &locals, &OSR_T_TAGS))
+            .expect("clean entry");
+
+        let base = deopt::ReconstructedFrame {
+            method_key: "craton/probe/OsrEntry.sum:([I)I".to_string(),
+            bci: OSR_T_HEADER as u32,
+            locals: vec![
+                deopt::FrameValue::Object(0x1234_5678),
+                deopt::FrameValue::Int(700),
+                deopt::FrameValue::Int(0),
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        };
+
+        // A deleted value in a local: the live frame's stale word is genuinely
+        // wrong, not merely unread, so it cannot be left in place.
+        let mut materialize = base.clone();
+        materialize.locals[1] = deopt::FrameValue::MaterializationRequired(
+            deopt::EliminatedValue::unknown(deopt::EliminationCause::EliminatedStore),
+        );
+        let err = plan.resume_after_exit(&cm, &materialize).unwrap_err();
+        assert_eq!(osr_t_tag(&err), Some(OSR_REFUSE_EXIT_REPLAY));
+        assert!(err.to_string().contains("local 1"), "{err}");
+
+        // `Unsupported` in a LOCAL is the documented exception: the whole-method
+        // kind classifier is coarse, the verifier guarantees such a slot is dead
+        // or re-stored before it is read, so the live frame's current value
+        // stands and the resume goes ahead.
+        let mut unsupported_local = base.clone();
+        unsupported_local.locals[2] = deopt::FrameValue::Unsupported;
+        assert_eq!(
+            plan.resume_after_exit(&cm, &unsupported_local).unwrap(),
+            OSR_T_HEADER
+        );
+
+        // `Unsupported` on the operand STACK has no such argument.
+        let mut unsupported_stack = base.clone();
+        unsupported_stack.stack = vec![deopt::FrameValue::Unsupported];
+        assert_eq!(
+            osr_t_tag(&plan.resume_after_exit(&cm, &unsupported_stack).unwrap_err()),
+            Some(OSR_REFUSE_EXIT_REPLAY)
+        );
+
+        // An inlined caller chain cannot be described at all.
+        let mut inlined = base.clone();
+        inlined.caller_frames = vec![base.clone()];
+        assert_eq!(
+            osr_t_tag(&plan.resume_after_exit(&cm, &inlined).unwrap_err()),
+            Some(OSR_REFUSE_INLINED_SCOPE)
+        );
+
+        // A bci this artifact never recorded a deopt point for is a mis-routed
+        // stash, not a resume point.
+        let mut stray = base.clone();
+        stray.bci = 5;
+        assert_eq!(
+            osr_t_tag(&plan.resume_after_exit(&cm, &stray).unwrap_err()),
+            Some(OSR_REFUSE_EXIT_REPLAY)
+        );
     }
 
     /// A crash handler must be able to tell "no compiled body covers this

@@ -124,7 +124,33 @@ struct VmSecurityState {
     shared_permissions: Option<(i32, ObjectRef)>,
 }
 
+/// Names one field of [`VmSecurityState`]. Accessors take this instead of a
+/// field-projecting closure so every read and write goes through the same
+/// VM-keyed lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Slot {
+    SecurityManager,
+    PolicyObject,
+    SharedPermissions,
+}
+
 impl VmSecurityState {
+    fn slot(&self, slot: Slot) -> Option<(i32, ObjectRef)> {
+        match slot {
+            Slot::SecurityManager => self.security_manager,
+            Slot::PolicyObject => self.policy_object,
+            Slot::SharedPermissions => self.shared_permissions,
+        }
+    }
+
+    fn set_slot(&mut self, slot: Slot, value: Option<(i32, ObjectRef)>) {
+        match slot {
+            Slot::SecurityManager => self.security_manager = value,
+            Slot::PolicyObject => self.policy_object = value,
+            Slot::SharedPermissions => self.shared_permissions = value,
+        }
+    }
+
     /// True once every slot is empty, so the VM's row can be dropped instead of
     /// kept as an all-`None` shell.
     fn is_empty(&self) -> bool {
@@ -187,33 +213,46 @@ fn with_security_state<R>(
 
 /// Read one slot of the CALLING VM's state. Another VM's slot is not
 /// addressable from here — the key comes from `ctx`, never from a caller.
-fn security_slot(
-    ctx: &dyn NativeContext,
-    pick: impl Fn(&VmSecurityState) -> Option<(i32, ObjectRef)>,
-) -> Option<(i32, ObjectRef)> {
+fn security_slot(ctx: &dyn NativeContext, slot: Slot) -> Option<(i32, ObjectRef)> {
     let vm = ctx.vm_identity();
-    with_security_state(|table| table.get(&vm).and_then(|state| pick(state)))
+    with_security_state(|table| table.get(&vm).and_then(|state| state.slot(slot)))
 }
 
 /// Store (or clear) one slot of the CALLING VM's state. Clearing the last
 /// occupied slot drops the VM's row entirely.
-fn set_security_slot(
-    ctx: &dyn NativeContext,
-    entry: Option<(i32, ObjectRef)>,
-    pick: impl Fn(&mut VmSecurityState) -> &mut Option<(i32, ObjectRef)>,
-) {
+fn set_security_slot(ctx: &dyn NativeContext, slot: Slot, entry: Option<(i32, ObjectRef)>) {
     let vm = ctx.vm_identity();
-    with_security_state(|table| match entry {
-        Some(_) => *pick(table.entry(vm).or_default()) = entry,
-        None => {
-            if let Some(state) = table.get_mut(&vm) {
-                *pick(state) = None;
-                if state.is_empty() {
-                    table.remove(&vm);
-                }
+    with_security_state(|table| {
+        if entry.is_some() {
+            table.entry(vm).or_default().set_slot(slot, entry);
+        } else if let Some(state) = table.get_mut(&vm) {
+            state.set_slot(slot, None);
+            if state.is_empty() {
+                table.remove(&vm);
             }
         }
     });
+}
+
+/// Publish `entry` into the calling VM's `slot` unless another thread got there
+/// first; return whichever entry is installed afterwards. Used by the two lazy
+/// initialisers, whose allocation deliberately happens before this call.
+fn publish_security_slot(
+    ctx: &dyn NativeContext,
+    slot: Slot,
+    entry: (i32, ObjectRef),
+) -> (i32, ObjectRef) {
+    let vm = ctx.vm_identity();
+    with_security_state(|table| {
+        let state = table.entry(vm).or_default();
+        match state.slot(slot) {
+            Some(existing) => existing,
+            None => {
+                state.set_slot(slot, Some(entry));
+                entry
+            }
+        }
+    })
 }
 
 /// Re-read the CURRENT address of a cached `(identity_key, ObjectRef)` pair.
@@ -289,6 +328,10 @@ pub fn gc_update_security_manager_refs(
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = pointer_map.get(&old_addr) {
                     debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    // SAFETY: `new_addr` is the post-move address the calling
+                    // collector just assigned to this very object, taken from
+                    // its own relocation map. Same construction as
+                    // `lang_math::gc_update_value_of_cache_refs`.
                     *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                 }
             }
@@ -335,7 +378,7 @@ pub(crate) fn security_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// The answer is scoped to `ctx`: another VM's manager is neither readable nor
 /// clearable from here, so one VM can no longer disarm another's gates.
 pub(crate) fn get_security_manager(ctx: &dyn NativeContext) -> Option<ObjectRef> {
-    let slot = security_slot(ctx, |state| state.security_manager)?;
+    let slot = security_slot(ctx, Slot::SecurityManager)?;
     // Re-read the CURRENT address (see `resolve_slot`).
     Some(resolve_slot(ctx, slot))
 }
@@ -344,7 +387,7 @@ fn set_security_manager(ctx: &mut dyn NativeContext, sm: Option<ObjectRef>) {
     // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
     // the identity key lets every later read re-read the current address.
     let entry = sm.map(|obj| root_for_cache(ctx, obj));
-    set_security_slot(&*ctx, entry, |state| &mut state.security_manager);
+    set_security_slot(&*ctx, Slot::SecurityManager, entry);
 }
 
 /// Override the calling VM's SecurityManager slot for tests. Lets unit tests
@@ -377,11 +420,11 @@ pub(crate) fn set_security_manager_for_test(
 
 // ---------------------------------------------------------------------------
 // T19_H9_ANCHOR_POLICY_SINGLETON
-// Global java.security.Policy singleton
+// Per-VM java.security.Policy singleton
 // ---------------------------------------------------------------------------
 //
 // Mirrors the layout of HotSpot's `Policy.policyInfo` static slot: a single
-// process-wide reference that `Policy.setPolicy(Policy)` writes to and
+// per-VM reference that `Policy.setPolicy(Policy)` writes to and
 // `Policy.getPolicy()` reads from. Real JDK 25 throws
 // `UnsupportedOperationException` from these entry points (JEP 411 sealing
 // the SecurityManager surface), but cratonvm's lenient model accepts the
@@ -389,11 +432,12 @@ pub(crate) fn set_security_manager_for_test(
 // WildFly, and EJBCA — which call `Policy.setPolicy(new ModulesPolicy())`
 // during boot — can proceed.
 //
-// Storage is a plain `Mutex<Option<...>>`, not `OnceLock`, because
-// the slot must be reassignable. `setPolicy(null)` clears the slot and the
+// Storage is a plain `Option<...>` slot in the VM's row, not a `OnceLock`,
+// because it must be reassignable. `setPolicy(null)` clears the slot and the
 // next `getPolicy()` call lazily re-creates the synthetic default — no
-// null-deref window can occur because the lazy init runs under the same
-// mutex that gates the read.
+// null-deref window can occur because publication of the lazy default is a
+// single atomic step under the state mutex (the ALLOCATION deliberately
+// happens outside it; see `ensure_default_policy_object`).
 //
 // The singleton is per-VM, and within one VM it is process-wide in the sense
 // the JDK means: a hostile caller from inside that JVM can read or overwrite
@@ -411,14 +455,14 @@ pub(crate) fn set_security_manager_for_test(
 /// the CURRENT (post-GC) address from the var-handle-root registry; contexts
 /// without a registry (mocks) fall back to the cached raw ref.
 fn get_policy_object(ctx: &dyn NativeContext) -> Option<ObjectRef> {
-    let slot = security_slot(ctx, |state| state.policy_object)?;
+    let slot = security_slot(ctx, Slot::PolicyObject)?;
     Some(resolve_slot(ctx, slot))
 }
 
 /// Cheap "is a Policy installed in this VM?" probe that does not touch object
 /// addresses (used by `Policy.isSet`, which only needs presence).
 fn policy_object_installed(ctx: &dyn NativeContext) -> bool {
-    security_slot(ctx, |state| state.policy_object).is_some()
+    security_slot(ctx, Slot::PolicyObject).is_some()
 }
 
 /// Store a new Java `Policy` reference for the calling VM (or clear with
@@ -428,7 +472,7 @@ fn policy_object_installed(ctx: &dyn NativeContext) -> bool {
 fn set_policy_object(ctx: &mut dyn NativeContext, p: Option<ObjectRef>) {
     // Keep alive + registry-remapped across GC moves (VarHandle-root pattern).
     let entry = p.map(|obj| root_for_cache(ctx, obj));
-    set_security_slot(&*ctx, entry, |state| &mut state.policy_object);
+    set_security_slot(&*ctx, Slot::PolicyObject, entry);
 }
 
 /// Lazily allocate the calling VM's synthetic default Policy, used when no
@@ -455,14 +499,7 @@ fn ensure_default_policy_object(ctx: &mut dyn NativeContext) -> ObjectRef {
     // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
     // key computed on the just-registered address, no allocation in between.
     let entry = root_for_cache(ctx, p);
-    let vm = ctx.vm_identity();
-    let winner = with_security_state(|table| {
-        *table
-            .entry(vm)
-            .or_default()
-            .policy_object
-            .get_or_insert(entry)
-    });
+    let winner = publish_security_slot(&*ctx, Slot::PolicyObject, entry);
     resolve_slot(&*ctx, winner)
 }
 
@@ -474,7 +511,7 @@ fn ensure_default_policy_object(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// Allocates outside the state lock for the same reason as
 /// [`ensure_default_policy_object`] — see the note there.
 fn ensure_shared_permission_collection(ctx: &mut dyn NativeContext) -> ObjectRef {
-    if let Some(slot) = security_slot(&*ctx, |state| state.shared_permissions) {
+    if let Some(slot) = security_slot(&*ctx, Slot::SharedPermissions) {
         return resolve_slot(&*ctx, slot);
     }
     let perms = build_permissive_collection(ctx);
@@ -483,14 +520,7 @@ fn ensure_shared_permission_collection(ctx: &mut dyn NativeContext) -> ObjectRef
     // The AllPermission entry in slot 0 stays live via normal heap tracing
     // from this root.
     let entry = root_for_cache(ctx, perms);
-    let vm = ctx.vm_identity();
-    let winner = with_security_state(|table| {
-        *table
-            .entry(vm)
-            .or_default()
-            .shared_permissions
-            .get_or_insert(entry)
-    });
+    let winner = publish_security_slot(&*ctx, Slot::SharedPermissions, entry);
     resolve_slot(&*ctx, winner)
 }
 
@@ -3220,7 +3250,7 @@ mod tests {
     // These tests cover the lenient `setPolicy`/`getPolicy` contract
     // documented in `register_policy_natives`. Each test grabs the
     // global `policy_test_lock` so it runs serial w.r.t. other tests
-    // that mutate `ACTIVE_POLICY_OBJECT` or the parsed `Policy` slot,
+    // that mutate the mock VM's Policy slot or the parsed `Policy` slot,
     // and clears state both at entry and exit so a panic in one test
     // doesn't leak singleton state into the next.
     // -----------------------------------------------------------------------
@@ -3708,6 +3738,236 @@ mod tests {
         assert!(set_sm(&mut ctx, &[Value::Object(None)]).is_ok());
 
         clear_policy_and_stack();
-        let _ = set_security_manager_for_test(None);
+        let _ = set_security_manager_for_test(&ctx, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-VM isolation of the SecurityManager / Policy state
+    // -----------------------------------------------------------------------
+    //
+    // Every `MockNativeContext` reports `vm_identity() == 0` by default, which
+    // is what the single-VM tests above exercise. These tests give each mock
+    // its own identity — the same thing `SharedVm::vm_identity` does for two
+    // real VMs in one process — so they are also parallel-safe and need no
+    // shared test lock: no other test can address these rows.
+
+    /// Distinct, unlikely-to-collide VM identities for the tests below.
+    const VM_A: usize = 0x0C2_0001;
+    const VM_B: usize = 0x0C2_0002;
+
+    /// Build a mock context that reports `vm` as its VM identity.
+    fn vm_scoped_ctx(vm: usize) -> MockNativeContext {
+        let ctx = MockNativeContext::new();
+        ctx.set_vm_identity(vm);
+        ctx
+    }
+
+    #[test]
+    fn two_vms_hold_independent_security_managers() {
+        let mut a = vm_scoped_ctx(VM_A);
+        let mut b = vm_scoped_ctx(VM_B);
+        let sm_a = alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0);
+        let sm_b = alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0);
+
+        // Installing in A must not be visible in B, and vice versa. Before the
+        // per-VM keying this read handed B the raw `sm_a` address — a pointer
+        // into a heap B's collector neither scans nor owns.
+        set_security_manager(&mut a, Some(sm_a));
+        assert_eq!(get_security_manager(&a), Some(sm_a));
+        assert!(
+            get_security_manager(&b).is_none(),
+            "VM B must not see VM A's SecurityManager"
+        );
+
+        set_security_manager(&mut b, Some(sm_b));
+        assert_eq!(get_security_manager(&a), Some(sm_a));
+        assert_eq!(get_security_manager(&b), Some(sm_b));
+
+        forget_vm_security_state(VM_A);
+        forget_vm_security_state(VM_B);
+    }
+
+    #[test]
+    fn clearing_one_vms_security_manager_leaves_the_other_armed() {
+        let mut a = vm_scoped_ctx(VM_A + 0x10);
+        let mut b = vm_scoped_ctx(VM_B + 0x10);
+        let sm_a = alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0);
+        let sm_b = alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0);
+        set_security_manager(&mut a, Some(sm_a));
+        set_security_manager(&mut b, Some(sm_b));
+
+        // This is the privilege-escalation-by-removal case: an unsandboxed VM
+        // calling `System.setSecurityManager(null)` used to write `None` to the
+        // shared slot and disarm the sandboxed VM's checkExec / loadLibrary
+        // gates. It must now clear only the caller's VM.
+        set_security_manager(&mut a, None);
+        assert!(get_security_manager(&a).is_none());
+        assert_eq!(
+            get_security_manager(&b),
+            Some(sm_b),
+            "clearing VM A's manager must leave VM B armed"
+        );
+
+        forget_vm_security_state(VM_A + 0x10);
+        forget_vm_security_state(VM_B + 0x10);
+    }
+
+    #[test]
+    fn policy_and_permission_slots_are_per_vm() {
+        let mut a = vm_scoped_ctx(VM_A + 0x20);
+        let mut b = vm_scoped_ctx(VM_B + 0x20);
+
+        let policy_a = alloc_concurrent_synthetic(&mut a, "java/security/Policy", 1);
+        set_policy_object(&mut a, Some(policy_a));
+        assert_eq!(get_policy_object(&a), Some(policy_a));
+        assert_eq!(get_policy_object(&b), None);
+        assert!(policy_object_installed(&a));
+        assert!(!policy_object_installed(&b));
+
+        // The lazy default and the shared Permissions collection are per-VM
+        // too: each VM gets its own, allocated from its own heap.
+        let default_b = ensure_default_policy_object(&mut b);
+        assert_eq!(get_policy_object(&a), Some(policy_a));
+        assert_eq!(get_policy_object(&b), Some(default_b));
+
+        let perms_a = ensure_shared_permission_collection(&mut a);
+        let perms_b = ensure_shared_permission_collection(&mut b);
+        assert_eq!(
+            ensure_shared_permission_collection(&mut a),
+            perms_a,
+            "identity of the shared collection must be stable within a VM"
+        );
+        assert_eq!(ensure_shared_permission_collection(&mut b), perms_b);
+
+        forget_vm_security_state(VM_A + 0x20);
+        forget_vm_security_state(VM_B + 0x20);
+    }
+
+    #[test]
+    fn security_manager_ref_is_scanned_and_remapped_per_vm() {
+        let vm_a = VM_A + 0x30;
+        let vm_b = VM_B + 0x30;
+        let mut a = vm_scoped_ctx(vm_a);
+        let mut b = vm_scoped_ctx(vm_b);
+
+        let sm_a = alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0);
+        let policy_a = alloc_concurrent_synthetic(&mut a, "java/security/Policy", 1);
+        let sm_b = alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0);
+        set_security_manager(&mut a, Some(sm_a));
+        set_policy_object(&mut a, Some(policy_a));
+        set_security_manager(&mut b, Some(sm_b));
+
+        // Scan: the collector must be told about the refs this module holds,
+        // and ONLY about the ones belonging to the VM it is collecting.
+        let mut roots = Vec::new();
+        gc_scan_security_manager_roots(vm_a, &mut roots);
+        assert!(roots.contains(&sm_a), "the installed SM must be a root");
+        assert!(roots.contains(&policy_a), "the Policy object must be a root");
+        assert!(
+            !roots.contains(&sm_b),
+            "VM A's scan must not report VM B's objects"
+        );
+
+        // Remap: stand in for a moving collection that relocated `sm_a` onto a
+        // second, genuinely-allocated object's address. An empty map is a
+        // no-op (the non-moving sweep).
+        let relocated = alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0);
+        gc_update_security_manager_refs(vm_a, &std::collections::HashMap::new());
+        assert_eq!(get_security_manager(&a), Some(sm_a));
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(sm_a.as_ptr() as usize, relocated.as_ptr() as usize);
+        gc_update_security_manager_refs(vm_a, &map);
+        assert_eq!(
+            get_security_manager(&a),
+            Some(relocated),
+            "the cached copy must follow the object, not stay on the vacated slot"
+        );
+        assert_eq!(
+            get_policy_object(&a),
+            Some(policy_a),
+            "an object the collector did not move must be left alone"
+        );
+        assert_eq!(
+            get_security_manager(&b),
+            Some(sm_b),
+            "VM A's remap must not touch VM B's slots"
+        );
+
+        forget_vm_security_state(vm_a);
+        forget_vm_security_state(vm_b);
+    }
+
+    #[test]
+    fn vm_teardown_does_not_disturb_the_other_vm() {
+        let vm_a = VM_A + 0x40;
+        let vm_b = VM_B + 0x40;
+        let mut a = vm_scoped_ctx(vm_a);
+        let mut b = vm_scoped_ctx(vm_b);
+        let sm_a = alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0);
+        let sm_b = alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0);
+        let perms_b = ensure_shared_permission_collection(&mut b);
+        set_security_manager(&mut a, Some(sm_a));
+        set_security_manager(&mut b, Some(sm_b));
+
+        forget_vm_security_state(vm_a);
+
+        assert!(
+            get_security_manager(&a).is_none(),
+            "teardown must drop the torn-down VM's slots"
+        );
+        let mut roots_a = Vec::new();
+        gc_scan_security_manager_roots(vm_a, &mut roots_a);
+        assert!(
+            roots_a.is_empty(),
+            "a torn-down VM must report no roots (its heap is gone)"
+        );
+
+        assert_eq!(get_security_manager(&b), Some(sm_b));
+        assert_eq!(ensure_shared_permission_collection(&mut b), perms_b);
+        let mut roots_b = Vec::new();
+        gc_scan_security_manager_roots(vm_b, &mut roots_b);
+        assert!(roots_b.contains(&sm_b));
+        assert!(roots_b.contains(&perms_b));
+
+        forget_vm_security_state(vm_b);
+    }
+
+    #[test]
+    fn single_vm_behaviour_is_unchanged() {
+        // One VM sees exactly the old semantics: install / read back / clear,
+        // a stable lazy default Policy, a stable shared Permissions collection,
+        // and `isSet` following the Policy slot.
+        let vm = VM_A + 0x50;
+        let mut ctx = vm_scoped_ctx(vm);
+
+        assert!(get_security_manager(&ctx).is_none());
+        let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
+        set_security_manager(&mut ctx, Some(sm));
+        assert_eq!(get_security_manager(&ctx), Some(sm));
+        set_security_manager(&mut ctx, None);
+        assert!(get_security_manager(&ctx).is_none());
+
+        assert!(!policy_object_installed(&ctx));
+        let default_policy = ensure_default_policy_object(&mut ctx);
+        assert_eq!(
+            ensure_default_policy_object(&mut ctx),
+            default_policy,
+            "the lazy default must be allocated exactly once per VM"
+        );
+        assert!(policy_object_installed(&ctx));
+        assert_eq!(get_policy_object(&ctx), Some(default_policy));
+
+        let installed = alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1);
+        set_policy_object(&mut ctx, Some(installed));
+        assert_eq!(get_policy_object(&ctx), Some(installed));
+        set_policy_object(&mut ctx, None);
+        assert_eq!(get_policy_object(&ctx), None);
+        assert!(!policy_object_installed(&ctx));
+
+        let perms = ensure_shared_permission_collection(&mut ctx);
+        assert_eq!(ensure_shared_permission_collection(&mut ctx), perms);
+
+        forget_vm_security_state(vm);
     }
 }

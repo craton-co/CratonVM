@@ -6,6 +6,12 @@
 //! Moved verbatim out of `x64.rs`'s `SIMD loop analysis and vectorization`
 //! section. Lint levels declared at the parent module level (including
 //! its no-panic `deny` gate, where it has one) are inherited here.
+//!
+//! The bytecode pattern detectors below are the *historical* layer: each one
+//! recognizes a single hand-written shape and hands it to a hand-written
+//! emitter. [`vector_gate`] is the replacement discipline — a general
+//! admission gate that proves a loop *could* be vectorized, or names why not.
+//! It emits nothing; see its module doc for what an emitter still owes.
 
 use super::*;
 
@@ -832,4 +838,1214 @@ pub(crate) fn detect_loop_unswitch_candidates(
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// P2 — vectorization admission gate
+// ---------------------------------------------------------------------------
+
+/// Decides whether a counted loop *could* be vectorized — and emits nothing.
+///
+/// The deep-research report's P2 is an ordering claim, not a feature request:
+/// *"Vector work before alias, range, alignment, safepoint, and deopt metadata
+/// are sound will multiply wrong-code risk."* Those four dependencies now
+/// exist, so what this module adds is the thing that consumes them and says
+/// **no** — a gate, with a refusal taxonomy and a proof for every admission.
+///
+/// # What this module is not
+///
+/// There is no vector emitter here and nothing turns one on. Every admitted
+/// loop comes back as a [`VecPlan`]: a lane count, a tail plan, an alignment
+/// verdict, an overflow model, and a list of [`PreheaderGuard`]s that a future
+/// emitter **must** discharge. A consumer that cannot emit one of those guards
+/// has to treat the whole plan as refused — a partially-emitted guard set
+/// proves nothing, exactly as in [`crate::scev`].
+///
+/// # Where the facts come from
+///
+/// Nothing here re-derives a fact another pass already proves:
+///
+/// * **Stride, trip count, index range, overflow** — [`crate::scev`]. The
+///   [`CountedLoop`] is asked for [`CountedLoop::index_span`],
+///   [`CountedLoop::prove_index_in_bounds_of`] and
+///   [`CountedLoop::trip_count`]; its [`OverflowModel`] is copied into the
+///   plan rather than re-argued. A hand-rolled range check here would be the
+///   duplicated-proof failure the report's ordering exists to prevent.
+/// * **Aliasing** — [`Graph::may_alias`] over [`AliasClass`]. The dependence
+///   test asks the IR memory model whether two accesses *can* overlap and only
+///   then computes a distance from the affine subscripts. It never decides
+///   disjointness on its own.
+/// * **Vector width** — [`crate::x64::cpu_features`], through
+///   [`VectorIsa::detect`]. No width is ever assumed.
+///
+/// # The legality rule
+///
+/// The only transform this gate reasons about is **body widening**: iterations
+/// `b .. b+VF` run as one pass in which each scalar operation becomes one
+/// whole-vector operation, in the original program order. Everything below is
+/// stated against that transform and nothing else.
+///
+/// For a pair of memory accesses `E` (earlier in program order) and `L`
+/// (later), let `d` be the number of iterations such that `L` at iteration
+/// `k + d` touches what `E` touches at iteration `k`:
+///
+/// | `d` | preserved by widening? |
+/// |---|---|
+/// | no integer solution | there is no dependence at all |
+/// | `d == 0` | yes — within one vector pass `E`'s op still precedes `L`'s |
+/// | `d > 0` | yes, at **any** lane count — program order and iteration order agree |
+/// | `d < 0` | only when `VF <= |d|`; otherwise widening inverts the two |
+/// | unknown | no — refuse |
+///
+/// The `d < 0` row is the one that matters and it is why the distance is kept
+/// *signed* rather than collapsed into a flow/anti/output classification. An
+/// anti-dependence is not automatically safe and a flow dependence is not
+/// automatically fatal: `a[i] = a[i+1]` (a distance-1 anti-dependence) widens
+/// correctly because the whole vector load precedes the whole vector store,
+/// while `a[i-1] = x; y = a[i];` (also distance 1, also an anti-dependence)
+/// does not, because there the store is the earlier op. The kind is reported
+/// for diagnostics; the sign decides.
+///
+/// # Floating point
+///
+/// Reassociating `float`/`double` addition is **not** value-preserving, so a
+/// floating-point reduction is refused unless the caller passes
+/// [`FpRelaxation::AllowReassociation`]. The default is
+/// [`FpRelaxation::Strict`]. Three further FP facts are encoded rather than
+/// assumed:
+///
+/// * *Element-wise* FP arithmetic is admitted even under `Strict`. IEEE-754
+///   add/sub/mul/div are defined per operand pair; a lane computes exactly the
+///   scalar result, including NaN payload propagation and signed zeros. There
+///   is no reassociation because there is no accumulator.
+/// * FP `min`/`max` are refused **unconditionally**. `Math.min`/`Math.max` on
+///   `double` order `-0.0` below `+0.0` and return NaN if either operand is
+///   NaN; `MINPD`/`MAXPD` return the *second* operand for both of those cases.
+///   The relaxation flag does not cover this — it is a wrong answer, not a
+///   reordering.
+/// * Integer reduction *is* admitted under `Strict`. JVM `int`/`long`
+///   arithmetic is modular two's-complement, so `+`, `*`, `&`, `|`, `^` are
+///   associative and commutative over the whole domain: reassociating them is
+///   exact, and `PADDD`/`PMULLD` wrap identically to `iadd`/`imul`.
+///
+/// Integer `/` and `%` are refused: they trap per element
+/// (`ArithmeticException` on a zero divisor, and `Integer.MIN_VALUE / -1`
+/// overflows), which a lane cannot express.
+///
+/// # Hard refusals
+///
+/// Safepoints, deopt points, GC references, irreducible control flow,
+/// unprovable alignment on an ISA that requires it, and float reassociation
+/// are refusals with no lane count that rescues them. See [`VecRefusal`].
+pub mod vector_gate {
+    #![allow(dead_code)]
+
+    use crate::ir::{AliasClass, Graph, MemEffect, MemKind, NodeId, NO_NODE};
+    use crate::scev::{
+        BoundsProof, CountedLoop, IndexExpr, IntRange, OverflowModel, PreheaderGuard, RangeEnv,
+        RefusalReason, TripCount,
+    };
+    use cratonvm_types::{element_byte_size, ArrayElementType, HEADER_SIZE};
+
+    // -- element widths ----------------------------------------------------
+
+    /// The width in bytes of one array element of `kind`.
+    ///
+    /// Deferred to `cratonvm_types::element_byte_size` so a layout change
+    /// cannot leave a second table here to drift. Array elements in this VM
+    /// are natural-width and contiguous from `HEADER_SIZE`, which is what
+    /// makes a lane-per-element vector access meaningful at all.
+    pub(crate) fn elem_bytes(kind: MemKind) -> usize {
+        element_byte_size(match kind {
+            MemKind::Int => ArrayElementType::Int,
+            MemKind::Long => ArrayElementType::Long,
+            MemKind::Float => ArrayElementType::Float,
+            MemKind::Double => ArrayElementType::Double,
+            MemKind::Byte => ArrayElementType::Byte,
+            MemKind::Char => ArrayElementType::Char,
+            MemKind::Short => ArrayElementType::Short,
+            MemKind::Ref => ArrayElementType::Reference,
+        })
+    }
+
+    /// True for the two IEEE-754 element types.
+    pub(crate) fn is_float(kind: MemKind) -> bool {
+        matches!(kind, MemKind::Float | MemKind::Double)
+    }
+
+    // -- the target ---------------------------------------------------------
+
+    /// Whether the ISA's vector moves tolerate an unaligned address.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AlignmentPolicy {
+        /// Unaligned vector moves exist and are architecturally correct
+        /// (x86 `MOVDQU`/`VMOVDQU`, AArch64 `LDR q`). Alignment is then a
+        /// *performance* fact and never a correctness one.
+        UnalignedOk,
+        /// Every vector access must be naturally aligned to the vector width.
+        /// Unprovable alignment is a refusal, not a slower encoding.
+        NaturalRequired,
+    }
+
+    /// What the target actually supports. Never inferred from the host at a
+    /// call site — obtained from [`VectorIsa::detect`] or named explicitly.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct VectorIsa {
+        /// Diagnostic name.
+        pub name: &'static str,
+        /// Vector register width in bytes.
+        pub width_bytes: usize,
+        /// Whether unaligned vector moves are legal.
+        pub alignment: AlignmentPolicy,
+        /// Whether 32-bit integer multiply and min/max exist lane-wise
+        /// (`PMULLD` / `PMINSD` / `PMAXSD` — SSE4.1 on x86, architectural on
+        /// NEON). SSE2 alone has neither.
+        pub int32_mul_minmax: bool,
+        /// Whether the ISA can mask a partial vector, making a remainder loop
+        /// unnecessary. No ISA modelled here can (that is AVX-512 `k`
+        /// registers, which `cpu_features` does not detect).
+        pub masked_tail: bool,
+    }
+
+    impl VectorIsa {
+        /// SSE2 — architectural on every x86-64 CPU. 128-bit, unaligned moves
+        /// legal, no 32-bit integer multiply.
+        pub(crate) const fn sse2() -> VectorIsa {
+            VectorIsa {
+                name: "sse2",
+                width_bytes: 16,
+                alignment: AlignmentPolicy::UnalignedOk,
+                int32_mul_minmax: false,
+                masked_tail: false,
+            }
+        }
+
+        /// SSE4.1 — SSE2 plus `PMULLD`/`PMINSD`/`PMAXSD`.
+        pub(crate) const fn sse41() -> VectorIsa {
+            VectorIsa {
+                name: "sse4.1",
+                int32_mul_minmax: true,
+                ..VectorIsa::sse2()
+            }
+        }
+
+        /// AVX2 — 256-bit integer and FP lanes.
+        pub(crate) const fn avx2() -> VectorIsa {
+            VectorIsa {
+                name: "avx2",
+                width_bytes: 32,
+                int32_mul_minmax: true,
+                ..VectorIsa::sse2()
+            }
+        }
+
+        /// AArch64 NEON — 128-bit, architectural, unaligned moves legal.
+        pub(crate) const fn neon128() -> VectorIsa {
+            VectorIsa {
+                name: "neon128",
+                width_bytes: 16,
+                alignment: AlignmentPolicy::UnalignedOk,
+                int32_mul_minmax: true,
+                masked_tail: false,
+            }
+        }
+
+        /// A 128-bit ISA whose vector moves *must* be naturally aligned.
+        ///
+        /// No target this JIT emits for is one. It exists so the
+        /// alignment refusal has a target that exercises it, rather than being
+        /// an untested branch waiting for the first strict backend.
+        pub(crate) const fn strict_align128() -> VectorIsa {
+            VectorIsa {
+                name: "strict-align128",
+                alignment: AlignmentPolicy::NaturalRequired,
+                ..VectorIsa::sse2()
+            }
+        }
+
+        /// The widest ISA the host actually supports, or `None` when the
+        /// target architecture has no modelled vector unit.
+        ///
+        /// `cfg!` rather than `#[cfg]` so both arms typecheck everywhere; the
+        /// `cpu_features` queries already answer `false` off x86-64.
+        pub(crate) fn detect() -> Option<VectorIsa> {
+            if cfg!(target_arch = "x86_64") {
+                if crate::x64::has_avx2() {
+                    Some(VectorIsa::avx2())
+                } else if crate::x64::has_sse41() {
+                    Some(VectorIsa::sse41())
+                } else {
+                    Some(VectorIsa::sse2())
+                }
+            } else if cfg!(target_arch = "aarch64") {
+                Some(VectorIsa::neon128())
+            } else {
+                None
+            }
+        }
+
+        /// How many `elem`-typed lanes fit in one vector register.
+        pub(crate) fn lanes_for(self, elem: MemKind) -> usize {
+            let size = elem_bytes(elem);
+            if size == 0 {
+                0
+            } else {
+                self.width_bytes / size
+            }
+        }
+    }
+
+    // -- alignment ----------------------------------------------------------
+
+    /// The alignment verdict for a loop's vector accesses.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Alignment {
+        /// Every vector access starts on a boundary of this many bytes.
+        Proven(usize),
+        /// Not proven. Correct only under [`AlignmentPolicy::UnalignedOk`].
+        Unknown,
+    }
+
+    /// The alignment the allocator provably gives every object base.
+    ///
+    /// `types/src/heap_types.rs` pins the TLAB bump grid at 8 bytes
+    /// (`HEADER_SIZE % 8 == 0`, asserted at compile time) and nothing pins it
+    /// higher. `HEADER_SIZE` is 32, so element 0 of an array sits 32 bytes past
+    /// a base that is only 8-byte aligned: **16-byte alignment of an array's
+    /// element 0 is not provable today**, and neither is 32-byte. That is why
+    /// every x86 plan this gate admits comes back
+    /// [`Alignment::Unknown`] — which is harmless on x86 (`MOVDQU`) and would
+    /// be a hard refusal on a strict-alignment target.
+    pub(crate) const PROVEN_OBJECT_ALIGNMENT: usize = 8;
+
+    /// Whether a vector access starting at `first_index` is `width_bytes`
+    /// aligned.
+    ///
+    /// `first_index` is `None` when the first accessed element is not a
+    /// compile-time constant, which is itself an unprovable alignment — the
+    /// answer is the refusing one, never an assumption.
+    pub(crate) fn analyze_alignment(
+        elem: MemKind,
+        first_index: Option<i64>,
+        base_alignment: usize,
+        width_bytes: usize,
+    ) -> Alignment {
+        if width_bytes == 0 || base_alignment < width_bytes {
+            return Alignment::Unknown;
+        }
+        let first = match first_index {
+            Some(f) => f,
+            None => return Alignment::Unknown,
+        };
+        let byte_offset = match first
+            .checked_mul(elem_bytes(elem) as i64)
+            .and_then(|b| b.checked_add(HEADER_SIZE as i64))
+        {
+            Some(b) if b >= 0 => b,
+            _ => return Alignment::Unknown,
+        };
+        if byte_offset % width_bytes as i64 == 0 {
+            Alignment::Proven(width_bytes)
+        } else {
+            Alignment::Unknown
+        }
+    }
+
+    // -- the dependence test ------------------------------------------------
+
+    /// Whether an access reads or writes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AccessKind {
+        /// A load.
+        Read,
+        /// A store.
+        Write,
+    }
+
+    /// One memory access in the loop body, reduced to the four facts the
+    /// dependence test needs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct VecAccess {
+        /// The IR node, for diagnostics and for [`Graph::may_reorder`].
+        pub node: NodeId,
+        /// Where it touches memory, as the IR memory model classifies it.
+        pub class: AliasClass,
+        /// Read or write.
+        pub kind: AccessKind,
+        /// Element type.
+        pub elem: MemKind,
+        /// The subscript as an affine function of the loop's IV.
+        pub index: IndexExpr,
+    }
+
+    impl VecAccess {
+        /// The `(reads, writes)` pair this access contributes, in the shape
+        /// [`Graph::may_alias`] consumes.
+        fn split(&self) -> (AliasClass, AliasClass) {
+            match self.kind {
+                AccessKind::Read => (self.class, AliasClass::None),
+                AccessKind::Write => (AliasClass::None, self.class),
+            }
+        }
+    }
+
+    /// The classification of a dependence, in *execution* order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DepKind {
+        /// Write then read — a true dependence.
+        Flow,
+        /// Read then write.
+        Anti,
+        /// Write then write.
+        Output,
+    }
+
+    impl DepKind {
+        /// The kind seen with the two accesses swapped.
+        fn reversed(self) -> DepKind {
+            match self {
+                DepKind::Flow => DepKind::Anti,
+                DepKind::Anti => DepKind::Flow,
+                DepKind::Output => DepKind::Output,
+            }
+        }
+    }
+
+    /// How far apart in the iteration space the two ends of a dependence are,
+    /// **relative to program order**. See the module doc's legality table.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DepDistance {
+        /// Distance zero: both ends are the same iteration. Widening keeps the
+        /// program order inside one vector pass, so this never caps the lane
+        /// count.
+        Same,
+        /// The sink is `k` iterations after the source, *and* the source is
+        /// also the earlier of the two in program order. Iteration order and
+        /// program order agree, so widening preserves it at any lane count.
+        Forward(u64),
+        /// The dependence runs against program order: the later-in-program
+        /// access at iteration `n` conflicts with the earlier-in-program access
+        /// at iteration `n + k`. Widening inverts the two unless the lane count
+        /// is at most `k`.
+        Backward(u64),
+        /// The accesses may overlap and no distance could be computed — a
+        /// runtime-aliased pair, a mismatched scale, or a non-unit step.
+        Unknown,
+    }
+
+    /// One dependence between two accesses in the loop body.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Dependence {
+        /// The access that runs first.
+        pub source: NodeId,
+        /// The access that observes it.
+        pub sink: NodeId,
+        /// Flow / anti / output, for diagnostics.
+        pub kind: DepKind,
+        /// The signed distance, which is what decides legality.
+        pub distance: DepDistance,
+    }
+
+    /// The dependence between two body accesses given in **program order**.
+    ///
+    /// `None` means there is provably no dependence: either the memory model
+    /// says the two locations cannot overlap ([`Graph::may_alias`]), or the
+    /// affine subscripts admit no integer iteration pair that makes them equal.
+    ///
+    /// The aliasing question is asked *first* and asked of the IR model. A
+    /// distance is only computed once the two accesses are known to share one
+    /// base node, because a distance between two references that merely *might*
+    /// be the same array is meaningless — that case answers
+    /// [`DepDistance::Unknown`], which the gate refuses.
+    pub(crate) fn dependence_between(
+        graph: &Graph,
+        earlier: &VecAccess,
+        later: &VecAccess,
+        stride: i32,
+    ) -> Option<Dependence> {
+        let (earlier_reads, earlier_writes) = earlier.split();
+        let (later_reads, later_writes) = later.split();
+        let conflicts = graph.may_alias(earlier_writes, later_reads)
+            || graph.may_alias(earlier_reads, later_writes)
+            || graph.may_alias(earlier_writes, later_writes);
+        if !conflicts {
+            return None;
+        }
+
+        let kind = match (earlier.kind, later.kind) {
+            (AccessKind::Write, AccessKind::Read) => DepKind::Flow,
+            (AccessKind::Read, AccessKind::Write) => DepKind::Anti,
+            (AccessKind::Write, AccessKind::Write) => DepKind::Output,
+            // A read/read pair never constrains anything, whatever it aliases.
+            (AccessKind::Read, AccessKind::Read) => return None,
+        };
+        let unknown = Dependence {
+            source: earlier.node,
+            sink: later.node,
+            kind,
+            distance: DepDistance::Unknown,
+        };
+
+        // A distance is only meaningful between two accesses to the *same*
+        // object. `may_alias` answering "maybe" over two different base nodes
+        // is precisely the runtime-alias case, and it has no distance.
+        let same_base = match (earlier.class.base(), later.class.base()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        if !same_base
+            || earlier.index.iv_local != later.index.iv_local
+            || earlier.index.scale != later.index.scale
+            || elem_bytes(earlier.elem) != elem_bytes(later.elem)
+        {
+            return Some(unknown);
+        }
+
+        // Address of `access` at iteration `k` is
+        // `scale * (init + stride * k) + offset`, so successive iterations
+        // advance it by `scale * stride` elements and the two accesses sit
+        // `later.offset - earlier.offset` elements apart within one iteration.
+        let step = match (earlier.index.scale as i64).checked_mul(stride as i64) {
+            Some(0) | None => return Some(unknown),
+            Some(s) => s,
+        };
+        let delta = later.index.offset as i64 - earlier.index.offset as i64;
+        if delta % step != 0 {
+            // No integer iteration pair makes the two addresses equal.
+            return None;
+        }
+        let d = -(delta / step);
+
+        Some(if d == 0 {
+            Dependence {
+                source: earlier.node,
+                sink: later.node,
+                kind,
+                distance: DepDistance::Same,
+            }
+        } else if d > 0 {
+            Dependence {
+                source: earlier.node,
+                sink: later.node,
+                kind,
+                distance: DepDistance::Forward(d.unsigned_abs()),
+            }
+        } else {
+            // The conflicting execution order is `later` at the earlier
+            // iteration, then `earlier` at the later one — so the roles and
+            // the kind both flip.
+            Dependence {
+                source: later.node,
+                sink: earlier.node,
+                kind: kind.reversed(),
+                distance: DepDistance::Backward(d.unsigned_abs()),
+            }
+        })
+    }
+
+    // -- the loop body ------------------------------------------------------
+
+    /// One node of the loop body, as the gate needs to see it.
+    ///
+    /// `effect` is what [`Graph::memory_effect`] answers for the node — the
+    /// gate never re-derives it. `elem` and `index` decorate an array access
+    /// with the two facts the IR memory model does not carry: the element type
+    /// (the alias class knows *which* array, not what is in it) and the
+    /// subscript as an affine function of the loop's induction variable.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct VecBodyOp {
+        /// The IR node.
+        pub node: NodeId,
+        /// Its memory effect, ordering, safepoint-ness and allocation-ness.
+        pub effect: MemEffect,
+        /// Element type, for an array access.
+        pub elem: Option<MemKind>,
+        /// Subscript, for an array access.
+        pub index: Option<IndexExpr>,
+        /// This node can deoptimize: a speculative guard, an implicit-exception
+        /// check that rebuilds an interpreter frame, an uncommon trap.
+        pub deopts: bool,
+    }
+
+    impl VecBodyOp {
+        /// A body node that touches no memory and cannot trap.
+        pub(crate) fn pure(node: NodeId) -> VecBodyOp {
+            VecBodyOp {
+                node,
+                effect: MemEffect::NONE,
+                elem: None,
+                index: None,
+                deopts: false,
+            }
+        }
+
+        /// An array element access.
+        pub(crate) fn array(
+            node: NodeId,
+            class: AliasClass,
+            kind: AccessKind,
+            elem: MemKind,
+            index: IndexExpr,
+        ) -> VecBodyOp {
+            VecBodyOp {
+                node,
+                effect: match kind {
+                    AccessKind::Read => MemEffect::read(class),
+                    AccessKind::Write => MemEffect::write(class),
+                },
+                elem: Some(elem),
+                index: Some(index),
+                deopts: false,
+            }
+        }
+    }
+
+    /// A lane-wise arithmetic operation the body performs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum VecOp {
+        /// `iadd` / `ladd` / `fadd` / `dadd`.
+        Add,
+        /// `isub` and friends.
+        Sub,
+        /// `imul` and friends.
+        Mul,
+        /// `idiv` / `fdiv` and friends.
+        Div,
+        /// `irem` / `frem` and friends.
+        Rem,
+        /// `iand` / `land`.
+        And,
+        /// `ior` / `lor`.
+        Or,
+        /// `ixor` / `lxor`.
+        Xor,
+        /// `Math.min`.
+        Min,
+        /// `Math.max`.
+        Max,
+        /// `ineg` and friends.
+        Neg,
+    }
+
+    /// One arithmetic operation in the loop body.
+    ///
+    /// The producer must list **every** arithmetic node, not only the ones it
+    /// believes are vectorizable: an operation this vocabulary cannot name is
+    /// an operation the gate cannot clear, and an omitted one is a silent
+    /// admission. [`VecOp`] therefore includes `Div`/`Rem`, which exist only to
+    /// be refused for integers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct VecArith {
+        /// The IR node.
+        pub node: NodeId,
+        /// The type the operation works on.
+        pub elem: MemKind,
+        /// Which operation.
+        pub op: VecOp,
+        /// True when the loop carries this operation's accumulator across
+        /// iterations. Vectorizing a reduction means **reassociating** it, and
+        /// for `float`/`double` that is not value-preserving.
+        pub reduction: bool,
+    }
+
+    /// Whether the caller permits floating-point reassociation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum FpRelaxation {
+        /// Refuse any transform that changes an FP result. The default, and
+        /// the only setting that matches Java's `strictfp`-by-default
+        /// arithmetic.
+        Strict,
+        /// The caller has taken responsibility for a different FP result.
+        /// Admits FP reductions; does **not** admit FP `min`/`max`, which is a
+        /// wrong answer rather than a reordered one.
+        AllowReassociation,
+    }
+
+    /// Everything the gate is asked to decide about.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct VecCandidate<'a> {
+        /// The loop, with its induction variable, limit and overflow model
+        /// already established by [`crate::scev`].
+        pub counted: &'a CountedLoop,
+        /// Compile-time knowledge about the locals the limit reads.
+        pub env: &'a RangeEnv,
+        /// Every node in the loop body.
+        pub body: &'a [VecBodyOp],
+        /// Every arithmetic operation in the loop body.
+        pub arith: &'a [VecArith],
+        /// False when the loop's control flow is irreducible, or when the body
+        /// has internal control flow the producer has not proved away.
+        pub reducible: bool,
+        /// The alignment the caller can prove of the *object base* of every
+        /// array the loop touches. [`PROVEN_OBJECT_ALIGNMENT`] is the honest
+        /// value for this VM today.
+        pub base_alignment: usize,
+        /// The FP policy.
+        pub fp: FpRelaxation,
+        /// The target.
+        pub isa: VectorIsa,
+    }
+
+    // -- verdict ------------------------------------------------------------
+
+    /// How the remainder iterations are handled.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum TailStrategy {
+        /// The trip count is an exact multiple of the lane count: no remainder
+        /// exists.
+        None,
+        /// Fall back into the untouched scalar loop for the last
+        /// `trip % lanes` iterations. At most `max_iterations` of them.
+        ///
+        /// This is the only strategy available: masking a partial vector needs
+        /// AVX-512 predicate registers, which `cpu_features` does not detect
+        /// and no [`VectorIsa`] here claims.
+        ScalarRemainder {
+            /// Upper bound on the scalar iterations left over.
+            max_iterations: usize,
+        },
+    }
+
+    /// A pre-header obligation, together with **which array it is about**.
+    ///
+    /// [`crate::scev`]'s guards are per-array by contract — a
+    /// [`PreheaderGuard::LengthAtLeast`] says "the guarded array is at least
+    /// this long" and names no array, because the caller is the one that knows
+    /// which access it asked about. Collapsing two arrays' identical-looking
+    /// guards into one would discharge the shorter array's obligation with the
+    /// longer array's length, which is exactly the multi-array out-of-bounds
+    /// store the bounds-check eliminator's provenance pass exists to prevent.
+    /// The attribution is therefore carried, and de-duplication only ever
+    /// happens within one array.
+    ///
+    /// Guards that are really about the induction variable rather than an
+    /// array (`AtMost`, `AtLeast`, `StrideInRange`) are attributed to each
+    /// array they were produced for. Emitting such a check more than once is
+    /// redundant, never wrong.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct ArrayGuard {
+        /// The array reference node whose access produced this obligation.
+        pub array: NodeId,
+        /// The obligation itself.
+        pub guard: PreheaderGuard,
+    }
+
+    /// An admitted loop, with every obligation the transform rests on.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct VecPlan {
+        /// The target the plan was decided against.
+        pub isa: VectorIsa,
+        /// The element type all accesses share.
+        pub elem: MemKind,
+        /// Lanes per vector operation. Always a power of two and at least 2.
+        pub lanes: usize,
+        /// `lanes * elem_bytes(elem)`. May be narrower than the register when
+        /// a dependence capped the lane count.
+        pub width_bytes: usize,
+        /// Whether every vector access is provably aligned.
+        pub alignment: Alignment,
+        /// What to do with the remainder.
+        pub tail: TailStrategy,
+        /// Bounds on the scalar trip count.
+        pub trip: TripCount,
+        /// The overflow assumption the index proofs rest on. `NoWrapGuarded`
+        /// means at least one entry of `guards` is load-bearing for
+        /// *soundness*, not just for bounds elision.
+        pub overflow: OverflowModel,
+        /// Pre-header obligations. **All** of them must be emitted, or the
+        /// plan is void.
+        pub guards: Vec<ArrayGuard>,
+        /// Every dependence the body carries, including the harmless ones.
+        pub dependences: Vec<Dependence>,
+        /// The lane ceiling the dependences imposed, if any.
+        pub max_safe_lanes: Option<usize>,
+    }
+
+    /// Why a loop was not admitted. Each variant is a *hard* refusal at the
+    /// stated lane count — none of them is a warning.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum VecRefusal {
+        /// The target has no modelled vector unit.
+        NoVectorIsa,
+        /// The loop's control flow is irreducible, or the body branches.
+        /// Widening a body assumes every iteration executes the same
+        /// straight-line trace.
+        IrreducibleControl,
+        /// The induction variable's step is a runtime value, so no compile-time
+        /// dependence distance exists.
+        VariableStride,
+        /// `scale * stride != 1`: the accesses are not unit-stride, so a
+        /// contiguous vector load does not cover one iteration block.
+        NonUnitStep {
+            /// The subscript's multiplier.
+            scale: i32,
+            /// The induction variable's step.
+            stride: i32,
+        },
+        /// [`CountedLoop::trip_count`] could not bound the iteration count.
+        UnknownTripCount,
+        /// The loop may execute fewer times than one vector pass covers, and
+        /// there is no guard shape that can say otherwise (see the module doc's
+        /// note on `PreheaderGuard`).
+        TripCountTooSmall {
+            /// The fewest iterations the loop may run.
+            min_trips: u64,
+            /// The lane count that needed more.
+            lanes: usize,
+        },
+        /// A node in the body is a safepoint. The back-edge poll is fine —
+        /// widening lowers its frequency by a bounded factor — but a safepoint
+        /// *inside* the body has to describe a frame whose locals a vectorized
+        /// iteration no longer holds.
+        SafepointInBody(NodeId),
+        /// A node in the body can deoptimize. The deopt metadata describes a
+        /// scalar frame at one bytecode index; there is no encoding for "lane 3
+        /// of this vector was iteration 11".
+        DeoptPointInBody(NodeId),
+        /// A node reads or writes [`AliasClass::Any`] — an unanalyzable call.
+        OpaqueMemoryEffect(NodeId),
+        /// A node carries JMM ordering (a volatile access, a monitor
+        /// operation). Widening would coalesce fences that the memory model
+        /// requires per iteration.
+        OrderedAccess(NodeId),
+        /// The loop touches an array of references. A vector store of oops
+        /// bypasses the GC write barrier — the same barrier-elision family that
+        /// produced a use-after-free on this branch. There is no lane count
+        /// that makes this safe; a reference vectorizer needs a vector-aware
+        /// barrier first.
+        GcReferenceAccess(NodeId),
+        /// A memory access that is not an array element (a field, a static, a
+        /// monitor) or that arrived without an element type.
+        UnstructuredMemoryAccess(NodeId),
+        /// The subscript is not an affine function of *this* loop's induction
+        /// variable.
+        NonAffineSubscript(NodeId),
+        /// The body touches elements of two different widths.
+        MixedElementWidths,
+        /// The body touches no memory at all, so there is nothing to widen.
+        NoMemoryAccess,
+        /// [`crate::scev`] refused to prove the subscript in range, or refused
+        /// its no-wrap obligation outright.
+        IndexNotProven {
+            /// The access.
+            node: NodeId,
+            /// Why the proof was refused.
+            reason: RefusalReason,
+        },
+        /// Two accesses may overlap and no distance could be computed.
+        UnknownAliasing {
+            /// The first access.
+            a: NodeId,
+            /// The second.
+            b: NodeId,
+        },
+        /// A dependence runs against program order at a distance below two
+        /// lanes, so no vector width preserves it.
+        LoopCarriedDependence(Dependence),
+        /// Vectorizing this reduction means reassociating floating point, and
+        /// the caller asked for [`FpRelaxation::Strict`].
+        FloatReassociation {
+            /// The accumulator type.
+            elem: MemKind,
+            /// The reduction operator.
+            op: VecOp,
+        },
+        /// The lane-wise instruction does not implement the Java operation.
+        /// FP `min`/`max` (NaN and signed-zero rules) and integer `/`/`%`
+        /// (per-lane traps) are the two families.
+        NonIeeeVectorOp {
+            /// The operand type.
+            elem: MemKind,
+            /// The operator.
+            op: VecOp,
+        },
+        /// The operation needs an ISA feature the target does not have.
+        MissingIsaFeature(&'static str),
+        /// One element does not fit at least twice in a vector register.
+        ElementTooWideForVector {
+            /// The element type.
+            elem: MemKind,
+            /// The register width that could not hold two of them.
+            width_bytes: usize,
+        },
+        /// The ISA requires naturally-aligned vector moves and the alignment
+        /// could not be proved.
+        UnprovableAlignment {
+            /// The alignment the ISA needs.
+            need: usize,
+        },
+    }
+
+    /// The gate's answer.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum VecVerdict {
+        /// Vectorizable, on these terms.
+        Admitted(VecPlan),
+        /// Not vectorizable. **Every** reason found, not just the first — a
+        /// gate that stops at the first refusal teaches the wrong lesson about
+        /// how far a loop is from admissible.
+        Refused(Vec<VecRefusal>),
+    }
+
+    impl VecVerdict {
+        /// True when the loop was admitted.
+        pub(crate) fn is_admitted(&self) -> bool {
+            matches!(self, VecVerdict::Admitted(_))
+        }
+
+        /// The plan, when there is one.
+        pub(crate) fn plan(&self) -> Option<&VecPlan> {
+            match self {
+                VecVerdict::Admitted(p) => Some(p),
+                VecVerdict::Refused(_) => Option::None,
+            }
+        }
+
+        /// Whether this refusal set contains `wanted`.
+        pub(crate) fn refused_for(&self, wanted: VecRefusal) -> bool {
+            match self {
+                VecVerdict::Refused(rs) => rs.contains(&wanted),
+                VecVerdict::Admitted(_) => false,
+            }
+        }
+
+        /// The refusals, or an empty slice.
+        pub(crate) fn refusals(&self) -> &[VecRefusal] {
+            match self {
+                VecVerdict::Refused(rs) => rs,
+                VecVerdict::Admitted(_) => &[],
+            }
+        }
+    }
+
+    /// The largest power of two not greater than `n` (`0` for `0`).
+    fn floor_pow2(n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            1usize << (usize::BITS - 1 - n.leading_zeros())
+        }
+    }
+
+    /// Reduce one body node to an access, a "nothing to see here", or a
+    /// refusal.
+    ///
+    /// The order of the checks is the order of severity, so the *reason*
+    /// reported for a call is `SafepointInBody` rather than the vaguer
+    /// `OpaqueMemoryEffect` it would also qualify for.
+    fn classify_body_op(op: &VecBodyOp, iv_local: usize) -> Result<Option<VecAccess>, VecRefusal> {
+        if op.deopts {
+            return Err(VecRefusal::DeoptPointInBody(op.node));
+        }
+        if op.effect.safepoint || op.effect.allocates {
+            return Err(VecRefusal::SafepointInBody(op.node));
+        }
+        if !op.effect.order.is_plain() {
+            return Err(VecRefusal::OrderedAccess(op.node));
+        }
+        if op.effect.reads == AliasClass::Any || op.effect.writes == AliasClass::Any {
+            return Err(VecRefusal::OpaqueMemoryEffect(op.node));
+        }
+        if !op.effect.touches_memory() {
+            return Ok(Option::None);
+        }
+        let (class, kind) = match (op.effect.reads.is_some(), op.effect.writes.is_some()) {
+            (true, false) => (op.effect.reads, AccessKind::Read),
+            (false, true) => (op.effect.writes, AccessKind::Write),
+            // Reads and writes at once is a monitor or an opaque node; neither
+            // is widenable and neither has a subscript.
+            _ => return Err(VecRefusal::OpaqueMemoryEffect(op.node)),
+        };
+        if !matches!(class, AliasClass::ArrayElem { .. }) {
+            return Err(VecRefusal::UnstructuredMemoryAccess(op.node));
+        }
+        let elem = match op.elem {
+            Some(e) => e,
+            Option::None => return Err(VecRefusal::UnstructuredMemoryAccess(op.node)),
+        };
+        if elem == MemKind::Ref {
+            return Err(VecRefusal::GcReferenceAccess(op.node));
+        }
+        let index = match op.index {
+            Some(i) if i.iv_local == iv_local => i,
+            _ => return Err(VecRefusal::NonAffineSubscript(op.node)),
+        };
+        Ok(Some(VecAccess {
+            node: op.node,
+            class,
+            kind,
+            elem,
+            index,
+        }))
+    }
+
+    /// Decide whether `cand` may be vectorized, and on what terms.
+    ///
+    /// Returns [`VecVerdict::Refused`] with the complete set of reasons, or
+    /// [`VecVerdict::Admitted`] with a [`VecPlan`] whose guards a consumer must
+    /// discharge in full.
+    pub(crate) fn admit_vectorization(graph: &Graph, cand: &VecCandidate<'_>) -> VecVerdict {
+        let mut refusals: Vec<VecRefusal> = Vec::new();
+
+        if cand.isa.width_bytes == 0 {
+            refusals.push(VecRefusal::NoVectorIsa);
+        }
+        if !cand.reducible {
+            refusals.push(VecRefusal::IrreducibleControl);
+        }
+
+        // ---- body hazards, and the accesses that survive them --------------
+        let mut accesses: Vec<VecAccess> = Vec::new();
+        for op in cand.body {
+            match classify_body_op(op, cand.counted.iv.local) {
+                Ok(Some(access)) => accesses.push(access),
+                Ok(Option::None) => {}
+                Err(refusal) => refusals.push(refusal),
+            }
+        }
+        if accesses.is_empty() {
+            refusals.push(VecRefusal::NoMemoryAccess);
+            return VecVerdict::Refused(refusals);
+        }
+
+        // ---- one element width ---------------------------------------------
+        // A lane count is one number, so a body that mixes widths would need
+        // two of them and a reconciliation this gate does not describe.
+        let elem = accesses[0].elem;
+        if accesses
+            .iter()
+            .any(|a| elem_bytes(a.elem) != elem_bytes(elem))
+        {
+            refusals.push(VecRefusal::MixedElementWidths);
+        }
+
+        // ---- stride and step -----------------------------------------------
+        let stride = cand.counted.iv.stride.as_const();
+        match stride {
+            Option::None => refusals.push(VecRefusal::VariableStride),
+            Some(s) => {
+                for access in &accesses {
+                    let step = (access.index.scale as i64).checked_mul(s as i64);
+                    if step != Some(1) {
+                        refusals.push(VecRefusal::NonUnitStep {
+                            scale: access.index.scale,
+                            stride: s,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ---- index range and overflow, delegated to scev --------------------
+        let mut guards: Vec<ArrayGuard> = Vec::new();
+        let mut overflow = OverflowModel::NoWrapProven;
+        for access in &accesses {
+            match cand.counted.index_span(&access.index, cand.env) {
+                Ok(proven) => {
+                    if proven.overflow == OverflowModel::NoWrapGuarded {
+                        overflow = OverflowModel::NoWrapGuarded;
+                    }
+                }
+                Err(reason) => {
+                    refusals.push(VecRefusal::IndexNotProven {
+                        node: access.node,
+                        reason,
+                    });
+                    continue;
+                }
+            }
+            // `None` for the array local: at IR level there is no JVM slot to
+            // name, so the `length >= a.length` tautology shortcut is
+            // unavailable and every access costs a `LengthAtLeast` guard.
+            match cand.counted.prove_index_in_bounds_of(
+                &access.index,
+                Option::None,
+                IntRange::array_length(),
+                cand.env,
+            ) {
+                BoundsProof::Static => {}
+                BoundsProof::Guarded(g) => {
+                    // `ArrayElem` always has a base; the fallback keeps the
+                    // function total without an `unwrap`.
+                    let array = access.class.base().unwrap_or(NO_NODE);
+                    for guard in g {
+                        let entry = ArrayGuard { array, guard };
+                        if !guards.contains(&entry) {
+                            guards.push(entry);
+                        }
+                    }
+                }
+                BoundsProof::Refused(reason) => refusals.push(VecRefusal::IndexNotProven {
+                    node: access.node,
+                    reason,
+                }),
+            }
+        }
+
+        // ---- the dependence test --------------------------------------------
+        let mut dependences: Vec<Dependence> = Vec::new();
+        if let Some(s) = stride {
+            for (i, a) in accesses.iter().enumerate() {
+                for b in accesses.iter().skip(i) {
+                    if let Some(dep) = dependence_between(graph, a, b, s) {
+                        dependences.push(dep);
+                    }
+                }
+            }
+        }
+        let mut max_safe_lanes: Option<usize> = Option::None;
+        let mut tightest: Option<Dependence> = Option::None;
+        for dep in &dependences {
+            match dep.distance {
+                // Both orders agree — widening preserves them at any width.
+                DepDistance::Same | DepDistance::Forward(_) => {}
+                DepDistance::Backward(k) => {
+                    let k = usize::try_from(k).unwrap_or(usize::MAX);
+                    let tighter = match max_safe_lanes {
+                        Option::None => true,
+                        Some(m) => k < m,
+                    };
+                    if tighter {
+                        max_safe_lanes = Some(k);
+                        tightest = Some(*dep);
+                    }
+                }
+                DepDistance::Unknown => refusals.push(VecRefusal::UnknownAliasing {
+                    a: dep.source,
+                    b: dep.sink,
+                }),
+            }
+        }
+        if let (Some(m), Some(dep)) = (max_safe_lanes, tightest) {
+            if m < 2 {
+                refusals.push(VecRefusal::LoopCarriedDependence(dep));
+            }
+        }
+
+        // ---- arithmetic: NaN, reassociation, ISA features -------------------
+        for a in cand.arith {
+            let fp = is_float(a.elem);
+            match a.op {
+                // `Math.min`/`Math.max` order -0.0 below +0.0 and are
+                // NaN-propagating; MINPD/MAXPD are neither. Not a relaxation.
+                VecOp::Min | VecOp::Max if fp => {
+                    refusals.push(VecRefusal::NonIeeeVectorOp {
+                        elem: a.elem,
+                        op: a.op,
+                    });
+                    continue;
+                }
+                // Integer division traps per element (`/ 0`, and
+                // `MIN_VALUE / -1` overflows); a lane cannot raise.
+                VecOp::Div | VecOp::Rem if !fp => {
+                    refusals.push(VecRefusal::NonIeeeVectorOp {
+                        elem: a.elem,
+                        op: a.op,
+                    });
+                    continue;
+                }
+                _ => {}
+            }
+            if fp && a.reduction && cand.fp == FpRelaxation::Strict {
+                refusals.push(VecRefusal::FloatReassociation {
+                    elem: a.elem,
+                    op: a.op,
+                });
+                continue;
+            }
+            if !fp
+                && matches!(a.op, VecOp::Mul | VecOp::Min | VecOp::Max)
+                && elem_bytes(a.elem) == 4
+                && !cand.isa.int32_mul_minmax
+            {
+                refusals.push(VecRefusal::MissingIsaFeature(
+                    "32-bit integer multiply / min / max (PMULLD, PMINSD, PMAXSD — SSE4.1)",
+                ));
+            }
+        }
+
+        // ---- lane count -------------------------------------------------------
+        let isa_lanes = cand.isa.lanes_for(elem);
+        if isa_lanes < 2 {
+            refusals.push(VecRefusal::ElementTooWideForVector {
+                elem,
+                width_bytes: cand.isa.width_bytes,
+            });
+        }
+        let capped = match max_safe_lanes {
+            Option::None => isa_lanes,
+            Some(m) => isa_lanes.min(m),
+        };
+        let lanes = floor_pow2(capped);
+
+        // ---- trip count and tail ---------------------------------------------
+        let trip = cand.counted.trip_count(cand.env);
+        let tail = match trip {
+            Option::None => {
+                refusals.push(VecRefusal::UnknownTripCount);
+                TailStrategy::ScalarRemainder { max_iterations: 0 }
+            }
+            Some(t) => {
+                if lanes >= 2 && t.min < lanes as u64 {
+                    // A runtime `trip >= lanes` check would rescue this, but
+                    // `scev::PreheaderGuard` has no variant that expresses one,
+                    // so the honest answer is a refusal rather than an
+                    // undischargeable obligation.
+                    refusals.push(VecRefusal::TripCountTooSmall {
+                        min_trips: t.min,
+                        lanes,
+                    });
+                }
+                match t.exact() {
+                    Some(exact) if lanes >= 2 && exact % lanes as u64 == 0 => TailStrategy::None,
+                    _ => TailStrategy::ScalarRemainder {
+                        max_iterations: lanes.saturating_sub(1),
+                    },
+                }
+            }
+        };
+
+        // ---- alignment ---------------------------------------------------------
+        let width_bytes = lanes.saturating_mul(elem_bytes(elem));
+        let mut alignment = Alignment::Proven(width_bytes);
+        for access in &accesses {
+            let first = cand.counted.iv.init.as_constant().and_then(|c| {
+                (c as i64)
+                    .checked_mul(access.index.scale as i64)?
+                    .checked_add(access.index.offset as i64)
+            });
+            if analyze_alignment(access.elem, first, cand.base_alignment, width_bytes)
+                == Alignment::Unknown
+            {
+                alignment = Alignment::Unknown;
+                break;
+            }
+        }
+        if alignment == Alignment::Unknown && cand.isa.alignment == AlignmentPolicy::NaturalRequired
+        {
+            refusals.push(VecRefusal::UnprovableAlignment { need: width_bytes });
+        }
+
+        if !refusals.is_empty() {
+            return VecVerdict::Refused(refusals);
+        }
+        let trip = match trip {
+            Some(t) => t,
+            // Unreachable: a missing trip count pushed `UnknownTripCount` above.
+            Option::None => return VecVerdict::Refused(vec![VecRefusal::UnknownTripCount]),
+        };
+        VecVerdict::Admitted(VecPlan {
+            isa: cand.isa,
+            elem,
+            lanes,
+            width_bytes,
+            alignment,
+            tail,
+            trip,
+            overflow,
+            guards,
+            dependences,
+            max_safe_lanes,
+        })
+    }
 }

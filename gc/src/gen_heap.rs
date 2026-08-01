@@ -4712,6 +4712,9 @@ impl GenerationalHeap {
         let mut young_object_starts =
             crate::young_mark::ObjectStartBits::new(young_base, young_used);
         let mut start_walk_complete = true;
+        // T-3: set when a reserved TLAB tail is published inside THIS
+        // from-space on the moving path — see the escalation note below.
+        let mut moving_with_reserved_tails = false;
         // Merge the free-block list with un-retired TLAB tails (reserved,
         // never on the free list — the exact gap class this walk was
         // breaking on) — the same skip set the non-moving exact walk builds
@@ -4732,25 +4735,58 @@ impl GenerationalHeap {
             // allocates into memory the collector has already handed back.
             //
             // The walk itself is correct either way (the tail is skipped, not
-            // parsed), so this is a diagnostic rather than a diversion: turning
-            // a live moving cycle into a sweep on a heuristic would be a worse
-            // trade than naming the offending transition. Rate-limited; the
-            // first occurrence is always visible.
+            // parsed); the hazard is entirely AFTERWARDS, when the owner
+            // resumes and bump-allocates from a cursor into memory this cycle
+            // handed back.
+            //
+            // T-3 ESCALATION (2026-07-31). This was a rate-limited warn and
+            // nothing else, on the argument that "diverting a live moving cycle
+            // on a heuristic would be a worse trade than naming the offending
+            // transition". Two things make the refusal the better trade now:
+            //
+            //  * It is not a heuristic. `jit_tlab_skip_offsets` has already
+            //    clipped the published tails to `[young_base, young_base +
+            //    young_used)` — this exact from-space. A non-empty result IS
+            //    the hazard condition, not a proxy for it.
+            //  * It is expected to be unreachable. Per the transition table in
+            //    `docs/gc/tlab-and-card-audit.md` §1.2 every alive thread
+            //    retires at its exclusion point, and the one intentional
+            //    un-retired case (an OS-frozen in-JIT peer) makes the VM call
+            //    `mark_moving_young_coverage_incomplete`, which sends the cycle
+            //    down the non-moving path before it ever gets here. So the
+            //    refusal costs nothing on a correct transition graph and
+            //    prevents a use-after-free on an incorrect one.
+            //
+            // Refusing means `start_walk_complete = false`, which skips this
+            // young collection entirely (see the block after the walk):
+            // over-retain for one cycle, spill to old gen, retry on the next
+            // trigger — by which point the owner has almost certainly retired.
+            // That is strictly safer than diverting to the non-moving sweep,
+            // which on this precise-root path lacks the conservative
+            // over-marking it needs.
+            //
+            // The warn stays, and stays rate-limited, because its occurrence
+            // count is the reproducer budget for finding the producing
+            // transition (audit §5 item 6). The FIRST occurrence is always
+            // visible.
             if !tails.is_empty() {
                 static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {
                     tracing::warn!(
                         tails = tails.len(),
-                        "[tlab-audit] a MOVING young collection is running with {} published \
-                         reserved TLAB tail(s). No in-JIT peer was frozen (that would have \
-                         forced the non-moving sweep), so an alive mutator left a TLAB \
-                         un-retired across its exclusion point — after the semispace swap its \
-                         cursor points into recycled memory. Occurrence #{}.",
+                        "[tlab-audit] a MOVING young collection was about to run with {} \
+                         published reserved TLAB tail(s) inside from-space. No in-JIT peer was \
+                         frozen (that would have forced the non-moving sweep), so an alive \
+                         mutator left a TLAB un-retired across its exclusion point — after the \
+                         semispace swap its cursor would point into recycled memory. REFUSING \
+                         this young collection (over-retain; retried next cycle). Occurrence \
+                         #{}.",
                         tails.len(),
                         n,
                     );
                 }
+                moving_with_reserved_tails = true;
             }
             v.extend(tails);
             v.sort_by_key(|&(off, _)| off);
@@ -4838,6 +4874,16 @@ impl GenerationalHeap {
                 break;
             }
             young_cursor += size;
+        }
+        if moving_with_reserved_tails {
+            // T-3 refusal. The walk above completed fine — the tails were
+            // skipped, not parsed — but a live mutator owns a TLAB inside the
+            // arena this cycle is about to evacuate, swap and reset. Take the
+            // same exit as an incomplete walk: skip the collection rather than
+            // hand the owner's cursor a recycled buffer. The warn naming the
+            // condition was already emitted (rate-limited) where it was
+            // detected.
+            start_walk_complete = false;
         }
         if !start_walk_complete {
             // A partial start set makes the moving cycle unsound (see the
@@ -12329,6 +12375,68 @@ mod tests {
         assert!(heap.jit_tlab_skip_offsets(base, end).is_empty());
     }
 
+    /// The ascending/disjoint/non-empty contract restated as a property over
+    /// adversarial publication orders, rather than over one hand-picked list.
+    ///
+    /// This is the invariant every consumer of `jit_tlab_skip_offsets` depends
+    /// on and NOTHING upstream of the heap guarantees: the producer
+    /// (`ThreadRegistry::collect_reserved_tlab_tails`) reads one published raw
+    /// `(cursor, end)` per alive registry entry, in registry order, and the
+    /// same `Tlab` can be published under two ids. If a future edit drops the
+    /// sort or the coalesce, `skip_free_blocks` resyncs the walk cursor twice
+    /// and swallows every object between the two spans — a live object never
+    /// visited by the non-moving sweep, i.e. premature reclamation.
+    #[test]
+    fn jit_tlab_skip_offsets_is_always_ascending_disjoint_and_non_empty() {
+        let heap = GenerationalHeap::with_sizes(64 * 1024, 64 * 1024);
+        let base = 0x20_0000usize;
+        let end = base + 0x10000;
+
+        // Nested, reversed, chained-overlapping, duplicated, back-to-back and
+        // separated — every shape the merge has to survive, in the worst order.
+        let published: Vec<(usize, usize)> = vec![
+            (base + 0x0800, base + 0x0900), // isolated, published last in order
+            (base + 0x5000, base + 0x6000),
+            (base + 0x5800, base + 0x6800), // chains onto the previous
+            (base + 0x5200, base + 0x5400), // fully nested inside the first
+            (base + 0x6800, base + 0x6900), // exactly touching the chain's end
+            (base + 0x5000, base + 0x6000), // exact duplicate
+            (base + 0x2000, base + 0x2008), // minimum-width span
+        ];
+        heap.set_jit_tlab_skip_regions(&published);
+        let spans = heap.jit_tlab_skip_offsets(base, end);
+
+        for w in spans.windows(2) {
+            assert!(
+                w[0].0 + w[0].1 <= w[1].0,
+                "spans must be ascending and disjoint: {spans:?}"
+            );
+        }
+        assert!(
+            spans.iter().all(|&(_, sz)| sz > 0),
+            "an empty span would make the walker consume an entry without \
+             advancing: {spans:?}"
+        );
+        // Coalescing may only ever GROW coverage — over-skipping over-retains,
+        // under-skipping walks an un-retired tail as objects. Every published
+        // byte inside the window must still be covered by exactly one span.
+        for &(c, e) in &published {
+            let (off, sz) = (c - base, e - c);
+            assert!(
+                spans
+                    .iter()
+                    .any(|&(so, ss)| so <= off && off + sz <= so + ss),
+                "published tail {off:#x}..{:#x} lost by the merge: {spans:?}",
+                off + sz
+            );
+        }
+        assert_eq!(
+            spans,
+            vec![(0x800, 0x100), (0x2000, 0x8), (0x5000, 0x1900)],
+            "the merge must be minimal as well as correct"
+        );
+    }
+
     /// Ordinary headers are unaffected by the kind guard.
     #[test]
     fn gen_object_total_size_still_sizes_objects_and_arrays() {
@@ -13824,6 +13932,96 @@ mod tests {
             }
             other => panic!("A's field should still reference B, got {other:?}"),
         }
+    }
+
+    /// T-3 (docs/gc/tlab-and-card-audit.md §1.3) — a MOVING young collection
+    /// must REFUSE to run while a reserved TLAB tail is published inside the
+    /// from-space it is about to evacuate, swap and reset.
+    ///
+    /// A published tail means some ALIVE thread still owns `[cursor, end)` in
+    /// that arena. The walk copes (the tail is skipped, not parsed); the hazard
+    /// is afterwards, when the owner resumes and bump-allocates from a cursor
+    /// into memory the collector has already handed back. This used to be a
+    /// rate-limited warn only. The refusal skips the cycle — over-retain for one
+    /// trigger — which is the same exit an unparseable young layout already
+    /// takes.
+    ///
+    /// The second half of the test is the part that matters as a regression
+    /// guard: the refusal must be CONDITIONAL. A version that simply stopped
+    /// moving would also pass the first half.
+    #[test]
+    fn a_moving_young_cycle_refuses_to_run_with_a_published_reserved_tlab_tail() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        // `pad` is allocated FIRST so the span published over it is strictly
+        // inside `[young_base, young_base + young_used)` and lands on the
+        // object grid — the walk then strides exactly over it and the only
+        // reason this cycle can decline is the refusal itself.
+        let pad = heap.alloc_object(ClassId::new(9), 1);
+        let pad_addr = pad.as_ptr() as usize;
+        let pad_size = {
+            // SAFETY: `pad` was just allocated; its header is initialized.
+            let h = unsafe { &*(pad.as_ptr() as *const ObjectHeader) };
+            gen_object_total_size(h)
+        };
+        assert!(pad_size >= HEADER_SIZE && pad_addr % 8 == 0);
+
+        let obj_a = heap.alloc_object(ClassId::new(1), 1);
+        let obj_b = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+        heap.set_field(obj_b, 0, Value::Int(4242));
+        let a_ptr = obj_a.as_ptr();
+
+        crate::gc_quiescence::publish_moving_young_enabled(true);
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::clear_force_non_moving_jit_roots();
+        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+        crate::gc_quiescence::enter();
+
+        // An alive mutator's un-retired TLAB tail, published for this pause.
+        heap.set_jit_tlab_skip_regions(&[(pad_addr, pad_addr + pad_size)]);
+
+        let mut roots = vec![obj_a];
+        let refused = heap.collect_garbage(&stw(), &mut roots, &monitors);
+
+        assert_eq!(
+            refused.stats.objects_copied, 0,
+            "a moving cycle must copy NOTHING while a live thread owns a TLAB \
+             in from-space — after the swap its cursor would point into \
+             recycled memory",
+        );
+        assert_eq!(
+            roots[0].as_ptr(),
+            a_ptr,
+            "the refusal must leave every object where it is (over-retain), not \
+             relocate some subset",
+        );
+        // Over-retained, not corrupted: the graph is still readable in place.
+        match heap.get_field(roots[0], 0) {
+            Value::Object(Some(b)) => assert_eq!(heap.get_field(b, 0).as_int(), Some(4242)),
+            other => panic!("A's field should still reference B, got {other:?}"),
+        }
+
+        // The owner retires; the next trigger must move again. Without this the
+        // "refusal" would be indistinguishable from having broken moving-young.
+        heap.clear_jit_tlab_skip_regions();
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        let moved = heap.collect_garbage(&stw(), &mut roots, &monitors);
+
+        crate::gc_quiescence::leave();
+        crate::gc_quiescence::publish_moving_young_enabled(false);
+
+        assert_eq!(
+            moved.stats.objects_copied, 2,
+            "once no reserved tail is published the very next cycle must be a \
+             normal Cheney copy — the refusal is per-cycle, not a latch",
+        );
+        assert_ne!(
+            roots[0].as_ptr(),
+            a_ptr,
+            "the recovered cycle must relocate the survivor and rewrite the root",
+        );
     }
 
     /// The mandatory safety net: moving-young in effect, JIT frame live, but a

@@ -13070,6 +13070,21 @@ impl Compiler {
             // We only test header PCs of hoists, not every loop — uncontained
             // loops (no LICM hoisting) are unaffected. The check is O(num_hoists),
             // and `num_hoists` is bounded by the static analysis upstream.
+            //
+            // Bytecode-loop-transform contract: `osr_entry_native` is published
+            // as `CompiledMethod::osr_pc_to_native` and INDEXED BY INTERPRETER
+            // BCI by the runtime's OSR entry check. That is correct today only
+            // because `compile_with_param_slots` compiles the caller's original
+            // bytecode, so `pc` here IS an interpreter bci
+            // (`bytecode_loop_xform_rewrites_bytecode() == false`). If the
+            // bytecode rewriter is ever wired in, this vector must be rebuilt in
+            // ORIGINAL-bci space via `LoopXform::osr_entry_pc(bci)` — not by
+            // writing `self.buf.pos()` at the transformed pc. The reverse of
+            // `bci_of` is one-to-many inside a transformed region, and picking
+            // the wrong image is a wrong-code bug, not a missed optimisation:
+            // entering a PEELED copy re-runs the peeled iterations, so the loop
+            // executes `k` times too many. `osr_entry_pc` always answers with
+            // the steady-state copy. See `docs/jit/loop-transform-wiring.md`.
             if !dead && pc < self.osr_entry_native.len() {
                 let inside_aaload_hoisted = self
                     .hoist_info
@@ -23112,6 +23127,135 @@ fn gc_inert_selfrec_candidate(
     pc == code_len && self_calls != 0 && saw_return
 }
 
+/// Does the bytecode-level loop transform (`plan_loop_peel` /
+/// `plan_loop_unroll` in `x64::licm`) rewrite the bytecode the emitter
+/// compiles?
+///
+/// `false` today. `compile_with_param_slots` compiles the caller's original
+/// bytecode verbatim, so every pc the emitter handles is an interpreter bci,
+/// every caller-supplied side table (`field_info`, `invoke_info`, `mic_slots`,
+/// `inline_sites`, …) is still keyed correctly, and every deopt bci, oop-map
+/// `bytecode_pc`, `pc_to_native` index and `osr_entry_native` index is already
+/// in interpreter-bci space with nothing to translate.
+///
+/// The transform IS used, as the native unroller's admission oracle — see
+/// [`plan_native_unroll`] — but only its *verdict* is consumed; the rewritten
+/// bytes are dropped.
+///
+/// Flipping this to `true` is the single switch that hands loop unrolling to
+/// the bytecode rewriter, and it is deliberately the same switch that turns
+/// the native byte-copy unroller off (see [`native_unroller_enabled`]): the
+/// two must never both fire on one loop, or `k+1` bytecode copies get
+/// machine-code-duplicated `k+1` more times behind one back edge, giving
+/// `(k+1)^2` bodies per poll — a time-to-safepoint neither unroller's budget
+/// check ever saw.
+///
+/// Do NOT flip it before every item in `docs/jit/loop-transform-wiring.md` is
+/// done. A half-wired rewrite records transformed PCs as interpreter bcis,
+/// which corrupts deopt and the GC's precise oop-map lookup silently.
+pub(crate) fn bytecode_loop_xform_rewrites_bytecode() -> bool {
+    false
+}
+
+/// Is the native byte-copy unroller (the `0xa7` arm of `compile_bytecode`)
+/// the current owner of loop unrolling?
+///
+/// Mutually exclusive with [`bytecode_loop_xform_rewrites_bytecode`] by
+/// construction — see that function for why the exclusion is a correctness
+/// requirement and not a tidiness one.
+pub(crate) fn native_unroller_enabled() -> bool {
+    !bytecode_loop_xform_rewrites_bytecode()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_UNROLL").is_none()
+}
+
+/// Structural admission test for the native byte-copy loop unroller.
+///
+/// The unroller duplicates emitted MACHINE CODE between `pc_to_native[header]`
+/// and the back edge, shifting eight patch vectors, re-resolving helper
+/// `rel32`s and minting fresh IC slots per copy. Whether that is legal is a
+/// question about the loop's CONTROL FLOW, and the test that used to guard it
+/// — `code[back_edge] == 0xa7` plus a body-byte-size band — asked no
+/// control-flow question at all. In particular it never established that:
+///
+/// * **the loop is reducible** (the header dominates its own region). In an
+///   irreducible loop "the bytes from the header to the back edge" are not one
+///   iteration of anything, so duplicating them duplicates the wrong region.
+/// * **the region has a single entry.** A branch from outside that lands
+///   *below* the header enters copy 0 mid-body; the `k` copies that follow it
+///   are then whole extra bodies the original would not have run before its
+///   next exit test.
+/// * **no cycle strictly inside the body is irreducible.** The duplicator
+///   resolves an internal forward patch to `pc_to_native[target] + shift`,
+///   which is only the copy's own image of the target when the inner cycle is
+///   reducible and wholly contained in the body span.
+/// * **nothing branches to the back-edge instruction itself.** That
+///   instruction exists in the last copy only, so such an edge would target
+///   code that is no longer where the branch thinks it is.
+/// * **no exception handler lands inside the duplicated region, and no
+///   protected range only partially overlaps it.** The bytecode→native handler
+///   ranges are derived from `pc_to_native`, which covers copy 0 only, so a
+///   throw from copy `1..k` is not covered by the range that protects the
+///   loop — the exception escapes a `try` that lexically encloses it.
+/// * **the header is not in `bypassable_headers`.** Every other speculating
+///   transform in this pipeline — the aaload LICM hoists, the arith LICM
+///   hoists, the FP hoists, matrix-dot, the bulk-byte loops — filters on that
+///   set, and the unroller sits on the same pre-header: `pc_to_native[header]`
+///   points PAST it, so `body_start` excludes it and each copy runs without
+///   it, while an external edge into the header bypasses it entirely.
+/// * **the poll-free span stays bounded.** `k+1` bodies now sit behind one
+///   back-edge poll.
+///
+/// Rather than re-derive those facts here, this asks the bytecode-level
+/// rewriter [`plan_loop_unroll`], whose admission test is exactly that list,
+/// proved with real dominators over an instruction-granularity CFG
+/// (`MethodCfg`) instead of the "any backward branch is a loop" heuristic used
+/// elsewhere in this backend, and re-checked on its own output. The rewritten
+/// bytes are discarded — only the verdict is used, so the emitter still sees
+/// the caller's bytecode and nothing needs re-keying. See
+/// `docs/jit/loop-transforms.md`.
+///
+/// Fail-closed: every refusal, including a malformed-input `BadShape`, means
+/// the loop is compiled without unrolling.
+fn plan_native_unroll(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+    extra_copies: usize,
+    exception_ranges: &[(usize, usize, usize)],
+    bypassable_headers: &FxHashSet<usize>,
+) -> Option<(usize, usize, usize)> {
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some();
+    if bypassable_headers.contains(&header) {
+        if dbg {
+            eprintln!(
+                "[JIT_GEN] unroll refused: header={header} back_edge={back_edge} \
+                 reason=BypassableHeader"
+            );
+        }
+        return None;
+    }
+    match plan_loop_unroll(
+        code,
+        code_len,
+        header,
+        back_edge,
+        extra_copies,
+        exception_ranges,
+    ) {
+        Ok(_) => Some((header, back_edge, extra_copies)),
+        Err(refusal) => {
+            if dbg {
+                eprintln!(
+                    "[JIT_GEN] unroll refused: header={header} back_edge={back_edge} \
+                     copies={extra_copies} reason={refusal:?}"
+                );
+            }
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
     code: &[u8],
@@ -23558,43 +23702,76 @@ pub fn compile_with_param_slots(
     //   Body ≤20 bytecodes  → 4x unroll (3 extra copies)
     //   Body 20-50 bytecodes → 2x unroll (1 extra copy)
     //   Body > 50            → no unroll (unless PGO says otherwise, up to 100 bytes)
-    let unroll_loops: Vec<(usize, usize, usize)> =
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_UNROLL").is_some() {
-            Vec::new()
-        } else {
-            loops
-                .iter()
-                .filter_map(|&(header, back_edge)| {
-                    // Only unroll loops with goto back-edge (not conditional)
-                    if code[back_edge] != 0xa7 {
-                        return None;
-                    }
-                    let body_size = back_edge - header;
-                    if body_size < 5 {
-                        return None;
-                    }
+    //
+    // The size band is a PROFITABILITY heuristic and nothing else. Every
+    // LEGALITY question — reducibility, single entry, inner-cycle
+    // reducibility, branches to the back edge, handler containment,
+    // pre-header bypass, time-to-safepoint — is answered by
+    // `plan_native_unroll`, which gates every entry that reaches
+    // `compiler.unroll_loops`. It must stay the only producer of this vector:
+    // the emitter's `0xa7` arm treats membership as proof that duplicating
+    // the body's machine code is sound. See its doc comment for what the old
+    // `code[back_edge] == 0xa7` + body-size test was missing.
+    let unroll_loops: Vec<(usize, usize, usize)> = if !native_unroller_enabled() {
+        Vec::new()
+    } else {
+        loops
+            .iter()
+            .filter_map(|&(header, back_edge)| {
+                // Only unroll loops with goto back-edge (not conditional)
+                if back_edge >= code_len || code[back_edge] != 0xa7 {
+                    return None;
+                }
+                let body_size = back_edge - header;
+                if body_size < 5 {
+                    return None;
+                }
 
-                    // PGO path: use profiled trip count if available for this back-edge
-                    if let Some(&pgo_factor) = loop_unroll_hints.get(&back_edge) {
-                        let extra_copies = pgo_factor - 1;
-                        // PGO extends unrolling eligibility to larger loops (up to 100 bytes)
-                        if body_size <= 50 || (body_size <= 100 && pgo_factor <= 2) {
-                            return Some((header, back_edge, extra_copies));
-                        }
+                // PGO path: use profiled trip count if available for this back-edge
+                if let Some(&pgo_factor) = loop_unroll_hints.get(&back_edge) {
+                    // `saturating_sub`: the old `pgo_factor - 1` underflowed on
+                    // a 0 hint. A 0/1 factor now means "no extra copies", which
+                    // `plan_native_unroll` refuses as `TooManyCopies`.
+                    let extra_copies = pgo_factor.saturating_sub(1);
+                    // PGO extends unrolling eligibility to larger loops (up to 100 bytes)
+                    if body_size <= 50 || (body_size <= 100 && pgo_factor <= 2) {
+                        return plan_native_unroll(
+                            code,
+                            code_len,
+                            header,
+                            back_edge,
+                            extra_copies,
+                            &exception_ranges,
+                            &bypassable_headers,
+                        );
                     }
+                }
 
-                    // Static heuristic fallback
-                    let extra_copies = if body_size <= 20 {
-                        3 // 4x unroll
-                    } else if body_size <= 50 {
-                        1 // 2x unroll (covers FP-heavy loops like N-Body advance)
-                    } else {
-                        return None;
-                    };
-                    Some((header, back_edge, extra_copies))
-                })
-                .collect()
-        };
+                // Static heuristic fallback
+                let extra_copies = if body_size <= 20 {
+                    3 // 4x unroll
+                } else if body_size <= 50 {
+                    1 // 2x unroll (covers FP-heavy loops like N-Body advance)
+                } else {
+                    return None;
+                };
+                plan_native_unroll(
+                    code,
+                    code_len,
+                    header,
+                    back_edge,
+                    extra_copies,
+                    &exception_ranges,
+                    &bypassable_headers,
+                )
+            })
+            .collect()
+    };
+    if !unroll_loops.is_empty()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    {
+        eprintln!("[JIT_GEN] unroll admitted={unroll_loops:?}");
+    }
 
     // FP LICM: detect loop-invariant FP loads to hoist
     let fp_hoist_info = find_fp_loop_hoists(code, code_len, &loops);

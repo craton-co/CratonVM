@@ -29,7 +29,7 @@ use crate::ir::{Graph, IrType, NodeId, Op, NO_NODE};
 use crate::ir_schedule::Schedule;
 use crate::metrics::CompileRecorder;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
 /// Conservative cap on `tableswitch` table size used by [`bc_len`].
 ///
@@ -4859,7 +4859,11 @@ pub fn allocate_linear_scan(
         }
     }
 
-    ls_finish(graph, live, reg_segments, splits)
+    // The allocation is checked before it is returned, so no caller can use an
+    // unverified one: `verify_allocation` is not an opt-in debug pass.
+    let alloc = ls_finish(graph, live, reg_segments, splits)?;
+    verify_allocation(graph, live, model, &alloc)?;
+    Ok(alloc)
 }
 
 /// Pick a free register for `current`, or `None` when nothing is usable.

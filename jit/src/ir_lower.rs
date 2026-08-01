@@ -5710,6 +5710,46 @@ pub(crate) fn lower_inner(
     helpers: &JitRuntimeHelpers,
     branch_hints: &HashMap<usize, bool>,
     sr_map: Option<&ScalarReplacementMap>,
+    direct_calls: &HashMap<usize, (usize, bool)>,
+    ic_slots: &HashMap<usize, (usize, usize)>,
+    compact_fields: &HashMap<usize, (u32, bool, u8)>,
+) -> Option<CompiledMethod> {
+    // No inlined callee scopes: every deopt point is a single flat frame, which
+    // is what this path has always produced.
+    let no_scopes = InlineScopeTable::new();
+    lower_inner_with_scopes(
+        graph,
+        schedule,
+        num_params,
+        num_locals,
+        helpers,
+        branch_hints,
+        sr_map,
+        direct_calls,
+        ic_slots,
+        compact_fields,
+        &no_scopes,
+    )
+}
+
+/// [`lower_inner`] plus the inlined-scope table.
+///
+/// Split from `lower_inner` rather than folded into it so the existing
+/// ten-argument call in `lib.rs` keeps compiling: a producer that has inlined
+/// something calls this one, everything else keeps calling `lower_inner` and
+/// gets an empty table. An empty table is byte-identical to the previous
+/// behaviour — `FrameState::caller` stays `None` at every deopt point.
+///
+/// See `docs/jit/deopt-inline-scopes.md` for the producer side.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_inner_with_scopes(
+    graph: &Graph,
+    schedule: &Schedule,
+    num_params: usize,
+    num_locals: usize,
+    helpers: &JitRuntimeHelpers,
+    branch_hints: &HashMap<usize, bool>,
+    sr_map: Option<&ScalarReplacementMap>,
     // IR direct-call lowering: `pc → (callee_entry, callee_needs_context)` for
     // every statically-bound call site whose callee was eagerly compiled. Empty
     // ⇒ every `Op::Call` keeps the historical `jit_invoke_dispatch` lowering.
@@ -5722,6 +5762,9 @@ pub(crate) fn lower_inner(
     // descriptor tag)` for every resolved compact instance field. Empty ⇒ every
     // `Op::Load` takes the checked helper, as it always did.
     compact_fields: &HashMap<usize, (u32, bool, u8)>,
+    // Which inlined callee each `graph.safepoints` entry belongs to, and the
+    // caller scopes above it. Empty ⇒ flat, caller-less deopt frames.
+    inline_scopes: &InlineScopeTable,
 ) -> Option<CompiledMethod> {
     // A live object allocation is now supported by the common allocation
     // stub. A zero helper pointer is only possible in synthetic unit-test
@@ -5850,6 +5893,7 @@ pub(crate) fn lower_inner(
         direct_calls,
         ic_slots,
         compact_fields,
+        inline_scopes,
     );
 
     // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
@@ -7287,6 +7331,7 @@ mod tests {
                 monitors: vec![],
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         // The map covers [rbp-40]; deopt spells that word as StackSlotRef(-40).
         let verifier = DeoptVerifier::new().with_oop_map(0x40, OopCoverage::complete([40]));
@@ -7334,6 +7379,7 @@ mod tests {
                 monitors: vec![],
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         assert!(
             DeoptVerifier::new()
@@ -7919,6 +7965,7 @@ mod tests {
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
         let no_compact_fields: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_scopes = InlineScopeTable::new();
         let buf = ExecutableBuffer::new(4096).expect("executable buffer");
         let helpers = no_helpers();
         let plan = plan_slots(&graph, &schedule, None);
@@ -7935,6 +7982,7 @@ mod tests {
             &no_direct,
             &no_ic,
             &no_compact_fields,
+            &no_scopes,
         );
 
         // Unallocated is an error, not an offset.
@@ -8517,5 +8565,288 @@ mod tests {
         let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a 5 000-node method lowers");
         assert_eq!(unsafe { cm.try_call(&[0]) }, Ok(5_000));
         assert_eq!(unsafe { cm.try_call(&[42]) }, Ok(5_042));
+    }
+
+    // ── Inlined caller scopes → `FrameState::caller` ─────────────────────
+
+    /// A trivially lowerable graph (`Start → Proj ctrl/mem → Param(0) →
+    /// Return`) with no safepoints; the caller pushes whatever snapshots the
+    /// test needs.
+    fn scope_fixture_graph() -> Graph {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let p0 = g.add(Op::Param(0), IrType::Int, vec![start], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![ctrl, p0], None);
+        g.exit = ret;
+        g
+    }
+
+    /// Resolve `graph.safepoints[index]` through a real `Lowerer` carrying
+    /// `scopes`, i.e. exactly the path `build_deopt_points` takes.
+    fn resolve_with_scopes(graph: &Graph, scopes: &InlineScopeTable, index: usize) -> FrameState {
+        let schedule = ir_schedule::schedule(graph);
+        let plan = plan_slots(graph, &schedule, None);
+        let empty: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let helpers = no_helpers();
+        let lowerer = Lowerer::new(
+            graph,
+            &schedule,
+            buf,
+            1,
+            1,
+            &plan,
+            &helpers,
+            &empty,
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact,
+            scopes,
+        );
+        lowerer.resolve_frame_state(&graph.safepoints[index], index)
+    }
+
+    /// The state of the world today: no scope table, so every deopt frame is
+    /// flat. This is the byte-identical-behaviour witness for the whole change.
+    #[test]
+    fn an_empty_scope_table_still_produces_a_flat_frame() {
+        let mut g = scope_fixture_graph();
+        g.safepoints.push(SafepointSnapshot {
+            bci: 4,
+            locals: vec![NO_NODE],
+            stack: vec![],
+        });
+        let fs = resolve_with_scopes(&g, &InlineScopeTable::new(), 0);
+        assert_eq!(fs.bci, 4);
+        assert!(fs.caller.is_none(), "no scope table ⇒ no caller chain");
+        assert!(crate::deopt::frame_state_is_resumable(&fs));
+    }
+
+    /// A snapshot bound to a scope round-trips through lowering into a
+    /// `FrameState` whose caller carries the scope's method key and the bci of
+    /// the `invoke` that is in progress — and whose locals come from the
+    /// caller's own recorded snapshot, not from thin air.
+    #[test]
+    fn a_bound_snapshot_lowers_into_its_caller_scope() {
+        let mut g = scope_fixture_graph();
+        let k = g.add(Op::Const(7), IrType::Int, vec![], None);
+        // snapshot 0 = the caller's state at the invoke; snapshot 1 = the
+        // inlined callee's state at the trapping bci.
+        g.safepoints.push(SafepointSnapshot {
+            bci: 12,
+            locals: vec![k],
+            stack: vec![],
+        });
+        g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![],
+        });
+
+        let mut scopes = InlineScopeTable::new();
+        let s = scopes
+            .push_scope("Outer.run:()V", 12, Some(0), None)
+            .expect("scope");
+        assert!(scopes.bind_snapshot(1, s));
+
+        let fs = resolve_with_scopes(&g, &scopes, 1);
+        assert_eq!(fs.bci, 3, "innermost scope is the trapping one");
+        let caller = fs.caller.as_ref().expect("caller scope present");
+        assert_eq!(caller.method_key, "Outer.run:()V");
+        assert_eq!(caller.bci, 12, "the invoke's bci, not the callee's");
+        assert_eq!(
+            caller.locals,
+            vec![FrameValue::Int(7)],
+            "the caller's locals come from its own snapshot"
+        );
+        assert!(caller.caller.is_none(), "depth 1 ⇒ nothing above");
+        assert!(crate::deopt::frame_state_is_resumable(&fs));
+
+        // The unbound snapshot in the same graph is unaffected.
+        assert!(resolve_with_scopes(&g, &scopes, 0).caller.is_none());
+    }
+
+    /// Depth 0..4: the chain length the lowerer produces is exactly the scope
+    /// depth, and the frames come out innermost-caller-first.
+    #[test]
+    fn caller_chains_of_depth_zero_through_four() {
+        for depth in 0..=4usize {
+            let mut g = scope_fixture_graph();
+            let k = g.add(Op::Const(1), IrType::Int, vec![], None);
+            // One caller snapshot per scope, then the trapping snapshot last.
+            for d in 0..depth {
+                g.safepoints.push(SafepointSnapshot {
+                    bci: 100 + d,
+                    locals: vec![k],
+                    stack: vec![],
+                });
+            }
+            let trap_index = depth;
+            g.safepoints.push(SafepointSnapshot {
+                bci: 9,
+                locals: vec![NO_NODE],
+                stack: vec![],
+            });
+
+            let mut scopes = InlineScopeTable::new();
+            // Push outermost-first so each parent already exists.
+            let mut parent = None;
+            for d in (0..depth).rev() {
+                parent = scopes.push_scope(
+                    &format!("M{d}.m:()V"),
+                    (100 + d) as u32,
+                    Some(d as u32),
+                    parent,
+                );
+                assert!(parent.is_some(), "depth {depth}, scope {d}");
+            }
+            if let Some(innermost) = parent {
+                assert!(scopes.bind_snapshot(trap_index, innermost));
+            }
+
+            let fs = resolve_with_scopes(&g, &scopes, trap_index);
+            let mut walked = 0usize;
+            let mut cursor = fs.caller.as_deref();
+            while let Some(f) = cursor {
+                // Scope 0 is the immediate caller, scope `depth-1` the outermost.
+                assert_eq!(f.method_key, format!("M{walked}.m:()V"));
+                assert_eq!(f.bci, (100 + walked) as u32);
+                walked += 1;
+                cursor = f.caller.as_deref();
+            }
+            assert_eq!(walked, depth, "chain length matches the scope depth");
+            assert!(crate::deopt::frame_state_is_resumable(&fs));
+        }
+    }
+
+    /// A caller scope whose own snapshot holds an unreconstructable slot must
+    /// be REFUSED, not resumed. The innermost scope here is spotless, so a
+    /// scope-local predicate would wave it through — which is precisely the
+    /// hazard `frame_state_is_resumable`'s caller walk closes.
+    #[test]
+    fn a_caller_scope_holding_materialization_required_is_refused() {
+        let mut g = scope_fixture_graph();
+        // A snapshot slot naming a node id past the end of the arena resolves
+        // to `MaterializationRequired` (see `frame_value_for`).
+        let dangling: NodeId = 9_999;
+        g.safepoints.push(SafepointSnapshot {
+            bci: 12,
+            locals: vec![dangling],
+            stack: vec![],
+        });
+        g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![],
+        });
+
+        let mut scopes = InlineScopeTable::new();
+        let s = scopes
+            .push_scope("Outer.run:()V", 12, Some(0), None)
+            .expect("scope");
+        assert!(scopes.bind_snapshot(1, s));
+
+        let fs = resolve_with_scopes(&g, &scopes, 1);
+        let caller = fs.caller.as_ref().expect("caller scope present");
+        assert!(
+            matches!(caller.locals[0], FrameValue::MaterializationRequired(_)),
+            "{:?}",
+            caller.locals[0]
+        );
+        // Innermost alone is clean …
+        let innermost_only = FrameState {
+            caller: None,
+            ..fs.clone()
+        };
+        assert!(
+            crate::deopt::frame_state_is_resumable(&innermost_only),
+            "precondition: a scope-local predicate would wave this through"
+        );
+        // … the chain is not.
+        assert!(
+            !crate::deopt::frame_state_is_resumable(&fs),
+            "an unresumable caller must sink the whole deopt point"
+        );
+    }
+
+    /// A scope with no recorded caller snapshot is rendered as an explicitly
+    /// UNRESUMABLE frame, never as an empty one — an empty caller frame
+    /// reconstructs as all-zero locals with no error anywhere.
+    #[test]
+    fn an_undescribed_caller_scope_is_unresumable_not_empty() {
+        let mut g = scope_fixture_graph();
+        g.safepoints.push(SafepointSnapshot {
+            bci: 3,
+            locals: vec![NO_NODE],
+            stack: vec![],
+        });
+
+        let mut scopes = InlineScopeTable::new();
+        let s = scopes
+            .push_scope("Outer.run:()V", 12, None, None)
+            .expect("scope");
+        assert!(scopes.bind_snapshot(0, s));
+
+        let fs = resolve_with_scopes(&g, &scopes, 0);
+        let caller = fs.caller.as_ref().expect("caller scope present");
+        assert_eq!(caller.locals, vec![FrameValue::Unsupported]);
+        assert!(!crate::deopt::frame_state_is_resumable(&fs));
+    }
+
+    /// Every `DeoptimizationPoint` this file builds carries
+    /// `ResumeSemantics::for_reason(reason)` — the convention, written down
+    /// instead of re-derived by each consumer. `build_deopt_points` is the
+    /// site under test; the two guard sites (`Op::Guard`, `emit_deopt_unless`)
+    /// box their points into code and are covered by the source witness below.
+    #[test]
+    fn every_deopt_point_stamps_for_reason() {
+        // iconst_5; iconst_3; iadd; iconst_2; imul; ireturn — two deopt points
+        // (bci 2 and bci 4), the same fixture `test_deopt_points_resolve_*` uses.
+        let code = [0x08, 0x06, 0x60, 0x05, 0x68, 0xac, 0, 0];
+        let cm = compile_via_ir_no_opt(&code, 6, 0, 0);
+        assert!(!cm.deopt_points.is_empty(), "fixture must emit deopt points");
+        for p in &cm.deopt_points {
+            assert_eq!(
+                p.semantics,
+                ResumeSemantics::for_reason(p.reason),
+                "deopt point at +{:#x} (reason {:?})",
+                p.native_offset,
+                p.reason
+            );
+            assert_eq!(
+                p.semantics,
+                ResumeSemantics::REEXECUTE,
+                "a resume point before the bytecode re-executes it"
+            );
+        }
+    }
+
+    /// Source witness: no `DeoptimizationPoint` literal in this file may omit
+    /// `semantics`. The two guard sites bake their point's *address* into
+    /// emitted code and are never handed back to a test, so the field's
+    /// presence there cannot be asserted behaviourally.
+    #[test]
+    fn every_deopt_point_literal_names_its_semantics() {
+        let src = include_str!("ir_lower.rs");
+        let literals = src.matches("DeoptimizationPoint {").count();
+        let stamped = src.matches("semantics: ResumeSemantics::").count();
+        assert!(
+            stamped >= literals,
+            "{literals} `DeoptimizationPoint` literal(s) but only {stamped} \
+             `semantics:` initialiser(s) — a construction site is inferring \
+             the re-execute convention again instead of recording it"
+        );
     }
 }

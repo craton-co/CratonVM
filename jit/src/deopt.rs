@@ -382,11 +382,47 @@ pub struct VirtualObjectState {
 /// it can never resume from fails on its first compiled call with
 /// `InternalError: precise deoptimization unavailable ... refusing
 /// side-effecting replay`, which is strictly worse than staying interpreted.
+///
+/// ## The whole chain, not just the innermost scope
+///
+/// The scan follows `caller`. It has to: a deopt inside an inlined callee
+/// rebuilds *every* frame in the chain, so a caller scope holding a value no
+/// one can describe is exactly as unresumable as the trapping scope holding
+/// one — and it is the caller's locals that the interpreter would silently
+/// fill with `Value::Int(0)`.
+///
+/// Every resume sink in the VM (`vm/src/vm.rs`, `vm/src/runtime/interpreter.rs`)
+/// calls this function and nothing else, so making it chain-aware is what stops
+/// the first inlined chain from resuming as if clean. It is behaviour-preserving
+/// until then: every producer sets `caller: None` today, and a one-scope chain
+/// is exactly the old predicate. The interned counterparts are
+/// [`FrameStateInterner::is_resumable`] (deliberately scope-local — it answers
+/// "is *this* scope clean") and [`FrameStateInterner::chain_is_resumable`],
+/// which is the handle-side equivalent of this function.
+///
+/// The walk is bounded by [`MAX_SCOPE_CHAIN`]: a chain longer than that is
+/// treated as unresumable rather than walked further, because a chain that deep
+/// is a metadata defect and refusing costs only a whole-method re-run.
 pub fn frame_state_is_resumable(fs: &FrameState) -> bool {
-    !fs.locals
-        .iter()
-        .chain(fs.stack.iter())
-        .any(value_blocks_resume)
+    let mut scope = Some(fs);
+    let mut seen = 0usize;
+    while let Some(f) = scope {
+        if f.locals
+            .iter()
+            .chain(f.stack.iter())
+            .any(value_blocks_resume)
+        {
+            return false;
+        }
+        seen += 1;
+        if seen >= MAX_SCOPE_CHAIN {
+            // Deeper than any real inliner produces: refuse rather than keep
+            // walking a chain that is already known to be malformed.
+            return f.caller.is_none();
+        }
+        scope = f.caller.as_deref();
+    }
+    true
 }
 
 /// `true` when `v` cannot be turned into an interpreter value: either it is
@@ -647,6 +683,22 @@ pub struct DeoptimizationPoint {
     pub speculation_id: u32,
     /// How to reconstruct the interpreter frame.
     pub frame_state: FrameState,
+    /// What the interpreter must do with the bytecode at `frame_state.bci`:
+    /// re-execute it, continue after it, or route a pending exception through
+    /// the method's exception table.
+    ///
+    /// This used to be a **prose convention** derived from `reason` by each
+    /// consumer independently — `docs/jit/deopt-metadata.md` records the
+    /// missing field as an outright gap, and "a consumer that gets the
+    /// convention wrong executes the instruction after a call that never
+    /// returned". Every producer stamps [`ResumeSemantics::for_reason`], which
+    /// *is* that convention, so recording it changes no behaviour; what changes
+    /// is that a producer which knows better — an inlined caller scope
+    /// ([`ResumeSemantics::for_caller_scope`]), a resume point after a call
+    /// that did return — can now say so, and that
+    /// [`FrameStateInterner::materialize_point`] can round-trip it instead of
+    /// dropping it.
+    pub semantics: ResumeSemantics,
 }
 
 // ---------------------------------------------------------------------------
@@ -1838,6 +1890,7 @@ mod x64_deopt_entry_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let _ = take_last_deopt(); // clear any prior stash
                                    // Null guard ⇒ no staleness check (the production / unstamped path).
@@ -1901,6 +1954,7 @@ mod x64_deopt_entry_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let _ = take_last_deopt();
         let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters, &guard);
@@ -1943,6 +1997,7 @@ mod x64_deopt_entry_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let _ = take_last_deopt();
         let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters, &guard);
@@ -2552,8 +2607,13 @@ impl FrameStateInterner {
         self.intern_node(node)
     }
 
-    /// Intern a [`DeoptimizationPoint`], deriving the innermost scope's
-    /// semantics from its reason.
+    /// Intern a [`DeoptimizationPoint`], taking the innermost scope's semantics
+    /// from the point itself.
+    ///
+    /// It used to re-derive them with [`ResumeSemantics::for_reason`], because
+    /// the owned point had no field to read. It does now, and every producer
+    /// fills that field with `for_reason(reason)` — so this is the same answer
+    /// today, and the *producer's* answer once one of them knows better.
     pub fn intern_point(&mut self, point: &DeoptimizationPoint) -> InternedDeoptPoint {
         InternedDeoptPoint {
             native_offset: point.native_offset,
@@ -2561,7 +2621,7 @@ impl FrameStateInterner {
             reason: point.reason,
             action: point.action,
             speculation_id: point.speculation_id,
-            frame_state: self.intern_for_reason(&point.frame_state, point.reason),
+            frame_state: self.intern_with(&point.frame_state, point.semantics),
         }
     }
 
@@ -2941,6 +3001,12 @@ impl FrameStateInterner {
     }
 
     /// Rebuild the owned [`DeoptimizationPoint`] an interned point names.
+    ///
+    /// The semantics survive the round trip: they are read back from the
+    /// interned innermost scope rather than re-derived from `reason`. (The
+    /// caller *scopes'* semantics are still dropped — the owned `FrameState`
+    /// has no field for them — which is the remaining half of the gap
+    /// `docs/jit/deopt-frame-state-interning.md` records.)
     pub fn materialize_point(&self, point: &InternedDeoptPoint) -> Option<DeoptimizationPoint> {
         Some(DeoptimizationPoint {
             native_offset: point.native_offset,
@@ -2949,18 +3015,23 @@ impl FrameStateInterner {
             action: point.action,
             speculation_id: point.speculation_id,
             frame_state: self.materialize(point.frame_state)?,
+            semantics: self
+                .semantics(point.frame_state)
+                .unwrap_or_else(|| ResumeSemantics::for_reason(point.reason)),
         })
     }
 
     // ── predicates over the interned form ────────────────────────────
 
-    /// [`frame_state_is_resumable`] without materializing.
+    /// Is *this* scope's own frame reconstructable?
     ///
-    /// Scope-local, matching the owned predicate exactly: only this scope's
-    /// own locals and stack are inspected. [`Self::chain_is_resumable`] is the
-    /// whole-chain version, which is what an inlined deopt actually needs —
-    /// they differ only once a producer builds a chain, and the owned
-    /// predicate cannot express the difference at all.
+    /// Scope-local by design: only this scope's locals and stack are
+    /// inspected, so it answers "is this one frame clean" for a caller walking
+    /// a chain itself. [`Self::chain_is_resumable`] is the whole-chain answer,
+    /// and it is the one that corresponds to the owned
+    /// [`frame_state_is_resumable`] — which follows `caller` for exactly the
+    /// reason spelled out there. The two agree on a one-scope chain, which is
+    /// every chain a producer builds today.
     ///
     /// An unknown handle is *not* resumable: refusing costs a whole-method
     /// re-run, accepting would resume a frame nobody can describe.
@@ -4023,6 +4094,7 @@ mod deopt_metadata_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         }
     }
 
@@ -4530,6 +4602,7 @@ mod deopt_metadata_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let regs = SavedRegisters::default();
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, 0);
@@ -4575,6 +4648,7 @@ mod deopt_metadata_tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         }])
         .is_empty());
     }
@@ -4679,6 +4753,69 @@ mod tests {
         );
     }
 
+    /// The predicate follows `caller`.
+    ///
+    /// This is the fix for a hazard that was latent only because nothing built
+    /// a chain: every resume sink in the VM calls `frame_state_is_resumable`
+    /// and nothing else, and it used to inspect the innermost scope alone. The
+    /// first inlined chain would therefore have resumed a caller frame whose
+    /// locals nobody could describe — filling them with `Value::Int(0)`, with
+    /// no error anywhere. `chain_is_resumable` already existed on the interned
+    /// side; this is its owned counterpart.
+    #[test]
+    fn resumability_follows_the_whole_caller_chain() {
+        let clean = || fs(vec![FrameValue::Int(1)], vec![]);
+        let mut chain = clean();
+        chain.caller = Some(Box::new(clean()));
+        assert!(
+            frame_state_is_resumable(&chain),
+            "a clean chain stays resumable"
+        );
+
+        for dirty in [
+            FrameValue::Unsupported,
+            FrameValue::MaterializationRequired(EliminatedValue::unknown(
+                EliminationCause::ElidedLock,
+            )),
+        ] {
+            let mut bad_caller = fs(vec![dirty.clone()], vec![]);
+            bad_caller.caller = None;
+            let mut inner = clean();
+            inner.caller = Some(Box::new(bad_caller));
+            assert!(
+                frame_state_is_resumable(&clean()),
+                "precondition: the innermost scope alone is clean"
+            );
+            assert!(
+                !frame_state_is_resumable(&inner),
+                "an unrebuildable CALLER slot ({dirty:?}) must sink the whole chain"
+            );
+
+            // …at depth 3 as well, not just as an immediate caller.
+            let mut deep = fs(vec![dirty.clone()], vec![]);
+            for _ in 0..3 {
+                let mut next = clean();
+                next.caller = Some(Box::new(deep));
+                deep = next;
+            }
+            assert!(!frame_state_is_resumable(&deep));
+        }
+    }
+
+    /// A caller chain deeper than `MAX_SCOPE_CHAIN` is refused rather than
+    /// walked further: that deep is a metadata defect, and refusing costs only
+    /// a whole-method re-run.
+    #[test]
+    fn an_absurdly_deep_chain_is_refused_not_walked() {
+        let mut deep = fs(vec![FrameValue::Int(0)], vec![]);
+        for _ in 0..(MAX_SCOPE_CHAIN + 4) {
+            let mut next = fs(vec![FrameValue::Int(0)], vec![]);
+            next.caller = Some(Box::new(deep));
+            deep = next;
+        }
+        assert!(!frame_state_is_resumable(&deep));
+    }
+
     // -- per-bci de-spec registry (Step 9 follow-up c) ---------------------
 
     /// `despec_insert`/`despec_contains`/`despec_count_for` are per-(method, bci):
@@ -4734,6 +4871,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: simple_frame_state(),
+            semantics: ResumeSemantics::REEXECUTE,
         }
     }
 
@@ -4779,6 +4917,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, rbp);
         assert_eq!(rf.locals[0], FrameValue::Object(0x1111_2222_3333_4444));
@@ -4835,6 +4974,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, rbp);
         assert_eq!(rf.locals[0], FrameValue::Float(float_bits as u64));
@@ -4901,6 +5041,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, rbp);
         assert_eq!(
@@ -4989,6 +5130,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: callee,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, 0);
         assert_eq!(rf.locals[0], FrameValue::Int(9));
@@ -5023,6 +5165,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame_from_machine_state(&dp, &regs, 0);
         assert_eq!(rf.monitors.len(), 1);
@@ -5592,6 +5735,7 @@ mod tests {
             action: DeoptAction::RecompileAndReinterpret,
             speculation_id: 1,
             frame_state: inner,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame(&dp);
         assert_eq!(rf.method_key, "Inner.go:()V");
@@ -5738,6 +5882,7 @@ mod tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            semantics: ResumeSemantics::REEXECUTE,
         };
         let rf = reconstruct_frame(&dp);
         assert_eq!(rf.monitors.len(), 1);
@@ -6070,6 +6215,7 @@ mod frame_state_interning_tests {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs.clone(),
+            semantics: ResumeSemantics::for_reason(DeoptReason::PendingException),
         };
         let interned = it.intern_point(&point);
         assert_eq!(
@@ -6108,6 +6254,7 @@ mod frame_state_interning_tests {
                 monitors: Vec::new(),
                 caller: None,
             },
+            semantics: ResumeSemantics::REEXECUTE,
         }
     }
 
@@ -6367,8 +6514,12 @@ mod frame_state_interning_tests {
         assert!(!it.is_resumable(poisoned_id));
         assert_eq!(it.count_materialization_required(poisoned_id), 1);
 
-        // `is_resumable` is scope-local (parity with `frame_state_is_resumable`);
-        // `chain_is_resumable` is the whole-chain answer an inlined deopt needs.
+        // `is_resumable` is scope-local — it answers "is *this* frame clean".
+        // `chain_is_resumable` is the whole-chain answer an inlined deopt
+        // needs, and it is the one the owned `frame_state_is_resumable` now
+        // matches: the owned predicate used to stop at the innermost scope, so
+        // this exact state round-tripped back as "resumable" while holding a
+        // caller slot nobody can rebuild.
         let mut inner = owned(1, vec![FrameValue::Int(0)], Vec::new());
         inner.caller = Some(Box::new(owned(2, vec![eliminated.clone()], Vec::new())));
         let inner_id = it.intern(&inner);
@@ -6380,9 +6531,11 @@ mod frame_state_interning_tests {
             !it.chain_is_resumable(inner_id),
             "an unrebuildable caller slot makes the whole chain unresumable"
         );
-        assert!(frame_state_is_resumable(
-            &it.materialize(inner_id).expect("round-trip")
-        ));
+        assert!(
+            !frame_state_is_resumable(&it.materialize(inner_id).expect("round-trip")),
+            "the owned predicate must agree with `chain_is_resumable`, not with \
+             `is_resumable` — this is the resume sinks' only guard"
+        );
     }
 
     // ── measurement ──────────────────────────────────────────────────
