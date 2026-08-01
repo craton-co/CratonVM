@@ -34,21 +34,34 @@ it: the symbolized frame (below) is `scan_object_for_old_refs` on an unvalidated
 worklist address, which is exactly what that commit screens.
 
 But F is **not** a pass. HotSpot gets `found=132 started=132 ok=132`; F gets
-`found=99 started=97 ok=97`. Thirty-three tests are never discovered, preceded in
-the log by
+`found=99 started=97 ok=97`.
+
+**That shortfall is the same corruption, not a separate discovery bug.** The
+count comes from `SummaryGeneratingListener`, which reads the `TestPlan`; and the
+`TestPlan` is losing entries out of its own map at run time:
 
 ```
 org.junit.platform.commons.PreconditionViolationException: No TestIdentifier with
 unique ID [[engine:junit-jupiter]/[class-template:…DefaultCatalogAndSchemaTest]]
 has been added to this TestPlan.
+    at org.junit.platform.launcher.TestPlan.getTestIdentifier(TestPlan.java:204)
+    at …ExecutionListenerAdapter.executionFinished(ExecutionListenerAdapter.java:57)
 ```
 
-— JUnit's `TestPlan` losing identifiers out of its own map. Six dropped writes
-still precede it (log line 6356 vs 7269), at `index=5`/`index=4`/`index=1` on
-`num_slots=0` receivers — `LinkedHashMap$Node`'s `after`/`before`/`key` slots.
+Those four exceptions are **interleaved, at the same millisecond, with a burst of
+101 dropped out-of-bounds field READS** plus 6 dropped writes — the `num_slots=0`
+(reclaimed-receiver) guard, at `index=5`/`4`/`1`, i.e. `LinkedHashMap$Node`'s
+`after`/`before`/`key`. The reads start at log line 6244, the first TestPlan
+exception at 7269, and they continue together to the end. A map whose nodes have
+been reclaimed returns null for a key it holds; JUnit's `Preconditions.notNull`
+turns that into the exception, and the summary undercounts.
+
 And the deep verifier still reports **≥40 UN-FORWARDED fields per major GC** on F
 (the report caps at 40), against `pointer_map size=3295701`, with the same
 referrer shapes as on C.
+
+So there is **one** defect left, not two: fix the un-forwarded edges and the
+`found` count should follow.
 
 So `c3dbb011a` removed the crash, not the corruption. Defect 3 is unchanged and
 is now a **silent wrong answer** — a third of the class's tests quietly vanish —
