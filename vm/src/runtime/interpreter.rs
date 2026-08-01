@@ -8405,7 +8405,7 @@ pub fn execute(
             frame.method_descriptor()
         );
     }
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
     if shared
         .mem
         .gc_barrier
@@ -8447,7 +8447,11 @@ pub fn execute(
                     .stack
                     .push(Value::Object(Some(exc_ref)));
                 thread.frames[frame_idx].pc = handler_pc;
-                fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                fire_jvmti_exception_catch(
+                    shared.vm_identity,
+                    &thread.frames[frame_idx],
+                    handler_pc,
+                );
                 // Fall through to execute_frame which will resume at handler_pc
             }
             None => {
@@ -8665,7 +8669,7 @@ pub(crate) fn execute_prebuilt_frame(
             frame.pc
         );
     }
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
     if shared
         .mem
         .gc_barrier
@@ -8794,10 +8798,17 @@ pub fn pop_and_recycle_frame_with_reason(
     // T17.Δ.2 — JVMTI MethodExit on exception unwind. Normal-return exits
     // are already fired from the return opcodes; here we handle only the
     // abrupt case. Cost when no agent is subscribed: single Acquire load.
+    //
+    // The guard is the process-wide union flag (over-approximates: it can be
+    // true because a *different* VM has a MethodExit listener); the delivery
+    // is `_for_vm`, which resolves this VM's environment and re-checks that
+    // environment's own enable set. Guards may over-approximate, delivery
+    // may not.
     if was_popped_by_exception && crate::runtime::jvmti::any_method_exit_listener_active() {
         if let Some(top) = thread.frames.last() {
             let method_id = synth_method_id(top);
-            crate::runtime::jvmti::fire_method_exit(
+            crate::runtime::jvmti::fire_method_exit_for_vm(
+                shared.vm_identity,
                 thread.thread_id.0,
                 method_id,
                 true,
@@ -8806,7 +8817,7 @@ pub fn pop_and_recycle_frame_with_reason(
         }
     }
     // T17.Δ.5 — JVMTI FramePop before the frame vanishes.
-    fire_jvmti_frame_pop_if_requested(thread, was_popped_by_exception);
+    fire_jvmti_frame_pop_if_requested(shared.vm_identity, thread, was_popped_by_exception);
     if let Some(f) = thread.frames.pop() {
         // Root-snapshot cache correctness: the frame that becomes the top again
         // (the caller this return/unwind exposes) is about to RE-EXECUTE and may
@@ -9210,7 +9221,11 @@ fn execute_frame_from_index(
                             .push(Value::Object(Some(exc_ref)))
                             .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
                         thread.frames[frame_idx].pc = handler_pc;
-                        fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                        fire_jvmti_exception_catch(
+                            shared.vm_identity,
+                            &thread.frames[frame_idx],
+                            handler_pc,
+                        );
                         thread.native_pin_roots.truncate(pin_base);
                         break;
                     }
@@ -9310,7 +9325,11 @@ fn execute_frame_from_index(
                                         MethodCallFailed::InternalError(VmError::Runtime(e))
                                     })?;
                                 thread.frames[frame_idx].pc = handler_pc;
-                                fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                                fire_jvmti_exception_catch(
+                                    shared.vm_identity,
+                                    &thread.frames[frame_idx],
+                                    handler_pc,
+                                );
                                 thread.native_pin_roots.truncate(pin_base);
                                 break;
                             }
@@ -9377,7 +9396,12 @@ fn execute_frame_from_index(
             // which exposes the whole frame stack, so hoist rule 1 forbids
             // routing it through `hot_fp`. Cold and listener-gated — it costs
             // nothing in the universal no-agent case.
-            fire_jvmti_single_step(thread, &thread.frames[frame_idx], saved_pc);
+            fire_jvmti_single_step(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                saved_pc,
+            );
         }
 
         // --- Fast path: handle hot bytecodes directly from raw bytes ---
@@ -10270,7 +10294,12 @@ fn execute_frame_from_index(
                     // JDK/Spring frames.
                     let return_value = Some(value);
                     let _ = frame;
-                    fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &return_value);
+                    fire_jvmti_method_exit_normal(
+                        shared.vm_identity,
+                        thread,
+                        &thread.frames[frame_idx],
+                        &return_value,
+                    );
                     if frame_idx > initial_frame_idx {
                         // Stackless return: pop child frame, push value to parent.
                         pop_and_recycle_frame(shared, thread);
@@ -10306,7 +10335,12 @@ fn execute_frame_from_index(
                 // return (void)
                 0xb1 => {
                     let _ = frame;
-                    fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &None);
+                    fire_jvmti_method_exit_normal(
+                        shared.vm_identity,
+                        thread,
+                        &thread.frames[frame_idx],
+                        &None,
+                    );
                     if frame_idx > initial_frame_idx {
                         pop_and_recycle_frame(shared, thread);
                         frame_idx -= 1;
@@ -12037,6 +12071,7 @@ fn execute_frame_from_index(
                                         })?;
                                     thread.frames[frame_idx].pc = handler_pc;
                                     fire_jvmti_exception_catch(
+                                        shared.vm_identity,
                                         &thread.frames[frame_idx],
                                         handler_pc,
                                     );
@@ -12147,7 +12182,11 @@ fn execute_frame_from_index(
                                     MethodCallFailed::InternalError(VmError::Runtime(e))
                                 })?;
                             thread.frames[frame_idx].pc = handler_pc;
-                            fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                            fire_jvmti_exception_catch(
+                                shared.vm_identity,
+                                &thread.frames[frame_idx],
+                                handler_pc,
+                            );
                             thread.native_pin_roots.truncate(pin_base);
                             break;
                         }
@@ -12198,15 +12237,21 @@ fn execute_frame_from_index(
 /// The `MethodId` is synthesized from the frame's class id and the first 32
 /// bits of an FNV hash of the method name. This matches the scheme used by
 /// the `VmClassMethodProvider` in `vm/src/jvmti/mod.rs`.
+///
+/// `vm` is the raising VM's `SharedVm::vm_identity`. It is a parameter rather
+/// than something read off `frame`/`thread` because neither `Frame` nor
+/// `JvmThread` carries a VM identity — see the module note on
+/// `push_frame_and_fire_entry`. Every caller has `shared: &SharedVm` in
+/// scope, so the value is always exact and never the unattributed seam.
 #[inline]
-fn fire_jvmti_exception_catch(frame: &Frame, handler_pc: usize) {
+fn fire_jvmti_exception_catch(vm: usize, frame: &Frame, handler_pc: usize) {
     let method_id = synth_method_id(frame);
     // Thread id is implicit in JVMTI's ExceptionCatch callback signature;
     // we pass 0 here (the interpreter does not track a JVMTI thread id on
     // the per-frame path). Agents that need the id consult `GetCurrentThread`
     // from within the callback.
     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
-    crate::runtime::jvmti::fire_exception_catch(0, method_id, handler_pc as i64);
+    crate::runtime::jvmti::fire_exception_catch_for_vm(vm, 0, method_id, handler_pc as i64);
 }
 
 /// Synthesize a stable JVMTI `MethodId` for `frame`.
@@ -12238,27 +12283,57 @@ pub(crate) fn synth_method_id(frame: &Frame) -> u64 {
 // the interpreter hot path stays compact. Every helper returns early on a
 // single `AtomicBool::Acquire` load when no agent is subscribed to the
 // corresponding event, adding < 2 ns per opcode in the no-agent case.
+//
+// **VM scoping.** Each helper takes `vm: usize` — the raising VM's
+// `SharedVm::vm_identity` — as its first parameter, and delivers through the
+// `runtime::jvmti::fire_*_for_vm` family, which resolves that VM's JVMTI
+// environment and re-checks *that environment's* enable set before invoking a
+// callback. The `any_*_listener_active()` calls immediately below are the
+// deliberate process-wide **union** pre-filter: with two VMs the union can be
+// true because the *other* VM has an agent, which costs this VM one predicted
+// branch plus one registry lookup and never delivers it another VM's event.
+// Guards may over-approximate; delivery may not.
+//
+// `vm` is a parameter and not a field read off `thread`/`frame` because
+// neither `JvmThread` (`vm/src/threading/jvm_thread.rs:336`) nor `Frame`
+// (`vm/src/runtime/frame.rs:249`) carries a VM identity, and the only
+// process-level `SharedVm` registry (`set_global_shared_vm_for_hooks`,
+// `vm/src/vm/vm_init.rs:3498`) is a fan-out list of *every* live VM — it can
+// answer "which VMs exist", never "which VM is running this frame". Guessing
+// there would be exactly the wrong-VM delivery bug this scoping exists to
+// close. Every caller of every helper below has `shared: &SharedVm` in scope,
+// so the identity is always exact.
 
 /// Fire `MethodEntry` for the frame at `frames_depth - 1` (the one just
 /// pushed). Costs a single Acquire load when no agent is attached.
+///
+/// Currently unused — `push_frame_and_fire_entry` inlines the equivalent
+/// logic so that the frame push and the event are a single chokepoint.
+/// Retained for callers that already hold the pushed frame.
+#[allow(dead_code)]
 #[inline]
-fn fire_jvmti_method_entry(thread: &JvmThread, frame: &Frame) {
+fn fire_jvmti_method_entry(vm: usize, thread: &JvmThread, frame: &Frame) {
     if !crate::runtime::jvmti::any_method_entry_listener_active() {
         return;
     }
     let method_id = synth_method_id(frame);
-    crate::runtime::jvmti::fire_method_entry(thread.thread_id.0, method_id);
+    crate::runtime::jvmti::fire_method_entry_for_vm(vm, thread.thread_id.0, method_id);
 }
 
 /// Fire `MethodExit` for a normal return with the given return value.
 #[inline]
-fn fire_jvmti_method_exit_normal(thread: &JvmThread, frame: &Frame, return_value: &Option<Value>) {
+fn fire_jvmti_method_exit_normal(
+    vm: usize,
+    thread: &JvmThread,
+    frame: &Frame,
+    return_value: &Option<Value>,
+) {
     if !crate::runtime::jvmti::any_method_exit_listener_active() {
         return;
     }
     let method_id = synth_method_id(frame);
     let lv = to_local_value(return_value.as_ref());
-    crate::runtime::jvmti::fire_method_exit(thread.thread_id.0, method_id, false, lv);
+    crate::runtime::jvmti::fire_method_exit_for_vm(vm, thread.thread_id.0, method_id, false, lv);
 }
 
 /// Fire `MethodExit` for an exception-unwind exit.  The return value is
@@ -12271,12 +12346,13 @@ fn fire_jvmti_method_exit_normal(thread: &JvmThread, frame: &Frame, return_value
 /// directly without duplicating the fast-path gate.
 #[allow(dead_code)]
 #[inline]
-fn fire_jvmti_method_exit_exception(thread: &JvmThread, frame: &Frame) {
+fn fire_jvmti_method_exit_exception(vm: usize, thread: &JvmThread, frame: &Frame) {
     if !crate::runtime::jvmti::any_method_exit_listener_active() {
         return;
     }
     let method_id = synth_method_id(frame);
-    crate::runtime::jvmti::fire_method_exit(
+    crate::runtime::jvmti::fire_method_exit_for_vm(
+        vm,
         thread.thread_id.0,
         method_id,
         /*was_popped_by_exception=*/ true,
@@ -12288,7 +12364,11 @@ fn fire_jvmti_method_exit_exception(thread: &JvmThread, frame: &Frame) {
 /// entry in `thread.frame_pop_requests`.  The matching entry is consumed
 /// so that a single `NotifyFramePop` call yields exactly one event.
 #[inline]
-fn fire_jvmti_frame_pop_if_requested(thread: &mut JvmThread, was_popped_by_exception: bool) {
+fn fire_jvmti_frame_pop_if_requested(
+    vm: usize,
+    thread: &mut JvmThread,
+    was_popped_by_exception: bool,
+) {
     if !crate::runtime::jvmti::any_frame_pop_listener_active() {
         return;
     }
@@ -12306,7 +12386,7 @@ fn fire_jvmti_frame_pop_if_requested(thread: &mut JvmThread, was_popped_by_excep
         let method_id = synth_method_id(frame);
         let tid = thread.thread_id.0;
         thread.frame_pop_requests.swap_remove(pos);
-        crate::runtime::jvmti::fire_frame_pop(tid, method_id, was_popped_by_exception);
+        crate::runtime::jvmti::fire_frame_pop_for_vm(vm, tid, method_id, was_popped_by_exception);
     }
 }
 
@@ -12314,7 +12394,7 @@ fn fire_jvmti_frame_pop_if_requested(thread: &mut JvmThread, was_popped_by_excep
 /// Cost when no agent is subscribed: a single `AtomicBool::Acquire` load
 /// (the per-event flag) plus one predicted branch.  No work otherwise.
 #[inline]
-fn fire_jvmti_single_step(thread: &JvmThread, frame: &Frame, saved_pc: usize) {
+fn fire_jvmti_single_step(vm: usize, thread: &JvmThread, frame: &Frame, saved_pc: usize) {
     if !crate::runtime::jvmti::any_single_step_listener_active() {
         return;
     }
@@ -12328,7 +12408,12 @@ fn fire_jvmti_single_step(thread: &JvmThread, frame: &Frame, saved_pc: usize) {
     }
     let method_id = synth_method_id(frame);
     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
-    crate::runtime::jvmti::fire_single_step(thread.thread_id.0, method_id, saved_pc as i64);
+    crate::runtime::jvmti::fire_single_step_for_vm(
+        vm,
+        thread.thread_id.0,
+        method_id,
+        saved_pc as i64,
+    );
 }
 
 /// Push `frame` onto the thread and fire `MethodEntry`.  The MethodEntry
@@ -12338,8 +12423,12 @@ fn fire_jvmti_single_step(thread: &JvmThread, frame: &Frame, saved_pc: usize) {
 /// This is the single chokepoint for every interpreter frame push. If a
 /// push site skips it (e.g. to call `thread.frames.push` directly for
 /// setup reasons), MethodEntry will NOT fire for that frame.
+///
+/// `vm` is `shared.vm_identity` at every one of the ten call sites. It cannot
+/// be derived from `thread` or `frame` — see the VM-scoping note at the top of
+/// this helper block.
 #[inline]
-pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
+pub(crate) fn push_frame_and_fire_entry(vm: usize, thread: &mut JvmThread, frame: Frame) {
     thread.frames.push(frame);
     if crate::runtime::jvmti::any_method_entry_listener_active() {
         // Safe: we just pushed.
@@ -12347,7 +12436,7 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
         let frame_ref = &thread.frames[last];
         let method_id = synth_method_id(frame_ref);
         let tid = thread.thread_id.0;
-        crate::runtime::jvmti::fire_method_entry(tid, method_id);
+        crate::runtime::jvmti::fire_method_entry_for_vm(vm, tid, method_id);
     }
     if crate::runtime::env_cache::trace_sb_filter() {
         let last = thread.frames.len() - 1;
@@ -12475,6 +12564,418 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
                 thread.thread_id.0,
             );
         }
+    }
+}
+
+/// Delivery-side VM scoping for the interpreter's JVMTI event helpers.
+///
+/// The registry half of this (`runtime::jvmti::ENVIRONMENTS`) is pinned by
+/// `runtime::jvmti`'s own tests. What is pinned *here* is the half those
+/// cannot reach: that the interpreter helpers pass a real, exact
+/// `vm_identity` down to the `fire_*_for_vm` family, rather than the
+/// `UNATTRIBUTED_VM` migration seam they used before this change. A
+/// regression that reverts any one helper to the VM-less `fire_*` free
+/// function delivers VM A's MethodEntry to VM B's `-agentpath:` agent, which
+/// a debugging interface people trust to be authoritative must never do.
+///
+/// Parallel safety: every test takes its own `scoped_vm()` identity from a
+/// base no real `SharedVm` can reach (`NEXT_VM_IDENTITY` counts from 1), and
+/// takes `jvmti_registry_test_lock()` because registering a listener moves
+/// the process-wide **union** mirrors that `runtime::jvmti`'s tests assert
+/// are false. Each test drops its rows again on the way out.
+#[cfg(test)]
+mod jvmti_delivery_scoping_tests {
+    use super::*;
+    use crate::runtime::jvmti::{
+        self, EventCallbacks, EventMode, JvmtiEventKind, JvmtiEventManager, MethodId,
+    };
+    use crate::threading::jvm_thread::ThreadId;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    use std::sync::{Arc, Mutex};
+
+    /// A `vm_identity` no other test and no real VM can collide with. Real
+    /// identities come from `NEXT_VM_IDENTITY` (`vm/src/vm/vm_init.rs:9`), a
+    /// counter starting at 1, so small integers are NOT safe to fake with in a
+    /// binary that also builds real `SharedVm`s. The base is distinct from
+    /// `runtime::jvmti`'s own `scoped_test_vm()` base (`0x7000_0000`) so the
+    /// two modules cannot hand out the same row even by accident.
+    fn scoped_vm() -> usize {
+        use std::sync::atomic::AtomicUsize;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        0x7100_0000 + NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+    }
+
+    /// Install an empty manager owned by `vm` and return it.
+    fn manager_for(vm: usize) -> Arc<JvmtiEventManager> {
+        jvmti::install_manager_for_vm(vm, Arc::new(JvmtiEventManager::new_for_vm(vm)));
+        let mgr = jvmti::manager_for_vm(vm).expect("row was just installed");
+        assert_eq!(
+            mgr.vm_identity(),
+            vm,
+            "manager_for_vm must not resolve through the unattributed seam for an installed row"
+        );
+        mgr
+    }
+
+    /// Subscribe `mgr`'s VM to `kinds` and install `callbacks`.
+    ///
+    /// `set_event_callbacks` replaces the whole struct, so it is called once
+    /// with every callback the test needs — calling it per kind would silently
+    /// drop all but the last, which is exactly the shape of bug that makes a
+    /// scoping test pass for the wrong reason.
+    fn watch(mgr: &Arc<JvmtiEventManager>, kinds: &[JvmtiEventKind], callbacks: EventCallbacks) {
+        for kind in kinds {
+            mgr.set_event_notification_mode(EventMode::Enable, *kind, None)
+                .expect("enabling an event on a fresh manager cannot fail");
+        }
+        mgr.set_event_callbacks(callbacks)
+            .expect("installing callbacks on a fresh manager cannot fail");
+    }
+
+    type Seen = Arc<Mutex<Vec<(u64, MethodId)>>>;
+
+    fn seen() -> Seen {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn method_entry_cb(sink: &Seen) -> EventCallbacks {
+        let s = sink.clone();
+        EventCallbacks {
+            method_entry: Some(Box::new(move |t, m| s.lock().unwrap().push((t, m)))),
+            ..Default::default()
+        }
+    }
+
+    fn method_exit_cb(sink: &Seen) -> EventCallbacks {
+        let s = sink.clone();
+        EventCallbacks {
+            method_exit: Some(Box::new(move |t, m, _exc, _rv| {
+                s.lock().unwrap().push((t, m))
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn test_frame(method_name: &str) -> Frame {
+        Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            method_name.to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            8,
+            4,
+            &[],
+        )
+    }
+
+    fn test_thread(name: &str) -> JvmThread {
+        JvmThread::new(ThreadId(1234), name)
+    }
+
+    /// MethodExit raised with VM A's identity reaches A's agent and never B's.
+    #[test]
+    fn method_exit_reaches_only_the_raising_vms_agent() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        watch(&ma, &[JvmtiEventKind::MethodExit], method_exit_cb(&sa));
+        watch(&mb, &[JvmtiEventKind::MethodExit], method_exit_cb(&sb));
+
+        let thread = test_thread("method-exit-scoping");
+        let frame = test_frame("m");
+        let expected = synth_method_id(&frame);
+        fire_jvmti_method_exit_normal(a, &thread, &frame, &Some(Value::Int(7)));
+
+        assert_eq!(
+            *sa.lock().unwrap(),
+            vec![(thread.thread_id.0, expected)],
+            "the raising VM's agent must see exactly one MethodExit"
+        );
+        assert!(
+            sb.lock().unwrap().is_empty(),
+            "a second VM's agent must never see another VM's MethodExit"
+        );
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
+    }
+
+    /// `push_frame_and_fire_entry` is the single frame-push chokepoint, so a
+    /// missed identity there mis-attributes *every* MethodEntry in the VM.
+    #[test]
+    fn push_frame_and_fire_entry_attributes_method_entry_to_its_vm() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        watch(&ma, &[JvmtiEventKind::MethodEntry], method_entry_cb(&sa));
+        watch(&mb, &[JvmtiEventKind::MethodEntry], method_entry_cb(&sb));
+
+        let mut thread = test_thread("method-entry-scoping");
+        let frame = test_frame("entered");
+        let expected = synth_method_id(&frame);
+        push_frame_and_fire_entry(b, &mut thread, frame);
+
+        assert_eq!(thread.frames.len(), 1, "the frame must still be pushed");
+        assert_eq!(
+            *sb.lock().unwrap(),
+            vec![(thread.thread_id.0, expected)],
+            "the pushing VM's agent must see the MethodEntry"
+        );
+        assert!(
+            sa.lock().unwrap().is_empty(),
+            "the other VM's agent must not see it"
+        );
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
+    }
+
+    /// FramePop consumes the request on the raising VM's thread and delivers
+    /// to that VM only.
+    #[test]
+    fn frame_pop_reaches_only_the_raising_vms_agent() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        let ca = sa.clone();
+        let cb = sb.clone();
+        watch(
+            &ma,
+            &[JvmtiEventKind::FramePop],
+            EventCallbacks {
+                frame_pop: Some(Box::new(move |t, m, _exc| ca.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+        watch(
+            &mb,
+            &[JvmtiEventKind::FramePop],
+            EventCallbacks {
+                frame_pop: Some(Box::new(move |t, m, _exc| cb.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+
+        let mut thread = test_thread("frame-pop-scoping");
+        thread.frames.push(test_frame("popping"));
+        let expected = synth_method_id(&thread.frames[0]);
+        thread.frame_pop_requests.push(0);
+        fire_jvmti_frame_pop_if_requested(a, &mut thread, false);
+
+        assert_eq!(*sa.lock().unwrap(), vec![(thread.thread_id.0, expected)]);
+        assert!(sb.lock().unwrap().is_empty());
+        assert!(
+            thread.frame_pop_requests.is_empty(),
+            "NotifyFramePop is one-shot: the matching request must be consumed"
+        );
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
+    }
+
+    /// SingleStep keeps its per-thread gate *and* gains the per-VM one.
+    #[test]
+    fn single_step_reaches_only_the_raising_vms_agent() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        let ca = sa.clone();
+        let cb = sb.clone();
+        watch(
+            &ma,
+            &[JvmtiEventKind::SingleStep],
+            EventCallbacks {
+                single_step: Some(Box::new(move |t, m, _loc| ca.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+        watch(
+            &mb,
+            &[JvmtiEventKind::SingleStep],
+            EventCallbacks {
+                single_step: Some(Box::new(move |t, m, _loc| cb.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+
+        let thread = test_thread("single-step-scoping");
+        let frame = test_frame("stepped");
+        let expected = synth_method_id(&frame);
+
+        // Per-thread gate closed: nobody hears it, whatever the VM.
+        fire_jvmti_single_step(a, &thread, &frame, 3);
+        assert!(
+            sa.lock().unwrap().is_empty(),
+            "the per-thread single-step gate must still be honoured"
+        );
+
+        thread
+            .single_step_enabled
+            .store(true, AtomicOrdering::Relaxed);
+        fire_jvmti_single_step(a, &thread, &frame, 3);
+        assert_eq!(*sa.lock().unwrap(), vec![(thread.thread_id.0, expected)]);
+        assert!(sb.lock().unwrap().is_empty());
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
+    }
+
+    /// ExceptionCatch is the one helper that has only a `&Frame` — no thread,
+    /// no VM — so it is the likeliest to be reverted to the VM-less fire.
+    #[test]
+    fn exception_catch_reaches_only_the_raising_vms_agent() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        let ca = sa.clone();
+        let cb = sb.clone();
+        watch(
+            &ma,
+            &[JvmtiEventKind::ExceptionCatch],
+            EventCallbacks {
+                exception_catch: Some(Box::new(move |t, m, _loc| ca.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+        watch(
+            &mb,
+            &[JvmtiEventKind::ExceptionCatch],
+            EventCallbacks {
+                exception_catch: Some(Box::new(move |t, m, _loc| cb.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+
+        let frame = test_frame("catcher");
+        let expected = synth_method_id(&frame);
+        fire_jvmti_exception_catch(b, &frame, 17);
+
+        assert_eq!(
+            *sb.lock().unwrap(),
+            vec![(0u64, expected)],
+            "ExceptionCatch carries thread id 0 by design; the VM must still be exact"
+        );
+        assert!(sa.lock().unwrap().is_empty());
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
+    }
+
+    /// The load-bearing asymmetry: the `any_*_listener_active()` guards are a
+    /// process-wide **union**, so a VM with no agent at all still enters the
+    /// helper body when some *other* VM is listening. Delivery must then find
+    /// nothing. If a helper trusted the union flag instead of re-resolving the
+    /// row, this is the test that fails — and the bug it would be hiding is an
+    /// event delivered to an agent that never asked for it.
+    #[test]
+    fn a_union_guard_never_delivers_another_vms_event() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (quiet, loud) = (scoped_vm(), scoped_vm());
+        let _quiet_mgr = manager_for(quiet); // installed, but subscribes to nothing
+        let loud_mgr = manager_for(loud);
+        let heard = seen();
+        let (entry_sink, exit_sink) = (heard.clone(), heard.clone());
+        watch(
+            &loud_mgr,
+            &[JvmtiEventKind::MethodEntry, JvmtiEventKind::MethodExit],
+            EventCallbacks {
+                method_entry: Some(Box::new(move |t, m| {
+                    entry_sink.lock().unwrap().push((t, m))
+                })),
+                method_exit: Some(Box::new(move |t, m, _exc, _rv| {
+                    exit_sink.lock().unwrap().push((t, m))
+                })),
+                ..Default::default()
+            },
+        );
+
+        // The union is true because `loud` is listening — that is the whole
+        // point of the guard, and it is what puts `quiet`'s interpreter on the
+        // slow path.
+        assert!(
+            jvmti::any_method_entry_listener_active(),
+            "the union guard must be set while any VM listens"
+        );
+        assert!(
+            !jvmti::any_method_entry_listener_active_for_vm(quiet),
+            "the exact per-VM query must disagree with the union here"
+        );
+
+        let mut thread = test_thread("union-guard");
+        fire_jvmti_method_exit_normal(quiet, &thread, &test_frame("m"), &None);
+        push_frame_and_fire_entry(quiet, &mut thread, test_frame("m"));
+
+        assert!(
+            heard.lock().unwrap().is_empty(),
+            "an over-approximating guard must not turn into an over-approximating delivery"
+        );
+
+        jvmti::forget_vm_jvmti_state(quiet);
+        jvmti::forget_vm_jvmti_state(loud);
+    }
+
+    /// Field watchpoints: the four getfield/getstatic/putfield/putstatic sites
+    /// pass `shared.vm_identity`, so a watch armed in one VM must not fire on
+    /// the same `(class_id, field_index)` in another. `class_id` is only
+    /// unique *within* a VM, so this pair genuinely aliases.
+    #[test]
+    fn field_watchpoints_do_not_alias_across_vms() {
+        let _lock = jvmti::jvmti_registry_test_lock();
+        let (a, b) = (scoped_vm(), scoped_vm());
+        let (ma, mb) = (manager_for(a), manager_for(b));
+        let (sa, sb) = (seen(), seen());
+        let ca = sa.clone();
+        let cb = sb.clone();
+        watch(
+            &ma,
+            &[JvmtiEventKind::FieldAccess],
+            EventCallbacks {
+                field_access: Some(Box::new(move |t, m, _f| ca.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+        watch(
+            &mb,
+            &[JvmtiEventKind::FieldAccess],
+            EventCallbacks {
+                field_access: Some(Box::new(move |t, m, _f| cb.lock().unwrap().push((t, m)))),
+                ..Default::default()
+            },
+        );
+
+        let (class_id, field_index) = (0xDEAD_BEEF_u64, 3usize);
+        jvmti::set_field_watchpoint_for_vm(a, class_id, field_index, true, false)
+            .expect("arming a watchpoint on a fresh row cannot fail");
+
+        // Exactly the call the getstatic/getfield sites now make.
+        jvmti::fire_field_access_if_watched_for_vm(b, 1234, 0x99, class_id, field_index);
+        assert!(
+            sb.lock().unwrap().is_empty(),
+            "VM B has no watch on this (class_id, field_index) — B's ids mean different classes"
+        );
+        assert!(
+            sa.lock().unwrap().is_empty(),
+            "and B's access must certainly not be reported to A, which does watch it"
+        );
+
+        jvmti::fire_field_access_if_watched_for_vm(a, 1234, 0x99, class_id, field_index);
+        assert_eq!(
+            sa.lock().unwrap().len(),
+            1,
+            "A's own access must reach A's agent"
+        );
+        assert!(sb.lock().unwrap().is_empty());
+
+        jvmti::forget_vm_jvmti_state(a);
+        jvmti::forget_vm_jvmti_state(b);
     }
 }
 
@@ -13305,7 +13806,7 @@ fn route_jit_exception_through_method(
             frame.method_descriptor()
         );
     }
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
     let new_idx = thread.frames.len() - 1;
     // Exception is already on the operand stack (rooted before the fire above);
     // just position the PC at the handler.
@@ -13493,7 +13994,7 @@ fn resume_from_ir_deopt(
             cached.class_name, cached.method_name, cached.method_descriptor, rframe.bci, locals,
         );
     }
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
     // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
     // the `Deoptimizing -> JavaRunning` edge. The reconstructed values now live
     // in a GC-scanned interpreter frame, which is precisely the property the
@@ -13939,7 +14440,7 @@ fn resume_real_ir_deopt(
             // Push FIRST, pins STILL installed: during the push the oops are
             // rooted by the pins, and once pushed also by the frame. Only THEN
             // release the pins — the frame roots them from here on.
-            push_frame_and_fire_entry(thread, frame);
+            push_frame_and_fire_entry(shared.vm_identity, thread, frame);
             thread.native_pin_roots.truncate(pin_base);
             Some(CachedCallResult::FramePushed)
         }
@@ -16989,31 +17490,56 @@ fn execute_instruction(
         Instruction::Return => {
             // T17.Δ.2 — MethodExit fires on every normal return. No-op fast
             // path when no agent listens.
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &None);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &None,
+            );
             return Ok(InstructionResult::Return(None));
         }
         Instruction::Ireturn => {
             let v = thread.frames[frame_idx].stack.pop_int()?;
             let rv = Some(Value::Int(v));
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &rv,
+            );
             return Ok(InstructionResult::Return(rv));
         }
         Instruction::Lreturn => {
             let v = thread.frames[frame_idx].stack.pop_long()?;
             let rv = Some(Value::Long(v));
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &rv,
+            );
             return Ok(InstructionResult::Return(rv));
         }
         Instruction::Freturn => {
             let v = thread.frames[frame_idx].stack.pop_float()?;
             let rv = Some(Value::Float(v));
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &rv,
+            );
             return Ok(InstructionResult::Return(rv));
         }
         Instruction::Dreturn => {
             let v = thread.frames[frame_idx].stack.pop_double()?;
             let rv = Some(Value::Double(v));
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &rv,
+            );
             return Ok(InstructionResult::Return(rv));
         }
         Instruction::Areturn => {
@@ -17021,7 +17547,12 @@ fn execute_instruction(
             let ret = crate::jit::return_type(thread.frames[frame_idx].method_descriptor());
             let v = coerce_value_for_return_validated(shared, v, ret);
             let rv = Some(v);
-            fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
+            fire_jvmti_method_exit_normal(
+                shared.vm_identity,
+                thread,
+                &thread.frames[frame_idx],
+                &rv,
+            );
             return Ok(InstructionResult::Return(rv));
         }
 
@@ -17039,11 +17570,16 @@ fn execute_instruction(
                     }
                 }
             };
-            // T17.Δ.4 — JVMTI FieldAccess watchpoint.  Consults the global
-            // registry; a single HashMap read + branch on the no-watch path.
+            // T17.Δ.4 — JVMTI FieldAccess watchpoint.  Consults *this VM's*
+            // watchpoint row; a single HashMap read + branch on the no-watch
+            // path. The process-wide `any_field_watchpoint_active()` union
+            // gate inside the callee stays as the cheap pre-filter — it may
+            // say "yes" because another VM is watching, and the per-VM lookup
+            // then answers exactly.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
-                crate::runtime::jvmti::fire_field_access_if_watched(
+                crate::runtime::jvmti::fire_field_access_if_watched_for_vm(
+                    shared.vm_identity,
                     thread.thread_id.0,
                     method_id,
                     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
@@ -17197,10 +17733,11 @@ fn execute_instruction(
                     }
                 }
             };
-            // T17.Δ.4 — JVMTI FieldModification watchpoint.
+            // T17.Δ.4 — JVMTI FieldModification watchpoint, scoped to this VM.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
-                crate::runtime::jvmti::fire_field_modification_if_watched(
+                crate::runtime::jvmti::fire_field_modification_if_watched_for_vm(
+                    shared.vm_identity,
                     thread.thread_id.0,
                     method_id,
                     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
@@ -17543,11 +18080,14 @@ fn execute_instruction(
             // direct CompactValue push path for J/D.  Two field loads — no
             // hashmap work on the fast path.
             let desc_byte = Some(field.desc_byte);
-            // T17.Δ.4 — JVMTI FieldAccess watchpoint.  Fast path: no
-            // watchpoint registered ⇒ one HashMap read returning None.
+            // T17.Δ.4 — JVMTI FieldAccess watchpoint, scoped to this VM.
+            // Fast path: no watchpoint registered ⇒ one atomic load; when the
+            // process-wide union says some VM is watching, one HashMap read
+            // against *this* VM's row returning None.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
-                crate::runtime::jvmti::fire_field_access_if_watched(
+                crate::runtime::jvmti::fire_field_access_if_watched_for_vm(
+                    shared.vm_identity,
                     thread.thread_id.0,
                     method_id,
                     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
@@ -18035,10 +18575,11 @@ fn execute_instruction(
                     }
                 }
             } // end `if any_field_diag()` — consolidated putfield diagnostics
-              // T17.Δ.4 — JVMTI FieldModification watchpoint.
+              // T17.Δ.4 — JVMTI FieldModification watchpoint, scoped to this VM.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
-                crate::runtime::jvmti::fire_field_modification_if_watched(
+                crate::runtime::jvmti::fire_field_modification_if_watched_for_vm(
+                    shared.vm_identity,
                     thread.thread_id.0,
                     method_id,
                     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)

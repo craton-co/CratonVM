@@ -12121,7 +12121,7 @@ pub(super) fn try_stackless_invoke(
             frame.method_descriptor()
         );
     }
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
 
     Ok(CachedCallResult::FramePushed)
 }
@@ -13670,7 +13670,7 @@ pub(super) fn execute_invokestatic_cached(
                     frame.method_descriptor()
                 );
             }
-            push_frame_and_fire_entry(thread, frame);
+            push_frame_and_fire_entry(shared.vm_identity, thread, frame);
             Ok(CachedCallResult::FramePushed)
         }
         _ => Ok(CachedCallResult::CacheMiss),
@@ -15650,7 +15650,7 @@ pub(super) fn try_osr(
                     frame.stack.clear();
                     let _ = frame.stack.push(Value::Object(Some(exc_ref)));
                     frame.pc = handler_pc;
-                    fire_jvmti_exception_catch(frame, handler_pc);
+                    fire_jvmti_exception_catch(shared.vm_identity, frame, handler_pc);
                     return None;
                 }
                 // No in-frame handler. Propagate out of the OSR'd frame
@@ -15700,7 +15700,7 @@ pub(super) fn try_osr(
                     frame.stack.clear();
                     let _ = frame.stack.push(Value::Object(Some(exc_ref)));
                     frame.pc = handler_pc;
-                    fire_jvmti_exception_catch(frame, handler_pc);
+                    fire_jvmti_exception_catch(shared.vm_identity, frame, handler_pc);
                     return None;
                 }
                 // No in-frame handler. Propagate out of the OSR'd frame
@@ -15743,7 +15743,7 @@ pub(super) fn try_osr(
                     frame.stack.clear();
                     let _ = frame.stack.push(Value::Object(Some(exc_ref)));
                     frame.pc = handler_pc;
-                    fire_jvmti_exception_catch(frame, handler_pc);
+                    fire_jvmti_exception_catch(shared.vm_identity, frame, handler_pc);
                     return None;
                 }
                 // No in-frame handler. Propagate out of the OSR'd frame
@@ -21590,7 +21590,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
         &mut thread.stacks_pool,
     );
     frame.monitor_on_exit = monitor_obj;
-    push_frame_and_fire_entry(thread, frame);
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
 
     // Populate invoke_cache so subsequent sibling-class misses from this
     // caller class take the cheaper thread-local path next time.
@@ -22791,7 +22791,7 @@ pub(super) fn execute_invokevirtual_cached(
                             frame.method_descriptor()
                         );
                     }
-                    push_frame_and_fire_entry(thread, frame);
+                    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
                     Ok(CachedCallResult::FramePushed)
                 }
                 Value::Object(None) => {
@@ -23337,7 +23337,7 @@ pub(super) fn execute_invokevirtual_cached(
                     frame.method_descriptor()
                 );
             }
-            push_frame_and_fire_entry(thread, frame);
+            push_frame_and_fire_entry(shared.vm_identity, thread, frame);
             Ok(CachedCallResult::FramePushed)
         }
         CachedInvokeTarget::Native {

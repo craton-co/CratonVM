@@ -2969,10 +2969,14 @@ fn publish_union_listener_flags() {
 /// given `vm_identity` wins, matching the old process-wide behaviour but one
 /// scope down.
 ///
-/// **This is the entry point production wiring should use.** `SharedVm::new`
-/// still calls the VM-less [`install_global_manager`]; see
-/// `docs/known-issues/jvmti-vm-scoping.md` for the one-line change that
-/// switches it over.
+/// **This is the entry point production wiring uses.** `SharedVm::new` calls
+/// it with `vm.vm_identity`, so every live VM owns a row and the
+/// [`UNATTRIBUTED_VM`] fallback is reached only by hooks that genuinely have
+/// no VM in scope — see `docs/known-issues/jvmti-delivery-threading.md` for
+/// the current census. `SharedVm::new` *also* still installs the row-0
+/// manager, and that is not redundant: the six remaining VM-less sites
+/// resolve row 0 through `global_manager()`, an exact lookup with no
+/// fallback.
 pub fn install_manager_for_vm(vm: usize, mgr: Arc<JvmtiEventManager>) {
     // On the "already installed" path `mgr` is dropped. Do it outside the
     // lock: dropping a manager runs agent-supplied callback destructors.
@@ -3265,6 +3269,31 @@ pub fn fire_vm_init() {
 /// Fire VMDeath at the global level. Called from VM shutdown / drop.
 pub fn fire_vm_death() {
     if let Some(m) = global_manager() {
+        m.fire_vm_death();
+    }
+}
+
+/// Fire VMInit into `vm`'s environment only.
+///
+/// Provided so `SharedVm::new`'s `fire_vm_init()` (`vm/src/vm/vm_init.rs`) can
+/// become a one-line change: `vm.vm_identity` is in scope there, and VMInit is
+/// per VM by definition — it is the event that tells an agent *its* VM is up.
+/// Unlike the class-load / GC hook adapters, this site has no signature
+/// problem; it is simply still on the VM-less call. See
+/// `docs/known-issues/jvmti-delivery-threading.md`.
+pub fn fire_vm_init_for_vm(vm: usize) {
+    if let Some(m) = manager_for_vm(vm) {
+        m.fire_vm_init();
+    }
+}
+
+/// Fire VMDeath into `vm`'s environment only. Sibling of
+/// [`fire_vm_init_for_vm`]; `Vm`'s shutdown path has `self.shared.vm_identity`
+/// in scope. Must run **before** [`forget_vm_jvmti_state`] drops the row, or
+/// it resolves through the unattributed seam and the agent that asked for
+/// VMDeath never learns its VM died.
+pub fn fire_vm_death_for_vm(vm: usize) {
+    if let Some(m) = manager_for_vm(vm) {
         m.fire_vm_death();
     }
 }
@@ -3941,6 +3970,28 @@ pub(crate) fn reset_global_manager_for_tests() {
     }
     publish_union_listener_flags();
     refresh_watchpoint_union();
+}
+
+/// Process-wide serialisation for tests that move the JVMTI registry's
+/// **shared** state: the [`UNATTRIBUTED_VM`] row and the process-wide union
+/// listener/watchpoint mirrors. Tests that only touch their own
+/// `scoped_test_vm()` row do not need it.
+///
+/// It lives at module scope, not inside `mod tests`, because the delivery
+/// sites this registry exists to serve are in `runtime::interpreter`, and
+/// that module's tests move the same union mirrors. A lock only one of two
+/// test modules can name is not a lock — an earlier lane found this crate's
+/// JVMTI test block was parallel-unsafe and passing by luck, and a
+/// cross-module half of the same state would reintroduce exactly that.
+///
+/// Poison-tolerant on purpose: a panicking test must not convert every later
+/// JVMTI test in the binary into a spurious failure that hides the first one.
+#[cfg(test)]
+pub(crate) fn jvmti_registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -4957,11 +5008,13 @@ mod tests {
     // Global manager & wired-safepoint tests
     // ----------------------------------------------------------------
 
-    /// Serialize test access to the global manager since it's a process-wide
-    /// singleton installed via `install_global_manager`.
+    /// Serialize test access to the unattributed row and the process-wide
+    /// union mirrors. Delegates to the module-scope
+    /// [`super::jvmti_registry_test_lock`] so that `runtime::interpreter`'s
+    /// delivery tests — which move the same union mirrors — serialise against
+    /// these tests and not merely against each other.
     fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        super::jvmti_registry_test_lock()
     }
 
     /// Ensure the process-wide manager exists, and return a handle. Tests

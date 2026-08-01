@@ -3417,7 +3417,9 @@ impl SharedVm {
         // `Weak::upgrade()` returns None and the call is a no-op —
         // perfectly safe for unit tests that construct a SharedVm
         // outside an Arc.
-        crate::runtime::jvmti::fire_vm_init();
+        // Attributed: a row-0 agent used to see VMInit for every VM in the
+        // process. JVMTI specifies that it sees its own.
+        crate::runtime::jvmti::fire_vm_init_for_vm(vm.vm_identity);
 
         // Boot-cost summary. `SharedVm::new` is only part of startup — the
         // launcher still has to run `System.initPhase1/2/3` and load the
@@ -7402,7 +7404,9 @@ impl Drop for Vm {
         // agent callbacks see the final heap and subsystem state. One-shot
         // per Vm drop; the underlying `fire_vm_death` is idempotent and
         // gated on the global manager's enable flag.
-        crate::runtime::jvmti::fire_vm_death();
+        // Attributed, and it must stay ahead of `release_vm_native_state`
+        // below, which drops this VM's JVMTI row.
+        crate::runtime::jvmti::fire_vm_death_for_vm(self.shared.vm_identity);
 
         // LAST, after the finalizer run and VMDeath above: those still execute
         // Java and still go through natives, and a native that has just lost its
