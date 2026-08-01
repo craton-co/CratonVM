@@ -212,13 +212,73 @@ pub enum CompletionKind {
     AcceptedChannel(i32),
 }
 
+/// The `CompletionHandler` + `attachment` pair a queued AIO op must keep
+/// reachable until its completion is delivered, held as **global GC roots**.
+///
+/// AUDIT 2026-08-01 (native-collections-root-audit): these two used to travel
+/// through `Job`/`Completion` as bare `ObjectRef`s. That is a scan/remap hole
+/// of the worst kind on this path — the reference is parked on a worker thread
+/// across a *blocking* syscall (`connect(2)` waits up to the 30 s policy
+/// timeout, `accept(2)` waits indefinitely on an idle server) and then hops a
+/// queue to the dispatcher. Nothing rooted it, so the collector was free to
+/// reclaim the handler outright, and nothing remapped it, so a moving
+/// collection left the `ObjectRef` pointing at whatever later occupied the
+/// address. `invoke_virtual(handler, "completed", ...)` then dispatched on a
+/// recycled object. The sibling `ReadCompletion`/`FutureCompletion` paths in
+/// this same file already did this correctly (`handler_gref`/`attachment_gref`)
+/// and `Job::Write` had been converted for its *buffer* alone in the 2026-07-26
+/// audit — the handler on the very same struct was left bare.
+///
+/// `0` is the "absent" handle in both slots, matching `add_global_root`'s
+/// no-op contract for mock contexts. Ownership rule: whoever holds a
+/// `HandlerRoots` owns the roots. Exactly one of `push_handler_completion`
+/// (which transfers ownership to the dispatcher) or [`queue_handler_release`]
+/// (which parks them for release) must be reached on every path, or the roots
+/// leak.
+#[derive(Clone, Copy, Default)]
+pub struct HandlerRoots {
+    /// Global-root handle for the `CompletionHandler` (0 ⇒ no handler, i.e.
+    /// nothing to deliver).
+    pub handler: usize,
+    /// Global-root handle for the `attachment` (0 ⇒ null attachment).
+    pub attachment: usize,
+}
+
+impl HandlerRoots {
+    /// Root a handler/attachment pair on the VM thread that is enqueuing the
+    /// job. Must be called with a `&mut NativeContext`; worker threads have
+    /// none, which is exactly why the roots have to be taken here.
+    fn new(
+        ctx: &mut dyn NativeContext,
+        handler: Option<ObjectRef>,
+        attachment: Option<ObjectRef>,
+    ) -> Self {
+        HandlerRoots {
+            handler: handler.map(|h| ctx.add_global_root(h)).unwrap_or(0),
+            attachment: attachment.map(|a| ctx.add_global_root(a)).unwrap_or(0),
+        }
+    }
+
+    /// True when there is a handler to deliver to.
+    fn has_handler(self) -> bool {
+        self.handler != 0
+    }
+}
+
+/// Park both roots of a `HandlerRoots` for release on the next user-thread
+/// drain. Used by worker paths that decide there is nothing to deliver — a
+/// job whose `CompletionHandler` was null still rooted its attachment.
+fn queue_handler_release(roots: HandlerRoots) {
+    queue_root_release(roots.handler);
+    queue_root_release(roots.attachment);
+}
+
 /// A single completed AIO op waiting to be reported to its
 /// `CompletionHandler` on a user-facing JVM thread.
 pub struct Completion {
-    /// The CompletionHandler instance registered by the caller.
-    pub handler: ObjectRef,
-    /// The `attachment` parameter passed in alongside the handler.
-    pub attachment: Option<ObjectRef>,
+    /// Global roots for the CompletionHandler and its attachment. Owned by
+    /// this completion; released by `drain_completions` after delivery.
+    pub roots: HandlerRoots,
     /// Outcome of the op (`Err` ⇒ dispatch calls `failed(Throwable, A)`).
     pub outcome: Result<CompletionKind, String>,
 }
@@ -245,9 +305,34 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
     // Release (and, for handler-less writes, apply) any buffer roots parked
     // by `Job::Write` workers.
     flush_pending_root_releases(ctx);
+    // The flushes above are pure VM-state bookkeeping and are safe on any
+    // thread. DISPATCHING is not: it runs arbitrary Java. Only a designated
+    // completion thread may do that — see `on_completion_thread`. An
+    // application thread that merely called some other AIO native (a
+    // `write`, an `isOpen`) must not have a `CompletionHandler` run on it.
+    if !on_completion_thread() && dispatcher_available() {
+        if !completion_queue().lock().is_empty() {
+            ensure_dispatcher();
+            // Same condvar `push_handler_completion` signals.
+            read_completion_state().1.notify_one();
+        }
+        return;
+    }
     for _ in 0..DRAIN_LIMIT {
         let next = completion_queue().lock().pop_front();
         let Some(c) = next else { break };
+        // AUDIT 2026-08-01: resolve the handler/attachment through their global
+        // roots — the *current*, post-relocation addresses — instead of using
+        // the raw `ObjectRef`s the worker captured before it blocked. The roots
+        // are released once, below, on every exit from this iteration.
+        let Some(handler) = ctx.resolve_global_root(c.roots.handler) else {
+            // The handle is gone (or was never taken: a handler-less job must
+            // not reach the completion queue at all). Nothing to deliver;
+            // still drop whatever the attachment slot held.
+            ctx.remove_global_root(c.roots.handler);
+            ctx.remove_global_root(c.roots.attachment);
+            continue;
+        };
         match c.outcome {
             Ok(kind) => {
                 let result_val = match kind {
@@ -305,12 +390,16 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
                         Value::Object(Some(ch))
                     }
                 };
-                let attach = Value::Object(c.attachment);
+                // `new_object` / `alloc_obj` above can allocate and therefore
+                // move the handler and attachment. Re-read both through their
+                // roots rather than reusing the pre-allocation locals.
+                let handler = ctx.resolve_global_root(c.roots.handler).unwrap_or(handler);
+                let attach = Value::Object(ctx.resolve_global_root(c.roots.attachment));
                 let inv = ctx.invoke(
                     "java/nio/channels/CompletionHandler",
                     "completed",
                     "(Ljava/lang/Object;Ljava/lang/Object;)V",
-                    &[Value::Object(Some(c.handler)), result_val, attach],
+                    &[Value::Object(Some(handler)), result_val, attach],
                 );
                 // A `CompletionHandler.completed` that throws used to be
                 // discarded silently (`let _ = ctx.invoke(..)`), which hid
@@ -320,25 +409,46 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
                 }
             }
             Err(msg) => {
+                // Allocate the message string FIRST: `create_string` is an
+                // allocation, so building it after the exception would leave
+                // `throw` — an unrooted local — pointing at a pre-move address
+                // by the time `set_field_by_name` writes through it.
+                let m = ctx.create_string(&msg);
+                let m_gref = ctx.add_global_root(m);
                 let throw = match ctx.new_object("java/io/IOException") {
                     Ok(Some(Value::Object(Some(t)))) => t,
-                    _ => continue,
+                    _ => {
+                        // Nothing can be delivered — release the roots rather
+                        // than leaking them on the way out.
+                        ctx.remove_global_root(m_gref);
+                        ctx.remove_global_root(c.roots.handler);
+                        ctx.remove_global_root(c.roots.attachment);
+                        continue;
+                    }
                 };
-                let m = ctx.create_string(&msg);
+                let m = ctx.resolve_global_root(m_gref).unwrap_or(m);
+                ctx.remove_global_root(m_gref);
                 ctx.set_field_by_name(throw, "detailMessage", Value::Object(Some(m)));
-                let attach = Value::Object(c.attachment);
+                // Same hazard as the `Ok` arm: `new_object` + `create_string`
+                // are allocations, so refresh through the roots.
+                let handler = ctx.resolve_global_root(c.roots.handler).unwrap_or(handler);
+                let attach = Value::Object(ctx.resolve_global_root(c.roots.attachment));
                 let _ = ctx.invoke(
                     "java/nio/channels/CompletionHandler",
                     "failed",
                     "(Ljava/lang/Throwable;Ljava/lang/Object;)V",
                     &[
-                        Value::Object(Some(c.handler)),
+                        Value::Object(Some(handler)),
                         Value::Object(Some(throw)),
                         attach,
                     ],
                 );
             }
         }
+        // Delivery is done (or was skipped): the completion owned these roots,
+        // so drop them exactly once here.
+        ctx.remove_global_root(c.roots.handler);
+        ctx.remove_global_root(c.roots.attachment);
     }
 }
 
@@ -488,6 +598,10 @@ const READ_DRAIN_LIMIT: usize = 256;
 /// `CompletionHandler.completed` / `failed` on the calling (dispatcher) thread.
 /// Requires a live `NativeContext`, so it must run on a VM/attached thread.
 pub fn drain_completions_pub(ctx: &mut dyn NativeContext) {
+    // This IS the pool thread of our `AsynchronousChannelGroup` equivalent, so
+    // it — and anything it calls, including a handler re-arming its next read —
+    // may invoke Java completion callbacks.
+    let _delivering = CompletionThreadGuard::enter();
     // Handler-form accept/connect/write completions live in a separate queue
     // that used to have no dispatcher at all — see `push_handler_completion`.
     drain_completions(ctx);
@@ -817,6 +931,66 @@ pub fn set_dispatcher_launcher(f: DispatcherLauncher) {
     *dispatcher_launcher().lock() = Some(f);
 }
 
+thread_local! {
+    /// True while this thread is acting as an AIO *completion-delivery* thread
+    /// — i.e. it is the VM-attached dispatcher (`drain_completions_pub`), or
+    /// the JDK's own port dispatcher loop (`Iocp`/`EPollPort`/`KQueuePort`
+    /// `drain`/`poll`), or it is already inside a delivery on one of those.
+    ///
+    /// Invoking a Java `CompletionHandler` is only permitted on such a thread.
+    /// `AsynchronousChannelGroup` allows an immediate completion to run on the
+    /// initiating thread ONLY "where ... the initiating thread is one of the
+    /// pooled threads in the group" — the qualifier exists precisely so an
+    /// application thread is never hijacked into running a handler that may
+    /// block. See [`on_completion_thread`].
+    static DELIVERING_COMPLETIONS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks the calling thread as a completion-delivery thread for its lifetime,
+/// restoring the previous state on drop (so nesting and unwinding are safe).
+struct CompletionThreadGuard(bool);
+
+impl CompletionThreadGuard {
+    fn enter() -> Self {
+        CompletionThreadGuard(DELIVERING_COMPLETIONS.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for CompletionThreadGuard {
+    fn drop(&mut self) {
+        DELIVERING_COMPLETIONS.with(|c| c.set(self.0));
+    }
+}
+
+/// Whether this thread may invoke Java `CompletionHandler` callbacks.
+///
+/// BUG (TestWsRemoteEndpointImplServerDeadlock, 2026-08-01): before this gate,
+/// ANY thread that armed a handler-form read whose bytes had already arrived
+/// ran `completed()` itself, and any thread that called an unrelated AIO native
+/// drained the pending-handler queue. Tomcat's WebSocket client arms its first
+/// read from `WsFrameClient.startInputProcessing`, which runs on the
+/// APPLICATION thread inside `WsWebSocketContainer.connectToServer`. On
+/// loopback the server's frames are already buffered, so `completed()` fired
+/// inline, re-armed, completed inline again, and delivered a whole text message
+/// to `onMessage` — all on the application thread, still inside
+/// `connectToServer`. That test's `@OnMessage` blocks on a latch that only the
+/// application thread can count down, so it deadlocked permanently (~35-50% of
+/// runs, whenever the frames happened to be buffered in time).
+///
+/// A completion parked for the dispatcher is never delayed by this: every
+/// `push_*_completion` signals the dispatcher's condvar.
+fn on_completion_thread() -> bool {
+    DELIVERING_COMPLETIONS.with(|c| c.get())
+}
+
+/// Whether a real dispatcher can be started. Pure-Rust users of this crate (the
+/// in-crate tests) never install a launcher, and for them the opportunistic
+/// drain remains the only delivery mechanism — so the gate above must not
+/// strand completions there.
+fn dispatcher_available() -> bool {
+    dispatcher_launcher().lock().is_some()
+}
+
 /// Start the AIO dispatcher on first use (idempotent).
 fn ensure_dispatcher() {
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -836,26 +1010,35 @@ enum Job {
     Connect {
         id: i32,
         addr: String,
-        handler: Option<ObjectRef>,
-        attachment: Option<ObjectRef>,
-        /// Round-8 C29: the user-visible `AsynchronousSocketChannel`
-        /// object whose `F_CONNECTED` flag was set optimistically by
-        /// `aio_asc_connect` before this job ran. On connect failure
-        /// the worker parks a `PendingFieldReset` so the next user-
-        /// thread drain clears it back to 0 — otherwise the channel
-        /// would lie to `isConnected()` after a failed connect.
-        channel: Option<ObjectRef>,
+        /// Global roots for the handler/attachment pair — see [`HandlerRoots`].
+        /// `policy_connect` blocks for up to the configured connect timeout
+        /// (30 s by default), so this is one of the longest GC windows in the
+        /// crate.
+        roots: HandlerRoots,
+        /// Round-8 C29: global-root handle for the user-visible
+        /// `AsynchronousSocketChannel` object whose `F_CONNECTED` flag was set
+        /// optimistically by `aio_asc_connect` before this job ran. On connect
+        /// failure the worker parks a `PendingFieldReset` so the next
+        /// user-thread drain clears it back to 0 — otherwise the channel would
+        /// lie to `isConnected()` after a failed connect.
+        ///
+        /// AUDIT 2026-08-01: was a bare `ObjectRef`. The reset is applied on a
+        /// *different* thread after a blocking connect, so writing through the
+        /// captured address could clear `F_CONNECTED` on an unrelated object.
+        /// `0` ⇒ no channel to reset.
+        channel_gref: usize,
     },
-    Read {
-        id: i32,
-        len: usize,
-        bb_addr: i64,
-        bb_arr: Option<ObjectRef>,
-        bb_offset: i32,
-        bb_obj: ObjectRef,
-        handler: Option<ObjectRef>,
-        attachment: Option<ObjectRef>,
-    },
+    // REMOVED 2026-08-01 (native-collections-root-audit): `Job::Read`, the
+    // registry-backed handler-form read. It was already UNREACHABLE — nothing
+    // in the crate constructed it, the handler-form read having been rerouted
+    // to `Job::ReadFd`, which holds every Java reference as a global root.
+    // What it left behind was a liability rather than dead weight: its
+    // `bb_arr`/`bb_obj`/`handler`/`attachment` were bare `ObjectRef`s parked
+    // across a *blocking* worker-thread read, scanned by nothing and remapped
+    // by nothing, and it was the only consumer of the equally unrooted
+    // `PendingArrayWrite` side table (removed with it). Anyone restoring a
+    // registry-backed read must root its references the way `Job::ReadFd`
+    // does; see `docs/known-issues/native-collections-root-audit.md`.
     Write {
         id: i32,
         data: Vec<u8>,
@@ -865,13 +1048,17 @@ enum Job {
         /// (`bb_obj`) held across a worker-thread blocking write — both
         /// unrooted against a moving GC and, worse, simply discarded.
         bb_gref: usize,
-        handler: Option<ObjectRef>,
-        attachment: Option<ObjectRef>,
+        /// AUDIT 2026-08-01: the 2026-07-26 audit rooted the buffer above and
+        /// left the handler/attachment on this same struct bare. See
+        /// [`HandlerRoots`].
+        roots: HandlerRoots,
     },
     Accept {
         id: i32,
-        handler: Option<ObjectRef>,
-        attachment: Option<ObjectRef>,
+        /// AUDIT 2026-08-01: `accept(2)` blocks indefinitely on an idle
+        /// listener, so an unrooted handler here was the longest-lived
+        /// dangling `ObjectRef` in the crate. See [`HandlerRoots`].
+        roots: HandlerRoots,
     },
     /// WP3.2 completion-delivery fix: a handler-form
     /// `AsynchronousSocketChannel.read(ByteBuffer, A, CompletionHandler)` whose
@@ -958,9 +1145,8 @@ fn handle_job(job: Job) -> Result<(), String> {
         Job::Connect {
             id,
             addr,
-            handler,
-            attachment,
-            channel,
+            roots,
+            channel_gref,
         } => {
             // Task #16: route through the shared outbound-policy hook so
             // the async path matches the blocking-NIO path's SSRF posture.
@@ -984,12 +1170,14 @@ fn handle_job(job: Job) -> Result<(), String> {
                     aio_registry()
                         .write()
                         .insert(id, AioHandle::Stream(Arc::new(Mutex::new(stream))));
-                    if let Some(h) = handler {
+                    queue_root_release(channel_gref);
+                    if roots.has_handler() {
                         push_handler_completion(Completion {
-                            handler: h,
-                            attachment,
+                            roots,
                             outcome: Ok(CompletionKind::Void),
                         });
+                    } else {
+                        queue_handler_release(roots);
                     }
                 }
                 Err(e) => {
@@ -1001,120 +1189,33 @@ fn handle_job(job: Job) -> Result<(), String> {
                     // contract violation. We can't touch the Java object
                     // from this worker thread; park a field-reset that
                     // the next user-thread drain applies.
-                    if let Some(ch) = channel {
-                        pending_field_resets().lock().push(PendingFieldReset {
-                            target: ch,
+                    if channel_gref != 0 {
+                        // Both resets name the SAME root handle; the flusher
+                        // releases it once, after the last entry (see
+                        // `flush_pending_field_resets`).
+                        let mut resets = pending_field_resets().lock();
+                        resets.push(PendingFieldReset {
+                            target_gref: channel_gref,
                             field: F_CONNECTED,
                             value: Value::Int(0),
+                            release_root: false,
                         });
                         // Also clear the registry id so callers don't
                         // try to look up a now-removed handle.
-                        pending_field_resets().lock().push(PendingFieldReset {
-                            target: ch,
+                        resets.push(PendingFieldReset {
+                            target_gref: channel_gref,
                             field: F_REG_ID,
                             value: Value::Int(-1),
+                            release_root: true,
                         });
                     }
-                    if let Some(h) = handler {
+                    if roots.has_handler() {
                         push_handler_completion(Completion {
-                            handler: h,
-                            attachment,
+                            roots,
                             outcome: Err(format!("connect failed: {e}")),
                         });
-                    }
-                }
-            }
-        }
-        Job::Read {
-            id,
-            len,
-            bb_addr,
-            bb_arr,
-            bb_offset,
-            bb_obj: _,
-            handler,
-            attachment,
-        } => {
-            // Acquire the stream.
-            let stream = {
-                let map = aio_registry().read();
-                match map.get(&id) {
-                    Some(AioHandle::Stream(s)) => Arc::clone(s),
-                    _ => {
-                        if let Some(h) = handler {
-                            push_handler_completion(Completion {
-                                handler: h,
-                                attachment,
-                                outcome: Err("read: channel closed".to_string()),
-                            });
-                        }
-                        return Ok(());
-                    }
-                }
-            };
-            let mut buf = vec![0u8; len];
-            // Hold the per-stream lock during the read so concurrent reads
-            // on the same channel serialize (matching JDK contract: only
-            // one read may be outstanding per channel).
-            let read_res = {
-                let s = stream.lock();
-                let mut r = &*s;
-                r.read(&mut buf)
-            };
-            match read_res {
-                Ok(0) => {
-                    if let Some(h) = handler {
-                        push_handler_completion(Completion {
-                            handler: h,
-                            attachment,
-                            outcome: Ok(CompletionKind::IntCount(-1)),
-                        });
-                    }
-                }
-                Ok(n) => {
-                    // Stash the bytes back into the buffer. Direct buffers
-                    // can be written directly from the worker thread (raw
-                    // memory). Heap buffers must be flushed on the user
-                    // thread because `set_array_element` requires
-                    // `&mut dyn NativeContext` — so we park the bytes in
-                    // a side table the dispatch path drains.
-                    if bb_addr != 0 {
-                        // R2 audit: this raw memcpy runs on the worker thread
-                        // (no `NativeContext`), so it cannot route through
-                        // `copy_to_native_memory`. That is safe because
-                        // `bb_addr` here can only be a *real* direct-buffer
-                        // pointer: we intercept at the public
-                        // `AsynchronousSocketChannel.read` level, where a heap
-                        // buffer is taken via `bb_arr` (parked above) and we
-                        // never substitute a `Util.getTemporaryDirectBuffer`
-                        // arena handle. So an arena handle never reaches here.
-                        // SAFETY: caller-allocated direct buffer; the
-                        // address is valid for `len` bytes.
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(buf.as_ptr(), bb_addr as *mut u8, n);
-                        }
-                    } else if let Some(arr) = bb_arr {
-                        pending_array_writes().lock().push(PendingArrayWrite {
-                            arr,
-                            offset: bb_offset,
-                            bytes: buf[..n].to_vec(),
-                        });
-                    }
-                    if let Some(h) = handler {
-                        push_handler_completion(Completion {
-                            handler: h,
-                            attachment,
-                            outcome: Ok(CompletionKind::IntCount(n as i32)),
-                        });
-                    }
-                }
-                Err(e) => {
-                    if let Some(h) = handler {
-                        push_handler_completion(Completion {
-                            handler: h,
-                            attachment,
-                            outcome: Err(format!("read failed: {e}")),
-                        });
+                    } else {
+                        queue_handler_release(roots);
                     }
                 }
             }
@@ -1123,8 +1224,7 @@ fn handle_job(job: Job) -> Result<(), String> {
             id,
             data,
             bb_gref,
-            handler,
-            attachment,
+            roots,
         } => {
             let stream = {
                 let map = aio_registry().read();
@@ -1132,12 +1232,13 @@ fn handle_job(job: Job) -> Result<(), String> {
                     Some(AioHandle::Stream(s)) => Arc::clone(s),
                     _ => {
                         queue_root_release(bb_gref);
-                        if let Some(h) = handler {
+                        if roots.has_handler() {
                             push_handler_completion(Completion {
-                                handler: h,
-                                attachment,
+                                roots,
                                 outcome: Err("write: channel closed".to_string()),
                             });
+                        } else {
+                            queue_handler_release(roots);
                         }
                         return Ok(());
                     }
@@ -1170,13 +1271,12 @@ fn handle_job(job: Job) -> Result<(), String> {
             };
             match res {
                 Ok(n) => {
-                    if let Some(h) = handler {
+                    if roots.has_handler() {
                         // `WriteCount` carries the buffer root so the
                         // dispatcher advances `position` by `n` before
                         // invoking `completed()`; it also releases the root.
                         push_handler_completion(Completion {
-                            handler: h,
-                            attachment,
+                            roots,
                             outcome: Ok(CompletionKind::WriteCount {
                                 n: n as i32,
                                 buffer_gref: bb_gref,
@@ -1184,8 +1284,9 @@ fn handle_job(job: Job) -> Result<(), String> {
                         });
                     } else {
                         // No handler to deliver to — still advance the
-                        // buffer (a write DID happen) and drop the root.
+                        // buffer (a write DID happen) and drop the roots.
                         queue_write_advance(bb_gref, n as i32);
+                        queue_handler_release(roots);
                     }
                 }
                 Err(e) => {
@@ -1194,32 +1295,30 @@ fn handle_job(job: Job) -> Result<(), String> {
                     // JDK reports the operation as failed and leaves the
                     // buffer position unspecified; just release the root.
                     queue_root_release(bb_gref);
-                    if let Some(h) = handler {
+                    if roots.has_handler() {
                         push_handler_completion(Completion {
-                            handler: h,
-                            attachment,
+                            roots,
                             outcome: Err(format!("write failed: {e}")),
                         });
+                    } else {
+                        queue_handler_release(roots);
                     }
                 }
             }
         }
-        Job::Accept {
-            id,
-            handler,
-            attachment,
-        } => {
+        Job::Accept { id, roots } => {
             let listener = {
                 let map = aio_registry().read();
                 match map.get(&id) {
                     Some(AioHandle::Listener(l, _)) => Arc::clone(l),
                     _ => {
-                        if let Some(h) = handler {
+                        if roots.has_handler() {
                             push_handler_completion(Completion {
-                                handler: h,
-                                attachment,
+                                roots,
                                 outcome: Err("accept: channel closed".to_string()),
                             });
+                        } else {
+                            queue_handler_release(roots);
                         }
                         return Ok(());
                     }
@@ -1232,21 +1331,23 @@ fn handle_job(job: Job) -> Result<(), String> {
             match res {
                 Ok((stream, _peer)) => {
                     let new_id = aio_register(AioHandle::Stream(Arc::new(Mutex::new(stream))));
-                    if let Some(h) = handler {
+                    if roots.has_handler() {
                         push_handler_completion(Completion {
-                            handler: h,
-                            attachment,
+                            roots,
                             outcome: Ok(CompletionKind::AcceptedChannel(new_id)),
                         });
+                    } else {
+                        queue_handler_release(roots);
                     }
                 }
                 Err(e) => {
-                    if let Some(h) = handler {
+                    if roots.has_handler() {
                         push_handler_completion(Completion {
-                            handler: h,
-                            attachment,
+                            roots,
                             outcome: Err(format!("accept failed: {e}")),
                         });
+                    } else {
+                        queue_handler_release(roots);
                     }
                 }
             }
@@ -1498,46 +1599,40 @@ mod crossbeam_compat {
 // Pending side-effects parked for user-thread flush.
 // ---------------------------------------------------------------------------
 
-struct PendingArrayWrite {
-    arr: ObjectRef,
-    offset: i32,
-    bytes: Vec<u8>,
-}
+// REMOVED 2026-08-01 (native-collections-root-audit): `PendingArrayWrite` and
+// `pending_array_writes`. The struct parked the destination `byte[]` of an
+// async read as a bare `ObjectRef` on a worker thread and wrote into it later
+// on a user thread — unrooted across a blocking `read(2)`, so the array could
+// be reclaimed (the flush then read `array_length == 0` and silently dropped
+// the bytes the application had asked for) or relocated (the bulk write landed
+// in whatever now occupied the address). It was reachable only from the
+// already-unreachable `Job::Read`, so removing that arm removed the only
+// producer. `flush_pending_array_writes_inner` is kept as a no-op shim below
+// so the four drain sites keep their shape and a future rooted implementation
+// has an obvious home.
 
-fn pending_array_writes() -> &'static Mutex<Vec<PendingArrayWrite>> {
-    static V: OnceLock<Mutex<Vec<PendingArrayWrite>>> = OnceLock::new();
-    V.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn flush_pending_array_writes_inner(ctx: &mut dyn NativeContext) {
-    // AUDIT 2026-05-17: bulk write via NativeContext intrinsic instead
-    // of per-element `set_array_element`. The VM override does a single
-    // `ptr::copy_nonoverlapping` against the compact byte-array payload.
-    let parked = std::mem::take(&mut *pending_array_writes().lock());
-    for p in parked {
-        let arr_len = ctx.array_length(p.arr);
-        let off = p.offset as usize;
-        if off >= arr_len {
-            continue;
-        }
-        let max = arr_len - off;
-        let n = p.bytes.len().min(max);
-        if n == 0 {
-            continue;
-        }
-        ctx.write_byte_array_from(p.arr, off, &p.bytes[..n]);
-    }
-}
+/// No-op since the unrooted `PendingArrayWrite` park was removed; retained so
+/// the drain sites keep documenting where a rooted heap-buffer flush would go.
+fn flush_pending_array_writes_inner(_ctx: &mut dyn NativeContext) {}
 
 /// Round-8 C29 fix: workers can't touch the user-visible Java object
 /// directly (no `&mut NativeContext`). When a worker needs to reset a
 /// field on a channel — e.g. clearing `F_CONNECTED = 0` after a connect
 /// failure — it parks a `PendingFieldReset` here and the next AIO native
 /// call on the user thread drains it via `flush_pending_field_resets`.
+/// AUDIT 2026-08-01: `target` was a bare `ObjectRef`. The park happens on a
+/// worker thread after a failed `connect(2)` and the apply happens later on a
+/// user thread, so a moving collection in between repointed the channel and
+/// this wrote `F_CONNECTED = 0` into whatever now lived at the old address —
+/// or, if the channel had died, into reclaimed memory. It is a global root
+/// handle now; `release_root` marks the LAST entry for a given handle so the
+/// flusher drops the root exactly once (the connect-failure path parks two
+/// resets against one channel).
 struct PendingFieldReset {
-    target: ObjectRef,
+    target_gref: usize,
     field: usize,
     value: Value,
+    release_root: bool,
 }
 
 fn pending_field_resets() -> &'static Mutex<Vec<PendingFieldReset>> {
@@ -1548,8 +1643,15 @@ fn pending_field_resets() -> &'static Mutex<Vec<PendingFieldReset>> {
 fn flush_pending_field_resets(ctx: &mut dyn NativeContext) {
     let parked = std::mem::take(&mut *pending_field_resets().lock());
     for r in parked {
-        if ctx.object_num_fields(r.target) > r.field {
-            ctx.set_field(r.target, r.field, r.value);
+        // Resolve through the root: this is the target's CURRENT address, not
+        // the one the worker captured before it blocked.
+        if let Some(target) = ctx.resolve_global_root(r.target_gref) {
+            if ctx.object_num_fields(target) > r.field {
+                ctx.set_field(target, r.field, r.value);
+            }
+        }
+        if r.release_root {
+            ctx.remove_global_root(r.target_gref);
         }
     }
 }
@@ -1841,23 +1943,52 @@ fn aio_asc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let attachment = obj_or_none(args, 2);
     let handler = obj_or_none(args, 3);
 
-    let addr = decode_addr(ctx, sa)?;
+    // AUDIT 2026-08-01: root the handler, attachment and channel HERE, on the
+    // VM thread that still has a `NativeContext`. Two hazards, one fix:
+    //   * `decode_addr` dispatches `getPort()`/`getHostString()` on the
+    //     SocketAddress — real bytecode that can allocate and relocate all
+    //     three of `this`/`handler`/`attachment` before they are ever used.
+    //   * the worker then blocks in `policy_connect` for up to the connect
+    //     timeout (30 s by default) holding them, with nothing scanning or
+    //     remapping them for that whole window.
+    let roots = HandlerRoots::new(ctx, handler, attachment);
+    let channel_gref = ctx.add_global_root(this);
+    let addr = match decode_addr(ctx, sa) {
+        Ok(a) => a,
+        Err(e) => {
+            ctx.remove_global_root(channel_gref);
+            ctx.remove_global_root(roots.handler);
+            ctx.remove_global_root(roots.attachment);
+            return Err(e);
+        }
+    };
+    let this = ctx.resolve_global_root(channel_gref).unwrap_or(this);
     // Reserve an id up front in `Pending` state so close() can find it.
     let id = aio_register(AioHandle::Pending);
-    if ctx.object_num_fields(this) >= N_FIELDS {
+    let this = if ctx.object_num_fields(this) >= N_FIELDS {
         ctx.set_field(this, F_REG_ID, Value::Int(id));
         let host_str = ctx.create_string(&addr);
+        // `create_string` allocates: re-read the channel through its root
+        // before writing the second field.
+        let this = ctx.resolve_global_root(channel_gref).unwrap_or(this);
         ctx.set_field(this, F_REMOTE, Value::Object(Some(host_str)));
-    }
+        this
+    } else {
+        this
+    };
     if let Err(e) = job_sender().send(Job::Connect {
         id,
         addr,
-        handler,
-        attachment,
+        roots,
         // Round-8 C29: pass the user-visible channel so the worker can
         // park a `F_CONNECTED = 0` reset on connect failure.
-        channel: Some(this),
+        channel_gref,
     }) {
+        // The job never reached a worker, so nothing downstream will release
+        // these — drop them here or they leak for the life of the VM.
+        ctx.remove_global_root(channel_gref);
+        ctx.remove_global_root(roots.handler);
+        ctx.remove_global_root(roots.attachment);
         // 2026-05-24: previously swallowed with `Err(_)`; the caller
         // and the user-visible CompletionHandler had no way to
         // distinguish "channel just closed" from any other failure.
@@ -2119,6 +2250,17 @@ fn try_deliver_ready_read(
     attachment: Option<ObjectRef>,
     buffer: ObjectRef,
 ) -> bool {
+    // HARD PRECONDITION, checked before anything else: only a designated
+    // completion thread may run `completed()`. On any other thread this must
+    // fall back to the worker pool no matter how ready the socket is — see
+    // `on_completion_thread` for the deadlock this closes. (Checked first
+    // because it is a TLS read, versus a `FIONREAD` syscall below.)
+    if !on_completion_thread() {
+        if aio_inline_dbg_enabled() {
+            aio_inline_record(&AIO_INLINE_FOREIGN_THREAD);
+        }
+        return false;
+    }
     // Probe readiness BEFORE the depth check, so a read that is both capped and
     // has no data is attributed to "not ready" rather than to the cap. Getting
     // this order wrong reported 491 depth-capped reads that were really just
@@ -2262,6 +2404,13 @@ fn aio_inline_dbg_enabled() -> bool {
 static AIO_INLINE_TAKEN: AtomicUsize = AtomicUsize::new(0);
 static AIO_INLINE_NOT_READY: AtomicUsize = AtomicUsize::new(0);
 static AIO_INLINE_DEPTH_CAPPED: AtomicUsize = AtomicUsize::new(0);
+/// Reads declined by the inline fast path because the initiating thread is not
+/// a completion-delivery thread. Expected to be non-zero and harmless: it
+/// counts the first read of each handler chain, which an application thread
+/// arms (e.g. `WsFrameClient.startInputProcessing`). Only the follow-on reads,
+/// armed from inside `completed()` on the dispatcher, are eligible to inline —
+/// which is the case the fast path was built for.
+static AIO_INLINE_FOREIGN_THREAD: AtomicUsize = AtomicUsize::new(0);
 
 /// Split of where a NOT-READY read's latency goes, under
 /// `CRATONVM_DBG_AIO_INLINE`.
@@ -2359,11 +2508,12 @@ fn aio_inline_record(counter: &AtomicUsize) {
     let taken = AIO_INLINE_TAKEN.load(Ordering::Relaxed);
     let not_ready = AIO_INLINE_NOT_READY.load(Ordering::Relaxed);
     let capped = AIO_INLINE_DEPTH_CAPPED.load(Ordering::Relaxed);
-    let total = taken + not_ready + capped;
+    let foreign = AIO_INLINE_FOREIGN_THREAD.load(Ordering::Relaxed);
+    let total = taken + not_ready + capped + foreign;
     if total % 500 == 0 {
         eprintln!(
             "[DBG_AIO_INLINE] reads={total} inline={taken} not_ready={not_ready} \
-             depth_capped={capped} inline_rate={:.3}",
+             depth_capped={capped} foreign_thread={foreign} inline_rate={:.3}",
             taken as f64 / total as f64
         );
     }
@@ -2617,30 +2767,41 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         (obj_or_none(args, 2), obj_or_none(args, 3))
     };
     let id = read_aio_id(ctx, this).ok_or_else(|| ioex("write: not connected"))?;
-    let data = read_buffer_bytes(ctx, bb);
-    if data.is_empty() {
-        if let Some(h) = handler {
-            push_handler_completion(Completion {
-                handler: h,
-                attachment,
-                outcome: Ok(CompletionKind::IntCount(0)),
-            });
-        }
-        return Ok(Some(Value::Object(None)));
-    }
-    // Root the source buffer for the duration of the worker write: the
+    // AUDIT 2026-08-01: root the handler/attachment alongside the buffer, and
+    // do it BEFORE `read_buffer_bytes` — that walks the buffer's backing store
+    // through the context and is a GC point. The 2026-07-26 audit rooted only
+    // the buffer, and only after the read; the handler on the same job rode
+    // across `write(2)` as a bare `ObjectRef`.
+    //
+    // The source buffer is rooted for the duration of the worker write: the
     // dispatcher must advance its `position` by the bytes actually written
     // (`AsynchronousByteChannel.write` contract), and a moving collection can
     // run while the worker is parked in `write(2)`.
+    let roots = HandlerRoots::new(ctx, handler, attachment);
     let bb_gref = ctx.add_global_root(bb);
+    let bb = ctx.resolve_global_root(bb_gref).unwrap_or(bb);
+    let data = read_buffer_bytes(ctx, bb);
+    if data.is_empty() {
+        ctx.remove_global_root(bb_gref);
+        if roots.has_handler() {
+            push_handler_completion(Completion {
+                roots,
+                outcome: Ok(CompletionKind::IntCount(0)),
+            });
+        } else {
+            queue_handler_release(roots);
+        }
+        return Ok(Some(Value::Object(None)));
+    }
     if let Err(e) = job_sender().send(Job::Write {
         id,
         data,
         bb_gref,
-        handler,
-        attachment,
+        roots,
     }) {
         ctx.remove_global_root(bb_gref);
+        ctx.remove_global_root(roots.handler);
+        ctx.remove_global_root(roots.attachment);
         eprintln!(
             "native-io: aio_asc_write: job channel closed; \
              CompletionHandler will not fire (id={id}, err={e})"
@@ -2869,11 +3030,15 @@ fn aio_assc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let attachment = obj_or_none(args, 1);
     let handler = obj_or_none(args, 2);
     let id = read_aio_id(ctx, this).ok_or_else(|| ioex("accept: not bound"))?;
-    if let Err(e) = job_sender().send(Job::Accept {
-        id,
-        handler,
-        attachment,
-    }) {
+    // AUDIT 2026-08-01: an armed `accept()` blocks until a client shows up —
+    // on an idle server, indefinitely. The handler and attachment used to ride
+    // that entire wait as bare `ObjectRef`s: nothing kept them alive and
+    // nothing repointed them, so the first connection of the day dispatched
+    // `completed()` on whatever had since been allocated at those addresses.
+    let roots = HandlerRoots::new(ctx, handler, attachment);
+    if let Err(e) = job_sender().send(Job::Accept { id, roots }) {
+        ctx.remove_global_root(roots.handler);
+        ctx.remove_global_root(roots.attachment);
         eprintln!(
             "native-io: aio_assc_accept: job channel closed; \
              CompletionHandler will not fire (id={id}, err={e})"
@@ -2905,6 +3070,9 @@ fn iocp_close(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult
 }
 
 fn iocp_drain(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // `Iocp`/`EPollPort`/`KQueuePort` `drain`/`poll` are called from the JDK's
+    // own dispatcher loop, so this caller is a pool thread by construction.
+    let _delivering = CompletionThreadGuard::enter();
     drain_completions(ctx);
     flush_pending_array_writes_inner(ctx);
     Ok(None)
@@ -3159,10 +3327,10 @@ mod tests {
         ctx.set_field_by_name(bb, "position", Value::Int(5));
         let buffer_gref = ctx.add_global_root(bb);
         let handler = ctx.alloc_object(1);
+        let roots = HandlerRoots::new(&mut ctx, Some(handler), None);
 
         push_handler_completion(Completion {
-            handler,
-            attachment: None,
+            roots,
             outcome: Ok(CompletionKind::WriteCount {
                 n: 7,
                 buffer_gref,
@@ -3178,7 +3346,7 @@ mod tests {
         assert_eq!(
             ctx.global_root_count(),
             0,
-            "the buffer's global root must be released after delivery"
+            "the buffer AND handler global roots must be released after delivery"
         );
     }
 
@@ -3210,6 +3378,216 @@ mod tests {
             "a failed write must not advance the buffer"
         );
         assert_eq!(ctx.global_root_count(), 0, "both roots must be freed");
+    }
+
+    // -----------------------------------------------------------------
+    // Root audit 2026-08-01 — handler/attachment/channel remapping.
+    //
+    // Before this wave, `Completion` carried the `CompletionHandler` and its
+    // attachment as bare `ObjectRef`s captured on a worker thread *before* a
+    // blocking syscall. They were in no root set, so a moving collection was
+    // free to relocate them and nothing repointed the copies. Each test below
+    // relocates the root between park and drain — the mock's
+    // `relocate_global_root` models exactly what the collector's remap pass
+    // does — and asserts the delivered reference is the POST-move one. Against
+    // the old bare-`ObjectRef` shape the assertion fails with the pre-move
+    // address, which is the dangling read this fixes.
+    // -----------------------------------------------------------------
+
+    /// `completed()` must be dispatched on the handler's post-relocation
+    /// address, and both roots must be released exactly once.
+    #[test]
+    fn audit_completion_handler_is_remapped_before_delivery() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        completion_queue().lock().clear();
+
+        let handler_before = ctx.alloc_object(1);
+        let attachment_before = ctx.alloc_object(1);
+        let roots = HandlerRoots::new(&mut ctx, Some(handler_before), Some(attachment_before));
+        push_handler_completion(Completion {
+            roots,
+            outcome: Ok(CompletionKind::Void),
+        });
+
+        // A moving collection runs while the completion sits in the queue.
+        let handler_after = ctx.alloc_object(1);
+        let attachment_after = ctx.alloc_object(1);
+        ctx.relocate_global_root(roots.handler, handler_after);
+        ctx.relocate_global_root(roots.attachment, attachment_after);
+        assert_ne!(handler_before, handler_after);
+
+        drain_completions(&mut ctx);
+
+        let delivered = ctx
+            .recorded_calls()
+            .iter()
+            .find(|c| c.method_name == "completed")
+            .expect("completed must be dispatched")
+            .clone();
+        assert_eq!(
+            delivered.args[0],
+            Value::Object(Some(handler_after)),
+            "the handler must be resolved through its global root, not from \
+             the pre-move ObjectRef the worker captured"
+        );
+        assert_eq!(
+            delivered.args[2],
+            Value::Object(Some(attachment_after)),
+            "the attachment must be remapped too"
+        );
+        assert_eq!(
+            ctx.global_root_count(),
+            0,
+            "handler and attachment roots must both be released after delivery"
+        );
+    }
+
+    /// The `failed()` path takes a different branch (it allocates an
+    /// IOException and a message String first, either of which can move the
+    /// handler again) and must remap just the same.
+    #[test]
+    fn audit_failed_delivery_is_remapped_and_releases_roots() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        completion_queue().lock().clear();
+
+        let handler_before = ctx.alloc_object(1);
+        let roots = HandlerRoots::new(&mut ctx, Some(handler_before), None);
+        push_handler_completion(Completion {
+            roots,
+            outcome: Err("connect failed: refused".to_string()),
+        });
+
+        let handler_after = ctx.alloc_object(1);
+        ctx.relocate_global_root(roots.handler, handler_after);
+
+        drain_completions(&mut ctx);
+
+        let delivered = ctx
+            .recorded_calls()
+            .iter()
+            .find(|c| c.method_name == "failed")
+            .expect("failed must be dispatched")
+            .clone();
+        assert_eq!(
+            delivered.args[0],
+            Value::Object(Some(handler_after)),
+            "failed() must dispatch on the post-move handler"
+        );
+        assert_eq!(
+            ctx.global_root_count(),
+            0,
+            "the handler root must be released even on the failure path"
+        );
+    }
+
+    /// A handler-less job still roots its attachment, so the release path must
+    /// drop both handles or every such op leaks one root for the life of the VM.
+    #[test]
+    fn audit_handler_less_job_releases_its_attachment_root() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        pending_root_releases().lock().clear();
+
+        let attachment = ctx.alloc_object(1);
+        let roots = HandlerRoots::new(&mut ctx, None, Some(attachment));
+        assert!(!roots.has_handler());
+        assert_eq!(ctx.global_root_count(), 1);
+
+        queue_handler_release(roots);
+        flush_pending_root_releases(&mut ctx);
+        assert_eq!(
+            ctx.global_root_count(),
+            0,
+            "a null CompletionHandler must not strand the attachment's root"
+        );
+    }
+
+    /// `PendingFieldReset` writes `F_CONNECTED = 0` on a *different* thread
+    /// from the one that parked it. It must resolve the channel through its
+    /// root: writing through the pre-move `ObjectRef` clears the flag on
+    /// whatever object now occupies that address.
+    #[test]
+    fn audit_pending_field_reset_targets_the_relocated_channel() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        pending_field_resets().lock().clear();
+
+        let channel_before = ctx.alloc_object(N_FIELDS);
+        ctx.set_field(channel_before, F_CONNECTED, Value::Int(1));
+        let channel_gref = ctx.add_global_root(channel_before);
+
+        pending_field_resets().lock().push(PendingFieldReset {
+            target_gref: channel_gref,
+            field: F_CONNECTED,
+            value: Value::Int(0),
+            release_root: true,
+        });
+
+        // The collector moves the channel while the reset is parked. The
+        // old address is now a different live object.
+        let channel_after = ctx.alloc_object(N_FIELDS);
+        ctx.set_field(channel_after, F_CONNECTED, Value::Int(1));
+        ctx.relocate_global_root(channel_gref, channel_after);
+
+        flush_pending_field_resets(&mut ctx);
+
+        assert_eq!(
+            ctx.get_field(channel_after, F_CONNECTED),
+            Value::Int(0),
+            "the reset must land on the channel's post-move address"
+        );
+        assert_eq!(
+            ctx.get_field(channel_before, F_CONNECTED),
+            Value::Int(1),
+            "and must NOT be written through the stale pre-move reference"
+        );
+        assert_eq!(
+            ctx.global_root_count(),
+            0,
+            "the channel root is released by the last reset for that handle"
+        );
+    }
+
+    /// The connect-failure path parks TWO resets against one channel root.
+    /// Only the last carries `release_root`, so the first must still find the
+    /// root live — a premature release would silently drop the second write.
+    #[test]
+    fn audit_two_field_resets_share_one_channel_root() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        pending_field_resets().lock().clear();
+
+        let channel = ctx.alloc_object(N_FIELDS);
+        ctx.set_field(channel, F_CONNECTED, Value::Int(1));
+        ctx.set_field(channel, F_REG_ID, Value::Int(7));
+        let channel_gref = ctx.add_global_root(channel);
+
+        {
+            let mut resets = pending_field_resets().lock();
+            resets.push(PendingFieldReset {
+                target_gref: channel_gref,
+                field: F_CONNECTED,
+                value: Value::Int(0),
+                release_root: false,
+            });
+            resets.push(PendingFieldReset {
+                target_gref: channel_gref,
+                field: F_REG_ID,
+                value: Value::Int(-1),
+                release_root: true,
+            });
+        }
+        flush_pending_field_resets(&mut ctx);
+
+        assert_eq!(ctx.get_field(channel, F_CONNECTED), Value::Int(0));
+        assert_eq!(
+            ctx.get_field(channel, F_REG_ID),
+            Value::Int(-1),
+            "the second reset must still resolve — the root outlives it"
+        );
+        assert_eq!(ctx.global_root_count(), 0);
     }
 
     /// A zero handle is the "no root" sentinel and must never be queued.
@@ -3278,9 +3656,8 @@ mod tests {
         let _ = job_sender().send(Job::Connect {
             id,
             addr: format!("127.0.0.1:{port}"),
-            handler: None,
-            attachment: None,
-            channel: None,
+            roots: HandlerRoots::default(),
+            channel_gref: 0,
         });
 
         // Wait for the registry to flip to Stream.

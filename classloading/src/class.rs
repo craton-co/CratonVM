@@ -378,11 +378,21 @@ pub struct Class {
 
     /// RKC16N.3 — Array-class metadata.
     ///
-    /// `Some(_)` if and only if this class represents a Java array type
-    /// (binary name starts with `[`). The bootstrap class loader
-    /// **synthesises** these classes from the resolved component class —
-    /// JVMS §5.3.3 forbids any classpath I/O for reference-array types.
-    /// `None` for ordinary classes and interfaces.
+    /// `Some(_)` for an array type whose component is a **reference** type
+    /// (`[Lp/X;`, `[[I`, …); `None` for an ordinary class or interface **and**
+    /// for a primitive-component array (`[I`, `[Z`, …), whose component has no
+    /// `ClassId` in the store — primitive pseudo-classes are surfaced lazily by
+    /// `Class.getPrimitiveClass` and never registered here. The VM
+    /// **synthesises** array classes from the resolved component class; JVMS
+    /// §5.3.3 forbids any classpath I/O for them.
+    ///
+    /// The recorded [`ArrayInfo::component_class_id`] is the array class's
+    /// *identity witness*: per JVMS §5.3.3 the array's defining loader is the
+    /// defining loader of that exact component, so two array classes with the
+    /// same name and different components are genuinely different classes.
+    /// `ClassManager::load_array_class_for_loader` reads it to decide whether a
+    /// pre-existing bootstrap-keyed array class may be re-keyed or must be left
+    /// alone — see `docs/known-issues/array-class-defining-loader.md`.
     pub array_info: Option<ArrayInfo>,
 
     /// Round 8 audit fix (CRIT #4): per-class initialization-state
@@ -441,8 +451,12 @@ pub const RECORD_OBJ_COMPUTED: u8 = 1 << 7;
 pub struct ArrayInfo {
     /// `ClassId` of the **immediate** component type. For `[Ljava/util/HashMap;`
     /// this is the id of `java/util/HashMap`. For `[[I` this is the id of
-    /// the inner array class `[I`. For primitive arrays such as `[I` this
-    /// is the id of the primitive pseudo-class (`int`, `long`, …).
+    /// the inner array class `[I`.
+    ///
+    /// Primitive-component arrays (`[I`, `[Z`, …) carry no `ArrayInfo` at all
+    /// (the enclosing `Class::array_info` is `None`), because a primitive
+    /// pseudo-class has no `ClassId` in the `ClassStore` and inventing one here
+    /// would make this field lie about class identity.
     pub component_class_id: ClassId,
 
     /// Total number of `[` prefixes in the array's binary name. For `[I`

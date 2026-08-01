@@ -245,7 +245,30 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
     // Pin args across the re-entrant invokes below (a moving GC during any
     // invoke would otherwise leave these ObjectRefs stale).
+    //
+    // The pinned region is delimited here and nowhere else. Everything that
+    // can fail lives in `ec_multiply_pinned`, so **every** exit — the two
+    // explicit refusals and the dozen `?` early returns alike — passes through
+    // the single `unpin_native_roots` below. Previously only the refusals
+    // unpinned and each `?` leaked its pins into the root set for the life of
+    // the VM; a caller that repeatedly hit `getX`-returned-null would grow the
+    // root set without bound. This is a root-set leak, not a cryptographic
+    // degradation, but it lives on the same paths.
     let pin_base = ctx.pin_native_root(ec_ops);
+    let result = ec_multiply_pinned(ctx, pin_base, ec_ops, affine_p, &scalar_le);
+    ctx.unpin_native_roots(pin_base);
+    result
+}
+
+/// The body of [`native_ec_multiply`], running inside the pinned region opened
+/// by its caller. Must not unpin: the caller does that on every exit path.
+fn ec_multiply_pinned(
+    ctx: &mut dyn NativeContext,
+    pin_base: usize,
+    ec_ops: ObjectRef,
+    affine_p: ObjectRef,
+    scalar_le: &[u8],
+) -> MethodCallResult {
     let p_affine = ctx.pin_native_root(affine_p);
 
     // field = ecOps.getField()
@@ -275,12 +298,11 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let field_cls = match field_cls {
         Some(c) => c,
         None => {
-            ctx.unpin_native_roots(pin_base);
             return Err(throw_jca(
                 ctx,
                 PROVIDER_EXCEPTION,
                 "native EC multiply: field object has no resolvable class name",
-            ));
+            ))
         }
     };
     // SUPPORTED vs REJECTED: exactly P-256, P-384 and P-521 are implemented
@@ -291,12 +313,11 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let curve = match Curve::from_field_class(&field_cls) {
         Some(c) => c,
         None => {
-            ctx.unpin_native_roots(pin_base);
             return Err(throw_jca(
                 ctx,
                 PROVIDER_EXCEPTION,
                 &format!("native EC multiply: unsupported curve field {field_cls}"),
-            ));
+            ))
         }
     };
     let n = curve.byte_len();
@@ -327,9 +348,9 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
     // ---- pure Rust EC math (no Java refs held) ----
     let (rx, ry) = match curve {
-        Curve::P256 => scalar_mul_p256(&bx, &by, &scalar_le),
-        Curve::P384 => scalar_mul_p384(&bx, &by, &scalar_le),
-        Curve::P521 => scalar_mul_p521(&bx, &by, &scalar_le),
+        Curve::P256 => scalar_mul_p256(&bx, &by, scalar_le),
+        Curve::P384 => scalar_mul_p384(&bx, &by, scalar_le),
+        Curve::P521 => scalar_mul_p521(&bx, &by, scalar_le),
     }
     .ok_or_else(|| internal_err("native EC scalar multiply failed (bad point/scalar)"))?;
     // Empty coordinates = point-at-infinity (e.g. the `n·P` order check in
@@ -386,10 +407,49 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         )?;
     }
 
+    // Read the pin *before* returning: the caller unpins immediately after,
+    // and this ObjectRef has to be the post-GC one.
     let result = ctx.read_native_pin(p_res, result);
-    ctx.unpin_native_roots(pin_base);
     Ok(Some(Value::Object(Some(result))))
 }
+
+// ── Group orders ──────────────────────────────────────────────────────────
+//
+// The order `n` of each curve's base-point group, big-endian, left-padded to
+// the curve's field byte width. These exist for exactly one purpose: to tell
+// the *one* legitimate non-canonical scalar (`s == n`, the public-key order
+// check in `ECDHKeyAgreement.validate`) apart from every other `s >= n`, which
+// is a scalar this code cannot represent and must therefore refuse.
+//
+// Hard-coding them means no new dependency on a `crypto-bigint` re-export whose
+// integer width differs per curve. The values are not trusted on their own:
+// `tests::group_order_constants_are_exact` proves each one equals the backend's
+// own modulus, using only `Scalar::from_repr`. `from_repr(v)` is `Some` iff
+// `v < n`, so `from_repr(ORDER) == None` gives `ORDER >= n` and
+// `from_repr(ORDER - 1) == Some` gives `ORDER <= n`. Together: `ORDER == n`.
+// A mistyped digit cannot survive that test.
+
+/// P-256 group order (`n`), big-endian, 32 bytes.
+const P256_ORDER_BE: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+];
+
+/// P-384 group order (`n`), big-endian, 48 bytes.
+const P384_ORDER_BE: [u8; 48] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc7, 0x63, 0x4d, 0x81, 0xf4, 0x37, 0x2d, 0xdf,
+    0x58, 0x1a, 0x0d, 0xb2, 0x48, 0xb0, 0xa7, 0x7a, 0xec, 0xec, 0x19, 0x6a, 0xcc, 0xc5, 0x29, 0x73,
+];
+
+/// P-521 group order (`n`), big-endian, left-padded to the 66-byte field width.
+const P521_ORDER_BE: [u8; 66] = [
+    0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xfa, 0x51, 0x86, 0x87, 0x83, 0xbf, 0x2f, 0x96, 0x6b, 0x7f, 0xcc, 0x01, 0x48, 0xf7, 0x09,
+    0xa5, 0xd0, 0x3b, 0xb5, 0xc9, 0xb8, 0x89, 0x9c, 0x47, 0xae, 0xbb, 0x6f, 0xb7, 0x1e, 0x91, 0x38,
+    0x64, 0x09,
+];
 
 /// Generate a curve `scalar_mul` over the RustCrypto curve crate `$krate` with
 /// field/scalar byte length `$nbytes`: `s · (x, y)` → affine `(rx, ry)` as
@@ -397,12 +457,15 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// (`$nbytes` bytes), `s_le` the little-endian scalar.
 ///
 /// Returns `None` — which the caller surfaces as a thrown exception — for a
-/// wrong-length coordinate, a point that is not on the curve, or a scalar with
-/// significant bytes beyond the field width. `Some((empty, empty))` is the
-/// point-at-infinity signal (see the `TRUST BOUNDARY` note inside). There is no
-/// input for which this returns a coordinate pair it is not confident in.
+/// wrong-length coordinate, a point that is not on the curve, a scalar with
+/// significant bytes beyond the field width, or a scalar that is
+/// non-canonical for any reason other than being exactly the group order.
+/// `Some((empty, empty))` is the point-at-infinity signal. There is no input
+/// for which this returns a coordinate pair it is not confident in.
+///
+/// `$order_be` is the curve's group order `n`, big-endian, `$nbytes` long.
 macro_rules! impl_curve_scalar_mul {
-    ($name:ident, $krate:ident, $nbytes:literal) => {
+    ($name:ident, $krate:ident, $nbytes:literal, $order_be:ident) => {
         fn $name(x: &[u8], y: &[u8], s_le: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
             use $krate::elliptic_curve::ff::PrimeField;
             use $krate::elliptic_curve::generic_array::GenericArray;
@@ -445,23 +508,31 @@ macro_rules! impl_curve_scalar_mul {
             let scalar = if ct.is_some().into() {
                 ct.unwrap()
             } else {
-                // TRUST BOUNDARY: a non-canonical scalar (>= the group order
-                // `n`) is reported as the neutral element rather than refused.
+                // The scalar is non-canonical (`>= n`), so the backend will not
+                // build it and no multiply can be performed. Exactly ONE such
+                // scalar has a defined, expected answer:
                 //
-                // This is load-bearing for `ECDHKeyAgreement.validate`, whose
-                // public-key order check multiplies the (already on-curve,
-                // verified just above) point by `n` and requires `n·P = O`.
-                // Keygen/sign/real-ECDH scalars are always in `[1, n)` and take
-                // the canonical branch above, so no legitimate call reaches
-                // here — but the conflation is real: if some future caller did
-                // pass a >= n scalar for an actual multiply, it would receive
-                // the identity instead of an error, and identity is a
-                // *plausible* answer. Narrowing this (accepting the neutral
-                // result only when the scalar equals `n` for the detected
-                // curve) needs the group order plumbed in per curve and
-                // end-to-end ECDH validation; tracked as a residual gap in
-                // docs/security/crypto-failure-contract.md.
-                return Some((Vec::new(), Vec::new()));
+                //   * `s == n` — `ECDHKeyAgreement.validate`'s public-key order
+                //     check. It multiplies the (already on-curve, verified just
+                //     above) point by the group order and requires `n·P = O`.
+                //     Returning the neutral element is the *right* answer, and
+                //     the JDK depends on it.
+                //
+                // Everything else `>= n` is a scalar this code cannot honour.
+                // It used to receive the identity too — and identity is a
+                // *plausible* answer, so the caller could not tell "your scalar
+                // was rejected" from "the product really is the point at
+                // infinity". That is the failure-as-output shape this audit
+                // exists to remove, on a private-key operand. Refuse instead;
+                // the native caller turns `None` into a thrown exception.
+                //
+                // Keygen / sign / real-ECDH scalars are always in `[1, n)` and
+                // take the canonical branch above, so this narrowing cannot
+                // reject a legitimate multiply.
+                if be == $order_be {
+                    return Some((Vec::new(), Vec::new()));
+                }
+                return None;
             };
 
             let prod = (ProjectivePoint::from(affine) * scalar).to_affine();
@@ -479,9 +550,9 @@ macro_rules! impl_curve_scalar_mul {
     };
 }
 
-impl_curve_scalar_mul!(scalar_mul_p256, p256, 32);
-impl_curve_scalar_mul!(scalar_mul_p384, p384, 48);
-impl_curve_scalar_mul!(scalar_mul_p521, p521, 66);
+impl_curve_scalar_mul!(scalar_mul_p256, p256, 32, P256_ORDER_BE);
+impl_curve_scalar_mul!(scalar_mul_p384, p384, 48, P384_ORDER_BE);
+impl_curve_scalar_mul!(scalar_mul_p521, p521, 66, P521_ORDER_BE);
 
 // JDK-ONLY-CLASSIFY: unknown — needs census. Same structural hazard as
 // `sunec_intpoly`: the single registration below carries no category and
@@ -525,15 +596,63 @@ mod tests {
         )
     }
 
-    /// The P-256 group order `n`, big-endian.
-    const P256_ORDER_BE: [u8; 32] = [
-        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
-        0x25, 0x51,
-    ];
-
     fn le(be: &[u8]) -> Vec<u8> {
         be.iter().rev().copied().collect()
+    }
+
+    /// The uncompressed affine coordinates of a curve's base point, taken from
+    /// the curve crate itself.
+    macro_rules! generator_of {
+        ($krate:ident) => {{
+            use $krate::elliptic_curve::group::prime::PrimeCurveAffine as _;
+            use $krate::elliptic_curve::sec1::ToEncodedPoint as _;
+            let g = $krate::AffinePoint::generator().to_encoded_point(false);
+            (
+                g.x().expect("generator has an x").to_vec(),
+                g.y().expect("generator has a y").to_vec(),
+            )
+        }};
+    }
+
+    /// Prove a hard-coded `*_ORDER_BE` constant is **exactly** the curve's
+    /// group order, using nothing but the backend's own canonicity test.
+    ///
+    /// `Scalar::from_repr(v)` is `Some` iff `v < n`. So:
+    ///   * `from_repr(ORDER)` is `None`      ⟹ `ORDER >= n`
+    ///   * `from_repr(ORDER - 1)` is `Some`  ⟹ `ORDER - 1 < n`, i.e. `ORDER <= n`
+    /// Together the two bound it from both sides: `ORDER == n`. A single
+    /// mistyped digit in the constant fails one direction or the other, so the
+    /// constants cannot silently drift from the curves they gate.
+    macro_rules! assert_order_exact {
+        ($krate:ident, $order:ident, $name:literal) => {{
+            use $krate::elliptic_curve::ff::PrimeField as _;
+            use $krate::elliptic_curve::generic_array::GenericArray;
+            use $krate::Scalar;
+
+            let at_order = Scalar::from_repr(GenericArray::clone_from_slice(&$order));
+            assert!(
+                bool::from(at_order.is_none()),
+                "{}: the constant is accepted as canonical, so it is below the group order",
+                $name
+            );
+
+            let mut below = $order;
+            let last = below.len() - 1;
+            below[last] -= 1; // every order ends in a non-zero byte, so no borrow
+            let just_below = Scalar::from_repr(GenericArray::clone_from_slice(&below));
+            assert!(
+                bool::from(just_below.is_some()),
+                "{}: the constant minus one is rejected, so the constant is above the group order",
+                $name
+            );
+        }};
+    }
+
+    #[test]
+    fn group_order_constants_are_exact() {
+        assert_order_exact!(p256, P256_ORDER_BE, "P-256");
+        assert_order_exact!(p384, P384_ORDER_BE, "P-384");
+        assert_order_exact!(p521, P521_ORDER_BE, "P-521");
     }
 
     // ---- supported curves are recognised; everything else is rejected ----
@@ -666,5 +785,71 @@ mod tests {
 
         let order = scalar_mul_p256(&gx, &gy, &le(&P256_ORDER_BE)).expect("n·G is defined");
         assert_eq!(order, (Vec::new(), Vec::new()), "n·G must be the identity");
+    }
+
+    /// ...and the same must hold on the two curves whose scalar arithmetic the
+    /// tests above do not exercise. Both cases short-circuit in the
+    /// non-canonical branch, so this pins the constant-driven decision itself,
+    /// not the curve crates' point arithmetic.
+    #[test]
+    fn the_group_order_is_the_identity_on_every_supported_curve() {
+        let (gx, gy) = generator_of!(p384);
+        assert_eq!(
+            scalar_mul_p384(&gx, &gy, &le(&P384_ORDER_BE)).expect("n·G is defined"),
+            (Vec::new(), Vec::new())
+        );
+        let (gx, gy) = generator_of!(p521);
+        assert_eq!(
+            scalar_mul_p521(&gx, &gy, &le(&P521_ORDER_BE)).expect("n·G is defined"),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    /// **The narrowing under test.** A non-canonical scalar that is *not* the
+    /// group order used to be answered with the identity — a plausible,
+    /// well-formed point — so a caller could not tell "your scalar was
+    /// rejected" from "the product really is the point at infinity". On a
+    /// private-key operand that is the failure-as-output shape this audit
+    /// exists to remove. It must now be a refusal (`None`), which the native
+    /// entry point turns into a thrown exception.
+    #[test]
+    fn non_canonical_scalars_other_than_the_group_order_are_refused() {
+        // n + 1: still `>= n`, so still non-canonical, but not the one value
+        // `ECDHKeyAgreement.validate` depends on. Every order ends in a byte
+        // below 0xff, so incrementing cannot carry.
+        let mut n_plus_1 = P256_ORDER_BE;
+        let last = n_plus_1.len() - 1;
+        n_plus_1[last] += 1;
+
+        let (gx, gy) = p256_generator();
+        assert!(
+            scalar_mul_p256(&gx, &gy, &le(&n_plus_1)).is_none(),
+            "n+1 must be refused, not answered with the identity"
+        );
+
+        // The all-ones scalar (2^256 - 1) is comfortably above n.
+        assert!(
+            scalar_mul_p256(&gx, &gy, &[0xffu8; 32]).is_none(),
+            "a scalar far above the group order must be refused"
+        );
+
+        // ...and the guard did not swallow the one value that must survive it.
+        assert_eq!(
+            scalar_mul_p256(&gx, &gy, &le(&P256_ORDER_BE)).expect("n·G is still defined"),
+            (Vec::new(), Vec::new())
+        );
+
+        // Same narrowing on the other two curves.
+        let mut n_plus_1 = P384_ORDER_BE;
+        let last = n_plus_1.len() - 1;
+        n_plus_1[last] += 1;
+        let (gx, gy) = generator_of!(p384);
+        assert!(scalar_mul_p384(&gx, &gy, &le(&n_plus_1)).is_none());
+
+        let mut n_plus_1 = P521_ORDER_BE;
+        let last = n_plus_1.len() - 1;
+        n_plus_1[last] += 1;
+        let (gx, gy) = generator_of!(p521);
+        assert!(scalar_mul_p521(&gx, &gy, &le(&n_plus_1)).is_none());
     }
 }

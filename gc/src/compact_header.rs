@@ -479,14 +479,66 @@ impl HashCodeTable {
         self.table.read().get(&obj_addr).copied()
     }
 
-    /// After a GC relocation, remap all stored addresses according to
-    /// `pointer_map` (old address -> new address).
-    pub fn update_after_gc(&self, pointer_map: &HashMap<usize, usize>) {
+    /// After a GC cycle, remap the addresses of objects that moved **and drop
+    /// the entries of objects that did not survive**.
+    ///
+    /// * an entry in `pointer_map` — the object moved; re-key it to the new
+    ///   address;
+    /// * otherwise `survived(addr)` — the object is still live at the same
+    ///   address (a stationary survivor, or an object in a generation this
+    ///   cycle did not touch); keep it as it is;
+    /// * otherwise — dead; drop it.
+    ///
+    /// # GCAUD-7 — why the survival predicate is a parameter
+    ///
+    /// This used to be `pointer_map.get(&addr).copied().unwrap_or(addr)`: an
+    /// address the map did not mention kept its entry forever, and there was no
+    /// sweep anywhere (`remove_dead` below has never had a caller). That is the
+    /// classic address-keyed-cache failure — a dead key held at a recycled
+    /// address, so the next object allocated there inherits the dead object's
+    /// identity hash, and the table grows without bound.
+    ///
+    /// The obvious repair, "absent from the pointer map ⇒ did not survive", is
+    /// the proof the reference processor uses — but it is only sound when the
+    /// producer of the map guarantees an entry for **every** survivor, stationary
+    /// ones included. The generational collector does that only for addresses
+    /// the VM registered as watched (`gc_quiescence::set_watched_referents`;
+    /// see the identity-entry arms in `OldGen::compact` and in the in-place old
+    /// sweep), and a minor collection's map says nothing at all about old gen.
+    /// Applying that proof unconditionally here would silently change a live
+    /// object's `identityHashCode` mid-life, which is a different bug of the
+    /// same size.
+    ///
+    /// So the caller must state it. `survived` makes the precondition a
+    /// parameter instead of a convention, which is the whole point: this table
+    /// has **no production consumer today** (it is exported from `lib.rs` and
+    /// referenced only by tests — the generational heap mints identity hashes
+    /// through `GenerationalHeap::mint_identity_hash_code` instead), and the
+    /// hazard is entirely about what happens when someone wires it up. A
+    /// signature that cannot be called without answering "which of these
+    /// addresses are still alive?" cannot be wired up wrongly by accident.
+    ///
+    /// Pass `&|_| false` to sweep every unmoved entry; pass `&|_| true` for the
+    /// old remap-only behaviour, and read the paragraph above first.
+    pub fn update_after_gc(
+        &self,
+        pointer_map: &HashMap<usize, usize>,
+        survived: &dyn Fn(usize) -> bool,
+    ) {
         let mut write = self.table.write();
         let old: Vec<(usize, i32)> = write.drain().collect();
         for (addr, hash) in old {
-            let new_addr = pointer_map.get(&addr).copied().unwrap_or(addr);
-            write.insert(new_addr, hash);
+            match pointer_map.get(&addr).copied() {
+                Some(new_addr) => {
+                    write.insert(new_addr, hash);
+                }
+                None if survived(addr) => {
+                    write.insert(addr, hash);
+                }
+                // Dead: dropped. Keeping it would hand the next object
+                // allocated at this address a stranger's identity hash.
+                None => {}
+            }
         }
     }
 
@@ -1506,10 +1558,50 @@ mod tests {
         let hash = ht.get_or_assign(0x1000);
         let mut map = HashMap::new();
         map.insert(0x1000usize, 0x5000usize);
-        ht.update_after_gc(&map);
+        ht.update_after_gc(&map, &|_| false);
         // Old address gone, new address has the same hash.
         assert!(!ht.has_hash(0x1000));
         assert_eq!(ht.get(0x5000), Some(hash));
+    }
+
+    /// GCAUD-7 — `update_after_gc` must remap **and sweep**.
+    ///
+    /// Before this it was remap-only (`unwrap_or(addr)`), so an address the
+    /// pointer map did not mention kept its entry forever. With no sweep
+    /// anywhere (`remove_dead` has never had a caller), the next object
+    /// allocated at that recycled address inherits a dead object's identity
+    /// hash — and the table grows without bound.
+    ///
+    /// All three outcomes are asserted together, because a sweep that drops
+    /// stationary survivors is just as wrong as one that keeps dead keys: an
+    /// object's `identityHashCode` must not change while it is alive.
+    #[test]
+    fn hash_table_update_after_gc_sweeps_dead_keys_and_keeps_stationary_survivors() {
+        let ht = HashCodeTable::new();
+        let moved = ht.get_or_assign(0x1000);
+        let stayed = ht.get_or_assign(0x2000);
+        let died = ht.get_or_assign(0x3000);
+        assert_ne!(stayed, died);
+
+        let mut map = HashMap::new();
+        map.insert(0x1000usize, 0x5000usize);
+        // Only 0x2000 is a stationary survivor; 0x3000 was reclaimed.
+        ht.update_after_gc(&map, &|addr| addr == 0x2000);
+
+        assert_eq!(ht.get(0x5000), Some(moved), "a moved object keeps its hash");
+        assert!(!ht.has_hash(0x1000), "the pre-move key must not linger");
+        assert_eq!(
+            ht.get(0x2000),
+            Some(stayed),
+            "a live object that did not move must keep its identity hash — \
+             changing it mid-life breaks every hash container holding it",
+        );
+        assert!(
+            !ht.has_hash(0x3000),
+            "a dead key must be swept: an object later allocated at 0x3000 \
+             would otherwise inherit this hash",
+        );
+        assert_eq!(ht.len(), 2, "the table must not grow without bound");
     }
 
     #[test]

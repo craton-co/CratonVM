@@ -32,17 +32,43 @@
 //!
 //! ## Measured vs. not measured
 //!
-//! Several quantities the review names are not obtainable without changing
-//! modules this task does not own (`regalloc.rs`). Reporting them as `0` would
-//! be worse than useless — a reader cannot tell "this method spilled nothing"
-//! from "nobody counts spills". Every numeric field is therefore a
-//! [`Measured<T>`], which renders as JSON `null` when no call site has supplied
-//! it. The uninstrumented fields today are [`CompilationReport::spills`] and
-//! [`CompilationReport::reloads`]; their setters exist and are wired to
-//! nothing, so a future `regalloc` change is a one-line addition rather than a
-//! schema change. [`CompilationReport::peak_live_values`] left that list once
-//! `ir_lower` gained liveness-based frame-slot colouring: its slot planner
-//! computes the peak, and [`note_current_peak_live_values`] carries it here.
+//! Reporting an unmeasured quantity as `0` would be worse than useless — a
+//! reader cannot tell "this method spilled nothing" from "nobody counts
+//! spills". Every numeric field is therefore a [`Measured<T>`], which renders
+//! as JSON `null` when no call site has supplied it, and that distinction is
+//! load-bearing for the fields whose *producer* exists but whose *call site*
+//! does not yet:
+//!
+//! * [`CompilationReport::peak_live_values`] is fed: `ir_lower`'s
+//!   liveness-based frame-slot colouring computes the peak and
+//!   [`note_current_peak_live_values`] carries it here.
+//! * [`CompilationReport::spills`] / [`CompilationReport::reloads`] are fed on
+//!   exactly one path: `ir_lower::lower_inner_with_scopes` with
+//!   `CRATONVM_JIT_IR_LINEAR_SCAN` on, which runs
+//!   `regalloc::allocate_linear_scan` and reports the register↔memory
+//!   transitions it EMITTED through [`note_current_spills`] /
+//!   [`note_current_reloads`] (the ambient form, because that function's
+//!   signature is pinned and cannot take a recorder). The numbers describe
+//!   generated code, not `regalloc::Allocation`'s plan: that wiring executes
+//!   only the subset of the plan it can prove, so reporting
+//!   `Allocation::spills` would describe instructions nobody emitted.
+//!
+//!   With the flag off — the default, and every compile today — the lowerer
+//!   allocates no registers at all: every value lives in a frame slot and
+//!   there is no register↔memory transition to count. Both stay
+//!   `NotMeasured`, which is the honest answer. A reported `0` would be
+//!   indistinguishable from "an allocator ran and spilled nothing", and that
+//!   distinction is the entire reason [`Measured`] exists.
+//!   `regalloc::record_allocation_metrics` remains the recorder-holding
+//!   sibling of the two hooks, for a caller that has one.
+//!
+//!   See `docs/jit/linear-scan-wiring.md` for what that path does and does
+//!   not do.
+//! * the inlining tallies ([`CompilationReport::inline_candidates`] and
+//!   friends) are harvested from `CompiledMethod::inline_tally` in
+//!   [`CompileRecorder::installed`], so they are measured on every installed
+//!   body and absent on every bailout — which is the truth, not a gap.
+//!
 //! `docs/jit/compiler-metrics.md` keeps the current inventory.
 //!
 //! Likewise [`Phase::Encode`] and [`Phase::Install`] always report
@@ -493,18 +519,48 @@ pub struct CompilationReport {
     /// [`note_current_peak_live_values`]. Optimizing path only; the single-pass
     /// backend computes no live ranges and leaves this unmeasured.
     pub peak_live_values: Measured<u32>,
-    /// Values spilled to the frame. **Not measured** — `regalloc` computes live
-    /// ranges but publishes no spill/reload counts, and this task does not own
-    /// that file.
+    /// Register → memory transitions the backend **emitted**.
+    ///
+    /// Supplied by [`note_current_spills`] from
+    /// `ir_lower::lower_inner_with_scopes` when `CRATONVM_JIT_IR_LINEAR_SCAN`
+    /// is on, or by `regalloc::record_allocation_metrics` when a caller holds
+    /// a recorder. `NotMeasured` on every path that allocates no registers,
+    /// which is the default build: absence of an allocator is not a spill
+    /// count of zero.
     pub spills: Measured<u32>,
-    /// Reloads from the frame. **Not measured** — see
-    /// [`spills`](Self::spills).
+    /// Memory → register transitions the backend **emitted**. See
+    /// [`spills`](Self::spills) for who supplies it.
     pub reloads: Measured<u32>,
     /// `CompiledMethod::frame_layout.frame_size` — bytes subtracted from RSP.
     pub frame_bytes: Measured<u32>,
     /// Emitted machine-code bytes (`CompiledMethod::code_bytes().len()`), i.e.
     /// the buffer's write position, not its mapped capacity.
     pub code_bytes: Measured<u32>,
+    /// Call sites the inliner considered — `crate::InlineDecisionTally::
+    /// candidates`. Harvested from the artifact in
+    /// [`CompileRecorder::installed`], so it is `NotMeasured` on every report
+    /// that produced no body. Note the tally's own caveat: a site the invoke
+    /// loop short-circuits once the expansion budget is exhausted is never
+    /// counted, so this is "sites the resolver was asked about".
+    pub inline_candidates: Measured<u32>,
+    /// Sites actually inlined (`InlineDecisionTally::inlined_sites`).
+    pub inlined_sites: Measured<u32>,
+    /// Of [`inlined_sites`](Self::inlined_sites), those resting on a receiver-type
+    /// speculation and its guard (`InlineDecisionTally::speculative_sites`).
+    pub speculative_inlined_sites: Measured<u32>,
+    /// Callee bytecodes spliced into this body — the review's "inlined
+    /// bytecodes" (`InlineDecisionTally::inlined_bytecodes`).
+    pub inlined_bytecodes: Measured<u32>,
+    /// Summed profile-observed executions of the inlined sites — the review's
+    /// "call count" (`InlineDecisionTally::observed_calls_inlined`). A measured
+    /// `0` here means "inlined, but the compile was unprofiled", which is a
+    /// different claim from `null` ("nothing harvested a tally").
+    pub inlined_call_count: Measured<u64>,
+    /// Refusals by `crate::InlineRefusal::category`, in the tally's first-seen
+    /// order. Empty is *not* the same as absent: check
+    /// [`inline_candidates`](Self::inline_candidates) to tell "no site was
+    /// refused" from "no tally was harvested".
+    pub inline_refusals: Vec<(String, u32)>,
     /// `graph.safepoints.len()` at lowering — the builder's snapshot count.
     /// Optimizing path only.
     pub ir_safepoints: Measured<u32>,
@@ -551,6 +607,12 @@ impl CompilationReport {
             reloads: Measured::NotMeasured,
             frame_bytes: Measured::NotMeasured,
             code_bytes: Measured::NotMeasured,
+            inline_candidates: Measured::NotMeasured,
+            inlined_sites: Measured::NotMeasured,
+            speculative_inlined_sites: Measured::NotMeasured,
+            inlined_bytecodes: Measured::NotMeasured,
+            inlined_call_count: Measured::NotMeasured,
+            inline_refusals: Vec::new(),
             ir_safepoints: Measured::NotMeasured,
             oop_maps: Measured::NotMeasured,
             deopt_points: Measured::NotMeasured,
@@ -649,6 +711,31 @@ impl CompilationReport {
             self.deopt_metadata_bytes.json(),
             self.code_cache_bytes_at_install.json(),
         );
+        let _ = write!(
+            s,
+            ",\"inline_candidates\":{},\"inlined_sites\":{},\"speculative_inlined_sites\":{}",
+            self.inline_candidates.json(),
+            self.inlined_sites.json(),
+            self.speculative_inlined_sites.json(),
+        );
+        let _ = write!(
+            s,
+            ",\"inlined_bytecodes\":{},\"inlined_call_count\":{}",
+            self.inlined_bytecodes.json(),
+            self.inlined_call_count.json(),
+        );
+        // A nested object rather than an array of pairs: the categories are a
+        // fixed vocabulary (`InlineRefusal::category`), so a consumer keys on
+        // them directly. Emitted even when empty, so `inline_refusals` is never
+        // a missing key.
+        s.push_str(",\"inline_refusals\":{");
+        for (i, (category, count)) in self.inline_refusals.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(s, "\"{}\":{}", json_escape(category), count);
+        }
+        s.push('}');
         let _ = write!(s, ",\"total_wall_ns\":{}", self.total_wall_ns.json());
         s.push('}');
         s
@@ -807,6 +894,51 @@ pub fn note_current_peak_live_values(n: usize) {
     // otherwise run after `state`; the trailing semicolon ends its scope first.
     if let Ok(mut report) = state.report.try_borrow_mut() {
         report.peak_live_values = Measured::Value(n.min(u32::MAX as usize) as u32);
+    };
+}
+
+/// Record the emitted spill count against the innermost in-flight compilation
+/// on this thread.
+///
+/// Two ways to get a spill count here, for two different callers:
+///
+/// * `regalloc::record_allocation_metrics(&recorder, &alloc)` — for a caller
+///   that holds a [`CompileRecorder`], reporting what the *allocation* plans;
+/// * this function — for a caller that does not, because its signature is
+///   pinned. `ir_lower::lower_inner_with_scopes` is that caller: it takes no
+///   recorder and already reports [`note_current_peak_live_values`] the same
+///   way, so wiring the allocator into it must not widen its parameter list.
+///   It passes what it **emitted**, which is the smaller number — its wiring
+///   executes only the subset of the allocation it can prove.
+///
+/// Only call this from a path that actually allocated registers. Leaving the
+/// field `NotMeasured` is the correct report for a backend that keeps every
+/// value in a frame slot; a `0` there would claim a measurement nobody made.
+///
+/// Same shape and same reason as [`note_current_bailout`]. A no-op when metrics
+/// are off, and a no-op when no compilation is in flight — so an allocator run
+/// from a unit test records nothing.
+pub fn note_current_spills(n: usize) {
+    let Some(state) = current() else {
+        return;
+    };
+    // The `Result<RefMut<..>, _>` scrutinee is a temporary whose drop would
+    // otherwise run after `state`; the trailing semicolon ends its scope first.
+    if let Ok(mut report) = state.report.try_borrow_mut() {
+        report.spills = Measured::Value(n.min(u32::MAX as usize) as u32);
+    };
+}
+
+/// Record the allocator's reload count against the innermost in-flight
+/// compilation on this thread. See [`note_current_spills`].
+pub fn note_current_reloads(n: usize) {
+    let Some(state) = current() else {
+        return;
+    };
+    // The `Result<RefMut<..>, _>` scrutinee is a temporary whose drop would
+    // otherwise run after `state`; the trailing semicolon ends its scope first.
+    if let Ok(mut report) = state.report.try_borrow_mut() {
+        report.reloads = Measured::Value(n.min(u32::MAX as usize) as u32);
     };
 }
 
@@ -970,13 +1102,15 @@ impl CompileRecorder {
         });
     }
 
-    /// Spill count. No call site yet — see
+    /// Spill count, recorded against *this* recorder — the form
+    /// `regalloc::record_allocation_metrics` uses. A caller whose signature
+    /// cannot carry a recorder uses [`note_current_spills`] instead. See
     /// [`CompilationReport::spills`].
     pub fn set_spills(&self, n: usize) {
         self.with_report(|r| r.spills = Measured::Value(n.min(u32::MAX as usize) as u32));
     }
 
-    /// Reload count. No call site yet — see
+    /// Reload count. Same two forms as [`set_spills`](Self::set_spills); see
     /// [`CompilationReport::spills`].
     pub fn set_reloads(&self, n: usize) {
         self.with_report(|r| r.reloads = Measured::Value(n.min(u32::MAX as usize) as u32));
@@ -1011,6 +1145,14 @@ impl CompileRecorder {
         let cache_bytes =
             crate::COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed) as u64;
         let used_ir = cm.used_ir_backend;
+        // The inlining tallies ride on the artifact for exactly this reason:
+        // harvesting them here costs nothing on the ~40 `return None` paths
+        // through `try_compile_inner` and cannot go stale, because it is the
+        // installed body's own record of what was spliced into it. Borrowed
+        // rather than cloned up front: the refusal histogram is the only
+        // allocation in this method, and `with_report` never runs the closure
+        // when metrics are off.
+        let tally = &cm.inline_tally;
         self.with_report(|r| {
             r.outcome = Outcome::Installed;
             r.path = if used_ir {
@@ -1024,6 +1166,16 @@ impl CompileRecorder {
             r.deopt_points = Measured::Value(deopt_points.min(u32::MAX as usize) as u32);
             r.deopt_metadata_bytes = Measured::Value(deopt_bytes);
             r.code_cache_bytes_at_install = Measured::Value(cache_bytes);
+            r.inline_candidates = Measured::Value(tally.candidates);
+            r.inlined_sites = Measured::Value(tally.inlined_sites);
+            r.speculative_inlined_sites = Measured::Value(tally.speculative_sites);
+            r.inlined_bytecodes = Measured::Value(tally.inlined_bytecodes);
+            r.inlined_call_count = Measured::Value(tally.observed_calls_inlined);
+            r.inline_refusals = tally
+                .refusals
+                .iter()
+                .map(|(c, n)| ((*c).to_string(), *n))
+                .collect();
         });
     }
 
@@ -1189,6 +1341,143 @@ pub fn clear_reports() {
     ring().lock().clear();
 }
 
+// ── Scheduling counters ──────────────────────────────────────────────
+//
+// Everything above this line describes a compilation that *ran*. These count
+// the compilations that never ran because the scheduler threw the request
+// away, which is the one class of event a per-compilation report structurally
+// cannot carry: there is no report, because there was no compile.
+//
+// That gap is why they exist. A request the tier manager drops silently is a
+// method that stays interpreted forever, and nothing downstream can tell it
+// apart from a method that was never hot — no bailout, no `Outcome`, no ring
+// entry, no log line. `docs/jit/broker-install-epoch.md` is the write-up.
+//
+// The design is a deliberate copy of [`crate::bailout`]'s: a fixed array of
+// `&'static str` names and a parallel array of relaxed counters, read back as
+// `Vec<(&'static str, u64)>` in a stable order including the zeroes. Two
+// consequences are load-bearing and match that module:
+//
+//   * The names are an **external contract** — a test or a dashboard keys on
+//     them — so they must not be renamed along with any field.
+//   * The counters are **not gated on [`enabled`]**. A dropped request is a
+//     correctness-adjacent event, not a measurement, and it has to be visible
+//     in a default production run where `CRATONVM_JIT_METRICS` is unset.
+
+/// Every scheduling event that discards a compilation request, in the fixed
+/// order [`scheduling_counts`] reports.
+pub const SCHEDULING_EVENTS: [&str; 4] = [
+    // A queued request was discarded at dispatch because the process-wide JIT
+    // install epoch (`crate::jit_install_epoch`) moved after it was queued —
+    // a JVMTI redefinition or a code-cache flush replaced the world the
+    // request was formed against. The method's in-flight slot is released, so
+    // the next invocation re-admits it against the bytecode that is loaded
+    // now. Non-zero is expected under an instrumenting agent and is not by
+    // itself a fault.
+    "queue_dropped_stale_install_epoch",
+    // A queued request was discarded because its class was invalidated —
+    // `TieredCompilationManager::invalidate_class`, which the VM's class-unload
+    // path calls. Unlike a stale-epoch drop this one is final: the class is
+    // gone, so there is no next invocation to re-admit the method. Counted
+    // separately for exactly that reason.
+    "queue_dropped_class_invalidated",
+    // The install epoch moved *while* a compile was running. The artifact is
+    // not lost here: `JitCache::put`/`put_osr` compare it against the owning
+    // cache's flush barrier and refuse it there (counted separately by
+    // `crate::stale_install_epoch_refusals`). This counts the wasted-work
+    // window that the dispatch-time drop cannot close, because the epoch had
+    // not moved yet when the request was dispatched.
+    "inflight_epoch_moved",
+    // Requests still queued when the background compiler was shut down. Only
+    // ever non-zero at VM teardown, where abandoning them is correct — but a
+    // non-zero value in the middle of a run means the worker was stopped with
+    // work outstanding, which is not.
+    "queue_shutdown_abandoned",
+];
+
+/// One relaxed counter per [`SCHEDULING_EVENTS`] entry. Fixed array, same
+/// reasoning as [`crate::bailout`]'s: the event set is closed, so this needs
+/// no allocation, no lock and no initialization order.
+static SCHEDULING_COUNTERS: [AtomicU64; SCHEDULING_EVENTS.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Index of `event` in [`SCHEDULING_EVENTS`], compared by content so a
+/// hand-built name also resolves.
+fn scheduling_index(event: &str) -> Option<usize> {
+    SCHEDULING_EVENTS.iter().position(|e| *e == event)
+}
+
+/// Count `n` occurrences of `event`.
+///
+/// Infallible, non-blocking, and independent of [`enabled`]. An unknown event
+/// name is ignored rather than panicking: this is called from the compile
+/// worker's drain loop, where a panic would take the only compiler thread in
+/// the process down.
+///
+/// Callers should prefer the `SCHEDULING_EVENTS` constants over string
+/// literals at the call site; see `crate::tiered`, which does.
+pub fn record_scheduling_events(event: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    if let Some(idx) = scheduling_index(event) {
+        SCHEDULING_COUNTERS[idx].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Count one occurrence of `event`.
+pub fn record_scheduling_event(event: &str) {
+    record_scheduling_events(event, 1);
+}
+
+/// Read every scheduling event's count.
+///
+/// Returns **all** events, including zero-valued ones, in the fixed
+/// [`SCHEDULING_EVENTS`] order — for the same reason
+/// [`crate::bailout::bailout_counts`] does: a sink wants a stable row set, and
+/// "this drop never happened" is itself information. Counts are relaxed loads
+/// and are therefore a sample, not an atomic snapshot.
+pub fn scheduling_counts() -> Vec<(&'static str, u64)> {
+    SCHEDULING_EVENTS
+        .iter()
+        .zip(SCHEDULING_COUNTERS.iter())
+        .map(|(name, counter)| (*name, counter.load(Ordering::Relaxed)))
+        .collect()
+}
+
+/// Read one event's count, or `None` if the name is not a known event.
+pub fn scheduling_count(event: &str) -> Option<u64> {
+    scheduling_index(event).map(|idx| SCHEDULING_COUNTERS[idx].load(Ordering::Relaxed))
+}
+
+/// Total requests discarded by the scheduler without a compile ever running.
+///
+/// The in-flight-epoch counter is deliberately excluded: that compile *ran*,
+/// and whether its artifact survived is the code cache's question, not the
+/// scheduler's.
+pub fn scheduling_dropped_total() -> u64 {
+    scheduling_count(SCHEDULING_EVENTS[0]).unwrap_or(0)
+        + scheduling_count(SCHEDULING_EVENTS[1]).unwrap_or(0)
+        + scheduling_count(SCHEDULING_EVENTS[3]).unwrap_or(0)
+}
+
+/// Zero every scheduling counter, so a test can assert on exact values without
+/// being perturbed by a sibling test in the same process.
+///
+/// `pub(crate)` and test-only: these counters are monotone by contract in a
+/// real run, and a production reset would make "how many requests has this
+/// process thrown away" unanswerable.
+#[cfg(test)]
+pub(crate) fn reset_scheduling_counts_for_test() {
+    for counter in SCHEDULING_COUNTERS.iter() {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
 // ── Summary ──────────────────────────────────────────────────────────
 
 /// Aggregate view over the retained reports plus the process-wide bailout
@@ -1221,6 +1510,14 @@ pub struct MetricsSummary {
     /// restricted to the retained reports, and fed by every `record_bailout`
     /// call site whether or not metrics are enabled.
     pub bailout_categories: Vec<(&'static str, u64)>,
+    /// [`scheduling_counts`] verbatim: compilation requests the *scheduler*
+    /// discarded, so they never became a report at all.
+    ///
+    /// Read this before concluding from `by_outcome` that a method was never
+    /// hot: a request dropped at dispatch produces no row anywhere else in
+    /// this summary. Same process-wide, metrics-flag-independent semantics as
+    /// `bailout_categories`.
+    pub scheduling: Vec<(&'static str, u64)>,
 }
 
 /// Aggregate the retained reports.
@@ -1279,6 +1576,7 @@ pub fn summary() -> MetricsSummary {
         phase_totals_ns,
         phase_runs,
         bailout_categories: crate::bailout::bailout_counts(),
+        scheduling: scheduling_counts(),
     }
 }
 
@@ -1318,6 +1616,7 @@ impl MetricsSummary {
             ",\"bailout_categories\":{}",
             pairs(&self.bailout_categories)
         );
+        let _ = write!(s, ",\"scheduling\":{}", pairs(&self.scheduling));
         s.push('}');
         s
     }
@@ -1330,8 +1629,8 @@ pub(crate) fn set_enabled_for_test(on: bool) {
     ENABLED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
 }
 
-/// Serializes every test that touches the process-wide enable flag or the
-/// report ring.
+/// Serializes every test that touches the process-wide enable flag, the
+/// report ring, or the [`SCHEDULING_COUNTERS`] table.
 ///
 /// Module-level and `pub(crate)` rather than private to `mod tests`, because the
 /// enable flag is one process-wide `AtomicU8`: `ir_lower`'s end-to-end wiring
@@ -1620,6 +1919,9 @@ mod tests {
             assert!(!t.is_measuring());
             drop(t);
             note_current_bailout(&Bailout::new(BailoutReason::RegisterPressure), "verify");
+            note_current_peak_live_values(4);
+            note_current_spills(3);
+            note_current_reloads(2);
             drop(rec); // Drop must not publish.
         }
 
@@ -1758,10 +2060,193 @@ mod tests {
     }
 
     #[test]
+    fn spill_reload_and_inline_fields_round_trip_through_to_json() {
+        let mut r = CompilationReport::new("inl/Probe", "hot", "(I)I", true);
+        r.spills = Measured::Value(7);
+        r.reloads = Measured::Value(4);
+        r.peak_live_values = Measured::Value(11);
+        r.inline_candidates = Measured::Value(9);
+        r.inlined_sites = Measured::Value(3);
+        r.speculative_inlined_sites = Measured::Value(1);
+        r.inlined_bytecodes = Measured::Value(214);
+        r.inlined_call_count = Measured::Value(4_000_000_000);
+        r.inline_refusals = vec![
+            ("guard-not-emittable".to_string(), 5),
+            ("budget-exhausted".to_string(), 1),
+        ];
+
+        let json = r.to_json();
+        assert!(!json.contains('\n'), "JSON lines must be one line: {json}");
+        assert!(json.contains("\"spills\":7"), "{json}");
+        assert!(json.contains("\"reloads\":4"), "{json}");
+        assert!(json.contains("\"peak_live_values\":11"), "{json}");
+        assert!(json.contains("\"inline_candidates\":9"), "{json}");
+        assert!(json.contains("\"inlined_sites\":3"), "{json}");
+        assert!(json.contains("\"speculative_inlined_sites\":1"), "{json}");
+        assert!(json.contains("\"inlined_bytecodes\":214"), "{json}");
+        // A u64 that does not fit an i32/u32, so a narrowing regression shows.
+        assert!(json.contains("\"inlined_call_count\":4000000000"), "{json}");
+        // The refusal histogram nests as an object keyed by category, in the
+        // tally's first-seen order.
+        assert!(
+            json.contains("\"inline_refusals\":{\"guard-not-emittable\":5,\"budget-exhausted\":1}"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn inline_and_allocation_fields_stay_distinguishable_from_zero() {
+        let fresh = CompilationReport::new("inl/Fresh", "m", "()V", true);
+        for (name, m) in [
+            ("inline_candidates", fresh.inline_candidates),
+            ("inlined_sites", fresh.inlined_sites),
+            ("speculative_inlined_sites", fresh.speculative_inlined_sites),
+            ("inlined_bytecodes", fresh.inlined_bytecodes),
+            ("spills", fresh.spills),
+            ("reloads", fresh.reloads),
+        ] {
+            assert_eq!(m, Measured::NotMeasured, "{name}");
+            assert!(
+                fresh.to_json().contains(&format!("\"{name}\":null")),
+                "{name} must render null: {}",
+                fresh.to_json()
+            );
+        }
+        assert_eq!(fresh.inlined_call_count, Measured::NotMeasured);
+        assert!(fresh.to_json().contains("\"inlined_call_count\":null"));
+        // An empty histogram is an empty object, never a missing key — and it
+        // is a different claim from "no tally was harvested", which the
+        // `inline_candidates: null` above carries.
+        assert!(fresh.inline_refusals.is_empty());
+        assert!(fresh.to_json().contains("\"inline_refusals\":{}"));
+
+        // A method the inliner looked at and declined everywhere reports
+        // measured zeros, and the two encodings differ.
+        let mut none_inlined = fresh.clone();
+        none_inlined.inline_candidates = Measured::Value(4);
+        none_inlined.inlined_sites = Measured::Value(0);
+        none_inlined.inlined_bytecodes = Measured::Value(0);
+        none_inlined.inlined_call_count = Measured::Value(0);
+        none_inlined.spills = Measured::Value(0);
+        none_inlined.reloads = Measured::Value(0);
+        let json = none_inlined.to_json();
+        assert!(json.contains("\"inlined_sites\":0"), "{json}");
+        assert!(json.contains("\"inlined_call_count\":0"), "{json}");
+        assert!(json.contains("\"spills\":0"), "{json}");
+        assert!(json.contains("\"reloads\":0"), "{json}");
+        assert_ne!(fresh.to_json(), json);
+    }
+
+    #[test]
+    fn ambient_spill_and_reload_hooks_reach_the_innermost_compilation() {
+        let _guard = TEST_LOCK.lock();
+        set_enabled_for_test(true);
+        clear_reports();
+        {
+            let outer = CompileRecorder::begin("metrics/AllocOuter", "m", "()V", true);
+            {
+                let _inner = CompileRecorder::begin("metrics/AllocInner", "m", "()V", true);
+                // `callee_compiler` nests compilations; an allocator run for the
+                // callee must not be billed to the caller.
+                note_current_spills(6);
+                note_current_reloads(2);
+            }
+            note_current_spills(0);
+            drop(outer);
+        }
+        let inner = last_compilation_report(Some("metrics/AllocInner")).expect("inner published");
+        let outer = last_compilation_report(Some("metrics/AllocOuter")).expect("outer published");
+        assert_eq!(inner.spills, Measured::Value(6));
+        assert_eq!(inner.reloads, Measured::Value(2));
+        // The outer compilation measured zero spills and never measured
+        // reloads at all — two different facts, and the report keeps them apart.
+        assert_eq!(outer.spills, Measured::Value(0));
+        assert_eq!(outer.reloads, Measured::NotMeasured);
+        let json = outer.to_json();
+        assert!(json.contains("\"spills\":0"), "{json}");
+        assert!(json.contains("\"reloads\":null"), "{json}");
+        clear_reports();
+        set_enabled_for_test(false);
+    }
+
+    #[test]
     fn json_escape_covers_control_characters() {
         assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
         assert_eq!(json_escape("x\u{1}y"), "x\\u0001y");
         assert_eq!(json_escape("plain/name;()I"), "plain/name;()I");
+    }
+
+    // ── Scheduling counters ──────────────────────────────────────────
+
+    #[test]
+    fn scheduling_counts_report_every_event_in_a_fixed_order() {
+        let names: Vec<&str> = scheduling_counts().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, SCHEDULING_EVENTS.to_vec());
+        // The whole point of a fixed row set: an event that never fired still
+        // has a row, so "zero drops" and "nobody counts drops" are different
+        // readings.
+        assert_eq!(names.len(), SCHEDULING_EVENTS.len());
+    }
+
+    #[test]
+    fn scheduling_events_are_distinct_names() {
+        let mut sorted = SCHEDULING_EVENTS.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), before, "two events share a name: {sorted:?}");
+    }
+
+    #[test]
+    fn recording_a_scheduling_event_is_visible_without_metrics_enabled() {
+        let _guard = TEST_LOCK.lock();
+        // Explicitly OFF. A dropped compilation request must be countable in a
+        // default production run, where `CRATONVM_JIT_METRICS` is unset — this
+        // is the property that distinguishes these counters from the ring.
+        set_enabled_for_test(false);
+        reset_scheduling_counts_for_test();
+
+        record_scheduling_event(SCHEDULING_EVENTS[0]);
+        record_scheduling_events(SCHEDULING_EVENTS[0], 4);
+        record_scheduling_events(SCHEDULING_EVENTS[3], 2);
+        // A zero count must not advance anything.
+        record_scheduling_events(SCHEDULING_EVENTS[1], 0);
+        // An unknown name is ignored rather than panicking.
+        record_scheduling_event("not_an_event");
+
+        assert_eq!(scheduling_count(SCHEDULING_EVENTS[0]), Some(5));
+        assert_eq!(scheduling_count(SCHEDULING_EVENTS[1]), Some(0));
+        assert_eq!(scheduling_count(SCHEDULING_EVENTS[3]), Some(2));
+        assert_eq!(scheduling_count("not_an_event"), None);
+        // `inflight_epoch_moved` describes a compile that RAN, so it is not a
+        // drop and must stay out of the total.
+        record_scheduling_events(SCHEDULING_EVENTS[2], 9);
+        assert_eq!(scheduling_dropped_total(), 7);
+
+        reset_scheduling_counts_for_test();
+    }
+
+    #[test]
+    fn summary_carries_the_scheduling_table_and_json() {
+        let _guard = TEST_LOCK.lock();
+        set_enabled_for_test(false);
+        reset_scheduling_counts_for_test();
+        record_scheduling_events(SCHEDULING_EVENTS[0], 3);
+
+        let s = summary();
+        let names: Vec<&str> = s.scheduling.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, SCHEDULING_EVENTS.to_vec());
+        assert_eq!(
+            s.scheduling.iter().find(|(n, _)| *n == SCHEDULING_EVENTS[0]),
+            Some(&(SCHEDULING_EVENTS[0], 3))
+        );
+        let json = s.to_json();
+        assert!(
+            json.contains("\"scheduling\":{\"queue_dropped_stale_install_epoch\":3"),
+            "{json}"
+        );
+
+        reset_scheduling_counts_for_test();
     }
 
     #[test]

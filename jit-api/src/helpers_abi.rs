@@ -4,12 +4,38 @@
 //! Typed ABI description for [`JitRuntimeHelpers`].
 //!
 //! [`JitRuntimeHelpers`] is, and must remain, a `#[repr(C)]` table of bare
-//! `usize` words: the JIT bakes each slot's **byte offset** into generated RWX
-//! machine code (`CALL [helpers + disp32]`, `MOV reg, [helpers + disp32]`), so
-//! the field order, field count, and per-field width are a frozen binary
-//! contract. Changing a field's Rust *type* would change nothing about the
-//! emitted code but would break the `size_of::<JitRuntimeHelpers>() / 8`
-//! identity every offset assertion in this crate depends on.
+//! `usize` words. What is actually baked into generated RWX machine code, and
+//! what therefore is and is not load-bearing, is worth stating precisely —
+//! the previous version of this paragraph overstated it, which made the
+//! weakest link look like the strongest.
+//!
+//! **What the emitter bakes.** The `jit` crate holds the table *by value*
+//! (`helpers: JitRuntimeHelpers` in `jit/src/x64.rs`) and reads each slot by
+//! Rust field name. `emit_call_absolute` then bakes the helper's **absolute
+//! address** as a `rel32` displacement (or a 12-byte `imm64` form out of
+//! ±2 GiB reach). There is no `CALL [helpers + disp32]` anywhere in the
+//! backend. So within this workspace, where producer and consumer are the same
+//! Rust type compiled from this file, a field *reorder* alone does not
+//! mis-target a call — the compiler follows the reorder on both sides.
+//!
+//! **What is load-bearing anyway.**
+//!
+//! * The **signature** of each slot. The backend loads N argument registers by
+//!   hand at each call site and jumps to a bare address; nothing in the type
+//!   system connects that hand-written setup to the callee's real arity,
+//!   argument widths, or whether it returns a value at all. This is the live
+//!   hazard, and it is why [`HELPER_FN_SIGS`] exists.
+//! * The **byte offsets**, for `as_words`/`word_at` (which reinterpret the
+//!   struct as `[usize; NUM_FIELDS]` and index it) and for any future
+//!   out-of-process or non-Rust producer. `#[repr(C)]` plus the all-`usize`
+//!   rule is what makes that reinterpretation sound.
+//! * The **append-only rule**, because a removal or an insert in the middle
+//!   rebases every later offset at once, and because the diff of such a change
+//!   looks small.
+//!
+//! Changing a field's Rust *type* would change nothing about the emitted code
+//! but would break the `size_of::<JitRuntimeHelpers>() / 8` identity every
+//! offset assertion in this crate depends on.
 //!
 //! This module adds — **without touching the layout** — the information the
 //! raw `usize` throws away:
@@ -22,8 +48,22 @@
 //!   re-deriving offsets by hand;
 //! * typed, null-checked accessors (`<field>_fn`) that return
 //!   `Option<HelperFn*>` instead of a naked integer;
+//! * [`HELPER_FN_SIGS`], the per-slot arity / argument-class / returns-a-value
+//!   shape, derived from those same aliases, so the facts a call site needs are
+//!   available as data rather than only as a type;
+//! * [`GOLDEN_HELPER_OFFSETS`], the frozen name → byte-offset contract written
+//!   as literals — the one check here that a *coordinated* reorder of the
+//!   struct and all its derived tables cannot satisfy;
+//! * [`ABI_REVISIONS`], the shape ledger that makes appending a field without
+//!   bumping [`JIT_HELPERS_ABI_VERSION`] a compile error;
 //! * [`JitRuntimeHelpers::validate_with`], a version-checked validator that
 //!   names the first missing required slot.
+//!
+//! **The validator is not armed.** Nothing outside this crate calls
+//! [`JitRuntimeHelpers::validate_abi`], [`JitRuntimeHelpers::validate`] or
+//! [`JitRuntimeHelpers::null_pointers`] — the runtime half of this contract
+//! exists and is tested, but never runs in a real VM. See
+//! `docs/jit/helper-abi-audit.md`.
 //!
 //! # ABI contract
 //!
@@ -66,10 +106,15 @@ use crate::JitRuntimeHelpers;
 /// `build_helpers`) and consumers (the JIT backends) that disagree on this
 /// number disagree on where the helpers live.
 ///
-/// `2` is the revision of the 60-field, 480-byte table shipped today —
-/// revision `1` was the 58-field, 464-byte table, which `2` extends by
-/// appending `new_object_cp` and `anewarray_object_cp`.
-pub const JIT_HELPERS_ABI_VERSION: u32 = 2;
+/// `3` is the revision of the 62-field, 496-byte table shipped today. The
+/// full history is in [`ABI_REVISIONS`], which a const assertion ties to this
+/// constant, to [`NUM_HELPER_FIELDS`] and to [`JIT_HELPERS_ABI_SIZE`] — so
+/// appending a field without bumping this number no longer compiles.
+///
+/// (Revision `2` shipped the 60-field table; the `monitor_enter`/`monitor_exit`
+/// append that made it 62 did not bump this constant, because at the time
+/// nothing checked it. `ABI_REVISIONS` is that check.)
+pub const JIT_HELPERS_ABI_VERSION: u32 = 3;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -131,6 +176,183 @@ pub struct HelperFieldDesc {
     /// `true` when zero is invalid: the backend `CALL`s this slot
     /// unconditionally. `false` when zero is the "not wired" sentinel.
     pub required: bool,
+}
+
+// ---------------------------------------------------------------------
+// Signature vocabulary.
+//
+// The `HelperFn*` aliases carry each slot's real C signature, but a type
+// alias is not something a const assertion — or the emitter — can ask
+// questions of. These two traits turn "what does this argument cost in the
+// calling convention" into a value the macro can fold into `HELPER_FN_SIGS`.
+//
+// They are deliberately NOT blanket-implemented. A helper whose signature
+// uses a type not listed here fails to compile with "the trait bound is not
+// satisfied" — which is the correct outcome: a new argument or return type is
+// a calling-convention decision that must be made explicitly, not absorbed.
+// ---------------------------------------------------------------------
+
+/// Calling-convention class of one helper argument.
+///
+/// Implemented only for the types the helper ABI actually uses. Adding a
+/// helper whose argument is of any other type is a compile error until the
+/// type is classified here — see the module-level note on fail-closed
+/// classification.
+pub trait HelperArgAbi {
+    /// `true` when the argument travels in an XMM register rather than an
+    /// integer ARG_REG. The two register files are assigned independently on
+    /// SysV but *positionally* on Win64, which is why
+    /// [`HelperFnSig::float_args`] is pinned rather than merely recorded.
+    const IS_FLOAT: bool;
+    /// Width in bytes of the argument as the callee reads it.
+    const WIDTH: usize;
+}
+
+/// Calling-convention class of a helper's return value.
+///
+/// Implemented only for the return types the helper ABI actually uses; see
+/// [`HelperArgAbi`] for why there is no blanket impl.
+pub trait HelperRetAbi {
+    /// `false` only for `()`. A call site that reserves a result register for
+    /// a `()`-returning helper reads whatever the callee left in RAX.
+    const RETURNS_VALUE: bool;
+    /// `true` when the result comes back in XMM0 rather than RAX.
+    const IS_FLOAT: bool;
+}
+
+macro_rules! impl_helper_arg_abi {
+    ( $( $t:ty => $is_float:expr ),* $(,)? ) => {
+        $(
+            impl HelperArgAbi for $t {
+                const IS_FLOAT: bool = $is_float;
+                const WIDTH: usize = core::mem::size_of::<$t>();
+            }
+        )*
+    };
+}
+
+impl_helper_arg_abi! {
+    i64 => false,
+    usize => false,
+    f32 => true,
+    f64 => true,
+    *const u8 => false,
+}
+
+impl HelperRetAbi for () {
+    const RETURNS_VALUE: bool = false;
+    const IS_FLOAT: bool = false;
+}
+impl HelperRetAbi for i64 {
+    const RETURNS_VALUE: bool = true;
+    const IS_FLOAT: bool = false;
+}
+impl HelperRetAbi for f32 {
+    const RETURNS_VALUE: bool = true;
+    const IS_FLOAT: bool = true;
+}
+impl HelperRetAbi for f64 {
+    const RETURNS_VALUE: bool = true;
+    const IS_FLOAT: bool = true;
+}
+impl HelperRetAbi for *mut c_void {
+    const RETURNS_VALUE: bool = true;
+    const IS_FLOAT: bool = false;
+}
+
+/// Signature shape of one callable slot, derived from `helper_fn_slots!`.
+///
+/// Everything here is *derived from the `HelperFn*` alias*, not transcribed:
+/// there is no second list to keep in step. What the emitter does with it is
+/// still on the emitter — see `docs/jit/helper-abi-audit.md` for the check
+/// that belongs in `jit/` and cannot live in this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HelperFnSig {
+    /// Rust field name on [`JitRuntimeHelpers`].
+    pub field: &'static str,
+    /// Name of the `<field>_fn` accessor.
+    pub accessor: &'static str,
+    /// Name of the `HelperFn*` type alias carrying the full signature.
+    pub alias: &'static str,
+    /// Number of declared parameters. This is the number of argument
+    /// registers the call site must load — no helper takes a by-value
+    /// aggregate, which is pinned by [`HelperArgAbi`] having no impl for one.
+    pub arity: usize,
+    /// How many of those parameters are floating-point.
+    pub float_args: usize,
+    /// `false` only for a `-> ()` helper.
+    pub returns_value: bool,
+    /// `true` when the result is in XMM0.
+    pub returns_float: bool,
+}
+
+impl HelperFnSig {
+    /// Integer/pointer parameters — the ones that consume an integer ARG_REG.
+    pub const fn int_args(&self) -> usize {
+        self.arity - self.float_args
+    }
+
+    /// Parameters that do NOT fit the Win64 four-register integer file and so
+    /// must be written to the stack by the call site (`[RSP+32]`, `[RSP+40]`,
+    /// …) in addition to the 32-byte shadow space.
+    ///
+    /// Zero for every helper but `invoke_virtual_mic`; see
+    /// [`HELPERS_NEEDING_WIN64_STACK_ARGS`].
+    pub const fn win64_stack_args(&self) -> usize {
+        if self.arity > WIN64_INT_ARG_REGS {
+            self.arity - WIN64_INT_ARG_REGS
+        } else {
+            0
+        }
+    }
+}
+
+/// Integer argument registers available on Win64 (RCX, RDX, R8, R9).
+///
+/// Beyond this the caller must place arguments on the stack above the 32-byte
+/// shadow space. Mirrors `CALL_ARG_REGS` in `jit/src/ir_lower.rs`.
+pub const WIN64_INT_ARG_REGS: usize = 4;
+
+/// Integer argument registers available on SysV x86-64
+/// (RDI, RSI, RDX, RCX, R8, R9). The upper bound on helper arity.
+pub const SYSV_INT_ARG_REGS: usize = 6;
+
+/// Byte-wise `&str` equality usable in a `const` context.
+///
+/// `==` on `&str` is not const-callable, and every cross-table name check in
+/// this module has to run at compile time to be worth anything.
+pub const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `accessor == concat!(field, "_fn")`, in a `const` context.
+///
+/// The naming rule is mechanical on purpose: it is the only thing that ties a
+/// `helper_fn_slots!` row's getter to its field without a second list.
+pub const fn accessor_name_matches_field(accessor: &str, field: &str) -> bool {
+    let (a, f) = (accessor.as_bytes(), field.as_bytes());
+    if a.len() != f.len() + 3 {
+        return false;
+    }
+    let mut i = 0;
+    while i < f.len() {
+        if a[i] != f[i] {
+            return false;
+        }
+        i += 1;
+    }
+    a[f.len()] == b'_' && a[f.len() + 1] == b'f' && a[f.len() + 2] == b'n'
 }
 
 // ---------------------------------------------------------------------
@@ -228,9 +450,92 @@ macro_rules! helper_fn_slots {
             /// assertion.
             pub const NUM_HELPER_FN_FIELDS: usize =
                 [ $( helper_fn_slots!(@unit $field) ),* ].len();
+
+            /// Every `<field>_fn` accessor, invoked, paired with the name of
+            /// the field it is *supposed* to read.
+            ///
+            /// Generated from the same macro rows as the accessors themselves,
+            /// so it cannot omit one. The point is not the values but the
+            /// pairing: `accessor_reads_only_its_own_slot` wires exactly one
+            /// callable slot at a time and asserts that exactly one probe entry
+            /// goes `Some`, and that it is the entry named for that slot. That
+            /// is what catches two swapped rows in `helper_fn_slots!` — a swap
+            /// that gives one helper another helper's signature while every
+            /// count, offset and census check still passes.
+            #[cfg(test)]
+            fn helper_fn_accessor_probe(
+                &self,
+            ) -> [(&'static str, Option<usize>); Self::NUM_HELPER_FN_FIELDS] {
+                [
+                    $( (stringify!($field), self.$getter().map(|f| f as usize)), )*
+                ]
+            }
         }
+
+        /// Per-slot C signature shape for every callable slot, derived from the
+        /// same macro rows that declare the `HelperFn*` aliases.
+        ///
+        /// This is the information the emitter needs and currently re-derives
+        /// by hand at each call site: how many argument registers to load,
+        /// whether they are integer or floating, and whether anything comes
+        /// back. See [`HelperFnSig`] for what each field pins.
+        pub const HELPER_FN_SIGS: &[HelperFnSig] = &[
+            $(
+                HelperFnSig {
+                    field: stringify!($field),
+                    accessor: stringify!($getter),
+                    alias: stringify!($alias),
+                    arity: 0 $( + helper_fn_slots!(@one $arg) )*,
+                    float_args: 0 $( + (<$arg as HelperArgAbi>::IS_FLOAT as usize) )*,
+                    returns_value: <$ret as HelperRetAbi>::RETURNS_VALUE,
+                    returns_float: <$ret as HelperRetAbi>::IS_FLOAT,
+                },
+            )*
+        ];
+
+        // One pin per row, naming the row in its own failure message.
+        //
+        // (a) The accessor name must be the field name plus `_fn`. The row
+        //     supplies both independently, so a row edited to point a getter at
+        //     a different field — the swap that hands a helper another helper's
+        //     signature — stops compiling here instead of miscompiling later.
+        //     TRIPS ON: `HelperFnMonitorEnter, monitor_exit, monitor_enter_fn;`.
+        //
+        // (b) Every integer or pointer argument is a full machine word. A
+        //     narrower one is a silent ABI lie: the emitter loads the whole
+        //     64-bit ARG_REG and the callee would read only part of it. Floats
+        //     are exempt — `f32` is a legitimately 4-byte scalar in XMM.
+        //     TRIPS ON: declaring an argument `i32`, `u32`, `bool`, ….
+        $(
+            const _: () = {
+                assert!(
+                    accessor_name_matches_field(stringify!($getter), stringify!($field)),
+                    concat!(
+                        "the `", stringify!($getter), "` accessor is not named \
+                         after the `", stringify!($field), "` field it reads — \
+                         this helper_fn_slots! row pairs a getter with the \
+                         wrong field, which would give that helper another \
+                         helper's C signature",
+                    ),
+                );
+                let args_are_machine_words = true
+                    $( && (<$arg as HelperArgAbi>::IS_FLOAT
+                           || <$arg as HelperArgAbi>::WIDTH == 8) )*;
+                assert!(
+                    args_are_machine_words,
+                    concat!(
+                        "an argument of the `", stringify!($field), "` helper \
+                         is narrower than a machine word — the JIT loads the \
+                         full 64-bit ARG_REG, so a narrow integer parameter \
+                         here is an ABI lie even though the emitted code is \
+                         unchanged",
+                    ),
+                );
+            };
+        )*
     };
     (@unit $field:ident) => { () };
+    (@one $arg:ty) => { 1usize };
 }
 
 helper_fn_slots! {
@@ -367,6 +672,10 @@ helper_fn_slots! {
     HelperFnNewObjectCp, new_object_cp, new_object_cp_fn, (i64, i64, i64) -> i64;
     HelperFnAnewarrayObjectCp, anewarray_object_cp, anewarray_object_cp_fn,
         (i64, i64, i64, i64) -> i64;
+    // (vm_ptr, obj) -> possibly-remapped obj. The return is not advisory:
+    // a contended acquire can move the object while the thread is parked.
+    HelperFnMonitorEnter, monitor_enter, monitor_enter_fn, (i64, i64) -> i64;
+    HelperFnMonitorExit, monitor_exit, monitor_exit_fn, (i64, i64) -> i64;
 }
 
 // ---------------------------------------------------------------------
@@ -475,6 +784,9 @@ helper_field_table! {
     // (not-yet-loaded) `new`/`anewarray` site instead of emitting a CALL to 0.
     (new_object_cp,                  Function, false),
     (anewarray_object_cp,            Function, false),
+    // Optional: 0 makes `ir_lower` refuse monitor ops rather than drop them.
+    (monitor_enter,                  Function, false),
+    (monitor_exit,                   Function, false),
 }
 
 // ---------------------------------------------------------------------
@@ -495,7 +807,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 60,
+    NUM_HELPER_FIELDS == 62,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -503,8 +815,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 480,
-    "JitRuntimeHelpers size changed (expected 60 * 8 = 480) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 496,
+    "JitRuntimeHelpers size changed (expected 62 * 8 = 496) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -576,6 +888,444 @@ const _: () = {
         i += 1;
     }
 };
+
+// ---------------------------------------------------------------------
+// The golden name → offset table.
+//
+// Everything above derives offsets from the struct: `offset_of!` follows a
+// reorder, and `index * 8` follows a reorder that also reorders the descriptor
+// rows. A contributor who moves a field and dutifully moves its row in
+// `helper_field_table!`, in `helper_fn_slots!` and in the probe list therefore
+// passes every check in this crate while changing the binary contract.
+//
+// These are LITERAL numbers keyed by NAME. They are the one place a human must
+// change a value that no expression can recompute. Do not "fix" a failure here
+// by editing the number: a failure means the field genuinely moved, and moving
+// a field is the thing this table exists to prevent.
+//
+// Appending a helper adds ONE row at the end with offset `previous + 8`.
+// ---------------------------------------------------------------------
+
+/// The frozen byte offset of every [`JitRuntimeHelpers`] slot, by name.
+///
+/// Keyed by name and written as literals, so unlike every other check in this
+/// module it survives a coordinated reorder of the struct and all its
+/// descriptor tables — which is the one reorder every other check here misses.
+pub const GOLDEN_HELPER_OFFSETS: [(&'static str, usize); NUM_HELPER_FIELDS] = [
+    ("newarray", 0),
+    ("new_object", 8),
+    ("anewarray_object", 16),
+    ("baload", 24),
+    ("bastore", 32),
+    ("iaload", 40),
+    ("iastore", 48),
+    ("aaload", 56),
+    ("aastore", 64),
+    ("multianewarray_2d", 72),
+    ("arraylength", 80),
+    ("getfield", 88),
+    ("putfield_int", 96),
+    ("putfield_long", 104),
+    ("putfield_float", 112),
+    ("putfield_double", 120),
+    ("putfield_object", 128),
+    ("getstatic", 136),
+    ("putstatic_int", 144),
+    ("putstatic_long", 152),
+    ("putstatic_float", 160),
+    ("putstatic_double", 168),
+    ("putstatic_object", 176),
+    ("checkcast", 184),
+    ("instanceof_check", 192),
+    ("throw_aioobe", 200),
+    ("throw_arithmetic", 208),
+    ("invoke_dispatch", 216),
+    ("invoke_virtual_mic", 224),
+    ("lambda_int_to_double", 232),
+    ("write_barrier", 240),
+    ("satb_pre_write_barrier", 248),
+    ("uncommon_trap", 256),
+    ("math_fma_double", 264),
+    ("math_fma_float", 272),
+    ("tlab_cursor_offset_in_thread", 280),
+    ("tlab_end_offset_in_thread", 288),
+    ("class_id_offset_in_obj", 296),
+    ("get_current_thread", 304),
+    ("tlab_post_init", 312),
+    ("frame_record", 320),
+    ("shadow_stack_offset_in_thread", 328),
+    ("throw_exception", 336),
+    ("jit_npe_with_action", 344),
+    ("dispatch_threw", 352),
+    ("jit_frem", 360),
+    ("jit_drem", 368),
+    ("self_call_stack_guard", 376),
+    ("region_bounds_addr", 384),
+    ("native_stack_floor_fn", 392),
+    ("ldc_string", 400),
+    ("safepoint_flag_addr", 408),
+    ("safepoint_slow_path", 416),
+    ("jit_card_table_addr", 424),
+    ("jit_card_old_base", 432),
+    ("jit_card_old_end", 440),
+    ("set_throw_bci", 448),
+    ("service_callee_deopt", 456),
+    ("new_object_cp", 464),
+    ("anewarray_object_cp", 472),
+    ("monitor_enter", 480),
+    ("monitor_exit", 488),
+];
+
+// Every golden row must name the descriptor row at the same index AND agree
+// with its `offset_of!`-derived offset.
+//
+// TRIPS ON: renaming a field; inserting a field anywhere but the end;
+// swapping two fields (even two same-width `OptionalPtr`s, even if the
+// descriptor table and the alias list are swapped in step); deleting a field.
+const _: () = {
+    let mut i = 0;
+    while i < NUM_HELPER_FIELDS {
+        assert!(
+            str_eq(GOLDEN_HELPER_OFFSETS[i].0, HELPER_FIELDS[i].name),
+            "GOLDEN_HELPER_OFFSETS disagrees with HELPER_FIELDS on the name of \
+             a slot — a field was renamed, reordered, inserted or removed. The \
+             golden table is the frozen contract; do not edit it to match.",
+        );
+        assert!(
+            GOLDEN_HELPER_OFFSETS[i].1 == HELPER_FIELDS[i].offset,
+            "a JitRuntimeHelpers field is no longer at its golden byte offset \
+             — the layout moved. Do not edit the golden number; move the field \
+             back and append instead.",
+        );
+        assert!(
+            GOLDEN_HELPER_OFFSETS[i].1 == i * HELPER_FIELD_STRIDE,
+            "the golden offset table is not a dense 8-byte-strided sequence — \
+             a row was inserted, removed, or given a hand-typed wrong offset",
+        );
+        i += 1;
+    }
+};
+
+// ---------------------------------------------------------------------
+// The ABI revision ledger.
+//
+// `JIT_HELPERS_ABI_VERSION` is the one invariant the previous wave got wrong:
+// `monitor_enter`/`monitor_exit` were appended (60 fields/480 bytes → 62/496),
+// every size and count literal was updated deliberately, and the version stayed
+// at 2 — because nothing connected the two. The contract at the top of this
+// module says a bump is mandatory "including a pure append"; a contract with no
+// tripwire is a comment.
+//
+// The ledger connects them: the last row must describe the table as it is now.
+// ---------------------------------------------------------------------
+
+/// One historical shape of the helper table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HelperAbiRevision {
+    /// The [`JIT_HELPERS_ABI_VERSION`] value that named this shape.
+    pub version: u32,
+    /// How many slots the table had.
+    pub num_fields: usize,
+    /// `size_of::<JitRuntimeHelpers>()` at that revision.
+    pub size: usize,
+}
+
+/// Every shape [`JitRuntimeHelpers`] has had, oldest first.
+///
+/// Append a row whenever the table's shape changes, and bump
+/// [`JIT_HELPERS_ABI_VERSION`] to the new row's `version`. The const assertions
+/// below make that the only way to get a shape change to compile.
+pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
+    // v1 — the table before the constant-pool-indexed allocation helpers.
+    HelperAbiRevision {
+        version: 1,
+        num_fields: 58,
+        size: 464,
+    },
+    // v2 — appended `new_object_cp`, `anewarray_object_cp`.
+    HelperAbiRevision {
+        version: 2,
+        num_fields: 60,
+        size: 480,
+    },
+    // v3 — appended `monitor_enter`, `monitor_exit`. (Shipped under v2 by
+    // mistake; the ledger is what makes that mistake unrepresentable.)
+    HelperAbiRevision {
+        version: 3,
+        num_fields: 62,
+        size: 496,
+    },
+];
+
+// The newest ledger row must be exactly the table this build compiles.
+//
+// TRIPS ON: appending a helper field (the row's `num_fields`/`size` no longer
+// match) without adding a ledger row and bumping JIT_HELPERS_ABI_VERSION. Also
+// trips if the version is bumped without a matching row, or a row is added
+// without bumping the version.
+const _: () = {
+    let last = ABI_REVISIONS[ABI_REVISIONS.len() - 1];
+    assert!(
+        last.version == JIT_HELPERS_ABI_VERSION,
+        "JIT_HELPERS_ABI_VERSION is not the newest ABI_REVISIONS row — a shape \
+         change must append a ledger row AND bump the version constant",
+    );
+    assert!(
+        last.num_fields == NUM_HELPER_FIELDS,
+        "the helper table's field count changed without a new ABI_REVISIONS row \
+         — append one and bump JIT_HELPERS_ABI_VERSION (this is exactly the \
+         check the monitor_enter/monitor_exit append walked through)",
+    );
+    assert!(
+        last.size == JIT_HELPERS_ABI_SIZE,
+        "the helper table's size changed without a new ABI_REVISIONS row",
+    );
+};
+
+// The ledger itself must describe an append-only history: versions increase by
+// one, field counts strictly increase, and size stays `fields * 8`.
+//
+// TRIPS ON: a ledger row that records a *removal* or a reorder — i.e. writing
+// down a change the "append only" rule forbids, rather than quietly making it.
+const _: () = {
+    let mut i = 0;
+    while i < ABI_REVISIONS.len() {
+        let r = ABI_REVISIONS[i];
+        assert!(
+            r.version as usize == i + 1,
+            "ABI_REVISIONS versions must be dense and start at 1",
+        );
+        assert!(
+            r.size == r.num_fields * HELPER_FIELD_STRIDE,
+            "an ABI_REVISIONS row records a size that is not fields * 8 — the \
+             table would have gained padding or a non-usize field",
+        );
+        if i > 0 {
+            assert!(
+                r.num_fields > ABI_REVISIONS[i - 1].num_fields,
+                "an ABI_REVISIONS row does not grow the table — the helper \
+                 table is append-only; removing a slot rebases every later \
+                 offset and is not a supported edit",
+            );
+        }
+        i += 1;
+    }
+};
+
+// ---------------------------------------------------------------------
+// Signature pins.
+//
+// `HELPER_FN_SIGS` is derived from the `HelperFn*` aliases, so these assert
+// facts about the *shape* of the helper ABI that the emitter's hand-written
+// call sites depend on.
+// ---------------------------------------------------------------------
+
+// Every callable descriptor row has exactly one signature row with the same
+// name, and vice versa. The pre-existing check compared only COUNTS, which a
+// pair of compensating edits (drop one alias, add another) satisfies.
+//
+// TRIPS ON: adding a field to `helper_field_table!` as `Function` without
+// adding its row to `helper_fn_slots!`; renaming a field in one list only.
+const _: () = {
+    let mut s = 0;
+    while s < HELPER_FN_SIGS.len() {
+        let mut found = 0;
+        let mut d = 0;
+        while d < NUM_HELPER_FIELDS {
+            if str_eq(HELPER_FN_SIGS[s].field, HELPER_FIELDS[d].name) {
+                assert!(
+                    matches!(HELPER_FIELDS[d].kind, HelperKind::Function),
+                    "a slot has a callable signature but is described as a \
+                     non-callable (Offset/Constant) slot",
+                );
+                found += 1;
+            }
+            d += 1;
+        }
+        assert!(
+            found == 1,
+            "a `helper_fn_slots!` row names a field that has no (or more than \
+             one) matching row in `helper_field_table!`",
+        );
+        s += 1;
+    }
+    let mut d = 0;
+    while d < NUM_HELPER_FIELDS {
+        if matches!(HELPER_FIELDS[d].kind, HelperKind::Function) {
+            let mut found = 0;
+            let mut s = 0;
+            while s < HELPER_FN_SIGS.len() {
+                if str_eq(HELPER_FN_SIGS[s].field, HELPER_FIELDS[d].name) {
+                    found += 1;
+                }
+                s += 1;
+            }
+            assert!(
+                found == 1,
+                "a callable slot has no signature alias — add it to \
+                 `helper_fn_slots!` so its arity and widths are pinned",
+            );
+        }
+        d += 1;
+    }
+};
+
+/// How many helpers take more arguments than the Win64 integer register file
+/// holds, and therefore need the call site to write arguments to the stack
+/// above the shadow space.
+///
+/// Exactly one today: `invoke_virtual_mic` (6 arguments; the MIC and PIC
+/// pointers go to `[RSP+32]` and `[RSP+40]` on Windows and to R8/R9 on SysV —
+/// `jit/src/x64.rs`, the `#[cfg(target_os = "windows")]` split at the
+/// `invoke_virtual_mic` call site).
+pub const HELPERS_NEEDING_WIN64_STACK_ARGS: usize = {
+    let mut n = 0;
+    let mut i = 0;
+    while i < HELPER_FN_SIGS.len() {
+        if HELPER_FN_SIGS[i].win64_stack_args() > 0 {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+};
+
+// Arity and calling-convention shape.
+//
+// TRIPS ON (in order): a helper with more than 6 arguments; a helper mixing
+// integer and floating arguments; a float helper with more than 4 arguments;
+// a SECOND helper that spills arguments to the stack on Win64.
+const _: () = {
+    let mut i = 0;
+    while i < HELPER_FN_SIGS.len() {
+        let s = HELPER_FN_SIGS[i];
+        assert!(
+            s.arity <= SYSV_INT_ARG_REGS,
+            "a helper takes more arguments than the SysV integer argument \
+             register file holds; the emitter has no general stack-argument \
+             path for helper calls",
+        );
+        // Win64 assigns the integer and SSE register files POSITIONALLY (arg 2
+        // is RDX or XMM1 depending on its own type); SysV assigns them
+        // independently (the first float is always XMM0). A helper that mixes
+        // the two classes therefore needs a different register assignment per
+        // platform, and every helper call site in the backend is written as if
+        // one uniform rule applies. Today every helper is all-integer or
+        // all-float, so the divergence is unreachable. Keep it that way.
+        assert!(
+            s.float_args == 0 || s.float_args == s.arity,
+            "a helper mixes integer and floating-point arguments — Win64 \
+             assigns argument registers positionally across both files and \
+             SysV does not, so this helper needs a per-platform register \
+             assignment the emitter does not have",
+        );
+        // Win64 has XMM0-XMM3 for float arguments.
+        assert!(
+            s.float_args <= WIN64_INT_ARG_REGS,
+            "a floating-point helper takes more arguments than Win64's four \
+             XMM argument registers",
+        );
+        i += 1;
+    }
+    assert!(
+        HELPERS_NEEDING_WIN64_STACK_ARGS == 1,
+        "the number of helpers needing Win64 stack arguments changed. Only \
+         `invoke_virtual_mic` has ever exceeded four arguments, and its call \
+         site in jit/src/x64.rs writes args 5 and 6 to [RSP+32]/[RSP+40] by \
+         hand. A new >4-argument helper needs the same treatment; adding one \
+         without it silently passes garbage in R8/R9 on Windows.",
+    );
+};
+
+// Census pins. The runtime test in the crate root checks these too, but a
+// `#[test]` only fires if someone runs it, and a reclassification is exactly
+// the kind of edit that gets made without running this crate's tests.
+//
+// TRIPS ON: promoting or demoting any slot between Function/Offset/Constant,
+// or between required and optional.
+const _: () = {
+    let (mut functions, mut offsets, mut constants) = (0usize, 0usize, 0usize);
+    let (mut required, mut optional_fns) = (0usize, 0usize);
+    let mut i = 0;
+    while i < NUM_HELPER_FIELDS {
+        match HELPER_FIELDS[i].kind {
+            HelperKind::Function => {
+                functions += 1;
+                if HELPER_FIELDS[i].required {
+                    required += 1;
+                } else {
+                    optional_fns += 1;
+                }
+            }
+            HelperKind::Offset => offsets += 1,
+            HelperKind::Constant => constants += 1,
+        }
+        i += 1;
+    }
+    assert!(functions == 53, "callable-slot count changed");
+    assert!(
+        offsets == 4,
+        "the number of displacement slots changed — an Offset slot is baked as \
+         a disp32 into an addressing mode, not CALLed; confirm the new one \
+         really is a displacement and is range-checked by validate_with",
+    );
+    assert!(
+        constants == 5,
+        "the number of baked-address slots changed — a Constant slot is loaded \
+         as data and is NOT range-checked by validate_with, so misclassifying \
+         a displacement as one silently removes its only sanity check",
+    );
+    assert!(required == 42, "required-slot count changed");
+    assert!(
+        optional_fns == 11,
+        "the optional-callable count changed — every optional slot MUST have a \
+         zero check at its emitter call site; confirm the new one does before \
+         updating this number",
+    );
+    assert!(functions + offsets + constants == NUM_HELPER_FIELDS);
+    assert!(required + optional_fns == functions);
+};
+
+// ---------------------------------------------------------------------
+// Platform pins.
+//
+// The JIT is 64-bit only and the accessors transmute a `usize` into a function
+// pointer. `core::mem::transmute` already refuses a size mismatch, but it does
+// so at the transmute, deep inside a macro expansion; these say why.
+// ---------------------------------------------------------------------
+
+// TRIPS ON: building for a 32-bit target. Every offset in the golden table
+// above is `index * 8`.
+const _: () = assert!(
+    core::mem::size_of::<usize>() == 8 && core::mem::align_of::<usize>() == 8,
+    "the helper ABI requires an 8-byte, 8-byte-aligned usize; the golden \
+     offsets are `index * 8` and would silently halve on a 32-bit target",
+);
+
+// TRIPS ON: a target where a function pointer is not a plain machine word
+// (a segmented or descriptor-based ABI). The `<field>_fn` accessors transmute
+// `usize` → fn pointer, and `build_helpers` casts fn → usize.
+const _: () = assert!(
+    core::mem::size_of::<unsafe extern "C" fn()>() == core::mem::size_of::<usize>(),
+    "a function pointer is not one machine word on this target — the helper \
+     table stores entry points as bare `usize` and could not round-trip",
+);
+
+// TRIPS ON: a target without the null-pointer optimization for fn pointers.
+// The accessors return `Option<HelperFn*>` and the whole optional-slot
+// discipline rests on "zero means None"; if `Option` grew a discriminant word
+// the mapping would still be correct but the zero-cost claim would be false.
+const _: () = assert!(
+    core::mem::size_of::<Option<unsafe extern "C" fn()>>() == core::mem::size_of::<usize>(),
+    "Option<fn pointer> is not niche-optimized on this target",
+);
+
+// TRIPS ON: a raw pointer that is not a plain address (a fat or tagged
+// pointer target). `*const u8` appears in three helper signatures.
+const _: () = assert!(
+    core::mem::size_of::<*const u8>() == core::mem::size_of::<usize>(),
+    "a thin raw pointer is not one machine word on this target",
+);
 
 /// Why a [`JitRuntimeHelpers`] table was rejected by
 /// [`JitRuntimeHelpers::validate_with`].
@@ -737,10 +1487,43 @@ impl JitRuntimeHelpers {
     }
 }
 
+/// Bind a helper function to its declared [`JitRuntimeHelpers`] signature and
+/// yield its address as the `usize` the table stores.
+///
+/// The producer (`vm/src/jit/helpers.rs::build_helpers`) currently writes
+/// `jit_monitor_enter as *const () as usize`, which discards the signature: any
+/// `extern "C"` function of any shape casts cleanly, so the arity and widths
+/// declared in `helper_fn_slots!` are checked against *nothing*. Going through
+/// this macro makes the coercion to the declared `HelperFn*` alias a compile
+/// error when they disagree.
+///
+/// ```
+/// use cratonvm_jit_api::typed_helper_addr;
+///
+/// unsafe extern "C" fn my_arraylength(_array_ptr: i64) -> i64 {
+///     0
+/// }
+/// let slot: usize = typed_helper_addr!(HelperFnArraylength, my_arraylength);
+/// assert_eq!(slot, my_arraylength as usize);
+/// ```
+///
+/// Giving `my_arraylength` a second parameter, or a `-> ()` return, stops the
+/// example compiling — which is the entire point.
+#[macro_export]
+macro_rules! typed_helper_addr {
+    ($alias:ident, $f:expr $(,)?) => {{
+        // The coercion is the check: a fn item only coerces to this fn-pointer
+        // type if its `extern`-ness, arity, argument types and return type all
+        // match the declared helper signature.
+        const SIGNATURE_CHECKED: $crate::helpers_abi::$alias = $f;
+        SIGNATURE_CHECKED as usize
+    }};
+}
+
 /// Look up a slot descriptor by field name.
 ///
-/// Linear over 58 entries; intended for diagnostics and tooling, not for a hot
-/// path.
+/// Linear over [`NUM_HELPER_FIELDS`] entries; intended for diagnostics and
+/// tooling, not for a hot path.
 pub fn helper_field(name: &str) -> Option<&'static HelperFieldDesc> {
     HELPER_FIELDS.iter().find(|d| d.name == name)
 }
@@ -835,6 +1618,8 @@ mod tests {
             ("service_callee_deopt", offset_of!(H, service_callee_deopt)),
             ("new_object_cp", offset_of!(H, new_object_cp)),
             ("anewarray_object_cp", offset_of!(H, anewarray_object_cp)),
+            ("monitor_enter", offset_of!(H, monitor_enter)),
+            ("monitor_exit", offset_of!(H, monitor_exit)),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -865,15 +1650,249 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 480);
+        assert_eq!(core::mem::size_of::<H>(), 496);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 480);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 496);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 60);
-        assert_eq!(H::NUM_FIELDS, 60);
-        assert_eq!(H::NUM_HELPER_FN_FIELDS, 51);
-        assert_eq!(JIT_HELPERS_ABI_VERSION, 2);
+        assert_eq!(NUM_HELPER_FIELDS, 62);
+        assert_eq!(H::NUM_FIELDS, 62);
+        assert_eq!(H::NUM_HELPER_FN_FIELDS, 53);
+        assert_eq!(JIT_HELPERS_ABI_VERSION, 3);
+    }
+
+    /// The golden table is the only name→offset binding in the crate written
+    /// as literals. Everything else derives from the struct and therefore
+    /// follows a reorder instead of catching it.
+    #[test]
+    fn golden_offsets_are_the_struct_offsets() {
+        assert_eq!(GOLDEN_HELPER_OFFSETS.len(), H::NUM_FIELDS);
+        for (i, (name, offset)) in GOLDEN_HELPER_OFFSETS.iter().enumerate() {
+            let desc = helper_field(name)
+                .unwrap_or_else(|| panic!("golden table names an unknown slot `{}`", name));
+            assert_eq!(
+                desc.offset, *offset,
+                "`{}` moved: golden offset {}, struct offset {}",
+                name, offset, desc.offset,
+            );
+            assert_eq!(
+                HELPER_FIELDS[i].name, *name,
+                "golden row {} is `{}`, HELPER_FIELDS row {} is `{}`",
+                i, name, i, HELPER_FIELDS[i].name,
+            );
+        }
+        // The last golden offset plus one stride is the whole table.
+        let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
+        assert_eq!(last_name, "monitor_exit");
+        assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
+    }
+
+    #[test]
+    fn abi_revision_ledger_names_the_current_table() {
+        let last = *ABI_REVISIONS.last().expect("the ledger is never empty");
+        assert_eq!(last.version, JIT_HELPERS_ABI_VERSION);
+        assert_eq!(last.num_fields, NUM_HELPER_FIELDS);
+        assert_eq!(last.size, core::mem::size_of::<H>());
+        assert_eq!(
+            last,
+            HelperAbiRevision {
+                version: 3,
+                num_fields: 62,
+                size: 496,
+            },
+        );
+        // Append-only history: each revision strictly grows the table.
+        for pair in ABI_REVISIONS.windows(2) {
+            assert!(pair[1].version == pair[0].version + 1);
+            assert!(pair[1].num_fields > pair[0].num_fields);
+        }
+    }
+
+    /// The signature table is derived from the `HelperFn*` aliases, so this
+    /// pins the shapes the emitter's hand-written call sites assume.
+    #[test]
+    fn helper_fn_sigs_record_the_real_c_signatures() {
+        let by_name = |n: &str| {
+            *HELPER_FN_SIGS
+                .iter()
+                .find(|s| s.field == n)
+                .unwrap_or_else(|| panic!("no signature row for `{}`", n))
+        };
+
+        assert_eq!(HELPER_FN_SIGS.len(), H::NUM_HELPER_FN_FIELDS);
+
+        // The only helper that outruns Win64's four integer argument
+        // registers. Its call site writes args 5 and 6 to [RSP+32]/[RSP+40].
+        let mic = by_name("invoke_virtual_mic");
+        assert_eq!((mic.arity, mic.float_args), (6, 0));
+        assert_eq!(mic.win64_stack_args(), 2);
+        assert_eq!(mic.int_args(), 6);
+        assert!(mic.returns_value && !mic.returns_float);
+        assert_eq!(HELPERS_NEEDING_WIN64_STACK_ARGS, 1);
+
+        // All-float helpers: operands and result in XMM.
+        let fma = by_name("math_fma_double");
+        assert_eq!((fma.arity, fma.float_args), (3, 3));
+        assert!(fma.returns_value && fma.returns_float);
+        let frem = by_name("jit_frem");
+        assert_eq!((frem.arity, frem.float_args), (2, 2));
+        assert!(frem.returns_float);
+
+        // `-> ()`. A call site that treats one of these as returning a value
+        // reads whatever the callee left in RAX.
+        for void_helper in [
+            "jit_npe_with_action",
+            "safepoint_slow_path",
+            "set_throw_bci",
+            "write_barrier",
+            "frame_record",
+        ] {
+            assert!(
+                !by_name(void_helper).returns_value,
+                "`{}` is declared `-> ()`",
+                void_helper,
+            );
+        }
+
+        // Zero-argument helpers.
+        for nullary in [
+            "throw_arithmetic",
+            "dispatch_threw",
+            "get_current_thread",
+            "safepoint_slow_path",
+            "native_stack_floor_fn",
+        ] {
+            assert_eq!(by_name(nullary).arity, 0, "`{}` takes no arguments", nullary);
+        }
+
+        // The mechanical accessor-naming rule, including the field that
+        // already ends in `_fn`.
+        for sig in HELPER_FN_SIGS {
+            assert_eq!(
+                sig.accessor,
+                format!("{}_fn", sig.field),
+                "accessor naming rule broken for `{}`",
+                sig.field,
+            );
+            assert!(accessor_name_matches_field(sig.accessor, sig.field));
+            assert!(sig.float_args == 0 || sig.float_args == sig.arity);
+        }
+        assert_eq!(
+            by_name("native_stack_floor_fn").accessor,
+            "native_stack_floor_fn_fn",
+        );
+    }
+
+    #[test]
+    fn every_accessor_is_none_on_a_zeroed_table() {
+        let h = H::default();
+        let probe = h.helper_fn_accessor_probe();
+        assert_eq!(probe.len(), H::NUM_HELPER_FN_FIELDS);
+        for (name, value) in probe.iter() {
+            assert!(
+                value.is_none(),
+                "`{}_fn` returned Some for an unwired (zero) slot — a null \
+                 helper could be CALLed",
+                name,
+            );
+        }
+    }
+
+    /// Wire exactly one callable slot and require that exactly one accessor
+    /// sees it, and that it is the accessor named for that slot.
+    ///
+    /// This is what catches two swapped rows in `helper_fn_slots!`: swapping
+    /// the fields of two rows leaves every count, offset, census and size
+    /// check satisfied while handing each helper the other's C signature.
+    #[test]
+    fn accessor_reads_only_its_own_slot() {
+        unsafe extern "C" fn marker() {}
+        let addr = marker as usize;
+        assert_ne!(addr, 0);
+
+        let fn_slots: Vec<&HelperFieldDesc> = HELPER_FIELDS
+            .iter()
+            .filter(|d| d.kind == HelperKind::Function)
+            .collect();
+        assert_eq!(fn_slots.len(), H::NUM_HELPER_FN_FIELDS);
+
+        for target in fn_slots {
+            let mut h = H::default();
+            let idx = target.offset / HELPER_FIELD_STRIDE;
+            // SAFETY: `idx < NUM_FIELDS` because `offset` came from
+            // `offset_of!` on this struct and the layout is exactly
+            // `[usize; NUM_FIELDS]` (see `as_words`). The write is in bounds,
+            // correctly typed and correctly aligned. `addr` is the address of
+            // a real function, so no accessor fabricates an invalid function
+            // pointer; none of them are called.
+            unsafe { *(&mut h as *mut H as *mut usize).add(idx) = addr };
+
+            let probe = h.helper_fn_accessor_probe();
+            let wired: Vec<&'static str> = probe
+                .iter()
+                .filter(|(_, v)| v.is_some())
+                .map(|(n, _)| *n)
+                .collect();
+            assert_eq!(
+                wired,
+                vec![target.name],
+                "wiring only `{}` should light up only its own accessor",
+                target.name,
+            );
+            let (_, value) = probe
+                .iter()
+                .find(|(n, _)| *n == target.name)
+                .expect("the probe covers every callable slot");
+            assert_eq!(
+                *value,
+                Some(addr),
+                "`{}_fn` returned a different address than the slot holds",
+                target.name,
+            );
+        }
+    }
+
+    #[test]
+    fn typed_helper_addr_yields_the_declared_functions_address() {
+        unsafe extern "C" fn stub_arraylength(_array_ptr: i64) -> i64 {
+            3
+        }
+        // Compiles only because `stub_arraylength` really has
+        // `HelperFnArraylength`'s shape.
+        let addr = crate::typed_helper_addr!(HelperFnArraylength, stub_arraylength);
+        assert_eq!(addr, stub_arraylength as usize);
+
+        let mut h = H::default();
+        h.arraylength = addr;
+        let f = h.arraylength_fn().expect("wired slot must be Some");
+        // SAFETY: the slot holds `stub_arraylength`, which matches
+        // `HelperFnArraylength` exactly and dereferences none of its arguments.
+        assert_eq!(unsafe { f(0) }, 3);
+    }
+
+    /// The census the const assertions pin, restated as values so a failure
+    /// says which class drifted rather than only that one did.
+    #[test]
+    fn slot_census_matches_the_pinned_counts() {
+        let functions = HELPER_FIELDS
+            .iter()
+            .filter(|d| d.kind == HelperKind::Function)
+            .count();
+        let offsets = HELPER_FIELDS
+            .iter()
+            .filter(|d| d.kind == HelperKind::Offset)
+            .count();
+        let constants = HELPER_FIELDS
+            .iter()
+            .filter(|d| d.kind == HelperKind::Constant)
+            .count();
+        let required = HELPER_FIELDS.iter().filter(|d| d.required).count();
+        assert_eq!(functions, 53, "callable slots");
+        assert_eq!(offsets, 4, "displacement slots");
+        assert_eq!(constants, 5, "baked-address slots");
+        assert_eq!(required, 42, "required slots");
+        assert_eq!(functions - required, 11, "optional callable slots");
+        assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
     }
 
     /// The descriptor table and the crate root's `helper_fields!` list are two
@@ -1026,13 +2045,13 @@ mod tests {
     fn as_words_matches_the_struct_fields() {
         let mut h = H::default();
         h.newarray = 1;
-        // The LAST field, whatever it currently is — `anewarray_object_cp`
-        // since the CP-indexed allocation slots were appended.
-        h.anewarray_object_cp = 2;
+        // The LAST field, whatever it currently is — `monitor_exit`
+        // since the monitor helpers were appended.
+        h.monitor_exit = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 60);
+        assert_eq!(w.len(), 62);
     }
 
     /// Build a table with every *required* slot non-zero and every optional
