@@ -181,7 +181,7 @@ resurfaces.
 
 `TestDiskFull` *is* genuinely unstable for other reasons, which are now
 recorded separately in
-`docs/known-issues/h2/bug-h2-testdiskfull-classid0-corruption-segv-cce.md`
+the retired `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up (now in this directory)
 — `SIGSEGV` after a `class_id=ClassId(0)`/`num_slots=0` guard burst, a
 `cratonvm.synthetic.AnonymousObject$3 cannot be cast to [Ljava.lang.String;`
 `ClassCastException`, and >300 s hangs, none of which occur on stock HotSpot.

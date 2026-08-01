@@ -2592,19 +2592,53 @@ pub(super) fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: Objec
     {
         return false;
     }
+    // The bridge this is standing in for holds a real `checkcast`, and a
+    // `checkcast` RESOLVES its target class (JVMS §5.4.3.1) before comparing.
+    // So must this: "not loaded yet" is a statement about the class store, not
+    // about the object, and answering `false` there skips the cast entirely for
+    // every instantiated type whose first mention IS this call site.
+    //
+    // Spring's `ApplicationListener.forPayload` is exactly that shape. Its
+    // lambda's instantiated parameter is `PayloadApplicationEvent`, which
+    // nothing has referenced when the first `ContextRefreshedEvent` is
+    // multicast — so the cast was skipped, the body ran on the wrong event, and
+    // `event.getPayload()` raised `NoSuchMethodError`.
+    // `SimpleApplicationEventMulticaster.doInvokeListener` catches
+    // `ClassCastException` for precisely this case ("possibly a lambda-defined
+    // listener which we could not resolve the generic event type for") and
+    // suppresses it; a `NoSuchMethodError` walks straight past that catch and
+    // fails the context refresh
+    // (`DevToolsR2dbcAutoConfigurationTests$Pooled`,
+    // `probes/SpringForPayloadListenerProbe.java` — whose `preload` argument
+    // resolves the type up front and made the same run pass, which is what
+    // identified this branch).
+    //
+    // A load that FAILS still fails open: an instantiated type that is not on
+    // the classpath at all is the one case where guessing is worse than
+    // deferring, and it leaves the pre-existing behaviour untouched.
+    let loaded_target = {
+        let cm = shared.classes.class_manager.read();
+        cm.get_loaded_class_id(target)
+    };
+    let loaded_target = match loaded_target {
+        Some(tcid) => tcid,
+        // Resolve it, exactly as the bridge's `checkcast` would on first
+        // execution. `load_class_concurrent` loads and links without running
+        // `<clinit>`, which is the resolution a `checkcast` performs.
+        None => match shared.load_class_concurrent(target) {
+            Ok(tcid) => tcid,
+            Err(_) => return false,
+        },
+    };
     let (target_cid, is_sub, target_is_interface) = {
         let cm = shared.classes.class_manager.read();
-        match cm.get_loaded_class_id(target) {
-            // Not loaded → no instance could exist, but don't guess; fail open.
-            None => return false,
-            Some(tcid) => (
-                tcid,
-                obj_class_id == tcid || cm.is_subclass_of(obj_class_id, tcid),
-                cm.get_class(tcid)
-                    .map(|c| c.is_interface())
-                    .unwrap_or(false),
-            ),
-        }
+        (
+            loaded_target,
+            obj_class_id == loaded_target || cm.is_subclass_of(obj_class_id, loaded_target),
+            cm.get_class(loaded_target)
+                .map(|c| c.is_interface())
+                .unwrap_or(false),
+        )
     };
     // The lambda bridge descriptor carries a binary name only.  In a forked
     // class-loader run the loader-blind lookup above may select the app copy

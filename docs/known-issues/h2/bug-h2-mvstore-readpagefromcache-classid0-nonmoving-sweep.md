@@ -101,10 +101,11 @@ through `sweep_old_gen_non_moving` instead of the compactor. Do **not** add
 | `TestMVStoreCacheLoop`, `origin/dev` @ `c8a3ba181d` | ~6.3 | 2 (1 CCE + 1 SIGSEGV) |
 | `TestMVStoreCachePerformance` (stock), same binary | ~5.5 | 0 |
 
-`org.h2.test.synth.TestDiskFull` — offered by
-`bug-h2-testdiskfull-classid0-corruption-segv-cce.md` as a 2-second reproducer
-for this family — produced **0 SIGSEGV and 0 CCE in ~110 runs** across three
-binaries on the same day, so it is not a usable handle right now.
+`org.h2.test.synth.TestDiskFull` — offered by the now-retired
+`bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up as a 2-second
+reproducer for this family — produced **0 SIGSEGV and 0 CCE in ~110 runs**
+across three binaries on the same day, so it is not a usable handle right now.
+See *Handed over from `TestDiskFull`* below.
 
 ## The instrumentation was part of the problem
 
@@ -196,10 +197,38 @@ over lists that are already built and already sorted):
    owner. Previously only a `CRATONVM_DBG_A2` diagnostic, and an
    O(dead × free) double loop.
 
+## Handed over from `TestDiskFull` (2026-08-01)
+
+The sibling report `bug-h2-testdiskfull-classid0-corruption-segv-cce.md` was
+resolved and retired the same day by a concurrent line of work, and it hands
+this doc one residual. Both halves of that write-up corroborate the diagnosis
+above:
+
+* Its symptom 1 — the `class_id=ClassId(0) num_slots=0` guard bursts — was
+  fixed by `c0d09e2451` and `b86945eafe`, *"post-GC reference processing wrote
+  through stale **old-gen** addresses"* and *"the refproc staleness guard had
+  the same old-gen blind spot"*. Same generation, same shape, a fix that had
+  already landed. Its constant `0xe0` receiver-to-value delta turned out to be
+  `Reference`/referent pair spacing, not a miscomputed field offset.
+* Its residual is **one `SIGSEGV` in 330 runs on `dev@c8a3ba181d`** — the exact
+  binary this doc's reproduction ran on — with `r10` pointing at eight zero
+  words, i.e. an all-zero object header inside compiled code. Not root-caused
+  there because it did not recur; 203 further runs *armed with
+  `CRATONVM_DBG_SWEEP_ZERO=1`* produced no second occurrence and no ring hit,
+  which is the instrumentation confound described above showing up a third
+  time.
+
+`TestDiskFull` is therefore in the same family but is **not** currently a
+cheaper handle on it: 110 short-form runs here across three binaries produced
+0 `SIGSEGV` and 0 `ClassCastException`. `TestMVStoreCacheLoop` is.
+
 ## Related
-- `docs/known-issues/h2/bug-h2-testdiskfull-classid0-corruption-segv-cce.md` —
-  same signature, and its `class_id=ClassId(0) num_slots=0` guard bursts are
-  reads through the same kind of reclaimed block.
+- the retired `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up —
+  same signature; see *Handed over from `TestDiskFull`* above.
+- `c0d09e2451`, `b86945eafe` — post-GC reference processing writing through
+  stale OLD-GEN addresses, and the same blind spot in its staleness guard.
+  Already on `dev` before the reproduction here, so they do not close this, but
+  they are the same generation and the same shape.
 - `5750caf5f` — *close the live set before the in-place old sweep decides what
   is dead*: the in-place sweep now runs the compactor's live-set fixpoint, and
   the seven PRECISE mark push sites stop being screened by a plausibility test
