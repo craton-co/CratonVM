@@ -119,11 +119,55 @@ runs — ~2 s. Re-running in the H2 checkout root instead gives a real
 every class a fresh scratch CWD, so the short form is what the suite actually
 measures.
 
+## Update 2026-08-01: the sibling report is root-caused, and this one no longer reproduces
+
+The `TestMVStoreCachePerformance` family this doc calls itself a fast
+reproducer for **was** reproduced and re-diagnosed on 2026-08-01. Two things
+from that work apply directly here.
+
+**1. `ClassId(0)` is not evidence about the young sweep.** An all-zero header
+has four producers: an un-hashed `new Object()`, a young-sweep dead span,
+`OldGen::compact`'s zeroed tail, and a freed old-gen block the allocator
+re-zeroed before stamping a header. The sibling report's victim turned out to
+be in an **old-gen free block** — a live object `old_gen_gc`'s mark phase
+missed — not a young-sweep span. Any `class_id=ClassId(0) num_slots=0` guard
+burst in this doc is a read through such a block, so *"suggested next step" 3
+below (the `0xe0` delta) is probably not a miscomputed offset at all*: it is a
+read at a fixed field offset within a block whose header is gone.
+
+The `checkcast`/receiver reporters now answer this outright, with **no flag set
+in advance** (`GenerationalHeap::reclaimed_hole_at`, plus an unconditional
+old-gen reclamation ring that names the freed block's original class). Re-run
+any `ClassId(0)` failure and read the `cratonvm::gc::guard` line first.
+
+**2. Do not reach for `CRATONVM_DBG_SWEEP_ZERO=1`** (or `CRATONVM_DBG_A2`,
+`CRATONVM_DBG_SWEEP_CENSUS`, `CRATONVM_DBG_WATCHREF`) as step 1. Each of them
+feeds `retain_dead_objects`, which **disables the parallel young sweep** — so
+the instrumented run is not the code that failed. That is the leading
+explanation for the sibling report's "reproduced 40 %, then 0/18 with
+instrumentation, so the variable must be the host".
+
+**Rates re-measured today (2026-08-01), same host, 90 s cap, 3 binaries
+in parallel — 110 short-form runs total:**
+
+| arm | pass | `Chunk N not found` | timeout | `SIGSEGV` | `CCE` |
+|---|---|---|---|---|---|
+| `origin/dev` @ `c8a3ba181d` | 18 | 3 | 12 | **0** | **0** |
+| + the young-sweep invariants | 22 | 1 | 14 | **0** | **0** |
+| + `5750caf5f` (old-gen live-set closure) | 23 | 4 | 12 | **0** | **0** |
+
+Zero `SIGSEGV` and zero `ClassCastException` in any arm, against the 9/60 and
+1/60 this doc recorded on 2026-07-31. The timeouts are host load (the box was
+carrying six other VMs), not a signal — they are flat across arms. So this
+reproducer has stopped producing the CratonVM-only failures on demand, exactly
+as the sibling report's did; treat the rates above as the current baseline and
+do NOT read the old table as still current.
+
 ## Suggested next steps
-1. `CRATONVM_DBG_CELLCORRUPT=1` on a failing short run to get the holder dump +
-   backtrace for the `class_id=ClassId(0)` receivers — that single step is what
-   turned the `TestGetGeneratedKeys` report from "heap corruption, root cause
-   open" into a one-line fix, and no one has done it for this signature yet.
+1. Read the `cratonvm::gc::guard` line, then follow the sibling report's
+   old-generation trail. The older suggestion here — `CRATONVM_DBG_CELLCORRUPT=1`
+   for the holder dump — is still useful, but it is no longer step 1 and it is
+   not what the sibling report needed.
 2. Symptom 2 gives a named, specific target: find who writes
    `cratonvm.synthetic.AnonymousObject$3` into `StringUtils.TO_UPPER_CACHE`'s
    static slot (or who reads that static with the wrong slot index).
