@@ -40221,6 +40221,18 @@ mod loop_unroll_admission {
             let _armed = Armed::new();
             compile_accum_fixture().expect("the rewritten fixture must compile")
         };
+        // Prove the premise before asserting anything about it. Every other
+        // assertion below is also satisfied by an artifact that was NEVER
+        // rewritten — a transform the planner declined leaves the baseline's
+        // OSR vector, which has 22 slots, a live entry at bci 4 and live
+        // entries in the suffix. Without this the test can pass while
+        // testing nothing.
+        assert_ne!(
+            rewritten.code.len(),
+            baseline.code.len(),
+            "the planner declined the transform, so this test would be \
+             asserting against an unrewritten artifact"
+        );
         let osr = rewritten
             .osr_pc_to_native
             .as_ref()

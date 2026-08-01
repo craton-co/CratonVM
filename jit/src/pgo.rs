@@ -1578,14 +1578,27 @@ mod tests {
     /// only `add_receiver` refreshes.
     #[test]
     fn dominant_type_ignores_a_stale_cached_ratio() {
+        // Both entries are spelled out so the counts SUM to `total_calls`. A
+        // lone 95-of-100 entry would leave five calls unattributed, and
+        // `is_truncated` is derived from exactly that accounting — it would
+        // (correctly) report the profile as having lost an entry, which is a
+        // different property from the one this test is about.
         let tp = ReceiverTypeProfile {
             call_site_bci: 0,
-            entries: vec![TypeProfileEntry {
-                class_id: 5,
-                method_id: 50,
-                count: 95,
-                ratio: 0.0, // never recomputed
-            }],
+            entries: vec![
+                TypeProfileEntry {
+                    class_id: 5,
+                    method_id: 50,
+                    count: 95,
+                    ratio: 0.0, // never recomputed
+                },
+                TypeProfileEntry {
+                    class_id: 6,
+                    method_id: 60,
+                    count: 5,
+                    ratio: 0.0,
+                },
+            ],
             total_calls: 100,
         };
         assert!(!tp.is_truncated());

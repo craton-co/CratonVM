@@ -2113,10 +2113,16 @@ mod tests {
 
         e.dmb(0b1111); // DMB SY
         assert_eq!(last_inst(&e), 0xD503_3FBF);
+        // The barrier encoding is `base | CRm << 8`, so CRm lands in the third
+        // hex digit from the right: DMB's base is D50330BF, and ISH (CRm=1011)
+        // is D5033BBF, not D50333BF. The two literals below were written with
+        // that nibble one position out — an easy transposition, and precisely
+        // why these bytes are pinned against the ARM ARM rather than against
+        // the emitter that produced them.
         e.dmb(0b1011); // DMB ISH
-        assert_eq!(last_inst(&e), 0xD503_33BF);
+        assert_eq!(last_inst(&e), 0xD503_3BBF);
         e.dmb(0b1010); // DMB ISHST
-        assert_eq!(last_inst(&e), 0xD503_32BF);
+        assert_eq!(last_inst(&e), 0xD503_3ABF);
 
         e.isb(); // ISB SY
         assert_eq!(last_inst(&e), 0xD503_3FDF);
