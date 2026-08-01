@@ -20,6 +20,7 @@ PROMOTION is enabled:
 | promotion **OFF** (`CRATONVM_NO_SELECTIVE_PROMOTE=1`, same binary) | 3 | **0** | 1 clean; 1 × 6 failures @54; 1 × 1 failure @11 |
 | promotion **OFF** — pure `origin/dev`, no local changes | 5 | **0** | 4 clean; 1 × 1 failure @50 |
 | promotion **ON**, on base `32f9db9a2` instead of the dev tip | 3 | **0** | 3 × clean `132/132` |
+| promotion **ON** + `CRATONVM_NO_OLDGEN_COALESCE=1` | 2 | **0** | 1 clean `132/132`; 1 × 8 failures and progress collapsing to ~2 tests/20 min |
 | HotSpot control | 2 | 0 | `132/132`, ~120 s |
 
 **6 crashes in 8 promotion-ON runs; 0 in 8 promotion-OFF runs.** And promotion-ON
@@ -62,14 +63,27 @@ and sweeping young cycles in one run, alongside unguarded direct JIT→JIT calle
 
 Cheap next steps, in order — the top one is a specific, testable hypothesis:
 
-1. **Revert `730348352` ("old-gen free list never coalesced when compaction
-   cannot run") on top of the fix branch and re-run.** Selective promotion
-   allocates heavily *into old gen*; it is the only thing on either branch that
-   does so at volume; and dev changed old-gen free-list coalescing in that exact
-   window. A coalescer that merges a block still holding a live promoted object
-   corrupts precisely like this. Sibling candidate: `c3dbb011a` ("the old-gen
-   mark must not accept unvalidated addresses, and old-gen liveness must be
-   free-list aware").
+1. **`730348352`'s old-gen coalescer is the leading suspect, and it was tested.**
+   That commit ships its own escape hatch, so no rebuild is needed:
+   `CRATONVM_NO_OLDGEN_COALESCE=1`. With it set, **2 runs produced 0 crashes**
+   where the same binary crashed 6 times in 8 without it. Selective promotion is
+   the only thing on either branch that allocates into old gen at volume, and a
+   coalescer that widens a free block over a live promoted object corrupts
+   exactly like this.
+
+   That is suggestive, **not conclusive** — n=2, and the flag is not a viable
+   configuration in its own right: the second run degenerated to ~2 tests per
+   20 minutes, which is precisely the un-coalesced free-list collapse
+   `730348352` exists to fix. So the answer is not "turn coalescing off"; it is
+   to find why coalescing and freshly-promoted old-gen objects disagree. Start
+   at `OldGen::coalesce_free_blocks` and ask what can put a block on the free
+   list while a promoted object still occupies it — the selective-promotion
+   evacuate pass installs `GC_FLAG_OLD_GEN` and bumps `bytes_promoted` at
+   `gen_heap.rs` ~6800, and its "(3) fix up references … then dirty cards" pass
+   runs later, so there is a window.
+
+   Sibling candidate, untested: `c3dbb011a` ("the old-gen mark must not accept
+   unvalidated addresses, and old-gen liveness must be free-list aware").
 2. `CRATONVM_DBG_SWEEP_LIVENESS=1` (dev's own `6ce9be3ab`/`e91fd7232`) for a full
    class run — it asserts nothing live still points at a block the sweep frees.
    It does **not** fire on `probes/GcPromoteProbe.java`, which promotes megabytes
