@@ -14,23 +14,25 @@ use crate::class_reader_error::ClassReaderError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::byte_view::SharedBytes;
 use crate::field::ClassFileField;
+// Resource limits and the checked-arithmetic helpers that enforce them all
+// live in one place — see `reader/src/limits.rs` and
+// `docs/security/reader/limits.md` for the inventory.
+use crate::limits::{
+    bounded_capacity, checked_end, ensure_count_fits, wire_len_to_usize,
+    MIN_CONSTANT_POOL_ENTRY_BYTES,
+};
 use crate::method::ClassFileMethod;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
 const CLASS_FILE_MAGIC: u32 = 0xCAFEBABE;
 
-/// Safety cap for `Vec::with_capacity` to avoid excessive pre-allocation on
-/// malformed class files.  The actual count (bounded by u16) may exceed this;
-/// the Vec will simply grow on demand.
-const PREALLOC_CAP: usize = 1024;
-
 /// Maximum count for constant pool, methods, fields, interfaces, exception
 /// table entries, and attributes.  Per JVM spec these are u16 fields, so the
 /// hard upper bound is 65 535.  We validate against this limit *before*
 /// allocating to prevent a crafted class file with huge counts from causing
 /// an out-of-memory denial-of-service.
-const MAX_CP_SIZE: u16 = u16::MAX; // 65 535 — JVM spec §4.1
+const MAX_CP_SIZE: u16 = crate::limits::MAX_CONSTANT_POOL_COUNT; // 65 535 — JVM spec §4.1
 const MAX_FIELD_COUNT: u16 = u16::MAX;
 const MAX_METHOD_COUNT: u16 = u16::MAX;
 const MAX_INTERFACE_COUNT: u16 = u16::MAX;
@@ -38,6 +40,22 @@ const MAX_ATTRIBUTE_COUNT: u16 = u16::MAX;
 // MAX_EXCEPTION_TABLE_COUNT was used by the eager `Code` parser; that parser
 // now lives in `attribute.rs` (called on-demand via `LazyAttribute::decode`),
 // so the constant is no longer needed here.
+
+// Smallest possible on-the-wire size of one entry in each of the top-level
+// tables. These are the multipliers that turn a declared count into "the
+// input is too short to contain this table", so preallocation is bounded by
+// the *file*, not by a number typed into a two-byte field.
+//
+//   interfaces[]  — one u2 constant-pool index          (JVMS §4.1)
+//   field_info    — access_flags, name_index,
+//                   descriptor_index, attributes_count  (JVMS §4.5)
+//   method_info   — same four u2 fields                 (JVMS §4.6)
+//   attribute_info— attribute_name_index (u2) +
+//                   attribute_length (u4)               (JVMS §4.7)
+const INTERFACE_ENTRY_BYTES: usize = 2;
+const FIELD_ENTRY_BYTES: usize = 8;
+const METHOD_ENTRY_BYTES: usize = 8;
+const ATTRIBUTE_HEADER_BYTES: usize = 6;
 
 /// Validate that a section count does not exceed the given limit.
 fn validate_count(label: &str, count: u16, limit: u16) -> Result<(), ClassReaderError> {
@@ -137,8 +155,19 @@ pub fn read_class_shared(source: SharedBytes) -> Result<ClassFile, ClassReaderEr
     // Interfaces
     let interfaces_count = buf.read_u16()?;
     validate_count("interfaces", interfaces_count, MAX_INTERFACE_COUNT)?;
-    let mut interfaces: Vec<Arc<str>> =
-        Vec::with_capacity((interfaces_count as usize).min(PREALLOC_CAP));
+    // Reject a declared count the remaining bytes cannot possibly hold
+    // BEFORE reserving for it — see `limits::ensure_count_fits`.
+    ensure_count_fits(
+        "interfaces",
+        interfaces_count as usize,
+        INTERFACE_ENTRY_BYTES,
+        buf.remaining(),
+    )?;
+    let mut interfaces: Vec<Arc<str>> = Vec::with_capacity(bounded_capacity(
+        interfaces_count as usize,
+        INTERFACE_ENTRY_BYTES,
+        buf.remaining(),
+    ));
     for _ in 0..interfaces_count {
         let iface_index = buf.read_u16()?;
         let iface_name = constant_pool
@@ -153,7 +182,17 @@ pub fn read_class_shared(source: SharedBytes) -> Result<ClassFile, ClassReaderEr
     // Fields
     let fields_count = buf.read_u16()?;
     validate_count("fields", fields_count, MAX_FIELD_COUNT)?;
-    let mut fields = Vec::with_capacity((fields_count as usize).min(PREALLOC_CAP));
+    ensure_count_fits(
+        "fields",
+        fields_count as usize,
+        FIELD_ENTRY_BYTES,
+        buf.remaining(),
+    )?;
+    let mut fields = Vec::with_capacity(bounded_capacity(
+        fields_count as usize,
+        FIELD_ENTRY_BYTES,
+        buf.remaining(),
+    ));
     for _ in 0..fields_count {
         fields.push(read_field(&mut buf, &constant_pool, &source)?);
     }
@@ -161,7 +200,17 @@ pub fn read_class_shared(source: SharedBytes) -> Result<ClassFile, ClassReaderEr
     // Methods
     let methods_count = buf.read_u16()?;
     validate_count("methods", methods_count, MAX_METHOD_COUNT)?;
-    let mut methods = Vec::with_capacity((methods_count as usize).min(PREALLOC_CAP));
+    ensure_count_fits(
+        "methods",
+        methods_count as usize,
+        METHOD_ENTRY_BYTES,
+        buf.remaining(),
+    )?;
+    let mut methods = Vec::with_capacity(bounded_capacity(
+        methods_count as usize,
+        METHOD_ENTRY_BYTES,
+        buf.remaining(),
+    ));
     for _ in 0..methods_count {
         methods.push(read_method(&mut buf, &constant_pool, &source)?);
     }
@@ -260,9 +309,25 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
         });
     }
     validate_count("constant_pool", count, MAX_CP_SIZE)?;
-    // `count` is a u16 read from the file, so it is already bounded at
-    // 65535 — there is no preallocation-DoS risk. Reserve the exact size
-    // up front to avoid reallocations while parsing large classes.
+    // `count` is a u16, so it is bounded at 65 535 — but 65 535
+    // `ConstantPoolEntry`s is still a multi-megabyte reservation that a
+    // *two-byte* header can demand from a file with nothing after it. The
+    // pool holds `count - 1` real entries (slot 0 is the reserved
+    // sentinel), and every `cp_info` costs at least
+    // `MIN_CONSTANT_POOL_ENTRY_BYTES` per slot it covers, so a declared
+    // count needing more bytes than the file has left is provably a lie.
+    // Reject it here rather than after the allocator has been asked for
+    // the memory. The bound is conservative — `buf.remaining()` still
+    // includes the post-pool sections, so no legal class file is refused.
+    ensure_count_fits(
+        "constant_pool",
+        (count as usize) - 1,
+        MIN_CONSTANT_POOL_ENTRY_BYTES,
+        buf.remaining(),
+    )?;
+    // With that check passed, `count` is itself bounded by the input
+    // length, so reserving the exact size is safe and avoids reallocations
+    // while parsing large classes.
     let mut entries: Vec<ConstantPoolEntry> = Vec::with_capacity(count as usize);
     entries.push(ConstantPoolEntry::Tombstone); // Index 0
 
@@ -565,7 +630,20 @@ fn read_attributes(
 ) -> Result<Vec<LazyAttribute>, ClassReaderError> {
     let count = buf.read_u16()?;
     validate_count("attributes", count, MAX_ATTRIBUTE_COUNT)?;
-    let mut attributes = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
+    // An attribute costs at least its 6-byte header, so a declared count
+    // needing more bytes than remain is a truncated/hostile file. Rejecting
+    // here means the reservation below is bounded by the input size.
+    ensure_count_fits(
+        "attributes",
+        count as usize,
+        ATTRIBUTE_HEADER_BYTES,
+        buf.remaining(),
+    )?;
+    let mut attributes = Vec::with_capacity(bounded_capacity(
+        count as usize,
+        ATTRIBUTE_HEADER_BYTES,
+        buf.remaining(),
+    ));
 
     for _ in 0..count {
         let name_index = buf.read_u16()?;
@@ -577,7 +655,10 @@ fn read_attributes(
                 message: "attribute name must reference a valid Utf8 entry".to_string(),
             }
         })?;
-        let length = buf.read_u32()? as usize;
+        // `attribute_length` is a u4 on the wire. `wire_len_to_usize` states
+        // the narrowing explicitly rather than relying on `u32 as usize`
+        // being lossless on every host the VM is built for.
+        let length = wire_len_to_usize("attribute_length", buf.read_u32()?)?;
 
         // Validate attribute length does not exceed remaining buffer before
         // we slice into it. Catches truncated class files (and a hostile
@@ -605,7 +686,11 @@ fn read_attributes(
         // eliminating the misalignment attack that the eager path's
         // snapshot/check wrapper guarded against.
         let _ = buf.read_bytes(length)?;
-        let end = start + length;
+        // `read_bytes` already proved `start + length` is inside the buffer,
+        // but compute the end with `checked_add` anyway: a wrapped `end`
+        // would produce a *reversed* range that later slicing would panic
+        // on rather than reject.
+        let end = checked_end("attribute body range", start, length)?;
 
         // Eager shape-only validation for a small, fixed set of
         // attribute kinds whose laziness would otherwise hide
@@ -927,11 +1012,104 @@ mod tests {
     fn prealloc_cap_constant_exists_and_is_bounded() {
         // Verify the PREALLOC_CAP constant is set to a reasonable value
         // to prevent excessive pre-allocation on malformed class files.
-        assert!(PREALLOC_CAP > 0, "PREALLOC_CAP must be positive");
+        // The constant now lives in `crate::limits` so every parser in the
+        // crate shares one definition.
+        let cap = crate::limits::PREALLOC_CAP;
+        assert!(cap > 0, "PREALLOC_CAP must be positive");
         assert!(
-            PREALLOC_CAP <= 65536,
+            cap <= 65536,
             "PREALLOC_CAP should be bounded to prevent excessive allocation"
         );
+    }
+
+    // ── Declared-count vs. remaining-input boundary tests ────────────────
+    //
+    // Each "must reject" case below has a "must accept" twin built from the
+    // same helper with a count the input can actually hold, so the suite
+    // cannot pass by rejecting everything.
+
+    /// Build a class-file prefix up to (and including) `constant_pool_count`.
+    fn class_prefix_with_cp_count(count: u16) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xCAFEBABE_u32.to_be_bytes());
+        data.extend_from_slice(&0_u16.to_be_bytes()); // minor
+        data.extend_from_slice(&52_u16.to_be_bytes()); // major (Java 8)
+        data.extend_from_slice(&count.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn constant_pool_count_beyond_remaining_bytes_is_rejected_before_allocating() {
+        // A 10-byte file that claims 65 535 constant-pool slots. Without
+        // the `ensure_count_fits` guard this reserves ~1.5 MB and only
+        // then fails on the first tag read.
+        let data = class_prefix_with_cp_count(u16::MAX);
+        let err = read_class(&data).expect_err("hostile cp_count must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("constant_pool") && msg.contains("bytes"),
+            "expected a count-vs-remaining rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn constant_pool_count_within_remaining_bytes_is_not_rejected_by_the_size_guard() {
+        // Must-accept twin: the same guard must not fire on a pool whose
+        // declared slots fit in the bytes that follow. This file is still
+        // truncated (no access_flags/this_class), so it errors — but it
+        // must error *past* the size guard, i.e. not with that message.
+        let mut data = class_prefix_with_cp_count(2); // one real entry
+        data.push(1); // CONSTANT_Utf8
+        data.extend_from_slice(&4_u16.to_be_bytes());
+        data.extend_from_slice(b"Test");
+        let err = read_class(&data).expect_err("file is truncated after the pool");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("declared count"),
+            "the size guard must not fire on a pool that fits: {msg}"
+        );
+    }
+
+    #[test]
+    fn constant_pool_count_of_one_is_the_empty_pool_boundary() {
+        // count == 1 means "sentinel only, no entries" — zero-length
+        // boundary. The guard must not reject it even with no bytes left
+        // for entries (the file is still truncated afterwards, but for a
+        // different reason).
+        let data = class_prefix_with_cp_count(1);
+        let err = read_class(&data).expect_err("file ends after the pool count");
+        assert!(
+            !err.to_string().contains("declared count"),
+            "an empty constant pool must clear the size guard"
+        );
+        // And count == 0 is a JVMS §4.1 violation, rejected separately.
+        let zero = class_prefix_with_cp_count(0);
+        assert!(read_class(&zero).is_err());
+    }
+
+    #[test]
+    fn section_count_guards_reject_impossible_declarations() {
+        // Drive `ensure_count_fits` at exactly the boundary each top-level
+        // section uses, both directions. This is the unit-level twin of
+        // the whole-file tests above.
+        for (label, entry_bytes) in [
+            ("interfaces", INTERFACE_ENTRY_BYTES),
+            ("fields", FIELD_ENTRY_BYTES),
+            ("methods", METHOD_ENTRY_BYTES),
+            ("attributes", ATTRIBUTE_HEADER_BYTES),
+        ] {
+            // u16::MAX entries can never fit in a 40-byte tail.
+            assert!(
+                ensure_count_fits(label, u16::MAX as usize, entry_bytes, 40).is_err(),
+                "{label}: 65535 entries must not fit in 40 bytes"
+            );
+            // Exactly as many as fit is accepted; one more is not.
+            let fits = 40 / entry_bytes;
+            assert!(ensure_count_fits(label, fits, entry_bytes, 40).is_ok());
+            assert!(ensure_count_fits(label, fits + 1, entry_bytes, 40).is_err());
+            // Zero entries always fit, even in an empty tail.
+            assert!(ensure_count_fits(label, 0, entry_bytes, 0).is_ok());
+        }
     }
 
     #[test]

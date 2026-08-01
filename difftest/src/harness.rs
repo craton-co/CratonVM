@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::census;
+use crate::crossmode::{self, PathDisagreement};
 use crate::ledger::{
     self, Channel, Classification, Ledger, LedgerEntry, LedgerStatus, Observation, StrictCensus,
 };
@@ -96,6 +97,22 @@ impl ProgramResult {
             .iter()
             .find(|m| !m.verdict.agrees())
             .or_else(|| self.modes.first())
+    }
+
+    /// Pairs of CratonVM execution paths that disagreed **with each other** on
+    /// this program (see [`crate::crossmode`]).
+    ///
+    /// Strictly stronger evidence than a divergence against HotSpot: no
+    /// reference, no environment difference and no normalization rule can
+    /// explain two of the VM's own executors printing different things for the
+    /// same deterministic program. Reported alongside the gate verdict and
+    /// deliberately outside its exit code — a `JitOnly` row already on the
+    /// ledger *is* a path split by construction, so gating here would fail the
+    /// frozen baseline on findings that are already tracked.
+    pub fn path_disagreements(&self) -> Vec<PathDisagreement> {
+        let runs: Vec<(Mode, &Observation)> =
+            self.modes.iter().map(|m| (m.mode, &m.cratonvm)).collect();
+        crossmode::disagreements(&runs)
     }
 
     // -- per-profile views ---------------------------------------------------
@@ -696,12 +713,26 @@ pub fn render_summary(summary: &RunSummary) -> String {
             per_mode.join(" ")
         );
     }
+    // Path splits are printed for every program, including ones that agreed
+    // with HotSpot everywhere: two executors can be wrong in the same direction
+    // against the reference and still disagree with each other on a *third*
+    // program, and that is precisely the case the reference cannot see.
+    for r in &summary.results {
+        let splits = r.path_disagreements();
+        s.push_str(&crossmode::render(&r.program, &splits));
+    }
     for (prog, reason) in &summary.skipped {
         let _ = writeln!(s, "  SKIP  {prog} — {reason}");
     }
+    let split_programs = summary
+        .results
+        .iter()
+        .filter(|r| !r.path_disagreements().is_empty())
+        .count();
     let _ = writeln!(
         s,
-        "{}/{} programs diverged ({} skipped)",
+        "{}/{} programs diverged from the reference, {split_programs} split across CratonVM's own \
+         execution paths ({} skipped)",
         summary.diverged(),
         summary.total(),
         summary.skipped.len()
@@ -721,13 +752,11 @@ fn verdict_channels(v: &Verdict) -> String {
     }
 }
 
+/// The stable label for a channel. Delegates to [`Channel::label`] so the
+/// summary, the gate report and the cross-path report can never disagree about
+/// what a dimension is called.
 fn channel_label(c: Channel) -> &'static str {
-    match c {
-        Channel::ExitCode => "exit-code",
-        Channel::Exception => "exception",
-        Channel::Stdout => "stdout",
-        Channel::Stderr => "stderr",
-    }
+    c.label()
 }
 
 fn classification_label(c: Classification) -> &'static str {
@@ -811,6 +840,18 @@ pub struct GateReport {
     /// too would double-count it and would make the first strict run fail
     /// wholesale, which is the outcome the measurement wave exists to avoid.
     pub strict_violations: Vec<StrictViolation>,
+    /// Programs where two of CratonVM's **own** execution paths disagreed, as
+    /// `"Program: nojit≠ir-jit[stdout]"` (see [`crate::crossmode`]).
+    ///
+    /// **Informational — this list does not move the exit code**, for the same
+    /// reason `strict_violations` does not: a `JitOnly` divergence already on
+    /// the ledger *is* a path split by construction (`jit-on` disagrees with
+    /// HotSpot while `nojit` agrees, so the two disagree with each other), and
+    /// gating here would fail the frozen baseline on findings that are already
+    /// tracked and triaged. It is reported because it is the strongest evidence
+    /// the harness produces: it needs no reference JDK, so neither the
+    /// reference nor the normalization can be blamed for it.
+    pub path_splits: Vec<String>,
 }
 
 impl GateReport {
@@ -863,6 +904,15 @@ pub fn gate(summary: &RunSummary, ledger: &Ledger) -> GateReport {
     };
 
     for r in &summary.results {
+        // Path splits are collected for every program, diverging or not: two
+        // executors can agree with HotSpot on one program and disagree with
+        // each other on another, and the reference cannot see that.
+        for split in r.path_disagreements() {
+            report
+                .path_splits
+                .push(format!("{}: {}", r.program, split.label()));
+        }
+
         // Violations are collected from every census-collecting mode, whether
         // or not that mode diverged — an enforced refusal that happened to
         // leave behaviour unchanged is still the measurement wave's output.
@@ -942,6 +992,16 @@ pub fn render_gate(report: &GateReport) -> String {
         "nondeterministic (skipped)",
         &report.nondeterministic,
     );
+    if !report.path_splits.is_empty() {
+        let _ = writeln!(
+            s,
+            "  CratonVM execution paths disagreed with each other (reported, not gated): {}",
+            report.path_splits.len()
+        );
+        for split in &report.path_splits {
+            let _ = writeln!(s, "      {split}");
+        }
+    }
     if !report.strict_violations.is_empty() {
         let _ = writeln!(
             s,
@@ -1555,6 +1615,84 @@ mod tests {
     }
 
     // -- census-free modes are untouched -------------------------------------
+
+    // -- cross-path (reference-free) findings --------------------------------
+
+    #[test]
+    fn two_execution_paths_disagreeing_is_reported_but_does_not_gate() {
+        // `nojit` printed "42" and `ir-jit` printed nothing: one of the VM's own
+        // executors is wrong, and no reference JDK is needed to know it. It is
+        // surfaced on the gate report and deliberately left out of the exit
+        // code — a `JitOnly` row already on the ledger is a path split by
+        // construction, so gating here would fail the frozen baseline.
+        let r = program_with(
+            "X",
+            vec![
+                diverging_outcome(Mode::NoJit),
+                agreeing_outcome(Mode::IrJit),
+            ],
+        );
+        let splits = r.path_disagreements();
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].label(), "nojit≠ir-jit[stdout]");
+
+        // The ledger says this program is a known divergence, so the gate is
+        // clean — and the split is still reported.
+        let report = gate(
+            &summary_of(vec![r]),
+            &ledger_with("X", LedgerStatus::Known, "42"),
+        );
+        assert_eq!(report.path_splits, vec!["X: nojit≠ir-jit[stdout]".to_string()]);
+        assert_eq!(report.exit_code(), 0, "a path split must not move the gate");
+        assert!(report.is_clean());
+        assert!(render_gate(&report).contains("reported, not gated"));
+    }
+
+    #[test]
+    fn paths_that_agree_produce_no_split_even_when_all_diverge_from_hotspot() {
+        // The `Universal` shape: every executor is wrong in the same way. There
+        // is no path split, because the paths agree with each other — which is
+        // itself the useful signal (the bug is shared, not JIT-specific).
+        let r = diverging_program("X");
+        assert!(r.path_disagreements().is_empty());
+        let report = gate(
+            &summary_of(vec![r]),
+            &Ledger::new("h".into(), "t".into(), "25".into()),
+        );
+        assert!(report.path_splits.is_empty());
+        assert!(!render_gate(&report).contains("reported, not gated"));
+    }
+
+    #[test]
+    fn a_cross_policy_pair_is_never_reported_as_a_path_split() {
+        // `--jdk-only` refusing something the compatible run allowed is a policy
+        // finding with its own ledger row, not two executors disagreeing.
+        let r = program_with(
+            "X",
+            vec![
+                diverging_outcome(Mode::JitOn),
+                agreeing_outcome(Mode::JdkOnlyJit),
+            ],
+        );
+        assert!(
+            r.path_disagreements().is_empty(),
+            "the policy axis must not masquerade as an execution-path split"
+        );
+    }
+
+    #[test]
+    fn the_summary_names_the_dimension_that_moved() {
+        // The whole point of splitting the exception channel: a report says
+        // `exception-message`, not `exception`.
+        let mut outcome = agreeing_outcome(Mode::JitOn);
+        outcome.verdict = Verdict::Diverge(vec![ChannelDiff {
+            channel: Channel::ExceptionMessage,
+            cratonvm: "no detail".into(),
+            hotspot: "Index 9 out of bounds for length 3".into(),
+        }]);
+        let rendered = render_summary(&summary_of(vec![program_with("X", vec![outcome])]));
+        assert!(rendered.contains("jit-on:exception-message"), "{rendered}");
+    }
 
     #[test]
     fn legacy_modes_carry_no_census_and_no_violation() {

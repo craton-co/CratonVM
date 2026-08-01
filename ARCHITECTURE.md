@@ -276,6 +276,14 @@ proof is not. Read both before reasoning about allocation-path or GC-pause code.
    (`gc_quiescence::incomplete_reason`), and `--verbose:gc` / `CRATONVM_GC_STATS`
    print `moving_young: cycles=N coverage_fallbacks=M` plus a per-reason
    histogram.
+3. **Ask the runtime, not a document.** `gc_metrics::collector_decision_report()`
+   (`gc/src/gc_metrics.rs`) renders the last collection's actual decision —
+   backend, moving/non-moving verdict, the stable reason code, and the specific
+   unproven obligation — and `print_gc_summary` emits it on every `--verbose:gc`
+   run. It is the authority for "did this process compact?"; prose about the
+   flag is not. `docs/GC.md`'s backend table stated the pre-2026-07-26 rule
+   until the drift was resolved in
+   [`docs/gc/tlab-and-card-audit.md`](docs/gc/tlab-and-card-audit.md) §3.2.
 
    (An earlier `fail_closed_non_moving = is_active() && !allow_moving_young`
    term made this unconditional — it meant `CRATONVM_MOVING_YOUNG=1` alone could

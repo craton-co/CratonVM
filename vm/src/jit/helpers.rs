@@ -23,6 +23,7 @@ use crate::runtime::redefine_state::{
     named_class_was_redefined,
 };
 use crate::threading::jvm_thread::JvmThread;
+use crate::threading::thread_state::{self, ThreadExecState};
 use crate::vm::SharedVm;
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
 
@@ -884,6 +885,21 @@ pub(crate) fn stash_jit_pending_npe_action(code: u8) {
 #[inline]
 pub(crate) fn set_jit_deopt_pending() {
     JIT_SIGNALS.with(|s| s.deopt.set(true));
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // the deopt trap is the `CompiledUninterruptible -> Deoptimizing` edge —
+    // the only tabled way into that state. From here until the interpreter has
+    // materialised the frames, the thread holds `FrameValue` buffers that are
+    // in neither the compiled frame's oop map nor a not-yet-built interpreter
+    // frame, which is exactly what makes the window its own state.
+    //
+    // The window is closed by whichever comes first: the JIT entry pop
+    // (`conservative_roots::leaving_compiled_state`, which resolves
+    // `Deoptimizing` to `JavaRunning` rather than manufacturing an untabled
+    // edge) or the interpreter's own resume sites.
+    thread_state::record_transition(
+        ThreadExecState::Deoptimizing,
+        "jit::helpers::set_jit_deopt_pending",
+    );
 }
 
 /// Read+clear the out-of-band deopt/exception signal. The interpreter's
@@ -1345,6 +1361,24 @@ unsafe fn bail_to_interpreter(
     info: &JitInvokeInfo,
     args: &[Value],
 ) -> i64 {
+    // This bail resolves the callee from a class NAME, and a lambda-proxy
+    // receiver has no name of its own: it resolves as its functional interface,
+    // which for four of them runs a collector native in place of the lambda
+    // body. Same hazard as the dispatch slow path — see
+    // `try_lambda_proxy_sam_dispatch`, which declines everything that is not a
+    // proxy's SAM, so the routing below is unchanged for every other call.
+    if let Some(result) = try_lambda_proxy_sam_dispatch(vm, thread, info, args) {
+        return match result {
+            Ok(Some(Value::Int(v))) => v as i64,
+            Ok(Some(Value::Long(v))) => v,
+            Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+            Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+            Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+            Ok(Some(Value::Object(None)) | None) => 0,
+            Ok(_) => 0,
+            Err(error) => handle_jit_dispatch_error(vm, thread, error, info),
+        };
+    }
     // invokespecial (kind=1) must NOT virtually re-target onto the receiver's
     // runtime class — same rationale as the kind=1 arm of the dispatch slow
     // path below. `invoke_or_native` → `invoke_on_class_shared` applies the
@@ -1412,6 +1446,79 @@ unsafe fn bail_to_interpreter(
         Ok(Some(Value::Object(None))) | Ok(None) => 0,
         Ok(_) => 0,
         Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
+    }
+}
+
+/// Dispatch a SAM call on a lambda-proxy receiver through the proxy registry.
+/// `None` means "not that" — not a virtual/interface call, not a lambda-proxy
+/// receiver, or not the proxy's SAM — and the caller proceeds unchanged.
+///
+/// Every JIT path that resolves a callee BY NAME needs this in front of it. A
+/// lambda proxy's class id is synthetic and absent from the class store, so
+/// name resolution falls back to the constant-pool class — the FUNCTIONAL
+/// INTERFACE — and CratonVM registers natives on four of those
+/// (`java/util/function/Supplier.get`, `BiConsumer.accept`, `Function.apply`,
+/// `BinaryOperator.apply`) to serve the synthetic objects
+/// `Collector.accumulator()` and its siblings hand out. Those natives cannot
+/// decline: with no collector tag in field 0 they take their catch-all arm, so
+/// an ordinary user lambda routed to them has its body skipped entirely —
+/// `Supplier.get` returns an empty `ArrayList`, `Function.apply` returns its
+/// argument, `BiConsumer.accept(a, b)` calls `a.add(b)`, and
+/// `BinaryOperator.apply(a, b)` calls `a.addAll(b)`. Three of those four are
+/// SILENT.
+///
+/// The interpreter never had the problem — `try_lambda_dispatch` runs before
+/// native resolution there — so the failure is JIT-only, and it additionally
+/// needs the call site to be megamorphic, since a site that only ever sees one
+/// proxy class stays on a cached path. That combination is why it took
+/// Hibernate's `forEachSubInitializer(BiConsumer, ..)` — invoked with
+/// `Initializer::startLoading`, `::resolveKey` and `::initializeInstance` — to
+/// surface it, as `NoSuchMethodError: <sub-initializer>.add(Ljava/lang/Object;)Z`,
+/// three failures in every full-class run of `ASTParserLoadingTest`.
+/// `apps/hib-suite-runner/FunctionalInterfaceHijackProbe.java` is the reduced
+/// witness for all four interfaces; `docs/internal/fixed-suite-bugs/hibernate/
+/// hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
+///
+/// Kept as one helper rather than repeated at each bail so a third by-name
+/// dispatch path added later inherits the guard instead of re-opening the hole.
+///
+/// SAFETY: same contract as the callers — a live `SharedVm` and a current
+/// `JvmThread`, since the SAM body may resume interpretation.
+fn try_lambda_proxy_sam_dispatch(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    values: &[Value],
+) -> Option<Result<Option<Value>, crate::error::MethodCallFailed>> {
+    if !matches!(info.invoke_kind, 0 | 2) {
+        return None;
+    }
+    let Some(Value::Object(Some(receiver))) = values.first().copied() else {
+        return None;
+    };
+    let receiver_class_id = vm.mem.heap.class_id_of(receiver);
+    if !vm
+        .classes
+        .lambda_proxies
+        .read()
+        .contains_key(&receiver_class_id)
+    {
+        return None;
+    }
+    match crate::runtime::interpreter::try_lambda_dispatch(
+        vm,
+        thread,
+        receiver,
+        receiver_class_id,
+        info.method_name,
+        info.descriptor,
+        &values[1..],
+    ) {
+        Ok(Some(result)) => Some(Ok(result)),
+        // Not the proxy's SAM (a default method on the functional interface,
+        // say) — fall through to the caller's ordinary path, unchanged.
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
     }
 }
 
@@ -7763,6 +7870,22 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 // null — keep the defensive 0 bail (does not mask a real NPE).
                 _ => return 0,
             };
+            // A lambda-proxy receiver must be dispatched through the proxy
+            // registry, never by name — see `try_lambda_proxy_sam_dispatch`
+            // for what resolving one by its functional-interface name runs
+            // instead of the lambda body.
+            if let Some(result) = try_lambda_proxy_sam_dispatch(vm, thread, info, &values) {
+                return match result {
+                    Ok(Some(Value::Int(v))) => v as i64,
+                    Ok(Some(Value::Long(v))) => v,
+                    Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+                    Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+                    Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+                    Ok(Some(Value::Object(None)) | None) => 0,
+                    Ok(_) => 0,
+                    Err(error) => handle_jit_dispatch_error(vm, thread, error, info),
+                };
+            }
             // Match the register-overflow bail path: `NativeContext::invoke_virtual`
             // resolves solely from the heap object's class id. That is insufficient
             // for a synthetic/ClassId(0) receiver (common for Lucene iterator

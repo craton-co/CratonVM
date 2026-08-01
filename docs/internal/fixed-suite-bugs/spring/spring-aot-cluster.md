@@ -33,7 +33,7 @@ one**: chunk 9 aborted with an unrelated `@Bean` attribute-resolution NPE. That
 is a low-rate flake, not a residual of this cluster — chunk 9 then ran clean 3/3
 on the same binary, 3/3 on the pre-fix binary, and the failing class ran clean
 8/8 alone. It is filed on its own, with two eliminations, as
-[`../../../known-issues/spring/spring-bean-attribute-type-null-flake.md`](../../../known-issues/spring/spring-bean-attribute-type-null-flake.md).
+[`../../../known-issues/spring/spring-bean-attribute-type-null-flake.md`](../../../known-issues/springboot/spring-bean-attribute-type-null-flake.md).
 
 ## Chunk 4: what it actually was
 

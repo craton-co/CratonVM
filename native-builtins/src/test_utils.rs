@@ -595,6 +595,17 @@ pub(crate) struct MockNativeContext {
     /// T19.N1: per-class signer certificate blocks (raw PKCS#7 bytes).
     /// Returned by `class_code_source_certs`; empty by default.
     pub(crate) code_source_certs_override: UnsafeCell<HashMap<u32, Vec<Vec<u8>>>>,
+    /// What `vm_identity()` reports. Defaults to `0`, which is the value the
+    /// `NativeContext` trait's own default impl returns — so every existing
+    /// test sees exactly what it saw before.
+    ///
+    /// It is settable because the per-VM capability index
+    /// (`cratonvm_native_api::install_capabilities`) is keyed on this value.
+    /// A capability test that installed an `Enforce` policy under the shared
+    /// identity `0` would be visible to every *other* test running in
+    /// parallel with a mock context, and could refuse their I/O. Giving such a
+    /// test its own identity keeps the policy where it belongs.
+    vm_identity_override: std::cell::Cell<usize>,
     blocking_begin_count: usize,
     blocking_end_count: usize,
     /// WP0.2: per-class overrides for `declared_fields`. Empty vec by
@@ -775,6 +786,7 @@ impl MockNativeContext {
             interrupted_flag: UnsafeCell::new(false),
             code_base_override: UnsafeCell::new(HashMap::new()),
             code_source_certs_override: UnsafeCell::new(HashMap::new()),
+            vm_identity_override: std::cell::Cell::new(0),
             blocking_begin_count: 0,
             blocking_end_count: 0,
             declared_fields_override: UnsafeCell::new(HashMap::new()),
@@ -805,6 +817,15 @@ impl MockNativeContext {
             gpu_stream_create_calls: UnsafeCell::new(0),
             gpu_stream_release_calls: UnsafeCell::new(Vec::new()),
         }
+    }
+
+    /// Give this context its own VM identity, so a per-VM policy installed
+    /// for it (capabilities, and anything else keyed on `vm_identity()`) is
+    /// invisible to the other mock contexts in the suite, which all report
+    /// the default `0`. See `vm_identity_override`.
+    #[allow(dead_code)]
+    pub(crate) fn set_vm_identity(&self, id: usize) {
+        self.vm_identity_override.set(id);
     }
 
     /// CGLIB-η: declare that `class_id` belongs to the given raw loader
@@ -2387,6 +2408,13 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
     fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
         let statics = unsafe { &mut *self.static_fields_override.get() };
         statics.insert((class_id.as_u32(), field_index), value);
+    }
+
+    /// Overrides the trait default (`0`) with whatever `set_vm_identity`
+    /// installed, so a test can own a private VM identity. Untouched contexts
+    /// still report `0`.
+    fn vm_identity(&self) -> usize {
+        self.vm_identity_override.get()
     }
 
     fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {

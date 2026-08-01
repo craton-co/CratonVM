@@ -56,6 +56,12 @@ cratonvm-types = { path = "../types", version = "0.3.0" }
 # top of `run()`) — dumps the dispatch_trace ring before silent System.exit
 # calls so the last Java method is visible in stderr for diagnosis.
 cratonvm-native-builtins = { path = "../native-builtins", version = "0.3.0" }
+# Direct dep (rather than reaching through `cratonvm_vm::jfr`) so the launcher
+# owns the process-level phase boundaries: `phase::mark_process_start` beside
+# `expand_process_env`, the `vm_startup` / `java_execution` / `vm_shutdown`
+# spans in `run()`, and the shutdown report in `maybe_dump_shutdown_reports`.
+# See `docs/observability/phase-accounting.md` §10.2-§10.5.
+cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }

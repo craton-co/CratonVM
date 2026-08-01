@@ -371,9 +371,13 @@ fn arrstore_check(
 fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool {
     use parking_lot::Mutex;
     use std::sync::OnceLock;
-    static MEMO: OnceLock<Mutex<std::collections::HashMap<u32, bool>>> = OnceLock::new();
+    // PER-VM STATE (P0, `docs/architecture/per-vm-state.md`): the memo answers
+    // "does this ClassId's name match the EC watch list?", and `ClassId`s are
+    // allocated per-VM, so the key must carry `vm_identity` or a second VM
+    // reads the first VM's verdict for an unrelated class.
+    static MEMO: OnceLock<Mutex<std::collections::HashMap<(usize, u32), bool>>> = OnceLock::new();
     let memo = MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let key = cid.as_u32();
+    let key = (shared.vm_identity, cid.as_u32());
     if let Some(&v) = memo.lock().get(&key) {
         return v;
     }
@@ -13443,6 +13447,18 @@ fn resume_from_ir_deopt(
         );
     }
     push_frame_and_fire_entry(thread, frame);
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // the `Deoptimizing -> JavaRunning` edge. The reconstructed values now live
+    // in a GC-scanned interpreter frame, which is precisely the property the
+    // `Deoptimizing` state exists to say the thread did NOT have. Usually a
+    // no-op self-edge — the JIT entry pop that returned us here already
+    // resolved the window (see `conservative_roots::leaving_compiled_state`) —
+    // but this is the site that closes it for any deopt path that materialises
+    // frames without an intervening pop.
+    crate::threading::thread_state::record_transition(
+        crate::threading::thread_state::ThreadExecState::JavaRunning,
+        "interpreter::resume_from_ir_deopt",
+    );
     Some(CachedCallResult::FramePushed)
 }
 
@@ -14330,6 +14346,18 @@ fn real_frame_deopt_resume_and_despeculate(
                 );
             }
         }
+    }
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // close the `Deoptimizing` window on the RESUMED path only. A `None` here
+    // means no frame was materialised and the caller falls back to the
+    // whole-method re-run — that path leaves compiled code through the JIT
+    // entry pop, which resolves the window itself
+    // (`conservative_roots::leaving_compiled_state`).
+    if resumed.is_some() {
+        crate::threading::thread_state::record_transition(
+            crate::threading::thread_state::ThreadExecState::JavaRunning,
+            "interpreter::real_frame_deopt_resume_and_despeculate",
+        );
     }
     resumed
 }

@@ -3,9 +3,9 @@
 **Status:** OPEN, measured 2026-07-31 against dev `f14b64379`.
 
 This is a narrow companion to the two existing reports on this class —
-[`../spring/springboot-basicerrorcontroller-checkcast-abort-20260731.md`](../spring/springboot-basicerrorcontroller-checkcast-abort-20260731.md)
+[`../spring/springboot-basicerrorcontroller-checkcast-abort-20260731.md`](springboot-basicerrorcontroller-checkcast-abort-20260731.md)
 and
-[`../spring/basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](../spring/basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md).
+[`../spring/basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md).
 It does not re-file those. It records one fact they do not cover, which will
 otherwise cause a wrong conclusion about a different subsystem.
 

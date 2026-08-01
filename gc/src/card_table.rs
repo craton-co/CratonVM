@@ -675,6 +675,12 @@ impl CardTable {
         if pending.is_empty() {
             return 0;
         }
+        // Observability (see `crate::gc_metrics`): every offset that does NOT
+        // produce a clean->dirty transition is a duplicate mark — the mutator
+        // buffered a card that was already dirty. This is the only place in the
+        // system that can tell the two apart, and it is off the hot path (once
+        // per drain, not per store), so it is counted unconditionally.
+        let pending_len = pending.len() as u64;
         let mut cells = self.cells.lock();
         let mut newly_dirtied = 0usize;
         for offset in pending {
@@ -697,7 +703,36 @@ impl CardTable {
                 newly_dirtied += 1;
             }
         }
+        crate::gc_metrics::record_duplicate_card_marks(
+            pending_len.saturating_sub(newly_dirtied as u64),
+        );
         newly_dirtied
+    }
+
+    /// Bytes of remembered-set metadata this table currently retains.
+    ///
+    /// Three contributions, all of them real memory the card table costs the
+    /// process for as long as it is alive:
+    ///
+    /// * the card byte-map itself — one `AtomicU8` per [`CARD_SIZE`] bytes of
+    ///   covered region, i.e. a fixed 1/512 of the old generation;
+    /// * the `dirty_cards` tracking list — one `usize` per card currently
+    ///   dirty, which is what makes `take_dirty_cards` O(dirty) instead of
+    ///   O(total cards);
+    /// * the undrained `pending_offsets` queue — one `usize` per buffered
+    ///   old→young edge not yet folded into the bitmap.
+    ///
+    /// Excludes the per-thread [`DirtyPartitions`] buffers, which are owned by
+    /// the threads rather than by this table. Takes both locks, so this is a
+    /// diagnostic call (`gc_metrics`), not something to put on an allocation
+    /// path.
+    pub fn retained_bytes(&self) -> usize {
+        let cells = self.cells.lock();
+        let map = std::mem::size_of_val(&cells.cards[..]);
+        let tracking = cells.dirty_cards.capacity() * std::mem::size_of::<usize>();
+        drop(cells);
+        let pending = self.pending_offsets.lock().capacity() * std::mem::size_of::<usize>();
+        map + tracking + pending
     }
 
     /// T5.5.2 — How many offsets are currently queued in the shared
@@ -753,6 +788,78 @@ mod tests {
         unsafe { &*cards.add(2) }.store(CARD_DIRTY, Ordering::Release);
         assert_eq!(ct.take_dirty_cards(), vec![2]);
         assert!(!ct.is_dirty(2));
+    }
+
+    /// `drain_pending` is the only place in the system that can tell a card
+    /// mark that dirtied a clean card from one that hit an already-dirty card,
+    /// so it is where the duplicate-mark counter is attributed. The arithmetic
+    /// must be exact — `duplicates = offsets consumed - clean→dirty
+    /// transitions` — because `duplicate_mark_ratio` is what argues for or
+    /// against adding a per-thread last-card filter to the barrier.
+    #[test]
+    fn drain_pending_attributes_duplicate_card_marks() {
+        crate::gc_metrics::reset_metrics_for_test();
+        let ct = CardTable::new(0x1000, CARD_SIZE * 4);
+
+        // Six buffered marks landing on three distinct cards: 3 clean→dirty
+        // transitions and 3 duplicates.
+        for offset in [0usize, 4, CARD_SIZE, CARD_SIZE + 8, 2 * CARD_SIZE, 8] {
+            ct.thread_local_dirty(offset);
+        }
+        ct.flush_dirty_buffer();
+        assert_eq!(ct.pending_count(), 6);
+
+        assert_eq!(ct.drain_pending(), 3, "three distinct cards became dirty");
+        assert_eq!(
+            crate::gc_metrics::gc_metrics_raw().duplicate_card_marks,
+            3,
+            "the other three offsets hit a card that was already dirty",
+        );
+
+        // A second drain with nothing pending must not invent duplicates.
+        assert_eq!(ct.drain_pending(), 0);
+        assert_eq!(
+            crate::gc_metrics::gc_metrics_raw().duplicate_card_marks,
+            3,
+            "an empty drain is not a duplicate mark",
+        );
+
+        // Re-dirtying the SAME cards after they have been consumed is three
+        // genuine clean→dirty transitions again, not three duplicates.
+        assert_eq!(ct.take_dirty_cards().len(), 3);
+        for offset in [0usize, CARD_SIZE, 2 * CARD_SIZE] {
+            ct.thread_local_dirty(offset);
+        }
+        ct.flush_dirty_buffer();
+        assert_eq!(ct.drain_pending(), 3);
+        assert_eq!(crate::gc_metrics::gc_metrics_raw().duplicate_card_marks, 3);
+    }
+
+    /// The remembered set's space cost, measured rather than assumed: one byte
+    /// per [`CARD_SIZE`] bytes of covered region, plus the dirty-index tracking
+    /// list, plus the undrained pending queue.
+    #[test]
+    fn retained_bytes_accounts_for_the_byte_map_and_the_queues() {
+        let region = CARD_SIZE * 64;
+        let ct = CardTable::new(0x1000, region);
+        let empty = ct.retained_bytes();
+        assert_eq!(
+            empty,
+            region / CARD_SIZE,
+            "an untouched table costs exactly the card byte-map (1/512 of the \
+             covered region)",
+        );
+
+        for i in 0..16 {
+            ct.thread_local_dirty(i * CARD_SIZE);
+        }
+        ct.flush_dirty_buffer();
+        assert!(
+            ct.retained_bytes() > empty,
+            "buffered old→young edges are retained memory too",
+        );
+        ct.drain_pending();
+        assert!(ct.retained_bytes() > empty, "so is the dirty-card index");
     }
 
     #[test]

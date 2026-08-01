@@ -195,9 +195,12 @@ One of six JIT witness runs on the converted binary failed
 `from Human where ?1 is null` parsed, but its parameter never reached
 `ParameterMetadataImpl`. That is **not** this document's symptom: no
 `SyntaxException` appeared in any of the twelve JIT/`--nojit` witness runs, and
-this shape is a silently missing production rather than a rejected parse. It is
-tracked separately in
-`docs/known-issues/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731.md`;
+this shape is a silently missing production rather than a rejected parse. It was
+tracked separately and is now closed (2026-07-31) in
+`docs/internal/fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`
+— which found and fixed two real defects but never reproduced that
+one-in-fourteen event, so read its "What is and is not proven" before assuming
+the shape is understood;
 `HqlParseStress` now carries parameter queries and a tree-text assertion so the
 fast probe can catch that shape too.
 

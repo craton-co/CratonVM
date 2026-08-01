@@ -1080,6 +1080,7 @@ mod backend_stub;
 #[cfg(not(feature = "cuda"))]
 use backend_stub as backend;
 
+pub mod critical;
 pub mod event;
 pub mod launch;
 pub mod stream;

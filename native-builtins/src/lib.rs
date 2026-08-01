@@ -4079,6 +4079,12 @@ fn native_wildfly_security_manager_get_property_privileged(
     }
 }
 
+/// Per-call-site capability gates for this crate's native surface.
+///
+/// `grep capability_gate:: native-builtins/src` is the complete list of gated
+/// sites here; `docs/security/capability-wiring.md` records which of the audit
+/// rows in `docs/security/native-capabilities.md` they close.
+pub mod capability_gate;
 pub mod case_map;
 pub mod lang_class;
 pub mod lang_string;
@@ -4121,6 +4127,11 @@ pub mod t27_tls;
 pub mod t27_tls_cbc;
 pub mod t3_impl;
 pub mod tls;
+// Deny-by-default guard for the JSSE socket-factory surface: an
+// `SSLSocketFactory`/`SSLServerSocketFactory` overload with no TLS bridge must
+// raise rather than inherit `javax.net.{Socket,ServerSocket}Factory`'s
+// plaintext implementation. See `docs/security/tls-and-jca-failure-audit.md`.
+pub mod tls_deny;
 // Step 1 of the limb-based BigInteger rewrite (docs/biginteger-limb-rewrite-scope.md).
 // Additive only — nothing routes through it yet; later steps migrate the
 // BigInteger natives off the O(digits^2) decimal-string primitives onto this.

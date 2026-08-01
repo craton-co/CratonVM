@@ -31,8 +31,8 @@ use crate::gc::{GcResult, GcStats};
 use crate::gc_flags;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
-    ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, HEADER_SIZE, OBJECT_KIND_OFFSET,
-    SLOT_SIZE,
+    ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, GC_FLAG_OLD_GEN, HEADER_SIZE,
+    OBJECT_KIND_OFFSET, SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::region::{RegionType, RememberedSet};
@@ -527,7 +527,12 @@ impl<'a> SharedEvac<'a> {
         }
 
         let new_header = &mut *(new_ptr as *mut ObjectHeader);
-        if !promote {
+        if promote {
+            // G1AUD-1 — same old-generation stamp as the serial
+            // `evacuate_object`; see the long note there for why the JIT's
+            // inline reference-store fast paths depend on this bit.
+            new_header.gc_flags |= GC_FLAG_OLD_GEN;
+        } else {
             new_header.gc_age = new_header.gc_age.saturating_add(1);
         }
         // Clear the NEW copy's forwarding slot (the memcpy may have copied a
@@ -2057,6 +2062,23 @@ impl G1Collector {
             }
             self.kept_unresolved_any.store(true, Ordering::Release);
         }
+        // Overwrites this pause's young/mixed record on purpose: when a drain
+        // ran, the drain is what the operator needs to see, and `kind` names
+        // it unambiguously. A wedged drain is the one G1 state that silently
+        // converts most of the heap into kept, mostly-garbage regions, so it
+        // must never be invisible.
+        let mut degraded = crate::gc_metrics::g1_degraded::EVACUATION_FAILURE;
+        if !seeds.is_empty() {
+            degraded |= crate::gc_metrics::g1_degraded::EVACUATION_FAILURE_UNRESOLVED;
+        }
+        crate::gc_metrics::record_g1_cycle(
+            crate::gc_metrics::g1_cycle_kind::KEPT_REGION_DRAIN,
+            0,
+            0,
+            0,
+            0,
+            degraded,
+        );
         acc
     }
 
@@ -2314,7 +2336,29 @@ impl G1Collector {
             .map(|(i, _)| i)
             .collect();
 
+        // How many young regions each pin vocabulary kept out of this CSet.
+        // These are the regions the pause CANNOT reclaim, so they belong in
+        // the cycle record: an operator seeing G1 reclaim nothing needs to be
+        // able to tell "nothing was garbage" from "everything was pinned".
+        let (jni_pinned_out, jit_pinned_out) =
+            count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+
         if cset.is_empty() {
+            let mut degraded = crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET;
+            if jni_pinned_out > 0 {
+                degraded |= crate::gc_metrics::g1_degraded::JNI_PINNED_REGIONS_EXCLUDED;
+            }
+            if jit_pinned_out > 0 {
+                degraded |= crate::gc_metrics::g1_degraded::JIT_PINNED_REGIONS_EXCLUDED;
+            }
+            crate::gc_metrics::record_g1_cycle(
+                crate::gc_metrics::g1_cycle_kind::YOUNG,
+                0,
+                0,
+                (jni_pinned_out + jit_pinned_out) as u32,
+                0,
+                degraded,
+            );
             return GcResult {
                 stats: GcStats {
                     objects_copied: 0,
@@ -2324,6 +2368,19 @@ impl G1Collector {
                 pointer_map,
             };
         }
+
+        // A pinned region must never enter a collection set: Phase 5 resets
+        // (zero-fills and re-types) every CSet region that holds no
+        // self-forwarded object, so a pinned region in the CSet is a
+        // relocated-or-freed JNI-critical array — the precise thing
+        // `pin_region_for_addr` promises cannot happen. The filter above is
+        // the enforcement; this states it so a future edit to the predicate
+        // cannot quietly drop a term. Cheap: one pass over a short Vec.
+        debug_assert!(
+            cset.iter()
+                .all(|&i| !regions[i].pinned && !jit_pinned_regions.contains(&i)),
+            "G1 young CSet contains a pinned region"
+        );
 
         // Phase 1: Scan roots and evacuate reachable objects from CSet
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
@@ -2410,6 +2467,21 @@ impl G1Collector {
         // Deliberately NOT added wholesale here: an unconditional walk of
         // pinned regions would resurrect their dead objects' referents every
         // pause (the documented "undead" compounding) for no soundness gain.
+        //
+        // G1AUD-4 (2026-07-31) — the "all ref stores funnel through
+        // `post_write_barrier_rset`" premise above is TRUE for the interpreter
+        // and for every native/JIT-helper store, and is now also true for
+        // JIT-compiled stores into OLD receivers (see the `GC_FLAG_OLD_GEN`
+        // stamp in `evacuate_object`, which routes them to
+        // `jit_putfield_object`). It is NOT yet true for a JIT-compiled
+        // null->non-null `putfield` into a YOUNG receiver: those take an
+        // inline store with no post barrier. That is harmless for an ordinary
+        // young source (every young region is in this CSet, so the holder is
+        // traced) but NOT for a young source held out of the CSet by a JNI
+        // pin, which is reached only through its remembered set. Closing it
+        // requires a `jit/` change (see `docs/gc/g1-audit.md`, defect G1-2);
+        // the debug-only `verify_no_dangling_into_cset` below is the tripwire
+        // in the meantime.
         let mut unique_sources: std::collections::HashSet<usize> = rset_sources
             .iter()
             .flat_map(|(_, srcs)| srcs.iter().copied())
@@ -2417,6 +2489,7 @@ impl G1Collector {
         let dbg_phases = gc_flags().g1_dbg_reach;
         let p1_forwards = pointer_map.len();
         unique_sources.extend(jit_pinned_regions.iter().copied());
+        let rset_sources_scanned = unique_sources.len();
         if dbg_phases {
             eprintln!(
                 "[g1][PHASES] roots={} p1_forwards={p1_forwards} sources={:?}",
@@ -2563,6 +2636,14 @@ impl G1Collector {
             bytes_freed,
         };
         self.record_collection(G1CollectionType::YoungOnly, pause_us, &stats);
+        crate::gc_metrics::record_g1_cycle(
+            crate::gc_metrics::g1_cycle_kind::YOUNG,
+            cset.len() as u32,
+            0,
+            (jni_pinned_out + jit_pinned_out) as u32,
+            rset_sources_scanned as u32,
+            g1_pause_degraded_flags(&pointer_map, jni_pinned_out, jit_pinned_out, false),
+        );
 
         GcResult { stats, pointer_map }
     }
@@ -2709,6 +2790,9 @@ impl G1Collector {
             })
             .map(|(i, _)| i)
             .collect();
+        let cset_young = cset.len();
+        let (jni_pinned_out, jit_pinned_out) =
+            count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
 
         // Select old regions sorted by gc_efficiency (lowest = most
         // garbage first).  See [`Self::select_old_regions_for_mixed_gc`]
@@ -2763,6 +2847,16 @@ impl G1Collector {
         }
 
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
+        // Same invariant as the young path: a pinned region must never enter a
+        // collection set, because Phase 5 resets every CSet region that holds
+        // no self-forwarded object. A mixed CSet is the harder case — it also
+        // takes Old regions, where a long-lived JIT-rooted or JNI-pinned object
+        // is most likely to have ended up.
+        debug_assert!(
+            cset.iter()
+                .all(|&i| !regions[i].pinned && !jit_pinned_regions.contains(&i)),
+            "G1 mixed CSet contains a pinned region"
+        );
         let mut work_list: Vec<*mut u8> = Vec::new();
 
         // Evacuate roots
@@ -2836,6 +2930,7 @@ impl G1Collector {
             set.extend(jit_pinned_regions.iter().copied());
             set
         };
+        let rset_sources_scanned = mixed_rset_sources.len();
 
         for src_idx in mixed_rset_sources {
             self.scan_source_region_for_cset_refs(
@@ -2955,6 +3050,14 @@ impl G1Collector {
             bytes_freed,
         };
         self.record_collection(G1CollectionType::Mixed, pause_us, &stats);
+        crate::gc_metrics::record_g1_cycle(
+            crate::gc_metrics::g1_cycle_kind::MIXED,
+            cset_young as u32,
+            old_selected as u32,
+            (jni_pinned_out + jit_pinned_out) as u32,
+            rset_sources_scanned as u32,
+            g1_pause_degraded_flags(&pointer_map, jni_pinned_out, jit_pinned_out, false),
+        );
 
         GcResult { stats, pointer_map }
     }
@@ -3376,6 +3479,16 @@ impl G1Collector {
             bytes_freed,
         };
         self.record_collection(G1CollectionType::YoungOnly, pause_us, &stats);
+        let (jni_pinned_out, jit_pinned_out) =
+            count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+        crate::gc_metrics::record_g1_cycle(
+            crate::gc_metrics::g1_cycle_kind::YOUNG,
+            cset.len() as u32,
+            0,
+            (jni_pinned_out + jit_pinned_out) as u32,
+            0,
+            g1_pause_degraded_flags(&pointer_map, jni_pinned_out, jit_pinned_out, true),
+        );
         GcResult { stats, pointer_map }
     }
 
@@ -3787,7 +3900,33 @@ impl G1Collector {
 
         // Increment GC age on the new copy
         let new_header = unsafe { &mut *(new_ptr as *mut ObjectHeader) };
-        if !promote {
+        if promote {
+            // G1AUD-1 — stamp the header's old-generation bit on promotion.
+            //
+            // G1 does not need this bit itself (region type is authoritative,
+            // and `region_for_ptr` is O(log R)); the JIT does. Every inline
+            // reference-store fast path in `jit/src/x64.rs` decides "no post
+            // barrier needed" from `gc_flags & GC_FLAG_OLD_GEN == 0`
+            // (`:8778`, `:8846`, `:16741`, `:16810`). The INT-6 mitigation
+            // intended G1 receivers to be routed to the full-barrier helper by
+            // the published-region containment guard instead — but two emitters
+            // reach the same inline store WITHOUT that guard (the
+            // `receiver_is_trusted_oop` arms at `:16707`/`:16795`, which emit a
+            // bare null check, and `emit_inline_fresh_ctor_compact_ref_putfield`
+            // at `:8825`, which emits none). On an unstamped G1 heap every
+            // receiver reads as young there, so a null->non-null store into a
+            // promoted object skipped `post_write_barrier_rset` and the
+            // old->young edge never entered the remembered set — the next young
+            // pause frees the still-live referent (UAF).
+            //
+            // Stamping makes the JIT's own old-generation test fire, which is
+            // the fail-safe direction: the store takes `jit_putfield_object`,
+            // which runs the complete SATB + RSet barrier pair. Nothing inside
+            // this crate reads the bit on a G1 heap (`grep '\.gc_flags'
+            // gc/src/g1.rs`), and `concurrent_mark`'s header validator already
+            // lists it as a known flag, so the stamp is invisible to G1 itself.
+            new_header.gc_flags |= GC_FLAG_OLD_GEN;
+        } else {
             new_header.gc_age = new_header.gc_age.saturating_add(1);
         }
         new_header.forwarding_ptr = std::ptr::null_mut();
@@ -4904,8 +5043,18 @@ impl G1Collector {
         self.mark_saw_implausible.store(false, Ordering::Relaxed);
         // INT-8: the skip set is per-cycle state.
         self.reference_skip.lock().clear();
-        let _ = self.satb_queue.deactivate_and_drain();
+        // G1AUD-2 — leave the marking-active phase BEFORE deactivating the
+        // queue, not after. The reverse order opens a window in which
+        // `is_marking_active()` is still true while the queue is already
+        // INACTIVE: every reference store in that window reads its old value
+        // (the phase gate admits it) and then drops it (the queue gate rejects
+        // it). Harmless for an *abort*, whose bitmap is discarded anyway — but
+        // it is the only place in the collector that violated
+        // `is_marking_active() => satb_queue.is_active()`, so the invariant
+        // could not be asserted globally while it stood. See
+        // `satb_pre_barrier_required`.
         self.gc_state.set_phase(ConcurrentGcPhase::Idle);
+        let _ = self.satb_queue.deactivate_and_drain();
     }
 
     /// Start a concurrent marking cycle. Sets phase to InitialMark.
@@ -4945,6 +5094,16 @@ impl G1Collector {
         // reused address's slot 0 — the VM re-publishes the current set
         // right after this call (still inside the initial-mark STW).
         self.reference_skip.lock().clear();
+        // G1AUD-2 — the queue MUST already be live before the phase becomes
+        // marking-active: the store paths read their old slot value on the
+        // phase and retain it on the queue, so flipping the phase first would
+        // silently drop every edge overwritten in between. See
+        // `satb_pre_barrier_required` for the full statement of the invariant.
+        debug_assert!(
+            self.satb_queue.is_active(),
+            "start_concurrent_mark: the SATB queue must be activated BEFORE the phase \
+             becomes marking-active"
+        );
         self.gc_state.set_phase(ConcurrentGcPhase::ConcurrentMark);
     }
 
@@ -5631,6 +5790,47 @@ impl G1Collector {
                  retaining all regions this cycle (no in-place frees)"
             );
         }
+        // G1AUD-3 — the gray set MUST be empty here.
+        //
+        // Cleanup's in-place free of a zero-live Old region (and the humongous
+        // reclaim below) is sound only if the transitive closure is COMPLETE:
+        // `live_bytes == 0` is read as "every object in this region predates
+        // the mark snapshot and is unreachable in it". A non-empty gray set
+        // means the closure was never driven to a fixed point, so unmarked
+        // does not imply unreachable and the verdict frees live objects.
+        //
+        // The precondition was documented on the driver
+        // (`VmHeap::g1_final_remark_and_cleanup` runs
+        // `while !concurrent_mark_step(usize::MAX) {}` before calling here) and
+        // enforced by nothing — and the sibling driver
+        // `VmHeap::g1_signal_marking_complete`, retained for the abort/teardown
+        // path, calls `cleanup()` with NO remark and NO drain at all. Rather
+        // than trust the caller, detect it and take the same fail-safe the
+        // implausible-header gate takes: retain everything for this cycle. The
+        // next cycle re-derives liveness from scratch, so the cost is one
+        // delayed reclamation, against freeing a live region.
+        //
+        // Lock order is regions -> worklist, matching every other site that
+        // holds both (`marking_keepalive_roots`, `concurrent_mark_step`, and
+        // the post-pause worklist remaps).
+        // Deliberately a warn + retain, NOT a `debug_assert!`: cleanup runs on
+        // a heap that may already be damaged, and the module's own policy (see
+        // the `live_bytes > region.cursor` clamp below) is that it must not
+        // introduce a panic path there. The invariant is pinned by
+        // `cleanup_with_an_undrained_gray_set_retains_every_region` instead,
+        // which is a stronger check than an assertion because it proves the
+        // fail-safe actually retains.
+        let closure_incomplete = !self.mark_worklist.lock().is_empty();
+        if closure_incomplete {
+            tracing::warn!(
+                "g1 cleanup: gray set non-empty at cleanup — the mark closure is \
+                 incomplete; retaining all regions this cycle (no in-place frees). \
+                 Drive `concurrent_mark_step(usize::MAX)` to a fixed point first \
+                 (see `VmHeap::g1_final_remark_and_cleanup`)."
+            );
+        }
+        // Either fail-safe suppresses every reclamation decision this cycle.
+        let retain_all = saw_implausible || closure_incomplete;
         // TAMS guard (see `mark_start_snapshot`): bytes allocated after the
         // mark-start snapshot carry no mark information and MUST count as
         // live, or this pass frees Old regions filled by promotion during
@@ -5786,7 +5986,7 @@ impl G1Collector {
             // by SATB. The empty-snapshot gate keeps the bitmap-only verdict
             // advisory when cleanup is driven outside a real cycle (unit
             // tests) — no in-place free there.
-            if !saw_implausible
+            if !retain_all
                 && !mark_snapshot.is_empty()
                 && region.live_bytes == 0
                 && region.region_type == RegionType::Old
@@ -5803,8 +6003,9 @@ impl G1Collector {
         }
 
         // G1MARK-8: humongous reclaim trusts the same possibly-incomplete
-        // closure — skip it under the fail-safe.
-        if !saw_implausible {
+        // closure — skip it under either fail-safe (G1AUD-3 adds the
+        // undrained-gray-set case to the implausible-header one).
+        if !retain_all {
             self.reclaim_dead_humongous_spans_locked(&mut regions);
         }
 
@@ -5837,6 +6038,20 @@ impl G1Collector {
             }
         }
 
+        // Publish the remembered-set size gauge for G1. Until now
+        // `remembered_set_bytes` described only the generational card table, so
+        // `rset_bytes_per_live_byte` read as zero under `-XX:+UseG1GC` — the
+        // reconciliation item left open by `docs/gc/tlab-and-card-audit.md`
+        // §2.3. Measured here (once per mark cycle, after the prune) rather
+        // than per pause: this is the point at which the set is smallest and
+        // final, and it costs one lock per region on a path that just walked
+        // every region anyway.
+        let rset_sources_total: usize = regions.iter().map(|r| r.rset.source_count()).sum();
+        crate::gc_metrics::record_remembered_set_bytes(
+            (rset_sources_total * std::mem::size_of::<usize>()) as u64,
+        );
+        let pinned_regions = regions.iter().filter(|r| r.pinned).count();
+
         // Refresh the IHOP occupancy statistic NOW: cleanup just freed Old
         // regions and dead humongous spans, and leaving the pre-cleanup sum
         // in place until the next evacuation pause lets
@@ -5848,9 +6063,12 @@ impl G1Collector {
         // deactivate the SATB write barrier — the cycle is fully done.
         self.mark_worklist.lock().clear();
         // Round-9 gc HIGH-5: clear the overflow indicator so the next
-        // cycle starts in a clean state.
-        self.mark_worklist_overflowed
-            .store(false, Ordering::Relaxed);
+        // cycle starts in a clean state. Captured on the way out so the cycle
+        // record can name it: `concurrent_mark_step` clears the flag when it
+        // runs its recovery rescan, so a `true` here means an overflow was
+        // still OUTSTANDING at cleanup (the rescan never ran), which is the
+        // case worth reporting.
+        let overflow_outstanding = self.mark_worklist_overflowed.swap(false, Ordering::Relaxed);
         // INT-8: referent-slot hiding ends with the cycle.
         self.reference_skip.lock().clear();
         // Round-5 CRIT #4: close the SATB barrier with a drain-then-flip
@@ -5872,6 +6090,31 @@ impl G1Collector {
         self.marking_complete.store(true, Ordering::Release);
         self.mixed_gc_remaining
             .store(self.config.mixed_gc_count_target as u64, Ordering::Relaxed);
+
+        // State what this cleanup decided, including any fail-safe it took.
+        // Without this an operator watching G1 fail to reclaim old gen cannot
+        // tell "the closure was abandoned" from "there is no garbage".
+        let mut degraded = crate::gc_metrics::g1_degraded::NONE;
+        if saw_implausible {
+            degraded |= crate::gc_metrics::g1_degraded::MARK_IMPLAUSIBLE_HEADER;
+        }
+        if closure_incomplete {
+            degraded |= crate::gc_metrics::g1_degraded::CLEANUP_CLOSURE_INCOMPLETE;
+        }
+        if overflow_outstanding {
+            degraded |= crate::gc_metrics::g1_degraded::MARK_WORKLIST_OVERFLOW;
+        }
+        if pinned_regions > 0 {
+            degraded |= crate::gc_metrics::g1_degraded::JNI_PINNED_REGIONS_EXCLUDED;
+        }
+        crate::gc_metrics::record_g1_cycle(
+            crate::gc_metrics::g1_cycle_kind::CONCURRENT_CLEANUP,
+            0,
+            0,
+            pinned_regions as u32,
+            rset_sources_total as u32,
+            degraded,
+        );
     }
 
     /// Reclaim dead humongous spans after a mark cycle.
@@ -6605,6 +6848,41 @@ impl G1Collector {
         if self.satb_queue.is_active() {
             crate::satb::satb_thread_local_log(&self.satb_queue, old_ref);
         }
+    }
+
+    /// Is the SATB pre-barrier obligation in force for a store happening now?
+    ///
+    /// This is `gc_state.is_marking_active()` plus the assertion that makes the
+    /// two-flag gate safe. A reference store logs its old value only when BOTH
+    /// the phase says marking is active (that is what makes the store path read
+    /// the old slot at all) AND the queue is active (that is what makes
+    /// `satb_pre_barrier` retain the value). If a window ever existed where the
+    /// phase said "marking" while the queue was already/still inactive, every
+    /// store in that window would read its old value and then throw it away —
+    /// a silently lost snapshot edge, which is exactly the mark-completeness
+    /// hole SATB exists to close.
+    ///
+    /// The invariant `is_marking_active() => satb_queue.is_active()` is
+    /// established by the ORDER of the two state changes:
+    ///
+    /// * [`Self::start_concurrent_mark`] calls `satb_queue.activate()` while
+    ///   the phase is still `InitialMark` (not marking-active) and only then
+    ///   flips it to `ConcurrentMark`;
+    /// * [`Self::cleanup`] and [`Self::abort_concurrent_mark`] leave the
+    ///   marking-active phases BEFORE `deactivate_and_drain()`.
+    ///
+    /// Both orderings are load-bearing and neither was checked anywhere, so
+    /// this `debug_assert!` is the tripwire for a future reordering.
+    #[inline]
+    fn satb_pre_barrier_required(&self) -> bool {
+        let marking = self.gc_state.is_marking_active();
+        debug_assert!(
+            !marking || self.satb_queue.is_active(),
+            "G1 SATB gate is half-open: the concurrent-mark phase is active but the SATB \
+             queue is not, so this store would read its old reference value and then \
+             discard it. See `G1Collector::satb_pre_barrier_required`."
+        );
+        marking
     }
 
     /// Post-write barrier: track cross-region references in remembered sets.
@@ -7417,7 +7695,7 @@ impl GarbageCollector for G1Collector {
         // reference processing depends on. The TLS read is gated behind the
         // marking-active check, so the non-marking hot path pays nothing.
         let is_ref_store = matches!(value, Value::Object(_));
-        if is_ref_store && self.gc_state.is_marking_active() && !satb_pre_suppressed() {
+        if is_ref_store && self.satb_pre_barrier_required() && !satb_pre_suppressed() {
             let old = self.get_field(obj, index);
             if let Value::Object(Some(old_ref)) = old {
                 self.satb_pre_barrier(old_ref.as_ptr() as usize);
@@ -7621,7 +7899,7 @@ impl GarbageCollector for G1Collector {
                 HEADER_SIZE + crate::heap::array_data_size(len, element_type).unwrap_or(0);
             let span = self.humongous_span(&regions, obj, total_size);
 
-            if is_ref && self.gc_state.is_marking_active() && !satb_pre_suppressed() {
+            if is_ref && self.satb_pre_barrier_required() && !satb_pre_suppressed() {
                 let mut old_raw = [0u8; 8];
                 let read_ok = match span {
                     Some((start, total_payload)) => self.humongous_copy(
@@ -7745,6 +8023,17 @@ impl GarbageCollector for G1Collector {
                 regions.len(), free, eden, survivor, old, pinned
             );
         }
+        // Name the backend in the process-wide decision report. G1 has no
+        // young-moving *choice* to record — its collection set is always
+        // evacuated — but a report that stays silent under `-XX:+UseG1GC` is
+        // exactly how the `docs/GC.md` drift went unnoticed for the
+        // generational path. Recording the constant answer makes "which
+        // collector produced this summary?" a question the runtime answers.
+        crate::gc_metrics::record_collector_decision(
+            "g1",
+            crate::gc_metrics::decision_reason::MOVING_BACKEND_ALWAYS_EVACUATES,
+            crate::gc_quiescence::incomplete_reason::NONE,
+        );
         let pause_start = std::time::Instant::now();
         let result = if self.needs_mixed_gc() {
             self.mixed_collection(roots, monitors)
@@ -7885,6 +8174,71 @@ fn consume_satb_pre_barrier_epoch() -> bool {
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
+
+/// Assemble the [`crate::gc_metrics::g1_degraded`] mask for one evacuation
+/// pause from the facts the pause already computed.
+///
+/// An identity entry (`key == value`) in the forwarding map IS the definition
+/// of an evacuation failure: `evacuate_object` installs one when no to-space
+/// could be allocated, and `free_or_keep_cset` reads exactly the same predicate
+/// to decide which regions it must keep. Deriving the flag from the map rather
+/// than from a separate counter is what stops the report and the reclamation
+/// decision from ever disagreeing.
+fn g1_pause_degraded_flags(
+    pointer_map: &HashMap<usize, usize>,
+    jni_pinned_out: usize,
+    jit_pinned_out: usize,
+    parallel: bool,
+) -> u32 {
+    use crate::gc_metrics::g1_degraded as flag;
+    let mut degraded = flag::NONE;
+    if pointer_map.iter().any(|(k, v)| k == v) {
+        degraded |= flag::EVACUATION_FAILURE;
+    }
+    if jni_pinned_out > 0 {
+        degraded |= flag::JNI_PINNED_REGIONS_EXCLUDED;
+    }
+    if jit_pinned_out > 0 {
+        degraded |= flag::JIT_PINNED_REGIONS_EXCLUDED;
+    }
+    if parallel {
+        degraded |= flag::PARALLEL_EVACUATOR;
+    }
+    degraded
+}
+
+/// How many *young* (Eden/Survivor) regions each pin vocabulary kept out of a
+/// collection set, as `(jni_no_relocation_pins, jit_conservative_root_pins)`.
+///
+/// The two vocabularies are deliberately counted apart because they mean
+/// different things and are fixed by different people: `G1Region::pinned` is a
+/// JNI critical section the application controls, while
+/// `G1Collector::jit_pinned_region_set` is a conservative JIT root (or a frozen
+/// peer's un-retired TLAB tail) the runtime could in principle make precise. A
+/// region carrying both is attributed to the JNI pin, which is the one that
+/// will not go away on its own.
+///
+/// (A third, unrelated "pin" exists — `crate::pinned`, the process-global
+/// keep-alive address set — which does NOT imply no-relocation and is not
+/// counted here. See `docs/threading/objectref-concurrency-contract.md`.)
+fn count_young_regions_pinned_out(
+    regions: &[G1Region],
+    jit_pinned: &std::collections::HashSet<usize>,
+) -> (usize, usize) {
+    let mut jni = 0usize;
+    let mut jit = 0usize;
+    for (i, r) in regions.iter().enumerate() {
+        if r.region_type != RegionType::Eden && r.region_type != RegionType::Survivor {
+            continue;
+        }
+        if r.pinned {
+            jni += 1;
+        } else if jit_pinned.contains(&i) {
+            jit += 1;
+        }
+    }
+    (jni, jit)
+}
 
 /// Find the first free region.
 fn find_free_region(regions: &[G1Region]) -> Option<usize> {
@@ -12742,5 +13096,535 @@ mod tests {
             gc.needs_gc_free_percent.load(Ordering::Relaxed) < raised,
             "a clean pause must decay the trigger back toward baseline"
         );
+    }
+
+    // =======================================================================
+    // G1 correctness audit (docs/gc/g1-audit.md)
+    // =======================================================================
+
+    use crate::gc_metrics::{g1_cycle_kind, g1_degraded, last_g1_cycle};
+
+    /// G1AUD-1 — promotion must stamp `GC_FLAG_OLD_GEN`.
+    ///
+    /// G1 itself never reads the bit; the JIT does. Every inline
+    /// reference-store fast path in `jit/src/x64.rs` treats a receiver with the
+    /// bit clear as "young, no post barrier needed". On an unstamped G1 heap
+    /// every promoted object read as young, so a JIT-compiled null->non-null
+    /// store into it skipped `post_write_barrier_rset` and the old->young edge
+    /// never reached the remembered set.
+    #[test]
+    fn promotion_stamps_the_old_generation_bit_the_jit_barrier_reads() {
+        let mut cfg = small_config();
+        cfg.promotion_age = 1;
+        let gc = G1Collector::new(cfg);
+
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        assert_eq!(
+            gc.get_header(obj).gc_flags & GC_FLAG_OLD_GEN,
+            0,
+            "a freshly allocated Eden object is young"
+        );
+
+        // Pass 1: age 0 < promotion_age 1 => Survivor, still young.
+        let mut roots = vec![obj];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        assert_eq!(
+            gc.get_header(roots[0]).gc_flags & GC_FLAG_OLD_GEN,
+            0,
+            "a Survivor copy is still young and MUST NOT be stamped — stamping it \
+             would send every JIT store on a survivor down the helper for nothing"
+        );
+
+        // Pass 2: age 1 >= promotion_age 1 => promoted to Old, stamped.
+        gc.young_collection(&mut roots, &NoopMonitors);
+        let promoted = gc
+            .lookup_region_for_addr(roots[0].as_ptr() as usize)
+            .expect("promoted object is in a region");
+        assert_eq!(
+            gc.regions.lock()[promoted].region_type,
+            RegionType::Old,
+            "the object should have been promoted by the second pass"
+        );
+        assert_ne!(
+            gc.get_header(roots[0]).gc_flags & GC_FLAG_OLD_GEN,
+            0,
+            "a promoted object MUST carry GC_FLAG_OLD_GEN so the JIT's inline \
+             reference-store fast paths bail to the full-barrier helper"
+        );
+    }
+
+    /// The stamp must not clobber the layout bit that decides how the object is
+    /// read back — a promoted compact instance that lost `GC_FLAG_COMPACT`
+    /// would be walked with the legacy 16-byte-cell stride.
+    #[test]
+    fn the_old_generation_stamp_preserves_every_other_header_flag() {
+        let mut cfg = small_config();
+        cfg.promotion_age = 1;
+        let gc = G1Collector::new(cfg);
+
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        // `GC_FLAG_MARKED` is the safe sentinel here: G1 keeps liveness in
+        // per-region bitmaps and never reads this bit, whereas `GC_FLAG_COMPACT`
+        // changes how `object_total_size` measures the object and would make
+        // the test's own evacuation stride disagree with the allocation.
+        let sentinel = cratonvm_types::GC_FLAG_MARKED;
+        unsafe {
+            let h = &mut *(obj.as_ptr() as *mut ObjectHeader);
+            h.gc_flags |= sentinel;
+        }
+
+        let mut roots = vec![obj];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        let flags = gc.get_header(roots[0]).gc_flags;
+        assert_ne!(flags & GC_FLAG_OLD_GEN, 0, "promoted");
+        assert_ne!(
+            flags & sentinel,
+            0,
+            "the promotion stamp must OR the old-gen bit in, never overwrite the \
+             flags byte"
+        );
+    }
+
+    /// G1AUD-2 — `is_marking_active() => satb_queue.is_active()`.
+    ///
+    /// A reference store reads its old slot value on the PHASE and retains it
+    /// on the QUEUE. A window where the phase says "marking" but the queue is
+    /// off silently discards every edge overwritten in it.
+    #[test]
+    fn the_satb_gate_is_never_half_open_across_a_whole_cycle() {
+        let gc = make_collector();
+        let check = |where_: &str| {
+            if gc.gc_state.is_marking_active() {
+                assert!(
+                    gc.satb_queue.is_active(),
+                    "SATB gate half-open at {where_}: marking is active but the \
+                     queue is not, so overwritten references are being dropped"
+                );
+            }
+        };
+
+        check("idle");
+        gc.start_concurrent_mark();
+        check("after start_concurrent_mark");
+        assert!(gc.gc_state.is_marking_active() && gc.satb_queue.is_active());
+
+        gc.remark(&[]);
+        check("after remark");
+
+        gc.abort_concurrent_mark();
+        check("after abort");
+        assert!(
+            !gc.gc_state.is_marking_active(),
+            "abort must leave the marking phase"
+        );
+        assert!(!gc.satb_queue.is_active(), "abort must close the queue");
+    }
+
+    /// The abort path used to deactivate the queue BEFORE leaving the marking
+    /// phase, which is the only ordering in the collector that opened the
+    /// window above. Pin the order explicitly, because reversing it back would
+    /// still leave the end state this test's sibling checks.
+    #[test]
+    fn abort_leaves_the_marking_phase_before_closing_the_satb_queue() {
+        let gc = make_collector();
+        gc.start_concurrent_mark();
+        assert!(gc.gc_state.is_marking_active());
+        assert!(gc.satb_queue.is_active());
+        gc.abort_concurrent_mark();
+        // Both ends observable only after the fact, so assert the invariant
+        // that the ordering exists to preserve: at no point may the phase be
+        // marking-active with the queue closed. The end state has BOTH off.
+        assert!(!gc.gc_state.is_marking_active());
+        assert!(!gc.satb_queue.is_active());
+    }
+
+    /// SATB completeness for the store paths this crate owns: a reference
+    /// overwrite performed through `set_field` while marking is active must
+    /// deliver the OLD value to the marker, not the new one.
+    #[test]
+    fn set_field_logs_the_overwritten_reference_while_marking() {
+        let gc = make_collector();
+        let holder = gc.alloc_object(ClassId::new(1), 1);
+        let old = gc.alloc_object(ClassId::new(2), 0);
+        let new = gc.alloc_object(ClassId::new(3), 0);
+        gc.set_field(holder, 0, Value::Object(Some(old)));
+
+        gc.start_concurrent_mark();
+        gc.set_field(holder, 0, Value::Object(Some(new)));
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+
+        let logged = gc.satb_queue().drain();
+        assert!(
+            logged.contains(&(old.as_ptr() as usize)),
+            "the pre-barrier must log the OLD value: {logged:?}"
+        );
+        assert!(
+            !logged.contains(&(new.as_ptr() as usize)),
+            "the pre-barrier must not log the value being stored: {logged:?}"
+        );
+    }
+
+    /// Same obligation on the array path — `set_array_element` reads the old
+    /// element inside the SAME regions critical section as the store.
+    #[test]
+    fn set_array_element_logs_the_overwritten_reference_while_marking() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Reference, 2);
+        let old = gc.alloc_object(ClassId::new(2), 0);
+        let new = gc.alloc_object(ClassId::new(3), 0);
+        gc.set_array_element(arr, 0, Value::Object(Some(old)))
+            .expect("in bounds");
+
+        gc.start_concurrent_mark();
+        gc.set_array_element(arr, 0, Value::Object(Some(new)))
+            .expect("in bounds");
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+
+        let logged = gc.satb_queue().drain();
+        assert!(
+            logged.contains(&(old.as_ptr() as usize)),
+            "aastore's pre-barrier must log the OLD element: {logged:?}"
+        );
+    }
+
+    /// No SATB traffic at all outside a mark cycle: the barrier's cost when
+    /// idle is one Acquire load, and a run that logs while idle would grow the
+    /// shards without bound with nobody to drain them.
+    #[test]
+    fn no_reference_is_logged_when_no_mark_cycle_is_active() {
+        let gc = make_collector();
+        let holder = gc.alloc_object(ClassId::new(1), 1);
+        let old = gc.alloc_object(ClassId::new(2), 0);
+        let new = gc.alloc_object(ClassId::new(3), 0);
+        gc.set_field(holder, 0, Value::Object(Some(old)));
+        gc.set_field(holder, 0, Value::Object(Some(new)));
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+        assert!(gc.satb_queue().is_empty());
+    }
+
+    /// Retype the region holding `obj` and hand back its index.
+    fn retype_region_of(gc: &G1Collector, addr: usize, ty: RegionType) -> usize {
+        let idx = gc
+            .lookup_region_for_addr(addr)
+            .expect("address is inside a region");
+        gc.with_regions_mut(|rs| rs[idx].region_type = ty);
+        idx
+    }
+
+    /// G1AUD-3 — cleanup's in-place free is sound only on a COMPLETE closure.
+    /// The baseline: with the gray set drained, a zero-live Old region is
+    /// recycled.
+    #[test]
+    fn cleanup_frees_a_zero_live_old_region_when_the_closure_is_complete() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        let idx = retype_region_of(&gc, obj.as_ptr() as usize, RegionType::Old);
+
+        gc.start_concurrent_mark();
+        assert!(gc.mark_worklist.lock().is_empty());
+        gc.cleanup();
+
+        assert_eq!(
+            gc.regions.lock()[idx].region_type,
+            RegionType::Free,
+            "an unmarked Old region under a complete closure is garbage"
+        );
+    }
+
+    /// ...and the fail-safe: with a gray entry still outstanding, "unmarked"
+    /// does not imply "unreachable", so nothing may be freed. The precondition
+    /// was documented on `VmHeap::g1_final_remark_and_cleanup` and enforced by
+    /// nothing — and its sibling `g1_signal_marking_complete` calls `cleanup()`
+    /// with no remark and no drain at all.
+    #[test]
+    fn cleanup_with_an_undrained_gray_set_retains_every_region() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        let idx = retype_region_of(&gc, obj.as_ptr() as usize, RegionType::Old);
+
+        gc.start_concurrent_mark();
+        // One gray entry the marker never got to. Its address is irrelevant —
+        // what matters is that the closure is not at a fixed point.
+        gc.mark_worklist.lock().push(obj.as_ptr() as usize);
+        gc.cleanup();
+
+        assert_eq!(
+            gc.regions.lock()[idx].region_type,
+            RegionType::Old,
+            "cleanup must NOT free a region on an incomplete mark closure"
+        );
+        let facts = last_g1_cycle().expect("cleanup records a cycle");
+        assert_eq!(facts.kind, g1_cycle_kind::CONCURRENT_CLEANUP);
+        assert_ne!(
+            facts.degraded & g1_degraded::CLEANUP_CLOSURE_INCOMPLETE,
+            0,
+            "the fail-safe must be visible in the cycle record, not silent"
+        );
+    }
+
+    /// The humongous reclaimer trusts the same closure, so it must be
+    /// suppressed by the same fail-safe.
+    #[test]
+    fn cleanup_with_an_undrained_gray_set_also_spares_humongous_spans() {
+        let gc = make_collector();
+        // Two regions' worth: HumongousStart + one continuation.
+        let big = gc.alloc_array(
+            ClassId::new(1),
+            ArrayElementType::Long,
+            small_config().region_size / 8,
+        );
+        let start = gc
+            .lookup_region_for_addr(big.as_ptr() as usize)
+            .expect("humongous start region");
+        assert_eq!(
+            gc.regions.lock()[start].region_type,
+            RegionType::HumongousStart
+        );
+
+        gc.start_concurrent_mark();
+        gc.mark_worklist.lock().push(big.as_ptr() as usize);
+        gc.cleanup();
+
+        assert_eq!(
+            gc.regions.lock()[start].region_type,
+            RegionType::HumongousStart,
+            "an unmarked humongous span must survive an incomplete closure"
+        );
+    }
+
+    /// A humongous span occupies a physically contiguous run: one
+    /// `HumongousStart` carrying the whole object size as its cursor, then
+    /// `HumongousContinuation` regions with cursor 0 so walkers skip them.
+    /// Every walker in this file derives the span extent from that shape.
+    #[test]
+    fn a_humongous_span_is_a_contiguous_start_plus_continuations() {
+        let gc = make_collector();
+        let region_size = small_config().region_size;
+        let big = gc.alloc_array(ClassId::new(1), ArrayElementType::Long, region_size / 8);
+        let start = gc
+            .lookup_region_for_addr(big.as_ptr() as usize)
+            .expect("humongous start region");
+
+        let regions = gc.regions.lock();
+        assert_eq!(regions[start].region_type, RegionType::HumongousStart);
+        let total = regions[start].cursor;
+        assert!(total > region_size, "the object spans more than one region");
+        let needed = total.div_ceil(region_size).max(1);
+        for r in &regions[start + 1..start + needed] {
+            assert_eq!(
+                r.region_type,
+                RegionType::HumongousContinuation,
+                "every region a span owns must be typed as a continuation — the \
+                 reclaimer refuses to free a span whose shape disagrees"
+            );
+            assert_eq!(r.cursor, 0, "continuations must be invisible to walkers");
+        }
+        // The object's first and last byte are inside the reserved run.
+        let base = regions[start].data.addr();
+        assert_eq!(big.as_ptr() as usize, base);
+        assert!(total <= needed * region_size);
+    }
+
+    /// Region pinning, no-relocation vocabulary: a pinned region must never
+    /// enter a collection set, because Phase 5 zero-fills and re-types every
+    /// CSet region that holds no self-forwarded object. That is what lets
+    /// `pin_region_for_addr` promise a JNI critical section a stable address.
+    #[test]
+    fn a_pinned_region_is_never_evacuated() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        let before = obj.as_ptr() as usize;
+        let idx = gc.pin_region_for_addr(before).expect("region for object");
+        assert!(gc.is_pinned(idx));
+
+        let mut roots = vec![obj];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            roots[0].as_ptr() as usize,
+            before,
+            "an object in a pinned region must not move"
+        );
+        assert!(
+            result.pointer_map.is_empty(),
+            "a pinned-only heap has nothing to evacuate"
+        );
+        assert_ne!(
+            gc.regions.lock()[idx].region_type,
+            RegionType::Free,
+            "a pinned region must not be freed"
+        );
+        let facts = last_g1_cycle().expect("the pause records a cycle");
+        assert_ne!(
+            facts.degraded & g1_degraded::JNI_PINNED_REGIONS_EXCLUDED,
+            0,
+            "a pause that could not collect because of a pin must say so"
+        );
+    }
+
+    /// Pins are refcounted: overlapping critical sections release
+    /// independently, and the region only becomes collectable again when the
+    /// last one is gone.
+    #[test]
+    fn overlapping_pins_release_independently() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        let idx = gc.pin_region_for_addr(obj.as_ptr() as usize).unwrap();
+        let idx2 = gc.pin_region_for_addr(obj.as_ptr() as usize).unwrap();
+        assert_eq!(idx, idx2);
+
+        gc.unpin_region(idx);
+        assert!(
+            gc.is_pinned(idx),
+            "one release must not drop the other section's pin"
+        );
+        gc.unpin_region(idx);
+        assert!(!gc.is_pinned(idx));
+
+        // Unbalanced extra release must not underflow into a wrong state.
+        gc.unpin_region(idx);
+        assert!(!gc.is_pinned(idx));
+    }
+
+    /// Evacuation failure: with no to-space anywhere, a reached object is
+    /// self-forwarded IN PLACE and its region is kept rather than freed.
+    /// Dropping it instead would leave every referrer pointing into a region
+    /// Phase 5 had just reset.
+    #[test]
+    fn evacuation_failure_self_forwards_and_keeps_the_region() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        let before = obj.as_ptr() as usize;
+        let home = gc
+            .lookup_region_for_addr(before)
+            .expect("object is in a region");
+
+        // Put EVERY region into the collection set (Eden), so
+        // `alloc_in_type_locked` can find neither a non-CSet destination nor a
+        // Free region.
+        gc.with_regions_mut(|rs| {
+            for r in rs.iter_mut() {
+                r.region_type = RegionType::Eden;
+            }
+        });
+
+        let mut roots = vec![obj];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            roots[0].as_ptr() as usize,
+            before,
+            "a self-forwarded object stays at its own address"
+        );
+        assert_eq!(
+            result.pointer_map.get(&before),
+            Some(&before),
+            "the identity forward is what Phase 5 reads to keep the region"
+        );
+        assert_eq!(
+            gc.regions.lock()[home].region_type,
+            RegionType::Survivor,
+            "a kept Eden region is retyped to Survivor, not freed"
+        );
+        let facts = last_g1_cycle().expect("the pause records a cycle");
+        assert_ne!(
+            facts.degraded & g1_degraded::EVACUATION_FAILURE,
+            0,
+            "an evacuation failure must be visible in the cycle record"
+        );
+    }
+
+    /// Remembered sets: the mutator post-barrier records EVERY cross-region
+    /// edge (including young->young, which a JNI-pinned holder depends on),
+    /// and never records a same-region one.
+    #[test]
+    fn the_post_write_barrier_records_every_cross_region_edge() {
+        let gc = make_collector();
+        let holder = gc.alloc_object(ClassId::new(1), 1);
+        let src = gc
+            .lookup_region_for_addr(holder.as_ptr() as usize)
+            .expect("holder region");
+
+        // Same-region target: nothing to remember.
+        let near = gc.alloc_object(ClassId::new(2), 0);
+        gc.set_field(holder, 0, Value::Object(Some(near)));
+        let near_region = gc
+            .lookup_region_for_addr(near.as_ptr() as usize)
+            .expect("target region");
+        if near_region == src {
+            assert!(
+                gc.regions.lock()[near_region].rset.sources().is_empty(),
+                "a same-region edge must not enter a remembered set"
+            );
+        }
+
+        // Cross-region target: the edge must be remembered against the TARGET.
+        let far_region = (src + 1) % gc.num_regions();
+        let far_addr = {
+            let mut regions = gc.regions.lock();
+            regions[far_region].region_type = RegionType::Old;
+            let (ptr, _) = regions[far_region]
+                .bump_alloc(HEADER_SIZE, 8)
+                .expect("room in a fresh region");
+            ptr as usize
+        };
+        gc.post_write_barrier_rset(holder, unsafe {
+            ObjectRef::from_raw(far_addr as *mut u8)
+        });
+        assert!(
+            gc.regions.lock()[far_region].rset.sources().contains(&src),
+            "the holder's region must be recorded as a source of the target's rset"
+        );
+    }
+
+    /// Region recycling must not leave a target remembering a source that no
+    /// longer holds anything: `reset()` clears the recycled region's OWN rset,
+    /// and `cleanup` prunes entries naming a now-Free source. Without the
+    /// prune a recycled index is re-walked wholesale once it is re-typed,
+    /// resurrecting dead objects' referents.
+    #[test]
+    fn recycling_a_region_drops_the_stale_remembered_set_edges() {
+        let gc = make_collector();
+        let target = 1usize;
+        let source = 2usize;
+        gc.with_regions_mut(|rs| {
+            // Survivor, not Old: cleanup's in-place free applies only to Old
+            // regions, and the point of this test is the PRUNE, not the free.
+            rs[target].region_type = RegionType::Survivor;
+            rs[source].region_type = RegionType::Old;
+            rs[target].rset.add_reference(source);
+        });
+        assert!(gc.regions.lock()[target].rset.sources().contains(&source));
+
+        // The SOURCE is recycled. Its own rset is cleared by `reset`...
+        gc.with_regions_mut(|rs| rs[source].reset());
+        assert!(gc.regions.lock()[source].rset.sources().is_empty());
+
+        // ...and cleanup prunes the now-dangling entry naming it.
+        gc.start_concurrent_mark();
+        gc.cleanup();
+        assert!(
+            !gc.regions.lock()[target].rset.sources().contains(&source),
+            "an entry naming a Free source must be pruned, not carried forever"
+        );
+    }
+
+    /// The G1 cycle record must reach the shared decision report, so a
+    /// `--verbose:gc` run under `-XX:+UseG1GC` states which collector produced
+    /// the summary and what it was unable to do.
+    #[test]
+    fn a_g1_pause_states_its_own_decision_in_the_report() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        let mut roots = vec![obj];
+        gc.collect_garbage(&stw(), &mut roots, &NoopMonitors);
+
+        let text = crate::gc_metrics::collector_decision_report();
+        assert!(text.contains("backend=g1"), "{text}");
+        assert!(text.contains("young=MOVING"), "{text}");
+        assert!(text.contains("[GC] g1 cycle"), "{text}");
+        assert!(text.contains("kind=young"), "{text}");
     }
 }

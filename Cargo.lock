@@ -461,6 +461,7 @@ name = "cratonvm-classloading"
 version = "0.3.0"
 dependencies = [
  "const-oid",
+ "cratonvm-jfr",
  "cratonvm-jit-api",
  "cratonvm-native-api",
  "cratonvm-native-builtins-crypto",
@@ -492,6 +493,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cratonvm-cuda-bridge",
+ "cratonvm-jfr",
  "cratonvm-jit",
  "cratonvm-native-api",
  "cratonvm-native-builtins",
@@ -511,6 +513,7 @@ dependencies = [
  "bytemuck",
  "cudarc",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -535,6 +538,7 @@ dependencies = [
 name = "cratonvm-gc"
 version = "0.3.0"
 dependencies = [
+ "cratonvm-jfr",
  "cratonvm-jit",
  "cratonvm-types",
  "loom",
@@ -565,6 +569,7 @@ version = "0.3.0"
 dependencies = [
  "arc-swap",
  "cratonvm-gc",
+ "cratonvm-jfr",
  "cratonvm-jit-api",
  "cratonvm-reader",
  "cratonvm-types",

@@ -18,7 +18,11 @@
 //! single-pass `x64::compile`.
 
 use crate::JitInvokeInfo;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Node identity ────────────────────────────────────────────────────
 
@@ -431,6 +435,397 @@ impl Op {
     }
 }
 
+// ── Compact edge lists ───────────────────────────────────────────────
+
+/// Number of edges an [`Inputs`] list stores inline before spilling to the heap.
+///
+/// Picked from the arity of the node constructors in this file — every
+/// non-test `Graph::add` call site, counted mechanically:
+///
+/// | inputs | call sites | constructors |
+/// |--------|-----------:|--------------|
+/// | 0      | 6          | `Const`, `ConstF`, `Param`, `Start` |
+/// | 1      | 10         | `Proj`, `Neg`, the `I2L`/`L2I`/… conversions |
+/// | 2      | 7          | `Add`/`Sub`/`Mul`/`Cmp`, `Return [ctrl, val]`, `If [ctrl, cmp]` |
+/// | 3      | 0          | — |
+/// | 4      | 3          | `Load [ctrl, mem, base, offset]` |
+/// | 5      | 3          | `Store [ctrl, mem, base, offset, value]` |
+///
+/// 29 fixed-arity sites, none wider than 5, plus 11 variable-arity ones: `Phi`
+/// (`1 + preds`, 3 sites), `Merge`/`Region` (`preds`) and `Op::Call`
+/// (`[ctrl, mem, args…]`, i.e. `2 + args`). A capacity of **5** therefore
+/// covers every fixed-arity constructor in the IR — including the widest one,
+/// `Op::Store` — a φ over up to four predecessors, and a call with up to three
+/// arguments. Only genuinely wide merges and many-argument calls spill. (The
+/// *dynamic* distribution is even more concentrated: `Op::Const` and
+/// `Op::Param` nodes dominate a real graph and carry no edges at all.)
+///
+/// The capacity is free in memory terms: the spilled variant carries a `Vec`
+/// (24 bytes on 64-bit), so any inline buffer up to that size rounds to the
+/// same enum footprint. Dropping to 2 would save nothing and spill the whole
+/// `Load`/`Store` family.
+pub const INLINE_INPUTS: usize = 5;
+
+thread_local! {
+    /// Monotonic counter bumped by every edge write that does **not** go
+    /// through a [`Graph`] mutator.
+    ///
+    /// `Node::inputs` is a public field, and several files in this crate still
+    /// rewrite edges through it directly (`graph.nodes[i].inputs[0] = x`,
+    /// `.push(..)`, `.iter_mut()`). Those writes cannot maintain a use list,
+    /// and a *missed* one would make [`Graph::replace_all_uses`] silently skip
+    /// a real reference. Every mutating entry point on [`Inputs`] therefore
+    /// bumps this counter; a [`Graph`] records the value it last reconciled
+    /// with in its [`UseLists`], and any mismatch demotes the next mutation to
+    /// the full scan (which also rebuilds the lists). The guard is
+    /// conservative in the safe direction: an unrelated graph's edit only
+    /// costs one rebuild, never correctness.
+    static EDGE_EPOCH: Cell<u64> = Cell::new(1);
+
+    /// Identity of this thread, so a graph cannot mistake *another* thread's
+    /// epoch for its own.
+    ///
+    /// The epoch is per-thread (a process-wide counter would let one compiler
+    /// thread's edge write invalidate every other thread's use lists, which
+    /// costs a rebuild per pass and gives back the whole win). A graph is
+    /// `Send`, though, so it could in principle be stamped on one thread, made
+    /// stale there, and then consulted on a thread whose counter happens to
+    /// hold the same value. Pairing the epoch with a thread token makes that
+    /// coincidence impossible: a graph reconciled on another thread simply
+    /// reads as stale.
+    static THREAD_TOKEN: u64 = NEXT_THREAD_TOKEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Source of the per-thread tokens. Never 0, so `UseLists::new()` (owner 0)
+/// can never be mistaken for a reconciled state.
+static NEXT_THREAD_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Note an untracked edge write. See [`EDGE_EPOCH`].
+#[inline]
+fn bump_edge_epoch() {
+    EDGE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+}
+
+/// The current edge epoch. See [`EDGE_EPOCH`].
+#[inline]
+fn edge_epoch() -> u64 {
+    EDGE_EPOCH.with(|e| e.get())
+}
+
+/// This thread's identity. See [`THREAD_TOKEN`].
+#[inline]
+fn thread_token() -> u64 {
+    THREAD_TOKEN.with(|t| *t)
+}
+
+/// A node's edge list: up to [`INLINE_INPUTS`] ids stored inline, spilling to
+/// a heap `Vec` past that.
+///
+/// Externally this behaves like the `Vec<NodeId>` it replaces — it derefs to
+/// `[NodeId]`, so indexing, slicing, `len()`, `iter()`, `first()`, `get()`,
+/// `contains()`, `swap()` and `&node.inputs` → `&[NodeId]` coercion all work
+/// unchanged — plus inherent `push`/`pop`/`clear` and `PartialEq` against
+/// `Vec<NodeId>`. Only struct-literal construction differs: write
+/// `Inputs::new()` or `vec![…].into()` instead of a bare `vec![…]`.
+///
+/// It is also the storage for the maintained use lists in [`UseLists`], where
+/// the same "a handful of entries, no allocation" shape applies.
+#[derive(Clone, Default)]
+pub struct Inputs(InputsRepr);
+
+#[derive(Clone)]
+enum InputsRepr {
+    Inline {
+        len: u8,
+        buf: [NodeId; INLINE_INPUTS],
+    },
+    Spilled(Vec<NodeId>),
+}
+
+impl Default for InputsRepr {
+    fn default() -> Self {
+        InputsRepr::Inline {
+            len: 0,
+            buf: [0; INLINE_INPUTS],
+        }
+    }
+}
+
+impl Inputs {
+    /// An empty edge list (no allocation).
+    pub fn new() -> Self {
+        Inputs(InputsRepr::default())
+    }
+
+    /// An empty edge list sized for `n` edges: still inline when `n` fits.
+    pub fn with_capacity(n: usize) -> Self {
+        if n <= INLINE_INPUTS {
+            Self::new()
+        } else {
+            Inputs(InputsRepr::Spilled(Vec::with_capacity(n)))
+        }
+    }
+
+    /// The edges as a slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[NodeId] {
+        match &self.0 {
+            InputsRepr::Inline { len, buf } => &buf[..*len as usize],
+            InputsRepr::Spilled(v) => v.as_slice(),
+        }
+    }
+
+    /// Mutable slice **without** bumping the edge epoch.
+    ///
+    /// Private on purpose: the only callers are the [`Graph`] mutators, which
+    /// update the use lists themselves and then re-stamp the epoch. Every
+    /// public mutable path goes through [`Inputs::as_mut_slice`].
+    #[inline]
+    fn slots_mut(&mut self) -> &mut [NodeId] {
+        match &mut self.0 {
+            InputsRepr::Inline { len, buf } => &mut buf[..*len as usize],
+            InputsRepr::Spilled(v) => v.as_mut_slice(),
+        }
+    }
+
+    /// The edges as a mutable slice. Marks the graph's use lists stale.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [NodeId] {
+        bump_edge_epoch();
+        self.slots_mut()
+    }
+
+    /// Append an edge. Marks the graph's use lists stale.
+    pub fn push(&mut self, id: NodeId) {
+        bump_edge_epoch();
+        self.push_untracked(id);
+    }
+
+    fn push_untracked(&mut self, id: NodeId) {
+        match &mut self.0 {
+            InputsRepr::Inline { len, buf } => {
+                if (*len as usize) < INLINE_INPUTS {
+                    buf[*len as usize] = id;
+                    *len += 1;
+                    return;
+                }
+            }
+            InputsRepr::Spilled(v) => {
+                v.push(id);
+                return;
+            }
+        }
+        // Inline buffer full: spill.
+        let mut v = Vec::with_capacity(INLINE_INPUTS * 2);
+        v.extend_from_slice(self.as_slice());
+        v.push(id);
+        self.0 = InputsRepr::Spilled(v);
+    }
+
+    /// Remove and return the last edge. Marks the graph's use lists stale.
+    pub fn pop(&mut self) -> Option<NodeId> {
+        bump_edge_epoch();
+        self.pop_untracked()
+    }
+
+    fn pop_untracked(&mut self) -> Option<NodeId> {
+        match &mut self.0 {
+            InputsRepr::Inline { len, buf } => {
+                if *len == 0 {
+                    None
+                } else {
+                    *len -= 1;
+                    Some(buf[*len as usize])
+                }
+            }
+            InputsRepr::Spilled(v) => v.pop(),
+        }
+    }
+
+    /// Drop every edge. Marks the graph's use lists stale.
+    pub fn clear(&mut self) {
+        bump_edge_epoch();
+        self.clear_untracked();
+    }
+
+    fn clear_untracked(&mut self) {
+        match &mut self.0 {
+            InputsRepr::Inline { len, .. } => *len = 0,
+            InputsRepr::Spilled(v) => v.clear(),
+        }
+    }
+
+    /// Remove the first occurrence of `val`, `true` when one was found.
+    ///
+    /// Order is not preserved (the last entry fills the hole). Used for use
+    /// lists, where the entries are an unordered multiset — the *set* of
+    /// rewritten edges, and therefore the resulting graph, does not depend on
+    /// the order they are visited in.
+    fn swap_remove_first_untracked(&mut self, val: NodeId) -> bool {
+        let idx = match self.as_slice().iter().position(|&x| x == val) {
+            Some(i) => i,
+            None => return false,
+        };
+        let slots = self.slots_mut();
+        let last = slots.len() - 1;
+        slots.swap(idx, last);
+        self.pop_untracked();
+        true
+    }
+
+    /// True when the edges live on the heap (more than [`INLINE_INPUTS`] of
+    /// them were pushed at some point). Diagnostic / test hook.
+    pub fn is_spilled(&self) -> bool {
+        matches!(self.0, InputsRepr::Spilled(_))
+    }
+
+    /// The inline capacity, as a function for callers that cannot name the
+    /// constant.
+    pub const fn inline_capacity() -> usize {
+        INLINE_INPUTS
+    }
+
+    /// Consume the list into a `Vec`.
+    pub fn into_vec(self) -> Vec<NodeId> {
+        match self.0 {
+            InputsRepr::Inline { len, buf } => buf[..len as usize].to_vec(),
+            InputsRepr::Spilled(v) => v,
+        }
+    }
+}
+
+impl Deref for Inputs {
+    type Target = [NodeId];
+    #[inline]
+    fn deref(&self) -> &[NodeId] {
+        self.as_slice()
+    }
+}
+
+impl DerefMut for Inputs {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [NodeId] {
+        bump_edge_epoch();
+        self.slots_mut()
+    }
+}
+
+impl<'a> IntoIterator for &'a Inputs {
+    type Item = &'a NodeId;
+    type IntoIter = std::slice::Iter<'a, NodeId>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Inputs {
+    type Item = &'a mut NodeId;
+    type IntoIter = std::slice::IterMut<'a, NodeId>;
+    fn into_iter(self) -> Self::IntoIter {
+        bump_edge_epoch();
+        self.slots_mut().iter_mut()
+    }
+}
+
+impl IntoIterator for Inputs {
+    type Item = NodeId;
+    type IntoIter = std::vec::IntoIter<NodeId>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
+    }
+}
+
+impl FromIterator<NodeId> for Inputs {
+    fn from_iter<T: IntoIterator<Item = NodeId>>(iter: T) -> Self {
+        let mut out = Inputs::new();
+        for id in iter {
+            out.push_untracked(id);
+        }
+        out
+    }
+}
+
+impl Extend<NodeId> for Inputs {
+    fn extend<T: IntoIterator<Item = NodeId>>(&mut self, iter: T) {
+        bump_edge_epoch();
+        for id in iter {
+            self.push_untracked(id);
+        }
+    }
+}
+
+impl From<Vec<NodeId>> for Inputs {
+    fn from(v: Vec<NodeId>) -> Self {
+        if v.len() <= INLINE_INPUTS {
+            let mut buf = [0; INLINE_INPUTS];
+            buf[..v.len()].copy_from_slice(&v);
+            Inputs(InputsRepr::Inline {
+                len: v.len() as u8,
+                buf,
+            })
+        } else {
+            Inputs(InputsRepr::Spilled(v))
+        }
+    }
+}
+
+impl From<&[NodeId]> for Inputs {
+    fn from(s: &[NodeId]) -> Self {
+        let mut out = Inputs::with_capacity(s.len());
+        for &id in s {
+            out.push_untracked(id);
+        }
+        out
+    }
+}
+
+impl From<Inputs> for Vec<NodeId> {
+    fn from(i: Inputs) -> Vec<NodeId> {
+        i.into_vec()
+    }
+}
+
+impl PartialEq for Inputs {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Inputs {}
+
+impl PartialEq<Vec<NodeId>> for Inputs {
+    fn eq(&self, other: &Vec<NodeId>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl PartialEq<Inputs> for Vec<NodeId> {
+    fn eq(&self, other: &Inputs) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl PartialEq<[NodeId]> for Inputs {
+    fn eq(&self, other: &[NodeId]) -> bool {
+        self.as_slice() == other
+    }
+}
+
+impl std::hash::Hash for Inputs {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
+impl fmt::Debug for Inputs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Print exactly like the `Vec<NodeId>` this replaced, so existing
+        // `{:?}` diagnostics (e.g. the `[irslot] UNALLOCATED` line in
+        // `ir_lower`) keep their output.
+        fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
+
 // ── Node ─────────────────────────────────────────────────────────────
 
 /// A single node in the IR graph.
@@ -441,7 +836,7 @@ pub struct Node {
     /// Value type produced by this node.
     pub ty: IrType,
     /// Input edges (data + control + memory).
-    pub inputs: Vec<NodeId>,
+    pub inputs: Inputs,
     /// Bytecode PC that produced this node (for OSR / debug).
     pub bytecode_pc: Option<usize>,
 }
@@ -510,6 +905,170 @@ impl SafepointSnapshot {
     }
 }
 
+// ── Def-use edges ────────────────────────────────────────────────────
+
+/// Which half of a [`SafepointSnapshot`] a slot lives in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SafepointSlotKind {
+    /// `SafepointSnapshot::locals`
+    Local,
+    /// `SafepointSnapshot::stack`
+    Stack,
+}
+
+/// One safepoint snapshot slot: `graph.safepoints[snapshot].locals[slot]` (or
+/// `.stack[slot]`).
+///
+/// A snapshot slot is a *reference to a node* exactly like an input edge — it
+/// has to follow a value through [`Graph::replace_all_uses`] or a deopt frame
+/// state is left naming a node that no longer defines the value. It is not,
+/// however, counted by [`Graph::use_counts`] (which reports input edges only);
+/// that asymmetry is pre-existing and preserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SafepointSlot {
+    /// Index into `Graph::safepoints`.
+    pub snapshot: u32,
+    /// Which half of the snapshot.
+    pub kind: SafepointSlotKind,
+    /// Index within that half.
+    pub slot: u32,
+}
+
+/// Incremental def-use edges: for every node, who references it.
+///
+/// Maintained by the [`Graph`] mutators so [`Graph::replace_all_uses`] can walk
+/// the affected uses instead of every node and every snapshot slot, and so
+/// [`Graph::use_counts`] can read maintained counts instead of rescanning.
+///
+/// ## Invariant
+///
+/// While the lists are *current* (see [`Graph::use_lists_valid`]):
+///
+/// - `users[i]` holds one entry per input **slot** that names `i`: a node with
+///   two edges to `i` appears twice, so `users[i].len()` is exactly the count
+///   [`Graph::use_counts`] reports for `i`;
+/// - `sp_users[i]` holds every snapshot slot that names `i`. This one is a
+///   *superset*: `ir_optimize`'s dead-slot normalisation clears snapshot slots
+///   through the public `Graph::safepoints` field, which cannot notify the
+///   lists. Clearing only ever *removes* a reference, and every rewrite
+///   re-checks the slot's current value before touching it, so a stale entry is
+///   inert. A direct write that *installs* a new node id into a slot would not
+///   be — that is what [`Graph::set_safepoint_slot`] is for.
+///
+/// Both invariants are checked by [`Graph::verify_use_lists`].
+///
+/// Edge writes that bypass the mutators (through the public `Node::inputs`
+/// field) bump [`EDGE_EPOCH`] and demote the next mutation to a full scan, so
+/// bypassing costs performance, never correctness.
+#[derive(Clone)]
+pub struct UseLists {
+    /// `users[i]` = one entry per input slot naming node `i`.
+    users: Vec<Inputs>,
+    /// `sp_users[i]` = snapshot slots naming node `i` (superset — see above).
+    sp_users: Vec<Vec<SafepointSlot>>,
+    /// Master switch. Off means "never maintain, never consult".
+    tracking: bool,
+    /// Whether `users` / `sp_users` currently describe the graph.
+    valid: bool,
+    /// Value of [`EDGE_EPOCH`] when the lists were last reconciled.
+    epoch: u64,
+    /// [`THREAD_TOKEN`] of the thread that reconciled them. 0 = never.
+    owner: u64,
+    /// `Graph::safepoints.len()` when the lists were last reconciled.
+    sp_len: usize,
+    /// An edge names an id past the end of the arena. Such an edge is invisible
+    /// to `use_counts` today, but a later `add` could make the id real, so the
+    /// lists are re-derived rather than extended while this is set.
+    dangling: bool,
+    /// Instrumentation: input slots examined by `replace_all_uses`.
+    examined: u64,
+    /// Instrumentation: full rebuilds performed.
+    rebuilds: u64,
+}
+
+impl UseLists {
+    /// Empty, tracking enabled, nothing derived yet.
+    pub fn new() -> Self {
+        UseLists {
+            users: Vec::new(),
+            sp_users: Vec::new(),
+            tracking: true,
+            valid: false,
+            epoch: 0,
+            owner: 0,
+            sp_len: 0,
+            dangling: false,
+            examined: 0,
+            rebuilds: 0,
+        }
+    }
+
+    /// Record that the lists now describe the graph, as of this thread and
+    /// this edge epoch.
+    #[inline]
+    fn stamp(&mut self) {
+        self.epoch = edge_epoch();
+        self.owner = thread_token();
+    }
+
+    /// True when nothing has written an edge outside the mutators since the
+    /// last [`UseLists::stamp`], on this thread.
+    #[inline]
+    fn stamped(&self) -> bool {
+        self.owner == thread_token() && self.epoch == edge_epoch()
+    }
+
+    /// Drop the derived state (keeps the counters and the master switch).
+    fn discard(&mut self) {
+        self.users = Vec::new();
+        self.sp_users = Vec::new();
+        self.valid = false;
+        self.dangling = false;
+    }
+
+    /// Record that input slot of `user` names `def`.
+    #[inline]
+    fn record_input(&mut self, def: NodeId, user: NodeId, num_nodes: usize) {
+        if def == NO_NODE {
+            return;
+        }
+        if (def as usize) < num_nodes {
+            self.users[def as usize].push_untracked(user);
+        } else {
+            self.dangling = true;
+        }
+    }
+
+    /// Record that a snapshot slot names `def`.
+    #[inline]
+    fn record_slot(&mut self, def: NodeId, slot: SafepointSlot, num_nodes: usize) {
+        if def == NO_NODE {
+            return;
+        }
+        if (def as usize) < num_nodes {
+            self.sp_users[def as usize].push(slot);
+        } else {
+            self.dangling = true;
+        }
+    }
+}
+
+impl Default for UseLists {
+    fn default() -> Self {
+        UseLists::new()
+    }
+}
+
+impl fmt::Debug for UseLists {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UseLists")
+            .field("tracking", &self.tracking)
+            .field("valid", &self.valid)
+            .field("nodes", &self.users.len())
+            .finish()
+    }
+}
+
 // ── Graph ────────────────────────────────────────────────────────────
 
 /// The IR graph — a flat arena of nodes with an entry and exit.
@@ -524,11 +1083,23 @@ pub struct Graph {
     /// boundaries and resolved into `DeoptimizationPoint`s by the lowerer.
     /// Empty when the builder did not record any (e.g. hand-built graphs).
     pub safepoints: Vec<SafepointSnapshot>,
+    /// Incremental def-use edges. A hand-built graph can leave this
+    /// `UseLists::default()`: the lists are derived on first demand.
+    pub uses: UseLists,
 }
 
 impl Graph {
     /// Allocate a new node, returning its `NodeId`.
     pub fn add(&mut self, op: Op, ty: IrType, inputs: Vec<NodeId>, pc: Option<usize>) -> NodeId {
+        self.add_inputs(op, ty, Inputs::from(inputs), pc)
+    }
+
+    /// [`Graph::add`] taking an already-compact edge list.
+    ///
+    /// The `Vec` form stays the primary entry point because every existing
+    /// call site spells its edges `vec![…]`; this one exists for code that
+    /// already holds an [`Inputs`] (a cloned edge list, a `collect()`).
+    pub fn add_inputs(&mut self, op: Op, ty: IrType, inputs: Inputs, pc: Option<usize>) -> NodeId {
         let id = self.nodes.len() as NodeId;
         // Ids are dense from 0, so this can only fire if a graph ever reaches
         // `u32::MAX` nodes — at which point a real id would be indistinguishable
@@ -539,12 +1110,29 @@ impl Graph {
             "node id collided with the NO_NODE sentinel ({} nodes)",
             self.nodes.len()
         );
+        let current = self.use_lists_current();
         self.nodes.push(Node {
             op,
             ty,
             inputs,
             bytecode_pc: pc,
         });
+        if current {
+            if self.uses.dangling {
+                // Some edge already names an id past the old end of the arena,
+                // and `id` may be that id. Re-derive rather than guess.
+                self.uses.valid = false;
+            } else {
+                self.uses.users.push(Inputs::new());
+                self.uses.sp_users.push(Vec::new());
+                let num_nodes = self.nodes.len();
+                let (nodes, uses) = (&self.nodes, &mut self.uses);
+                for &inp in nodes[id as usize].inputs.as_slice() {
+                    uses.record_input(inp, id, num_nodes);
+                }
+                self.uses.stamp();
+            }
+        }
         id
     }
 
@@ -554,29 +1142,213 @@ impl Graph {
     /// deopt frame state survives optimization rewrites (GVN, const-fold,
     /// materialization) intact — a safepoint slot pointing at `old` must
     /// follow the value to `new_id`, exactly like a real input edge.
+    ///
+    /// With current [`UseLists`] this visits only the recorded users of `old`
+    /// (and only the snapshot slots that name it); otherwise it falls back to
+    /// the historical full scan, which re-derives the lists in the same pass so
+    /// the fallback is paid once rather than per call. The resulting graph is
+    /// the same either way: both paths rewrite exactly the slots whose current
+    /// value is `old`, and nodes are neither created, removed nor reordered.
     pub fn replace_all_uses(&mut self, old: NodeId, new_id: NodeId) {
-        for node in &mut self.nodes {
-            for inp in &mut node.inputs {
-                if *inp == old {
-                    *inp = new_id;
+        // Self-replacement is a graph no-op, but it is NOT a use-list no-op on
+        // the tracked path: rewriting a slot to `old` leaves it matching `old`,
+        // so every visit of a multi-edge user counts the same hits again and
+        // re-pushes them. A user with k edges then accrues k² entries. Nothing
+        // in the graph changes, so return before either path runs.
+        if old == new_id {
+            return;
+        }
+        // `old == NO_NODE` (or an out-of-range id) has no use list to walk: the
+        // scan would rewrite every *undefined* slot, which is a different
+        // operation. Preserve it exactly by scanning.
+        if self.use_lists_current() && old != NO_NODE && (old as usize) < self.nodes.len() {
+            self.replace_all_uses_tracked(old, new_id);
+        } else {
+            self.replace_all_uses_scanning(old, new_id);
+        }
+    }
+
+    /// Incremental rewrite: walk the recorded users of `old`.
+    fn replace_all_uses_tracked(&mut self, old: NodeId, new_id: NodeId) {
+        let num_nodes = self.nodes.len();
+        let new_is_node = new_id != NO_NODE && (new_id as usize) < num_nodes;
+        let new_is_dangling = new_id != NO_NODE && !new_is_node;
+        let mut examined = 0u64;
+
+        // Take the list: after the rewrite nothing names `old` any more, so the
+        // entries either move to `new_id` or disappear.
+        let candidates = std::mem::take(&mut self.uses.users[old as usize]);
+        for &user in candidates.as_slice() {
+            if (user as usize) >= num_nodes {
+                continue;
+            }
+            let hits = {
+                let slots = self.nodes[user as usize].inputs.slots_mut();
+                examined += slots.len() as u64;
+                let mut hits = 0usize;
+                for slot in slots.iter_mut() {
+                    if *slot == old {
+                        *slot = new_id;
+                        hits += 1;
+                    }
+                }
+                hits
+            };
+            // A user with two edges to `old` appears twice in the list; the
+            // second visit finds nothing left to rewrite, which is why the
+            // move-over is driven by `hits` and not by the entry count.
+            if hits > 0 && new_is_node {
+                for _ in 0..hits {
+                    self.uses.users[new_id as usize].push_untracked(user);
                 }
             }
         }
-        for sp in &mut self.safepoints {
-            for v in sp.locals.iter_mut().chain(sp.stack.iter_mut()) {
+        if new_is_dangling {
+            self.uses.dangling = true;
+        }
+
+        // Snapshot slots. The list is a superset (see `UseLists`), so each slot
+        // is re-checked before it is rewritten.
+        let sp_candidates = std::mem::take(&mut self.uses.sp_users[old as usize]);
+        for r in sp_candidates {
+            let sp = match self.safepoints.get_mut(r.snapshot as usize) {
+                Some(sp) => sp,
+                None => continue,
+            };
+            let cell = match r.kind {
+                SafepointSlotKind::Local => sp.locals.get_mut(r.slot as usize),
+                SafepointSlotKind::Stack => sp.stack.get_mut(r.slot as usize),
+            };
+            match cell {
+                Some(v) if *v == old => {
+                    *v = new_id;
+                    if new_is_node {
+                        self.uses.sp_users[new_id as usize].push(r);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.uses.examined += examined;
+        // Nothing here bumped the epoch (`slots_mut` is the untracked path), but
+        // re-read it rather than assume: an unrelated graph may have moved it.
+        self.uses.stamp();
+    }
+
+    /// The historical full scan, plus (when tracking is on) a rebuild of the
+    /// use lists in the same pass — the scan already touches every edge, so
+    /// deriving the lists from it costs only the pushes.
+    fn replace_all_uses_scanning(&mut self, old: NodeId, new_id: NodeId) {
+        let num_nodes = self.nodes.len();
+        let track = self.uses.tracking;
+        let mut users: Vec<Inputs> = if track {
+            vec![Inputs::new(); num_nodes]
+        } else {
+            Vec::new()
+        };
+        let mut sp_users: Vec<Vec<SafepointSlot>> = if track {
+            vec![Vec::new(); num_nodes]
+        } else {
+            Vec::new()
+        };
+        let mut dangling = false;
+        let mut examined = 0u64;
+
+        for (uid, node) in self.nodes.iter_mut().enumerate() {
+            let slots = node.inputs.slots_mut();
+            examined += slots.len() as u64;
+            for inp in slots.iter_mut() {
+                if *inp == old {
+                    *inp = new_id;
+                }
+                if track {
+                    let def = *inp;
+                    if def == NO_NODE {
+                        continue;
+                    }
+                    if (def as usize) < num_nodes {
+                        users[def as usize].push_untracked(uid as NodeId);
+                    } else {
+                        dangling = true;
+                    }
+                }
+            }
+        }
+        for (si, sp) in self.safepoints.iter_mut().enumerate() {
+            let locals = sp.locals.len();
+            for (k, v) in sp.locals.iter_mut().chain(sp.stack.iter_mut()).enumerate() {
                 if *v == old {
                     *v = new_id;
                 }
+                if track {
+                    let def = *v;
+                    if def == NO_NODE {
+                        continue;
+                    }
+                    let slot = if k < locals {
+                        SafepointSlot {
+                            snapshot: si as u32,
+                            kind: SafepointSlotKind::Local,
+                            slot: k as u32,
+                        }
+                    } else {
+                        SafepointSlot {
+                            snapshot: si as u32,
+                            kind: SafepointSlotKind::Stack,
+                            slot: (k - locals) as u32,
+                        }
+                    };
+                    if (def as usize) < num_nodes {
+                        sp_users[def as usize].push(slot);
+                    } else {
+                        dangling = true;
+                    }
+                }
             }
+        }
+
+        self.uses.examined += examined;
+        if track {
+            self.uses.users = users;
+            self.uses.sp_users = sp_users;
+            self.uses.dangling = dangling;
+            self.uses.sp_len = self.safepoints.len();
+            self.uses.valid = true;
+            self.uses.rebuilds += 1;
+            self.uses.stamp();
         }
     }
 
     /// Mark a node as dead (clears inputs and op).
     pub fn kill(&mut self, id: NodeId) {
-        let n = &mut self.nodes[id as usize];
-        n.op = Op::Dead;
-        n.inputs.clear();
-        n.ty = IrType::Void;
+        let current = self.use_lists_current();
+        let num_nodes = self.nodes.len();
+        let removed = {
+            // Index (rather than `get_mut`) so an out-of-range id still panics,
+            // as it always has.
+            let n = &mut self.nodes[id as usize];
+            n.op = Op::Dead;
+            let removed = if current {
+                let edges = n.inputs.clone();
+                n.inputs.clear_untracked();
+                Some(edges)
+            } else {
+                n.inputs.clear();
+                None
+            };
+            n.ty = IrType::Void;
+            removed
+        };
+        if let Some(edges) = removed {
+            for &inp in edges.as_slice() {
+                if inp == NO_NODE || (inp as usize) >= num_nodes {
+                    continue;
+                }
+                self.uses.users[inp as usize].swap_remove_first_untracked(id);
+            }
+            self.uses.stamp();
+        }
     }
 
     /// Number of live (non-dead) nodes.
@@ -679,7 +1451,15 @@ impl Graph {
     }
 
     /// Build a use-count vector: `uses[id]` = number of nodes that reference `id` as an input.
+    ///
+    /// Reads the maintained [`UseLists`] when they are current, and otherwise
+    /// falls back to the historical scan. Both produce the same vector: an
+    /// entry per referencing input *slot*, snapshot slots excluded, edges to
+    /// [`NO_NODE`] or to an id past the end of the arena ignored.
     pub fn use_counts(&self) -> Vec<u32> {
+        if self.use_lists_current() {
+            return self.uses.users.iter().map(|u| u.len() as u32).collect();
+        }
         let mut counts = vec![0u32; self.nodes.len()];
         for node in &self.nodes {
             for &inp in &node.inputs {
@@ -689,6 +1469,1548 @@ impl Graph {
             }
         }
         counts
+    }
+
+    // ── Incremental def-use edges ────────────────────────────────────
+
+    /// True when the maintained [`UseLists`] describe this graph and may be
+    /// consulted.
+    ///
+    /// Cheap enough to call on every mutation: a flag, a thread-local read and
+    /// two length comparisons. `sp_len` catches snapshots pushed through the
+    /// public `safepoints` field; the epoch catches edges written through the
+    /// public `Node::inputs` field.
+    #[inline]
+    pub fn use_lists_valid(&self) -> bool {
+        self.use_lists_current()
+    }
+
+    #[inline]
+    fn use_lists_current(&self) -> bool {
+        self.uses.tracking
+            && self.uses.valid
+            && self.uses.stamped()
+            && self.uses.users.len() == self.nodes.len()
+            && self.uses.sp_len == self.safepoints.len()
+    }
+
+    /// Turn def-use maintenance on or off. On by default.
+    ///
+    /// Turning it off drops the derived state and sends every mutation down the
+    /// historical full-scan path — the escape hatch if a caller ever needs the
+    /// pre-incremental behaviour bit for bit.
+    pub fn set_use_tracking(&mut self, on: bool) {
+        self.uses.tracking = on;
+        if !on {
+            self.uses.discard();
+        }
+    }
+
+    /// Derive the def-use edges from a full scan of the graph.
+    ///
+    /// `O(nodes + edges + snapshot slots)`. Called automatically whenever a
+    /// mutation finds the lists stale; public so a pass that is about to do
+    /// many rewrites can pay for it up front. An explicit rebuild also turns
+    /// tracking back on if [`Graph::set_use_tracking`] had turned it off.
+    pub fn rebuild_use_lists(&mut self) {
+        let num_nodes = self.nodes.len();
+        self.uses.tracking = true;
+        self.uses.users = vec![Inputs::new(); num_nodes];
+        self.uses.sp_users = vec![Vec::new(); num_nodes];
+        self.uses.dangling = false;
+        {
+            let (nodes, uses) = (&self.nodes, &mut self.uses);
+            for (uid, node) in nodes.iter().enumerate() {
+                for &inp in node.inputs.as_slice() {
+                    uses.record_input(inp, uid as NodeId, num_nodes);
+                }
+            }
+        }
+        {
+            let (safepoints, uses) = (&self.safepoints, &mut self.uses);
+            for (si, sp) in safepoints.iter().enumerate() {
+                for (k, &v) in sp.locals.iter().enumerate() {
+                    uses.record_slot(
+                        v,
+                        SafepointSlot {
+                            snapshot: si as u32,
+                            kind: SafepointSlotKind::Local,
+                            slot: k as u32,
+                        },
+                        num_nodes,
+                    );
+                }
+                for (k, &v) in sp.stack.iter().enumerate() {
+                    uses.record_slot(
+                        v,
+                        SafepointSlot {
+                            snapshot: si as u32,
+                            kind: SafepointSlotKind::Stack,
+                            slot: k as u32,
+                        },
+                        num_nodes,
+                    );
+                }
+            }
+        }
+        self.uses.sp_len = self.safepoints.len();
+        self.uses.valid = true;
+        self.uses.rebuilds += 1;
+        self.uses.stamp();
+    }
+
+    /// Make the def-use edges current, deriving them if they are not.
+    pub fn ensure_use_lists(&mut self) {
+        if self.uses.tracking && !self.use_lists_current() {
+            self.rebuild_use_lists();
+        }
+    }
+
+    /// Number of input slots naming `id`, in O(1) when the lists are current.
+    ///
+    /// The single-node form of [`Graph::use_counts`]; same definition, same
+    /// exclusions (snapshot slots do not count).
+    pub fn use_count(&self, id: NodeId) -> u32 {
+        if self.use_lists_current() {
+            return self.uses.users.get(id as usize).map_or(0, |u| u.len() as u32);
+        }
+        if id == NO_NODE {
+            return 0;
+        }
+        let mut n = 0u32;
+        for node in &self.nodes {
+            for &inp in &node.inputs {
+                if inp == id {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// The distinct nodes that reference `id` as an input, in no particular
+    /// order.
+    pub fn users_of(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = Vec::new();
+        if self.use_lists_current() {
+            if let Some(list) = self.uses.users.get(id as usize) {
+                for &u in list.as_slice() {
+                    if !out.contains(&u) {
+                        out.push(u);
+                    }
+                }
+            }
+            return out;
+        }
+        if id == NO_NODE {
+            return out;
+        }
+        for (uid, node) in self.nodes.iter().enumerate() {
+            if node.inputs.as_slice().contains(&id) {
+                out.push(uid as NodeId);
+            }
+        }
+        out
+    }
+
+    /// The snapshot slots that reference `id`.
+    pub fn safepoint_users_of(&self, id: NodeId) -> Vec<SafepointSlot> {
+        let mut out: Vec<SafepointSlot> = Vec::new();
+        if id == NO_NODE {
+            return out;
+        }
+        if self.use_lists_current() {
+            if let Some(list) = self.uses.sp_users.get(id as usize) {
+                // Superset: re-check each slot's current value.
+                for &r in list {
+                    let live = self.safepoints.get(r.snapshot as usize).and_then(|sp| {
+                        match r.kind {
+                            SafepointSlotKind::Local => sp.locals.get(r.slot as usize),
+                            SafepointSlotKind::Stack => sp.stack.get(r.slot as usize),
+                        }
+                        .copied()
+                    });
+                    if live == Some(id) && !out.contains(&r) {
+                        out.push(r);
+                    }
+                }
+            }
+            return out;
+        }
+        for (si, sp) in self.safepoints.iter().enumerate() {
+            for (k, &v) in sp.locals.iter().enumerate() {
+                if v == id {
+                    out.push(SafepointSlot {
+                        snapshot: si as u32,
+                        kind: SafepointSlotKind::Local,
+                        slot: k as u32,
+                    });
+                }
+            }
+            for (k, &v) in sp.stack.iter().enumerate() {
+                if v == id {
+                    out.push(SafepointSlot {
+                        snapshot: si as u32,
+                        kind: SafepointSlotKind::Stack,
+                        slot: k as u32,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    // ── Tracked edge mutation ────────────────────────────────────────
+    //
+    // The write half of the def-use invariant. Every one of these keeps the
+    // lists current; the equivalent direct write through `Node::inputs` or
+    // `Graph::safepoints` is still legal but costs a rebuild.
+
+    /// Overwrite input slot `idx` of `node`. `false` when the node or the slot
+    /// does not exist.
+    pub fn set_input(&mut self, node: NodeId, idx: usize, new: NodeId) -> bool {
+        if !self.is_valid_id(node) || idx >= self.nodes[node as usize].inputs.len() {
+            return false;
+        }
+        let current = self.use_lists_current();
+        let num_nodes = self.nodes.len();
+        let old = {
+            let slots = self.nodes[node as usize].inputs.slots_mut();
+            let old = slots[idx];
+            slots[idx] = new;
+            old
+        };
+        if current {
+            if old != NO_NODE && (old as usize) < num_nodes {
+                self.uses.users[old as usize].swap_remove_first_untracked(node);
+            }
+            self.uses.record_input(new, node, num_nodes);
+            self.uses.stamp();
+        } else {
+            bump_edge_epoch();
+        }
+        true
+    }
+
+    /// Append an input edge to `node`. `false` when the node does not exist.
+    pub fn push_input(&mut self, node: NodeId, new: NodeId) -> bool {
+        if !self.is_valid_id(node) {
+            return false;
+        }
+        let current = self.use_lists_current();
+        let num_nodes = self.nodes.len();
+        self.nodes[node as usize].inputs.push_untracked(new);
+        if current {
+            self.uses.record_input(new, node, num_nodes);
+            self.uses.stamp();
+        } else {
+            bump_edge_epoch();
+        }
+        true
+    }
+
+    /// Replace the whole edge list of `node`. `false` when it does not exist.
+    pub fn set_inputs(&mut self, node: NodeId, inputs: impl Into<Inputs>) -> bool {
+        if !self.is_valid_id(node) {
+            return false;
+        }
+        let current = self.use_lists_current();
+        let num_nodes = self.nodes.len();
+        let new_inputs = inputs.into();
+        let old = std::mem::replace(&mut self.nodes[node as usize].inputs, new_inputs);
+        if current {
+            for &inp in old.as_slice() {
+                if inp != NO_NODE && (inp as usize) < num_nodes {
+                    self.uses.users[inp as usize].swap_remove_first_untracked(node);
+                }
+            }
+            let (nodes, uses) = (&self.nodes, &mut self.uses);
+            for &inp in nodes[node as usize].inputs.as_slice() {
+                uses.record_input(inp, node, num_nodes);
+            }
+            self.uses.stamp();
+        } else {
+            bump_edge_epoch();
+        }
+        true
+    }
+
+    /// Drop every input edge of `node` (without marking it dead). `false` when
+    /// it does not exist.
+    pub fn clear_inputs(&mut self, node: NodeId) -> bool {
+        self.set_inputs(node, Inputs::new())
+    }
+
+    /// Append a safepoint snapshot, recording the node references it carries.
+    pub fn push_safepoint(&mut self, sp: SafepointSnapshot) {
+        let current = self.use_lists_current();
+        let si = self.safepoints.len() as u32;
+        self.safepoints.push(sp);
+        if current {
+            let num_nodes = self.nodes.len();
+            let (safepoints, uses) = (&self.safepoints, &mut self.uses);
+            let snap = &safepoints[si as usize];
+            for (k, &v) in snap.locals.iter().enumerate() {
+                uses.record_slot(
+                    v,
+                    SafepointSlot {
+                        snapshot: si,
+                        kind: SafepointSlotKind::Local,
+                        slot: k as u32,
+                    },
+                    num_nodes,
+                );
+            }
+            for (k, &v) in snap.stack.iter().enumerate() {
+                uses.record_slot(
+                    v,
+                    SafepointSlot {
+                        snapshot: si,
+                        kind: SafepointSlotKind::Stack,
+                        slot: k as u32,
+                    },
+                    num_nodes,
+                );
+            }
+            self.uses.sp_len = self.safepoints.len();
+            self.uses.stamp();
+        }
+    }
+
+    /// Overwrite one snapshot slot. `false` when the snapshot or slot does not
+    /// exist.
+    ///
+    /// Use this rather than `graph.safepoints[i].locals[k] = v` whenever the
+    /// new value is a real node id: a direct write that *installs* a reference
+    /// is the one edit the def-use edges cannot notice.
+    pub fn set_safepoint_slot(
+        &mut self,
+        snapshot: usize,
+        kind: SafepointSlotKind,
+        slot: usize,
+        new: NodeId,
+    ) -> bool {
+        let current = self.use_lists_current();
+        let num_nodes = self.nodes.len();
+        let sp = match self.safepoints.get_mut(snapshot) {
+            Some(sp) => sp,
+            None => return false,
+        };
+        let cell = match kind {
+            SafepointSlotKind::Local => sp.locals.get_mut(slot),
+            SafepointSlotKind::Stack => sp.stack.get_mut(slot),
+        };
+        let cell = match cell {
+            Some(c) => c,
+            None => return false,
+        };
+        *cell = new;
+        if current {
+            self.uses.record_slot(
+                new,
+                SafepointSlot {
+                    snapshot: snapshot as u32,
+                    kind,
+                    slot: slot as u32,
+                },
+                num_nodes,
+            );
+            self.uses.stamp();
+        }
+        // The stale entry left on the previous value is harmless: every rewrite
+        // re-checks the slot before touching it (see `UseLists`).
+        true
+    }
+
+    // ── Verification / instrumentation ───────────────────────────────
+
+    /// Re-derive the def-use edges by a full scan and compare them with the
+    /// maintained ones.
+    ///
+    /// `Ok(())` when they agree — or when the lists are not current, in which
+    /// case they make no claim and the next mutation re-derives them anyway.
+    /// Cheap to call from a test or from `ir_verify`; it allocates two
+    /// scratch vectors and touches every edge once.
+    ///
+    /// Checked:
+    /// - the derived vectors are sized to the arena;
+    /// - `users[i]` is exactly the multiset of input slots naming `i`
+    ///   (so `users[i].len()` is the `use_counts` entry for `i`);
+    /// - `sp_users[i]` *contains* every snapshot slot naming `i`. Extra entries
+    ///   are tolerated by design — see [`UseLists`] — because a slot cleared
+    ///   through the public `safepoints` field cannot notify the list, and a
+    ///   stale entry only ever costs a re-check.
+    pub fn verify_use_lists(&self) -> Result<(), String> {
+        if !self.use_lists_current() {
+            return Ok(());
+        }
+        let num_nodes = self.nodes.len();
+        if self.uses.users.len() != num_nodes || self.uses.sp_users.len() != num_nodes {
+            return Err(format!(
+                "use lists are sized {} / {} for a {}-node graph",
+                self.uses.users.len(),
+                self.uses.sp_users.len(),
+                num_nodes
+            ));
+        }
+
+        let mut expect_users: Vec<Vec<NodeId>> = vec![Vec::new(); num_nodes];
+        for (uid, node) in self.nodes.iter().enumerate() {
+            for &inp in node.inputs.as_slice() {
+                if inp != NO_NODE && (inp as usize) < num_nodes {
+                    expect_users[inp as usize].push(uid as NodeId);
+                }
+            }
+        }
+        for (id, expect) in expect_users.iter_mut().enumerate() {
+            let mut got: Vec<NodeId> = self.uses.users[id].as_slice().to_vec();
+            got.sort_unstable();
+            expect.sort_unstable();
+            if got != *expect {
+                return Err(format!(
+                    "use list for node {id} is {got:?}, the graph says {expect:?}"
+                ));
+            }
+        }
+
+        for (si, sp) in self.safepoints.iter().enumerate() {
+            let halves = [
+                (SafepointSlotKind::Local, &sp.locals),
+                (SafepointSlotKind::Stack, &sp.stack),
+            ];
+            for (kind, values) in halves {
+                for (k, &v) in values.iter().enumerate() {
+                    if v == NO_NODE || (v as usize) >= num_nodes {
+                        continue;
+                    }
+                    let want = SafepointSlot {
+                        snapshot: si as u32,
+                        kind,
+                        slot: k as u32,
+                    };
+                    if !self.uses.sp_users[v as usize].contains(&want) {
+                        return Err(format!(
+                            "safepoint slot {want:?} names node {v}, but is missing \
+                             from its use list"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Input slots examined by [`Graph::replace_all_uses`] since the counter
+    /// was last reset. The measurement hook — see the def-use tests.
+    pub fn use_list_slots_examined(&self) -> u64 {
+        self.uses.examined
+    }
+
+    /// Full rebuilds of the def-use edges since the counter was last reset.
+    pub fn use_list_rebuilds(&self) -> u64 {
+        self.uses.rebuilds
+    }
+
+    /// Zero the instrumentation counters.
+    pub fn reset_use_list_stats(&mut self) {
+        self.uses.examined = 0;
+        self.uses.rebuilds = 0;
+    }
+}
+
+// ── Memory-effect model ──────────────────────────────────────────────
+//
+// The IR's only *encoded* ordering relation between two memory operations is
+// the memory-token chain: every memory-effecting node takes the previous
+// writer as an input edge and hands itself on as the token for the next one.
+// That chain is a total order. It is sound — the scheduler's topological sort
+// cannot reorder across an input edge — and it is far stronger than the Java
+// Memory Model requires: it serialises a load of `a.x` behind a store to
+// `b.y`, two reads behind each other, and an `ArrayLength` behind everything.
+//
+// Every pass that wanted to beat that order had to re-derive, privately, what
+// the chain means. `ir_optimize` grew `RefPointsTo` / `resolve_ref_points_to`
+// / `loop_store_clobber` for LICM and a second, differently-shaped
+// `StoreLoc` / `is_memory_barrier` pair for dead-store elimination; `lib.rs`
+// grew a third copy of the token predicate for the escape-analysis bridge;
+// `ir_verify` a fourth for its ordering lane. Four private notions of "may
+// these two touch the same memory", none of them able to answer the question
+// an optimizer actually asks.
+//
+// This section is that answer, in one place:
+//
+//   * [`AliasClass`] — *where* a node touches memory: a named field cell, an
+//     array element, an array's length word, a static field, an object's
+//     monitor, nothing, or anything.
+//   * [`MemOrder`] — *how strongly* it is ordered: the JMM acquire/release
+//     lattice, so a monitor-enter and a volatile read pin later accesses
+//     below them and a monitor-exit and a volatile write pin earlier
+//     accesses above them.
+//   * [`MemEffect`] — the pair of alias classes a node reads and writes, its
+//     [`MemOrder`], and whether it is a safepoint / an allocation.
+//   * [`Graph::may_alias`], [`Graph::may_reorder`],
+//     [`Graph::may_reorder_effects`] — the query API. The answer is a
+//     [`Reorder`], which carries the *reason*: a [`ReorderProof`] naming the
+//     fact that licenses the move, or a [`ReorderBlock`] naming the fact that
+//     forbids it. A pass records the proof rather than re-deriving it.
+//
+// **The token chain becomes a consumer of this model, not a rival truth.**
+// [`memory_token_slot`] and [`is_memory_token_slot`] — the canonical
+// spellings of the predicate that exists in three private copies today — are
+// *derived* from the same [`Op::memory_shape`] table the effect
+// classification reads, so the two can no longer drift apart. The chain stays
+// as the graph's conservative default ordering; [`Graph::may_reorder`] is how
+// a pass proves it may deviate from it.
+//
+// ## What this model deliberately does NOT answer
+//
+// `may_reorder` is a **memory-side** question. Two other orderings constrain
+// node placement and are unaffected by any answer here:
+//
+//   * **Control dependence.** A node's `ctrl` input pins it to a block. The
+//     query refuses outright ([`ReorderBlock::Control`]) when either node is
+//     a control node, and it never licenses moving a node across its own
+//     control edge.
+//   * **Implicit exception order.** `Op::Load` / `Op::Store` /
+//     `Op::ArrayLoad` / `Op::ArrayStore` fault on a null base or an
+//     out-of-range index and deopt. Whether `a.f = 1; b.g = 2` may be swapped
+//     when `b` is null is a question about the *exception*, not about the
+//     memory: the two stores provably touch disjoint cells, and it is the
+//     control/exception edge that keeps them in order. That is why those four
+//     ops are **not** flagged [`MemEffect::safepoint`] — flagging them would
+//     make the model answer "no" to every question and it would be answering
+//     the wrong one. A scheduler must combine this answer with control
+//     dependence; it must not use it alone.
+//
+// The query is also **pairwise**: `may_reorder(a, b)` says nothing about a
+// third node between them. Moving `b` above `a` past an intervening `c`
+// requires the query to hold for `(c, b)` too.
+
+/// The offset operand of a memory access — the second half of an
+/// [`AliasClass`]'s address, after the base reference.
+///
+/// Two accesses to the same base are disjoint exactly when their offsets are
+/// two *different compile-time constants*. Every other combination is
+/// "possibly the same cell": two runtime values may be equal, and a runtime
+/// value may equal any constant. Note that [`AccessOffset::Dynamic`] naming
+/// the *same* node twice is a must-alias, not a disjointness — the same node
+/// computes the same value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AccessOffset {
+    /// A compile-time constant: a field index (`Op::Load` / `Op::Store`) or a
+    /// constant-folded array index.
+    Const(i64),
+    /// A runtime value produced by this node.
+    Dynamic(NodeId),
+    /// The layout carries no offset operand at all — the compact
+    /// `[base, value]` `Store` and `[base]` `Load` forms the EA bridge and the
+    /// hand-built test graphs use. Treated as "the object's storage", so it is
+    /// never disjoint from another access to the same base.
+    Absent,
+}
+
+impl AccessOffset {
+    /// True when these two offsets provably name different cells.
+    ///
+    /// The whole precision of the model lives in this one line, so it is
+    /// stated positively: disjointness must be *proved*, and only a pair of
+    /// unequal constants proves it.
+    pub fn provably_distinct(self, other: AccessOffset) -> bool {
+        match (self, other) {
+            (AccessOffset::Const(a), AccessOffset::Const(b)) => a != b,
+            _ => false,
+        }
+    }
+}
+
+/// Where in memory a node reads or writes.
+///
+/// The classes are *storage kinds*, and different kinds never overlap: an
+/// instance field cell is not an array element, an array's length word is not
+/// a field cell, a class's static storage is not any object's instance
+/// storage, and an object's monitor is not any of them. Those cross-kind
+/// disjointness claims are the model's premises, and each is recorded at its
+/// arm in [`Graph::may_alias`] so a future op that violates one is caught at
+/// the place that would silently start returning the wrong answer.
+///
+/// [`AliasClass::Any`] is the top of the lattice ("could be anywhere") and
+/// [`AliasClass::None`] the bottom ("touches no memory"). An unreadable node
+/// layout always degrades to `Any`, never to `None`: the failure direction has
+/// to be the one that refuses optimizations, not the one that licenses them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AliasClass {
+    /// No memory at all. The bottom of the lattice — aliases nothing, not even
+    /// itself.
+    None,
+    /// The instance field cell `base.#offset`. `Op::Load` / `Op::Store`.
+    Field {
+        /// The object reference.
+        base: NodeId,
+        /// The field index (constant in the builder-emitted form).
+        offset: AccessOffset,
+    },
+    /// The array element `array[index]`. `Op::ArrayLoad` / `Op::ArrayStore`.
+    ArrayElem {
+        /// The array reference.
+        array: NodeId,
+        /// The element index — usually [`AccessOffset::Dynamic`].
+        index: AccessOffset,
+    },
+    /// An array's length word. `Op::ArrayLength`.
+    ///
+    /// Its own class because array length is **immutable**: nothing in the JVM
+    /// writes it after the allocation that produced it, so no store — not even
+    /// an opaque call — can clobber it. That is what lets the model prove an
+    /// `ArrayLength` commutes with a store, which the token chain (where it
+    /// sits between two writers) cannot.
+    ArrayLength {
+        /// The array reference.
+        array: NodeId,
+    },
+    /// A class's static field cell.
+    ///
+    /// Keyed by `(class_id, field)` rather than by a base node, because static
+    /// storage has no reference operand to resolve — which makes static
+    /// accesses the one class the model can disambiguate *exactly*. No op
+    /// produces this yet (`getstatic` / `putstatic` have no IR lowering); the
+    /// class exists so the lowering lands with a classification instead of
+    /// widening everything to [`AliasClass::Any`].
+    Static {
+        /// Declaring class.
+        class_id: u32,
+        /// Field index within the class's static storage.
+        field: u32,
+    },
+    /// An object's monitor (lock word). `monitorenter` / `monitorexit`.
+    ///
+    /// Aliasing is only half the story for a monitor: its *ordering* comes
+    /// from [`MemOrder`], not from this class. Two monitor operations on
+    /// provably distinct objects do not alias, and they still do not commute
+    /// with the accesses between them, because monitor-enter is an acquire and
+    /// monitor-exit a release.
+    Monitor {
+        /// The locked object.
+        obj: NodeId,
+    },
+    /// Anywhere. The top of the lattice: aliases everything except
+    /// [`AliasClass::None`].
+    Any,
+}
+
+impl AliasClass {
+    /// True when this names no memory at all.
+    pub fn is_none(self) -> bool {
+        matches!(self, AliasClass::None)
+    }
+
+    /// True when this names memory (anything but [`AliasClass::None`]).
+    pub fn is_some(self) -> bool {
+        !self.is_none()
+    }
+
+    /// The base reference operand, when the class has one.
+    ///
+    /// [`AliasClass::Static`] has no base by construction, and `None` / `Any`
+    /// are not addressed by a reference.
+    pub fn base(self) -> Option<NodeId> {
+        match self {
+            AliasClass::Field { base, .. } => Some(base),
+            AliasClass::ArrayElem { array, .. } => Some(array),
+            AliasClass::ArrayLength { array } => Some(array),
+            AliasClass::Monitor { obj } => Some(obj),
+            AliasClass::None | AliasClass::Static { .. } | AliasClass::Any => Option::None,
+        }
+    }
+}
+
+/// The Java Memory Model ordering strength of a node.
+///
+/// The lattice is the two independent fence halves:
+///
+/// ```text
+///            SeqCst          (both — a volatile write)
+///           /      \
+///      Acquire    Release    (monitor-enter / volatile read,
+///           \      /          monitor-exit / volatile write)
+///            Plain           (an ordinary load or store)
+/// ```
+///
+/// Read the two halves as motion bans, which is what the query needs:
+///
+/// * **Acquire** on the *earlier* node — nothing after it may move above it.
+/// * **Release** on the *later* node — nothing before it may move below it.
+///
+/// That asymmetry is the JMM's "roach motel": accesses may move *into* a
+/// synchronized region from either end, never *out* of it. It is what makes
+/// `monitorenter … monitorexit` bound the operations between them without
+/// pinning the operations outside them.
+///
+/// A volatile **read** is `Acquire`. A volatile **write** is
+/// [`MemOrder::SeqCst`] rather than a bare `Release`: the JMM requires
+/// sequential consistency across volatile accesses, which HotSpot implements
+/// with a `StoreLoad` fence after the write, so it is a barrier in both
+/// directions. Being stronger than a bare release here is the conservative
+/// direction and it is what the acceptance test pins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemOrder {
+    /// No ordering of its own — the ordinary case.
+    Plain,
+    /// Acquire: no later access may move above this node.
+    Acquire,
+    /// Release: no earlier access may move below this node.
+    Release,
+    /// A full fence: both halves.
+    SeqCst,
+}
+
+impl MemOrder {
+    /// True when nothing after this node may move above it.
+    pub fn has_acquire(self) -> bool {
+        matches!(self, MemOrder::Acquire | MemOrder::SeqCst)
+    }
+
+    /// True when nothing before this node may move below it.
+    pub fn has_release(self) -> bool {
+        matches!(self, MemOrder::Release | MemOrder::SeqCst)
+    }
+
+    /// True for a full (bidirectional) fence.
+    pub fn is_fence(self) -> bool {
+        matches!(self, MemOrder::SeqCst)
+    }
+
+    /// True when this imposes no ordering of its own.
+    pub fn is_plain(self) -> bool {
+        matches!(self, MemOrder::Plain)
+    }
+
+    /// Least upper bound: the strength of a node that does both.
+    pub fn join(self, other: MemOrder) -> MemOrder {
+        match (
+            self.has_acquire() || other.has_acquire(),
+            self.has_release() || other.has_release(),
+        ) {
+            (true, true) => MemOrder::SeqCst,
+            (true, false) => MemOrder::Acquire,
+            (false, true) => MemOrder::Release,
+            (false, false) => MemOrder::Plain,
+        }
+    }
+}
+
+/// The complete memory effect of one node: what it reads, what it writes, how
+/// strongly it is ordered, and whether it is a safepoint or an allocation.
+///
+/// Reads and writes are kept as two separate [`AliasClass`]es rather than one
+/// class plus a read/write flag, because the interesting nodes do both to
+/// *different* places — and because a read-read pair commutes regardless of
+/// aliasing, which a merged representation cannot express.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MemEffect {
+    /// Locations this node may read.
+    pub reads: AliasClass,
+    /// Locations this node may write.
+    pub writes: AliasClass,
+    /// JMM ordering strength — see [`MemOrder`].
+    pub order: MemOrder,
+    /// This node is a safepoint: control may leave for the runtime here and
+    /// an interpreter frame may be rebuilt from it (`Op::Call`, `Op::New`,
+    /// `Op::NewArray`, `Op::Guard`).
+    ///
+    /// The constraint that follows is specifically about **writes**: every
+    /// store the method has performed must have happened before the frame is
+    /// rebuilt, and no store it has not yet performed may have. Loads may
+    /// cross a safepoint freely — a load has no visible effect, and re-running
+    /// one after a deopt reproduces it. Two safepoints may cross each other
+    /// unless one of them allocates.
+    ///
+    /// See the section header for why the implicit null/bounds faults of
+    /// `Op::Load` and friends are *not* modelled here.
+    pub safepoint: bool,
+    /// This node may allocate (`Op::New`, `Op::NewArray`, and any call, whose
+    /// callee may). Two allocating nodes do not commute: which one runs first
+    /// is observable through `OutOfMemoryError` and through the addresses and
+    /// identity hashes the collector hands out.
+    pub allocates: bool,
+}
+
+impl MemEffect {
+    /// The effect of a node that touches no memory and imposes no ordering.
+    pub const NONE: MemEffect = MemEffect {
+        reads: AliasClass::None,
+        writes: AliasClass::None,
+        order: MemOrder::Plain,
+        safepoint: false,
+        allocates: false,
+    };
+
+    /// Reads and writes anything, is a safepoint, and may allocate — the
+    /// effect of a call whose callee is unknown, and the fallback for any node
+    /// whose layout could not be read. The top of the effect lattice.
+    pub const OPAQUE: MemEffect = MemEffect {
+        reads: AliasClass::Any,
+        writes: AliasClass::Any,
+        order: MemOrder::Plain,
+        safepoint: true,
+        allocates: true,
+    };
+
+    /// A plain read of one location.
+    pub fn read(class: AliasClass) -> MemEffect {
+        MemEffect {
+            reads: class,
+            ..MemEffect::NONE
+        }
+    }
+
+    /// A plain write of one location.
+    pub fn write(class: AliasClass) -> MemEffect {
+        MemEffect {
+            writes: class,
+            ..MemEffect::NONE
+        }
+    }
+
+    /// A fresh allocation: writes only storage nothing else can yet name, but
+    /// is a safepoint and orders against other allocations.
+    pub fn allocation() -> MemEffect {
+        MemEffect {
+            safepoint: true,
+            allocates: true,
+            ..MemEffect::NONE
+        }
+    }
+
+    /// `monitorenter` on `obj` — an **acquire**.
+    ///
+    /// No op produces this yet (`monitorenter` has no IR lowering, so a
+    /// synchronized method bails to the single-pass backend). The constructor
+    /// exists so the lowering lands with a classification, and so the ordering
+    /// discipline can be stated and tested now rather than discovered later.
+    pub fn monitor_enter(obj: NodeId) -> MemEffect {
+        MemEffect {
+            reads: AliasClass::Monitor { obj },
+            writes: AliasClass::Monitor { obj },
+            order: MemOrder::Acquire,
+            safepoint: true,
+            allocates: false,
+        }
+    }
+
+    /// `monitorexit` on `obj` — a **release**. See [`MemEffect::monitor_enter`].
+    pub fn monitor_exit(obj: NodeId) -> MemEffect {
+        MemEffect {
+            reads: AliasClass::Monitor { obj },
+            writes: AliasClass::Monitor { obj },
+            order: MemOrder::Release,
+            safepoint: true,
+            allocates: false,
+        }
+    }
+
+    /// A volatile read of `class` — an **acquire**. See
+    /// [`MemEffect::monitor_enter`] for why this has no producing op yet.
+    pub fn volatile_read(class: AliasClass) -> MemEffect {
+        MemEffect {
+            reads: class,
+            writes: AliasClass::None,
+            order: MemOrder::Acquire,
+            safepoint: false,
+            allocates: false,
+        }
+    }
+
+    /// A volatile write of `class` — a **full fence**, so a barrier in both
+    /// directions. See [`MemOrder`] for why this is `SeqCst` and not a bare
+    /// release.
+    pub fn volatile_write(class: AliasClass) -> MemEffect {
+        MemEffect {
+            reads: AliasClass::None,
+            writes: class,
+            order: MemOrder::SeqCst,
+            safepoint: false,
+            allocates: false,
+        }
+    }
+
+    /// True when this node reads or writes memory.
+    pub fn touches_memory(self) -> bool {
+        self.reads.is_some() || self.writes.is_some()
+    }
+
+    /// True when this node writes memory.
+    pub fn is_write(self) -> bool {
+        self.writes.is_some()
+    }
+
+    /// True when this node constrains motion in *no* way — no memory, no
+    /// fence, no safepoint, no allocation. Such a node commutes with anything.
+    pub fn is_inert(self) -> bool {
+        !self.touches_memory() && self.order.is_plain() && !self.safepoint && !self.allocates
+    }
+}
+
+/// What kind of memory access an op performs — the `access` half of
+/// [`OpMemoryShape`], and the discriminator [`access_location`] keys off when
+/// it reads the base/offset operands out of a node's edge list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemAccess {
+    /// Reads one instance field cell.
+    FieldRead,
+    /// Writes one instance field cell.
+    FieldWrite,
+    /// Reads one array element.
+    ArrayRead,
+    /// Writes one array element.
+    ArrayWrite,
+    /// Reads an array's (immutable) length word.
+    LengthRead,
+    /// Allocates fresh storage.
+    Allocate,
+    /// Reads and writes anything.
+    Opaque,
+}
+
+/// Static description of a memory-effecting op: where its incoming memory
+/// token sits, what distinguishes the documented full layout from the compact
+/// ones, and what it does to memory.
+///
+/// **This is the single table.** [`memory_token_slot`] reads it to answer
+/// "which slot is the token", and [`effect_of_node`] reads it to answer "what
+/// does this node touch". Before this existed the two questions had separate
+/// tables in separate files (three copies of the first, four private notions
+/// of the second), which is how they drifted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OpMemoryShape {
+    /// Input slot carrying the incoming memory token in the documented
+    /// `[ctrl, mem, …]` form. Always 1 today; named rather than assumed.
+    pub token_slot: usize,
+    /// Minimum input count of the documented full form.
+    ///
+    /// The arity guard is what distinguishes that form from the compact
+    /// hand-built / EA-bridge layouts `ir_optimize::store_operands` and
+    /// `ir_optimize::load_base` also accept — a compact `Store` is
+    /// `[base, value]`, whose slot 1 is a *value*, not a token. Below this
+    /// arity the node has no memory token at all.
+    pub min_full_arity: usize,
+    /// What the op does to memory.
+    pub access: MemAccess,
+}
+
+impl Op {
+    /// The memory shape of this op, or `None` when it consumes no memory token
+    /// in the documented `[ctrl, mem, …]` layout.
+    ///
+    /// `None` here is **not** "touches no memory": a memory-typed `Op::Phi`
+    /// consumes a token from every predecessor rather than at one fixed slot,
+    /// and `Op::Return` ends the method. Both are classified directly by
+    /// [`effect_of_node`] / [`is_memory_token_slot`]. This table answers the
+    /// narrower question "does this op have a single token slot, and where".
+    ///
+    /// The arities are the ones `ir_optimize::memory_token_slot`,
+    /// `ir_verify::is_memory_token_input` and `lib.rs::ea_memory_token_slot`
+    /// each carry a private copy of; the anti-drift test in this file asserts
+    /// all of them still agree, op by op and arity by arity.
+    pub fn memory_shape(&self) -> Option<OpMemoryShape> {
+        let (min_full_arity, access) = match self {
+            Op::Load(_) => (3, MemAccess::FieldRead), // [ctrl, mem, base]
+            Op::Store(_) => (4, MemAccess::FieldWrite), // [ctrl, mem, base, value]
+            Op::ArrayLoad(_) => (4, MemAccess::ArrayRead), // [ctrl, mem, array, index]
+            Op::ArrayStore(_) => (5, MemAccess::ArrayWrite), // [ctrl, mem, array, index, value]
+            Op::ArrayLength => (3, MemAccess::LengthRead), // [ctrl, mem, array_ref]
+            Op::New { .. } => (2, MemAccess::Allocate), // [ctrl, mem]
+            Op::NewArray { .. } => (3, MemAccess::Allocate), // [ctrl, mem, length]
+            Op::Call { .. } => (2, MemAccess::Opaque), // [ctrl, mem, args…]
+            Op::LambdaIntToDouble => (4, MemAccess::Opaque), // [ctrl, mem, lambda, index]
+            _ => return None,
+        };
+        Some(OpMemoryShape {
+            token_slot: 1,
+            min_full_arity,
+            access,
+        })
+    }
+}
+
+/// The input slot carrying `node`'s incoming memory token, or `None` when this
+/// op does not consume one.
+///
+/// **The canonical spelling.** Three private copies of this predicate exist —
+/// `ir_optimize::memory_token_slot`, `ir_verify::is_memory_token_input` and
+/// `lib.rs::ea_memory_token_slot` — reconciled by hand and kept numerically
+/// identical by a comment in each. They should all become calls to this
+/// function; see the anti-drift test, which fails the moment any of the
+/// reachable ones diverges.
+///
+/// Derived from [`Op::memory_shape`], so the token convention and the effect
+/// classification cannot disagree about which ops are memory operations.
+pub fn memory_token_slot(node: &Node) -> Option<usize> {
+    let shape = node.op.memory_shape()?;
+    if node.inputs.len() >= shape.min_full_arity {
+        Some(shape.token_slot)
+    } else {
+        None
+    }
+}
+
+/// True when input `idx` of `node` is a memory *token* — an ordering edge
+/// naming the previous writer — rather than a value the node reads.
+///
+/// A memory-typed φ is the one op whose token edges are not a single slot:
+/// *every* value input (slots 1.., past the control anchor) is a token from
+/// one predecessor.
+pub fn is_memory_token_slot(node: &Node, idx: usize) -> bool {
+    if matches!(node.op, Op::Phi) {
+        return node.ty == IrType::Memory && idx >= 1;
+    }
+    memory_token_slot(node) == Some(idx)
+}
+
+/// Read the `(base, offset)` a memory access addresses, out of whichever edge
+/// layout the node is in.
+///
+/// Mirrors `ir_optimize::store_operands` / `ir_optimize::load_base` exactly,
+/// including their tolerance for the compact hand-built and EA-bridge forms.
+/// An unreadable layout returns [`AliasClass::Any`] — the direction that
+/// refuses optimizations.
+///
+/// Offsets come back as [`AccessOffset::Dynamic`]; [`Graph::memory_effect`]
+/// constant-folds them, which is where the model gets the precision that lets
+/// two field stores commute.
+fn access_location(node: &Node, access: MemAccess) -> AliasClass {
+    let inputs = node.inputs.as_slice();
+    let dyn_at = |i: usize| match inputs.get(i).copied().and_then(node_id_opt) {
+        Some(id) => AccessOffset::Dynamic(id),
+        None => AccessOffset::Absent,
+    };
+    match access {
+        // `load_base`: compact `[base]` / `[base, index]`, full
+        // `[ctrl, mem, base, index?]`.
+        MemAccess::FieldRead => match inputs.len() {
+            1 | 2 => AliasClass::Field {
+                base: inputs[0],
+                offset: dyn_at(1),
+            },
+            n if n >= 3 => AliasClass::Field {
+                base: inputs[2],
+                offset: dyn_at(3),
+            },
+            _ => AliasClass::Any,
+        },
+        // `store_operands`: compact `[base, value]`, full-without-offset
+        // `[ctrl, mem, base, value]`, full `[ctrl, mem, base, offset, value]`.
+        // Note the arity-4 form's slot 3 is the *value*, so the offset is
+        // Absent there — reading it as an offset would invent a disjointness.
+        MemAccess::FieldWrite => match inputs.len() {
+            2 => AliasClass::Field {
+                base: inputs[0],
+                offset: AccessOffset::Absent,
+            },
+            4 => AliasClass::Field {
+                base: inputs[2],
+                offset: AccessOffset::Absent,
+            },
+            n if n >= 5 => AliasClass::Field {
+                base: inputs[2],
+                offset: dyn_at(3),
+            },
+            _ => AliasClass::Any,
+        },
+        // `[ctrl, mem, array, index]` — the only documented form.
+        MemAccess::ArrayRead | MemAccess::ArrayWrite => {
+            if inputs.len() >= 4 {
+                AliasClass::ArrayElem {
+                    array: inputs[2],
+                    index: dyn_at(3),
+                }
+            } else {
+                AliasClass::Any
+            }
+        }
+        // `[ctrl, mem, array_ref]`, or the hand-built `[array]`. The arity
+        // range is deliberately 1..=3 (see `ir_verify`'s arity lane).
+        MemAccess::LengthRead => match inputs.len() {
+            1 | 2 => AliasClass::ArrayLength { array: inputs[0] },
+            n if n >= 3 => AliasClass::ArrayLength { array: inputs[2] },
+            _ => AliasClass::Any,
+        },
+        MemAccess::Allocate => AliasClass::None,
+        MemAccess::Opaque => AliasClass::Any,
+    }
+}
+
+/// The memory effect of a node, read from its op and edge layout alone.
+///
+/// Offsets stay [`AccessOffset::Dynamic`] because folding one needs the graph;
+/// use [`Graph::memory_effect`] to get the folded form. Everything else — the
+/// alias classes, the ordering, the safepoint and allocation flags — is final
+/// here.
+///
+/// Ops with no memory shape are classified explicitly:
+///
+/// * a **memory-typed φ** is [`MemEffect::OPAQUE`]. It performs no access of
+///   its own, but it is the merge of two token chains, and letting an access
+///   float across it is a control-flow question this model does not answer.
+/// * a **non-memory φ** is inert: it computes a value, it reads no memory.
+/// * `Op::Return` is [`MemEffect::OPAQUE`] — the method's writes must all have
+///   happened.
+/// * every other **control** op is inert. `Op::Start`'s `Proj(1)` is the
+///   initial memory token, but producing a token is not an access; a control
+///   node's placement is governed by control edges, and
+///   [`Graph::may_reorder`] refuses control nodes outright.
+/// * `Op::Dead` is [`MemEffect::OPAQUE`]. A killed node should never be
+///   queried; if one is, it must not answer "commutes with everything".
+/// * everything else (arithmetic, comparisons, conversions, constants,
+///   parameters, `Op::Phi` on data) is inert. `Op::Div` / `Op::Rem` throw on a
+///   zero divisor, which is an exception-ordering question, not a memory one —
+///   see the section header.
+pub fn effect_of_node(node: &Node) -> MemEffect {
+    match &node.op {
+        Op::Phi => {
+            if node.ty == IrType::Memory {
+                MemEffect::OPAQUE
+            } else {
+                MemEffect::NONE
+            }
+        }
+        Op::Return | Op::Dead => MemEffect::OPAQUE,
+        Op::Guard { .. } => MemEffect {
+            safepoint: true,
+            ..MemEffect::NONE
+        },
+        op => match op.memory_shape() {
+            None => MemEffect::NONE,
+            Some(shape) => {
+                let class = access_location(node, shape.access);
+                match shape.access {
+                    MemAccess::FieldRead | MemAccess::ArrayRead | MemAccess::LengthRead => {
+                        MemEffect::read(class)
+                    }
+                    MemAccess::FieldWrite | MemAccess::ArrayWrite => MemEffect::write(class),
+                    MemAccess::Allocate => MemEffect::allocation(),
+                    MemAccess::Opaque => MemEffect::OPAQUE,
+                }
+            }
+        },
+    }
+}
+
+/// Largest allocation set [`Graph::ref_origin`] will carry before giving up
+/// and reporting unknown provenance.
+///
+/// A reference that may be one of nine different allocations is not a
+/// reference any pass profits from disambiguating, and the bound keeps the
+/// join over a deep φ web linear.
+pub const MAX_ALIAS_ALLOC_SET: usize = 8;
+
+/// Recursion bound for [`Graph::ref_origin`]. A loop-carried φ cycle resolves
+/// to unknown rather than hanging.
+const REF_ORIGIN_MAX_DEPTH: u32 = 32;
+
+/// What a reference node may point to — the provenance half of
+/// [`Graph::may_alias`].
+///
+/// Same shape as `ir_optimize`'s private `RefPointsTo`, which it is meant to
+/// replace: `allocs` is the set of in-method allocations the reference may
+/// name (`None` = unknown provenance, may be anything), and `pre_existing`
+/// records whether it may be an object that existed before the method ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefOrigin {
+    /// The fresh in-method allocations this reference may name, or `None` when
+    /// its provenance is unknown (a loaded reference, a call result, an
+    /// over-wide φ join).
+    pub allocs: Option<Vec<NodeId>>,
+    /// True when it may be a *pre-existing* reference — a parameter, `this`.
+    /// Never an in-method allocation.
+    pub pre_existing: bool,
+}
+
+impl RefOrigin {
+    /// Unknown provenance: may be any object at all.
+    pub fn unknown() -> RefOrigin {
+        RefOrigin {
+            allocs: None,
+            pre_existing: false,
+        }
+    }
+
+    /// True when nothing is known about this reference.
+    pub fn is_unknown(&self) -> bool {
+        self.allocs.is_none()
+    }
+
+    /// Exactly one fresh allocation.
+    fn alloc(id: NodeId) -> RefOrigin {
+        RefOrigin {
+            allocs: Some(vec![id]),
+            pre_existing: false,
+        }
+    }
+
+    /// A pre-existing reference and nothing else.
+    fn pre_existing_only() -> RefOrigin {
+        RefOrigin {
+            allocs: Some(Vec::new()),
+            pre_existing: true,
+        }
+    }
+
+    /// Join another origin into this one (the φ merge). Any unknown input
+    /// poisons the result, and overflowing [`MAX_ALIAS_ALLOC_SET`] degrades it
+    /// to unknown.
+    fn absorb(&mut self, other: RefOrigin) {
+        self.pre_existing |= other.pre_existing;
+        match (self.allocs.as_mut(), other.allocs) {
+            (Some(mine), Some(theirs)) => {
+                for id in theirs {
+                    if !mine.contains(&id) {
+                        mine.push(id);
+                    }
+                }
+                if mine.len() > MAX_ALIAS_ALLOC_SET {
+                    self.allocs = None;
+                }
+            }
+            _ => self.allocs = None,
+        }
+    }
+
+    /// True when these two references provably name **different** objects.
+    ///
+    /// Requires both sides to have known provenance, their allocation sets to
+    /// be disjoint, and at most one of them to be possibly-pre-existing —
+    /// because two parameters can be the same object (`foo(x, x)`), while a
+    /// fresh allocation can never be a value that existed before the method
+    /// ran.
+    pub fn provably_distinct(&self, other: &RefOrigin) -> bool {
+        let (mine, theirs) = match (&self.allocs, &other.allocs) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return false,
+        };
+        if self.pre_existing && other.pre_existing {
+            return false;
+        }
+        !mine.iter().any(|id| theirs.contains(id))
+    }
+}
+
+/// A `may_reorder` answer, with the fact that justifies it.
+///
+/// The point of returning a reason rather than a `bool` is the acceptance
+/// criterion: *"optimizations cannot reorder through side effects without a
+/// proof encoded in the graph."* A pass that moves a node records the
+/// [`ReorderProof`] it moved on; a pass that declines records the
+/// [`ReorderBlock`] it hit. Both are checkable after the fact, and a `Blocked`
+/// reason is the diagnostic a missed optimization report needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Reorder {
+    /// The two nodes may be swapped, on the strength of this fact.
+    Allowed(ReorderProof),
+    /// They may not, because of this fact.
+    Blocked(ReorderBlock),
+}
+
+impl Reorder {
+    /// True when the swap is licensed.
+    pub fn is_allowed(self) -> bool {
+        matches!(self, Reorder::Allowed(_))
+    }
+
+    /// True when the swap is refused.
+    pub fn is_blocked(self) -> bool {
+        matches!(self, Reorder::Blocked(_))
+    }
+}
+
+/// Why a reorder is licensed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReorderProof {
+    /// At least one of the two constrains motion in no way at all — no memory,
+    /// no fence, no safepoint, no allocation.
+    EffectFree,
+    /// Neither node writes memory, so no read can observe a difference.
+    ReadOnly,
+    /// Both touch memory, but the locations are provably disjoint.
+    DisjointLocations,
+}
+
+/// Why a reorder is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReorderBlock {
+    /// One of the ids does not name a node.
+    UnknownNode,
+    /// One of them is a control node. Control placement is governed by control
+    /// edges, which this model does not reason about.
+    Control,
+    /// The later node consumes the earlier one as a **value** (or control)
+    /// input. Note this deliberately does *not* fire for a memory-token edge:
+    /// breaking an over-strict token edge is exactly what the model is for.
+    DataDependence,
+    /// One of them is a full fence — a volatile access.
+    Fence,
+    /// The earlier node is an acquire (monitor-enter, volatile read), so
+    /// nothing after it may move above it.
+    Acquire,
+    /// The later node is a release (monitor-exit, volatile write), so nothing
+    /// before it may move below it.
+    Release,
+    /// Both allocate, and allocation order is observable.
+    Allocation,
+    /// One is a safepoint and the other writes memory.
+    Safepoint,
+    /// Their locations may be the same, and at least one of them writes.
+    MayAlias,
+}
+
+impl Graph {
+    /// The memory effect of `id`, with constant offsets folded.
+    ///
+    /// The graph-aware form of [`effect_of_node`]: an offset operand that
+    /// resolves to an `Op::Const` becomes an [`AccessOffset::Const`], which is
+    /// the *only* thing that ever proves two accesses to the same base
+    /// disjoint. A node id that names nothing answers [`MemEffect::OPAQUE`].
+    pub fn memory_effect(&self, id: NodeId) -> MemEffect {
+        let node = match self.node_opt(id) {
+            Some(n) => n,
+            None => return MemEffect::OPAQUE,
+        };
+        let mut eff = effect_of_node(node);
+        eff.reads = self.fold_offsets(eff.reads);
+        eff.writes = self.fold_offsets(eff.writes);
+        eff
+    }
+
+    /// Replace a [`AccessOffset::Dynamic`] offset with [`AccessOffset::Const`]
+    /// when the node it names is an integer constant.
+    fn fold_offsets(&self, class: AliasClass) -> AliasClass {
+        let fold = |off: AccessOffset| match off {
+            AccessOffset::Dynamic(id) => match self.node_opt(id).map(|n| &n.op) {
+                Some(Op::Const(v)) => AccessOffset::Const(*v),
+                _ => off,
+            },
+            other => other,
+        };
+        match class {
+            AliasClass::Field { base, offset } => AliasClass::Field {
+                base,
+                offset: fold(offset),
+            },
+            AliasClass::ArrayElem { array, index } => AliasClass::ArrayElem {
+                array,
+                index: fold(index),
+            },
+            other => other,
+        }
+    }
+
+    /// What reference `id` may point to, following `Op::Phi` merges.
+    ///
+    /// Leaves: `Op::New` / `Op::NewArray` are exactly themselves (the node *is*
+    /// the reference — see the builder's `new` arm); `Op::Param` is a
+    /// pre-existing reference; anything else is unknown provenance. A φ joins
+    /// its value inputs, skipping the control anchor at its head.
+    pub fn ref_origin(&self, id: NodeId) -> RefOrigin {
+        self.ref_origin_at(id, 0)
+    }
+
+    fn ref_origin_at(&self, id: NodeId, depth: u32) -> RefOrigin {
+        if depth > REF_ORIGIN_MAX_DEPTH {
+            return RefOrigin::unknown();
+        }
+        let node = match self.node_opt(id) {
+            Some(n) => n,
+            None => return RefOrigin::unknown(),
+        };
+        match &node.op {
+            Op::New { .. } | Op::NewArray { .. } => RefOrigin::alloc(id),
+            Op::Param(_) => RefOrigin::pre_existing_only(),
+            Op::Phi => {
+                let mut joined = RefOrigin {
+                    allocs: Some(Vec::new()),
+                    pre_existing: false,
+                };
+                let mut saw_value = false;
+                for &inp in node.inputs.iter() {
+                    let pred = match self.node_opt(inp) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    if pred.op.is_control() {
+                        continue; // the φ's region/merge anchor, not a value
+                    }
+                    saw_value = true;
+                    joined.absorb(self.ref_origin_at(inp, depth + 1));
+                }
+                if saw_value {
+                    joined
+                } else {
+                    RefOrigin::unknown()
+                }
+            }
+            _ => RefOrigin::unknown(),
+        }
+    }
+
+    /// True when two reference nodes may name the same object.
+    ///
+    /// The same id is always a must-alias. Otherwise the answer is the
+    /// negation of [`RefOrigin::provably_distinct`].
+    pub fn refs_may_alias(&self, a: NodeId, b: NodeId) -> bool {
+        if a == b {
+            return true;
+        }
+        !self.ref_origin(a).provably_distinct(&self.ref_origin(b))
+    }
+
+    /// True when two alias classes may name overlapping memory.
+    ///
+    /// This is the model's core disjointness judgement, and every "false" it
+    /// returns is a claim that has to be true of the VM's object layout:
+    ///
+    /// * **Different storage kinds never overlap.** A field cell is not an
+    ///   array element (a Java object is either an array or a class instance,
+    ///   never both, and verified bytecode never reaches `getfield` on an
+    ///   array or `aaload` on a non-array); an array's length word is not a
+    ///   field cell; a class's static storage is a per-class area no object
+    ///   reference addresses; an object's monitor is not any of them. If an op
+    ///   is ever added that violates one of these — a raw `Unsafe`-style
+    ///   access with a computed offset, say — it must classify as
+    ///   [`AliasClass::Any`], not as one of the structured classes.
+    /// * **`ArrayLength` is read-only storage.** Nothing writes an array's
+    ///   length, so [`AliasClass::ArrayLength`] never conflicts with a write —
+    ///   not even an opaque one, since [`AliasClass::Any`] is handled by the
+    ///   earlier arm only because an opaque node may *read* it too. (An
+    ///   `Any` write does conservatively conflict with a length read; the
+    ///   precision available here is the cross-kind one, which is what lets an
+    ///   `ArrayLength` commute with a field or element store.)
+    /// * **Same kind, same base:** disjoint only when the offsets are two
+    ///   different compile-time constants ([`AccessOffset::provably_distinct`]).
+    /// * **Same kind, different base:** disjoint only when the bases are
+    ///   provably different objects ([`Graph::refs_may_alias`]).
+    ///
+    /// Aliasing alone does not decide reordering — see
+    /// [`Graph::may_reorder_effects`], which also applies the JMM fences and
+    /// the safepoint rule.
+    pub fn may_alias(&self, a: AliasClass, b: AliasClass) -> bool {
+        use AliasClass as C;
+        match (a, b) {
+            // Bottom: no memory, nothing to conflict with.
+            (C::None, _) | (_, C::None) => false,
+            // Top: could be anywhere.
+            (C::Any, _) | (_, C::Any) => true,
+            (C::Field { base: x, offset: i }, C::Field { base: y, offset: j }) => {
+                !i.provably_distinct(j) && self.refs_may_alias(x, y)
+            }
+            (C::ArrayElem { array: x, index: i }, C::ArrayElem { array: y, index: j }) => {
+                !i.provably_distinct(j) && self.refs_may_alias(x, y)
+            }
+            (C::ArrayLength { array: x }, C::ArrayLength { array: y }) => self.refs_may_alias(x, y),
+            (C::Static { class_id: c, field: i }, C::Static { class_id: d, field: j }) => {
+                c == d && i == j
+            }
+            (C::Monitor { obj: x }, C::Monitor { obj: y }) => self.refs_may_alias(x, y),
+            // Different storage kinds — see the premises in the doc above.
+            _ => false,
+        }
+    }
+
+    /// May the node `earlier` and the node `later` — given in **program
+    /// order** — be swapped?
+    ///
+    /// This is the question a pass asks as *"may I move this load above that
+    /// store?"*: `may_reorder(store, load)`, with the store first because that
+    /// is the order they are in today.
+    ///
+    /// On top of [`Graph::may_reorder_effects`] it adds the two graph-level
+    /// refusals:
+    ///
+    /// * either node being a **control** node ([`ReorderBlock::Control`]);
+    /// * `later` consuming `earlier` through a **non-token** input edge
+    ///   ([`ReorderBlock::DataDependence`]). A memory-token edge is
+    ///   deliberately *not* a refusal: the token chain is this model's
+    ///   conservative default, and overriding it with a proof is the entire
+    ///   purpose of the query. A pass that acts on an `Allowed` answer must
+    ///   then repair the chain (`ir_optimize::kill_store_splicing_memory_chain`
+    ///   is the existing splice) so the graph still encodes the new order.
+    ///
+    /// See the section header for what this does *not* cover: control
+    /// dependence, implicit-exception order, and any third node between the
+    /// two.
+    pub fn may_reorder(&self, earlier: NodeId, later: NodeId) -> Reorder {
+        let (a, b) = match (self.node_opt(earlier), self.node_opt(later)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Reorder::Blocked(ReorderBlock::UnknownNode),
+        };
+        if a.op.is_control() || b.op.is_control() {
+            return Reorder::Blocked(ReorderBlock::Control);
+        }
+        for (i, &inp) in b.inputs.iter().enumerate() {
+            if inp == earlier && !is_memory_token_slot(b, i) {
+                return Reorder::Blocked(ReorderBlock::DataDependence);
+            }
+        }
+        self.may_reorder_effects(self.memory_effect(earlier), self.memory_effect(later))
+    }
+
+    /// [`Graph::may_reorder`] over two effects directly, for a caller holding
+    /// an effect that no node produces yet.
+    ///
+    /// That is not a hypothetical: `monitorenter` / `monitorexit` and volatile
+    /// field access have no `Op` variant (a synchronized method bails to the
+    /// single-pass backend today), so [`MemEffect::monitor_enter`],
+    /// [`MemEffect::volatile_write`] and friends are the only way to state
+    /// their ordering — and the only way to test it before the ops land.
+    ///
+    /// The rules, in the order they are applied:
+    ///
+    /// 1. Either side inert → allowed ([`ReorderProof::EffectFree`]).
+    /// 2. Either side a full fence → [`ReorderBlock::Fence`].
+    /// 3. `earlier` is an acquire → [`ReorderBlock::Acquire`]: nothing after a
+    ///    monitor-enter or a volatile read may move above it.
+    /// 4. `later` is a release → [`ReorderBlock::Release`]: nothing before a
+    ///    monitor-exit or a volatile write may move below it.
+    ///    Rules 3 and 4 are one-sided on purpose — that asymmetry is the JMM's
+    ///    roach motel, and it is why a synchronized region *bounds* the
+    ///    accesses inside it without pinning the ones outside.
+    /// 5. Both allocate → [`ReorderBlock::Allocation`].
+    /// 6. Their locations may conflict (write/read, read/write, write/write) →
+    ///    [`ReorderBlock::MayAlias`].
+    /// 7. One is a safepoint and the other writes → [`ReorderBlock::Safepoint`].
+    /// 8. Neither writes → allowed ([`ReorderProof::ReadOnly`]).
+    /// 9. Otherwise allowed ([`ReorderProof::DisjointLocations`]).
+    ///
+    /// The alias test precedes the safepoint test only so that the *reason* a
+    /// call blocks a store is the sharper `MayAlias` rather than `Safepoint`;
+    /// both refuse.
+    pub fn may_reorder_effects(&self, earlier: MemEffect, later: MemEffect) -> Reorder {
+        if earlier.is_inert() || later.is_inert() {
+            return Reorder::Allowed(ReorderProof::EffectFree);
+        }
+        if earlier.order.is_fence() || later.order.is_fence() {
+            return Reorder::Blocked(ReorderBlock::Fence);
+        }
+        if earlier.order.has_acquire() {
+            return Reorder::Blocked(ReorderBlock::Acquire);
+        }
+        if later.order.has_release() {
+            return Reorder::Blocked(ReorderBlock::Release);
+        }
+        if earlier.allocates && later.allocates {
+            return Reorder::Blocked(ReorderBlock::Allocation);
+        }
+        let conflicts = self.may_alias(earlier.writes, later.reads)
+            || self.may_alias(earlier.reads, later.writes)
+            || self.may_alias(earlier.writes, later.writes);
+        if conflicts {
+            return Reorder::Blocked(ReorderBlock::MayAlias);
+        }
+        if (earlier.safepoint && later.is_write()) || (later.safepoint && earlier.is_write()) {
+            return Reorder::Blocked(ReorderBlock::Safepoint);
+        }
+        if !earlier.is_write() && !later.is_write() {
+            return Reorder::Allowed(ReorderProof::ReadOnly);
+        }
+        Reorder::Allowed(ReorderProof::DisjointLocations)
     }
 }
 
@@ -795,7 +3117,12 @@ impl IrBuilder {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: UseLists::new(),
         };
+        // The builder appends: every edge it writes goes through the tracked
+        // mutators, so the def-use edges are maintained from an empty graph
+        // rather than derived by a scan once optimization starts.
+        graph.rebuild_use_lists();
 
         // Node 0: Start
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
@@ -1135,7 +3462,7 @@ impl IrBuilder {
         let region = state.merge_id;
         // The region's control inputs are the forward-entry ctrls so far; the
         // back-edge ctrl is appended in patch_loop_backedge.
-        self.graph.nodes[region as usize].inputs = state.ctrl_inputs.clone();
+        self.graph.set_inputs(region, state.ctrl_inputs.clone());
         self.ctrl = region;
 
         // Memory phi: [region, entry_mem_0, …]; back-edge mem appended later.
@@ -1207,7 +3534,7 @@ impl IrBuilder {
         };
         let region = self.merges[&target_pc].merge_id;
         let back_ctrl = self.ctrl;
-        self.graph.nodes[region as usize].inputs.push(back_ctrl);
+        self.graph.push_input(region, back_ctrl);
 
         // Appending the back-edge value completes the φ's input list, so its
         // type is re-derived from the *whole* merge (`retype_phi`): the type
@@ -1215,19 +3542,19 @@ impl IrBuilder {
         for (i, &phi) in lp.local_phis.iter().enumerate() {
             if let Some(phi) = node_id_opt(phi) {
                 let v = self.locals.get(i).copied().unwrap_or(NO_NODE);
-                self.graph.nodes[phi as usize].inputs.push(v);
+                self.graph.push_input(phi, v);
                 self.retype_phi(phi);
             }
         }
         for (i, &phi) in lp.stack_phis.iter().enumerate() {
             if let Some(phi) = node_id_opt(phi) {
                 let v = self.stack.get(i).copied().unwrap_or(NO_NODE);
-                self.graph.nodes[phi as usize].inputs.push(v);
+                self.graph.push_input(phi, v);
                 self.retype_phi(phi);
             }
         }
         if let Some(mem_phi) = node_id_opt(lp.mem_phi) {
-            self.graph.nodes[mem_phi as usize].inputs.push(self.mem);
+            self.graph.push_input(mem_phi, self.mem);
         }
         // Record this back-edge as a predecessor for completeness (so any later
         // consumer that scans MergeState sees the right pred count).
@@ -1249,7 +3576,7 @@ impl IrBuilder {
 
         // Update merge node inputs
         let merge_id = state.merge_id;
-        self.graph.nodes[merge_id as usize].inputs = state.ctrl_inputs.clone();
+        self.graph.set_inputs(merge_id, state.ctrl_inputs.clone());
         self.ctrl = merge_id;
 
         // Create phi for memory
@@ -1432,7 +3759,7 @@ impl IrBuilder {
             // so it is skipped. These snapshots are emit-and-discard until the
             // lowerer resolves them — they do not affect codegen on their own.
             if self.ctrl_opt().is_some() {
-                self.graph.safepoints.push(SafepointSnapshot {
+                self.graph.push_safepoint(SafepointSnapshot {
                     bci: pc,
                     locals: self.locals.clone(),
                     stack: self.stack.clone(),
@@ -3729,6 +6056,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: UseLists::new(),
         };
         let a = graph.add(Op::Const(1), IrType::Int, vec![], None);
         let b = graph.add(Op::Const(2), IrType::Int, vec![], None);
@@ -4148,6 +6476,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: UseLists::new(),
         }
     }
 
@@ -4444,5 +6773,510 @@ mod tests {
             assert_ne!(id, NO_NODE);
             assert!(g.is_valid_id(id));
         }
+    }
+
+    // ── Compact edge lists (`Inputs`) ────────────────────────────────
+
+    /// `Inputs` must behave like the `Vec<NodeId>` it replaced, including the
+    /// spill from the inline buffer to the heap and back down again.
+    #[test]
+    fn test_inputs_matches_vec_semantics_including_spill() {
+        let mut v: Vec<NodeId> = Vec::new();
+        let mut i = Inputs::new();
+        assert!(i.is_empty());
+        assert_eq!(i.len(), 0);
+        assert!(!i.is_spilled());
+
+        // Push past the inline bound; the two stay identical throughout.
+        for k in 0..(INLINE_INPUTS as NodeId * 3) {
+            v.push(k);
+            i.push(k);
+            assert_eq!(i.as_slice(), v.as_slice(), "after push {k}");
+            assert_eq!(i.len(), v.len());
+        }
+        assert!(
+            i.is_spilled(),
+            "{} entries must have spilled past the inline bound of {}",
+            i.len(),
+            INLINE_INPUTS
+        );
+
+        // Slice access, indexing, iteration, `contains`, equality with a Vec.
+        assert_eq!(i[2], v[2]);
+        assert_eq!(i.first().copied(), Some(0));
+        assert_eq!(&i[1..3], &v[1..3]);
+        assert!(i.contains(&(INLINE_INPUTS as NodeId)));
+        assert_eq!(i.iter().sum::<NodeId>(), v.iter().sum::<NodeId>());
+        assert_eq!(i, v);
+        assert_eq!(i.to_vec(), v);
+
+        // Mutation through the slice.
+        i.as_mut_slice()[0] = 77;
+        v[0] = 77;
+        assert_eq!(i.as_slice(), v.as_slice());
+
+        while let Some(x) = v.pop() {
+            assert_eq!(i.pop(), Some(x));
+            assert_eq!(i.as_slice(), v.as_slice());
+        }
+        assert_eq!(i.pop(), None);
+
+        // The inline boundary itself.
+        let mut j = Inputs::new();
+        for k in 0..INLINE_INPUTS as NodeId {
+            j.push(k);
+            assert!(!j.is_spilled(), "{} entries still fit inline", j.len());
+        }
+        j.push(99);
+        assert!(j.is_spilled());
+        assert_eq!(j.len(), INLINE_INPUTS + 1);
+        j.clear();
+        assert!(j.is_empty());
+
+        // Conversions.
+        let from_vec = Inputs::from(vec![1u32, 2, 3]);
+        assert_eq!(from_vec, vec![1u32, 2, 3]);
+        assert_eq!(from_vec.clone().into_vec(), vec![1u32, 2, 3]);
+        let collected: Inputs = (0..8u32).collect();
+        assert_eq!(collected.len(), 8);
+        assert!(collected.is_spilled());
+        assert_eq!(format!("{:?}", from_vec), "[1, 2, 3]");
+    }
+
+    // ── Incremental def-use edges ────────────────────────────────────
+
+    /// A deterministic LCG — the randomized graphs must be reproducible so a
+    /// failure can be replayed.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 {
+                0
+            } else {
+                self.next() % n
+            }
+        }
+    }
+
+    /// A graph of `n` nodes with random edges into earlier nodes, some
+    /// `NO_NODE` holes, and a handful of safepoint snapshots.
+    fn random_graph(seed: u64, n: usize) -> Graph {
+        let mut g = empty_graph();
+        let mut rng = Lcg(seed);
+        g.add(Op::Start, IrType::Control, vec![], None);
+        for i in 1..n {
+            let arity = rng.below(7) as usize;
+            let mut inputs: Vec<NodeId> = Vec::with_capacity(arity);
+            for _ in 0..arity {
+                // One slot in eight is an undefined placeholder.
+                if rng.below(8) == 0 {
+                    inputs.push(NO_NODE);
+                } else {
+                    inputs.push(rng.below(i as u64) as NodeId);
+                }
+            }
+            let op = if arity == 0 {
+                Op::Const(rng.below(64) as i64)
+            } else {
+                Op::Add
+            };
+            g.add(op, IrType::Int, inputs, None);
+        }
+        for s in 0..6usize {
+            let mut locals: Vec<NodeId> = Vec::new();
+            let mut stack: Vec<NodeId> = Vec::new();
+            for _ in 0..4 {
+                locals.push(if rng.below(4) == 0 {
+                    NO_NODE
+                } else {
+                    rng.below(n as u64) as NodeId
+                });
+            }
+            for _ in 0..2 {
+                stack.push(rng.below(n as u64) as NodeId);
+            }
+            g.safepoints.push(SafepointSnapshot {
+                bci: s,
+                locals,
+                stack,
+            });
+        }
+        g
+    }
+
+    /// Every node and every snapshot slot, compared field by field.
+    fn assert_same_graph(a: &Graph, b: &Graph, what: &str) {
+        assert_eq!(a.nodes.len(), b.nodes.len(), "{what}: node count");
+        for (id, (x, y)) in a.nodes.iter().zip(b.nodes.iter()).enumerate() {
+            assert_eq!(x.op, y.op, "{what}: node {id} op");
+            assert_eq!(x.ty, y.ty, "{what}: node {id} type");
+            assert_eq!(
+                x.inputs.as_slice(),
+                y.inputs.as_slice(),
+                "{what}: node {id} inputs"
+            );
+            assert_eq!(x.bytecode_pc, y.bytecode_pc, "{what}: node {id} pc");
+        }
+        assert_eq!(
+            a.safepoints.len(),
+            b.safepoints.len(),
+            "{what}: safepoint count"
+        );
+        for (si, (x, y)) in a.safepoints.iter().zip(b.safepoints.iter()).enumerate() {
+            assert_eq!(x.bci, y.bci, "{what}: safepoint {si} bci");
+            assert_eq!(x.locals, y.locals, "{what}: safepoint {si} locals");
+            assert_eq!(x.stack, y.stack, "{what}: safepoint {si} stack");
+        }
+    }
+
+    /// A chain: node `i` is `Add(i-1, i-2)`, so every node has exactly two
+    /// inputs and (in the interior) exactly two users. The shape makes the
+    /// operation counts below exact rather than approximate.
+    fn chain_graph(n: usize) -> Graph {
+        assert!(n >= 4);
+        let mut g = empty_graph();
+        g.add(Op::Start, IrType::Control, vec![], None);
+        g.add(Op::Const(1), IrType::Int, vec![], None);
+        g.add(Op::Const(2), IrType::Int, vec![], None);
+        for i in 3..n {
+            g.add(
+                Op::Add,
+                IrType::Int,
+                vec![(i - 1) as NodeId, (i - 2) as NodeId],
+                None,
+            );
+        }
+        g.exit = (n - 1) as NodeId;
+        g
+    }
+
+    /// Use lists follow `add`, `replace_all_uses` and `kill`, and the counts
+    /// they report are the counts the historical scan reported.
+    #[test]
+    fn test_use_lists_maintained_across_add_replace_kill() {
+        let mut g = empty_graph();
+        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = g.add(Op::Const(2), IrType::Int, vec![], None);
+        g.rebuild_use_lists();
+        assert!(g.use_lists_valid());
+
+        // `add` records the new node's edges.
+        let s = g.add(Op::Add, IrType::Int, vec![a, b], None);
+        let t = g.add(Op::Add, IrType::Int, vec![a, a], None);
+        assert!(g.use_lists_valid(), "add keeps the lists current");
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert_eq!(g.use_count(a), 3, "one edge from s, two from t");
+        assert_eq!(g.use_count(b), 1);
+        assert_eq!(g.use_counts(), vec![3, 1, 0, 0]);
+        let mut users = g.users_of(a);
+        users.sort_unstable();
+        assert_eq!(users, vec![s, t]);
+
+        // `replace_all_uses` moves every edge, including the doubled one.
+        g.replace_all_uses(a, b);
+        assert!(g.use_lists_valid());
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert_eq!(g.use_count(a), 0);
+        assert_eq!(g.use_count(b), 4);
+        assert!(g.users_of(a).is_empty());
+
+        // `kill` drops the dead node's outgoing edges.
+        g.kill(t);
+        assert!(g.use_lists_valid());
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert_eq!(g.use_count(b), 2);
+        assert_eq!(g.users_of(b), vec![s]);
+        assert_eq!(g.use_counts(), vec![0, 2, 0, 0]);
+    }
+
+    /// Snapshot slots are use edges too: they are recorded, rewritten and
+    /// verified alongside input edges.
+    #[test]
+    fn test_use_lists_track_safepoint_slots() {
+        let mut g = empty_graph();
+        let a = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = g.add(Op::Const(2), IrType::Int, vec![], None);
+        g.rebuild_use_lists();
+
+        g.push_safepoint(SafepointSnapshot {
+            bci: 0,
+            locals: vec![a, NO_NODE],
+            stack: vec![a, b],
+        });
+        assert!(g.use_lists_valid(), "push_safepoint keeps the lists current");
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert_eq!(g.safepoint_users_of(a).len(), 2);
+        assert_eq!(
+            g.use_count(a),
+            0,
+            "snapshot slots are not input edges and never were"
+        );
+
+        g.replace_all_uses(a, b);
+        assert_eq!(g.safepoints[0].locals[0], b);
+        assert_eq!(g.safepoints[0].locals[1], NO_NODE, "a hole stays a hole");
+        assert_eq!(g.safepoints[0].stack[0], b);
+        assert_eq!(g.safepoints[0].stack[1], b);
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert!(g.safepoint_users_of(a).is_empty());
+        assert_eq!(g.safepoint_users_of(b).len(), 3);
+
+        // The tracked slot writer keeps the lists current …
+        assert!(g.set_safepoint_slot(0, SafepointSlotKind::Local, 1, a));
+        assert!(g.use_lists_valid());
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        g.replace_all_uses(a, b);
+        assert_eq!(g.safepoints[0].locals[1], b);
+
+        // … while a snapshot pushed through the public field demotes the next
+        // mutation to the scan, which is exactly the point of the guard.
+        g.safepoints.push(SafepointSnapshot {
+            bci: 1,
+            locals: vec![b],
+            stack: vec![],
+        });
+        assert!(!g.use_lists_valid());
+        g.replace_all_uses(b, a);
+        assert_eq!(g.safepoints[1].locals[0], a, "the scan still rewrote it");
+        assert!(g.use_lists_valid(), "the scan re-derived the lists");
+        assert_eq!(g.verify_use_lists(), Ok(()));
+    }
+
+    /// `verify_use_lists` is the safety net for the invariant, so it has to
+    /// actually fail on a broken list — in both directions.
+    #[test]
+    fn test_verify_use_lists_catches_a_corrupted_list() {
+        let mut g = chain_graph(12);
+        g.rebuild_use_lists();
+        assert_eq!(g.verify_use_lists(), Ok(()));
+
+        // A use that the graph does not have.
+        g.uses.users[4].push_untracked(11);
+        assert!(
+            g.verify_use_lists().is_err(),
+            "an invented use must be reported"
+        );
+        g.rebuild_use_lists();
+        assert_eq!(g.verify_use_lists(), Ok(()));
+
+        // A use the graph has but the list lost.
+        g.uses.users[4].clear_untracked();
+        let err = g.verify_use_lists().expect_err("a dropped use is a bug");
+        assert!(err.contains("node 4"), "unexpected message: {err}");
+
+        // A snapshot slot the list never learned about.
+        g.rebuild_use_lists();
+        g.push_safepoint(SafepointSnapshot {
+            bci: 0,
+            locals: vec![5],
+            stack: vec![],
+        });
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        g.uses.sp_users[5].clear();
+        assert!(g.verify_use_lists().is_err(), "a dropped slot is a bug");
+    }
+
+    /// An edge written through the public `Node::inputs` field cannot notify
+    /// the use lists, so it must demote the next mutation to the full scan
+    /// rather than be silently missed.
+    #[test]
+    fn test_direct_field_writes_demote_to_the_scan() {
+        let mut g = chain_graph(20);
+        g.rebuild_use_lists();
+        assert!(g.use_lists_valid());
+
+        // A brand new edge to node 3, invisible to the lists.
+        g.nodes[5].inputs.push(3);
+        assert!(!g.use_lists_valid(), "the epoch guard must notice");
+
+        g.replace_all_uses(3, 4);
+        assert!(
+            !g.nodes.iter().any(|n| n.inputs.contains(&3)),
+            "the untracked edge must have been rewritten too"
+        );
+        assert!(g.use_lists_valid(), "the scan re-derived the lists");
+        assert_eq!(g.verify_use_lists(), Ok(()));
+        assert_eq!(g.use_counts(), scanned_use_counts(&g));
+    }
+
+    /// `use_counts` as it was written before the use lists existed.
+    fn scanned_use_counts(g: &Graph) -> Vec<u32> {
+        let mut counts = vec![0u32; g.nodes.len()];
+        for node in &g.nodes {
+            for &inp in node.inputs.as_slice() {
+                if (inp as usize) < counts.len() {
+                    counts[inp as usize] += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    /// The incremental rewrite must produce the *same graph* as the historical
+    /// full scan on graphs it did not choose, for replacements it did not
+    /// choose. `set_use_tracking(false)` is the reference implementation: it is
+    /// the pre-existing scan, byte for byte.
+    #[test]
+    fn test_replace_all_uses_matches_the_full_scan_on_random_graphs() {
+        for seed in 0..24u64 {
+            let n = 24 + (seed as usize % 40);
+            let mut reference = random_graph(seed, n);
+            let mut incremental = random_graph(seed, n);
+            assert_same_graph(&reference, &incremental, "construction");
+
+            reference.set_use_tracking(false);
+            incremental.rebuild_use_lists();
+
+            let mut rng = Lcg(seed ^ 0xa5a5_5a5a);
+            for round in 0..16 {
+                let old = rng.below(n as u64) as NodeId;
+                let new = rng.below(n as u64) as NodeId;
+
+                // The tracked graph goes first, from a known-current state:
+                // mutating the *reference* graph bumps the shared edge epoch
+                // (its `kill` clears inputs through the public path), which
+                // would otherwise demote every incremental step to a scan and
+                // quietly stop testing the thing under test.
+                incremental.ensure_use_lists();
+                assert!(incremental.use_lists_valid());
+                incremental.replace_all_uses(old, new);
+                assert_eq!(
+                    incremental.verify_use_lists(),
+                    Ok(()),
+                    "seed {seed} round {round}"
+                );
+                reference.replace_all_uses(old, new);
+                assert_same_graph(
+                    &reference,
+                    &incremental,
+                    &format!("seed {seed} round {round} ({old} → {new})"),
+                );
+                assert_eq!(
+                    incremental.use_counts(),
+                    reference.use_counts(),
+                    "seed {seed} round {round}"
+                );
+
+                // Interleave the other mutators so the lists are exercised
+                // against a moving graph, not a frozen one.
+                if round % 4 == 3 {
+                    let victim = rng.below(n as u64) as NodeId;
+                    let holder = rng.below(n as u64) as NodeId;
+                    let val = rng.below(n as u64) as NodeId;
+                    incremental.ensure_use_lists();
+                    incremental.kill(victim);
+                    incremental.push_input(holder, val);
+                    let fresh_i = incremental.add(Op::Add, IrType::Int, vec![old, new], None);
+                    assert_eq!(
+                        incremental.verify_use_lists(),
+                        Ok(()),
+                        "seed {seed} round {round} after mutation"
+                    );
+                    reference.kill(victim);
+                    reference.push_input(holder, val);
+                    let fresh_r = reference.add(Op::Add, IrType::Int, vec![old, new], None);
+                    assert_eq!(fresh_r, fresh_i);
+                    assert_same_graph(
+                        &reference,
+                        &incremental,
+                        &format!("seed {seed} round {round} after mutation"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The measurement the review asked for, made by construction rather than
+    /// by timing: how many node-input slots does one `replace_all_uses` touch?
+    ///
+    /// The chain graph has `n - 3` two-input nodes, so a full scan examines
+    /// `E = 2·(n-3)` slots *per call*, whatever the replacement is. The
+    /// incremental walk visits only the users of the replaced node — exactly
+    /// two of them, of two inputs each — so it examines 4 slots per call
+    /// regardless of `n`. With `R = 8` replacements:
+    ///
+    /// | nodes  | E      | scan `R·E` | incremental `R·4` | ratio  |
+    /// |--------|--------|-----------:|------------------:|-------:|
+    /// | 100    | 194    | 1 552      | 32                | 48.5×  |
+    /// | 1 000  | 1 994  | 15 952     | 32                | 498×   |
+    /// | 5 000  | 9 994  | 79 952     | 32                | 2 498× |
+    /// | 20 000 | 39 994 | 319 952    | 32                | 9 998× |
+    ///
+    /// The incremental cost is independent of graph size; the scan is linear
+    /// in it. (Real passes also pay one rebuild per untracked edit — asserted
+    /// to be zero here — so the end-to-end win on a mutation-heavy pass is
+    /// bounded by how often the pass writes edges through the public field.)
+    #[test]
+    fn test_replace_all_uses_slot_counts_by_graph_size() {
+        // Eight replacement targets, 8 apart, so no target is a user of
+        // another and each rewrite is independent of the ones before it.
+        const ROUNDS: usize = 8;
+        let targets: Vec<NodeId> = (0..ROUNDS).map(|k| (10 + 8 * k) as NodeId).collect();
+
+        for &n in &[100usize, 1_000, 5_000, 20_000] {
+            let edges = 2 * (n - 3) as u64;
+
+            // Reference: the historical full scan.
+            let mut scan = chain_graph(n);
+            scan.set_use_tracking(false);
+            scan.reset_use_list_stats();
+            for &t in &targets {
+                scan.replace_all_uses(t, 1);
+            }
+            assert_eq!(
+                scan.use_list_slots_examined(),
+                ROUNDS as u64 * edges,
+                "the scan examines every input slot on every call (n = {n})"
+            );
+
+            // Incremental: only the users of the replaced node.
+            let mut inc = chain_graph(n);
+            inc.rebuild_use_lists();
+            inc.reset_use_list_stats();
+            for &t in &targets {
+                inc.replace_all_uses(t, 1);
+            }
+            assert_eq!(
+                inc.use_list_slots_examined(),
+                ROUNDS as u64 * 4,
+                "two users of two inputs each, per call (n = {n})"
+            );
+            assert_eq!(
+                inc.use_list_rebuilds(),
+                0,
+                "no rebuild is needed once the lists are current (n = {n})"
+            );
+
+            // Same work, same graph.
+            assert_same_graph(&scan, &inc, &format!("n = {n}"));
+            assert_eq!(inc.verify_use_lists(), Ok(()));
+            assert_eq!(inc.use_counts(), scan.use_counts());
+        }
+    }
+
+    /// A builder-produced graph arrives with its def-use edges already
+    /// current: every edge the builder writes goes through a tracked mutator,
+    /// so the first optimization rewrite is incremental without a warm-up
+    /// scan.
+    #[test]
+    fn test_builder_graphs_arrive_with_current_use_lists() {
+        // iload_0; iload_1; iadd; ireturn
+        let code = [0x1a, 0x1b, 0x60, 0xac, 0, 0];
+        let graph = build_ir(&code, 4, 2, 2);
+        assert!(
+            graph.use_lists_valid(),
+            "the builder must not leave the lists stale"
+        );
+        assert_eq!(graph.verify_use_lists(), Ok(()));
+        assert_eq!(graph.use_counts(), scanned_use_counts(&graph));
     }
 }

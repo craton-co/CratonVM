@@ -102,6 +102,37 @@ mod threadreg_perf {
     }
 }
 
+/// The calling OS thread's id, in the same encoding `ThreadEntry::os_tid`
+/// stores (`GetCurrentThreadId` on Windows, `gettid` on Linux) — see
+/// `ThreadRegistry::set_os_tid_current`, whose publication this reads back.
+/// `0` means "this platform has no takeover/identity backend", which every
+/// caller must read as "unknown": `0` is also the never-published sentinel in
+/// the entry.
+#[cfg(windows)]
+#[inline]
+fn current_os_tid() -> u32 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+    unsafe { GetCurrentThreadId() }
+}
+
+/// Linux variant of [`current_os_tid`].
+#[cfg(target_os = "linux")]
+#[inline]
+fn current_os_tid() -> u32 {
+    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+}
+
+/// Fallback for platforms with no `os_tid` publication (the takeover machinery
+/// is Windows/Linux-only, and so is `set_os_tid_current`).
+#[cfg(all(not(windows), not(target_os = "linux")))]
+#[inline]
+fn current_os_tid() -> u32 {
+    0
+}
+
 /// An entry in the thread registry for one JVM thread.
 struct ThreadEntry {
     /// Human-readable name.
@@ -883,6 +914,16 @@ impl ThreadRegistry {
                 by_java_tid.remove(&java_tid);
             }
         }
+        // P1 shadow record — the `-> Terminated` edge. `mark_dead` is NOT
+        // always self-called: `ThreadRegistry::join` (below) marks the joinee
+        // dead from the *joining* thread. `record_transition_for` therefore
+        // records only when the calling thread's cell is bound to this id, so
+        // a peer's termination can never be attributed to the caller.
+        crate::threading::thread_state::record_transition_for(
+            thread_id.0,
+            crate::threading::thread_state::ThreadExecState::Terminated,
+            "thread_registry::mark_dead",
+        );
     }
 
     /// Aliasing-proof identity lookup: registry `ThreadId` by the Java-side
@@ -963,6 +1004,16 @@ impl ThreadRegistry {
         if let Some(entry) = threads.get(&thread_id) {
             entry.stw_ready.store(true, Ordering::Release);
         }
+        drop(threads);
+        // P1 shadow record — the `Starting -> JavaRunning` edge. Always
+        // self-called by the freshly spawned carrier (`vm/src/vm/vm_exec.rs`
+        // `thread_start` and the virtual-thread first-mount arm), inside
+        // `GcBarrier::run_if_no_stw_requested`, so binding here is safe.
+        crate::threading::thread_state::bind_current_thread(thread_id.0);
+        crate::threading::thread_state::record_transition(
+            crate::threading::thread_state::ThreadExecState::JavaRunning,
+            "thread_registry::mark_stw_ready",
+        );
     }
 
     /// Block the calling OS thread until the target thread finishes.
@@ -1559,6 +1610,76 @@ impl ThreadRegistry {
                 .in_blocked_region
                 .store(false, Ordering::Release);
         }
+    }
+
+    /// CENSUS-RECONCILE — the shared [`GcBlockState`] published for
+    /// `thread_id`.
+    ///
+    /// This is the SAME `Arc` the owning `JvmThread` holds (installed by
+    /// [`Self::set_gc_block_state`]), so a caller that cannot reach the
+    /// `JvmThread` itself can still hand the *authoritative*
+    /// `in_blocked_region` flag to
+    /// [`crate::threading::gc_barrier::GcBarrier::leave_blocked_region_flagged`]
+    /// rather than clearing it with a bare `store(false)` (finding 1(c): a
+    /// bare store lets a pause requested between the drain and the store both
+    /// EXCLUDE the thread and let it run).
+    ///
+    /// `jni::host_thread_leave_native` is the motivating caller: it runs on a
+    /// host OS thread that has no `JNI_THREAD` binding, so `with_jni_context`
+    /// — every other path's route to the flag — resolves to `None` there.
+    ///
+    /// The `Arc` is CLONED out rather than borrowed on purpose: the registry
+    /// lock must be released before the caller can park inside the barrier.
+    /// Holding it across a pause drain would queue every later census behind a
+    /// pending registry writer.
+    pub fn gc_block_state_of(&self, thread_id: ThreadId) -> Option<Arc<GcBlockState>> {
+        self.threads
+            .read()
+            .get(&thread_id)
+            .map(|entry| entry.gc_block_state.clone())
+    }
+
+    /// CENSUS-RECONCILE — the registered, alive `ThreadId` whose published
+    /// `os_tid` is the CALLING OS thread's.
+    ///
+    /// The identity census (`alive_count_blocked_and_os_tids`) keys the STW
+    /// exclusion set on `ThreadId`, so a host-facing entry point that wants to
+    /// be *excluded* must name itself. A host thread parked outside the VM has
+    /// no `JvmThread` borrow and no JNI TLS binding, but its carrier's
+    /// `os_tid` was published by [`Self::set_os_tid_current`] at registration
+    /// — which makes the OS id the only identity link that survives leaving
+    /// the VM.
+    ///
+    /// Returns `None` when the answer would be ambiguous or unknown:
+    ///
+    /// * no alive entry claims this OS thread (a genuinely foreign host
+    ///   thread — it is not in `alive_count` either, so it occupies no
+    ///   `expected` slot and needs no exclusion),
+    /// * MORE than one does (a virtual thread mounted on this carrier
+    ///   republishes the carrier's `os_tid` under the vthread's own id, see
+    ///   `vm_exec.rs`'s mount path — guessing between them could exclude the
+    ///   wrong identity from a pause), or
+    /// * the platform has no `os_tid` backend at all (`current_os_tid() == 0`).
+    ///
+    /// `None` is always the safe answer: the caller then falls back to the
+    /// anonymous-counter-only behaviour, which is what every such call did
+    /// before this existed.
+    pub fn thread_id_for_current_os_tid(&self) -> Option<ThreadId> {
+        let os_tid = current_os_tid();
+        if os_tid == 0 {
+            return None;
+        }
+        let threads = self.threads.read();
+        let mut found: Option<ThreadId> = None;
+        for (tid, e) in threads.iter() {
+            if e.alive.load(Ordering::Acquire) && e.os_tid.load(Ordering::Acquire) == os_tid {
+                if found.is_some() {
+                    return None; // ambiguous — see the doc comment
+                }
+                found = Some(*tid);
+            }
+        }
+        found
     }
 
     /// DBG (CRATONVM_DBG_MTROOTS): per-thread (tid, in_blocked_region,
