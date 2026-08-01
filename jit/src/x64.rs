@@ -121,6 +121,20 @@ pub use reg_encoding::*;
 pub mod disp;
 pub use disp::{base_requires_displacement, base_requires_sib, disp8_const, Disp, DispOutOfRange};
 // ---------------------------------------------------------------------------
+// Instruction patterns and instruction selection
+// ---------------------------------------------------------------------------
+//
+// This declaration was missing until 2026-08-01, so `x64/isel.rs` had never
+// been compiled: its declarative pattern table, and the byte-for-byte
+// equivalence sweep against the hand-written emitters below that is the only
+// reason to trust that table, had never been seen by a compiler or run.
+//
+// Declared `pub mod` rather than `mod` + glob re-export because the table and
+// the selector are addressed by qualified path (`isel::select_block`), and a
+// glob would drop several hundred pattern-row constants into this file's
+// namespace.
+pub mod isel;
+// ---------------------------------------------------------------------------
 // SIMD loop analysis and vectorization
 // ---------------------------------------------------------------------------
 //

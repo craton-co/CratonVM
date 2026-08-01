@@ -3262,7 +3262,10 @@ pub(super) enum LoopXformKind {
 /// unpolled cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(super) enum LoopXformRefusal {
+// `pub(crate)`, not `pub(super)`: `x64::LoopRewriteRefusal::Planner` carries one
+// of these and is itself reachable at crate visibility, so the narrower spelling
+// made the variant's field more private than the item holding it.
+pub(crate) enum LoopXformRefusal {
     /// Malformed or out-of-range inputs (bad PCs, truncated branch, oversized
     /// method), or an internal invariant that did not hold.
     BadShape,

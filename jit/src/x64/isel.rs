@@ -4242,10 +4242,25 @@ pub fn select_block(
             continue;
         }
         let mut cands: Vec<Tile> = Vec::new();
+        // ALU forms are offered BEFORE `LEA`, and the order is load-bearing:
+        // `min_by_key` keeps the first minimum, so this is the tie-break. On a
+        // one-register address (`p + 24`) the two are identical on every axis
+        // the cost model measures — 1 uop, 4 bytes, latency 1 — and the ALU
+        // form is still the better answer, because `LEA` occupies the address
+        // generation unit and carries worse latency on several
+        // microarchitectures than the table's uniform figure admits. Offering
+        // `LEA` first made `p + 24` select an `LEA`, which is what
+        // `a_constant_that_fits_imm8_becomes_an_immediate` caught the first
+        // time this file was ever compiled.
+        //
+        // Ties are the only thing this order decides. Where `LEA` genuinely
+        // wins — a live left operand, where the ALU form must copy first — it
+        // wins on cost regardless of position; see
+        // `lea_wins_only_when_the_alu_form_would_need_a_copy`.
+        cands.extend(tiles_alu(&ctx, id, &claimed, opts, &mut notes));
         if let Some(t) = tile_lea(&ctx, id, &claimed, &mut notes) {
             cands.push(t);
         }
-        cands.extend(tiles_alu(&ctx, id, &claimed, opts, &mut notes));
         if let Some(t) = tile_cmp_setcc(&ctx, id, &claimed) {
             cands.push(t);
         }
