@@ -284,6 +284,8 @@ struct Lowerer<'a> {
     /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
     /// nodes use the same shared runtime-lowering stub as the baseline tier.
     new_object: usize,
+    monitor_enter: usize,
+    monitor_exit: usize,
     /// Cooperative GC poll flag and no-argument slow path. IR values are
     /// canonicalized in frame slots, so the slow-path call needs no spill.
     safepoint_flag_addr: usize,
@@ -661,6 +663,8 @@ impl<'a> Lowerer<'a> {
             getfield: helpers.getfield,
             putfield_int: helpers.putfield_int,
             new_object: helpers.new_object,
+            monitor_enter: helpers.monitor_enter,
+            monitor_exit: helpers.monitor_exit,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
@@ -2932,6 +2936,49 @@ fn reloc_emit_enabled() -> bool {
                 self.buf.emit(&[0x48, 0x89, 0xD0]);
                 self.patch_div_overflow_after(ovf_after);
                 self.store_rax(slot);
+            }
+            Op::MonitorEnter | Op::MonitorExit => {
+                // `[ctrl, mem, obj]`.
+                let obj_id = node.inputs[2];
+                let obj_slot = self.slot_of(obj_id);
+                // Publish the map BEFORE the call, same contract as `Op::Call`:
+                // both monitor ops carry `safepoint: true`, and a contended
+                // acquire parks this thread for an entire collection.
+                let sp_live_hi = self.spill_high_water;
+                self.emit_safepoint_map(sp_live_hi);
+                let target = if matches!(node.op, Op::MonitorEnter) {
+                    self.monitor_enter
+                } else {
+                    self.monitor_exit
+                };
+                crate::runtime_lowering::emit_monitor_stub(
+                    &mut self.buf,
+                    self.context_slot_off,
+                    obj_slot,
+                    target,
+                    self.frame_record,
+                );
+                // `i64::MIN` means the helper published a pending Java
+                // exception (a null receiver takes the NPE path).
+                self.emit_mov_reg_imm64(RCX, i64::MIN as u64);
+                self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                self.buf.emit(&[0x0F, 0x85]); // JNE ok
+                let ok_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.buf.emit_byte(0xE9); // JMP shared exception epilogue
+                let exception_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.call_exc_patches.push(exception_patch);
+                let ok = self.buf.pos();
+                let rel = ok as i32 - (ok_patch as i32 + 4);
+                Self::patch_or_bail(&mut self.buf, ok_patch, rel);
+                // Store the possibly-REMAPPED reference back. A contended
+                // acquire can move the object while this thread is parked.
+                // Idempotent with the collector's own rewrite:
+                // `conservative_roots::remap_one_jit_frame` rewrites published
+                // slots keyed on their CURRENT value, so if it already wrote
+                // the new address, writing the same address again is a no-op.
+                self.store_rax(obj_slot);
             }
             Op::New {
                 class_id,
@@ -5972,15 +6019,16 @@ pub(crate) fn lower_inner_with_scopes(
     // to exist before that arm is ever added: the failure it prevents is
     // silent. Adding the helper is not a small change — the helper table's byte
     // offsets are baked into emitted machine code.
-    if graph
-        .nodes
-        .iter()
-        .any(|n| matches!(n.op, Op::MonitorEnter | Op::MonitorExit))
+    if (helpers.monitor_enter == 0 || helpers.monitor_exit == 0)
+        && graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::MonitorEnter | Op::MonitorExit))
     {
         return refuse(Bailout::with_context(
-            BailoutReason::UnsupportedShape("monitor op has no lowering"),
-            "ir_lower has no MonitorEnter/MonitorExit arm and JitRuntimeHelpers \
-             has no monitor helper; refusing rather than dropping the lock",
+            BailoutReason::UnsupportedShape("monitor helper absent"),
+            "graph contains monitor ops but the helper table has no monitor \
+             entry; refusing rather than emitting nothing and dropping the lock",
         ));
     }
     // A live object allocation is now supported by the common allocation
@@ -6606,6 +6654,52 @@ mod tests {
     /// Build → schedule → lower WITHOUT the optimizer, so safepoint NodeIds
     /// stay stable (DCE/GVN safepoint preservation is a later concern; the
     /// emit-and-discard points are validated on the un-optimized graph).
+    /// A synchronized region now reaches the IR tier instead of bailing.
+    ///
+    /// Two halves, and both matter. With NO monitor helper the compile must be
+    /// REFUSED — `lower_data_node`'s catch-all would otherwise emit nothing for
+    /// the monitor and the lock would silently disappear. With a helper present
+    /// it must compile, and the emitted code must actually CALL that helper
+    /// twice (enter + exit), not merely accept the graph.
+    #[test]
+    fn a_synchronized_region_lowers_through_the_monitor_helper() {
+        // aload_0; monitorenter; aload_0; monitorexit; return
+        let code = [0x2a, 0xc2, 0x2a, 0xc3, 0xb1, 0, 0];
+        let builder = IrBuilder::new(1, 1);
+        let graph = builder.build(&code, 5).expect("builder must accept monitors");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::MonitorEnter)),
+            "the builder must emit a MonitorEnter node"
+        );
+        let schedule = ir_schedule::schedule(&graph);
+
+        // No helper -> refuse, rather than drop the lock.
+        assert!(
+            lower(&graph, &schedule, 1, 1, &no_helpers()).is_none(),
+            "a monitor graph with no helper must be REFUSED, never lowered to \
+             nothing"
+        );
+
+        // Helper present -> compiles, and both monitor calls are emitted.
+        extern "C" fn fake_monitor(_vm: i64, obj: i64) -> i64 {
+            obj
+        }
+        let mut helpers = no_helpers();
+        helpers.monitor_enter = fake_monitor as *const () as usize;
+        helpers.monitor_exit = fake_monitor as *const () as usize;
+        let cm = lower(&graph, &schedule, 1, 1, &helpers)
+            .expect("a monitor graph with a helper must compile");
+        let target = (fake_monitor as *const () as usize).to_le_bytes();
+        let bytes = cm.code_bytes();
+        let calls = bytes
+            .windows(8)
+            .filter(|w| *w == target)
+            .count();
+        assert_eq!(calls, 2, "monitorenter and monitorexit must each call the helper");
+    }
     fn compile_via_ir_no_opt(
         code: &[u8],
         code_len: usize,

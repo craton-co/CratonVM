@@ -5046,6 +5046,28 @@ impl IrBuilder {
                     self.mem = store;
                     pc += 3;
                 }
+                // monitorenter / monitorexit — emitted so escape analysis can
+                // see the lock and offer an elision or coarsening plan. Both
+                // advance the memory token: they are ordering barriers with JMM
+                // acquire/release semantics and both are safepoints, so nothing
+                // may be reordered across them.
+                //
+                // `ir_lower` refuses the graph when the helper table carries no
+                // monitor entry, so a backend that cannot lower these declines
+                // the method rather than silently emitting nothing.
+                0xc2 | 0xc3 => {
+                    let obj = self.pop();
+                    let op = if code[pc] == 0xc2 {
+                        Op::MonitorEnter
+                    } else {
+                        Op::MonitorExit
+                    };
+                    let mon =
+                        self.graph
+                            .add(op, IrType::Memory, vec![self.ctrl, self.mem, obj], Some(pc));
+                    self.mem = mon;
+                    pc += 1;
+                }
                 // new — allocate an object as an `Op::New`. Emitted so escape
                 // analysis can scalar-replace it when it does not escape (no
                 // heap allocation, fields become SSA values). An escaping
