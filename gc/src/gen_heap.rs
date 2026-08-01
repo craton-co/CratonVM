@@ -7402,6 +7402,13 @@ impl GenerationalHeap {
         let retain_dead_objects =
             sweep_zero_enabled() || crate::a2dbg::enabled() || gc_flags().dbg_sweep_census;
         let mut dead_regions: Vec<(usize, usize, u32, u8, usize)> = Vec::new();
+        // CRATONVM_DBG_SWEEP_LIVENESS: bases of the objects this walk decides to
+        // KEEP, so the assertion below can ask whether any of them still points
+        // into a span the walk decided to zero. Collected here rather than by a
+        // second walk because the walk is the only thing that knows the object
+        // grid — re-deriving it is exactly the desync hazard documented on
+        // `mark_young_to_old_refs`.
+        let mut young_survivors: Vec<usize> = Vec::new();
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
         // Index into `dead_regions` at the last trustworthy walk anchor
@@ -7985,6 +7992,9 @@ impl GenerationalHeap {
             } else if side_marked_survivor {
                 // Side-marked survivor: pure retention, no header writes.
                 objects_live += 1;
+                if gc_flags().dbg_sweep_liveness {
+                    young_survivors.push(obj_ptr as usize);
+                }
                 // Family-A fix follow-up: a side-marked survivor is kept in
                 // place exactly like a header-marked one (same "never moves"
                 // guarantee), so it needs the SAME watched-referent identity
@@ -8013,6 +8023,9 @@ impl GenerationalHeap {
                 header.gc_flags &= !GC_FLAG_MARKED;
                 header.gc_age = header.gc_age.saturating_add(1);
                 objects_live += 1;
+                if gc_flags().dbg_sweep_liveness {
+                    young_survivors.push(obj_ptr as usize);
+                }
                 // RandomizedContext WeakHashMap<Thread,...> fix (see
                 // gc_quiescence::is_watched_referent): this survivor is kept
                 // in place at its ORIGINAL address, so selective promotion
@@ -8183,11 +8196,37 @@ impl GenerationalHeap {
                     }
                 }
             }
+            // YOUNG->YOUNG. Three prior runs of this assertion came back clean
+            // (old->old, old->young, and the PIN-STALE canary), and the shape
+            // that remains is a young referrer holding a young victim — e.g. a
+            // bucket array and its chain nodes both allocated inside one test
+            // method, never promoted. `young_survivors` is collected by the
+            // walk itself, because the walk is the only thing that knows the
+            // object grid; re-deriving it by a second linear scan is the exact
+            // desync hazard `mark_young_to_old_refs` documents.
+            let young_referrers = std::mem::take(&mut young_survivors);
+            for &obj_ptr in &young_referrers {
+                // SAFETY: these bases came from the sweep walk itself, which
+                // only classifies spans it has parsed as valid object headers.
+                let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                // SAFETY: a survivor has a valid header and an in-bounds body —
+                // `for_each_ref_slot`'s contract.
+                unsafe {
+                    for_each_ref_slot(obj_ptr as *mut u8, h, |ref_ptr, slot| {
+                        let victim = ref_ptr as usize;
+                        if in_doomed(victim) && hits.len() < 64 {
+                            hits.push((victim, h.class_id.as_u32(), obj_ptr, slot));
+                        }
+                    });
+                }
+            }
             if !hits.is_empty() {
                 eprintln!(
-                    "[SWEEP-LIVENESS young] {} live OLD-gen ref(s) point into {} young span(s) this sweep is about to zero",
+                    "[SWEEP-LIVENESS young] {} live ref(s) point into {} young span(s) this sweep is about to zero ({} old-gen + {} young survivors scanned)",
                     hits.len(),
                     spans.len(),
+                    objects_live,
+                    young_referrers.len(),
                 );
                 for (victim, cid, referrer, slot) in hits.iter().take(12) {
                     eprintln!(
