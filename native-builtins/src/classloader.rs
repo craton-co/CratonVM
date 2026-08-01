@@ -1445,13 +1445,32 @@ pub(crate) fn is_user_defined_loader(ctx: &mut dyn NativeContext, this: ObjectRe
     }
 }
 
-/// Identity-hash → CratonVM loader-namespace-id side table for real-JDK mode.
+/// Loader-object → CratonVM loader-namespace-id side table for real-JDK mode.
 ///
 /// In synthetic-JDK mode a user loader's namespace id lives in the synthetic
 /// `CL_LOADER_ID` field slot (populated by `ClassLoader.<init>`/`defineClass`).
 /// In real-JDK mode that slot is a genuine `java.lang.ClassLoader` field and
-/// cannot be repurposed, so the id is keyed instead on the loader's STABLE
-/// identity hash. Holds only `i32 → u32` (no `ObjectRef`s) — no GC rooting.
+/// cannot be repurposed, so the id is keyed on the loader OBJECT instead.
+///
+/// # GC contract — both halves are load-bearing
+///
+/// The entries are `(ObjectRef, u32)`. The `ObjectRef` is a raw heap address, so
+/// this table has a two-part GC contract and **neither half may be dropped**:
+///
+/// * it is deliberately **NOT** a GC root (see `gc_scan_loader_singleton_roots`,
+///   which roots only the app/platform singletons) — rooting it would pin every
+///   user loader forever and defeat loader unloading;
+/// * therefore [`gc_reconcile_defining_loaders`] MUST prune entries whose loader
+///   died this cycle and remap the survivors that moved. That is the *only*
+///   thing standing between a dead loader's address being reused and a brand-new
+///   loader silently inheriting the dead one's namespace id — and, through
+///   `register_user_loader_parent`, its parent link too.
+///
+/// The doc comment this replaced still described the table's *previous*,
+/// identity-hash-keyed form ("holds only `i32 → u32` … no GC rooting"), which
+/// had stopped being true; a reader who believed it would conclude there was
+/// nothing for the collector to do here. Pinned by
+/// `loader_namespace_store_is_pruned_and_remapped_by_gc_reconcile`.
 fn loader_namespace_id_store() -> &'static Mutex<Vec<(ObjectRef, u32)>> {
     // Keyed by the loader OBJECT, not its identity hash: identity hashes can
     // collide across distinct loader instances (address-derived hashes recur
@@ -9473,6 +9492,106 @@ mod classloader_tests {
             peek_loader_namespace_id(&mut ctx, loader).is_none(),
             "VM reset must not leave stale real-JDK loader namespace ids"
         );
+    }
+
+    /// SHIM-AUDIT handover item 2 — pins the GC contract documented on
+    /// [`loader_namespace_id_store`].
+    ///
+    /// This is a PIN, not a fail-before-the-fix regression test: both halves
+    /// (prune the dead, remap the moved) are already wired, and were verified
+    /// by reading `gc_reconcile_defining_loaders`. Until now the only thing
+    /// holding the invariant was a prose comment, and the comment had already
+    /// drifted (it still described the table's old identity-hash-keyed form and
+    /// claimed it held no `ObjectRef`s at all). Deleting either half of the
+    /// `retain_mut` now fails here instead of silently reintroducing the
+    /// original defect: a dead loader's entry outliving it, its address being
+    /// reused, and the new loader at that address inheriting the dead one's
+    /// namespace id *and* — via `register_user_loader_parent` — its parent link.
+    #[test]
+    fn loader_namespace_store_is_pruned_and_remapped_by_gc_reconcile() {
+        let mut ctx = MockNativeContext::new();
+        let class_loader = ctx
+            .ensure_class_initialized("java/lang/ClassLoader")
+            .expect("ClassLoader class");
+        let isolated = ctx
+            .ensure_class_initialized("example/GcReconcileLoader")
+            .expect("isolated loader class");
+        ctx.set_superclass(isolated, class_loader);
+
+        let dead = new_object_ref(&mut ctx, "example/GcReconcileLoader");
+        let moved_from = new_object_ref(&mut ctx, "example/GcReconcileLoader");
+        let moved_to = new_object_ref(&mut ctx, "example/GcReconcileLoader");
+
+        // Ids well above `ClassLoaderId::NATIVE_FIRST_USER_DEFINED` and far from
+        // anything another test in this process allocates.
+        const DEAD_NS: u32 = 90_001;
+        const MOVED_NS: u32 = 90_002;
+
+        {
+            let mut store = loader_namespace_id_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.push((dead, DEAD_NS));
+            store.push((moved_from, MOVED_NS));
+        }
+        assert_eq!(
+            peek_loader_namespace_id(&mut ctx, dead),
+            Some(DEAD_NS),
+            "precondition: the dead loader's entry is in the store"
+        );
+
+        let dead_addr = dead.as_ptr() as usize;
+        let from_addr = moved_from.as_ptr() as usize;
+        let to_addr = moved_to.as_ptr() as usize;
+
+        // These side-tables are process-global and the test binary is
+        // multi-threaded, so this predicate reports every address it does not
+        // own as ALIVE. Only `dead` is collected; nothing another test put in
+        // either store can be pruned by this call.
+        //
+        // `moved_from` is reported alive on purpose: a relocated object IS a
+        // survivor. That mirrors the real predicate
+        // (`pointer_map.contains_key(addr) || heap.is_addr_live(addr)`) named in
+        // `gc_reconcile_defining_loaders`' doc comment.
+        let is_marked = move |addr: usize| addr != dead_addr;
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(from_addr, to_addr);
+
+        gc_reconcile_defining_loaders(&is_marked, &pointer_map);
+
+        // Half 1 — PRUNE. The collected loader's entry is gone, so its address
+        // can be recycled without the next loader inheriting its namespace.
+        assert!(
+            peek_loader_namespace_id(&mut ctx, dead).is_none(),
+            "a loader collected this cycle must not keep its namespace-id entry"
+        );
+        assert!(
+            loader_object_for_namespace_id(DEAD_NS).is_none(),
+            "the dead namespace id must no longer resolve to any loader object"
+        );
+
+        // Half 2 — REMAP. The survivor kept its id and now answers at its NEW
+        // address; the old address answers for nobody.
+        assert_eq!(
+            peek_loader_namespace_id(&mut ctx, moved_to),
+            Some(MOVED_NS),
+            "a relocated loader must keep its namespace id at its new address"
+        );
+        assert_eq!(
+            loader_object_for_namespace_id(MOVED_NS).map(|o| o.as_ptr()),
+            Some(moved_to.as_ptr()),
+            "the reverse lookup must hand back the post-collection address"
+        );
+        assert!(
+            peek_loader_namespace_id(&mut ctx, moved_from).is_none(),
+            "the pre-collection address must no longer resolve"
+        );
+
+        // Leave the process-global store as we found it.
+        loader_namespace_id_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, id)| *id != DEAD_NS && *id != MOVED_NS);
     }
 
     #[test]

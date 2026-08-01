@@ -37,10 +37,33 @@
 //! honestly reports what an agent will and won't see. Full unification
 //! remains a separate, larger task.
 //!
+//! ---------------------------------------------------------------------------
+//! # SCOPE: one JVMTI environment per VM (C2 review remediation, 2026-08-01)
+//! ---------------------------------------------------------------------------
+//!
+//! JVMTI's own model is one `jvmtiEnv` per agent per **VM**. This file used to
+//! hold two process-global cells instead — `GLOBAL_MANAGER` (every callback
+//! and every `any_*_listener` fast-path flag) and `REAL_AGENT_ENV_BRIDGE` (a
+//! single `Weak<SharedVm>`) — so event delivery had no VM scope at all. They
+//! are replaced by `ENVIRONMENTS`, a `vm_identity`-keyed registry of
+//! `VmJvmtiEnvironment` rows (manager + bridge + field watchpoints).
+//!
+//! Two rules to keep in mind when adding to this file:
+//!
+//!  * **Guards may over-approximate; delivery may not.** `any_*_listener_active()`
+//!    reads a process-wide union mirror so the interpreter's per-opcode check
+//!    stays a single atomic load. Every `fire_*` resolves the exact owning VM
+//!    before it dispatches.
+//!  * **`UNATTRIBUTED_VM` (`0`) is a migration seam, not a scope.** Call sites
+//!    that cannot supply a `vm_identity` land there, and per-VM lookups fall
+//!    back to it. Prefer the `*_for_vm` entry points; see
+//!    `docs/known-issues/jvmti-vm-scoping.md` for what is still unattributed
+//!    and why.
+//!
 //! What IS live in this file on a default build:
 //!
 //!  * `install_global_manager` runs unconditionally from `SharedVm::new`, so
-//!    the process-global `JvmtiEventManager` always exists.
+//!    the unattributed `JvmtiEventManager` always exists.
 //!  * `fire_class_load` / `fire_class_prepare` are driven by the
 //!    `classloading` hook adapters, `fire_gc_start` / `fire_gc_finish` by the
 //!    `gc` hook adapters, `fire_vm_init` / `fire_vm_death` by the VM
@@ -67,7 +90,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+// `OnceLock` is deliberately NOT imported here: the two process-global
+// `OnceLock`s this module used to carry (`GLOBAL_MANAGER`,
+// `REAL_AGENT_ENV_BRIDGE`) were the C2-review bug, and a bare `OnceLock` in
+// this file is now almost always the wrong tool — per-VM state belongs in
+// `ENVIRONMENTS`. The one remaining use is a `#[cfg(test)]` serialisation
+// mutex, which spells the path out in full.
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 // ---------------------------------------------------------------------------
 // JVMTI Version Constants
@@ -884,6 +913,18 @@ impl fmt::Debug for EventCallbacks {
 /// hot-path cost at O(1) (a single relaxed load + branch) when no tool is
 /// attached, which is the overwhelming common case.
 pub struct JvmtiEventManager {
+    /// The `vm_identity` of the VM this manager belongs to, or
+    /// [`UNATTRIBUTED_VM`] (`0`) for a manager that was installed through the
+    /// legacy, VM-less [`install_global_manager`] entry point (or built
+    /// standalone by a unit test).
+    ///
+    /// This is what makes the D14 bridge per-VM: a bridged `fire_*` resolves
+    /// the real, native-agent-facing env through *this* field, so a manager
+    /// owned by VM B can never deliver into VM A's `shared.debug.jvmti_env`.
+    /// An unattributed manager falls back to [`sole_live_bridge`], which
+    /// answers `None` unless exactly one VM is live — fail-closed, never a
+    /// guess. See `docs/known-issues/jvmti-vm-scoping.md`.
+    vm: usize,
     /// Global event enable/disable state.
     global_events: RwLock<HashSet<JvmtiEventKind>>,
     /// Per-thread event enable/disable state.
@@ -927,8 +968,23 @@ pub struct JvmtiEventManager {
 pub const DEFAULT_SAMPLING_INTERVAL_BYTES: u64 = 512 * 1024;
 
 impl JvmtiEventManager {
+    /// A manager with no owning VM. Equivalent to `new_for_vm(UNATTRIBUTED_VM)`.
+    ///
+    /// Kept for the legacy [`install_global_manager`] call site and for unit
+    /// tests. **New production wiring should use [`Self::new_for_vm`]** so the
+    /// manager's events, listener flags and D14 bridge are scoped to one VM.
     pub fn new() -> Self {
+        Self::new_for_vm(UNATTRIBUTED_VM)
+    }
+
+    /// A manager owned by the VM with `vm_identity == vm`.
+    ///
+    /// `vm` must be a real `vm_identity` (monotonic, allocated from
+    /// `NEXT_VM_IDENTITY` in `vm/src/vm/vm_init.rs`, never recycled, never
+    /// `0`). Passing `0` produces an unattributed manager.
+    pub fn new_for_vm(vm: usize) -> Self {
         Self {
+            vm,
             global_events: RwLock::new(HashSet::new()),
             thread_events: RwLock::new(HashMap::new()),
             callbacks: RwLock::new(EventCallbacks::default()),
@@ -943,6 +999,31 @@ impl JvmtiEventManager {
             any_frame_pop_listener: AtomicBool::new(false),
             sampling_bytes: AtomicU64::new(0),
             sampling_threshold: AtomicU64::new(DEFAULT_SAMPLING_INTERVAL_BYTES),
+        }
+    }
+
+    /// The `vm_identity` this manager belongs to, or [`UNATTRIBUTED_VM`].
+    #[inline]
+    pub fn vm_identity(&self) -> usize {
+        self.vm
+    }
+
+    /// The live `SharedVm` whose real, native-agent-facing JVMTI env this
+    /// manager's bridged events belong to.
+    ///
+    /// * An attributed manager resolves **its own** VM's bridge, and answers
+    ///   `None` once that VM is gone. It can never reach another VM's agent.
+    /// * An unattributed manager (the legacy [`install_global_manager`] path,
+    ///   which carries no VM) falls back to [`sole_live_bridge`]: the unique
+    ///   live VM if there is exactly one, `None` if there are none or several.
+    ///   Dropping is deliberate — delivering VM B's `ClassLoad`, carrying a
+    ///   `ClassId` from VM B's class-id space, into VM A's agent is a
+    ///   correctness bug in an interface debuggers treat as authoritative.
+    fn bridged_shared(&self) -> Option<Arc<crate::vm::SharedVm>> {
+        if self.vm == UNATTRIBUTED_VM {
+            sole_live_bridge()
+        } else {
+            bridge_for_vm(self.vm)
         }
     }
 
@@ -982,6 +1063,7 @@ impl JvmtiEventManager {
                 .store(enabled, Ordering::Release),
             _ => {}
         }
+        publish_union_listener_flags();
     }
 
     /// Fast-path query for `MethodEntry` listener. Single Acquire load.
@@ -1025,6 +1107,7 @@ impl JvmtiEventManager {
             .map_err(|_| JvmtiError::Internal)?;
         list.push(Arc::downgrade(env));
         self.any_listener.store(true, Ordering::Release);
+        publish_union_listener_flags();
         Ok(())
     }
 
@@ -1059,6 +1142,7 @@ impl JvmtiEventManager {
             any_env_left || have_global || have_thread,
             Ordering::Release,
         );
+        publish_union_listener_flags();
         Ok(())
     }
 
@@ -1082,6 +1166,7 @@ impl JvmtiEventManager {
             .unwrap_or(false);
         self.any_listener
             .store(have_env || have_global || have_thread, Ordering::Release);
+        publish_union_listener_flags();
     }
 
     /// Fast-path check: is any listener attached at all?
@@ -1217,7 +1302,7 @@ impl JvmtiEventManager {
     pub fn fire_vm_init(&self) {
         #[cfg(feature = "experimental-debug")]
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
-        if let Some(shared) = real_agent_shared() {
+        if let Some(shared) = self.bridged_shared() {
             crate::jvmti::notify_vm_init(&shared.debug.jvmti_env.lock(), 0);
         }
         if !self.is_event_enabled(JvmtiEventKind::VmInit, None) {
@@ -1234,7 +1319,7 @@ impl JvmtiEventManager {
     pub fn fire_vm_death(&self) {
         #[cfg(feature = "experimental-debug")]
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
-        if let Some(shared) = real_agent_shared() {
+        if let Some(shared) = self.bridged_shared() {
             crate::jvmti::notify_vm_death(&shared.debug.jvmti_env.lock());
         }
         if !self.is_event_enabled(JvmtiEventKind::VmDeath, None) {
@@ -1251,7 +1336,7 @@ impl JvmtiEventManager {
     pub fn fire_thread_start(&self, thread: ThreadId) {
         #[cfg(feature = "experimental-debug")]
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
-        if let Some(shared) = real_agent_shared() {
+        if let Some(shared) = self.bridged_shared() {
             let name = resolve_thread_name_for_bridge(&shared, thread);
             crate::jvmti::notify_thread_start(&shared.debug.jvmti_env.lock(), thread, &name);
         }
@@ -1274,7 +1359,7 @@ impl JvmtiEventManager {
         // that call redundant whenever this method is *also* invoked for the
         // same thread exit, but harmless — ThreadEnd carries no per-call
         // state an agent couldn't tolerate seeing twice as cheaply as never.
-        if let Some(shared) = real_agent_shared() {
+        if let Some(shared) = self.bridged_shared() {
             crate::jvmti::notify_thread_end(&shared.debug.jvmti_env.lock(), thread);
         }
         if !self.is_event_enabled(JvmtiEventKind::ThreadEnd, Some(thread)) {
@@ -1329,7 +1414,7 @@ impl JvmtiEventManager {
         // was removed so ClassLoad reaches the real env exactly once, from
         // every class-definition path, not just that one.
         #[cfg(feature = "experimental-debug")]
-        if let Some(shared) = real_agent_shared() {
+        if let Some(shared) = self.bridged_shared() {
             if let Some(name) = resolve_class_name_for_bridge(&shared, class_id) {
                 crate::jvmti::notify_class_load(&shared.debug.jvmti_env.lock(), class_id, &name);
             }
@@ -1360,7 +1445,7 @@ impl JvmtiEventManager {
     pub fn fire_class_prepare(&self, thread: ThreadId, class_id: ClassId) {
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
         #[cfg(feature = "experimental-debug")]
-        if let Some(shared) = real_agent_shared() {
+        if let Some(shared) = self.bridged_shared() {
             if let Some(name) = resolve_class_name_for_bridge(&shared, class_id) {
                 crate::jvmti::notify_class_prepare(&shared.debug.jvmti_env.lock(), class_id, &name);
             }
@@ -1576,7 +1661,7 @@ impl JvmtiEventManager {
     pub fn fire_gc_start(&self) {
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
         #[cfg(feature = "experimental-debug")]
-        if let Some(shared) = real_agent_shared() {
+        if let Some(shared) = self.bridged_shared() {
             crate::jvmti::notify_gc_start(&shared.debug.jvmti_env.lock());
         }
         if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionStart, None) {
@@ -1593,7 +1678,7 @@ impl JvmtiEventManager {
     pub fn fire_gc_finish(&self) {
         // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
         #[cfg(feature = "experimental-debug")]
-        if let Some(shared) = real_agent_shared() {
+        if let Some(shared) = self.bridged_shared() {
             crate::jvmti::notify_gc_finish(&shared.debug.jvmti_env.lock());
         }
         if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionFinish, None) {
@@ -1756,7 +1841,7 @@ impl JvmtiEventManager {
         // real native agent with `can_tag_objects` and nothing registered
         // here would otherwise never see its own ObjectFree events.
         #[cfg(feature = "experimental-debug")]
-        if let Some(shared) = real_agent_shared() {
+        if let Some(shared) = self.bridged_shared() {
             crate::jvmti::notify_object_free(&shared.debug.jvmti_env.lock(), tag);
         }
         if !self.has_any_listener() {
@@ -2721,44 +2806,308 @@ impl fmt::Debug for JvmtiEnv {
 }
 
 // ---------------------------------------------------------------------------
-// Global JVMTI Event Manager (T6.3 wiring)
+// Per-VM JVMTI environment registry (C2 review remediation, 2026-08-01)
 // ---------------------------------------------------------------------------
 //
-// The global manager lets crates that must not depend on `cratonvm-vm`
-// (classloading, gc) fire JVMTI events without carrying a back-reference
-// to the VM. The VM installs a manager at `SharedVm::new`; every other
-// component calls the free `fire_*` functions in this module.
+// This replaces the two process-global cells this module used to carry:
 //
-// The hot-path invariant is: when no manager is installed, every fire_*
-// function returns after a single `OnceLock::get()` + branch. When a
-// manager is installed but no agent is attached, the manager's own
-// `has_any_listener` fast-path returns after a single atomic load.
+//   * `GLOBAL_MANAGER: OnceLock<Arc<JvmtiEventManager>>` — one event manager
+//     for the whole process, holding every registered callback and every
+//     `any_*_listener` fast-path flag. Event *delivery* was process-global,
+//     so re-keying any one downstream table (the field-watchpoint map, say)
+//     produced a subsystem that looked isolated in review and was not. See
+//     `docs/known-issues/vm-process-global-state-round-2.md` § "Still open".
+//   * `REAL_AGENT_ENV_BRIDGE: OnceLock<Weak<SharedVm>>` — a single `Weak`,
+//     first-writer-wins. Exactly the shape that made `RedefineClasses`
+//     silently do nothing in a second VM. Verified failure modes:
+//       - two live VMs: VM B's bridged events were delivered into VM A's
+//         `shared.debug.jvmti_env`, carrying VM B's `ClassId`s and thread
+//         ids, which VM A's agent resolves against VM A's class manager;
+//       - **sequential** VMs: after VM A is dropped, `OnceLock::set` from
+//         VM B still fails and the stored `Weak` no longer upgrades, so
+//         VM B's native agent received *zero* bridged events, permanently.
+//         That breaks sequential embedding, not just concurrency.
+//
+// The registry below is keyed on `vm_identity` (`vm/src/vm/vm_init.rs`'s
+// `NEXT_VM_IDENTITY` — monotonic, allocated from 1, never recycled, so a
+// stale key can never be re-observed by a later VM). `0` is the reserved
+// "unattributed" key, per the convention established by round 1.
+//
+// Hot-path contract, unchanged from before: `any_*_listener_active()` is a
+// single `Acquire` `AtomicBool` load against a process-wide **union**
+// mirror. A union is a deliberate over-approximation — VM A may pay the
+// branch cost of VM B's agent — because the alternative (a map lookup under
+// a lock per getfield/putfield/invoke) is not affordable. Over-approximating
+// the *guard* is safe; over-approximating *delivery* is not, and delivery is
+// always resolved against the exact VM below.
 
-static GLOBAL_MANAGER: OnceLock<Arc<JvmtiEventManager>> = OnceLock::new();
+/// The reserved key for state that arrived without a VM identity.
+///
+/// `vm_identity` is allocated from `NEXT_VM_IDENTITY`, which starts at 1, so
+/// `0` can never collide with a real VM.
+pub const UNATTRIBUTED_VM: usize = 0;
 
-/// Install the process-wide JVMTI event manager. Idempotent — only the
-/// first install wins. Callers should treat this as a one-shot setup at
-/// VM construction time.
+/// One VM's JVMTI environment.
+struct VmJvmtiEnvironment {
+    /// The event manager this VM's listeners are registered on.
+    ///
+    /// `None` means this VM never installed one of its own — it was created
+    /// by [`install_real_agent_env_bridge`] to hold a bridge. Such a VM
+    /// resolves through the [`UNATTRIBUTED_VM`] row instead
+    /// ([`manager_for_vm`]). Storing `None` rather than eagerly minting an
+    /// empty manager is what keeps that fallback reachable: an empty manager
+    /// present in the row would shadow the unattributed one and silently
+    /// swallow every event.
+    manager: Option<Arc<JvmtiEventManager>>,
+    /// Bridge to this VM's real, native-agent-facing env
+    /// (`shared.debug.jvmti_env`). `Weak`, so the registry never keeps a VM
+    /// alive.
+    ///
+    /// `None` means *no bridge was ever installed* for this row (a bare
+    /// `SharedVm` built by a unit test, or a row created by
+    /// `install_manager_for_vm` before `Vm::new` runs). `Some(w)` with
+    /// `w.strong_count() == 0` means the VM is **gone**. The two must not be
+    /// conflated: pruning on `strong_count() == 0` alone would delete a live
+    /// row that simply has no bridge yet.
+    bridge: Option<Weak<crate::vm::SharedVm>>,
+    /// This VM's field access/modification watchpoints, keyed on
+    /// `(class_id, field_index)`. `class_id` is only unique *within* a VM,
+    /// which is why this table cannot be process-global: a watchpoint set by
+    /// an agent in VM A would otherwise fire on an unrelated field of an
+    /// unrelated class in VM B.
+    ///
+    /// Holds no `ObjectRef` and no heap address — this is metadata only, so
+    /// it needs no GC root source and no remap half.
+    watchpoints: HashMap<(u64, usize), FieldWatchpoint>,
+}
+
+impl VmJvmtiEnvironment {
+    fn empty() -> Self {
+        Self {
+            manager: None,
+            bridge: None,
+            watchpoints: HashMap::new(),
+        }
+    }
+
+    /// `true` once this row's VM has definitively gone away: a bridge was
+    /// installed and its `Weak` no longer upgrades.
+    fn is_dead(&self) -> bool {
+        matches!(&self.bridge, Some(w) if w.strong_count() == 0)
+    }
+}
+
+/// The per-VM environments. `None` until the first VM registers, so the
+/// static needs no lazy initialiser.
+static ENVIRONMENTS: RwLock<Option<HashMap<usize, VmJvmtiEnvironment>>> = RwLock::new(None);
+
+// Process-wide union mirrors of the per-VM fast-path flags. Each is `true`
+// iff *some* registered VM has that listener. Conservative by construction:
+// never false while a VM is listening, so no event can be missed; possibly
+// true while the asking VM is not listening, which costs a predicted branch
+// and a per-VM re-check inside the corresponding `fire_*`.
+static UNION_ANY_LISTENER: AtomicBool = AtomicBool::new(false);
+static UNION_METHOD_ENTRY: AtomicBool = AtomicBool::new(false);
+static UNION_METHOD_EXIT: AtomicBool = AtomicBool::new(false);
+static UNION_SINGLE_STEP: AtomicBool = AtomicBool::new(false);
+static UNION_FIELD_ACCESS: AtomicBool = AtomicBool::new(false);
+static UNION_FIELD_MODIFICATION: AtomicBool = AtomicBool::new(false);
+static UNION_FRAME_POP: AtomicBool = AtomicBool::new(false);
+
+fn environments_read(
+) -> std::sync::RwLockReadGuard<'static, Option<HashMap<usize, VmJvmtiEnvironment>>> {
+    // Poison recovery rather than propagation: a poisoned lock must not turn
+    // the JVMTI plane into a permanent no-op (or a panic on the interpreter's
+    // hot path). The data is a plain map; a panic mid-write leaves it
+    // structurally intact.
+    match ENVIRONMENTS.read() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
+fn environments_write(
+) -> std::sync::RwLockWriteGuard<'static, Option<HashMap<usize, VmJvmtiEnvironment>>> {
+    match ENVIRONMENTS.write() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
+/// Recompute every union mirror from the registered managers.
+///
+/// Called from each listener-state mutator on `JvmtiEventManager`. Those
+/// transitions happen on agent attach/detach and `SetEventNotificationMode`,
+/// never on an event, so the walk is off every hot path.
+fn publish_union_listener_flags() {
+    let (mut any, mut me, mut mx, mut ss, mut fa, mut fm, mut fp) =
+        (false, false, false, false, false, false, false);
+    {
+        let guard = environments_read();
+        if let Some(map) = guard.as_ref() {
+            for m in map.values().filter_map(|e| e.manager.as_ref()) {
+                any |= m.has_any_listener();
+                me |= m.has_method_entry_listener();
+                mx |= m.has_method_exit_listener();
+                ss |= m.has_single_step_listener();
+                fa |= m.has_field_access_listener();
+                fm |= m.has_field_modification_listener();
+                fp |= m.has_frame_pop_listener();
+            }
+        }
+    }
+    UNION_ANY_LISTENER.store(any, Ordering::Release);
+    UNION_METHOD_ENTRY.store(me, Ordering::Release);
+    UNION_METHOD_EXIT.store(mx, Ordering::Release);
+    UNION_SINGLE_STEP.store(ss, Ordering::Release);
+    UNION_FIELD_ACCESS.store(fa, Ordering::Release);
+    UNION_FIELD_MODIFICATION.store(fm, Ordering::Release);
+    UNION_FRAME_POP.store(fp, Ordering::Release);
+}
+
+/// Install `vm`'s event manager. Idempotent per VM — the first install for a
+/// given `vm_identity` wins, matching the old process-wide behaviour but one
+/// scope down.
+///
+/// **This is the entry point production wiring uses.** `SharedVm::new` calls
+/// it with `vm.vm_identity`, so every live VM owns a row and the
+/// [`UNATTRIBUTED_VM`] fallback is reached only by hooks that genuinely have
+/// no VM in scope — see `docs/known-issues/jvmti-delivery-threading.md` for
+/// the current census. `SharedVm::new` *also* still installs the row-0
+/// manager, and that is not redundant: the six remaining VM-less sites
+/// resolve row 0 through `global_manager()`, an exact lookup with no
+/// fallback.
+pub fn install_manager_for_vm(vm: usize, mgr: Arc<JvmtiEventManager>) {
+    // On the "already installed" path `mgr` is dropped. Do it outside the
+    // lock: dropping a manager runs agent-supplied callback destructors.
+    let rejected;
+    {
+        let mut guard = environments_write();
+        let map = guard.get_or_insert_with(HashMap::new);
+        let entry = map.entry(vm).or_insert_with(VmJvmtiEnvironment::empty);
+        // Idempotent: the first install for a VM wins, and a bridge or
+        // watchpoints registered before the manager are preserved.
+        if entry.manager.is_none() {
+            entry.manager = Some(mgr);
+            rejected = None;
+        } else {
+            rejected = Some(mgr);
+        }
+    }
+    drop(rejected);
+    publish_union_listener_flags();
+}
+
+/// Install the JVMTI event manager for callers that have no VM identity.
+///
+/// Retained because `SharedVm::new` (`vm/src/vm/vm_init.rs`) and the
+/// `classloading` / `gc` hook adapters it installs are `fn` pointers with no
+/// VM in scope. Registers under [`UNATTRIBUTED_VM`], which every
+/// `*_for_vm` lookup falls back to, so a VM that never installs its own
+/// manager still sees listeners registered this way — that fallback is what
+/// keeps the migration safe in either order.
 pub fn install_global_manager(mgr: Arc<JvmtiEventManager>) {
-    let _ = GLOBAL_MANAGER.set(mgr);
+    install_manager_for_vm(UNATTRIBUTED_VM, mgr);
 }
 
-/// Return a clone of the installed manager if one exists. Callers that just
-/// want to fire an event should use the thin wrappers in this module
-/// (e.g. [`fire_gc_start`]) — those already perform the null check.
+/// The unattributed manager, if one was installed. Prefer
+/// [`manager_for_vm`].
 pub fn global_manager() -> Option<Arc<JvmtiEventManager>> {
-    GLOBAL_MANAGER.get().cloned()
+    manager_for_vm_exact(UNATTRIBUTED_VM)
 }
 
-/// `true` iff a global manager is installed AND at least one listener
-/// (env, global event, or direct callback) is active. Hot-path callers
-/// should branch on this before building event arguments.
+/// `vm`'s manager if it has one, else the unattributed manager.
+///
+/// The fallback is the migration seam: an event site that has already been
+/// converted to pass `vm_identity` keeps reaching listeners registered
+/// through [`install_global_manager`] until `SharedVm::new` is converted too.
+/// Once every VM installs its own manager the unattributed row is never
+/// created and the fallback is inert.
+pub fn manager_for_vm(vm: usize) -> Option<Arc<JvmtiEventManager>> {
+    let guard = environments_read();
+    let map = guard.as_ref()?;
+    if let Some(m) = map.get(&vm).and_then(|e| e.manager.as_ref()) {
+        return Some(Arc::clone(m));
+    }
+    map.get(&UNATTRIBUTED_VM)
+        .and_then(|e| e.manager.as_ref())
+        .map(Arc::clone)
+}
+
+/// `vm`'s manager, with no fallback to the unattributed row.
+fn manager_for_vm_exact(vm: usize) -> Option<Arc<JvmtiEventManager>> {
+    let guard = environments_read();
+    guard
+        .as_ref()?
+        .get(&vm)
+        .and_then(|e| e.manager.as_ref())
+        .map(Arc::clone)
+}
+
+/// `true` iff **some** registered VM has a listener. A conservative
+/// over-approximation for VM-less hot-path guards; see
+/// [`any_listener_active_for_vm`] for the exact answer.
 #[inline]
 pub fn any_listener_active() -> bool {
-    match GLOBAL_MANAGER.get() {
-        Some(m) => m.has_any_listener(),
-        None => false,
+    UNION_ANY_LISTENER.load(Ordering::Acquire)
+}
+
+/// `true` iff **this** VM has a listener.
+pub fn any_listener_active_for_vm(vm: usize) -> bool {
+    manager_for_vm(vm).is_some_and(|m| m.has_any_listener())
+}
+
+/// Drop every scrap of `vm`'s JVMTI state: its event manager (and with it
+/// every callback closure the agent registered), its bridge to the real env,
+/// and its field watchpoints.
+///
+/// Must be called when a VM is released. Without it a disposed VM's manager
+/// keeps its agent's callback closures alive for the life of the process, its
+/// listener flags keep every *other* VM's interpreter on the slow path, and
+/// its watchpoints keep firing for a `class_id` that now means something else.
+///
+/// Idempotent — removing an absent row is a no-op — because the teardown hook
+/// it belongs in (`release_vm_native_state`) is deliberately invoked from two
+/// places, either of which may run first or alone.
+pub fn forget_vm_jvmti_state(vm: usize) {
+    // Rows are moved out under the lock and dropped after it is released.
+    // Dropping a row drops its manager, and with it every agent-supplied
+    // callback closure — arbitrary code that must not run while this module's
+    // registry lock is held. This hook is reached from `Drop for SharedVm`.
+    let mut released: Vec<VmJvmtiEnvironment> = Vec::new();
+    {
+        let mut guard = environments_write();
+        if let Some(map) = guard.as_mut() {
+            if let Some(row) = map.remove(&vm) {
+                released.push(row);
+            }
+            // Opportunistically prune rows whose VM is provably gone but was
+            // never released explicitly (a VM torn down before this hook
+            // existed, or one leaked by a test). Keeping them would make
+            // `sole_live_bridge` answer `None` forever after the first VM,
+            // which is the exact sequential-embedding bug this change fixes.
+            // `is_dead` requires a bridge that was installed and has since
+            // expired, so a live bridge-less row is never touched.
+            let dead: Vec<usize> = map
+                .iter()
+                .filter(|(k, env)| **k != UNATTRIBUTED_VM && env.is_dead())
+                .map(|(k, _)| *k)
+                .collect();
+            for k in dead {
+                if let Some(row) = map.remove(&k) {
+                    released.push(row);
+                }
+            }
+        }
     }
+    drop(released);
+    publish_union_listener_flags();
+    refresh_watchpoint_union();
+}
+
+/// Number of registered environments. Diagnostics and tests only.
+pub fn registered_environment_count() -> usize {
+    environments_read().as_ref().map_or(0, |m| m.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -2797,24 +3146,80 @@ pub fn any_listener_active() -> bool {
 // task — this bridge closes the "silently receives nothing" gap without
 // attempting that rewrite.
 
-static REAL_AGENT_ENV_BRIDGE: OnceLock<Weak<crate::vm::SharedVm>> = OnceLock::new();
-
-/// Install the bridge to the real, native-agent-facing JVMTI env. Idempotent
-/// — only the first install wins. Called once from `SharedVm::new`, right
-/// where [`install_global_manager`] itself is installed.
+/// Install the bridge to `shared`'s real, native-agent-facing JVMTI env.
+///
+/// Keyed on `shared.vm_identity`, so it is idempotent **per VM** and every VM
+/// gets its own bridge. The previous shape — one `OnceLock<Weak<SharedVm>>`
+/// for the process — had two verified failure modes, both fixed here:
+///
+/// * with two live VMs, `OnceLock::set` from the second VM failed silently
+///   and VM B's bridged events were delivered into VM A's
+///   `shared.debug.jvmti_env`;
+/// * **sequentially**, after VM A was dropped the stored `Weak` no longer
+///   upgraded and `set` from VM B still failed, so VM B's native agent
+///   received nothing at all, for the life of the process.
+///
+/// Called from `Vm::new` (`vm/src/vm/vm_init.rs`), which is the only place
+/// with both the `Arc<SharedVm>` and its identity in hand.
 pub fn install_real_agent_env_bridge(shared: &Arc<crate::vm::SharedVm>) {
-    let _ = REAL_AGENT_ENV_BRIDGE.set(Arc::downgrade(shared));
+    let vm = shared.vm_identity;
+    let mut released: Vec<VmJvmtiEnvironment> = Vec::new();
+    {
+        let mut guard = environments_write();
+        let map = guard.get_or_insert_with(HashMap::new);
+        let entry = map.entry(vm).or_insert_with(VmJvmtiEnvironment::empty);
+        entry.bridge = Some(Arc::downgrade(shared));
+        // A new VM registering means any row left behind by a previous,
+        // now-dead VM is stale; drop those so `sole_live_bridge` can resolve
+        // again. Rows are moved out and dropped after the lock is released —
+        // dropping one runs an agent's callback destructors.
+        let dead: Vec<usize> = map
+            .iter()
+            .filter(|(k, env)| **k != UNATTRIBUTED_VM && **k != vm && env.is_dead())
+            .map(|(k, _)| *k)
+            .collect();
+        for k in dead {
+            if let Some(row) = map.remove(&k) {
+                released.push(row);
+            }
+        }
+    }
+    drop(released);
+    publish_union_listener_flags();
 }
 
-/// The live `SharedVm` behind the bridge, if installed and not yet torn
-/// down. Every bridged `fire_*` method calls this first and skips its
-/// bridging logic entirely on `None` (no bridge installed — e.g. a unit
-/// test that builds a bare `JvmtiEventManager` without a `SharedVm`, or a
-/// `SharedVm` in the middle of being dropped) — same cost as any other
-/// "no listener" fast path in this file: one `OnceLock::get`, one
-/// `Weak::upgrade`.
-fn real_agent_shared() -> Option<Arc<crate::vm::SharedVm>> {
-    REAL_AGENT_ENV_BRIDGE.get()?.upgrade()
+/// `vm`'s live `SharedVm`, if it registered a bridge and has not been torn
+/// down. Never falls back to another VM.
+fn bridge_for_vm(vm: usize) -> Option<Arc<crate::vm::SharedVm>> {
+    let guard = environments_read();
+    guard.as_ref()?.get(&vm)?.bridge.as_ref()?.upgrade()
+}
+
+/// The unique live bridged VM, or `None` if there are zero or more than one.
+///
+/// This is what an *unattributed* manager (one installed through the VM-less
+/// [`install_global_manager`]) uses to find the real env. With the single VM
+/// that every non-embedding run has, it is exact. With two live VMs it
+/// answers `None` and the bridged event is dropped rather than delivered to a
+/// guess: an event attributed to the wrong VM's agent carries `ClassId`s and
+/// thread ids from the wrong id space, which is worse than no event at all in
+/// an interface a debugger treats as authoritative.
+///
+/// The fix that removes the ambiguity is at the call site, not here — see
+/// `docs/known-issues/jvmti-vm-scoping.md`.
+fn sole_live_bridge() -> Option<Arc<crate::vm::SharedVm>> {
+    let guard = environments_read();
+    let map = guard.as_ref()?;
+    let mut found: Option<Arc<crate::vm::SharedVm>> = None;
+    for env in map.values() {
+        if let Some(shared) = env.bridge.as_ref().and_then(|w| w.upgrade()) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(shared);
+        }
+    }
+    found
 }
 
 /// Resolve a loaded class's name for `vm/src/jvmti/mod.rs`'s
@@ -2856,14 +3261,39 @@ fn resolve_thread_name_for_bridge(shared: &crate::vm::SharedVm, thread: ThreadId
 
 /// Fire VMInit at the global level. No-op if no manager is installed.
 pub fn fire_vm_init() {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_vm_init();
     }
 }
 
 /// Fire VMDeath at the global level. Called from VM shutdown / drop.
 pub fn fire_vm_death() {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
+        m.fire_vm_death();
+    }
+}
+
+/// Fire VMInit into `vm`'s environment only.
+///
+/// Provided so `SharedVm::new`'s `fire_vm_init()` (`vm/src/vm/vm_init.rs`) can
+/// become a one-line change: `vm.vm_identity` is in scope there, and VMInit is
+/// per VM by definition — it is the event that tells an agent *its* VM is up.
+/// Unlike the class-load / GC hook adapters, this site has no signature
+/// problem; it is simply still on the VM-less call. See
+/// `docs/known-issues/jvmti-delivery-threading.md`.
+pub fn fire_vm_init_for_vm(vm: usize) {
+    if let Some(m) = manager_for_vm(vm) {
+        m.fire_vm_init();
+    }
+}
+
+/// Fire VMDeath into `vm`'s environment only. Sibling of
+/// [`fire_vm_init_for_vm`]; `Vm`'s shutdown path has `self.shared.vm_identity`
+/// in scope. Must run **before** [`forget_vm_jvmti_state`] drops the row, or
+/// it resolves through the unattributed seam and the agent that asked for
+/// VMDeath never learns its VM died.
+pub fn fire_vm_death_for_vm(vm: usize) {
+    if let Some(m) = manager_for_vm(vm) {
         m.fire_vm_death();
     }
 }
@@ -2880,7 +3310,7 @@ pub fn fire_vm_death() {
 /// `JvmtiEventManager::fire_class_load`. Also now bridged to the real,
 /// native-agent-facing env — see `install_real_agent_env_bridge` (D14).
 pub fn fire_class_load(thread: ThreadId, class_id: ClassId) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_class_load(thread, class_id);
     }
 }
@@ -2888,7 +3318,7 @@ pub fn fire_class_load(thread: ThreadId, class_id: ClassId) {
 /// Fire ClassPrepare at the global level. Called from the class manager
 /// after the class has been linked / prepared. See [`fire_class_load`].
 pub fn fire_class_prepare(thread: ThreadId, class_id: ClassId) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_class_prepare(thread, class_id);
     }
 }
@@ -2896,21 +3326,21 @@ pub fn fire_class_prepare(thread: ThreadId, class_id: ClassId) {
 /// Fire GarbageCollectionStart at the global level. Called from the GC
 /// driver immediately before the collection phase.
 pub fn fire_gc_start() {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_gc_start();
     }
 }
 
 /// Fire GarbageCollectionFinish at the global level.
 pub fn fire_gc_finish() {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_gc_finish();
     }
 }
 
 /// Fire Exception at the global level.
 pub fn fire_exception(thread: ThreadId, method: MethodId, location: i64) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_exception(thread, method, location);
     }
 }
@@ -2918,7 +3348,7 @@ pub fn fire_exception(thread: ThreadId, method: MethodId, location: i64) {
 /// Fire ExceptionCatch at the global level. Called from the interpreter
 /// when a matching exception handler is resolved.
 pub fn fire_exception_catch(thread: ThreadId, method: MethodId, location: i64) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_exception_catch(thread, method, location);
     }
 }
@@ -2931,70 +3361,128 @@ pub fn fire_exception_catch(thread: ThreadId, method: MethodId, location: i64) {
 // listed in docs/roadmap-100.md §T17.Δ. The hot-path contract for each of
 // these is:
 //
-//   1. One `OnceLock::get()` branch to see whether a manager is installed
-//      (in practice the branch is perfectly predicted).
-//   2. A single `AtomicBool::Acquire` load on the per-event flag — skipped
-//      when there's no manager, noted on the fast-path assembly as one
-//      `mov`+`test`.
-//   3. If the flag is set the function enters the full manager.fire_* path
-//      which takes the event's map read-locks, records the count, and
-//      dispatches to callbacks under `catch_unwind`.
+//   1. A single `AtomicBool::Acquire` load on the per-event **union** mirror
+//      (`UNION_*`), which is `true` iff some registered VM is listening.
+//   2. If the flag is set the caller enters the full manager.fire_* path
+//      which resolves the owning VM's manager, takes the event's map
+//      read-locks, records the count, and dispatches to callbacks under
+//      `catch_unwind`.
 //
-// When no JVMTI agent is attached the flag is false and each call bottoms
-// out in about 3 instructions after inlining. That satisfies the < 2 ns
-// per-site budget documented in the roadmap.
+// When no JVMTI agent is attached anywhere in the process the flag is false
+// and each call bottoms out in one load + one predicted branch after
+// inlining — cheaper than the `OnceLock::get()` + per-manager load it
+// replaced.
+//
+// The union is deliberate. With two VMs it can put VM A's interpreter on the
+// slow path because VM B has an agent; that costs a branch and a re-check.
+// It never *delivers* VM B's event to VM A — `fire_*_for_vm` resolves the
+// exact VM, and the VM-less `fire_*` resolves the unattributed manager.
+// Over-approximating a guard is safe; over-approximating delivery is not.
 
-/// Fast-path query: any listener interested in `MethodEntry`?
+/// Fast-path query: any listener anywhere interested in `MethodEntry`?
 #[inline]
 pub fn any_method_entry_listener_active() -> bool {
-    match GLOBAL_MANAGER.get() {
-        Some(m) => m.has_method_entry_listener(),
-        None => false,
-    }
+    UNION_METHOD_ENTRY.load(Ordering::Acquire)
 }
 
-/// Fast-path query: any listener interested in `MethodExit`?
+/// Fast-path query: any listener anywhere interested in `MethodExit`?
 #[inline]
 pub fn any_method_exit_listener_active() -> bool {
-    match GLOBAL_MANAGER.get() {
-        Some(m) => m.has_method_exit_listener(),
-        None => false,
-    }
+    UNION_METHOD_EXIT.load(Ordering::Acquire)
 }
 
-/// Fast-path query: any listener interested in `SingleStep`?
+/// Fast-path query: any listener anywhere interested in `SingleStep`?
 #[inline]
 pub fn any_single_step_listener_active() -> bool {
-    match GLOBAL_MANAGER.get() {
-        Some(m) => m.has_single_step_listener(),
-        None => false,
-    }
+    UNION_SINGLE_STEP.load(Ordering::Acquire)
 }
 
-/// Fast-path query: any listener interested in `FieldAccess`?
+/// Fast-path query: any listener anywhere interested in `FieldAccess`?
 #[inline]
 pub fn any_field_access_listener_active() -> bool {
-    match GLOBAL_MANAGER.get() {
-        Some(m) => m.has_field_access_listener(),
-        None => false,
-    }
+    UNION_FIELD_ACCESS.load(Ordering::Acquire)
 }
 
-/// Fast-path query: any listener interested in `FieldModification`?
+/// Fast-path query: any listener anywhere interested in `FieldModification`?
 #[inline]
 pub fn any_field_modification_listener_active() -> bool {
-    match GLOBAL_MANAGER.get() {
-        Some(m) => m.has_field_modification_listener(),
-        None => false,
+    UNION_FIELD_MODIFICATION.load(Ordering::Acquire)
+}
+
+/// Fast-path query: any listener anywhere interested in `FramePop`?
+#[inline]
+pub fn any_frame_pop_listener_active() -> bool {
+    UNION_FRAME_POP.load(Ordering::Acquire)
+}
+
+/// Exact per-VM query: is **this** VM listening for `MethodEntry`?
+pub fn any_method_entry_listener_active_for_vm(vm: usize) -> bool {
+    manager_for_vm(vm).is_some_and(|m| m.has_method_entry_listener())
+}
+
+/// Exact per-VM query: is **this** VM listening for `MethodExit`?
+pub fn any_method_exit_listener_active_for_vm(vm: usize) -> bool {
+    manager_for_vm(vm).is_some_and(|m| m.has_method_exit_listener())
+}
+
+/// Exact per-VM query: is **this** VM listening for `SingleStep`?
+pub fn any_single_step_listener_active_for_vm(vm: usize) -> bool {
+    manager_for_vm(vm).is_some_and(|m| m.has_single_step_listener())
+}
+
+/// Exact per-VM query: is **this** VM listening for `FramePop`?
+pub fn any_frame_pop_listener_active_for_vm(vm: usize) -> bool {
+    manager_for_vm(vm).is_some_and(|m| m.has_frame_pop_listener())
+}
+
+/// Fire MethodEntry into `vm`'s environment only.
+#[inline]
+pub fn fire_method_entry_for_vm(vm: usize, thread: ThreadId, method: MethodId) {
+    if let Some(m) = manager_for_vm(vm) {
+        m.fire_method_entry(thread, method);
     }
 }
 
-/// Fast-path query: any listener interested in `FramePop`?
+/// Fire MethodExit into `vm`'s environment only.
 #[inline]
-pub fn any_frame_pop_listener_active() -> bool {
-    match GLOBAL_MANAGER.get() {
-        Some(m) => m.has_frame_pop_listener(),
-        None => false,
+pub fn fire_method_exit_for_vm(
+    vm: usize,
+    thread: ThreadId,
+    method: MethodId,
+    was_popped_by_exception: bool,
+    return_value: LocalValue,
+) {
+    if let Some(m) = manager_for_vm(vm) {
+        m.fire_method_exit(thread, method, was_popped_by_exception, return_value);
+    }
+}
+
+/// Fire SingleStep into `vm`'s environment only.
+#[inline]
+pub fn fire_single_step_for_vm(vm: usize, thread: ThreadId, method: MethodId, location: i64) {
+    if let Some(m) = manager_for_vm(vm) {
+        m.fire_single_step(thread, method, location);
+    }
+}
+
+/// Fire FramePop into `vm`'s environment only.
+#[inline]
+pub fn fire_frame_pop_for_vm(
+    vm: usize,
+    thread: ThreadId,
+    method: MethodId,
+    was_popped_by_exception: bool,
+) {
+    if let Some(m) = manager_for_vm(vm) {
+        m.fire_frame_pop(thread, method, was_popped_by_exception);
+    }
+}
+
+/// Fire ExceptionCatch into `vm`'s environment only.
+#[inline]
+pub fn fire_exception_catch_for_vm(vm: usize, thread: ThreadId, method: MethodId, location: i64) {
+    if let Some(m) = manager_for_vm(vm) {
+        m.fire_exception_catch(thread, method, location);
     }
 }
 
@@ -3004,7 +3492,7 @@ pub fn any_frame_pop_listener_active() -> bool {
 /// path.
 #[inline]
 pub fn fire_method_entry(thread: ThreadId, method: MethodId) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_method_entry(thread, method);
     }
 }
@@ -3019,7 +3507,7 @@ pub fn fire_method_exit(
     was_popped_by_exception: bool,
     return_value: LocalValue,
 ) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_method_exit(thread, method, was_popped_by_exception, return_value);
     }
 }
@@ -3028,7 +3516,7 @@ pub fn fire_method_exit(
 /// dispatch loop when the thread's single-step flag is set.
 #[inline]
 pub fn fire_single_step(thread: ThreadId, method: MethodId, location: i64) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_single_step(thread, method, location);
     }
 }
@@ -3037,7 +3525,7 @@ pub fn fire_single_step(thread: ThreadId, method: MethodId, location: i64) {
 /// when a watchpoint exists for the resolved (class_id, field_index) tuple.
 #[inline]
 pub fn fire_field_access(thread: ThreadId, method: MethodId, field: FieldId) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_field_access(thread, method, field);
     }
 }
@@ -3046,7 +3534,7 @@ pub fn fire_field_access(thread: ThreadId, method: MethodId, field: FieldId) {
 /// putstatic when a watchpoint exists.
 #[inline]
 pub fn fire_field_modification(thread: ThreadId, method: MethodId, field: FieldId) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_field_modification(thread, method, field);
     }
 }
@@ -3055,7 +3543,7 @@ pub fn fire_field_modification(thread: ThreadId, method: MethodId, field: FieldI
 /// that frame's depth has a registered `NotifyFramePop` request.
 #[inline]
 pub fn fire_frame_pop(thread: ThreadId, method: MethodId, was_popped_by_exception: bool) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_frame_pop(thread, method, was_popped_by_exception);
     }
 }
@@ -3075,6 +3563,17 @@ pub fn fire_frame_pop(thread: ThreadId, method: MethodId, was_popped_by_exceptio
 // index (matching the interpreter's `ResolvedField`). Lookup is a single
 // HashMap read; on the zero-watchpoint common case the read returns None
 // and the interpreter skips the rest of the path.
+//
+// C2 review remediation (2026-08-01): the table now lives inside the per-VM
+// environment (`VmJvmtiEnvironment::watchpoints`), not in a process-global
+// static. `class_id` is only unique *within* a VM, so a process-wide table
+// meant a watchpoint set by an agent in VM A fired on an unrelated field of
+// an unrelated class in VM B. Round 1 of the process-global-state sweep
+// recommended re-keying this map on `(vm_identity, class_id, field_index)`;
+// round 2 corrected that to "do not fix in isolation", because delivery
+// (`GLOBAL_MANAGER`) was process-global too and a re-keyed map alone would
+// have produced a subsystem that looked isolated in review and was not.
+// Both halves land together here.
 
 /// A single field watchpoint. A field may be watched for access only,
 /// modification only, or both; booleans disambiguate.
@@ -3090,111 +3589,177 @@ pub struct FieldWatchpoint {
     pub modification_watched: bool,
 }
 
-/// Global watchpoint registry. Keyed by `(class_id, field_index)`. Empty on
-/// VM start; populated by JVMTI `SetFieldAccessWatch` /
-/// `SetFieldModificationWatch` calls.
-static FIELD_WATCHPOINTS: RwLock<Option<HashMap<(u64, usize), FieldWatchpoint>>> =
-    RwLock::new(None);
-
-/// Lock-free mirror of `!FIELD_WATCHPOINTS.is_empty()`, updated under the
-/// `FIELD_WATCHPOINTS` write lock on every register/clear. `any_field_watchpoint_active()`
-/// reads THIS (a relaxed-ish atomic) instead of taking the RwLock — it is polled
-/// per getfield/getstatic/putfield/putstatic (the most common opcodes in OO
-/// bytecode), so a per-access `RwLock::read` was pure overhead in the
-/// overwhelmingly-common no-JVMTI-agent case. Mirrors the existing
-/// `any_single_step_listener: AtomicBool` design.
+/// Lock-free mirror of "some registered VM has at least one watchpoint",
+/// recomputed from `ENVIRONMENTS` after every register/clear.
+/// [`any_field_watchpoint_active`] reads THIS instead of taking the lock — it
+/// is polled per getfield/getstatic/putfield/putstatic (the most common
+/// opcodes in OO bytecode), so a per-access `RwLock::read` was pure overhead
+/// in the overwhelmingly-common no-JVMTI-agent case.
+///
+/// Like the `UNION_*` listener mirrors this is a process-wide
+/// over-approximation: VM A pays a predicted branch for VM B's watchpoint.
+/// The `(class_id, field_index)` match that follows is per-VM, so VM A can
+/// never *fire* on VM B's watchpoint.
 static FIELD_WATCHPOINTS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-fn watchpoints_read_inner(
-) -> std::sync::RwLockReadGuard<'static, Option<HashMap<(u64, usize), FieldWatchpoint>>> {
-    // Panic-safe: on poison we would otherwise block the interpreter; fall
-    // back by returning an already-poisoned guard which tests consult with
-    // caution.  Callers simply treat a poisoned lock as "no watchpoints".
-    match FIELD_WATCHPOINTS.read() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    }
+/// Recompute [`FIELD_WATCHPOINTS_ACTIVE`] across every registered VM.
+fn refresh_watchpoint_union() {
+    let active = environments_read()
+        .as_ref()
+        .is_some_and(|m| m.values().any(|e| !e.watchpoints.is_empty()));
+    FIELD_WATCHPOINTS_ACTIVE.store(active, Ordering::Release);
 }
 
-/// Register a field access / modification watchpoint.
+/// Register a field access / modification watchpoint in `vm`'s environment.
 ///
 /// `access` and `modification` are additive: calling with
 /// `(true, false)` then `(false, true)` on the same field enables both.
+pub fn set_field_watchpoint_for_vm(
+    vm: usize,
+    class_id: u64,
+    field_index: usize,
+    access: bool,
+    modification: bool,
+) -> JvmtiResult<()> {
+    {
+        let mut guard = environments_write();
+        let map = guard.get_or_insert_with(HashMap::new);
+        let env = map.entry(vm).or_insert_with(VmJvmtiEnvironment::empty);
+        let entry = env
+            .watchpoints
+            .entry((class_id, field_index))
+            .or_insert(FieldWatchpoint {
+                class_id,
+                field_index,
+                access_watched: false,
+                modification_watched: false,
+            });
+        entry.access_watched = entry.access_watched || access;
+        entry.modification_watched = entry.modification_watched || modification;
+    }
+    refresh_watchpoint_union();
+    Ok(())
+}
+
+/// Register a watchpoint with no VM identity. Lands in the
+/// [`UNATTRIBUTED_VM`] row, which every VM's lookup falls back to.
 pub fn set_field_watchpoint(
     class_id: u64,
     field_index: usize,
     access: bool,
     modification: bool,
 ) -> JvmtiResult<()> {
-    let mut guard = FIELD_WATCHPOINTS
-        .write()
-        .map_err(|_| JvmtiError::Internal)?;
-    let map = guard.get_or_insert_with(HashMap::new);
-    let entry = map
-        .entry((class_id, field_index))
-        .or_insert(FieldWatchpoint {
-            class_id,
-            field_index,
-            access_watched: false,
-            modification_watched: false,
-        });
-    entry.access_watched = entry.access_watched || access;
-    entry.modification_watched = entry.modification_watched || modification;
-    FIELD_WATCHPOINTS_ACTIVE.store(!map.is_empty(), Ordering::Release);
+    set_field_watchpoint_for_vm(UNATTRIBUTED_VM, class_id, field_index, access, modification)
+}
+
+/// Clear a field watchpoint's access / modification flags in `vm`'s
+/// environment. If both become false the entry is removed from the map.
+/// Returns Ok even if the watchpoint wasn't previously registered.
+pub fn clear_field_watchpoint_for_vm(
+    vm: usize,
+    class_id: u64,
+    field_index: usize,
+    access: bool,
+    modification: bool,
+) -> JvmtiResult<()> {
+    {
+        let mut guard = environments_write();
+        if let Some(env) = guard.as_mut().and_then(|m| m.get_mut(&vm)) {
+            let key = (class_id, field_index);
+            let now_empty = match env.watchpoints.get_mut(&key) {
+                Some(entry) => {
+                    if access {
+                        entry.access_watched = false;
+                    }
+                    if modification {
+                        entry.modification_watched = false;
+                    }
+                    !entry.access_watched && !entry.modification_watched
+                }
+                None => false,
+            };
+            if now_empty {
+                env.watchpoints.remove(&key);
+            }
+        }
+    }
+    refresh_watchpoint_union();
     Ok(())
 }
 
-/// Clear a field watchpoint's access / modification flags. If both become
-/// false the entry is removed from the map. Returns Ok even if the
-/// watchpoint wasn't previously registered.
+/// Clear a watchpoint with no VM identity — see [`set_field_watchpoint`].
 pub fn clear_field_watchpoint(
     class_id: u64,
     field_index: usize,
     access: bool,
     modification: bool,
 ) -> JvmtiResult<()> {
-    let mut guard = FIELD_WATCHPOINTS
-        .write()
-        .map_err(|_| JvmtiError::Internal)?;
-    let Some(map) = guard.as_mut() else {
-        return Ok(());
-    };
-    let key = (class_id, field_index);
-    if let Some(entry) = map.get_mut(&key) {
-        if access {
-            entry.access_watched = false;
-        }
-        if modification {
-            entry.modification_watched = false;
-        }
-        if !entry.access_watched && !entry.modification_watched {
-            map.remove(&key);
-        }
-    }
-    FIELD_WATCHPOINTS_ACTIVE.store(!map.is_empty(), Ordering::Release);
-    Ok(())
+    clear_field_watchpoint_for_vm(UNATTRIBUTED_VM, class_id, field_index, access, modification)
 }
 
-/// Look up a field watchpoint by `(class_id, field_index)`. Returns `None`
-/// when no watchpoint matches — the common interpreter hot-path result.
+/// Look up `vm`'s watchpoint for `(class_id, field_index)`, falling back to
+/// the [`UNATTRIBUTED_VM`] row. Returns `None` when no watchpoint matches —
+/// the common interpreter hot-path result.
 ///
 /// The `field_index` is a zero-based index into the declaring class's own
 /// field list.  Callers that receive an arbitrary caller-supplied index
 /// should validate it via [`field_watchpoint_is_valid`] first.
+///
+/// The fallback exists only for the migration window in which watchpoints are
+/// still registered without a VM (see [`set_field_watchpoint`]). Once
+/// `SetFieldAccessWatch` passes a `vm_identity`, the unattributed row is never
+/// populated and the fallback is inert.
 #[inline]
-pub fn field_watchpoint_for(class_id: u64, field_index: usize) -> Option<FieldWatchpoint> {
-    let guard = watchpoints_read_inner();
-    guard.as_ref()?.get(&(class_id, field_index)).copied()
+pub fn field_watchpoint_for_vm(
+    vm: usize,
+    class_id: u64,
+    field_index: usize,
+) -> Option<FieldWatchpoint> {
+    let guard = environments_read();
+    let map = guard.as_ref()?;
+    let key = (class_id, field_index);
+    if let Some(wp) = map.get(&vm).and_then(|e| e.watchpoints.get(&key)) {
+        return Some(*wp);
+    }
+    if vm == UNATTRIBUTED_VM {
+        return None;
+    }
+    map.get(&UNATTRIBUTED_VM)
+        .and_then(|e| e.watchpoints.get(&key))
+        .copied()
 }
 
-/// True iff there is at least one registered field watchpoint.
+/// Look up a watchpoint with no VM identity — consults only the
+/// [`UNATTRIBUTED_VM`] row, never another VM's.
+#[inline]
+pub fn field_watchpoint_for(class_id: u64, field_index: usize) -> Option<FieldWatchpoint> {
+    field_watchpoint_for_vm(UNATTRIBUTED_VM, class_id, field_index)
+}
+
+/// True iff **some** registered VM has at least one field watchpoint.
 ///
 /// Interpreter callers branch on this before doing a watchpoint lookup so
-/// the zero-agent common case is a single Option::is_some check.
+/// the zero-agent common case is a single atomic load. Conservative across
+/// VMs by design; the lookup that follows is per-VM.
 #[inline]
 pub fn any_field_watchpoint_active() -> bool {
     // Lock-free: read the atomic mirror maintained by set/clear_field_watchpoint.
     FIELD_WATCHPOINTS_ACTIVE.load(Ordering::Acquire)
+}
+
+/// True iff **this** VM has at least one field watchpoint (including any it
+/// inherits from the unattributed row).
+pub fn any_field_watchpoint_active_for_vm(vm: usize) -> bool {
+    let guard = environments_read();
+    let Some(map) = guard.as_ref() else {
+        return false;
+    };
+    let own = map.get(&vm).is_some_and(|e| !e.watchpoints.is_empty());
+    if own || vm == UNATTRIBUTED_VM {
+        return own;
+    }
+    map.get(&UNATTRIBUTED_VM)
+        .is_some_and(|e| !e.watchpoints.is_empty())
 }
 
 /// Validate that `field_index` is within bounds for the class identified by
@@ -3250,6 +3815,57 @@ pub fn fire_field_modification_if_watched(
     }
 }
 
+/// VM-scoped [`fire_field_access_if_watched`]: the watchpoint lookup and the
+/// event delivery both resolve against `vm`.
+///
+/// This is the form the interpreter should call — `shared.vm_identity` is in
+/// scope at all four `getfield`/`getstatic`/`putfield`/`putstatic` sites. The
+/// process-wide `any_field_watchpoint_active()` gate is kept as the first
+/// check because it is a single atomic load and is never false while some VM
+/// is watching.
+#[inline]
+pub fn fire_field_access_if_watched_for_vm(
+    vm: usize,
+    thread: ThreadId,
+    method: MethodId,
+    class_id: u64,
+    field_index: usize,
+) {
+    if !any_field_watchpoint_active() {
+        return;
+    }
+    if let Some(wp) = field_watchpoint_for_vm(vm, class_id, field_index) {
+        if wp.access_watched {
+            let field_id = encode_field_id(class_id, field_index);
+            if let Some(m) = manager_for_vm(vm) {
+                m.fire_field_access(thread, method, field_id);
+            }
+        }
+    }
+}
+
+/// VM-scoped [`fire_field_modification_if_watched`].
+#[inline]
+pub fn fire_field_modification_if_watched_for_vm(
+    vm: usize,
+    thread: ThreadId,
+    method: MethodId,
+    class_id: u64,
+    field_index: usize,
+) {
+    if !any_field_watchpoint_active() {
+        return;
+    }
+    if let Some(wp) = field_watchpoint_for_vm(vm, class_id, field_index) {
+        if wp.modification_watched {
+            let field_id = encode_field_id(class_id, field_index);
+            if let Some(m) = manager_for_vm(vm) {
+                m.fire_field_modification(thread, method, field_id);
+            }
+        }
+    }
+}
+
 /// Pack a (class_id, field_index) pair into a single `FieldId` u64.  The
 /// JVMTI spec treats field ids as opaque to agents; we pick a packing that
 /// keeps both halves decodable (upper 32 bits = class id, lower 32 bits =
@@ -3268,7 +3884,7 @@ pub fn decode_field_id(field_id: FieldId) -> (u64, usize) {
 /// Fire ObjectFree at the global level. Called from the GC after a
 /// tagged object is reclaimed.
 pub fn fire_object_free(tag: i64) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_object_free(tag);
     }
 }
@@ -3276,7 +3892,7 @@ pub fn fire_object_free(tag: i64) {
 /// Fire VMObjectAlloc at the global level. Called from the allocator
 /// fast path; caller should branch on [`any_listener_active`] first.
 pub fn fire_vm_object_alloc(thread: ThreadId, object_addr: u64, class_id: ClassId, size: usize) {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_vm_object_alloc(thread, object_addr, class_id, size);
     }
 }
@@ -3289,7 +3905,7 @@ pub fn record_allocation_sample(
     class_id: ClassId,
     size: usize,
 ) -> bool {
-    match GLOBAL_MANAGER.get() {
+    match global_manager() {
         Some(m) => m.record_allocation_sample(thread, object_addr, class_id, size),
         None => false,
     }
@@ -3297,18 +3913,27 @@ pub fn record_allocation_sample(
 
 /// Fire DataDumpRequest at the global level.
 pub fn fire_data_dump_request() {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         m.fire_data_dump_request();
     }
 }
 
-/// Test-only reset hook: drop the installed global manager and install a
-/// fresh one. Used by tests that need a clean state; not wired into any
-/// production path. The `OnceLock` itself cannot be reset, so we drain the
-/// existing manager's enabled events instead.
+/// Test-only reset hook: drain the **unattributed** environment back to a
+/// clean state. Used by tests that need a clean slate; not wired into any
+/// production path.
+///
+/// Deliberately touches only the [`UNATTRIBUTED_VM`] row. It must not sweep
+/// other VMs' rows: real `SharedVm`s built by other test modules in this
+/// crate register their own rows, and dropping those from under them would
+/// be a landmine. Tests that create their own VM identity are responsible
+/// for calling [`forget_vm_jvmti_state`] themselves.
+///
+/// The union mirrors are recomputed at the end, so a test that asserts
+/// "no listener anywhere" after a reset sees the truth even if another row
+/// exists.
 #[cfg(test)]
 pub(crate) fn reset_global_manager_for_tests() {
-    if let Some(m) = GLOBAL_MANAGER.get() {
+    if let Some(m) = global_manager() {
         // Best-effort clear of enabled state so tests don't see stale fires.
         if let Ok(mut g) = m.global_events.write() {
             g.clear();
@@ -3335,14 +3960,38 @@ pub(crate) fn reset_global_manager_for_tests() {
         m.any_frame_pop_listener.store(false, Ordering::Release);
         m.sampling_bytes.store(0, Ordering::Relaxed);
     }
-    // Also clear the T17.Δ field-watchpoint registry so watch-dependent
-    // tests start from an empty table.
-    if let Ok(mut w) = FIELD_WATCHPOINTS.write() {
-        if let Some(m) = w.as_mut() {
-            m.clear();
+    // Also clear the T17.Δ field-watchpoint table for the unattributed row so
+    // watch-dependent tests start empty.
+    {
+        let mut guard = environments_write();
+        if let Some(env) = guard.as_mut().and_then(|m| m.get_mut(&UNATTRIBUTED_VM)) {
+            env.watchpoints.clear();
         }
     }
-    FIELD_WATCHPOINTS_ACTIVE.store(false, Ordering::Release);
+    publish_union_listener_flags();
+    refresh_watchpoint_union();
+}
+
+/// Process-wide serialisation for tests that move the JVMTI registry's
+/// **shared** state: the [`UNATTRIBUTED_VM`] row and the process-wide union
+/// listener/watchpoint mirrors. Tests that only touch their own
+/// `scoped_test_vm()` row do not need it.
+///
+/// It lives at module scope, not inside `mod tests`, because the delivery
+/// sites this registry exists to serve are in `runtime::interpreter`, and
+/// that module's tests move the same union mirrors. A lock only one of two
+/// test modules can name is not a lock — an earlier lane found this crate's
+/// JVMTI test block was parallel-unsafe and passing by luck, and a
+/// cross-module half of the same state would reintroduce exactly that.
+///
+/// Poison-tolerant on purpose: a panicking test must not convert every later
+/// JVMTI test in the binary into a spurious failure that hides the first one.
+#[cfg(test)]
+pub(crate) fn jvmti_registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -4359,11 +5008,13 @@ mod tests {
     // Global manager & wired-safepoint tests
     // ----------------------------------------------------------------
 
-    /// Serialize test access to the global manager since it's a process-wide
-    /// singleton installed via `install_global_manager`.
+    /// Serialize test access to the unattributed row and the process-wide
+    /// union mirrors. Delegates to the module-scope
+    /// [`super::jvmti_registry_test_lock`] so that `runtime::interpreter`'s
+    /// delivery tests — which move the same union mirrors — serialise against
+    /// these tests and not merely against each other.
     fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        super::jvmti_registry_test_lock()
     }
 
     /// Ensure the process-wide manager exists, and return a handle. Tests
@@ -4932,5 +5583,399 @@ mod tests {
 
         clear_field_watchpoint(5, 2, false, true).unwrap();
         assert!(field_watchpoint_for(5, 2).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // C2 review remediation (2026-08-01) — one JVMTI environment per VM
+    //
+    // Every test below gives itself its OWN `vm_identity`. The block above
+    // shares one process-wide manager and is only safe because each test takes
+    // `global_test_lock()`; these take the same lock (they read and reset the
+    // unattributed row, and they move the process-wide union mirrors) but they
+    // never share a row with each other.
+    // -----------------------------------------------------------------------
+
+    /// A `vm_identity` no other test and no real VM can collide with.
+    ///
+    /// Real identities come from `NEXT_VM_IDENTITY` (`vm/src/vm/vm_init.rs`),
+    /// a counter starting at 1, so small integers are NOT safe to fake with in
+    /// a binary that also constructs real `SharedVm`s. The high base puts these
+    /// far outside any plausible allocation.
+    fn scoped_test_vm() -> usize {
+        use std::sync::atomic::AtomicUsize;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        0x7000_0000 + NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Install a fresh, empty manager owned by `vm` and return it.
+    fn manager_owned_by(vm: usize) -> Arc<JvmtiEventManager> {
+        install_manager_for_vm(vm, Arc::new(JvmtiEventManager::new_for_vm(vm)));
+        let m = manager_for_vm(vm).expect("just installed");
+        assert_eq!(m.vm_identity(), vm, "the row must hold the VM's own manager");
+        m
+    }
+
+    /// A watchpoint set by an agent in VM A must not exist in VM B. `class_id`
+    /// is only unique *within* a VM, so the old flat `(class_id, field_index)`
+    /// map made VM A's watch fire on an unrelated field of an unrelated class
+    /// in VM B.
+    #[test]
+    fn watchpoints_are_per_vm() {
+        let _lock = global_test_lock();
+        let _mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let a = scoped_test_vm();
+        let b = scoped_test_vm();
+
+        set_field_watchpoint_for_vm(a, 99, 3, true, true).unwrap();
+
+        assert!(field_watchpoint_for_vm(a, 99, 3).is_some());
+        assert!(
+            field_watchpoint_for_vm(b, 99, 3).is_none(),
+            "VM B must not inherit VM A's watchpoint for the same (class_id, field_index)"
+        );
+        assert!(any_field_watchpoint_active_for_vm(a));
+        assert!(!any_field_watchpoint_active_for_vm(b));
+
+        // The process-wide mirror is a deliberate superset: B pays a branch,
+        // but the per-VM lookup above is what decides whether anything fires.
+        assert!(any_field_watchpoint_active());
+
+        forget_vm_jvmti_state(a);
+        forget_vm_jvmti_state(b);
+        assert!(!any_field_watchpoint_active());
+    }
+
+    /// The whole point of doing this at environment scope rather than re-keying
+    /// the watchpoint map alone: a watchpoint hit must reach the owning VM's
+    /// callbacks and nobody else's.
+    #[test]
+    fn watchpoint_hits_reach_only_the_owning_vms_callbacks() {
+        let _lock = global_test_lock();
+        let _mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let a = scoped_test_vm();
+        let b = scoped_test_vm();
+        let mgr_a = manager_owned_by(a);
+        let mgr_b = manager_owned_by(b);
+
+        let tid: ThreadId = 21;
+        let mid: MethodId = 0x1234;
+        for m in [&mgr_a, &mgr_b] {
+            m.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::FieldAccess, Some(tid))
+                .unwrap();
+        }
+
+        let hits_a = Arc::new(AtomicU32::new(0));
+        let hits_b = Arc::new(AtomicU32::new(0));
+        let ha = hits_a.clone();
+        let hb = hits_b.clone();
+        mgr_a
+            .set_event_callbacks(EventCallbacks {
+                field_access: Some(Box::new(move |_t, _m, _f| {
+                    ha.fetch_add(1, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        mgr_b
+            .set_event_callbacks(EventCallbacks {
+                field_access: Some(Box::new(move |_t, _m, _f| {
+                    hb.fetch_add(1, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Only VM A watches the field.
+        set_field_watchpoint_for_vm(a, 77, 1, true, false).unwrap();
+
+        fire_field_access_if_watched_for_vm(a, tid, mid, 77, 1);
+        // Same class id and field index, but in VM B, where nothing is watched.
+        fire_field_access_if_watched_for_vm(b, tid, mid, 77, 1);
+
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            hits_b.load(Ordering::SeqCst),
+            0,
+            "VM B's agent must not see a hit for a watchpoint VM A installed"
+        );
+
+        forget_vm_jvmti_state(a);
+        forget_vm_jvmti_state(b);
+    }
+
+    /// Listener flags: exact per VM, superset across the process.
+    #[test]
+    fn listener_flags_are_per_vm_and_the_union_is_only_a_guard() {
+        let _lock = global_test_lock();
+        let _mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let a = scoped_test_vm();
+        let b = scoped_test_vm();
+        let mgr_a = manager_owned_by(a);
+        let _mgr_b = manager_owned_by(b);
+
+        assert!(!any_method_entry_listener_active());
+
+        mgr_a
+            .set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, None)
+            .unwrap();
+
+        assert!(any_method_entry_listener_active_for_vm(a));
+        assert!(
+            !any_method_entry_listener_active_for_vm(b),
+            "VM B must not report a listener because VM A attached one"
+        );
+        assert!(
+            any_method_entry_listener_active(),
+            "the union guard must be true so no VM's event is ever missed"
+        );
+
+        mgr_a
+            .set_event_notification_mode(EventMode::Disable, JvmtiEventKind::MethodEntry, None)
+            .unwrap();
+        assert!(!any_method_entry_listener_active());
+
+        forget_vm_jvmti_state(a);
+        forget_vm_jvmti_state(b);
+    }
+
+    /// Delivery is exact even when the union guard is true for the other VM.
+    #[test]
+    fn events_are_delivered_only_to_the_owning_vms_manager() {
+        let _lock = global_test_lock();
+        let _mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let a = scoped_test_vm();
+        let b = scoped_test_vm();
+        let mgr_a = manager_owned_by(a);
+        let mgr_b = manager_owned_by(b);
+
+        let tid: ThreadId = 22;
+        for m in [&mgr_a, &mgr_b] {
+            m.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodEntry, Some(tid))
+                .unwrap();
+        }
+
+        let seen_a = Arc::new(AtomicU32::new(0));
+        let seen_b = Arc::new(AtomicU32::new(0));
+        let sa = seen_a.clone();
+        let sb = seen_b.clone();
+        mgr_a
+            .set_event_callbacks(EventCallbacks {
+                method_entry: Some(Box::new(move |_t, _m| {
+                    sa.fetch_add(1, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        mgr_b
+            .set_event_callbacks(EventCallbacks {
+                method_entry: Some(Box::new(move |_t, _m| {
+                    sb.fetch_add(1, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+
+        fire_method_entry_for_vm(a, tid, 0x900);
+        assert_eq!(seen_a.load(Ordering::SeqCst), 1);
+        assert_eq!(seen_b.load(Ordering::SeqCst), 0);
+        assert_eq!(mgr_b.event_count(JvmtiEventKind::MethodEntry), 0);
+
+        fire_method_entry_for_vm(b, tid, 0x901);
+        assert_eq!(seen_a.load(Ordering::SeqCst), 1);
+        assert_eq!(seen_b.load(Ordering::SeqCst), 1);
+
+        forget_vm_jvmti_state(a);
+        forget_vm_jvmti_state(b);
+    }
+
+    /// The migration seam: a VM that never installed a manager of its own
+    /// resolves through the unattributed row, so converting a call site to
+    /// `*_for_vm` before converting `SharedVm::new` does not silently stop
+    /// delivering events. Once the VM installs its own, that one wins.
+    #[test]
+    fn an_unclaimed_vm_falls_back_to_the_unattributed_row() {
+        let _lock = global_test_lock();
+        let unattributed = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let vm = scoped_test_vm();
+        let fallback = manager_for_vm(vm).expect("must fall back, not answer None");
+        assert!(
+            Arc::ptr_eq(&fallback, &unattributed),
+            "an unclaimed VM must resolve to the unattributed manager"
+        );
+        assert_eq!(fallback.vm_identity(), UNATTRIBUTED_VM);
+
+        let own = manager_owned_by(vm);
+        assert!(!Arc::ptr_eq(&own, &unattributed));
+        assert!(Arc::ptr_eq(&manager_for_vm(vm).unwrap(), &own));
+
+        forget_vm_jvmti_state(vm);
+        // Back to the fallback once the VM's row is gone.
+        assert!(Arc::ptr_eq(&manager_for_vm(vm).unwrap(), &unattributed));
+    }
+
+    /// Teardown. Without this, a disposed VM's manager keeps its agent's
+    /// callback closures alive forever, its listener flags keep every other
+    /// VM's interpreter on the slow path, and its watchpoints keep matching a
+    /// `class_id` that now means something else.
+    #[test]
+    fn forget_vm_jvmti_state_drops_everything_and_is_idempotent() {
+        let _lock = global_test_lock();
+        let _mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let vm = scoped_test_vm();
+        let mgr = manager_owned_by(vm);
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::MethodExit, None)
+            .unwrap();
+        set_field_watchpoint_for_vm(vm, 5, 0, true, true).unwrap();
+        assert!(any_method_exit_listener_active());
+        assert!(any_field_watchpoint_active());
+
+        // Row counts are not asserted: other test modules in this binary build
+        // real `Vm`s in parallel, and each of those registers a row. Membership
+        // of *this* VM's row is the property that matters and is stable.
+        assert!(manager_for_vm_exact(vm).is_some());
+
+        forget_vm_jvmti_state(vm);
+        assert!(manager_for_vm_exact(vm).is_none(), "the row must be gone");
+        assert!(!any_method_exit_listener_active_for_vm(vm));
+        assert!(!any_field_watchpoint_active_for_vm(vm));
+        assert!(
+            !any_method_exit_listener_active(),
+            "the union mirror must be recomputed on teardown, not left latched"
+        );
+        assert!(!any_field_watchpoint_active());
+
+        // Second call must be a no-op — `release_vm_native_state` is invoked
+        // from two places, either of which may run first or alone.
+        forget_vm_jvmti_state(vm);
+        assert!(manager_for_vm_exact(vm).is_none());
+    }
+
+    /// `None` bridge (never installed) and `Some(dead Weak)` (VM gone) must not
+    /// be conflated: pruning on `strong_count() == 0` alone would delete a live
+    /// row that simply has no bridge yet.
+    #[test]
+    fn a_dead_bridge_is_pruned_but_a_bridgeless_row_is_kept() {
+        let _lock = global_test_lock();
+        let _mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let dead = scoped_test_vm();
+        let bridgeless = scoped_test_vm();
+        let trigger = scoped_test_vm();
+
+        let _ = manager_owned_by(bridgeless);
+        {
+            let mut guard = environments_write();
+            let map = guard.get_or_insert_with(HashMap::new);
+            // A `Weak::new()` never upgrades — exactly what a torn-down VM's
+            // bridge looks like.
+            map.entry(dead)
+                .or_insert_with(VmJvmtiEnvironment::empty)
+                .bridge = Some(Weak::new());
+        }
+        assert!(bridge_for_vm(dead).is_none());
+        assert_ne!(
+            sole_live_bridge().map(|s| s.vm_identity),
+            Some(dead),
+            "a dead bridge must never be resolved as the sole live VM"
+        );
+
+        // Any registry write prunes provably-dead rows.
+        forget_vm_jvmti_state(trigger);
+        assert!(
+            manager_for_vm_exact(bridgeless).is_some(),
+            "a live row with no bridge installed must survive the prune"
+        );
+        {
+            let guard = environments_read();
+            assert!(
+                !guard.as_ref().unwrap().contains_key(&dead),
+                "a row whose bridge expired must be pruned"
+            );
+        }
+
+        forget_vm_jvmti_state(bridgeless);
+    }
+
+    /// The headline bug. `REAL_AGENT_ENV_BRIDGE` was one
+    /// `OnceLock<Weak<SharedVm>>`, first-writer-wins:
+    ///
+    /// * two live VMs — VM B's `set` failed, so VM B's bridged events went into
+    ///   VM A's `shared.debug.jvmti_env`, carrying VM B's `ClassId`s;
+    /// * **sequentially** — after VM A was dropped the stored `Weak` stopped
+    ///   upgrading and VM B's `set` *still* failed, so VM B's native agent
+    ///   received nothing at all, for the life of the process. That breaks
+    ///   sequential embedding, not just concurrency.
+    ///
+    /// Both halves are asserted here.
+    #[test]
+    fn bridge_is_per_vm_and_a_second_vm_is_not_silently_dropped() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let _lock = global_test_lock();
+
+        let a = Arc::new(SharedVm::new(VmConfig::default()));
+        let b = Arc::new(SharedVm::new(VmConfig::default()));
+        let (a_id, b_id) = (a.vm_identity, b.vm_identity);
+        assert_ne!(a_id, b_id);
+
+        install_real_agent_env_bridge(&a);
+        install_real_agent_env_bridge(&b);
+
+        assert!(
+            Arc::ptr_eq(&bridge_for_vm(a_id).expect("VM A must have its bridge"), &a),
+            "VM A's bridge must resolve to VM A"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &bridge_for_vm(b_id).expect("VM B's bridge must not be dropped"),
+                &b
+            ),
+            "the second VM must get its own bridge, not silently lose it"
+        );
+        assert!(
+            sole_live_bridge().is_none(),
+            "with two live VMs an unattributed event must be dropped, not guessed"
+        );
+
+        // Sequential embedding: VM A goes away, VM B keeps working.
+        forget_vm_jvmti_state(a_id);
+        drop(a);
+        assert!(bridge_for_vm(a_id).is_none());
+        assert!(
+            Arc::ptr_eq(
+                &bridge_for_vm(b_id).expect("VM B must outlive VM A's teardown"),
+                &b
+            ),
+            "dropping the first VM must not take the second VM's bridge with it"
+        );
+        assert_ne!(
+            sole_live_bridge().map(|s| s.vm_identity),
+            Some(a_id),
+            "a released VM must never be resolved as the sole live bridge"
+        );
+        // `sole_live_bridge() == Some(b_id)` is the property we actually want
+        // here, but it cannot be asserted in this binary: other test modules
+        // build real `Vm`s in parallel and each registers a live bridge, so
+        // the "exactly one" precondition is not ours to control. The
+        // `bridge_for_vm(b_id)` assertion above is the load-bearing one — under
+        // the old single `OnceLock<Weak<SharedVm>>` it returned `None`, because
+        // VM B was never registered at all.
+
+        forget_vm_jvmti_state(b_id);
+        drop(b);
     }
 }

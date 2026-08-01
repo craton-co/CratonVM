@@ -19,19 +19,26 @@
 //!
 //! Surface under test (all in `classloading/src/jar_signer.rs` unless
 //! noted):
-//!   * `verify_signer_block` (`:279`) — DER `ContentInfo` → `SignedData` →
+//!   * `verify_signer_block` (`:357`) — DER `ContentInfo` → `SignedData` →
 //!     `SignerInfo` walk, `authenticatedAttributes` digest binding, cert
 //!     extraction, and the chain-to-anchor gate.
-//!   * `verify_chain` (`:2791`) — path building, cycle detection,
+//!   * `verify_chain` (`:3042`) — path building, cycle detection,
 //!     `MAX_CHAIN_LEN`, RFC 5280 extension checks.
-//!   * `X509Cert::parse` (`:2312`) and `link_signature_ok` (`:2447`).
-//!   * `verify_sf_binds_manifest` (`:3032`) — the `.SF`'s
+//!   * `X509Cert::parse` (`:2529`) and `link_signature_ok` (`:2664`).
+//!   * `verify_sf_binds_manifest` (`:3338`) — the `.SF`'s
 //!     `<alg>-Digest-Manifest` binding.
-//!   * `parse_manifest_entry_digests` (`:3083`) — per-entry
+//!   * `parse_manifest_entry_digests` (`:3405`) — per-entry
 //!     `<alg>-Digest` sections, including the 4 KiB entry-name cap.
-//!   * `digest_matches` (`:3156`) — constant-time digest comparison.
-//!   * `TrustStore::{empty, add_anchor_der, load_pem_bundle}` (`:1809`,
-//!     `:1846`, `:1892`) — anchor ingestion and its `MAX_TRUST_ANCHORS` cap.
+//!   * `digest_matches` (`:3489`) — constant-time digest comparison.
+//!   * `TrustStore::{empty, add_anchor_der, load_pem_bundle}` (`:2012`,
+//!     `:2049`, `:2095`) — anchor ingestion and its `MAX_TRUST_ANCHORS`
+//!     cap (`:1966`).
+//!
+//! Note what this target's oracle *cannot* see: `verify_signer_block`
+//! examines only the first `SignerInfo` in the SET (`:476-481`, documented
+//! at `:110` and `:353`). That is not a crash and not a fail-open against a
+//! zero-anchor store, so no amount of fuzzing here reaches it. It needs an
+//! ordering-invariance test — see `docs/known-issues/fuzzing-state.md`.
 //!   * `cratonvm_classloading::ManifestInfo::parse`
 //!     (`classloading/src/class_path.rs:711`) — the manifest reader the
 //!     class path itself uses.
@@ -71,7 +78,7 @@ use cratonvm_classloading::ManifestInfo;
 const MAX_INPUT: usize = 1024 * 1024;
 
 /// `parse_manifest_entry_digests` caps a per-entry `Name:` value at 4 KiB
-/// and drops longer ones (`classloading/src/jar_signer.rs:3128`).
+/// and drops longer ones (`classloading/src/jar_signer.rs:3449`).
 const MAX_MANIFEST_ENTRY_NAME: usize = 4096;
 
 /// Every digest algorithm the JAR signer accepts, with its output length.
@@ -90,7 +97,7 @@ const DIGEST_ALGS: [(DigestAlg, usize); 4] = [
 /// grow past `MAX_TRUST_ANCHORS`, not to actually reach 4096.
 const ANCHOR_INSERT_ATTEMPTS: usize = 4;
 
-/// `MAX_CERT_DER` in `classloading/src/jar_signer.rs:145`. Anchor
+/// `MAX_CERT_DER` in `classloading/src/jar_signer.rs:173`. Anchor
 /// ingestion copies its input, so the harness only probes that path with
 /// blobs the store could plausibly accept — otherwise each iteration would
 /// memcpy megabytes for a guaranteed rejection.
