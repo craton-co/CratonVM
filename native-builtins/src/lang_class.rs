@@ -4482,6 +4482,33 @@ pub(crate) fn check_class_loader_define_class_is_encapsulated(
     if caller_is_jdk_internal(accessor_name.as_deref(), accessor_loader_id) {
         return Ok(());
     }
+    // `--add-opens=java.base/java.lang=ALL-UNNAMED` is precisely the grant the
+    // denial message below tells the user to add, and HotSpot honours it. This
+    // check used to deny unconditionally, so the flag was a no-op: Spring's own
+    // Gradle test task passes it to EVERY test JVM (buildSrc
+    // `TestConventions.java`), and without the resulting
+    // `ClassLoader.defineClass` access Spring-CGLIB cannot define any generated
+    // class at all — `BshScriptFactoryTests` 5/18 and `Spr15042Tests` 0/1 under
+    // CratonVM, both 18/18 and 1/1 on HotSpot *because of* the flag.
+    //
+    // A runtime `java.lang.Module.addOpens(...)` lands in the same registry, so
+    // an agent that opens the package at runtime is honoured too. With neither,
+    // nothing changes: the registry has no `java.base` open edge and the denial
+    // stands, which is what keeps CratonVM matching a bare `java` invocation.
+    if ctx.is_package_open_unqualified("java.base", "java/lang") {
+        if trace {
+            eprintln!("[setacc] allowed: java.base/java.lang is open (unqualified)");
+        }
+        return Ok(());
+    }
+    if let Some(accessor_module) = ctx.module_name_of_class(accessor_cid) {
+        if ctx.is_package_open_to("java.base", "java/lang", &accessor_module) {
+            if trace {
+                eprintln!("[setacc] allowed: java.base/java.lang opens to {accessor_module}");
+            }
+            return Ok(());
+        }
+    }
     Err(
         "Unable to make protected final java.lang.Class java.lang.ClassLoader.defineClass(\
          java.lang.String,byte[],int,int,java.security.ProtectionDomain) throws \
@@ -14096,82 +14123,31 @@ pub(crate) fn native_class_get_generic_interfaces(
         if let Some(iface_id) =
             lambda_functional_interface_id_loader_aware(ctx, class_id, &iface_name)
         {
-            // Prefer a real `ParameterizedType` (e.g. `ApplicationContextInitializer<
-            // ConfigurableApplicationContext>`) when the functional interface is
-            // itself generic — reflection-based generic-argument resolvers
-            // require one and throw on a bare raw `Class`. Falls back to the
-            // long-standing raw-mirror behavior for non-generic SAM interfaces
-            // or whenever the type variable(s) can't be matched.
-            let dbg_lg = crate::nbflags().dbg_lambda_generic;
-            if let Some((sam_name, sam_desc, inst_desc)) =
-                ctx.lambda_call_site_descriptors(class_id)
-            {
-                let sig = crate::generics::lambda_functional_interface_generic_type(
-                    ctx,
-                    iface_id,
-                    &iface_name,
-                    &sam_name,
-                    &sam_desc,
-                    &inst_desc,
-                );
-                if dbg_lg {
-                    eprintln!(
-                        "[LAMBDA-GENERIC] class_id={class_id:?} iface={iface_name} sam_name={sam_name} sam_desc={sam_desc} inst_desc={inst_desc} sig={sig:?}"
-                    );
-                }
-                if let Some(sig) = sig {
-                    // Residual 4 (2026-07-20, docs/known-issues/springboot/
-                    // core-spring-boot-test-config-data-and-classpath-scan-cluster.md):
-                    // `sig` names the lambda's OWN functional interface (e.g.
-                    // Spring AOT's `AotApplicationContextInitializer<C>`) as its
-                    // raw type — `typesig_to_real_type` must resolve that name
-                    // to a `Class` mirror, and does so through
-                    // `class_id_in_generic_scope`'s current `GENERIC_DECL_SCOPE`.
-                    // Without a scope set here, that resolution is loader-blind
-                    // and can pick up whichever copy the flat global store
-                    // already holds (observed: the Application loader's copy)
-                    // instead of the lambda's own fork loader's copy — the same
-                    // gap already fixed for the "real class" branch above (see
-                    // its own `GenericDeclScope::new` a few lines up). Scope to
-                    // the lambda's host class (its defining/enclosing class,
-                    // already correctly fork-loader-resolved by the time the
-                    // lambda exists) so the interface name resolves in the same
-                    // loader context as the lambda itself.
-                    let host_name = ctx.lambda_proxy_host(class_id);
-                    let host_id = host_name.as_deref().and_then(|n| ctx.class_id_by_name(n));
-                    if dbg_lg {
-                        eprintln!(
-                            "[LAMBDA-GENERIC] host-scope class_id={class_id:?} host_name={host_name:?} host_id={host_id:?}"
-                        );
-                    }
-                    let _gscope =
-                        host_id
-                            .map(|host_id| ctx.get_class_mirror(host_id))
-                            .map(|host_mirror| {
-                                crate::generics::GenericDeclScope::new(Value::Object(Some(
-                                    host_mirror,
-                                )))
-                            });
-                    let val = crate::generics::typesig_to_real_type(ctx, &sig);
-                    if dbg_lg {
-                        eprintln!("[LAMBDA-GENERIC] typesig_to_real_type -> {val:?}");
-                    }
-                    if let Value::Object(Some(pt)) = val {
-                        // Building the result array can move the newly-created
-                        // ParameterizedTypeImpl before it is published.
-                        let pt_pin = ctx.pin_native_root(pt);
-                        let arr = ctx.new_ref_array(ClassId::new(0), 1);
-                        let pt = ctx.read_native_pin(pt_pin, pt);
-                        ctx.set_array_element(arr, 0, Value::Object(Some(pt)));
-                        ctx.unpin_native_roots(pt_pin);
-                        return Ok(Some(Value::Object(Some(arr))));
-                    }
-                }
-            } else if dbg_lg {
-                eprintln!(
-                    "[LAMBDA-GENERIC] class_id={class_id:?} iface={iface_name} lambda_call_site_descriptors=None"
-                );
-            }
+            // HotSpot parity: a `LambdaMetafactory`-spun implementation
+            // class carries NO `Signature` attribute at all, so real HotSpot's
+            // `getGenericInterfaces()` hands back the RAW functional-interface
+            // `Class` for every lambda -- never a `ParameterizedType`, and
+            // regardless of how concretely the call site's target type was
+            // parameterized (verified against `jdk-25.0.3.9-hotspot`; see
+            // `docs/internal/fixed-suite-bugs/springboot/
+            // lambda-getgenericinterfaces-fabricates-parameterizedtype-FIXED.md`).
+            //
+            // A previous session reconstructed a concrete `ParameterizedType`
+            // here out of the lambda's call-site instantiated descriptor, so
+            // that `GenericTypeResolver.resolveTypeArgument` could find a type
+            // argument for a lambda-typed `ApplicationContextInitializer`. That
+            // premise was wrong: on real HotSpot the resolver succeeds through
+            // `ResolvableType`'s TYPE-VARIABLE BOUND fallback -- the raw
+            // interface `Class` still reports its own `getTypeParameters()`,
+            // and a variable nothing binds resolves to its declared bound --
+            // not through any `ParameterizedType`. Fabricating one is itself
+            // observably wrong, and broke two Spring idioms that depend on a
+            // lambda's generics being reported as UNRESOLVABLE:
+            // `ApplicationConversionService.addBean` (which branches on
+            // `hasUnresolvableGenerics()` to pick a type-aware adapter) and
+            // `LambdaSafe.GenericTypeFilter` (which must NOT pre-filter a
+            // lambda callback, so the deliberate erasure-driven
+            // `ClassCastException` its javadoc exists to catch still happens).
             let mirror = ctx.get_class_mirror(iface_id);
             let elem = ctx
                 .class_id_by_name("java/lang/Class")

@@ -513,12 +513,20 @@ impl ExecutableBuffer {
     /// interpreter; the caller may ignore the `Err` and rely on that bail.
     pub fn try_patch_i32(&mut self, offset: usize, value: i32) -> Result<(), CompileError> {
         if offset.checked_add(4).map_or(true, |end| end > self.len) {
+            // Log only the FIRST overflow for this buffer. `overflowed` is
+            // sticky, so every later patch in the same compile hits this arm
+            // too; one oversized method used to emit tens of thousands of
+            // identical lines. The actionable diagnostic (method, code_len,
+            // capacity, wanted) is logged once per method by the compile
+            // driver's "code buffer estimate too small" bail.
+            if !self.overflowed {
+                tracing::warn!(
+                    offset = offset,
+                    len = self.len,
+                    "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
+                );
+            }
             self.overflowed = true;
-            tracing::warn!(
-                offset = offset,
-                len = self.len,
-                "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
-            );
             return Err(CompileError::PatchFailed {
                 kind: "i32",
                 offset,
@@ -540,12 +548,15 @@ impl ExecutableBuffer {
     /// [`try_patch_i32`](Self::try_patch_i32) for the bail-out contract.
     pub fn try_patch_byte(&mut self, offset: usize, value: u8) -> Result<(), CompileError> {
         if offset >= self.len {
+            // First overflow only; see `try_patch_i32` for why.
+            if !self.overflowed {
+                tracing::warn!(
+                    offset = offset,
+                    len = self.len,
+                    "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
+                );
+            }
             self.overflowed = true;
-            tracing::warn!(
-                offset = offset,
-                len = self.len,
-                "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
-            );
             return Err(CompileError::PatchFailed {
                 kind: "byte",
                 offset,

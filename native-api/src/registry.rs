@@ -700,25 +700,6 @@ pub trait NativeClassAccess {
         None
     }
 
-    /// For a synthetic lambda-proxy `ClassId`, return `(sam_method_name,
-    /// sam_erased_descriptor, instantiated_descriptor)` from the
-    /// `LambdaMetafactory` bootstrap that created it. `sam_erased_descriptor`
-    /// is the functional interface's own (type-erased) SAM descriptor — the
-    /// key needed to look up that method's generic `Signature` attribute via
-    /// `method_signature`. `instantiated_descriptor` is the call-site-specific,
-    /// concrete-typed descriptor (e.g. `(Lcom/foo/Bar;)V` for a
-    /// `Consumer<Bar>` lambda) — the source of truth for substituting the
-    /// functional interface's type variable(s) with concrete types. Returns
-    /// `None` for any non-lambda class. Used to synthesize a real
-    /// `ParameterizedType` for `Class.getGenericInterfaces()` on a lambda
-    /// proxy instead of falling back to the raw (non-generic) interface
-    /// `Class` — Spring's `GenericTypeResolver` (and similar reflection-based
-    /// generic-argument resolvers) require an actual `ParameterizedType` and
-    /// throw when only a raw `Class` is available.
-    fn lambda_call_site_descriptors(&self, _class_id: ClassId) -> Option<(String, String, String)> {
-        None
-    }
-
     /// For a synthetic lambda-proxy `ClassId`, return the full lambda
     /// call-site metadata required to serialize and later reconstruct the
     /// lambda (see [`LambdaSerialMetadata`]). Returns `None` for any
