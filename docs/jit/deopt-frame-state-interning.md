@@ -199,7 +199,7 @@ consecutive snapshots.
 | distinct states | 100 | 100 handles (400 B) |
 | method keys | 100 copies | 1 |
 
-**87.9 % of slots shared; 87.2 % of slot bytes saved.** The test asserts
+**88.0 % of slots shared; 87.2 % of slot bytes saved.** The test asserts
 `> 85 %` and `> 80 %` respectively, and pins the exact chunk arithmetic
 (`chunks == 9 + 99`, `stored_slots == 64 + 8 + 99×8`) so a regression in the
 sharing shows up as a hard failure rather than a drifting number.

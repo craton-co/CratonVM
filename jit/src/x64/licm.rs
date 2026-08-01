@@ -2851,7 +2851,7 @@ pub(super) fn branch_targets_at(
                 // Cast: signed branch displacement to isize
                 i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
             };
-            if !push_t(rd(p), out) {
+            if !push_t(rd(p), &mut *out) {
                 return false;
             }
             // Cast: table bound to i32
@@ -2867,7 +2867,7 @@ pub(super) fn branch_targets_at(
                 if jp + 4 > code_len {
                     return false;
                 }
-                if !push_t(rd(jp), out) {
+                if !push_t(rd(jp), &mut *out) {
                     return false;
                 }
                 jp += 4;
@@ -2886,7 +2886,7 @@ pub(super) fn branch_targets_at(
                 // Cast: signed branch displacement to isize
                 i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
             };
-            if !push_t(rd(p), out) {
+            if !push_t(rd(p), &mut *out) {
                 return false;
             }
             let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
@@ -2901,7 +2901,7 @@ pub(super) fn branch_targets_at(
                     return false;
                 }
                 // A pair is (match:i32, offset:i32); the offset is at jp + 4.
-                if !push_t(rd(jp + 4), out) {
+                if !push_t(rd(jp + 4), &mut *out) {
                     return false;
                 }
                 jp += 8;

@@ -3703,27 +3703,14 @@ mod tests {
         for p in PATTERNS {
             for &r1 in REGS.iter() {
                 for &r2 in REGS.iter() {
-                    if p.constraints.contains(&Constraint::SameRegister) && r1 != r2 {
+                    if p.constraints.contains(&Constraint::NoSibBase) && base_requires_sib(r2) {
                         continue;
                     }
-                    let mem = if p.constraints.contains(&Constraint::IndexNotRsp) {
-                        Mem::base_index(r2, RCX, 4, 16)
-                    } else if p.constraints.contains(&Constraint::NoSibBase)
-                        && base_requires_sib(r2)
-                    {
+                    if p.constraints.contains(&Constraint::IndexNotRsp) && r2 == RSP {
                         continue;
-                    } else if matches!(p.disp, DispPolicy::Force32) {
-                        Mem::base_disp32(r2, 64)
-                    } else {
-                        Mem::base_disp(r2, 64)
-                    };
-                    let a = Args {
-                        dst: r1,
-                        src: r2,
-                        mem,
-                        imm: if matches!(p.imm, ImmForm::ImmU8) { 1 } else { 0 },
-                        op_byte: if matches!(p.op, Op::Jcc) { 0x84 } else { 0x44 },
-                    };
+                    }
+                    let a = args_for(p, r1, r2, r2, RCX, 64);
+                    let mem = a.mem;
                     let e = match p.encode(&a) {
                         Ok(e) => e,
                         Err(err) => panic!("`{}` r{r1}/r{r2}: {err}", p.name),
@@ -3731,7 +3718,7 @@ mod tests {
                     if e.bytes.is_empty() {
                         // The elided self-move: nothing to decode.
                         assert_eq!(p.peephole, Peephole::ElideWhenDstEqSrc);
-                        assert_eq!(r1, r2);
+                        assert_eq!(a.dst, a.src);
                         continue;
                     }
                     let d = decode(&e.bytes, p.enc.modrm)
@@ -3757,19 +3744,19 @@ mod tests {
                     // The register fields came back intact.
                     if p.enc.modrm {
                         let want_reg = match p.enc.reg {
-                            RegF::Dst => r1,
-                            RegF::Src => r2,
+                            RegF::Dst => a.dst,
+                            RegF::Src => a.src,
                             RegF::Ext(n) => n,
                         };
                         assert_eq!(d.reg(), Some(want_reg), "`{}` reg field", p.name);
                         match p.enc.rm {
                             RmF::RegDst => {
                                 assert_eq!(d.mod_bits(), Some(0b11), "`{}`", p.name);
-                                assert_eq!(d.rm_reg(), Some(r1), "`{}` r/m", p.name);
+                                assert_eq!(d.rm_reg(), Some(a.dst), "`{}` r/m", p.name);
                             }
                             RmF::RegSrc => {
                                 assert_eq!(d.mod_bits(), Some(0b11), "`{}`", p.name);
-                                assert_eq!(d.rm_reg(), Some(r2), "`{}` r/m", p.name);
+                                assert_eq!(d.rm_reg(), Some(a.src), "`{}` r/m", p.name);
                             }
                             RmF::Mem => {
                                 assert_eq!(d.base(), Some(mem.base), "`{}` base", p.name);

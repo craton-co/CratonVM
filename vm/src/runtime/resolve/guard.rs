@@ -589,6 +589,17 @@ fn the_access_control_implementations_are_the_two_known_ones() {
 
     let mut found: Vec<String> = Vec::new();
     for path in &sources {
+        let relative = path.strip_prefix(&root).unwrap_or(path);
+        let shown = relative.display().to_string().replace('\\', "/");
+        // This file names both declarations as literals, and `super` is the
+        // sanctioned wrapper rather than a third implementation. Same
+        // exclusion rule as the bypass scan.
+        if OWNER_PREFIXES
+            .iter()
+            .any(|p| *p == "vm/src/runtime/resolve/" && shown.starts_with(p))
+        {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
@@ -598,8 +609,7 @@ fn the_access_control_implementations_are_the_two_known_ones() {
                     || line.contains("fn check_method_access("))
         });
         if declares {
-            let relative = path.strip_prefix(&root).unwrap_or(path);
-            found.push(relative.display().to_string().replace('\\', "/"));
+            found.push(shown);
         }
     }
     found.sort();
