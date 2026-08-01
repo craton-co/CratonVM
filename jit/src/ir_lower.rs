@@ -9148,7 +9148,14 @@ mod tests {
             "the swap loop must COMPILE — a None here is the cyclic-parallel-copy \
              refusal coming back, which drops the method a tier",
         );
-        let f = |a: i64, b: i64, n: i64| unsafe { cm.try_call(&[a, b, n]).expect("call") };
+        // `ireturn` leaves a 32-bit value in the return register, so the raw
+        // i64 readout carries an untouched upper half and a negative result
+        // reads as its u32 bit pattern (-4 as 0xFFFF_FFFC). Sign-extend before
+        // comparing, or a correct swap reports as a failure.
+        let f = |a: i64, b: i64, n: i64| {
+            let raw = unsafe { cm.try_call(&[a, b, n]).expect("call") };
+            raw as i32 as i64
+        };
         assert_eq!(f(3, 7, 0), -4, "no iterations: 3 - 7");
         assert_eq!(f(3, 7, 1), 4, "one swap: 7 - 3 (0 would mean a == b)");
         assert_eq!(f(3, 7, 2), -4, "two swaps: back to 3 - 7");

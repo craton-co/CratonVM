@@ -1121,11 +1121,16 @@ pub(super) fn collect_i16_branch_targets(code: &[u8], code_len: usize) -> Option
 ///
 /// Everything that fails this proof falls back to the *speculative* per-array
 /// header guard, which checks the runtime lengths instead (see
-/// `SpeculativeBCEGuard`). Before this proof existed, `find_safe_array_accesses`
+/// `SpeculativeBCEGuard`). Before this proof existed, the static-elision pass
 /// treated the loop guard `iv < bound` as bounding EVERY array indexed by the
 /// IV — eliding the store check of `out[i] = a[i] + b[i]` from a guard on
 /// `a.length`, a silent out-of-bounds heap write when `out` is shorter
 /// (docs/known-issues/jit-bce-multi-array-oob-store-20260711.md).
+///
+/// `recognise_loop` now consumes this by REWRITING the limit: a `Local(bl)`
+/// whose provenance is `A.length` becomes `BoundSource::ArrayLength(A)`, and
+/// `prove_index_in_bounds_of` discharges `A[iv]` against the resulting
+/// tautology while leaving every other array's guard in place.
 pub(super) fn find_bound_arraylength_provenance(
     code: &[u8],
     code_len: usize,
@@ -2279,9 +2284,9 @@ mod range_bce_tests {
         assert_eq!(safe, vec![7], "the rotated entry lands on the test");
         assert_eq!(guards, vec![(5, 1, 2, 3, vec![7])]);
 
-        // `do { } while`: identical bytes except the entry `goto` is replaced by
-        // two `nop`s and a fall-through into the header, so the body runs once
-        // BEFORE the first test.
+        // `do { } while`: identical bytes except the entry `goto` is replaced
+        // by three `nop`s, so control falls through into the header and the
+        // body runs once BEFORE the first test.
         let mut do_while = rotated.clone();
         do_while[2] = 0x00; // nop
         do_while[3] = 0x00; // nop
