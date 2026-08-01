@@ -16823,6 +16823,21 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
     // WatchService.poll() → WatchKey (or null)
     r.register(ws, "poll", "()Ljava/nio/file/WatchKey;", native_ws_poll);
 
+    // WatchService.poll(long, TimeUnit) → WatchKey (or null after the timeout)
+    //
+    // `WatchService` is an interface, so an unregistered overload has no `Code`
+    // attribute and calling it raises `AbstractMethodError` — it does not
+    // silently do nothing. Spring Boot's `FileWatcher$WatcherThread.run` polls
+    // with exactly this overload, so its watcher thread died on the very first
+    // iteration and every later `Path.register` then reported "service is
+    // closed or unknown".
+    r.register(
+        ws,
+        "poll",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/nio/file/WatchKey;",
+        native_ws_poll_timed,
+    );
+
     // WatchService.take() → WatchKey (blocking)
     r.register(ws, "take", "()Ljava/nio/file/WatchKey;", native_ws_take);
 
@@ -17148,6 +17163,69 @@ fn native_ws_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         // close() / interrupt become visible promptly.
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// `WatchService.poll(long timeout, TimeUnit unit)` — the same drain-and-check
+/// loop as [`native_ws_take`], bounded by the caller's deadline and returning
+/// `null` (not an exception) when it expires.
+///
+/// A closed service is the one case that still throws: `take()` and `poll()`
+/// both report `ClosedWatchServiceException`/IOException there, and Spring
+/// Boot's watcher loop relies on the throw to end the thread when the
+/// `FileWatcher` is stopped.
+fn native_ws_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    // Ask the unit itself rather than decode an ordinal, so any TimeUnit
+    // constant works (mirrors `stamped_timeout_nanos` in native-builtins).
+    let nanos = match (args.get(1), args.get(2)) {
+        (Some(Value::Long(t)), Some(Value::Object(Some(unit)))) => {
+            match ctx.invoke_virtual(*unit, "toNanos", "(J)J", &[Value::Long(*t)]) {
+                Ok(Some(Value::Long(n))) => n.max(0),
+                // An unreadable unit: fall back to treating the value as
+                // milliseconds, the overwhelmingly common caller unit. Better a
+                // slightly-wrong bound than an unbounded block.
+                _ => t.saturating_mul(1_000_000).max(0),
+            }
+        }
+        _ => 0,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(nanos as u64);
+    // `this` is re-read from a pin on every iteration: the loop spans
+    // `native_ws_poll`, which allocates (WatchEvent/Path/array), so a moving
+    // young GC can relocate the receiver mid-wait (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
+    let result = (|| loop {
+        let this = ctx.read_native_pin(this_pin, this);
+        if !matches!(ctx.get_field(this, WS_FIELD_OPEN), Value::Int(1)) {
+            return Err(RuntimeError::IOException {
+                message: "WatchService is closed".into(),
+            }
+            .into());
+        }
+        {
+            let this_key = ctx.identity_hash_code(this);
+            let mut services = watch_services().lock();
+            if let Some(state) = services.get_mut(&this_key) {
+                drain_into_queues(state);
+            }
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        if let Some(Value::Object(Some(wk))) =
+            native_ws_poll(ctx, &[Value::Object(Some(this))])?.as_ref()
+        {
+            return Ok(Some(Value::Object(Some(*wk))));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(Some(Value::Object(None)));
+        }
+        // Same 50ms slice as `take()`, clipped so we never overshoot the
+        // caller's deadline.
+        let slice = (deadline - now).min(std::time::Duration::from_millis(50));
+        std::thread::sleep(slice);
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_ws_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
