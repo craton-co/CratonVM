@@ -51,10 +51,11 @@ No existing document covers this assertion shape (checked
 
 ## Reproduction rate, 2026-08-01
 
-Reproduced on a binary from `fix/springboot-conditionreport-cce-20260801`
-(`6c2a8a677d`), real JDK 25, complete Spring Boot 4.1.0-SNAPSHOT fixture, JIT
-on: **1 failure in 5 full-class runs.** The other four runs pass this test, so
-a single green run of the class does not clear it.
+Reproduced on binaries from `fix/springboot-conditionreport-cce-20260801`,
+real JDK 25, complete Spring Boot 4.1.0-SNAPSHOT fixture, JIT on: **1 failure
+in 4 full-class runs.** The other three pass this test, so a single green run
+of the class does not clear it — budget at least 8 runs before calling it
+fixed.
 
 The rest of the class is clean as of that binary. The
 `localeCharsetMappingsAreConfigured` failure that used to accompany this one

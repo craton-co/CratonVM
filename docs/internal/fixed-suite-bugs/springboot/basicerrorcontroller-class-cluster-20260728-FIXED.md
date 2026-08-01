@@ -214,6 +214,16 @@ Probes:
 | `probes/JitHandlerResumeLocalProbe.java` | `<local3> is null`, 3 of 3 | `mismatches=0`, 5 of 5 (HotSpot 0) |
 | `probes/LocaleToStringProbe.java` | `bad=11` | `bad=0` (HotSpot 0) |
 
+Everything above was then re-run on the branch MERGED with `origin/dev`
+(`0cd98d110c`, 24 commits ahead of the branch point) — the binary that actually
+lands. All green on a quiet box: both probes, `BasicErrorControllerDirectMockMvcTests`
+3/3, `OAuth2ResourceServerAutoConfigurationTests` 52/52,
+`CloudFoundryActuatorAutoConfigurationTests` 14/14,
+`JettyServletWebServerFactoryTests` **113/113 twice**, and
+`BasicErrorControllerIntegrationTests` 26/26 four times. This re-run is the one
+to trust: a merge is exactly where a fix like this gets silently relocated or
+dropped.
+
 Unit tests on the fix branch: `cratonvm-jit --lib` 1228/0, `cratonvm-vm --lib`
 2330/0. `cratonvm-native-builtins --lib` is 3202 passed / 2 failed, and **both
 failures pre-date this work** — `panama::tests::test_85_4_upcall_handle_and_invoke`
@@ -222,8 +232,8 @@ identically with these changes stashed.
 
 `JettyServletWebServerFactoryTests` is not 113/113 every run. One test,
 `whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade`, fails
-intermittently (1 of 5 runs) with a `404` where a refused connection is
-expected. That is the residual the GC report already recorded, it has nothing
+intermittently — 1 of the 4 runs made on a binary carrying the `Locale`
+fix — with a `404` where a refused connection is expected. That is the residual the GC report already recorded, it has nothing
 to do with this cluster, and it is re-filed — see below. The class's other
 failure, `localeCharsetMappingsAreConfigured`, WAS fixed here (`6c2a8a677d`):
 `Locale.toString()` returned `""` for every real-JDK `Locale`, and Jetty keys
