@@ -8123,6 +8123,80 @@ impl GenerationalHeap {
                 }
             }
         }
+        // ---- CRATONVM_DBG_SWEEP_LIVENESS, young side ----
+        //
+        // The old-gen half of this assertion (see `old_gen_gc`) came back CLEAN
+        // on the `--nojit` DefaultCatalogAndSchemaTest reproducer: SIGSEGV at
+        // 94/132 with zero hits, so no marked old-gen object still pointed at a
+        // block that sweep freed. But the corrupt receiver in that crash reads
+        // `class_id=0 num_slots=0` — *zeroed* memory — and zeroing is what the
+        // YOUNG sweep does to dead spans, not what `OldGen::free` does (it only
+        // returns the block to a free list, leaving the bytes in place). So the
+        // victim is a young object, and the question moves here.
+        //
+        // Checked from the OLD generation into the young dead spans, because
+        // that is exactly the edge in the failing workload: a promoted bucket
+        // array still pointing at a young chain node. A hit means the young mark
+        // missed an old->young root — the remembered-set/card path — and the
+        // sweep is about to zero a live node.
+        //
+        // Interior hits count: the spans are coalesced, so this asks "does a
+        // live old-gen ref point INTO a doomed span", which also catches a
+        // reference to a field cell rather than the object base.
+        if gc_flags().dbg_sweep_liveness && !dead_regions.is_empty() {
+            let base = from_base;
+            let mut spans: Vec<(usize, usize)> = dead_regions
+                .iter()
+                .map(|&(off, sz, _, _, _)| (base + off, sz))
+                .collect();
+            spans.sort_unstable();
+            let in_doomed = |addr: usize| -> bool {
+                match spans.binary_search_by(|&(s, _)| s.cmp(&addr)) {
+                    Ok(_) => true,
+                    Err(0) => false,
+                    Err(i) => {
+                        let (s, sz) = spans[i - 1];
+                        addr < s + sz
+                    }
+                }
+            };
+            let mut hits: Vec<(usize, u32, usize, usize)> = Vec::new();
+            {
+                // Use the guard this function already holds (taken at the top,
+                // alongside `young_from`). `parking_lot::Mutex` is NOT
+                // reentrant, so re-locking `self.old_gen` here would deadlock
+                // the collector at a safepoint — with every mutator thread
+                // already stopped, i.e. a silent whole-VM hang rather than a
+                // panic.
+                for (obj_ptr, _size) in old_gen.walk_objects() {
+                    // SAFETY: `walk_objects` yields valid old-gen object starts.
+                    let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                    // SAFETY: a walked old-gen object has a valid header and an
+                    // in-bounds body — `for_each_ref_slot`'s contract.
+                    unsafe {
+                        for_each_ref_slot(obj_ptr, h, |ref_ptr, slot| {
+                            let victim = ref_ptr as usize;
+                            if in_doomed(victim) && hits.len() < 64 {
+                                hits.push((victim, h.class_id.as_u32(), obj_ptr as usize, slot));
+                            }
+                        });
+                    }
+                }
+            }
+            if !hits.is_empty() {
+                eprintln!(
+                    "[SWEEP-LIVENESS young] {} live OLD-gen ref(s) point into {} young span(s) this sweep is about to zero",
+                    hits.len(),
+                    spans.len(),
+                );
+                for (victim, cid, referrer, slot) in hits.iter().take(12) {
+                    eprintln!(
+                        "[SWEEP-LIVENESS young]   victim=0x{victim:x} <- referrer=0x{referrer:x} class_id={cid} slot={slot}",
+                    );
+                }
+            }
+        }
+
         // Coalesce the newly-dead spans while they are still in walk order.
         // Publishing every object-sized hole first and sorting the arena free
         // list afterward made a bintrees18 collection allocate, sort, and merge
