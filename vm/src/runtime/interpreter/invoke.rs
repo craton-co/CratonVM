@@ -15176,6 +15176,12 @@ pub(super) fn compile_osr_artifact(
             // previously ran memory-homed. Opt out:
             // `CRATONVM_JIT_KERNEL_REG_OSR=0`.
             crate::jit::x64::set_kernel_reg_homes_osr_request(true);
+            // Stamp this artifact's install epoch from HERE, not from the
+            // `put_osr` below. This path calls the backend directly instead of
+            // going through `try_compile`, so without the witness it is stamped
+            // at finalize and a redefine that lands mid-compile would not be
+            // caught by the install barrier.
+            let _compile_epoch = cratonvm_jit::open_compile_epoch_witness();
             let mut cm = crate::jit::x64::compile_with_param_slots(
                 &code,
                 code_len,
