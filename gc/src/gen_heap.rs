@@ -8825,37 +8825,52 @@ impl GenerationalHeap {
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
         let mut root_shadow = roots.to_vec();
-        // NOT DONE HERE — and the reason is measured, not theoretical.
+        // An object PROMOTED by this very cycle is live for this cycle.
         //
-        // `sweep_young_non_moving` commits selective promotions (young→old)
-        // into `promotions` but leaves the caller's roots on their PRE-
-        // promotion young addresses. This sweep marks from those roots, and
-        // `old_gen_gc`'s seed loop drops any address `old_gen.contains()`
-        // rejects — so a stale young address seeds NOTHING, the object at its
-        // new old-gen home is never marked, and this sweep hands a LIVE
-        // object's block back to the free list. That is defect 4 in
-        // `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`,
-        // it is real, and `ROverlaySystemGcStress` catches it in seconds.
+        // `sweep_young_non_moving` copies each promoted survivor into old gen
+        // and explicitly clears its mark bit (`dhdr.gc_flags &= !GC_FLAG_MARKED`),
+        // so the copy arrives UNMARKED — and this sweep frees every unmarked
+        // old-gen block. Most promoted objects are saved anyway, because the
+        // young phase's step (3a) rewrites surviving young objects' fields to
+        // the new old-gen addresses, and `mark_young_to_old_refs` then marks
+        // them. What that misses is an object whose ONLY reference is a root
+        // slot or a native side table: the caller's roots still hold the
+        // PRE-promotion young address, `old_gen_gc`'s seed loop drops it as
+        // not-old-gen, nothing marks the copy, and its block goes straight back
+        // on the free list while Java is still using it. That is defect 4 in
+        // `docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`;
+        // `ROverlaySystemGcStress` catches it in seconds.
         //
-        // The obvious repair — rewrite the roots through `promotions` before
-        // marking — fixes that probe and the whole regression suite, and makes
-        // `DefaultCatalogAndSchemaTest` SIGSEGV. Measured on the same host and
-        // fixture, `rc=139` counts out of three runs each:
+        // Seeding the destinations directly — rather than repairing the roots —
+        // is deliberate, and is the shape a generational collector normally
+        // has: you do not reclaim in a pause what you promoted in that same
+        // pause. It does not depend on working out which root channel held the
+        // only reference (roots, overlays, pins, or a channel added later), it
+        // is purely additive to the mark set, and the worst case is retaining
+        // one cycle's promotions.
         //
-        //     baseline (no fixup)              0/3
-        //     fixup applied to `root_shadow`   2/3
-        //     fixup applied to caller's roots  3/3
-        //
-        // So it is not merely that mutating the caller's snapshot was wrong
-        // (it was — that slice outlives this call); marking the extra
-        // destinations is itself destabilising, which means at least one
-        // address in `promotions` is not the valid old-gen object base this
-        // seed loop assumes. Until that is understood, seeding them trades a
-        // silent use-after-free for a crash, which is not an improvement.
-        //
-        // `promotions` is threaded in and deliberately unused so the next
-        // attempt starts from the measurement rather than rediscovering it.
-        let _ = promotions;
+        // Appended, never substituted: replacing a root would drop whatever the
+        // original address still legitimately seeds. An earlier attempt that
+        // rewrote the CALLER's slice was worse still — that slice is the VM's
+        // root snapshot and outlives this call.
+        if !promotions.is_empty() {
+            let mut seeded: FxHashSet<usize> = FxHashSet::default();
+            for &dst in promotions.values() {
+                // Skip the identity entries `sweep_young_non_moving` also
+                // records for watched survivors that did NOT move: those are
+                // young addresses, and `old_gen.contains` would reject them
+                // anyway.
+                if !old_gen.contains(dst as *const u8) {
+                    continue;
+                }
+                if seeded.insert(dst) {
+                    // SAFETY: a promotion destination is an old-gen object base
+                    // this cycle wrote. `old_gen_gc`'s seed loop screens it
+                    // again before dereferencing.
+                    root_shadow.push(unsafe { ObjectRef::from_raw(dst as *mut u8) });
+                }
+            }
+        }
         let survivors = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
         (before.saturating_sub(old_gen.used()), survivors)
     }
