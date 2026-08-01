@@ -14629,7 +14629,7 @@ mod tests {
         // Only the holder is rooted; the victim must survive via the holder's
         // ref slot, which is precisely the edge the detector inspects.
         let live = vec![holder];
-        let (_reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live);
+        let (_reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
 
         let vm = crate::vm_heap::VmHeap::Generational(heap);
         assert!(
