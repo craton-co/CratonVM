@@ -86,7 +86,7 @@ Symbolic links could not previously exist under CratonVM, so every link-blind co
 - **`Files.find` passed no `LinkOption` to `readAttributes`**, so a `BiPredicate` could never see
   `attrs.isSymbolicLink()` on a non-following walk.
 
-`WatchService.poll(long, TimeUnit)` was also registered — a *different* filed bug
+The whole `WatchService` implementation was also repaired — a *different* filed bug
 (`filewatcher-watchservice-timed-poll-missing-native-20260731.md`), but its dead watcher thread
 made the five symlink-dependent `FileWatcherTests` cases unverifiable, so it is fixed in the same
 branch. See `filewatcher-watchservice-timed-poll-missing-native-FIXED.md`.
@@ -95,23 +95,37 @@ branch. See `filewatcher-watchservice-timed-poll-missing-native-FIXED.md`.
 
 Linux (`victor@20.83.144.174`, Ubuntu, JDK 21) — a host where symbolic links can actually be
 created, unlike the Windows suite host, which lacks `SeCreateSymbolicLinkPrivilege` and where
-*both* VMs fail these classes identically (see `RESULTS-20260717.md` §3).
+*both* VMs fail these classes identically (see `apps/spring-boot-suite-runner/RESULTS-20260717.md`
+§3). Binary `cratonvm-symlink-20260801` (release, `f1649b0f49`).
 
-Two probes, each diffed line-for-line against a real-JDK run of the same source:
+Two probes, each diffed line-for-line against a real-JDK run of the same source — the pass
+criterion is byte-identical output, not "no exception":
 
-- `SymlinkProbe` — 22 checks: create/read file and directory links, relative targets, read through
+- `SymlinkProbe` — 20 checks: create/read file and directory links, relative targets, read through
   a link, `FileAlreadyExistsException` on an existing link, `NotLinkException` on a non-link, hard
   links, delete-link-keeps-target, broken-link semantics, `NOFOLLOW`/follow attribute reads.
-- `SymlinkWalkProbe` — the follow-vs-don't-follow decisions: `walk`/`find` with and without
-  `FOLLOW_LINKS` over a Kubernetes ConfigMap tree, `walkFileTree` on a symlink root, delete of a
-  link-to-directory, every `LinkOption`-sensitive predicate, and a symlink cycle.
+  **IDENTICAL to the real JDK.**
+- `SymlinkWalkProbe` — 18 lines covering the follow-vs-don't-follow decisions: `walk`/`find` with
+  and without `FOLLOW_LINKS` over a Kubernetes ConfigMap tree, `walkFileTree` on a symlink root,
+  delete of a link-to-directory, every `LinkOption`-sensitive predicate, and a symlink cycle.
+  **IDENTICAL to the real JDK.**
 
 Spring Boot classes, run through `SbRunner` against both VMs on that host:
 
 | Class | HotSpot | CratonVM before | CratonVM after |
 |---|---|---|---|
-| `ConfigTreePropertySourceTests` | 23/23 | 3 failures (UOE) | 23/23 |
-| `ApplicationTempTests` | 6/6 | 3 failures | 6/6 |
-| `FileWatcherTests` | 15/15 | 14 failures | 15/15 |
+| `ConfigTreePropertySourceTests` | 23/23 | 3 failures (UOE) | **23/23** |
+| `ApplicationTempTests` | 6/6 | 3 failures | **6/6** |
+| `FileWatcherTests` | 15/15 | 14 failures | **15/15** |
+
+Repeated **3 consecutive times** with identical results — `FileWatcherTests` is timing-dependent
+(it waits on real filesystem events), so a single green run would not have settled it.
 
 Probe sources: `docs/known-issues/repros/nio-symlink/`.
+
+### A host-fixture trap worth remembering
+
+`ConfigTreePropertySourceTests` creates `/tmp/symlinkTempDir` at a FIXED path. A run that dies
+before its cleanup leaves that symlink behind, and the next run of the class — **on either VM** —
+fails with `FileAlreadyExistsException: /tmp/symlinkTempDir`. Seen once mid-investigation and
+briefly misread as a regression. `rm -rf /tmp/symlinkTempDir` before rerunning.
