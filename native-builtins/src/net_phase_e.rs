@@ -4664,6 +4664,9 @@ fn re2_bind_listener(
 ) -> MethodCallResult {
     let ip = resolve_host(host)?;
     let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
+    // GAP I6: `java.net.ServerSocket` binds a `TcpListener` directly rather
+    // than through `fd_table`, so it needs the bare endpoint gate.
+    crate::capability_gate::gate_network(&*ctx, &addr.to_string())?;
     let listener = TcpListener::bind(addr).map_err(|e| {
         // Must be a concrete `java.net.BindException`, not a generic
         // IOException with "BindException" as a text prefix — real code
@@ -6330,8 +6333,286 @@ fn field5_is_full_url(s: &str) -> bool {
     }
 }
 
+/// Slot indices of CratonVM's synthetic `java.net.URL` layout, mirrored from
+/// `net_uri_inet::url_parse` (which is the writer). Slots 0..=2 coincide with
+/// the real-JDK `URL` field order (`protocol`, `host`, `port`), slot 3 is the
+/// path (read by `lib.rs`'s `url_path_or_file_field`), slot 4 the query and
+/// slot 5 the cached full external form.
+const URLS_PROTOCOL: usize = 0;
+const URLS_HOST: usize = 1;
+const URLS_PORT: usize = 2;
+const URLS_QUERY: usize = 4;
+const URLS_FULL: usize = 5;
+
+/// `true` when `s` is a bare URL scheme token (`https`, `jar`, `file`, …) as
+/// opposed to a whole URL or an authority. Used to tell CratonVM's two
+/// synthetic URL layouts apart: `url_parse` puts the SCHEME in slot 0, while
+/// the older classloader helpers put the FULL URL string there.
+fn url_is_scheme_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+}
+
+/// Recover a synthetic URL's full external form from its raw slots.
+///
+/// A synthetic `java/net/URL` is minted by `ensure_synthetic_class`, which
+/// declares a slot COUNT and ZERO field names — so `get_field_by_name` on such
+/// an object always answers `Object(None)` and every by-name getter silently
+/// degrades to its default. Both synthetic layouts cache the full URL at slot
+/// 5; the legacy classloader layout also puts it at slot 0.
+fn url_raw_full_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+    let n = ctx.object_num_fields(this);
+    for slot in [URLS_FULL, URLS_PROTOCOL] {
+        if n <= slot {
+            continue;
+        }
+        if let Value::Object(Some(s)) = ctx.get_field(this, slot) {
+            if let Some(text) = ctx.read_string(s) {
+                if field5_is_full_url(&text) {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Split a full URL string the way `java.net.URL` does:
+/// `protocol:[//[userinfo@]host[:port]]path[?query][#ref]`.
+///
+/// Returns `(protocol, host, port, path, query, ref)` with `port = -1` when no
+/// port is present and `None` for an absent (as opposed to empty) query/ref.
+#[allow(clippy::type_complexity)]
+fn url_components(spec: &str) -> (String, String, i32, String, Option<String>, Option<String>) {
+    let (scheme, rest) = match spec.find(':') {
+        Some(i) if url_is_scheme_token(&spec[..i]) => (spec[..i].to_string(), &spec[i + 1..]),
+        _ => (String::new(), spec),
+    };
+    let (rest, reff) = match rest.find('#') {
+        Some(i) => (&rest[..i], Some(rest[i + 1..].to_string())),
+        None => (rest, None),
+    };
+    let (authority, path_query) = match rest.strip_prefix("//") {
+        Some(after) => match after.find(['/', '?']) {
+            Some(i) => (&after[..i], &after[i..]),
+            None => (after, ""),
+        },
+        None => ("", rest),
+    };
+    // Strip any `userinfo@` prefix — it is not part of the host.
+    let host_port = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    let (host, port) = if let Some(close) = host_port.strip_prefix('[').and_then(|_| {
+        // IPv6 literal: `[::1]:8080` — the port colon is the one AFTER `]`.
+        host_port.find(']')
+    }) {
+        let port = host_port[close + 1..]
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<i32>().ok())
+            .unwrap_or(-1);
+        (host_port[..=close].to_string(), port)
+    } else {
+        match host_port.rfind(':') {
+            Some(i) => match host_port[i + 1..].parse::<i32>() {
+                Ok(p) => (host_port[..i].to_string(), p),
+                // Not a port (e.g. a malformed authority) — keep it all as host.
+                Err(_) => (host_port.to_string(), -1),
+            },
+            None => (host_port.to_string(), -1),
+        }
+    };
+    let (path, query) = match path_query.find('?') {
+        Some(i) => (
+            path_query[..i].to_string(),
+            Some(path_query[i + 1..].to_string()),
+        ),
+        None => (path_query.to_string(), None),
+    };
+    (
+        scheme,
+        host,
+        port,
+        path,
+        query.filter(|q| !q.is_empty()),
+        reff.filter(|f| !f.is_empty()),
+    )
+}
+
+/// Read a URL component reference the layout-neutral way: by field NAME first
+/// (a real `java.net.URL`, or one of our 13-slot real-shaped synthetics), then
+/// by raw SLOT (the synthetic layouts, whose fields have no names at all).
+/// Returns the EXISTING `String` reference on a hit — callers must not
+/// re-create it, both to keep object identity and to keep these hot getters
+/// allocation-free. `None` means "fall back to re-parsing the full URL".
+fn url_component_ref(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+    slot: usize,
+) -> Option<ObjectRef> {
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(this, name) {
+        return Some(s);
+    }
+    if ctx.object_num_fields(this) > slot {
+        if let Value::Object(Some(s)) = ctx.get_field(this, slot) {
+            return Some(s);
+        }
+    }
+    None
+}
+
 fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     let url = "java/net/URL";
+
+    // ---- java.net.URL(String) ------------------------------------------
+    //
+    // `register_net_natives` dropped this constructor when the synthetic URL
+    // substitute was removed ("defers to real JDK bytecode") — but its own
+    // call site in lib.rs still documents `URL.<init>(String)` as one of the
+    // entry points it must keep alive, and nothing re-registered it. In
+    // synthetic-JDK mode (no real `java.net.URL` bytecode) `new URL(spec)`
+    // therefore died with `NoSuchMethodError`, and so did every native that
+    // builds a URL through `invoke_special` (e.g.
+    // `JarURLConnection.getJarFileURL`).
+    //
+    // A registered native ALWAYS wins over bytecode at every dispatch site, so
+    // this registration must NOT shadow a real `java.net.URL`: when the class
+    // has genuine bytecode we hand the call straight back to it via
+    // `invoke_special_bytecode_only` (the "just run this bytecode, no native
+    // check" primitive) and only parse ourselves when the class is a fabricated
+    // stub.
+    r.register(url, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
+        if !ctx.is_class_synthetic_stub("java/net/URL")
+            && ctx.method_exists("java/net/URL", "<init>", "(Ljava/lang/String;)V")
+        {
+            return ctx.invoke_special_bytecode_only(
+                "java/net/URL",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                args,
+            );
+        }
+        let this = obj_arg(args, 0)?;
+        let spec = match args.get(1) {
+            Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+            _ => String::new(),
+        };
+        // `java.net.URL` rejects a spec with no scheme
+        // (`MalformedURLException: no protocol: <spec>`); callers such as
+        // Spring's `ResourceUtils.isUrl` rely on that throw to fall back to a
+        // classpath/file lookup, so a silently-accepted garbage URL is worse
+        // than none.
+        if url_components(&spec).0.is_empty() {
+            let msg = ctx.create_string(&format!("no protocol: {spec}"));
+            if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+                "java/net/MalformedURLException",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(msg))],
+            ) {
+                return Err(MethodCallFailed::ExceptionThrown(exc));
+            }
+        }
+        crate::net_uri_inet::url_parse(ctx, this, &spec);
+        Ok(None)
+    });
+
+    // ---- component getters ---------------------------------------------
+    //
+    // These re-register the versions from `lib.rs::register_essential_natives`
+    // (this function runs last, so it wins) with the missing slot/full-string
+    // fallbacks, and add `getPort`/`getQuery`/`getRef`, which were never
+    // registered at all. The by-name step and the final defaults are unchanged,
+    // so a real `java.net.URL` behaves exactly as before; only the synthetic
+    // layouts — whose fields have no names, making every by-name read answer
+    // `Object(None)` — take the new paths.
+    r.register(url, "getProtocol", "()Ljava/lang/String;", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(Some(Value::Object(None)));
+        };
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "protocol") {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+        // `url_parse`'s synthetic layout: slot 0 is the bare scheme. The legacy
+        // layout puts the WHOLE url there, which is not a scheme token — that
+        // case falls through to the full-string parse below.
+        if ctx.object_num_fields(this) > URLS_PROTOCOL {
+            if let Value::Object(Some(s)) = ctx.get_field(this, URLS_PROTOCOL) {
+                if ctx.read_string(s).is_some_and(|t| url_is_scheme_token(&t)) {
+                    return Ok(Some(Value::Object(Some(s))));
+                }
+            }
+        }
+        if let Some(full) = url_raw_full_string(ctx, this) {
+            let scheme = url_components(&full).0;
+            if !scheme.is_empty() {
+                let s = ctx.create_string(&scheme);
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
+        Ok(Some(Value::Object(Some(ctx.create_string("file")))))
+    });
+    r.register(url, "getHost", "()Ljava/lang/String;", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(Some(Value::Object(None)));
+        };
+        if let Some(s) = url_component_ref(ctx, this, "host", URLS_HOST) {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+        // `URL.getHost()` is "" (never null) for a host-less URL such as
+        // `file:/tmp/x`, matching the real JDK.
+        let host = url_raw_full_string(ctx, this)
+            .map(|full| url_components(&full).1)
+            .unwrap_or_default();
+        Ok(Some(Value::Object(Some(ctx.create_string(&host)))))
+    });
+    r.register(url, "getPort", "()I", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(Some(Value::Int(-1)));
+        };
+        if let Value::Int(p) = ctx.get_field_by_name(this, "port") {
+            return Ok(Some(Value::Int(p)));
+        }
+        if ctx.object_num_fields(this) > URLS_PORT {
+            if let Value::Int(p) = ctx.get_field(this, URLS_PORT) {
+                return Ok(Some(Value::Int(p)));
+            }
+        }
+        let port = url_raw_full_string(ctx, this)
+            .map(|full| url_components(&full).2)
+            .unwrap_or(-1);
+        Ok(Some(Value::Int(port)))
+    });
+    r.register(url, "getQuery", "()Ljava/lang/String;", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(Some(Value::Object(None)));
+        };
+        if let Some(s) = url_component_ref(ctx, this, "query", URLS_QUERY) {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+        // Absent query is `null`, per `java.net.URL.getQuery`.
+        match url_raw_full_string(ctx, this).and_then(|full| url_components(&full).4) {
+            Some(q) => Ok(Some(Value::Object(Some(ctx.create_string(&q))))),
+            None => Ok(Some(Value::Object(None))),
+        }
+    });
+    r.register(url, "getRef", "()Ljava/lang/String;", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(Some(Value::Object(None)));
+        };
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "ref") {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+        // No synthetic slot carries the fragment; recover it from the cached
+        // full URL string.
+        match url_raw_full_string(ctx, this).and_then(|full| url_components(&full).5) {
+            Some(f) => Ok(Some(Value::Object(Some(ctx.create_string(&f))))),
+            None => Ok(Some(Value::Object(None))),
+        }
+    });
 
     // Our getResources / Class.getProtectionDomain overrides return URL
     // objects that never run java.net.URL.<init>, so the real-JDK
@@ -11886,10 +12167,10 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ds, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd = ctx
-            .fd_table()
-            .open_udp(Some("0.0.0.0:0"))
-            .map_err(|e| ioex(format!("UDP open: {e}")))?;
+        // GAP I6 (UDP half): a datagram bind is a network authority too.
+        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some("0.0.0.0:0")).map_err(|e| {
+            crate::capability_gate::translate_open_failure(e, |io| format!("UDP open: {io}"))
+        })?;
         let port = ctx
             .fd_table()
             .udp_local_addr(fd)
@@ -11908,10 +12189,10 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let addr_spec = format!("0.0.0.0:{port}");
-        let fd = ctx
-            .fd_table()
-            .open_udp(Some(&addr_spec))
-            .map_err(|e| ioex(format!("UDP bind: {e}")))?;
+        // GAP I6 (UDP half).
+        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some(&addr_spec)).map_err(|e| {
+            crate::capability_gate::translate_open_failure(e, |io| format!("UDP bind: {io}"))
+        })?;
         let actual_port = ctx
             .fd_table()
             .udp_local_addr(fd)
@@ -11935,10 +12216,11 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             }
             _ => "0.0.0.0".to_string(),
         };
-        let fd = ctx
-            .fd_table()
-            .open_udp(Some(&format!("{host}:{port}")))
-            .map_err(|e| ioex(format!("UDP bind: {e}")))?;
+        // GAP I6 (UDP half).
+        let fd = crate::capability_gate::open_udp_gated(&*ctx, Some(&format!("{host}:{port}")))
+            .map_err(|e| {
+                crate::capability_gate::translate_open_failure(e, |io| format!("UDP bind: {io}"))
+            })?;
         let actual_port = ctx
             .fd_table()
             .udp_local_addr(fd)
@@ -14720,6 +15002,174 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Open (and configure) the listening socket for an `InetSocketAddress`.
+///
+/// Returns the live listener plus the endpoint it ACTUALLY landed on: port 0
+/// means "ephemeral", and `getAddress()` has to report the port the OS picked,
+/// not the zero the caller asked for.
+fn re10_open_listener(
+    ctx: &mut dyn NativeContext,
+    sa: ObjectRef,
+) -> Result<(TcpListener, IpAddr, i32), MethodCallFailed> {
+    let (host, port) = read_inet_socket_address(ctx, sa)?;
+    let ip = resolve_host(&host)?;
+    let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
+    let listener =
+        TcpListener::bind(addr).map_err(|e| ioex(format!("HttpServer bind {addr}: {e}")))?;
+    // Non-blocking so the accept loop polls `running` (and so it can be
+    // closed promptly by stop()).
+    listener.set_nonblocking(true).ok();
+    let bound_addr = listener.local_addr().ok();
+    let bound_port = bound_addr.map(|a| a.port() as i32).unwrap_or(port);
+    let bound_ip = bound_addr.map(|a| a.ip()).unwrap_or(ip);
+    Ok((listener, bound_ip, bound_port))
+}
+
+/// Allocate the native-backed `HttpServer` receiver AND its `server_registry`
+/// entry, as one operation.
+///
+/// Every `HttpServer` factory MUST come through here. `bind`/`start`/`stop`/
+/// `createContext` all locate their state by the `HS_SERVER_ID` slot, so a
+/// factory that mints a receiver without a registry entry produces a server
+/// that can never be started: the phase-72 no-arg `create()` used to allocate
+/// its own 3-slot object with no id and no entry, and `start()` on it read slot
+/// `HS_SERVER_ID` out of bounds (id 0, which is never handed out — the counter
+/// starts at 1) and failed with `IOException: server not registered`.
+///
+/// `bound` is `None` for the UNBOUND servers `HttpServer.create()` and
+/// `create(null, backlog)` return; the JDK contract is that such a server must
+/// be `bind()`-ed before `start()`.
+fn re10_alloc_server(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    bound: Option<(TcpListener, IpAddr, i32)>,
+) -> ObjectRef {
+    let (listener, endpoint) = match bound {
+        Some((l, ip, port)) => (Some(l), Some((ip, port))),
+        None => (None, None),
+    };
+    // -1, not 0: 0 is a legitimate "ephemeral" request but never a legitimate
+    // bound port, so it must not read back as one.
+    let bound_port = endpoint.map(|(_, p)| p).unwrap_or(-1);
+    let server_id = next_server_id();
+    let state = std::sync::Arc::new(ServerState {
+        listener: Mutex::new(listener),
+        running: AtomicBool::new(false),
+        handlers: Mutex::new(Vec::new()),
+        bound_port: AtomicI32::new(bound_port),
+    });
+    server_registry().lock().insert(server_id, state);
+    let srv0 = alloc_concurrent_synthetic(ctx, class_name, 6);
+    // `alloc_inet_socket_address_resolved` allocates, so a moving young GC can
+    // relocate `srv` between the two — pin it and read the forwarded address
+    // back (native stale-local family). The previous inline version wrote its
+    // six slots through the pre-GC ObjectRef.
+    let srv_pin = ctx.pin_native_root(srv0);
+    // Fully-resolved echo (matches HotSpot: `getAddress()` returns the socket's
+    // ACTUAL bound address, not the caller's original hostname string) — see
+    // `alloc_inet_socket_address_resolved`.
+    let sa_echo = match endpoint {
+        Some((ip, port)) => {
+            let ip_str = ip.to_string();
+            Some(alloc_inet_socket_address_resolved(
+                ctx, &ip_str, &ip_str, port,
+            ))
+        }
+        None => None,
+    };
+    let srv = ctx.read_native_pin(srv_pin, srv0);
+    ctx.set_field(srv, HS_ADDRESS, Value::Object(sa_echo));
+    ctx.set_field(srv, HS_STARTED, Value::Int(0));
+    ctx.set_field(srv, HS_CONTEXTS, Value::Object(None));
+    ctx.set_field(srv, HS_SERVER_ID, Value::Int(server_id));
+    ctx.set_field(srv, HS_PORT, Value::Int(bound_port));
+    ctx.set_field(srv, HS_EXECUTOR, Value::Object(None));
+    ctx.unpin_native_roots(srv_pin);
+    srv
+}
+
+/// `HttpServer.create(InetSocketAddress, int)`.
+///
+/// `class_name` is the receiver's runtime class. Native dispatch is keyed by
+/// the receiver class and `alias_class` copies a SNAPSHOT, so a factory that
+/// mints `HS_IMPL_CLASS` only reaches the natives registered on `HttpServer`
+/// BEFORE the alias at the end of this registrar. Callers registered after that
+/// point (phase 72's `createContext(String)`, `getAttributes`, …) therefore ask
+/// for the public class name instead.
+pub(crate) fn re10_create_server(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+) -> MethodCallResult {
+    // Backlog is advisory; `TcpListener::bind` uses the platform default.
+    let _backlog = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    // `create(null, backlog)` is the documented way to obtain an UNBOUND
+    // server ("If addr is null, then the bind method must be called to set
+    // the address"). `obj_arg(args, 0)?` used to turn that into an NPE.
+    let sa_arg = args.first().copied().unwrap_or(Value::Object(None));
+    let bound = match sa_arg {
+        Value::Object(Some(sa)) => Some(re10_open_listener(ctx, sa)?),
+        _ => None,
+    };
+    let srv = re10_alloc_server(ctx, class_name, bound);
+    Ok(Some(Value::Object(Some(srv))))
+}
+
+/// `HttpServer.create()` — a server that is deliberately NOT bound yet.
+///
+/// Minted under the PUBLIC class name rather than `HS_IMPL_CLASS`: the
+/// `alias_class` snapshot taken at the end of `register_re10_http_server`
+/// cannot see the phase-72 natives registered afterwards, and this factory's
+/// callers (`createContext(String)`, `getAttributes()`, `getServer()`) are
+/// exactly those. See [`re10_create_server`].
+pub(crate) fn re10_create_unbound_server(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let srv = re10_alloc_server(ctx, "com/sun/net/httpserver/HttpServer", None);
+    Ok(Some(Value::Object(Some(srv))))
+}
+
+/// `HttpServer.bind(InetSocketAddress, int)` — really bind the listener.
+///
+/// This used to be a phase-72 no-op that stored the address in a slot, so
+/// `create(); bind(addr, 0); start();` — the only sequence the no-arg factory
+/// supports — could never serve a request.
+pub(crate) fn re10_bind_server(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = ctx.get_field(this, HS_SERVER_ID).as_int().unwrap_or(-1);
+    // Clone the Arc out from under the registry lock before touching the
+    // per-server locks (the invariant `gc_scan_re10_handler_roots` documents).
+    let state = {
+        let reg = server_registry().lock();
+        reg.get(&id).cloned()
+    };
+    let Some(state) = state else {
+        return Err(ioex("HttpServer.bind: server not registered"));
+    };
+    if state.running.load(Ordering::SeqCst) {
+        return Err(RuntimeError::IllegalStateException {
+            message: "server already started".to_string(),
+        }
+        .into());
+    }
+    let already_bound = state.listener.lock().is_some();
+    if already_bound {
+        return Err(ioex("HttpServer.bind: server already bound"));
+    }
+    let sa = obj_arg(args, 1)?;
+    let _backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let (listener, bound_ip, bound_port) = re10_open_listener(ctx, sa)?;
+    *state.listener.lock() = Some(listener);
+    state.bound_port.store(bound_port, Ordering::SeqCst);
+    // Pin `this` across the address allocation (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
+    let ip_str = bound_ip.to_string();
+    let sa_echo = alloc_inet_socket_address_resolved(ctx, &ip_str, &ip_str, bound_port);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, HS_ADDRESS, Value::Object(Some(sa_echo)));
+    ctx.set_field(this, HS_PORT, Value::Int(bound_port));
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
+}
+
 fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     let hs = "com/sun/net/httpserver/HttpServer";
     // The JDK factory contract returns this concrete implementation, not the
@@ -14733,48 +15183,29 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         hs,
         "create",
         "(Ljava/net/InetSocketAddress;I)Lcom/sun/net/httpserver/HttpServer;",
-        |ctx, args| {
-            let sa = obj_arg(args, 0)?;
-            let (host, port) = read_inet_socket_address(ctx, sa)?;
-            let backlog = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-            let ip = resolve_host(&host)?;
-            let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
-            let listener = TcpListener::bind(addr)
-                .map_err(|e| ioex(format!("HttpServer bind {addr}: {e}")))?;
-            // Non-blocking so the accept loop polls `running` (and so it can be
-            // closed promptly by stop()).
-            listener.set_nonblocking(true).ok();
-            let bound_addr = listener.local_addr().ok();
-            let bound_port = bound_addr.map(|a| a.port() as i32).unwrap_or(port);
-            let bound_ip = bound_addr.map(|a| a.ip()).unwrap_or(ip);
-            let server_id = next_server_id();
-            let state = std::sync::Arc::new(ServerState {
-                listener: Mutex::new(Some(listener)),
-                running: AtomicBool::new(false),
-                handlers: Mutex::new(Vec::new()),
-                bound_port: AtomicI32::new(bound_port),
-            });
-            server_registry().lock().insert(server_id, state);
-            // The public class is abstract, but this native-backed server owns
-            // the concrete implementation. Keep state for every abstract
-            // method we bridge below, including the optional Executor.
-            let srv = alloc_concurrent_synthetic(ctx, HS_IMPL_CLASS, 6);
-            // Fully-resolved echo (matches HotSpot: `getAddress()` returns
-            // the socket's ACTUAL bound address, not the caller's original
-            // hostname string) — see `alloc_inet_socket_address_resolved`.
-            let bound_ip_str = bound_ip.to_string();
-            let sa_echo =
-                alloc_inet_socket_address_resolved(ctx, &bound_ip_str, &bound_ip_str, bound_port);
-            ctx.set_field(srv, HS_ADDRESS, Value::Object(Some(sa_echo)));
-            ctx.set_field(srv, HS_STARTED, Value::Int(0));
-            ctx.set_field(srv, HS_CONTEXTS, Value::Object(None));
-            ctx.set_field(srv, HS_SERVER_ID, Value::Int(server_id));
-            ctx.set_field(srv, HS_PORT, Value::Int(bound_port));
-            ctx.set_field(srv, HS_EXECUTOR, Value::Object(None));
-            let _ = backlog;
-            Ok(Some(Value::Object(Some(srv))))
-        },
+        // The public class is abstract, but this native-backed server owns the
+        // concrete implementation, so the factory hands back `HS_IMPL_CLASS`
+        // (aliased at the end of this registrar).
+        |ctx, args| re10_create_server(ctx, args, HS_IMPL_CLASS),
     );
+
+    // No-arg factory. Previously registered ONLY by phase 72, which minted a
+    // 3-slot object with no `server_registry` entry — `start()` on it reported
+    // "server not registered", and in real-JDK mode (where phase 72 does not
+    // run at all) `HttpServer.create()` resolved to the abstract declaration.
+    r.register(
+        hs,
+        "create",
+        "()Lcom/sun/net/httpserver/HttpServer;",
+        |ctx, _args| re10_create_unbound_server(ctx),
+    );
+
+    // Real bind. Phase 72's version only wrote the address into a slot, so the
+    // documented `create(); bind(addr, backlog); start();` sequence never
+    // opened a socket.
+    r.register(hs, "bind", "(Ljava/net/InetSocketAddress;I)V", |ctx, args| {
+        re10_bind_server(ctx, args)
+    });
 
     // `HttpServer` declares these methods abstract. `create` returns the
     // native-backed receiver above, so both calls must be registered here;
@@ -14817,6 +15248,26 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         if id < 0 {
             return Err(ioex("HttpServer not initialised"));
         }
+        // `ServerImpl.start()` throws IllegalStateException("server in wrong
+        // state") for a server that was never bound. It matters that this is
+        // NOT an IOException: `HttpServer.start()` declares no checked
+        // exception, so an IOException here is undeclared — and the condition
+        // is the ordinary "created with `create()` and forgot to `bind()`"
+        // programming mistake, not an I/O failure.
+        let state = {
+            let reg = server_registry().lock();
+            reg.get(&id).cloned()
+        };
+        let bound = match state {
+            Some(state) => state.listener.lock().is_some(),
+            None => false,
+        };
+        if !bound {
+            return Err(RuntimeError::IllegalStateException {
+                message: "server in wrong state".to_string(),
+            }
+            .into());
+        }
         re10_start_server(id).map_err(|e| ioex(format!("HttpServer start: {e}")))?;
         ctx.set_field(this, HS_STARTED, Value::Int(1));
         // The OS accept thread (re10_start_server) only parses requests into the
@@ -14834,7 +15285,14 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let id = ctx.get_field(this, HS_SERVER_ID).as_int().unwrap_or(-1);
         if id >= 0 {
-            if let Some(state) = server_registry().lock().get(&id) {
+            // Clone the Arc out from under the registry lock before taking the
+            // per-server `listener` lock — the two must never be held at once
+            // (see `gc_scan_re10_handler_roots`).
+            let state = {
+                let reg = server_registry().lock();
+                reg.get(&id).cloned()
+            };
+            if let Some(state) = state {
                 state.running.store(false, Ordering::SeqCst);
                 // Close the OS listener NOW (drop it) so the port immediately
                 // refuses connections — a round-robin client must see a stopped
@@ -15283,6 +15741,53 @@ mod tests {
         assert!(!field5_is_full_url("localhost:8080"));
         assert!(!field5_is_full_url("alice:secret@localhost:8080"));
         assert!(!field5_is_full_url("alice@localhost:8080"));
+    }
+
+    #[test]
+    fn re4_url_components_matches_java_net_url_grammar() {
+        let (proto, host, port, path, query, reff) =
+            url_components("https://example.com:8080/path?key=value#frag");
+        assert_eq!(proto, "https");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/path");
+        assert_eq!(query.as_deref(), Some("key=value"));
+        assert_eq!(reff.as_deref(), Some("frag"));
+
+        // No authority, no port, no query, no fragment.
+        let (proto, host, port, path, query, reff) = url_components("file:/tmp/x.txt");
+        assert_eq!(proto, "file");
+        assert_eq!(host, "");
+        assert_eq!(port, -1);
+        assert_eq!(path, "/tmp/x.txt");
+        assert_eq!(query, None);
+        assert_eq!(reff, None);
+
+        // user-info is stripped from the host; IPv6 literals keep their
+        // brackets and only the post-`]` colon is a port.
+        let (_, host, port, ..) = url_components("http://alice:secret@localhost:8080/x");
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 8080);
+        let (_, host, port, ..) = url_components("http://[::1]:9090/x");
+        assert_eq!(host, "[::1]");
+        assert_eq!(port, 9090);
+        let (_, host, port, ..) = url_components("http://[::1]/x");
+        assert_eq!(host, "[::1]");
+        assert_eq!(port, -1);
+
+        // A spec with no scheme yields an empty protocol — the signal
+        // `URL.<init>` uses to raise MalformedURLException.
+        assert_eq!(url_components("not a url").0, "");
+    }
+
+    #[test]
+    fn re4_url_scheme_token_rejects_full_urls_and_authorities() {
+        assert!(url_is_scheme_token("https"));
+        assert!(url_is_scheme_token("jar"));
+        assert!(!url_is_scheme_token("file:/tmp/x"));
+        assert!(!url_is_scheme_token("localhost:8080"));
+        assert!(!url_is_scheme_token(""));
+        assert!(!url_is_scheme_token("8080"));
     }
 
     #[test]

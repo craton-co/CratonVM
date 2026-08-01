@@ -477,6 +477,36 @@ impl OldGen {
         ptr >= base && ptr < end
     }
 
+    /// True when `ptr` lies inside an **allocated** span of old gen.
+    ///
+    /// [`Self::contains`] is a bare range check over the whole backing store,
+    /// so it answers `true` for memory that has already been returned to the
+    /// free list — the non-moving old-gen sweep (`old_gen_gc(compact = false)`)
+    /// reclaims dead blocks IN PLACE and does not zero them, so the dead
+    /// object's bytes stay put and the address keeps passing `contains`. This
+    /// is the discriminator a liveness query needs; see
+    /// `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    ///
+    /// O(log n) in the free-block count, over the same offset-sorted view
+    /// `walk_objects` already caches.
+    pub fn is_allocated_addr(&self, ptr: *const u8) -> bool {
+        let base = self.data.as_ptr() as usize;
+        let addr = ptr as usize;
+        if addr < base || addr >= base + self.data.len() {
+            return false;
+        }
+        let off = addr - base;
+        self.with_sorted_free_blocks(|sorted| {
+            // Free blocks are disjoint and offset-sorted, so the last block
+            // starting at or before `off` is the only one that can cover it.
+            let i = sorted.partition_point(|b| b.offset <= off);
+            i == 0 || {
+                let b = &sorted[i - 1];
+                off >= b.offset + b.size
+            }
+        })
+    }
+
     /// Backing-storage extent as plain integers: `[lo, hi)`.
     ///
     /// `OldGen` is not `Sync` (it owns the storage), so a parallel young-sweep

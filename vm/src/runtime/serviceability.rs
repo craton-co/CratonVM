@@ -3019,11 +3019,22 @@ mod tests {
         }
     }
 
-    /// The attach surface has no production wiring: `AttachListener` never
-    /// creates a socket and `JcmdProcessor` is only constructed in tests. This
-    /// test pins the first half — if someone gives `start_listening` real
-    /// socket behaviour they must also revisit the LIVENESS block at the top
-    /// of this module and the fabricated-data audit notes it points at.
+    /// Pins the attach surface's real socket behaviour: `start_listening`
+    /// binds, `stop_listening` unlinks. If someone changes either half they
+    /// must also revisit the LIVENESS block at the top of this module and the
+    /// fabricated-data audit notes it points at.
+    ///
+    /// Platform split, deliberate and asserted rather than skipped: the
+    /// implementation is `#[cfg(unix)]` (see `AttachListener::start_listening`
+    /// — HotSpot itself splits per OS, Unix domain socket on Linux/macOS
+    /// versus a named pipe on Windows, and the Windows side is unimplemented
+    /// here). This test used to assert the Unix shape unconditionally, so on
+    /// a Windows checkout it demanded a `/tmp/...` socket file that the
+    /// `#[cfg(not(unix))]` `start_listening` — which only flips
+    /// `is_listening` — never creates, and failed 100% of the time. It now
+    /// pins the Unix contract in full and the non-Unix contract exactly as
+    /// documented, so the gap stays visible instead of being papered over by
+    /// a skip.
     #[test]
     fn obsaudit_attach_listener_creates_a_real_socket() {
         // obsaudit D15 (2026-07-26), FIXED: renamed from
@@ -3032,16 +3043,16 @@ mod tests {
         // now binds a real Unix domain socket at `socket_path` — see the
         // struct doc comment for the wire protocol, verified empirically
         // against a real OpenJDK 21 jcmd/jstack/jmap.
-        let path = "/tmp/cratonvm-obsaudit-attach-socket-pin-test";
-        let mut l = AttachListener::new(path);
-        l.start_listening();
-        assert!(l.is_listening);
-        assert!(
-            std::path::Path::new(path).exists(),
-            "AttachListener must create a real socket file at socket_path"
-        );
         #[cfg(unix)]
         {
+            let path = "/tmp/cratonvm-obsaudit-attach-socket-pin-test";
+            let mut l = AttachListener::new(path);
+            l.start_listening();
+            assert!(l.is_listening);
+            assert!(
+                std::path::Path::new(path).exists(),
+                "AttachListener must create a real socket file at socket_path"
+            );
             use std::os::unix::fs::FileTypeExt;
             let meta = std::fs::symlink_metadata(path).unwrap();
             assert!(
@@ -3049,12 +3060,34 @@ mod tests {
                 "the file at socket_path must actually be a Unix domain socket, \
                  not e.g. a stray regular file"
             );
+            l.stop_listening();
+            assert!(
+                !std::path::Path::new(path).exists(),
+                "stop_listening must remove the socket file"
+            );
         }
-        l.stop_listening();
-        assert!(
-            !std::path::Path::new(path).exists(),
-            "stop_listening must remove the socket file"
-        );
+        #[cfg(not(unix))]
+        {
+            // No named-pipe implementation yet, so the documented contract is
+            // "flips the flag, touches nothing on disk". Pin BOTH halves: the
+            // flag round-trip (so callers that only read `is_listening` keep
+            // working) and the absence of any file at `socket_path` (so a
+            // future Windows implementation that starts creating one is
+            // forced to come back here and state what it created).
+            let path = std::env::temp_dir().join("cratonvm-obsaudit-attach-socket-pin-test");
+            let _ = std::fs::remove_file(&path);
+            let mut l = AttachListener::new(&path.to_string_lossy());
+            l.start_listening();
+            assert!(l.is_listening);
+            assert!(
+                !path.exists(),
+                "non-Unix start_listening has no socket implementation, so it \
+                 must not leave anything behind at socket_path"
+            );
+            l.stop_listening();
+            assert!(!l.is_listening);
+            assert!(!path.exists());
+        }
     }
 
     #[test]

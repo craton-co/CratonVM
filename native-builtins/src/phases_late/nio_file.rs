@@ -5294,17 +5294,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             #[cfg(windows)]
             {
-                let requested_type = obj_arg(args, 2)
-                    .ok()
-                    .and_then(|class| crate::lang_class::mirror_class_name(ctx, class))
-                    .unwrap_or_default();
-                if !windows_supports_file_attributes_type(&requested_type) {
-                    return Err(RuntimeError::UnsupportedOperationException {
-                        message: format!(
-                            "File attribute type {requested_type} is not supported on Windows"
-                        ),
+                // See the `Files.readAttributes` registration: only a PRESENT,
+                // NAMEABLE `Class` argument states a requested type. Absent or
+                // unresolvable means "no request" and falls back to the
+                // declared return type, `BasicFileAttributes`.
+                if let Some(Value::Object(Some(class))) = args.get(2) {
+                    let requested_type =
+                        crate::lang_class::mirror_class_name(ctx, *class).unwrap_or_default();
+                    if !requested_type.is_empty()
+                        && !windows_supports_file_attributes_type(&requested_type)
+                    {
+                        return Err(RuntimeError::UnsupportedOperationException {
+                            message: format!(
+                                "File attribute type {requested_type} is not supported on Windows"
+                            ),
+                        }
+                        .into());
                     }
-                    .into());
                 }
             }
             let path_obj = obj_arg(args, 1)?;
@@ -5479,21 +5485,42 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // (ResourceTests#resourceCreateRelativeUnknown). Mapping every open
             // failure to a generic `IOException` made that catch miss, so the
             // raw `IOException` propagated to the caller instead.
-            let open_result = if writable {
-                ctx.fd_table().open_read_write(&p, create)
+            // GAP I2: these openers used to call `fd_table()` directly, so the
+            // whole `java.nio.file` surface bypassed every path policy in the
+            // VM. Route through the capability gate, which runs the check
+            // before the fd is reserved and before the syscall. With no policy
+            // installed (today's default) this is the same call as before.
+            let gated = if writable {
+                crate::capability_gate::open_read_write_gated(&*ctx, &p, create)
             } else {
-                ctx.fd_table().open_read_write(&p, false)
-                    .or_else(|_| ctx.fd_table().open_read(&p))
-            };
-            let fd_id = open_result.map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    RuntimeError::NoSuchFileException { path: p.clone() }
-                } else {
-                    RuntimeError::IOException {
-                        message: format!("Cannot open {}: {}", p, e),
-                    }
+                // Read-only request: try read+write first (a seekable fd), and
+                // fall back to a plain read. A `FileWrite` denial takes the
+                // same fallback an `EACCES` would, which is the right answer —
+                // the caller only asked to read.
+                match crate::capability_gate::open_read_write_gated(&*ctx, &p, false) {
+                    Ok(fd) => Ok(fd),
+                    Err(_) => crate::capability_gate::open_read_gated(&*ctx, &p),
                 }
-            })?;
+            };
+            let fd_id = match gated {
+                Ok(fd) => fd,
+                // A refusal is a `SecurityException`. It must NOT become
+                // `NoSuchFileException`: callers such as
+                // `FileSystemResource.readableChannel()` catch that one and
+                // recover, which would silently swallow the policy decision.
+                Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+                    return Err(denied.into())
+                }
+                Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
+                    return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                        RuntimeError::NoSuchFileException { path: p.clone() }.into()
+                    } else {
+                        MethodCallFailed::from(RuntimeError::IOException {
+                            message: format!("Cannot open {}: {}", p, e),
+                        })
+                    })
+                }
+            };
             if truncate && writable {
                 let _ = ctx.fd_table().rw_set_length(fd_id, 0);
             }
@@ -5909,7 +5936,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         append: bool,
     ) -> MethodCallResult {
         let p = p57_read_path(ctx, path_obj);
-        match ctx.fd_table().open_write(&p, append) {
+        // GAP I2 — see `newFileChannel`.
+        match crate::capability_gate::open_write_gated(&*ctx, &p, append) {
             Ok(fd) => {
                 let bw = alloc_concurrent_synthetic(ctx, "java/io/BufferedWriter", 3);
                 ctx.set_field(bw, 0, Value::Int(fd as i32));
@@ -5918,6 +5946,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 ctx.set_field(bw, 1, Value::Int(0));
                 ctx.set_field(bw, 2, Value::Object(None));
                 Ok(Some(Value::Object(Some(bw))))
+            }
+            // A capability refusal is a `SecurityException`, not an
+            // `IOException`: it happened before the syscall and must not be
+            // retried. An I/O failure keeps the message it always had.
+            Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+                Err(denied.into())
             }
             Err(e) => Err(RuntimeError::IOException {
                 message: format!("newBufferedWriter({}): {}", p, e),
@@ -7575,9 +7609,17 @@ pub(crate) fn fsp_new_input_stream(
             Err(e) => Err(p57_io_error(&e)),
         };
     }
-    let fd = match ctx.fd_table().open_read(&p) {
+    // GAP I2 — see `newFileChannel`. The check runs before the fd is reserved
+    // and before `open`, so a refusal leaves nothing behind.
+    let fd = match crate::capability_gate::open_read_gated(&*ctx, &p) {
         Ok(fd) => fd,
-        Err(e) => {
+        // A refusal is a `SecurityException`: it is not an I/O condition and
+        // must not be mapped onto `NoSuchFileException`/`AccessDeniedException`,
+        // which callers legitimately catch and recover from.
+        Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+            return Err(denied.into())
+        }
+        Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
             return Err(match e.kind() {
                 std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p),
                 std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p),
@@ -7670,9 +7712,15 @@ pub(crate) fn fsp_new_output_stream(
         ctx.unpin_native_roots(exc_pin);
         return Err(MethodCallFailed::ExceptionThrown(exc));
     }
-    let fd = match ctx.fd_table().open_write(&p, append) {
+    // GAP I2 — see `newFileChannel`.
+    let fd = match crate::capability_gate::open_write_gated(&*ctx, &p, append) {
         Ok(fd) => fd,
-        Err(e) => {
+        // A refusal is a `SecurityException`, not one of the typed
+        // `java.nio.file` I/O exceptions below.
+        Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+            return Err(denied.into())
+        }
+        Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
             // Surface the TYPED `java.nio.file` exception HotSpot throws, not a
             // bare IOException. Opening a directory for output denies access on
             // Windows (os error 5) → `AccessDeniedException` (SC-resource-io
@@ -9485,6 +9533,24 @@ pub(crate) fn raf_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<u32
     }
 }
 
+/// Translate a gated `RandomAccessFile` open failure.
+///
+/// A capability refusal becomes the `SecurityException` it is — it happened
+/// before the syscall and must not be retried. An I/O failure keeps the exact
+/// `Cannot open {path}: {err}` `IOException` these constructors have always
+/// thrown, so nothing that catches it changes behaviour.
+fn raf_open_failure(
+    path: &str,
+) -> impl FnOnce(cratonvm_native_api::fd_table::FdCapabilityError) -> MethodCallFailed + '_ {
+    move |err| match err {
+        cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied) => denied.into(),
+        cratonvm_native_api::fd_table::FdCapabilityError::Io(io) => RuntimeError::IOException {
+            message: format!("Cannot open {}: {}", path, io),
+        }
+        .into(),
+    }
+}
+
 pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -9514,25 +9580,23 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             let create = writable; // create file if mode is "rw"/"rws"/"rwd"
 
             if !writable {
-                // Read-only mode: use open_read
-                let fd_id = ctx
-                    .fd_table()
-                    .open_read_write(&path, false)
-                    .or_else(|_| {
-                        // Fallback: try read-only open
-                        ctx.fd_table().open_read(&path).map(|id| id)
-                    })
-                    .map_err(|e| RuntimeError::IOException {
-                        message: format!("Cannot open {}: {}", path, e),
-                    })?;
+                // Read-only mode: use open_read.
+                // GAP I2 — gated; see `newFileChannel`.
+                let open_result =
+                    match crate::capability_gate::open_read_write_gated(&*ctx, &path, false) {
+                        Ok(fd) => Ok(fd),
+                        // Fallback: try read-only open. A `FileWrite` refusal
+                        // takes the same fallback an `EACCES` would — mode "r"
+                        // only ever asked to read.
+                        Err(_) => crate::capability_gate::open_read_gated(&*ctx, &path),
+                    };
+                let fd_id = open_result.map_err(raf_open_failure(&path))?;
                 raf_set_fd(ctx, this, fd_id);
                 ctx.set_field(this, 1, Value::Int(0)); // read-only
             } else {
-                let fd_id = ctx.fd_table().open_read_write(&path, create).map_err(|e| {
-                    RuntimeError::IOException {
-                        message: format!("Cannot open {}: {}", path, e),
-                    }
-                })?;
+                let fd_id =
+                    crate::capability_gate::open_read_write_gated(&*ctx, &path, create)
+                        .map_err(raf_open_failure(&path))?;
                 raf_set_fd(ctx, this, fd_id);
                 ctx.set_field(this, 1, Value::Int(1)); // read-write
             }
@@ -9573,12 +9637,9 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
                 _ => "r".into(),
             };
             let writable = mode_str.contains('w');
-            let fd_id = ctx
-                .fd_table()
-                .open_read_write(&path, writable)
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("Cannot open {}: {}", path, e),
-                })?;
+            // GAP I2 — gated; see `newFileChannel`.
+            let fd_id = crate::capability_gate::open_read_write_gated(&*ctx, &path, writable)
+                .map_err(raf_open_failure(&path))?;
             raf_set_fd(ctx, this, fd_id);
             ctx.set_field(this, 1, Value::Int(if writable { 1 } else { 0 }));
             Ok(None)
@@ -12890,17 +12951,26 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             #[cfg(windows)]
             {
-                let requested_type = obj_arg(args, 1)
-                    .ok()
-                    .and_then(|class| crate::lang_class::mirror_class_name(ctx, class))
-                    .unwrap_or_default();
-                if !windows_supports_file_attributes_type(&requested_type) {
-                    return Err(RuntimeError::UnsupportedOperationException {
-                        message: format!(
-                            "File attribute type {requested_type} is not supported on Windows"
-                        ),
+                // Only a PRESENT `Class` argument states a requested type. A
+                // null/absent one carries no request at all, and rejecting it
+                // produced the nonsense `File attribute type  is not supported
+                // on Windows` (note the empty name) for a caller that never
+                // asked for anything unsupported. Fall back to the method's
+                // declared return type, `BasicFileAttributes`, which Windows
+                // does support.
+                if let Some(Value::Object(Some(class))) = args.get(1) {
+                    let requested_type =
+                        crate::lang_class::mirror_class_name(ctx, *class).unwrap_or_default();
+                    if !requested_type.is_empty()
+                        && !windows_supports_file_attributes_type(&requested_type)
+                    {
+                        return Err(RuntimeError::UnsupportedOperationException {
+                            message: format!(
+                                "File attribute type {requested_type} is not supported on Windows"
+                            ),
+                        }
+                        .into());
                     }
-                    .into());
                 }
             }
             let path = args.first().copied().unwrap_or(Value::Object(None));
@@ -13113,11 +13183,67 @@ pub(crate) fn basic_file_attributes_is_windows(ctx: &dyn NativeContext, attrs: O
         == Some("sun/nio/fs/WindowsFileAttributes")
 }
 
+/// True when `attrs` is the synthetic-JDK stub minted by
+/// `basic_file_attributes_alloc`'s fallback rather than a real
+/// `sun.nio.fs.{Unix,Windows}FileAttributes`.
+///
+/// `java.nio.file.attribute.BasicFileAttributes` is an INTERFACE in every real
+/// JDK, so no genuine instance can ever carry that class id — a hit here is
+/// unambiguously our own stub.
+///
+/// Why this matters: `ensure_synthetic_class` declares a slot COUNT but ZERO
+/// named fields, so `set_field_by_name` silently drops the write and
+/// `get_field_by_name` answers `Object(None)`. Every attribute
+/// `basic_file_attributes_store` wrote by name vanished, and every predicate
+/// below read back its default — a plain file reported `isRegularFile() ==
+/// false`, `size() == 0` and epoch timestamps. The accessors therefore switch
+/// to the fixed slot layout below for this class.
+pub(crate) fn basic_file_attributes_is_synthetic(
+    ctx: &dyn NativeContext,
+    attrs: ObjectRef,
+) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(attrs))
+        .as_deref()
+        == Some("java/nio/file/attribute/BasicFileAttributes")
+}
+
+/// Slot layout of the synthetic `BasicFileAttributes` stub (5 slots — keep in
+/// sync with the `alloc_concurrent_synthetic(..., 5)` call in
+/// `basic_file_attributes_alloc`). The mode word uses the Unix `st_mode`
+/// encoding (type bits | permission bits) on every host so the shared
+/// predicates can decode it uniformly.
+pub(crate) const BFA_SYN_SLOT_MODE: usize = 0;
+pub(crate) const BFA_SYN_SLOT_SIZE: usize = 1;
+pub(crate) const BFA_SYN_SLOT_CREATION: usize = 2;
+pub(crate) const BFA_SYN_SLOT_ACCESS: usize = 3;
+pub(crate) const BFA_SYN_SLOT_MODIFIED: usize = 4;
+
+/// Read the synthetic stub's `st_mode`-encoded mode word.
+fn basic_file_attributes_syn_mode(ctx: &dyn NativeContext, attrs: ObjectRef) -> i32 {
+    match ctx.get_field(attrs, BFA_SYN_SLOT_MODE) {
+        Value::Int(v) => v,
+        Value::Long(v) => v as i32,
+        _ => 0,
+    }
+}
+
 pub(crate) fn basic_file_attributes_time_millis(
     ctx: &dyn NativeContext,
     attrs: ObjectRef,
     which: &str,
 ) -> i64 {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        let slot = match which {
+            "creation" => BFA_SYN_SLOT_CREATION,
+            "access" => BFA_SYN_SLOT_ACCESS,
+            _ => BFA_SYN_SLOT_MODIFIED,
+        };
+        return match ctx.get_field(attrs, slot) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+    }
     let field = if basic_file_attributes_is_windows(ctx, attrs) {
         match which {
             "creation" => "creationTime",
@@ -13138,6 +13264,9 @@ pub(crate) fn basic_file_attributes_time_millis(
 }
 
 pub(crate) fn basic_file_attributes_is_dir(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return basic_file_attributes_syn_mode(ctx, attrs) & UNIX_S_IFMT == 0o040000;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         return matches!(ctx.get_field_by_name(attrs, "fileAttrs"), Value::Int(v) if v & 0x10 != 0);
     }
@@ -13153,6 +13282,9 @@ pub(crate) const WIN_ATTR_DIRECTORY: i32 = 0x10;
 pub(crate) const WIN_ATTR_REPARSE_POINT: i32 = 0x400;
 
 pub(crate) fn basic_file_attributes_is_symlink(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return basic_file_attributes_syn_mode(ctx, attrs) & UNIX_S_IFMT == UNIX_S_IFLNK;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         return matches!(ctx.get_field_by_name(attrs, "fileAttrs"),
             Value::Int(v) if v & WIN_ATTR_REPARSE_POINT != 0);
@@ -13162,6 +13294,9 @@ pub(crate) fn basic_file_attributes_is_symlink(ctx: &dyn NativeContext, attrs: O
 }
 
 pub(crate) fn basic_file_attributes_is_regular(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return basic_file_attributes_syn_mode(ctx, attrs) & UNIX_S_IFMT == UNIX_S_IFREG;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         return matches!(ctx.get_field_by_name(attrs, "fileAttrs"),
             Value::Int(v) if v & (WIN_ATTR_DIRECTORY | WIN_ATTR_REPARSE_POINT) == 0);
@@ -13515,6 +13650,13 @@ pub(crate) fn basic_file_attributes_file_key(
 }
 
 pub(crate) fn basic_file_attributes_size(ctx: &dyn NativeContext, attrs: ObjectRef) -> i64 {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        return match ctx.get_field(attrs, BFA_SYN_SLOT_SIZE) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+    }
     let field = if basic_file_attributes_is_windows(ctx, attrs) {
         "size"
     } else {
@@ -13536,6 +13678,22 @@ pub(crate) fn basic_file_attributes_store(
     modified_millis: i64,
     unix_perm_bits: i32,
 ) {
+    if basic_file_attributes_is_synthetic(ctx, attrs) {
+        // Synthetic stub: NO named fields exist, so every `set_field_by_name`
+        // below would be a silent no-op. Write the fixed slot layout the
+        // accessors read (`BFA_SYN_SLOT_*`).
+        let type_bits = if is_dir { 0o040000 } else { 0o100000 };
+        ctx.set_field(
+            attrs,
+            BFA_SYN_SLOT_MODE,
+            Value::Int(type_bits | (unix_perm_bits & 0o7777)),
+        );
+        ctx.set_field(attrs, BFA_SYN_SLOT_SIZE, Value::Long(size));
+        ctx.set_field(attrs, BFA_SYN_SLOT_CREATION, Value::Long(creation_millis));
+        ctx.set_field(attrs, BFA_SYN_SLOT_ACCESS, Value::Long(access_millis));
+        ctx.set_field(attrs, BFA_SYN_SLOT_MODIFIED, Value::Long(modified_millis));
+        return;
+    }
     if basic_file_attributes_is_windows(ctx, attrs) {
         ctx.set_field_by_name(
             attrs,
@@ -13726,7 +13884,15 @@ pub(crate) fn p59_files_read_attributes(
             // following read resolves the target (and the real JDK likewise
             // reports `isSymbolicLink() == false` there).
             if meta.file_type().is_symlink() {
-                if basic_file_attributes_is_windows(ctx, bfa) {
+                if basic_file_attributes_is_synthetic(ctx, bfa) {
+                    // Synthetic stub has no named fields — patch the slot.
+                    let cur = basic_file_attributes_syn_mode(ctx, bfa);
+                    ctx.set_field(
+                        bfa,
+                        BFA_SYN_SLOT_MODE,
+                        Value::Int((cur & !UNIX_S_IFMT) | UNIX_S_IFLNK),
+                    );
+                } else if basic_file_attributes_is_windows(ctx, bfa) {
                     let cur = match ctx.get_field_by_name(bfa, "fileAttrs") {
                         Value::Int(v) => v,
                         _ => 0,

@@ -52,11 +52,45 @@
 //! argv, same env, same rows — so the committed `difftest/seeds` gate baseline
 //! keeps measuring exactly what it always did.
 
+//! ## C2 review: dimensions, paths, and a generated matrix
+//!
+//! Three additions answer the C2 review's differential-testing items, and each
+//! is built so that a reported divergence is *actionable evidence* rather than a
+//! raw diff:
+//!
+//! * [`normalize`] turns every transform the oracle may apply into a **named
+//!   rule** with a documented target, justification and risk. An
+//!   un-normalized nondeterminism is a false-positive generator; a silent
+//!   over-normalization hides a real bug. Both are review-able only if the
+//!   rules have names.
+//! * [`checksum`] adds the report's fifth channel — a quantity the *program*
+//!   computes and declares. It is read from un-normalized stdout, so no rule
+//!   can launder it, and a divergence names the quantity rather than a byte
+//!   offset.
+//! * [`crossmode`] compares CratonVM's execution paths **against each other**.
+//!   The VM has four semantic implementations (interpreter fast path with
+//!   superinstructions, interpreter decoded fallback, single-pass direct
+//!   emitter, optimizing IR pipeline) plus OSR and deopt as transitions; a fix
+//!   landing in one is a wrong-code risk in the others. Two of the VM's own
+//!   paths disagreeing needs no reference JDK to be a defect.
+//! * [`matrix`] derives, from the corpus class files themselves, which opcodes
+//!   and operand forms each path actually reaches — so the gaps are visible
+//!   instead of assumed.
+//!
+//! `docs/testing/differential.md` is the operator-facing write-up: what is
+//! compared, every normalization rule, the mode axis and the real VM flags it
+//! sets, how to read the matrix, and how to tell a harness false positive from
+//! a real VM divergence.
+
 pub mod census;
+pub mod checksum;
+pub mod crossmode;
 pub mod generate;
 pub mod harness;
 pub mod ledger;
+pub mod matrix;
 pub mod minimize;
 pub mod mutate;
+pub mod normalize;
 pub mod oracle;
 pub mod runner;

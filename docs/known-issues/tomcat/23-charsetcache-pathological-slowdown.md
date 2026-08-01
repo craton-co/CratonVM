@@ -14,9 +14,15 @@ returns false whenever moving-young is on, which is the default, so every call
 site in every compiled body falls through to the generic dispatch helper.
 Opening it in the same binary takes `invokestatic` from 94.9 to 5.6 ns/op. The
 test compares one arm that makes one call against two arms that make two, so it
-cannot pass until that gate can be reopened safely. See
-`../jit-direct-call-gate-closed-by-moving-young-is-the-call-floor.md`; the
-arithmetic is in *What the test actually needs now*.
+could not pass while that gate was closed.
+
+**That gate is now OPEN by default (2026-07-31, `7f1b1f263`)** — the raw
+JIT-to-JIT edge was fixed. The cause was a truncated `rel8` in the PIC cascade,
+NOT the root-scan hazard the gate comment had asserted. Retired write-up:
+`../../internal/jit-direct-call-gate-is-the-call-floor-FIXED-20260731.md`. The
+arithmetic is in *What the test actually needs now* — **re-measure both
+assertions against the current default before doing any further work here**,
+since the premise of this whole status has changed.
 
 Everything between here and that section is kept as the record of how the
 earlier layers were peeled off. Several of its conclusions were corrected
@@ -1005,9 +1011,13 @@ Ranked next steps, with the evidence for each:
    `CRATONVM_JIT_DIRECT_CALLEE_CALLS=force`; virtual and interface 149 → 37;
    the call-free control unmoved at 1.6. Worth roughly 2x on both cached arms
    and only 1x on the control, which is exactly the direction this test needs.
-   Reopening it requires making an unguarded callee frame describable to the
-   root scan — written up, with the design and the acceptance gate, in
-   `../jit-direct-call-gate-closed-by-moving-young-is-the-call-floor.md`.
+   **REOPENED 2026-07-31 (`7f1b1f263`); the gate now defaults open, so this
+   item is no longer a blocker.** The claim that reopening required "making an
+   unguarded callee frame describable to the root scan" was WRONG — the root
+   scan was already correct (`chain_entry_rbp_is_foreign` detects the frame and
+   the cycle diverts to the non-moving sweep). The real defect was a truncated
+   `rel8` branch in the PIC cascade. Retired write-up:
+   `../../internal/jit-direct-call-gate-is-the-call-floor-FIXED-20260731.md`.
 
    **The ~630 ns figure this document previously quoted was inflated by its own
    harness** — `NativeCallCostProbe`'s timing loop sits inside a lambda invoked

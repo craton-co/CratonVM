@@ -6,14 +6,20 @@
 //! Walks the scheduled basic blocks, emits native instructions for each
 //! IR node, and patches forward branches.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::num::NonZeroU32;
 
 use super::ir::{Graph, IrType, MemKind, NodeId, Op, SafepointSnapshot, NO_NODE};
 use super::ir_schedule::Schedule;
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo, JitRuntimeHelpers};
+use crate::bailout::{
+    record_bailout, Bailout, BailoutReason, CompileResult, DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_MAX_NODES,
+};
 use crate::deopt::{
-    ir_deopt_entry, DeoptAction, DeoptReason, DeoptimizationPoint, FrameState, FrameValue,
-    VirtualObjectState,
+    ir_deopt_entry, DeoptAction, DeoptReason, DeoptVerifier, DeoptimizationPoint, EliminatedValue,
+    EliminationCause, FrameState, FrameValue, MethodFrameLimits, OopCoverage, VirtualObjectState,
 };
 use cratonvm_types::{ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
 
@@ -65,10 +71,14 @@ const _: () = assert!(
 // When escape analysis scalar-replaces an `Op::New` (the allocation is elided,
 // its field loads redirected to the stored values), the object no longer exists
 // in the JIT frame — but it may still be live at a deopt point. The default
-// behaviour resolves its (now-`Op::Dead`) snapshot slot to `FrameValue::Undefined`,
-// forcing a whole-method re-run. With this map threaded into the lowerer, such a
-// slot instead lowers to a `FrameValue::VirtualObject`, which the VM's
-// `materialize_virtual_objects` consumer rebuilds on a precise resume.
+// behaviour resolves its (now-`Op::Dead`) snapshot slot to
+// `FrameValue::MaterializationRequired`, which refuses the precise resume and
+// forces a whole-method re-run. (It used to resolve to `FrameValue::Undefined`,
+// which every resume sink maps to `Value::Int(0)` — so a reference local came
+// back as `null` with no error at all. See `frame_value_for_object`.) With this
+// map threaded into the lowerer, such a slot instead lowers to a
+// `FrameValue::VirtualObject`, which the VM's `materialize_virtual_objects`
+// consumer rebuilds on a precise resume.
 //
 // Built by `lib.rs::build_scalar_replacement_map` from the escape-analysis result
 // (so `class_id`/`num_fields`/`field_values` are captured before the `Op::New` is
@@ -166,20 +176,53 @@ struct Lowerer<'a> {
     graph: &'a Graph,
     schedule: &'a Schedule,
     buf: ExecutableBuffer,
-    /// Maps NodeId → frame offset where its result is stored.
-    node_slot: Vec<i32>,
+    /// Maps NodeId → frame offset where its result is stored, or `None` when
+    /// the node has no location yet.
+    ///
+    /// `Option<NonZeroU32>` rather than `i32`, so "unallocated" is not a
+    /// *value* on the same axis as a real offset. The old representation was
+    /// zero-initialised, and `0` is simultaneously "never allocated" and the
+    /// encoding of `[rbp - 0]` — the saved caller frame pointer. A missed
+    /// allocation therefore lowered to code that read the caller's RBP as
+    /// program data (observed as heap addresses landing in `double[]`
+    /// elements, i.e. silent array mis-sorts). Neither state is representable
+    /// now: `None` cannot be emitted, and a `NonZeroU32` offset cannot be 0.
+    node_slot: Vec<Option<NonZeroU32>>,
     /// Soundness latch (ES SortingDigestTests -Jit on): set when `slot_of`
-    /// is asked for a node that never went through `alloc_slot`. `node_slot`
-    /// is zero-initialised and `first_spill > 0`, so a 0 readback means the
-    /// scheduler never placed the node in an emitted block (observed: the
+    /// is asked for a node that never went through `alloc_slot` (observed: the
     /// pc17 ArrayLoad(Double) feeding a GVN-collapsed loop phi in
-    /// DualPivotQuicksort.insertionSort) — emitting `[rbp - 0]` would read
-    /// the saved caller RBP as a data value (heap addresses stored into
-    /// double[] elements, silent mis-sorts). The lowering entry point checks
-    /// this latch and bails to the single-pass backend instead.
+    /// DualPivotQuicksort.insertionSort — the scheduler never placed the node
+    /// in an emitted block). The lowering entry point checks this latch and
+    /// bails to the single-pass backend instead.
+    ///
+    /// **This latch is now unreachable.** `verify_data_locations` runs BEFORE
+    /// any code is emitted and refuses exactly the graphs that used to trip it
+    /// (a data input that no emitted node defines, or one defined after its
+    /// use), so `slot_of` can no longer meet an unallocated node. It is kept —
+    /// and strengthened, it now carries a structured [`Bailout`] rather than
+    /// one bit — as a belt-and-braces net for a future lowering that allocates
+    /// a slot on some paths only. If it ever fires again, the pre-emission
+    /// verifier has a hole; fix the verifier, not the latch.
     unallocated_slot_use: std::cell::Cell<bool>,
-    /// Next available frame spill offset.
-    next_spill: i32,
+    /// Structured reason for the first latched failure (the `Bailout` form of
+    /// `unallocated_slot_use`, plus any resource bailout raised from a legacy
+    /// infallible accessor). Read and reported by `lower_inner`.
+    latched_bailout: std::cell::RefCell<Option<Bailout>>,
+    /// Liveness-based frame-slot colouring for this method: which 8-byte spill
+    /// slot each value lives in. Computed by [`plan_slots`] before the frame is
+    /// sized, so `frame_size` budgets the *peak simultaneously live* value
+    /// count rather than the node count. `alloc_slot_checked` reads it; it
+    /// never bump-allocates.
+    slot_plan: &'a SlotPlan,
+    /// Highest spill offset any already-emitted node's slot reaches
+    /// (exclusive), i.e. `max(offset + 8)` over every `alloc_slot` so far.
+    ///
+    /// Was `next_spill`, the bump cursor, whose value happened to mean the same
+    /// thing while slots were handed out in emission order. Under colouring the
+    /// cursor is gone but the *watermark* is still exactly what a safepoint's
+    /// `live_frame_hi` needs: words above it have never been written by this
+    /// frame, so the collector's band scan may skip them.
+    spill_high_water: i32,
     /// Maps block index → native code offset (for branch patching).
     block_offsets: Vec<usize>,
     /// Forward branch patches: (native_offset_of_rel32, target_block_idx).
@@ -400,7 +443,7 @@ impl<'a> Lowerer<'a> {
         buf: ExecutableBuffer,
         num_params: usize,
         num_locals: usize,
-        max_nodes: usize,
+        slot_plan: &'a SlotPlan,
         helpers: &JitRuntimeHelpers,
         branch_hints: &'a HashMap<usize, bool>,
         sr_map: Option<&'a ScalarReplacementMap>,
@@ -429,28 +472,18 @@ impl<'a> Lowerer<'a> {
         // `needs_context` ⇒ the method takes the VM ptr as a hidden first arg
         // and reserves a context slot. `max_call_args` sizes the Java-argument
         // staging region a call marshals its args into before dispatching.
-        let mut needs_context = false;
-        let mut max_call_args = 0usize;
-        for n in &graph.nodes {
-            if matches!(n.op, Op::Call { .. }) {
-                needs_context = true;
-                // inputs = [ctrl, mem, args…]
-                max_call_args = max_call_args.max(n.inputs.len().saturating_sub(2));
-            }
-            if matches!(n.op, Op::LambdaIntToDouble) {
-                needs_context = true;
-            }
-            if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
-                needs_context = true;
-            }
-            if matches!(n.op, Op::New { .. }) {
-                needs_context = true;
-            }
-        }
+        //
+        // Shared with `estimate_frame_bytes`, which `lower_inner` uses to
+        // refuse an over-budget frame BEFORE this constructor reserves it; the
+        // two must see the same needs or the check would bound a different
+        // frame than the one built here.
+        let needs = scan_frame_needs(graph, helpers);
+        let needs_context = needs.needs_context;
+        let max_call_args = needs.max_call_args;
 
         // Frame layout (rbp downward): locals, [context slot], spills, [args
         // staging], 16-byte stack-arg reserve, 32-byte shadow. Reserve slots for
-        // locals + max_nodes spills + shadow. The 16-byte tail above the shadow
+        // locals + one per COLOUR + shadow. The 16-byte tail above the shadow
         // region holds in-frame stack args for any helper called without
         // `emit_stack_arg_setup`; see the matching comment in `x64.rs`
         // (Compiler::new) for the worst-case 6-arg `jit_invoke_virtual_mic` site.
@@ -460,18 +493,38 @@ impl<'a> Lowerer<'a> {
         // `*mut JvmThread`, the shadow stack's base `top` for this push, and
         // the shadow `top` watermark captured at method entry.
         let sp_id_size = 8i32 * 4;
-        let spill_size = (max_nodes as i32) * 8;
+        // Liveness-based slot reuse: one 8-byte slot per *colour*, not per
+        // graph node. [`plan_slots`] has already packed every value whose live
+        // range does not overlap another's into a shared slot, so this term is
+        // the peak simultaneous live count (plus the pinned classes), not
+        // `graph.nodes.len()`. A value dead since block 0 no longer owns a slot
+        // for the rest of the method.
+        let spill_size = (slot_plan.slots as i32) * 8;
         let args_stage_size = (max_call_args as i32) * 8;
         let shadow = 32i32;
         let stack_arg_reserve = 16i32;
-        let total = locals_size
-            + context_size
-            + sp_id_size
-            + spill_size
-            + args_stage_size
-            + shadow
-            + stack_arg_reserve;
-        let frame_size = (total + 15) & !15;
+        // The frame is SIZED by the same estimator `lower_inner` bounds against
+        // (`estimate_frame_bytes` + `check_frame_size`), so "the frame we
+        // checked" and "the frame we build" are the same number by
+        // construction rather than by two hand-kept-in-sync expressions. The
+        // check has already refused anything above `DEFAULT_MAX_FRAME_BYTES`
+        // (32 KiB), so every i32 term below is small and cannot overflow —
+        // previously `(graph.nodes.len() as i32) * 8` on a pathological graph
+        // could.
+        let frame_size = estimate_frame_bytes(num_locals, slot_plan.slots, &needs) as i32;
+        debug_assert_eq!(
+            frame_size,
+            ((locals_size
+                + context_size
+                + sp_id_size
+                + spill_size
+                + args_stage_size
+                + shadow
+                + stack_arg_reserve)
+                + 15)
+                & !15,
+            "estimate_frame_bytes must mirror the frame this constructor lays out",
+        );
 
         // The context slot is the first slot after the locals; spills start
         // after it.
@@ -536,9 +589,11 @@ impl<'a> Lowerer<'a> {
             graph,
             schedule,
             buf,
-            node_slot: vec![0; graph.nodes.len()],
+            node_slot: vec![None; graph.nodes.len()],
             unallocated_slot_use: std::cell::Cell::new(false),
-            next_spill: first_spill,
+            latched_bailout: std::cell::RefCell::new(None),
+            slot_plan,
+            spill_high_water: first_spill,
             block_offsets: vec![0; schedule.blocks.len()],
             branch_patches: Vec::new(),
             num_params,
@@ -593,8 +648,41 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Allocate a frame slot for a node result.
-    /// Panics if the spill offset exceeds the allocated frame capacity.
+    /// Latch a structured bailout raised from an infallible legacy accessor.
+    ///
+    /// The first one wins (it is the cause; later ones are consequences of
+    /// continuing to emit into an artifact that is already doomed).
+    /// `lower_inner` takes it and reports it instead of returning a bare
+    /// `None`. Interior mutability because both `&self` (`slot_of`) and
+    /// `&mut self` (`alloc_slot`) accessors latch.
+    fn latch_bailout(&self, bailout: Bailout) {
+        let mut slot = self.latched_bailout.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(bailout);
+        }
+    }
+
+    /// Take the latched bailout, if any.
+    fn take_latched_bailout(&self) -> Option<Bailout> {
+        self.latched_bailout.borrow_mut().take()
+    }
+
+    /// A frame offset that is safe to *emit* against but is not a real
+    /// location: the first spill slot. Returned only by the legacy infallible
+    /// accessors, and only after a bailout has been latched — which makes
+    /// `lower_inner` discard the whole artifact before it can be executed.
+    ///
+    /// It exists so a doomed compile finishes walking the graph without
+    /// panicking and without addressing memory outside the frame. The one
+    /// value it must never be is `0`: that is `[rbp - 0]`, the saved caller
+    /// frame pointer, which is exactly the read this whole change exists to
+    /// make unrepresentable.
+    fn poison_slot(&self) -> i32 {
+        debug_assert!(self.first_spill > 0);
+        self.first_spill
+    }
+
+    /// Allocate a frame slot for a node result, or refuse the compile.
     ///
     /// real-frame-deopt (#6): the deopt stub calls `ir_deopt_entry` while the
     /// frame is live, with `rsp = rbp - frame_size`. The Win64 ABI requires 32
@@ -604,22 +692,80 @@ impl<'a> Lowerer<'a> {
     /// `o <= frame_size - DEOPT_SHADOW_SPACE`. `frame_size` already budgets the
     /// 32-byte shadow (plus a 16-byte stack-arg reserve), so this never rejects
     /// a method the old `o < frame_size` bound accepted.
-    fn alloc_slot(&mut self, id: NodeId) -> i32 {
-        let offset = self.next_spill;
+    ///
+    /// Exceeding that cap used to be an `assert!`, i.e. a panic on the compiler
+    /// thread — which in a release VM is `fatal runtime error: failed to
+    /// initiate panic` → SIGABRT of the whole process, for what is only a
+    /// *compiler* resource limit. It is now a `FrameTooLarge` bailout: the
+    /// method loses its optimized body and runs in a lower tier, which is
+    /// always semantically valid.
+    ///
+    /// The offset is no longer a bump cursor: it is `first_spill + colour * 8`
+    /// for the colour [`plan_slots`] assigned this value, so two values whose
+    /// live ranges do not overlap land on the same word. Calling this twice for
+    /// one node is therefore idempotent rather than wasteful. A node the plan
+    /// does not cover is an internal inconsistency (the plan enumerates exactly
+    /// the nodes `prealloc_phi_slots` and `lower_data_node` allocate for), and
+    /// refuses the compile rather than inventing an offset.
+    fn alloc_slot_checked(&mut self, id: NodeId) -> CompileResult<i32> {
+        let color = match self.slot_plan.node_color.get(id as usize).copied().flatten() {
+            Some(color) => color,
+            None => {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal(
+                        "ir_lower: the slot plan has no colour for a value being lowered",
+                    ),
+                    format!(
+                        "n{id} reached alloc_slot with no planned frame slot (op {:?})",
+                        self.graph.nodes.get(id as usize).map(|n| &n.op),
+                    ),
+                ))
+            }
+        };
+        let offset = i32::try_from(u64::from(color).saturating_mul(8))
+            .ok()
+            .and_then(|delta| self.first_spill.checked_add(delta))
+            .ok_or_else(|| {
+                Bailout::new(BailoutReason::Internal(
+                    "ir_lower: coloured spill offset overflowed the frame arithmetic",
+                ))
+            })?;
         // `spill_cap_off` excludes the 32-byte shadow space AND (Gap B) the
         // Java-arg staging region, so a spill never overlaps either. For a
         // no-call method it equals `frame_size - DEOPT_SHADOW_SPACE` — the
         // historical bound, unchanged.
-        assert!(
-            offset <= self.spill_cap_off,
-            "JIT lowerer: spill offset {} exceeds frame capacity {} \
-             (cap {}, less shadow + arg-staging reserve)",
-            offset,
-            self.frame_size,
-            self.spill_cap_off,
-        );
-        self.next_spill += 8;
-        self.node_slot[id as usize] = offset;
+        if offset > self.spill_cap_off {
+            return Err(Bailout::with_context(
+                BailoutReason::FrameTooLarge {
+                    bytes: offset.max(0) as usize,
+                    limit: self.spill_cap_off.max(0) as usize,
+                },
+                format!(
+                    "spill slot for n{id} past the frame's spill cap \
+                     (frame {} bytes, cap {})",
+                    self.frame_size, self.spill_cap_off
+                ),
+            ));
+        }
+        // `first_spill > 0` and colours are non-negative, so this cannot be
+        // `None` — but the conversion is where the "no zero offsets" invariant
+        // is *enforced* rather than assumed, so it is checked, not asserted.
+        let located = u32::try_from(offset)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                Bailout::new(BailoutReason::Internal(
+                    "ir_lower: spill offset 0 would encode [rbp - 0] (saved caller RBP)",
+                ))
+            })?;
+        let cell = self.node_slot.get_mut(id as usize).ok_or_else(|| {
+            Bailout::new(BailoutReason::Internal("ir_lower: node id out of range"))
+        })?;
+        *cell = Some(located);
+        // Watermark, not a cursor: the highest word any emitted node's slot has
+        // reached. Every safepoint's `live_frame_hi` is read off this, and with
+        // reuse it stops growing once the peak live set is reached.
+        self.spill_high_water = self.spill_high_water.max(offset.saturating_add(8));
         // Relocation contract: a slot becomes publishable the moment the
         // emitting code writes it. `alloc_slot` is called at the point of
         // emission for every node EXCEPT phis, whose slots are reserved up
@@ -628,26 +774,65 @@ impl<'a> Lowerer<'a> {
         if !matches!(self.graph.nodes[id as usize].op, Op::Phi) {
             self.defined_nodes[id as usize] = true;
         }
-        offset
+        Ok(offset)
     }
 
-    /// Get the frame offset for a node's result (must have been allocated).
-    /// A `0` readback means the node was never `alloc_slot`'d — see
-    /// `unallocated_slot_use`; the latch makes the whole lowering bail
-    /// rather than emit a `[rbp - 0]` access to the saved caller RBP.
-    fn slot_of(&self, id: NodeId) -> i32 {
-        let s = self.node_slot[id as usize];
-        if s == 0 {
-            self.unallocated_slot_use.set(true);
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IRSLOT").is_some() {
-                let n = &self.graph.nodes[id as usize];
-                eprintln!(
-                    "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
-                    id, n.op, n.ty, n.inputs, n.bytecode_pc
-                );
+    /// Infallible façade over [`Self::alloc_slot_checked`] for the ~45
+    /// per-opcode emission sites, which are `fn(..) -> ()` and cannot `?`.
+    ///
+    /// On refusal it latches the structured bailout — so `lower_inner` discards
+    /// the artifact and the caller falls back to the single-pass backend — and
+    /// returns the poison slot so the doomed walk finishes without panicking.
+    /// New code should call `alloc_slot_checked` and propagate.
+    fn alloc_slot(&mut self, id: NodeId) -> i32 {
+        match self.alloc_slot_checked(id) {
+            Ok(offset) => offset,
+            Err(bailout) => {
+                self.latch_bailout(bailout);
+                self.poison_slot()
             }
         }
-        s
+    }
+
+    /// The frame offset of a node's result, or a bailout if it has none.
+    ///
+    /// The only read path into `node_slot`. There is no longer a value that
+    /// means "unallocated": an absent location is an `Err`, never `0`.
+    fn slot_of_checked(&self, id: NodeId) -> CompileResult<i32> {
+        match self.node_slot.get(id as usize).copied().flatten() {
+            // `NonZeroU32` ⇒ never 0, and `alloc_slot_checked` bounds it by
+            // `spill_cap_off` ⇒ always inside the frame.
+            Some(off) => Ok(off.get() as i32),
+            None => Err(Bailout::new(BailoutReason::UnallocatedValue { node: id })),
+        }
+    }
+
+    /// Infallible façade over [`Self::slot_of_checked`] for the emission sites.
+    ///
+    /// See `unallocated_slot_use`: this path is unreachable now that
+    /// `verify_data_locations` refuses such graphs before emission starts. If
+    /// it is ever taken, the latch discards the artifact and the caller falls
+    /// back to the single-pass backend — the same outcome as before, but with a
+    /// structured reason attached, and returning the poison slot rather than
+    /// `0` so no `[rbp - 0]` read can be emitted even transiently.
+    fn slot_of(&self, id: NodeId) -> i32 {
+        match self.slot_of_checked(id) {
+            Ok(offset) => offset,
+            Err(bailout) => {
+                self.unallocated_slot_use.set(true);
+                self.latch_bailout(bailout);
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IRSLOT").is_some() {
+                    match self.graph.nodes.get(id as usize) {
+                        Some(n) => eprintln!(
+                            "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
+                            id, n.op, n.ty, n.inputs, n.bytecode_pc
+                        ),
+                        None => eprintln!("[irslot] UNALLOCATED node={id} (out of range)"),
+                    }
+                }
+                self.poison_slot()
+            }
+        }
     }
 
     /// `CRATONVM_JIT_IR_RELOC_EMIT=0` — disable the relocation contract's EMISSION
@@ -726,8 +911,17 @@ fn reloc_emit_enabled() -> bool {
             if !self.defined_nodes[id] || self.graph.nodes[id].ty != IrType::Ref {
                 continue;
             }
-            let off = self.node_slot[id];
-            if off <= 0 || off > i16::MAX as i32 {
+            // `defined_nodes[id]` implies an allocated slot, so `None` here is
+            // an internal inconsistency, not a `Ref` without a home. Treat it
+            // exactly like an unencodable offset: fail closed, publish no map.
+            let off = match self.node_slot[id] {
+                Some(off) => off.get() as i32,
+                None => {
+                    coverable = false;
+                    break;
+                }
+            };
+            if off > i16::MAX as i32 {
                 coverable = false;
                 break;
             }
@@ -801,12 +995,17 @@ fn reloc_emit_enabled() -> bool {
     /// A forward branch can target a merge block whose phis have not yet
     /// been lowered, so the destination slots must exist before any edge
     /// copy is emitted. Phis are skipped by `lower_data_node`.
-    fn prealloc_phi_slots(&mut self) {
+    ///
+    /// Fallible: this is the first thing that can exhaust the frame, and a
+    /// refusal here must reach `lower_inner` as a `FrameTooLarge` bailout
+    /// rather than a panic.
+    fn prealloc_phi_slots(&mut self) -> CompileResult<()> {
         for id in 0..self.graph.nodes.len() {
             if matches!(self.graph.nodes[id].op, Op::Phi) {
-                self.alloc_slot(id as NodeId);
+                self.alloc_slot_checked(id as NodeId)?;
             }
         }
+        Ok(())
     }
 
     /// Resolve the block that produces control token `ctrl` by walking up
@@ -816,24 +1015,12 @@ fn reloc_emit_enabled() -> bool {
     /// control node) as `merge.inputs[k]`; that token is either a block
     /// head directly (goto fall-through) or a `Proj` off an `If` (block
     /// head). Walking control inputs makes the mapping robust to either.
-    fn block_of_ctrl(&self, mut ctrl: NodeId) -> Option<usize> {
-        for _ in 0..self.graph.nodes.len() {
-            if ctrl == NO_NODE {
-                return None;
-            }
-            let blk = self.schedule.node_to_block[ctrl as usize];
-            if blk != usize::MAX && self.schedule.blocks[blk].ctrl == ctrl {
-                return Some(blk);
-            }
-            // Step up the control chain (first input is the control edge for
-            // Proj/If/Merge-derived nodes).
-            let node = &self.graph.nodes[ctrl as usize];
-            match node.inputs.first() {
-                Some(&next) if next != ctrl => ctrl = next,
-                _ => return None,
-            }
-        }
-        None
+    ///
+    /// Delegates to the free function [`ctrl_block_of`] so the slot planner,
+    /// which must reproduce this exact edge attribution to see phi inputs as
+    /// uses at the *predecessor's* terminator, cannot drift from the emitter.
+    fn block_of_ctrl(&self, ctrl: NodeId) -> Option<usize> {
+        ctrl_block_of(self.graph, self.schedule, ctrl)
     }
 
     /// Emit the parallel-copy stores for every phi at `succ_block` whose
@@ -1443,8 +1630,10 @@ fn reloc_emit_enabled() -> bool {
                 matches!(self.graph.nodes[id].op, Op::Phi)
                     && self.graph.nodes[id].ty == IrType::Ref
             })
-            .map(|id| (id, self.node_slot[id]))
-            .filter(|&(_, off)| off > 0)
+            // A phi with no location cannot be zeroed and must not be
+            // published; `prealloc_phi_slots` gives every phi one, so this
+            // filter drops nothing in a well-formed compile.
+            .filter_map(|id| self.node_slot[id].map(|off| (id, off.get() as i32)))
             .collect();
         for (id, off) in refs {
             // MOV qword [rbp - off], 0
@@ -3144,9 +3333,13 @@ fn reloc_emit_enabled() -> bool {
                 // result slot defined — but that slot is not written until the
                 // call RETURNS, so covering it here would publish whatever the
                 // previous frame left at that offset as a live reference.
-                // `live_frame_hi` is the spill cursor as it stands now, i.e.
-                // before this node's result slot is carved.
-                let sp_live_hi = self.next_spill;
+                // `live_frame_hi` is the spill watermark as it stands now, i.e.
+                // before this node's result slot is carved. Under liveness
+                // colouring the call's result slot may *recycle* a colour, so
+                // "the watermark" is no longer "one past the last slot handed
+                // out" — but it is still an upper bound on every word this
+                // frame has written, which is exactly what the band scan needs.
+                let sp_live_hi = self.spill_high_water;
                 self.emit_safepoint_map(sp_live_hi);
                 let slot = self.alloc_slot(id);
                 let num_args = node.inputs.len().saturating_sub(2);
@@ -3503,7 +3696,17 @@ fn reloc_emit_enabled() -> bool {
         if node_id == NO_NODE {
             return FrameValue::Undefined;
         }
-        let node = &self.graph.nodes[node_id as usize];
+        // Checked, not indexed. A snapshot slot naming an id past the end of the
+        // arena means the snapshot and the graph being lowered disagree — the
+        // one situation where panicking is worst, because it takes the VM down
+        // from the compiler thread. Answer with the honest "this slot's value is
+        // gone and I cannot describe it", which is unresumable by construction
+        // (`frame_state_is_resumable`) rather than a fabricated zero.
+        let Some(node) = self.graph.nodes.get(node_id as usize) else {
+            return FrameValue::MaterializationRequired(EliminatedValue::unknown(
+                EliminationCause::Unclassified,
+            ));
+        };
         match node.op {
             // Integer / long constants need no machine location. A cat-1 `int`
             // constant resolves to `Int`; a cat-2 `long` constant resolves to
@@ -3530,23 +3733,45 @@ fn reloc_emit_enabled() -> bool {
                 // The prologue stored param `idx` at `[rbp - (idx+1)*8]`. If
                 // the Param node was also scheduled it has its own spill slot
                 // holding the same value; prefer that, else the prologue slot.
-                let slot = self.node_slot[node_id as usize];
-                let off = if slot != 0 {
-                    slot
-                } else {
-                    ((idx as i32) + 1) * 8
+                let off = match self.node_slot.get(node_id as usize).copied().flatten() {
+                    Some(slot) => slot.get() as i32,
+                    None => ((idx as i32) + 1) * 8,
                 };
                 Self::typed_stack_slot(-off, node.ty)
             }
             _ => {
-                let slot = self.node_slot[node_id as usize];
-                if slot != 0 {
-                    Self::typed_stack_slot(-slot, node.ty)
-                } else {
-                    // No machine location assigned (unscheduled / dead in this
-                    // naive lowerer). A real resolver would never see this for
-                    // a value that is live at the safepoint; first-cut fallback.
-                    FrameValue::Undefined
+                match self.node_slot.get(node_id as usize).copied().flatten() {
+                    Some(slot) => Self::typed_stack_slot(-(slot.get() as i32), node.ty),
+                    // No machine location assigned. Two OPPOSITE situations wear
+                    // the same shape here, and spelling them the same way is how
+                    // a scalar-replaced reference local reconstructs as `null`
+                    // with no error anywhere (every resume sink maps `Undefined`
+                    // to `Value::Int(0)`):
+                    //
+                    //   * the producer is `Op::Dead` — some pass (escape
+                    //     analysis' `apply_ea_to_ir`, DCE) DELETED the value the
+                    //     interpreter will read. That is
+                    //     `MaterializationRequired`: unresumable by construction,
+                    //     so the deopt is refused and the method re-runs, instead
+                    //     of resuming with a fabricated zero. The cause is
+                    //     `Unclassified` because this generic slot resolver
+                    //     cannot tell which pass retired the node —
+                    //     `frame_value_for_object` knows, and says so.
+                    //   * the producer is live but unscheduled in this naive
+                    //     lowerer. Genuinely without a location; keep the
+                    //     historical `Undefined`.
+                    //
+                    // Note this is a deopt *description*, not an emitted
+                    // access: neither answer reads `[rbp - 0]`. That is why a
+                    // missing location is tolerated here and refused in
+                    // `slot_of`.
+                    None if matches!(node.op, Op::Dead) => {
+                        FrameValue::MaterializationRequired(EliminatedValue::new(
+                            node_id,
+                            EliminationCause::Unclassified,
+                        ))
+                    }
+                    None => FrameValue::Undefined,
                 }
             }
         }
@@ -3573,6 +3798,30 @@ fn reloc_emit_enabled() -> bool {
             IrType::Double => FrameValue::StackSlotDouble(off),
             _ => FrameValue::Unsupported,
         }
+    }
+
+    /// The refusal every [`Self::frame_value_for_object`] bail returns: "escape
+    /// analysis deleted this object, and I could not describe how to rebuild it
+    /// here".
+    ///
+    /// Carries the producer node and the allocated class so the compiler report
+    /// can name *which* allocation at *which* site the deopt path cannot undo —
+    /// the difference between an actionable finding and an anonymous "cannot
+    /// resume". `cause` distinguishes the plain
+    /// [`EliminationCause::ScalarReplacedObject`] bails (no deopt block, a
+    /// non-dominating allocation/store, an unresolvable field) from
+    /// [`EliminationCause::NestedVirtualObject`] (the object is describable, but
+    /// one of its fields is itself virtual and v1 emits no nested graphs).
+    fn eliminated_object(
+        new_id: NodeId,
+        info: &VirtualObjectInfo,
+        cause: EliminationCause,
+    ) -> FrameValue {
+        FrameValue::MaterializationRequired(EliminatedValue::allocation(
+            new_id,
+            info.class_id,
+            cause,
+        ))
     }
 
     /// Resolve the `FrameState` for `bci` from its recorded safepoint
@@ -3958,8 +4207,10 @@ fn reloc_emit_enabled() -> bool {
     /// Lower a scalar-replaced object (`new_id`, an eliminated `Op::New`) that is
     /// live in a deopt snapshot slot into a `FrameValue::VirtualObject` (its
     /// first occurrence in this frame) or `VirtualObjectRef` (a later, shared
-    /// occurrence). Bails to `FrameValue::Undefined` (⇒ safe whole-method re-run)
-    /// unless every soundness condition holds:
+    /// occurrence). Bails to
+    /// [`FrameValue::MaterializationRequired`] (⇒ the deopt is refused and the
+    /// method takes the safe whole-method re-run) unless every soundness
+    /// condition holds:
     ///   * a deopt block is known, and the `Op::New` + every eliminated field
     ///     store **strictly dominate** it — so each field genuinely holds its
     ///     recorded value at the deopt bci (a deopt *before* a store would
@@ -3967,8 +4218,17 @@ fn reloc_emit_enabled() -> bool {
     ///   * no field value is itself another scalar-replaced (virtual) object —
     ///     nested virtual graphs are a deferred follow-up (v1);
     ///   * every field value resolves to a real machine/const `FrameValue`
-    ///     (never `Undefined`/`Unsupported`), which `resolve_value` makes
-    ///     concrete from machine state at deopt time.
+    ///     (never `Undefined`/`Unsupported`/`MaterializationRequired`), which
+    ///     `resolve_value` makes concrete from machine state at deopt time.
+    ///
+    /// Every bail below used to be spelled `FrameValue::Undefined`, and that was
+    /// the last silent-null producer in this pipeline: the slot describes an
+    /// object escape analysis DELETED, the interpreter *will* read it, and every
+    /// resume sink maps `Undefined` to `Value::Int(0)` — i.e. `null` for a
+    /// reference local, with no error and no refusal. `MaterializationRequired`
+    /// says the same thing honestly and is unresumable by construction (see the
+    /// `deopt` module's "Eliminated vs. undefined" section), so the wrong value
+    /// becomes a refused deopt instead.
     fn frame_value_for_object(
         &self,
         new_id: NodeId,
@@ -3979,7 +4239,15 @@ fn reloc_emit_enabled() -> bool {
         let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some();
         let info = match sr.objects.get(&new_id) {
             Some(i) => i,
-            None => return FrameValue::Undefined,
+            // Unreachable through `resolve_frame_state` (which only calls here
+            // for a key it just found), so the class id is not recoverable —
+            // record the producer alone rather than invent a `class_id`.
+            None => {
+                return FrameValue::MaterializationRequired(EliminatedValue::new(
+                    new_id,
+                    EliminationCause::ScalarReplacedObject,
+                ))
+            }
         };
         let db = match deopt_block {
             Some(b) => b,
@@ -3987,7 +4255,11 @@ fn reloc_emit_enabled() -> bool {
                 if dbg {
                     eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: no deopt block for bci");
                 }
-                return FrameValue::Undefined;
+                return Self::eliminated_object(
+                    new_id,
+                    info,
+                    EliminationCause::ScalarReplacedObject,
+                );
             }
         };
         // The allocation and every field store must have executed before the
@@ -4007,7 +4279,7 @@ fn reloc_emit_enabled() -> bool {
                     self.schedule.node_to_block.get(info.new_ctrl as usize)
                 );
             }
-            return FrameValue::Undefined;
+            return Self::eliminated_object(new_id, info, EliminationCause::ScalarReplacedObject);
         }
         for &store_ctrl in &info.store_ctrls {
             if !self.schedule.node_strictly_dominates_block(store_ctrl, db) {
@@ -4018,7 +4290,11 @@ fn reloc_emit_enabled() -> bool {
                         self.schedule.node_to_block.get(store_ctrl as usize)
                     );
                 }
-                return FrameValue::Undefined;
+                return Self::eliminated_object(
+                    new_id,
+                    info,
+                    EliminationCause::ScalarReplacedObject,
+                );
             }
         }
         // A later occurrence of an already-defined object is a back/shared edge.
@@ -4038,14 +4314,33 @@ fn reloc_emit_enabled() -> bool {
                         if dbg {
                             eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: field {i} is nested virtual (node {vnode})");
                         }
-                        return FrameValue::Undefined; // nested virtual — deferred
+                        // nested virtual — deferred (v1 emits no nested graphs)
+                        return Self::eliminated_object(
+                            new_id,
+                            info,
+                            EliminationCause::NestedVirtualObject,
+                        );
                     }
                     let fv = self.frame_value_for(vnode);
-                    if matches!(fv, FrameValue::Undefined | FrameValue::Unsupported) {
+                    // `MaterializationRequired` joins the refusal set: a field
+                    // whose own producer was deleted must not be stored into a
+                    // materialized object (`frame_state_is_resumable` documents
+                    // that the producers, i.e. here, refuse such a field rather
+                    // than let it through inside a `VirtualObject`).
+                    if matches!(
+                        fv,
+                        FrameValue::Undefined
+                            | FrameValue::Unsupported
+                            | FrameValue::MaterializationRequired(_)
+                    ) {
                         if dbg {
                             eprintln!("[DBG_SCALAR_DEOPT] bail new {new_id}: field {i} node {vnode} -> {fv:?}");
                         }
-                        return FrameValue::Undefined;
+                        return Self::eliminated_object(
+                            new_id,
+                            info,
+                            EliminationCause::ScalarReplacedObject,
+                        );
                     }
                     fv
                 }
@@ -4094,6 +4389,1082 @@ fn reloc_emit_enabled() -> bool {
         points.dedup_by_key(|p| p.native_offset);
         points
     }
+}
+
+// ── Resource bounds (checked BEFORE anything is reserved) ────────────
+//
+// The lowerer used to size its frame straight from `graph.nodes.len()` — one
+// 8-byte spill slot per node, unconditionally — and then `assert!` its way out
+// if a slot fell past the cap. Two problems: `nodes * 8` on a pathological
+// graph overflows the `i32` frame arithmetic before any check runs, and the
+// assertion is a panic on the compiler thread for what is only a compiler
+// resource limit. Both are now decided up front, from the same numbers the
+// frame is actually built from — and the spill term itself is now the
+// liveness-coloured slot count ([`plan_slots`]) rather than the node count.
+
+/// What a graph demands of the frame beyond its own spills. Shared by
+/// [`Lowerer::new`] (which builds the frame) and [`estimate_frame_bytes`]
+/// (which bounds it), so the checked size and the built size cannot drift.
+struct FrameNeeds {
+    /// The method takes the VM context pointer as a hidden first argument and
+    /// reserves a frame slot for it.
+    needs_context: bool,
+    /// Widest outgoing Java-argument list staged for a call.
+    max_call_args: usize,
+}
+
+/// Scan the graph for the call/allocation shapes that widen the frame.
+fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
+    let mut needs_context = false;
+    let mut max_call_args = 0usize;
+    for n in &graph.nodes {
+        if matches!(n.op, Op::Call { .. }) {
+            needs_context = true;
+            // inputs = [ctrl, mem, args…]
+            max_call_args = max_call_args.max(n.inputs.len().saturating_sub(2));
+        }
+        if matches!(n.op, Op::LambdaIntToDouble) {
+            needs_context = true;
+        }
+        if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
+            needs_context = true;
+        }
+        if matches!(n.op, Op::New { .. }) {
+            needs_context = true;
+        }
+    }
+    FrameNeeds {
+        needs_context,
+        max_call_args,
+    }
+}
+
+/// Estimated peak frame requirement, in bytes, for a method the lowerer would
+/// build with `num_locals` locals, `spill_slots` distinct spill slots and
+/// `needs`.
+///
+/// Mirrors [`Lowerer::new`]'s layout exactly — locals, optional context slot,
+/// the four reserved bookkeeping slots, the spill reservation, the outgoing
+/// argument staging area, the 16-byte stack-argument reserve and the 32-byte
+/// ABI shadow space, rounded up to the 16-byte stack alignment — but in
+/// saturating `usize` arithmetic, so a graph big enough to overflow the
+/// constructor's `i32` math is *counted* rather than wrapped. `usize::MAX`
+/// therefore reads as "far too large", which is exactly what
+/// [`check_frame_size`] concludes.
+///
+/// `spill_slots` is [`SlotPlan::slots`] — the number of *colours* the liveness
+/// colouring needed, i.e. the maximum number of simultaneously live values plus
+/// the pinned classes. It used to be `graph.nodes.len()`, which assumed every
+/// value in the graph was live at once; a long straight-line method now pays
+/// for its working set instead of for its history. The two callers
+/// ([`lower_inner`]'s bound and [`Lowerer::new`]'s layout) pass the same
+/// `SlotPlan`, so "the frame we checked" and "the frame we build" stay the same
+/// number by construction.
+fn estimate_frame_bytes(num_locals: usize, spill_slots: usize, needs: &FrameNeeds) -> usize {
+    let locals = num_locals.saturating_mul(8);
+    let context = if needs.needs_context { 8 } else { 0 };
+    // safepoint id, cached thread pointer, shadow save-base, shadow save-top.
+    let bookkeeping = 8usize * 4;
+    let spills = spill_slots.saturating_mul(8);
+    let args_stage = needs.max_call_args.saturating_mul(8);
+    let shadow = 32usize;
+    let stack_arg_reserve = 16usize;
+    let total = locals
+        .saturating_add(context)
+        .saturating_add(bookkeeping)
+        .saturating_add(spills)
+        .saturating_add(args_stage)
+        .saturating_add(shadow)
+        .saturating_add(stack_arg_reserve);
+    // 16-byte alignment, saturating rather than wrapping at the top end.
+    total.saturating_add(15) & !15usize
+}
+
+/// Refuse a graph whose node count exceeds the compile-time budget.
+///
+/// Defence in depth: `lib.rs` already screens on `ir::IR_MAX_GRAPH_NODES`
+/// before building a schedule. This restates the bound at the point that
+/// *allocates* per node, so a future caller that skips the screen cannot
+/// reserve an unbounded frame.
+fn check_graph_size(node_count: usize, limit: usize) -> CompileResult<()> {
+    if node_count > limit {
+        return Err(Bailout::new(BailoutReason::GraphTooLarge {
+            nodes: node_count,
+            limit,
+        }));
+    }
+    Ok(())
+}
+
+/// Refuse a frame estimate that exceeds the frame budget.
+///
+/// The bound is a correctness bound, not a stack-consumption policy: this file
+/// encodes oop-map slot offsets as `i16`, so a reference living past
+/// `i16::MAX` is *unrepresentable* in the map the collector reads. See
+/// [`DEFAULT_MAX_FRAME_BYTES`].
+fn check_frame_size(frame_bytes: usize, limit: usize) -> CompileResult<()> {
+    if frame_bytes > limit {
+        return Err(Bailout::new(BailoutReason::FrameTooLarge {
+            bytes: frame_bytes,
+            limit,
+        }));
+    }
+    Ok(())
+}
+
+// ── Pre-emission location verification ───────────────────────────────
+
+/// True for the IR types that occupy a frame slot, i.e. the inputs a lowering
+/// reads through [`Lowerer::slot_of`]. `Control`, `Memory` and `Void` inputs
+/// are edges, not values, and never have a location.
+fn is_value_ty(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::Int | IrType::Long | IrType::Float | IrType::Double | IrType::Ref
+    )
+}
+
+/// True iff lowering this op assigns its result a frame slot.
+///
+/// Must stay in step with `lower_data_node`'s match arms: every arm that calls
+/// `alloc_slot` is listed here, plus `Op::Phi` (reserved up front by
+/// `prealloc_phi_slots`). Ops that reach `lower_data_node`'s catch-all — they
+/// emit nothing — are deliberately absent, because a value read from one of
+/// them has no location either.
+fn op_defines_result_slot(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Const(_)
+            | Op::ConstF(_)
+            | Op::Param(_)
+            | Op::Phi
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::Cmp(_)
+            | Op::LCmp
+            | Op::FCmp { .. }
+            | Op::I2L
+            | Op::L2I
+            | Op::I2F
+            | Op::I2D
+            | Op::L2F
+            | Op::L2D
+            | Op::F2I
+            | Op::F2L
+            | Op::F2D
+            | Op::D2I
+            | Op::D2L
+            | Op::D2F
+            | Op::Load(_)
+            | Op::ArrayLoad(_)
+            | Op::ArrayStore(_)
+            | Op::New { .. }
+            | Op::Call { .. }
+            | Op::LambdaIntToDouble
+    )
+}
+
+/// Refuse, *before a single byte is emitted*, any graph in which some node the
+/// lowerer will emit reads a value that has no frame location at that point.
+///
+/// This is the structural fix for the `[rbp - 0]` defect. The observed failure
+/// (ES `SortingDigestTests` with the IR tier on) was a `pc17 ArrayLoad(Double)`
+/// feeding a GVN-collapsed loop phi: the scheduler placed the phi but not the
+/// load, so the load had no slot, and `slot_of` handed back the
+/// zero-initialised entry — `[rbp - 0]`, the saved caller frame pointer, read
+/// as a `double`. The old detection was a sticky bit consulted *after* the
+/// whole body had been emitted.
+///
+/// Three ways a data input can fail to have a location; all three are the same
+/// bailout:
+///
+///  1. the defining node is in no emitted block (dead, or a scheduler
+///     omission) — it never reaches `lower_data_node`, so nothing allocates;
+///  2. its op emits nothing (`lower_data_node`'s catch-all), so even though it
+///     is scheduled it defines no slot;
+///  3. it is emitted, but *after* the use — every location here is created at
+///     the point of emission, so a later definition is as absent as no
+///     definition.
+///
+/// Phis are exempt from (3): their slots are reserved by `prealloc_phi_slots`
+/// before any block is lowered, precisely so a forward branch can copy into
+/// one. Phi *inputs* are exempt too — they are written by predecessor edge
+/// copies, not read in the phi's own block — so only (1) and (2) apply to them.
+///
+/// Rejecting here can only lose graphs that the `unallocated_slot_use` latch
+/// already rejected after the fact, so it costs no coverage; what it buys is
+/// that the refusal happens before emission, where a mutation that drops a
+/// node from the schedule is caught by construction rather than by a bit that
+/// someone must remember to check.
+///
+/// Known residual (why the latch is kept rather than deleted): a phi's value
+/// inputs are consumed by `emit_phi_copies` at the *predecessor's* terminator,
+/// not in the phi's own block, so their ordering constraint is per-CFG-edge —
+/// reconstructing it here would duplicate `block_of_ctrl`'s walk. A def that
+/// reached its edge copy too late would still be caught by the latch, one
+/// phase later. Every *placement* failure — the class that produced the
+/// observed bug — is caught here.
+fn verify_data_locations(graph: &Graph, schedule: &Schedule) -> CompileResult<()> {
+    // Emission order: blocks in index order; within a block, its data nodes in
+    // scheduled order, then its terminator. This is exactly `lower_inner`'s
+    // `for block_idx in 0..blocks.len() { lower_block(block_idx) }`.
+    let mut emit_index: Vec<Option<usize>> = vec![None; graph.nodes.len()];
+    let mut seq = 0usize;
+    for block in &schedule.blocks {
+        for &node_id in &block.nodes {
+            if let Some(cell) = emit_index.get_mut(node_id as usize) {
+                *cell = Some(seq);
+            }
+            seq += 1;
+        }
+        if let Some(term) = block.terminator {
+            if let Some(cell) = emit_index.get_mut(term as usize) {
+                *cell = Some(seq);
+            }
+            seq += 1;
+        }
+    }
+
+    let check_user = |user: NodeId| -> CompileResult<()> {
+        let node = match graph.nodes.get(user as usize) {
+            Some(n) => n,
+            None => {
+                return Err(Bailout::new(BailoutReason::Internal(
+                    "ir_lower: schedule names a node outside the graph",
+                )))
+            }
+        };
+        let user_is_phi = matches!(node.op, Op::Phi);
+        for &input in &node.inputs {
+            if input == NO_NODE {
+                continue;
+            }
+            let def = match graph.nodes.get(input as usize) {
+                Some(d) => d,
+                None => {
+                    return Err(Bailout::new(BailoutReason::Internal(
+                        "ir_lower: node input outside the graph",
+                    )))
+                }
+            };
+            // Control / memory edges carry no value and are never `slot_of`'d.
+            if !is_value_ty(def.ty) {
+                continue;
+            }
+            if !op_defines_result_slot(&def.op) {
+                // (1) dead / (2) no lowering ⇒ no location, ever.
+                return Err(Bailout::with_context(
+                    BailoutReason::UnallocatedValue { node: input },
+                    format!(
+                        "n{input} ({:?}, {:?}) is read by n{user} ({:?}) but its \
+                         lowering assigns no frame slot",
+                        def.op, def.ty, node.op
+                    ),
+                ));
+            }
+            let def_seq = match emit_index.get(input as usize).copied().flatten() {
+                Some(s) => s,
+                None => {
+                    // Phis are reserved before emission, so "not in any emitted
+                    // block" is still fatal for them: nothing would write the
+                    // slot. Report the same way.
+                    return Err(Bailout::with_context(
+                        BailoutReason::UnallocatedValue { node: input },
+                        format!(
+                            "n{input} ({:?}) is read by n{user} ({:?}) but is in no \
+                             emitted block",
+                            def.op, node.op
+                        ),
+                    ));
+                }
+            };
+            if user_is_phi || matches!(def.op, Op::Phi) {
+                // Phi slots exist before the first block is lowered, and a
+                // phi's own inputs are consumed by predecessor edge copies
+                // rather than read in the phi's block — neither is an
+                // ordering constraint.
+                continue;
+            }
+            let use_seq = emit_index
+                .get(user as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(usize::MAX);
+            if def_seq >= use_seq {
+                return Err(Bailout::with_context(
+                    BailoutReason::UnallocatedValue { node: input },
+                    format!(
+                        "n{input} ({:?}) is emitted at position {def_seq}, after its \
+                         use by n{user} ({:?}) at position {use_seq}",
+                        def.op, node.op
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    for block in &schedule.blocks {
+        for &node_id in &block.nodes {
+            check_user(node_id)?;
+        }
+        if let Some(term) = block.terminator {
+            check_user(term)?;
+        }
+    }
+    Ok(())
+}
+
+// ── Liveness-based frame-slot reuse ──────────────────────────────────
+//
+// The lowerer used to reserve one 8-byte spill slot per graph node, forever: a
+// value dead since block 0 still owned a word of the frame at the return. On a
+// 4000-node method that is 32 KiB of stack — the entire `DEFAULT_MAX_FRAME_BYTES`
+// budget — spent almost entirely on values nothing can read any more, and it is
+// why the optimizing tier *declined* anything much past 4000 nodes.
+//
+// What replaces it is a textbook two-step: compute each value's live range over
+// the lowerer's own emission order, then colour the ranges so values that are
+// never live at the same time share a word.
+//
+// ## Positions
+//
+// The "program points" are the linear emission positions `lower_inner` walks:
+// blocks in index order, within a block its scheduled data nodes then its
+// terminator, then ONE more position for the block's outgoing edge — the point
+// at which `emit_phi_copies` writes this edge's parallel copies and the block's
+// jump is emitted. `verify_data_locations` numbers the first two the same way;
+// the third is the subtlety that file already documents: **a phi's value inputs
+// are consumed at the predecessor's terminator, not in the phi's own block**, so
+// they must stay live to the end of every predecessor that feeds them.
+//
+// ## Liveness
+//
+// A backward may-analysis over the block CFG:
+//
+//     live_out[b] = phi_out[b] ∪ ⋃_{s ∈ succ(b)} live_in[s]
+//     live_in[b]  = use[b] ∪ (live_out[b] \ def[b])
+//
+// with `use[b]` the upward-exposed uses, `def[b]` the values the block defines
+// and `phi_out[b]` the values `emit_phi_copies` reads on b's outgoing edges.
+// Iterated to a fixed point, so a back edge propagates a loop body's uses
+// around the loop and a value used anywhere in a loop is live across the whole
+// loop — no special case needed, that is what the fixed point *means*.
+//
+// Each value's range is then the closed interval
+//
+//     [ min(def position, start of every block it is live-in to),
+//       max(use positions,  end   of every block it is live-out of) ]
+//
+// which is a contiguous over-approximation in position space: every point at
+// which the value is live is inside it. That is all interference needs — two
+// values live at the same point have overlapping intervals, so refusing to
+// share on overlap can never alias two live values. It can *over*-estimate
+// (a value live only in blocks 0 and 9 covers 1..8 too), which costs slots, not
+// correctness.
+//
+// ## Colouring
+//
+// Linear scan over intervals sorted by start, with an expiry heap and a free
+// list of released colours. Endpoints are inclusive on both sides — an interval
+// starting exactly where another ends does NOT reuse its slot — because a
+// node's lowering allocates its result slot *before* reading its operands at
+// some sites and after at others, and one word of frame is not worth auditing
+// forty emission arms for.
+//
+// ## What is NOT coloured, and why
+//
+//   * **Phis.** `prealloc_phi_slots` reserves them before any block is lowered
+//     and `emit_phi_copies` writes them from predecessors that may be lowered
+//     much later; the whole phi web has to keep one identity, and
+//     `zero_ref_phi_slots` additionally publishes every `Ref` phi's slot as a
+//     GC root from the prologue onward. Dedicated slot.
+//   * **Anything a deopt frame names.** Every node reachable from a
+//     `SafepointSnapshot` (and every scalar-replacement field value, when
+//     `sr_map` is set) is read by `frame_value_for` at a native offset chosen at
+//     runtime — `find_deopt_point` binary-searches, so the frame state of *any*
+//     recorded bci can be consumed. Its slot must still hold its value there.
+//     Reconstructing which guard that is belongs to the deopt producer, not to
+//     a register allocator. Dedicated slot.
+//   * **`Ref` results of `Op::Call`.** `emit_safepoint_map` publishes the slot
+//     of every `Ref` node defined so far, and the self-recursive route
+//     (`emit_self_recursive_call`) stores the call's result BEFORE
+//     `emit_shadow_reload` copies the published values back. A call result that
+//     recycled a published colour would be overwritten by the reload. These may
+//     *donate* their colour once they die, but never *receive* a recycled one —
+//     the colour they take has been handed to nobody, so it cannot be in the
+//     published set (any value that later inherits it is defined strictly after
+//     this call, hence not yet in `defined_nodes` here).
+//
+// ## Reference / primitive separation
+//
+// A colour is `Ref` or `Prim` from its first assignment and never changes
+// class: the two free lists are disjoint. `emit_safepoint_map` publishes a slot
+// because *some* `Ref` node was defined into it, and `defined_nodes` is
+// monotone, so a slot the map names may hold a stale (but genuine) reference —
+// that is the pre-existing behaviour and the collector handles it. What must
+// never happen is a slot the map names holding an `int`, which separating the
+// pools makes unrepresentable rather than unlikely.
+
+/// A closed interval of linear emission positions over which a value must keep
+/// its frame slot. See the module section above for how positions are numbered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveRange {
+    lo: usize,
+    hi: usize,
+}
+
+impl LiveRange {
+    /// Endpoint-**inclusive** overlap: `[4, 7]` and `[7, 9]` overlap.
+    ///
+    /// Deliberately stricter than "live at a common point". A node's lowering
+    /// may allocate its result slot before or after loading its operands
+    /// depending on the opcode, so a value whose last use is at position `p`
+    /// and a value defined at position `p` are kept apart.
+    fn overlaps(self, other: LiveRange) -> bool {
+        self.lo <= other.hi && other.lo <= self.hi
+    }
+}
+
+/// Which pool a value's frame slot is drawn from. A colour's class is fixed at
+/// its first assignment; see the section comment on reference separation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotClass {
+    /// Reference-typed. Shares only with other references — a slot an oop map
+    /// names must never hold a primitive.
+    Ref,
+    /// Non-reference. Shares only with other non-references.
+    Prim,
+    /// Never shares with anything: phis, deopt-visible values, and any other
+    /// class this file cannot prove safe to alias.
+    Pinned,
+}
+
+/// The frame-slot assignment for one method.
+struct SlotPlan {
+    /// `node_color[id]` = the 0-based 8-byte slot index node `id`'s result
+    /// lives in, or `None` when the lowerer never allocates for that node.
+    node_color: Vec<Option<u32>>,
+    /// `range[id]` = the live range colouring used, kept so
+    /// [`verify_slot_colouring`] can re-derive (rather than trust) the
+    /// no-aliasing property.
+    range: Vec<Option<LiveRange>>,
+    /// `class[id]` = which pool the colour came from.
+    class: Vec<Option<SlotClass>>,
+    /// Distinct 8-byte slots the plan needs — what [`estimate_frame_bytes`]
+    /// budgets and [`Lowerer::new`] reserves.
+    slots: usize,
+    /// Maximum number of live ranges covering any single position: the floor a
+    /// perfect colouring with no pinned classes would reach. Reported for
+    /// measurement only; nothing is sized from it.
+    peak_live: usize,
+}
+
+/// Work budget for the liveness fixed point, in `nodes × blocks` units.
+///
+/// Past this the analysis is skipped and every value keeps a dedicated slot —
+/// still an improvement on the old reservation (only nodes that actually
+/// allocate get a slot, rather than every arena node), and the frame bound then
+/// declines the method exactly as it does today. A compiler must not turn a
+/// pathological graph into a pathological *compile*.
+const SLOT_PLAN_WORK_BUDGET: usize = 8_000_000;
+
+/// Hard cap on liveness fixed-point iterations. The analysis converges in
+/// loop-depth + 2 passes over a reducible CFG walked in reverse block order;
+/// exceeding this means the block order is not what we think it is, and the
+/// answer is discarded (everything pinned) rather than truncated — a truncated
+/// may-analysis under-approximates liveness, which would alias live values.
+const SLOT_PLAN_MAX_ITERATIONS: usize = 256;
+
+/// Resolve the block that produces control token `ctrl` by walking up control
+/// inputs until a node that heads some block is reached.
+///
+/// Free-function form of [`Lowerer::block_of_ctrl`], which delegates here, so
+/// [`plan_slots`] attributes a phi's value inputs to exactly the predecessor
+/// block `emit_phi_copies` will copy them from. Every index is checked: the
+/// planner runs before `verify_data_locations`, on a graph nothing has vetted.
+fn ctrl_block_of(graph: &Graph, schedule: &Schedule, mut ctrl: NodeId) -> Option<usize> {
+    for _ in 0..graph.nodes.len() {
+        if ctrl == NO_NODE {
+            return None;
+        }
+        let blk = *schedule.node_to_block.get(ctrl as usize)?;
+        if blk != usize::MAX && schedule.blocks.get(blk).map(|b| b.ctrl) == Some(ctrl) {
+            return Some(blk);
+        }
+        // Step up the control chain (first input is the control edge for
+        // Proj/If/Merge-derived nodes).
+        let node = graph.nodes.get(ctrl as usize)?;
+        match node.inputs.first() {
+            Some(&next) if next != ctrl => ctrl = next,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Set bit `i`. Out-of-range indices are ignored rather than panicking: the
+/// planner runs on a graph nothing has verified yet.
+#[inline]
+fn bits_insert(bits: &mut [u64], i: usize) {
+    if let Some(word) = bits.get_mut(i / 64) {
+        *word |= 1u64 << (i % 64);
+    }
+}
+
+/// Is bit `i` set?
+#[inline]
+fn bits_contains(bits: &[u64], i: usize) -> bool {
+    bits.get(i / 64).is_some_and(|w| w & (1u64 << (i % 64)) != 0)
+}
+
+/// Visit every set bit, in increasing order.
+#[inline]
+fn bits_for_each(bits: &[u64], mut f: impl FnMut(usize)) {
+    for (w, &word) in bits.iter().enumerate() {
+        let mut rest = word;
+        while rest != 0 {
+            let b = rest.trailing_zeros() as usize;
+            f(w * 64 + b);
+            rest &= rest - 1;
+        }
+    }
+}
+
+/// Compute the liveness-based frame-slot colouring for one scheduled graph.
+///
+/// Total: never panics and never fails. A graph it cannot analyse (over the
+/// work budget, or a fixed point that will not converge) falls back to a
+/// dedicated slot per allocating value, which is what the lowerer did before
+/// this existed. The result is *checked* by [`verify_slot_colouring`], not
+/// trusted — the property it establishes (two values live at one point never
+/// share a word) is the one whose violation is silent wrong code.
+fn plan_slots(
+    graph: &Graph,
+    schedule: &Schedule,
+    sr_map: Option<&ScalarReplacementMap>,
+) -> SlotPlan {
+    let n = graph.nodes.len();
+    let nb = schedule.blocks.len();
+
+    // ── 1. Which values receive a frame slot ─────────────────────────
+    //
+    // Exactly the set `alloc_slot` is called for: every phi (reserved by
+    // `prealloc_phi_slots` whether scheduled or not) plus every scheduled node
+    // whose lowering allocates. `op_defines_result_slot` is the same predicate
+    // `verify_data_locations` uses, so the two cannot drift.
+    let mut wants_slot = vec![false; n];
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if matches!(node.op, Op::Phi) {
+            wants_slot[id] = true;
+        }
+    }
+    for block in &schedule.blocks {
+        for &nid in &block.nodes {
+            if let Some(node) = graph.nodes.get(nid as usize) {
+                if op_defines_result_slot(&node.op) {
+                    wants_slot[nid as usize] = true;
+                }
+            }
+        }
+    }
+
+    // ── 2. Linear emission positions and block spans ─────────────────
+    let mut pos_of: Vec<Option<usize>> = vec![None; n];
+    let mut span: Vec<(usize, usize)> = Vec::with_capacity(nb);
+    let mut seq = 0usize;
+    for block in &schedule.blocks {
+        let start = seq;
+        for &nid in &block.nodes {
+            if let Some(cell) = pos_of.get_mut(nid as usize) {
+                *cell = Some(seq);
+            }
+            seq += 1;
+        }
+        if let Some(term) = block.terminator {
+            if let Some(cell) = pos_of.get_mut(term as usize) {
+                *cell = Some(seq);
+            }
+            seq += 1;
+        }
+        // One position past the block's last instruction: the outgoing edge,
+        // where `emit_phi_copies` reads this block's phi arguments.
+        let end = seq;
+        seq += 1;
+        span.push((start, end));
+    }
+    let total_positions = seq;
+
+    // ── 3. Classes that never share ──────────────────────────────────
+    let mut pinned = vec![false; n];
+    let mut fresh_only = vec![false; n];
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if !wants_slot[id] {
+            continue;
+        }
+        if matches!(node.op, Op::Phi) {
+            pinned[id] = true;
+        }
+        if node.ty == IrType::Ref && matches!(node.op, Op::Call { .. }) {
+            fresh_only[id] = true;
+        }
+    }
+    for sp in &graph.safepoints {
+        for &v in sp.locals.iter().chain(sp.stack.iter()) {
+            if v != NO_NODE {
+                if let Some(slot) = pinned.get_mut(v as usize) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    if let Some(sr) = sr_map {
+        for info in sr.objects.values() {
+            for &v in info.field_values.iter().flatten() {
+                if v != NO_NODE {
+                    if let Some(slot) = pinned.get_mut(v as usize) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 4. Uses, definitions and the liveness fixed point ────────────
+    let mut lo = vec![usize::MAX; n];
+    let mut hi = vec![0usize; n];
+    // Past the work budget nothing below runs — including the `nodes × blocks`
+    // bit-set allocation, which is the expensive part — and every value keeps a
+    // dedicated slot.
+    let mut coloured = n.saturating_mul(nb) <= SLOT_PLAN_WORK_BUDGET;
+    if coloured {
+        let words = n.div_ceil(64).max(1);
+        let mut def_bits = vec![0u64; words * nb];
+        let mut use_bits = vec![0u64; words * nb];
+        let mut phi_out_bits = vec![0u64; words * nb];
+
+        // Direct (non-phi) uses and definitions, in block order so that "used
+        // before defined in this block" — the upward-exposed set the dataflow
+        // needs — falls out of a single pass.
+        let mut local_def = vec![0u64; words];
+        for b in 0..nb {
+            let base = b * words;
+            local_def.fill(0);
+            let block = &schedule.blocks[b];
+            for u in block.nodes.iter().copied().chain(block.terminator) {
+                let ui = u as usize;
+                let node = match graph.nodes.get(ui) {
+                    Some(node) => node,
+                    None => continue,
+                };
+                let upos = pos_of.get(ui).copied().flatten().unwrap_or(span[b].0);
+                // A phi's value inputs are NOT read here — the predecessor's
+                // edge copy reads them, handled below; `inputs[0]` is control.
+                if !matches!(node.op, Op::Phi) {
+                    for &inp in &node.inputs {
+                        let ii = inp as usize;
+                        if inp == NO_NODE || ii >= n || !wants_slot[ii] {
+                            continue;
+                        }
+                        lo[ii] = lo[ii].min(upos);
+                        hi[ii] = hi[ii].max(upos);
+                        if !bits_contains(&local_def, ii) {
+                            bits_insert(&mut use_bits[base..base + words], ii);
+                        }
+                    }
+                }
+                if wants_slot[ui] {
+                    bits_insert(&mut local_def, ui);
+                    bits_insert(&mut def_bits[base..base + words], ui);
+                    lo[ui] = lo[ui].min(upos);
+                    hi[ui] = hi[ui].max(upos);
+                }
+            }
+        }
+
+        // Phi edge copies. Grouping the phis by their merge control once turns
+        // `emit_phi_copies`' per-edge whole-graph scan into a single pass.
+        let mut phis_of: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if !matches!(node.op, Op::Phi) {
+                continue;
+            }
+            if let Some(&merge) = node.inputs.first() {
+                if merge != NO_NODE {
+                    phis_of.entry(merge).or_default().push(id as NodeId);
+                }
+            }
+        }
+        for succ in 0..nb {
+            let merge_ctrl = schedule.blocks[succ].ctrl;
+            let merge_node = match graph.nodes.get(merge_ctrl as usize) {
+                Some(m) if matches!(m.op, Op::Merge | Op::Region) => m,
+                _ => continue,
+            };
+            let phis = match phis_of.get(&merge_ctrl) {
+                Some(phis) => phis,
+                None => continue,
+            };
+            // merge.inputs[k] is the control token for phi value k (= input k+1).
+            for (k, &ctrl_in) in merge_node.inputs.iter().enumerate() {
+                let pred = match ctrl_block_of(graph, schedule, ctrl_in) {
+                    Some(pred) if pred < nb => pred,
+                    _ => continue,
+                };
+                let at = span[pred].1;
+                for &pid in phis {
+                    let v = match graph
+                        .nodes
+                        .get(pid as usize)
+                        .and_then(|p| p.inputs.get(k + 1))
+                    {
+                        Some(&v) if v != NO_NODE => v,
+                        _ => continue,
+                    };
+                    let vi = v as usize;
+                    if vi >= n || !wants_slot[vi] {
+                        continue;
+                    }
+                    lo[vi] = lo[vi].min(at);
+                    hi[vi] = hi[vi].max(at);
+                    bits_insert(&mut phi_out_bits[pred * words..(pred + 1) * words], vi);
+                }
+            }
+        }
+
+        let mut live_in = vec![0u64; words * nb];
+        let mut live_out = vec![0u64; words * nb];
+        let mut scratch = vec![0u64; words];
+        let mut converged = false;
+        for _ in 0..SLOT_PLAN_MAX_ITERATIONS {
+            let mut changed = false;
+            // Reverse block order approximates reverse postorder, which is the
+            // fast direction for a backward analysis.
+            for b in (0..nb).rev() {
+                let base = b * words;
+                scratch.copy_from_slice(&phi_out_bits[base..base + words]);
+                for &s in &schedule.blocks[b].successors {
+                    if s >= nb {
+                        continue;
+                    }
+                    for w in 0..words {
+                        scratch[w] |= live_in[s * words + w];
+                    }
+                }
+                for w in 0..words {
+                    let merged_out = live_out[base + w] | scratch[w];
+                    if merged_out != live_out[base + w] {
+                        live_out[base + w] = merged_out;
+                        changed = true;
+                    }
+                    let entering = use_bits[base + w] | (merged_out & !def_bits[base + w]);
+                    let merged_in = live_in[base + w] | entering;
+                    if merged_in != live_in[base + w] {
+                        live_in[base + w] = merged_in;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                converged = true;
+                break;
+            }
+        }
+        coloured = converged;
+
+        // ── 5a. Widen each range to cover every block it is live in ──
+        //
+        // This is where loops are handled: a value used inside a loop is
+        // live-out of every block on the back edge's path, so its range covers
+        // the whole loop without the colouring ever knowing what a loop is.
+        if coloured {
+            for b in 0..nb {
+                let base = b * words;
+                let (start, end) = span[b];
+                bits_for_each(&live_in[base..base + words], |v| {
+                    if v < n && wants_slot[v] {
+                        lo[v] = lo[v].min(start);
+                    }
+                });
+                bits_for_each(&live_out[base..base + words], |v| {
+                    if v < n && wants_slot[v] {
+                        hi[v] = hi[v].max(end);
+                    }
+                });
+            }
+        }
+    }
+
+    // ── 5b. Finalise the ranges ──────────────────────────────────────
+    let whole_method = LiveRange {
+        lo: 0,
+        hi: total_positions.saturating_sub(1),
+    };
+    let mut range: Vec<Option<LiveRange>> = vec![None; n];
+    for id in 0..n {
+        if !wants_slot[id] {
+            continue;
+        }
+        if !coloured {
+            pinned[id] = true;
+        }
+        range[id] = Some(if lo[id] == usize::MAX || !coloured {
+            // Never placed and never live anywhere (an unscheduled phi, or the
+            // analysis was skipped): assume the whole method and pin it.
+            whole_method
+        } else {
+            LiveRange {
+                lo: lo[id],
+                hi: hi[id].max(lo[id]),
+            }
+        });
+    }
+
+    // Peak simultaneous liveness, by sweeping the interval endpoints. This is
+    // the floor a perfect colouring would reach; `slots` sits above it by the
+    // pinned classes plus whatever the contiguous-interval approximation costs.
+    let mut delta = vec![0i64; total_positions + 2];
+    for r in range.iter().flatten() {
+        if r.lo < delta.len() && r.hi + 1 < delta.len() {
+            delta[r.lo] += 1;
+            delta[r.hi + 1] -= 1;
+        }
+    }
+    let mut running = 0i64;
+    let mut peak_live = 0i64;
+    for d in &delta {
+        running += d;
+        peak_live = peak_live.max(running);
+    }
+
+    // ── 6. Colouring ─────────────────────────────────────────────────
+    //
+    // Pinned values first, in node-id order — the order `prealloc_phi_slots`
+    // walks — so a phi web's slots stay where they have always been and the
+    // frame layout of a phi-only change is unperturbed.
+    let mut node_color: Vec<Option<u32>> = vec![None; n];
+    let mut class: Vec<Option<SlotClass>> = vec![None; n];
+    // A colour index cannot exceed the node count, and `NodeId` is a `u32`, so
+    // the counter provably fits.
+    let mut next_color: u32 = 0;
+    for id in 0..n {
+        if wants_slot[id] && pinned[id] {
+            node_color[id] = Some(next_color);
+            class[id] = Some(SlotClass::Pinned);
+            next_color = next_color.saturating_add(1);
+        }
+    }
+
+    let mut order: Vec<usize> = (0..n).filter(|&id| wants_slot[id] && !pinned[id]).collect();
+    order.sort_by_key(|&id| (range[id].map_or(0, |r| r.lo), id));
+    // (hi, colour, is_ref), min-heap on `hi` so the earliest-expiring colour
+    // is released first.
+    let mut active: BinaryHeap<Reverse<(usize, u32, bool)>> = BinaryHeap::new();
+    let mut free_ref: Vec<u32> = Vec::new();
+    let mut free_prim: Vec<u32> = Vec::new();
+    for id in order {
+        let r = match range[id] {
+            Some(r) => r,
+            None => continue,
+        };
+        while let Some(&Reverse((active_hi, active_color, active_is_ref))) = active.peek() {
+            if active_hi >= r.lo {
+                break;
+            }
+            active.pop();
+            if active_is_ref {
+                free_ref.push(active_color);
+            } else {
+                free_prim.push(active_color);
+            }
+        }
+        let is_ref = graph.nodes[id].ty == IrType::Ref;
+        let recycled = if fresh_only[id] {
+            None
+        } else if is_ref {
+            free_ref.pop()
+        } else {
+            free_prim.pop()
+        };
+        let color = match recycled {
+            Some(color) => color,
+            None => {
+                let color = next_color;
+                next_color = next_color.saturating_add(1);
+                color
+            }
+        };
+        node_color[id] = Some(color);
+        class[id] = Some(if is_ref {
+            SlotClass::Ref
+        } else {
+            SlotClass::Prim
+        });
+        active.push(Reverse((r.hi, color, is_ref)));
+    }
+
+    SlotPlan {
+        node_color,
+        range,
+        class,
+        slots: next_color as usize,
+        peak_live: peak_live.max(0) as usize,
+    }
+}
+
+/// Refuse, before a single byte is emitted, a colouring that could alias two
+/// simultaneously live values onto one frame word.
+///
+/// This is the counterpart of [`verify_data_locations`]: that one asks whether
+/// every value *has* a location, this one asks whether the locations are
+/// *distinct where they must be*. Both failures are silent wrong code — the
+/// first reads the saved caller RBP as program data, the second reads one
+/// value where another was written — so neither is assumed.
+///
+/// Four properties, in the order a violation would bite:
+///
+///   1. every value the lowerer will allocate for has a colour (a plan that
+///      missed one would take `alloc_slot`'s internal-bailout path mid-emission
+///      instead of declining up front);
+///   2. every colour is inside the reservation the frame was sized from;
+///   3. **no two values with overlapping live ranges share a colour** — the
+///      wrong-code property;
+///   4. a colour is never shared across [`SlotClass`]es, so a slot an oop map
+///      names can never hold a primitive, and a pinned value never shares at
+///      all.
+fn verify_slot_colouring(
+    graph: &Graph,
+    schedule: &Schedule,
+    plan: &SlotPlan,
+) -> CompileResult<()> {
+    let color_of = |id: usize| plan.node_color.get(id).copied().flatten();
+
+    // (1) Coverage — the same two sources `plan_slots` enumerates.
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if matches!(node.op, Op::Phi) && color_of(id).is_none() {
+            return Err(Bailout::with_context(
+                BailoutReason::UnallocatedValue { node: id as NodeId },
+                format!("phi n{id} has no planned frame slot"),
+            ));
+        }
+    }
+    for block in &schedule.blocks {
+        for &nid in &block.nodes {
+            let node = match graph.nodes.get(nid as usize) {
+                Some(node) => node,
+                None => {
+                    return Err(Bailout::new(BailoutReason::Internal(
+                        "ir_lower: schedule names a node outside the graph",
+                    )))
+                }
+            };
+            if op_defines_result_slot(&node.op) && color_of(nid as usize).is_none() {
+                return Err(Bailout::with_context(
+                    BailoutReason::UnallocatedValue { node: nid },
+                    format!("scheduled n{nid} ({:?}) has no planned frame slot", node.op),
+                ));
+            }
+        }
+    }
+
+    // (2) Every colour is inside the reservation.
+    for (id, color) in plan.node_color.iter().enumerate() {
+        if let Some(color) = color {
+            if *color as usize >= plan.slots {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal(
+                        "ir_lower: a planned colour is outside the spill reservation",
+                    ),
+                    format!("n{id} coloured {color} with only {} slots", plan.slots),
+                ));
+            }
+        }
+    }
+
+    // (3) + (4) Group by colour and check the members pairwise. Sorting each
+    // group by range start makes the adjacent pairs sufficient: if any pair
+    // overlaps, the earliest offender's predecessor in sort order overlaps it
+    // too, so an adjacent pair always witnesses the violation.
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); plan.slots];
+    for (id, color) in plan.node_color.iter().enumerate() {
+        if let Some(color) = color {
+            if let Some(bucket) = members.get_mut(*color as usize) {
+                bucket.push(id);
+            }
+        }
+    }
+    for (color, bucket) in members.iter().enumerate() {
+        if bucket.len() < 2 {
+            continue;
+        }
+        for &id in bucket {
+            if plan.class.get(id).copied().flatten() == Some(SlotClass::Pinned) {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("ir_lower: a pinned value shares its frame slot"),
+                    format!("slot {color} is shared by {} values, one pinned", bucket.len()),
+                ));
+            }
+        }
+        let classes: Vec<Option<SlotClass>> = bucket
+            .iter()
+            .map(|&id| plan.class.get(id).copied().flatten())
+            .collect();
+        if classes.windows(2).any(|w| w[0] != w[1]) {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal(
+                    "ir_lower: a frame slot is shared across reference and primitive values",
+                ),
+                format!("slot {color} mixes {classes:?}"),
+            ));
+        }
+        let mut intervals: Vec<(LiveRange, usize)> = bucket
+            .iter()
+            .filter_map(|&id| plan.range.get(id).copied().flatten().map(|r| (r, id)))
+            .collect();
+        if intervals.len() != bucket.len() {
+            return Err(Bailout::new(BailoutReason::Internal(
+                "ir_lower: a coloured value has no live range",
+            )));
+        }
+        intervals.sort_by_key(|(r, id)| (r.lo, r.hi, *id));
+        for pair in intervals.windows(2) {
+            let ((a, ai), (b, bi)) = (pair[0], pair[1]);
+            if a.overlaps(b) {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal(
+                        "ir_lower: two simultaneously live values share a frame slot",
+                    ),
+                    format!(
+                        "slot {color}: n{ai} live [{}, {}] overlaps n{bi} live [{}, {}]",
+                        a.lo, a.hi, b.lo, b.hi
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Funnel every refusal in this file through one place: count it, then return
+/// the `None` the public entry points have always returned, which is the
+/// caller's signal to run the method in a lower tier. A compiler refusal must
+/// never terminate the VM.
+fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_BAILOUT").is_some() {
+        eprintln!("[ir-bailout] {bailout}");
+    }
+    record_bailout(&bailout);
+    None
 }
 
 // ── Public entry point ───────────────────────────────────────────────
@@ -4295,6 +5666,51 @@ pub(crate) fn lower_inner(
     {
         return None;
     }
+
+    // ── Resource bounds, decided before anything is reserved ─────────
+    //
+    // Both checks precede `ExecutableBuffer::new` and `Lowerer::new`, so an
+    // over-budget method costs neither an executable mapping nor an enormous
+    // frame. `estimate_frame_bytes` is the same function `Lowerer::new` sizes
+    // the frame from, so passing here guarantees the constructor's `i32`
+    // arithmetic stays in range.
+    if let Err(bailout) = check_graph_size(graph.nodes.len(), DEFAULT_MAX_NODES) {
+        return refuse(bailout);
+    }
+    let frame_needs = scan_frame_needs(graph, helpers);
+    // Liveness-based frame-slot reuse: values whose live ranges do not overlap
+    // share one 8-byte word, so the spill reservation is sized by the peak
+    // number of simultaneously live values instead of by the node count. The
+    // colouring is *checked* before it is used — an aliased pair of live values
+    // is silent wrong code, so it is not taken on trust.
+    let slot_plan = plan_slots(graph, schedule, sr_map);
+    if let Err(bailout) = verify_slot_colouring(graph, schedule, &slot_plan) {
+        return refuse(bailout);
+    }
+    let frame_estimate = estimate_frame_bytes(num_locals, slot_plan.slots, &frame_needs);
+    if let Err(bailout) = check_frame_size(frame_estimate, DEFAULT_MAX_FRAME_BYTES) {
+        return refuse(bailout);
+    }
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SLOTS").is_some() {
+        eprintln!(
+            "[ir-slots] nodes={} blocks={} slots={} peak_live={} frame_bytes={frame_estimate}",
+            graph.nodes.len(),
+            schedule.blocks.len(),
+            slot_plan.slots,
+            slot_plan.peak_live,
+        );
+    }
+
+    // ── Every emitted value has a location, decided before emission ──
+    //
+    // The acceptance test for the `[rbp - 0]` defect: drop a node from the
+    // schedule and this refuses the compile here, with no code emitted at all,
+    // instead of emitting a read of the saved caller frame pointer and
+    // detecting it afterwards with a sticky bit.
+    if let Err(bailout) = verify_data_locations(graph, schedule) {
+        return refuse(bailout);
+    }
+
     // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
     // lowering: an arithmetic node emits well under 32 bytes, but a single
     // MIC + 4-way-PIC dual-ABI inline-cache site emits ~360 and a direct call
@@ -4323,7 +5739,7 @@ pub(crate) fn lower_inner(
         buf,
         num_params,
         num_locals,
-        graph.nodes.len(),
+        &slot_plan,
         helpers,
         branch_hints,
         sr_map,
@@ -4350,7 +5766,9 @@ pub(crate) fn lower_inner(
     // BUG FIX [jit-irlower #2]: reserve phi destination slots before any
     // block is lowered — a forward branch's edge copies (emit_phi_copies)
     // reference slots of phis in not-yet-lowered merge blocks.
-    lowerer.prealloc_phi_slots();
+    if let Err(bailout) = lowerer.prealloc_phi_slots() {
+        return refuse(bailout);
+    }
 
     lowerer.emit_prologue();
     lowerer.emit_safepoint_poll();
@@ -4362,11 +5780,22 @@ pub(crate) fn lower_inner(
 
     // Soundness bail (ES SortingDigestTests -Jit on): some emitted use asked
     // for the frame slot of a node that was never allocated one (scheduler
-    // gap — the node sits in no emitted block). The emitted code would read
-    // `[rbp - 0]`, i.e. the saved caller RBP, as a data value. Discard the
-    // artifact and let the caller fall back to the single-pass backend.
+    // gap — the node sits in no emitted block), or a slot allocation ran past
+    // the frame's spill cap. Discard the artifact and let the caller fall back
+    // to the single-pass backend.
+    //
+    // Both are now UNREACHABLE — `verify_data_locations` and the frame-size
+    // check above refuse those graphs before emission begins — so this is a
+    // net, not a mechanism. It is kept, and upgraded from one sticky bit to a
+    // structured reason, so that if a future lowering finds a path the
+    // pre-checks miss, the compile still fails closed *and* says why.
+    if let Some(bailout) = lowerer.take_latched_bailout() {
+        return refuse(bailout);
+    }
     if lowerer.unallocated_slot_use.get() {
-        return None;
+        return refuse(Bailout::new(BailoutReason::Internal(
+            "ir_lower: unallocated slot latched without a reason",
+        )));
     }
 
     // Soundness bail: every emitted shadow PUSH must have exactly one emitted
@@ -4421,6 +5850,94 @@ pub(crate) fn lower_inner(
     let spill_cap_off = lowerer.spill_cap_off;
     let frame_size = lowerer.frame_size;
 
+    // ── Install-time deopt-metadata verification ─────────────────────
+    //
+    // The metadata is checked BEFORE the artifact becomes a `CompiledMethod`,
+    // because a frame that cannot be reconstructed is only discoverable at
+    // runtime otherwise — at a guard, on a VM thread, with the frame already
+    // half torn down. Bailing here is always semantically valid (the method
+    // takes the single-pass backend or the interpreter); installing code whose
+    // deopt map disagrees with its oop map is not.
+    //
+    // Which lanes are active is decided by which data this backend actually
+    // has, so every check that fires is one this file can be held to:
+    //
+    //   * **scope** — `resolve_frame_state` records `method_key: String::new()`
+    //     (the lowerer does not know the method's identity; deopt resume keys on
+    //     the running `CompiledMethod`), so the limits are registered under that
+    //     same empty key. `code_len`/`max_locals`/`max_stack` are saturated: the
+    //     bytecode length and `max_stack` never reach this function, and
+    //     `num_locals` is not a bound a hand-built graph's snapshots respect.
+    //     What the lane does buy is the `UnknownMethod` check — the day inlined
+    //     caller scopes start carrying real method keys, they must arrive with
+    //     limits rather than silently skipping every per-scope check.
+    //   * **removed-node** — every `Op::Dead` id, cross-checked against the
+    //     scalar-replacement map's keys as the ones a `VirtualObject` recipe is
+    //     allowed to name. This is the lane that catches a recipe built from a
+    //     stale graph.
+    //   * **oop-map agreement** — one `OopCoverage` per emitted `OopMapEntry`,
+    //     keyed by native offset. `emit_safepoint_map` currently pushes entries
+    //     with `native_pc_offset: 0` (the relocation path matches them by the
+    //     safepoint id in the frame slot, not by pc), and registering every map
+    //     under key `0` would compare deopt points against an arbitrary map, so
+    //     only anchored entries are registered. The lane therefore arms itself
+    //     the moment this backend starts anchoring its maps to native offsets.
+    //   * **structural** — always on.
+    let mut verifier = DeoptVerifier::new()
+        .with_method(MethodFrameLimits::new(
+            String::new(),
+            u32::MAX,
+            u16::MAX,
+            u16::MAX,
+        ))
+        .with_removed_nodes(
+            graph
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| matches!(n.op, Op::Dead))
+                .map(|(id, _)| id as u32),
+        );
+    if let Some(sr) = sr_map {
+        verifier = verifier.with_materializable_nodes(sr.objects.keys().copied());
+    }
+    for entry in &oop_maps {
+        if entry.native_pc_offset != 0 {
+            verifier = verifier.with_oop_map(
+                entry.native_pc_offset,
+                OopCoverage {
+                    frame_slot_offsets: entry.frame_slot_offsets.clone(),
+                    // The IR lowerer keeps every live value in a frame slot; it
+                    // never publishes a reference in a GPR.
+                    registers: Vec::new(),
+                    moving_young_coverage_complete: entry.moving_young_coverage_complete,
+                },
+            );
+        }
+    }
+    // Both sets are checked. `deopt_points` is the sorted, native-offset-keyed
+    // list `find_deopt_point` binary-searches; `deopt_boxes` are the boxes baked
+    // into the emitted guards, and those are the frame states a *live* deopt
+    // actually reconstructs from. Each box is verified on its own — they are not
+    // one sorted sequence, so checking them as a slice would report a bogus
+    // ordering violation.
+    for point in &deopt_boxes {
+        if let Err(bailout) = verifier.verify(std::slice::from_ref(&**point)) {
+            return refuse(bailout);
+        }
+    }
+    if let Err(bailout) = verifier.verify(&deopt_points) {
+        return refuse(bailout);
+    }
+
+    // The liveness colouring's peak — the number of values simultaneously live
+    // at the busiest program point — is exactly what
+    // `CompilationReport::peak_live_values` asks for, and this is the only place
+    // in the compiler that computes it. Recorded through the thread-local hook
+    // rather than a parameter because `lower_inner`'s signature is pinned (see
+    // `metrics::note_current_peak_live_values`); a no-op when metrics are off.
+    crate::metrics::note_current_peak_live_values(slot_plan.peak_live);
+
     let buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
     // non-panicking: on capacity exhaustion it sets a sticky `overflowed` flag
@@ -4432,7 +5949,10 @@ pub(crate) fn lower_inner(
     // estimate materially harder, so check it here and let the caller fall back
     // to single-pass, exactly like the unallocated-slot latch above.
     if buf.overflowed() {
-        return None;
+        return refuse(Bailout::new(BailoutReason::CodeBufferExhausted {
+            needed: buf.pos(),
+            capacity: estimated_size.max(4096),
+        }));
     }
     let _code_size = buf.pos();
 
@@ -4592,6 +6112,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -4640,6 +6161,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -5310,6 +6832,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -5377,6 +6900,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -5500,18 +7024,264 @@ mod tests {
     #[test]
     fn test_scalar_deopt_bails_when_store_not_dominating() {
         // Guard in the SAME block as the New/store → strict dominance fails (v1
-        // conservatively rejects same-block ordering) → bail to Undefined → the
-        // resume falls back to a safe whole-method re-run.
-        let (g, sr_map, _newo) = build_sr_deopt_graph(true, false);
+        // conservatively rejects same-block ordering). The bail names the
+        // eliminated allocation instead of claiming the slot is undefined, so
+        // the resume is REFUSED (safe whole-method re-run) rather than served a
+        // fabricated `Int(0)` — which for this reference local would be `null`.
+        let (g, sr_map, newo) = build_sr_deopt_graph(true, false);
         let schedule = ir_schedule::schedule(&g);
         let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
             .expect("lower");
         let locals = deopt_locals_at(&cm, 10);
         assert_eq!(
             locals[1],
-            FrameValue::Undefined,
-            "same-block store must bail to Undefined (safe re-run)"
+            FrameValue::MaterializationRequired(EliminatedValue::allocation(
+                newo,
+                7,
+                EliminationCause::ScalarReplacedObject,
+            )),
+            "a non-dominating store must bail to MaterializationRequired, naming \
+             the producer node and the class it allocated"
         );
+        let fs = &cm
+            ._deopt_point_boxes
+            .iter()
+            .find(|p| p.bci == 10)
+            .expect("deopt box at bci 10")
+            .frame_state;
+        assert!(
+            !crate::deopt::frame_state_is_resumable(fs),
+            "the frame must be unresumable, which is what turns the old silent \
+             null into a refused deopt"
+        );
+        assert_eq!(crate::deopt::count_materialization_required(fs), 1);
+    }
+
+    /// Every remaining bail in `frame_value_for_object` — not just the
+    /// dominance one — must name the elimination rather than spell it
+    /// `Undefined`. The nested-virtual bail additionally carries its own cause,
+    /// so a compiler report can distinguish "escape analysis left me nothing to
+    /// rebuild from" (fix the dominance gate) from "the recipe exists but v1
+    /// emits no nested graphs" (implement nested virtual objects).
+    #[test]
+    fn scalar_deopt_nested_virtual_field_bails_with_its_own_cause() {
+        let (mut g, mut sr_map, newo) = build_sr_deopt_graph(false, false);
+        // Make field 0's value itself a scalar-replaced object: add a second
+        // dead `Op::New` and register it in the map, then point the first
+        // object's only field at it.
+        let inner = g.add(Op::Dead, IrType::Ref, vec![], None);
+        sr_map.objects.insert(
+            inner,
+            VirtualObjectInfo {
+                class_id: 9,
+                num_fields: 0,
+                field_values: vec![],
+                new_ctrl: 1, // Proj(0) — the entry control, dominates everything
+                store_ctrls: vec![],
+            },
+        );
+        sr_map
+            .objects
+            .get_mut(&newo)
+            .expect("outer object")
+            .field_values = vec![Some(inner)];
+
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
+        assert_eq!(
+            deopt_locals_at(&cm, 10)[1],
+            FrameValue::MaterializationRequired(EliminatedValue::allocation(
+                newo,
+                7,
+                EliminationCause::NestedVirtualObject,
+            )),
+            "a nested virtual field must bail with NestedVirtualObject, not \
+             ScalarReplacedObject and not Undefined"
+        );
+    }
+
+    /// A `NO_NODE` snapshot slot is the one case that is *genuinely* undefined —
+    /// the local was never stored on any path reaching this bci, so the verifier
+    /// guarantees the interpreter cannot read it and `Value::Int(0)` is correct.
+    /// It must keep resolving to `Undefined`; widening the eliminated marker to
+    /// cover it would make every method with an unwritten local unresumable.
+    #[test]
+    fn no_node_snapshot_slot_stays_undefined() {
+        let (mut g, sr_map, _newo) = build_sr_deopt_graph(false, false);
+        // locals were [cond, o]; append an unwritten slot.
+        g.safepoints
+            .iter_mut()
+            .find(|s| s.bci == 10)
+            .expect("snapshot at bci 10")
+            .locals
+            .push(NO_NODE);
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower_with_scalar_deopt(&g, &schedule, 1, 3, &no_helpers(), Some(&sr_map))
+            .expect("lower");
+        let locals = deopt_locals_at(&cm, 10);
+        assert_eq!(
+            locals[2],
+            FrameValue::Undefined,
+            "an unwritten local is genuinely undefined, not eliminated"
+        );
+        // And it does NOT block the resume — only the eliminated marker does.
+        assert!(crate::deopt::frame_state_is_resumable(&FrameState {
+            method_key: String::new(),
+            bci: 10,
+            locals: vec![FrameValue::Undefined],
+            stack: vec![],
+            monitors: vec![],
+            caller: None,
+        }));
+    }
+
+    /// `frame_value_for` used to index `graph.nodes` directly, so a snapshot slot
+    /// naming an id past the end of the arena panicked — on the compiler thread,
+    /// which takes the VM down. It must bail to the unresumable marker instead.
+    #[test]
+    fn out_of_range_snapshot_node_id_bails_instead_of_panicking() {
+        let (mut g, _sr_map, _newo) = build_sr_deopt_graph(false, false);
+        let past_end = g.nodes.len() as NodeId + 7;
+        g.safepoints
+            .iter_mut()
+            .find(|s| s.bci == 10)
+            .expect("snapshot at bci 10")
+            .locals
+            .push(past_end);
+        let schedule = ir_schedule::schedule(&g);
+        let cm = lower(&g, &schedule, 1, 3, &no_helpers()).expect("lower");
+        let locals = deopt_locals_at(&cm, 10);
+        assert_eq!(
+            locals[2],
+            FrameValue::MaterializationRequired(EliminatedValue::unknown(
+                EliminationCause::Unclassified,
+            )),
+            "an out-of-range node id must resolve to the unresumable marker"
+        );
+    }
+
+    /// The install-time verifier must reject metadata whose reference slot the
+    /// oop map does not cover — the disagreement that leaves a live reference
+    /// invisible to a relocating collector. Built here directly (rather than
+    /// through `lower_inner`) because this backend does not yet anchor its oop
+    /// maps to native offsets, so the agreement lane has nothing to join on in a
+    /// real compile; the wiring in `lower_inner` arms the moment it does.
+    #[test]
+    fn install_verifier_rejects_an_oop_map_deopt_map_disagreement() {
+        let point = |locals: Vec<FrameValue>| DeoptimizationPoint {
+            native_offset: 0x40,
+            bci: 3,
+            reason: DeoptReason::NullCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: 3,
+                locals,
+                stack: vec![],
+                monitors: vec![],
+                caller: None,
+            },
+        };
+        // The map covers [rbp-40]; deopt spells that word as StackSlotRef(-40).
+        let verifier = DeoptVerifier::new().with_oop_map(0x40, OopCoverage::complete([40]));
+        assert!(
+            verifier
+                .verify(std::slice::from_ref(&point(vec![FrameValue::StackSlotRef(
+                    -40
+                )])))
+                .is_ok(),
+            "a covered reference slot must pass"
+        );
+        let err = verifier
+            .verify(std::slice::from_ref(&point(vec![FrameValue::StackSlotRef(
+                -48,
+            )])))
+            .expect_err("an uncovered reference slot must bail the install");
+        assert!(
+            err.to_string().contains("oop map"),
+            "the bailout must say which agreement broke, got: {err}"
+        );
+    }
+
+    /// A `VirtualObject` recipe may only name a removed node the emitter also
+    /// registered as materializable. Naming a node the optimizer retired without
+    /// a recipe means the metadata was built from a stale graph, and the artifact
+    /// must not install.
+    #[test]
+    fn install_verifier_rejects_a_recipe_for_an_unmaterializable_removed_node() {
+        let point = DeoptimizationPoint {
+            native_offset: 0x10,
+            bci: 1,
+            reason: DeoptReason::DivByZero,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: 1,
+                locals: vec![FrameValue::VirtualObject(VirtualObjectState {
+                    id: 12,
+                    class_id: 3,
+                    num_fields: 1,
+                    field_values: vec![FrameValue::Int(0)],
+                })],
+                stack: vec![],
+                monitors: vec![],
+                caller: None,
+            },
+        };
+        assert!(
+            DeoptVerifier::new()
+                .with_removed_nodes([12u32])
+                .with_materializable_nodes([12u32])
+                .verify(std::slice::from_ref(&point))
+                .is_ok(),
+            "a removed node registered as materializable is exactly what a \
+             VirtualObject slot is allowed to name"
+        );
+        assert!(
+            DeoptVerifier::new()
+                .with_removed_nodes([12u32])
+                .verify(std::slice::from_ref(&point))
+                .is_err(),
+            "a removed node with no recipe must bail the install"
+        );
+    }
+
+    /// `lower_inner` publishes the slot planner's peak-liveness figure to the
+    /// per-compilation report. The number itself is `plan_slots`' business; what
+    /// this pins is that the metric is no longer `NotMeasured` after a compile,
+    /// which is what made it useless to a reader.
+    #[test]
+    fn peak_live_values_reaches_the_compilation_report() {
+        let _guard = crate::metrics::METRICS_TEST_LOCK.lock();
+        crate::metrics::set_enabled_for_test(true);
+
+        // int f(int a, int b) { return a + b; } — two live params at the Add.
+        let code = [0x1a, 0x1b, 0x60, 0xac, 0, 0];
+        let builder = IrBuilder::new(2, 2);
+        let graph = builder.build(&code, 4).expect("build");
+        let schedule = ir_schedule::schedule(&graph);
+        let expected = plan_slots(&graph, &schedule, None).peak_live;
+
+        let published = {
+            let rec = crate::metrics::CompileRecorder::begin("IrLowerPeak", "f", "(II)I", true);
+            lower(&graph, &schedule, 2, 2, &no_helpers()).expect("lower");
+            rec.snapshot().expect("in-flight snapshot")
+        };
+        crate::metrics::set_enabled_for_test(false);
+
+        // `Measured::Value(n)` is distinguishable from `NotMeasured` at every
+        // `n`, so this equality proves the wiring on its own — the planner's
+        // arithmetic is pinned separately by
+        // `non_overlapping_values_share_a_frame_slot`.
+        assert_eq!(
+            published.peak_live_values,
+            crate::metrics::Measured::Value(expected as u32),
+            "lower_inner must publish SlotPlan::peak_live"
+        );
+        assert!(published.to_json().contains("\"peak_live_values\":"));
     }
 
     #[test]
@@ -5537,13 +7307,25 @@ mod tests {
 
     #[test]
     fn test_scalar_deopt_disabled_without_map() {
-        // With `sr_map = None` (the default), the dead-New slot resolves to
-        // Undefined exactly as before — byte-identical to the prior producer.
-        let (g, _sr_map, _newo) = build_sr_deopt_graph(false, false);
+        // With `sr_map = None` (the default), no `VirtualObject` recipe is
+        // emitted — but the slot still describes an object escape analysis
+        // deleted, so it resolves to the unresumable marker rather than to
+        // `Undefined`. This is the DEFAULT-configuration half of the silent-null
+        // fix: `apply_ea_to_ir` runs whether or not `CRATONVM_SCALAR_DEOPT` is
+        // set, so an ordinary production compile reaches exactly this path.
+        // `Unclassified` because the generic slot resolver only knows the
+        // producer is `Op::Dead`, not which pass retired it.
+        let (g, _sr_map, newo) = build_sr_deopt_graph(false, false);
         let schedule = ir_schedule::schedule(&g);
         let cm = lower(&g, &schedule, 1, 3, &no_helpers()).expect("lower");
         let locals = deopt_locals_at(&cm, 10);
-        assert_eq!(locals[1], FrameValue::Undefined);
+        assert_eq!(
+            locals[1],
+            FrameValue::MaterializationRequired(EliminatedValue::new(
+                newo,
+                EliminationCause::Unclassified,
+            )),
+        );
     }
 
     #[test]
@@ -5651,6 +7433,7 @@ mod tests {
             entry: 0,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -5930,5 +7713,705 @@ mod tests {
         // slots 1/3 are dummies (never read by the interpreter).
         assert_eq!(frame.locals[0], FrameValue::Long(0x7_0000_0000));
         assert_eq!(frame.locals[2], FrameValue::Long(0));
+    }
+
+    // ── `[rbp - 0]` sentinel removal + resource bounds ───────────────────
+
+    /// `int f(int a) { return a + 1; }` as a hand-built graph, plus its
+    /// schedule. The smallest shape that has a real data edge to verify.
+    fn add_one_graph() -> (Graph, Schedule) {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let one = graph.add(Op::Const(1), IrType::Int, vec![], None);
+        let sum = graph.add(Op::Add, IrType::Int, vec![a, one], None);
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum], None);
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
+    /// The verifier must not refuse a graph the lowerer handles — otherwise the
+    /// "bail before emission" fix would silently cost JIT coverage.
+    #[test]
+    fn verification_accepts_a_well_formed_graph() {
+        let (graph, schedule) = add_one_graph();
+        assert!(verify_data_locations(&graph, &schedule).is_ok());
+        let method = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a+1 must lower");
+        assert_eq!(unsafe { method.try_call(&[41]) }, Ok(42));
+    }
+
+    /// Acceptance test for the `[rbp - 0]` defect (report: "replace
+    /// zero-initialized `node_slot` with verified optional locations").
+    ///
+    /// A data input that no emitted node defines — here an `Op::Dead` node,
+    /// which the scheduler never places, exactly like the GVN-collapsed
+    /// `ArrayLoad(Double)` observed in `DualPivotQuicksort.insertionSort` —
+    /// must refuse the compile *before* emission, not be detected afterwards by
+    /// a sticky bit. Before this change the use lowered to `[rbp - 0]`, reading
+    /// the saved caller frame pointer as a `double`.
+    #[test]
+    fn an_unallocated_data_input_refuses_the_compile_before_emission() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        // Scheduler omission, modelled: `Op::Dead` is never placed into a
+        // block, so nothing ever allocates a location for it.
+        let ghost = graph.add(Op::Dead, IrType::Int, vec![], None);
+        let sum = graph.add(Op::Add, IrType::Int, vec![a, ghost], None);
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, sum], None);
+
+        let schedule = ir_schedule::schedule(&graph);
+        assert_eq!(
+            schedule.node_to_block[ghost as usize],
+            usize::MAX,
+            "precondition: the ghost node is in no emitted block",
+        );
+
+        let err = verify_data_locations(&graph, &schedule)
+            .expect_err("an unallocated data input must be refused");
+        assert_eq!(err.reason, BailoutReason::UnallocatedValue { node: ghost });
+        assert_eq!(err.category(), "unallocated_value");
+
+        // …and the public entry point turns that into the historical "run in a
+        // lower tier" answer rather than emitting or panicking.
+        assert!(lower(&graph, &schedule, 1, 1, &no_helpers()).is_none());
+    }
+
+    /// The slot accessor has no encoding for "unallocated", so it can never
+    /// hand back `0` — the offset that means `[rbp - 0]`, the saved caller RBP.
+    #[test]
+    fn slot_accessor_never_yields_the_rbp_zero_sentinel() {
+        let (graph, schedule) = add_one_graph();
+        let a = graph
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::Param(0)))
+            .expect("param node") as NodeId;
+        let sum = graph
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Op::Add))
+            .expect("add node") as NodeId;
+
+        let empty: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact_fields: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let helpers = no_helpers();
+        let plan = plan_slots(&graph, &schedule, None);
+        let mut lowerer = Lowerer::new(
+            &graph,
+            &schedule,
+            buf,
+            1,
+            1,
+            &plan,
+            &helpers,
+            &empty,
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact_fields,
+        );
+
+        // Unallocated is an error, not an offset.
+        assert!(lowerer.slot_of_checked(a).is_err());
+        assert!(lowerer.node_slot.iter().all(|slot| slot.is_none()));
+
+        let off = lowerer.alloc_slot_checked(a).expect("first spill slot");
+        assert!(off >= lowerer.first_spill, "{off} < {}", lowerer.first_spill);
+        assert_ne!(off, 0);
+        assert_eq!(lowerer.slot_of_checked(a).expect("allocated"), off);
+        // Non-zero by type, not by convention: every occupied entry is a
+        // `NonZeroU32`, so `0` is not a representable location at all.
+        assert!(lowerer
+            .node_slot
+            .iter()
+            .flatten()
+            .all(|located| located.get() > 0));
+
+        // The infallible façade the emission sites use latches a structured
+        // reason and still never returns 0.
+        let poison = lowerer.slot_of(sum);
+        assert_ne!(poison, 0, "the façade must never emit [rbp - 0]");
+        assert!(lowerer.unallocated_slot_use.get());
+        let latched = lowerer.take_latched_bailout().expect("a latched reason");
+        assert_eq!(latched.reason, BailoutReason::UnallocatedValue { node: sum });
+        // An out-of-range id is an error too — it used to index-panic.
+        assert!(lowerer.slot_of_checked(NO_NODE).is_err());
+    }
+
+    /// Report: "bound graph and frame memory before allocation" — an
+    /// over-budget node count is refused with `GraphTooLarge`.
+    #[test]
+    fn an_over_limit_node_count_bails_with_graph_too_large() {
+        assert!(check_graph_size(0, DEFAULT_MAX_NODES).is_ok());
+        assert!(check_graph_size(DEFAULT_MAX_NODES, DEFAULT_MAX_NODES).is_ok());
+        let err = check_graph_size(DEFAULT_MAX_NODES + 1, DEFAULT_MAX_NODES)
+            .expect_err("over the node budget");
+        assert_eq!(
+            err.reason,
+            BailoutReason::GraphTooLarge {
+                nodes: DEFAULT_MAX_NODES + 1,
+                limit: DEFAULT_MAX_NODES,
+            }
+        );
+        assert_eq!(err.category(), "graph_too_large");
+    }
+
+    /// Report: "bound graph and frame memory before allocation" — the frame is
+    /// estimated (spill reservation + locals + staged outgoing args) and
+    /// refused with `FrameTooLarge` before a byte of it is reserved.
+    #[test]
+    fn an_over_limit_frame_estimate_bails_with_frame_too_large() {
+        let plain = FrameNeeds {
+            needs_context: false,
+            max_call_args: 0,
+        };
+
+        // A normal method is nowhere near the bound.
+        let small = estimate_frame_bytes(4, 32, &plain);
+        assert!(small < DEFAULT_MAX_FRAME_BYTES, "{small}");
+        assert!(check_frame_size(small, DEFAULT_MAX_FRAME_BYTES).is_ok());
+        assert_eq!(small % 16, 0, "the estimate is 16-byte aligned");
+
+        // Each of the three terms the report names moves the estimate.
+        assert!(estimate_frame_bytes(64, 32, &plain) > small); // locals
+        assert!(estimate_frame_bytes(4, 512, &plain) > small); // spills
+        assert!(
+            estimate_frame_bytes(
+                4,
+                32,
+                &FrameNeeds {
+                    needs_context: true,
+                    max_call_args: 8,
+                },
+            ) > small,
+            "staged outgoing arguments must count",
+        );
+
+        // A method whose PEAK LIVE set is as wide as the node budget still has
+        // to be refused: 20_000 simultaneously live values is ~160 KiB, five
+        // times the 32 KiB oop-map bound. What changed with liveness reuse is
+        // that reaching this now takes 20_000 values live *at once*, not merely
+        // 20_000 values in the arena — see
+        // `a_previously_declined_large_method_now_compiles`.
+        let huge = estimate_frame_bytes(0, DEFAULT_MAX_NODES, &plain);
+        assert!(huge > DEFAULT_MAX_FRAME_BYTES, "{huge}");
+        let err =
+            check_frame_size(huge, DEFAULT_MAX_FRAME_BYTES).expect_err("over the frame budget");
+        assert_eq!(
+            err.reason,
+            BailoutReason::FrameTooLarge {
+                bytes: huge,
+                limit: DEFAULT_MAX_FRAME_BYTES,
+            }
+        );
+        assert_eq!(err.category(), "frame_too_large");
+
+        // Saturating, not wrapping: a pathological count reports "enormous"
+        // instead of overflowing into a small (or negative) frame.
+        assert_eq!(
+            estimate_frame_bytes(0, usize::MAX, &plain),
+            usize::MAX & !15usize,
+        );
+
+        // End to end: the public entry point refuses instead of reserving a
+        // frame whose slot offsets the oop map could not even encode.
+        let (graph, schedule) = add_one_graph();
+        assert!(
+            lower(&graph, &schedule, 1, 10_000, &no_helpers()).is_none(),
+            "10_000 locals is an 80 KiB frame — refuse, do not build it",
+        );
+        // The same graph with a sane local count still compiles.
+        assert!(lower(&graph, &schedule, 1, 1, &no_helpers()).is_some());
+    }
+
+    // ── Liveness-based frame-slot reuse ──────────────────────────────────
+
+    /// An empty graph shell, so each test below only writes the shape it cares
+    /// about.
+    fn empty_graph() -> Graph {
+        Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        }
+    }
+
+    /// `int f(int a) { a += 1; a += 1; … }` with `len` increments: a chain in
+    /// which every temporary is dead the instant the next one consumes it. The
+    /// shape the old one-slot-per-node reservation was worst on.
+    fn straight_line_chain(len: usize) -> (Graph, Schedule) {
+        let mut graph = empty_graph();
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let one = graph.add(Op::Const(1), IrType::Int, vec![], None);
+        let mut cur = a;
+        for _ in 0..len {
+            cur = graph.add(Op::Add, IrType::Int, vec![cur, one], None);
+        }
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, cur], None);
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
+    /// Re-derive the linear emission positions [`plan_slots`] numbers, so a
+    /// test can assert *where* a value is live. Deliberately a separate
+    /// implementation of the numbering the module comment documents: if the two
+    /// ever disagree, the loop test below is the one that notices.
+    #[allow(clippy::type_complexity)]
+    fn emission_positions(
+        graph: &Graph,
+        schedule: &Schedule,
+    ) -> (Vec<Option<usize>>, Vec<(usize, usize)>) {
+        let mut pos = vec![None; graph.nodes.len()];
+        let mut span = Vec::with_capacity(schedule.blocks.len());
+        let mut seq = 0usize;
+        for block in &schedule.blocks {
+            let start = seq;
+            for &nid in &block.nodes {
+                pos[nid as usize] = Some(seq);
+                seq += 1;
+            }
+            if let Some(term) = block.terminator {
+                pos[term as usize] = Some(seq);
+                seq += 1;
+            }
+            span.push((start, seq));
+            seq += 1;
+        }
+        (pos, span)
+    }
+
+    /// How many values the plan gives a slot to at all — the number the old
+    /// reservation would have needed (one word each, forever).
+    fn slotted_value_count(plan: &SlotPlan) -> usize {
+        plan.node_color.iter().flatten().count()
+    }
+
+    /// The colouring's whole point: values that are never live at the same time
+    /// land on the same frame word.
+    #[test]
+    fn non_overlapping_values_share_a_frame_slot() {
+        let (graph, schedule) = straight_line_chain(64);
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+
+        let slotted = slotted_value_count(&plan);
+        assert_eq!(slotted, 66, "param + const + 64 adds each want a slot");
+        // Successive links of the chain overlap at one position (the consumer's
+        // own position), so the chain alternates between two words; the
+        // constant and the parameter account for the rest.
+        assert!(
+            plan.slots <= 8,
+            "64 chained temporaries should collapse to a handful of slots, got {}",
+            plan.slots,
+        );
+        assert!(
+            plan.slots < slotted,
+            "no reuse happened at all: {} slots for {slotted} values",
+            plan.slots,
+        );
+        assert!(
+            plan.peak_live <= plan.slots,
+            "peak live ({}) is the floor the colouring cannot beat, slots = {}",
+            plan.peak_live,
+            plan.slots,
+        );
+    }
+
+    /// …and values that ARE live at the same time never do. The endpoint-
+    /// inclusive overlap rule means a value whose last use is at position `p`
+    /// also keeps its word against a value defined at `p`.
+    #[test]
+    fn overlapping_values_never_share_a_frame_slot() {
+        // int f(int a, int b) { int s = a + b; return a + s; }  — `a` is live
+        // across `s`, so the two cannot share; `b` dies at `s`, so it can be
+        // recycled by the value defined last.
+        let mut graph = empty_graph();
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let a = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let b = graph.add(Op::Param(1), IrType::Int, vec![start], None);
+        let s = graph.add(Op::Add, IrType::Int, vec![a, b], None);
+        let t = graph.add(Op::Add, IrType::Int, vec![a, s], None);
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, t], None);
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+        let color = |id: NodeId| plan.node_color[id as usize].expect("a coloured value");
+
+        assert_ne!(color(a), color(b), "both live into the first add");
+        assert_ne!(color(a), color(s), "a outlives s's definition");
+        assert_ne!(color(a), color(t), "a is live where t is defined");
+        assert_ne!(color(s), color(t), "s is live where t is defined");
+        // Four values, one legitimate sharing pair (b dies before t is defined).
+        assert_eq!(slotted_value_count(&plan), 4);
+        assert!(
+            plan.slots < 4,
+            "a dead-before-t value must be recycled, got {} slots",
+            plan.slots,
+        );
+
+        // End to end, the code still computes a + (a + b).
+        let cm = lower(&graph, &schedule, 2, 2, &no_helpers()).expect("lowers");
+        assert_eq!(unsafe { cm.try_call(&[3, 4]) }, Ok(10));
+        assert_eq!(unsafe { cm.try_call(&[-1, 5]) }, Ok(3));
+    }
+
+    /// A value used anywhere in a loop is live across the WHOLE loop, not just
+    /// up to its textually last use — otherwise the second iteration reads a
+    /// word some later definition has overwritten.
+    ///
+    /// The liveness fixed point produces this without knowing what a loop is:
+    /// the back edge makes the header's uses reach every block on the path back
+    /// to it. This test pins that it actually happens.
+    #[test]
+    fn a_loop_carried_value_stays_live_across_the_whole_loop() {
+        // int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; } —
+        // `n` is compared every iteration, so it must survive the back edge.
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        let mut graph = IrBuilder::new(1, 3).build(&code, 21).expect("IR build");
+        ir_optimize::optimize(&mut graph);
+        // Drop the deopt snapshots: every node they name is deliberately pinned
+        // to a dedicated slot, which would make this test pass for the wrong
+        // reason. The pinning itself is covered by
+        // `a_deopt_visible_value_keeps_a_dedicated_slot`.
+        graph.safepoints.clear();
+        let schedule = ir_schedule::schedule(&graph);
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+
+        let (_pos, span) = emission_positions(&graph, &schedule);
+        // The loop: the last back edge (a successor at or before its own block
+        // index — the same test `lower_block` uses to place a safepoint poll)
+        // and the header it returns to.
+        let mut back_edge: Option<(usize, usize)> = None;
+        for (b, block) in schedule.blocks.iter().enumerate() {
+            for &s in &block.successors {
+                if s <= b {
+                    back_edge = Some((s, b));
+                }
+            }
+        }
+        let (header, latch) = back_edge.expect("the counted loop has a back edge");
+        assert!(
+            header < latch,
+            "precondition: the loop spans more than one block ({header}..={latch})",
+        );
+
+        let n_node = graph
+            .nodes
+            .iter()
+            .position(|node| matches!(node.op, Op::Param(0)))
+            .expect("the loop bound is a parameter") as NodeId;
+        let n_range = plan.range[n_node as usize].expect("the loop bound has a live range");
+        assert!(
+            n_range.lo <= span[header].0 && n_range.hi >= span[latch].1,
+            "the loop bound is live [{}, {}] but the loop spans [{}, {}]",
+            n_range.lo,
+            n_range.hi,
+            span[header].0,
+            span[latch].1,
+        );
+
+        // …and therefore nothing defined inside the loop took its word.
+        let n_color = plan.node_color[n_node as usize].expect("a coloured value");
+        for (id, color) in plan.node_color.iter().enumerate() {
+            if id as NodeId == n_node || *color != Some(n_color) {
+                continue;
+            }
+            let block = schedule.node_to_block[id];
+            assert!(
+                block == usize::MAX || block < header || block > latch,
+                "n{id} is inside the loop (block {block}) and reused the loop \
+                 bound's frame slot",
+            );
+        }
+
+        // The behavioural proof is `test_lower_counted_loop_sum`, which runs
+        // this exact method; keep the compile working here too.
+        assert!(lower(&graph, &schedule, 1, 3, &no_helpers()).is_some());
+    }
+
+    /// A reference and a primitive never share a frame word.
+    ///
+    /// `emit_safepoint_map` publishes a slot as a GC root because *some* `Ref`
+    /// value was defined into it, and `defined_nodes` never un-sets. If a
+    /// primitive could inherit that word, the collector would follow an `int`
+    /// as an object pointer. The two free lists are disjoint, so this is a
+    /// property of the representation, not of the schedule.
+    #[test]
+    fn a_reference_is_never_aliased_with_a_non_reference() {
+        // Object f(Object r, int a) { int t = a + 1; int u = t + 1; return r; }
+        // `r` is live to the return; `a`, `t`, `u` die in sequence, so the
+        // primitive pool recycles while the reference pool does not.
+        let mut graph = empty_graph();
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let _mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let r = graph.add(Op::Param(0), IrType::Ref, vec![start], None);
+        let a = graph.add(Op::Param(1), IrType::Int, vec![start], None);
+        let one = graph.add(Op::Const(1), IrType::Int, vec![], None);
+        let t = graph.add(Op::Add, IrType::Int, vec![a, one], None);
+        let u = graph.add(Op::Add, IrType::Int, vec![t, one], None);
+        let v = graph.add(Op::Add, IrType::Int, vec![u, one], None);
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, r], None);
+        let schedule = ir_schedule::schedule(&graph);
+
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+
+        // Reuse did happen among the primitives…
+        assert!(
+            plan.slots < slotted_value_count(&plan),
+            "the primitive chain should have recycled a word",
+        );
+        // …and no word holds both classes.
+        let mut class_of_color: HashMap<u32, SlotClass> = HashMap::new();
+        for (id, color) in plan.node_color.iter().enumerate() {
+            let (color, class) = match (color, plan.class[id]) {
+                (Some(color), Some(class)) => (*color, class),
+                _ => continue,
+            };
+            match class_of_color.get(&color) {
+                Some(seen) => assert_eq!(
+                    *seen, class,
+                    "slot {color} mixes {seen:?} and {class:?} (n{id})",
+                ),
+                None => {
+                    class_of_color.insert(color, class);
+                }
+            }
+        }
+        // The reference genuinely got a word of its own, not merely a word no
+        // primitive happened to want.
+        let r_color = plan.node_color[r as usize].expect("a coloured reference");
+        assert_eq!(class_of_color.get(&r_color), Some(&SlotClass::Ref));
+        for id in [a, t, u, v] {
+            assert_ne!(
+                plan.node_color[id as usize],
+                Some(r_color),
+                "n{id} is a primitive on the reference's word",
+            );
+        }
+    }
+
+    /// Every value a deopt frame names keeps a dedicated slot: the deopt
+    /// producer reads it at a native offset chosen at run time, so "dead by
+    /// then" is not a question this file can answer.
+    #[test]
+    fn a_deopt_visible_value_keeps_a_dedicated_slot() {
+        let (mut graph, _) = straight_line_chain(8);
+        // Name the first two adds in a snapshot, exactly as `IrBuilder` would
+        // for a bytecode boundary whose locals hold them.
+        let adds: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.op, Op::Add))
+            .map(|(id, _)| id as NodeId)
+            .take(2)
+            .collect();
+        graph.safepoints.push(SafepointSnapshot {
+            bci: 0,
+            locals: vec![adds[0]],
+            stack: vec![adds[1]],
+        });
+        let schedule = ir_schedule::schedule(&graph);
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+
+        for &pinned in &adds {
+            assert_eq!(
+                plan.class[pinned as usize],
+                Some(SlotClass::Pinned),
+                "n{pinned} is named by a deopt frame and must not share",
+            );
+            let color = plan.node_color[pinned as usize].expect("a coloured value");
+            let sharers = plan
+                .node_color
+                .iter()
+                .filter(|c| **c == Some(color))
+                .count();
+            assert_eq!(sharers, 1, "n{pinned}'s word is shared by {sharers} values");
+        }
+    }
+
+    /// The colouring verifier is a real check, not a comment: each way a
+    /// colouring could go wrong is refused.
+    #[test]
+    fn the_colouring_verifier_rejects_an_aliased_plan() {
+        let (graph, schedule) = straight_line_chain(8);
+        let good = plan_slots(&graph, &schedule, None);
+        assert!(verify_slot_colouring(&graph, &schedule, &good).is_ok());
+
+        let adds: Vec<usize> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.op, Op::Add))
+            .map(|(id, _)| id)
+            .collect();
+
+        // (a) Two values that ARE live together forced onto one word — the
+        //     silent-wrong-code case.
+        let mut aliased = plan_slots(&graph, &schedule, None);
+        let (first, second) = (adds[0], adds[1]);
+        assert!(
+            aliased.range[first]
+                .expect("range")
+                .overlaps(aliased.range[second].expect("range")),
+            "precondition: consecutive chain links overlap",
+        );
+        let (donor_color, donor_class) = (aliased.node_color[first], aliased.class[first]);
+        aliased.node_color[second] = donor_color;
+        aliased.class[second] = donor_class;
+        let err = verify_slot_colouring(&graph, &schedule, &aliased)
+            .expect_err("an aliased pair must be refused");
+        assert_eq!(err.category(), "internal");
+        assert!(
+            err.to_string().contains("simultaneously live"),
+            "unexpected reason: {err}",
+        );
+
+        // (b) A reference on a primitive's word.
+        let mut mixed = plan_slots(&graph, &schedule, None);
+        let shared = mixed.node_color[adds[0]];
+        mixed.node_color[adds[2]] = shared;
+        mixed.class[adds[2]] = Some(SlotClass::Ref);
+        mixed.class[adds[0]] = Some(SlotClass::Prim);
+        let err = verify_slot_colouring(&graph, &schedule, &mixed)
+            .expect_err("a mixed-class word must be refused");
+        assert!(
+            err.to_string().contains("reference and primitive"),
+            "unexpected reason: {err}",
+        );
+
+        // (c) A value the lowerer will allocate for, left uncoloured — the
+        //     scheduler-omission class `verify_data_locations` guards, restated
+        //     for the plan.
+        let mut missing = plan_slots(&graph, &schedule, None);
+        missing.node_color[adds[0]] = None;
+        let err = verify_slot_colouring(&graph, &schedule, &missing)
+            .expect_err("an uncoloured scheduled value must be refused");
+        assert_eq!(err.category(), "unallocated_value");
+
+        // (d) A colour outside the reservation the frame was sized from.
+        let mut oversized = plan_slots(&graph, &schedule, None);
+        let beyond = oversized.slots as u32 + 1;
+        oversized.node_color[adds[0]] = Some(beyond);
+        assert!(verify_slot_colouring(&graph, &schedule, &oversized).is_err());
+    }
+
+    /// The measurement the report asks for: frame bytes against node count on a
+    /// long straight-line method.
+    #[test]
+    fn frame_bytes_track_peak_liveness_not_node_count() {
+        let plain = FrameNeeds {
+            needs_context: false,
+            max_call_args: 0,
+        };
+        let (graph, schedule) = straight_line_chain(512);
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+
+        let before = estimate_frame_bytes(0, graph.nodes.len(), &plain);
+        let after = estimate_frame_bytes(0, plan.slots, &plain);
+        assert!(
+            after * 8 < before,
+            "frame bytes only fell from {before} to {after} on a 512-link chain",
+        );
+        // The residual is the fixed part of the frame — bookkeeping slots, the
+        // stack-arg reserve and the ABI shadow space — not spill.
+        assert!(after <= 160, "{after} bytes for a 4-slot working set");
+    }
+
+    /// The node ceiling the frame bound implies, before and after.
+    ///
+    /// One 8-byte slot per node put the ceiling at ~4 000 nodes: past that the
+    /// frame estimate crossed `DEFAULT_MAX_FRAME_BYTES` and the optimizing tier
+    /// declined the method outright. Sized by peak liveness instead, a long
+    /// method is bounded by `DEFAULT_MAX_NODES` again.
+    #[test]
+    fn a_previously_declined_large_method_now_compiles() {
+        let plain = FrameNeeds {
+            needs_context: false,
+            max_call_args: 0,
+        };
+
+        // Where the old accounting stopped: the largest node count whose
+        // one-slot-per-node frame still fit.
+        let old_ceiling = (1..=DEFAULT_MAX_NODES)
+            .take_while(|&n| estimate_frame_bytes(0, n, &plain) <= DEFAULT_MAX_FRAME_BYTES)
+            .last()
+            .expect("some node count fits");
+        assert!(
+            (4000..4200).contains(&old_ceiling),
+            "the old ceiling was ~4 000 nodes, computed {old_ceiling}",
+        );
+
+        let (graph, schedule) = straight_line_chain(5_000);
+        assert!(
+            graph.nodes.len() > old_ceiling,
+            "precondition: this method was over the old ceiling",
+        );
+        assert!(
+            check_frame_size(
+                estimate_frame_bytes(0, graph.nodes.len(), &plain),
+                DEFAULT_MAX_FRAME_BYTES,
+            )
+            .is_err(),
+            "precondition: one slot per node would still be refused",
+        );
+
+        let plan = plan_slots(&graph, &schedule, None);
+        verify_slot_colouring(&graph, &schedule, &plan).expect("a sound colouring");
+        assert!(
+            check_frame_size(
+                estimate_frame_bytes(1, plan.slots, &plain),
+                DEFAULT_MAX_FRAME_BYTES,
+            )
+            .is_ok(),
+            "{} slots should fit comfortably",
+            plan.slots,
+        );
+
+        // And it really compiles and really runs.
+        let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("a 5 000-node method lowers");
+        assert_eq!(unsafe { cm.try_call(&[0]) }, Ok(5_000));
+        assert_eq!(unsafe { cm.try_call(&[42]) }, Ok(5_042));
     }
 }

@@ -4361,6 +4361,17 @@ pub struct NativeMethodRegistry {
     /// errors. `Intrinsic` and `Bridge` registrations are never affected.
     /// See docs/synthetic-vs-real-explained.md.
     drop_synthetic_stubs: bool,
+    /// Opt out of the `java/net/Socket` / `ServerSocket` drop below.
+    ///
+    /// That filter exists because ONE registered native shadows a class's real
+    /// bytecode at every dispatch site, so under `CRATONVM_REAL_NET_SOCKETS`
+    /// the synthetic socket surface has to be absent from the registry, not
+    /// merely un-called. That is right for a running VM and wrong for a
+    /// registry built purely to unit-test the synthetic natives themselves:
+    /// there is no real socket bytecode in that process to shadow, so the
+    /// filter just leaves the tests with nothing to call. Default `false`; only
+    /// `cratonvm-vm`'s inline test registry sets it.
+    allow_synthetic_net_sockets: bool,
     /// VM-scoped strict policy (`docs/feature-designs/jdk-only-mode.md` §4,
     /// 2026-07-31). Set once at VM init by
     /// [`set_compatibility_mode`](Self::set_compatibility_mode), before the
@@ -4448,6 +4459,29 @@ pub struct NativeMethodRegistry {
     /// registered for multiple triples (e.g. compiler function merging), the
     /// first-seen triple is the resolved name, exactly as before.
     name_index: FxHashMap<usize, usize>,
+    /// This VM's capability policy, or `None` when the embedder installed none.
+    ///
+    /// A **field**, not a process global, for exactly the reason
+    /// [`compatibility_mode`](Self) is: a policy shared between two `SharedVm`s
+    /// in one process is the cross-VM interference
+    /// `crate::capability` exists to remove. `Arc` because the same policy
+    /// object is also reachable from every native through
+    /// [`CapabilityCheck`](crate::capability::CapabilityCheck), and the audit
+    /// log must be one log, not two.
+    ///
+    /// `None` is the default and costs one null check in `register()` and one
+    /// in [`check_dispatch_capability`](Self::check_dispatch_capability).
+    capabilities: Option<Arc<crate::capability::CapabilitySet>>,
+    /// `slot index -> capability kind` for the handful of registered natives
+    /// that definitionally exercise a capability
+    /// ([`classify_native`](crate::capability::classify_native)).
+    ///
+    /// Sparse on purpose: of ~3,100 registrations only a few dozen classify,
+    /// so this is a small map rather than a byte on the `Copy` `NativeSlot`
+    /// that the `find`/`find_with_kind` hot path copies by value. Populated in
+    /// `register()` only when a policy is installed — with no policy there is
+    /// nothing to check and the map stays empty.
+    sensitive_slots: FxHashMap<u32, crate::capability::CapabilityKind>,
 }
 
 impl NativeMethodRegistry {
@@ -4481,6 +4515,7 @@ impl NativeMethodRegistry {
             // Read once at construction. `CRATONVM_NO_STUBS` (any non-empty
             // value) enables strict mode: synthetic-stub registrations are
             // dropped so calls hit real bytecode or a clear error.
+            allow_synthetic_net_sockets: false,
             drop_synthetic_stubs: cratonvm_types::flags::runtime_var_os("CRATONVM_NO_STUBS")
                 .is_some_and(|v| !v.is_empty()),
             // JDK-only policy is a CLI/init decision, never an env var: it must
@@ -4497,7 +4532,77 @@ impl NativeMethodRegistry {
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
             ),
+            // No policy until an embedder installs one: today's behaviour
+            // exactly. See `capabilities` field doc.
+            capabilities: None,
+            sensitive_slots: FxHashMap::default(),
         }
+    }
+
+    /// Install this VM's capability policy.
+    ///
+    /// Call **once at VM init, before the `register_*` population pass** — this
+    /// gates `register()`, and it is what populates the dispatch-side
+    /// classification map, so a policy installed afterwards leaves the already-
+    /// registered natives unclassified. `&mut self` is the enforcement:
+    /// dispatch only ever holds `&`, so a running native cannot swap the
+    /// policy out from under the gate.
+    ///
+    /// Pass the same `Arc` to
+    /// [`install_capabilities`](crate::capability::install_capabilities) so
+    /// per-call-site gates reached through `NativeContext` share one audit log
+    /// with the registry.
+    pub fn set_capabilities(&mut self, caps: Arc<crate::capability::CapabilitySet>) {
+        self.capabilities = Some(caps);
+    }
+
+    /// This VM's capability policy, if one was installed.
+    #[inline]
+    pub fn capabilities(&self) -> Option<&Arc<crate::capability::CapabilitySet>> {
+        self.capabilities.as_ref()
+    }
+
+    /// The capability a registered native definitionally exercises, or `None`
+    /// for the ~3,100 that exercise none (and for every registration accepted
+    /// before a policy was installed).
+    #[inline]
+    pub fn capability_of_id(
+        &self,
+        id: NativeMethodId,
+    ) -> Option<crate::capability::CapabilityKind> {
+        self.sensitive_slots.get(&(id.index() as u32)).copied()
+    }
+
+    /// Dispatch-side capability gate: check the capability class of the native
+    /// behind `id` before invoking it.
+    ///
+    /// This is the coarse safety net under the per-call-site gates. It can only
+    /// report [`Scope::Any`](crate::capability::Scope::Any) — at this point the
+    /// arguments have not been decoded, so there is no path or host to name —
+    /// which means an `Enforce` deployment must hold the unscoped grant (e.g.
+    /// `process-spawn:*`) for the class of native to dispatch at all, and the
+    /// per-call-site gate then applies the scoped decision. Its value is
+    /// coverage: it fires for every native in
+    /// [`classify_native`](crate::capability::classify_native), including ones
+    /// whose implementation has no gate of its own yet.
+    ///
+    /// With no policy installed this is one `Option` discriminant test.
+    #[inline]
+    #[track_caller]
+    pub fn check_dispatch_capability(
+        &self,
+        id: NativeMethodId,
+    ) -> Result<(), crate::capability::CapabilityDenied> {
+        let Some(caps) = self.capabilities.as_ref() else {
+            return Ok(());
+        };
+        let Some(kind) = self.capability_of_id(id) else {
+            return Ok(());
+        };
+        caps.check(crate::capability::Capability::of(
+            kind,
+            crate::capability::Scope::Any,
+        ))
     }
 
     /// Override the strict no-stubs mode programmatically (e.g. for tests or a
@@ -4653,6 +4758,13 @@ impl NativeMethodRegistry {
             .collect()
     }
 
+    /// Permit the synthetic `java.net.Socket` / `ServerSocket` natives to be
+    /// registered even under `CRATONVM_REAL_NET_SOCKETS`. See
+    /// [`Self::allow_synthetic_net_sockets`]. Test-registry use only.
+    pub fn allow_synthetic_net_sockets(&mut self, allow: bool) {
+        self.allow_synthetic_net_sockets = allow;
+    }
+
     /// Register a native method implementation.
     ///
     /// `#[track_caller]` (2026-07-31, JDK-only §4): the ~40 `register_*`
@@ -4743,6 +4855,7 @@ impl NativeMethodRegistry {
         // phases_late p72, net_phase_e re1/re2, socket_channel, …) — filtering
         // here catches them all in one place. See `reference_server_socket_gap`.
         if real_net_sockets_enabled()
+            && !self.allow_synthetic_net_sockets
             && (class_name == "java/net/Socket"
                 || class_name == "java/net/ServerSocket"
                 // DoHead third root cause (2026-07-13): the WildFly bootstrap
@@ -5184,6 +5297,28 @@ impl NativeMethodRegistry {
         // dispatch path reached the native, and preserving true async
         // semantics for a real pool's `execute()` (not just synchronous
         // fallback).
+        // CAPABILITY GATE (`NativeRegister`). Deliberately the LAST drop arm:
+        // every arm above answers "should this native exist at all in this
+        // build", which is a compatibility question; this one answers "is this
+        // VM permitted to install native code for this triple", which is a
+        // security question, and it must see exactly the set of registrations
+        // that would otherwise be accepted.
+        //
+        // Under the default (no policy installed) this is one `Option`
+        // discriminant test per registration and nothing else — the ~3,100
+        // boot registrations pay a predicted not-taken branch.
+        //
+        // A refusal RETURNS WITHOUT INSERTING, like the JDK-only arm: nothing
+        // reaches `registrations` / `categories` / `provenance` / `slots`, so
+        // the refused triple never appears in the census and `generation()`
+        // does not move. The denial is recorded in the capability audit log,
+        // which is where an operator looks for it.
+        if let Some(caps) = self.capabilities.as_ref() {
+            let request = crate::capability::Capability::native_register(class_name, method_name);
+            if caps.check(request).is_err() {
+                return;
+            }
+        }
         let key = native_method_hash(class_name, method_name, descriptor);
         // With 128-bit composite keys, collisions on our keyspace are
         // vanishingly unlikely. We keep a cheap `debug_assert!` as
@@ -5283,6 +5418,33 @@ impl NativeMethodRegistry {
                 self.slot_invocations
                     .push(std::sync::atomic::AtomicU64::new(0));
                 self.slot_by_key.insert(key, idx);
+            }
+        }
+        // CAPABILITY: classify the slot once, here, so the dispatch-side gate
+        // (`check_dispatch_capability`) is an integer map lookup rather than a
+        // per-invocation string match. Populated only when a policy is
+        // installed — with none there is nothing to gate, and the map stays
+        // empty and unallocated.
+        //
+        // Kept adjacent to the slot publication above because it is keyed by
+        // the slot index, and re-registration of a triple UPDATES the slot in
+        // place: recomputing here keeps the classification tracking whichever
+        // triple currently owns the slot.
+        if self.capabilities.is_some() {
+            let slot_index = match prior_slot {
+                Some(idx) => idx,
+                None => (self.slots.len() - 1) as u32,
+            };
+            match crate::capability::classify_native(class_name, method_name) {
+                Some(kind) => {
+                    self.sensitive_slots.insert(slot_index, kind);
+                }
+                None => {
+                    // A re-registration may have replaced a sensitive triple
+                    // with a non-sensitive one; drop the stale classification
+                    // rather than leaving the slot gated for the wrong reason.
+                    self.sensitive_slots.remove(&slot_index);
+                }
             }
         }
         // AUDIT 2026-05-17 (Fix 5): also populate the class-agnostic
@@ -7073,5 +7235,200 @@ mod tests {
                 "expected a file:line site, got {site}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Capability gate (registration + dispatch chokepoints)
+    // -----------------------------------------------------------------------
+
+    use crate::capability::{
+        Capability, CapabilityKind, CapabilityMode, CapabilitySet, Scope, VmId,
+    };
+
+    #[test]
+    fn no_capability_policy_means_no_gate_at_all() {
+        // The default must be byte-for-byte today's behaviour: registration
+        // accepted, no classification recorded, dispatch check trivially Ok.
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("java/lang/ProcessBuilder", "start", "()V", dummy_native);
+        let id = registry
+            .resolve_id("java/lang/ProcessBuilder", "start", "()V")
+            .expect("registered");
+        assert!(registry.capabilities().is_none());
+        assert_eq!(registry.capability_of_id(id), None);
+        assert!(registry.check_dispatch_capability(id).is_ok());
+    }
+
+    #[test]
+    fn permissive_policy_classifies_but_never_refuses() {
+        let mut registry = NativeMethodRegistry::new();
+        let caps = std::sync::Arc::new(CapabilitySet::new(
+            VmId::from_raw(0xCA9A_0001),
+            CapabilityMode::Permissive,
+        ));
+        registry.set_capabilities(std::sync::Arc::clone(&caps));
+
+        registry.register("java/lang/ProcessBuilder", "start", "()V", dummy_native);
+        registry.register("java/util/HashMap", "put", "()V", dummy_native_2);
+
+        let spawn = registry
+            .resolve_id("java/lang/ProcessBuilder", "start", "()V")
+            .expect("permissive must accept the registration");
+        let benign = registry
+            .resolve_id("java/util/HashMap", "put", "()V")
+            .expect("registered");
+
+        assert_eq!(
+            registry.capability_of_id(spawn),
+            Some(CapabilityKind::ProcessSpawn)
+        );
+        assert_eq!(registry.capability_of_id(benign), None);
+        assert!(registry.check_dispatch_capability(spawn).is_ok());
+        assert!(registry.check_dispatch_capability(benign).is_ok());
+
+        // Both the registration and the dispatch are in the audit log, so a
+        // deployment can see what it would have to grant.
+        let report = caps.audit_report();
+        assert!(
+            report.uses.iter().any(|u| {
+                u.capability.kind() == CapabilityKind::NativeRegister
+                    && u.capability.scope().to_string() == "java/lang/ProcessBuilder.start"
+            }),
+            "registration must be recorded:\n{report}"
+        );
+        assert!(
+            report
+                .uses
+                .iter()
+                .any(|u| u.capability.kind() == CapabilityKind::ProcessSpawn),
+            "dispatch must be recorded:\n{report}"
+        );
+    }
+
+    #[test]
+    fn enforce_refuses_ungranted_registration_without_inserting() {
+        let mut registry = NativeMethodRegistry::new();
+        let mut set = CapabilitySet::new(VmId::from_raw(0xCA9A_0002), CapabilityMode::Enforce);
+        // Grant registration of the HashMap native only.
+        set.grant(Capability::NativeRegister(Scope::name("java/util/HashMap.*")));
+        registry.set_capabilities(std::sync::Arc::new(set));
+
+        let generation_before = registry.generation();
+        registry.register("java/lang/ProcessBuilder", "start", "()V", dummy_native);
+        assert!(
+            registry
+                .find("java/lang/ProcessBuilder", "start", "()V")
+                .is_none(),
+            "a refused registration must not be reachable"
+        );
+        assert_eq!(
+            registry.generation(),
+            generation_before,
+            "a refused registration must not move the registry generation"
+        );
+        assert!(
+            registry.dump_registrations().is_empty(),
+            "a refused registration must not appear in the census"
+        );
+
+        // The granted one still lands.
+        registry.register("java/util/HashMap", "put", "()V", dummy_native_2);
+        assert!(registry.find("java/util/HashMap", "put", "()V").is_some());
+    }
+
+    #[test]
+    fn enforce_gates_dispatch_of_a_classified_native() {
+        let mut registry = NativeMethodRegistry::new();
+        let mut set = CapabilitySet::new(VmId::from_raw(0xCA9A_0003), CapabilityMode::Enforce);
+        // Registration of everything is allowed; the *use* of a spawn native
+        // is not. This is the layering the design intends: install natives
+        // freely, gate what they do.
+        set.grant(Capability::NativeRegister(Scope::Any));
+        set.grant(Capability::LibraryLoad(Scope::Any));
+        registry.set_capabilities(std::sync::Arc::new(set));
+
+        registry.register("java/lang/ProcessBuilder", "start", "()V", dummy_native);
+        registry.register("java/lang/System", "loadLibrary", "()V", dummy_native_2);
+
+        let spawn = registry
+            .resolve_id("java/lang/ProcessBuilder", "start", "()V")
+            .expect("registered");
+        let load = registry
+            .resolve_id("java/lang/System", "loadLibrary", "()V")
+            .expect("registered");
+
+        let denied = registry
+            .check_dispatch_capability(spawn)
+            .expect_err("process-spawn is not granted");
+        assert_eq!(denied.capability, CapabilityKind::ProcessSpawn);
+        assert_eq!(denied.vm, VmId::from_raw(0xCA9A_0003));
+        // `library-load:*` IS granted, so that native dispatches.
+        assert!(registry.check_dispatch_capability(load).is_ok());
+    }
+
+    #[test]
+    fn reregistration_updates_the_slots_capability_classification() {
+        // Re-registration rewrites the slot in place (that is what keeps an
+        // already-issued NativeMethodId valid), so the classification must
+        // track the triple that currently owns the slot — including dropping
+        // it when the new owner is not capability-relevant.
+        let mut registry = NativeMethodRegistry::new();
+        let caps = std::sync::Arc::new(CapabilitySet::new(
+            VmId::from_raw(0xCA9A_0004),
+            CapabilityMode::Permissive,
+        ));
+        registry.set_capabilities(caps);
+
+        registry.register("java/lang/Runtime", "loadLibrary0", "()V", dummy_native);
+        let id = registry
+            .resolve_id("java/lang/Runtime", "loadLibrary0", "()V")
+            .expect("registered");
+        assert_eq!(
+            registry.capability_of_id(id),
+            Some(CapabilityKind::LibraryLoad)
+        );
+
+        // Same triple, new callback: the slot is reused and stays classified.
+        registry.register("java/lang/Runtime", "loadLibrary0", "()V", dummy_native_2);
+        assert_eq!(
+            registry.resolve_id("java/lang/Runtime", "loadLibrary0", "()V"),
+            Some(id),
+            "re-registration must reuse the slot"
+        );
+        assert_eq!(
+            registry.capability_of_id(id),
+            Some(CapabilityKind::LibraryLoad)
+        );
+    }
+
+    #[test]
+    fn two_registries_do_not_share_a_capability_policy() {
+        // The whole point of putting the policy in a field: two VMs in one
+        // process must not see each other's decisions.
+        let mut strict = NativeMethodRegistry::new();
+        let mut lax = NativeMethodRegistry::new();
+        strict.set_capabilities(std::sync::Arc::new(CapabilitySet::new(
+            VmId::from_raw(0xCA9A_0005),
+            CapabilityMode::Enforce,
+        )));
+        lax.set_capabilities(std::sync::Arc::new(CapabilitySet::new(
+            VmId::from_raw(0xCA9A_0006),
+            CapabilityMode::Permissive,
+        )));
+
+        strict.register("java/lang/ProcessBuilder", "start", "()V", dummy_native);
+        lax.register("java/lang/ProcessBuilder", "start", "()V", dummy_native);
+
+        assert!(
+            strict
+                .find("java/lang/ProcessBuilder", "start", "()V")
+                .is_none(),
+            "the enforcing registry refuses"
+        );
+        assert!(
+            lax.find("java/lang/ProcessBuilder", "start", "()V")
+                .is_some(),
+            "the permissive registry is unaffected by the other VM's policy"
+        );
     }
 }

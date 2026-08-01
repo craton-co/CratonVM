@@ -9,10 +9,287 @@
 //!
 //! Control nodes define the block structure; data nodes float freely
 //! and are pinned to blocks by this pass.
+//!
+//! ## Block frequency, layout and intra-block priority (C2 review P1)
+//!
+//! On top of the placement above this module estimates how often each block
+//! executes ([`BlockFrequencies`]), can reorder the block list so hot
+//! successors land physically next and cold subtrees sink to the end
+//! ([`layout_blocks`]), and can list-schedule the *pure* nodes inside a block
+//! by critical path and register pressure rather than raw dependence order
+//! ([`schedule_with_options`]).
+//!
+//! All three are **opt-in**: [`schedule`] is exactly
+//! `schedule_with_options(graph, &ScheduleOptions::default())`, and the default
+//! options leave the block order, the intra-block order and therefore the
+//! emitted bytes byte-for-byte identical to what this pass produced before.
+//! Only [`Schedule::freq`] and [`Schedule::layout`] are new, and both are
+//! additive read-only reports.
+//!
+//! ### The contract with `ir_lower`
+//!
+//! `ir_lower` derives three things from the *order* of [`Schedule::blocks`],
+//! and every one of them survives a reordering by construction:
+//!
+//! 1. **`plan_slots`' position model.** Each block occupies a contiguous run of
+//!    linear positions — one per data node, one for the terminator, then one
+//!    extra for the outgoing edge where `emit_phi_copies` reads that block's phi
+//!    arguments. Reordering permutes whole blocks and never splits, merges,
+//!    adds or drops one, so the numbering is still "spans back to back, one
+//!    edge position each". Intra-block priority scheduling permutes a block's
+//!    `nodes` but keeps the same node *set*, so the block's span keeps its
+//!    length; it also keeps every definition before every use, so no live range
+//!    inverts.
+//! 2. **The back-edge test `succ <= block_idx`,** which `lower_block` /
+//!    `lower_terminator` use to decide where to emit a safepoint poll. The
+//!    layout is a *reverse postorder*: for every edge `u → v` reachable from the
+//!    entry, `pos(u) < pos(v)` unless the edge is retreating (its target is a
+//!    DFS ancestor of its source). Every cycle contains at least one retreating
+//!    edge in any DFS, so every loop still gets at least one poll per iteration.
+//!    A natural loop's back edge — whose target dominates its source — is
+//!    retreating in *every* DFS, so it is polled in every layout.
+//! 3. **`blocks[0]` is the entry.** The layout pins it at position 0, so
+//!    [`compute_dominators`]' entry assumption and `find_best_block`'s fallback
+//!    are unchanged.
+//!
+//! Nothing else in `ir_lower` reads a block index as an ordering:
+//! `emit_phi_copies` matches predecessors by *control token*, and
+//! `patch_branches` resolves every edge through `block_offsets`, so control flow
+//! is index-addressed rather than layout-addressed.
+//!
+//! ### What a "fall-through" means here
+//!
+//! `ir_lower` currently ends **every** block with an explicit `JMP`, including
+//! the edge it calls the fall-through. Making the hot successor physically next
+//! is therefore necessary but not yet sufficient: the redundant `JMP` to
+//! `block_idx + 1` still has to be elided in `ir_lower::lower_block` /
+//! `lower_terminator` for the layout to turn into fewer taken branches and
+//! fewer bytes. [`LayoutReport`] measures the opportunity this pass creates so
+//! that change can be evaluated against a number rather than a hunch.
 
+use super::bailout::{Bailout, BailoutReason};
 use super::ir::{Graph, NodeId, Op, NO_NODE};
+use std::collections::HashMap;
+
+// ── Tuning constants ─────────────────────────────────────────────────
+
+/// Trip count assumed for a loop with no usable profile.
+///
+/// The classic static-profile default (Ball–Larus / Wu–Larus and every
+/// production compiler since) — a loop back edge is taken ~90 % of the time,
+/// i.e. the body runs ~10× per entry. It is deliberately modest: over-
+/// estimating trip counts inflates every block inside a loop relative to
+/// straight-line code, and the layout only needs the *ordering* of frequencies
+/// to be right, not their absolute scale.
+pub const DEFAULT_TRIP_COUNT: f64 = 10.0;
+
+/// Clamp on an estimated trip count, so a profile that saw one loop exit in a
+/// million iterations cannot produce a frequency that saturates `f64` precision
+/// once it is raised to the nesting depth.
+const MAX_TRIP_COUNT: f64 = 1_000.0;
+
+/// Edge probabilities are clamped away from 0 and 1 so a single profiled
+/// branch can never drive a reachable block's frequency to exactly zero (which
+/// would make "hotter than" comparisons meaningless for everything downstream
+/// of it).
+const MIN_EDGE_PROB: f64 = 0.01;
+const MAX_EDGE_PROB: f64 = 1.0 - MIN_EDGE_PROB;
+
+/// Minimum observations before a branch profile is trusted over the static
+/// heuristics. Matches `profile::BranchCounts::is_usually_taken`'s own
+/// `total >= 20` floor, so the two tiers agree about what "profiled" means.
+pub const MIN_PROFILE_SAMPLES: u64 = 20;
+
+/// Saturation ceiling for a block frequency. A deeply nested loop nest reaches
+/// this long before `f64` loses precision, and every consumer only compares
+/// frequencies, so saturating is strictly better than overflowing to infinity.
+const MAX_BLOCK_FREQ: f64 = 1.0e9;
+
+/// A block is "cold" when it executes less than this fraction of one entry
+/// execution — i.e. it is reached only through an unlikely branch.
+pub const COLD_FREQ_THRESHOLD: f64 = 0.05;
 
 // ── Public types ─────────────────────────────────────────────────────
+
+/// Observed taken / not-taken counts for one conditional branch.
+///
+/// Deliberately a plain pair rather than a borrow of `profile::BranchCounts`:
+/// the scheduler must not depend on the profile module's storage (the same
+/// numbers arrive from `profile::MethodProfile::branches`, from
+/// `pgo::BranchProfile`, and from hand-written tests), and the counts are two
+/// integers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BranchBias {
+    /// Times the branch condition was TRUE (the `Proj(0)` edge was taken).
+    pub taken: u64,
+    /// Times the branch condition was FALSE (the `Proj(1)` edge was taken).
+    pub not_taken: u64,
+}
+
+impl BranchBias {
+    /// Total observations.
+    pub fn total(&self) -> u64 {
+        self.taken.saturating_add(self.not_taken)
+    }
+
+    /// Probability of the TRUE edge, or `None` when there are too few samples
+    /// to prefer this over the static heuristics.
+    pub fn taken_probability(&self) -> Option<f64> {
+        let total = self.total();
+        if total < MIN_PROFILE_SAMPLES {
+            return None;
+        }
+        Some(clamp_prob(self.taken as f64 / total as f64))
+    }
+}
+
+/// Knobs for [`schedule_with_options`]. `Default` reproduces the historical
+/// scheduler exactly: no profile, no reordering, dependence-order-only
+/// intra-block scheduling.
+#[derive(Debug, Clone, Default)]
+pub struct ScheduleOptions {
+    /// Profiled branch bias keyed by the *bytecode PC* of the `Op::If`, which
+    /// is the same key `ir_lower`'s `branch_hints` and the interpreter's
+    /// `profile::MethodProfile::record_branch` use. Empty ⇒ static heuristics
+    /// only.
+    pub branch_counts: HashMap<usize, BranchBias>,
+    /// Reorder [`Schedule::blocks`] so hot successors fall through and cold
+    /// subtrees sink towards the end.
+    pub layout_hot_paths: bool,
+    /// List-schedule the pure nodes inside each block by critical path and
+    /// register pressure instead of plain dependence order.
+    pub priority_within_blocks: bool,
+    /// Groups of block indices (in the *pre-layout* numbering) that must stay
+    /// contiguous and in relative order — the shape an exception handler's
+    /// protected range takes once the IR grows exception edges.
+    ///
+    /// The IR front end does not build exception edges today (`IrBuilder::build`
+    /// skips handler bodies outright, so a JIT frame never takes one), which is
+    /// why this is empty in the production pipeline. It exists because a layout
+    /// pass that has no notion of a region cannot be *made* region-safe later
+    /// without re-deriving the order, and because "cold-block sinking must not
+    /// move a block out of its protected range" is a property worth pinning
+    /// before there is a range to violate.
+    pub protected_regions: Vec<Vec<usize>>,
+}
+
+/// Where a block's frequency estimate came from, and what it is.
+///
+/// Frequencies are **normalized on the entry block**: `freq[0] == 1.0` means
+/// "once per invocation of this method", so a block inside a 10-trip loop reads
+/// ~9.0 and a block behind a 1-in-100 branch reads ~0.01. That normalization is
+/// what makes the numbers comparable across methods and stable under
+/// reordering — permuting blocks permutes this vector and changes no value.
+#[derive(Debug, Clone, Default)]
+pub struct BlockFrequencies {
+    /// Estimated executions per method invocation, one entry per block.
+    /// Always finite, non-negative and `<= MAX_BLOCK_FREQ`.
+    pub freq: Vec<f64>,
+    /// Loop nesting depth (0 = not in any loop).
+    pub depth: Vec<u32>,
+    /// True for a block that is the target of a natural loop back edge.
+    pub is_loop_header: Vec<bool>,
+    /// Estimated trip count for each loop header (1.0 for non-headers).
+    pub trip: Vec<f64>,
+    /// `edge_prob[b][i]` is the probability of leaving `b` via
+    /// `blocks[b].successors[i]`. Parallel to `successors`, which the layout
+    /// never reorders, so `ir_lower`'s "`successors[0]` is the taken edge"
+    /// convention is untouched.
+    pub edge_prob: Vec<Vec<f64>>,
+    /// Two-way branches whose probabilities came from real profile data.
+    pub profiled_branches: usize,
+    /// Two-way branches that fell back to the static heuristics.
+    pub static_branches: usize,
+}
+
+impl BlockFrequencies {
+    /// The largest frequency in the method (at least 1.0, since the entry is
+    /// normalized to 1.0 and there is always an entry).
+    pub fn max_freq(&self) -> f64 {
+        self.freq
+            .iter()
+            .copied()
+            .fold(1.0f64, |a, b| if b > a { b } else { a })
+    }
+
+    /// Frequency of `b` as a fraction of the hottest block, in `[0, 1]`.
+    /// Returns 0.0 for an out-of-range index rather than panicking.
+    pub fn relative(&self, b: usize) -> f64 {
+        match self.freq.get(b) {
+            Some(&f) => (f / self.max_freq()).clamp(0.0, 1.0),
+            None => 0.0,
+        }
+    }
+
+    /// True when `b` runs on well under one invocation in twenty — the blocks
+    /// worth sinking away from the hot path. Out-of-range indices are cold.
+    pub fn is_cold(&self, b: usize) -> bool {
+        self.freq.get(b).copied().unwrap_or(0.0) < COLD_FREQ_THRESHOLD
+    }
+
+    /// Fraction of two-way branches whose probability came from a profile
+    /// rather than a heuristic — the "profile accuracy" input the review asks
+    /// to measure. 1.0 with no branches at all (nothing was guessed).
+    pub fn profile_coverage(&self) -> f64 {
+        let total = self.profiled_branches + self.static_branches;
+        if total == 0 {
+            1.0
+        } else {
+            self.profiled_branches as f64 / total as f64
+        }
+    }
+}
+
+/// What the layout pass actually achieved, measured on the CFG it just laid
+/// out rather than asserted.
+///
+/// `fallthrough_weight` counts an edge `u → v` when `v` is *physically next*
+/// after `u`, weighted by how often that edge is estimated to execute
+/// (`freq[u] * P(u → v)`). `baseline_fallthrough_weight` is the same sum over
+/// the original order, so the two together are the improvement this pass makes
+/// available to `ir_lower` once it stops emitting `JMP next`.
+#[derive(Debug, Clone, Default)]
+pub struct LayoutReport {
+    /// False when the layout was not requested, or was computed and rejected
+    /// by its own validator (in which case the original order is kept).
+    pub applied: bool,
+    /// Edges whose target is the physically next block, after layout.
+    pub fallthrough_edges: usize,
+    /// Same, before layout.
+    pub baseline_fallthrough_edges: usize,
+    /// Execution-weighted fall-through, after layout.
+    pub fallthrough_weight: f64,
+    /// Same, before layout.
+    pub baseline_fallthrough_weight: f64,
+    /// Total execution weight over all CFG edges — the denominator for both
+    /// weights above.
+    pub total_edge_weight: f64,
+    /// Cold blocks that moved strictly later in the order.
+    pub cold_blocks_sunk: usize,
+    /// Why the layout was rejected, when it was.
+    pub rejected: Option<String>,
+}
+
+impl LayoutReport {
+    /// Fraction of execution weight that leaves a block by falling into the
+    /// physically next one. 1.0 when there are no edges at all.
+    pub fn fallthrough_fraction(&self) -> f64 {
+        if self.total_edge_weight <= 0.0 {
+            1.0
+        } else {
+            (self.fallthrough_weight / self.total_edge_weight).clamp(0.0, 1.0)
+        }
+    }
+
+    /// The same fraction for the pre-layout order.
+    pub fn baseline_fallthrough_fraction(&self) -> f64 {
+        if self.total_edge_weight <= 0.0 {
+            1.0
+        } else {
+            (self.baseline_fallthrough_weight / self.total_edge_weight).clamp(0.0, 1.0)
+        }
+    }
+}
 
 /// A basic block in the scheduled output.
 #[derive(Debug)]
@@ -42,6 +319,14 @@ pub struct Schedule {
     /// guard-surviving scalar-replacement producer — can prove that a value's
     /// defining block always executes before a deopt point.
     pub dom: Vec<Vec<bool>>,
+    /// Per-block execution frequency estimate, indexed by the *final* block
+    /// index (i.e. permuted along with `blocks` when a layout is applied).
+    /// Always populated — it costs one linear pass over a CFG whose block count
+    /// is small — so a consumer can weight spill cost, code alignment or
+    /// inlining without asking for the layout.
+    pub freq: BlockFrequencies,
+    /// What the frequency-driven layout did, or why it did nothing.
+    pub layout: LayoutReport,
 }
 
 impl Schedule {
@@ -72,7 +357,23 @@ impl Schedule {
 // ── Scheduler ────────────────────────────────────────────────────────
 
 /// Schedule the IR graph into basic blocks.
+///
+/// Exactly `schedule_with_options(graph, &ScheduleOptions::default())`: no
+/// profile, no reordering, dependence-order-only intra-block scheduling. The
+/// block list, each block's node order and therefore the bytes `ir_lower`
+/// emits are unchanged from before block frequencies existed; the only
+/// addition is the read-only [`Schedule::freq`] / [`Schedule::layout`] report.
 pub fn schedule(graph: &Graph) -> Schedule {
+    schedule_with_options(graph, &ScheduleOptions::default())
+}
+
+/// Schedule the IR graph into basic blocks, with frequency-driven block layout
+/// and priority intra-block scheduling under caller control.
+///
+/// Total: this function never panics and never fails. Every optional stage
+/// validates its own output and silently keeps the previous state when the
+/// validation fails, recording the reason in [`Schedule::layout`].
+pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule {
     let num_nodes = graph.nodes.len();
 
     // Step 1: Identify control-flow nodes and build block structure
@@ -216,15 +517,69 @@ pub fn schedule(graph: &Graph) -> Schedule {
         blocks[block].nodes.push(id as NodeId);
     }
 
-    // Step 5: Topological sort data nodes within each block
+    // Step 5: Order the data nodes within each block.
+    //
+    // The baseline is a plain dependence (topological) order. With
+    // `priority_within_blocks` the *pure* nodes are instead list-scheduled by
+    // critical path and register pressure; impure nodes keep their relative
+    // order exactly, because the IR threads memory through `mem` edges but
+    // `Op::Guard` carries none — its ordering against a store is positional, so
+    // moving it would be a semantic change, not a scheduling decision.
     for block in &mut blocks {
         topo_sort_block(graph, &mut block.nodes);
+        if opts.priority_within_blocks {
+            priority_sort_block(graph, &mut block.nodes);
+        }
     }
+
+    // Step 6: Estimate how often each block runs, then (optionally) lay the
+    // blocks out so the hot successors fall through.
+    let mut freq = compute_frequencies(graph, &blocks, &dom, opts);
+    let mut layout = LayoutReport {
+        total_edge_weight: total_edge_weight(&blocks, &freq),
+        ..LayoutReport::default()
+    };
+    let identity: Vec<usize> = (0..blocks.len()).collect();
+    layout.baseline_fallthrough_edges = count_fallthrough_edges(&blocks, &identity);
+    layout.baseline_fallthrough_weight = fallthrough_weight(&blocks, &freq, &identity);
+    layout.fallthrough_edges = layout.baseline_fallthrough_edges;
+    layout.fallthrough_weight = layout.baseline_fallthrough_weight;
+
+    if opts.layout_hot_paths {
+        match layout_blocks(&blocks, &freq, &opts.protected_regions) {
+            Ok(order) => {
+                layout.fallthrough_edges = count_fallthrough_edges(&blocks, &order);
+                layout.fallthrough_weight = fallthrough_weight(&blocks, &freq, &order);
+                layout.cold_blocks_sunk = count_cold_sunk(&freq, &order);
+                layout.applied = true;
+                apply_order(&mut blocks, &mut node_to_block, &mut freq, &order);
+            }
+            Err(bailout) => {
+                // Not a compilation bailout: the method still compiles, it just
+                // keeps the order it already had. Recorded rather than counted,
+                // so the bailout table stays a table of *refused compiles*.
+                layout.rejected = Some(bailout.to_string());
+            }
+        }
+    }
+
+    // The dominator relation is a property of the CFG, not of its numbering,
+    // but `dom` is *indexed* by block number — so recompute it after a
+    // permutation rather than trying to permute a matrix in place. Callers
+    // (`Schedule::node_strictly_dominates_block`, the scalar-replacement deopt
+    // producer) index it with post-layout indices.
+    let dom = if layout.applied {
+        compute_dominators(&blocks)
+    } else {
+        dom
+    };
 
     Schedule {
         blocks,
         node_to_block,
         dom,
+        freq,
+        layout,
     }
 }
 
@@ -453,6 +808,963 @@ fn topo_sort_block(graph: &Graph, nodes: &mut Vec<NodeId>) {
     }
 
     *nodes = sorted;
+}
+
+// ── Intra-block priority scheduling ──────────────────────────────────
+
+/// Blocks larger than this keep the plain dependence order.
+///
+/// The selection loop rescans the ready set on every pick, so it is quadratic
+/// in the block's node count. A straight-line method can put thousands of nodes
+/// in one block (the deep-operand-chain case `topo_sort_block` exists for), and
+/// a compiler must not turn a pathological graph into a pathological *compile*
+/// — the same rule `ir_lower::SLOT_PLAN_WORK_BUDGET` states for liveness.
+const PRIORITY_BLOCK_BUDGET: usize = 4_000;
+
+/// Re-order the data nodes of one block by scheduling priority, refining the
+/// dependence order [`topo_sort_block`] has already produced.
+///
+/// Two things drive the priority, in this order:
+///
+/// * **Register pressure.** A node whose operands die at it *frees* frame slots;
+///   a node that only defines a value *costs* one. Preferring the negative-delta
+///   candidates keeps peak liveness — the number `ir_lower::plan_slots` colours
+///   and `estimate_frame_bytes` budgets — down.
+/// * **Critical path.** Among candidates with equal pressure delta, the one with
+///   the longest remaining dependence chain goes first, so the chain that
+///   determines the block's length starts as early as possible.
+///
+/// Ties break on the seed order, so the output is a deterministic function of
+/// the input — a scheduler that depends on hash iteration order cannot be
+/// bisected against.
+///
+/// **What it never reorders.** Only *pure* nodes float. Every impure node
+/// (`Op::Store`, `Op::Call`, `Op::Guard`, `Op::Div`, …) is wired into a total
+/// chain in its existing relative order, so no side effect, deopt point or
+/// potentially-throwing operation changes position relative to another. That
+/// matters because the IR threads memory through `mem` edges but `Op::Guard`
+/// carries none: its ordering against a store is positional, and moving it
+/// would be a semantic change rather than a scheduling decision.
+///
+/// Total: leaves `nodes` untouched on anything it cannot schedule (a duplicate
+/// entry, a dangling id, a dependence cycle, or a block over budget).
+fn priority_sort_block(graph: &Graph, nodes: &mut Vec<NodeId>) {
+    let count = nodes.len();
+    if count <= 2 || count > PRIORITY_BLOCK_BUDGET {
+        return;
+    }
+    // `nodes` is already a valid topological order on entry.
+    let baseline: Vec<NodeId> = nodes.clone();
+
+    let mut idx_of: HashMap<NodeId, usize> = HashMap::with_capacity(count);
+    for (i, &id) in baseline.iter().enumerate() {
+        idx_of.insert(id, i);
+    }
+    if idx_of.len() != count {
+        return; // duplicate entry — not a shape this pass reasons about
+    }
+
+    let is_phi = |i: usize| -> bool {
+        matches!(
+            graph.nodes.get(baseline[i] as usize),
+            Some(node) if matches!(node.op, Op::Phi)
+        )
+    };
+
+    // Value dependences inside this block.
+    //
+    // A phi's *value* inputs are deliberately excluded: they are read by the
+    // predecessor block's edge copies (`ir_lower::emit_phi_copies`) at the
+    // predecessor's outgoing-edge position, not at the phi's own position —
+    // exactly the attribution `plan_slots` makes. Including them would also make
+    // a loop-carried phi depend on a node defined later in its own block, a
+    // cycle no order can satisfy.
+    let mut val_deps: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut val_use_count: Vec<usize> = vec![0; count];
+    for (i, &id) in baseline.iter().enumerate() {
+        let node = match graph.nodes.get(id as usize) {
+            Some(node) => node,
+            None => return,
+        };
+        if matches!(node.op, Op::Phi) {
+            continue;
+        }
+        for &inp in &node.inputs {
+            if inp == NO_NODE {
+                continue;
+            }
+            if let Some(&j) = idx_of.get(&inp) {
+                if j != i && !val_deps[i].contains(&j) {
+                    val_deps[i].push(j);
+                    val_use_count[j] += 1;
+                }
+            }
+        }
+    }
+
+    // Full ordering DAG = value dependences + the side-effect chain.
+    let mut deps: Vec<Vec<usize>> = val_deps.clone();
+    let mut users: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (i, d) in deps.iter().enumerate() {
+        for &j in d {
+            users[j].push(i);
+        }
+    }
+    // Phis lead the chain: a phi is defined on entry to its block, before any
+    // instruction in it. Everything else keeps its existing relative order.
+    let mut chain: Vec<usize> = (0..count)
+        .filter(|&i| {
+            !graph
+                .nodes
+                .get(baseline[i] as usize)
+                .map(|node| node.op.is_pure())
+                .unwrap_or(false)
+        })
+        .collect();
+    chain.sort_by_key(|&i| (!is_phi(i), i));
+    for w in chain.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if !deps[b].contains(&a) {
+            deps[b].push(a);
+            users[a].push(b);
+        }
+    }
+
+    // Seed order: phis first, then the incoming dependence order. This is a
+    // valid topological order of the DAG above (a phi has no in-block
+    // dependence, and the chain follows the incoming order among non-phis), so
+    // it both computes heights and breaks ties deterministically.
+    let mut seed: Vec<usize> = (0..count).collect();
+    seed.sort_by_key(|&i| (!is_phi(i), i));
+    let mut seed_rank = vec![0usize; count];
+    for (r, &i) in seed.iter().enumerate() {
+        seed_rank[i] = r;
+    }
+
+    // Critical-path height: longest chain of dependent nodes still ahead.
+    let mut height = vec![1usize; count];
+    for &i in seed.iter().rev() {
+        let mut h = 1usize;
+        for &u in &users[i] {
+            h = h.max(height[u].saturating_add(1));
+        }
+        height[i] = h;
+    }
+
+    let mut remaining_deps: Vec<usize> = deps.iter().map(|d| d.len()).collect();
+    let mut remaining_uses: Vec<usize> = val_use_count.clone();
+    let mut ready: Vec<usize> = (0..count).filter(|&i| remaining_deps[i] == 0).collect();
+    let mut out: Vec<NodeId> = Vec::with_capacity(count);
+
+    while !ready.is_empty() {
+        let mut best_slot = 0usize;
+        let mut best_key: Option<(i64, usize, usize)> = None;
+        for (k, &i) in ready.iter().enumerate() {
+            // Operands whose *last* remaining consumer is this node die here.
+            let kills = val_deps[i]
+                .iter()
+                .filter(|&&j| remaining_uses[j] == 1)
+                .count() as i64;
+            // `usize::MAX - height` turns "prefer the longest chain" into a
+            // minimisation, so the whole key is compared in one direction.
+            let key = (1i64 - kills, usize::MAX - height[i], seed_rank[i]);
+            if best_key.map(|b| key < b).unwrap_or(true) {
+                best_key = Some(key);
+                best_slot = k;
+            }
+        }
+        let i = ready.swap_remove(best_slot);
+        out.push(baseline[i]);
+        for &j in &val_deps[i] {
+            if remaining_uses[j] > 0 {
+                remaining_uses[j] -= 1;
+            }
+        }
+        for &u in &users[i] {
+            if remaining_deps[u] > 0 {
+                remaining_deps[u] -= 1;
+                if remaining_deps[u] == 0 {
+                    ready.push(u);
+                }
+            }
+        }
+    }
+
+    // A cycle would leave nodes unscheduled. The plain topological order is
+    // always valid, so keep it rather than emitting a partial block.
+    if out.len() == count {
+        *nodes = out;
+    }
+}
+
+// ── Block frequency estimation ───────────────────────────────────────
+
+/// Clamp a probability into `[MIN_EDGE_PROB, MAX_EDGE_PROB]`, mapping NaN and
+/// the infinities to "no information" (0.5) rather than propagating them.
+#[inline]
+fn clamp_prob(p: f64) -> f64 {
+    if !p.is_finite() {
+        return 0.5;
+    }
+    p.clamp(MIN_EDGE_PROB, MAX_EDGE_PROB)
+}
+
+/// The index within `blocks[b].successors` of the TRUE (`Proj(0)`) edge of an
+/// `Op::If`, or `None` when `b` is not a two-way branch or the projections
+/// cannot be identified.
+///
+/// Read off the successor's *control node* rather than from the successor's
+/// position, because `schedule` builds the successor list by scanning the graph
+/// in node-id order and `ir_lower` only ever assumes `successors[0]` is the
+/// taken edge — an assumption this pass must read, not re-derive.
+fn true_successor_index(graph: &Graph, blocks: &[Block], b: usize) -> Option<usize> {
+    let blk = blocks.get(b)?;
+    if blk.successors.len() != 2 {
+        return None;
+    }
+    for (i, &s) in blk.successors.iter().enumerate() {
+        let ctrl = blocks.get(s)?.ctrl;
+        if let Some(node) = graph.nodes.get(ctrl as usize) {
+            if node.op == Op::Proj(0) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Profiled probability of the TRUE edge of `blocks[b]`'s `Op::If`, keyed by
+/// the branch's bytecode PC. `None` when there is no terminator, no PC, no
+/// profile entry, or too few samples to beat the static heuristics.
+fn profiled_taken_prob(
+    graph: &Graph,
+    blocks: &[Block],
+    b: usize,
+    opts: &ScheduleOptions,
+) -> Option<f64> {
+    let term = blocks.get(b)?.terminator?;
+    let node = graph.nodes.get(term as usize)?;
+    if node.op != Op::If {
+        return None;
+    }
+    let pc = node.bytecode_pc?;
+    opts.branch_counts.get(&pc)?.taken_probability()
+}
+
+/// Estimate how often each block executes, normalized so the entry block is
+/// 1.0 (once per method invocation).
+///
+/// The model, in order of precedence:
+///
+/// 1. **Real profile.** A two-way branch whose bytecode PC has at least
+///    [`MIN_PROFILE_SAMPLES`] observations takes its edge probabilities straight
+///    from the counts (clamped away from 0 and 1). The same counts also give the
+///    enclosing loop its trip count, via `trip = 1 / P(exit)`.
+/// 2. **Loop structure.** Natural loops are found from the CFG's back edges
+///    (an edge whose target *dominates* its source), giving each block a nesting
+///    depth. A loop header's frequency is multiplied by its trip count, so its
+///    body outweighs everything outside the loop.
+/// 3. **Static branch heuristics.** With no profile, an edge that leaves the
+///    innermost enclosing loop gets `1 / trip` and the edge that stays gets the
+///    rest; an edge back to a dominating header likewise gets the bulk. Anything
+///    else is an even split — guessing at a branch nobody measured is how a
+///    static profile earns a *worse* layout than no layout.
+///
+/// Frequencies are then propagated once in reverse postorder, ignoring edges
+/// that run backwards in that order (their source is not yet known; the loop
+/// multiplier is what accounts for them). This is a single linear pass rather
+/// than an iterative fixed point, so the cost is `O(blocks + edges)` and the
+/// result is a deterministic function of the CFG and the profile.
+///
+/// Total: never panics. An empty CFG yields empty vectors.
+pub fn compute_frequencies(
+    graph: &Graph,
+    blocks: &[Block],
+    dom: &[Vec<bool>],
+    opts: &ScheduleOptions,
+) -> BlockFrequencies {
+    let n = blocks.len();
+    let mut out = BlockFrequencies {
+        freq: vec![0.0; n],
+        depth: vec![0; n],
+        is_loop_header: vec![false; n],
+        trip: vec![1.0; n],
+        edge_prob: blocks
+            .iter()
+            .map(|blk| vec![0.0; blk.successors.len()])
+            .collect(),
+        profiled_branches: 0,
+        static_branches: 0,
+    };
+    if n == 0 {
+        return out;
+    }
+
+    // ── 1. Natural loops ─────────────────────────────────────────────
+    //
+    // A back edge is one whose target dominates its source. The loop body is
+    // everything that reaches the latch without passing back through the
+    // header, i.e. the standard backward closure over predecessors.
+    let mut loop_body: Vec<Option<Vec<bool>>> = vec![None; n];
+    for (latch, blk) in blocks.iter().enumerate() {
+        for &header in &blk.successors {
+            if header >= n || !dominates(dom, header, latch) {
+                continue;
+            }
+            out.is_loop_header[header] = true;
+            let body = loop_body[header].get_or_insert_with(|| {
+                let mut v = vec![false; n];
+                v[header] = true;
+                v
+            });
+            if latch == header {
+                continue; // self loop: the header is the whole body
+            }
+            let mut stack = Vec::new();
+            if !body[latch] {
+                body[latch] = true;
+                stack.push(latch);
+            }
+            while let Some(x) = stack.pop() {
+                for &p in &blocks[x].predecessors {
+                    if p < n && !body[p] {
+                        body[p] = true;
+                        stack.push(p);
+                    }
+                }
+            }
+        }
+    }
+    for h in 0..n {
+        if let Some(body) = &loop_body[h] {
+            for (x, &inside) in body.iter().enumerate() {
+                if inside {
+                    out.depth[x] = out.depth[x].saturating_add(1);
+                }
+            }
+        }
+    }
+    // Innermost enclosing loop per block: the deepest header whose body
+    // contains it. Ties (two headers at equal depth) go to the lower index, so
+    // the answer does not depend on iteration order.
+    let mut innermost: Vec<Option<usize>> = vec![None; n];
+    for h in 0..n {
+        if let Some(body) = &loop_body[h] {
+            for (x, &inside) in body.iter().enumerate() {
+                if !inside {
+                    continue;
+                }
+                let better = match innermost[x] {
+                    None => true,
+                    Some(cur) => out.depth[h] > out.depth[cur],
+                };
+                if better {
+                    innermost[x] = Some(h);
+                }
+            }
+        }
+    }
+
+    // ── 2. Trip counts ───────────────────────────────────────────────
+    for h in 0..n {
+        let body = match &loop_body[h] {
+            Some(body) => body,
+            None => continue,
+        };
+        let mut trip = DEFAULT_TRIP_COUNT;
+        for b in 0..n {
+            if !body[b] || blocks[b].successors.len() != 2 {
+                continue;
+            }
+            let s0 = blocks[b].successors[0];
+            let s1 = blocks[b].successors[1];
+            let in0 = s0 < n && body[s0];
+            let in1 = s1 < n && body[s1];
+            if in0 == in1 {
+                continue; // not a loop exit branch
+            }
+            let (ti, pt) = match (
+                true_successor_index(graph, blocks, b),
+                profiled_taken_prob(graph, blocks, b, opts),
+            ) {
+                (Some(ti), Some(pt)) => (ti, pt),
+                _ => continue,
+            };
+            // Probability of the edge that leaves the loop.
+            let p_true_is_exit = if ti == 0 { !in0 } else { !in1 };
+            let p_exit = if p_true_is_exit { pt } else { 1.0 - pt };
+            trip = (1.0 / clamp_prob(p_exit)).clamp(1.0, MAX_TRIP_COUNT);
+            break;
+        }
+        out.trip[h] = trip;
+    }
+
+    // ── 3. Edge probabilities ────────────────────────────────────────
+    for b in 0..n {
+        let ns = blocks[b].successors.len();
+        match ns {
+            0 => {}
+            1 => out.edge_prob[b][0] = 1.0,
+            2 => {
+                let ti = true_successor_index(graph, blocks, b);
+                let profiled = profiled_taken_prob(graph, blocks, b, opts);
+                if let (Some(ti), Some(pt)) = (ti, profiled) {
+                    out.profiled_branches += 1;
+                    out.edge_prob[b][ti] = pt;
+                    out.edge_prob[b][1 - ti] = 1.0 - pt;
+                } else {
+                    out.static_branches += 1;
+                    let (p0, p1) = static_branch_probs(blocks, dom, &loop_body, &innermost, &out, b);
+                    out.edge_prob[b][0] = p0;
+                    out.edge_prob[b][1] = p1;
+                }
+            }
+            _ => {
+                let p = 1.0 / ns as f64;
+                for i in 0..ns {
+                    out.edge_prob[b][i] = p;
+                }
+            }
+        }
+    }
+
+    // ── 4. Propagate in reverse postorder ────────────────────────────
+    let dfs = dfs_layout(blocks, None);
+    out.freq[0] = 1.0;
+    for &b in &dfs.order {
+        if b == 0 {
+            continue;
+        }
+        let mut acc = 0.0f64;
+        for &p in &blocks[b].predecessors {
+            if p >= n {
+                continue;
+            }
+            // Skip edges that run backwards in this order: their source's
+            // frequency is not known yet, and the loop multiplier below is what
+            // accounts for the iterations they represent.
+            if dfs.pos[p] >= dfs.pos[b] || dfs.pos[p] == usize::MAX {
+                continue;
+            }
+            let i = match blocks[p].successors.iter().position(|&s| s == b) {
+                Some(i) => i,
+                None => continue,
+            };
+            acc += out.freq[p] * out.edge_prob[p].get(i).copied().unwrap_or(0.0);
+        }
+        if out.is_loop_header[b] {
+            acc *= out.trip[b];
+        }
+        out.freq[b] = acc;
+    }
+
+    // ── 5. Normalize ─────────────────────────────────────────────────
+    //
+    // The entry is 1.0 by construction; every other value is finite,
+    // non-negative and saturated at MAX_BLOCK_FREQ so a deep loop nest cannot
+    // reach infinity and make "hotter than" meaningless.
+    for f in out.freq.iter_mut() {
+        if !f.is_finite() || *f < 0.0 {
+            *f = 0.0;
+        } else if *f > MAX_BLOCK_FREQ {
+            *f = MAX_BLOCK_FREQ;
+        }
+    }
+    out.freq[0] = 1.0;
+    out
+}
+
+/// Static (profile-free) probabilities for the two successors of `blocks[b]`.
+///
+/// Returns `(P(successors[0]), P(successors[1]))`.
+fn static_branch_probs(
+    blocks: &[Block],
+    dom: &[Vec<bool>],
+    loop_body: &[Option<Vec<bool>>],
+    innermost: &[Option<usize>],
+    freq: &BlockFrequencies,
+    b: usize,
+) -> (f64, f64) {
+    let n = blocks.len();
+    let s0 = blocks[b].successors[0];
+    let s1 = blocks[b].successors[1];
+
+    // Back-edge heuristic: an edge to a header that dominates this block closes
+    // a loop, and a loop is entered to be repeated.
+    let back0 = s0 < n && dominates(dom, s0, b);
+    let back1 = s1 < n && dominates(dom, s1, b);
+    if back0 != back1 {
+        let header = if back0 { s0 } else { s1 };
+        let trip = freq.trip.get(header).copied().unwrap_or(DEFAULT_TRIP_COUNT);
+        let p_back = clamp_prob(1.0 - 1.0 / trip.max(1.0));
+        return if back0 {
+            (p_back, 1.0 - p_back)
+        } else {
+            (1.0 - p_back, p_back)
+        };
+    }
+
+    // Loop-exit heuristic: leaving the innermost enclosing loop is the
+    // improbable direction, by exactly the trip count that defines the loop.
+    if let Some(h) = innermost.get(b).copied().flatten() {
+        if let Some(body) = loop_body.get(h).and_then(|x| x.as_ref()) {
+            let in0 = s0 < n && body[s0];
+            let in1 = s1 < n && body[s1];
+            if in0 != in1 {
+                let trip = freq.trip.get(h).copied().unwrap_or(DEFAULT_TRIP_COUNT);
+                let p_stay = clamp_prob(1.0 - 1.0 / trip.max(1.0));
+                return if in0 {
+                    (p_stay, 1.0 - p_stay)
+                } else {
+                    (1.0 - p_stay, p_stay)
+                };
+            }
+        }
+    }
+
+    // Nothing to go on. An even split is deliberate: inventing a bias for a
+    // branch nobody measured is how a static profile earns a worse layout than
+    // no layout at all.
+    (0.5, 0.5)
+}
+
+// ── Block layout ─────────────────────────────────────────────────────
+
+/// The depth-first walk both the frequency propagation and the layout share.
+struct DfsResult {
+    /// Blocks in reverse postorder — the entry block's tree first, then any
+    /// block unreachable from the entry, each in its own reverse postorder.
+    order: Vec<usize>,
+    /// `pos[b]` is `b`'s index in `order` (`usize::MAX` if absent).
+    pos: Vec<usize>,
+    /// Reachable from block 0.
+    reachable: Vec<bool>,
+    /// Edges whose target was on the DFS stack — the retreating edges. Every
+    /// cycle contains at least one, and a natural loop's back edge (target
+    /// dominates source) is retreating in *every* DFS.
+    retreating: Vec<(usize, usize)>,
+}
+
+/// Depth-first reverse postorder over the block CFG.
+///
+/// With `priority`, each block's successors are visited in **ascending**
+/// priority. Reverse postorder emits a block immediately before the subtree of
+/// its *last-visited* successor, so visiting cold-first puts the hottest
+/// successor physically next — the fall-through — and sinks the cold subtree
+/// behind it.
+///
+/// Iterative, with an explicit work stack: a recursive walk overflows the native
+/// stack on a long chain of blocks, which is the same reason `topo_sort_block`
+/// is iterative.
+fn dfs_layout(blocks: &[Block], priority: Option<&[f64]>) -> DfsResult {
+    let n = blocks.len();
+    let mut result = DfsResult {
+        order: Vec::with_capacity(n),
+        pos: vec![usize::MAX; n],
+        reachable: vec![false; n],
+        retreating: Vec::new(),
+    };
+    if n == 0 {
+        return result;
+    }
+
+    let mut succ_order: Vec<Vec<usize>> = Vec::with_capacity(n);
+    for blk in blocks {
+        let mut ss: Vec<usize> = blk.successors.iter().copied().filter(|&s| s < n).collect();
+        if let Some(pri) = priority {
+            ss.sort_by(|&a, &b| {
+                let fa = pri.get(a).copied().unwrap_or(0.0);
+                let fb = pri.get(b).copied().unwrap_or(0.0);
+                fa.partial_cmp(&fb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(&b))
+            });
+        }
+        succ_order.push(ss);
+    }
+
+    const UNVISITED: u8 = 0;
+    const ON_STACK: u8 = 1;
+    const DONE: u8 = 2;
+    let mut state = vec![UNVISITED; n];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+
+    // Block 0 is the entry and must stay at position 0, so it roots the first
+    // walk; anything it cannot reach is walked afterwards and appended, never
+    // prepended.
+    let mut next_root = Some(0usize);
+    while let Some(root) = next_root {
+        let mut post: Vec<usize> = Vec::new();
+        state[root] = ON_STACK;
+        stack.push((root, 0));
+        while let Some(&(b, edge)) = stack.last() {
+            let frame = stack.len() - 1;
+            if edge < succ_order[b].len() {
+                stack[frame].1 = edge + 1;
+                let s = succ_order[b][edge];
+                if state[s] == UNVISITED {
+                    state[s] = ON_STACK;
+                    stack.push((s, 0));
+                } else if state[s] == ON_STACK {
+                    result.retreating.push((b, s));
+                }
+            } else {
+                state[b] = DONE;
+                post.push(b);
+                stack.pop();
+            }
+        }
+        let entry_tree = result.order.is_empty();
+        for &b in post.iter().rev() {
+            result.pos[b] = result.order.len();
+            result.order.push(b);
+            if entry_tree {
+                result.reachable[b] = true;
+            }
+        }
+        next_root = (0..n).find(|&b| state[b] == UNVISITED);
+    }
+    result
+}
+
+/// Compute a frequency-driven block order: `order[position] = block index`.
+///
+/// The result is a reverse postorder of the block CFG in which each block's
+/// hottest successor is visited last, so it lands immediately after — the
+/// fall-through — while cold subtrees sink behind it. Reverse postorder is not
+/// an aesthetic choice: `ir_lower` reads `succ <= block_idx` as "this is a back
+/// edge, emit a safepoint poll", and reverse postorder is exactly the property
+/// that makes that test mean what it says.
+///
+/// Cold sinking is therefore bounded by that constraint. A cold block is moved
+/// *behind the hot subtree that shares its predecessor*, not to the physical end
+/// of the method: relocating it past its own successors would turn forward edges
+/// into apparent back edges, and a layout pass may not manufacture safepoint
+/// semantics.
+///
+/// Returns a structured [`Bailout`] rather than panicking or silently emitting a
+/// broken order when the result fails its own validation; the caller keeps the
+/// order it already had, which is always correct.
+pub fn layout_blocks(
+    blocks: &[Block],
+    freq: &BlockFrequencies,
+    protected_regions: &[Vec<usize>],
+) -> Result<Vec<usize>, Bailout> {
+    let n = blocks.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let dfs = dfs_layout(blocks, Some(&freq.freq));
+    if dfs.order.len() != n {
+        return Err(Bailout::with_context(
+            BailoutReason::Internal("block layout did not enumerate every block"),
+            format!("laid out {} of {} blocks", dfs.order.len(), n),
+        ));
+    }
+    let mut order = dfs.order.clone();
+    repair_regions(&mut order, protected_regions, n)?;
+    validate_order(blocks, &order, &dfs, protected_regions)?;
+    Ok(order)
+}
+
+/// Pull each protected region's members back together, contiguously, at the
+/// position of its earliest member — keeping their laid-out relative order.
+///
+/// This is what stops cold-block sinking from lifting a block out of an
+/// exception handler's protected range: a cold block inside the range is still
+/// ordered after the hot ones *within* the range, but it cannot leave it.
+fn repair_regions(
+    order: &mut Vec<usize>,
+    regions: &[Vec<usize>],
+    n: usize,
+) -> Result<(), Bailout> {
+    for region in regions {
+        let mut members: Vec<usize> = region.iter().copied().filter(|&b| b < n).collect();
+        members.sort_unstable();
+        members.dedup();
+        if members.len() < 2 {
+            continue; // a region of one block is contiguous by definition
+        }
+        let pos = positions_of(order, n);
+        if members.iter().any(|&b| pos[b] == usize::MAX) {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal("protected region names a block outside the layout"),
+                format!("region {members:?}"),
+            ));
+        }
+        let mut by_pos = members.clone();
+        by_pos.sort_by_key(|&b| pos[b]);
+        let anchor = pos[by_pos[0]];
+        let mut rebuilt: Vec<usize> = Vec::with_capacity(order.len());
+        for (p, &b) in order.iter().enumerate() {
+            if p == anchor {
+                rebuilt.extend(by_pos.iter().copied());
+            }
+            if !members.contains(&b) {
+                rebuilt.push(b);
+            }
+        }
+        *order = rebuilt;
+    }
+    Ok(())
+}
+
+/// Check every property `ir_lower` and this module's own callers rely on:
+/// the order is a permutation of the blocks, the entry stays first, no edge
+/// that is not retreating runs backwards, and every protected region is
+/// contiguous.
+fn validate_order(
+    blocks: &[Block],
+    order: &[usize],
+    dfs: &DfsResult,
+    regions: &[Vec<usize>],
+) -> Result<(), Bailout> {
+    let n = blocks.len();
+    if order.len() != n {
+        return Err(Bailout::with_context(
+            BailoutReason::Internal("block layout changed the block count"),
+            format!("{} positions for {} blocks", order.len(), n),
+        ));
+    }
+    let mut pos = vec![usize::MAX; n];
+    for (p, &b) in order.iter().enumerate() {
+        if b >= n {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal("block layout names a block that does not exist"),
+                format!("position {p} holds b{b}"),
+            ));
+        }
+        if pos[b] != usize::MAX {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal("block layout repeats a block"),
+                format!("b{b} at positions {} and {p}", pos[b]),
+            ));
+        }
+        pos[b] = p;
+    }
+    if order.first() != Some(&0) {
+        return Err(Bailout::new(BailoutReason::Internal(
+            "block layout moved the entry block off position 0",
+        )));
+    }
+
+    // Reverse-postorder property. Every backwards edge out of *reachable* code
+    // must be one the DFS classified as retreating; that is what keeps
+    // `ir_lower`'s `succ <= block_idx` safepoint-poll test meaning "back edge",
+    // and it guarantees every loop still polls at least once per iteration.
+    let retreating: std::collections::HashSet<(usize, usize)> =
+        dfs.retreating.iter().copied().collect();
+    for (b, blk) in blocks.iter().enumerate() {
+        if !dfs.reachable[b] {
+            continue; // dead code: an extra poll there is harmless
+        }
+        for &s in &blk.successors {
+            if s >= n || pos[s] > pos[b] {
+                continue;
+            }
+            if !retreating.contains(&(b, s)) {
+                return Err(Bailout::with_context(
+                    BailoutReason::Internal("block layout put a forward edge backwards"),
+                    format!("edge b{b} -> b{s} at positions {} -> {}", pos[b], pos[s]),
+                ));
+            }
+        }
+    }
+
+    for region in regions {
+        let mut members: Vec<usize> = region.iter().copied().filter(|&b| b < n).collect();
+        members.sort_unstable();
+        members.dedup();
+        if members.len() < 2 {
+            continue;
+        }
+        let mut ps: Vec<usize> = members.iter().map(|&b| pos[b]).collect();
+        ps.sort_unstable();
+        let span = ps[ps.len() - 1] - ps[0] + 1;
+        if span != ps.len() {
+            return Err(Bailout::with_context(
+                BailoutReason::Internal("block layout split a protected region"),
+                format!("region {members:?} spans {span} positions"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite the block list, the node→block map and the frequency report into the
+/// order's numbering.
+///
+/// Only called with an order that [`validate_order`] has accepted, so the
+/// permutation is total; the recovery path exists because a scheduler that can
+/// leave the block list half-moved is worse than one that gives up.
+fn apply_order(
+    blocks: &mut Vec<Block>,
+    node_to_block: &mut [usize],
+    freq: &mut BlockFrequencies,
+    order: &[usize],
+) {
+    let n = blocks.len();
+    if order.len() != n || n == 0 {
+        return;
+    }
+    let new_index = positions_of(order, n);
+    if new_index.iter().any(|&p| p == usize::MAX) {
+        return;
+    }
+
+    let mut slots: Vec<Option<Block>> = std::mem::take(blocks).into_iter().map(Some).collect();
+    let mut reordered: Vec<Block> = Vec::with_capacity(n);
+    for &b in order {
+        match slots.get_mut(b).and_then(|slot| slot.take()) {
+            Some(blk) => reordered.push(blk),
+            None => break,
+        }
+    }
+    if reordered.len() != n {
+        // Unreachable after validation. Put every block back, in its original
+        // order (each still carries its original `id`), and change nothing else
+        // — the schedule stays exactly as it was.
+        for slot in slots.iter_mut() {
+            if let Some(blk) = slot.take() {
+                reordered.push(blk);
+            }
+        }
+        reordered.sort_by_key(|blk| blk.id);
+        *blocks = reordered;
+        return;
+    }
+
+    for (p, blk) in reordered.iter_mut().enumerate() {
+        blk.id = p;
+        for s in blk.successors.iter_mut() {
+            if *s < n {
+                *s = new_index[*s];
+            }
+        }
+        for pred in blk.predecessors.iter_mut() {
+            if *pred < n {
+                *pred = new_index[*pred];
+            }
+        }
+    }
+    *blocks = reordered;
+
+    for slot in node_to_block.iter_mut() {
+        if *slot < n {
+            *slot = new_index[*slot];
+        }
+    }
+
+    // The frequency report is indexed by block, so it permutes with them.
+    // `edge_prob` rows stay aligned with `successors` because the layout never
+    // reorders a block's successor list — only the indices it names.
+    let new_freq: Vec<f64> = order
+        .iter()
+        .map(|&b| freq.freq.get(b).copied().unwrap_or(0.0))
+        .collect();
+    let new_depth: Vec<u32> = order
+        .iter()
+        .map(|&b| freq.depth.get(b).copied().unwrap_or(0))
+        .collect();
+    let new_header: Vec<bool> = order
+        .iter()
+        .map(|&b| freq.is_loop_header.get(b).copied().unwrap_or(false))
+        .collect();
+    let new_trip: Vec<f64> = order
+        .iter()
+        .map(|&b| freq.trip.get(b).copied().unwrap_or(1.0))
+        .collect();
+    let new_probs: Vec<Vec<f64>> = order
+        .iter()
+        .map(|&b| freq.edge_prob.get(b).cloned().unwrap_or_default())
+        .collect();
+    freq.freq = new_freq;
+    freq.depth = new_depth;
+    freq.is_loop_header = new_header;
+    freq.trip = new_trip;
+    freq.edge_prob = new_probs;
+}
+
+// ── Layout measurement ───────────────────────────────────────────────
+
+/// Invert an order into `pos[block] = position`.
+fn positions_of(order: &[usize], n: usize) -> Vec<usize> {
+    let mut pos = vec![usize::MAX; n];
+    for (p, &b) in order.iter().enumerate() {
+        if b < n {
+            pos[b] = p;
+        }
+    }
+    pos
+}
+
+/// Estimated executions of `blocks[b]`'s `i`-th outgoing edge.
+fn edge_weight(freq: &BlockFrequencies, b: usize, i: usize) -> f64 {
+    let f = freq.freq.get(b).copied().unwrap_or(0.0);
+    let p = freq
+        .edge_prob
+        .get(b)
+        .and_then(|row| row.get(i))
+        .copied()
+        .unwrap_or(0.0);
+    f * p
+}
+
+/// Total estimated executions over every CFG edge — the denominator for the
+/// fall-through fractions in [`LayoutReport`].
+fn total_edge_weight(blocks: &[Block], freq: &BlockFrequencies) -> f64 {
+    let mut total = 0.0f64;
+    for (b, blk) in blocks.iter().enumerate() {
+        for i in 0..blk.successors.len() {
+            total += edge_weight(freq, b, i);
+        }
+    }
+    total
+}
+
+/// Edges whose target is the physically next block under `order`.
+fn count_fallthrough_edges(blocks: &[Block], order: &[usize]) -> usize {
+    let n = blocks.len();
+    let pos = positions_of(order, n);
+    let mut count = 0usize;
+    for (b, blk) in blocks.iter().enumerate() {
+        if pos[b] == usize::MAX {
+            continue;
+        }
+        for &s in &blk.successors {
+            if s < n && pos[s] != usize::MAX && pos[s] == pos[b] + 1 {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// The same edges, weighted by how often they are estimated to execute.
+fn fallthrough_weight(blocks: &[Block], freq: &BlockFrequencies, order: &[usize]) -> f64 {
+    let n = blocks.len();
+    let pos = positions_of(order, n);
+    let mut weight = 0.0f64;
+    for (b, blk) in blocks.iter().enumerate() {
+        if pos[b] == usize::MAX {
+            continue;
+        }
+        for (i, &s) in blk.successors.iter().enumerate() {
+            if s < n && pos[s] != usize::MAX && pos[s] == pos[b] + 1 {
+                weight += edge_weight(freq, b, i);
+            }
+        }
+    }
+    weight
+}
+
+/// Cold blocks that ended up strictly later than they started.
+fn count_cold_sunk(freq: &BlockFrequencies, order: &[usize]) -> usize {
+    let n = order.len();
+    let pos = positions_of(order, n);
+    (0..n)
+        .filter(|&b| freq.is_cold(b) && pos[b] != usize::MAX && pos[b] > b)
+        .count()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -696,6 +2008,7 @@ mod tests {
             entry: NO_NODE,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let a = graph.add(Op::Const(1), IrType::Int, vec![], None); // 0
         let b = graph.add(Op::Const(2), IrType::Int, vec![], None); // 1
@@ -717,6 +2030,7 @@ mod tests {
             entry: NO_NODE,
             exit: NO_NODE,
             safepoints: Vec::new(),
+            uses: Default::default(),
         };
         let base = graph.add(Op::Const(0), IrType::Int, vec![], None);
         let mut prev = base;

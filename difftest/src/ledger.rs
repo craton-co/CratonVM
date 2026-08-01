@@ -172,17 +172,72 @@ impl Observation {
 /// An observable channel the oracle compares (design §3.3). Each disagreement
 /// a [`compare`](crate::oracle::compare) reports is tagged with the channel it
 /// came from, so the ledger and the run summary can say *what* diverged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// ## Why the exception channel is four channels
+///
+/// "The exception differed" is not an actionable report: a wrong *type* is a
+/// dispatch or resolution bug, a wrong *message* is usually a formatting or
+/// helpful-NPE gap, and wrong *frames* are an attribution bug in the unwinder.
+/// The committed `ExceptionId` ledger row is exactly this case — its CCE
+/// message lacks HotSpot's module/loader detail while the type and frames are
+/// right — and collapsing all three into one string made that read as a single
+/// opaque "exception" diff. Each is now its own dimension, reported
+/// independently, so a divergence names which one moved.
+///
+/// [`Channel::Exception`] survives as the **presence** dimension: one VM threw
+/// and the other did not, which is a different finding from the two throwing
+/// differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Channel {
     /// Process exit code (a CratonVM timeout is reported here too).
     ExitCode,
-    /// Uncaught-exception identity (fqcn + message + ordered frames).
+    /// Uncaught-exception **presence**: one side threw, the other did not.
     Exception,
+    /// Uncaught-exception **type** (`fqcn`), compared exactly.
+    ExceptionType,
+    /// Uncaught-exception **message**, compared exactly after normalization.
+    ExceptionMessage,
+    /// Uncaught-exception **stack frames**, compared in order (so a reversed
+    /// stack trace surfaces as an ordering diff).
+    ExceptionFrames,
     /// Program stdout (strict after normalization).
     Stdout,
     /// Program stderr (contextual; not gated by default).
     Stderr,
+    /// The program's own declared checksums (`crate::checksum`), compared on
+    /// **un-normalized** stdout so no normalization rule can launder them.
+    Checksum,
+}
+
+impl Channel {
+    /// Every channel the oracle can report, in report order.
+    pub fn all() -> &'static [Channel] {
+        &[
+            Channel::ExitCode,
+            Channel::Exception,
+            Channel::ExceptionType,
+            Channel::ExceptionMessage,
+            Channel::ExceptionFrames,
+            Channel::Stdout,
+            Channel::Stderr,
+            Channel::Checksum,
+        ]
+    }
+
+    /// The stable kebab-case label used in run/gate output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Channel::ExitCode => "exit-code",
+            Channel::Exception => "exception",
+            Channel::ExceptionType => "exception-type",
+            Channel::ExceptionMessage => "exception-message",
+            Channel::ExceptionFrames => "exception-frames",
+            Channel::Stdout => "stdout",
+            Channel::Stderr => "stderr",
+            Channel::Checksum => "checksum",
+        }
+    }
 }
 
 /// How a confirmed divergence is triaged — this is the bisection the human
@@ -743,6 +798,24 @@ mod tests {
     fn classification_jdk_only_violation_serializes_kebab_case() {
         let json = serde_json::to_string(&Classification::JdkOnlyViolation).unwrap();
         assert_eq!(json, "\"jdk-only-violation\"");
+    }
+
+    #[test]
+    fn every_channel_has_a_unique_stable_label() {
+        // The labels are what a divergence report prints, so they are a
+        // compatibility surface: a reader (and a CI log grep) must be able to
+        // tell `exception-type` from `exception-message`.
+        let labels: Vec<&str> = Channel::all().iter().map(|c| c.label()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "duplicate channel label");
+        assert_eq!(labels.len(), 8);
+        // The serde spelling and the report spelling must not drift apart.
+        for c in Channel::all() {
+            let json = serde_json::to_string(c).unwrap();
+            assert_eq!(json, format!("\"{}\"", c.label()), "{c:?}");
+        }
     }
 
     #[test]

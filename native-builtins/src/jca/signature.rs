@@ -34,13 +34,16 @@
 //! |  3   | `pending`   Int | bytes accumulated since init     |
 //! |  4   | `key_id`    Long  | crypto_impl handle from KPG    |
 //!
-//! The actual `update(byte[])` payload lives in a process-wide side
-//! table keyed on `NativeContext::identity_hash_code(this)` — see
-//! `crypto_impl::sig_data_{append,take,clear}_h`.  Identity-hash-code keys
-//! survive GC compaction (`HashCodeTable::update_after_gc` in
+//! The actual `update(byte[])` payload lives in a side table keyed on
+//! `(NativeContext::vm_identity(), identity_hash_code(this))` — see
+//! `sig_payload_table` below.  Identity-hash-code keys survive GC
+//! compaction (`HashCodeTable::update_after_gc` in
 //! `gc/src/compact_header.rs`).  Pre-C18 the table was keyed on
 //! `this.as_ptr() as u64`; a compaction silently orphaned the entry and
-//! `sign()` returned a signature over `b""`.
+//! `sign()` returned a signature over `b""`.  The `vm_identity` component
+//! was added later: the store used to be `crypto_impl::sig_data_*_h`,
+//! which is process-global, so two `Vm`s in one process could consume each
+//! other's buffers whenever their receivers' identity hashes collided.
 
 #![allow(clippy::collapsible_if)]
 
@@ -94,48 +97,89 @@ const SIG_PRIVATE_SLOTS: usize = 6;
 // (`HashCodeTable::update_after_gc`, `gc/src/compact_header.rs`).  All
 // accessors therefore thread `&mut dyn NativeContext`.  Mirrors the pattern
 // from `lang_invoke::VH_META_TABLE` (`native-builtins/src/lang_invoke.rs`).
+//
+// VM-scope fix: the identity hash code is unique only *within one heap*.
+// Rust tests (and any embedder) create several independent `Vm`s in one
+// process, and these tables are `static` — so VM B's `Signature` whose
+// identity hash happens to equal VM A's silently reads VM A's algorithm /
+// state / key id.  `NativeContext::vm_identity`'s own doc states the rule
+// ("Native side caches ... must scope entries to this value",
+// `native-api/src/registry.rs`); the same omission in native-collections'
+// `widened_obj_key` aliased two VMs' collections and aborted the process.
+// Every key here is therefore `(vm_identity, identity_hash_code)` — the
+// established shape, cf. `phases_late::net_channels` and `servlet.rs`.
+//
+// None of these tables hold heap `ObjectRef`s (algorithm index, state,
+// `crypto_impl` key handle and the raw `update()` payload are all plain Rust
+// data), so no GC scan/remap companion is required — only the keys had to
+// become address- and heap-independent.
 // ---------------------------------------------------------------------------
 
-fn sig_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+/// VM-scoped, GC-stable side-table key for a `Signature` receiver.
+type SigKey = (usize, i32);
+
+/// `(owning VM, GC-stable identity hash)` for `this`.
+fn sig_key(ctx: &mut dyn NativeContext, this: ObjectRef) -> SigKey {
+    (ctx.vm_identity(), ctx.identity_hash_code(this))
+}
+
+fn sig_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn sig_state_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+fn sig_state_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn sig_keyid_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, u64>> {
+fn sig_keyid_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, u64>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, u64>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, u64>>> = OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+/// The `Signature.update(...)` payload store.
+///
+/// Was `crypto_impl::sig_data_{append,take,clear}_h`, a `static
+/// HashMap<i32, Vec<u8>>` keyed on the identity hash alone.  That store is
+/// process-global with no VM scope, so two VMs in one process could append
+/// to — and `take` — each other's buffers: VM B's `sign()` would consume the
+/// bytes VM A had accumulated (and leave VM A's `sign()` to fail the
+/// `take_data` `None` check with `IllegalStateException`).  The payload lives
+/// here instead, under the same `(vm_identity, identity_hash)` key as the
+/// sibling tables above.  `Vec<u8>` — no `ObjectRef`s, so no GC hooks.
+fn sig_payload_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, Vec<u8>>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, Vec<u8>>>> =
+        OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 fn set_sig_algo(ctx: &mut dyn NativeContext, this: ObjectRef, idx: i32) {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_algo_table().lock().insert(key, idx);
 }
 fn get_sig_algo(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_algo_table().lock().get(&key).copied()
 }
 fn set_sig_state(ctx: &mut dyn NativeContext, this: ObjectRef, st: i32) {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_state_table().lock().insert(key, st);
 }
 fn get_sig_state(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_state_table().lock().get(&key).copied()
 }
 fn set_sig_keyid(ctx: &mut dyn NativeContext, this: ObjectRef, kid: u64) {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_keyid_table().lock().insert(key, kid);
 }
 fn get_sig_keyid(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<u64> {
-    let key = ctx.identity_hash_code(this);
+    let key = sig_key(ctx, this);
     sig_keyid_table().lock().get(&key).copied()
 }
 
@@ -343,7 +387,11 @@ fn extract_key_id_from_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> u64 {
     // `key_id` via the GC-stable identity map registered at keygen/import, so the
     // fast Rust sign/verify still applies. Check that FIRST; a synthetic key is
     // never in the map and falls through to its slot-3 `key_id`.
-    if let Some(id) = crypto_impl::rsa_realkey_map_get(ctx.identity_hash_code(key)) {
+    // The map is keyed `(vm_identity, identity_hash)`: an identity hash is
+    // unique only within one heap, and the map is a process-global static.
+    if let Some(id) =
+        crypto_impl::rsa_realkey_map_get(ctx.vm_identity(), ctx.identity_hash_code(key))
+    {
         return id;
     }
     match ctx.get_field(key, 3) {
@@ -364,8 +412,12 @@ fn append_data(ctx: &mut dyn NativeContext, this: ObjectRef, data: &[u8]) {
         base + SIG_OFF_PENDING,
         Value::Int(cur + data.len() as i32),
     );
-    let key = ctx.identity_hash_code(this);
-    crypto_impl::sig_data_append_h(key, data);
+    let key = sig_key(ctx, this);
+    sig_payload_table()
+        .lock()
+        .entry(key)
+        .or_default()
+        .extend_from_slice(data);
 }
 
 /// Remove the receiver's accumulated payload from the side table.
@@ -385,8 +437,9 @@ fn take_data(
 ) -> Result<Vec<u8>, cratonvm_types::error::MethodCallFailed> {
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
-    let key = ctx.identity_hash_code(this);
-    crypto_impl::sig_data_take_h(key).ok_or_else(|| {
+    let key = sig_key(ctx, this);
+    let taken = sig_payload_table().lock().remove(&key);
+    taken.ok_or_else(|| {
         RuntimeError::IllegalStateException {
             message: "Signature payload missing post-GC or init*() never called".into(),
         }
@@ -395,8 +448,11 @@ fn take_data(
 }
 
 fn clear_data(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    let key = ctx.identity_hash_code(this);
-    crypto_impl::sig_data_clear_h(key);
+    let key = sig_key(ctx, this);
+    // Seed an *empty* buffer rather than removing the entry: `take_data`
+    // distinguishes "init*() ran, no update() bytes" (Some(empty)) from
+    // "never initialised / entry lost" (None → IllegalStateException).
+    sig_payload_table().lock().insert(key, Vec::new());
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +481,73 @@ fn sign_dispatch(alg: i32, key_id: u64, data: &[u8]) -> Option<Vec<u8>> {
         SIG_ED25519 => crypto_impl::ed25519_sign(key_id, data),
         _ => None,
     }
+}
+
+/// Whether `sign_dispatch`/`verify_dispatch` have a native arm for `alg` at
+/// all.
+///
+/// Kept in lock-step with the two `match`es by
+/// `tests::natively_dispatched_matches_the_dispatch_arms`. Used only to say
+/// *why* a dispatch returned `None`: an algorithm with no arm is "we cannot do
+/// this at all", an algorithm with an arm is "the key handle was not in the
+/// backing store". Both refuse; the messages differ.
+fn natively_dispatched(alg: i32) -> bool {
+    matches!(
+        alg,
+        SIG_SHA256_RSA
+            | SIG_PSS_SHA256
+            | SIG_PSS_SHA384
+            | SIG_PSS_SHA512
+            | SIG_SHA256_ECDSA
+            | SIG_SHA384_ECDSA
+            | SIG_ED25519
+    )
+}
+
+/// `java.security.SignatureException` — the checked exception that BOTH
+/// `Signature.sign()` and `Signature.verify()` declare, so every caller of
+/// either can catch it. Deliberately preferred over `NoSuchAlgorithmException`
+/// (undeclared here, and the algorithm was already accepted at `getInstance`
+/// time) and over `ProviderException` (unchecked, so it escapes the
+/// `catch (SignatureException)` that signature-verifying code is written
+/// around).
+const SIGNATURE_EXCEPTION: &str = "java/security/SignatureException";
+
+/// Refuse a `sign`/`verify` whose dispatch returned `None`.
+///
+/// **This is the core of the P0 fix in this file.** `None` from
+/// `sign_dispatch`/`verify_dispatch` means the cryptographic question was
+/// never asked — either no native arm exists for the algorithm, or the key
+/// handle is absent from `crypto_impl`'s key store (see
+/// `crypto_impl::rsa_verify`: `guard.get(&id).map(..)`, so `None` is
+/// unambiguously "no such key", never a verification outcome).
+///
+/// Before this, `sign()` did `.unwrap_or_default()` — an **empty `byte[]`
+/// presented as a signature** — and `verify()` did `.unwrap_or(false)`, which
+/// the caller cannot tell from a forgery. `false` is the answer to "is this
+/// signature valid?"; it is not the answer to "we never checked".
+fn refuse_unanswerable(
+    ctx: &mut dyn NativeContext,
+    alg: i32,
+    op: &str,
+) -> cratonvm_types::error::MethodCallFailed {
+    let why = if natively_dispatched(alg) {
+        "the key handle is not present in this VM's key store (the key was \
+         never registered, or was registered against a different Signature \
+         instance)"
+    } else {
+        "this VM has no native implementation for that algorithm"
+    };
+    crate::phases_early::throw_jca_exc(
+        ctx,
+        SIGNATURE_EXCEPTION,
+        &format!(
+            "Signature.{op} could not be performed for {} ({}): refusing to \
+             report a cryptographic result for an operation that never ran.",
+            algo_name(alg),
+            why
+        ),
+    )
 }
 
 fn verify_dispatch(alg: i32, key_id: u64, data: &[u8], sig: &[u8]) -> Option<bool> {
@@ -459,16 +582,29 @@ fn verify_dispatch(alg: i32, key_id: u64, data: &[u8], sig: &[u8]) -> Option<boo
 
 /// Real-SunEC `ECDSASignature$*` SPI class for an algo index, or `None` when EC
 /// routing is off or the algo is not ECDSA.
-fn ecdsa_real_spi_class(alg: i32) -> Option<&'static str> {
+///
+/// `ctx` is consulted because `route_ec_to_real()` only says we *prefer* the
+/// real SunEC bytecode — it does not say the bytecode is present. Under the
+/// synthetic JDK the named class would be a fabricated, code-less stub, and
+/// `jca::key_factory::real_ec_keypair_available` makes EC keygen fall back to
+/// `crypto_impl` in exactly that case. The two checks must agree: a synthetic
+/// EC key carries a `crypto_impl` `key_id` that a SunEC SPI cannot read, and a
+/// real `ECPrivateKeyImpl` carries no `key_id` for the synthetic dispatch. Both
+/// keys and both signature operations therefore key off the same question.
+fn ecdsa_real_spi_class(ctx: &dyn NativeContext, alg: i32) -> Option<&'static str> {
     if !crate::route_ec_to_real() {
         return None;
     }
-    match alg {
-        SIG_SHA256_ECDSA => Some("sun/security/ec/ECDSASignature$SHA256"),
-        SIG_SHA384_ECDSA => Some("sun/security/ec/ECDSASignature$SHA384"),
-        SIG_SHA512_ECDSA => Some("sun/security/ec/ECDSASignature$SHA512"),
-        _ => None,
+    let cls = match alg {
+        SIG_SHA256_ECDSA => "sun/security/ec/ECDSASignature$SHA256",
+        SIG_SHA384_ECDSA => "sun/security/ec/ECDSASignature$SHA384",
+        SIG_SHA512_ECDSA => "sun/security/ec/ECDSASignature$SHA512",
+        _ => return None,
+    };
+    if ctx.would_fabricate_synthetic_stub(cls) {
+        return None;
     }
+    Some(cls)
 }
 
 /// Real SunEC EdDSA SPI for the requested curve. The generic `EdDSA` SPI
@@ -918,7 +1054,7 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER output).
-    if let Some(spi_class) = ecdsa_real_spi_class(alg) {
+    if let Some(spi_class) = ecdsa_real_spi_class(ctx, alg) {
         return drive_real_signature_spi(ctx, this, spi_class, None);
     }
     if let Some(spi_class) = eddsa_real_spi_class(alg) {
@@ -939,7 +1075,13 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // produced an apparent success).
     let data = take_data(ctx, this)?;
 
-    let sig_bytes = sign_dispatch(alg, key_id, &data).unwrap_or_default();
+    // P0: `.unwrap_or_default()` here produced an EMPTY byte[] and returned it
+    // as the signature. A caller storing that into a JWS/JAR/token sees a
+    // successful `sign()` and ships an unsigned artefact.
+    let sig_bytes = match sign_dispatch(alg, key_id, &data) {
+        Some(bytes) => bytes,
+        None => return Err(refuse_unanswerable(ctx, alg, "sign()")),
+    };
     let arr = alloc_byte_array(ctx, &sig_bytes);
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -960,7 +1102,13 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // could orphan the buffer after GC compaction and the empty-fallback
     // produced an apparent success).
     let data = take_data(ctx, this)?;
-    let sig_bytes = sign_dispatch(alg, key_id, &data).unwrap_or_default();
+    // P0, as in `sig_sign`: an empty signature written into the caller's
+    // buffer with a `written` count of 0 reads as "signed, zero-length" rather
+    // than "not signed".
+    let sig_bytes = match sign_dispatch(alg, key_id, &data) {
+        Some(bytes) => bytes,
+        None => return Err(refuse_unanswerable(ctx, alg, "sign(byte[],int,int)")),
+    };
 
     let off = match args.get(2) {
         Some(Value::Int(n)) => *n as usize,
@@ -990,7 +1138,7 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER verify).
-    if let Some(spi_class) = ecdsa_real_spi_class(alg) {
+    if let Some(spi_class) = ecdsa_real_spi_class(ctx, alg) {
         let provided = match args.get(1) {
             Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
             _ => Vec::new(),
@@ -1031,7 +1179,15 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         _ => Vec::new(),
     };
 
-    let ok = verify_dispatch(alg, key_id, &data, &provided).unwrap_or(false);
+    // P0. `Some(false)` is a PRESERVED NEGATIVE — the signature really was
+    // checked against the key and really did not match; that is the security
+    // decision the caller asked for and it stays a `false`. `None` is
+    // "never checked" and now raises. `.unwrap_or(false)` conflated the two,
+    // so an unusable key was reported as a bad signature.
+    let ok = match verify_dispatch(alg, key_id, &data, &provided) {
+        Some(answer) => answer,
+        None => return Err(refuse_unanswerable(ctx, alg, "verify()")),
+    };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -1064,7 +1220,12 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(arr))) => read_byte_array_range(ctx, *arr, off, len),
         _ => Vec::new(),
     };
-    let ok = verify_dispatch(alg, key_id, &data, &provided).unwrap_or(false);
+    // P0 — same split as `sig_verify`: `Some(false)` is the preserved genuine
+    // negative, `None` is "the question was never asked" and raises.
+    let ok = match verify_dispatch(alg, key_id, &data, &provided) {
+        Some(answer) => answer,
+        None => return Err(refuse_unanswerable(ctx, alg, "verify(byte[],int,int)")),
+    };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -1435,5 +1596,225 @@ mod tests {
             "ML-DSA sign must route to the real SPI (Ok(None) from the mock SPI), \
              not fall through to the synthetic empty-signature stub; got {r:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P0 — "a security API never encodes failure as ordinary output"
+    //
+    // Every "must raise" case below has a "must still work" twin using a real
+    // RSA key, so the suite cannot be satisfied by refusing everything. The
+    // genuine-negative case (a real signature that really does not match) is
+    // asserted to stay a `false` with NO exception.
+    // -----------------------------------------------------------------------
+
+    /// One 1024-bit RSA key pair for the whole module — key generation is the
+    /// expensive part and the tests only need *a* usable key.
+    fn shared_rsa_key_id() -> u64 {
+        use std::sync::OnceLock;
+        static ID: OnceLock<u64> = OnceLock::new();
+        *ID.get_or_init(|| {
+            let (public_key, private_key) = crypto_impl::Rsa::generate_keypair(1024);
+            let id = crypto_impl::rsa_key_next_id();
+            crypto_impl::rsa_key_store(
+                id,
+                crypto_impl::RsaKeyPairData {
+                    public_key,
+                    private_key,
+                },
+            );
+            id
+        })
+    }
+
+    /// A stand-in `Key` object carrying `key_id` in slot 3, which is where
+    /// `extract_key_id_from_key` reads a synthetic key's handle from.
+    fn key_object(ctx: &mut crate::test_utils::MockNativeContext, key_id: u64) -> ObjectRef {
+        let cid = ctx.ensure_class_initialized("java/security/Key").unwrap();
+        let key = ctx.alloc_object(cid, 8);
+        ctx.set_field(key, 3, Value::Long(key_id as i64));
+        key
+    }
+
+    /// The classification helper must not drift away from the two `match`es it
+    /// summarises: every algorithm `sign_dispatch` handles must be reported as
+    /// natively dispatched, and every one it does not must not be.
+    #[test]
+    fn natively_dispatched_matches_the_dispatch_arms() {
+        // Handled by both dispatch tables.
+        for alg in [
+            SIG_SHA256_RSA,
+            SIG_PSS_SHA256,
+            SIG_PSS_SHA384,
+            SIG_PSS_SHA512,
+            SIG_SHA256_ECDSA,
+            SIG_SHA384_ECDSA,
+            SIG_ED25519,
+        ] {
+            assert!(natively_dispatched(alg), "alg {alg} has a dispatch arm");
+        }
+        // Not handled — these reach the `_ => None` arm and must be reported
+        // as such so the refusal message is accurate.
+        for alg in [
+            SIG_SHA384_RSA,
+            SIG_SHA512_RSA,
+            SIG_SHA1_RSA,
+            SIG_SHA512_ECDSA,
+            SIG_SHA256_DSA,
+            SIG_SHA1_DSA,
+            SIG_MLDSA,
+            -1,
+        ] {
+            assert!(
+                !natively_dispatched(alg),
+                "alg {alg} has no dispatch arm and must not be claimed as one"
+            );
+        }
+    }
+
+    /// The `Option` contract the whole fix rests on: `None` means "never
+    /// checked", `Some(false)` means "checked, and it does not match".
+    #[test]
+    fn verify_dispatch_distinguishes_never_checked_from_did_not_match() {
+        let id = shared_rsa_key_id();
+        let msg = b"the message that was signed";
+        let sig = sign_dispatch(SIG_SHA256_RSA, id, msg).expect("a registered key must sign");
+        assert!(!sig.is_empty(), "a real signature is never zero-length");
+
+        // MUST STILL WORK.
+        assert_eq!(
+            verify_dispatch(SIG_SHA256_RSA, id, msg, &sig),
+            Some(true),
+            "the signature this key just produced must verify"
+        );
+        // PRESERVED NEGATIVE — a forgery is `Some(false)`, not an error.
+        let mut forged = sig.clone();
+        forged[0] ^= 0xff;
+        assert_eq!(
+            verify_dispatch(SIG_SHA256_RSA, id, msg, &forged),
+            Some(false)
+        );
+        assert_eq!(
+            verify_dispatch(SIG_SHA256_RSA, id, b"a different message", &sig),
+            Some(false)
+        );
+        // NEVER CHECKED — an unregistered handle and an unsupported algorithm
+        // are both `None`, and neither may be collapsed into `false`.
+        assert_eq!(verify_dispatch(SIG_SHA256_RSA, u64::MAX, msg, &sig), None);
+        assert_eq!(verify_dispatch(SIG_SHA1_DSA, id, msg, &sig), None);
+        assert_eq!(sign_dispatch(SIG_SHA256_RSA, u64::MAX, msg), None);
+        assert_eq!(sign_dispatch(SIG_SHA1_DSA, id, msg), None);
+    }
+
+    /// MUST STILL WORK, at the native-call level: sign then verify through the
+    /// registered natives, and confirm a tampered signature comes back as a
+    /// plain `false` with no exception.
+    #[test]
+    fn native_sign_verify_round_trip_and_genuine_mismatch_is_false() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let id = shared_rsa_key_id();
+
+        let signing_key = key_object(&mut ctx, id);
+        let signer = make_inited_sig(&mut ctx, "SHA256withRSA", Some(signing_key), false);
+        let sig_arr = match sig_sign(&mut ctx, &[Value::Object(Some(signer))]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            other => panic!("sign() must succeed for a registered key, got {other:?}"),
+        };
+        let sig_bytes = read_byte_array_full(&mut ctx, sig_arr);
+        assert!(!sig_bytes.is_empty(), "sign() must not return an empty array");
+
+        // Genuine positive.
+        let verify_key = key_object(&mut ctx, id);
+        let verifier = make_inited_sig(&mut ctx, "SHA256withRSA", Some(verify_key), true);
+        let good = alloc_byte_array(&mut ctx, &sig_bytes);
+        assert_eq!(
+            sig_verify(
+                &mut ctx,
+                &[Value::Object(Some(verifier)), Value::Object(Some(good))]
+            )
+            .unwrap(),
+            Some(Value::Int(1))
+        );
+
+        // PRESERVED NEGATIVE: tampered bits are what a forgery looks like.
+        // This is the real security decision and must stay a `false`.
+        let mut tampered = sig_bytes.clone();
+        tampered[0] ^= 0xff;
+        let verify_key2 = key_object(&mut ctx, id);
+        let verifier2 = make_inited_sig(&mut ctx, "SHA256withRSA", Some(verify_key2), true);
+        let bad = alloc_byte_array(&mut ctx, &tampered);
+        assert_eq!(
+            sig_verify(
+                &mut ctx,
+                &[Value::Object(Some(verifier2)), Value::Object(Some(bad))]
+            )
+            .unwrap(),
+            Some(Value::Int(0)),
+            "a real digest mismatch must remain a `false`, not become an exception"
+        );
+    }
+
+    /// MUST RAISE: `verify()` with a key this VM cannot use answered `false`
+    /// before — indistinguishable, at the call site, from a forged signature.
+    #[test]
+    fn native_verify_with_an_unusable_key_raises_instead_of_returning_false() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        // Slot 3 left at 0: no such handle in `crypto_impl`'s RSA key store.
+        let verifier = make_inited_sig(&mut ctx, "SHA256withRSA", None, true);
+        let sig = alloc_byte_array(&mut ctx, &[1, 2, 3, 4]);
+        let err = sig_verify(
+            &mut ctx,
+            &[Value::Object(Some(verifier)), Value::Object(Some(sig))],
+        )
+        .expect_err("an unanswerable verify must raise, not report a mismatch");
+        assert_signature_exception(&mut ctx, err);
+    }
+
+    /// MUST RAISE: `sign()` used to hand back an empty `byte[]` — a caller
+    /// storing that ships an unsigned artefact believing it signed one.
+    #[test]
+    fn native_sign_with_an_unusable_key_raises_instead_of_returning_an_empty_signature() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let signer = make_inited_sig(&mut ctx, "SHA256withRSA", None, false);
+        let err = sig_sign(&mut ctx, &[Value::Object(Some(signer))])
+            .expect_err("an unanswerable sign must raise, not return an empty signature");
+        assert_signature_exception(&mut ctx, err);
+    }
+
+    /// MUST RAISE: an algorithm with no native arm at all (SHA-512withECDSA is
+    /// mapped by `algo_idx` but has no `sign_dispatch`/`verify_dispatch` arm)
+    /// and EC routing off. Uses the dispatch layer directly so the test does
+    /// not depend on the real-SPI routing flags.
+    #[test]
+    fn an_algorithm_with_no_backend_is_never_reported_as_a_mismatch() {
+        assert_eq!(
+            verify_dispatch(SIG_SHA512_ECDSA, shared_rsa_key_id(), b"m", b"s"),
+            None,
+            "an algorithm with no backend must not answer the verification question"
+        );
+    }
+
+    fn assert_signature_exception(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        err: cratonvm_types::error::MethodCallFailed,
+    ) {
+        use cratonvm_types::error::MethodCallFailed;
+        match err {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                let cid = ctx.class_id_of_object(exc);
+                assert_eq!(
+                    ctx.class_name_of_id(cid).as_deref(),
+                    Some(SIGNATURE_EXCEPTION),
+                    "the refusal must be the exception sign()/verify() declare"
+                );
+            }
+            // `throw_jca_exc`'s fallback arm — still loud, still not a value.
+            MethodCallFailed::InternalError(e) => {
+                let text = format!("{e}");
+                assert!(
+                    text.contains("IllegalArgumentException"),
+                    "unexpected fallback: {text}"
+                );
+            }
+        }
     }
 }

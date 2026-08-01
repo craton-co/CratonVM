@@ -313,6 +313,22 @@ pub static SWEEP_BAD_FORWARD_HITS: AtomicU64 = AtomicU64::new(0);
 /// allocated from, so out-of-extent headers are rejected without marking.
 pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// Old-gen mark-worklist entries whose `kind` byte is not a valid `ObjectKind`
+/// discriminant — i.e. the mark BFS was handed an address that is not an object
+/// base and decoded whatever bytes were there as an `ObjectHeader`.
+///
+/// See `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+/// A non-zero value here means a side table is holding a dangling old-gen
+/// address, or a reference slot holds a non-base word.
+pub static OLDMARK_BAD_KIND_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Old-gen mark-worklist candidates rejected by
+/// [`old_gen_mark_candidate_plausible`]. Non-zero means a reference slot or a
+/// side table held an in-range address that is not an old-gen object base —
+/// before the screen existed, each of these was a blind `gc_flags` write into
+/// whatever occupied that address.
+pub static OLDMARK_REJECTED_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+
 /// Conservative root candidates may be interior heap addresses.  Only the
 /// opt-in A2 forensic mode reports rejected candidates; normal collection
 /// silently discards an address that is not an object start.
@@ -2161,8 +2177,38 @@ impl GenerationalHeap {
 
     /// BUG-03 — the published JIT TLAB skip regions as young-from byte
     /// offsets `(offset, size)`, filtered to those that fall wholly inside the
-    /// given `[from_base, from_end)` window and sorted ascending. Empty on the
-    /// normal collection path.
+    /// given `[from_base, from_end)` window, sorted ascending, and **coalesced
+    /// so no two entries overlap**. Empty on the normal collection path.
+    ///
+    /// # Why the coalesce is load-bearing (TLAB audit, `docs/gc/tlab-and-card-audit.md`)
+    ///
+    /// Both consumers merge this list with `Arena::free_blocks_sorted()` and
+    /// then feed the result to [`skip_free_blocks`], whose contract is a list of
+    /// **ascending, disjoint** spans: it advances the walk cursor to `off + sz`
+    /// and drops the entry. Two entries covering the same bytes therefore make
+    /// the walker "skip the same tail twice" — the second entry is consumed
+    /// harmlessly only when the cursor already sits past it, but a *partially*
+    /// overlapping pair (`[a, c)` then `[b, d)` with `a < b < c < d`) resyncs the
+    /// cursor to `c`, then immediately to `d`, silently swallowing the objects
+    /// in `[c, d)`. On the object-start walk that is a missed object grid entry;
+    /// on the non-moving sweep it is a live object never visited.
+    ///
+    /// Before this change the disjointness was asserted in prose at both call
+    /// sites ("both inputs are ascending & disjoint") and guaranteed by nothing:
+    /// the producer is `ThreadRegistry::collect_reserved_tlab_tails`, which
+    /// reads one `(cursor, end)` pair per ALIVE registry entry through a
+    /// published raw address. Two entries can name the same `Tlab` — a virtual
+    /// thread's boxed `JvmThread` is published under its own thread id at
+    /// `install_runtime` and re-published at every remount, and a registry that
+    /// ever holds two live ids for one continuation (or a foreign thread that
+    /// re-attaches before its previous entry is reaped) yields the identical
+    /// pair twice. Duplicates are also exactly what a stale, never-cleared
+    /// publication looks like.
+    ///
+    /// Coalescing is the fail-safe direction: over-skipping a span can only
+    /// over-retain (the span is treated as reserved, so nothing in it is
+    /// reclaimed), whereas the desync it prevents frees live memory. The
+    /// `debug_assert!` records the invariant the callers rely on.
     fn jit_tlab_skip_offsets(&self, from_base: usize, from_end: usize) -> Vec<(usize, usize)> {
         let g = self.jit_tlab_skip_regions.lock();
         if g.is_empty() {
@@ -2178,8 +2224,29 @@ impl GenerationalHeap {
                 }
             })
             .collect();
+        drop(g);
         v.sort_by_key(|&(off, _)| off);
-        v
+        // Coalesce overlapping and touching spans into one. `sz` is recomputed
+        // from the merged end so the result is always `(start, end - start)`.
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(v.len());
+        for (off, sz) in v {
+            match merged.last_mut() {
+                Some((last_off, last_sz)) if off <= *last_off + *last_sz => {
+                    let end = (off + sz).max(*last_off + *last_sz);
+                    *last_sz = end - *last_off;
+                }
+                _ => merged.push((off, sz)),
+            }
+        }
+        debug_assert!(
+            merged
+                .windows(2)
+                .all(|w| w[0].0 + w[0].1 <= w[1].0 && w[0].1 > 0),
+            "jit_tlab_skip_offsets must return ascending, disjoint, non-empty spans — \
+             `skip_free_blocks` resyncs the walk cursor to each span's end and would \
+             swallow the objects between two partially-overlapping spans: {merged:?}",
+        );
+        merged
     }
 
     /// Lock-free `[min_base, max_end)` envelope over every arena this heap
@@ -3384,6 +3451,14 @@ impl GenerationalHeap {
             _ => return,
         };
 
+        // Observability, DELIBERATELY GATED (`crate::gc_metrics`): this barrier
+        // runs on every reference store in the VM, so an unconditional
+        // `fetch_add` here would be a process-global cache line pinged between
+        // every storing mutator. `record_barrier_ref_store` compiles to one
+        // relaxed load of an already-resolved, read-only-shared byte plus a
+        // predicted not-taken branch unless `CRATONVM_GC_CARD_METRICS` is set.
+        crate::gc_metrics::record_barrier_ref_store();
+
         let src_addr = obj.as_ptr() as usize;
         let dst_addr = target_ref.as_ptr() as usize;
 
@@ -3421,6 +3496,12 @@ impl GenerationalHeap {
         // `drain_pending` while the GC holds the card_table mutex
         // exclusively.
         self.card_table.thread_local_dirty_addr(src_addr);
+        // Same gate as `record_barrier_ref_store` above. NOTE: this counts
+        // interpreter/native card marks ONLY — the JIT's inline post-write
+        // barrier (`jit_card_table_info`) stores `CARD_DIRTY` directly into the
+        // bitmap and never enters this function. The collector-side counters
+        // (`cards_found_dirty`, `duplicate_card_marks`) see both.
+        crate::gc_metrics::record_card_mark();
     }
 
     /// Stable card-table metadata for the x64 inline post-write barrier.
@@ -3523,6 +3604,24 @@ impl GenerationalHeap {
     /// so `ResourceBundle.getBundle(.., null, ..)` threw `MissingResourceException`.
     pub fn is_old_gen_addr(&self, addr: usize) -> bool {
         self.old_gen.lock().contains(addr as *const u8)
+    }
+
+    /// True when `addr` is inside an **allocated** old-gen span.
+    ///
+    /// The strict counterpart of [`Self::is_old_gen_addr`], which is a bare
+    /// range check. That range check is the right answer to "which generation
+    /// is this address in?" (`metadata_pin_deferrable` / `mirror_pin_deferrable`
+    /// ask exactly that) but the WRONG answer to "is the object still there?".
+    ///
+    /// `is_old_gen_addr`'s comment justifies the permissive form with "a minor
+    /// collection never touches the old generation". That premise does not hold:
+    /// [`Self::sweep_old_gen_non_moving`] runs a full old-gen mark-sweep that
+    /// reclaims dead blocks IN PLACE, during a YOUNG collection, whenever a live
+    /// JIT frame blocks the moving young collector — and it does not zero what
+    /// it frees. Use this predicate for liveness; see
+    /// `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    pub fn is_live_old_gen_addr(&self, addr: usize) -> bool {
+        self.old_gen.lock().is_allocated_addr(addr as *const u8)
     }
 
     /// True when `addr` is the start of a young from-space object that
@@ -3729,6 +3828,24 @@ impl GenerationalHeap {
         let young_live = from.used().saturating_sub(from.free_list_bytes());
         drop(from);
         young_live + self.old_gen.lock().used()
+    }
+
+    /// Publish the denominators [`crate::gc_metrics::gc_metrics_report`]
+    /// normalizes by: objects allocated since startup, bytes allocated, and the
+    /// current live-byte estimate.
+    ///
+    /// Called at the top of every collection (so a report taken at any later
+    /// point divides by numbers from the most recent pause) and again by the
+    /// end-of-run GC summary. Takes the young and old locks, so it must be
+    /// called with neither held — the top of `collect_garbage_inner` is before
+    /// either is acquired.
+    pub fn publish_gc_metrics_occupancy(&self) {
+        let s = self.stats.snapshot();
+        crate::gc_metrics::record_heap_occupancy(
+            s.young_allocations.saturating_add(s.old_allocations),
+            self.allocated_bytes() as u64,
+            self.live_bytes_estimate() as u64,
+        );
     }
 
     /// DBG (bc math-ec `0x4`): scan the young from-space for the FIRST object
@@ -4029,6 +4146,13 @@ impl GenerationalHeap {
         // No-op when the `gpu-offload` feature is off.
         crate::vm_heap::wait_for_gpu_critical_drain();
 
+        // Refresh the allocation / live-byte denominators the card-cost report
+        // normalizes by. Here rather than at the end of the cycle because the
+        // function has several exit paths (young-skip backstops, the non-moving
+        // early return) and this is the one point every one of them passes
+        // through — and because neither the young nor the old lock is held yet.
+        self.publish_gc_metrics_occupancy();
+
         // SAFETY: If any thread is currently inside a JIT call, we MUST NOT
         // run a *moving* collection. JIT frames hold raw object pointers in
         // their spill slots / registers which are NOT precisely described by
@@ -4230,6 +4354,39 @@ impl GenerationalHeap {
                 // this whole item exists to make impossible.
                 crate::gc_quiescence::record_moving_young_coverage_fallback();
             }
+            // Ground truth for the collector-decision report. Recorded from the
+            // branch that actually decides, so `gc_metrics::
+            // collector_decision_report()` can never drift from the code the
+            // way `docs/GC.md` and `ARCHITECTURE.md` drifted from each other
+            // (see `docs/gc/tlab-and-card-audit.md` §3). The order of the arms
+            // below mirrors the order of the terms in `divert_non_moving`, so
+            // the reported reason is the FIRST one that forced the diversion —
+            // the one an operator has to fix to get a moving cycle back.
+            {
+                use crate::gc_metrics::decision_reason as dr;
+                let (reason, unproven) = if divert_for_incomplete_moving_coverage {
+                    (
+                        dr::NON_MOVING_COVERAGE_INCOMPLETE,
+                        crate::gc_quiescence::moving_young_incomplete_reason(),
+                    )
+                } else if has_conservative_roots && !moving_young {
+                    (
+                        dr::NON_MOVING_CONSERVATIVE_JIT_ROOTS,
+                        crate::gc_quiescence::incomplete_reason::NONE,
+                    )
+                } else if honor_promotion_oom_risk {
+                    (
+                        dr::NON_MOVING_PROMOTION_OOM_RISK,
+                        crate::gc_quiescence::incomplete_reason::NONE,
+                    )
+                } else {
+                    (
+                        dr::NON_MOVING_EXPLICIT_FULL_GC,
+                        crate::gc_quiescence::incomplete_reason::NONE,
+                    )
+                };
+                crate::gc_metrics::record_collector_decision("generational", reason, unproven);
+            }
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
                  unregistered_jit_frame={}, promotion_oom_risk={}, honored={}, moving_young={}, \
@@ -4250,6 +4407,28 @@ impl GenerationalHeap {
             // "is the young generation actually copying?" is answerable at
             // runtime (paired with the coverage-fallback counter).
             crate::gc_quiescence::record_moving_young_cycle();
+        }
+        // The moving arm of the decision record (see the non-moving arm above).
+        // The three cases are genuinely different claims and an operator needs
+        // to tell them apart: "nothing was compiled, so relocation is trivially
+        // safe" is not evidence that the per-cycle coverage proof works, and a
+        // `CRATONVM_DBG_FORCE_MOVING` cycle is not evidence of anything at all.
+        {
+            use crate::gc_metrics::decision_reason as dr;
+            let reason = if divert_non_moving {
+                // We are here despite `divert_non_moving` — only `force_moving`
+                // gets you past the branch above.
+                dr::MOVING_FORCED_BY_DEBUG_FLAG
+            } else if has_conservative_roots {
+                dr::MOVING_WITH_PROVEN_JIT_COVERAGE
+            } else {
+                dr::MOVING_NO_JIT_FRAMES
+            };
+            crate::gc_metrics::record_collector_decision(
+                "generational",
+                reason,
+                crate::gc_quiescence::incomplete_reason::NONE,
+            );
         }
 
         let mut young_from = self.young_from.lock();
@@ -4583,7 +4762,41 @@ impl GenerationalHeap {
         // via its local `merge_skips`. Both inputs are ascending & disjoint.
         let start_skips = {
             let mut v = young_from.free_blocks_sorted();
-            v.extend(self.jit_tlab_skip_offsets(young_base, young_base + young_used));
+            let tails = self.jit_tlab_skip_offsets(young_base, young_base + young_used);
+            // TLAB AUDIT TRIPWIRE (docs/gc/tlab-and-card-audit.md §1, defect
+            // T-3). We are on the MOVING path: from-space is about to be
+            // evacuated, swapped and reset. A published reserved tail means
+            // some ALIVE thread still owns a TLAB `[cursor, end)` in the arena
+            // being reset, and that thread is not one of the OS-frozen in-JIT
+            // peers — freezing a peer makes the VM call
+            // `mark_moving_young_coverage_incomplete`, which would have sent
+            // this cycle down the non-moving path instead. So the owner is a
+            // parked or blocked mutator that reached its exclusion point
+            // WITHOUT retiring, and after the swap its stale cursor bump-
+            // allocates into memory the collector has already handed back.
+            //
+            // The walk itself is correct either way (the tail is skipped, not
+            // parsed), so this is a diagnostic rather than a diversion: turning
+            // a live moving cycle into a sweep on a heuristic would be a worse
+            // trade than naming the offending transition. Rate-limited; the
+            // first occurrence is always visible.
+            if !tails.is_empty() {
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        tails = tails.len(),
+                        "[tlab-audit] a MOVING young collection is running with {} published \
+                         reserved TLAB tail(s). No in-JIT peer was frozen (that would have \
+                         forced the non-moving sweep), so an alive mutator left a TLAB \
+                         un-retired across its exclusion point — after the semispace swap its \
+                         cursor points into recycled memory. Occurrence #{}.",
+                        tails.len(),
+                        n,
+                    );
+                }
+            }
+            v.extend(tails);
             v.sort_by_key(|&(off, _)| off);
             v
         };
@@ -8510,14 +8723,19 @@ impl GenerationalHeap {
         // alignment, no header validation), so before this fix ANY garbage
         // address landing inside old gen's byte range got `gc_flags` blindly
         // RMW'd — the exact same corruption family, on the OTHER generation.
-        // Reject implausible candidates instead of marking them: mirrors the
-        // already-established pattern in `scan_object_for_old_refs`'s extent
-        // check (skip-on-implausible, never corrupt) — old-gen compaction
-        // decides liveness purely from `gc_flags & GC_FLAG_MARKED`, so unlike
-        // the young sweep there is no side-mark-set escape hatch; the safe
-        // choice for an address that fails these checks is to not mark it
-        // (over-retention is not even at stake here — a failing candidate
-        // was never a valid object to begin with).
+        // Reject implausible candidates instead of marking them
+        // (skip-on-implausible, never corrupt) — old-gen compaction decides
+        // liveness purely from `gc_flags & GC_FLAG_MARKED`, so unlike the young
+        // sweep there is no side-mark-set escape hatch; the safe choice for an
+        // address that fails these checks is to not mark it (over-retention is
+        // not even at stake here — a failing candidate was never a valid object
+        // to begin with).
+        //
+        // 2026-07-31: this screen is no longer local to the root seed. It lives
+        // in `old_gen_mark_candidate_plausible` and EVERY push site into the
+        // mark worklist goes through it, because the seven that did not were
+        // still doing exactly what the paragraph above describes — see
+        // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
         //
         // NOTE this predicate deliberately does NOT require a non-zero first
         // header word (unlike `mark_young`'s zero-word0 side-mark split):
@@ -8546,29 +8764,17 @@ impl GenerationalHeap {
         // pre-xt-activation background DoHead crash face.
         for root in roots.iter() {
             let ptr = root.as_ptr();
-            if (ptr as usize) & 0x7 == 0 && old_gen.contains(ptr) {
-                // SAFETY: `ptr` is 8-aligned and inside old gen (verified by
-                // `contains` above); reading its header is in-bounds.
+            // `conservative = true`: these are register/stack-scanned GUESSES,
+            // so they also need the zero-word0 neighbour disambiguation. The
+            // rest of the screen is the same one every other push site now
+            // uses — see `old_gen_mark_candidate_plausible`.
+            if old_gen_mark_candidate_plausible(ptr, old_gen, true) {
+                // SAFETY: the screen verified 8-alignment, old-gen containment
+                // and a header whose claimed extent fits inside old gen.
                 let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-                let kind_byte = header.kind as u8;
-                let is_array = header.kind == ObjectKind::Array;
-                let word0 = unsafe { *(ptr as *const u64) };
-                let plausible = kind_byte <= 1
-                    && (is_array || header.num_slots() <= (1 << 24))
-                    && (!is_array || header.array_length() <= i32::MAX as u32)
-                    && header_reserved_fields_plausible(header)
-                    && (word0 != 0 || !victim8_neighbor_explains_zero_prefix(ptr, old_gen));
-                if plausible {
-                    let total = gen_object_total_size(header);
-                    let fits = total >= HEADER_SIZE
-                        // SAFETY: total >= HEADER_SIZE was just checked; the
-                        // addition stays within a sane pointer range for a
-                        // plausibility probe (no dereference here).
-                        && old_gen.contains(unsafe { ptr.add(total - 1) });
-                    if fits && header.gc_flags & GC_FLAG_MARKED == 0 {
-                        header.gc_flags |= GC_FLAG_MARKED;
-                        worklist.push(ptr);
-                    }
+                if header.gc_flags & GC_FLAG_MARKED == 0 {
+                    header.gc_flags |= GC_FLAG_MARKED;
+                    worklist.push(ptr);
                 }
             }
         }
@@ -8585,15 +8791,12 @@ impl GenerationalHeap {
                 young_from.contains(owner_addr as *mut u8)
             })
         {
-            let overlay_ptr = overlay_ref.as_ptr();
-            if old_gen.contains(overlay_ptr) {
-                // SAFETY: `overlay_ptr` lies in old gen, verified above.
-                let h = unsafe { &mut *(overlay_ptr as *mut ObjectHeader) };
-                if h.gc_flags & GC_FLAG_MARKED == 0 {
-                    h.gc_flags |= GC_FLAG_MARKED;
-                    worklist.push(overlay_ptr);
-                }
-            }
+            mark_and_push_old_gen(
+                overlay_ref.as_ptr(),
+                old_gen,
+                &mut worklist,
+                "external-overlay(young owner)",
+            );
         }
 
         // BFS: transitively mark all reachable old-gen objects
@@ -8611,16 +8814,12 @@ impl GenerationalHeap {
             for overlay_ref in
                 crate::external_roots::external_roots_for_owner(obj_ptr as usize)
             {
-                let overlay_ptr = overlay_ref.as_ptr();
-                if old_gen.contains(overlay_ptr) {
-                    // SAFETY: `overlay_ptr` is in old gen; this is the same
-                    // marking transition used by the defining-loader pin below.
-                    let h = unsafe { &mut *(overlay_ptr as *mut ObjectHeader) };
-                    if h.gc_flags & GC_FLAG_MARKED == 0 {
-                        h.gc_flags |= GC_FLAG_MARKED;
-                        worklist.push(overlay_ptr);
-                    }
-                }
+                mark_and_push_old_gen(
+                    overlay_ref.as_ptr(),
+                    old_gen,
+                    &mut worklist,
+                    "external-overlay(BFS owner)",
+                );
             }
             if loader_pin_on {
                 // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
@@ -8628,15 +8827,12 @@ impl GenerationalHeap {
                 if let Some(loader_addr) =
                     cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
                 {
-                    let lp = loader_addr as *mut u8;
-                    if old_gen.contains(lp) {
-                        // SAFETY: `lp` is within old gen (verified by `contains`).
-                        let h = unsafe { &mut *(lp as *mut ObjectHeader) };
-                        if h.gc_flags & GC_FLAG_MARKED == 0 {
-                            h.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(lp);
-                        }
-                    }
+                    mark_and_push_old_gen(
+                        loader_addr as *mut u8,
+                        old_gen,
+                        &mut worklist,
+                        "loader_pin",
+                    );
                 }
             }
             // Class-mirror liveness pin (mirror_pin, companion to loader_pin
@@ -8653,31 +8849,24 @@ impl GenerationalHeap {
                 cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize)
             {
                 for mirror_addr in mirror_addrs {
-                    let mp = mirror_addr as *mut u8;
-                    if old_gen.contains(mp) {
-                        // SAFETY: `mp` is within old gen (verified by `contains`).
-                        let h = unsafe { &mut *(mp as *mut ObjectHeader) };
-                        if h.gc_flags & GC_FLAG_MARKED == 0 {
-                            h.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(mp);
-                        }
-                    }
+                    mark_and_push_old_gen(
+                        mirror_addr as *mut u8,
+                        old_gen,
+                        &mut worklist,
+                        "mirror_pin",
+                    );
                 }
             }
             if let Some(metadata_addrs) =
                 cratonvm_types::metadata_pin::roots_for_loader(obj_ptr as usize)
             {
                 for metadata_addr in metadata_addrs {
-                    let mp = metadata_addr as *mut u8;
-                    if old_gen.contains(mp) {
-                        // SAFETY: `mp` is within old gen and is a registered
-                        // loader-owned heap root.
-                        let h = unsafe { &mut *(mp as *mut ObjectHeader) };
-                        if h.gc_flags & GC_FLAG_MARKED == 0 {
-                            h.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(mp);
-                        }
-                    }
+                    mark_and_push_old_gen(
+                        metadata_addr as *mut u8,
+                        old_gen,
+                        &mut worklist,
+                        "metadata_pin",
+                    );
                 }
             }
         }
@@ -8883,15 +9072,7 @@ impl GenerationalHeap {
             // SAFETY: `obj_ptr`/`header` are a valid live young-from object.
             unsafe {
                 for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                    if old_gen.contains(ref_ptr) {
-                        // SAFETY: `ref_ptr` is in old gen (verified by `contains`);
-                        // its header is valid and mutable for marking.
-                        let ref_header = &mut *(ref_ptr as *mut ObjectHeader);
-                        if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                            ref_header.gc_flags |= GC_FLAG_MARKED;
-                            worklist.push(ref_ptr);
-                        }
-                    }
+                    mark_and_push_old_gen(ref_ptr, old_gen, worklist, "young->old ref slot");
                 });
             }
 
@@ -8901,6 +9082,16 @@ impl GenerationalHeap {
 
     /// Scan a single object's reference slots for old-gen pointers and mark them.
     fn scan_object_for_old_refs(obj_ptr: *mut u8, old_gen: &OldGen, worklist: &mut Vec<*mut u8>) {
+        // A worklist entry whose `kind` byte is not a valid discriminant was
+        // never an object base: some push site handed us a dangling or interior
+        // address. Counted (not rejected) here — rejecting is the FIX, which is
+        // deliberately not part of this diagnostic commit. See
+        // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+        // SAFETY: every push site range-checked `obj_ptr` against old gen, so
+        // offset 4 is mapped.
+        if unsafe { *obj_ptr.add(OBJECT_KIND_OFFSET) } > 2 {
+            OLDMARK_BAD_KIND_HITS.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: `obj_ptr` is a live old-gen object from the mark worklist; its header is valid.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
         // DoHead comb-7 fix (2026-07-03): validate the claimed extent before
@@ -8931,15 +9122,7 @@ impl GenerationalHeap {
         // SAFETY: `obj_ptr`/`header` are a valid live object.
         unsafe {
             for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                if old_gen.contains(ref_ptr) {
-                    // SAFETY: `ref_ptr` is in old gen (verified by `contains`); its
-                    // header is valid and mutable for marking.
-                    let ref_header = &mut *(ref_ptr as *mut ObjectHeader);
-                    if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                        ref_header.gc_flags |= GC_FLAG_MARKED;
-                        worklist.push(ref_ptr);
-                    }
-                }
+                mark_and_push_old_gen(ref_ptr, old_gen, worklist, "old-gen ref slot");
             });
         }
     }
@@ -9956,7 +10139,42 @@ impl GenerationalHeap {
     ///
     /// For each dirty card, walks the objects in that card region and collects
     /// slots containing references into young from-space.
+    ///
+    /// This is the **card refinement pass**, and this wrapper is where it is
+    /// priced (`crate::gc_metrics`): wall time, the remembered-set metadata the
+    /// table retains, and the old→young edges the walk actually found. All
+    /// three are unconditional — the pass runs once per collection, so the
+    /// accounting is unmeasurable against the pause it is measuring, and gating
+    /// it would make the default report empty (which is the failure this item
+    /// exists to prevent). The per-store barrier counter is the one that IS
+    /// gated; see [`crate::gc_metrics`]'s module header.
+    ///
+    /// Edges are counted as the growth of `extra_roots` across the call rather
+    /// than tallied inside the walk, so no counting code sits inside the
+    /// per-slot loops.
     fn scan_dirty_cards(
+        card_table: &CardTable,
+        old_gen: &OldGen,
+        young_from: &Arena,
+        extra_roots: &mut Vec<(ObjectRef, usize, usize)>,
+    ) {
+        let started = std::time::Instant::now();
+        let edges_before = extra_roots.len();
+        crate::gc_metrics::record_remembered_set_bytes(card_table.retained_bytes() as u64);
+        Self::scan_dirty_cards_inner(card_table, old_gen, young_from, extra_roots);
+        crate::gc_metrics::record_old_to_young_edges(
+            extra_roots.len().saturating_sub(edges_before) as u64,
+        );
+        // `as_nanos()` is a u128; a single refinement pass cannot plausibly run
+        // for 584 years, but saturate rather than wrap if it somehow does.
+        let nanos = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        crate::gc_metrics::record_refinement(nanos);
+    }
+
+    /// The refinement walk itself. Split out from [`Self::scan_dirty_cards`] so
+    /// the accounting wrapper closes over every early return without holding a
+    /// borrow of `extra_roots` across the walk.
+    fn scan_dirty_cards_inner(
         card_table: &CardTable,
         old_gen: &OldGen,
         young_from: &Arena,
@@ -9972,6 +10190,7 @@ impl GenerationalHeap {
         // be lost on the next GC (see `CardTable::take_dirty_cards` docs — the
         // bt18 premature-reclamation fix).
         let mut dirty_indices = card_table.take_dirty_cards();
+        crate::gc_metrics::record_cards_found_dirty(dirty_indices.len() as u64);
         if dirty_indices.is_empty() {
             return;
         }
@@ -10752,6 +10971,120 @@ fn seedhunt_scan_young(
 /// Four bytes of near-uniform-random garbage failing this check is a ~1/2^29
 /// false-negative-on-garbage rate (2 padding bytes + 2 reserved bytes + 5
 /// undefined gc_flags bits); real objects always pass.
+/// The screen every old-gen mark-worklist push must pass.
+///
+/// [`OldGen::contains`] is a bare bounds check — no alignment, no header
+/// validation — so without this any word that happens to land inside old gen's
+/// byte range gets its `gc_flags` blindly read-modify-written and is then fed to
+/// `scan_object_for_old_refs` as an `ObjectHeader`. Two consequences, both
+/// reproduced by the tests named below: the mark bit lands in an unrelated LIVE
+/// object's PAYLOAD (an `int` field `0x41414141` becomes `0x43414141`), and
+/// those payload bytes are decoded as a header, which is how a byte that is not
+/// a valid `ObjectKind` discriminant reaches `gen_object_total_size`. See
+/// `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+///
+/// The root seed and the young->old conservative word scan already defended
+/// themselves (and their comments name this hazard as the reason); this is that
+/// same screen, factored out so the other seven push sites get it too.
+///
+/// `conservative` adds the zero-word0 neighbour disambiguation that only
+/// register/stack-scanned GUESSES need. It is deliberately NOT applied to
+/// precise references: a `ClassId(0)` ad-hoc container legitimately has an
+/// all-zero word0, and rejecting one that a real reference slot points at would
+/// free a live object. Every other clause is a property real objects always
+/// have, so precise sites can take them all with no risk of a false reject —
+/// which matters, because at a precise site a false reject IS a premature free.
+fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative: bool) -> bool {
+    if (ptr as usize) & 0x7 != 0 || !old_gen.contains(ptr) {
+        return false;
+    }
+    // SAFETY: `ptr` is 8-aligned and inside old gen, so the header read is
+    // in-bounds.
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    // Compare `kind` as a RAW BYTE: an out-of-range discriminant is exactly the
+    // case this screen exists to catch, and the optimiser is entitled to assume
+    // the enum is in 0..=2 — which would fold the check away.
+    // SAFETY: as above; `OBJECT_KIND_OFFSET` is inside the header.
+    let kind_byte = unsafe { *ptr.add(OBJECT_KIND_OFFSET) };
+    if kind_byte > ObjectKind::Array as u8 {
+        return false;
+    }
+    if kind_byte == ObjectKind::Array as u8 {
+        if header.array_length() > i32::MAX as u32 {
+            return false;
+        }
+    } else if header.num_slots() > (1 << 24) {
+        return false;
+    }
+    if !header_reserved_fields_plausible(header) {
+        return false;
+    }
+    if conservative {
+        // SAFETY: reads the first header word at an 8-aligned in-bounds ptr.
+        let word0 = unsafe { *(ptr as *const u64) };
+        if word0 == 0 && victim8_neighbor_explains_zero_prefix(ptr, old_gen) {
+            return false;
+        }
+    }
+    let total = gen_object_total_size(header);
+    // SAFETY: `total >= HEADER_SIZE` is checked first, so `ptr.add(total - 1)`
+    // is the object's last byte; `contains` only range-checks it.
+    total >= HEADER_SIZE && old_gen.contains(unsafe { ptr.add(total - 1) })
+}
+
+/// Mark `ptr` and push it onto the old-gen mark worklist — but only if it is a
+/// plausible old-gen object BASE. See [`old_gen_mark_candidate_plausible`].
+///
+/// An address outside old gen is silently ignored (it is simply not this
+/// generation's business). An address INSIDE old gen that fails the screen is
+/// counted and reported: it means a reference slot or a side table is holding
+/// something that is not an object base.
+fn mark_and_push_old_gen(
+    ptr: *mut u8,
+    old_gen: &OldGen,
+    worklist: &mut Vec<*mut u8>,
+    site: &'static str,
+) {
+    if !old_gen.contains(ptr) {
+        return;
+    }
+    if !old_gen_mark_candidate_plausible(ptr, old_gen, false) {
+        note_rejected_old_mark_candidate(ptr, site);
+        return;
+    }
+    // SAFETY: the screen verified 8-alignment, old-gen containment and a
+    // header whose claimed extent fits inside old gen.
+    let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
+    if header.gc_flags & GC_FLAG_MARKED == 0 {
+        header.gc_flags |= GC_FLAG_MARKED;
+        worklist.push(ptr);
+    }
+}
+
+/// Cold reporter for a rejected old-gen mark candidate.
+#[cold]
+#[inline(never)]
+fn note_rejected_old_mark_candidate(ptr: *mut u8, site: &'static str) {
+    let n = OLDMARK_REJECTED_CANDIDATES.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        // SAFETY: the caller verified `ptr` is inside old gen, so the 24 bytes
+        // a header occupies are mapped.
+        let w = unsafe { std::ptr::read_unaligned(ptr as *const [u64; 3]) };
+        tracing::warn!(
+            "old-gen mark: rejecting {} candidate {:p} — not a plausible object \
+             base (aligned={}, w0=0x{:016x} w1=0x{:016x} w2=0x{:016x}). A side \
+             table or reference slot is holding a stale old-gen address; see \
+             docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md",
+            site,
+            ptr,
+            (ptr as usize) & 7 == 0,
+            w[0],
+            w[1],
+            w[2],
+        );
+    }
+}
+
 #[inline]
 fn header_reserved_fields_plausible(header: &ObjectHeader) -> bool {
     header.gc_flags & !(GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT) == 0
@@ -11986,6 +12319,78 @@ mod tests {
         );
         noisy.shape = 55;
         assert_eq!(gen_object_total_size(&noisy), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // TLAB audit (docs/gc/tlab-and-card-audit.md) — reserved-tail skip
+    // regions must reach the walkers ascending, disjoint and non-empty.
+    // -----------------------------------------------------------------
+
+    /// `skip_free_blocks` resyncs the walk cursor to each span's end and drops
+    /// the span. Two spans that partially overlap therefore make it resync
+    /// twice — past the objects that live between the first span's end and the
+    /// second's — so the walk never visits them. The producer
+    /// (`ThreadRegistry::collect_reserved_tlab_tails`) is a per-registry-entry
+    /// read of a published `Tlab` address and guarantees no such property, so
+    /// the heap normalizes.
+    #[test]
+    fn jit_tlab_skip_offsets_coalesces_overlaps_and_duplicates() {
+        // The function is pure arithmetic over the published pairs plus a
+        // window filter, so a minimal heap is enough.
+        let heap = GenerationalHeap::with_sizes(64 * 1024, 64 * 1024);
+        let base = 0x10_0000usize;
+        let end = base + 0x10000;
+
+        heap.set_jit_tlab_skip_regions(&[
+            // Out of order, and the classic duplicate: two registry entries
+            // naming the same boxed `JvmThread`'s TLAB.
+            (base + 0x2000, base + 0x3000),
+            (base + 0x1000, base + 0x1800),
+            (base + 0x2000, base + 0x3000),
+            // Partially overlapping — the case that silently swallows objects.
+            (base + 0x2800, base + 0x4000),
+            // Exactly touching: merging is optional for correctness but keeps
+            // the list minimal.
+            (base + 0x4000, base + 0x4200),
+        ]);
+
+        let spans = heap.jit_tlab_skip_offsets(base, end);
+        assert_eq!(
+            spans,
+            vec![(0x1000, 0x800), (0x2000, 0x2200)],
+            "overlapping and duplicate reserved tails must arrive as one \
+             disjoint ascending span each",
+        );
+        // The invariant the walkers rely on, restated as a check.
+        for w in spans.windows(2) {
+            assert!(w[0].0 + w[0].1 <= w[1].0, "spans must be disjoint: {spans:?}");
+        }
+        assert!(spans.iter().all(|&(_, sz)| sz > 0));
+    }
+
+    /// A region that does not lie wholly inside the walked window, or whose
+    /// start is not 8-aligned, is dropped rather than clamped. Dropping is the
+    /// pre-existing behaviour and this test pins it: a clamped region could
+    /// hide live objects, whereas a dropped one only costs the walker the
+    /// pre-BUG-03 treatment of that tail.
+    #[test]
+    fn jit_tlab_skip_offsets_drops_regions_outside_the_walked_window() {
+        let heap = GenerationalHeap::with_sizes(64 * 1024, 64 * 1024);
+        let base = 0x10_0000usize;
+        let end = base + 0x1000;
+
+        heap.set_jit_tlab_skip_regions(&[
+            (base - 0x100, base + 0x100), // starts before the window
+            (base + 0xF00, end + 0x100),  // ends after the window
+            (base + 0x200, base + 0x200), // empty
+            (base + 0x301, base + 0x400), // start not 8-aligned
+            (base + 0x400, base + 0x480), // the only survivor
+        ]);
+
+        assert_eq!(heap.jit_tlab_skip_offsets(base, end), vec![(0x400, 0x80)]);
+
+        heap.clear_jit_tlab_skip_regions();
+        assert!(heap.jit_tlab_skip_offsets(base, end).is_empty());
     }
 
     /// Ordinary headers are unaffected by the kind guard.
@@ -13811,6 +14216,189 @@ mod tests {
         let obj1 = heap.alloc_object(ClassId::new(0), 0);
         let obj2 = heap.alloc_object(ClassId::new(0), 0);
         assert_ne!(heap.identity_hash_code(obj1), heap.identity_hash_code(obj2),);
+    }
+
+    /// After the NON-MOVING old-gen sweep, `is_addr_live` must NOT report a
+    /// freed block as live. (Half 1 of the fix; was an open defect.)
+    ///
+    /// `VmHeap::is_addr_live` answers `is_old_gen_addr(addr) ||
+    /// is_live_young_survivor(addr)`, and `is_old_gen_addr` is a bare range
+    /// check whose doc comment justifies itself with "a minor collection never
+    /// touches the old generation, so every old-gen object is live".
+    ///
+    /// That premise fails on the non-moving path.
+    /// `sweep_old_gen_non_moving` — the old-gen collector that runs whenever a
+    /// live JIT frame blocks the moving young collector, i.e. EVERY collection
+    /// in the H2 `TestOutOfMemory` window (`[moving-young] fallback:
+    /// reason=unregistered-jit-frame-on-stack`) — reclaims dead old-gen blocks
+    /// IN PLACE, and its own doc comment says "after it runs 'the address is
+    /// inside old gen' no longer implies 'the object is still there'". The two
+    /// comments contradict each other; this test shows which one is wrong.
+    ///
+    /// Consequence: every consumer that prunes a side table with
+    /// `pointer_map.contains_key(addr) || is_addr_live(addr)` — the `is_marked`
+    /// closure in `interpreter.rs` feeding `prune_external_roots`,
+    /// `reconcile_class_mirrors`/`rebuild_mirror_pins` and
+    /// `gc_reconcile_defining_loaders` — RETAINS the entry for a just-freed
+    /// object, leaving a dangling old-gen address for a later mark to decode.
+    ///
+    /// See `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    /// Fixed by giving `is_addr_live` a free-list-aware old-gen predicate
+    /// (`GenerationalHeap::is_live_old_gen_addr` -> `OldGen::is_allocated_addr`).
+    /// `is_old_gen_addr` itself is deliberately UNCHANGED: it answers "which
+    /// generation is this address in?", which `metadata_pin_deferrable` /
+    /// `mirror_pin_deferrable` legitimately ask.
+    #[test]
+    fn non_moving_old_sweep_frees_in_place_and_is_addr_live_says_so() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 8 * 1024);
+        let monitors = NoOpMonitors;
+
+        let keep = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(keep, 0, Value::Int(1));
+        let doomed = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(doomed, 0, Value::Int(2));
+
+        let mut roots = vec![keep, doomed];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        assert!(
+            heap.is_in_old(roots[0].as_ptr()) && heap.is_in_old(roots[1].as_ptr()),
+            "both objects must be promoted before the old-gen sweep is meaningful",
+        );
+
+        let keep = roots[0];
+        let doomed_addr = roots[1].as_ptr() as usize;
+
+        let live = vec![keep];
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live);
+        assert!(
+            reclaimed > 0,
+            "the sweep must actually have reclaimed the dropped object in place",
+        );
+
+        let vm = crate::vm_heap::VmHeap::Generational(heap);
+        assert!(
+            !vm.is_addr_live(doomed_addr),
+            "is_addr_live reported a block the non-moving old-gen sweep just \
+             freed in place (0x{doomed_addr:x}) as still live",
+        );
+    }
+
+    /// The old-gen mark BFS must not accept an in-range word that is not an
+    /// object base. (Half 2 of the fix; was an open defect.)
+    ///
+    /// `scan_object_for_old_refs` used to mark referents with
+    /// `if old_gen.contains(ref_ptr) { (*ref_ptr).gc_flags |= GC_FLAG_MARKED }`.
+    /// The ROOT seed in `old_gen_gc` documented this exact hazard and defended
+    /// against it ("ANY garbage address landing inside old gen's byte range got
+    /// `gc_flags` blindly RMW'd — the exact same corruption family, on the
+    /// OTHER generation"), but that screen had never been carried to the BFS,
+    /// to the young->old ref-slot seed, or to the four pin/overlay seeds. It now
+    /// lives in `old_gen_mark_candidate_plausible` and every push site uses it.
+    ///
+    /// Two consequences, both asserted here:
+    ///   * the mark bit is written into an unrelated LIVE object's payload,
+    ///     silently changing a Java field value — `0x41414141` becomes
+    ///     `0x43414141` (`|= GC_FLAG_MARKED`);
+    ///   * those payload bytes are then decoded as an `ObjectHeader`, which is
+    ///     how a byte that is not a valid `ObjectKind` discriminant reaches
+    ///     `gen_object_total_size` and the corrupt-header diagnostics.
+    ///
+    /// Together with the test above this is the whole path: a side table keeps
+    /// a dangling old-gen address because the prune predicate lies, and nothing
+    /// downstream re-checks it.
+    #[test]
+    fn old_gen_mark_rejects_an_interior_address_instead_of_decoding_it() {
+        let heap = GenerationalHeap::with_sizes(2 * 1024, 16 * 1024);
+        let monitors = NoOpMonitors;
+
+        let holder = heap.alloc_object(ClassId::new(0), 1);
+        let victim = heap.alloc_object(ClassId::new(0), 4);
+        for i in 0..4 {
+            heap.set_field(victim, i, Value::Int(0x4141_4141));
+        }
+        let mut roots = vec![holder, victim];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let (holder, victim) = (roots[0], roots[1]);
+        assert!(
+            heap.is_in_old(holder.as_ptr()) && heap.is_in_old(victim.as_ptr()),
+            "both objects must be in old gen for this to exercise the old-gen mark",
+        );
+
+        // An INTERIOR address of `victim`: 8-aligned, inside old gen, but not
+        // an object base. This is the shape a stale side-table entry takes once
+        // its block has been freed in place and the space reused.
+        let interior = unsafe { victim.as_ptr().add(HEADER_SIZE) };
+        assert!(
+            heap.is_in_old(interior),
+            "interior probe must stay in old gen"
+        );
+        // SAFETY: `interior` is a mapped old-gen address; storing it in a
+        // reference slot is exactly the state under test.
+        heap.set_field(
+            holder,
+            0,
+            Value::Object(Some(unsafe { ObjectRef::from_raw(interior) })),
+        );
+
+        let before = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            let mut major_roots = vec![holder, victim];
+            let _ =
+                GenerationalHeap::old_gen_gc(&mut major_roots, &young_from, &mut old_gen, false);
+        }
+        let after = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
+
+        let payload: Vec<i32> = (0..4)
+            .map(|i| heap.get_field(victim, i).as_int().unwrap_or(i32::MIN))
+            .collect();
+
+        assert_eq!(
+            payload,
+            vec![0x4141_4141_i32; 4],
+            "the old-gen mark wrote a mark bit into a LIVE object's payload",
+        );
+        assert_eq!(
+            after, before,
+            "the old-gen mark decoded an INTERIOR address as an ObjectHeader \
+             instead of rejecting it (bad-kind hits {before} -> {after})",
+        );
+    }
+
+    /// `OldGen::is_allocated_addr` is the discriminator `contains` cannot be:
+    /// a freed block stays inside the backing store (and keeps its bytes, since
+    /// only `alloc` zeroes), so only the free list can tell the two apart.
+    #[test]
+    fn old_gen_is_allocated_addr_distinguishes_freed_blocks_from_live_ones() {
+        let mut og = OldGen::new(64 * 1024);
+        let a = og.alloc(256, 8).expect("alloc a");
+        let b = og.alloc(256, 8).expect("alloc b");
+        assert!(og.is_allocated_addr(a) && og.is_allocated_addr(b));
+        // Interior addresses of a live object are still allocated storage.
+        assert!(og.is_allocated_addr(unsafe { a.add(128) }));
+
+        // SAFETY: `b` is exactly the (base, size) pair `alloc` just returned.
+        unsafe { og.free(b, 256) };
+        assert!(
+            og.contains(b),
+            "precondition: the freed block is still inside the backing store, \
+             which is why `contains` cannot answer a liveness question",
+        );
+        assert!(
+            !og.is_allocated_addr(b),
+            "a block returned to the free list must not read as allocated",
+        );
+        assert!(
+            og.is_allocated_addr(a),
+            "freeing a neighbour must not affect a live block",
+        );
+        // Outside the arena entirely.
+        assert!(!og.is_allocated_addr(std::ptr::null()));
     }
 
     #[test]

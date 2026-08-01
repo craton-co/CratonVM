@@ -43,7 +43,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             let addr_obj = args.first().copied().unwrap_or(Value::Object(None));
             let addr_str = p98_extract_socket_addr(ctx, addr_obj);
             let mut sc_obj = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
-            match ctx.fd_table().open_tcp_connect(&addr_str) {
+            match crate::capability_gate::open_tcp_connect_gated(&*ctx, &addr_str) {
                 Ok(fd) => {
                     ctx.set_field(sc_obj, 0, Value::Int(1));
                     ctx.set_field(sc_obj, 1, Value::Int(1));
@@ -77,7 +77,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         }
         let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
         let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-        match ctx.fd_table().open_tcp_connect(&addr_str) {
+        match crate::capability_gate::open_tcp_connect_gated(&*ctx, &addr_str) {
             Ok(fd) => {
                 ctx.set_field(this, 0, Value::Int(1));
                 // Pin across the create_string below — a moving young GC there
@@ -261,7 +261,10 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             if crate::nbflags().dbg_nio_bind {
                 eprintln!("[NIO_BIND] ssc.bind 1-arg addr='{}'", addr_str);
             }
-            match ctx.fd_table().open_tcp_listener(&addr_str) {
+            // GAP I6: server-socket bind was ungated — binding is an authority
+            // in its own right (a listener on 0.0.0.0 exposes the host), not a
+            // weaker form of connecting.
+            match crate::capability_gate::open_tcp_listener_gated(&*ctx, &addr_str) {
                 Ok(fd) => {
                     ctx.set_field(this, 1, Value::Int(1));
                     ctx.set_field(this, 2, Value::Int(fd as i32));
@@ -281,6 +284,11 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                         }
                     }
                     Ok(Some(Value::Object(Some(this))))
+                }
+                // A capability refusal is a `SecurityException`, not the
+                // `IOException` a failed bind raises.
+                Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+                    Err(denied.into())
                 }
                 Err(e) => {
                     if crate::nbflags().dbg_nio_bind {
@@ -314,7 +322,8 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                     addr_str, backlog
                 );
             }
-            match ctx.fd_table().open_tcp_listener(&addr_str) {
+            // GAP I6 — see the 1-arg `bind` above.
+            match crate::capability_gate::open_tcp_listener_gated(&*ctx, &addr_str) {
                 Ok(fd) => {
                     ctx.set_field(this, 1, Value::Int(1));
                     ctx.set_field(this, 2, Value::Int(fd as i32));
@@ -332,6 +341,10 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                         }
                     }
                     Ok(Some(Value::Object(Some(this))))
+                }
+                // A capability refusal is a `SecurityException`.
+                Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+                    Err(denied.into())
                 }
                 Err(e) => {
                     if crate::nbflags().dbg_nio_bind {
@@ -600,6 +613,16 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
 
     // SelectionKey = 4-field synthetic (channel=0, selector=1, interestOps=2, readyOps=3)
     let sk = "java/nio/channels/SelectionKey";
+
+    // The four public interest-op constants. They are `static final int`s, so
+    // they register with the FIELD descriptor "I" rather than a method one.
+    // Every `SelectionKey` instance method below existed, but nothing could
+    // name the bits they take: `key.interestOps(SelectionKey.OP_READ)` had no
+    // way to reach the value 1. The values are fixed by the JDK spec.
+    r.register(sk, "OP_READ", "I", |_ctx, _args| Ok(Some(Value::Int(1))));
+    r.register(sk, "OP_WRITE", "I", |_ctx, _args| Ok(Some(Value::Int(4))));
+    r.register(sk, "OP_CONNECT", "I", |_ctx, _args| Ok(Some(Value::Int(8))));
+    r.register(sk, "OP_ACCEPT", "I", |_ctx, _args| Ok(Some(Value::Int(16))));
     r.register(
         sk,
         "channel",
@@ -1462,11 +1485,12 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                 "127.0.0.1:80".into()
             };
             // Blocking TCP connect
-            let fd_id = ctx.fd_table().open_tcp_connect(&addr_str).map_err(|e| {
-                RuntimeError::IOException {
-                    message: format!("connect failed: {}", e),
-                }
-            })?;
+            let fd_id = crate::capability_gate::open_tcp_connect_gated(&*ctx, &addr_str)
+                .map_err(|e| {
+                    crate::capability_gate::translate_open_failure(e, |io| {
+                        format!("connect failed: {io}")
+                    })
+                })?;
             ctx.set_field(this, 0, Value::Int(1)); // connected
             ctx.set_field(this, 2, Value::Int(fd_id as i32));
             ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Object(None)));
@@ -2024,11 +2048,14 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
 
         // Connect
         let fd_id = if use_tls {
+            // `open_tls_connect` has no `_checked` twin on `FileDescriptorTable`,
+            // so gate the endpoint explicitly before the connect.
+            crate::capability_gate::gate_network(&*ctx, &format!("{}:{}", host, port))?;
             ctx.fd_table().open_tls_connect(&host, port)
                 .map_err(|e| RuntimeError::IOException { message: e.to_string() })?
         } else {
-            ctx.fd_table().open_tcp_connect(&format!("{}:{}", host, port))
-                .map_err(|e| RuntimeError::IOException { message: e.to_string() })?
+            crate::capability_gate::open_tcp_connect_gated(&*ctx, &format!("{}:{}", host, port))
+                .map_err(|e| crate::capability_gate::translate_open_failure(e, |io| io.to_string()))?
         };
 
         // Generate WebSocket key (16 random bytes, base64-encoded)
@@ -2780,12 +2807,11 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     let ms = "java/net/MulticastSocket";
     r.register(ms, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id =
-            ctx.fd_table()
-                .open_udp(Some("0.0.0.0:0"))
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("MulticastSocket bind failed: {}", e),
-                })?;
+        let fd_id = crate::capability_gate::open_udp_gated(&*ctx, Some("0.0.0.0:0")).map_err(|e| {
+            crate::capability_gate::translate_open_failure(e, |io| {
+                format!("MulticastSocket bind failed: {io}")
+            })
+        })?;
         ctx.set_field(this, 0, Value::Int(0));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(0));
@@ -2800,12 +2826,11 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let bind_addr = format!("0.0.0.0:{}", port);
-        let fd_id =
-            ctx.fd_table()
-                .open_udp(Some(&bind_addr))
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("MulticastSocket bind failed: {}", e),
-                })?;
+        let fd_id = crate::capability_gate::open_udp_gated(&*ctx, Some(&bind_addr)).map_err(|e| {
+            crate::capability_gate::translate_open_failure(e, |io| {
+                format!("MulticastSocket bind failed: {io}")
+            })
+        })?;
         ctx.set_field(this, 0, Value::Int(port));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(0));
@@ -3883,9 +3908,28 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     r.register(dc, "validOps", "()I", |_ctx, _args| Ok(Some(Value::Int(5))));
 
     // isBlocking() -> boolean
+    //
+    // Slot 3 only exists on the 5-field synthetic layout documented at the top
+    // of this function. `native-io`'s fd-table-backed `DatagramChannel.open`
+    // (which is registered LATER and therefore wins) allocates a 3-field
+    // object and keeps its state in identity-hash side tables, so slot 3 is
+    // out of bounds there — `get_field` answers `Object(None)`, i.e. "not
+    // blocking", for a channel the JDK specifies as blocking ("A newly-created
+    // channel is always in blocking mode", `SelectableChannel`). Fall back to
+    // that documented initial state whenever the receiver carries no blocking
+    // slot, instead of reporting the out-of-bounds read.
+    //
+    // RESIDUAL: on the fd-table layout a later `configureBlocking(false)` is
+    // applied to the OS socket by `native_dc_configure_blocking` but recorded
+    // nowhere Java-visible, so this still answers `true` afterwards. Closing
+    // that needs a blocking flag beside the fd in `native-io`'s `dc_fds`
+    // table, which is outside this module.
     r.register(dc, "isBlocking", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        match ctx.get_field(this, 3) {
+            v @ Value::Int(_) => Ok(Some(v)),
+            _ => Ok(Some(Value::Int(1))),
+        }
     });
     r.set_category(__prev_cat);
 }
@@ -4096,10 +4140,18 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // `URL.openConnection().getInputStream()` round-trips that target a loopback
     // HttpServer. We keep ONLY the HttpServerImpl alias for `create` (Phase E
     // registers `HttpServer` but not the impl class), the no-arg `create()`
-    // factory (Phase E only registers the 2-arg form), executor accessors,
-    // bind, and the HttpContext / HttpHandler / Headers helpers that Phase E
-    // does not cover. (`removeContext` was on that list until wave 3 found it
-    // shadowing Phase E's real one on the same key — see below.)
+    // factory, executor accessors, bind, and the HttpContext / HttpHandler /
+    // Headers helpers that Phase E does not cover. (`removeContext` was on that
+    // list until wave 3 found it shadowing Phase E's real one on the same key —
+    // see below.)
+    //
+    // Wave 4: `create()` (both arities) and `bind` now DELEGATE to Phase E
+    // rather than reimplementing. Every one of them used to mint (or mutate) a
+    // 3-slot carrier that had no `server_registry` entry, which is a server
+    // `start()` can never start ("server not registered") and `bind()` can never
+    // bind. Only the bodies moved — the keys stay registered here, because Phase
+    // 72 runs after Phase E and would otherwise shadow them again with the old
+    // behaviour.
     let hs = "com/sun/net/httpserver/HttpServer";
     let hs_simple = "com/sun/net/httpserver/HttpServerImpl";
 
@@ -4110,37 +4162,29 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         hs_simple,
         "create",
         "(Ljava/net/InetSocketAddress;I)Lcom/sun/net/httpserver/HttpServer;",
-        |ctx, _args| {
-            let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 3);
-            // Pin across the context-list alloc/init below — a moving young GC
-            // there would relocate them (native stale-local family).
-            let srv_pin = ctx.pin_native_root(srv);
-            ctx.set_field(srv, 1, Value::Int(0));
-            let ctxs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let ctxs_pin = ctx.pin_native_root(ctxs);
-            cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
-            let srv = ctx.read_native_pin(srv_pin, srv);
-            let ctxs = ctx.read_native_pin(ctxs_pin, ctxs);
-            ctx.set_field(srv, 2, Value::Object(Some(ctxs)));
-            ctx.unpin_native_roots(srv_pin);
-            Ok(Some(Value::Object(Some(srv))))
+        // Delegated to Phase E's factory (wave 4). The local body used to mint
+        // a 3-slot object with no `server_registry` entry and — despite taking
+        // an `InetSocketAddress` — never opened a socket, so `start()` on the
+        // result failed with "server not registered". Phase E's factory both
+        // binds and registers; the receiver keeps the PUBLIC class name so the
+        // `HttpServer`-keyed natives registered in this file (which Phase E's
+        // `alias_class` snapshot cannot see) still dispatch on it.
+        |ctx, args| {
+            crate::net_phase_e::re10_create_server(ctx, args, "com/sun/net/httpserver/HttpServer")
         },
     );
 
-    // No-arg factory not covered by Phase E.
+    // No-arg factory not covered by Phase E's 2-arg `create`. Phase E now owns
+    // the body: it allocates the same 6-slot carrier and registers the
+    // `ServerState` that `bind`/`start`/`stop`/`createContext` all look up.
+    // Per the JDK, `create()` returns an UNBOUND server — `bind()` must be
+    // called before `start()`.
     for cls in [hs, hs_simple] {
         r.register(
             cls,
             "create",
             "()Lcom/sun/net/httpserver/HttpServer;",
-            |ctx, _args| {
-                let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 3);
-                ctx.set_field(srv, 1, Value::Int(0));
-                let ctxs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
-                ctx.set_field(srv, 2, Value::Object(Some(ctxs)));
-                Ok(Some(Value::Object(Some(srv))))
-            },
+            |ctx, _args| crate::net_phase_e::re10_create_unbound_server(ctx),
         );
         r.register(
             cls,
@@ -4172,11 +4216,11 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         // setter dropped the executor and the getter always answered null, so
         // `server.setExecutor(pool); server.getExecutor()` returned null and a
         // caller that dispatches through the returned executor NPEs. The
-        // phase-72 `HttpServer` is a 3-slot object (address/started/contexts)
-        // with no executor slot — unlike net_phase_e's 6-slot `HttpServerImpl`,
-        // whose real set/getExecutor stay in force for servers built by
-        // `HttpServer.create(addr, backlog)` — so bind the executor in the same
-        // rooted side table the authenticator uses.
+        // side table keeps working whatever the carrier's slot count is, so it
+        // stayed put when the factories were unified onto net_phase_e's 6-slot
+        // layout (which does have an `HS_EXECUTOR` slot; its own set/getExecutor
+        // pair still serves receivers classed `sun/net/httpserver/HttpServerImpl`).
+        // Slot 1 is `started` in both layouts, so the guard below is unchanged.
         r.register(
             cls,
             "setExecutor",
@@ -4212,15 +4256,17 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 ))))
             },
         );
+        // `bind` used to store the address in slot 0 and stop there, so the
+        // ONLY sequence the no-arg factory supports —
+        // `create(); bind(addr, backlog); start();` — never opened a socket and
+        // `start()` reported the server unbound. Phase E's version really binds
+        // (and updates `getAddress()`/`getPort()` with the port the OS chose,
+        // which matters for the `bind(new InetSocketAddress(0), 0)` idiom).
         r.register(
             cls,
             "bind",
             "(Ljava/net/InetSocketAddress;I)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-                Ok(None)
-            },
+            |ctx, args| crate::net_phase_e::re10_bind_server(ctx, args),
         );
         // DELETED (wave 3) — both `removeContext` overloads used to be no-ops
         // here, on the premise that the real ones in
@@ -4235,10 +4281,11 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         // whose routes it is supposed to edit (ES MultipleHosts
         // `resetWaitHandlers`). Dropping these two restores it.
         //
-        // Safe for the 3-slot servers this phase's own `create()` mints: phase
-        // E's body reads the server id from slot `HS_SERVER_ID`, which those
-        // never set, and ids are handed out from 1 — so the registry lookup
-        // misses and the call is the same no-op it was before.
+        // Wave 4 addendum: this phase's `create()` no longer mints a carrier of
+        // its own, so phase E's `removeContext` now finds a real registry entry
+        // for THESE servers too and edits their routes for real, instead of
+        // missing the lookup and no-op-ing as it did while the id slot was
+        // never written.
     }
 
     // HttpContext = 2-field (path=0, handler=1)
@@ -4707,7 +4754,8 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
                 let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
                 let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-                match ctx.fd_table().open_tcp_listener(&addr_str) {
+                // GAP I6 — server-socket bind is its own authority.
+                match crate::capability_gate::open_tcp_listener_gated(&*ctx, &addr_str) {
                     Ok(fd) => {
                         ctx.set_field(ssc, 1, Value::Int(1));
                         ctx.set_field(ssc, 2, Value::Int(fd as i32));
@@ -4721,19 +4769,21 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                         return Ok(None);
                     }
                     Err(e) => {
-                        return Err(RuntimeError::IOException {
-                            message: format!("bind {addr_str}: {e}"),
-                        }
-                        .into());
+                        return Err(crate::capability_gate::translate_open_failure(e, |io| {
+                            format!("bind {addr_str}: {io}")
+                        }));
                     }
                 }
             }
         }
         // Plain ServerSocket path — bind a real TcpListener via s2_alloc_listener.
+        // GAP I6 (second half): this path never touches `fd_table`, so it needs
+        // the bare endpoint gate — `open_tcp_listener_gated` cannot reach it.
         use crate::servlet::s2_alloc_listener;
         use std::net::TcpListener;
         let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
         let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+        crate::capability_gate::gate_network(&*ctx, &addr_str)?;
         match TcpListener::bind(&addr_str) {
             Ok(listener) => {
                 let actual_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(0);
@@ -4760,7 +4810,8 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
                 let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
                 let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-                if let Ok(fd) = ctx.fd_table().open_tcp_listener(&addr_str) {
+                // GAP I6 — see the 1-arg `bind` above.
+                if let Ok(fd) = crate::capability_gate::open_tcp_listener_gated(&*ctx, &addr_str) {
                     ctx.set_field(ssc, 1, Value::Int(1));
                     ctx.set_field(ssc, 2, Value::Int(fd as i32));
                     let port = ctx
@@ -4774,10 +4825,12 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                 return Ok(None);
             }
         }
+        // GAP I6 (second half) — this path never touches `fd_table`.
         use crate::servlet::s2_alloc_listener;
         use std::net::TcpListener;
         let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
         let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+        crate::capability_gate::gate_network(&*ctx, &addr_str)?;
         match TcpListener::bind(&addr_str) {
             Ok(listener) => {
                 let actual_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(0);

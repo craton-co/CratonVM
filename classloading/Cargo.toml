@@ -22,6 +22,13 @@ cratonvm-reader = { path = "../reader", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
 cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
 cratonvm-native-builtins-crypto = { path = "../native-builtins-crypto", version = "0.3.0" }
+# Phase accounting (`docs/observability/phase-accounting.md` §10.2): the
+# `Category::ClassLoad` / `Category::Verification` spans in `class_manager.rs`
+# and `verifier.rs` need `cratonvm_jfr::phase`. Acyclic by inspection:
+# `cratonvm-jfr` depends on `cratonvm-types` and nothing else in the workspace
+# (and has no `[dev-dependencies]` at all), and `cratonvm-types` depends on no
+# workspace crate.
+cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
 tracing.workspace = true
 parking_lot.workspace = true
 zip.workspace = true

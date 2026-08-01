@@ -13,10 +13,34 @@
 //! - An `InvalidationManager` that tracks compilation assumptions and
 //!   determines which methods must be invalidated when the class hierarchy
 //!   changes.
+//! - A [`DeoptVerifier`] that checks emitted deopt metadata *before* the
+//!   artifact is installed, so a frame that could not be reconstructed
+//!   byte-for-byte bails the compile instead of becoming live code.
+//!
+//! ## Eliminated vs. undefined
+//!
+//! Two states that look identical in a snapshot are semantically opposite, and
+//! conflating them is how a scalar-replaced object silently reconstructs as
+//! `null`:
+//!
+//! * [`FrameValue::Undefined`] — the slot genuinely holds nothing at this bci
+//!   (never stored, or the reserved upper half of a cat-2 value). The resume
+//!   sink maps it to `Value::Int(0)`, which is correct *because the interpreter
+//!   never reads it*.
+//! * [`FrameValue::MaterializationRequired`] — the slot held a value the
+//!   optimizer **deleted** (a scalar-replaced allocation, an elided lock, an
+//!   eliminated store), and the emitter could not describe how to rebuild it.
+//!   The interpreter *will* read this slot. Resuming it as `Int(0)` hands Java
+//!   code a null where a live object was.
+//!
+//! Producers must never spell the second case as the first. See
+//! `docs/jit/deopt-metadata.md` for the producer-by-producer status.
 
 use std::{fmt, mem};
 
 use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::bailout::{Bailout, BailoutReason, CompileResult};
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -171,7 +195,37 @@ pub enum FrameValue {
     /// resolves it to the shell allocated for that id in Phase 1; it never
     /// resolves to a machine value, so `resolve_value` passes it through.
     VirtualObjectRef(usize),
-    /// Undefined / uninitialized.
+    /// **The value that belonged in this slot was deleted by an optimization
+    /// and must be materialised — but the emitter could not describe how.**
+    ///
+    /// Distinct from [`FrameValue::Undefined`] on purpose, and the distinction
+    /// is a correctness one, not a diagnostic nicety. `Undefined` means "the
+    /// interpreter never reads this slot", and every resume sink maps it to
+    /// `Value::Int(0)` on that basis. A scalar-replaced object recorded as
+    /// `Undefined` therefore reconstructs as `0` — i.e. `null` for a
+    /// reference-typed local — with no error anywhere: the exact silent
+    /// wrong-reconstruction this variant exists to make impossible.
+    ///
+    /// Semantics on resume: **unresumable**. [`frame_state_is_resumable`]
+    /// returns `false` for a frame containing one, and the VM sinks' catch-all
+    /// arms (`fv_to_value` → `None`, `field_value_to_value` → `Err`) already
+    /// refuse it, so the method takes the safe whole-method re-run instead of a
+    /// precise resume. It is strictly better than `Undefined` (wrong value,
+    /// silently) and strictly better than [`FrameValue::Unsupported`] (right
+    /// outcome, but it says "unknown width" and so misattributes the cause).
+    ///
+    /// A slot whose eliminated value the emitter *can* rebuild is
+    /// [`FrameValue::VirtualObject`] / [`FrameValue::VirtualObjectRef`], not
+    /// this.
+    MaterializationRequired(EliminatedValue),
+    /// Genuinely undefined / uninitialized at this bci: a local never stored on
+    /// any path reaching here, or the reserved upper half of a cat-2
+    /// `long`/`double`. Resume sinks map it to `Value::Int(0)`, which is sound
+    /// **only** because the bytecode verifier guarantees the interpreter cannot
+    /// read such a slot before something writes it.
+    ///
+    /// This must NOT be used for a value that was optimized away — that is
+    /// [`FrameValue::MaterializationRequired`].
     Undefined,
     /// A live slot whose precise value can't be reconstructed for resume. With
     /// cat-2 (`Long`/`Double`/`StackSlotLong`/`StackSlotDouble`) and FP
@@ -182,6 +236,106 @@ pub enum FrameValue {
     /// safe re-run path" rather than fabricate a value, so a method with such a
     /// slot live at a guard is never resumed with garbage.
     Unsupported,
+}
+
+/// Why a slot's value is gone from the machine state, for
+/// [`FrameValue::MaterializationRequired`].
+///
+/// Carried so the compiler report can name the *pass* that deleted the value
+/// rather than reporting an anonymous "cannot resume". Every variant means the
+/// same thing to the resume path (refuse), so a producer that cannot classify
+/// precisely should use [`EliminationCause::Unclassified`] rather than guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EliminationCause {
+    /// Escape analysis scalar-replaced the allocation, but the emitter could
+    /// not prove the object's fields were all stored before this deopt point
+    /// (or could not resolve one of them), so no `VirtualObject` recipe exists.
+    ScalarReplacedObject,
+    /// The object is scalar-replaced and one of its fields is *itself* a
+    /// scalar-replaced object — nested virtual graphs are not emitted yet.
+    NestedVirtualObject,
+    /// A store whose value this slot names was deleted by dead-store
+    /// elimination, so the slot's value has no producer left in the graph.
+    EliminatedStore,
+    /// The monitor this slot describes was elided by lock elision, so the
+    /// resume has no object to re-lock.
+    ElidedLock,
+    /// The producing node was removed and the emitter has no better
+    /// attribution. Prefer a specific cause when one is known.
+    Unclassified,
+}
+
+impl fmt::Display for EliminationCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::ScalarReplacedObject => "scalar-replaced object",
+            Self::NestedVirtualObject => "nested virtual object",
+            Self::EliminatedStore => "eliminated store",
+            Self::ElidedLock => "elided lock",
+            Self::Unclassified => "unclassified elimination",
+        };
+        f.write_str(s)
+    }
+}
+
+/// The provenance of a value an optimization deleted, carried by
+/// [`FrameValue::MaterializationRequired`].
+///
+/// `producer` is the IR `NodeId` of the node that used to compute the value
+/// (`u32::MAX` when the producer is unknown), which is what makes an
+/// unreconstructable slot *actionable*: the compiler report names the node the
+/// pass removed, and [`DeoptVerifier`] can cross-check it against the set of
+/// nodes the optimizer actually retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EliminatedValue {
+    /// IR node id of the deleted producer, or `u32::MAX` when unknown.
+    pub producer: u32,
+    /// Class id of the eliminated object when it was an allocation, else `0`.
+    pub class_id: u32,
+    /// Which pass deleted it.
+    pub cause: EliminationCause,
+}
+
+impl EliminatedValue {
+    /// An eliminated value with a known producer node and cause.
+    pub fn new(producer: u32, cause: EliminationCause) -> Self {
+        Self {
+            producer,
+            class_id: 0,
+            cause,
+        }
+    }
+
+    /// An eliminated *allocation* — producer node plus the class it allocated.
+    pub fn allocation(producer: u32, class_id: u32, cause: EliminationCause) -> Self {
+        Self {
+            producer,
+            class_id,
+            cause,
+        }
+    }
+
+    /// An eliminated value whose producer node id is not known to the emitter.
+    pub fn unknown(cause: EliminationCause) -> Self {
+        Self {
+            producer: u32::MAX,
+            class_id: 0,
+            cause,
+        }
+    }
+}
+
+impl fmt::Display for EliminatedValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.cause)?;
+        if self.producer != u32::MAX {
+            write!(f, " (producer n{})", self.producer)?;
+        }
+        if self.class_id != 0 {
+            write!(f, " class_id={}", self.class_id)?;
+        }
+        Ok(())
+    }
 }
 
 /// State of a scalar-replaced object that needs heap materialization.
@@ -201,9 +355,21 @@ pub struct VirtualObjectState {
 ///
 /// `false` as soon as any live local or operand-stack slot is
 /// [`FrameValue::Unsupported`] — the marker the snapshot emitter writes when it
-/// cannot determine a slot JVM width/type. The VM resume sink
-/// (`build_deopt_frame_inner`) maps such a slot to `None` and refuses the
-/// resume, so a deopt point carrying one is unresumable by construction.
+/// cannot determine a slot JVM width/type — or
+/// [`FrameValue::MaterializationRequired`], the marker for a slot whose value an
+/// optimization deleted without leaving a rebuild recipe. The VM resume sink
+/// (`build_deopt_frame_inner`) maps both to `None` and refuses the resume, so a
+/// deopt point carrying one is unresumable by construction.
+///
+/// The scan reaches into [`FrameValue::VirtualObject`] field graphs for the
+/// eliminated marker only: materializing an object whose field held a deleted
+/// value would store a `null` into a field that held a live reference.
+/// `Unsupported` *inside* a virtual object is deliberately left as it always
+/// was (not propagated) — the producers already refuse to emit such a field
+/// (`ir_lower::frame_value_for_object`), and widening the predicate there would
+/// silently change which methods the `invokedynamic` trap bail rejects.
+/// Recursion terminates because a `VirtualObjectRef` edge is *not* followed —
+/// it is the cycle/sharing terminator.
 ///
 /// Callers that emit an UNCONDITIONAL trap (the `invokedynamic` uncommon trap)
 /// use this to bail the whole compile: an artifact that always traps at a point
@@ -214,7 +380,57 @@ pub fn frame_state_is_resumable(fs: &FrameState) -> bool {
     !fs.locals
         .iter()
         .chain(fs.stack.iter())
-        .any(|v| matches!(v, FrameValue::Unsupported))
+        .any(value_blocks_resume)
+}
+
+/// `true` when `v` cannot be turned into an interpreter value: either it is
+/// itself unreconstructable, or it is a virtual object one of whose fields
+/// (transitively, without crossing a `VirtualObjectRef` edge) names a value an
+/// optimization deleted.
+fn value_blocks_resume(v: &FrameValue) -> bool {
+    match v {
+        FrameValue::Unsupported | FrameValue::MaterializationRequired(_) => true,
+        FrameValue::VirtualObject(state) => state
+            .field_values
+            .iter()
+            .any(contains_materialization_required),
+        _ => false,
+    }
+}
+
+/// `true` when `v` is — or transitively contains as a virtual-object field —
+/// a [`FrameValue::MaterializationRequired`].
+fn contains_materialization_required(v: &FrameValue) -> bool {
+    match v {
+        FrameValue::MaterializationRequired(_) => true,
+        FrameValue::VirtualObject(state) => state
+            .field_values
+            .iter()
+            .any(contains_materialization_required),
+        _ => false,
+    }
+}
+
+/// How many slots of `fs` name a value an optimization deleted without leaving
+/// a materialization recipe ([`FrameValue::MaterializationRequired`]).
+///
+/// The compiler-report counterpart of [`count_virtual_objects`]: that one
+/// counts eliminations the deopt path *can* undo, this one counts the ones it
+/// cannot. A non-zero count means every deopt at this point costs a
+/// whole-method re-run, which is the signal that a producer needs to start
+/// emitting a `VirtualObject` for that shape.
+pub fn count_materialization_required(fs: &FrameState) -> usize {
+    fn count_in(values: &[FrameValue]) -> usize {
+        values
+            .iter()
+            .map(|v| match v {
+                FrameValue::MaterializationRequired(_) => 1,
+                FrameValue::VirtualObject(state) => count_in(&state.field_values),
+                _ => 0,
+            })
+            .sum()
+    }
+    count_in(&fs.locals) + count_in(&fs.stack)
 }
 
 /// Lock/monitor state for a single object.
@@ -1160,19 +1376,63 @@ impl Default for SavedRegisters {
 /// `off` must address a word inside that frame. The deopt trampoline calls
 /// this *before* tearing the frame down, satisfying that invariant.
 fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue {
-    match v {
-        FrameValue::Register(r) => FrameValue::Int(regs.gpr[*r as usize] as i64),
-        FrameValue::RegisterLong(r) => FrameValue::Long(regs.gpr[*r as usize] as i64),
+    // A metadata defect must not take the VM down from inside a deopt stub, and
+    // it must not silently yield a plausible-looking wrong value either. Both
+    // are avoided by mapping the structured error to `Unsupported`, which every
+    // resume sink already refuses (→ safe whole-method re-run). The error itself
+    // is surfaced at compile time by `DeoptVerifier`, which is where it can
+    // still be acted on.
+    try_resolve_value(v, regs, rbp).unwrap_or(FrameValue::Unsupported)
+}
+
+/// [`resolve_value`], but reporting a structured error instead of falling back.
+///
+/// The only failure mode is a machine-location descriptor whose register number
+/// is outside the 16-entry GPR/XMM files the deopt stub spills — a
+/// [`FrameValue::Register`]`(17)` would otherwise index `gpr[17]` and panic
+/// inside the trampoline. Frame-slot reads are unchecked by construction (the
+/// `rbp`/offset contract is the caller's, documented on [`resolve_value`]);
+/// the compile-time cross-check that an offset is inside the frame and inside
+/// the oop map is [`DeoptVerifier`]'s job.
+fn try_resolve_value(
+    v: &FrameValue,
+    regs: &SavedRegisters,
+    rbp: u64,
+) -> Result<FrameValue, DeoptMetadataError> {
+    /// Checked read of GPR `r` from the spilled register file.
+    fn gpr(regs: &SavedRegisters, r: u8) -> Result<u64, DeoptMetadataError> {
+        regs.gpr
+            .get(r as usize)
+            .copied()
+            .ok_or(DeoptMetadataError::RegisterFileIndexOutOfRange {
+                bank: "gpr",
+                index: r,
+            })
+    }
+    /// Checked read of XMM `n` from the spilled register file.
+    fn xmm(regs: &SavedRegisters, n: u8) -> Result<u64, DeoptMetadataError> {
+        regs.xmm
+            .get(n as usize)
+            .copied()
+            .ok_or(DeoptMetadataError::RegisterFileIndexOutOfRange {
+                bank: "xmm",
+                index: n,
+            })
+    }
+
+    Ok(match v {
+        FrameValue::Register(r) => FrameValue::Int(gpr(regs, *r)? as i64),
+        FrameValue::RegisterLong(r) => FrameValue::Long(gpr(regs, *r)? as i64),
         // The register holds the raw heap pointer (0 == null) captured in-stub at
         // the guard — same as `StackSlotRef` but read from the spilled GPR file.
-        FrameValue::RegisterRef(r) => FrameValue::Object(regs.gpr[*r as usize]),
+        FrameValue::RegisterRef(r) => FrameValue::Object(gpr(regs, *r)?),
         FrameValue::XmmFloat(n) => {
             // Low 32 bits of the spilled XMM ARE the IEEE-754 float pattern.
-            FrameValue::Float(regs.xmm[*n as usize] & 0xFFFF_FFFF)
+            FrameValue::Float(xmm(regs, *n)? & 0xFFFF_FFFF)
         }
         FrameValue::XmmDouble(n) => {
             // Full 64 bits of the spilled XMM ARE the IEEE-754 double pattern.
-            FrameValue::Double(regs.xmm[*n as usize])
+            FrameValue::Double(xmm(regs, *n)?)
         }
         FrameValue::StackSlot(off) => {
             let addr = (rbp as i64 + *off as i64) as u64 as *const i64;
@@ -1221,12 +1481,17 @@ fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue 
         FrameValue::VirtualObject(state) => {
             let mut resolved = state.clone();
             for fv in resolved.field_values.iter_mut() {
-                *fv = resolve_value(fv, regs, rbp);
+                *fv = try_resolve_value(fv, regs, rbp)?;
             }
             FrameValue::VirtualObject(resolved)
         }
+        // Constants, `Undefined`, `Unsupported`, `VirtualObjectRef` and
+        // `MaterializationRequired` carry no machine location: they pass through
+        // to the resume sink exactly as the emitter wrote them. In particular a
+        // `MaterializationRequired` must NOT be softened to `Undefined` here —
+        // that would restore the silent-null reconstruction it exists to stop.
         other => other.clone(),
-    }
+    })
 }
 
 fn resolve_frame_state_machine(
@@ -1398,7 +1663,27 @@ pub fn restash_last_deopt(frame: ReconstructedFrame) {
 /// `CompiledMethod`), and `rbp` must be the live frame base of the trapping
 /// method. Both are guaranteed by the trampoline that calls this.
 pub extern "C" fn ir_deopt_entry(point: *const DeoptimizationPoint, rbp: u64) -> i64 {
-    // SAFETY: contract documented above.
+    // Checked, not assumed. The contract above says `point` is non-null, but a
+    // deopt trampoline is the worst place in the VM to find out that a
+    // contract was broken: dereferencing null here is UB inside a stub with a
+    // half-torn-down frame. A null pointer instead stashes the identity-less
+    // `bci == u32::MAX` re-run sentinel — the VM resume path rejects that bci
+    // and re-runs the method in the interpreter — so the `i64::MIN` return can
+    // never be mistaken for a legitimate `Long.MIN_VALUE` result.
+    if point.is_null() {
+        LAST_DEOPT.with(|c| {
+            *c.borrow_mut() = Some(ReconstructedFrame {
+                method_key: String::new(),
+                bci: u32::MAX,
+                locals: Vec::new(),
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller_frames: Vec::new(),
+            })
+        });
+        return i64::MIN;
+    }
+    // SAFETY: contract documented above; non-null checked immediately above.
     let point = unsafe { &*point };
     // The IR lowerer keeps every live value in a frame slot, so no register
     // file is needed; a register-allocating backend would spill GPRs/XMMs in
@@ -1673,6 +1958,1515 @@ pub fn count_virtual_objects(frame: &FrameState) -> usize {
     }
 
     count_in(&frame.locals) + count_in(&frame.stack)
+}
+
+// ---------------------------------------------------------------------------
+// Install-time deopt-metadata verification
+// ---------------------------------------------------------------------------
+//
+// The P0 acceptance criteria this section serves:
+//
+//   "Any guard or dependency failure reconstructs byte-for-byte equivalent
+//    interpreter state."
+//   "Moving GC at every call, allocation, poll, and deopt site preserves all
+//    objects and updates every reference."
+//
+// Neither can be proved by inspecting one slot at a time, because both are
+// *agreement* properties: a scope must agree with its method's bytecode
+// (`bci < code_len`, `locals.len() <= max_locals`), and a reference-typed deopt
+// slot must agree with the oop map (if the deopt map will hand the interpreter
+// the word at `[rbp-40]` as an object, the collector must know to rewrite that
+// same word — otherwise a moving collection between the safepoint and the
+// resume leaves the interpreter holding a pre-copy address).
+//
+// So the checks live here, run over the *emitted* metadata, and return a
+// `CompileResult<()>`: a disagreement bails the compile instead of installing
+// an artifact whose deopt cannot be reconstructed. That is strictly better than
+// discovering it at deopt time, when the only remaining options are a
+// whole-method re-run (duplicated side effects) or a wrong frame.
+
+/// Which part of a frame a violation was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotKind {
+    /// A local-variable slot.
+    Local,
+    /// An operand-stack slot (index 0 = bottom of stack).
+    Stack,
+    /// A held monitor's object.
+    Monitor,
+    /// A field of a scalar-replaced object that a slot materializes.
+    VirtualField {
+        /// [`VirtualObjectState::id`] of the object owning the field.
+        object_id: usize,
+    },
+}
+
+impl fmt::Display for SlotKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local => f.write_str("local"),
+            Self::Stack => f.write_str("stack"),
+            Self::Monitor => f.write_str("monitor"),
+            Self::VirtualField { object_id } => write!(f, "vobj#{object_id}.field"),
+        }
+    }
+}
+
+/// A fully-qualified address of one slot inside emitted deopt metadata:
+/// which deopt point (native PC), which inlined scope (depth + method), and
+/// which slot of that scope.
+///
+/// Every [`DeoptMetadataError`] that concerns a slot carries one, so a
+/// violation message names the exact PC/BCI/slot rather than "some frame is
+/// wrong" — the difference between an actionable bailout and a mystery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotRef {
+    /// Native code offset of the deopt point this slot belongs to.
+    pub native_offset: u32,
+    /// Bytecode index of the *scope* (not necessarily of the deopt point: an
+    /// inlined caller resumes at its own call bci).
+    pub bci: u32,
+    /// Method key of the scope.
+    pub method_key: String,
+    /// 0 for the innermost (trapping) scope, 1 for its inlined caller, …
+    pub scope_depth: usize,
+    /// Which part of the frame.
+    pub kind: SlotKind,
+    /// Index within that part.
+    pub index: usize,
+}
+
+impl SlotRef {
+    /// A slot reference for a field of a virtual object defined at `self`.
+    fn field(&self, object_id: usize, index: usize) -> SlotRef {
+        SlotRef {
+            native_offset: self.native_offset,
+            bci: self.bci,
+            method_key: self.method_key.clone(),
+            scope_depth: self.scope_depth,
+            kind: SlotKind::VirtualField { object_id },
+            index,
+        }
+    }
+}
+
+impl fmt::Display for SlotRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "pc+0x{:x} scope{}", self.native_offset, self.scope_depth)?;
+        if !self.method_key.is_empty() {
+            write!(f, " {}", self.method_key)?;
+        }
+        write!(f, " bci {} {}[{}]", self.bci, self.kind, self.index)
+    }
+}
+
+/// A defect found in emitted deoptimization metadata.
+///
+/// Every variant names enough to locate the defect in the compiler output
+/// without re-running the compile — that is the whole point of making these
+/// structured rather than a `bool` or a panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeoptMetadataError {
+    /// A machine-location descriptor named a register outside the 16-entry
+    /// GPR/XMM files the deopt stub spills. Produced by the *runtime* resolver
+    /// (where it degrades to an unresumable slot) as well as the verifier.
+    RegisterFileIndexOutOfRange {
+        /// `"gpr"` or `"xmm"`.
+        bank: &'static str,
+        /// The out-of-range register number.
+        index: u8,
+    },
+    /// A scope named a method the verifier has no limits for, so its bci and
+    /// slot counts cannot be checked at all.
+    UnknownMethod {
+        native_offset: u32,
+        bci: u32,
+        method_key: String,
+        scope_depth: usize,
+    },
+    /// A scope's resume bci is not a valid index into its method's code.
+    BciOutOfRange {
+        native_offset: u32,
+        bci: u32,
+        method_key: String,
+        scope_depth: usize,
+        code_len: u32,
+    },
+    /// A scope declares more locals than its method has slots for.
+    LocalCountMismatch {
+        native_offset: u32,
+        bci: u32,
+        method_key: String,
+        scope_depth: usize,
+        found: usize,
+        max_locals: u16,
+    },
+    /// A scope declares a deeper operand stack than its method's `max_stack`.
+    StackCountMismatch {
+        native_offset: u32,
+        bci: u32,
+        method_key: String,
+        scope_depth: usize,
+        found: usize,
+        max_stack: u16,
+    },
+    /// The deopt point's own bci disagrees with its innermost scope's bci.
+    PointBciMismatch {
+        native_offset: u32,
+        point_bci: u32,
+        frame_bci: u32,
+    },
+    /// A deopt point carries reference-typed slots but no oop map was
+    /// registered for its native offset — the GC has no description of this
+    /// program point, so a moving collection cannot update those references.
+    MissingOopMap { native_offset: u32, bci: u32 },
+    /// A reference-typed frame slot the deopt map will read as an object is not
+    /// covered by the oop map. **This is the moving-GC correctness bug**: the
+    /// collector will not rewrite that word, so the resume hands the
+    /// interpreter a pre-copy address.
+    ReferenceNotInOopMap {
+        at: SlotRef,
+        /// The `[rbp - off]` offset, as the oop map spells it (positive).
+        frame_offset: i32,
+    },
+    /// A reference-typed *register* slot is not covered by the oop map.
+    ReferenceRegisterNotInOopMap { at: SlotRef, reg: u8 },
+    /// A reference slot's frame offset does not fit the `i16` the oop map
+    /// encodes offsets in, so it is unrepresentable to the GC by construction.
+    UnencodableRefOffset { at: SlotRef, frame_offset: i32 },
+    /// A raw heap address was baked into the metadata as a constant. Nothing
+    /// can update it when the object moves, so it is only ever valid as a
+    /// *resolved* value, never as emitted metadata.
+    BakedObjectAddress { at: SlotRef, address: u64 },
+    /// A slot names an IR node the optimizer removed, without carrying the
+    /// recipe needed to rebuild its value.
+    SlotNamesRemovedNode { at: SlotRef, node: u32 },
+    /// A `VirtualObjectRef(id)` edge with no `VirtualObject(id)` definition
+    /// anywhere in the same scope — materialization would have nothing to point
+    /// the slot at.
+    UndefinedVirtualObjectRef { at: SlotRef, id: usize },
+    /// The same virtual-object id is *defined* twice in one scope. Each object
+    /// must be defined exactly once; later occurrences are `VirtualObjectRef`.
+    DuplicateVirtualObjectDefinition { at: SlotRef, id: usize },
+    /// A virtual object's `num_fields` and `field_values.len()` disagree.
+    VirtualObjectFieldCountMismatch {
+        at: SlotRef,
+        id: usize,
+        declared: usize,
+        found: usize,
+    },
+    /// The monitor list of a scope cannot be replayed as balanced
+    /// enter/exit pairs.
+    UnbalancedMonitor { at: SlotRef, detail: String },
+    /// `deopt_points` is not sorted by `native_offset`, so
+    /// `CompiledMethod::find_deopt_point`'s binary search can miss an entry —
+    /// which reads as "no deopt metadata here" and forces the imprecise path.
+    DeoptPointsUnsorted { first: u32, second: u32 },
+}
+
+impl fmt::Display for DeoptMetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RegisterFileIndexOutOfRange { bank, index } => write!(
+                f,
+                "{bank}[{index}] is outside the 16-entry register file the deopt stub spills"
+            ),
+            Self::UnknownMethod {
+                native_offset,
+                bci,
+                method_key,
+                scope_depth,
+            } => write!(
+                f,
+                "pc+0x{native_offset:x} scope{scope_depth} bci {bci}: no frame limits registered \
+                 for method {:?} — its bci and slot counts are unverifiable",
+                method_key
+            ),
+            Self::BciOutOfRange {
+                native_offset,
+                bci,
+                method_key,
+                scope_depth,
+                code_len,
+            } => write!(
+                f,
+                "pc+0x{native_offset:x} scope{scope_depth} {method_key}: resume bci {bci} is \
+                 outside the method's {code_len}-byte code"
+            ),
+            Self::LocalCountMismatch {
+                native_offset,
+                bci,
+                method_key,
+                scope_depth,
+                found,
+                max_locals,
+            } => write!(
+                f,
+                "pc+0x{native_offset:x} scope{scope_depth} {method_key} bci {bci}: {found} local \
+                 slot(s) recorded but max_locals is {max_locals}"
+            ),
+            Self::StackCountMismatch {
+                native_offset,
+                bci,
+                method_key,
+                scope_depth,
+                found,
+                max_stack,
+            } => write!(
+                f,
+                "pc+0x{native_offset:x} scope{scope_depth} {method_key} bci {bci}: {found} operand \
+                 stack slot(s) recorded but max_stack is {max_stack}"
+            ),
+            Self::PointBciMismatch {
+                native_offset,
+                point_bci,
+                frame_bci,
+            } => write!(
+                f,
+                "pc+0x{native_offset:x}: deopt point bci {point_bci} disagrees with its frame \
+                 state bci {frame_bci}"
+            ),
+            Self::MissingOopMap {
+                native_offset,
+                bci,
+            } => write!(
+                f,
+                "pc+0x{native_offset:x} bci {bci}: reference-typed deopt slots but no oop map — a \
+                 moving collection cannot update them"
+            ),
+            Self::ReferenceNotInOopMap { at, frame_offset } => write!(
+                f,
+                "{at}: reference at [rbp-{frame_offset}] is not in the oop map — the GC will not \
+                 update it, so the resumed frame would hold a stale address"
+            ),
+            Self::ReferenceRegisterNotInOopMap { at, reg } => write!(
+                f,
+                "{at}: reference in gpr[{reg}] is not in the oop map — the GC will not update it"
+            ),
+            Self::UnencodableRefOffset { at, frame_offset } => write!(
+                f,
+                "{at}: reference offset {frame_offset} does not fit the i16 the oop map encodes"
+            ),
+            Self::BakedObjectAddress { at, address } => write!(
+                f,
+                "{at}: raw heap address {address:#x} baked into deopt metadata — nothing can \
+                 update it when the object moves"
+            ),
+            Self::SlotNamesRemovedNode { at, node } => write!(
+                f,
+                "{at}: names removed node n{node} with no materialization recipe — the deopt \
+                 frame would rebuild this slot from nothing"
+            ),
+            Self::UndefinedVirtualObjectRef { at, id } => write!(
+                f,
+                "{at}: VirtualObjectRef({id}) has no defining VirtualObject in this scope"
+            ),
+            Self::DuplicateVirtualObjectDefinition { at, id } => write!(
+                f,
+                "{at}: virtual object {id} is defined twice in one scope (later occurrences must \
+                 be VirtualObjectRef)"
+            ),
+            Self::VirtualObjectFieldCountMismatch {
+                at,
+                id,
+                declared,
+                found,
+            } => write!(
+                f,
+                "{at}: virtual object {id} declares {declared} field(s) but carries {found}"
+            ),
+            Self::UnbalancedMonitor { at, detail } => {
+                write!(f, "{at}: unbalanced monitor state — {detail}")
+            }
+            Self::DeoptPointsUnsorted { first, second } => write!(
+                f,
+                "deopt points are not sorted by native offset (0x{first:x} precedes 0x{second:x}) \
+                 — find_deopt_point's binary search can miss an entry"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeoptMetadataError {}
+
+/// The bytecode-level facts a scope is checked against.
+///
+/// Supplied by the compiler at install time from the same `MethodInfo` the
+/// front end parsed, so "the frame agrees with the method" is checked against
+/// the method itself and not against a second, drifting copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodFrameLimits {
+    /// `"<class>.<method>:<descriptor>"`, matching [`FrameState::method_key`].
+    pub method_key: String,
+    /// Length of the method's `Code` attribute in bytes. A resume bci must be
+    /// `< code_len`.
+    pub code_len: u32,
+    /// The method's `max_locals`.
+    pub max_locals: u16,
+    /// The method's `max_stack`.
+    pub max_stack: u16,
+}
+
+impl MethodFrameLimits {
+    pub fn new(
+        method_key: impl Into<String>,
+        code_len: u32,
+        max_locals: u16,
+        max_stack: u16,
+    ) -> Self {
+        Self {
+            method_key: method_key.into(),
+            code_len,
+            max_locals,
+            max_stack,
+        }
+    }
+}
+
+/// What the GC knows about one safepoint — the other half of the agreement the
+/// verifier checks.
+///
+/// `frame_slot_offsets` uses the same encoding as `crate::OopMapEntry`:
+/// **positive** offsets naming the word at `[rbp - off]`. Deopt metadata spells
+/// the same word as a **negative** `StackSlotRef(off)` read as `*(rbp + off)`,
+/// so the verifier compares `-off` against this list. Getting that sign
+/// convention wrong in either direction is exactly the class of bug this type
+/// exists to catch, so it is stated once, here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OopCoverage {
+    /// Positive `[rbp - off]` frame-slot offsets holding live references.
+    pub frame_slot_offsets: Vec<i16>,
+    /// GPR numbers holding live references. Empty for the IR lowerer, which
+    /// keeps every live value in a frame slot.
+    pub registers: Vec<u8>,
+    /// Mirror of `OopMapEntry::moving_young_coverage_complete`. `false` means
+    /// the collector must fall back to a non-moving cycle for this frame
+    /// (`mark_moving_young_coverage_incomplete_because`), so a reference the
+    /// deopt map names but the oop map omits is *tolerated* — it cannot go
+    /// stale if nothing moves.
+    pub moving_young_coverage_complete: bool,
+}
+
+impl OopCoverage {
+    /// Coverage claiming completeness over `offsets` (positive `[rbp - off]`).
+    pub fn complete(offsets: impl IntoIterator<Item = i16>) -> Self {
+        Self {
+            frame_slot_offsets: offsets.into_iter().collect(),
+            registers: Vec::new(),
+            moving_young_coverage_complete: true,
+        }
+    }
+
+    /// Does the map cover the word at `[rbp - off]`?
+    pub fn covers_frame_slot(&self, off: i32) -> bool {
+        i16::try_from(off).is_ok_and(|o| self.frame_slot_offsets.contains(&o))
+    }
+
+    /// Does the map cover GPR `reg`?
+    pub fn covers_register(&self, reg: u8) -> bool {
+        self.registers.contains(&reg)
+    }
+}
+
+/// Cap on how many violations one report lists, mirroring
+/// `ir_verify::MAX_REPORTED_VIOLATIONS`. The count is always exact; only the
+/// rendered list is truncated.
+const MAX_REPORTED_DEOPT_VIOLATIONS: usize = 20;
+
+/// Install-time checker for emitted deopt metadata.
+///
+/// Built with what only the compiler knows (per-method bytecode limits, the oop
+/// maps it just emitted, the nodes its optimizer retired) and then run over the
+/// `DeoptimizationPoint`s about to be installed. Every lane is opt-in through
+/// the presence of the corresponding data, so a caller that can supply only
+/// some of it still gets the checks that data supports rather than nothing:
+///
+/// * **scope lane** — active once any [`MethodFrameLimits`] is registered.
+///   Checks bci ranges and local/stack counts per scope, including inlined
+///   caller scopes.
+/// * **oop-map agreement lane** — active once any [`OopCoverage`] is
+///   registered, or unconditionally with [`Self::requiring_oop_map`].
+/// * **removed-node lane** — active once retired node ids are registered.
+/// * **structural lane** — always on: virtual-object definition/reference
+///   integrity, field counts, register-file bounds, monitor balance, and the
+///   sortedness `find_deopt_point` depends on.
+#[derive(Debug, Default)]
+pub struct DeoptVerifier {
+    methods: FxHashMap<String, MethodFrameLimits>,
+    oop_coverage: FxHashMap<u32, OopCoverage>,
+    removed_nodes: FxHashSet<u32>,
+    materializable_nodes: FxHashSet<u32>,
+    require_oop_map: bool,
+}
+
+impl DeoptVerifier {
+    /// A verifier with no data registered: structural lane only.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register the bytecode limits of one method (the root method or any
+    /// inlined callee whose scopes appear in the metadata).
+    pub fn with_method(mut self, limits: MethodFrameLimits) -> Self {
+        self.methods.insert(limits.method_key.clone(), limits);
+        self
+    }
+
+    /// Register the oop map covering the safepoint at `native_offset`.
+    pub fn with_oop_map(mut self, native_offset: u32, coverage: OopCoverage) -> Self {
+        self.oop_coverage.insert(native_offset, coverage);
+        self
+    }
+
+    /// Register IR node ids the optimizer removed. A slot that names one of
+    /// these without carrying a rebuild recipe is rejected.
+    pub fn with_removed_nodes(mut self, nodes: impl IntoIterator<Item = u32>) -> Self {
+        self.removed_nodes.extend(nodes);
+        self
+    }
+
+    /// Register removed node ids the emitter *can* rebuild (the scalar
+    /// replacement map's keys). These are the removed nodes a
+    /// `VirtualObject` slot is allowed to name.
+    pub fn with_materializable_nodes(mut self, nodes: impl IntoIterator<Item = u32>) -> Self {
+        self.materializable_nodes.extend(nodes);
+        self
+    }
+
+    /// Require every deopt point carrying reference slots to have a registered
+    /// oop map. Off by default, because a backend that has not wired precise
+    /// maps yet publishes none at all and its frames are handled
+    /// conservatively — flagging every point there would be noise, not a
+    /// finding.
+    pub fn requiring_oop_map(mut self, require: bool) -> Self {
+        self.require_oop_map = require;
+        self
+    }
+
+    /// Verify `points`, returning every violation found (never short-circuits:
+    /// the second violation is usually the one that explains the first).
+    ///
+    /// Never panics and never mutates — same contract as
+    /// `ir_verify::verify_graph`, and for the same reason: this is the
+    /// component that must survive input it was not designed for.
+    pub fn violations(&self, points: &[DeoptimizationPoint]) -> Vec<DeoptMetadataError> {
+        let mut out = Vec::new();
+
+        for w in points.windows(2) {
+            if w[0].native_offset > w[1].native_offset {
+                out.push(DeoptMetadataError::DeoptPointsUnsorted {
+                    first: w[0].native_offset,
+                    second: w[1].native_offset,
+                });
+            }
+        }
+
+        for point in points {
+            self.check_point(point, &mut out);
+        }
+        out
+    }
+
+    /// [`Self::violations`], as a compile step: `Ok(())` or a [`Bailout`]
+    /// listing what was wrong.
+    ///
+    /// A failure means the artifact must NOT be installed. Bailing is always
+    /// semantically valid — the method takes the interpreter or the
+    /// single-pass backend — whereas installing code whose deopt cannot be
+    /// reconstructed is not.
+    pub fn verify(&self, points: &[DeoptimizationPoint]) -> CompileResult<()> {
+        let errors = self.violations(points);
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(deopt_metadata_bailout(&errors))
+    }
+
+    // ── per-point ────────────────────────────────────────────────────
+
+    fn check_point(&self, point: &DeoptimizationPoint, out: &mut Vec<DeoptMetadataError>) {
+        // A `PendingException` frame deliberately carries the *throwing* bci and
+        // a post-pop operand stack — it is not a resume point (see
+        // `DeoptReason::PendingException`), so the point-vs-frame bci identity
+        // still holds and is checked, but nothing below assumes resumability.
+        if point.bci != point.frame_state.bci {
+            out.push(DeoptMetadataError::PointBciMismatch {
+                native_offset: point.native_offset,
+                point_bci: point.bci,
+                frame_bci: point.frame_state.bci,
+            });
+        }
+
+        let coverage = self.oop_coverage.get(&point.native_offset);
+        let mut scope: Option<&FrameState> = Some(&point.frame_state);
+        let mut depth = 0usize;
+        while let Some(state) = scope {
+            self.check_scope(point, state, depth, coverage, out);
+            scope = state.caller.as_deref();
+            depth += 1;
+        }
+    }
+
+    fn check_scope(
+        &self,
+        point: &DeoptimizationPoint,
+        state: &FrameState,
+        depth: usize,
+        coverage: Option<&OopCoverage>,
+        out: &mut Vec<DeoptMetadataError>,
+    ) {
+        // ── scope lane ───────────────────────────────────────────────
+        if !self.methods.is_empty() {
+            match self.methods.get(&state.method_key) {
+                None => out.push(DeoptMetadataError::UnknownMethod {
+                    native_offset: point.native_offset,
+                    bci: state.bci,
+                    method_key: state.method_key.clone(),
+                    scope_depth: depth,
+                }),
+                Some(limits) => {
+                    if state.bci >= limits.code_len {
+                        out.push(DeoptMetadataError::BciOutOfRange {
+                            native_offset: point.native_offset,
+                            bci: state.bci,
+                            method_key: state.method_key.clone(),
+                            scope_depth: depth,
+                            code_len: limits.code_len,
+                        });
+                    }
+                    if state.locals.len() > limits.max_locals as usize {
+                        out.push(DeoptMetadataError::LocalCountMismatch {
+                            native_offset: point.native_offset,
+                            bci: state.bci,
+                            method_key: state.method_key.clone(),
+                            scope_depth: depth,
+                            found: state.locals.len(),
+                            max_locals: limits.max_locals,
+                        });
+                    }
+                    if state.stack.len() > limits.max_stack as usize {
+                        out.push(DeoptMetadataError::StackCountMismatch {
+                            native_offset: point.native_offset,
+                            bci: state.bci,
+                            method_key: state.method_key.clone(),
+                            scope_depth: depth,
+                            found: state.stack.len(),
+                            max_stack: limits.max_stack,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── slot lanes ───────────────────────────────────────────────
+        //
+        // Virtual-object ids are scope-local (the materializer resolves shells
+        // per reconstructed frame), so definitions and references are collected
+        // per scope. References are validated at the end because a
+        // `VirtualObjectRef` may legally precede its definition — the
+        // materializer allocates all shells before wiring any field.
+        let mut defined: FxHashSet<usize> = FxHashSet::default();
+        let mut referenced: Vec<(SlotRef, usize)> = Vec::new();
+        let mut needs_oop_map = false;
+
+        let base = |kind: SlotKind, index: usize| SlotRef {
+            native_offset: point.native_offset,
+            bci: state.bci,
+            method_key: state.method_key.clone(),
+            scope_depth: depth,
+            kind,
+            index,
+        };
+
+        for (i, v) in state.locals.iter().enumerate() {
+            self.check_value(
+                v,
+                &base(SlotKind::Local, i),
+                coverage,
+                &mut defined,
+                &mut referenced,
+                &mut needs_oop_map,
+                out,
+            );
+        }
+        for (i, v) in state.stack.iter().enumerate() {
+            self.check_value(
+                v,
+                &base(SlotKind::Stack, i),
+                coverage,
+                &mut defined,
+                &mut referenced,
+                &mut needs_oop_map,
+                out,
+            );
+        }
+
+        // ── monitor lane ─────────────────────────────────────────────
+        //
+        // "Balanced" here means the list can be replayed as `monitorenter`
+        // pairs on resume: every entry names a re-lockable object, carries a
+        // depth of at least one (a depth-0 entry is a lock nobody holds), and
+        // no object appears twice (a re-entrant lock is ONE entry with depth 2 —
+        // two entries would make the resume enter it twice and leave the
+        // interpreter one `monitorexit` short at method end).
+        for (i, m) in state.monitors.iter().enumerate() {
+            let at = base(SlotKind::Monitor, i);
+            if m.lock_depth == 0 {
+                out.push(DeoptMetadataError::UnbalancedMonitor {
+                    at: at.clone(),
+                    detail: "lock_depth is 0, so the resume would record a lock nobody holds"
+                        .to_string(),
+                });
+            }
+            if state.monitors[..i].iter().any(|p| p.object == m.object) {
+                out.push(DeoptMetadataError::UnbalancedMonitor {
+                    at: at.clone(),
+                    detail: format!(
+                        "object {:?} is already held by an earlier entry — re-entrancy must be \
+                         one entry with lock_depth > 1",
+                        m.object
+                    ),
+                });
+            }
+            if value_blocks_resume(&m.object) || matches!(m.object, FrameValue::Undefined) {
+                out.push(DeoptMetadataError::UnbalancedMonitor {
+                    at: at.clone(),
+                    detail: format!(
+                        "monitor object {:?} cannot be reconstructed, so the resume cannot \
+                         unlock it",
+                        m.object
+                    ),
+                });
+            }
+            self.check_value(
+                &m.object,
+                &at,
+                coverage,
+                &mut defined,
+                &mut referenced,
+                &mut needs_oop_map,
+                out,
+            );
+        }
+
+        for (at, id) in referenced {
+            if !defined.contains(&id) {
+                out.push(DeoptMetadataError::UndefinedVirtualObjectRef { at, id });
+            }
+        }
+
+        if needs_oop_map && coverage.is_none() && self.require_oop_map {
+            out.push(DeoptMetadataError::MissingOopMap {
+                native_offset: point.native_offset,
+                bci: state.bci,
+            });
+        }
+    }
+
+    /// Check one `FrameValue`, recursing through virtual-object fields.
+    #[allow(clippy::too_many_arguments)]
+    fn check_value(
+        &self,
+        v: &FrameValue,
+        at: &SlotRef,
+        coverage: Option<&OopCoverage>,
+        defined: &mut FxHashSet<usize>,
+        referenced: &mut Vec<(SlotRef, usize)>,
+        needs_oop_map: &mut bool,
+        out: &mut Vec<DeoptMetadataError>,
+    ) {
+        match v {
+            // ── register-file bounds ─────────────────────────────────
+            FrameValue::Register(r) | FrameValue::RegisterLong(r) => {
+                self.check_gpr_index(*r, out);
+            }
+            FrameValue::XmmFloat(n) | FrameValue::XmmDouble(n) => {
+                if *n as usize >= 16 {
+                    out.push(DeoptMetadataError::RegisterFileIndexOutOfRange {
+                        bank: "xmm",
+                        index: *n,
+                    });
+                }
+            }
+
+            // ── oop-map agreement ────────────────────────────────────
+            FrameValue::RegisterRef(r) => {
+                *needs_oop_map = true;
+                self.check_gpr_index(*r, out);
+                if let Some(cov) = coverage {
+                    if cov.moving_young_coverage_complete && !cov.covers_register(*r) {
+                        out.push(DeoptMetadataError::ReferenceRegisterNotInOopMap {
+                            at: at.clone(),
+                            reg: *r,
+                        });
+                    }
+                }
+            }
+            FrameValue::StackSlotRef(off) => {
+                *needs_oop_map = true;
+                // Deopt spells the word as `*(rbp + off)` with `off < 0`; the
+                // oop map spells the same word as the positive `[rbp - off]`.
+                let positive = -*off;
+                if i16::try_from(positive).is_err() {
+                    out.push(DeoptMetadataError::UnencodableRefOffset {
+                        at: at.clone(),
+                        frame_offset: positive,
+                    });
+                } else if let Some(cov) = coverage {
+                    if cov.moving_young_coverage_complete && !cov.covers_frame_slot(positive) {
+                        out.push(DeoptMetadataError::ReferenceNotInOopMap {
+                            at: at.clone(),
+                            frame_offset: positive,
+                        });
+                    }
+                }
+            }
+            FrameValue::Object(addr) if *addr != 0 => {
+                out.push(DeoptMetadataError::BakedObjectAddress {
+                    at: at.clone(),
+                    address: *addr,
+                });
+            }
+
+            // ── virtual objects ──────────────────────────────────────
+            FrameValue::VirtualObject(state) => {
+                if !defined.insert(state.id) {
+                    out.push(DeoptMetadataError::DuplicateVirtualObjectDefinition {
+                        at: at.clone(),
+                        id: state.id,
+                    });
+                }
+                if state.num_fields != state.field_values.len() {
+                    out.push(DeoptMetadataError::VirtualObjectFieldCountMismatch {
+                        at: at.clone(),
+                        id: state.id,
+                        declared: state.num_fields,
+                        found: state.field_values.len(),
+                    });
+                }
+                // The id IS the IR node of the eliminated allocation. Naming a
+                // removed node is only legal when that node is also registered
+                // as materializable — otherwise the recipe was built from a
+                // stale graph and rebuilds a slot from nothing.
+                let node = state.id as u32;
+                if self.removed_nodes.contains(&node) && !self.materializable_nodes.contains(&node)
+                {
+                    out.push(DeoptMetadataError::SlotNamesRemovedNode {
+                        at: at.clone(),
+                        node,
+                    });
+                }
+                for (i, fv) in state.field_values.iter().enumerate() {
+                    let field_at = at.field(state.id, i);
+                    self.check_value(
+                        fv,
+                        &field_at,
+                        coverage,
+                        defined,
+                        referenced,
+                        needs_oop_map,
+                        out,
+                    );
+                }
+            }
+            FrameValue::VirtualObjectRef(id) => referenced.push((at.clone(), *id)),
+
+            // ── eliminated vs. undefined ─────────────────────────────
+            //
+            // `MaterializationRequired` is NOT a violation: it is the honest
+            // marker for "this value was deleted and I cannot rebuild it", and
+            // it already makes the frame unresumable, so the method takes the
+            // safe re-run. What WOULD be a violation is the same situation
+            // spelled `Undefined` — and that one is undetectable here by
+            // construction, which is exactly why producers must be fixed to
+            // emit this variant. See `docs/jit/deopt-metadata.md`.
+            FrameValue::MaterializationRequired(_) => {}
+
+            _ => {}
+        }
+    }
+
+    fn check_gpr_index(&self, r: u8, out: &mut Vec<DeoptMetadataError>) {
+        if r as usize >= 16 {
+            out.push(DeoptMetadataError::RegisterFileIndexOutOfRange {
+                bank: "gpr",
+                index: r,
+            });
+        }
+    }
+}
+
+/// Render a violation list as a compilation [`Bailout`].
+///
+/// Uses [`BailoutReason::IrVerification`] with a `phase=deopt-metadata`
+/// context: the reason set in `bailout.rs` has no deopt-specific category yet
+/// (adding one is a change to a file this module does not own — see
+/// `docs/jit/deopt-metadata.md`), and `ir_verification` is the closest existing
+/// bucket, since this *is* a verifier rejecting emitted compiler output.
+fn deopt_metadata_bailout(errors: &[DeoptMetadataError]) -> Bailout {
+    let shown = errors.len().min(MAX_REPORTED_DEOPT_VIOLATIONS);
+    let mut msg = format!("{} deopt-metadata violation(s): ", errors.len());
+    let rendered: Vec<String> = errors[..shown].iter().map(|e| e.to_string()).collect();
+    msg.push_str(&rendered.join("; "));
+    if errors.len() > shown {
+        msg.push_str(&format!(" … and {} more", errors.len() - shown));
+    }
+    Bailout::with_context(
+        BailoutReason::DeoptMetadata(msg),
+        "phase=install".to_string(),
+    )
+}
+
+/// Convenience wrapper: verify `points` with a verifier built from `methods`
+/// and `oop_maps`.
+///
+/// The shape an install site wants — one call, `CompileResult<()>`, bail on
+/// failure — without having to know the builder API.
+pub fn verify_deopt_metadata(
+    points: &[DeoptimizationPoint],
+    methods: impl IntoIterator<Item = MethodFrameLimits>,
+    oop_maps: impl IntoIterator<Item = (u32, OopCoverage)>,
+) -> CompileResult<()> {
+    let mut verifier = DeoptVerifier::new();
+    for m in methods {
+        verifier = verifier.with_method(m);
+    }
+    for (off, cov) in oop_maps {
+        verifier = verifier.with_oop_map(off, cov);
+    }
+    verifier.verify(points)
+}
+
+#[cfg(test)]
+mod deopt_metadata_tests {
+    use super::*;
+
+    const M: &str = "T.m:(I)I";
+
+    fn limits() -> MethodFrameLimits {
+        // 32 bytes of code, 3 locals, 2 stack.
+        MethodFrameLimits::new(M, 32, 3, 2)
+    }
+
+    /// A well-formed point: bci in range, counts within limits, the one
+    /// reference local ([rbp-40]) covered by the oop map.
+    fn good_point() -> DeoptimizationPoint {
+        DeoptimizationPoint {
+            native_offset: 0x40,
+            bci: 12,
+            reason: DeoptReason::BoundsCheck,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: M.to_string(),
+                bci: 12,
+                locals: vec![FrameValue::StackSlotRef(-40), FrameValue::Int(7)],
+                stack: vec![FrameValue::StackSlot(-48)],
+                monitors: Vec::new(),
+                caller: None,
+            },
+        }
+    }
+
+    fn verifier() -> DeoptVerifier {
+        DeoptVerifier::new()
+            .with_method(limits())
+            .with_oop_map(0x40, OopCoverage::complete([40]))
+    }
+
+    fn rendered(errors: &[DeoptMetadataError]) -> String {
+        errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[test]
+    fn well_formed_metadata_passes() {
+        let v = verifier();
+        let points = [good_point()];
+        assert!(
+            v.violations(&points).is_empty(),
+            "{}",
+            rendered(&v.violations(&points))
+        );
+        assert!(v.verify(&points).is_ok());
+    }
+
+    #[test]
+    fn bci_past_the_end_of_the_method_is_rejected() {
+        let mut p = good_point();
+        p.bci = 99;
+        p.frame_state.bci = 99;
+        let errs = verifier().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::BciOutOfRange { bci: 99, code_len: 32, .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        let msg = rendered(&errs);
+        assert!(msg.contains("resume bci 99"), "{msg}");
+        assert!(msg.contains("32-byte code"), "{msg}");
+    }
+
+    #[test]
+    fn more_locals_than_max_locals_is_rejected() {
+        let mut p = good_point();
+        p.frame_state.locals = vec![FrameValue::Int(0); 4]; // max_locals is 3
+        let errs = verifier().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::LocalCountMismatch {
+                    found: 4,
+                    max_locals: 3,
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("max_locals is 3"));
+    }
+
+    #[test]
+    fn deeper_stack_than_max_stack_is_rejected() {
+        let mut p = good_point();
+        p.frame_state.stack = vec![FrameValue::Int(0); 3]; // max_stack is 2
+        let errs = verifier().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::StackCountMismatch {
+                    found: 3,
+                    max_stack: 2,
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    /// The moving-GC agreement rule: a reference the deopt map will hand the
+    /// interpreter must be a reference the collector knows to update. A
+    /// `StackSlotRef` whose word the oop map does not name is a stale-pointer
+    /// bug waiting for the first relocating young collection.
+    #[test]
+    fn reference_slot_absent_from_the_oop_map_is_rejected() {
+        let mut p = good_point();
+        // The oop map covers [rbp-40]; move the reference to [rbp-56].
+        p.frame_state.locals[0] = FrameValue::StackSlotRef(-56);
+        let errs = verifier().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::ReferenceNotInOopMap {
+                    frame_offset: 56,
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        let msg = rendered(&errs);
+        assert!(msg.contains("[rbp-56]"), "{msg}");
+        assert!(msg.contains("local[0]"), "must name the slot: {msg}");
+        assert!(msg.contains("stale address"), "{msg}");
+    }
+
+    /// A register-resident reference is checked against the same map.
+    #[test]
+    fn reference_register_absent_from_the_oop_map_is_rejected() {
+        let mut p = good_point();
+        p.frame_state.locals[0] = FrameValue::RegisterRef(9);
+        let errs = verifier().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::ReferenceRegisterNotInOopMap { reg: 9, .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    /// An oop map that does NOT claim moving-young completeness forces a
+    /// non-moving cycle for this frame, so an uncovered reference cannot go
+    /// stale — the lane must not report it (that would be a false positive on
+    /// every conservatively-handled frame).
+    #[test]
+    fn incomplete_coverage_does_not_flag_uncovered_references() {
+        let mut p = good_point();
+        p.frame_state.locals[0] = FrameValue::StackSlotRef(-56);
+        let v = DeoptVerifier::new().with_method(limits()).with_oop_map(
+            0x40,
+            OopCoverage {
+                frame_slot_offsets: vec![40],
+                registers: Vec::new(),
+                moving_young_coverage_complete: false,
+            },
+        );
+        assert!(v.violations(&[p]).is_empty());
+    }
+
+    #[test]
+    fn reference_slots_without_any_oop_map_are_rejected_when_required() {
+        let p = good_point();
+        let v = DeoptVerifier::new().with_method(limits()).requiring_oop_map(true);
+        let errs = v.violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::MissingOopMap { native_offset: 0x40, .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    /// A slot that names an IR node the optimizer removed, without that node
+    /// being registered as materializable, rebuilds the slot from nothing.
+    #[test]
+    fn slot_naming_a_removed_node_is_rejected() {
+        let mut p = good_point();
+        p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState {
+            id: 17, // IR node 17
+            class_id: 5,
+            num_fields: 1,
+            field_values: vec![FrameValue::Int(3)],
+        });
+        let v = verifier().with_removed_nodes([17u32]);
+        let errs = v.violations(&[p.clone()]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::SlotNamesRemovedNode { node: 17, .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("rebuild this slot from nothing"));
+
+        // The same node, registered as materializable (it has a recipe), is fine.
+        let ok = verifier()
+            .with_removed_nodes([17u32])
+            .with_materializable_nodes([17u32]);
+        assert!(ok.violations(&[p]).is_empty());
+    }
+
+    #[test]
+    fn unbalanced_lock_state_is_rejected() {
+        // depth 0 — a lock nobody holds.
+        let mut p = good_point();
+        p.frame_state.monitors = vec![MonitorInfo {
+            object: FrameValue::StackSlotRef(-40),
+            lock_depth: 0,
+        }];
+        let errs = verifier().violations(&[p]);
+        assert!(
+            matches!(errs.first(), Some(DeoptMetadataError::UnbalancedMonitor { .. })),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("lock_depth is 0"));
+
+        // The same object recorded twice instead of once at depth 2.
+        let mut p2 = good_point();
+        p2.frame_state.monitors = vec![
+            MonitorInfo {
+                object: FrameValue::StackSlotRef(-40),
+                lock_depth: 1,
+            },
+            MonitorInfo {
+                object: FrameValue::StackSlotRef(-40),
+                lock_depth: 1,
+            },
+        ];
+        let errs2 = verifier().violations(&[p2]);
+        assert!(
+            rendered(&errs2).contains("already held by an earlier entry"),
+            "{}",
+            rendered(&errs2)
+        );
+
+        // A monitor whose object cannot be reconstructed cannot be unlocked.
+        let mut p3 = good_point();
+        p3.frame_state.monitors = vec![MonitorInfo {
+            object: FrameValue::MaterializationRequired(EliminatedValue::new(
+                4,
+                EliminationCause::ElidedLock,
+            )),
+            lock_depth: 1,
+        }];
+        let errs3 = verifier().violations(&[p3]);
+        assert!(
+            rendered(&errs3).contains("cannot be reconstructed"),
+            "{}",
+            rendered(&errs3)
+        );
+    }
+
+    #[test]
+    fn virtual_object_graph_integrity_is_checked() {
+        // Field count disagreement.
+        let mut p = good_point();
+        p.frame_state.locals[0] = FrameValue::VirtualObject(VirtualObjectState {
+            id: 3,
+            class_id: 1,
+            num_fields: 2,
+            field_values: vec![FrameValue::Int(1)],
+        });
+        let errs = verifier().violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::VirtualObjectFieldCountMismatch {
+                    declared: 2,
+                    found: 1,
+                    ..
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+
+        // A dangling reference edge.
+        let mut p2 = good_point();
+        p2.frame_state.locals[0] = FrameValue::VirtualObjectRef(9);
+        let errs2 = verifier().violations(&[p2]);
+        assert!(
+            matches!(
+                errs2.first(),
+                Some(DeoptMetadataError::UndefinedVirtualObjectRef { id: 9, .. })
+            ),
+            "{}",
+            rendered(&errs2)
+        );
+
+        // A forward reference (ref in a local, definition later on the stack)
+        // is legal — the materializer allocates every shell before wiring.
+        let mut p3 = good_point();
+        p3.frame_state.locals[0] = FrameValue::VirtualObjectRef(4);
+        p3.frame_state.stack[0] = FrameValue::VirtualObject(VirtualObjectState {
+            id: 4,
+            class_id: 1,
+            num_fields: 0,
+            field_values: Vec::new(),
+        });
+        assert!(verifier().violations(&[p3]).is_empty());
+
+        // Defining the same object twice in one scope is not.
+        let mut p4 = good_point();
+        let vo = FrameValue::VirtualObject(VirtualObjectState {
+            id: 4,
+            class_id: 1,
+            num_fields: 0,
+            field_values: Vec::new(),
+        });
+        p4.frame_state.locals[0] = vo.clone();
+        p4.frame_state.stack[0] = vo;
+        let errs4 = verifier().violations(&[p4]);
+        assert!(
+            matches!(
+                errs4.first(),
+                Some(DeoptMetadataError::DuplicateVirtualObjectDefinition { id: 4, .. })
+            ),
+            "{}",
+            rendered(&errs4)
+        );
+    }
+
+    #[test]
+    fn inlined_caller_scopes_are_checked_too() {
+        let mut p = good_point();
+        p.frame_state.caller = Some(Box::new(FrameState {
+            method_key: "T.outer:()V".to_string(),
+            bci: 500, // past the caller's code length
+            locals: Vec::new(),
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        }));
+        let v = verifier().with_method(MethodFrameLimits::new("T.outer:()V", 20, 1, 1));
+        let errs = v.violations(&[p]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::BciOutOfRange { scope_depth: 1, .. })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("T.outer:()V"));
+    }
+
+    #[test]
+    fn a_scope_naming_an_unregistered_method_is_rejected() {
+        let mut p = good_point();
+        p.frame_state.method_key = "Other.x:()V".to_string();
+        let errs = verifier().violations(&[p]);
+        assert!(
+            matches!(errs.first(), Some(DeoptMetadataError::UnknownMethod { .. })),
+            "{}",
+            rendered(&errs)
+        );
+        assert!(rendered(&errs).contains("unverifiable"));
+    }
+
+    #[test]
+    fn out_of_range_register_descriptors_are_rejected() {
+        let mut p = good_point();
+        p.frame_state.locals[1] = FrameValue::Register(31);
+        p.frame_state.stack[0] = FrameValue::XmmDouble(20);
+        let errs = verifier().violations(&[p]);
+        assert_eq!(errs.len(), 2, "{}", rendered(&errs));
+        assert!(rendered(&errs).contains("gpr[31]"));
+        assert!(rendered(&errs).contains("xmm[20]"));
+    }
+
+    #[test]
+    fn a_baked_heap_address_is_rejected() {
+        let mut p = good_point();
+        p.frame_state.locals[1] = FrameValue::Object(0x7f00_1234);
+        let errs = verifier().violations(&[p]);
+        assert!(
+            matches!(errs.first(), Some(DeoptMetadataError::BakedObjectAddress { .. })),
+            "{}",
+            rendered(&errs)
+        );
+        // A null constant is fine — nothing to update.
+        let mut p2 = good_point();
+        p2.frame_state.locals[1] = FrameValue::Object(0);
+        assert!(verifier().violations(&[p2]).is_empty());
+    }
+
+    #[test]
+    fn unsorted_points_break_the_binary_search_and_are_rejected() {
+        let mut a = good_point();
+        a.native_offset = 0x80;
+        let mut b = good_point();
+        b.native_offset = 0x40;
+        let v = DeoptVerifier::new();
+        let errs = v.violations(&[a, b]);
+        assert!(
+            matches!(
+                errs.first(),
+                Some(DeoptMetadataError::DeoptPointsUnsorted {
+                    first: 0x80,
+                    second: 0x40
+                })
+            ),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    #[test]
+    fn point_bci_must_match_its_frame_state_bci() {
+        let mut p = good_point();
+        p.bci = 13; // frame_state.bci is 12
+        let errs = verifier().violations(&[p]);
+        assert!(
+            matches!(errs.first(), Some(DeoptMetadataError::PointBciMismatch { .. })),
+            "{}",
+            rendered(&errs)
+        );
+    }
+
+    #[test]
+    fn verify_returns_a_bailout_naming_every_violation() {
+        let mut p = good_point();
+        p.bci = 99;
+        p.frame_state.bci = 99;
+        p.frame_state.locals = vec![FrameValue::Int(0); 4];
+        let err = verifier().verify(&[p]).unwrap_err();
+        assert_eq!(err.category(), "deopt_metadata");
+        assert_eq!(err.context.as_deref(), Some("phase=install"));
+        let s = err.to_string();
+        assert!(s.contains("2 deopt-metadata violation(s)"), "{s}");
+        assert!(s.contains("resume bci 99"), "{s}");
+        assert!(s.contains("max_locals is 3"), "{s}");
+    }
+
+    #[test]
+    fn free_function_wrapper_matches_the_builder() {
+        let points = [good_point()];
+        assert!(verify_deopt_metadata(
+            &points,
+            [limits()],
+            [(0x40u32, OopCoverage::complete([40]))],
+        )
+        .is_ok());
+    }
+
+    // ── eliminated vs. undefined ─────────────────────────────────────
+
+    /// The distinction that keeps a scalar-replaced object from silently
+    /// reconstructing as `null`: `Undefined` is resumable (the sink maps it to
+    /// `Int(0)` because nothing reads the slot), `MaterializationRequired` is
+    /// not (the sink refuses, forcing a safe re-run), and the two are never
+    /// equal — so a producer that emits one can never be mistaken for the other.
+    #[test]
+    fn eliminated_and_undefined_are_distinct_states() {
+        let eliminated = FrameValue::MaterializationRequired(EliminatedValue::allocation(
+            12,
+            77,
+            EliminationCause::ScalarReplacedObject,
+        ));
+        assert_ne!(eliminated, FrameValue::Undefined);
+        assert_ne!(eliminated, FrameValue::Unsupported);
+
+        let undefined_frame = FrameState {
+            method_key: M.to_string(),
+            bci: 0,
+            locals: vec![FrameValue::Undefined],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        let eliminated_frame = FrameState {
+            method_key: M.to_string(),
+            bci: 0,
+            locals: vec![eliminated.clone()],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        assert!(
+            frame_state_is_resumable(&undefined_frame),
+            "a genuinely undefined slot must stay resumable"
+        );
+        assert!(
+            !frame_state_is_resumable(&eliminated_frame),
+            "an eliminated-but-unrebuildable slot must NOT resume as a value"
+        );
+        assert_eq!(count_materialization_required(&undefined_frame), 0);
+        assert_eq!(count_materialization_required(&eliminated_frame), 1);
+    }
+
+    /// The marker survives machine-state resolution unchanged — softening it to
+    /// `Undefined` (or to a machine read) anywhere in the pipeline restores the
+    /// silent-null reconstruction.
+    #[test]
+    fn eliminated_marker_round_trips_through_reconstruction() {
+        let eliminated = FrameValue::MaterializationRequired(EliminatedValue::new(
+            3,
+            EliminationCause::NestedVirtualObject,
+        ));
+        let dp = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 4,
+            reason: DeoptReason::UncommonTrap,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: M.to_string(),
+                bci: 4,
+                locals: vec![eliminated.clone(), FrameValue::Undefined],
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            },
+        };
+        let regs = SavedRegisters::default();
+        let rf = reconstruct_frame_from_machine_state(&dp, &regs, 0);
+        assert_eq!(rf.locals[0], eliminated);
+        assert_eq!(rf.locals[1], FrameValue::Undefined);
+        // …and through the constant-only reconstruction path as well.
+        let rf2 = reconstruct_frame(&dp);
+        assert_eq!(rf2.locals[0], eliminated);
+    }
+
+    /// A `MaterializationRequired` field inside an otherwise-complete virtual
+    /// object poisons the whole object: materializing it would store a null
+    /// into a field that held a live reference.
+    #[test]
+    fn an_unrebuildable_field_makes_the_virtual_object_unresumable() {
+        let fs = FrameState {
+            method_key: M.to_string(),
+            bci: 0,
+            locals: vec![FrameValue::VirtualObject(VirtualObjectState {
+                id: 1,
+                class_id: 2,
+                num_fields: 2,
+                field_values: vec![
+                    FrameValue::Int(4),
+                    FrameValue::MaterializationRequired(EliminatedValue::unknown(
+                        EliminationCause::EliminatedStore,
+                    )),
+                ],
+            })],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        assert!(!frame_state_is_resumable(&fs));
+        assert_eq!(count_materialization_required(&fs), 1);
+        // The object itself is still a well-formed *description* — the verifier
+        // reports no violation, because refusing to resume is the correct,
+        // already-safe outcome. Only the resumability predicate rejects it.
+        assert!(DeoptVerifier::new().violations(&[DeoptimizationPoint {
+            native_offset: 0,
+            bci: 0,
+            reason: DeoptReason::UncommonTrap,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: fs,
+        }])
+        .is_empty());
+    }
+
+    /// `EliminationCause` reaches the report: the rendered marker names the
+    /// pass that deleted the value and the node it deleted.
+    #[test]
+    fn eliminated_value_renders_its_cause_and_producer() {
+        let ev = EliminatedValue::allocation(21, 9, EliminationCause::ScalarReplacedObject);
+        let s = ev.to_string();
+        assert!(s.contains("scalar-replaced object"), "{s}");
+        assert!(s.contains("n21"), "{s}");
+        assert!(s.contains("class_id=9"), "{s}");
+        assert_eq!(
+            EliminatedValue::unknown(EliminationCause::Unclassified).to_string(),
+            "unclassified elimination"
+        );
+    }
+
+    /// A null `DeoptimizationPoint` must not be dereferenced inside the
+    /// trampoline: the entry stashes the `u32::MAX` re-run sentinel so the VM
+    /// takes the safe whole-method path and never reads the `i64::MIN` return
+    /// as a legitimate `Long.MIN_VALUE`.
+    #[test]
+    fn ir_deopt_entry_survives_a_null_point() {
+        let _ = take_last_deopt();
+        assert_eq!(ir_deopt_entry(std::ptr::null(), 0), i64::MIN);
+        let frame = take_last_deopt().expect("null point stashes the re-run sentinel");
+        assert_eq!(frame.bci, u32::MAX);
+        assert!(frame.method_key.is_empty());
+    }
+
+    /// The runtime resolver must not panic on a malformed register descriptor:
+    /// it degrades to `Unsupported` (refuse + safe re-run) and the structured
+    /// error is available to the checked path.
+    #[test]
+    fn out_of_range_register_resolves_to_unsupported_instead_of_panicking() {
+        let regs = SavedRegisters::default();
+        assert_eq!(
+            resolve_value(&FrameValue::Register(200), &regs, 0),
+            FrameValue::Unsupported
+        );
+        assert_eq!(
+            try_resolve_value(&FrameValue::XmmFloat(99), &regs, 0),
+            Err(DeoptMetadataError::RegisterFileIndexOutOfRange {
+                bank: "xmm",
+                index: 99,
+            })
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

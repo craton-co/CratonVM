@@ -91,7 +91,15 @@ pub enum SkipReason {
     /// TCK class — exercises the `instanceof` JIT bug. (A1.2)
     /// REMOVED in NEW-1.2 — never produced. Kept for ABI/parser compatibility.
     TckClass,
-    /// `cratonvm/*` test fixture — broad ban for legacy reasons. (A1.4)
+    /// Historical name only — the `cratonvm/*` fixture ban it was introduced
+    /// for is long gone. This is now the GENERIC "banned" reason: the two
+    /// `CRATONVM_JIT_BISECT_*` development hooks return it (neither is a ban —
+    /// both are env-gated and inert by default), and so do four unrelated
+    /// targeted bans: the ANTLR `PredictionContext` cluster, one Tomcat lambda,
+    /// `org/apache/commons/logging/`, and `org/jboss/modules/`. Kept as the
+    /// variant name for ABI/parser compatibility with older JFR events and
+    /// logs — but do NOT read a `RustJvmTestFixture` in a census as "a test
+    /// fixture is banned". Grep the call sites; each carries its real cause.
     RustJvmTestFixture,
     /// Finalizer-bearing class — JIT frames lacked GC stack maps. (A1.1)
     /// REMOVED in NEW-1.5 (conservative JIT root scan replaces precise maps).
@@ -387,15 +395,23 @@ pub fn should_skip_jit_with_init(
     allow_packages: &[&str],
     init_complexity: InitComplexity,
 ) -> Option<SkipReason> {
-    if method_name == "<clinit>" {
-        if init_complexity != InitComplexity::Trivial {
-            return Some(SkipReason::ClassInitializer);
-        }
-    } else if method_name == "<init>" {
-        if init_complexity != InitComplexity::Trivial {
-            return Some(SkipReason::Constructor);
-        }
-    }
+    // ==== ALL JIT BANS COMMENTED OUT — 2026-07-31 ====
+    // Every ban below is disabled. The gates, and the incident write-ups in
+    // their comments, are deliberately left in place so the set can be
+    // restored by deleting the disabling lines. The explicit inventory of what
+    // was disabled, and what each one protected against, is in
+    // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md.
+    // Re-add one ad hoc without a rebuild via CRATONVM_JIT_BISECT_SKIP.
+    // if method_name == "<clinit>" {
+    //     if init_complexity != InitComplexity::Trivial {
+    //         return Some(SkipReason::ClassInitializer);
+    //     }
+    // } else if method_name == "<init>" {
+    //     if init_complexity != InitComplexity::Trivial {
+    //         return Some(SkipReason::Constructor);
+    //     }
+    // }
+    let _ = init_complexity;
     should_skip_jit_internal(
         class_name,
         method_name,
@@ -439,9 +455,10 @@ fn should_skip_jit_internal(
     // invoke a lambda apply method through the wrong receiver after an
     // aggressive java/util promotion. Interpret this dispatcher until the
     // invokeinterface PIC invalidation handles changing lambda receivers.
-    if class_name == "java/util/Collections" && method_name == "indexedBinarySearch" {
-        return Some(SkipReason::JavaUtilCollection);
-    }
+    // DISABLED 2026-07-31 — see the all-bans-disabled note below.
+    // if class_name == "java/util/Collections" && method_name == "indexedBinarySearch" {
+    //     return Some(SkipReason::JavaUtilCollection);
+    // }
 
     // ES-PERF-20260719 (2026-07-21): see StreamMatchOpsUncommonTrap doc comment.
     // Confirmed via CRATONVM_DBG_DEOPT against the real testSlicesDense
@@ -452,14 +469,15 @@ fn should_skip_jit_internal(
     // shape (a MatchKind switch building a sink via an internal lambda) and
     // are included defensively even though only `makeInt` was observed
     // faulting in this workload.
-    if class_name == "java/util/stream/MatchOps"
-        && matches!(
-            method_name,
-            "makeInt" | "makeRef" | "makeLong" | "makeDouble"
-        )
-    {
-        return Some(SkipReason::StreamMatchOpsUncommonTrap);
-    }
+    // DISABLED 2026-07-31 — see the all-bans-disabled note below.
+    // if class_name == "java/util/stream/MatchOps"
+    //     && matches!(
+    //         method_name,
+    //         "makeInt" | "makeRef" | "makeLong" | "makeDouble"
+    //     )
+    // {
+    //     return Some(SkipReason::StreamMatchOpsUncommonTrap);
+    // }
 
 
     // SPRING-TESTCOMPILER.1-4 / HIB-STOREDPROC-JIT.1 / TYPES-ERASURE.1 /
@@ -584,9 +602,24 @@ fn should_skip_jit_internal(
         }
     }
 
+    // ==== ALL JIT BANS COMMENTED OUT — 2026-07-31 ====
+    // Every ban below is disabled. The gates, and the incident write-ups in
+    // their comments, are deliberately left in place so the set can be
+    // restored by deleting the disabling lines. The explicit inventory of what
+    // was disabled, and what each one protected against, is in
+    // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md.
+    // Re-add one ad hoc without a rebuild via CRATONVM_JIT_BISECT_SKIP.
+    // Disabled in one place rather than at each of the 17 gates below, so the
+    // whole set comes back by deleting the next two lines. The two
+    // CRATONVM_JIT_BISECT_* hooks ABOVE stay live on purpose — they are the
+    // lever for pinning a single method while a defect is being bisected.
+    #[allow(clippy::needless_return)]
+    return None;
+
     // Targeted bans — these correspond to *reproducible* JIT crashes and
     // apply under both policies. Removed bans (JavaLangCore, TckClass,
     // FinalizerTest) are intentionally not checked here — see module docs.
+    #[allow(unreachable_code)]
     if !skip_init_check {
         if method_name == "<clinit>" {
             return Some(SkipReason::ClassInitializer);
@@ -916,8 +949,35 @@ fn should_skip_jit_internal(
     // `new TreeMap<>(session)` loses its comparator once the allocating method
     // is compiled, and reproduced in 60 lines of pure JDK code by
     // `apps/h2database-suite-runner/probes/TreeMapCmpProbe.java` (HotSpot
-    // 40000/40000, CratonVM fails from iteration ~503). LIFT THIS BAN once
-    // that is fixed; everything else is already in place.
+    // 40000/40000, CratonVM fails from iteration ~503).
+    //
+    // 2026-07-31 RE-MEASURED — the TreeMap defect is FIXED (that probe now
+    // passes 40000/40000 over four consecutive runs, and `TestMetaData` passes
+    // 3/3 lifted, having been FAIL 3/3), but the "+7 PASS" above no longer
+    // holds and the ban STAYS. A fresh full 218-class A/B, one binary and the
+    // `CRATONVM_JIT_ALLOW_PACKAGES=org/h2/` lever as the only difference:
+    //
+    //     banned  161 PASS / 22 FAIL / 34 HANG / 1 CRASH
+    //     lifted  161 PASS / 21 FAIL / 36 HANG / 0 CRASH
+    //
+    // PASS is a WASH, not +7. Every status change was re-run serially in
+    // isolation (3x per arm) because both suite arms shared a loaded host:
+    //   * `TestMemoryEstimator`  PASS 3/3 banned, FAIL 3/3 lifted — REAL, and
+    //     the new sole blocker. `AssertionError: Avg=99, err=0.2902…, pct=8 8`
+    //     at `TestMemoryEstimator.testEstimator:61` — H2's statistical
+    //     `MemoryEstimator` computes a wrong average once org/h2 is compiled.
+    //     Deterministic; a far better witness than the old TreeMap one.
+    //   * `TestCacheLongKeyLIRS` PASS 3/3 BOTH arms — the suite's PASS->HANG
+    //     was a load artifact, not a regression.
+    //   * Recovered: `TestCompatibility` FAIL->PASS, `TestIntPerfectHash`
+    //     HANG->PASS, `TestSynth` CRASH->FAIL.
+    //   * Already-failing classes that merely changed shape (they now burn the
+    //     300 s timeout instead of failing fast, costing suite wall time):
+    //     `TestMultiThread` and `TestGetGeneratedKeys`, both FAIL->HANG. Both
+    //     are tracked separately.
+    //
+    // LIFT THIS BAN once `TestMemoryEstimator` passes lifted; re-run the A/B
+    // rather than trusting either recorded number.
     if class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages) {
         return Some(SkipReason::RustJvmTestFixture);
     }
@@ -2489,6 +2549,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn clinit_always_skipped() {
         assert_eq!(
             check("Foo", "<clinit>", false, true, SkipPolicy::Aggressive),
@@ -2497,6 +2558,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn init_always_skipped() {
         assert_eq!(
             check("Foo", "<init>", false, true, SkipPolicy::Aggressive),
@@ -2505,6 +2567,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn interface_default_always_skipped() {
         assert_eq!(
             check("Foo", "bar", true, true, SkipPolicy::Aggressive),
@@ -2513,6 +2576,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn unnamed_thread_always_skipped() {
         assert_eq!(
             check("Foo", "bar", false, false, SkipPolicy::Aggressive),
@@ -2544,6 +2608,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn biginteger_itself_is_always_interpreted() {
         // HIB-BIGINTEGER-AIOOBE.2: BigInteger itself, not just its
         // MutableBigInteger helper, must stay interpreted regardless of
@@ -2567,6 +2632,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn hibernate_biginteger_divide_cluster_is_always_interpreted() {
         // HIB-BIGINTEGER-AIOOBE.1: do not let a package-allow override or the
         // aggressive policy re-enable the known-corrupting arithmetic class.
@@ -2742,6 +2808,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn aqs_condition_wait_variants_stay_skipped_unconditionally() {
         // Superseded by `is_known_miscompile_aqs_family`: this family is
         // demonstrably still broken even under the safe (GPR-local-homes-
@@ -2784,6 +2851,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn aqs_long_synchronizer_and_rrwl_sync_family_skipped_unconditionally() {
         // The newly-discovered members of this family (Node helpers,
         // tryInitializeHead, ReentrantReadWriteLock$Sync/HoldCounter) —
@@ -2871,6 +2939,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn concurrent_locks_package_is_conservative_only() {
         let class_name = "java/util/concurrent/locks/ReentrantLock$Sync";
         assert_eq!(
@@ -3370,6 +3439,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn commons_logging_is_jit_banned_after_spb9_narrowing() {
         // Re-banned 2026-07-26, same day as the SPB.9 blanket removal, after
         // a real Spring Boot suite regression (LoggingApplicationListenerTests
@@ -3512,6 +3582,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn hibernate_unshaded_antlr_runtime_is_jit_eligible_after_hib_longtail_1_narrowing() {
         // HIB-ANTLR.1's own check was removed 2026-07-26; the last thing still
         // forcing org/antlr/v4/runtime/ to the interpreter was HIB-LONGTAIL.1's
@@ -3564,6 +3635,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn antlr_prediction_context_cluster_stays_interpreted_under_validation_lift() {
         for (cls, mn) in [
             (
@@ -3733,6 +3805,7 @@ mod tests {
     /// the regalloc/length-table fixes, while field-storing boxing constructors
     /// remain interpreted through the generic constructor gate.
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn integer_long_valueof_lifted_but_constructors_stay_guarded() {
         for (cls, mn) in [
             ("java/lang/Integer", "valueOf"),
@@ -3922,6 +3995,7 @@ mod tests {
     /// The `putfield` side is covered by
     /// [`putfield_only_ctor_is_jit_eligible_by_default`].
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn complex_ctor_keeps_constructor_ban() {
         // aload_0; monitorenter; aload_0; monitorexit; return
         let complex_bc = vec![0x2a, 0xc2, 0x2a, 0xc3, 0xb1];
@@ -3972,6 +4046,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn unknown_complexity_keeps_ban_default() {
         // Legacy callers pass Unknown and get the original behavior.
         assert_eq!(
@@ -3989,6 +4064,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn legacy_should_skip_jit_unchanged() {
         // The legacy `should_skip_jit` (without complexity) still bans
         // every <init>, preserving callers that haven't migrated.
@@ -4074,6 +4150,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn stream_matchops_uncommon_trap_stays_interpreted() {
         // ES-PERF-20260719: makeInt/makeRef/makeLong/makeDouble deopt on
         // literally every call once JIT-compiled (an internal indy site
@@ -4146,6 +4223,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn tier1_skip_list_former_targeted_entries_are_jit_eligible() {
         // This test used to police the membership of `is_known_miscompile`.
         // That list was inert (private default-off gate) and was deleted
@@ -4420,6 +4498,7 @@ mod tests {
     /// the OOM that pinned it. Deliberately not liftable by
     /// `CRATONVM_JIT_ALLOW_PACKAGES`, hence "under every policy".
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn generated_proxy_class_is_never_jit_eligible_spr_proxy_1() {
         for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
             for (class, method) in [
@@ -4459,6 +4538,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "JIT bans all disabled 2026-07-31 (docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md). The assertions are kept as the record of what each ban covered; un-ignore when the ban is restored."]
     fn tomcat_keyedlock_compute_lambda_stays_skipped_under_conservative() {
         assert_eq!(
             check(

@@ -2220,20 +2220,54 @@ impl Rsa {
         s.to_bytes_be_padded(k)
     }
 
-    /// PKCS#1 v1.5 SHA-256 verification.
-    pub fn verify_sha256(key: &RsaPublicKey, message: &[u8], signature: &[u8]) -> bool {
-        cratonvm_native_builtins_crypto::signature::verify_rsa_pkcs1_v15(
+    /// PKCS#1 v1.5 SHA-256 verification, **checked**.
+    ///
+    /// `Ok(true)` / `Ok(false)` is the genuine cryptographic answer: these
+    /// bytes are, or are not, a valid signature over this message under this
+    /// key. `Err` means the question was never asked — the backend rejected
+    /// the *key* (an even exponent, `e < 2`, `e > 2³³−1`, a modulus over
+    /// `RsaPublicKey::MAX_SIZE` = 4096 bits, or an absent/zero component) or
+    /// the signature's *length* was wrong for the modulus, both of which are
+    /// refusals before any RSA operation runs. See
+    /// `docs/security/crypto-failure-contract.md` §2.1 items 1–4.
+    ///
+    /// The distinction matters because a legitimate 8192-bit signer key is
+    /// rejected by the backend, and collapsing that to `false` reports
+    /// "signature did not verify" when nothing was checked.
+    pub fn try_verify_sha256(
+        key: &RsaPublicKey,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, cratonvm_native_builtins_crypto::failure::CryptoFailure> {
+        cratonvm_native_builtins_crypto::signature::verify_rsa_pkcs1_v15_checked(
             &key.n.to_bytes_be(),
             &key.e.to_bytes_be(),
             cratonvm_native_builtins_crypto::signature::DigestAlgorithm::Sha256,
             message,
             signature,
         )
-        // A modulus too small to hold the DigestInfo + padding can never carry
-        // a valid PKCS#1 v1.5 signature. Reject it as a verification failure
-        // (fail-closed) rather than underflowing the padding-length math — this
-        // is reachable from `verify_signature`/`checkServerTrusted` with an
-        // attacker-supplied issuer key carrying a tiny RSA modulus.
+    }
+
+    /// PKCS#1 v1.5 SHA-256 verification, **fail-closed `bool`**.
+    ///
+    /// Retained for the callers whose surface is a `bool` — certificate-chain
+    /// validation (`x509_manager`, `checkServerTrusted`), where a refusal and
+    /// a mismatch both mean "do not trust this chain" and the caller has no
+    /// exception channel. `Err` can never surface as `true`; `matches!` is
+    /// used rather than `unwrap_or(false)` so this stays a deliberate,
+    /// greppable collapse.
+    ///
+    /// Callers that DO have an exception channel — `Signature.verify()`, via
+    /// [`rsa_verify`] — must use [`try_verify_sha256`] instead, so that
+    /// "unusable key" is not reported to Java as "forged signature".
+    ///
+    /// A modulus too small to hold the DigestInfo + padding can never carry a
+    /// valid PKCS#1 v1.5 signature. Rejecting it (rather than underflowing the
+    /// padding-length math) is reachable from
+    /// `verify_signature`/`checkServerTrusted` with an attacker-supplied
+    /// issuer key carrying a tiny RSA modulus.
+    pub fn verify_sha256(key: &RsaPublicKey, message: &[u8], signature: &[u8]) -> bool {
+        matches!(Self::try_verify_sha256(key, message, signature), Ok(true))
     }
 
     /// Build the PKCS#1 v1.5 EMSA encoding (DigestInfo for SHA-256 wrapped in
@@ -4387,12 +4421,28 @@ pub fn rsa_sign(id: u64, message: &[u8]) -> Option<Vec<u8>> {
         .map(|kp| Rsa::sign_sha256(&kp.private_key, message))
 }
 
+/// `Signature.verify()`'s RSA backend.
+///
+/// The `Option` is load-bearing and is the contract `jca::signature`'s
+/// `verify_dispatch` relies on:
+///
+/// * `Some(true)` / `Some(false)` — the signature really was checked against
+///   this key, and really does or does not match. `Some(false)` is what a
+///   forgery looks like and stays a `false` all the way out to Java.
+/// * `None` — the question was never asked: either no key is registered under
+///   `id`, **or** the backend refused the key or the signature encoding
+///   outright (see [`Rsa::try_verify_sha256`]). `jca::signature` turns this
+///   into a `SignatureException`.
+///
+/// The second `None` case is the migration off the ambiguous `bool` wrapper
+/// (`native-builtins-crypto`'s `verify_rsa_pkcs1_v15`, whose only remaining
+/// call site was `Rsa::verify_sha256`). Before it, a legitimate signer key the
+/// backend rejects — an 8192-bit modulus, say — was reported to Java as a
+/// **failed verification**: a trust decision made on no evidence.
 pub fn rsa_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
     let guard = RSA_KEY_STORE.read();
-    guard
-        .as_ref()
-        .and_then(|m| m.get(&id))
-        .map(|kp| Rsa::verify_sha256(&kp.public_key, message, signature))
+    let key_pair = guard.as_ref().and_then(|m| m.get(&id))?;
+    Rsa::try_verify_sha256(&key_pair.public_key, message, signature).ok()
 }
 
 /// Maps a *real* RSA key object's GC-stable `identityHashCode` to its
@@ -4402,19 +4452,49 @@ pub fn rsa_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
 /// `key_id` slot). This is the bridge that lets us keep BOTH optimizations —
 /// fast Rust keygen AND fast Rust sign/verify — while returning spec-correct key
 /// objects. Same GC-stable-identity precedent as the signature payload table.
-static RSA_REALKEY_MAP: parking_lot::RwLock<Option<HashMap<i32, u64>>> =
+///
+/// VM scope: an `identityHashCode` is unique only *within one heap*, but this
+/// table is `static`. Rust tests (and any embedder) create several independent
+/// `Vm`s in one process, so without a VM component VM B's real RSA key whose
+/// identity hash happens to equal an entry VM A registered would resolve to VM
+/// A's `crypto_impl` handle - and `Signature.sign()`/`verify()`
+/// (`jca::signature::extract_key_id_from_key`) plus `Cipher`'s RSA component
+/// lookup (`jca::cipher::rsa_key_components`) would silently use the WRONG KEY.
+/// That is a *correctness* failure, not a crash: the table holds `u64` handles,
+/// never `ObjectRef`s, so nothing dangles - the signature is simply made with
+/// another VM's key. `NativeContext::vm_identity`'s own doc states the rule
+/// ("Native side caches ... must scope entries to this value",
+/// `native-api/src/registry.rs`); the same omission in native-collections'
+/// `widened_obj_key` aliased two VMs' collections and aborted the process.
+/// Keys are therefore `(vm_identity, identity_hash_code)` - the shape already
+/// used by `jca::signature`'s `SigKey` and `jca::key_factory`'s `KpgObjKey`.
+///
+/// GC: no `ObjectRef` is stored (key = a pair of integers, value = a `u64`
+/// `crypto_impl` handle), and `identity_hash_code` is preserved across moving
+/// collection (`HashCodeTable::update_after_gc`, `gc/src/compact_header.rs`),
+/// so this table needs no collector scan/remap companion.
+static RSA_REALKEY_MAP: parking_lot::RwLock<Option<HashMap<RsaRealKeyKey, u64>>> =
     parking_lot::RwLock::new(None);
 
-pub fn rsa_realkey_map_set(identity_hash: i32, key_id: u64) {
+/// `(NativeContext::vm_identity(), identity_hash_code(key))`.
+type RsaRealKeyKey = (usize, i32);
+
+/// Register `key_id` for the real RSA key whose identity hash is
+/// `identity_hash`, inside VM `vm` (`NativeContext::vm_identity()`).
+pub fn rsa_realkey_map_set(vm: usize, identity_hash: i32, key_id: u64) {
     let mut guard = RSA_REALKEY_MAP.write();
     guard
         .get_or_insert_with(HashMap::new)
-        .insert(identity_hash, key_id);
+        .insert((vm, identity_hash), key_id);
 }
 
-pub fn rsa_realkey_map_get(identity_hash: i32) -> Option<u64> {
+/// Look up the `crypto_impl` key handle registered for `identity_hash` **in VM
+/// `vm`**. Never pass a bare identity hash from one VM to look up another's.
+pub fn rsa_realkey_map_get(vm: usize, identity_hash: i32) -> Option<u64> {
     let guard = RSA_REALKEY_MAP.read();
-    guard.as_ref().and_then(|m| m.get(&identity_hash).copied())
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&(vm, identity_hash)).copied())
 }
 
 /// Global ECDSA key store.
@@ -4570,6 +4650,19 @@ pub fn ed25519_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool>
 // ---------------------------------------------------------------------------
 
 /// GC-stable signature-payload store: keyed on `identity_hash_code(this)`.
+///
+/// **VM-UNSCOPED — DO NOT WIRE UP AGAIN AS-IS.** This store and the six
+/// `sig_data_*` functions below currently have ZERO callers anywhere in the
+/// workspace: `jca::signature` moved the payload into its own
+/// `sig_payload_table`, keyed `(vm_identity, identity_hash_code)`, and the
+/// `crypto.rs` legacy-synthetic shim that used the raw-pointer API no longer
+/// exists. The defect is therefore inert, not fixed: the key here is a bare
+/// identity hash, which is unique only *within one heap*, while the table is a
+/// process-global `static`. Two `Vm`s in one process would append to — and
+/// `take` — each other's buffers. Any new caller MUST first re-key this on
+/// `(NativeContext::vm_identity(), identity_hash_code(this))`, exactly like
+/// `RSA_REALKEY_MAP` above and `jca::signature::SigKey`; prefer deleting the
+/// whole block instead.
 static SIG_DATA_STORE: parking_lot::RwLock<Option<HashMap<i32, Vec<u8>>>> =
     parking_lot::RwLock::new(None);
 
@@ -6718,5 +6811,92 @@ mod tests {
         assert_eq!(ct_eq_bytes(b"abc", b"abc"), 0xFF);
         assert_eq!(ct_eq_bytes(b"abc", b"abd"), 0x00);
         assert_eq!(ct_eq_bytes(b"abc", b"ab"), 0x00);
+    }
+
+    // -----------------------------------------------------------------------
+    // Migration off the ambiguous `bool` wrapper.
+    //
+    // `Rsa::verify_sha256` was the last call site of
+    // `native-builtins-crypto`'s `verify_rsa_pkcs1_v15` (the `-> bool` form
+    // the crypto-failure contract flags as ambiguous). `rsa_verify` — the
+    // backend behind `Signature.verify()` — now goes through the *checked*
+    // form so that "the backend refused this key" and "the signature does not
+    // match" are two different answers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rsa_verify_separates_a_refused_key_from_a_failed_verification() {
+        // MUST STILL WORK: a real key round-trips, and a tampered signature is
+        // a plain `Some(false)` — the genuine negative, preserved.
+        let (public_key, private_key) = Rsa::generate_keypair(1024);
+        let good_n = public_key.n.clone();
+        let id = rsa_key_next_id();
+        rsa_key_store(
+            id,
+            RsaKeyPairData {
+                public_key,
+                private_key,
+            },
+        );
+        let msg = b"a message worth signing";
+        let sig = rsa_sign(id, msg).expect("a registered key must sign");
+        assert_eq!(rsa_verify(id, msg, &sig), Some(true));
+
+        let mut tampered = sig.clone();
+        tampered[0] ^= 0xff;
+        assert_eq!(
+            rsa_verify(id, msg, &tampered),
+            Some(false),
+            "a real digest mismatch is the answer to the question asked"
+        );
+        assert_eq!(rsa_verify(id, b"a different message", &sig), Some(false));
+
+        // MUST BE UNANSWERABLE: an even public exponent is rejected by the
+        // backend before any RSA operation runs. Collapsed to `false` before
+        // this migration, which the caller could not tell from a forgery.
+        let (_ignored_pub, refused_priv) = Rsa::generate_keypair(1024);
+        let refused_id = rsa_key_next_id();
+        rsa_key_store(
+            refused_id,
+            RsaKeyPairData {
+                public_key: RsaPublicKey {
+                    n: good_n,
+                    e: BigUint::from_u64(4), // even — not a valid RSA exponent
+                },
+                private_key: refused_priv,
+            },
+        );
+        assert_eq!(
+            rsa_verify(refused_id, msg, &sig),
+            None,
+            "a key the backend refuses must not answer the verification question"
+        );
+
+        // And an unregistered handle stays `None`, as before.
+        assert_eq!(rsa_verify(u64::MAX, msg, &sig), None);
+    }
+
+    /// The `bool` surface that certificate-chain validation still uses must
+    /// stay fail-closed: neither a refusal nor a mismatch may become `true`.
+    #[test]
+    fn the_bool_verify_surface_is_still_fail_closed() {
+        let (public_key, private_key) = Rsa::generate_keypair(1024);
+        let msg = b"chain-validation payload";
+        let sig = Rsa::sign_sha256(&private_key, msg);
+        assert!(Rsa::verify_sha256(&public_key, msg, &sig));
+
+        let mut tampered = sig.clone();
+        tampered[0] ^= 0xff;
+        assert!(!Rsa::verify_sha256(&public_key, msg, &tampered));
+
+        let refused = RsaPublicKey {
+            n: public_key.n.clone(),
+            e: BigUint::from_u64(4),
+        };
+        assert!(
+            !Rsa::verify_sha256(&refused, msg, &sig),
+            "an Err must never surface as true"
+        );
+        assert!(Rsa::try_verify_sha256(&refused, msg, &sig).is_err());
     }
 }

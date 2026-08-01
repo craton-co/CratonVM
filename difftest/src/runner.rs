@@ -195,6 +195,19 @@ fn resolve_jdk_tool(jdk_home: Option<&Path>, tool: &str) -> PathBuf {
 /// three census dumps. They are a second axis, not a replacement: a program can
 /// be run under both, and lands on **two ledger rows** keyed by
 /// `(class, jdk_profile)`.
+///
+/// The **six execution-path modes** (`interp-decoded` … `forced-deopt`) drive
+/// the VM's four semantic implementations directly. CratonVM does not have one
+/// executor, it has four — the interpreter's raw fast path with
+/// superinstructions, the interpreter's decoded fallback, the single-pass
+/// (direct) x64 emitter, and the optimizing IR pipeline — plus OSR entry and
+/// deoptimization as cross-cutting transitions. A fix that lands in one and not
+/// the others is a wrong-code risk, and the only way to see that is to run the
+/// same program down each path and compare the *paths to each other*
+/// ([`crate::crossmode`]), which needs no reference JDK at all.
+///
+/// Every flag these modes set is a real, live knob verified against its read
+/// site; see `docs/testing/differential.md` for the read site of each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Default execution (JIT enabled).
@@ -220,6 +233,75 @@ pub enum Mode {
     RealCompatibleJit,
     /// `--real-jdk`, interpreter only.
     RealCompatibleNoJit,
+
+    /// Interpreter **decoded fallback**: `--noverify` + `CRATONVM_DISABLE_JIT=1`.
+    ///
+    /// `vm/src/runtime/interpreter.rs:9280` gates the raw superinstruction fast
+    /// path on `!shared.config.skip_verification` — the fused handlers index
+    /// `frame.locals` without a bounds check and rely on the verifier having
+    /// proven the operand in range, so the VM disables them wholesale when
+    /// verification is off. `--noverify` (`vm-cli/src/main.rs:1224`, also the
+    /// target of `-Xverify:none` / `-noverify`) is therefore the switch that
+    /// selects the *decoded* interpreter for the whole run.
+    ///
+    /// Caveat, and it is a real one: `--noverify` also turns off bytecode
+    /// verification. For a `javac`-produced corpus that is inert (the classes
+    /// verify anyway), but a **mutated** class is not — see the mode's entry in
+    /// `docs/testing/differential.md`.
+    InterpDecoded,
+
+    /// **Direct (single-pass) emitter**: `CRATONVM_NO_IR_BRANCHY=1` +
+    /// `CRATONVM_JIT_IR_CALL=0`.
+    ///
+    /// `jit/src/lib.rs:9915` routes a branchy, call-free method to the
+    /// single-pass `x64::compile` backend when `CRATONVM_NO_IR_BRANCHY` is set
+    /// ("the emergency opt-out — restores single-pass-only routing for this
+    /// shape"), and `vm/src/runtime/env_cache.rs:1089` makes
+    /// `CRATONVM_JIT_IR_CALL=0` the documented opt-out to single-pass dispatch.
+    ///
+    /// **This is not a hard "IR off" switch, because the VM exposes none.**
+    /// Methods the IR builder can still fully build take the IR pipeline
+    /// regardless. Reported as a coverage gap rather than papered over.
+    DirectEmit,
+
+    /// **Optimizing IR pipeline**: `CRATONVM_JIT_FORCE_C2=1`.
+    ///
+    /// `jit/src/lib.rs:8026`/`:9243` — `let optimize = optimize ||
+    /// force_c2_enabled();`, i.e. every compile request is treated as a C2
+    /// request. The flag exists precisely because `optimize=false` is decided
+    /// outside the jit crate and was unreachable from a probe. It changes which
+    /// tier compiles a method, never what a compiled method does — anything the
+    /// optimizing pipeline cannot lower still falls back to single-pass.
+    IrJit,
+
+    /// **Back-edge OSR, eagerly**: `CRATONVM_JIT_OSR=1` +
+    /// `CRATONVM_TIER_OSR_BACKEDGE=1` + `CRATONVM_JIT_THRESHOLD=1`.
+    ///
+    /// `vm/src/runtime/env_cache.rs:246` is the OSR master enable (default ON,
+    /// `=0` forces it off) and `:362` is the *live* per-frame back-edge trigger
+    /// on both the inline and background OSR paths, clamped to `>= 1`. Setting
+    /// it to 1 makes a hot loop enter compiled code on its first back-edge, so
+    /// OSR entry-state reconstruction is exercised by a loop of any length.
+    OsrEager,
+
+    /// **OSR off**: `CRATONVM_JIT_OSR=0` — the control for [`Mode::OsrEager`].
+    ///
+    /// A pair that differs only in whether OSR ran turns "the OSR entry state
+    /// is wrong" into a single-bit bisection, with no reference JDK involved.
+    NoOsr,
+
+    /// **Forced deoptimization**: `CRATONVM_DEOPT_EAGER=1` +
+    /// `CRATONVM_DEOPT_REAL=1` + `CRATONVM_DEOPT_VERIFY=1` +
+    /// `CRATONVM_JIT_THRESHOLD=1`.
+    ///
+    /// `jit/src/lib.rs:1182` (`CRATONVM_DEOPT_EAGER`, presence-parsed) plus
+    /// `deopt_real_enabled()` at `:1135` is the pair `jit/src/x64.rs:23589`
+    /// checks to force a reason-2 deopt **exit** at the first speculative
+    /// guard, and `CRATONVM_DEOPT_VERIFY` (`jit/src/lib.rs:1166`) turns on the
+    /// structural check of every reconstructed frame. Together they make the
+    /// compiled→interpreted transition happen on demand instead of waiting for
+    /// a speculation to fail naturally.
+    ForcedDeopt,
 }
 
 impl Mode {
@@ -235,6 +317,30 @@ impl Mode {
             Mode::JdkOnlyNoJit,
             Mode::RealCompatibleJit,
             Mode::RealCompatibleNoJit,
+            Mode::InterpDecoded,
+            Mode::DirectEmit,
+            Mode::IrJit,
+            Mode::OsrEager,
+            Mode::NoOsr,
+            Mode::ForcedDeopt,
+        ]
+    }
+
+    /// The six execution-path modes, in the order a reviewer reads them:
+    /// interpreter fast → interpreter decoded → direct emitter → IR → OSR →
+    /// deopt. This is the `--modes` list the semantics contract runs.
+    ///
+    /// `nojit` leads because it *is* the interpreter-fast row: the raw
+    /// superinstruction path with the JIT out of the picture.
+    pub fn execution_paths() -> &'static [Mode] {
+        &[
+            Mode::NoJit,
+            Mode::InterpDecoded,
+            Mode::DirectEmit,
+            Mode::IrJit,
+            Mode::OsrEager,
+            Mode::NoOsr,
+            Mode::ForcedDeopt,
         ]
     }
 
@@ -251,6 +357,12 @@ impl Mode {
             Mode::JdkOnlyNoJit => "jdk-only-nojit",
             Mode::RealCompatibleJit => "real-compatible-jit",
             Mode::RealCompatibleNoJit => "real-compatible-nojit",
+            Mode::InterpDecoded => "interp-decoded",
+            Mode::DirectEmit => "direct-emit",
+            Mode::IrJit => "ir-jit",
+            Mode::OsrEager => "osr-eager",
+            Mode::NoOsr => "no-osr",
+            Mode::ForcedDeopt => "forced-deopt",
         }
     }
 
@@ -273,6 +385,33 @@ impl Mode {
             Mode::LowJitThreshold => &[("CRATONVM_JIT_THRESHOLD", "1")],
             Mode::JdkOnlyJit | Mode::RealCompatibleJit => &[],
             Mode::JdkOnlyNoJit | Mode::RealCompatibleNoJit => &[("CRATONVM_DISABLE_JIT", "1")],
+
+            // -- execution-path modes ---------------------------------------
+            // The interpreter path is selected by `--noverify` (a launcher
+            // flag, see `cli_args`); the JIT is disabled here so the run is
+            // unambiguously interpreted.
+            Mode::InterpDecoded => &[("CRATONVM_DISABLE_JIT", "1")],
+            Mode::DirectEmit => &[
+                ("CRATONVM_NO_IR_BRANCHY", "1"),
+                ("CRATONVM_JIT_IR_CALL", "0"),
+                ("CRATONVM_JIT_THRESHOLD", "1"),
+            ],
+            Mode::IrJit => &[
+                ("CRATONVM_JIT_FORCE_C2", "1"),
+                ("CRATONVM_JIT_THRESHOLD", "1"),
+            ],
+            Mode::OsrEager => &[
+                ("CRATONVM_JIT_OSR", "1"),
+                ("CRATONVM_TIER_OSR_BACKEDGE", "1"),
+                ("CRATONVM_JIT_THRESHOLD", "1"),
+            ],
+            Mode::NoOsr => &[("CRATONVM_JIT_OSR", "0")],
+            Mode::ForcedDeopt => &[
+                ("CRATONVM_DEOPT_EAGER", "1"),
+                ("CRATONVM_DEOPT_REAL", "1"),
+                ("CRATONVM_DEOPT_VERIFY", "1"),
+                ("CRATONVM_JIT_THRESHOLD", "1"),
+            ],
         }
     }
 
@@ -285,6 +424,10 @@ impl Mode {
         match self {
             Mode::JdkOnlyJit | Mode::JdkOnlyNoJit => &["--jdk-only"],
             Mode::RealCompatibleJit | Mode::RealCompatibleNoJit => &["--real-jdk"],
+            // The only way to select the interpreter's decoded fallback: the
+            // raw superinstruction handlers are gated on the *global*
+            // verification bool, not on an env knob.
+            Mode::InterpDecoded => &["--noverify"],
             _ => &[],
         }
     }
@@ -336,18 +479,53 @@ impl Mode {
             "jdk-only-nojit" | "jdk-only-no-jit" => Some(Mode::JdkOnlyNoJit),
             "real-compatible-jit" => Some(Mode::RealCompatibleJit),
             "real-compatible-nojit" | "real-compatible-no-jit" => Some(Mode::RealCompatibleNoJit),
+            "interp-decoded" => Some(Mode::InterpDecoded),
+            "direct-emit" => Some(Mode::DirectEmit),
+            "ir-jit" => Some(Mode::IrJit),
+            "osr-eager" => Some(Mode::OsrEager),
+            "no-osr" => Some(Mode::NoOsr),
+            "forced-deopt" => Some(Mode::ForcedDeopt),
             _ => None,
         }
+    }
+
+    /// Whether this mode is one of the six execution-path rows.
+    pub fn is_execution_path(self) -> bool {
+        matches!(
+            self,
+            Mode::InterpDecoded
+                | Mode::DirectEmit
+                | Mode::IrJit
+                | Mode::OsrEager
+                | Mode::NoOsr
+                | Mode::ForcedDeopt
+        )
     }
 }
 
 /// Every `CRATONVM_*` knob any mode can set — cleared on each child before the
 /// active mode re-sets its own, so an inherited env can't leak across modes.
+///
+/// The clear-list is the reason a mode axis is trustworthy at all: without it a
+/// stale `CRATONVM_JIT_FORCE_C2` exported in the developer's shell would make
+/// every "direct emitter" row silently an IR row, and the whole cross-path
+/// comparison would compare a path against itself and report a clean sheet.
+/// `all_mode_knobs_cover_every_override` fails the build if a mode sets a knob
+/// that is not listed here.
 const ALL_MODE_KNOBS: &[&str] = &[
     "CRATONVM_DISABLE_JIT",
     "CRATONVM_DISABLE_INTRINSICS",
     "CRATONVM_NO_SELECTIVE_PROMOTE",
     "CRATONVM_JIT_THRESHOLD",
+    // Execution-path knobs.
+    "CRATONVM_NO_IR_BRANCHY",
+    "CRATONVM_JIT_IR_CALL",
+    "CRATONVM_JIT_FORCE_C2",
+    "CRATONVM_JIT_OSR",
+    "CRATONVM_TIER_OSR_BACKEDGE",
+    "CRATONVM_DEOPT_EAGER",
+    "CRATONVM_DEOPT_REAL",
+    "CRATONVM_DEOPT_VERIFY",
 ];
 
 /// Set `cmd`'s environment to exactly `mode`'s knobs: clear every knob, then
@@ -897,10 +1075,107 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), labels.len(), "duplicate label in Mode::all()");
-        assert_eq!(labels.len(), 9);
+        assert_eq!(labels.len(), 15, "5 legacy + 4 profile + 6 execution-path");
         for label in &labels {
             assert!(Mode::from_label(label).is_some(), "{label} must parse");
         }
+    }
+
+    // -- the execution-path modes --------------------------------------------
+
+    #[test]
+    fn execution_path_modes_round_trip_and_stay_on_the_compatible_profile() {
+        let modes =
+            parse_modes("interp-decoded,direct-emit,ir-jit,osr-eager,no-osr,forced-deopt").unwrap();
+        assert_eq!(
+            modes,
+            vec![
+                Mode::InterpDecoded,
+                Mode::DirectEmit,
+                Mode::IrJit,
+                Mode::OsrEager,
+                Mode::NoOsr,
+                Mode::ForcedDeopt
+            ]
+        );
+        for m in &modes {
+            assert_eq!(Mode::from_label(m.label()), Some(*m), "label round-trips");
+            assert!(m.is_execution_path(), "{}", m.label());
+            // They are an execution axis, not a policy axis: they must key onto
+            // the same ledger rows the historical five do, or a JIT-path
+            // finding would silently fork a second baseline.
+            assert_eq!(m.jdk_profile(), crate::ledger::PROFILE_COMPATIBLE);
+            assert!(!m.is_jdk_only());
+            assert!(!m.collects_census(), "{} must not request dumps", m.label());
+        }
+        // The historical and profile modes are not execution-path rows.
+        for m in [Mode::JitOn, Mode::NoJit, Mode::JdkOnlyJit, Mode::MovingGc] {
+            assert!(!m.is_execution_path(), "{}", m.label());
+        }
+    }
+
+    #[test]
+    fn execution_path_modes_set_the_flags_their_docs_name() {
+        // Each of these was verified against a live read site; the assertion is
+        // here so a rename in the VM shows up as a difftest failure rather than
+        // as a mode that silently stops selecting anything. The read sites are
+        // listed on each variant and in docs/testing/differential.md.
+        assert_eq!(Mode::InterpDecoded.cli_args(), &["--noverify"]);
+        assert_eq!(
+            Mode::InterpDecoded.env_overrides(),
+            &[("CRATONVM_DISABLE_JIT", "1")]
+        );
+        assert!(Mode::DirectEmit
+            .env_overrides()
+            .contains(&("CRATONVM_NO_IR_BRANCHY", "1")));
+        assert!(Mode::DirectEmit
+            .env_overrides()
+            .contains(&("CRATONVM_JIT_IR_CALL", "0")));
+        assert!(Mode::IrJit
+            .env_overrides()
+            .contains(&("CRATONVM_JIT_FORCE_C2", "1")));
+        assert!(Mode::OsrEager
+            .env_overrides()
+            .contains(&("CRATONVM_TIER_OSR_BACKEDGE", "1")));
+        assert_eq!(Mode::NoOsr.env_overrides(), &[("CRATONVM_JIT_OSR", "0")]);
+        assert!(Mode::ForcedDeopt
+            .env_overrides()
+            .contains(&("CRATONVM_DEOPT_EAGER", "1")));
+        assert!(Mode::ForcedDeopt
+            .env_overrides()
+            .contains(&("CRATONVM_DEOPT_VERIFY", "1")));
+        // Only `interp-decoded` passes a launcher flag; the rest are env-only,
+        // so they cannot perturb argv-sensitive behaviour.
+        for m in Mode::execution_paths() {
+            if *m != Mode::InterpDecoded {
+                assert!(m.cli_args().is_empty(), "{}", m.label());
+            }
+        }
+    }
+
+    #[test]
+    fn osr_pair_differs_in_exactly_one_bit() {
+        // The value of the pair is that a divergence between them isolates OSR
+        // with no reference JDK involved — which only holds if nothing else
+        // differs. `osr-eager` additionally lowers the trigger; the assertion
+        // is that the master enable has opposite senses and no third knob
+        // appears in `no-osr`.
+        let eager: Vec<&str> = Mode::OsrEager
+            .env_overrides()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert!(eager.contains(&"CRATONVM_JIT_OSR"));
+        assert_eq!(Mode::NoOsr.env_overrides().len(), 1);
+    }
+
+    #[test]
+    fn execution_paths_lists_the_interpreter_fast_row_first() {
+        // `nojit` *is* the interpreter-fast row (raw superinstruction handlers,
+        // no JIT), so the contract list must lead with it — otherwise the
+        // decoded fallback has nothing to be compared against.
+        assert_eq!(Mode::execution_paths()[0], Mode::NoJit);
+        assert!(Mode::execution_paths().contains(&Mode::InterpDecoded));
     }
 
     // -- census dumps --------------------------------------------------------

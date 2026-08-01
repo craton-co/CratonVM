@@ -925,10 +925,33 @@ impl Default for VtableManager {
 // both the struct field and this global cell, so the hook's adapter can
 // upgrade the cell to reach the manager with zero per-call overhead.
 //
-// The single-VM-per-process convention matches every other global in this
-// crate (`JvmtiEventManager`, GC hooks, class-load hooks). If a multi-VM
-// harness ever lands, each installed manager will race to win the `set`;
-// whichever lands first owns the population stream.
+// KNOWN MULTI-VM BLOCKER (P0 — `docs/architecture/per-vm-state.md`, item V1).
+//
+// An earlier version of this comment said a second VM would merely "lose the
+// race" for the `set`. That understates it. `ClassId`s are allocated PER VM
+// (`ClassStore::next_id` returns `self.classes.len()`, and each `SharedVm` owns
+// its own `ClassStore`), so with two VMs live:
+//
+//   * the second VM's `install_global_vtable_manager` is silently ignored, and
+//   * `vtable_install_adapter` — a captureless `fn(u32, Vec<…>)` handed to the
+//     classloading crate, with no VM parameter — writes the SECOND VM's vtables
+//     into the FIRST VM's manager under colliding numeric ids.
+//
+// The result is not "one VM owns the stream": it is two VMs' virtual-dispatch
+// tables interleaved in one index, so `resolve_virtual_slot` can hand a caller
+// in VM B a `CachedBytecodeMethod` compiled from VM A's class. That is silent
+// wrong dispatch, and it is why "100 concurrent VMs" cannot be claimed today.
+//
+// Unlike the redefine/JIT-invalidation hooks (see
+// `vm_init::live_hook_vms`), this one CANNOT be fixed by fanning out to every
+// live VM: invalidation is idempotent and safe to over-apply, whereas vtable
+// INSTALLATION is a write of authoritative state and fanning it out would
+// corrupt every other VM rather than merely over-invalidate them.
+//
+// The fix requires a VM parameter on `cratonvm_classloading::VtableInstallHook`
+// (or a current-VM thread-local established around class loading), both of
+// which live outside this crate. Until then this global is correct for exactly
+// one VM per process and unsound for two.
 // ---------------------------------------------------------------------------
 
 static GLOBAL_VTABLE_MANAGER: OnceLock<Arc<RwLock<VtableManager>>> = OnceLock::new();

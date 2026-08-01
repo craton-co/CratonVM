@@ -345,13 +345,63 @@ pub(crate) fn drain_input_stream_per_byte(
 pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // Real-JDK GZIPInputStream must retain its bytecode implementation: it
-    // initializes and drives the zlib state through zip_real's private
-    // Inflater natives.  Synthetic-layout replacements here corrupt real JDK
-    // resource streams, so only the GZIPOutputStream bridge remains below.
+    // GZIPInputStream / GZIPOutputStream.
+    //
+    // These are registered again after a period during which they were removed
+    // outright, because a slot-indexed synthetic native applied to a REAL
+    // `java.util.zip` receiver corrupts the zlib state that `zip_real`'s
+    // private Inflater/Deflater natives own. Two things keep that from
+    // recurring:
+    //
+    //  1. This registrar is only reachable from `register_synthetic_overrides`
+    //     (`#[cfg(feature = "synthetic-jdk")]`, and only taken when the VM
+    //     actually booted in synthetic mode) — the mode in which there is no
+    //     `java.util.zip` bytecode to fall back to at all, so leaving these
+    //     unregistered meant `GZIPInputStream`/`GZIPOutputStream` simply did
+    //     not exist.
+    //  2. Every native below re-checks the RECEIVER at call time with
+    //     `is_real_layout`. An instance whose class file genuinely declares the
+    //     JDK field (`GZIPInputStream.eos` / `GZIPOutputStream.crc`) is handed
+    //     straight back to its own bytecode instead of being interpreted
+    //     against this module's slot conventions.
+    //
+    // Layout (synthetic): GZIPInputStream  = slot 0 inflated byte[], slot 1 read
+    // position. GZIPOutputStream = slot 0 sink `OutputStream` (dual-written to
+    // the `out` field name when one exists); the pending uncompressed payload
+    // lives in the identity-keyed `dos_state()` side table, because a caller may
+    // legitimately allocate the receiver with as few as two slots.
+    let gi = "java/util/zip/GZIPInputStream";
+    r.register(gi, "<init>", "(Ljava/io/InputStream;)V", |ctx, args| {
+        p58_gzip_in_init_desc(ctx, args, "(Ljava/io/InputStream;)V")
+    });
+    r.register(gi, "<init>", "(Ljava/io/InputStream;I)V", |ctx, args| {
+        p58_gzip_in_init_desc(ctx, args, "(Ljava/io/InputStream;I)V")
+    });
+    r.register(gi, "read", "()I", p58_gzip_in_read);
+    r.register(gi, "read", "([B)I", p58_gzip_in_read_array);
+    r.register(gi, "read", "([BII)I", p58_gzip_in_read_bytes);
+    r.register(gi, "available", "()I", p58_gzip_in_available);
+    r.register(gi, "close", "()V", p58_gzip_in_close);
 
-    // GZIPOutputStream follows the same real-JDK path, including its private
-    // Deflater natives and deterministic compressed-byte behavior.
+    let go = "java/util/zip/GZIPOutputStream";
+    r.register(go, "<init>", "(Ljava/io/OutputStream;)V", |ctx, args| {
+        p58_gzip_out_init_desc(ctx, args, "(Ljava/io/OutputStream;)V")
+    });
+    r.register(go, "<init>", "(Ljava/io/OutputStream;I)V", |ctx, args| {
+        p58_gzip_out_init_desc(ctx, args, "(Ljava/io/OutputStream;I)V")
+    });
+    r.register(go, "<init>", "(Ljava/io/OutputStream;Z)V", |ctx, args| {
+        p58_gzip_out_init_desc(ctx, args, "(Ljava/io/OutputStream;Z)V")
+    });
+    r.register(go, "<init>", "(Ljava/io/OutputStream;IZ)V", |ctx, args| {
+        p58_gzip_out_init_desc(ctx, args, "(Ljava/io/OutputStream;IZ)V")
+    });
+    r.register(go, "write", "(I)V", p58_gzip_out_write);
+    r.register(go, "write", "([B)V", p58_gzip_out_write_array);
+    r.register(go, "write", "([BII)V", p58_gzip_out_write_bytes);
+    r.register(go, "finish", "()V", p58_gzip_out_finish);
+    r.register(go, "flush", "()V", p58_gzip_out_flush);
+    r.register(go, "close", "()V", p58_gzip_out_close);
 
     // ZipInputStream = 5-field (underlying=0, entry_names=1, entry_data=2, current_index=3, read_pos=4)
     let zi = "java/util/zip/ZipInputStream";
@@ -544,7 +594,11 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         // genuine `ZipInputStream`/`InflaterInputStream` bytecode instead,
         // per `check_override` in vm_exec.rs) — kept correct for parity with
         // that mode rather than leaving an unconditional no-op here.
-        if let Value::Object(Some(underlying)) = ctx.get_field_by_name(this, "out") {
+        //
+        // The wrapped stream is `in` (this is an INPUT stream); the previous
+        // `get_field_by_name(this, "out")` never resolved on any layout, so the
+        // propagation documented above silently never happened.
+        if let Some(underlying) = iis_underlying(ctx, this) {
             let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
         }
         ctx.set_field(this, 1, Value::Object(None));
@@ -557,7 +611,15 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     let zo = "java/util/zip/ZipOutputStream";
     r.register(zo, "<init>", "(Ljava/io/OutputStream;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+        let sink = args.get(1).copied().unwrap_or(Value::Object(None));
+        ctx.set_field(this, 0, sink);
+        // Dual write: the readers below (`zo_try_activate_real_fast`,
+        // `zo_write_zip`, `close`) resolve the sink name-first, slot-second.
+        // A synthetic receiver has no named fields at all, so the by-name
+        // store is a no-op there and slot 0 is the only truth — but writing
+        // only one of the two is exactly how a writer and a reader end up
+        // addressing different storage (see `set_field_by_name` semantics).
+        ctx.set_field_by_name(this, "out", sink);
         // Initialize empty entry lists (using arrays as dynamic lists with a count sentinel)
         let names = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
         let datas = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
@@ -716,7 +778,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         }
         zo_finalize_current_entry(ctx, this);
         zo_write_zip(ctx, this)?;
-        if let Value::Object(Some(underlying)) = ctx.get_field_by_name(this, "out") {
+        if let Some(underlying) = dos_underlying(ctx, this) {
             let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
         }
         let key = zo_buf_key(ctx, this);
@@ -1545,8 +1607,23 @@ fn try_direct_file_to_stored_zip_output(
 
 // GZIPInputStream: field 0=decompressed byte[], field 1=read position (Int)
 // Reads all compressed data from underlying stream, decompresses with flate2, stores result.
-pub(crate) fn p58_gzip_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+//
+// `desc` is the descriptor this native was registered under, so a real-JDK
+// receiver can be handed back to the matching constructor bytecode.
+pub(crate) fn p58_gzip_in_init_desc(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    desc: &str,
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "eos") {
+        return ctx.invoke_special_bytecode_only(
+            "java/util/zip/GZIPInputStream",
+            "<init>",
+            desc,
+            args,
+        );
+    }
     let input_stream = args.get(1).copied().unwrap_or(Value::Object(None));
     // Read all bytes from underlying stream eagerly.  Resource streams are
     // frequently `ByteArrayInputStream`s backed by jar entries; use the scalar
@@ -1590,6 +1667,9 @@ pub(crate) fn p58_gzip_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 pub(crate) fn p58_gzip_in_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "eos") {
+        return ctx.invoke_virtual_bytecode_only(this, "read", "()I", &[]);
+    }
     let pos = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
     if let Value::Object(Some(data)) = ctx.get_field(this, 0) {
         let len = ctx.array_length(data);
@@ -1613,26 +1693,66 @@ pub(crate) fn p58_gzip_in_read_bytes(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "eos") {
+        return ctx.invoke_virtual_bytecode_only(this, "read", "([BII)I", &args[1..]);
+    }
     let pos = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
     let buf = obj_arg(args, 1)?;
-    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+    // Validate the SIGNED off/len against the destination before widening: a
+    // negative len sign-extends into a huge usize, and `InputStream.read([BII)`
+    // contractually throws here (same guard as `iis_read_bytes`).
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+    let buf_len = ctx.array_length(buf) as i64;
+    if off < 0 || len < 0 || (off as i64) + (len as i64) > buf_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: if off < 0 { off } else { off.wrapping_add(len) },
+        }
+        .into());
+    }
+    let (off, len) = (off as usize, len as usize);
     if let Value::Object(Some(data)) = ctx.get_field(this, 0) {
         let data_len = ctx.array_length(data);
         if pos >= data_len {
             return Ok(Some(Value::Int(-1)));
         }
+        if len == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let available = data_len - pos;
         let to_read = len.min(available);
-        for i in 0..to_read {
-            let val = ctx.get_array_element(data, pos + i);
-            ctx.set_array_element(buf, off + i, val);
-        }
-        ctx.set_field(this, 1, Value::Int((pos + to_read) as i32));
-        Ok(Some(Value::Int(to_read as i32)))
+        // Bulk memcpy rather than a per-element `Value` round trip.
+        let mut scratch = vec![0u8; to_read];
+        let copied = ctx.read_byte_array_into(data, pos, &mut scratch);
+        ctx.write_byte_array_from(buf, off, &scratch[..copied]);
+        ctx.set_field(this, 1, Value::Int((pos + copied) as i32));
+        Ok(Some(Value::Int(copied as i32)))
     } else {
         Ok(Some(Value::Int(-1)))
     }
+}
+
+/// `read(byte[])` is `read(b, 0, b.length)` — without it a caller fell through
+/// to `InputStream.read([B)I`, which knows nothing about the inflated payload.
+pub(crate) fn p58_gzip_in_read_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "eos") {
+        return ctx.invoke_virtual_bytecode_only(this, "read", "([B)I", &args[1..]);
+    }
+    let buf = obj_arg(args, 1)?;
+    let len = ctx.array_length(buf) as i32;
+    p58_gzip_in_read_bytes(
+        ctx,
+        &[
+            args[0],
+            Value::Object(Some(buf)),
+            Value::Int(0),
+            Value::Int(len),
+        ],
+    )
 }
 
 pub(crate) fn p58_gzip_in_available(
@@ -1640,6 +1760,9 @@ pub(crate) fn p58_gzip_in_available(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "eos") {
+        return ctx.invoke_virtual_bytecode_only(this, "available", "()I", &[]);
+    }
     let pos = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
     if let Value::Object(Some(data)) = ctx.get_field(this, 0) {
         let len = ctx.array_length(data);
@@ -1653,23 +1776,104 @@ pub(crate) fn p58_gzip_in_available(
     }
 }
 
-// GZIPOutputStream: field 0=accumulated uncompressed byte[], field 1=count (Int)
-// Accumulates data; on finish/close, compresses with flate2 and writes to underlying stream.
-pub(crate) fn p58_gzip_out_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// `close()` drops the inflated payload so every later read reports EOF.
+///
+/// The wrapped stream is NOT closed here: `<init>` already drained it to EOF
+/// and this layout keeps no reference to it (slot 0 holds the inflated bytes,
+/// not the source), so there is nothing left to propagate to. Guarded on the
+/// slot count because callers may allocate the receiver with fewer slots than
+/// this layout uses.
+pub(crate) fn p58_gzip_in_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Field 0 = accumulated bytes array, field 1 = count, field 2 = underlying OutputStream
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1024);
-    ctx.set_field(this, 0, Value::Object(Some(arr)));
-    ctx.set_field(this, 1, Value::Int(0));
-    ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
+    if is_real_layout(ctx, this, "eos") {
+        return ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[]);
+    }
+    if ctx.object_num_fields(this) > 0 {
+        ctx.set_field(this, 0, Value::Object(None));
+        if ctx.object_num_fields(this) > 1 {
+            ctx.set_field(this, 1, Value::Int(0));
+        }
+    }
+    Ok(None)
+}
+
+// GZIPOutputStream (synthetic layout): slot 0 = sink `OutputStream`, dual
+// written to the `out` field name when the receiver has one. The pending
+// UNCOMPRESSED payload lives in the identity-keyed `dos_state()` side table
+// rather than in a heap field, for two reasons: callers legitimately allocate
+// this receiver with as few as two slots (a heap-field buffer at slot 2 would
+// be silently dropped by the out-of-bounds guard), and the buffer accumulates
+// across many `write()` calls whose intervening Java allocations can relocate
+// `this` under a moving young GC — the same argument `zo_buf_key` documents.
+//
+// Reusing `dos_state()` (rather than a private map) is deliberate: it is the
+// same buffer `DeflaterOutputStream`'s inherited `write` natives fill, so a
+// payload that arrives through the superclass native is still picked up by
+// `finish()` here and gzip-framed rather than silently lost.
+pub(crate) fn p58_gzip_out_init_desc(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    desc: &str,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "crc") {
+        return ctx.invoke_special_bytecode_only(
+            "java/util/zip/GZIPOutputStream",
+            "<init>",
+            desc,
+            args,
+        );
+    }
+    let sink = args.get(1).copied().unwrap_or(Value::Object(None));
+    if ctx.object_num_fields(this) > 0 {
+        ctx.set_field(this, 0, sink);
+    }
+    ctx.set_field_by_name(this, "out", sink);
+    // A fresh stream must never inherit a previous one's pending bytes or its
+    // `finished` latch (identity hashes are reused after collection).
+    let key = zo_buf_key(ctx, this);
+    dos_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            key,
+            DosState {
+                pending: Vec::new(),
+                finished: false,
+            },
+        );
     Ok(None)
 }
 
 pub(crate) fn p58_gzip_out_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "crc") {
+        return ctx.invoke_virtual_bytecode_only(this, "write", "(I)V", &args[1..]);
+    }
     let byte_val = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-    p98_gzip_out_append(ctx, this, &[byte_val]);
+    dos_append(ctx, this, &[byte_val]);
     Ok(None)
+}
+
+pub(crate) fn p58_gzip_out_write_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "crc") {
+        return ctx.invoke_virtual_bytecode_only(this, "write", "([B)V", &args[1..]);
+    }
+    let src = obj_arg(args, 1)?;
+    let len = ctx.array_length(src) as i32;
+    p58_gzip_out_write_bytes(
+        ctx,
+        &[
+            args[0],
+            Value::Object(Some(src)),
+            Value::Int(0),
+            Value::Int(len),
+        ],
+    )
 }
 
 pub(crate) fn p58_gzip_out_write_bytes(
@@ -1677,43 +1881,29 @@ pub(crate) fn p58_gzip_out_write_bytes(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    if let Some(Value::Object(Some(src))) = args.get(1) {
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let mut bytes = Vec::with_capacity(len);
-        for i in 0..len {
-            if let Value::Int(b) = ctx.get_array_element(*src, off + i) {
-                bytes.push(b as u8);
-            }
-        }
-        p98_gzip_out_append(ctx, this, &bytes);
+    if is_real_layout(ctx, this, "crc") {
+        return ctx.invoke_virtual_bytecode_only(this, "write", "([BII)V", &args[1..]);
     }
+    let Some(Value::Object(Some(src))) = args.get(1) else {
+        return Ok(None);
+    };
+    let src = *src;
+    // Signed validation before widening — a negative len would sign-extend
+    // into a huge usize and abort the allocation below.
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+    let arr_len = ctx.array_length(src) as i64;
+    if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: if off < 0 { off } else { off.wrapping_add(len) },
+        }
+        .into());
+    }
+    let mut bytes = vec![0u8; len as usize];
+    let copied = ctx.read_byte_array_into(src, off as usize, &mut bytes);
+    bytes.truncate(copied);
+    dos_append(ctx, this, &bytes);
     Ok(None)
-}
-
-/// Helper: append bytes to the GZIPOutputStream's accumulation buffer.
-pub(crate) fn p98_gzip_out_append(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
-    let count = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-    if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-        let cap = ctx.array_length(arr);
-        let new_count = count + bytes.len();
-        // Grow if needed
-        let target = if new_count > cap {
-            let new_cap = (new_count * 2).max(1024);
-            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_cap);
-            for i in 0..count {
-                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
-            }
-            ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-            new_arr
-        } else {
-            arr
-        };
-        for (i, &b) in bytes.iter().enumerate() {
-            ctx.set_array_element(target, count + i, Value::Int(b as i8 as i32));
-        }
-        ctx.set_field(this, 1, Value::Int(new_count as i32));
-    }
 }
 
 pub(crate) static ZO_ENTRY_BUFS: std::sync::OnceLock<StdMutex<ZoHashMap<u64, Vec<u8>>>> =
@@ -1806,7 +1996,14 @@ fn zo_try_activate_real_fast(
     this: ObjectRef,
     first_entry: ObjectRef,
 ) -> bool {
-    let Value::Object(Some(out)) = ctx.get_field_by_name(this, "out") else {
+    // Name-first, slot-second. A `ZipOutputStream` built through this module's
+    // own `<init>` is a synthetic object with UNNAMED fields, so `"out"` never
+    // resolves on it and the sink only exists in slot 0. Reading the name alone
+    // made activation fail for every synthetic receiver, which sent
+    // `putNextEntry` into the `invoke_virtual_bytecode_only` fallback — and
+    // there is no `ZipOutputStream` bytecode in synthetic mode, so that
+    // surfaced as `NoSuchMethodError ZipOutputStream.putNextEntry`.
+    let Some(out) = dos_underlying(ctx, this) else {
         return false;
     };
     let out_class = ctx.class_name_of_id(ctx.class_id_of_object(out));
@@ -2095,7 +2292,7 @@ pub(crate) fn zo_write_zip(
             return Ok(());
         }
         let zip_bytes = zo_write_compact_zip(entries);
-        if let Value::Object(Some(underlying)) = ctx.get_field_by_name(this, "out") {
+        if let Some(underlying) = dos_underlying(ctx, this) {
             // The bounded compact path can materialize a multi-megabyte
             // outer archive in one Rust buffer. Sending that buffer back
             // through the interpreted FileOutputStream bytecode turns a
@@ -2243,6 +2440,9 @@ pub(crate) fn iis_state() -> &'static StdMutex<ZoHashMap<u64, IisState>> {
 fn iis_underlying(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     if let Value::Object(Some(o)) = ctx.get_field_by_name(this, "in") {
         return Some(o);
+    }
+    if ctx.object_num_fields(this) == 0 {
+        return None;
     }
     match ctx.get_field(this, 0) {
         Value::Object(Some(o)) => Some(o),
@@ -2418,15 +2618,40 @@ pub(crate) fn dos_state() -> &'static StdMutex<ZoHashMap<u64, DosState>> {
     DOS_STREAM_STATE.get_or_init(|| StdMutex::new(ZoHashMap::new()))
 }
 
-/// Resolve the stream this `DeflaterOutputStream` wraps.
+/// Resolve the sink an output stream in this module wraps.
+///
+/// Real layout inherits `out` from `FilterOutputStream`; every synthetic
+/// output-stream layout in this module (`DeflaterOutputStream`,
+/// `GZIPOutputStream`, `ZipOutputStream`) keeps its sink in slot 0 instead.
+/// Name-first, slot-second, because a synthetic receiver has NO named fields
+/// at all and a real one may not put `out` at slot 0.
 fn dos_underlying(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     if let Value::Object(Some(o)) = ctx.get_field_by_name(this, "out") {
         return Some(o);
+    }
+    if ctx.object_num_fields(this) == 0 {
+        return None;
     }
     match ctx.get_field(this, 0) {
         Value::Object(Some(o)) => Some(o),
         _ => None,
     }
+}
+
+/// True when `this` really carries the genuine JDK layout for its class — i.e.
+/// its class file declares `field`.
+///
+/// The `java.util.zip` natives in this module address their receiver by SLOT,
+/// against a layout this module itself defines. Applying them to a real JDK
+/// instance, whose zlib state is owned by `zip_real`'s private
+/// Inflater/Deflater natives, reads and writes the wrong storage — that is the
+/// regression that once caused the GZIP/Deflater registrations to be deleted
+/// outright. Registration is already confined to synthetic-JDK boots; this is
+/// the per-instance backstop for a mixed classpath, and the receivers it
+/// catches are delegated back to their own bytecode.
+fn is_real_layout(ctx: &dyn NativeContext, this: ObjectRef, field: &str) -> bool {
+    ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(this), field)
+        .is_some()
 }
 
 /// Identity-hash keying, for the same reason `zo_buf_key` uses it: the payload
@@ -2633,34 +2858,94 @@ pub(crate) fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Finish GZIP compression: read accumulated data, compress, write to underlying stream.
+/// `finish()` — gzip-frame everything written so far and hand it to the sink.
+///
+/// Emits a complete GZIP member (10-byte header, raw DEFLATE body, CRC-32 and
+/// ISIZE trailer) via `p58_gzip_compress`, which routes through statically
+/// linked zlib so the bitstream matches HotSpot's byte for byte. Emitting twice
+/// would produce a second member, hence the `finished` latch — the same latch
+/// `close()` relies on to be idempotent.
 pub(crate) fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let count = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-
-    // Read accumulated uncompressed data
-    let mut data = Vec::with_capacity(count);
-    if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-        for i in 0..count {
-            if let Value::Int(b) = ctx.get_array_element(arr, i) {
-                data.push(b as u8);
-            }
-        }
+    if is_real_layout(ctx, this, "crc") {
+        return ctx.invoke_virtual_bytecode_only(this, "finish", "()V", &[]);
     }
+    let key = zo_buf_key(ctx, this);
+    let pending = {
+        let mut states = dos_state().lock().unwrap_or_else(|e| e.into_inner());
+        let st = states.entry(key).or_insert_with(|| DosState {
+            pending: Vec::new(),
+            finished: false,
+        });
+        if st.finished {
+            return Ok(None);
+        }
+        st.finished = true;
+        std::mem::take(&mut st.pending)
+    };
 
-    let compressed = p58_gzip_compress(&data).map_err(|e| RuntimeError::IOException {
-        message: format!("GZIP compression failed: {}", e),
+    let compressed = p58_gzip_compress(&pending).map_err(|e| RuntimeError::IOException {
+        message: format!("GZIPOutputStream: compression failed: {e}"),
     })?;
 
-    // Write compressed bytes to underlying OutputStream
-    if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
-        for &b in &compressed {
-            let _ = ctx.invoke_virtual(underlying, "write", "(I)V", &[Value::Int(b as i32)]);
-        }
-    }
+    let Some(underlying) = dos_underlying(ctx, this) else {
+        return Ok(None);
+    };
+    // Pin across `new_array` — a moving young GC there would relocate the sink
+    // (native stale-local family).
+    let u_pin = ctx.pin_native_root(underlying);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, compressed.len());
+    ctx.write_byte_array_from(arr, 0, &compressed);
+    let underlying = ctx.read_native_pin(u_pin, underlying);
+    let result = ctx.invoke_virtual(
+        underlying,
+        "write",
+        "([BII)V",
+        &[
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(compressed.len() as i32),
+        ],
+    );
+    ctx.unpin_native_roots(u_pin);
+    result?;
+    Ok(None)
+}
 
-    // Mark as finished (set count to -1)
-    ctx.set_field(this, 1, Value::Int(-1));
+/// `flush()` on a non-`syncFlush` GZIP stream flushes the sink only; the
+/// deflater buffer is deliberately left alone (matching the JDK, whose public
+/// constructors leave `syncFlush` false).
+pub(crate) fn p58_gzip_out_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "crc") {
+        return ctx.invoke_virtual_bytecode_only(this, "flush", "()V", &[]);
+    }
+    if let Some(underlying) = dos_underlying(ctx, this) {
+        let _ = ctx.invoke_virtual(underlying, "flush", "()V", &[]);
+    }
+    Ok(None)
+}
+
+/// `close()` = `finish()` then close the sink, then drop the per-stream state.
+pub(crate) fn p58_gzip_out_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "crc") {
+        return ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[]);
+    }
+    // `finish` re-enters Java (the sink's `write`), which can move `this`.
+    let this_pin = ctx.pin_native_root(this);
+    let finish = p58_gzip_out_finish(ctx, args);
+    let this = ctx.read_native_pin(this_pin, this);
+    let key = zo_buf_key(ctx, this);
+    dos_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    if let Some(underlying) = dos_underlying(ctx, this) {
+        let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+    }
+    ctx.unpin_native_roots(this_pin);
+    finish?;
     Ok(None)
 }
 
@@ -2725,30 +3010,629 @@ pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) {
 // Zip/compression extras: Adler32, Deflater, Inflater, ZipFile, Checked streams
 // =============================================================================
 
-pub(crate) fn p71_init_defl(
+// ---------------------------------------------------------------------------
+// java.util.zip.Deflater / java.util.zip.Inflater (synthetic-JDK bridge)
+//
+// These were once registered as stubs whose `deflate`/`inflate` returned a
+// constant 0 while `setInput` merely stashed the array reference — i.e. every
+// caller silently produced an EMPTY compressed stream. They were then deleted
+// wholesale. Neither is acceptable: in synthetic-JDK mode there is no
+// `java.util.zip` bytecode behind them at all, so `new Deflater()` simply did
+// not exist.
+//
+// What follows is a genuine zlib bridge. All state lives in a Rust-side
+// `flate2::Compress` / `flate2::Decompress` stream (the same libz that backs
+// `zip_real`'s private natives) keyed by the receiver's identity hash, which is
+// stable across a moving GC — a heap field would be both layout-fragile (these
+// receivers are frequently allocated with a hand-picked slot count) and
+// unable to hold a live zlib stream anyway.
+//
+// A receiver whose class file genuinely declares `zsRef` is a real JDK
+// Deflater/Inflater driven by `zip_real`; `is_real_layout` sends it back to its
+// own bytecode rather than aliasing it onto this state.
+// ---------------------------------------------------------------------------
+
+/// Incremental Adler-32 (RFC 1950), used for `getAdler()` on both classes.
+/// `flate2` does not expose the stream's running checksum, and the JDK's
+/// `getAdler()` is the checksum of the UNCOMPRESSED data either way, so track
+/// it over the bytes that actually flow through.
+fn adler32_update(current: u32, data: &[u8]) -> u32 {
+    let (mut s1, mut s2) = (current & 0xFFFF, (current >> 16) & 0xFFFF);
+    for &b in data {
+        s1 = (s1 + b as u32) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    (s2 << 16) | s1
+}
+
+struct DeflaterState {
+    stream: flate2::Compress,
+    /// Input handed over by `setInput` but not yet consumed by `deflate`.
+    input: Vec<u8>,
+    /// Read cursor into `input`.
+    pos: usize,
+    /// `finish()` was called: subsequent `deflate` calls flush the final block.
+    finish_requested: bool,
+    /// zlib reported `StreamEnd` — this is what `finished()` answers, matching
+    /// the JDK, where the flag is set inside `deflate()` and NOT by `finish()`.
+    finished: bool,
+    /// Adler-32 of everything consumed so far.
+    adler: u32,
+    level: u32,
+    nowrap: bool,
+}
+
+impl DeflaterState {
+    fn new(level: i32, nowrap: bool) -> Self {
+        // JDK `DEFAULT_COMPRESSION` is -1; zlib maps that to 6.
+        let level = if (0..=9).contains(&level) {
+            level as u32
+        } else {
+            6
+        };
+        Self {
+            stream: flate2::Compress::new(flate2::Compression::new(level), !nowrap),
+            input: Vec::new(),
+            pos: 0,
+            finish_requested: false,
+            finished: false,
+            adler: 1,
+            level,
+            nowrap,
+        }
+    }
+}
+
+struct InflaterState {
+    stream: flate2::Decompress,
+    input: Vec<u8>,
+    pos: usize,
+    finished: bool,
+    adler: u32,
+    nowrap: bool,
+}
+
+impl InflaterState {
+    fn new(nowrap: bool) -> Self {
+        Self {
+            stream: flate2::Decompress::new(!nowrap),
+            input: Vec::new(),
+            pos: 0,
+            finished: false,
+            adler: 1,
+            nowrap,
+        }
+    }
+}
+
+static DEFLATER_STATES: std::sync::OnceLock<StdMutex<ZoHashMap<u64, DeflaterState>>> =
+    std::sync::OnceLock::new();
+static INFLATER_STATES: std::sync::OnceLock<StdMutex<ZoHashMap<u64, InflaterState>>> =
+    std::sync::OnceLock::new();
+
+fn deflater_states() -> &'static StdMutex<ZoHashMap<u64, DeflaterState>> {
+    DEFLATER_STATES.get_or_init(|| StdMutex::new(ZoHashMap::new()))
+}
+
+fn inflater_states() -> &'static StdMutex<ZoHashMap<u64, InflaterState>> {
+    INFLATER_STATES.get_or_init(|| StdMutex::new(ZoHashMap::new()))
+}
+
+/// Copy a Java `byte[]` range out, with the same signed bounds contract the
+/// JDK's `setInput(byte[], int, int)` enforces.
+fn copy_java_bytes(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-    level: i32,
-) -> MethodCallResult {
+) -> Result<Vec<u8>, MethodCallFailed> {
+    let Some(Value::Object(Some(src))) = args.get(1) else {
+        return Ok(Vec::new());
+    };
+    let src = *src;
+    let arr_len = ctx.array_length(src) as i64;
+    let (off, len) = match (args.get(2), args.get(3)) {
+        (Some(Value::Int(off)), Some(Value::Int(len))) => (*off, *len),
+        _ => (0, arr_len as i32),
+    };
+    if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: if off < 0 { off } else { off.wrapping_add(len) },
+        }
+        .into());
+    }
+    let mut buf = vec![0u8; len as usize];
+    let copied = ctx.read_byte_array_into(src, off as usize, &mut buf);
+    buf.truncate(copied);
+    Ok(buf)
+}
+
+/// Resolve the destination `byte[]`, offset and length for a
+/// `deflate`/`inflate` call, accepting both the `([B)` and `([BII)` shapes.
+fn output_target(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Option<(ObjectRef, usize, usize)>, MethodCallFailed> {
+    let Some(Value::Object(Some(dst))) = args.get(1) else {
+        return Ok(None);
+    };
+    let dst = *dst;
+    let arr_len = ctx.array_length(dst) as i64;
+    let (off, len) = match (args.get(2), args.get(3)) {
+        (Some(Value::Int(off)), Some(Value::Int(len))) => (*off, *len),
+        _ => (0, arr_len as i32),
+    };
+    if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: if off < 0 { off } else { off.wrapping_add(len) },
+        }
+        .into());
+    }
+    Ok(Some((dst, off as usize, len as usize)))
+}
+
+fn deflater_init(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    ctx.set_field(this, 0, Value::Object(None));
-    ctx.set_field(this, 1, Value::Int(level));
-    ctx.set_field(this, 2, Value::Int(0));
-    ctx.set_field(this, 3, Value::Long(0));
+    if is_real_layout(ctx, this, "zsRef") {
+        return ctx.invoke_special_bytecode_only("java/util/zip/Deflater", "<init>", desc, args);
+    }
+    let level = args.get(1).and_then(Value::as_int).unwrap_or(-1);
+    let nowrap = matches!(args.get(2), Some(Value::Int(1)));
+    let key = zo_buf_key(ctx, this);
+    deflater_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, DeflaterState::new(level, nowrap));
     Ok(None)
 }
 
-pub(crate) fn p71_init_infl(
+fn deflater_deflate(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "zsRef") {
+        return ctx.invoke_virtual_bytecode_only(this, "deflate", desc, &args[1..]);
+    }
+    let Some((dst, off, len)) = output_target(ctx, args)? else {
+        return Ok(Some(Value::Int(0)));
+    };
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let key = zo_buf_key(ctx, this);
+    let mut scratch = vec![0u8; len];
+    let produced = {
+        let mut states = deflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = states.get_mut(&key) else {
+            return Ok(Some(Value::Int(0)));
+        };
+        if state.finished {
+            0
+        } else {
+            // Destructured so the compressor and its input buffer are borrowed
+            // as disjoint fields.
+            let DeflaterState {
+                stream,
+                input,
+                pos,
+                finish_requested,
+                finished,
+                adler,
+                ..
+            } = state;
+            let start = (*pos).min(input.len());
+            let before_in = stream.total_in();
+            let before_out = stream.total_out();
+            let flush = if *finish_requested {
+                flate2::FlushCompress::Finish
+            } else {
+                flate2::FlushCompress::None
+            };
+            let status = stream
+                .compress(&input[start..], &mut scratch, flush)
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("Deflater: {e}"),
+                })?;
+            let consumed = (stream.total_in() - before_in) as usize;
+            *adler = adler32_update(*adler, &input[start..start + consumed]);
+            *pos = start + consumed;
+            if matches!(status, flate2::Status::StreamEnd) {
+                *finished = true;
+            }
+            (stream.total_out() - before_out) as usize
+        }
+    };
+    if produced > 0 {
+        ctx.write_byte_array_from(dst, off, &scratch[..produced]);
+    }
+    Ok(Some(Value::Int(produced as i32)))
+}
+
+fn inflater_init(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "zsRef") {
+        return ctx.invoke_special_bytecode_only("java/util/zip/Inflater", "<init>", desc, args);
+    }
+    let nowrap = matches!(args.get(1), Some(Value::Int(1)));
+    let key = zo_buf_key(ctx, this);
+    inflater_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, InflaterState::new(nowrap));
+    Ok(None)
+}
+
+fn inflater_inflate(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "zsRef") {
+        return ctx.invoke_virtual_bytecode_only(this, "inflate", desc, &args[1..]);
+    }
+    let Some((dst, off, len)) = output_target(ctx, args)? else {
+        return Ok(Some(Value::Int(0)));
+    };
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let key = zo_buf_key(ctx, this);
+    let mut scratch = vec![0u8; len];
+    let produced = {
+        let mut states = inflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = states.get_mut(&key) else {
+            return Ok(Some(Value::Int(0)));
+        };
+        if state.finished {
+            0
+        } else {
+            let InflaterState {
+                stream,
+                input,
+                pos,
+                finished,
+                adler,
+                ..
+            } = state;
+            let start = (*pos).min(input.len());
+            let before_in = stream.total_in();
+            let before_out = stream.total_out();
+            let status = stream
+                .decompress(&input[start..], &mut scratch, flate2::FlushDecompress::None)
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("Inflater: invalid compressed data: {e}"),
+                })?;
+            *pos = start + (stream.total_in() - before_in) as usize;
+            let produced = (stream.total_out() - before_out) as usize;
+            *adler = adler32_update(*adler, &scratch[..produced]);
+            if matches!(status, flate2::Status::StreamEnd) {
+                *finished = true;
+            }
+            produced
+        }
+    };
+    if produced > 0 {
+        ctx.write_byte_array_from(dst, off, &scratch[..produced]);
+    }
+    Ok(Some(Value::Int(produced as i32)))
+}
+
+/// Register the real zlib-backed `Deflater`/`Inflater` surface.
+fn register_p71_deflater_inflater(r: &mut NativeMethodRegistry) {
+    let dl = "java/util/zip/Deflater";
+    r.register(dl, "<init>", "()V", |ctx, args| {
+        deflater_init(ctx, args, "()V")
+    });
+    r.register(dl, "<init>", "(I)V", |ctx, args| {
+        deflater_init(ctx, args, "(I)V")
+    });
+    r.register(dl, "<init>", "(IZ)V", |ctx, args| {
+        deflater_init(ctx, args, "(IZ)V")
+    });
+    r.register(dl, "setInput", "([B)V", |ctx, args| {
+        deflater_set_input(ctx, args, "([B)V")
+    });
+    r.register(dl, "setInput", "([BII)V", |ctx, args| {
+        deflater_set_input(ctx, args, "([BII)V")
+    });
+    r.register(dl, "setLevel", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "setLevel", "(I)V", &args[1..]);
+        }
+        let level = args.get(1).and_then(Value::as_int).unwrap_or(-1);
+        let key = zo_buf_key(ctx, this);
+        let mut states = deflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = states.get_mut(&key) {
+            // zlib applies a level change at the next flush boundary; a fresh
+            // stream is the faithful equivalent for a Deflater that has not
+            // consumed input yet, which is the only point the JDK documents
+            // `setLevel` as meaningful without an intervening `deflate`.
+            // Pending (not-yet-consumed) input and the finish request survive —
+            // rebuilding the stream must not silently drop the caller's data.
+            let nowrap = state.nowrap;
+            if state.stream.total_in() == 0 {
+                let input = std::mem::take(&mut state.input);
+                let (pos, finish_requested) = (state.pos, state.finish_requested);
+                *state = DeflaterState::new(level, nowrap);
+                state.input = input;
+                state.pos = pos;
+                state.finish_requested = finish_requested;
+            }
+        }
+        Ok(None)
+    });
+    // `setStrategy` selects between zlib's literal/filtered/huffman-only
+    // heuristics. All of them emit a valid DEFLATE stream that any inflater
+    // reads back identically, and `flate2`'s safe API exposes no strategy
+    // selector, so honour the call without changing the output rather than
+    // refusing it.
+    r.register(dl, "setStrategy", "(I)V", |_ctx, _args| Ok(None));
+    r.register(dl, "needsInput", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "needsInput", "()Z", &[]);
+        }
+        let key = zo_buf_key(ctx, this);
+        let states = deflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        let needs = states
+            .get(&key)
+            .map_or(true, |state| state.pos >= state.input.len());
+        Ok(Some(Value::Int(i32::from(needs))))
+    });
+    r.register(dl, "finish", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "finish", "()V", &[]);
+        }
+        let key = zo_buf_key(ctx, this);
+        let mut states = deflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = states.get_mut(&key) {
+            state.finish_requested = true;
+        }
+        Ok(None)
+    });
+    r.register(dl, "finished", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "finished", "()Z", &[]);
+        }
+        let key = zo_buf_key(ctx, this);
+        let states = deflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        let finished = states.get(&key).is_some_and(|state| state.finished);
+        Ok(Some(Value::Int(i32::from(finished))))
+    });
+    r.register(dl, "deflate", "([B)I", |ctx, args| {
+        deflater_deflate(ctx, args, "([B)I")
+    });
+    r.register(dl, "deflate", "([BII)I", |ctx, args| {
+        deflater_deflate(ctx, args, "([BII)I")
+    });
+    r.register(dl, "getBytesRead", "()J", |ctx, args| {
+        deflater_counter(ctx, args, DeflaterCounter::BytesRead)
+    });
+    r.register(dl, "getBytesWritten", "()J", |ctx, args| {
+        deflater_counter(ctx, args, DeflaterCounter::BytesWritten)
+    });
+    r.register(dl, "getTotalIn", "()I", |ctx, args| {
+        deflater_counter(ctx, args, DeflaterCounter::TotalIn)
+    });
+    r.register(dl, "getTotalOut", "()I", |ctx, args| {
+        deflater_counter(ctx, args, DeflaterCounter::TotalOut)
+    });
+    r.register(dl, "getAdler", "()I", |ctx, args| {
+        deflater_counter(ctx, args, DeflaterCounter::Adler)
+    });
+    r.register(dl, "reset", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "reset", "()V", &[]);
+        }
+        let key = zo_buf_key(ctx, this);
+        let mut states = deflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = states.get_mut(&key) {
+            let (level, nowrap) = (state.level as i32, state.nowrap);
+            *state = DeflaterState::new(level, nowrap);
+        }
+        Ok(None)
+    });
+    r.register(dl, "end", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "end", "()V", &[]);
+        }
+        let key = zo_buf_key(ctx, this);
+        deflater_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        Ok(None)
+    });
+
+    let il = "java/util/zip/Inflater";
+    r.register(il, "<init>", "()V", |ctx, args| {
+        inflater_init(ctx, args, "()V")
+    });
+    r.register(il, "<init>", "(Z)V", |ctx, args| {
+        inflater_init(ctx, args, "(Z)V")
+    });
+    r.register(il, "setInput", "([B)V", |ctx, args| {
+        inflater_set_input(ctx, args, "([B)V")
+    });
+    r.register(il, "setInput", "([BII)V", |ctx, args| {
+        inflater_set_input(ctx, args, "([BII)V")
+    });
+    r.register(il, "inflate", "([B)I", |ctx, args| {
+        inflater_inflate(ctx, args, "([B)I")
+    });
+    r.register(il, "inflate", "([BII)I", |ctx, args| {
+        inflater_inflate(ctx, args, "([BII)I")
+    });
+    r.register(il, "needsInput", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "needsInput", "()Z", &[]);
+        }
+        let key = zo_buf_key(ctx, this);
+        let states = inflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        let needs = states
+            .get(&key)
+            .map_or(true, |state| state.pos >= state.input.len());
+        Ok(Some(Value::Int(i32::from(needs))))
+    });
+    // No `setDictionary` bridge is registered, so a preset dictionary is never
+    // pending: report false rather than leaving the method unresolvable.
+    r.register(il, "needsDictionary", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "needsDictionary", "()Z", &[]);
+        }
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(il, "finished", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "finished", "()Z", &[]);
+        }
+        let key = zo_buf_key(ctx, this);
+        let states = inflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        let finished = states.get(&key).is_some_and(|state| state.finished);
+        Ok(Some(Value::Int(i32::from(finished))))
+    });
+    r.register(il, "getRemaining", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "getRemaining", "()I", &[]);
+        }
+        let key = zo_buf_key(ctx, this);
+        let states = inflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        let remaining = states
+            .get(&key)
+            .map_or(0, |state| state.input.len().saturating_sub(state.pos));
+        Ok(Some(Value::Int(remaining as i32)))
+    });
+    r.register(il, "getBytesRead", "()J", |ctx, args| {
+        inflater_counter(ctx, args, DeflaterCounter::BytesRead)
+    });
+    r.register(il, "getBytesWritten", "()J", |ctx, args| {
+        inflater_counter(ctx, args, DeflaterCounter::BytesWritten)
+    });
+    r.register(il, "getTotalIn", "()I", |ctx, args| {
+        inflater_counter(ctx, args, DeflaterCounter::TotalIn)
+    });
+    r.register(il, "getTotalOut", "()I", |ctx, args| {
+        inflater_counter(ctx, args, DeflaterCounter::TotalOut)
+    });
+    r.register(il, "getAdler", "()I", |ctx, args| {
+        inflater_counter(ctx, args, DeflaterCounter::Adler)
+    });
+    r.register(il, "reset", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "reset", "()V", &[]);
+        }
+        let key = zo_buf_key(ctx, this);
+        let mut states = inflater_states().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = states.get_mut(&key) {
+            let nowrap = state.nowrap;
+            *state = InflaterState::new(nowrap);
+        }
+        Ok(None)
+    });
+    r.register(il, "end", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_real_layout(ctx, this, "zsRef") {
+            return ctx.invoke_virtual_bytecode_only(this, "end", "()V", &[]);
+        }
+        let key = zo_buf_key(ctx, this);
+        inflater_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        Ok(None)
+    });
+}
+
+fn deflater_set_input(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "zsRef") {
+        return ctx.invoke_virtual_bytecode_only(this, "setInput", desc, &args[1..]);
+    }
+    let bytes = copy_java_bytes(ctx, args)?;
+    let key = zo_buf_key(ctx, this);
+    let mut states = deflater_states().lock().unwrap_or_else(|e| e.into_inner());
+    let state = states
+        .entry(key)
+        .or_insert_with(|| DeflaterState::new(-1, false));
+    state.input = bytes;
+    state.pos = 0;
+    Ok(None)
+}
+
+fn inflater_set_input(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if is_real_layout(ctx, this, "zsRef") {
+        return ctx.invoke_virtual_bytecode_only(this, "setInput", desc, &args[1..]);
+    }
+    let bytes = copy_java_bytes(ctx, args)?;
+    let key = zo_buf_key(ctx, this);
+    let mut states = inflater_states().lock().unwrap_or_else(|e| e.into_inner());
+    let state = states
+        .entry(key)
+        .or_insert_with(|| InflaterState::new(false));
+    state.input = bytes;
+    state.pos = 0;
+    Ok(None)
+}
+
+#[derive(Clone, Copy)]
+enum DeflaterCounter {
+    BytesRead,
+    BytesWritten,
+    TotalIn,
+    TotalOut,
+    Adler,
+}
+
+fn deflater_counter(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-    nowrap: i32,
+    which: DeflaterCounter,
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    ctx.set_field(this, 0, Value::Object(None));
-    ctx.set_field(this, 1, Value::Int(nowrap));
-    ctx.set_field(this, 2, Value::Int(0));
-    ctx.set_field(this, 3, Value::Long(0));
-    Ok(None)
+    let key = zo_buf_key(ctx, this);
+    let states = deflater_states().lock().unwrap_or_else(|e| e.into_inner());
+    let (total_in, total_out, adler) = states.get(&key).map_or((0, 0, 1), |state| {
+        (
+            state.stream.total_in(),
+            state.stream.total_out(),
+            state.adler,
+        )
+    });
+    Ok(Some(match which {
+        DeflaterCounter::BytesRead => Value::Long(total_in as i64),
+        DeflaterCounter::BytesWritten => Value::Long(total_out as i64),
+        DeflaterCounter::TotalIn => Value::Int(total_in as i32),
+        DeflaterCounter::TotalOut => Value::Int(total_out as i32),
+        DeflaterCounter::Adler => Value::Int(adler as i32),
+    }))
+}
+
+fn inflater_counter(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    which: DeflaterCounter,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = zo_buf_key(ctx, this);
+    let states = inflater_states().lock().unwrap_or_else(|e| e.into_inner());
+    let (total_in, total_out, adler) = states.get(&key).map_or((0, 0, 1), |state| {
+        (
+            state.stream.total_in(),
+            state.stream.total_out(),
+            state.adler,
+        )
+    });
+    Ok(Some(match which {
+        DeflaterCounter::BytesRead => Value::Long(total_in as i64),
+        DeflaterCounter::BytesWritten => Value::Long(total_out as i64),
+        DeflaterCounter::TotalIn => Value::Int(total_in as i32),
+        DeflaterCounter::TotalOut => Value::Int(total_out as i32),
+        DeflaterCounter::Adler => Value::Int(adler as i32),
+    }))
 }
 
 /// Read a synthetic `java/util/zip/ZipFile`'s backing archive path (slot 0).
@@ -2902,10 +3786,13 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // Do not override real-JDK Deflater/Inflater public constructors or methods.
-    // Their bytecode initializes `zsRef` through the private natives registered
-    // in zip_real; the old synthetic-layout stubs left it uninitialized and
-    // corrupted GZIPInputStream decompression.
+    // Real zlib-backed `Deflater` / `Inflater`. These are NOT the old
+    // synthetic-layout stubs (whose `deflate`/`inflate` returned a constant 0):
+    // each receiver owns a genuine `flate2` stream, and any receiver that
+    // really carries the JDK layout (its class file declares `zsRef`, so its
+    // zlib state belongs to `zip_real`'s private natives) is delegated back to
+    // its own bytecode instead — see `register_p71_deflater_inflater`.
+    register_p71_deflater_inflater(r);
 
     // ZipFile = 2-field (name=0, closed=1)
     let zf = "java/util/zip/ZipFile";

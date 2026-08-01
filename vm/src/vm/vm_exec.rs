@@ -25,6 +25,7 @@ use crate::native::registry::{
     NativeThreadBlocker, StackTraceEntry,
 };
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
+use crate::threading::thread_state::{self, ThreadExecState};
 use crate::types::{jlong_bits_as_aligned_object_ptr, ObjectRef, Value};
 
 use super::SharedVm;
@@ -1108,25 +1109,44 @@ fn pin_value_for_native_call(shared: &SharedVm, roots: &mut Vec<ObjectRef>, v: &
     }
 }
 
-/// `java.lang.Object`'s `ClassId`, resolved once and cached lock-free
-/// thereafter. `java.lang.Object` is always loaded before any bytecode runs
-/// (it roots the class hierarchy the VM needs to bootstrap), so in practice
-/// the lookup below succeeds on the very first call — but if it were ever to
-/// return `None`, nothing is cached and the next call retries the real
-/// lookup rather than permanently disabling the stale-receiver check.
+/// `java.lang.Object`'s `ClassId`, resolved once per (host thread, VM) and
+/// cached lock-free thereafter. `java.lang.Object` is always loaded before any
+/// bytecode runs (it roots the class hierarchy the VM needs to bootstrap), so
+/// in practice the lookup below succeeds on the very first call — but if it
+/// were ever to return `None`, nothing is cached and the next call retries the
+/// real lookup rather than permanently disabling the stale-receiver check.
+///
+/// PER-VM STATE (P0, `docs/architecture/per-vm-state.md`). This was a
+/// process-global `OnceLock<ClassId>`. `ClassId`s are allocated per-VM
+/// (`ClassStore::next_id` returns `self.classes.len()`), so with two VMs live
+/// the first VM to boot pinned ITS `java/lang/Object` id for the whole
+/// process; the second VM then compared its own receivers' ids against a
+/// foreign VM's id. The only caller is
+/// `recover_stale_lambda_receiver_from_native_pins`'s `stale_object_receiver`
+/// test, so the failure mode is silent: a genuinely-stale `Object`-typed
+/// receiver stops being recovered (spurious `NoSuchMethodError`), or an
+/// ordinary receiver is misclassified as stale and the native-pin scan runs on
+/// every virtual call. Keyed by `shared.vm_identity` it cannot alias, and the
+/// cache is a thread-local `Cell` exactly like the two wrapper-class caches
+/// below (same shape, same `(vm_identity, ClassId)` key convention).
 #[inline]
 fn object_class_id(shared: &SharedVm) -> Option<ClassId> {
-    use std::sync::OnceLock;
-    static OBJECT_CLASS_ID: OnceLock<ClassId> = OnceLock::new();
-    if let Some(id) = OBJECT_CLASS_ID.get() {
-        return Some(*id);
+    thread_local! {
+        static OBJECT_CLASS_ID: std::cell::Cell<Option<(usize, ClassId)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    let vm_key = shared.vm_identity;
+    if let Some((cached_vm, id)) = OBJECT_CLASS_ID.with(|c| c.get()) {
+        if cached_vm == vm_key {
+            return Some(id);
+        }
     }
     let resolved = shared
         .classes
         .class_manager
         .read()
         .find_bootstrap_class_by_name("java/lang/Object")?;
-    let _ = OBJECT_CLASS_ID.set(resolved); // races are harmless; loser just re-resolves next time
+    OBJECT_CLASS_ID.with(|c| c.set(Some((vm_key, resolved))));
     Some(resolved)
 }
 
@@ -1554,6 +1574,44 @@ fn safe_native_call_impl(
     } else {
         false
     };
+
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // `NativeRunning` is the state the STW census deliberately WAITS for — "a
+    // *running* native still holds raw `ObjectRef`s in Rust locals and must be
+    // waited for so the copying collector does not relocate objects under it"
+    // (`gc_barrier.rs`). This is the funnel every native dispatch passes
+    // through, so recording here covers them all.
+    //
+    // The prior state is restored rather than assumed: this call site is
+    // reached from the interpreter (`JavaRunning`), from compiled code
+    // (`CompiledUninterruptible`) and from a re-entrant native, and inventing
+    // an edge the code does not perform is what the tripwire is meant to
+    // catch. Restoring on `Drop` covers the `catch_unwind`-caught panic and
+    // the early returns below it. A native that opened a blocking region and
+    // came back is left in whatever `end_blocking_region` recorded until this
+    // guard restores the caller's state — both are tabled edges.
+    struct NativeStateGuard(ThreadExecState);
+    impl Drop for NativeStateGuard {
+        fn drop(&mut self) {
+            thread_state::record_transition(self.0, "vm_exec::safe_native_call_impl:return");
+        }
+    }
+    let _native_state_guard = NativeStateGuard(match thread_state::current_state() {
+        // `Starting` is ALSO the recorder's answer for a thread it has never
+        // observed (`current_state`'s doc), and this funnel is often the first
+        // thing a carrier records. Restoring it would assert the one thing the
+        // table says cannot be true of a thread that just ran a native
+        // (`Starting -> NativeRunning` is deliberately absent), and would then
+        // repeat on that thread's every later native call. Resume as
+        // `JavaRunning`: the state such a thread demonstrably reached, and the
+        // tabled return edge from a native.
+        ThreadExecState::Starting => ThreadExecState::JavaRunning,
+        prior => prior,
+    });
+    thread_state::record_transition(
+        ThreadExecState::NativeRunning,
+        "vm_exec::safe_native_call_impl",
+    );
 
     let result = {
         // Heap-exhaustion unwind permission. The callback below runs directly
@@ -2807,6 +2865,29 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         }
         .check_post_block_gc();
     } else {
+        // CENSUS-RECONCILE (2026-07-31): the bare store survives ONLY because
+        // this arm's `GcBlockState` is virgin, which makes it a no-op — the
+        // reasoning was prose, so pin it. If the precondition ever breaks, the
+        // store becomes a genuine finding-1(c) flag clear performed outside the
+        // barrier lock (a pause requested in the window both excludes this
+        // thread and lets it run), and the accumulated fixup is dropped
+        // unapplied. Both are silent; `check_post_block_gc` (the `resumed` arm
+        // above) is the correct handler and the assert names it.
+        debug_assert!(
+            !thread
+                .gc_block_state
+                .in_blocked_region
+                .load(std::sync::atomic::Ordering::Acquire),
+            "first-mount continuation must have a virgin GcBlockState \
+             (in_blocked_region already down); a raised flag here needs \
+             check_post_block_gc, not a bare store",
+        );
+        debug_assert!(
+            thread.gc_block_state.fixup.lock().is_empty(),
+            "first-mount continuation must have a virgin GcBlockState \
+             (empty fixup); a non-empty one is a blocked-window remap this \
+             bare store would drop unapplied",
+        );
         thread
             .gc_block_state
             .in_blocked_region
@@ -4631,6 +4712,28 @@ impl NativeThreadBlocker for VmNativeThreadBlocker {
 
     fn leave_blocked(&self) {
         self.shared.mem.gc_barrier.mark_blocked_region_leave();
+        // CENSUS-RECONCILE (2026-07-31): clear the IDENTITY flag through the
+        // barrier, not with `mark_native_thread_unblocked`'s bare
+        // `store(false)`. `mark_blocked_region_leave` above only waits out the
+        // pause that was active when it ran; a pause requested in the window
+        // between that and the store would both EXCLUDE this thread (its
+        // census reads the still-raised flag) and let it run — finding 1(c)'s
+        // "excluded but running mutator" corruption window.
+        // `leave_blocked_region_flagged` closes it by clearing under the same
+        // lock hold that proved no pause is active. The
+        // `mark_native_thread_unblocked` call is kept for its side-table drain
+        // (fixup / slot_origins / snapshot); its own store is then a no-op.
+        if let Some(gc_block_state) = self
+            .shared
+            .threads
+            .thread_registry
+            .gc_block_state_of(self.thread_id)
+        {
+            self.shared
+                .mem
+                .gc_barrier
+                .leave_blocked_region_flagged(self.thread_id, &gc_block_state.in_blocked_region);
+        }
         self.shared
             .threads
             .thread_registry
@@ -9861,7 +9964,21 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
     }
 
     fn thread_start(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
-        let shared_arc = self.shared.get_arc();
+        // Spawning a child thread needs an owning `Arc<SharedVm>` to hand to it.
+        // A `SharedVm` built directly (`Arc::new(SharedVm::new(config))`, the
+        // shape unit fixtures use) has no weak self-reference — only `Vm::new()`
+        // installs one — so `get_arc()` would abort the process here. Report the
+        // missing threading substrate as an error instead: natives that spawn
+        // workers (e.g. `StructuredTaskScope.fork`) already document an inline
+        // fallback for "thread_start returned Err (no thread registry
+        // available)", and that fallback cannot run if we panic first.
+        let Some(shared_arc) = self.shared.try_get_arc() else {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: "Thread.start: this VM cannot spawn threads (no `self_arc` \
+                          self-reference installed; not built via Vm::new)"
+                    .to_string(),
+            }));
+        };
         let tid = self.shared.threads.thread_registry.next_thread_id();
         let header = self.shared.mem.heap.get_header(thread_obj);
 
@@ -11855,7 +11972,7 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     fn gpu_clear_input_cache(&mut self) {
         #[cfg(feature = "gpu-offload")]
         {
-            crate::runtime::offload::input_cache::clear_all();
+            crate::runtime::offload::input_cache::clear_all(self.shared.vm_identity);
         }
     }
 
@@ -21523,9 +21640,18 @@ fn invoke_on_class_shared_inner(
                 // MechanismDatabase when a Reader ref went stale). Dump the
                 // frame stack so the producing frame is named, exactly like
                 // CCE-BT-STK.
-                if class_name == "java/lang/Object"
-                    && crate::runtime::interpreter::dbg_cce_bt_enabled()
-                {
+                //
+                // `java/lang/Object` is only the cid=0 END of that family's
+                // range. A recycled address that now holds a REAL object of an
+                // unrelated class produces the identical defect with a concrete
+                // class name — `EmbeddableInitializerImpl.add(Ljava/lang/Object;)Z`
+                // for a `Collection.add` call site, say — and the old class-name
+                // test made the tracer blind to exactly those, which are the ones
+                // where naming the producing frame matters most. The flag is
+                // opt-in and this is a terminal error path, so every miss gets
+                // the dump; the receiver's resolved class is printed with it so
+                // "wrong class" and "no class" stay distinguishable in the log.
+                if crate::runtime::interpreter::dbg_cce_bt_enabled() {
                     eprintln!(
                         "CRATONVM_DBG_CCE_BT: site=nsme_dispatch method={class_name}.{method_name}{descriptor}"
                     );

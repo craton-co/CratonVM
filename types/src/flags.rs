@@ -205,6 +205,7 @@ impl FlagSource for OverlaySource {
 /// the semantics.
 pub mod parse {
     use super::FlagSource;
+    use std::ffi::OsString;
 
     /// `std::env::var_os(NAME).is_some()` — presence is truth.
     ///
@@ -462,6 +463,55 @@ pub mod parse {
         utf8(src, name)
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&n| n > 0)
+    }
+
+    /// `Some(true)` for `1`/`true`/`yes`/`on`, `Some(false)` for
+    /// `0`/`false`/`no`/`off`, `None` for unset, non-UTF-8, **or an
+    /// unrecognised spelling**. Trimmed and lower-cased first. Truth table 12.
+    ///
+    /// The first parser here whose `None` does not mean "off". Three callers
+    /// need that distinction because their default is neither: `ir_verify`'s
+    /// `CRATONVM_JIT_VERIFY_IR` and `thread_state`'s
+    /// `CRATONVM_STRESS_THREAD_STATES` resolve *unset* to
+    /// `cfg!(debug_assertions)` while treating an explicit `0` as off even in a
+    /// debug build. Folding those two into one `bool` here would silently arm
+    /// the verifier in release builds, so the tri-state is the whole point.
+    ///
+    /// Lifted from the byte-identical private `env_flag` helpers in
+    /// `jit/src/ir_verify.rs` and `jit/src/metrics.rs`.
+    #[inline]
+    pub fn tristate_word(src: &dyn FlagSource, name: &str) -> Option<bool> {
+        let raw = src.get(name)?;
+        let value = raw.to_str()?.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// `Some(false)` for exactly `0` / `false` / `off`, `Some(true)` for any
+    /// other value, `None` when unset or not UTF-8. Untrimmed and
+    /// case-sensitive. Truth table 13.
+    ///
+    /// The tri-state twin of [`on_unless_off_word`]: same "off" words, but
+    /// "unset" is reported instead of folded into a default, and an
+    /// unrecognised spelling reads as **on** (where [`tristate_word`] would
+    /// report `None`). Lifted from `vm::threading::thread_state`.
+    #[inline]
+    pub fn tristate_off_word(src: &dyn FlagSource, name: &str) -> Option<bool> {
+        utf8(src, name).map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
+    }
+
+    /// The raw OS value, `None` when unset **or empty**.
+    ///
+    /// The OS-native sibling of [`non_empty_string`], for values that are paths
+    /// and must not be forced through UTF-8. Lifted from
+    /// `jit::metrics::json_sink`, which reads an exported-but-empty
+    /// `CRATONVM_JIT_METRICS_OUT` as "no sink" rather than as a file named `""`.
+    #[inline]
+    pub fn os_non_empty(src: &dyn FlagSource, name: &str) -> Option<OsString> {
+        src.get(name).filter(|v| !v.is_empty())
     }
 }
 
@@ -1781,6 +1831,13 @@ pub struct VmFlags {
     pub io: IoFlags,
     /// Flags read only by `native-builtins`.
     pub natives: NativeFlags,
+    /// The subsystems migrated off direct environment reads under report P1:
+    /// the JIT IR verifier and metrics, the GC card counters, the thread-state
+    /// tripwire and the capability model. See [`crate::subsystem_config`] for
+    /// why these live in their own module rather than as more `bool` fields
+    /// here — every one of them is a tri-state, a path, a capacity or a mode
+    /// word, and the type is the point.
+    pub subsystems: crate::subsystem_config::SubsystemConfig,
     /// Resolved legacy values retained for configuration consumers that have
     /// not yet been converted to a typed field. Private so new code cannot
     /// widen the public configuration surface.
@@ -1798,6 +1855,7 @@ impl VmFlags {
             loader: LoaderFlags::from_source(src),
             io: IoFlags::from_source(src),
             natives: NativeFlags::from_source(src),
+            subsystems: crate::subsystem_config::SubsystemConfig::from_source(src),
             legacy_values: MapSource::declared_snapshot(src),
         }
     }

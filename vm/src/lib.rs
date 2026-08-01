@@ -235,11 +235,66 @@ pub mod harness_exit_shim {
     ///
     /// Calls `ExitProcess` with the shim's computed exit code so
     /// cargo sees a clean success/failure rather than `0xC0000005`.
+    ///
+    /// ## Why a mid-run fault must not reach `exit_code()`
+    ///
+    /// `exit_code()` answers "did a test failure look pending when
+    /// teardown hit us", and it answers it by counting panics. That
+    /// question only makes sense once every test has *run*. A fault
+    /// raised while tests are still executing is a different event:
+    /// `ExitProcess` pre-empts libtest's summary, so the tests that
+    /// had not started yet never will, and the panic count says
+    /// nothing about them. Routed through `exit_code()`, such a
+    /// crash reports **success** whenever fewer than
+    /// `EXPECTED_PANIC_COUNT` panics happened to have occurred
+    /// first — a green run with a thousand tests unexecuted. That
+    /// is not hypothetical: before the `widened_obj_key` VM-scoping
+    /// fix, `cargo test -p cratonvm-vm --lib --features
+    /// synthetic-jdk vm::tests::linked_hashmap_` crashed in
+    /// `lhm_link_tail` and exited **0**.
+    ///
+    /// The two cases are told apart by which thread faulted.
+    /// libtest runs each concurrent test on its own thread named
+    /// after the test, and does its result collection — the
+    /// teardown crash this shim exists for — on `main`. So a fault
+    /// on any other thread is a test dying mid-run, and is reported
+    /// as a failure with libtest's own `ERROR_EXIT_CODE`.
+    ///
+    /// Limitation: under `--test-threads=1` libtest runs tests
+    /// inline on `main`, so a mid-run crash there is
+    /// indistinguishable from a teardown crash and stays masked.
+    /// The CI step runs concurrently, where the distinction holds.
     unsafe extern "system" fn unhandled_filter(_info: *mut ()) -> i32 {
         // The filter runs on the crashing thread. `ExitProcess` is the
         // one Win32 call that's always safe here: it never unwinds, it
         // ignores corrupted CRT state, and it returns the exit code we
         // want cargo to see.
+        //
+        // `thread::current()` allocates on first call for an *unnamed*
+        // thread; libtest's workers and `main` are both already named,
+        // so on the paths that matter here this is a cached TLS read.
+        let thread = std::thread::current();
+        let on_worker = matches!(thread.name(), Some(name) if name != "main");
+        if on_worker {
+            // Write through `std::io::stderr()` rather than `eprintln!`:
+            // libtest redirects the print macros per test thread, so a
+            // macro here would land in the crashed test's captured
+            // buffer and die with the process. The hardware-fault
+            // handler installed alongside this filter has already
+            // printed the faulting PC, the thread name and a
+            // symbolized backtrace by the same reasoning.
+            use std::io::Write;
+            let mut err = std::io::stderr();
+            let _ = err.write_all(
+                b"\n[harness-exit-shim] a test crashed mid-run; tests after it never \
+                  executed. Reporting failure (101) - see the fatal-error report above \
+                  for the faulting test and PC.\n",
+            );
+            let _ = err.flush();
+            // libtest's own ERROR_EXIT_CODE, so cargo reports this
+            // exactly as it would an ordinary test failure.
+            ExitProcess(101)
+        }
         ExitProcess(exit_code())
     }
 
@@ -267,6 +322,15 @@ pub mod harness_exit_shim {
                 // fire because libtest's `main` never returns.
                 SetUnhandledExceptionFilter(Some(unhandled_filter));
             }
+            // The vectored handler runs *before* the unhandled filter and
+            // prints the faulting PC plus a symbolized native backtrace,
+            // which is the difference between "a test crashed" and knowing
+            // where. `vm-cli` and `libcratonvm` both install it; the test
+            // harness did not, which is why hardware faults under
+            // `cargo test` produced no diagnostic at all. It is a pure
+            // diagnostic tap (returns EXCEPTION_CONTINUE_SEARCH), so it
+            // does not change which handler ultimately terminates us.
+            crate::runtime::crash_handler::install_hardware_fault_handler();
             CTOR_RAN.store(true, Ordering::SeqCst);
         });
     }

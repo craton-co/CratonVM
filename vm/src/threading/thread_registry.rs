@@ -102,6 +102,37 @@ mod threadreg_perf {
     }
 }
 
+/// The calling OS thread's id, in the same encoding `ThreadEntry::os_tid`
+/// stores (`GetCurrentThreadId` on Windows, `gettid` on Linux) — see
+/// `ThreadRegistry::set_os_tid_current`, whose publication this reads back.
+/// `0` means "this platform has no takeover/identity backend", which every
+/// caller must read as "unknown": `0` is also the never-published sentinel in
+/// the entry.
+#[cfg(windows)]
+#[inline]
+fn current_os_tid() -> u32 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+    unsafe { GetCurrentThreadId() }
+}
+
+/// Linux variant of [`current_os_tid`].
+#[cfg(target_os = "linux")]
+#[inline]
+fn current_os_tid() -> u32 {
+    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+}
+
+/// Fallback for platforms with no `os_tid` publication (the takeover machinery
+/// is Windows/Linux-only, and so is `set_os_tid_current`).
+#[cfg(all(not(windows), not(target_os = "linux")))]
+#[inline]
+fn current_os_tid() -> u32 {
+    0
+}
+
 /// An entry in the thread registry for one JVM thread.
 struct ThreadEntry {
     /// Human-readable name.
@@ -883,6 +914,16 @@ impl ThreadRegistry {
                 by_java_tid.remove(&java_tid);
             }
         }
+        // P1 shadow record — the `-> Terminated` edge. `mark_dead` is NOT
+        // always self-called: `ThreadRegistry::join` (below) marks the joinee
+        // dead from the *joining* thread. `record_transition_for` therefore
+        // records only when the calling thread's cell is bound to this id, so
+        // a peer's termination can never be attributed to the caller.
+        crate::threading::thread_state::record_transition_for(
+            thread_id.0,
+            crate::threading::thread_state::ThreadExecState::Terminated,
+            "thread_registry::mark_dead",
+        );
     }
 
     /// Aliasing-proof identity lookup: registry `ThreadId` by the Java-side
@@ -963,6 +1004,16 @@ impl ThreadRegistry {
         if let Some(entry) = threads.get(&thread_id) {
             entry.stw_ready.store(true, Ordering::Release);
         }
+        drop(threads);
+        // P1 shadow record — the `Starting -> JavaRunning` edge. Always
+        // self-called by the freshly spawned carrier (`vm/src/vm/vm_exec.rs`
+        // `thread_start` and the virtual-thread first-mount arm), inside
+        // `GcBarrier::run_if_no_stw_requested`, so binding here is safe.
+        crate::threading::thread_state::bind_current_thread(thread_id.0);
+        crate::threading::thread_state::record_transition(
+            crate::threading::thread_state::ThreadExecState::JavaRunning,
+            "thread_registry::mark_stw_ready",
+        );
     }
 
     /// Block the calling OS thread until the target thread finishes.
@@ -1559,6 +1610,76 @@ impl ThreadRegistry {
                 .in_blocked_region
                 .store(false, Ordering::Release);
         }
+    }
+
+    /// CENSUS-RECONCILE — the shared [`GcBlockState`] published for
+    /// `thread_id`.
+    ///
+    /// This is the SAME `Arc` the owning `JvmThread` holds (installed by
+    /// [`Self::set_gc_block_state`]), so a caller that cannot reach the
+    /// `JvmThread` itself can still hand the *authoritative*
+    /// `in_blocked_region` flag to
+    /// [`crate::threading::gc_barrier::GcBarrier::leave_blocked_region_flagged`]
+    /// rather than clearing it with a bare `store(false)` (finding 1(c): a
+    /// bare store lets a pause requested between the drain and the store both
+    /// EXCLUDE the thread and let it run).
+    ///
+    /// `jni::host_thread_leave_native` is the motivating caller: it runs on a
+    /// host OS thread that has no `JNI_THREAD` binding, so `with_jni_context`
+    /// — every other path's route to the flag — resolves to `None` there.
+    ///
+    /// The `Arc` is CLONED out rather than borrowed on purpose: the registry
+    /// lock must be released before the caller can park inside the barrier.
+    /// Holding it across a pause drain would queue every later census behind a
+    /// pending registry writer.
+    pub fn gc_block_state_of(&self, thread_id: ThreadId) -> Option<Arc<GcBlockState>> {
+        self.threads
+            .read()
+            .get(&thread_id)
+            .map(|entry| entry.gc_block_state.clone())
+    }
+
+    /// CENSUS-RECONCILE — the registered, alive `ThreadId` whose published
+    /// `os_tid` is the CALLING OS thread's.
+    ///
+    /// The identity census (`alive_count_blocked_and_os_tids`) keys the STW
+    /// exclusion set on `ThreadId`, so a host-facing entry point that wants to
+    /// be *excluded* must name itself. A host thread parked outside the VM has
+    /// no `JvmThread` borrow and no JNI TLS binding, but its carrier's
+    /// `os_tid` was published by [`Self::set_os_tid_current`] at registration
+    /// — which makes the OS id the only identity link that survives leaving
+    /// the VM.
+    ///
+    /// Returns `None` when the answer would be ambiguous or unknown:
+    ///
+    /// * no alive entry claims this OS thread (a genuinely foreign host
+    ///   thread — it is not in `alive_count` either, so it occupies no
+    ///   `expected` slot and needs no exclusion),
+    /// * MORE than one does (a virtual thread mounted on this carrier
+    ///   republishes the carrier's `os_tid` under the vthread's own id, see
+    ///   `vm_exec.rs`'s mount path — guessing between them could exclude the
+    ///   wrong identity from a pause), or
+    /// * the platform has no `os_tid` backend at all (`current_os_tid() == 0`).
+    ///
+    /// `None` is always the safe answer: the caller then falls back to the
+    /// anonymous-counter-only behaviour, which is what every such call did
+    /// before this existed.
+    pub fn thread_id_for_current_os_tid(&self) -> Option<ThreadId> {
+        let os_tid = current_os_tid();
+        if os_tid == 0 {
+            return None;
+        }
+        let threads = self.threads.read();
+        let mut found: Option<ThreadId> = None;
+        for (tid, e) in threads.iter() {
+            if e.alive.load(Ordering::Acquire) && e.os_tid.load(Ordering::Acquire) == os_tid {
+                if found.is_some() {
+                    return None; // ambiguous — see the doc comment
+                }
+                found = Some(*tid);
+            }
+        }
+        found
     }
 
     /// DBG (CRATONVM_DBG_MTROOTS): per-thread (tid, in_blocked_region,
@@ -2765,21 +2886,30 @@ mod tests {
 
     /// HelloWorld parity: an empty registry waits for zero threads
     /// and returns immediately.
+    ///
+    /// `n == 0` is the property. The elapsed bound only distinguishes
+    /// "returned" from "blocked forever", so it is a hang backstop, not a
+    /// 50 ms performance budget — a loaded runner can lose 50 ms to
+    /// scheduling before the test body even starts (observed failing).
     #[test]
     fn t19_k1_wait_with_empty_registry_returns_zero() {
         let registry = ThreadRegistry::new();
         let start = std::time::Instant::now();
         let n = registry.wait_for_non_daemon_threads(None);
         assert_eq!(n, 0);
-        // Must not block: < 50 ms is generous on slow CI.
         assert!(
-            start.elapsed() < std::time::Duration::from_millis(50),
-            "empty wait must not block",
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "empty wait must not block: {:?}",
+            start.elapsed(),
         );
     }
 
     /// HelloWorld parity: a registry that contains only daemon threads
     /// waits for zero threads and returns immediately.
+    ///
+    /// As above: `n == 0` plus "neither daemon was joined" (only `join()`
+    /// marks a thread dead) are the timing-independent properties; the
+    /// elapsed bound is a hang backstop.
     #[test]
     fn t19_k1_wait_with_only_daemons_returns_zero() {
         let registry = ThreadRegistry::new();
@@ -2788,76 +2918,126 @@ mod tests {
         let start = std::time::Instant::now();
         let n = registry.wait_for_non_daemon_threads(None);
         assert_eq!(n, 0);
-        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+        assert!(registry.is_alive(ThreadId(1)));
+        assert!(registry.is_alive(ThreadId(2)));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "daemon-only wait must not block: {:?}",
+            start.elapsed(),
+        );
     }
 
-    /// Happy path: a non-daemon thread that finishes after 100 ms
-    /// blocks the wait until it terminates.
+    /// Happy path: a non-daemon thread blocks the wait until it
+    /// terminates.
+    ///
+    /// "Blocked until it terminated" is stated directly by the worker's
+    /// completion flag: the flag is set as the worker's last action, so
+    /// observing it `true` *after* the wait returned proves the ordering.
+    /// The old `elapsed >= 80 ms` was a proxy for that and is not actually
+    /// safe under load in the way a lower bound usually is: the clock only
+    /// starts after `spawn` + `set_join_handle`, so on a loaded box the
+    /// worker's 100 ms sleep can be over before `start` is even sampled
+    /// (its sibling `t19_k1_wait_for_multiple_non_daemons` was observed
+    /// failing that way at 134 µs).
     #[test]
     fn t19_k1_wait_blocks_until_non_daemon_finishes() {
         let registry = ThreadRegistry::new();
         let tid = ThreadId(1);
         registry.register(tid, "user", None);
-        let handle = std::thread::spawn(|| {
+        let finished = Arc::new(AtomicBool::new(false));
+        let f = finished.clone();
+        let handle = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            f.store(true, Ordering::Release);
         });
         registry.set_join_handle(tid, handle);
-        let start = std::time::Instant::now();
         let joined = registry.wait_for_non_daemon_threads(None);
-        let elapsed = start.elapsed();
         assert_eq!(joined, 1);
         assert!(
-            elapsed >= std::time::Duration::from_millis(80),
-            "wait should block ~100ms, got {:?}",
-            elapsed,
+            finished.load(Ordering::Acquire),
+            "the wait returned before the non-daemon thread had finished",
         );
     }
 
-    /// A daemon thread does not extend the wait — even if it sleeps
-    /// for a long time, the wait returns immediately because it isn't
-    /// considered.
+    /// A daemon thread does not extend the wait — even if it runs for a
+    /// long time, the wait returns without considering it.
+    ///
+    /// Same flake shape as `t19_k1_mixed_only_joins_non_daemons`: the
+    /// original `start.elapsed() < 50 ms` is a fixed wall-clock bound with
+    /// essentially no margin, and it was observed failing under load. What
+    /// must be true is that the daemon was *not waited for*, which the
+    /// counters below state directly and load cannot falsify.
     #[test]
     fn t19_k1_daemon_thread_does_not_keep_main_alive() {
         let registry = ThreadRegistry::new();
         let tid = ThreadId(1);
         registry.register_with_daemon(tid, "dmn", None, true);
-        let handle = std::thread::spawn(|| {
-            // Long sleep — the wait must not block on this.
-            std::thread::sleep(std::time::Duration::from_secs(60));
+        let daemon_finished = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let df = daemon_finished.clone();
+        let rel = release.clone();
+        let handle = std::thread::spawn(move || {
+            // Long-running — the wait must not block on this. The 60 s cap
+            // makes a regression fail rather than hang forever.
+            let cap = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !rel.load(Ordering::Acquire) && std::time::Instant::now() < cap {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            df.store(true, Ordering::Release);
         });
         registry.set_join_handle(tid, handle);
         let start = std::time::Instant::now();
         let joined = registry.wait_for_non_daemon_threads(None);
-        assert_eq!(joined, 0);
+        let elapsed = start.elapsed();
+        assert_eq!(joined, 0, "a daemon must never be joined");
         assert!(
-            start.elapsed() < std::time::Duration::from_millis(50),
-            "daemon thread must not delay shutdown",
+            !daemon_finished.load(Ordering::Acquire),
+            "the wait returned only after the daemon finished — it was waited for",
         );
+        // Only `join()` marks a thread dead, so this is a direct readout
+        // that the daemon was skipped.
+        assert!(registry.is_alive(tid));
+        // Hang backstop only — well under the daemon's 60 s cap so
+        // "waited for the daemon anyway" still fails here.
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "daemon thread must not delay shutdown: {:?}",
+            elapsed,
+        );
+        release.store(true, Ordering::Release);
+        assert!(registry.join(tid), "daemon handle should still be present");
     }
 
     /// Multiple non-daemon threads — the wait blocks until ALL of them
     /// finish, and the count reflects all joined.
+    ///
+    /// "Waited for the slowest" is stated as a completion count taken
+    /// after the wait returned, not as an elapsed-time lower bound. The
+    /// old `elapsed >= 80 ms` looked like a safe-direction assertion but
+    /// was not: the clock starts only after all three spawns, so on a
+    /// loaded box the sleeps can already be over by then — this test was
+    /// observed failing with `must wait for slowest: 134.294µs`.
     #[test]
     fn t19_k1_wait_for_multiple_non_daemons() {
         let registry = ThreadRegistry::new();
+        let done = Arc::new(AtomicU64::new(0));
         for (i, sleep_ms) in [50u64, 100, 80].iter().enumerate() {
             let tid = ThreadId(i as u64 + 1);
             registry.register(tid, &format!("user-{i}"), None);
             let ms = *sleep_ms;
+            let d = done.clone();
             let handle = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
+                d.fetch_add(1, Ordering::AcqRel);
             });
             registry.set_join_handle(tid, handle);
         }
-        let start = std::time::Instant::now();
         let joined = registry.wait_for_non_daemon_threads(None);
-        let elapsed = start.elapsed();
         assert_eq!(joined, 3);
-        // Must have waited for the slowest (100ms).
-        assert!(
-            elapsed >= std::time::Duration::from_millis(80),
-            "must wait for slowest: {:?}",
-            elapsed,
+        assert_eq!(
+            done.load(Ordering::Acquire),
+            3,
+            "the wait returned before every non-daemon thread had finished",
         );
     }
 
@@ -2881,15 +3061,38 @@ mod tests {
         let joined = registry.wait_for_non_daemon_threads(None);
         let elapsed = start.elapsed();
         assert_eq!(joined, 1, "panicked thread should still count as joined");
+        // `joined == 1` is the property (the `Err` from `JoinHandle::join`
+        // was swallowed and counted). The elapsed check only separates
+        // "returned" from "deadlocked", so it is a hang backstop — the
+        // former 5 s budget was observed failing on a loaded runner.
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "join must complete in bounded time even when target panicked",
+            elapsed < std::time::Duration::from_secs(20),
+            "join must complete in bounded time even when target panicked: {:?}",
+            elapsed,
         );
     }
 
     /// Mixed daemon + non-daemon: the wait only joins the non-daemon
     /// threads. The daemon thread is left alive (its handle still in
     /// the registry — caller is expected to abandon it on exit).
+    ///
+    /// The property under test is WHICH threads were joined, not how long
+    /// the call took. The earlier version asserted
+    /// `start.elapsed() < 1s`, which is a fixed wall-clock bound over three
+    /// OS-thread spawns plus a 30 ms sleep; on a loaded CI runner the
+    /// spawns alone can blow it, so it flaked. Every assertion below is
+    /// timing-independent except one deliberately generous hang backstop:
+    ///
+    /// * `joined == 1` — exactly one join succeeded.
+    /// * `user_finished` — the non-daemon's body ran to completion before
+    ///   the wait returned (we really did wait for it).
+    /// * `!daemon_finished` — the daemon was still mid-flight when the
+    ///   wait returned (we did *not* wait for it). The daemon is gated on
+    ///   a flag this test owns, so this cannot be falsified by slowness:
+    ///   load can only delay the observation, never open the gate.
+    /// * `is_alive(dmn)` / `!is_alive(user)` — only `join()` calls
+    ///   `mark_dead`, so the alive flags are a direct readout of who was
+    ///   joined, independent of wall clock.
     #[test]
     fn t19_k1_mixed_only_joins_non_daemons() {
         let registry = ThreadRegistry::new();
@@ -2898,24 +3101,60 @@ mod tests {
         registry.register_with_daemon(user, "user", None, false);
         registry.register_with_daemon(dmn, "dmn", None, true);
 
-        let user_h = std::thread::spawn(|| {
+        let user_finished = Arc::new(AtomicBool::new(false));
+        let daemon_finished = Arc::new(AtomicBool::new(false));
+        // Gate that keeps the daemon running until this test releases it.
+        let release_daemon = Arc::new(AtomicBool::new(false));
+
+        let uf = user_finished.clone();
+        let user_h = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(30));
+            uf.store(true, Ordering::Release);
         });
-        let dmn_h = std::thread::spawn(|| {
-            // Long-running daemon — must NOT be joined.
-            std::thread::sleep(std::time::Duration::from_secs(60));
+        let df = daemon_finished.clone();
+        let rd = release_daemon.clone();
+        let dmn_h = std::thread::spawn(move || {
+            // Long-running daemon — must NOT be joined. The 60 s cap is a
+            // safety net so a regression fails instead of hanging forever.
+            let cap = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !rd.load(Ordering::Acquire) && std::time::Instant::now() < cap {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            df.store(true, Ordering::Release);
         });
         registry.set_join_handle(user, user_h);
         registry.set_join_handle(dmn, dmn_h);
 
         let start = std::time::Instant::now();
         let joined = registry.wait_for_non_daemon_threads(None);
-        assert_eq!(joined, 1);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        let elapsed = start.elapsed();
+
+        assert_eq!(joined, 1, "only the non-daemon thread may be joined");
+        assert!(
+            user_finished.load(Ordering::Acquire),
+            "the non-daemon thread must have completed before the wait returned",
+        );
+        assert!(
+            !daemon_finished.load(Ordering::Acquire),
+            "the wait returned only after the daemon finished — it was waited for",
+        );
         // Daemon is still alive (we didn't join it).
         assert!(registry.is_alive(dmn));
         // User thread is joined → marked dead.
         assert!(!registry.is_alive(user));
+        // Hang backstop only. Must stay comfortably below the daemon's 60 s
+        // cap so "joined the daemon anyway" still fails here rather than
+        // sailing through; it is *not* a performance assertion.
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "wait_for_non_daemon_threads appears to have hung: {:?}",
+            elapsed,
+        );
+
+        // Release and reap the daemon so it doesn't linger for the rest of
+        // the test binary's life.
+        release_daemon.store(true, Ordering::Release);
+        assert!(registry.join(dmn), "daemon handle should still be present");
     }
 
     /// Deadline-bounded wait: when a non-daemon thread's
@@ -2942,13 +3181,28 @@ mod tests {
         // ~50 ms, the join to complete, and the loop to exit
         // before the deadline. This proves the deadline path
         // doesn't pessimize the happy path.
+        //
+        // `joined == 1` *is* the assertion: had the wait not completed
+        // within the deadline, the loop would have bailed out and returned
+        // 0. So the deadline itself is the bound under test, and it is set
+        // generously (a loaded runner needs the slack — the former 5 s
+        // deadline / 2 s assertion pair was observed failing). The elapsed
+        // check below is only a hang backstop.
         let start = std::time::Instant::now();
-        let deadline = start + std::time::Duration::from_secs(5);
+        let deadline = start + std::time::Duration::from_secs(60);
         let joined = registry.wait_for_non_daemon_threads(Some(deadline));
-        assert_eq!(joined, 1);
+        assert_eq!(
+            joined, 1,
+            "the happy path must complete within a generous deadline"
+        );
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "happy-path deadline should not extend execution",
+            !registry.is_alive(tid),
+            "the joined thread must be marked dead"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "happy-path deadline should not extend execution: {:?}",
+            start.elapsed(),
         );
     }
 
@@ -2978,30 +3232,34 @@ mod tests {
         registry.register(tid_a, "a", None);
 
         // Thread A sleeps a bit, then registers thread B.
+        let b_finished = Arc::new(AtomicBool::new(false));
+        let bf = b_finished.clone();
         let reg2 = registry.clone();
         let handle_a = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(40));
             // Register a second non-daemon thread that runs for 60 ms.
             let tid_b = ThreadId(2);
             reg2.register(tid_b, "b", None);
-            let h_b = std::thread::spawn(|| {
+            let h_b = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(60));
+                bf.store(true, Ordering::Release);
             });
             reg2.set_join_handle(tid_b, h_b);
         });
         registry.set_join_handle(tid_a, handle_a);
 
-        let start = std::time::Instant::now();
         let joined = registry.wait_for_non_daemon_threads(None);
-        let elapsed = start.elapsed();
-        // Both A and B must be joined.
-        assert_eq!(joined, 2);
-        // A=40ms then B=60ms ≈ at least 100ms total.
+        // Both A and B must be joined. `joined == 2` plus B's completion
+        // flag say "the re-snapshot caught B" directly; the former
+        // `elapsed >= 80 ms` said it only by proxy and, like its siblings,
+        // could be defeated by a loaded box finishing the sleeps before
+        // the clock was even sampled.
+        assert_eq!(joined, 2, "must catch late-spawned thread B");
         assert!(
-            elapsed >= std::time::Duration::from_millis(80),
-            "must catch late-spawned thread B: {:?}",
-            elapsed,
+            b_finished.load(Ordering::Acquire),
+            "the wait returned before late-spawned thread B had finished",
         );
+        assert!(!registry.is_alive(ThreadId(2)), "B must be joined + dead");
     }
 
     /// `register_with_daemon` and the legacy `register` must coexist —
@@ -3019,34 +3277,94 @@ mod tests {
         assert_eq!(ids, vec![ThreadId(1), ThreadId(3)]);
     }
 
-    /// Deadline-bounded wait fires before all threads complete:
-    /// schedule threads with cumulative durations exceeding the
-    /// deadline. After the deadline, the loop exits early.
+    /// Deadline-bounded wait exits before all threads are joined: an
+    /// expired deadline stops the loop, leaving live non-daemon threads
+    /// unjoined; the same registry then joins all of them once the
+    /// deadline is lifted.
+    ///
+    /// The deadline is checked *between* joins — an in-flight
+    /// `JoinHandle::join` is not interruptible — so the property under
+    /// test is "the loop stopped handing out joins", not "the call took
+    /// less than N milliseconds".
+    ///
+    /// The earlier version spawned five 30 ms sleepers with a 60 ms
+    /// deadline and asserted only `start.elapsed() < 1s`. That measured
+    /// nothing: the five sleepers run concurrently, so on an idle box all
+    /// five finish at ~30 ms and the deadline never fires at all, while on
+    /// a loaded CI runner five OS-thread spawns plus scheduling latency can
+    /// exceed 1 s outright — a pure machine-speed assertion, and a flaky
+    /// one. Here the workers are gated on a flag this test owns, so they
+    /// are guaranteed still alive and unjoinable while the deadline is
+    /// tested, and the outcome is decided by counters rather than a clock:
+    ///
+    /// * `joined == 0` with all five still `is_alive` after the expired
+    ///   deadline — only `join()` calls `mark_dead`, so this is a direct
+    ///   timing-independent readout that nothing was joined. Had the
+    ///   deadline been ignored, the call would have blocked on the gate
+    ///   (and, after the workers' own safety cap, reported 5).
+    /// * `joined == 5` on the follow-up unbounded wait — proves the zero
+    ///   above was the deadline's doing and not an empty snapshot.
     #[test]
     fn t19_k1_deadline_exits_before_all_joined() {
         let registry = ThreadRegistry::new();
-        // 5 threads of 30 ms each. Deadline of 60 ms ⇒ at most 2-3
-        // get joined before the deadline kicks in (the deadline
-        // is checked only between joins).
+        // Gate: the workers stay alive — and therefore unjoinable — until
+        // this test releases them.
+        let release = Arc::new(AtomicBool::new(false));
+        let mut ids = Vec::new();
         for i in 0..5 {
             let tid = ThreadId(i as u64 + 1);
             registry.register(tid, &format!("u-{i}"), None);
-            let handle = std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(30));
+            let rel = release.clone();
+            let handle = std::thread::spawn(move || {
+                // The 30 s cap is a safety net: a regression that ignores
+                // the deadline fails loudly instead of hanging forever.
+                let cap = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !rel.load(Ordering::Acquire) && std::time::Instant::now() < cap {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             });
             registry.set_join_handle(tid, handle);
+            ids.push(tid);
         }
+
+        // A deadline sampled *now* is already reached by the time the wait
+        // checks it (`Instant` is monotonic, and the check is `>=`), so the
+        // loop must bail out before its first join. No sleeping, no
+        // race: this cannot be perturbed by machine load.
         let start = std::time::Instant::now();
-        let deadline = start + std::time::Duration::from_millis(60);
-        let _joined = registry.wait_for_non_daemon_threads(Some(deadline));
-        // Even if all 5 happened to finish in 30 ms (unlikely but
-        // possible on a fast machine), the call must return
-        // promptly — < 1 second is the upper bound for the test.
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "deadline must bound the wait: {:?}",
-            start.elapsed(),
+        let deadline = std::time::Instant::now();
+        let joined = registry.wait_for_non_daemon_threads(Some(deadline));
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            joined, 0,
+            "an already-expired deadline must stop the wait before any join",
         );
+        for tid in &ids {
+            assert!(
+                registry.is_alive(*tid),
+                "{tid:?} was joined despite the expired deadline",
+            );
+        }
+        // Hang backstop only — must stay well under the workers' 30 s cap
+        // so a deadline regression still fails here. Not a perf assertion.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "deadline must bound the wait: {:?}",
+            elapsed,
+        );
+
+        // Lift the gate: the very same registry now joins all five, which
+        // is what makes the `0` above attributable to the deadline.
+        release.store(true, Ordering::Release);
+        assert_eq!(
+            registry.wait_for_non_daemon_threads(None),
+            5,
+            "the unbounded wait must join every non-daemon thread",
+        );
+        for tid in &ids {
+            assert!(!registry.is_alive(*tid), "{tid:?} should be joined + dead");
+        }
     }
 
     // -----------------------------------------------------------------

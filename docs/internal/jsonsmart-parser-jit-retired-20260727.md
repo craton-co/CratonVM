@@ -159,17 +159,17 @@ Disposition is unchanged: the corruption was in shared JIT frame
 reconstruction, not in `net/minidev/json/parser/` — re-banning the package
 would have hidden one victim of it, not fixed it.
 
-## Known, unrelated coverage gap seen in the same runs
+## Known, unrelated coverage gap seen in the same runs — FIXED 2026-07-31
 
 With no parse error ever thrown, `net/minidev/json/parser/ParseException` is
 never loaded, and every `JSONParserBase`/`JSONParserMemory`/`JSONParserString`
-method that constructs one bails out of compilation at
+method that constructs one bailed out of compilation at
 `cp_new_resolver -> None` (three attempts, then the method interprets forever —
-`readMain` accumulated 293,940 interpreted invocations). This is a general JIT
+`readMain` accumulated 293,940 interpreted invocations). This was a general JIT
 limitation, not a json-smart one: any hot method with a cold
-`throw new SomeNotYetLoadedException(...)` is uncompilable. Documented
-separately in
-`docs/known-issues/jit-bans/jit-compile-bail-unresolved-new-cold-class.md`.
+`throw new SomeNotYetLoadedException(...)` was uncompilable. Fixed by resolving
+such a site at RUN time through a CP-indexed allocation helper; written up in
+`docs/internal/jit-compile-bail-unresolved-new-cold-class.md`.
 It does not affect this ban's disposition — the three methods the ban named
 contain no `new` and compile regardless — but it is why `JsonSmartProbeWarmed`
 drives a few failing parses first: without that warm-up, most of the package

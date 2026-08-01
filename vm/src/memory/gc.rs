@@ -390,6 +390,19 @@ pub fn update_all_roots(
     // object handle in sync with a move and prune traces for collected
     // throwables before any early return for a non-relocating sweep.
     shared.remap_and_sweep_throwable_stack_traces(pointer_map);
+    // GPU input-residency cache: an `ObjectRef`-keyed table of device
+    // buffers that survives across kernel submissions. Same placement
+    // rationale as the two above — the sweep half must run on a
+    // non-relocating collection as well, or a dead array's key stays in
+    // the map and the next array allocated onto its reclaimed address
+    // gets served that array's device buffer. Not a root source: see
+    // `memory::addr_keyed`.
+    #[cfg(feature = "gpu-offload")]
+    crate::runtime::offload::input_cache::remap_and_sweep(
+        shared.vm_identity,
+        pointer_map,
+        &shared.mem.heap,
+    );
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ALTRACE").is_some() {
         eprintln!(
             "[altrace GC] count={} moved={} tid={}",

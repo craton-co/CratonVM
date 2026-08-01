@@ -23,6 +23,7 @@ use crate::runtime::redefine_state::{
     named_class_was_redefined,
 };
 use crate::threading::jvm_thread::JvmThread;
+use crate::threading::thread_state::{self, ThreadExecState};
 use crate::vm::SharedVm;
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
 
@@ -884,6 +885,21 @@ pub(crate) fn stash_jit_pending_npe_action(code: u8) {
 #[inline]
 pub(crate) fn set_jit_deopt_pending() {
     JIT_SIGNALS.with(|s| s.deopt.set(true));
+    // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
+    // the deopt trap is the `CompiledUninterruptible -> Deoptimizing` edge —
+    // the only tabled way into that state. From here until the interpreter has
+    // materialised the frames, the thread holds `FrameValue` buffers that are
+    // in neither the compiled frame's oop map nor a not-yet-built interpreter
+    // frame, which is exactly what makes the window its own state.
+    //
+    // The window is closed by whichever comes first: the JIT entry pop
+    // (`conservative_roots::leaving_compiled_state`, which resolves
+    // `Deoptimizing` to `JavaRunning` rather than manufacturing an untabled
+    // edge) or the interpreter's own resume sites.
+    thread_state::record_transition(
+        ThreadExecState::Deoptimizing,
+        "jit::helpers::set_jit_deopt_pending",
+    );
 }
 
 /// Read+clear the out-of-band deopt/exception signal. The interpreter's
@@ -1345,6 +1361,24 @@ unsafe fn bail_to_interpreter(
     info: &JitInvokeInfo,
     args: &[Value],
 ) -> i64 {
+    // This bail resolves the callee from a class NAME, and a lambda-proxy
+    // receiver has no name of its own: it resolves as its functional interface,
+    // which for four of them runs a collector native in place of the lambda
+    // body. Same hazard as the dispatch slow path — see
+    // `try_lambda_proxy_sam_dispatch`, which declines everything that is not a
+    // proxy's SAM, so the routing below is unchanged for every other call.
+    if let Some(result) = try_lambda_proxy_sam_dispatch(vm, thread, info, args) {
+        return match result {
+            Ok(Some(Value::Int(v))) => v as i64,
+            Ok(Some(Value::Long(v))) => v,
+            Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+            Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+            Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+            Ok(Some(Value::Object(None)) | None) => 0,
+            Ok(_) => 0,
+            Err(error) => handle_jit_dispatch_error(vm, thread, error, info),
+        };
+    }
     // invokespecial (kind=1) must NOT virtually re-target onto the receiver's
     // runtime class — same rationale as the kind=1 arm of the dispatch slow
     // path below. `invoke_or_native` → `invoke_on_class_shared` applies the
@@ -1412,6 +1446,79 @@ unsafe fn bail_to_interpreter(
         Ok(Some(Value::Object(None))) | Ok(None) => 0,
         Ok(_) => 0,
         Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
+    }
+}
+
+/// Dispatch a SAM call on a lambda-proxy receiver through the proxy registry.
+/// `None` means "not that" — not a virtual/interface call, not a lambda-proxy
+/// receiver, or not the proxy's SAM — and the caller proceeds unchanged.
+///
+/// Every JIT path that resolves a callee BY NAME needs this in front of it. A
+/// lambda proxy's class id is synthetic and absent from the class store, so
+/// name resolution falls back to the constant-pool class — the FUNCTIONAL
+/// INTERFACE — and CratonVM registers natives on four of those
+/// (`java/util/function/Supplier.get`, `BiConsumer.accept`, `Function.apply`,
+/// `BinaryOperator.apply`) to serve the synthetic objects
+/// `Collector.accumulator()` and its siblings hand out. Those natives cannot
+/// decline: with no collector tag in field 0 they take their catch-all arm, so
+/// an ordinary user lambda routed to them has its body skipped entirely —
+/// `Supplier.get` returns an empty `ArrayList`, `Function.apply` returns its
+/// argument, `BiConsumer.accept(a, b)` calls `a.add(b)`, and
+/// `BinaryOperator.apply(a, b)` calls `a.addAll(b)`. Three of those four are
+/// SILENT.
+///
+/// The interpreter never had the problem — `try_lambda_dispatch` runs before
+/// native resolution there — so the failure is JIT-only, and it additionally
+/// needs the call site to be megamorphic, since a site that only ever sees one
+/// proxy class stays on a cached path. That combination is why it took
+/// Hibernate's `forEachSubInitializer(BiConsumer, ..)` — invoked with
+/// `Initializer::startLoading`, `::resolveKey` and `::initializeInstance` — to
+/// surface it, as `NoSuchMethodError: <sub-initializer>.add(Ljava/lang/Object;)Z`,
+/// three failures in every full-class run of `ASTParserLoadingTest`.
+/// `apps/hib-suite-runner/FunctionalInterfaceHijackProbe.java` is the reduced
+/// witness for all four interfaces; `docs/internal/fixed-suite-bugs/hibernate/
+/// hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
+///
+/// Kept as one helper rather than repeated at each bail so a third by-name
+/// dispatch path added later inherits the guard instead of re-opening the hole.
+///
+/// SAFETY: same contract as the callers — a live `SharedVm` and a current
+/// `JvmThread`, since the SAM body may resume interpretation.
+fn try_lambda_proxy_sam_dispatch(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    values: &[Value],
+) -> Option<Result<Option<Value>, crate::error::MethodCallFailed>> {
+    if !matches!(info.invoke_kind, 0 | 2) {
+        return None;
+    }
+    let Some(Value::Object(Some(receiver))) = values.first().copied() else {
+        return None;
+    };
+    let receiver_class_id = vm.mem.heap.class_id_of(receiver);
+    if !vm
+        .classes
+        .lambda_proxies
+        .read()
+        .contains_key(&receiver_class_id)
+    {
+        return None;
+    }
+    match crate::runtime::interpreter::try_lambda_dispatch(
+        vm,
+        thread,
+        receiver,
+        receiver_class_id,
+        info.method_name,
+        info.descriptor,
+        &values[1..],
+    ) {
+        Ok(Some(result)) => Some(Ok(result)),
+        // Not the proxy's SAM (a default method on the functional interface,
+        // say) — fall through to the caller's ordinary path, unchanged.
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
     }
 }
 
@@ -3501,6 +3608,278 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     obj_ref.as_ptr() as i64
 }
 
+/// Stash `msg` as a `java/lang/InternalError` on the JIT pending-exception
+/// channel and return the `0`/null allocation sentinel.
+///
+/// Shared by the two CP-indexed allocation helpers below for the failures that
+/// are not a Java-level `MethodCallFailed` (a missing referencing class, a CP
+/// entry that is not a class reference). Same convention as `jit_alloc_oom`:
+/// the caller's `emit_post_alloc_oom_check()` sees the 0 and routes the stashed
+/// exception through the method's exception table.
+///
+/// # Safety
+/// Calls [`jit_thread_mut`]: same contract — invoke only from a JIT helper on
+/// the thread that installed `JIT_THREAD`, with no other `&mut JvmThread` (and
+/// no live `JitThreadGuard`) outstanding, and with NO class-manager lock held
+/// (constructing the exception re-enters the class manager).
+unsafe fn jit_cp_alloc_internal_error(vm: &SharedVm, msg: &str) -> i64 {
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/InternalError",
+            Some(msg),
+        ) {
+            set_jit_pending_exception(exc);
+        }
+    }
+    0
+}
+
+/// Stash a `MethodCallFailed` on the JIT pending-exception channel and return
+/// the `0`/null allocation sentinel. Mirrors `jit_new_object`'s `<clinit>`
+/// failure arm exactly (a thrown Java exception passes through unchanged; an
+/// internal error is reported as `java/lang/InternalError`).
+fn jit_cp_alloc_stash_failure(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    err: crate::error::MethodCallFailed,
+    context: &str,
+) -> i64 {
+    use crate::error::MethodCallFailed;
+    match err {
+        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(exc),
+        MethodCallFailed::InternalError(vm_err) => {
+            let msg = format!("{context}: {vm_err}");
+            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/InternalError",
+                Some(&msg),
+            ) {
+                set_jit_pending_exception(exc);
+            }
+        }
+    }
+    0
+}
+
+/// Resolve a `new`/`anewarray` constant-pool site at RUN TIME and return the
+/// resolved class id, or `None` after stashing the appropriate pending
+/// exception (the caller then returns the `0`/null allocation sentinel).
+///
+/// This is the run-time half of the cold-`new` fix. The compile-time resolver
+/// (`resolve_jit_new_site`) deliberately never loads a class — running a user
+/// `ClassLoader.loadClass` from inside the compile path is a
+/// deadlock/reentrancy hazard and would load classes the program never would.
+/// So a `new` whose target class had not been loaded yet used to bail the whole
+/// compile, permanently, leaving hot methods carrying a cold
+/// `throw new SomeException(...)` in the interpreter forever
+/// (`docs/internal/jit-compile-bail-unresolved-new-cold-class.md`).
+///
+/// Doing the same resolution HERE is sound for the reason the doc gives: it is
+/// exactly what the interpreter's own `0xbb`/`0xbd` handler does — same thread,
+/// same program point, same loader-faithful resolver, same access check. And it
+/// costs nothing on the hot path: a site whose class IS loaded at compile time
+/// never reaches this helper at all, and even here the second and later
+/// executions take the `find_class_by_name_for_class` fast path with no Java on
+/// the stack.
+///
+/// # Safety
+/// Calls [`jit_thread_mut`]: invoke only from a JIT helper on the thread that
+/// installed `JIT_THREAD`, with no other `&mut JvmThread` live.
+unsafe fn jit_resolve_cp_class(
+    vm: &SharedVm,
+    holder_cid: ClassId,
+    cp_index: u16,
+    check_access: bool,
+) -> Result<ClassId, i64> {
+    // (1) CP text → binary name, plus the already-loaded fast path under one
+    //     read lock. After the first execution of this site the class is loaded,
+    //     so this is all that runs.
+    //
+    //     Every exit from this block DROPS the read lock first and only then
+    //     builds an exception: `create_exception_object` re-enters the class
+    //     manager, and a nested read while a writer is queued deadlocks (see
+    //     the ClassManager nested-read reentrancy pattern). Hence the
+    //     "compute a reason, report after the lock" shape rather than an early
+    //     `return` from inside the block.
+    let resolved_name: Result<(String, Option<ClassId>), String> = {
+        let cm = vm.classes.class_manager.read();
+        match cm.get_class(holder_cid) {
+            None => Err(format!(
+                "JIT CP allocation: referencing class id {} not found",
+                holder_cid.as_u32()
+            )),
+            Some(class) => match class.constant_pool.get_class_name(cp_index) {
+                None => Err(format!(
+                    "JIT CP allocation: invalid class ref at cp#{cp_index} of class id {}",
+                    holder_cid.as_u32()
+                )),
+                Some(name) => {
+                    let name = name.to_string();
+                    let already = cm.find_class_by_name_for_class(&name, holder_cid);
+                    Ok((name, already))
+                }
+            },
+        }
+    };
+    let (class_name, already_loaded) = match resolved_name {
+        Ok(v) => v,
+        Err(msg) => return Err(jit_cp_alloc_internal_error(vm, &msg)),
+    };
+
+    // (2) Not loaded yet — drive the same loader-faithful resolution the
+    //     interpreter's `Instruction::New` does. `emit_post_alloc_oom_check`
+    //     forces `has_dispatch` on every site that can reach here, so
+    //     `JIT_THREAD` is set; the `None` arm is purely defensive.
+    let target_id = match already_loaded {
+        Some(id) => id,
+        None => {
+            let Some((thread, _guard)) = jit_thread_mut() else {
+                return Err(jit_cp_alloc_internal_error(
+                    vm,
+                    &format!("JIT CP allocation: no live JIT thread to resolve {class_name}"),
+                ));
+            };
+            match crate::runtime::interpreter::resolve_class_loader_aware(
+                vm,
+                thread,
+                holder_cid,
+                &class_name,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    let converted = crate::runtime::exceptions::convert_class_not_found(
+                        vm,
+                        thread,
+                        &class_name,
+                        e,
+                    );
+                    return Err(jit_cp_alloc_stash_failure(
+                        vm,
+                        thread,
+                        converted,
+                        &format!("JIT CP allocation: cannot resolve {class_name}"),
+                    ));
+                }
+            }
+        }
+    };
+
+    // (3) JVMS 6.5 `new` / 5.4.4 access check — the interpreter's `new` handler
+    //     runs it, so a `new` compiled through this helper must too. (The
+    //     `anewarray` handler does not, hence the flag.)
+    if check_access {
+        let denied = {
+            let cm = vm.classes.class_manager.read();
+            match (cm.get_class(holder_cid), cm.get_class(target_id)) {
+                (Some(accessor), Some(target)) => {
+                    crate::classloading::access_control::check_class_access(accessor, target)
+                        .err()
+                        .map(|e| e.to_string())
+                }
+                // Defensive: don't invent a denial when either class is missing.
+                _ => None,
+            }
+        };
+        if let Some(message) = denied {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                    vm,
+                    thread,
+                    "java/lang/IllegalAccessError",
+                    Some(&message),
+                ) {
+                    set_jit_pending_exception(exc);
+                }
+            }
+            return Err(0);
+        }
+    }
+
+    Ok(target_id)
+}
+
+/// CP-indexed `new` (0xbb) slow path — see [`jit_resolve_cp_class`] for why
+/// this exists and `jit_api::JitRuntimeHelpers::new_object_cp` for the ABI.
+///
+/// Resolves + access-checks the target class, then falls into
+/// [`jit_new_object`], which owns `<clinit>`, the TLAB/GC retry ladder and the
+/// `0`-on-failure convention. Splitting it this way means the deferred site
+/// behaves identically to a resolved one from the allocation onwards.
+///
+/// SAFETY: called from JIT-compiled code; `vm_ptr` must be a valid `SharedVm`
+/// pointer and `holder_class_id`/`cp_idx` must be the compile-time-baked
+/// referencing class and constant-pool index of this `new` site.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_new_object_cp(
+    vm_ptr: i64,
+    holder_class_id: i64,
+    cp_idx: i64,
+) -> i64 {
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // Cross the Rust<->JIT boundary BEFORE resolving, not just before
+    // allocating: resolution can run a user `ClassLoader.loadClass`, i.e.
+    // arbitrary Java that can itself GC. `jit_new_object` does both of these
+    // too, but it only runs after resolution — leaving the per-thread JIT-scan
+    // cache stale, and the SATB buffer unflushed, for the whole classloader
+    // call.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code that received it from the
+    // interpreter's SharedVm reference (same contract as `jit_new_object`).
+    let vm = &*(vm_ptr as *const SharedVm);
+    let holder_cid = ClassId::new(holder_class_id as u32);
+    let target_id = match jit_resolve_cp_class(vm, holder_cid, cp_idx as u16, true) {
+        Ok(id) => id,
+        Err(sentinel) => return sentinel,
+    };
+    let num_fields = vm
+        .classes
+        .class_manager
+        .read()
+        .get_class(target_id)
+        .map(|c| c.num_total_fields)
+        .unwrap_or(0);
+    jit_new_object(vm_ptr, i64::from(target_id.as_u32()), num_fields as i64)
+}
+
+/// CP-indexed `anewarray` (0xbd) slow path — the `anewarray` sibling of
+/// [`jit_new_object_cp`]. Resolves the COMPONENT class at run time and then
+/// falls into [`jit_anewarray_object`], which owns the negative-length and
+/// OOM conventions.
+///
+/// SAFETY: as [`jit_new_object_cp`], plus `length` is the JVM `int` array
+/// length already on the operand stack.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_anewarray_object_cp(
+    vm_ptr: i64,
+    holder_class_id: i64,
+    cp_idx: i64,
+    length: i64,
+) -> i64 {
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // See `jit_new_object_cp`: resolution can run Java, so cross the boundary
+    // before it, not just before the allocation.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: see `jit_new_object_cp`.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let holder_cid = ClassId::new(holder_class_id as u32);
+    // JVMS §anewarray resolves the component class but performs no `new`-style
+    // access check (that belongs to `new`), matching `Instruction::Anewarray`.
+    let component_id = match jit_resolve_cp_class(vm, holder_cid, cp_idx as u16, false) {
+        Ok(id) => id,
+        Err(sentinel) => return sentinel,
+    };
+    jit_anewarray_object(vm_ptr, i64::from(component_id.as_u32()), length)
+}
+
 /// Post-allocation init shared by the three JIT slow-path allocation arms:
 /// primitive-field default values + JLS §12.6 finalizer registration.
 ///
@@ -3983,6 +4362,11 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *mut i32;
     *elem_ptr = val as i32;
+    // Phase 10 #2: the host just wrote this array, so a GPU input-cache
+    // entry mirroring it is stale. Costs one relaxed load when nothing is
+    // cached, which is every run that never submits a kernel.
+    #[cfg(feature = "gpu-offload")]
+    crate::runtime::offload::input_cache::invalidate(cratonvm_types::ObjectRef::from_raw(ptr));
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
@@ -7486,6 +7870,22 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 // null — keep the defensive 0 bail (does not mask a real NPE).
                 _ => return 0,
             };
+            // A lambda-proxy receiver must be dispatched through the proxy
+            // registry, never by name — see `try_lambda_proxy_sam_dispatch`
+            // for what resolving one by its functional-interface name runs
+            // instead of the lambda body.
+            if let Some(result) = try_lambda_proxy_sam_dispatch(vm, thread, info, &values) {
+                return match result {
+                    Ok(Some(Value::Int(v))) => v as i64,
+                    Ok(Some(Value::Long(v))) => v,
+                    Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+                    Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+                    Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+                    Ok(Some(Value::Object(None)) | None) => 0,
+                    Ok(_) => 0,
+                    Err(error) => handle_jit_dispatch_error(vm, thread, error, info),
+                };
+            }
             // Match the register-overflow bail path: `NativeContext::invoke_virtual`
             // resolves solely from the heap object's class id. That is insufficient
             // for a synthetic/ClassId(0) receiver (common for Lucene iterator
@@ -11954,6 +12354,12 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,
         new_object: jit_new_object as *const () as usize,
         anewarray_object: jit_anewarray_object as *const () as usize,
+        // Cold-`new` fix: the CP-indexed variants, used for a `new`/`anewarray`
+        // whose target class was not loaded when the method compiled. Always
+        // wired in production — the OptionalPtr classification exists only so
+        // hand-built test tables can leave them 0.
+        new_object_cp: jit_new_object_cp as *const () as usize,
+        anewarray_object_cp: jit_anewarray_object_cp as *const () as usize,
         baload: jit_baload as *const () as usize,
         bastore: jit_bastore as *const () as usize,
         iaload: jit_iaload as *const () as usize,
