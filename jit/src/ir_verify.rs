@@ -550,21 +550,13 @@ fn is_memory_token_input(node: &Node, input_index: usize) -> bool {
     if matches!(node.op, Op::Phi) {
         return node.ty == IrType::Memory && input_index >= 1;
     }
-    // Minimum input count of the documented full `[ctrl, mem, …]` form. Kept
-    // numerically identical to `ir_optimize::memory_token_slot`.
-    let min_full_arity = match node.op {
-        Op::Load(_) => 3,           // [ctrl, mem, base]
-        Op::Store(_) => 4,          // [ctrl, mem, base, value]
-        Op::ArrayLoad(_) => 4,      // [ctrl, mem, array, index]
-        Op::ArrayStore(_) => 5,     // [ctrl, mem, array, index, value]
-        Op::ArrayLength => 3,       // [ctrl, mem, array_ref]
-        Op::New { .. } => 2,        // [ctrl, mem]
-        Op::NewArray { .. } => 3,   // [ctrl, mem, length]
-        Op::Call { .. } => 2,       // [ctrl, mem, args…]
-        Op::LambdaIntToDouble => 4, // [ctrl, mem, lambda, index]
-        _ => return false,
-    };
-    input_index == 1 && node.inputs.len() >= min_full_arity
+    // Delegates to the single table in `ir.rs` (`Op::memory_shape`), which is
+    // what `ir_optimize::memory_token_slot` and `lib.rs::ea_memory_token_slot`
+    // also read. Three hand-maintained copies of this arity table existed and
+    // were only *numerically* identical; a fourth op gaining a memory edge
+    // would have had to be added to all three, and a verifier that disagrees
+    // with the optimizer about what a token slot is proves nothing.
+    crate::ir::memory_token_slot(node) == Some(input_index)
 }
 
 // ── Lane: edges ──────────────────────────────────────────────────────

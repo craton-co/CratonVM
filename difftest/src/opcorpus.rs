@@ -243,9 +243,10 @@ const TEMPLATE: &str = r#"// difftest: strict (generated: opcode @HEX@ @MNEMONIC
 // rule. Deterministic by construction: no wall-clock, no identity hash, no map
 // iteration order.
 public class @CLASS@ {
-    // FNV-1a 64: offset basis, then the per-value step in `mix`. Chosen so a
-    // five-line Java helper reproduces `checksum::fnv1a64_hex`'s spelling
-    // without touching java.security, whose provider stack is itself under test.
+    // FNV-1a 64: the offset basis, then the per-value step in `mix`. This
+    // spelling is what `checksum::fnv1a64_hex` computes, reproduced in five
+    // lines of Java without touching java.security, whose provider stack is
+    // itself one of the things under test.
     static long acc = 0xcbf29ce484222325L;
 
     static void mix(long v) {
@@ -1407,23 +1408,32 @@ mod tests {
         assert!(looped.sites.values().all(|f| f.in_loop_method));
     }
 
+    /// Brace balance over generated Java, ignoring comment lines and the
+    /// contents of string and char literals. Comment lines are dropped whole
+    /// because an apostrophe in prose ("javac's") would otherwise open a char
+    /// literal that never closes and silently disable the rest of the check.
     fn balanced(s: &str) -> bool {
         let mut depth = 0i32;
-        let mut in_string = false;
-        let mut in_char = false;
-        let mut prev = '\0';
-        for ch in s.chars() {
-            match ch {
-                '"' if !in_char && prev != '\\' => in_string = !in_string,
-                '\'' if !in_string && prev != '\\' => in_char = !in_char,
-                '{' if !in_string && !in_char => depth += 1,
-                '}' if !in_string && !in_char => depth -= 1,
-                _ => {}
+        for line in s.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
             }
-            if depth < 0 {
-                return false;
+            let mut in_string = false;
+            let mut in_char = false;
+            let mut prev = '\0';
+            for ch in line.chars() {
+                match ch {
+                    '"' if !in_char && prev != '\\' => in_string = !in_string,
+                    '\'' if !in_string && prev != '\\' => in_char = !in_char,
+                    '{' if !in_string && !in_char => depth += 1,
+                    '}' if !in_string && !in_char => depth -= 1,
+                    _ => {}
+                }
+                if depth < 0 {
+                    return false;
+                }
+                prev = ch;
             }
-            prev = ch;
         }
         depth == 0
     }

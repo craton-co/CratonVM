@@ -408,11 +408,15 @@ impl From<ResolveError> for LinkageError {
             ResolveError::IncompatibleClassChange { message } => {
                 LinkageError::IncompatibleClassChangeError { message }
             }
-            // The three VM-shaped variants have no linkage analogue: a foreign
-            // `VmScoped`, a foreign vtable manager and a pending exception are
-            // all VM-internal conditions, not JVMS linkage errors. Rendering
-            // them through `Display` keeps the detail rather than collapsing
-            // them onto an unrelated Java exception class.
+            // The four remaining variants — `ForeignVm`, `ForeignVtableManager`,
+            // `Pending` and `Internal` — have no JVMS linkage analogue: they
+            // are VM-internal conditions, not linkage errors. Rendering them
+            // through `Display` keeps the detail rather than collapsing them
+            // onto an unrelated Java exception class. Note this direction is
+            // lossy for them; `From<ResolveError> for MethodCallFailed` is the
+            // one to use when a Java-visible outcome is needed, because it
+            // routes `Pending` back to the live throwable and `Internal` to
+            // `VmError::Internal` instead of coming through here.
             other => LinkageError::IncompatibleClassChangeError {
                 message: other.to_string(),
             },

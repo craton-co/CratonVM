@@ -564,7 +564,10 @@ pub fn find_iv_stride(code: &[u8], start: usize, end: usize, iv: usize) -> Optio
     while pc < end {
         let op = code[pc];
         match op {
-            0x84 if pc + 2 < end => {
+            0x84 => {
+                if pc + 2 >= end {
+                    return None; // truncated iinc: unreadable, so unprovable
+                }
                 if code[pc + 1] as usize == iv {
                     count += 1;
                     found = Some(Stride::Const(code[pc + 2] as i8 as i32));
@@ -572,16 +575,53 @@ pub fn find_iv_stride(code: &[u8], start: usize, end: usize, iv: usize) -> Optio
             }
             // Any wide-indexed store or iinc that could alias the IV is
             // unprovable; refuse rather than assume it targets another slot.
-            0xc4 if pc + 3 < end => {
+            0xc4 => {
+                if pc + 3 >= end {
+                    return None;
+                }
                 let real = code[pc + 1];
                 let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
-                if matches!(real, 0x36 | 0x84) && idx == iv {
+                if matches!(real, 0x36..=0x3a | 0x84)
+                    && (idx == iv || (matches!(real, 0x37 | 0x39) && idx + 1 == iv))
+                {
                     return None;
                 }
             }
             _ => {
+                // The JVM lets one slot hold different kinds across disjoint
+                // live ranges. A non-`int` store to the IV's slot — or the dead
+                // high half of a `long`/`double` store below it — changes the
+                // IV outside the recorded stride, so refuse.
+                let clobbers_iv = match op {
+                    0x37..=0x3a => {
+                        if pc + 1 >= end {
+                            return None;
+                        }
+                        let s = code[pc + 1] as usize;
+                        s == iv || (matches!(op, 0x37 | 0x39) && s + 1 == iv)
+                    }
+                    0x3f..=0x42 => {
+                        let s = (op - 0x3f) as usize;
+                        s == iv || s + 1 == iv
+                    }
+                    0x43..=0x46 => (op - 0x43) as usize == iv,
+                    0x47..=0x4a => {
+                        let s = (op - 0x47) as usize;
+                        s == iv || s + 1 == iv
+                    }
+                    0x4b..=0x4e => (op - 0x4b) as usize == iv,
+                    _ => false,
+                };
+                if clobbers_iv {
+                    return None;
+                }
                 let istore_target = match op {
-                    0x36 if pc + 1 < end => Some(code[pc + 1] as usize),
+                    0x36 => {
+                        if pc + 1 >= end {
+                            return None;
+                        }
+                        Some(code[pc + 1] as usize)
+                    }
                     0x3b..=0x3e => Some((op - 0x3b) as usize),
                     _ => None,
                 };
@@ -642,9 +682,14 @@ pub fn modified_locals_strict(code: &[u8], start: usize, end: usize) -> Option<u
     let mut pc = start;
     while pc < end {
         let op = code[pc];
+        // A store whose operand bytes fall outside the range is a store this
+        // scan cannot read — refuse rather than drop it from the set.
         let hit = match op {
             // istore/lstore/fstore/dstore/astore, wide index byte.
-            0x36..=0x3a if pc + 1 < end => {
+            0x36..=0x3a => {
+                if pc + 1 >= end {
+                    return None;
+                }
                 Some((code[pc + 1] as usize, matches!(op, 0x37 | 0x39)))
             }
             0x3b..=0x3e => Some(((op - 0x3b) as usize, false)),
@@ -652,8 +697,16 @@ pub fn modified_locals_strict(code: &[u8], start: usize, end: usize) -> Option<u
             0x43..=0x46 => Some(((op - 0x43) as usize, false)),
             0x47..=0x4a => Some(((op - 0x47) as usize, true)),
             0x4b..=0x4e => Some(((op - 0x4b) as usize, false)),
-            0x84 if pc + 2 < end => Some((code[pc + 1] as usize, false)),
-            0xc4 if pc + 3 < end => {
+            0x84 => {
+                if pc + 2 >= end {
+                    return None;
+                }
+                Some((code[pc + 1] as usize, false))
+            }
+            0xc4 => {
+                if pc + 3 >= end {
+                    return None;
+                }
                 let real = code[pc + 1];
                 let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
                 if matches!(real, 0x36..=0x3a | 0x84) {
@@ -1252,6 +1305,20 @@ mod tests {
             find_iv_stride(&wide_other, 0, wide_other.len(), 1),
             Some(Stride::Const(1))
         );
+    }
+
+    #[test]
+    fn a_non_int_store_to_the_iv_slot_refuses_the_loop() {
+        // MUST REFUSE: `astore_1` reuses the IV's slot for a reference, which
+        // the JVM permits across disjoint live ranges.
+        let clobber = vec![0x84, 0x01, 0x01, 0x4c]; // iinc 1,1 ; astore_1
+        assert_eq!(find_iv_stride(&clobber, 0, clobber.len(), 1), None);
+        // MUST REFUSE: an `lstore_0` writes slot 1 as its dead high half.
+        let high_half = vec![0x84, 0x01, 0x01, 0x3f]; // iinc 1,1 ; lstore_0
+        assert_eq!(find_iv_stride(&high_half, 0, high_half.len(), 1), None);
+        // MUST ACCEPT twin: the same store on a slot the IV does not occupy.
+        let ok = vec![0x84, 0x01, 0x01, 0x4d]; // iinc 1,1 ; astore_2
+        assert_eq!(find_iv_stride(&ok, 0, ok.len(), 1), Some(Stride::Const(1)));
     }
 
     #[test]

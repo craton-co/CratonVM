@@ -7578,10 +7578,22 @@ fn drain_deferred_jit_owners_if_quiescent() {
     if jit_leak_code_enabled() {
         return;
     }
+    // Take the lock BEFORE reading the quiescence counter, and hold it across
+    // both.
+    //
+    // Reading `is_zero()` first is a use-after-free of executable memory: this
+    // thread can observe zero at t0, be descheduled while another thread enters
+    // JIT at t1 and a third unpublishes-and-queues a body at t2 > t1, then
+    // resume and free that body on the strength of a t0 witness that predates
+    // its unpublication. Queueing also takes this lock, so holding it across
+    // the read guarantees the witness postdates every queued body's
+    // unpublication.
+    let mut queue = deferred_jit_owners().lock();
     if !ACTIVE_JIT_EXECUTIONS.is_zero() {
         return;
     }
-    let retired = std::mem::take(&mut *deferred_jit_owners().lock());
+    let retired = std::mem::take(&mut *queue);
+    drop(queue);
     drop(retired);
 }
 

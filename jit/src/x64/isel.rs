@@ -2926,7 +2926,7 @@ mod tests {
                 Operand::Mem(mem),
             ));
             assert_eq!(got, want, "MOV EAX, [rsp + {disp}]");
-            assert_eq!(&got[..3], &[0x8B, 0x84, 0x24]);
+            assert_eq!(&got[..3], &[0x8B, 0x84, 0x24][..]);
         }
     }
 
@@ -3730,7 +3730,7 @@ mod tests {
                         Opcode::One(b) => assert_eq!(d.opcode, vec![b], "`{}`", p.name),
                         Opcode::Two(b) => assert_eq!(d.opcode, vec![0x0F, b], "`{}`", p.name),
                         Opcode::PlusReg(b) => {
-                            assert_eq!(d.opcode, vec![b | (r1 & 7)], "`{}`", p.name)
+                            assert_eq!(d.opcode, vec![b | (a.dst & 7)], "`{}`", p.name)
                         }
                         Opcode::OperandOne => {
                             assert_eq!(d.opcode, vec![a.op_byte], "`{}`", p.name)
@@ -3847,30 +3847,7 @@ mod tests {
     fn every_pattern_produces_structurally_decodable_bytes() {
         let mut decoded_rows = 0usize;
         for p in PATTERNS {
-            let mem = if p.constraints.contains(&Constraint::IndexNotRsp) {
-                Mem::base_index(RSI, RDI, 8, 8)
-            } else if matches!(p.disp, DispPolicy::Force32) {
-                Mem::base_disp32(RBX, -8)
-            } else {
-                Mem::base_disp(RBX, -8)
-            };
-            let a = Args {
-                dst: R8,
-                src: if p.constraints.contains(&Constraint::SameRegister) {
-                    R8
-                } else {
-                    R11
-                },
-                mem,
-                imm: if matches!(p.imm, ImmForm::Imm64) {
-                    i64::MIN
-                } else if matches!(p.imm, ImmForm::ImmU8) {
-                    3
-                } else {
-                    0
-                },
-                op_byte: if matches!(p.op, Op::Jcc) { 0x85 } else { 0x45 },
-            };
+            let a = args_for(p, R8, R11, RBX, RDI, -8);
             let e = match p.encode(&a) {
                 Ok(e) => e,
                 Err(err) => panic!("`{}`: {err}", p.name),
