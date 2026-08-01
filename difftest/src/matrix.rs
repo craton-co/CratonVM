@@ -494,7 +494,10 @@ pub fn operand_form(code: &[u8], pc: usize) -> String {
         0xb9 => "cp16,count".to_string(),
         0xba => "cp16,zero16".to_string(),
         0xbc => format!("atype:{}", array_type_name(code.get(pc + 1).copied())),
-        0xc5 => format!("cp16,dims:{}", code.get(pc + 2).copied().unwrap_or(0)),
+        // multianewarray is `c5 indexbyte1 indexbyte2 dimensions` — the
+        // dimension count is the FOURTH byte, past both constant-pool index
+        // bytes. Reading `pc + 2` returned the low half of the CP index.
+        0xc5 => format!("cp16,dims:{}", code.get(pc + 3).copied().unwrap_or(0)),
         0xc4 => format!(
             "wide:{}",
             code.get(pc + 1)
