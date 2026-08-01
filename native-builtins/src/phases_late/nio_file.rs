@@ -5485,21 +5485,42 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // (ResourceTests#resourceCreateRelativeUnknown). Mapping every open
             // failure to a generic `IOException` made that catch miss, so the
             // raw `IOException` propagated to the caller instead.
-            let open_result = if writable {
-                ctx.fd_table().open_read_write(&p, create)
+            // GAP I2: these openers used to call `fd_table()` directly, so the
+            // whole `java.nio.file` surface bypassed every path policy in the
+            // VM. Route through the capability gate, which runs the check
+            // before the fd is reserved and before the syscall. With no policy
+            // installed (today's default) this is the same call as before.
+            let gated = if writable {
+                crate::capability_gate::open_read_write_gated(&*ctx, &p, create)
             } else {
-                ctx.fd_table().open_read_write(&p, false)
-                    .or_else(|_| ctx.fd_table().open_read(&p))
-            };
-            let fd_id = open_result.map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    RuntimeError::NoSuchFileException { path: p.clone() }
-                } else {
-                    RuntimeError::IOException {
-                        message: format!("Cannot open {}: {}", p, e),
-                    }
+                // Read-only request: try read+write first (a seekable fd), and
+                // fall back to a plain read. A `FileWrite` denial takes the
+                // same fallback an `EACCES` would, which is the right answer —
+                // the caller only asked to read.
+                match crate::capability_gate::open_read_write_gated(&*ctx, &p, false) {
+                    Ok(fd) => Ok(fd),
+                    Err(_) => crate::capability_gate::open_read_gated(&*ctx, &p),
                 }
-            })?;
+            };
+            let fd_id = match gated {
+                Ok(fd) => fd,
+                // A refusal is a `SecurityException`. It must NOT become
+                // `NoSuchFileException`: callers such as
+                // `FileSystemResource.readableChannel()` catch that one and
+                // recover, which would silently swallow the policy decision.
+                Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+                    return Err(denied.into())
+                }
+                Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
+                    return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                        RuntimeError::NoSuchFileException { path: p.clone() }.into()
+                    } else {
+                        MethodCallFailed::from(RuntimeError::IOException {
+                            message: format!("Cannot open {}: {}", p, e),
+                        })
+                    })
+                }
+            };
             if truncate && writable {
                 let _ = ctx.fd_table().rw_set_length(fd_id, 0);
             }
@@ -5915,7 +5936,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         append: bool,
     ) -> MethodCallResult {
         let p = p57_read_path(ctx, path_obj);
-        match ctx.fd_table().open_write(&p, append) {
+        // GAP I2 — see `newFileChannel`.
+        match crate::capability_gate::open_write_gated(&*ctx, &p, append) {
             Ok(fd) => {
                 let bw = alloc_concurrent_synthetic(ctx, "java/io/BufferedWriter", 3);
                 ctx.set_field(bw, 0, Value::Int(fd as i32));
@@ -5924,6 +5946,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 ctx.set_field(bw, 1, Value::Int(0));
                 ctx.set_field(bw, 2, Value::Object(None));
                 Ok(Some(Value::Object(Some(bw))))
+            }
+            // A capability refusal is a `SecurityException`, not an
+            // `IOException`: it happened before the syscall and must not be
+            // retried. An I/O failure keeps the message it always had.
+            Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+                Err(denied.into())
             }
             Err(e) => Err(RuntimeError::IOException {
                 message: format!("newBufferedWriter({}): {}", p, e),
@@ -7581,9 +7609,17 @@ pub(crate) fn fsp_new_input_stream(
             Err(e) => Err(p57_io_error(&e)),
         };
     }
-    let fd = match ctx.fd_table().open_read(&p) {
+    // GAP I2 — see `newFileChannel`. The check runs before the fd is reserved
+    // and before `open`, so a refusal leaves nothing behind.
+    let fd = match crate::capability_gate::open_read_gated(&*ctx, &p) {
         Ok(fd) => fd,
-        Err(e) => {
+        // A refusal is a `SecurityException`: it is not an I/O condition and
+        // must not be mapped onto `NoSuchFileException`/`AccessDeniedException`,
+        // which callers legitimately catch and recover from.
+        Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+            return Err(denied.into())
+        }
+        Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
             return Err(match e.kind() {
                 std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p),
                 std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p),
@@ -7676,9 +7712,15 @@ pub(crate) fn fsp_new_output_stream(
         ctx.unpin_native_roots(exc_pin);
         return Err(MethodCallFailed::ExceptionThrown(exc));
     }
-    let fd = match ctx.fd_table().open_write(&p, append) {
+    // GAP I2 — see `newFileChannel`.
+    let fd = match crate::capability_gate::open_write_gated(&*ctx, &p, append) {
         Ok(fd) => fd,
-        Err(e) => {
+        // A refusal is a `SecurityException`, not one of the typed
+        // `java.nio.file` I/O exceptions below.
+        Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+            return Err(denied.into())
+        }
+        Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
             // Surface the TYPED `java.nio.file` exception HotSpot throws, not a
             // bare IOException. Opening a directory for output denies access on
             // Windows (os error 5) → `AccessDeniedException` (SC-resource-io
@@ -9491,6 +9533,24 @@ pub(crate) fn raf_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<u32
     }
 }
 
+/// Translate a gated `RandomAccessFile` open failure.
+///
+/// A capability refusal becomes the `SecurityException` it is — it happened
+/// before the syscall and must not be retried. An I/O failure keeps the exact
+/// `Cannot open {path}: {err}` `IOException` these constructors have always
+/// thrown, so nothing that catches it changes behaviour.
+fn raf_open_failure(
+    path: &str,
+) -> impl FnOnce(cratonvm_native_api::fd_table::FdCapabilityError) -> MethodCallFailed + '_ {
+    move |err| match err {
+        cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied) => denied.into(),
+        cratonvm_native_api::fd_table::FdCapabilityError::Io(io) => RuntimeError::IOException {
+            message: format!("Cannot open {}: {}", path, io),
+        }
+        .into(),
+    }
+}
+
 pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -9520,25 +9580,23 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             let create = writable; // create file if mode is "rw"/"rws"/"rwd"
 
             if !writable {
-                // Read-only mode: use open_read
-                let fd_id = ctx
-                    .fd_table()
-                    .open_read_write(&path, false)
-                    .or_else(|_| {
-                        // Fallback: try read-only open
-                        ctx.fd_table().open_read(&path).map(|id| id)
-                    })
-                    .map_err(|e| RuntimeError::IOException {
-                        message: format!("Cannot open {}: {}", path, e),
-                    })?;
+                // Read-only mode: use open_read.
+                // GAP I2 — gated; see `newFileChannel`.
+                let open_result =
+                    match crate::capability_gate::open_read_write_gated(&*ctx, &path, false) {
+                        Ok(fd) => Ok(fd),
+                        // Fallback: try read-only open. A `FileWrite` refusal
+                        // takes the same fallback an `EACCES` would — mode "r"
+                        // only ever asked to read.
+                        Err(_) => crate::capability_gate::open_read_gated(&*ctx, &path),
+                    };
+                let fd_id = open_result.map_err(raf_open_failure(&path))?;
                 raf_set_fd(ctx, this, fd_id);
                 ctx.set_field(this, 1, Value::Int(0)); // read-only
             } else {
-                let fd_id = ctx.fd_table().open_read_write(&path, create).map_err(|e| {
-                    RuntimeError::IOException {
-                        message: format!("Cannot open {}: {}", path, e),
-                    }
-                })?;
+                let fd_id =
+                    crate::capability_gate::open_read_write_gated(&*ctx, &path, create)
+                        .map_err(raf_open_failure(&path))?;
                 raf_set_fd(ctx, this, fd_id);
                 ctx.set_field(this, 1, Value::Int(1)); // read-write
             }
@@ -9579,12 +9637,9 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
                 _ => "r".into(),
             };
             let writable = mode_str.contains('w');
-            let fd_id = ctx
-                .fd_table()
-                .open_read_write(&path, writable)
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("Cannot open {}: {}", path, e),
-                })?;
+            // GAP I2 — gated; see `newFileChannel`.
+            let fd_id = crate::capability_gate::open_read_write_gated(&*ctx, &path, writable)
+                .map_err(raf_open_failure(&path))?;
             raf_set_fd(ctx, this, fd_id);
             ctx.set_field(this, 1, Value::Int(if writable { 1 } else { 0 }));
             Ok(None)

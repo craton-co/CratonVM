@@ -2133,8 +2133,38 @@ impl GenerationalHeap {
 
     /// BUG-03 — the published JIT TLAB skip regions as young-from byte
     /// offsets `(offset, size)`, filtered to those that fall wholly inside the
-    /// given `[from_base, from_end)` window and sorted ascending. Empty on the
-    /// normal collection path.
+    /// given `[from_base, from_end)` window, sorted ascending, and **coalesced
+    /// so no two entries overlap**. Empty on the normal collection path.
+    ///
+    /// # Why the coalesce is load-bearing (TLAB audit, `docs/gc/tlab-and-card-audit.md`)
+    ///
+    /// Both consumers merge this list with `Arena::free_blocks_sorted()` and
+    /// then feed the result to [`skip_free_blocks`], whose contract is a list of
+    /// **ascending, disjoint** spans: it advances the walk cursor to `off + sz`
+    /// and drops the entry. Two entries covering the same bytes therefore make
+    /// the walker "skip the same tail twice" — the second entry is consumed
+    /// harmlessly only when the cursor already sits past it, but a *partially*
+    /// overlapping pair (`[a, c)` then `[b, d)` with `a < b < c < d`) resyncs the
+    /// cursor to `c`, then immediately to `d`, silently swallowing the objects
+    /// in `[c, d)`. On the object-start walk that is a missed object grid entry;
+    /// on the non-moving sweep it is a live object never visited.
+    ///
+    /// Before this change the disjointness was asserted in prose at both call
+    /// sites ("both inputs are ascending & disjoint") and guaranteed by nothing:
+    /// the producer is `ThreadRegistry::collect_reserved_tlab_tails`, which
+    /// reads one `(cursor, end)` pair per ALIVE registry entry through a
+    /// published raw address. Two entries can name the same `Tlab` — a virtual
+    /// thread's boxed `JvmThread` is published under its own thread id at
+    /// `install_runtime` and re-published at every remount, and a registry that
+    /// ever holds two live ids for one continuation (or a foreign thread that
+    /// re-attaches before its previous entry is reaped) yields the identical
+    /// pair twice. Duplicates are also exactly what a stale, never-cleared
+    /// publication looks like.
+    ///
+    /// Coalescing is the fail-safe direction: over-skipping a span can only
+    /// over-retain (the span is treated as reserved, so nothing in it is
+    /// reclaimed), whereas the desync it prevents frees live memory. The
+    /// `debug_assert!` records the invariant the callers rely on.
     fn jit_tlab_skip_offsets(&self, from_base: usize, from_end: usize) -> Vec<(usize, usize)> {
         let g = self.jit_tlab_skip_regions.lock();
         if g.is_empty() {
@@ -2150,8 +2180,29 @@ impl GenerationalHeap {
                 }
             })
             .collect();
+        drop(g);
         v.sort_by_key(|&(off, _)| off);
-        v
+        // Coalesce overlapping and touching spans into one. `sz` is recomputed
+        // from the merged end so the result is always `(start, end - start)`.
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(v.len());
+        for (off, sz) in v {
+            match merged.last_mut() {
+                Some((last_off, last_sz)) if off <= *last_off + *last_sz => {
+                    let end = (off + sz).max(*last_off + *last_sz);
+                    *last_sz = end - *last_off;
+                }
+                _ => merged.push((off, sz)),
+            }
+        }
+        debug_assert!(
+            merged
+                .windows(2)
+                .all(|w| w[0].0 + w[0].1 <= w[1].0 && w[0].1 > 0),
+            "jit_tlab_skip_offsets must return ascending, disjoint, non-empty spans — \
+             `skip_free_blocks` resyncs the walk cursor to each span's end and would \
+             swallow the objects between two partially-overlapping spans: {merged:?}",
+        );
+        merged
     }
 
     /// Lock-free `[min_base, max_end)` envelope over every arena this heap
@@ -3356,6 +3407,14 @@ impl GenerationalHeap {
             _ => return,
         };
 
+        // Observability, DELIBERATELY GATED (`crate::gc_metrics`): this barrier
+        // runs on every reference store in the VM, so an unconditional
+        // `fetch_add` here would be a process-global cache line pinged between
+        // every storing mutator. `record_barrier_ref_store` compiles to one
+        // relaxed load of an already-resolved, read-only-shared byte plus a
+        // predicted not-taken branch unless `CRATONVM_GC_CARD_METRICS` is set.
+        crate::gc_metrics::record_barrier_ref_store();
+
         let src_addr = obj.as_ptr() as usize;
         let dst_addr = target_ref.as_ptr() as usize;
 
@@ -3393,6 +3452,12 @@ impl GenerationalHeap {
         // `drain_pending` while the GC holds the card_table mutex
         // exclusively.
         self.card_table.thread_local_dirty_addr(src_addr);
+        // Same gate as `record_barrier_ref_store` above. NOTE: this counts
+        // interpreter/native card marks ONLY — the JIT's inline post-write
+        // barrier (`jit_card_table_info`) stores `CARD_DIRTY` directly into the
+        // bitmap and never enters this function. The collector-side counters
+        // (`cards_found_dirty`, `duplicate_card_marks`) see both.
+        crate::gc_metrics::record_card_mark();
     }
 
     /// Stable card-table metadata for the x64 inline post-write barrier.
@@ -3721,6 +3786,24 @@ impl GenerationalHeap {
         young_live + self.old_gen.lock().used()
     }
 
+    /// Publish the denominators [`crate::gc_metrics::gc_metrics_report`]
+    /// normalizes by: objects allocated since startup, bytes allocated, and the
+    /// current live-byte estimate.
+    ///
+    /// Called at the top of every collection (so a report taken at any later
+    /// point divides by numbers from the most recent pause) and again by the
+    /// end-of-run GC summary. Takes the young and old locks, so it must be
+    /// called with neither held — the top of `collect_garbage_inner` is before
+    /// either is acquired.
+    pub fn publish_gc_metrics_occupancy(&self) {
+        let s = self.stats.snapshot();
+        crate::gc_metrics::record_heap_occupancy(
+            s.young_allocations.saturating_add(s.old_allocations),
+            self.allocated_bytes() as u64,
+            self.live_bytes_estimate() as u64,
+        );
+    }
+
     /// DBG (bc math-ec `0x4`): scan the young from-space for the FIRST object
     /// reference field (or ref-array element) holding `Object(Some(p))` with
     /// `0 < p < 0x1000` — the `0x4` corruption signature, which we proved is
@@ -4019,6 +4102,13 @@ impl GenerationalHeap {
         // No-op when the `gpu-offload` feature is off.
         crate::vm_heap::wait_for_gpu_critical_drain();
 
+        // Refresh the allocation / live-byte denominators the card-cost report
+        // normalizes by. Here rather than at the end of the cycle because the
+        // function has several exit paths (young-skip backstops, the non-moving
+        // early return) and this is the one point every one of them passes
+        // through — and because neither the young nor the old lock is held yet.
+        self.publish_gc_metrics_occupancy();
+
         // SAFETY: If any thread is currently inside a JIT call, we MUST NOT
         // run a *moving* collection. JIT frames hold raw object pointers in
         // their spill slots / registers which are NOT precisely described by
@@ -4220,6 +4310,39 @@ impl GenerationalHeap {
                 // this whole item exists to make impossible.
                 crate::gc_quiescence::record_moving_young_coverage_fallback();
             }
+            // Ground truth for the collector-decision report. Recorded from the
+            // branch that actually decides, so `gc_metrics::
+            // collector_decision_report()` can never drift from the code the
+            // way `docs/GC.md` and `ARCHITECTURE.md` drifted from each other
+            // (see `docs/gc/tlab-and-card-audit.md` §3). The order of the arms
+            // below mirrors the order of the terms in `divert_non_moving`, so
+            // the reported reason is the FIRST one that forced the diversion —
+            // the one an operator has to fix to get a moving cycle back.
+            {
+                use crate::gc_metrics::decision_reason as dr;
+                let (reason, unproven) = if divert_for_incomplete_moving_coverage {
+                    (
+                        dr::NON_MOVING_COVERAGE_INCOMPLETE,
+                        crate::gc_quiescence::moving_young_incomplete_reason(),
+                    )
+                } else if has_conservative_roots && !moving_young {
+                    (
+                        dr::NON_MOVING_CONSERVATIVE_JIT_ROOTS,
+                        crate::gc_quiescence::incomplete_reason::NONE,
+                    )
+                } else if honor_promotion_oom_risk {
+                    (
+                        dr::NON_MOVING_PROMOTION_OOM_RISK,
+                        crate::gc_quiescence::incomplete_reason::NONE,
+                    )
+                } else {
+                    (
+                        dr::NON_MOVING_EXPLICIT_FULL_GC,
+                        crate::gc_quiescence::incomplete_reason::NONE,
+                    )
+                };
+                crate::gc_metrics::record_collector_decision("generational", reason, unproven);
+            }
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
                  unregistered_jit_frame={}, promotion_oom_risk={}, honored={}, moving_young={}, \
@@ -4240,6 +4363,28 @@ impl GenerationalHeap {
             // "is the young generation actually copying?" is answerable at
             // runtime (paired with the coverage-fallback counter).
             crate::gc_quiescence::record_moving_young_cycle();
+        }
+        // The moving arm of the decision record (see the non-moving arm above).
+        // The three cases are genuinely different claims and an operator needs
+        // to tell them apart: "nothing was compiled, so relocation is trivially
+        // safe" is not evidence that the per-cycle coverage proof works, and a
+        // `CRATONVM_DBG_FORCE_MOVING` cycle is not evidence of anything at all.
+        {
+            use crate::gc_metrics::decision_reason as dr;
+            let reason = if divert_non_moving {
+                // We are here despite `divert_non_moving` — only `force_moving`
+                // gets you past the branch above.
+                dr::MOVING_FORCED_BY_DEBUG_FLAG
+            } else if has_conservative_roots {
+                dr::MOVING_WITH_PROVEN_JIT_COVERAGE
+            } else {
+                dr::MOVING_NO_JIT_FRAMES
+            };
+            crate::gc_metrics::record_collector_decision(
+                "generational",
+                reason,
+                crate::gc_quiescence::incomplete_reason::NONE,
+            );
         }
 
         let mut young_from = self.young_from.lock();
@@ -4573,7 +4718,41 @@ impl GenerationalHeap {
         // via its local `merge_skips`. Both inputs are ascending & disjoint.
         let start_skips = {
             let mut v = young_from.free_blocks_sorted();
-            v.extend(self.jit_tlab_skip_offsets(young_base, young_base + young_used));
+            let tails = self.jit_tlab_skip_offsets(young_base, young_base + young_used);
+            // TLAB AUDIT TRIPWIRE (docs/gc/tlab-and-card-audit.md §1, defect
+            // T-3). We are on the MOVING path: from-space is about to be
+            // evacuated, swapped and reset. A published reserved tail means
+            // some ALIVE thread still owns a TLAB `[cursor, end)` in the arena
+            // being reset, and that thread is not one of the OS-frozen in-JIT
+            // peers — freezing a peer makes the VM call
+            // `mark_moving_young_coverage_incomplete`, which would have sent
+            // this cycle down the non-moving path instead. So the owner is a
+            // parked or blocked mutator that reached its exclusion point
+            // WITHOUT retiring, and after the swap its stale cursor bump-
+            // allocates into memory the collector has already handed back.
+            //
+            // The walk itself is correct either way (the tail is skipped, not
+            // parsed), so this is a diagnostic rather than a diversion: turning
+            // a live moving cycle into a sweep on a heuristic would be a worse
+            // trade than naming the offending transition. Rate-limited; the
+            // first occurrence is always visible.
+            if !tails.is_empty() {
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        tails = tails.len(),
+                        "[tlab-audit] a MOVING young collection is running with {} published \
+                         reserved TLAB tail(s). No in-JIT peer was frozen (that would have \
+                         forced the non-moving sweep), so an alive mutator left a TLAB \
+                         un-retired across its exclusion point — after the semispace swap its \
+                         cursor points into recycled memory. Occurrence #{}.",
+                        tails.len(),
+                        n,
+                    );
+                }
+            }
+            v.extend(tails);
             v.sort_by_key(|&(off, _)| off);
             v
         };
@@ -9896,7 +10075,42 @@ impl GenerationalHeap {
     ///
     /// For each dirty card, walks the objects in that card region and collects
     /// slots containing references into young from-space.
+    ///
+    /// This is the **card refinement pass**, and this wrapper is where it is
+    /// priced (`crate::gc_metrics`): wall time, the remembered-set metadata the
+    /// table retains, and the old→young edges the walk actually found. All
+    /// three are unconditional — the pass runs once per collection, so the
+    /// accounting is unmeasurable against the pause it is measuring, and gating
+    /// it would make the default report empty (which is the failure this item
+    /// exists to prevent). The per-store barrier counter is the one that IS
+    /// gated; see [`crate::gc_metrics`]'s module header.
+    ///
+    /// Edges are counted as the growth of `extra_roots` across the call rather
+    /// than tallied inside the walk, so no counting code sits inside the
+    /// per-slot loops.
     fn scan_dirty_cards(
+        card_table: &CardTable,
+        old_gen: &OldGen,
+        young_from: &Arena,
+        extra_roots: &mut Vec<(ObjectRef, usize, usize)>,
+    ) {
+        let started = std::time::Instant::now();
+        let edges_before = extra_roots.len();
+        crate::gc_metrics::record_remembered_set_bytes(card_table.retained_bytes() as u64);
+        Self::scan_dirty_cards_inner(card_table, old_gen, young_from, extra_roots);
+        crate::gc_metrics::record_old_to_young_edges(
+            extra_roots.len().saturating_sub(edges_before) as u64,
+        );
+        // `as_nanos()` is a u128; a single refinement pass cannot plausibly run
+        // for 584 years, but saturate rather than wrap if it somehow does.
+        let nanos = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        crate::gc_metrics::record_refinement(nanos);
+    }
+
+    /// The refinement walk itself. Split out from [`Self::scan_dirty_cards`] so
+    /// the accounting wrapper closes over every early return without holding a
+    /// borrow of `extra_roots` across the walk.
+    fn scan_dirty_cards_inner(
         card_table: &CardTable,
         old_gen: &OldGen,
         young_from: &Arena,
@@ -9912,6 +10126,7 @@ impl GenerationalHeap {
         // be lost on the next GC (see `CardTable::take_dirty_cards` docs — the
         // bt18 premature-reclamation fix).
         let mut dirty_indices = card_table.take_dirty_cards();
+        crate::gc_metrics::record_cards_found_dirty(dirty_indices.len() as u64);
         if dirty_indices.is_empty() {
             return;
         }
@@ -12040,6 +12255,78 @@ mod tests {
         );
         noisy.shape = 55;
         assert_eq!(gen_object_total_size(&noisy), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // TLAB audit (docs/gc/tlab-and-card-audit.md) — reserved-tail skip
+    // regions must reach the walkers ascending, disjoint and non-empty.
+    // -----------------------------------------------------------------
+
+    /// `skip_free_blocks` resyncs the walk cursor to each span's end and drops
+    /// the span. Two spans that partially overlap therefore make it resync
+    /// twice — past the objects that live between the first span's end and the
+    /// second's — so the walk never visits them. The producer
+    /// (`ThreadRegistry::collect_reserved_tlab_tails`) is a per-registry-entry
+    /// read of a published `Tlab` address and guarantees no such property, so
+    /// the heap normalizes.
+    #[test]
+    fn jit_tlab_skip_offsets_coalesces_overlaps_and_duplicates() {
+        // The function is pure arithmetic over the published pairs plus a
+        // window filter, so a minimal heap is enough.
+        let heap = GenerationalHeap::with_sizes(64 * 1024, 64 * 1024);
+        let base = 0x10_0000usize;
+        let end = base + 0x10000;
+
+        heap.set_jit_tlab_skip_regions(&[
+            // Out of order, and the classic duplicate: two registry entries
+            // naming the same boxed `JvmThread`'s TLAB.
+            (base + 0x2000, base + 0x3000),
+            (base + 0x1000, base + 0x1800),
+            (base + 0x2000, base + 0x3000),
+            // Partially overlapping — the case that silently swallows objects.
+            (base + 0x2800, base + 0x4000),
+            // Exactly touching: merging is optional for correctness but keeps
+            // the list minimal.
+            (base + 0x4000, base + 0x4200),
+        ]);
+
+        let spans = heap.jit_tlab_skip_offsets(base, end);
+        assert_eq!(
+            spans,
+            vec![(0x1000, 0x800), (0x2000, 0x2200)],
+            "overlapping and duplicate reserved tails must arrive as one \
+             disjoint ascending span each",
+        );
+        // The invariant the walkers rely on, restated as a check.
+        for w in spans.windows(2) {
+            assert!(w[0].0 + w[0].1 <= w[1].0, "spans must be disjoint: {spans:?}");
+        }
+        assert!(spans.iter().all(|&(_, sz)| sz > 0));
+    }
+
+    /// A region that does not lie wholly inside the walked window, or whose
+    /// start is not 8-aligned, is dropped rather than clamped. Dropping is the
+    /// pre-existing behaviour and this test pins it: a clamped region could
+    /// hide live objects, whereas a dropped one only costs the walker the
+    /// pre-BUG-03 treatment of that tail.
+    #[test]
+    fn jit_tlab_skip_offsets_drops_regions_outside_the_walked_window() {
+        let heap = GenerationalHeap::with_sizes(64 * 1024, 64 * 1024);
+        let base = 0x10_0000usize;
+        let end = base + 0x1000;
+
+        heap.set_jit_tlab_skip_regions(&[
+            (base - 0x100, base + 0x100), // starts before the window
+            (base + 0xF00, end + 0x100),  // ends after the window
+            (base + 0x200, base + 0x200), // empty
+            (base + 0x301, base + 0x400), // start not 8-aligned
+            (base + 0x400, base + 0x480), // the only survivor
+        ]);
+
+        assert_eq!(heap.jit_tlab_skip_offsets(base, end), vec![(0x400, 0x80)]);
+
+        heap.clear_jit_tlab_skip_regions();
+        assert!(heap.jit_tlab_skip_offsets(base, end).is_empty());
     }
 
     /// Ordinary headers are unaffected by the kind guard.

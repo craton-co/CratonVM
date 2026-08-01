@@ -61,8 +61,11 @@ fn inventory_matches_the_checked_in_surface() {
 
 #[test]
 fn the_surface_users_have_to_learn_is_fifteen_names() {
-    // 499 internal keys, 15 things to know. That ratio is the deliverable; if
+    // 642 internal keys, 15 things to know. That ratio is the deliverable; if
     // this number climbs, the consolidation is being undone one flag at a time.
+    // (The key count itself is *meant* to climb when a previously-undeclared
+    // read site is brought inside the boundary — 66 arrived that way in one
+    // pass. See docs/config/flag-inventory.md.)
     let user_facing = Group::ALL.len() + SCALARS.len();
     assert_eq!(
         user_facing, 15,

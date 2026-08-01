@@ -69,7 +69,7 @@ use parking_lot::Mutex;
 
 use crate::io_flags;
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{Capability, CapabilityCheck, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -432,6 +432,19 @@ fn spawn_and_wrap_with_redirects(
         .and_then(|s| s.strip_suffix('"'))
         .filter(|s| !s.is_empty())
         .unwrap_or(program);
+
+    // AUDIT ROW P3 / work-list item 10. `validate_spawn_program` returns `Ok`
+    // for **any** program when CWD confinement is off, which is the default —
+    // so without this line the capability layer never learns a spawn was
+    // attempted at all, and `capability_audit(vm)` would silently omit
+    // `process-spawn` from a run that spawned freely.
+    //
+    // It sits *before* the confinement validator deliberately: the capability
+    // decision is about authority, the validator is about sandbox geometry, and
+    // a refusal here must not be reported as the `IOException` the validator's
+    // failure is translated into below. Permissive by default, so with no
+    // policy installed this is a lookup and `Ok(())`.
+    ctx.check_capability_or_throw(Capability::process_spawn(program))?;
 
     // SECURITY (V1, HIGH): vet the executable against the CWD-confinement
     // policy before spawning. Under confinement this rejects bare PATH-resolved

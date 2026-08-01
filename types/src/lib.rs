@@ -28,6 +28,7 @@ pub mod mirror_pin;
 pub mod narrow_oop;
 pub mod reflective_probe;
 pub mod striped_counter;
+pub mod subsystem_config;
 mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};
@@ -53,6 +54,17 @@ pub use field_layout::{
 pub use flags::{
     flags, install as install_flags, BlockedAccessMode, EnvSource, FlagSource, GcFlags, IoFlags,
     JitFlags, LoaderFlags, MapSource, OverlaySource, VmFlags,
+};
+// The typed configuration for the subsystems migrated off direct `std::env`
+// reads (report P1). Re-exported at the crate root alongside `flags` because
+// the call sites that must move here — `jit`, `gc`, `vm`, `native-api` — name
+// the flag surface as `cratonvm_types::…` today and should not have to learn a
+// second path to reach the same one snapshot.
+pub use subsystem_config::{
+    capability as capability_config, gc_metrics as gc_metrics_config,
+    jit_metrics as jit_metrics_config, jit_verify as jit_verify_config, subsystems,
+    thread_stress as thread_stress_config, CapabilityConfig, GcMetricsConfig, JitMetricsConfig,
+    JitVerifyConfig, SubsystemConfig, ThreadStressConfig,
 };
 pub use float_format::{java_double_to_string, java_float_to_string};
 pub use handle::{HandleScope, HandleStorage, RootedHandle};

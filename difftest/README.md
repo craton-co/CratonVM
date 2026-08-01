@@ -1,12 +1,23 @@
 # difftest — semantic differential fuzzer vs HotSpot
 
-Runs Java programs on **both** CratonVM and a real JDK and **diffs observable
-behavior** — stdout, stderr, thrown exception type + message, and process exit
-code — automatically. This industrializes the manual "run it on HotSpot and
-eyeball the diff" loop that produced nearly every bug found and fixed during
-this project's manual bug-hunt history.
+Runs Java programs on **both** CratonVM and a real JDK — and through each of
+CratonVM's own execution paths — and **diffs observable behavior** across eight
+independently-reported dimensions: exit status, uncaught-exception presence /
+type / message / frames, stdout, stderr, and a program-declared checksum. This
+industrializes the manual "run it on HotSpot and eyeball the diff" loop that
+produced nearly every bug found and fixed during this project's manual bug-hunt
+history.
+
+Each dimension is judged separately, so a divergence **names the observable that
+moved** rather than saying two runs differ; and every transform applied before a
+comparison is a named rule with a documented justification and a documented
+risk, so an over-normalization is reviewable rather than buried in a regex.
 
 Full design: [`docs/feature-designs/differential-fuzzer.md`](../docs/feature-designs/differential-fuzzer.md).
+Operator guide — every dimension, every normalization rule and its risk, the
+execution-path mode axis, how to read the coverage matrix, and how to tell a
+harness false positive from a real VM divergence:
+[`docs/testing/differential.md`](../docs/testing/differential.md).
 
 > **Status: Steps 0-7 wired.** `run` A/Bs the corpus across the CratonVM mode
 > matrix vs HotSpot and auto-classifies each divergence; `gate` adds the
@@ -21,7 +32,12 @@ difftest/
   src/
     ledger.rs    divergence records + the committed JSON ledger (§3.5)
     runner.rs    two-VM A/B executor: binary resolution + mode matrix (§3.2)
-    oracle.rs    per-channel compare + normalize + classify (§3.3)
+    oracle.rs    per-dimension compare + normalize + classify (§3.3)
+    normalize.rs the named normalization rules (target/justification/risk)
+    checksum.rs  the program-declared checksum dimension
+    crossmode.rs CratonVM path-vs-path comparison (needs no reference JDK)
+    matrix.rs    opcode / execution-path coverage matrix, derived from the
+                 corpus class files themselves
     harness.rs   compile + run the matrix + diff + gate (§3.5)
     generate.rs  corpus generator (§3.1)
     minimize.rs  reproducer shrinker (§3.4)
@@ -64,7 +80,41 @@ cratonvm-difftest gate --corpus difftest/seeds
 # JDK-only mode: measure the strict policy against the compatible one.
 cratonvm-difftest gate --corpus difftest/seeds-jdk-only \
     --modes jdk-only-jit,jdk-only-nojit,real-compatible-jit
+
+# The execution-path contract: run the same program through every one of the
+# VM's semantic implementations and cross-compare them (C2 review P1).
+cratonvm-difftest run --corpus difftest/seeds \
+    --modes nojit,interp-decoded,direct-emit,ir-jit,osr-eager,no-osr,forced-deopt
+
+# Generate the opcode / execution-path coverage matrix (C2 review P0).
+cratonvm-difftest matrix --corpus difftest/seeds --show-gaps
 ```
+
+### Execution-path modes
+
+CratonVM has **four semantic implementations** — the interpreter's raw fast path
+with superinstructions, the interpreter's decoded fallback, the single-pass
+direct x64 emitter, and the optimizing IR pipeline — plus OSR and deopt as
+transitions between them. A fix that lands in one and not the others is a
+wrong-code risk, so six modes drive them explicitly:
+
+| Mode | Selects | Flags (all verified against live read sites) |
+|------|---------|---------------------------------------------|
+| `nojit` | interpreter, raw/superinstruction handlers | `CRATONVM_DISABLE_JIT=1` |
+| `interp-decoded` | interpreter, decoded fallback | `--noverify` + `CRATONVM_DISABLE_JIT=1` |
+| `direct-emit` | single-pass x64 emitter (approximate) | `CRATONVM_NO_IR_BRANCHY=1`, `CRATONVM_JIT_IR_CALL=0` |
+| `ir-jit` | optimizing IR pipeline | `CRATONVM_JIT_FORCE_C2=1` |
+| `osr-eager` / `no-osr` | back-edge OSR on (first back-edge) / off | `CRATONVM_JIT_OSR`, `CRATONVM_TIER_OSR_BACKEDGE=1` |
+| `forced-deopt` | compiled → interpreted transition | `CRATONVM_DEOPT_EAGER=1`, `CRATONVM_DEOPT_REAL=1`, `CRATONVM_DEOPT_VERIFY=1` |
+
+A divergence **between two of these** is stronger evidence than a divergence
+against HotSpot — it needs no reference, so neither the reference nor the
+normalization can be blamed for it. Such splits are printed as `PATH` lines and
+are deliberately **not** gated (a `known` `jit-only` ledger row is a path split
+by construction). Caveats — in particular that `interp-decoded` also turns off
+bytecode verification, and that `direct-emit` is approximate because the VM
+exposes no hard "IR off" switch — are in
+[`docs/testing/differential.md`](../docs/testing/differential.md).
 
 ### JDK-only modes
 
@@ -123,6 +173,12 @@ normalizer (design §3.3). Default comparison is **strict equality**; a seed mus
 *declare* it needs a normalizer via a `// difftest: <pragma>` header. This keeps
 the oracle sound — any CratonVM≠HotSpot diff on an accepted program is a real
 bug, not a coin flip.
+
+Every run prints the named normalization rules that were active on its second
+line, so a rule that should not be on is visible at the top of the log rather
+than in a source file. The rules, and the specific real divergence each one
+would hide, are tabulated in
+[`docs/testing/differential.md`](../docs/testing/differential.md) §2.
 
 ## Tiers
 

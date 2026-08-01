@@ -69,6 +69,10 @@ pub mod external_roots;
 pub mod g1;
 pub mod g1_concurrent;
 pub mod gc;
+/// Card / remembered-set cost counters and the per-cycle collector-decision
+/// record (see [`gc_metrics::gc_metrics_report`] and
+/// [`gc_metrics::collector_decision_report`]).
+pub mod gc_metrics;
 pub mod gc_quiescence;
 pub mod gen_heap;
 pub mod heap;
@@ -124,6 +128,9 @@ pub use g1_concurrent::{ConcurrentMarkController, ConcurrentMarkState};
 pub use gc::{
     install_class_info_hook, install_gc_finish_hook, install_gc_start_hook, resolve_class_info,
     ClassInfoHook, JvmtiGcHook,
+};
+pub use gc_metrics::{
+    collector_decision_report, gc_metrics_report, CollectorDecision, GcMetricsRaw, GcMetricsReport,
 };
 pub use gen_heap::{
     jit_region_bounds_addr, GenerationalHeap, HeapStats, HeapStatsSnapshot, JitRegionBoundsTable,

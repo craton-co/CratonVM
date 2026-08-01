@@ -44,7 +44,9 @@ impl FieldType {
     /// JVMS §4.3.2: an array type may have at most 255 dimensions. The cap
     /// also bounds recursion in `parse_partial`, preventing a stack-overflow
     /// DoS from an untrusted descriptor of nothing but `[` bytes.
-    const MAX_ARRAY_DIMENSIONS: usize = 255;
+    ///
+    /// Canonical value lives in [`crate::limits::MAX_ARRAY_DIMENSIONS`].
+    const MAX_ARRAY_DIMENSIONS: usize = crate::limits::MAX_ARRAY_DIMENSIONS;
 
     /// Parse a field type descriptor, returning the parsed type and the remaining unparsed string.
     pub fn parse_partial(descriptor: &str) -> Result<(Self, &str), ClassReaderError> {
