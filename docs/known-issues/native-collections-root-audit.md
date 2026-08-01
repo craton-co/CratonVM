@@ -69,8 +69,35 @@ moving collection. `swept?` = entry dropped when its owner dies.
 | `cslm_comparator_table` `:47131` | CSLM custom comparator | yes (`:34573`) | yes | yes (`:34997`) | none (table is fine; the *search* was not — see below) |
 | **`tm_force_array_set`** `:34229` | sticky "array mode" flag | n/a (no refs) | n/a | **NO** | **FIXED — swept now** |
 | `obj_key_registry` shards `:538` | `last_ptr` address markers | n/a | yes (`:34812`) | yes (`:34909`) | none |
-| `overlay_owner_keys` `:551` | owner addr → overlay keys | n/a | yes (`:34828`) | yes (`:35013`) | none |
+| **`overlay_owner_keys`** `:551` | owner addr → overlay keys | n/a | yes — but it was **not single-step** | yes (`:35013`) | **FIXED 2026-08-01 — rebuilt, not relocated in place; see below** |
 | `HM_INT_FAST_LAST_KEY` (TLS) `:1311` | (raw ptr, identity hash, key) memo | n/a | n/a | validated, not swept | none — see note |
+
+`overlay_owner_keys` is the row this audit's own criteria could not catch, and
+it is worth saying why: the three columns ask whether a remap **exists**, not
+whether it is **correct**. One did exist, and it was wrong.
+
+It relocated entries in place, one move at a time. A `pointer_map` may hold
+both `A -> B` and `B -> C` — old-gen sliding compaction hands one live object
+the address another live object just vacated — so applying `A -> B` first
+parked A's keys at B, and the later `B -> C` swept them onward with B's own.
+The collection that really was at B ended up with no entry at its own address,
+`gc_overlay_roots_for_collection(B)` answered "owns nothing", and the
+non-moving young marker and `old_gen_gc`'s mark BFS both skipped its backing
+array. `HashMap` iteration order decided whether it fired. Every *other* remap
+in the file is a single-step lookup, which is what `pointer_map` means: the
+collector composes `young -> promoted -> compacted` chains into one hop before
+handing it over.
+
+Pinned by
+`overlay_owner_liveness_tests::a_chained_pointer_map_does_not_sweep_one_owners_keys_onto_another`,
+verified to FAIL on the old algorithm. Full write-up in
+[`../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md`](../internal/fixed-suite-bugs/springboot/springboot-basicerrorcontroller-checkcast-abort-20260731-FIXED.md).
+
+**For the next pass over this table:** a `yes` in `Remapped?` should mean the
+transformation is single-step and order-independent, not merely that a remap
+function is wired. The only other address-keyed holder here is
+`obj_key_registry`'s `last_ptr`, which visits each slot once and is therefore
+already single-step.
 
 `HM_INT_FAST_LAST_KEY` deserves its row explained because it is the shape this
 branch has previously got wrong. It is an **address-keyed cache**, and the
