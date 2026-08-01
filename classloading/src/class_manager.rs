@@ -9127,6 +9127,39 @@ impl ClassManager {
         // `redefine_class` does for in-place bytecode replacement.
         fire_resolution_invalidate_hook(id.as_u32());
 
+        // NO vtable rebuild here, unlike `redefine_class` step 6 — and that is
+        // sound, not an oversight. Investigated 2026-08-01 off the back of the
+        // JEP 109 sibling bug (`refresh_inherited_vtable_descriptors`); the two
+        // properties that make it safe are pinned by
+        // `synthetic_stub_has_no_vtable_and_no_dispatchable_body`:
+        //
+        //   1. A compatibility stub NEVER has a vtable. Both mint paths
+        //      (`create_synthetic_stub` and `fabricate_class`) push straight
+        //      into `class_store` without calling `build_vtable_descriptors` or
+        //      firing the install hook, so `execute_invokevirtual_vtable_fast`
+        //      always answers `CacheMiss` for a stub receiver. There is no
+        //      stub-derived vtable entry this upgrade could leave stale.
+        //   2. A stub's methods are all `ACC_NATIVE` with no attributes
+        //      (`synthetic_stub_ctor_methods`), so they carry no Code — no
+        //      `Arc<CachedBytecodeMethod>` can be built from a stub body, and
+        //      therefore no stale *bytecode* snapshot can be sitting in a
+        //      thread's invoke cache or the promoted-invoke map either. That
+        //      matters because this path deliberately does NOT bump
+        //      `redefine_generations`, so `RedefineGate` would never evict one.
+        //
+        // What the missing rebuild costs is dispatch COVERAGE, never
+        // correctness: the upgraded class still has no vtable afterwards, and a
+        // subclass linked while its parent was a stub seeded its own descriptor
+        // vec from the parent's absent one. Both simply miss `lookup_slot` and
+        // fall to the (correct) slow path. Not worth a broad dispatch change on
+        // spec — a `CRATONVM_DBG_SYNUPGRADE` census over a Spring Boot JUnit
+        // class saw this branch's guard evaluated 6277 times and the upgrade
+        // itself taken ZERO times: every stub in the process is a VM-internal
+        // shape (`cratonvm/internal/*`, `java/util/HashMap$KeyItr`,
+        // `java/lang/annotation/AnnotationProxy`, `Proxy$Instance`, …) whose
+        // real bytes exist nowhere, so 3190 of 3205 stub-hits short-circuit on
+        // the known-absent memo and the remaining 15 scan and find nothing.
+
         // Cache the class bytes (FIFO-bounded helper).
         self.insert_class_bytes(id, bytes);
 
@@ -17719,6 +17752,57 @@ mod tests {
             .unwrap();
         assert_eq!(unrelated.declaring_class_id, unrelated_id.as_u32());
         assert!(unrelated.dispatch.is_none());
+    }
+
+    /// The two properties that make `upgrade_synthetic_class`'s *absence* of a
+    /// vtable rebuild sound — asserted against the real mint path, not a
+    /// hand-built `Class`, so a future change to stub creation trips this test
+    /// rather than silently resurrecting the JEP 109 bug on the upgrade path.
+    ///
+    /// See the "NO vtable rebuild here" comment in `upgrade_synthetic_class`.
+    /// If either assertion starts failing, that path needs the rebuild (and,
+    /// because a synthetic upgrade may change the method set outright, a full
+    /// descendant re-derivation rather than
+    /// [`Self::refresh_inherited_vtable_descriptors`]'s slot-wise refresh).
+    #[test]
+    fn synthetic_stub_has_no_vtable_and_no_dispatchable_body() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let id = mgr.ensure_synthetic_class("java/lang/Throwable", 2);
+
+        assert!(
+            mgr.class_store
+                .get(id)
+                .is_some_and(|c| c.is_synthetic_stub),
+            "fixture must actually be a compatibility stub",
+        );
+
+        // 1. No vtable — so the upgrade has nothing stale to refresh, and
+        //    `execute_invokevirtual_vtable_fast` can only answer CacheMiss.
+        assert!(
+            mgr.vtable_descriptors_of(id).is_none(),
+            "a synthetic stub must never carry vtable descriptors; if it does, \
+             upgrade_synthetic_class must rebuild them",
+        );
+
+        // 2. No dispatchable body — so no `CachedBytecodeMethod` snapshot of a
+        //    stub can be cached anywhere and survive the upgrade (this path
+        //    does not bump `redefine_generations`, so `RedefineGate` would not
+        //    evict one). `java/lang/Throwable` is chosen because
+        //    `synthetic_stub_ctor_methods` gives it the richest stub method
+        //    table of any name, so the assertion has something to bite on.
+        let methods = &mgr.class_store.get(id).expect("stub present").methods;
+        assert!(
+            !methods.is_empty(),
+            "fixture must have stub methods for this assertion to mean anything",
+        );
+        for method in methods {
+            assert!(
+                method.code().is_none(),
+                "stub method {}{} must carry no Code attribute",
+                method.name,
+                method.descriptor,
+            );
+        }
     }
 
     /// T10.5 — install hook receives the freshly-built descriptor vec.
