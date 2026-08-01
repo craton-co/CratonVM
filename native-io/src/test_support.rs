@@ -256,6 +256,22 @@ impl MockNativeContext {
         self.global_roots.len()
     }
 
+    /// Model a moving collection: repoint an existing global root at the
+    /// object's post-copy address, exactly as the collector's remap pass does
+    /// to the JNI/global-root table.
+    ///
+    /// This is what makes "is it remapped?" testable. Code that resolves
+    /// through the handle sees the NEW address; code that kept a bare
+    /// `ObjectRef` from before the move still sees the old one — which is the
+    /// defect, and the assertion that separates the two.
+    pub(crate) fn relocate_global_root(&mut self, handle: usize, new_obj: ObjectRef) {
+        assert!(
+            self.global_roots.contains_key(&handle),
+            "relocate_global_root: handle {handle} is not a live root"
+        );
+        self.global_roots.insert(handle, new_obj);
+    }
+
     pub(crate) fn blocking_region_counts(&self) -> (usize, usize) {
         (self.blocking_begin_count, self.blocking_end_count)
     }
@@ -488,7 +504,20 @@ impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
         }
         Ok(None)
     }
-    fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
+    fn invoke(&mut self, c: &str, m: &str, d: &str, a: &[Value]) -> MethodCallResult {
+        // Record interface-dispatch calls too. `drain_completions` delivers
+        // `CompletionHandler.completed`/`failed` through this entry point, and
+        // the root-audit tests need to see WHICH handler reference it passed —
+        // the whole point of resolving through the global root is that the
+        // address changes across a relocation.
+        // SAFETY: `&mut self` gives exclusive access to the test-only log.
+        let calls = unsafe { &mut *self.calls.get() };
+        calls.push(InvokeCall {
+            declared_class: Some(c.to_string()),
+            method_name: m.to_string(),
+            descriptor: d.to_string(),
+            args: a.to_vec(),
+        });
         Ok(None)
     }
 }

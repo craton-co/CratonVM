@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2026 Craton Software Company
+#
+# A coverage-guided campaign writes into this directory as it runs. Without
+# these rules a one-hour `run-all.sh` leaves thousands of untracked files in
+# `git status`, which is how a real finding gets lost in the noise — and how
+# a repo-wide auto-commit sweeps machine-specific bytes into history.
+
+# cargo-fuzz's build output.
+target/
+Cargo.lock.fuzz
+
+# `corpus/gen_seeds.py` is importable, so anything that imports it (a
+# validation script, a REPL) leaves bytecode next to the seeds.
+__pycache__/
+
+# Crash artifacts and per-target logs are per-run and machine-specific.
+# A *reproducer worth keeping* is committed deliberately:
+#     git add -f fuzz/artifacts/<target>/crash-<sha1>
+# `replay-corpus.sh` then replays it on every commit, so the fix stays fixed.
+artifacts/
+
+# Corpus entries libFuzzer discovers during a campaign. They are genuinely
+# useful — but they arrive by the thousand with SHA1-hex names, and which
+# ones are worth keeping is a `cargo fuzz cmin` decision, not a default.
+#
+# Two prefixes stay tracked: `seed-*` (everything `corpus/gen_seeds.py`
+# writes) and `regression-*` (a minimized crash input committed after the
+# bug it found was fixed — see "Crash Triage" in README.md).
+corpus/*/*
+!corpus/*/seed-*
+!corpus/*/regression-*

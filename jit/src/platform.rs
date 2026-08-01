@@ -7,7 +7,14 @@
 //! machine code. All platforms enforce W^X (write xor execute):
 //!
 //! - **Windows:** `VirtualAlloc` with `PAGE_READWRITE`, then `VirtualProtect`
-//!   to `PAGE_EXECUTE_READ` when code is finalized.
+//!   to `PAGE_EXECUTE_READ` when code is finalized. On non-x86 Windows
+//!   (`aarch64-pc-windows-msvc`, `arm64ec-*`) the I-cache is *not* coherent
+//!   with the D-cache, so `make_executable` additionally calls
+//!   `FlushInstructionCache` — see [`flush_icache_range_windows`]. This was
+//!   missing until the 2026-08-01 aarch64 parity audit: the Unix path had an
+//!   arch-conditional `__clear_cache` (added when the Linux/FreeBSD aarch64
+//!   port landed) but the Windows path had none, so a Windows-on-ARM build
+//!   published every JIT body without ever invalidating the I-cache.
 //! - **Linux/FreeBSD:** `mmap` with `PROT_READ | PROT_WRITE`, then `mprotect`
 //!   to `PROT_READ | PROT_EXEC`. On aarch64 we additionally flush the
 //!   instruction cache via the compiler builtin `__clear_cache` before the
@@ -135,6 +142,21 @@ fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
         fn GetLastError() -> u32;
     }
 
+    // Non-x86 Windows (aarch64 / arm64ec) has split, non-coherent I-cache and
+    // D-cache exactly like Linux aarch64. `VirtualProtect` alone does NOT
+    // invalidate the I-cache, so without this the CPU can fetch stale bytes for
+    // a freshly written (or freshly re-patched) JIT body. Done BEFORE the
+    // RW→RX flip for the same reason as the Unix path: while the page is still
+    // writable no instruction fetch can race the flush.
+    //
+    // x86-64/x86 Windows needs nothing (coherent caches, Intel SDM Vol.3 §11.6),
+    // and `FlushInstructionCache` there would be a pure syscall cost on the JIT
+    // hot path — so the *call* is arch-gated even though the helper is compiled
+    // (and therefore type- and link-checked) on every Windows host.
+    if !cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+        flush_icache_range_windows(ptr, size);
+    }
+
     let mut old_protect: u32 = 0;
     let ret = unsafe { VirtualProtect(ptr, size, PAGE_EXECUTE_READ, &mut old_protect) };
     if ret == 0 {
@@ -145,6 +167,39 @@ fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
         Err(JitError::ProtectFailed(err))
     } else {
         Ok(())
+    }
+}
+
+/// Invalidate the CPU instruction cache over `[ptr, ptr+size)` on Windows.
+///
+/// `FlushInstructionCache(GetCurrentProcess(), base, len)` is the documented
+/// Windows API for "I have just written instructions through the data path";
+/// on ARM64 it issues the `DC CVAU` / `DSB ISH` / `IC IVAU` / `DSB ISH` / `ISB`
+/// sequence the ARM ARM requires (B2.4.4, *Concurrent modification and
+/// execution of instructions*). It is a documented no-op on x86/x86-64, whose
+/// caches are coherent, which is why the call site above skips it there.
+///
+/// The function itself is compiled on every Windows target so a typo or a
+/// signature mistake is caught by an ordinary x86-64 Windows build, not only by
+/// a Windows-on-ARM cross-build nobody runs. Exercised on any Windows host by
+/// `tests::windows_icache_flush_is_callable`.
+#[cfg(target_os = "windows")]
+fn flush_icache_range_windows(ptr: *mut u8, size: usize) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn FlushInstructionCache(
+            hProcess: *mut core::ffi::c_void,
+            lpBaseAddress: *const core::ffi::c_void,
+            dwSize: usize,
+        ) -> i32;
+    }
+    unsafe {
+        // Returns BOOL; a failure here cannot be recovered from (we are about
+        // to publish this code either way), and the only documented failure
+        // mode is an invalid process handle, which `GetCurrentProcess` — a
+        // pseudo-handle constant — cannot produce. Deliberately ignored.
+        let _ = FlushInstructionCache(GetCurrentProcess(), ptr as *const core::ffi::c_void, size);
     }
 }
 
@@ -524,6 +579,32 @@ mod tests {
         assert!(format!("{}", e).contains("allocation"));
         let e2 = JitError::ProtectFailed(-1);
         assert!(format!("{}", e2).contains("-1"));
+    }
+
+    /// `flush_icache_range_windows` must be callable on any Windows host.
+    ///
+    /// The production call site is arch-gated (x86/x86-64 have coherent
+    /// caches and skip it), so on an ordinary x86-64 Windows CI machine the
+    /// call site never runs and a broken `extern` declaration — wrong
+    /// calling convention, wrong argument widths, missing symbol — would
+    /// only surface on a Windows-on-ARM build. Calling it directly here
+    /// forces the declaration to be compiled, linked and executed on every
+    /// Windows host. `FlushInstructionCache` is valid (and a documented
+    /// no-op) on x86-64, so this is safe to run anywhere Windows runs.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_icache_flush_is_callable() {
+        let size = 4096;
+        let ptr = alloc_executable(size).expect("alloc_executable failed");
+        unsafe {
+            *ptr = 0x90; // one byte of "code" so the range is not untouched
+        }
+        flush_icache_range_windows(ptr, size);
+        // Range covering a sub-page slice, and a zero-length range: both are
+        // legal arguments and must not fault.
+        flush_icache_range_windows(ptr, 4);
+        flush_icache_range_windows(ptr, 0);
+        free_executable(ptr, size);
     }
 
     /// End-to-end check that `make_executable` flushes the icache on

@@ -77,6 +77,17 @@ const SKIPPED_DIRS: &[&str] = &["target", ".git", "apps", "node_modules"];
 /// that call site — "it was easier" is not a reason.
 const ALLOWED: &[(&str, &str)] = &[
     (
+        "CRATONVM_",
+        "kind 1: the bare prefix, never a variable. Two test helpers named \
+         `with_env` (`vm/src/config.rs`, `libcratonvm/src/lib.rs`) \
+         `debug_assert!` that the key they are about to `set_var` does NOT \
+         start with it — they are refusing to touch declared flags — and \
+         `vm/src/vm/vm_init.rs` uses it to pick which of `std::env::vars()` to \
+         report as VM configuration. `exact_literals` matches it because a \
+         quote follows the underscore immediately; \
+         `the_scanner_only_matches_whole_string_literals` pins that.",
+    ),
+    (
         "CRATONVM_COMPATIBILITY_JDK_ONLY",
         "kind 1: the name of a `libcratonvm` C ABI integer constant, matched \
          here only because a unit test asserts the diagnostic message names it",
@@ -338,6 +349,14 @@ fn the_scanner_only_matches_whole_string_literals() {
     assert!(exact_literals(r#"format!("[CRATONVM_STREAM_PIN_CANARY] {site}")"#).is_empty());
     // Advice telling the operator what to export.
     assert!(exact_literals(r#"eprintln!("set CRATONVM_DBG=jit-method-stats")"#).is_empty());
+    // The bare prefix IS a match — the quote follows the underscore directly.
+    // It is not a variable, which is why `ALLOWED` carries a row for it; the
+    // alternative (teach the matcher a minimum length) would also blind it to
+    // any genuinely short name.
+    assert_eq!(
+        exact_literals(r#"        !key.starts_with("CRATONVM_"),"#),
+        vec!["CRATONVM_"]
+    );
     // Two on one line, the second overlapping the first's scan window.
     assert_eq!(
         exact_literals(r#"&["CRATONVM_REAL_AQS", "CRATONVM_SYNTHETIC_AQS"]"#),

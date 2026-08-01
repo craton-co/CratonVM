@@ -136,12 +136,28 @@ pub fn verify_rsa_pkcs1_v15_checked(
 ///
 /// # TRUST BOUNDARY
 ///
-/// The signed-JAR path (`classloading/src/jar_signer.rs:1516`) still calls
-/// this and maps `false` onto `SigVerify::Bad`, so an unusable signer key is
-/// currently reported as a bad signature rather than as an unverifiable one.
-/// Both outcomes refuse the JAR, so the immediate behaviour is safe; the
-/// migration to `verify_rsa_pkcs1_v15_checked` is tracked as a residual gap in
-/// `docs/security/crypto-failure-contract.md`.
+/// **This function now has zero callers in the tree** — verified by grep over
+/// every `.rs` file in the workspace; the only remaining occurrences of the
+/// name are doc comments describing the migration away from it. Both former
+/// call sites are gone:
+///
+/// * `classloading/src/jar_signer.rs` (`rsa_pkcs1v15_verify`) now calls
+///   [`verify_rsa_pkcs1_v15_checked`] and maps `Err` to
+///   `SigVerify::Unsupported` rather than `SigVerify::Bad`;
+/// * `native-builtins/src/crypto_impl.rs` (`Rsa::try_verify_sha256`, behind
+///   `rsa_verify`) does the same, returning `None` for "never checked".
+///
+/// It is therefore `#[deprecated]`: it is kept only so that an out-of-tree or
+/// mid-flight consumer does not break, and so that anyone who reaches for it
+/// gets told, at compile time, which function to use instead. Deleting it is
+/// the follow-up once the branch settles.
+#[deprecated(
+    since = "0.3.0",
+    note = "ambiguous on a trust path: a `false` cannot distinguish `the signature does not \
+            match` from `the key was rejected and nothing was verified`. Call \
+            verify_rsa_pkcs1_v15_checked and map Err onto a distinct `unverifiable` outcome. \
+            This wrapper has no remaining in-tree callers."
+)]
 pub fn verify_rsa_pkcs1_v15(
     modulus_be: &[u8],
     exponent_be: &[u8],
@@ -161,6 +177,12 @@ pub fn verify_rsa_pkcs1_v15(
 
 #[cfg(test)]
 mod tests {
+    // The `bool` wrapper is deprecated (see its doc comment) but must keep its
+    // fail-closed test: it is still compiled, and the property that an `Err`
+    // can never surface as `true` is exactly what makes leaving it in place
+    // safe rather than merely convenient.
+    #![allow(deprecated)]
+
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
