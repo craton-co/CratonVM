@@ -1,3 +1,16 @@
+// NEEDS-CLASSPATH: com.unboundid:unboundid-ldapsdk
+//
+// Hand-run probe, NOT part of the automatic fixture compilation. `vm/build.rs`
+// skips sources carrying this marker: it compiles each pass in a single javac
+// invocation with no classpath, so this file's unresolvable imports failed the
+// whole legacy pass and left all ~119 other fixtures unstaged — silently, since
+// the tests that read CRATONVM_TEST_CLASSES_DIR treat "no classes" as "skip".
+//
+// To run it by hand (regression coverage for
+// docs/internal/fixed-suite-bugs/ldap-sslsocketfactory-createsocket-inetaddress-abstractmethoderror-FIXED.md):
+//
+//   javac -cp unboundid-ldapsdk.jar -d <out> UnboundIdLdapsJks.java
+//   cratonvm -cp "<out>;unboundid-ldapsdk.jar" cratonvm.UnboundIdLdapsJks <path/to/test.jks>
 package cratonvm;
 
 import java.io.FileInputStream;

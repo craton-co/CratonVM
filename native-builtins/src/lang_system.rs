@@ -1309,6 +1309,22 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register("java/lang/Runtime", "exit", "(I)V", native_runtime_exit);
 
+    // `Runtime.halt(int)` is NOT intercepted — its real bytecode runs, and it
+    // calls two `java.lang.Shutdown` natives in order:
+    //
+    //     Shutdown.beforeHalt();   // notify JFR/agents; nothing observable
+    //     Shutdown.halt(status);   // -> synchronized { halt0(status); }
+    //
+    // Neither was registered, so the FIRST threw
+    // `UnsatisfiedLinkError: java/lang/Shutdown.beforeHalt()V` and the process
+    // kept running: a caller asking to die immediately got a linkage error out
+    // of a method that cannot legally return.
+    registry.register("java/lang/Shutdown", "beforeHalt", "()V", |_ctx, _args| {
+        // HotSpot's does nothing an application can observe.
+        Ok(None)
+    });
+    registry.register("java/lang/Shutdown", "halt0", "(I)V", native_shutdown_halt0);
+
     // Runtime.loadLibrary(String) / Runtime.load(String) вЂ” JNI library loading
     registry.register(
         "java/lang/Runtime",
@@ -1808,6 +1824,41 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     // B6: Surface Runtime.exit calls so silent shutdowns are visible.
     eprintln!("[cratonvm] Runtime.exit({code}) called вЂ” process terminating");
+    invoke_pre_exit_hook(code);
+    std::process::exit(code);
+}
+
+/// `java.lang.Shutdown.halt0(int)` — the bottom of `Runtime.halt(int)`.
+///
+/// Terminates with the requested status and, unlike the `exit` path, does NOT
+/// run Java shutdown hooks: `Runtime.halt` is specified as forcible
+/// termination, and the JDK runs hooks from `Shutdown.exit`, which halt
+/// bypasses. The VM-internal pre-exit hook (staged-archive cleanup, JFR
+/// dump-on-exit) still fires — it is not a Java shutdown hook, and its own
+/// comment already claims to cover `Runtime.halt`.
+pub(crate) fn native_shutdown_halt0(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let code = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+
+    // Same opt-in escape hatch the two `exit` natives honour: turn the
+    // termination into a return so whatever the caller was hiding behind it
+    // becomes visible. Off by default.
+    if crate::nbflags().soft_exit {
+        tracing::warn!(
+            target: "cratonvm::system_exit",
+            "[cratonvm] Runtime.halt({code}) soft-returned (CRATONVM_SOFT_EXIT=1)"
+        );
+        return Ok(None);
+    }
+
+    // Plain ASCII dash on purpose: the neighbouring exit messages carry a
+    // mojibake em-dash from an old encoding mishap and print as garbage.
+    eprintln!("[cratonvm] Runtime.halt({code}) called - process terminating");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
