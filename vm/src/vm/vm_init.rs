@@ -1475,6 +1475,23 @@ impl SharedVm {
                     },
                 );
                 native_methods.set_category(__prev);
+                // The legacy monitor-backed `ReentrantLock` / `Lock` /
+                // `Condition` / `Semaphore` natives.
+                //
+                // Real AQS became the default because the synthetic
+                // lock/condition bridge deadlocks the blocking-queue producer/
+                // consumer pattern, so `register_concurrent_natives` skips them
+                // unless `CRATONVM_SYNTHETIC_AQS=1`. That reasoning is entirely
+                // about real-JDK mode: it needs `AbstractQueuedSynchronizer`
+                // bytecode to defer to. Synthetic mode has none, so the skip
+                // left `new Semaphore(3)` and `new ReentrantLock()` raising
+                // `UnsatisfiedLinkError` — 14 `JucComplete` corpus tests,
+                // invisible for as long as the corpus was dark. Runtime-gated
+                // on `use_synthetic_jdk`, not on the Cargo feature, so a
+                // feature-enabled binary running real-JDK mode is unaffected.
+                cratonvm_native_builtins::util_concurrent_ext::register_synthetic_aqs_natives(
+                    &mut native_methods,
+                );
             } else {
                 // Real-JDK mode: register essential natives only. Do NOT use
                 // register_builtins — synthetic overrides assume synthetic field

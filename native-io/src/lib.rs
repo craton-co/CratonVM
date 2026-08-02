@@ -1414,6 +1414,45 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(None)
 }
 
+/// `FileInputStream.<init>(Ljava/io/File;)V` — synthetic-mode only.
+///
+/// The `FileOutputStream` side of this block has had `<init>(File)` and
+/// `<init>(File, boolean)` since FOS-FIX; the input side only ever got
+/// `<init>(String)`. In `synthetic-jdk` mode there is no bytecode constructor
+/// to fall back to, so `new FileInputStream(file)` raised
+/// `NoSuchMethodError: java.io.FileInputStream.<init>(Ljava/io/File;)V` — which
+/// took out seven `TckIo` corpus tests (`fis_readEof`, `fis_available`,
+/// `fis_skip`, `fis_closeIdempotent`, `fos_writeSingleByte`, `fos_writeBulk`,
+/// `e2e_writeReadRoundtrip`), all of which open their file through a `File`.
+///
+/// Resolves the path off the `File` exactly as `native_fos_init_file` does and
+/// then reuses `native_fis_open0`, so the fd layout and the constructor-field
+/// backfill stay in one place.
+fn native_fis_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: "FileInputStream.<init>(File): missing this".to_string(),
+            }))
+        }
+    };
+    let file_obj = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: "FileInputStream.<init>(File): missing File arg".to_string(),
+            }))
+        }
+    };
+    let path = read_file_path(ctx, file_obj).unwrap_or_default();
+    let path_str = ctx.create_string(&path);
+    native_fis_open0(
+        ctx,
+        &[Value::Object(Some(this)), Value::Object(Some(path_str))],
+    )
+}
+
 fn native_fis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -4908,6 +4947,14 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
             "<init>",
             "(Ljava/lang/String;)V",
             native_fis_open0,
+        );
+        // ...and the `File` overload, the one every `TckIo` fixture actually
+        // uses. Its absence was invisible for as long as the corpus was dark.
+        registry.register(
+            "java/io/FileInputStream",
+            "<init>",
+            "(Ljava/io/File;)V",
+            native_fis_init_file,
         );
         // Public FileInputStream read surface. In real-JDK mode the bytecode
         // read()/read(byte[])/read(byte[],i,i)/available()/skip()/close() call
