@@ -568,8 +568,51 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
             fields[index] = value;
         }
     }
-    fn new_object(&mut self, _c: &str) -> MethodCallResult {
-        Ok(None)
+    /// Allocate an object of `class`, tagged so `class_id_of_object` /
+    /// `class_name_of_id` identify it.
+    ///
+    /// This used to return `Ok(None)`, which is not "no opinion" — it is
+    /// "allocation failed", and natives have real fallback branches for that.
+    /// `async_socket::drain_completions` takes one: if it cannot build the
+    /// `java.io.IOException` for a failed op it drops the completion and
+    /// delivers nothing. So `audit_failed_delivery_is_remapped_and_releases_roots`
+    /// could never dispatch `failed()`, and was red from the day it landed —
+    /// the production path was correct, the mock could not express it.
+    fn new_object(&mut self, class: &str) -> MethodCallResult {
+        // Zero declared fields: this mock keeps instance state in the
+        // name-keyed side map (`set_field_by_name`), which does not consult the
+        // field vector, and `detailMessage` is written that way.
+        let obj = self.alloc_object_with_class(0, class);
+        Ok(Some(Value::Object(Some(obj))))
+    }
+
+    /// Allocate and "construct". The trait default runs `<init>` through
+    /// [`Self::invoke`], which in this mock only RECORDS the call — so a
+    /// `Throwable(String)` would come back with no message, and a native that
+    /// prefers the real constructor over a synthetic fallback (e.g.
+    /// `afc_io_exception`) would deliver an exception whose `detailMessage` is
+    /// null. Emulate the one constructor shape that matters here:
+    /// `(Ljava/lang/String;)V` stores its argument in `detailMessage`, exactly
+    /// as every `Throwable(String)` does.
+    fn new_object_initialized(
+        &mut self,
+        class_name: &str,
+        init_desc: &str,
+        init_args: &[Value],
+    ) -> MethodCallResult {
+        let obj_val = self.new_object(class_name)?;
+        if let Some(Value::Object(Some(obj))) = obj_val {
+            let mut full = Vec::with_capacity(init_args.len() + 1);
+            full.push(Value::Object(Some(obj)));
+            full.extend_from_slice(init_args);
+            self.invoke(class_name, "<init>", init_desc, &full)?;
+            if init_desc == "(Ljava/lang/String;)V" {
+                if let Some(message @ Value::Object(Some(_))) = init_args.first() {
+                    self.set_field_by_name(obj, "detailMessage", *message);
+                }
+            }
+        }
+        Ok(obj_val)
     }
     fn identity_hash_code(&self, o: ObjectRef) -> i32 {
         o.as_ptr() as i32

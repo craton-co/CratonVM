@@ -3475,6 +3475,26 @@ mod tests {
             Value::Object(Some(handler_after)),
             "failed() must dispatch on the post-move handler"
         );
+        // The Throwable itself matters: the arm that builds it is also the arm
+        // that can bail out and deliver nothing, so assert what arrived rather
+        // than only that something did.
+        let Value::Object(Some(thrown)) = delivered.args[1] else {
+            panic!("failed() was passed no Throwable: {:?}", delivered.args[1]);
+        };
+        assert_eq!(
+            ctx.class_name_of_id(ctx.class_id_of_object(thrown))
+                .as_deref(),
+            Some("java/io/IOException"),
+            "failed() must be handed a java.io.IOException"
+        );
+        let Value::Object(Some(message)) = ctx.get_field_by_name(thrown, "detailMessage") else {
+            panic!("the IOException carries no detailMessage");
+        };
+        assert_eq!(
+            ctx.read_string(message).as_deref(),
+            Some("connect failed: refused"),
+            "the worker's failure message must reach the handler"
+        );
         assert_eq!(
             ctx.global_root_count(),
             0,
