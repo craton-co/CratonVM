@@ -6576,6 +6576,27 @@ thread_local! {
 pub static IR_CODE_BUFFER_RETRIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// A/B opt-out (`CRATONVM_JIT_NO_IR_CODE_BUFFER_RETRY=1`): refuse the compile on
+/// a short code-buffer estimate instead of re-running the lowering at the size
+/// the first attempt measured, i.e. the pre-2026-08-01 behaviour.
+///
+/// It exists because the retry is the only change in its branch that allocates
+/// and unmaps EXTRA executable memory, and because two intermittent failures —
+/// a stall in Spring Boot's two-thread `OnClassCondition` filtering, and one
+/// SIGSEGV executing an unmapped code buffer — appeared on a tree carrying it
+/// and not on a same-sized control without it. Neither has been pinned on the
+/// retry, and neither sample is large enough to pin anything; this flag is how
+/// the next person compares the two behaviours on ONE binary rather than two.
+/// See `docs/known-issues/springboot/onclasscondition-join-never-returns-20260801.md`
+/// and `docs/known-issues/jit/sigsegv-in-unmapped-code-buffer-20260801.md`.
+fn ir_code_buffer_retry_disabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IR_CODE_BUFFER_RETRY").is_some()
+    })
+}
+
 /// Hard ceiling on a retry. A method whose body genuinely needs more than this
 /// is better left to the single-pass backend than handed several megabytes of
 /// committed executable memory — `COMMITTED_JIT_CODE_BYTES` (the code-cache
@@ -6697,7 +6718,7 @@ pub(crate) fn lower_inner_with_scopes(
     let wanted = IR_CODE_BUFFER_WANTED.with(|c| c.replace(0));
     // A refusal for any other reason leaves this at 0 — no retry, byte-for-byte
     // the old behaviour.
-    if wanted == 0 || wanted > IR_CODE_BUFFER_RETRY_CAP {
+    if wanted == 0 || wanted > IR_CODE_BUFFER_RETRY_CAP || ir_code_buffer_retry_disabled() {
         return None;
     }
     // `wanted` is a lower bound on its own terms (`rewind_to` does not take
@@ -6901,8 +6922,10 @@ fn lower_inner_sized(
     let mut buf = ExecutableBuffer::new(capacity)?;
     buf.set_tag("ir-lower");
     // The first attempt's overflow is a measurement the retry consumes, not a
-    // failure; only a retry that ALSO overflows is worth a warning.
-    buf.set_quiet_overflow(min_capacity == 0);
+    // failure; only a retry that ALSO overflows is worth a warning. With the
+    // retry opted out there is no second attempt, so the overflow is a method
+    // silently leaving the optimizing tier again and has to be audible.
+    buf.set_quiet_overflow(min_capacity == 0 && !ir_code_buffer_retry_disabled());
 
     let mut lowerer = Lowerer::new(
         graph,

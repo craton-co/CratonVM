@@ -2,15 +2,15 @@
 
 **Status: OPEN.** Signature captured with a watchdog stack dump; cause not
 located. Filed because it is what stopped
-`BasicErrorControllerIntegrationTests` from producing 14 consecutive clean runs
-on 2026-08-01 — the class itself is green (see
-[`../../internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md`](../../internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md)),
-and this is a separate, load-triggered defect that was in the way.
+`BasicErrorControllerIntegrationTests` from producing 14 *consecutive* clean
+runs on 2026-08-01 — the class itself is green (see
+[`../../internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md`](../../internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md))
+and this is a separate defect that was in the way.
 
 ## Symptom
 
-The process stops making progress mid-run, between two per-test Spring Boot
-context boots, and never resumes. No exception, no output, no exit.
+The process stops making progress between two per-test Spring Boot context
+boots and never resumes. No exception, no output, no exit.
 `--stack-dump-on-timeout 1500` names the wait site exactly:
 
 ```
@@ -20,7 +20,7 @@ tid=0 os_tid=3449799 name="main" alive=true daemon=false blocked=true roots=973
    <- org/springframework/boot/autoconfigure/condition/OnClassCondition$ThreadedOutcomesResolver.resolveOutcomes@4
 ```
 
-and the 93-frame dump below it is an ordinary Spring Boot startup:
+and the 90-odd frames below it are an ordinary Spring Boot startup:
 
 ```
 BasicErrorControllerIntegrationTests.load
@@ -29,9 +29,8 @@ BasicErrorControllerIntegrationTests.load
       ConfigurationClassPostProcessor.processConfigBeanDefinitions
         ConfigurationClassParser$DeferredImportSelectorGrouping.getImports
           AutoConfigurationImportSelector.getAutoConfigurationEntry
-            AutoConfigurationImportSelector$ConfigurationClassFilter.filter
-              OnClassCondition$ThreadedOutcomesResolver.resolveOutcomes
-                Thread.join()
+            OnClassCondition$ThreadedOutcomesResolver.resolveOutcomes
+              Thread.join()
 ```
 
 `OnClassCondition` splits Spring Boot's auto-configuration class-presence
@@ -39,10 +38,11 @@ filtering across TWO threads — the caller evaluates one half, a spawned thread
 evaluates the other, and the caller `join()`s it. The spawned thread never
 completes, so `join()` never returns.
 
+Two occurrences captured this way (2026-08-01), both at the same wait site.
+
 ## What is and is not established
 
-**Established.** The wait site, and that the process is otherwise idle. The
-watchdog aborts after dumping, so the run ends `EXIT=134` (SIGABRT).
+**Established.** The wait site, and that the process is otherwise idle.
 
 **NOT established.** What the spawned thread is doing. The dump prints frames
 for the wait-site thread only; every other entry in the 226-thread summary is
@@ -54,24 +54,30 @@ its wakeup"** — that field cannot support the claim. Extending the watchdog to
 dump every registered thread's frames is the obvious next step and would
 probably settle this in one occurrence.
 
-## Rate and trigger
+## Rate
 
-14 runs of `BasicErrorControllerIntegrationTests` on 2026-08-01, Linux
-x86-64, `cratonvm-becit-fix5-20260801`, 2 concurrent:
+Same class, same host and fixture, 3 concurrent, 2026-08-01:
 
-| outcome | runs |
-|---|---|
-| PASS 26/26 | 11 |
-| stalled, killed at the harness's 2400 s cap (no watchdog armed yet) | 1 |
-| stalled, watchdog dump above, `EXIT=134` | 1 |
-| `failed=1` — client-side `HttpClient request timed out` on `testRequestBodyValidationForMachineClient` | 1 |
+| binary | runs | stalls |
+|---|---|---|
+| pristine `origin/dev` `5443fae920` | 34 | **0** |
+| the `fix/basicerrorcontroller-jit-20260801` branch, before merging dev | 20 | 2 |
+| the same branch merged with dev | 54 | 1 |
+| the same, with `CRATONVM_JIT_NO_IR_CODE_BUFFER_RETRY=1` | 20 | 0 |
 
-Both stalls happened while the shared 16-core host was carrying an external
-load average above 100 (peaks of 266 from other tenants); all eleven clean runs
-happened below ~60. Three subsequent replacement runs at load ~40 are recorded
-in the companion doc. The correlation is strong enough to call this
-load-triggered and weak enough that it is NOT an explanation: a scheduling
-delay does not by itself make a `join` never return.
+**Not load-gated, contrary to a first reading.** The first two occurrences
+happened while the shared 16-core host was carrying an external load average
+above 100, which invited the conclusion that contention was the trigger. The
+third happened at load ~22, on an otherwise quiet box. Scheduling pressure may
+change the odds; it is not the mechanism.
+
+Three events in 74 runs of the branch against **0** in 34 of pristine dev
+**does not distinguish the two trees**: at a ~4% rate a 34-run control comes up
+empty about a quarter of the time. A same-binary A/B of the branch's only
+JIT-churn change (the optimizing tier's code-buffer retry, 20 interleaved
+on/off pairs) came back 20/20 clean on BOTH arms, so that change is not the
+trigger either. Anyone tempted to blame — or clear — a specific change on these
+numbers should collect a much larger control first.
 
 ## Where to look first
 
@@ -96,8 +102,7 @@ slip between the `isAlive()` check and the `wait`.
 
 ## Reproduction
 
-Not reliably reproducible on demand. It appeared twice in fourteen runs of
-this class, only under heavy external load:
+Not reliably reproducible on demand — three occurrences in 54 runs.
 
 ```bash
 D=/data/data/spring-boot-tomcat-crossmodule-20260717
@@ -111,4 +116,4 @@ harness with no dump and cost the information.
 
 ## Affected classes
 
-- `module/spring-boot-webmvc` — `org.springframework.boot.webmvc.autoconfigure.error.BasicErrorControllerIntegrationTests` (2 stalls in 14 runs). Nothing about the stall is specific to this class: `OnClassCondition` runs on every Spring Boot context boot, and this class boots one per test.
+- `module/spring-boot-webmvc` — `org.springframework.boot.webmvc.autoconfigure.error.BasicErrorControllerIntegrationTests`. Nothing about the stall is specific to this class: `OnClassCondition` runs on every Spring Boot context boot, and this class boots one per test, which is simply a lot of chances.

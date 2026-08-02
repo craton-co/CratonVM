@@ -251,7 +251,39 @@ taken as the receiver).
 `BasicErrorControllerIntegrationTests`, default flags, 14 consecutive clean
 runs, plus a same-binary gate-closed control.
 
-GATE_RESULTS_PLACEHOLDER
+Run on the merged tree (`origin/dev` `5443fae920` + this branch), Linux
+x86-64, real JDK 25, 3 concurrent:
+
+| arm | runs | clean |
+|---|---|---|
+| default flags | 20 | **19** |
+| `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` (gate-closed control) | 2 | **2** |
+
+**Both arms clean is what settles the question this gate asks**, and it is the
+answer this report was filed to make obtainable: the class's failure was never
+about the direct-call edge, and anyone reading a red run of it as evidence
+against that edge between 2026-07-31 and 2026-08-01 was reading the wrong
+defect.
+
+**Not 14 *consecutive* clean runs, and the difference is worth stating.** One
+run in 20 stalled — `main` parked in `Thread.join()` inside Spring Boot's
+two-thread `OnClassCondition` filtering, caught by
+`--stack-dump-on-timeout 1500`. It is a separate defect, filed as
+[`../../known-issues/springboot/onclasscondition-join-never-returns-20260801.md`](../../known-issues/springboot/onclasscondition-join-never-returns-20260801.md).
+An earlier round on the same branch also lost one run to a SIGSEGV in an
+unmapped code buffer, filed as
+[`../../known-issues/jit/sigsegv-in-unmapped-code-buffer-20260801.md`](../../known-issues/jit/sigsegv-in-unmapped-code-buffer-20260801.md),
+and one to a client-side `HttpClient request timed out` at external load 147.
+
+Neither intermittent failure is attributable to this work on the evidence
+collected. Across 2026-08-01, on the same host and fixture: **54 runs of this
+branch produced 2 events; 20 runs with the branch's only JIT-churn change
+switched off produced 0; 34 runs of pristine `origin/dev` produced 0.** A
+same-binary A/B of that change — 20 interleaved on/off pairs — came back 20/20
+clean on both arms, with the lever verified live first (96 retries to 0, 1109
+to 1044 optimizing-tier bodies). Those numbers are consistent with a single
+underlying rate and cannot separate the trees; they are recorded here so the
+next person starts from data rather than from this report's silence.
 
 ## Still open on this class, and untouched here
 
