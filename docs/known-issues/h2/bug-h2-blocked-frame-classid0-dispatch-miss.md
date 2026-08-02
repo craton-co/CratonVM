@@ -7,7 +7,7 @@ a two-paragraph aside; it is a silent memory-safety defect and deserves its own
 page.
 
 Sibling face, same family, already root-caused from the other end:
-`bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`. **Read that page
+the retired `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep` write-up. **Read that page
 before this one** — it establishes that `java.lang.Object` / `ClassId(0)` has
 **four** possible causes and that guessing between them has already cost two
 sessions.
@@ -166,7 +166,7 @@ put into a probe.
 
 ## Related
 
-* `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md` — same family,
+* the retired `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep` write-up — same family,
   old-gen face, has the `reclaimed_hole_at` verdict and the reclamation ring.
 * `../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`
   — the same all-zero receiver reaching `Thread.clone`.

@@ -355,6 +355,42 @@ impl OldGen {
         let mut blocks: Vec<FreeBlock> = self.buckets.iter().flatten().copied().collect();
         blocks.sort_unstable_by_key(|b| b.offset);
 
+        // H2-CID0 (2026-08-02): the list is sorted here anyway, so one
+        // comparison per block answers "did something free the same span
+        // twice?". The young sweep has had `DOUBLE_FREE_SPANS` since
+        // 2026-08-01; old gen had no equivalent, and a double free there
+        // produces the same all-zero-header face (the allocator serves the
+        // bytes twice and `alloc` zeroes them under the first owner).
+        {
+            let mut overlaps = 0usize;
+            let mut first: Option<(usize, usize, usize)> = None;
+            for w in blocks.windows(2) {
+                if w[0].offset + w[0].size > w[1].offset {
+                    overlaps += 1;
+                    if first.is_none() {
+                        first = Some((w[0].offset, w[0].size, w[1].offset));
+                    }
+                }
+            }
+            if overlaps > 0 {
+                crate::gen_heap::OLD_FREE_LIST_OVERLAPS
+                    .fetch_add(overlaps as u64, std::sync::atomic::Ordering::Relaxed);
+                static REPORTS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if REPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    let (o, s, n) = first.unwrap_or((0, 0, 0));
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        pairs = overlaps,
+                        first = format!("+{o:#x}+{s:#x} overlaps +{n:#x}"),
+                        "old-gen free list contains OVERLAPPING blocks — a span was freed \
+                         twice. The allocator can serve the same bytes to two objects and \
+                         zero them under the first owner.",
+                    );
+                }
+            }
+        }
+
         let mut merged: Vec<FreeBlock> = Vec::with_capacity(blocks.len());
         for b in blocks {
             match merged.last_mut() {
@@ -634,7 +670,16 @@ impl OldGen {
                 if block.offset > cursor {
                     self.scan_region(base, cursor, block.offset, &mut objects);
                 }
-                cursor = block.offset + block.size;
+                // `max` because the free list is only guaranteed sorted by
+                // OFFSET, not disjoint. A block nested inside its predecessor
+                // (`[100,300)` then `[150,200)`) would otherwise pull the cursor
+                // back to 200 and the next gap would be walked from inside the
+                // first block — parsing free bytes as object headers, which is
+                // how a phantom header comes to subsume live objects. Nested
+                // blocks mean a double free (see `OLD_FREE_LIST_OVERLAPS`); this
+                // makes the walk safe while that is being diagnosed rather than
+                // silently mis-parsing.
+                cursor = cursor.max(block.offset + block.size);
             }
             // Region after last free block
             if cursor < self.data.len() {
@@ -831,6 +876,20 @@ impl OldGen {
     /// Returns a pointer map (old_addr → new_addr) for objects that moved.
     /// Objects that stay in place are NOT included in the map.
     pub fn compact(&mut self) -> HashMap<usize, usize> {
+        self.compact_with_drop_flags(&HashMap::new())
+    }
+
+    /// [`Self::compact`], plus the caller's per-block explanation of why the
+    /// mark could have missed each block this compaction is about to drop.
+    ///
+    /// H2-CID0: the flags are threaded through to the old-gen reclamation ring
+    /// so a `checkcast` failing on a stale reference minutes later says WHY the
+    /// block was unmarked, not just that it was. See
+    /// `gen_heap::OLD_FREED_FLAG_WATCHED`.
+    pub fn compact_with_drop_flags(
+        &mut self,
+        drop_flags: &HashMap<usize, u8>,
+    ) -> HashMap<usize, usize> {
         let base = self.data.as_mut_ptr();
         let objects = self.walk_objects();
         // GCAUD-4: bumped up front, so it covers the abandoned path too — that
@@ -909,9 +968,11 @@ impl OldGen {
                 // object was reclaimed instead of only WHERE.
                 crate::gen_heap::record_old_freed(
                     obj_ptr as usize,
+                    total_size,
                     header.class_id.as_u32(),
                     header.kind as u8,
                     crate::gen_heap::OLD_FREED_SITE_COMPACT,
+                    drop_flags.get(&(obj_ptr as usize)).copied().unwrap_or(0),
                 );
                 continue; // Dead object — skip
             }

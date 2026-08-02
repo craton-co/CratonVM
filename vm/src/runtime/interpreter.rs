@@ -20187,8 +20187,7 @@ fn execute_instruction(
                         // reclaimed object usually surfaces as a failed CAST
                         // first, and that path reported nothing — so setting
                         // the flag and reproducing still produced silence. See
-                        // docs/known-issues/h2/
-                        // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+                        // docs/gc/old-sweep-liveness.md section 7.
                         // H2-CID0 follow-up (2026-08-01): the `ClassId(0)` gate
                         // below is too narrow. A block freed while still
                         // referenced only reads back as `java.lang.Object`
@@ -20210,8 +20209,8 @@ fn execute_instruction(
                         // address really was freed recently.
                         {
                             let addr = obj_ref.as_ptr() as usize;
-                            if let Some((cid, kind, site, seq)) =
-                                cratonvm_gc::gen_heap::old_freed_lookup(addr)
+                            if let Some((cid, kind, site, seq, fbase, fsize, fflags)) =
+                                cratonvm_gc::gen_heap::old_freed_lookup_covering(addr)
                             {
                                 static F: std::sync::atomic::AtomicU64 =
                                     std::sync::atomic::AtomicU64::new(0);
@@ -20235,6 +20234,14 @@ fn execute_instruction(
                                         target_class = %target_binary,
                                         original_class = %orig,
                                         original_kind = kind,
+                                        freed_block = format!("{fbase:#x}+{fsize:#x}"),
+                                        interior_off = addr - fbase,
+                                        was_weak_referent =
+                                            fflags & cratonvm_gc::gen_heap::OLD_FREED_FLAG_WATCHED
+                                                != 0,
+                                        interior_root_pointed_in = fflags
+                                            & cratonvm_gc::gen_heap::OLD_FREED_FLAG_INTERIOR_ROOT
+                                            != 0,
                                         freed_by = if site == 1 {
                                             "in-place old-gen sweep"
                                         } else {
@@ -20293,8 +20300,8 @@ fn execute_instruction(
                                     // the young sweep ring this answers on the
                                     // FIRST occurrence rather than only on a
                                     // re-run with the right flag pre-set.
-                                    if let Some((cid, kind, site, seq)) =
-                                        cratonvm_gc::gen_heap::old_freed_lookup(addr)
+                                    if let Some((cid, kind, site, seq, _b, _s, wflags)) =
+                                        cratonvm_gc::gen_heap::old_freed_lookup_covering(addr)
                                     {
                                         let orig = shared
                                             .classes
@@ -20311,6 +20318,9 @@ fn execute_instruction(
                                             obj = format!("{addr:#x}"),
                                             original_class = %orig,
                                             original_kind = kind,
+                                            was_weak_referent = wflags
+                                                & cratonvm_gc::gen_heap::OLD_FREED_FLAG_WATCHED
+                                                != 0,
                                             freed_by = if site == 1 {
                                                 "in-place old-gen sweep"
                                             } else {

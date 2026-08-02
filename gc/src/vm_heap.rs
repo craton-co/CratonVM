@@ -1895,6 +1895,42 @@ impl VmHeap {
                 eprintln!("[GC] oldgen_coalesce: calls={calls} blocks_merged={merged}");
             }
         }
+        // H2-CID0 — the conservative-root and free-list invariants. Printed
+        // unconditionally when non-zero so a soak log answers "did the workload
+        // actually enter the regime this fix is about?" without a debug flag.
+        //
+        // `interior_root_pins` non-zero means conservative roots really are
+        // interior words of live old-gen objects in this workload, i.e. the hole
+        // the pin closes was live. `freed_interior_pinned` is ZERO BY
+        // CONSTRUCTION unless `CRATONVM_GC_NO_OLD_INTERIOR_PINS` disabled the
+        // pin — it is the negative control, and a non-zero value on an ordinary
+        // run would mean the pin has regressed. `free_list_overlaps` non-zero
+        // means an old-gen span was freed twice.
+        {
+            use std::sync::atomic::Ordering as O;
+            let pins = crate::gen_heap::OLDMARK_INTERIOR_ROOT_PINS.load(O::Relaxed);
+            let freed = crate::gen_heap::OLD_SWEEP_FREED_INTERIOR_PINNED.load(O::Relaxed);
+            let overlaps = crate::gen_heap::OLD_FREE_LIST_OVERLAPS.load(O::Relaxed);
+            if pins | freed | overlaps != 0 {
+                eprintln!(
+                    "[GC] oldgen_conservative: interior_root_pins={pins} \
+                     freed_interior_pinned={freed} free_list_overlaps={overlaps}"
+                );
+            }
+            // The compacting arm's half of the same question, and the cost of
+            // the answer. `dropped_interior_root` is zero by construction once
+            // the downgrade is in; `downgraded` against `major=N` above says how
+            // often compaction had to give way to the in-place sweep.
+            let c_watched = crate::gen_heap::COMPACT_DROPPED_WATCHED.load(O::Relaxed);
+            let c_interior = crate::gen_heap::COMPACT_DROPPED_INTERIOR_ROOT.load(O::Relaxed);
+            let c_down = crate::gen_heap::COMPACT_DOWNGRADED_INTERIOR_ROOT.load(O::Relaxed);
+            if c_watched | c_interior | c_down != 0 {
+                eprintln!(
+                    "[GC] oldgen_compact: dropped_watched_referents={c_watched} \
+                     dropped_interior_root={c_interior} downgraded_to_inplace={c_down}"
+                );
+            }
+        }
         // What the collector actually did on the last cycle and why. This is
         // the line that settles the `docs/GC.md` ("young collections run
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`

@@ -3935,8 +3935,7 @@ fn run() -> Result<()> {
             // Cross-thread STW peer-scan coverage. A non-zero count means the
             // collector swept while a peer it could not classify was still
             // running JIT code, i.e. that cycle marked from an INCOMPLETE root
-            // set. See docs/known-issues/h2/
-            // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+            // set. See docs/gc/old-sweep-liveness.md.
             use std::sync::atomic::Ordering as O;
             let peers = cratonvm_vm::jit::xt_root_scan::XT_PEERS_UNCLASSIFIED.load(O::Relaxed);
             let cycles =
