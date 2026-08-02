@@ -13,6 +13,9 @@
 //! - [`addr_keyed`] — post-collection re-key + sweep for address-keyed
 //!   side-tables that must NOT root their keys (caches, as opposed to the
 //!   root sources in `native_roots`)
+//! - [`reclaim_guard`] — the flag-free "this receiver points into memory the
+//!   collector already reclaimed" verdict, shared by the failure paths that
+//!   see an all-zero `ClassId(0)` header
 
 // Re-export submodules from the gc crate so that existing
 // `use crate::memory::{arena, heap, ...}` paths continue to work.
@@ -28,6 +31,7 @@ pub use cratonvm_gc::vm_heap;
 pub mod addr_keyed;
 pub mod gc;
 pub mod native_roots;
+pub mod reclaim_guard;
 pub mod roots;
 pub mod smuggled_longs;
 

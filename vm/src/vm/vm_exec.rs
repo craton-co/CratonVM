@@ -22065,6 +22065,35 @@ fn invoke_on_class_shared_inner(
                         .unwrap_or_default(),
                     "NoSuchMethodError"
                 );
+                // H2-CID0, dispatch face (2026-08-02): the same flag-free
+                // reclaimed-memory verdict the two `checkcast` reporters emit.
+                // A receiver whose class resolved to `ClassId(0)` is ambiguous
+                // — bare `java.lang.Object`, an un-hashed `new Object()`, and
+                // the all-zero header the collector leaves over a reclaimed
+                // span all wear that face — and until now the INVOKE path said
+                // nothing at all about which. Free-list membership is not
+                // ambiguous, so ask the heap.
+                //
+                // Gated on the `ClassId(0)` face because this terminal is also
+                // reached in bulk on HEALTHY runs (a missing method on a
+                // synthetic classpath stub logs here on every call), and the
+                // probe takes the young and old heap locks.
+                //
+                // Witness: `NoSuchMethodError java/lang/Object.hasNext()Z` from
+                // `TestMultiThread.testConcurrentUpdate @pc=252` — the
+                // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
+                // docs/known-issues/h2/
+                // bug-h2-blocked-frame-classid0-dispatch-miss.md.
+                if class_id == ClassId::new(0) {
+                    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                        crate::memory::reclaim_guard::report_reclaimed_receiver(
+                            shared,
+                            recv.as_ptr() as usize,
+                            "invoke dispatch",
+                            &format!("{class_name}.{method_name}{descriptor}"),
+                        );
+                    }
+                }
                 // CRATONVM_DBG_CCE_BT: a dispatch miss whose receiver resolved
                 // to bare `java/lang/Object` is the stale-ObjectRef family's
                 // cid=0 signature surfacing at INVOKE (the checkcast tracer's

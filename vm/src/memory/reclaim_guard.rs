@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! The flag-free "was this receiver RECLAIMED?" verdict, in one place.
+//!
+//! H2-CID0 (2026-08-01) added [`GenerationalHeap::reclaimed_hole_at`] because
+//! a receiver that reads back as `java.lang.Object` is ambiguous on its face:
+//! `java.lang.Object` is `ClassId(0)`, and so is the all-zero header the
+//! collector leaves over a span it reclaimed, and so is an ordinary
+//! `new Object()` whose identity hash has not been minted. Free-list
+//! membership is not ambiguous — a live object is never inside a free block,
+//! never past the allocation frontier, and never in the inactive semispace —
+//! so the heap can answer outright, with no debug flag set in advance.
+//!
+//! That verdict was wired into the two `checkcast` failure paths and nowhere
+//! else. **A dispatch miss has exactly the same face and was not covered**:
+//!
+//! ```text
+//! NoSuchMethodError method="java/lang/Object.hasNext()Z"
+//!      caller="org/h2/test/db/TestMultiThread.testConcurrentUpdate()V @pc=252"
+//! ```
+//!
+//! is `jobs.iterator()`'s `Iterator` reading back as `ClassId(0)` with
+//! `num_fields=0` — the same defect reaching the VM through
+//! `invokeinterface` instead of through a cast, and the same four candidate
+//! explanations with nothing to separate them. `CRATONVM_DBG_CCE_BT` prints a
+//! rich dump there, but only if it was set BEFORE the run, which is never true
+//! of the run that actually reproduces. See
+//! `docs/known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md`.
+//!
+//! Both `checkcast` reporters had already drifted from each other (the
+//! interpreter's consults the young-sweep ring, the JIT's does not), which is
+//! why this is a function and not a third copy. `jit::helpers`' copy and this
+//! module's new `invoke`-dispatch caller both route through
+//! [`report_reclaimed_receiver`]; `runtime::interpreter`'s `checkcast` copy is
+//! the remaining un-migrated one and carries a pointer here.
+
+use crate::vm::SharedVm;
+
+/// Rate limit shared by every verdict this module prints. A reclaimed receiver
+/// cascades — one freed block is read by many call sites — and the first
+/// handful carry all the information.
+const MAX_REPORTS: u64 = 8;
+
+fn class_name_of(shared: &SharedVm, cid: u32) -> String {
+    shared
+        .classes
+        .class_manager
+        .try_read()
+        .and_then(|cm| {
+            cm.get_class(cratonvm_types::ClassId::new(cid))
+                .map(|c| c.name.to_string())
+        })
+        .unwrap_or_else(|| format!("class_id={cid}"))
+}
+
+/// Ask the heap whether `addr` is inside memory the collector has reclaimed,
+/// and if so say so — plus what the freeing collector recorded about the block.
+///
+/// `site` names the VM operation that tripped over it ("checkcast",
+/// "JIT checkcast", "invoke dispatch"); `target` is the class or method the
+/// operation was trying to reach. Returns `true` when a reclaimed-memory
+/// verdict was reached, so a caller can suppress a more speculative
+/// explanation of its own.
+///
+/// Costs nothing until something has already gone wrong: every caller is on a
+/// terminal error path. It does take the young/old heap locks, so callers on
+/// paths that can fire in bulk on a HEALTHY run (a `NoSuchMethodError` against
+/// a synthetic stub, say) must gate on the `ClassId(0)` face first.
+pub(crate) fn report_reclaimed_receiver(
+    shared: &SharedVm,
+    addr: usize,
+    site: &'static str,
+    target: &str,
+) -> bool {
+    let Some((what, span, size)) = shared.mem.heap.reclaimed_hole_at(addr) else {
+        return false;
+    };
+    static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_REPORTS {
+        return true;
+    }
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        site = site,
+        location = %what,
+        span = format!("{span:#x}+{size:#x}"),
+        target_class = %target,
+        "receiver points into RECLAIMED memory — a still-referenced object was \
+         collected. `java.lang.Object` here is the all-zero header the collector \
+         left behind, not a real Object.",
+    );
+    // What the block held, and which reclamation freed it. The old-gen ring is
+    // unconditional, so unlike the young sweep ring this answers on the FIRST
+    // occurrence rather than only on a re-run with the right flag pre-set.
+    if let Some((cid, kind, freed_site, seq)) = cratonvm_gc::gen_heap::old_freed_lookup(addr) {
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            obj = format!("{addr:#x}"),
+            site = site,
+            original_class = %class_name_of(shared, cid),
+            original_kind = kind,
+            freed_by = if freed_site == 1 {
+                "in-place old-gen sweep"
+            } else {
+                "old-gen mark-compact"
+            },
+            free_seq = seq,
+            "…and the old-gen reclamation ring knows what that block held. The \
+             original class names the mark-phase gap that freed it while it was \
+             still referenced.",
+        );
+    }
+    // The young-sweep ring only records under `CRATONVM_DBG_SWEEP_ZERO`, which
+    // also switches the young collector to the sequential walk — so a hit here
+    // means the run was instrumented, and a miss says nothing either way.
+    if let Some((cid, kind, cycle, reason, initiator, blocked)) =
+        cratonvm_gc::gen_heap::sweep_zero_lookup(addr)
+    {
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            obj = format!("{addr:#x}"),
+            site = site,
+            original_class = %class_name_of(shared, cid),
+            original_kind = kind,
+            sweep_cycle = cycle,
+            gc_reason = reason,
+            gc_initiator = initiator,
+            threads_blocked = blocked,
+            "…and it was RECLAIMED BY THE YOUNG SWEEP while still reachable. The \
+             original class names the root-coverage gap.",
+        );
+    }
+    true
+}
