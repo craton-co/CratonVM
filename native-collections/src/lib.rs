@@ -983,18 +983,122 @@ fn pack_obj_key(hash: u32, generation: u32) -> usize {
 /// Unknown key (no such slot) answers `true`: absence of evidence is not
 /// evidence of a mismatch, and dropping a root on it would be the unsafe
 /// direction. Over-retaining one cycle is the safe one.
-fn owner_key_class_matches(key: usize, actual_class_id: u32) -> bool {
+/// OFF BY DEFAULT — measured harmful. Opt in with `CRATONVM_OWNER_CLASS_FILTER=1`.
+///
+/// The defect this guards against is real and unit-proven (see
+/// `marker_owner_lookup_survives_address_recycling_by_a_non_collection`): the
+/// marker's owner→overlay lookup has no identity check, so an ordinary object
+/// that recycles a dead collection's block inherits its references. But
+/// ENFORCING the check costs more than it saves on the workload that motivated
+/// it.
+///
+/// One-binary A/B on `DefaultCatalogAndSchemaTest`, arms alternating, only this
+/// variable differing (`probes/owner-filter-flag-ab-20260801.sh`):
+///
+/// | arm | rc  | stale receivers |
+/// |-----|-----|-----------------|
+/// | off | 139 | 0               |
+/// | on  | 139 | 3641            |
+/// | off | 127 | 0               |
+/// | on  | 139 | 973             |
+///
+/// Dropping a key discards a LIVE collection's roots whenever the recorded and
+/// actual class disagree for any reason OTHER than recycling, and on this
+/// workload they disagree often enough to reclaim thousands of live objects.
+/// Exempting the zeroed-header case (`class_id == 0`, an already-freed owner)
+/// cut it from 5784/637 to 3641/973 but did not close it — so the remaining
+/// mismatches are not just corrupted owners.
+///
+/// It stays a runtime switch, not a second binary, because that is what made
+/// the effect attributable at all: a two-binary comparison had shown only
+/// `found=132` vs `110` and looked like a clean win.
+///
+/// Before re-enabling this, find a discriminator that cannot fire on a live
+/// collection — the recorded class is not one.
+fn owner_class_filter_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_OWNER_CLASS_FILTER").is_some()
+    })
+}
+
+/// `CRATONVM_DBG_OWNER_FILTER=1`: report every key this check DROPS.
+///
+/// A drop is only correct when the address was genuinely recycled. If the
+/// registry's recorded class can disagree with the marker's header class for
+/// any OTHER reason, this filter discards a LIVE collection's roots — the one
+/// direction that turns a diagnostic improvement into a use-after-free. The
+/// counter distinguishes "rare, and each one an aliased address" from
+/// "systematic", which is the difference between a fix and a regression.
+fn owner_filter_dbg() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OWNER_FILTER").is_some())
+}
+
+static OWNER_FILTER_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total keys dropped by the owner identity check this process.
+pub fn owner_class_filter_drop_count() -> u64 {
+    OWNER_FILTER_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn owner_key_class_matches(key: usize, actual_class_id: u32, owner_addr: usize) -> bool {
     let hash = (key >> 32) as u32;
     let generation = key as u32;
-    let shard = obj_key_shard_for(hash)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match shard.get(&hash) {
+    let recorded = {
+        let shard = obj_key_shard_for(hash)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match shard.get(&hash) {
+            None => None,
+            Some(slots) => slots
+                .iter()
+                .find(|s| s.generation == generation)
+                .map(|s| (s.class_id, s.last_ptr)),
+        }
+    };
+    match recorded {
+        // Unknown key: absence of evidence is not evidence of a mismatch, and
+        // dropping a root here would be the unsafe direction. Over-retaining
+        // one cycle is the safe one.
         None => true,
-        Some(slots) => match slots.iter().find(|s| s.generation == generation) {
-            None => true,
-            Some(slot) => slot.class_id == actual_class_id,
-        },
+        Some((recorded_class, last_ptr)) => {
+            if recorded_class == actual_class_id {
+                return true;
+            }
+            // A ZEROED header is not evidence of recycling. It is evidence of
+            // corruption somewhere ELSE, and dropping on it makes that
+            // corruption strictly worse.
+            //
+            // `class_id == 0` is both the all-zero header of an already-freed
+            // block and the legitimate `ClassId(0)` ad-hoc container shape, so
+            // it cannot discriminate. Measured on `DefaultCatalogAndSchemaTest`
+            // with `CRATONVM_DBG_OWNER_FILTER=1`: the drops were dominated by
+            // `recorded_class=64 actual_class=0 same_addr=true` — the owner's
+            // own block had already been freed underneath a live collection.
+            // Dropping its overlay refs there removes the last thing keeping
+            // that collection's CONTENTS marked, turning ONE premature free
+            // into a cascade: 637 and 5784 stale receivers on the two runs that
+            // crashed, against 117 with no filter at all.
+            //
+            // Retaining on an unreadable owner costs one cycle of
+            // over-retention — the same safe direction as the unknown-key arm.
+            if actual_class_id == 0 || recorded_class == 0 {
+                return true;
+            }
+            let n = OWNER_FILTER_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if owner_filter_dbg() && n < 32 {
+                eprintln!(
+                    "[owner-filter] DROP key=0x{key:x} owner=0x{owner_addr:x} \
+                     recorded_class={recorded_class} actual_class={actual_class_id} \
+                     slot_last_ptr=0x{last_ptr:x} same_addr={}",
+                    last_ptr == owner_addr,
+                );
+            }
+            false
+        }
     }
 }
 
@@ -34976,11 +35080,11 @@ pub fn gc_overlay_roots_for_collection(
     // the header), so a mismatch means the registering collection is gone and
     // this entry belongs to a previous tenant.
     let keys: Vec<usize> = match owner_class_id {
-        None => keys,
-        Some(actual) => keys
+        Some(actual) if owner_class_filter_enabled() => keys
             .into_iter()
-            .filter(|key| owner_key_class_matches(*key, actual))
+            .filter(|key| owner_key_class_matches(*key, actual, owner_addr))
             .collect(),
+        _ => keys,
     };
     if keys.is_empty() {
         return Vec::new();
@@ -51349,9 +51453,12 @@ mod tests {
     #[test]
     fn marker_owner_lookup_survives_address_recycling_by_a_non_collection() {
         use super::{
-            gc_overlay_roots_for_collection, ll_overlay, obj_key_shard_for, pack_obj_key,
-            register_overlay_owner_key, ObjKeyEntry,
+            obj_key_shard_for, owner_key_class_matches, pack_obj_key, ObjKeyEntry,
         };
+        // Tests the PREDICATE directly, not `gc_overlay_roots_for_collection`,
+        // so it documents the defect regardless of whether enforcement is
+        // enabled — which it is NOT by default; see
+        // `owner_class_filter_enabled` for the measurements that disabled it.
 
         // A never-dereferenced, 8-aligned fake address for the dead collection.
         const DEAD_HASH: u32 = 0x5EED_BEEF;
@@ -51360,15 +51467,8 @@ mod tests {
         let recycled_addr = 0x5EED_0000usize;
         let dead_key = pack_obj_key(DEAD_HASH, 0);
 
-        // A live LinkedList at `recycled_addr`, with one overlay reference and
-        // the registry slot `widened_obj_key` would have created for it.
-        let payload = unsafe { cratonvm_types::ObjectRef::from_raw(0x1234_5000 as *mut u8) };
-        ll_overlay()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(dead_key)
-            .or_default()
-            .insert("head", Value::Object(Some(payload)));
+        // The registry slot `widened_obj_key` would have created for a live
+        // LinkedList at `recycled_addr`.
         obj_key_shard_for(DEAD_HASH)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -51380,27 +51480,34 @@ mod tests {
                 class_id: LINKED_LIST_CLASS,
                 vm: 0,
             });
-        register_overlay_owner_key(recycled_addr, dead_key);
 
-        // While it is alive the marker must still see its references.
-        let live = gc_overlay_roots_for_collection(recycled_addr, Some(LINKED_LIST_CLASS));
+        // While the collection is alive its own class matches, so its roots
+        // are kept. (A predicate that answered `false` here would drop a live
+        // collection's references — the failure mode that keeps enforcement
+        // switched off by default.)
         assert!(
-            live.iter().any(|r| r.as_ptr() == payload.as_ptr()),
-            "a LIVE collection's overlay reference must still be marked"
+            owner_key_class_matches(dead_key, LINKED_LIST_CLASS, recycled_addr),
+            "a LIVE collection's own overlay keys must be kept"
         );
 
-        // Now it dies, its block is REALLOCATED to an ordinary object of a
-        // different class, and that object never touches an overlay — so
-        // `widened_obj_key` (and therefore case 2b's cleanup) never runs and
-        // nothing in the system observes the handover.
-        let roots = gc_overlay_roots_for_collection(recycled_addr, Some(UNRELATED_CLASS));
-
+        // It dies, and its block is REALLOCATED to an ordinary object of a
+        // different class that never touches an overlay — so `widened_obj_key`
+        // (and therefore case 2b's cleanup) never runs and nothing in the
+        // system observes the handover. The recorded class still names the
+        // dead collection, so the mismatch is detectable.
         assert!(
-            !roots.iter().any(|r| r.as_ptr() == payload.as_ptr()),
-            "the marker was handed a DEAD collection's overlay reference on \
-             behalf of an unrelated object that merely reuses its address; \
-             `gc_overlay_roots_for_collection` needs the same identity check \
-             `widened_obj_key` already applies"
+            !owner_key_class_matches(dead_key, UNRELATED_CLASS, recycled_addr),
+            "a recycled address must not inherit the DEAD collection's overlay              keys: the marker has no identity check of its own, while
+             `widened_obj_key` applies exactly this one"
+        );
+
+        // A ZEROED owner header is ambiguous — an already-freed block and the
+        // legitimate `ClassId(0)` container share it — so it must NOT license a
+        // drop. Enforcing there cascades one premature free into every element
+        // the collection holds.
+        assert!(
+            owner_key_class_matches(dead_key, 0, recycled_addr),
+            "class_id 0 is not evidence of recycling and must retain"
         );
     }
 
