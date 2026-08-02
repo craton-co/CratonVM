@@ -20,7 +20,7 @@ for CLS in \
   org.apache.tomcat.websocket.pojo.TestEncodingDecoding \
   org.apache.tomcat.websocket.TestWsSessionSuspendResume \
   org.apache.tomcat.websocket.server.TestAsyncMessagesPerformance \
-  org.apache.tomcat.websocket.TestWsRemoteEndpointImplClient ; do
+  org.apache.tomcat.websocket.TestWsRemoteEndpoint ; do
   short=$(echo "$CLS" | sed 's/.*\.//')
   out=$P/cl2-$TAG-$short-$rep.log
   if [ "$(basename "$EXE")" = "java" ]; then

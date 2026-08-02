@@ -59,6 +59,13 @@ grow. They are two independent defects that happened to meet in this test.
    `offer()` down its grow branch on *every* submission, so the pool runs
    straight to `maxThreads`. HotSpot's stays at 10.
 
+   Two of the three links here are measured — the predicate is wrong (probe
+   table below) and the pool saturates (A/B below). The third is an argument,
+   and it is checkable: `offer()` is the only place the pool decides to grow
+   past core, and the only three things it reads are `getMaximumPoolSize()` (a
+   plain field), `getSubmittedCount()` (an `AtomicInteger`) and
+   `getPoolSizeNoLock()`. The broken predicate is the only candidate.
+
 2. At `poolSize == maxPoolSize` there is a benign race in Tomcat's own
    executor: `TaskQueue.offer` can return `false` (asking for a new thread) just
    as `addWorker` starts refusing, so `execute()` lands in its
@@ -217,7 +224,7 @@ against a HotSpot control in the same window:
 | TestEncodingDecoding | PASS (6) | PASS (6) |
 | TestWsSessionSuspendResume | PASS (2) | PASS (2) |
 | TestAsyncMessagesPerformance | PASS (1) | **FAIL** — see below |
-| ~~TestWsRemoteEndpointImplClient~~ | *no such class* | *no such class* |
+| TestWsRemoteEndpoint | PASS (8) | PASS (8) |
 
 Selector regression batch — the Tomcat classes that lean hardest on
 `Selector`/`OP_WRITE` readiness, since the fix removes a readiness the code used
@@ -245,6 +252,11 @@ that blocked this test build when `5fa4cdb6fb` landed is gone on current dev.)
 `async_socket::tests::audit_failed_delivery_is_remapped_and_releases_roots`,
 confirmed failing identically on the unmodified base commit.
 
+Everything above was re-run on a binary built from the branch *after* merging
+`origin/dev@103d8328f`, since dev moved during the work: task ratio 1.01 on 3/3
+(HotSpot 1.01 on 3/3 interleaved), `TestWsRemoteEndpointImplServerDeadlock`
+PASS (4) on 2/2 reps, and the selector regression batch identical row for row.
+
 ## Handed over, not closed
 
 **`TestAsyncMessagesPerformance` is a separate, still-open latency gap.** It is
@@ -259,10 +271,11 @@ against HotSpot's 65/32/21/0. The selector fix helps `SEQ1` and is neutral on
 the cost is inside the WebSocket send path.
 
 **`TestWsRemoteEndpointImplClient` was never a failure.** The original
-validation script listed a class that does not exist in the fixture (the real
-one is `org.apache.tomcat.websocket.TestWsRemoteEndpoint`), so JUnit's
+validation script listed a class that does not exist in the fixture, so JUnit's
 `ClassNotFoundException` was being recorded as `FAIL[Tests run: 1, Failures: 1]`
-— on HotSpot too. `wscluster2.sh` drops it.
+— on HotSpot too. `wscluster2.sh` runs the real class,
+`org.apache.tomcat.websocket.TestWsRemoteEndpoint`, which passes 8/8 on both
+VMs.
 
 ## Reproduction
 
