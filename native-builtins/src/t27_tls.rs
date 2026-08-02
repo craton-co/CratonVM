@@ -7978,19 +7978,36 @@ fn engine_run_trust_check(
         cratonvm_types::ClassId::new(0),
         pending.peer_chain_der.len(),
     );
+    // Pin the chain array BEFORE it is filled, not after. `make_x509_mirror`
+    // allocates a `byte[]` and runs the real `sun.security.x509.X509CertImpl`
+    // constructor, and `create_string` below allocates too — any of which can
+    // trigger a moving young collection that relocates `arr`. The old code
+    // took its pin only after the fill loop, so a collection between two
+    // iterations left `arr` naming a stale slot: the `set_array_element` that
+    // followed was DROPPED by the heap guard (`gen_heap: out-of-bounds ...
+    // dropped`), the chain reached `X509TrustManagerImpl.checkServerTrusted`
+    // with a null element, and the handshake failed as
+    // `SSLHandshakeException: TrustManager rejected the peer certificate
+    // chain`. Observed on `TestSSLHostConfigCompat.testHostEC[JSSE-KEYSTORE]`
+    // once the sibling STW-takeover fix (`http_url_connection::perform`)
+    // stopped that same window from deadlocking instead. Family-1 shape: a
+    // native local held live across an allocation.
+    let base = ctx.pin_native_root(arr);
+    let mut arr = arr;
     for (i, der) in pending.peer_chain_der.iter().enumerate() {
         let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der);
+        // No allocation between this re-read and the store.
+        arr = ctx.read_native_pin(base, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
     }
     let auth_type_str = ctx.create_string(auth_type);
 
-    // Pin the chain array, the authType string, and every TrustManager we're
-    // about to call — each `invoke_virtual` below can allocate/GC, and a
-    // stale ObjectRef from an earlier loop iteration would silently resolve
-    // to a reused slot after a move (see `pin_native_root`'s doc). Mirrors
-    // the existing multi-call pin pattern in `net_phase_e.rs`'s
-    // group-collector native.
-    let base = ctx.pin_native_root(arr);
+    // Pin the authType string and every TrustManager we're about to call —
+    // each `invoke_virtual` below can allocate/GC, and a stale ObjectRef from
+    // an earlier loop iteration would silently resolve to a reused slot after
+    // a move (see `pin_native_root`'s doc). Mirrors the existing multi-call
+    // pin pattern in `net_phase_e.rs`'s group-collector native. `base + 1` is
+    // the authType pin because these two pins are taken back to back.
     let _ = ctx.pin_native_root(auth_type_str);
     let tm_pins: Vec<usize> = trust_managers
         .iter()

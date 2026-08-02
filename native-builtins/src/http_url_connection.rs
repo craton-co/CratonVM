@@ -2154,6 +2154,125 @@ fn huc_unverified_peer_message(host: &str) -> String {
     )
 }
 
+/// The part of an https exchange that happens once the TLS handshake — and
+/// every Java-facing gate hanging off it — is complete: write the request,
+/// read the response, drain any post-handshake control records.
+///
+/// Extracted from [`perform`] so its caller can run the whole thing inside one
+/// `begin_blocking_region()`/`end_blocking_region()` bracket without an early
+/// `return` ever escaping between the two (a thread that leaves a blocking
+/// region unclosed stays permanently marked GC-blocked — the mirror image of
+/// the deadlock the bracket exists to prevent; the `SSLSocketOutputStream`
+/// drain loop in `phases_late/ssl_security.rs` carries the same warning).
+/// Nothing here touches the Java heap or takes a `NativeContext`, which is
+/// what makes parking across it sound — see the STW-TAKEOVER-FIX note at the
+/// call site.
+fn https_post_handshake_exchange(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    req: &[u8],
+    head: bool,
+) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    // FIX (tls-handshake-enforcement-gap, doc 21): a TLS 1.3 client finishes
+    // its own side of the handshake before the server has accepted it, so a
+    // server that rejects (e.g. a REQUIRED client certificate that was not
+    // presented) sends its alert and closes while we are already past
+    // `is_handshaking()`. That surfaces here as a failing FIRST write/flush —
+    // before a single request byte has been acknowledged, let alone a response
+    // byte read — and was reported as a bare `IOException`. Real JSSE raises
+    // `SSLHandshakeException`; `TestSslHandshakeFailure
+    // .testMissingClientCertificate` asserts exactly that type. Only this
+    // first write is reclassified: any later write failure happens on a
+    // connection the server already accepted and is a genuine transport error.
+    stream.write_all(req).map_err(|e| {
+        format!(
+            "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
+             TLS handshake, before the request could be sent — the peer likely \
+             rejected the handshake: write: {e}"
+        )
+    })?;
+    stream.flush().map_err(|e| {
+        format!(
+            "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
+             TLS handshake, before the request could be sent — the peer likely \
+             rejected the handshake: flush: {e}"
+        )
+    })?;
+    // A TLS 1.3 client considers ITS side of the handshake finished (and so
+    // `is_handshaking()` above already flipped false) as soon as it has sent
+    // its own Finished — the server can still reject afterwards (e.g. a
+    // required-but-missing client certificate: `NoCertificatesPresented`)
+    // and close the connection without ever sending an HTTP response. Real
+    // JSSE surfaces that as `SSLHandshakeException`/`SSLException`, not a
+    // silent empty/malformed response, so a connection that closes before
+    // a single response byte arrives — immediately after our own optimistic
+    // handshake completion — is classified the same way here rather than
+    // falling through to `huc_real_perform`'s generic "-1" contract (which
+    // is correct for a genuinely malformed-but-present HTTP response, not
+    // for zero bytes at all).
+    let response = read_response(stream, head).map_err(|e| {
+        if e == "connection closed before response head" {
+            format!(
+                "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection closed immediately after the \
+                 TLS handshake with no response — the peer likely rejected the handshake \
+                 (e.g. a required client certificate was not presented): {e}"
+            )
+        } else if e.contains("received fatal alert") {
+            // FIX (tls-handshake-enforcement-gap, doc 21): the peer rejected
+            // the connection with a TLS alert instead of closing silently —
+            // e.g. `CertificateRequired` from a
+            // `certificateVerification="required"` connector when the client
+            // presented none (`TestSslHandshakeFailure
+            // .testMissingClientCertificate`). No response byte has been read
+            // at this point, so this is a rejected handshake, not a mid-stream
+            // transport error, and real JSSE raises `SSLHandshakeException`
+            // for it. Without this it fell through to the generic
+            // `IOException` wrapper — the exact type mismatch that test
+            // asserts on.
+            format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}{e}")
+        } else {
+            e
+        }
+    })?;
+    // TLS 1.3 tickets are post-handshake messages. The response body may
+    // finish before the server's NewSessionTicket has been read; consume any
+    // immediately available control records so the shared ClientConfig retains
+    // the ticket for the next URL connection.
+    let old_timeout = stream.sock.read_timeout().ok().flatten();
+    let _ = stream
+        .sock
+        .set_read_timeout(Some(Duration::from_millis(100)));
+    let mut drain_err: Option<String> = None;
+    while stream.conn.wants_read() {
+        match stream.conn.read_tls(&mut stream.sock) {
+            Ok(0) => break,
+            Ok(_) => {
+                if let Err(e) = stream.conn.process_new_packets() {
+                    drain_err =
+                        Some(format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}post-handshake TLS: {e}"));
+                    break;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                break;
+            }
+            Err(e) => {
+                drain_err = Some(format!("post-handshake TLS read: {e}"));
+                break;
+            }
+        }
+    }
+    let _ = stream.sock.set_read_timeout(old_timeout);
+    match drain_err {
+        Some(e) => Err(e),
+        None => Ok(response),
+    }
+}
+
 fn perform(
     ctx: &mut dyn NativeContext,
     connection: Option<ObjectRef>,
@@ -2507,96 +2626,7 @@ fn perform(
             // call back into Java.
             drop(active_ctx_guard);
             ctx.begin_blocking_region();
-            let exchange = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
-            // FIX (tls-handshake-enforcement-gap, doc 21): a TLS 1.3 client
-            // finishes its own side of the handshake before the server has
-            // accepted it, so a server that rejects (e.g. a REQUIRED client
-            // certificate that was not presented) sends its alert and closes
-            // while we are already past `is_handshaking()`. That surfaces
-            // here as a failing FIRST write/flush — before a single request
-            // byte has been acknowledged, let alone a response byte read —
-            // and was reported as a bare `IOException`. Real JSSE raises
-            // `SSLHandshakeException`; `TestSslHandshakeFailure
-            // .testMissingClientCertificate` asserts exactly that type. Only
-            // this first write is reclassified: any later write failure
-            // happens on a connection the server already accepted and is a
-            // genuine transport error.
-            stream.write_all(&req).map_err(|e| {
-                format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
-                         TLS handshake, before the request could be sent — the peer likely \
-                         rejected the handshake: write: {e}")
-            })?;
-            stream.flush().map_err(|e| {
-                format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
-                         TLS handshake, before the request could be sent — the peer likely \
-                         rejected the handshake: flush: {e}")
-            })?;
-            // A TLS 1.3 client considers ITS side of the handshake finished (and so
-            // `is_handshaking()` above already flipped false) as soon as it has sent
-            // its own Finished — the server can still reject afterwards (e.g. a
-            // required-but-missing client certificate: `NoCertificatesPresented`)
-            // and close the connection without ever sending an HTTP response. Real
-            // JSSE surfaces that as `SSLHandshakeException`/`SSLException`, not a
-            // silent empty/malformed response, so a connection that closes before
-            // a single response byte arrives — immediately after our own optimistic
-            // handshake completion — is classified the same way here rather than
-            // falling through to `huc_real_perform`'s generic "-1" contract (which
-            // is correct for a genuinely malformed-but-present HTTP response, not
-            // for zero bytes at all).
-            let response = read_response(&mut stream, head).map_err(|e| {
-                if e == "connection closed before response head" {
-                    format!(
-                        "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection closed immediately after the \
-                         TLS handshake with no response — the peer likely rejected the handshake \
-                         (e.g. a required client certificate was not presented): {e}"
-                    )
-                } else if e.contains("received fatal alert") {
-                    // FIX (tls-handshake-enforcement-gap, doc 21): the peer
-                    // rejected the connection with a TLS alert instead of
-                    // closing silently — e.g. `CertificateRequired` from a
-                    // `certificateVerification="required"` connector when the
-                    // client presented none (`TestSslHandshakeFailure
-                    // .testMissingClientCertificate`). No response byte has
-                    // been read at this point, so this is a rejected
-                    // handshake, not a mid-stream transport error, and real
-                    // JSSE raises `SSLHandshakeException` for it. Without
-                    // this it fell through to the generic `IOException`
-                    // wrapper — the exact type mismatch that test asserts on.
-                    format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}{e}")
-                } else {
-                    e
-                }
-            })?;
-            // TLS 1.3 tickets are post-handshake messages. The response body
-            // may finish before the server's NewSessionTicket has been read;
-            // consume any immediately available control records so the shared
-            // ClientConfig retains the ticket for the next URL connection.
-            let old_timeout = stream.sock.read_timeout().ok().flatten();
-            let _ = stream
-                .sock
-                .set_read_timeout(Some(Duration::from_millis(100)));
-            while stream.conn.wants_read() {
-                match stream.conn.read_tls(&mut stream.sock) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        stream.conn.process_new_packets().map_err(|e| {
-                            format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}post-handshake TLS: {e}")
-                        })?;
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) =>
-                    {
-                        break;
-                    }
-                    Err(e) => return Err(format!("post-handshake TLS read: {e}")),
-                }
-            }
-            let _ = stream.sock.set_read_timeout(old_timeout);
-            Ok(response)
-            })();
+            let exchange = https_post_handshake_exchange(&mut stream, &req, head);
             ctx.end_blocking_region();
             exchange
         })();
