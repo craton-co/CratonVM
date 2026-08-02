@@ -180,6 +180,32 @@ no SIGSEGV):
   org.h2.mvstore.Page` out of `FileStore.readPageFromCache`. Not reproduced
   on the merged build. If `TestMVStoreCachePerformance` regresses again,
   this is the shape to look for — and it is NOT what this doc describes.
+
+  **It recurred (2026-08-02).** A twelfth-pass `TestUpgrade`-session rerun
+  of the full FAIL/CRASH/HANG bucket, on a worktree merged straight to
+  `origin/dev` (well past this doc's own "final integrated tree" row above
+  — includes `c1fe51a244` and everything before it, i.e. genuinely the
+  merged build, not the pre-merge one), hit the identical shape again:
+  ```
+  Exception in thread "main" org/h2/mvstore/MVStoreException:
+    java.lang.ClassCastException: java.lang.Object cannot be cast to org.h2.mvstore.Page [2.4.249/3]
+  	at org/h2/mvstore/FileStore$BackgroundWriterThread.run(FileStore.java:2266)
+  	at org/h2/mvstore/FileStore.writeInBackground(FileStore.java:1869)
+  	at org/h2/mvstore/RandomAccessStore.doHousekeeping(RandomAccessStore.java:745)
+  	at org/h2/mvstore/MVStore.tryExecuteUnderStoreLock(MVStore.java:1079)
+  	at org/h2/mvstore/MVStore.panic(MVStore.java:515)
+  ```
+  (`--jit off`, `--Xmx 1g`, exit 1 @881.5s — via `FileStore.writeInBackground`'s
+  housekeeping/background-writer path this time, not `readPageFromCache`, so
+  it's not even the same call site as the one-off above; two different call
+  sites now share this exact cast-failure shape). No `gen_heap` guard hits or
+  corrupt-cell reports observed in this run's output — consistent with this
+  doc's own characterization that this shape is "NOT what this doc
+  describes," i.e. a second, still-unidentified defect distinct from the
+  old-gen reference-processing bug this doc fixed. Confirms this is a real,
+  recurring (if infrequent) issue, not a one-off artifact of the pre-merge
+  build — worth its own investigation rather than assuming it was
+  incidentally fixed alongside this one.
 * A JIT repeat was killed by the **host's** OOM killer (exit 137) at load
   average 379 with 0 GB free, log clean to the last line. Environment
   casualty, not a VM result.
