@@ -1,18 +1,21 @@
 # `TestDiskFull` hangs: an upstream H2 transaction-recovery livelock, amplified by CratonVM throughput
 
 ## Status
-**OPEN, but not a CratonVM defect.** Root-caused 2026-08-01. There is nothing
-to fix in the VM: the infinite loop is in H2 (`2.4.249-SNAPSHOT`, the version in
-`apps/h2database`), it is reachable on stock HotSpot, and every control that
-changes *when* the fault is injected removes it without touching CratonVM.
-CratonVM walks into it far more often only because it is slower.
+**CLOSED for CratonVM 2026-08-02.** Retired from `docs/known-issues/h2/`: every
+CratonVM-side residual this write-up named is closed, and what remains is an
+upstream H2 defect in `2.4.249-SNAPSHOT` that reproduces on stock HotSpot and
+that we must not patch (`apps/h2database` runs stock code by design).
 
-This doc exists so that the next person who sees `org.h2.test.synth.TestDiskFull`
-time out in the H2 suite does not spend a day looking for a GC bug. The
-heap-corruption report that used to cover this class
-(`class_id=ClassId(0)` guard burst → `SIGSEGV`/`ClassCastException`) is **fixed
-and retired**; see the retired `bug-h2-testdiskfull-classid0-corruption-segv-cce`
-write-up.
+`org.h2.test.synth.TestDiskFull` therefore **still wedges** in most CratonVM
+runs of the 60-iteration form, and that is expected, not a regression. The
+whole point of this page is that the next person who sees it does not spend a
+day looking for a GC bug. See *Closure, 2026-08-02* at the end for what was
+re-verified and what was fixed.
+
+The heap-corruption report that used to cover this class
+(`class_id=ClassId(0)` guard burst → `SIGSEGV`/`ClassCastException`) is fixed
+and retired separately; see the retired
+`bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up.
 
 ## Severity
 **MEDIUM** — `TestDiskFull` wedges (no progress, ~100 % CPU on `main`) in most
@@ -199,3 +202,63 @@ name the blocker and its status directly.
 * `bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md` — `Chunk N not
   found` is upstream fault-injection flakiness and shows on HotSpot too (58 of
   150 runs here).
+
+## Closure, 2026-08-02
+
+Re-run against `origin/dev@86a01abf90` on the Azure host (JDK 25, `--Xmx 1g`,
+`DFULL_MAX=60`, 10 runs, 4 at a time):
+
+| | 2026-08-01 (as filed) | 2026-08-02 (re-verified) |
+| --- | --- | --- |
+| runs that livelocked | 10 / 10 | **8 / 10** |
+| unapplied `COMMITTED` leftovers | 20 | 15 |
+| leftover map/key | `table.0` key 2 / 3 / 4 | `table.0` key 2 / 3 / 4 |
+
+Same defect, same leftovers, same keys. Nothing about the upstream chain moved.
+
+### Residual 1 — the `code buffer estimate too small` bails: CLOSED
+
+The write-up named `ValueDataType.write`, `MVStore.openMap` and
+`TransactionStore$TxMapBuilder.create` as methods this workload lost to the
+optimizing tier's under-sized code buffer. Across the 10 re-verification runs
+there is now **one** such bail in total, on a different method
+(`ValueDataType.readValue`), and none on the three named. Closed by
+`ebf1cf3131` (*perf/ir-code-buffer-estimate*), which refitted the estimate to
+`nodes*64 + calls*1536 + 4096`.
+
+### Residual 2 — what that fix exposed: FIXED
+
+Sizing the buffer correctly let the hot MVStore methods compile, and the
+artifacts two of them compiled into were broken. Filed as
+`docs/known-issues/jit/unresumable-unconditional-trap-mvmap-20260802.md`
+(`InternalError: … refusing side-effecting replay`, which killed
+`org.h2.test.db.TestMultiThread` in under 3 s), root-caused and fixed on
+2026-08-02:
+
+* `ir_lower` never stamped a method identity into the deopt frames it builds, so
+  an optimizing-tier deopt could not be resumed by the call site that triggered
+  it and instead surfaced as a hard `InternalError` blamed on an unrelated
+  caller, at a bci that does not exist in the method it named;
+* `Op::Div`/`Op::Rem` are floating nodes with no control edge, so the scheduler
+  could hoist an integer division — **and its trap** — above the branch that
+  guarantees a non-zero divisor. `org.h2.util.MemoryEstimator.estimateMemory`
+  (H2's `MVMap` key/value size estimator) is the measured case.
+
+`TestMultiThread` now runs 8 of 8 clean where it died 6 of 6 before. Details in
+the retired `unresumable-unconditional-trap-mvmap-20260802` write-up.
+
+Fixing it does **not** move this page's livelock: 9 of 12 runs still wedge, with
+the same leftover keys. That is the prediction this write-up already makes —
+the exposure is set by write-op density, and a JIT-correctness fix does not
+change per-statement cost by the ~3.5× that would be needed.
+
+### What is left, and where it lives
+
+Nothing on the CratonVM side. The upstream fix is the one described under
+*What would actually fix it*; it is worth reporting to H2, and it must not be
+applied to `apps/h2database`.
+
+The operational fact — *`TestDiskFull` wedging in the H2 suite is expected and
+is not a VM defect* — is restated in
+`docs/known-issues/repros/h2-testdiskfull-livelock/README.md`, which survives
+this page and ships the harness that proves it.

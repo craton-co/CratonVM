@@ -8,7 +8,7 @@ closed:
 | --- | --- |
 | 1 — `gen_heap::set_field`/`get_field` guard burst, `class_id=ClassId(0)` | **FIXED.** Reproduces 2 runs in 42 on a `dev` build from immediately *before* the post-GC reference-processing fix; **0 runs in 330** on current `dev`. |
 | 2 — `cratonvm.synthetic.AnonymousObject$3` cast to `[Ljava/lang/String;` | **Not reproducible** anywhere in the same census (0 `ClassCastException`, 0 `AnonymousObject`, 0 `corrupt Value cell`, 0 `AbstractMethodError` — on either build). |
-| 3 — >300 s "hang" | **Root-caused, and it is not a CratonVM defect.** An upstream H2 transaction-recovery livelock, reached far more often on CratonVM because CratonVM issues ~3.5× more file write operations for the same logical work. See `docs/known-issues/h2/h2-testdiskfull-upstream-transaction-recovery-livelock.md`. |
+| 3 — >300 s "hang" | **Root-caused, and it is not a CratonVM defect.** An upstream H2 transaction-recovery livelock, reached far more often on CratonVM because CratonVM issues ~3.5× more file write operations for the same logical work. See the retired `h2-testdiskfull-upstream-transaction-recovery-livelock` write-up. |
 
 One residual is **handed over, not closed**: a single `SIGSEGV` in those 330
 runs, with a different signature from this report's (see below). It is handed to
@@ -97,7 +97,7 @@ family; `TestDiskFull` at ~73 s per run may be a cheaper handle on it than
 ## Symptom 3 — the "hang" is a real livelock, in upstream H2
 
 Root-caused in full on 2026-08-01. Full write-up, evidence and controls:
-`docs/known-issues/h2/h2-testdiskfull-upstream-transaction-recovery-livelock.md`.
+the retired `h2-testdiskfull-upstream-transaction-recovery-livelock` write-up.
 Summary:
 
 1. H2's MVStore background writer (`WRITE_DELAY=10`, set by this test's URL)

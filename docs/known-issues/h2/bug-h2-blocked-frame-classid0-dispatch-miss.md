@@ -130,11 +130,17 @@ real occurrence**; what is verified is that the new call site is live and safe
 locks, prints nothing, and the error is still thrown and caught exactly as
 HotSpot does).
 
-Those 10 runs need
+Those 10 runs needed
 `CRATONVM_JIT_DENY=MVMap.evaluateMemoryForKey,MVMap.evaluateMemoryForValue`,
-because dev tip otherwise dies in under 3 seconds — see
-`../jit/unresumable-unconditional-trap-mvmap-20260802.md`. The deny forces two
-one-line methods to stay interpreted and is not otherwise load-bearing here.
+because dev tip at the time died in under 3 seconds with
+`InternalError: … refusing side-effecting replay`. **That is fixed as of
+2026-08-02 and the deny is no longer needed** — the optimizing tier was hoisting
+`org.h2.util.MemoryEstimator.estimateMemory`'s `ldiv` (and its zero-divisor
+trap) above the branch that guarantees a non-zero divisor, and the deopt frame
+it stashed carried no method identity, so the failure was blamed on whichever
+method happened to be on the JIT-dispatch boundary. See the retired
+`unresumable-unconditional-trap-mvmap-20260802` write-up. The deny forced two
+one-line methods to stay interpreted and was not otherwise load-bearing here.
 
 **A cheaper handle on what is probably the same defect.** Two of those same ten
 runs failed with `CloneNotSupportedException` on a `COMMIT` in
