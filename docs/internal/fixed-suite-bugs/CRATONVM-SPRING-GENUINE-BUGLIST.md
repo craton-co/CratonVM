@@ -3766,3 +3766,107 @@ those cold paths. Putting it at `interpreter::execute`'s entry (a substring scan
 on the hottest path in the VM) slows the run enough to look like a hang, and
 `RUST_BACKTRACE=full` does the same by making every internal error capture a
 backtrace.
+## 2026-08-02 `AotIntegrationTests#endToEndTestsForBeanOverrides` regression, bisected to `47d6b2dbe5` -- FIXED
+
+`org.springframework.test.context.aot.AotIntegrationTests` matched HotSpot
+(`found=4 succ=2 fail=0 skip=2`) up to `5e810c5c5c` and scored
+`succ=1 fail=1` from `47d6b2dbe5` onward. The failing inner class was
+`test.context.bean.override.mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests`:
+`given(spy.getDate(false)).willReturn(1L)` was ignored and the real
+`DateService.getDate` ran, four times. It passed standalone on both binaries, so
+it only reproduced inside the AOT end-to-end run.
+
+### Root cause: a QUALIFIED module open recorded as an UNQUALIFIED one
+
+Not in any of the three hunks that looked suspicious. `47d6b2dbe5` made
+`check_class_loader_define_class_is_encapsulated` consult the module registry so
+that `--add-opens=java.base/java.lang=ALL-UNNAMED` would finally be honoured.
+That consult was correct; the registry's *answer* was not.
+
+`phases_late/reflect_invoke.rs` derived the target of a dynamic
+`addOpens`/`addExports` edge with `read_module_name(ctx, m)`, which returns the
+EMPTY STRING for a module CratonVM cannot name -- and `ModuleRegistry::add_opens`
+reads an empty target as **unqualified, i.e. opened to every module in the
+process**. Two different meanings, one sentinel.
+
+Mockito's `InstrumentationMemberAccessor` lazily calls
+`Instrumentation.redefineModule` to open `java.base/java.lang` to its own
+ByteBuddy-injected dispatcher module. Traced in the failing run:
+
+```
+[opens] impl_add_opens_void module="java.base" pkg="java/lang" target=""
+  frames=[jdk/internal/module/Modules, sun/instrument/InstrumentationImpl,
+          InstrumentationMemberAccessor$Dispatcher$ByteBuddy$...,
+          InstrumentationMemberAccessor, ModuleMemberAccessor,
+          InlineDelegateByteBuddyMockMaker]
+[setacc] ClassLoader.defineClass requested by Some("org/springframework/cglib/core/ReflectUtils") loader=3
+[setacc] allowed: java.base/java.lang is open (unqualified)      <-- the bug
+```
+
+That was the ONLY `setAccessible(ClassLoader.defineClass)` in the entire run.
+With it allowed, Spring-CGLIB's `ReflectUtils` takes its middle option (the
+reflective `ClassLoader.defineClass`) instead of `Lookup.defineClass` on the
+neighbour class, so the AOP proxy landed in the requested loader rather than its
+superclass's. A package-private method then cannot be overridden across the
+runtime-package boundary (JVMS 5.4.5), `invokevirtual` on the proxy ran the
+superclass body, and the `@MockitoSpyBean` advice never got a frame. That is
+exactly the failure mode `3830d109d` documented when it added the denial.
+
+### HotSpot is the ground truth, and it disagreed
+
+`ForceInstrProbe` drives the identical Mockito `assureOpen` and then reads back
+three things. Real JDK 25 vs CratonVM `dev`:
+
+| after Mockito's `redefineModule`      | HotSpot | CratonVM dev | CratonVM fixed |
+| ------------------------------------- | ------- | ------------ | -------------- |
+| `java.base.isOpen("java.lang")`       | false   | **true**     | false          |
+| `isOpen("java.lang", app unnamed)`    | false   | **true**     | false          |
+| `setAccessible(ClassLoader.defineClass)` | DENIED | **ALLOWED** | DENIED         |
+
+HotSpot honours the qualification exactly: the grant reaches ByteBuddy's
+injected module and nothing else.
+
+### The fix
+
+`dynamic_edge_target()` in `phases_late/reflect_invoke.rs`, used by
+`Module.addOpens`/`addExports(String, Module)` and the `implAdd*` void forms.
+When the call supplies a target `Module` argument whose name does not resolve,
+the edge is recorded under `UNRESOLVED_TARGET_MODULE` -- a name no module has,
+so it grants nobody -- instead of collapsing to the unqualified sentinel. A call
+with NO target argument (`Module.implAddOpens(String)`, and the `--add-opens`
+CLI path) still means genuinely unqualified and is untouched.
+
+Recording an unnameable target as "grants nobody" reproduces HotSpot's observed
+answers exactly here, and can only ever grant LESS than HotSpot, never more.
+
+### Verification
+
+* `AotIntegrationTests`: `found=4 succ=2 fail=0 skip=2`, identical to HotSpot
+  (was `succ=1 fail=1`), over two consecutive runs.
+* Causally isolated first: an env-gated revert of each of `47d6b2dbe5`'s three
+  VM hunks showed the `lang_class.rs` consult alone flipped the score, with the
+  cglib and `invoke.rs` hunks inert.
+* The six classes `47d6b2dbe5` closed still pass 76/76
+  (Spr15042 1/1, Spr15275 6/6, PathMatchingResourcePatternResolver 22/22,
+  SimpleClientHttpRequestFactory 10/10, MockServletContext 19/19,
+  BshScriptFactory 18/18).
+* `--add-opens=java.base/java.lang=ALL-UNNAMED` still flips
+  `setAccessible(ClassLoader.defineClass)` ALLOWED, and its absence still DENIES
+  -- matching HotSpot in both directions.
+* `cargo test -p cratonvm-native-builtins --lib` 3234/0 and with
+  `--features synthetic-jdk` 3409/0, including three new
+  `dynamic_edge_target_tests`.
+* `cargo test -p cratonvm-vm --lib` fails only
+  `redefine_immunity_tests::layout_immunity_is_not_open_coded`, and
+  `--features synthetic-jdk` fails to COMPILE (`E0063`, `DeoptimizationPoint`
+  missing `semantics`, `vm_exec.rs:74988`). A pristine `origin/dev` control
+  build reproduces both identically, so neither is attributable to this change.
+
+### Known-adjacent, deliberately not changed
+
+`Module.implAddOpensToAllUnnamed(String)` is registered to
+`native_module_impl_add_opens_all`, so "to all unnamed modules" is still stored
+as "to everyone" -- the same widening the `--add-opens=...=ALL-UNNAMED` CLI path
+uses today (`config.rs::parse_add_exports` maps `ALL-UNNAMED` to the empty
+string). Separating those two would change what every `--add-opens` grant means
+process-wide and is out of scope here.
