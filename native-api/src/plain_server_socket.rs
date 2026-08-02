@@ -81,3 +81,48 @@ pub fn set(ops: PlainServerSocketOps) {
 pub fn get() -> Option<PlainServerSocketOps> {
     OPS.get().copied()
 }
+
+// ---------------------------------------------------------------------------
+// The other direction.
+// ---------------------------------------------------------------------------
+
+/// Accept one connection on the `ServerSocketChannel` behind a
+/// `ServerSocketChannel.socket()` adapter.
+///
+/// * `ObjectRef` — the `java.net.ServerSocket` adapter (the receiver).
+/// * `i32` — SO_TIMEOUT in ms; `0` means block indefinitely.
+/// * Returns `None` when the receiver has NO channel back-ref, i.e. it is a
+///   plain `ServerSocket` and the caller should handle it itself. `Some(..)` is
+///   the completed `accept()` — a `java.net.Socket`, or a thrown
+///   `SocketTimeoutException` once the timeout expires.
+pub type ChannelBackedAccept = fn(
+    &mut dyn crate::registry::NativeContext,
+    cratonvm_types::ObjectRef,
+    i32,
+) -> Option<cratonvm_types::error::MethodCallResult>;
+
+static CHANNEL_ACCEPT: OnceLock<ChannelBackedAccept> = OnceLock::new();
+
+/// Install the channel-backed `accept` handler. Called once from
+/// `socket_channel::register_socket_channel_real`.
+///
+/// This is [`set`] in reverse, and it exists because the delegation is not
+/// symmetric: `cratonvm-native-io` registers `java/net/ServerSocket` wrappers
+/// for six methods and wins them for every `ServerSocket`, so those delegate
+/// *out* to the plain owner. `accept` is NOT one of the six — it stays with
+/// `net_phase_e`'s RE.2 native, which owns plain sockets only. An adapter
+/// reaching that native has its listener in native-io's channel registry, so
+/// RE.2 has to hand it back the other way.
+///
+/// Wrapping `accept` in native-io instead would make it the winner for every
+/// `ServerSocket` in the VM and route all plain accepts through a second
+/// cross-crate hop, for one legacy non-default surface. One narrow hook the
+/// other way is the smaller change.
+pub fn set_channel_backed_accept(handler: ChannelBackedAccept) {
+    let _ = CHANNEL_ACCEPT.set(handler);
+}
+
+/// Fetch the channel-backed `accept` handler, if any.
+pub fn channel_backed_accept() -> Option<ChannelBackedAccept> {
+    CHANNEL_ACCEPT.get().copied()
+}
