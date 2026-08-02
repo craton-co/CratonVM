@@ -217,6 +217,10 @@ about a 0.6 % chance of seeing that if the rate were unchanged.
 `CRATONVM_GC=-moving-young` on `fix4` (pre-manager-pin): **14/14 clean**. That
 is the arm that localised defect 2 to a *relocation*, not a liveness, failure.
 
+`dev` moved 40 commits during this work, so the branch was merged up and
+**re-verified on the merged tree**: `cratonvm-tlsec-merged`, **20/20 clean**.
+That is the binary these fixes actually ship as.
+
 Neighbouring TLS classes, pre-fix (`cratonvm-tlsec-base`) vs post-fix
 (`cratonvm-tlsec-fix5`) — same pass/fail everywhere, all a little faster:
 
