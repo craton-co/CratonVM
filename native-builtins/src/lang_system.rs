@@ -2165,34 +2165,32 @@ pub(crate) fn native_system_getenv(
 // `gc_update_system_singleton_refs` (wired into `gc.rs`); `reset_system_singletons`
 // clears them when a new VM is created (mirrors `reset_loader_singletons`).
 // ---------------------------------------------------------------------------
-use std::sync::{Mutex, OnceLock};
+use cratonvm_native_api::vm_scoped::VmScoped;
 
-fn system_env_store() -> &'static Mutex<Option<ObjectRef>> {
-    static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(None))
-}
-
-fn system_props_store() -> &'static Mutex<Option<ObjectRef>> {
-    static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(None))
-}
+/// One cell per VM, not per process. `reset_system_singletons` was correct
+/// only while VMs were created strictly in sequence — a `Vm::new` on one test
+/// thread wiped the cell another live VM was using, and the loser then read
+/// back a `Map`/`Properties` object allocated in the other VM's heap. Keyed by
+/// `vm_identity` and torn down from `release_vm_native_state`; see
+/// `cratonvm_native_api::vm_scoped`.
+static SYSTEM_ENV: VmScoped<Option<ObjectRef>> = VmScoped::new();
+static SYSTEM_PROPS: VmScoped<Option<ObjectRef>> = VmScoped::new();
 
 /// The cached no-arg `System.getenv()` Map singleton, if already built.
-fn system_env_singleton() -> Option<ObjectRef> {
-    *system_env_store().lock().unwrap_or_else(|e| e.into_inner())
+fn system_env_singleton(vm: usize) -> Option<ObjectRef> {
+    SYSTEM_ENV.peek(vm, |cell| *cell).flatten()
 }
 
 /// Publish `obj` as the `System.getenv()` singleton (double-checked, like
 /// [`set_system_props_singleton`]); returns the canonical singleton.
-fn set_system_env_singleton(obj: ObjectRef) -> ObjectRef {
-    let mut g = system_env_store().lock().unwrap_or_else(|e| e.into_inner());
-    match *g {
+fn set_system_env_singleton(vm: usize, obj: ObjectRef) -> ObjectRef {
+    SYSTEM_ENV.with(vm, |cell| match *cell {
         Some(existing) => existing,
         None => {
-            *g = Some(obj);
+            *cell = Some(obj);
             obj
         }
-    }
+    })
 }
 
 /// Return the OpenJDK-shaped read-only wrapper used by `System.getenv()`.
@@ -2215,59 +2213,50 @@ fn wrap_system_env_map(ctx: &mut dyn NativeContext, map: ObjectRef) -> ObjectRef
 }
 
 /// The cached `System.getProperties()` `Properties` singleton, if already built.
-pub fn system_props_singleton() -> Option<ObjectRef> {
-    *system_props_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+pub fn system_props_singleton(vm_identity: usize) -> Option<ObjectRef> {
+    SYSTEM_PROPS.peek(vm_identity, |cell| *cell).flatten()
 }
 
 /// Publish `obj` as the `System.getProperties()` singleton, unless another
 /// thread already won the race вЂ” in which case the existing one is returned and
 /// `obj` is discarded (it becomes unreachable and is collected). Returns the
 /// canonical singleton so all callers converge on one identity.
-pub fn set_system_props_singleton(obj: ObjectRef) -> ObjectRef {
-    let mut g = system_props_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match *g {
+pub fn set_system_props_singleton(vm_identity: usize, obj: ObjectRef) -> ObjectRef {
+    SYSTEM_PROPS.with(vm_identity, |cell| match *cell {
         Some(existing) => existing,
         None => {
-            *g = Some(obj);
+            *cell = Some(obj);
             obj
         }
-    }
+    })
 }
 
 /// Replace the cached `System.getProperties()` singleton. Used by
 /// `System.setProperties(Properties)`, which HotSpot implements as a global
 /// swap of `System.props`, not as a mutation of the previous Properties object.
 /// Returns the previous singleton so callers can drop any system-props marker.
-pub fn replace_system_props_singleton(obj: Option<ObjectRef>) -> Option<ObjectRef> {
-    let mut g = system_props_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::mem::replace(&mut *g, obj)
+pub fn replace_system_props_singleton(
+    vm_identity: usize,
+    obj: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    SYSTEM_PROPS.with(vm_identity, |cell| std::mem::replace(cell, obj))
 }
 
 /// GC root scan for the `System.getenv()` / `System.getProperties()` singletons
 /// (companion to [`gc_update_system_singleton_refs`]). Mirrors
 /// `classloader::gc_scan_loader_singleton_roots`.
-pub fn gc_scan_system_singleton_roots(out: &mut Vec<ObjectRef>) {
-    if let Some(o) = *system_env_store().lock().unwrap_or_else(|e| e.into_inner()) {
-        out.push(o);
-    }
-    if let Some(o) = *system_props_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-    {
-        out.push(o);
-    }
+pub fn gc_scan_system_singleton_roots(vm_identity: usize, out: &mut Vec<ObjectRef>) {
+    out.extend(system_env_singleton(vm_identity));
+    out.extend(system_props_singleton(vm_identity));
 }
 
 /// Post-GC remap for the system singletons (companion to
 /// [`gc_scan_system_singleton_roots`]). Repoints the cached `ObjectRef`s to
 /// their relocated addresses after a moving collection.
-pub fn gc_update_system_singleton_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_system_singleton_refs(
+    vm_identity: usize,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
     if pointer_map.is_empty() {
         return;
     }
@@ -2280,22 +2269,21 @@ pub fn gc_update_system_singleton_refs(pointer_map: &std::collections::HashMap<u
             }
         }
     };
-    remap(&mut system_env_store().lock().unwrap_or_else(|e| e.into_inner()));
-    remap(
-        &mut system_props_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()),
-    );
+    SYSTEM_ENV.with(vm_identity, remap);
+    SYSTEM_PROPS.with(vm_identity, remap);
 }
 
-/// Reset the cached system singletons. Called when creating a new VM so a stale
-/// `ObjectRef` from a previous VM instance is never returned (mirrors
-/// `classloader::reset_loader_singletons`).
-pub fn reset_system_singletons() {
-    *system_env_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *system_props_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
+/// Per-VM teardown for the cached system singletons. Called from
+/// `release_vm_native_state`.
+///
+/// This replaces the old `reset_system_singletons()`, which `Vm::new` called
+/// to clear a *previous* VM's leftovers. That only worked while VMs were
+/// created in sequence: with two live at once it wiped a running VM's cell.
+/// A fresh `vm_identity` starts with no row, so there is nothing to reset at
+/// construction time any more.
+pub fn forget_vm_system_singletons(vm_identity: usize) {
+    SYSTEM_ENV.forget(vm_identity);
+    SYSTEM_PROPS.forget(vm_identity);
 }
 
 pub(crate) fn native_system_getenv_all(
@@ -2311,7 +2299,7 @@ pub(crate) fn native_system_getenv_all(
     // fallback still returns the OpenJDK-shaped unmodifiable wrapper but is left
     // uncached so a later call retries once the real `java/util/HashMap` layout
     // is resolvable.
-    if let Some(cached) = system_env_singleton() {
+    if let Some(cached) = system_env_singleton(ctx.vm_identity()) {
         return Ok(Some(Value::Object(Some(cached))));
     }
 
@@ -2441,7 +2429,7 @@ pub(crate) fn native_system_getenv_all(
         // publish). The wrapper's field 0 is the private `m` backing field that
         // libraries such as System Rules reach via reflection.
         let env = wrap_system_env_map(ctx, map);
-        let env = set_system_env_singleton(env);
+        let env = set_system_env_singleton(ctx.vm_identity(), env);
         return Ok(Some(Value::Object(Some(env))));
     }
 

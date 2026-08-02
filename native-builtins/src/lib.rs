@@ -9803,7 +9803,7 @@ pub fn register_essential_natives_with_shims(
             // reference -- SpEL's `#{systemProperties.foo}` (routed through
             // `MapAccessor.canRead` -> `Properties.containsKey`) then reports the
             // property as absent even though `System.getProperty("foo")` sees it.
-            if let Some(props) = crate::lang_system::system_props_singleton() {
+            if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 crate::properties_sidetable::store_property_in_sidetable(ctx, props, &key, &val);
             }
             match old {
@@ -9830,7 +9830,7 @@ pub fn register_essential_natives_with_shims(
             let result = ctx.remove_system_property(&key);
             // Mirror the removal into the cached singleton's side-table -- see
             // the matching comment in `setProperty` above (SC-web-method-spel RC-A).
-            if let Some(props) = crate::lang_system::system_props_singleton() {
+            if let Some(props) = crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 crate::properties_sidetable::remove_property_from_sidetable(ctx, props, &key);
             }
             match result {
@@ -9878,7 +9878,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(props))) => Some(*props),
                 _ => None,
             };
-            if let Some(old) = crate::lang_system::replace_system_props_singleton(new_singleton) {
+            if let Some(old) = crate::lang_system::replace_system_props_singleton(ctx.vm_identity(), new_singleton) {
                 crate::properties_sidetable::unmark_system_props(ctx, old);
             }
             if let Some(props) = new_singleton {
@@ -9961,12 +9961,12 @@ pub fn register_essential_natives_with_shims(
             // `System.getProperties().setProperty(...)`) propagate to the global
             // store — regular `new Properties()` objects must NOT (they'd pollute
             // system properties and cross-contaminate other Properties).
-            let props = match crate::lang_system::system_props_singleton() {
+            let props = match crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 Some(cached) => cached,
                 None => {
                     let p = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
                     crate::properties_sidetable::mark_system_props(ctx, p);
-                    crate::lang_system::set_system_props_singleton(p)
+                    crate::lang_system::set_system_props_singleton(ctx.vm_identity(), p)
                 }
             };
             // Resync the side-table to the current system-property snapshot on

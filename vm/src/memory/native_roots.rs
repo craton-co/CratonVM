@@ -138,11 +138,14 @@ fn remap_loaders_and_jmx(shared: &crate::vm::SharedVm, map: &HashMap<usize, usiz
     #[cfg(feature = "management")]
     cratonvm_native_builtins::jmx::gc_update_platform_mbean_server_ref(map);
 }
-fn scan_system(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
-    cratonvm_native_builtins::lang_system::gc_scan_system_singleton_roots(roots);
+fn scan_system(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::lang_system::gc_scan_system_singleton_roots(
+        shared.vm_identity,
+        roots,
+    );
 }
-fn remap_system(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
-    cratonvm_native_builtins::lang_system::gc_update_system_singleton_refs(map);
+fn remap_system(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::lang_system::gc_update_system_singleton_refs(shared.vm_identity, map);
 }
 fn scan_locale(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::gc_scan_locale_roots(roots);
@@ -151,12 +154,14 @@ fn remap_locale(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
     cratonvm_native_builtins::gc_update_locale_refs(map);
 }
 fn scan_class_values(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
-    cratonvm_native_builtins::phases_late::gc_scan_classvalue_cache_roots(roots, &|addr| {
-        shared.mem.heap.metadata_pin_deferrable(addr)
-    });
+    cratonvm_native_builtins::phases_late::gc_scan_classvalue_cache_roots(
+        shared.vm_identity,
+        roots,
+        &|addr| shared.mem.heap.metadata_pin_deferrable(addr),
+    );
 }
-fn remap_class_values(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
-    cratonvm_native_builtins::phases_late::gc_update_classvalue_cache_refs(map);
+fn remap_class_values(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::phases_late::gc_update_classvalue_cache_refs(shared.vm_identity, map);
 }
 fn scan_msc(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::jboss_msc::gc_scan_msc_service_roots(roots);

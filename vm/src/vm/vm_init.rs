@@ -1331,13 +1331,17 @@ impl SharedVm {
         let concurrent_gc_state = std::sync::Arc::new(cratonvm_gc::ConcurrentGcState::new());
         heap.enable_concurrent_gc(concurrent_satb.clone(), concurrent_gc_state.clone());
 
-        // Reset singleton classloader instances from any previous VM
+        // Reset the classloader side-tables that are still process-wide.
+        //
+        // NOTE what is deliberately NOT here any more: the built-in loader
+        // singletons and the `System.getenv()`/`getProperties()` singletons.
+        // Clearing those from `Vm::new` assumed VMs are created strictly in
+        // sequence; a Rust test binary runs `#[test]`s on several threads, so
+        // this call was wiping cells that a *concurrently live* VM was using —
+        // after which the two VMs traded heap objects and the reader segfaulted.
+        // They are keyed by `vm_identity` now (a fresh VM starts with no row)
+        // and dropped in `release_vm_native_state`.
         cratonvm_native_builtins::classloader::reset_loader_singletons();
-        // Reset cached System.getenv()/getProperties() singletons too, so a new
-        // VM never returns a stale ObjectRef from a previous instance.
-        cratonvm_native_builtins::lang_system::reset_system_singletons();
-        // Reset the ClassValue memoization cache (BUG-W) for the same reason.
-        cratonvm_native_builtins::phases_late::reset_classvalue_cache();
 
         let __boot_t2 = std::time::Instant::now();
         let bootstrap_phase = bootstrap_phase
@@ -7464,6 +7468,11 @@ pub fn release_vm_native_state(vm_identity: usize) {
     // mints from zero, so a surviving row is not merely a leak — it is a
     // wrong-heap hit for the next VM.
     cratonvm_native_builtins::lang_class::forget_vm_annotation_proxies(vm_identity);
+    // The cached `System.getenv()` map and `System.getProperties()` object.
+    cratonvm_native_builtins::lang_system::forget_vm_system_singletons(vm_identity);
+    // The `java.lang.ClassValue` memoization cache (BUG-W). Its key is a pair
+    // of 32-bit identity hashes, which two live VMs collide on readily.
+    cratonvm_native_builtins::phases_late::forget_vm_classvalue_cache(vm_identity);
     crate::runtime::instrument::forget_vm_transformers(vm_identity);
     // Without this a disposed VM's JVMTI row leaks its agent's callback
     // closures, and its listener flags keep every OTHER VM's interpreter on the
