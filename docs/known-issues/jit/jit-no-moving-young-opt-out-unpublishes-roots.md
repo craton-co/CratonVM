@@ -3,7 +3,7 @@
 **Status: 🟡 PARTIALLY FIXED 2026-07-31.** The first of two independent faults
 in this lane is fixed; the second is isolated to a named mechanism and stays
 open below. Supersedes
-[`repros/no-moving-young-lever-crashes-20260731.md`](repros/no-moving-young-lever-crashes-20260731.md),
+[`repros/no-moving-young-lever-crashes-20260731.md`](../repros/no-moving-young-lever-crashes-20260731.md),
 which found the same lane broken from a different workload the same day.
 
 ## Why the lane matters
@@ -11,7 +11,7 @@ which found the same lane broken from a different workload the same day.
 `CRATONVM_NO_MOVING_YOUNG=1` is the standard A/B lever for anything
 moving-young-related — it is named in `moving_young_disables_optimizing_tier`'s
 own warning text and it produced the cost tables in the retired
-[moving-young gate doc](../internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md)
+[moving-young gate doc](../../internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md)
 and in tomcat 32.1. While it crashes, none of those tables can be re-derived,
 and any new measurement that reaches for it reads as an unrelated failure.
 

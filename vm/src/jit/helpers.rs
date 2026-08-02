@@ -6668,15 +6668,21 @@ pub unsafe extern "C" fn jit_checkcast(
         // `invoke` dispatch miss — report the same verdict. This copy and the
         // interpreter's had already drifted (only the interpreter's consulted
         // the young-sweep ring), which is what a third copy for the dispatch
-        // face would have compounded.
-        if obj_class_id.as_u32() == 0 {
-            crate::memory::reclaim_guard::report_reclaimed_receiver(
-                vm,
-                obj_ref.as_ptr() as usize,
-                "JIT checkcast",
-                class_name,
-            );
-        }
+        // face would have compounded. The concurrent H2-CID0 follow-up that
+        // landed here — ask the reclamation ring on EVERY failing cast, not only
+        // on `ClassId(0)`, because a freed block only reads as
+        // `java.lang.Object` while it stays on the free list and afterwards
+        // shows a valid object of an unrelated class (`java.util.BitSet cannot
+        // be cast to org.h2.mvstore.Chunk`) — is folded into that function, so
+        // the dispatch face inherits it too. It is passed `actual_class_id`
+        // and takes the heap locks only for the `ClassId(0)` branch.
+        crate::memory::reclaim_guard::report_reclaimed_receiver(
+            vm,
+            obj_ref.as_ptr() as usize,
+            "JIT checkcast",
+            class_name,
+            obj_class_id.as_u32(),
+        );
         if let Some((thread, _jit_thread_guard)) = jit_thread_mut() {
             // Render an array receiver by its own descriptor. The header of a
             // reference array carries the COMPONENT class id, so the plain

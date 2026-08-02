@@ -20145,6 +20145,72 @@ fn execute_instruction(
                         // the flag and reproducing still produced silence. See
                         // docs/known-issues/h2/
                         // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+                        // H2-CID0 follow-up (2026-08-01): the `ClassId(0)` gate
+                        // below is too narrow. A block freed while still
+                        // referenced only reads back as `java.lang.Object`
+                        // while it stays on the free list; once the allocator
+                        // REUSES it the same stale reference sees a perfectly
+                        // valid object of some unrelated class, and the cast
+                        // fails with that class instead. Both faces were
+                        // observed in one A/B: `java.lang.Object cannot be cast
+                        // to java.nio.ByteBuffer` (still free) and
+                        // `java.util.BitSet cannot be cast to
+                        // org.h2.mvstore.Chunk` (reused). Gating the reporter on
+                        // `ClassId(0)` reports the first and stays silent on the
+                        // second, which is the same defect one step later in the
+                        // block's life.
+                        //
+                        // So ask on EVERY failing cast. Both queries are reached
+                        // only after a cast has already failed, and the
+                        // reclamation ring is bounded, so a match means the
+                        // address really was freed recently.
+                        {
+                            let addr = obj_ref.as_ptr() as usize;
+                            if let Some((cid, kind, site, seq)) =
+                                cratonvm_gc::gen_heap::old_freed_lookup(addr)
+                            {
+                                static F: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if F.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                    let orig = shared
+                                        .classes
+                                        .class_manager
+                                        .try_read()
+                                        .and_then(|cm| {
+                                            cm.class_store
+                                                .get(cratonvm_types::ClassId::new(cid))
+                                                .map(|c| c.name.to_string())
+                                        })
+                                        .unwrap_or_else(|| format!("class_id={cid}"));
+                                    let (old_alloc, young_surv, region) =
+                                        shared.mem.heap.liveness_arms(addr);
+                                    tracing::error!(
+                                        target: "cratonvm::gc::guard",
+                                        obj = format!("{addr:#x}"),
+                                        actual_class = %obj_binary,
+                                        target_class = %target_binary,
+                                        original_class = %orig,
+                                        original_kind = kind,
+                                        freed_by = if site == 1 {
+                                            "in-place old-gen sweep"
+                                        } else {
+                                            "old-gen mark-compact"
+                                        },
+                                        free_seq = seq,
+                                        region = %region,
+                                        old_gen_allocated = old_alloc,
+                                        young_survivor = young_surv,
+                                        "checkcast receiver is an OLD-GEN block this process \
+                                         RECLAIMED while it was still referenced. `original_class` \
+                                         is what the block held when it was freed; `actual_class` \
+                                         is whatever occupies it now (`java.lang.Object` means the \
+                                         block is still on the free list, anything else means the \
+                                         allocator has already re-served it). `freed_by` names the \
+                                         mark phase with the gap.",
+                                    );
+                                }
+                            }
+                        }
                         if obj_class_name == "java/lang/Object"
                             && target_class_name != "java/lang/Object"
                         {

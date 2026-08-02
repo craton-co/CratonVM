@@ -22074,25 +22074,29 @@ fn invoke_on_class_shared_inner(
                 // nothing at all about which. Free-list membership is not
                 // ambiguous, so ask the heap.
                 //
-                // Gated on the `ClassId(0)` face because this terminal is also
-                // reached in bulk on HEALTHY runs (a missing method on a
-                // synthetic classpath stub logs here on every call), and the
-                // probe takes the young and old heap locks.
+                // The receiver's class id is passed through: the helper takes
+                // the heap locks only for the `ClassId(0)` face, so this
+                // terminal — which is also reached in bulk on HEALTHY runs, a
+                // missing method on a synthetic classpath stub logging here on
+                // every call — pays only a lock-free ring probe otherwise. That
+                // probe still matters off the zero face: once the allocator
+                // hands a prematurely-freed block out again, the same stale
+                // reference resolves to a REAL class and the miss reads
+                // `SomeUnrelatedClass.hasNext()` instead.
                 //
                 // Witness: `NoSuchMethodError java/lang/Object.hasNext()Z` from
                 // `TestMultiThread.testConcurrentUpdate @pc=252` — the
                 // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
                 // docs/known-issues/h2/
                 // bug-h2-blocked-frame-classid0-dispatch-miss.md.
-                if class_id == ClassId::new(0) {
-                    if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                        crate::memory::reclaim_guard::report_reclaimed_receiver(
-                            shared,
-                            recv.as_ptr() as usize,
-                            "invoke dispatch",
-                            &format!("{class_name}.{method_name}{descriptor}"),
-                        );
-                    }
+                if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                    crate::memory::reclaim_guard::report_reclaimed_receiver(
+                        shared,
+                        recv.as_ptr() as usize,
+                        "invoke dispatch",
+                        &format!("{class_name}.{method_name}{descriptor}"),
+                        class_id.as_u32(),
+                    );
                 }
                 // CRATONVM_DBG_CCE_BT: a dispatch miss whose receiver resolved
                 // to bare `java/lang/Object` is the stale-ObjectRef family's
