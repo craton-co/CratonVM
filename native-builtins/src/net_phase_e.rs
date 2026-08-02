@@ -11676,11 +11676,28 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // perform` (the path `HttpsURLConnection`/`TestClientCert` uses)
             // does the latter today — see
             // docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
-            let cfg = crate::t27_tls::build_engine_client_config_with_identity(
+            // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): honour a
+            // version-pinned `SSLContext.getInstance(...)` on THIS path.
+            // `phases_late::ssl_security` registers the same
+            // (SSLSocketFactory, createSocket, (String,I)) triple and applies
+            // the ceiling to its native-tls connector, but this registration
+            // runs later and therefore wins in the real-JDK build — so a
+            // socket from a `TLSv1.2` context still negotiated TLS 1.3, and
+            // the pin appeared to be honoured nowhere. Feeding
+            // `enabled_protocols` into the rustls client config is the
+            // equivalent knob here; an empty slice keeps rustls's defaults,
+            // which is the pre-existing behaviour for an unpinned context.
+            let pinned_protocols: Vec<String> =
+                crate::phases_late::ssl_security::p68_factory_pinned_protocol_name(ctx, args)
+                    .into_iter()
+                    .collect();
+            let cfg = crate::t27_tls::build_engine_client_config_with_identity_ciphers(
                 &["http/1.1"],
                 client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
                 None,
                 None,
+                &[],
+                &pinned_protocols,
             )
             .map_err(|e| ioex(format!("client TLS config: {e}")))?;
             // T19.H1: TCP connect + full TLS handshake blocks for real, and this

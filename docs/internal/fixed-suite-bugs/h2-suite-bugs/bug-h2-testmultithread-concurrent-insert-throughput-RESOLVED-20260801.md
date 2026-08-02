@@ -142,7 +142,7 @@ Also ruled out, each with a one-variable experiment:
 
 | hypothesis | lever | result |
 | --- | --- | --- |
-| `org/h2/` JIT ban keeps H2 interpreted | `CRATONVM_JIT_ALLOW_PACKAGES=org/h2/` | lifting is **worse** (7 210 vs 6 634 ms) |
+| ~~`org/h2/` JIT ban keeps H2 interpreted~~ | ~~`CRATONVM_JIT_ALLOW_PACKAGES=org/h2/`~~ | **WITHDRAWN 2026-08-02 — a null A/B.** There is no `org/h2/` package ban: `CRATONVM_DBG_JIT_COMPILED=1` counts **27** `org/h2/…` methods compiled on the default build and **26** with the flag set. Both arms of "7 210 vs 6 634 ms" were the same configuration. |
 | young-gen heap pressure | `--Xmx` 1g/2g/4g/8g | no trend (22.8/16.8/21.6/14.6 s) |
 | young-GC livelock | `CRATONVM_DBG_YOUNG_TRIGGER=1` | `live` 63→172 MB vs `threshold=230MB`, never reached |
 | STW cross-thread takeover cost | `CRATONVM_XT_PEER_DEADLINE_MS` 1/20/200 | no effect (12.7/13.9/12.3 s) |
@@ -215,23 +215,37 @@ stream (`next_gaussian_matches_jdk_seeded_sequence`). `PageStorageProbe`'s
 seeded checksum now matches HotSpot exactly (`-996036681280942953`, was
 `1038429237398187486`).
 
-**2. A deterministic JIT-only zero-length-array defect — filed separately.**
-See `docs/known-issues/jit-zero-length-array-20260801.md`. It is the real reason
-`org.h2.test.unit.TestMemoryEstimator` fails, and therefore the real blocker on
-the `org/h2/` ban-lift condition recorded in `vm/src/jit/skip_list.rs`.
+**2. ~~A deterministic JIT-only zero-length-array defect — filed separately.~~**
+**WITHDRAWN 2026-08-02.** It does not reproduce — ~250 probe rounds and 25 runs
+of the real class, on current `dev` *and* on `8d837f1244`, the exact commit this
+page was written from. `TestMemoryEstimator` fails at HotSpot's own rate on an
+unseeded `Random` (cratonvm 2/25, HotSpot 3/25) and there is no `org/h2/` ban
+for it to block. See
+`jit-zero-length-array-20260801-WITHDRAWN.md` in this directory.
 
 ## What is left open
 
-1. **`testConcurrentUpdate` times out** (above). Different method, different
-   workload, never measured by this page. Start with the same discipline used
-   here: release binary, CPU time not wall, round-robin, `uptime` recorded.
-2. **`NoSuchMethodError: java/lang/Object.next()`** in `testConcurrentInsert`
-   (above) — a dispatch defect, HotSpot-clean.
-3. **The flat ~25-30x constant factor** — the general interpreter/dispatch gap.
-   Not specific to this test; see the profile section for the two clusters worth
-   attacking first.
-4. **`docs/known-issues/jit-zero-length-array-20260801.md`** — the JIT defect
-   found here, still open.
+*(Resolved 2026-08-02 — see `docs/known-issues/h2/` for where each went.)*
+
+1. ~~**`testConcurrentUpdate` times out.**~~ Measured. The class is not
+   deterministically broken: on a quiet host it **passes** in 727 s against
+   HotSpot's 7.3 s, and H2's own timeouts (a 10 s `LOCK_TIMEOUT`, a 5 min
+   `job.get`) trip in a different method on each run. The UPDATE path — unlike
+   the INSERT path this page measured — does have a real contention component:
+   CPU per update **doubles** from 4 to 25 threads (3.6 → 7.8 ms) while
+   HotSpot's falls (0.41 → 0.15). Now
+   `bug-h2-testmultithread-concurrent-update-timeout.md`.
+2. ~~**`NoSuchMethodError: java/lang/Object.next()`**~~ — reproduced with a
+   receiver dump, promoted to its own page:
+   `bug-h2-blocked-frame-classid0-dispatch-miss.md`. It is the ambiguous
+   `ClassId(0)` face, same family as
+   `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`.
+3. **The flat ~25-30x constant factor** — still open, and still the biggest
+   number here. See the profile section for the clusters worth attacking first;
+   the 25-thread UPDATE profile on the successor page adds a contended
+   `ClassManager` rwlock (`lock_shared_slow` 1.47%) that the 1-thread profile
+   could not show.
+4. ~~**the JIT zero-length-array defect**~~ — withdrawn, see above.
 
 ## Reproducing
 

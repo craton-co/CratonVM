@@ -2761,6 +2761,50 @@ impl Compiler {
         Some(start)
     }
 
+    /// Reserve the direct-call argument-service range, ABOVE the argument slots.
+    ///
+    /// A baked direct call has no dispatch-helper frame, so the cold
+    /// exception-table service needs the callee's Java arguments copied into a
+    /// contiguous frame range that outlives the CALL. The copy reads
+    /// `arg_slots[i]` and writes `base + (len-1-i)`.
+    ///
+    /// `pop_stack` rewinds `next_spill_offset` past a top-of-stack `Frame`
+    /// slot, but it still HANDS THE SLOT BACK and the popped `StackSlot`s stay
+    /// live until `emit_stack_arg_setup` marshals them. So a bare
+    /// `reserve_spill_slots` here is handed the argument slots themselves, and
+    /// that copy becomes a reversing copy into itself: with two int arguments
+    /// it stored arg0 over arg1 before the marshalling read it, and the callee
+    /// got arg0 in BOTH parameter slots — every comparison in it evaluating
+    /// `cmp a, a`. `docs/internal/fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md`.
+    ///
+    /// `args_frame_top` is `next_spill_offset` as it stood BEFORE the pops.
+    /// The overlap check afterwards is not redundant with the bump: it is what
+    /// makes this safe against a future change to either allocator. If the
+    /// range would alias an argument the reservation fails, the caller's
+    /// `and_then` yields `None`, and the direct call is emitted with no service
+    /// range — the cold path loses argument recovery, which is a degradation,
+    /// not a miscompile. `reset_spills` recycles the extra slots at the next
+    /// bytecode boundary.
+    fn reserve_direct_call_service_slots(
+        &mut self,
+        args_frame_top: i32,
+        arg_slots: &[StackSlot],
+    ) -> Option<i32> {
+        if self.next_spill_offset < args_frame_top {
+            self.next_spill_offset = args_frame_top;
+        }
+        let base = self.reserve_spill_slots(arg_slots.len())?;
+        let end = base.checked_add((arg_slots.len() as i32).checked_mul(8)?)?;
+        for slot in arg_slots {
+            if let StackSlot::Frame(off) = slot {
+                if *off >= base && *off < end {
+                    return None;
+                }
+            }
+        }
+        Some(base)
+    }
+
     fn spill_range_fits(&mut self, start: i32, slots: usize) -> bool {
         self.checked_spill_range_end(start, slots).is_some()
     }
@@ -19134,22 +19178,12 @@ impl Compiler {
                             // dispatch helper frame to recover them from when its own
                             // exception table must run.
                             let service_args_base = info_ptr.and_then(|_| {
-                                // Reserve ABOVE the argument slots. `pop_stack` reclaimed
-                                // them, so a bare `reserve_spill_slots` hands the SAME
-                                // slots back — and the copy below writes
-                                // `base + (len-1-i)` while reading `arg_slots[i]`, i.e. a
-                                // reversing copy into itself. With two int args that
-                                // stored arg0 over arg1 before `emit_stack_arg_setup`
-                                // read it, so the callee received arg0 in BOTH parameter
-                                // slots and every comparison in it evaluated `cmp a, a`.
-                                // The reservation also has to outlive the CALL for
-                                // `emit_inline_callee_deopt_check`, which the aliased
-                                // range could not. `reset_spills` recycles the extra
-                                // slots at the next bytecode boundary.
-                                if self.next_spill_offset < args_frame_top {
-                                    self.next_spill_offset = args_frame_top;
-                                }
-                                let base = self.reserve_spill_slots(arg_slots.len())?;
+                                // See `reserve_direct_call_service_slots`: this range MUST
+                                // sit above the argument slots `pop_stack` just handed
+                                // back, or the copy below reverses the arguments into
+                                // themselves and the callee gets arg0 in every slot.
+                                let base = self
+                                    .reserve_direct_call_service_slots(args_frame_top, &arg_slots)?;
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     self.load_slot_to_reg(R11, *slot);
                                     let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
@@ -20930,22 +20964,12 @@ impl Compiler {
                             // Preserve Java arguments for the cold direct-callee
                             // exception-table service before call marshalling.
                             let service_args_base = info_ptr.and_then(|_| {
-                                // Reserve ABOVE the argument slots. `pop_stack` reclaimed
-                                // them, so a bare `reserve_spill_slots` hands the SAME
-                                // slots back — and the copy below writes
-                                // `base + (len-1-i)` while reading `arg_slots[i]`, i.e. a
-                                // reversing copy into itself. With two int args that
-                                // stored arg0 over arg1 before `emit_stack_arg_setup`
-                                // read it, so the callee received arg0 in BOTH parameter
-                                // slots and every comparison in it evaluated `cmp a, a`.
-                                // The reservation also has to outlive the CALL for
-                                // `emit_inline_callee_deopt_check`, which the aliased
-                                // range could not. `reset_spills` recycles the extra
-                                // slots at the next bytecode boundary.
-                                if self.next_spill_offset < args_frame_top {
-                                    self.next_spill_offset = args_frame_top;
-                                }
-                                let base = self.reserve_spill_slots(arg_slots.len())?;
+                                // See `reserve_direct_call_service_slots`: this range MUST
+                                // sit above the argument slots `pop_stack` just handed
+                                // back, or the copy below reverses the arguments into
+                                // themselves and the callee gets arg0 in every slot.
+                                let base = self
+                                    .reserve_direct_call_service_slots(args_frame_top, &arg_slots)?;
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     self.load_slot_to_reg(R11, *slot);
                                     let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
@@ -23979,6 +24003,32 @@ pub fn compile_with_param_slots(
     // exhausted otherwise modest 10 KiB buffers, leaving hot methods in the
     // interpreter. Keep enough headroom for those sites; the code-cache cap
     // remains the global bound on retained executable memory.
+    //
+    // 512 -> 1024 (2026-08-01). Widening the PIC's inter-slot branch from
+    // `rel8` to `rel32` grew every inline-cache site, and 512 stopped covering
+    // them. Measured on one Spring Boot suite class: TEN methods overflowed per
+    // run, and in every one of them `inline_extra` was 0 and the whole shortfall
+    // sat in this term. Solving each for the per-invoke cost the body actually
+    // needed — `(wanted - code_len * 96 - 8192) / invokes`, which OVER-attributes
+    // (the `code_len * 96` term also pays for the invoke bytecodes) — gives:
+    //
+    //     MapperListener.containerEvent           68 invokes   957 B/invoke
+    //     AbstractBeanDefinition.<init>           83 invokes   824
+    //     OnBeanCondition.getMatchingBeans        34 invokes   728
+    //     ObjectCreateRule.begin                  22 invokes   674
+    //     ResolvableType.getNested                 6 invokes   642
+    //     ClassFileAnnotationMetadata.resolveTypeName 7 invokes 640
+    //     StringUtils.collectionToDelimitedString 16 invokes   578
+    //     AbstractAutowireCapableBeanFactory.populateBean 34   547
+    //     DateTimeFormatterBuilder$NumberPrinterParser.format 36 531
+    //     jdk.internal.classfile.impl.ClassImpl.forEach 21     515
+    //
+    // 1024 covers the worst of them with margin. Unlike the optimizing tier —
+    // which now measures the shortfall and re-runs the lowering at that size
+    // (`ir_lower::lower_inner`) — this backend cannot retry: it consumes six
+    // one-shot thread-local staging requests before the buffer is allocated,
+    // and re-entering it would find them gone. The estimate has to be right the
+    // first time here, so it errs high.
     let inline_extra: usize = inline_sites
         .values()
         .map(|s| s.callee_code_len.saturating_mul(64))
@@ -23986,9 +24036,10 @@ pub fn compile_with_param_slots(
     let estimated_size = code_len
         .saturating_mul(96)
         .saturating_add(8192)
-        .saturating_add(invoke_info.len().saturating_mul(512))
+        .saturating_add(invoke_info.len().saturating_mul(1024))
         .saturating_add(inline_extra);
-    let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
+    let mut buf = ExecutableBuffer::new(estimated_size.max(4096))?;
+    buf.set_tag("x64-single-pass");
 
     // Size operand-stack spills from the reader/verifier max_stack when the
     // production path supplies it. Keep the local estimator as a defensive floor

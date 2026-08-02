@@ -5,7 +5,7 @@
 callee reached over the direct edge, with no crash and no diagnostic.
 **HotSpot:** correct in 8.0e9 calls.
 Found while root-causing the Tomcat `TestWsRemoteEndpointImplServerDeadlock`
-close delay (`docs/known-issues/tomcat/wsremoteendpoint-server-close-never-completes.md`).
+close delay (`docs/internal/fixed-suite-bugs/tomcat/wsremoteendpoint-server-close-never-completes-FIXED.md`).
 
 ## Symptom
 

@@ -291,7 +291,7 @@ here. It was re-filed rather than retired with this document:
 * The JIT code-buffer overflow flood
   (`JIT try_patch_i32: offset out of bounds; marking buffer overflowed`, 3552
   in one 4-test class) →
-  `docs/known-issues/jit-ir-tier-code-buffer-overflow-flood-20260801.md`.
+  `docs/internal/fixed-suite-bugs/jit-ir-tier-code-buffer-estimate-20260801-FIXED.md` (FIXED 2026-08-01: the estimate was the IR tier's and is now fitted to a 1664-compile census).
   It is a silent de-optimization, not corruption. The re-filed version corrects
   the attribution: `CRATONVM_DBG_IR_BAILOUT=1` shows 54 optimizing-tier
   `code_buffer_exhausted` bailouts against 5 from `x64::compile`, so it is the

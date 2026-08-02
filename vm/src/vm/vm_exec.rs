@@ -22065,6 +22065,39 @@ fn invoke_on_class_shared_inner(
                         .unwrap_or_default(),
                     "NoSuchMethodError"
                 );
+                // H2-CID0, dispatch face (2026-08-02): the same flag-free
+                // reclaimed-memory verdict the two `checkcast` reporters emit.
+                // A receiver whose class resolved to `ClassId(0)` is ambiguous
+                // — bare `java.lang.Object`, an un-hashed `new Object()`, and
+                // the all-zero header the collector leaves over a reclaimed
+                // span all wear that face — and until now the INVOKE path said
+                // nothing at all about which. Free-list membership is not
+                // ambiguous, so ask the heap.
+                //
+                // The receiver's class id is passed through: the helper takes
+                // the heap locks only for the `ClassId(0)` face, so this
+                // terminal — which is also reached in bulk on HEALTHY runs, a
+                // missing method on a synthetic classpath stub logging here on
+                // every call — pays only a lock-free ring probe otherwise. That
+                // probe still matters off the zero face: once the allocator
+                // hands a prematurely-freed block out again, the same stale
+                // reference resolves to a REAL class and the miss reads
+                // `SomeUnrelatedClass.hasNext()` instead.
+                //
+                // Witness: `NoSuchMethodError java/lang/Object.hasNext()Z` from
+                // `TestMultiThread.testConcurrentUpdate @pc=252` — the
+                // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
+                // docs/known-issues/h2/
+                // bug-h2-blocked-frame-classid0-dispatch-miss.md.
+                if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                    crate::memory::reclaim_guard::report_reclaimed_receiver(
+                        shared,
+                        recv.as_ptr() as usize,
+                        "invoke dispatch",
+                        &format!("{class_name}.{method_name}{descriptor}"),
+                        class_id.as_u32(),
+                    );
+                }
                 // CRATONVM_DBG_CCE_BT: a dispatch miss whose receiver resolved
                 // to bare `java/lang/Object` is the stale-ObjectRef family's
                 // cid=0 signature surfacing at INVOKE (the checkcast tracer's

@@ -2472,6 +2472,18 @@ unsafe fn route_implicit_exc_through_callee(
     // Re-entering at bytecode 0 replays every prefix side effect (and was the
     // source of the old finally/counter leak).
     if let Some((thread, _guard)) = jit_thread_mut() {
+        // Drop any exceptional frame the abandoned compiled attempt published
+        // BEFORE materializing the exception. `create_exception_object`
+        // allocates on the Java heap and can therefore run a young collection,
+        // and a `ReconstructedFrame` is not a GC root — its object words would
+        // survive as stale addresses. `run_jit_callee_handler` reads that frame
+        // (that is how a handler recovers its non-parameter locals), so leaving
+        // a pre-allocation frame standing here would hand it relocated
+        // pointers. Without one it applies its `handler_reads_non_param_local`
+        // guard instead and refuses rather than reconstructing a params-only
+        // frame it cannot justify — which is exactly the conservative answer
+        // for this branch.
+        cratonvm_jit::deopt::clear_exceptional_frame();
         let exc = match (aioobe, npe) {
             (Some((index, length)), _) => {
                 let msg = format!("Index {index} out of bounds for length {length}");
@@ -6662,50 +6674,27 @@ pub unsafe extern "C" fn jit_checkcast(
         // reclaimed span; free-list membership tells the two apart.
         // See docs/known-issues/h2/
         // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
-        if obj_class_id.as_u32() == 0 {
-            let addr = obj_ref.as_ptr() as usize;
-            if let Some((what, span, size)) = vm.mem.heap.reclaimed_hole_at(addr) {
-                static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                    tracing::error!(
-                        target: "cratonvm::gc::guard",
-                        obj = format!("{addr:#x}"),
-                        location = %what,
-                        span = format!("{span:#x}+{size:#x}"),
-                        target_class = %class_name,
-                        "JIT checkcast receiver points into RECLAIMED memory — a \
-                         still-referenced object was collected.",
-                    );
-                    // H2-CID0: name the victim, unconditionally.
-                    if let Some((cid, kind, site, seq)) =
-                        cratonvm_gc::gen_heap::old_freed_lookup(addr)
-                    {
-                        let orig = vm
-                            .classes
-                            .class_manager
-                            .try_read()
-                            .and_then(|cm| {
-                                cm.get_class(cratonvm_types::ClassId::new(cid))
-                                    .map(|c| c.name.to_string())
-                            })
-                            .unwrap_or_else(|| format!("class_id={cid}"));
-                        tracing::error!(
-                            target: "cratonvm::gc::guard",
-                            obj = format!("{addr:#x}"),
-                            original_class = %orig,
-                            original_kind = kind,
-                            freed_by = if site == 1 {
-                                "in-place old-gen sweep"
-                            } else {
-                                "old-gen mark-compact"
-                            },
-                            free_seq = seq,
-                            "…and the old-gen reclamation ring knows what that block held.",
-                        );
-                    }
-                }
-            }
-        }
+        //
+        // 2026-08-02: moved into `memory::reclaim_guard` so the three faces of
+        // this defect — interpreted `checkcast`, compiled `checkcast`, and an
+        // `invoke` dispatch miss — report the same verdict. This copy and the
+        // interpreter's had already drifted (only the interpreter's consulted
+        // the young-sweep ring), which is what a third copy for the dispatch
+        // face would have compounded. The concurrent H2-CID0 follow-up that
+        // landed here — ask the reclamation ring on EVERY failing cast, not only
+        // on `ClassId(0)`, because a freed block only reads as
+        // `java.lang.Object` while it stays on the free list and afterwards
+        // shows a valid object of an unrelated class (`java.util.BitSet cannot
+        // be cast to org.h2.mvstore.Chunk`) — is folded into that function, so
+        // the dispatch face inherits it too. It is passed `actual_class_id`
+        // and takes the heap locks only for the `ClassId(0)` branch.
+        crate::memory::reclaim_guard::report_reclaimed_receiver(
+            vm,
+            obj_ref.as_ptr() as usize,
+            "JIT checkcast",
+            class_name,
+            obj_class_id.as_u32(),
+        );
         if let Some((thread, _jit_thread_guard)) = jit_thread_mut() {
             // Render an array receiver by its own descriptor. The header of a
             // reference array carries the COMPONENT class id, so the plain
