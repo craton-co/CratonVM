@@ -7164,38 +7164,61 @@ impl Vm {
         }
     }
 
-    /// Read `Throwable.detailMessage` off `obj`, walking the superclass chain
-    /// by field *name* so an arbitrary subclass's own slots cannot be
-    /// mistaken for it.
+    /// Read the detail message off `obj`.
+    ///
+    /// Two layouts have to be handled, which is why this is not a one-line
+    /// field read. Real-JDK `java.lang.Throwable` declares `detailMessage` by
+    /// name, so the hierarchy walk finds it. CratonVM's synthetic
+    /// `java/lang/Throwable` (`class_manager`'s `instance_fields(2)`) names its
+    /// slots `_f0`/`_f1` — message and cause — and real-JDK bootstrap metadata
+    /// can render Throwable's first slots opaquely the same way. For those,
+    /// fall back to scanning the Throwable's own slots for the first value
+    /// that decodes as a `java.lang.String`.
+    ///
+    /// Deliberately does not guess a fixed slot number: the message is slot 0
+    /// in the synthetic layout and slot 1 in the real one (slot 0 there is
+    /// `backtrace`), and picking wrong renders an unrelated object as the
+    /// message. Reading the value and requiring it to be a decodable String
+    /// answers that without encoding either layout.
     fn exception_detail_message(&self, obj: ObjectRef) -> Option<String> {
         let class_id = self.shared.mem.heap.class_id_of(obj);
-        let index = {
+        let (named, throwable_slots) = {
             let cm = self.shared.classes.class_manager.read();
             let mut walk = Some(class_id);
-            let mut found = None;
-            'outer: while let Some(cid) = walk {
+            let mut named = None;
+            let mut throwable_slots = None;
+            while let Some(cid) = walk {
                 let Some(cls) = cm.get_class(cid) else { break };
                 let mut instance = 0usize;
                 for f in &cls.fields {
                     if f.is_static() {
                         continue;
                     }
-                    if &*f.name == "detailMessage" {
-                        found = Some(cls.first_field_index + instance);
-                        break 'outer;
+                    if &*f.name == "detailMessage" && named.is_none() {
+                        named = Some(cls.first_field_index + instance);
                     }
                     instance += 1;
                 }
+                if &*cls.name == "java/lang/Throwable" {
+                    throwable_slots = Some((cls.first_field_index, instance));
+                }
                 walk = cls.superclass;
             }
-            found?
+            (named, throwable_slots)
         };
-        match self.shared.mem.heap.get_field(obj, index) {
-            Value::Object(Some(s)) => {
-                super::vm_object::read_java_string(&self.shared.mem.heap, s)
-            }
+
+        let read_string = |index: usize| match self.shared.mem.heap.get_field(obj, index) {
+            Value::Object(Some(s)) => super::vm_object::read_java_string(&self.shared.mem.heap, s),
             _ => None,
+        };
+
+        if let Some(index) = named {
+            if let Some(text) = read_string(index) {
+                return Some(text);
+            }
         }
+        let (base, count) = throwable_slots?;
+        (base..base + count).find_map(read_string)
     }
 
     /// Render any [`MethodCallFailed`] for a human.
