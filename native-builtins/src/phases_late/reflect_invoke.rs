@@ -2160,6 +2160,64 @@ pub(crate) fn p59_sw_get_caller_class(
 
 /// Helper: extract the module name string from a synthetic Module object (field 0).
 /// Returns `""` (unnamed module sentinel) if the Module has no name set.
+/// Target recorded for a dynamic `addExports`/`addOpens` edge whose target
+/// `Module` argument is present but whose name CratonVM cannot resolve.
+///
+/// No module is ever called this, so the edge grants nobody — which is the
+/// point. See [`dynamic_edge_target`].
+pub(crate) const UNRESOLVED_TARGET_MODULE: &str = "cratonvm.unresolved-target-module";
+
+/// Resolve the `target` string for a dynamic `addExports`/`addOpens` edge.
+///
+/// `ModuleRegistry::add_exports`/`add_opens` treat an EMPTY target as
+/// *unqualified* — opened to every module in the process. [`read_module_name`]
+/// also returns empty for the unnamed module. Those two meanings are not the
+/// same thing, and conflating them silently turns a qualified grant into a
+/// process-wide one.
+///
+/// That conflation was observable: Mockito's `InstrumentationMemberAccessor`
+/// lazily calls `Instrumentation.redefineModule` to open `java.base/java.lang`
+/// to *its own* ByteBuddy-injected dispatcher module. CratonVM cannot name that
+/// module, so `read_module_name` returned `""` and the edge was stored as
+/// "java.base opens java.lang to EVERYONE". `Module.isOpen("java.lang")` then
+/// answered `true` where HotSpot answers `false`, and every later
+/// encapsulation check keyed on that flag came apart — most visibly
+/// `check_class_loader_define_class_is_encapsulated`, which stopped denying
+/// Spring-CGLIB's `ReflectUtils` its reflective `ClassLoader.defineClass`. The
+/// CGLIB AOP proxy then landed in the requested loader instead of its
+/// superclass's, a package-private override stopped overriding (JVMS 5.4.5),
+/// and `@MockitoSpyBean` stubs silently ran the real method
+/// (`AotIntegrationTests#endToEndTestsForBeanOverrides`, 4 failures).
+///
+/// Measured against a real JDK 25 running the identical Mockito call: HotSpot
+/// reports `isOpen("java.lang")` false, `isOpen("java.lang", <app unnamed>)`
+/// false, and denies `setAccessible(ClassLoader.defineClass)` both before and
+/// after. Recording a target CratonVM cannot name as "grants nobody" reproduces
+/// that exactly, and can only ever grant LESS than HotSpot, never more.
+///
+/// `None` (no target argument at all — `Module.implAddOpens(String)`, or the
+/// `--add-opens` CLI path) still means genuinely unqualified and is unchanged.
+pub(crate) fn dynamic_edge_target(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    target_index: Option<usize>,
+) -> String {
+    let Some(idx) = target_index else {
+        return String::new(); // no target argument => unqualified, as before
+    };
+    match args.get(idx) {
+        Some(Value::Object(Some(m))) => {
+            let name = read_module_name(ctx, *m);
+            if name.is_empty() {
+                UNRESOLVED_TARGET_MODULE.to_string()
+            } else {
+                name
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 pub(crate) fn read_module_name(ctx: &dyn NativeContext, module_obj: ObjectRef) -> String {
     match ctx.get_field(module_obj, 0) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -2235,10 +2293,7 @@ pub(crate) fn native_module_add_exports(
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
-    let target = match args.get(2) {
-        Some(Value::Object(Some(m))) => read_module_name(ctx, *m),
-        _ => String::new(),
-    };
+    let target = dynamic_edge_target(ctx, args, Some(2));
     let pkg_slash = pkg_name.replace('.', "/");
     ctx.module_add_exports(&module_name, &pkg_slash, &target);
     Ok(Some(Value::Object(Some(this))))
@@ -2256,10 +2311,7 @@ pub(crate) fn native_module_add_opens(
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
-    let target = match args.get(2) {
-        Some(Value::Object(Some(m))) => read_module_name(ctx, *m),
-        _ => String::new(),
-    };
+    let target = dynamic_edge_target(ctx, args, Some(2));
     let pkg_slash = pkg_name.replace('.', "/");
     ctx.module_add_opens(&module_name, &pkg_slash, &target);
     Ok(Some(Value::Object(Some(this))))
@@ -2277,12 +2329,7 @@ pub(crate) fn module_add_exports_or_opens_void(
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(None),
     };
-    let target = target_index
-        .and_then(|idx| match args.get(idx) {
-            Some(Value::Object(Some(m))) => Some(read_module_name(ctx, *m)),
-            _ => None,
-        })
-        .unwrap_or_default();
+    let target = dynamic_edge_target(ctx, args, target_index);
     let pkg_slash = pkg_name.replace('.', "/");
     if open {
         ctx.module_add_opens(&module_name, &pkg_slash, &target);
@@ -3561,4 +3608,72 @@ pub(crate) fn register_p70_constant_bootstraps(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(vh))))
         });
     r.set_category(__prev_cat);
+}
+
+#[cfg(test)]
+mod dynamic_edge_target_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeHeapAccess, NativeInvokeAccess,
+        NativeSystemAccess, NativeThreadAccess,
+    };
+
+    use super::*;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+
+    /// Build a `java.lang.Module` whose field 0 (the name) is either a String
+    /// or null. Null is how CratonVM represents both the unnamed module and a
+    /// module it simply cannot name.
+    fn module_obj(ctx: &mut MockNativeContext, name: Option<&str>) -> Value {
+        let cid = ctx.ensure_class_initialized("java/lang/Module").unwrap();
+        let m = ctx.alloc_object(cid, 4);
+        match name {
+            Some(n) => {
+                let s = ctx.create_string(n);
+                ctx.set_field(m, 0, Value::Object(Some(s)));
+            }
+            None => ctx.set_field(m, 0, Value::Object(None)),
+        }
+        Value::Object(Some(m))
+    }
+
+    #[test]
+    fn no_target_argument_stays_unqualified() {
+        let mut ctx = mock_ctx();
+        // `Module.implAddOpens(String)` and the `--add-opens` CLI path have no
+        // target module at all; those really are unqualified.
+        assert_eq!(dynamic_edge_target(&mut ctx, &[], None), "");
+    }
+
+    #[test]
+    fn named_target_module_is_recorded_verbatim() {
+        let mut ctx = mock_ctx();
+        let target = module_obj(&mut ctx, Some("jdk.compiler"));
+        let args = [Value::Object(None), Value::Object(None), target];
+        assert_eq!(
+            dynamic_edge_target(&mut ctx, &args, Some(2)),
+            "jdk.compiler"
+        );
+    }
+
+    /// The regression guard. A target module CratonVM cannot name must NOT
+    /// collapse to the empty string: `ModuleRegistry::add_opens` reads an empty
+    /// target as *unqualified*, i.e. opened to every module in the process.
+    ///
+    /// Mockito's `InstrumentationMemberAccessor` opens `java.base/java.lang` to
+    /// its own ByteBuddy-injected module; widening that to "everyone" made
+    /// `Module.isOpen("java.lang")` answer true where HotSpot answers false and
+    /// broke `AotIntegrationTests#endToEndTestsForBeanOverrides`.
+    #[test]
+    fn unnameable_target_module_is_not_recorded_as_unqualified() {
+        let mut ctx = mock_ctx();
+        let target = module_obj(&mut ctx, None);
+        let args = [Value::Object(None), Value::Object(None), target];
+        let resolved = dynamic_edge_target(&mut ctx, &args, Some(2));
+        assert!(
+            !resolved.is_empty(),
+            "an empty target means unqualified/open-to-everyone"
+        );
+        assert_eq!(resolved, UNRESOLVED_TARGET_MODULE);
+    }
 }
