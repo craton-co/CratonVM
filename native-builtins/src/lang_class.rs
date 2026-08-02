@@ -68,7 +68,15 @@ pub(crate) fn dbg_bb_enabled() -> bool {
 // already lighter than `String` for read-only sharing.
 // ---------------------------------------------------------------------------
 
-type ClassNameCache = OnceLock<RwLock<FxHashMap<u32, Arc<str>>>>;
+/// Keyed by `(vm_identity, class_id)`, not by `class_id` alone.
+///
+/// Class ids are minted per VM from zero, so two `Vm`s in one process — which
+/// a Rust test binary routinely has running at once — collide immediately:
+/// VM B asking for the name of its class 42 got VM A's answer. That made
+/// `Class.getName()` lie, and with it every `getDeclaredMethod` /
+/// `isProxyClass` / package lookup built on top of it, showing up as
+/// intermittent `NoSuchMethodException`s in an otherwise green parallel run.
+type ClassNameCache = OnceLock<RwLock<FxHashMap<(usize, u32), Arc<str>>>>;
 
 static DOTTED_CLASS_NAME_CACHE: ClassNameCache = OnceLock::new();
 static SIMPLE_CLASS_NAME_CACHE: ClassNameCache = OnceLock::new();
@@ -76,21 +84,43 @@ static CANONICAL_CLASS_NAME_CACHE: ClassNameCache = OnceLock::new();
 static PACKAGE_NAME_CACHE: ClassNameCache = OnceLock::new();
 
 #[inline]
-fn cache_get_or_init(cache: &ClassNameCache) -> &RwLock<FxHashMap<u32, Arc<str>>> {
+fn cache_get_or_init(cache: &ClassNameCache) -> &RwLock<FxHashMap<(usize, u32), Arc<str>>> {
     cache.get_or_init(|| RwLock::new(FxHashMap::default()))
 }
 
 #[inline]
-fn cache_get(cache: &ClassNameCache, class_id: ClassId) -> Option<Arc<str>> {
+fn cache_get(cache: &ClassNameCache, vm: usize, class_id: ClassId) -> Option<Arc<str>> {
     let map = cache_get_or_init(cache);
-    map.read().get(&class_id.as_u32()).cloned()
+    map.read().get(&(vm, class_id.as_u32())).cloned()
 }
 
 #[inline]
-fn cache_insert(cache: &ClassNameCache, class_id: ClassId, value: Arc<str>) -> Arc<str> {
+fn cache_insert(
+    cache: &ClassNameCache,
+    vm: usize,
+    class_id: ClassId,
+    value: Arc<str>,
+) -> Arc<str> {
     let map = cache_get_or_init(cache);
-    map.write().insert(class_id.as_u32(), Arc::clone(&value));
+    map.write()
+        .insert((vm, class_id.as_u32()), Arc::clone(&value));
     value
+}
+
+/// Drop every class-name cache entry belonging to `vm_identity`. Called from
+/// `release_vm_native_state`; without it the tables grow by a whole class
+/// library per disposed VM.
+pub fn forget_vm_class_name_caches(vm_identity: usize) {
+    for cache in [
+        &DOTTED_CLASS_NAME_CACHE,
+        &SIMPLE_CLASS_NAME_CACHE,
+        &CANONICAL_CLASS_NAME_CACHE,
+        &PACKAGE_NAME_CACHE,
+    ] {
+        cache_get_or_init(cache)
+            .write()
+            .retain(|(vm, _), _| *vm != vm_identity);
+    }
 }
 
 /// Dotted form of a class's internal slashed name (`java/lang/Object` в†’
@@ -101,7 +131,7 @@ fn cache_insert(cache: &ClassNameCache, class_id: ClassId, value: Arc<str>) -> A
 /// primitives like `[I`) the dotted form equals the slashed form and we
 /// still cache the `Arc<str>` clone of the input.
 pub(crate) fn dotted_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
+    if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
         return arc;
     }
     let dotted: Arc<str> = if let Some(primitive) = primitive_descriptor_name(slashed) {
@@ -111,7 +141,7 @@ pub(crate) fn dotted_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
     } else {
         Arc::from(slashed)
     };
-    cache_insert(&DOTTED_CLASS_NAME_CACHE, class_id, dotted)
+    cache_insert(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, dotted)
 }
 
 /// Render an array class's internal descriptor as `Class.getTypeName()` does:
@@ -251,15 +281,15 @@ fn array_descriptor_to_package_name(desc: &str) -> Option<String> {
 /// class-based mock (see jndirealmintegration-ldap-connection-npe residual /
 /// EasyMock investigation).
 pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
+    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
         return arc;
     }
     if raw.starts_with('[') {
         let simple: Arc<str> = Arc::from(array_descriptor_to_simple_name(raw).unwrap_or_default());
-        return cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple);
+        return cache_insert(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, simple);
     }
     let simple: Arc<str> = Arc::from(raw.rsplit(&['/', '.'][..]).next().unwrap_or(raw));
-    cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple)
+    cache_insert(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, simple)
 }
 
 /// The class's OWN entry in its `InnerClasses` attribute, as
@@ -295,7 +325,7 @@ fn own_inner_class_entry(
 /// anonymous class — JLS 13.1), else the top-level derivation. Cached per
 /// `ClassId`.
 fn resolve_simple_name(ctx: &mut dyn NativeContext, class_id: ClassId, name: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
+    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
         return arc;
     }
     match own_inner_class_entry(ctx, class_id, name) {
@@ -308,7 +338,7 @@ fn resolve_simple_name(ctx: &mut dyn NativeContext, class_id: ClassId, name: &st
         // ("1"), which regression-suite `RReflect` catches as
         // "anonymous getSimpleName empty".
         Some((_outer, inner_name)) => {
-            cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, Arc::from(inner_name))
+            cache_insert(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, Arc::from(inner_name))
         }
         None => simple_class_name(class_id, name),
     }
@@ -328,7 +358,7 @@ pub(crate) fn canonical_class_name(
     class_id: ClassId,
     slashed: &str,
 ) -> Arc<str> {
-    if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
+    if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
         return arc;
     }
     let canonical: Arc<str> = if slashed.starts_with('[') {
@@ -370,7 +400,7 @@ pub(crate) fn canonical_class_name(
     } else {
         Arc::from(slashed.replace('/', "."))
     };
-    cache_insert(&CANONICAL_CLASS_NAME_CACHE, class_id, canonical)
+    cache_insert(&CANONICAL_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, canonical)
 }
 
 /// Package name (dotted) for a class. For `java/lang/Object` returns
@@ -378,7 +408,7 @@ pub(crate) fn canonical_class_name(
 /// `Class.getPackageName()` (`java.lang` for primitive arrays); for
 /// default-package classes returns the empty string. Cached per `ClassId`.
 pub(crate) fn package_name_of(class_id: ClassId, slashed: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+    if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
         return arc;
     }
     let pkg: Arc<str> = if slashed.starts_with('[') {
@@ -388,7 +418,7 @@ pub(crate) fn package_name_of(class_id: ClassId, slashed: &str) -> Arc<str> {
     } else {
         Arc::from("")
     };
-    cache_insert(&PACKAGE_NAME_CACHE, class_id, pkg)
+    cache_insert(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id, pkg)
 }
 
 // ---------------------------------------------------------------------------
@@ -970,7 +1000,7 @@ pub(crate) fn native_class_get_name(
                         return Ok(Some(Value::Object(Some(name_obj))));
                     }
                 }
-                if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
+                if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
                     let name_obj = ctx.create_string(&arc);
                     return Ok(Some(Value::Object(Some(name_obj))));
                 }
@@ -3406,7 +3436,7 @@ pub(crate) fn native_class_get_simple_name(
     // encode ClassId only via field-0 are excluded to avoid cross-test
     // pollution on ClassId(0).
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
-        if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
             let result = ctx.create_string(&arc);
             return Ok(Some(Value::Object(Some(result))));
         }
@@ -3420,6 +3450,7 @@ pub(crate) fn native_class_get_simple_name(
                 let elem_simple = resolve_simple_name(ctx, elem_id, elem).to_string();
                 let simple = cache_insert(
                     &SIMPLE_CLASS_NAME_CACHE,
+                    ctx.vm_identity(),
                     class_id,
                     Arc::from(append_array_suffix(elem_simple, dims)),
                 );
@@ -14877,7 +14908,7 @@ pub(crate) fn native_class_get_package_name(
     // program's lifetime. Cache-eligible mirrors are those owned by the
     // VM reverse map (rules out test-fixture ClassId(0) collisions).
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
-        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
         }
         // Synthetic lambda proxies aren't in the class store, so
@@ -15365,7 +15396,7 @@ pub(crate) fn native_class_get_package(
     let pkg_name: Arc<str> = if let Some(pkg_name) = lambda_pkg {
         pkg_name
     } else if let Some(class_id) = class_id {
-        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
             arc
         } else {
             package_name_of(class_id, &name)
@@ -15978,7 +16009,7 @@ pub(crate) fn i2_classloader_define_package_class(
     // Cache the dotted package prefix per `ClassId` for VM-registered
     // mirrors only вЂ” same rationale as `native_class_get_package`.
     let pkg_name: Arc<str> = if let Some(class_id) = ctx.class_id_from_mirror(class_arg) {
-        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
             arc
         } else {
             package_name_of(class_id, &class_name)
@@ -16397,7 +16428,7 @@ pub(crate) fn native_class_get_canonical_name(
         // An empty canonical name is `canonical_class_name`'s sentinel for
         // "this class has no canonical name" (local / anonymous / nested in
         // one, JLS 6.7) — `Class.getCanonicalName()` returns null for those.
-        if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
             if arc.is_empty() {
                 return Ok(Some(Value::Object(None)));
             }
@@ -16471,7 +16502,7 @@ pub(crate) fn native_class_get_type_name(
     // pure derivation from the slashed internal name and equals what
     // `dotted_class_name` produces вЂ” share the same cache as `Class.getName()`.
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
-        if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
+        if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {

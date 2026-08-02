@@ -24564,9 +24564,12 @@ fn object_to_string_dotted_name(
     use rustc_hash::FxHashMap;
     use std::sync::{Arc, OnceLock};
 
-    static CACHE: OnceLock<RwLock<FxHashMap<u32, Arc<str>>>> = OnceLock::new();
+    // Keyed by `(vm_identity, class_id)`: class ids restart at zero in every
+    // VM, and a test binary has several live at once — see the
+    // `ClassNameCache` note in `lang_class`.
+    static CACHE: OnceLock<RwLock<FxHashMap<(usize, u32), Arc<str>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| RwLock::new(FxHashMap::default()));
-    let key = class_id.as_u32();
+    let key = (ctx.vm_identity(), class_id.as_u32());
     if let Some(arc) = cache.read().get(&key).cloned() {
         return arc;
     }

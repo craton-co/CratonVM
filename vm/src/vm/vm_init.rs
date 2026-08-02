@@ -7518,6 +7518,9 @@ pub fn release_vm_native_state(vm_identity: usize) {
     // The synthetic `ReentrantLock` / `ReentrantReadWriteLock` state tables,
     // keyed by `(vm_identity, identity_hash)`.
     cratonvm_native_builtins::forget_vm_lock_state(vm_identity);
+    // The `Class.getName()` / simple / canonical / package name memos, keyed
+    // by `(vm_identity, class_id)`.
+    cratonvm_native_builtins::lang_class::forget_vm_class_name_caches(vm_identity);
     crate::runtime::instrument::forget_vm_transformers(vm_identity);
     // Without this a disposed VM's JVMTI row leaks its agent's callback
     // closures, and its listener flags keep every OTHER VM's interpreter on the
