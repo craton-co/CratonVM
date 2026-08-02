@@ -2580,7 +2580,7 @@ pub(crate) fn build_stack_trace_element_array(
     for (i, e) in trace.iter().rev().enumerate() {
         let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         let cls_dotted = match ctx.class_id_by_name(&e.class_name) {
-            Some(cid) => crate::lang_class::dotted_class_name(cid, &e.class_name),
+            Some(cid) => crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, &e.class_name),
             None => std::sync::Arc::from(e.class_name.replace('/', ".")),
         };
         crate::lang_misc::fill_stack_trace_element(

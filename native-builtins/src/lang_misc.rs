@@ -715,7 +715,7 @@ pub(crate) fn native_init_stack_trace_elements(
     for (i, (cls_slashed, meth, file, line)) in trace_data.iter().rev().take(cap).enumerate() {
         let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         let cls_dotted = match ctx.class_id_by_name(cls_slashed) {
-            Some(cid) => crate::lang_class::dotted_class_name(cid, cls_slashed),
+            Some(cid) => crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, cls_slashed),
             None => std::sync::Arc::from(cls_slashed.replace('/', ".")),
         };
         fill_stack_trace_element(
@@ -844,7 +844,9 @@ pub(crate) fn native_throwable_get_stack_trace_element(
             // that hit the same class (e.g. recursive frames) reuse the
             // existing `Arc<str>` instead of re-running `replace('/', ".")`.
             let dotted = match ctx.class_id_by_name(&ste.class_name) {
-                Some(cid) => crate::lang_class::dotted_class_name(cid, &ste.class_name),
+                Some(cid) => {
+                    crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, &ste.class_name)
+                }
                 None => std::sync::Arc::from(ste.class_name.replace('/', ".")),
             };
             let obj = build_ste(
@@ -1578,7 +1580,7 @@ pub(crate) fn native_throwable_get_stack_trace_array(
         // repeat frames in the same trace (recursion) hit the cached
         // Arc<str> instead of re-allocating.
         let cls_dotted = match ctx.class_id_by_name(cls_slashed) {
-            Some(cid) => crate::lang_class::dotted_class_name(cid, cls_slashed),
+            Some(cid) => crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, cls_slashed),
             None => std::sync::Arc::from(cls_slashed.replace('/', ".")),
         };
         fill_stack_trace_element(

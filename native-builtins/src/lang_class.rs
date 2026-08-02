@@ -130,7 +130,7 @@ pub fn forget_vm_class_name_caches(vm_identity: usize) {
 /// For names with no `/` (primitives like `int`, `void`, or arrays of
 /// primitives like `[I`) the dotted form equals the slashed form and we
 /// still cache the `Arc<str>` clone of the input.
-pub(crate) fn dotted_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
+pub(crate) fn dotted_class_name(vm: usize, class_id: ClassId, slashed: &str) -> Arc<str> {
     if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
         return arc;
     }
@@ -280,7 +280,7 @@ fn array_descriptor_to_package_name(desc: &str) -> Option<String> {
 /// truncated name (e.g. just `"1"`) and misreport `Not a mock` for every
 /// class-based mock (see jndirealmintegration-ldap-connection-npe residual /
 /// EasyMock investigation).
-pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
+pub(crate) fn simple_class_name(vm: usize, class_id: ClassId, raw: &str) -> Arc<str> {
     if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
         return arc;
     }
@@ -340,7 +340,7 @@ fn resolve_simple_name(ctx: &mut dyn NativeContext, class_id: ClassId, name: &st
         Some((_outer, inner_name)) => {
             cache_insert(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, Arc::from(inner_name))
         }
-        None => simple_class_name(class_id, name),
+        None => simple_class_name(ctx.vm_identity(), class_id, name),
     }
 }
 
@@ -407,7 +407,7 @@ pub(crate) fn canonical_class_name(
 /// `java.lang`; for arrays returns the component package reported by
 /// `Class.getPackageName()` (`java.lang` for primitive arrays); for
 /// default-package classes returns the empty string. Cached per `ClassId`.
-pub(crate) fn package_name_of(class_id: ClassId, slashed: &str) -> Arc<str> {
+pub(crate) fn package_name_of(vm: usize, class_id: ClassId, slashed: &str) -> Arc<str> {
     if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
         return arc;
     }
@@ -1005,7 +1005,7 @@ pub(crate) fn native_class_get_name(
                     return Ok(Some(Value::Object(Some(name_obj))));
                 }
                 if let Some(name) = ctx.class_name_of_id(class_id) {
-                    let dotted = dotted_class_name(class_id, &name);
+                    let dotted = dotted_class_name(ctx.vm_identity(), class_id, &name);
                     let name_obj = ctx.create_string(&dotted);
                     return Ok(Some(Value::Object(Some(name_obj))));
                 }
@@ -14927,7 +14927,7 @@ pub(crate) fn native_class_get_package_name(
             return Ok(Some(Value::Object(Some(ctx.create_string(&pkg)))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
-            let pkg = package_name_of(class_id, &name);
+            let pkg = package_name_of(ctx.vm_identity(), class_id, &name);
             return Ok(Some(Value::Object(Some(ctx.create_string(&pkg)))));
         }
     }
@@ -15399,7 +15399,7 @@ pub(crate) fn native_class_get_package(
         if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
             arc
         } else {
-            package_name_of(class_id, &name)
+            package_name_of(ctx.vm_identity(), class_id, &name)
         }
     } else if let Some(pos) = name.rfind('/') {
         Arc::from(name[..pos].replace('/', "."))
@@ -16012,7 +16012,7 @@ pub(crate) fn i2_classloader_define_package_class(
         if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
             arc
         } else {
-            package_name_of(class_id, &class_name)
+            package_name_of(ctx.vm_identity(), class_id, &class_name)
         }
     } else if let Some(pos) = class_name.rfind('/') {
         Arc::from(class_name[..pos].replace('/', "."))
@@ -16506,7 +16506,7 @@ pub(crate) fn native_class_get_type_name(
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
-            let type_name = dotted_class_name(class_id, &name);
+            let type_name = dotted_class_name(ctx.vm_identity(), class_id, &name);
             return Ok(Some(Value::Object(Some(ctx.create_string(&type_name)))));
         }
     }
@@ -19344,11 +19344,11 @@ mod tests {
     #[test]
     fn class_get_name_normalizes_primitive_descriptors() {
         assert_eq!(
-            dotted_class_name(ClassId::new(0xfff0_0001), "Z").as_ref(),
+            dotted_class_name(0, ClassId::new(0xfff0_0001), "Z").as_ref(),
             "boolean"
         );
         assert_eq!(
-            dotted_class_name(ClassId::new(0xfff0_0002), "I").as_ref(),
+            dotted_class_name(0, ClassId::new(0xfff0_0002), "I").as_ref(),
             "int"
         );
     }
