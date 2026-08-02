@@ -1004,16 +1004,68 @@ pub fn take_major_gc_request() -> bool {
 /// be rooted directly otherwise.
 ///
 /// Mirrors `GenerationalHeap::collect_garbage_inner`'s `divert_non_moving`
-/// decision, but deliberately only in its *certain* direction: every term here
-/// forces the non-moving sweep on its own, and the two switches that could
-/// still route a cycle back to the moving path (`CRATONVM_MOVING_YOUNG`,
-/// `CRATONVM_DBG_FORCE_MOVING`) veto it. A false negative merely costs one
+/// decision, but deliberately only in its *certain* direction: every arm here
+/// forces the non-moving sweep on its own. A false negative merely costs one
 /// extra conservative root; a false positive would DROP a live root, so this
 /// errs strictly toward `false`.
+///
+/// # Term-by-term, against `divert_non_moving`
+///
+/// `divert_non_moving` is
+///
+/// ```text
+/// (has_conservative_roots && !moving_young) || honor_promotion_oom_risk
+///     || divert_for_incomplete_moving_coverage || explicit_full_gc
+/// ```
+///
+/// and only `CRATONVM_DBG_FORCE_MOVING` can carry a cycle past it — hence the
+/// veto below. Of the four terms, two are usable here:
+///
+/// * `explicit_full_gc` (`major_gc_requested`) diverts **on its own**, with no
+///   reference to moving-young at all. This is the `System.gc()` case.
+/// * `has_conservative_roots && !moving_young` — the legacy conservative-JIT-root
+///   rule, live only while moving-young is off.
+///
+/// The other two (`honor_promotion_oom_risk`,
+/// `divert_for_incomplete_moving_coverage`) are per-cycle verdicts not yet
+/// decided when the root gatherer asks, so they are conservatively ignored.
+///
+/// # Why the `!moving_young_enabled()` term is NOT a common factor
+///
+/// It used to be: this function read
+///
+/// ```text
+/// !dbg_force_moving && !moving_young_enabled() && (is_active() || … || major_gc_requested())
+/// ```
+///
+/// which factored the `!moving_young` guard — correct for the conservative-root
+/// term — across `major_gc_requested()` as well, where `divert_non_moving` has
+/// no such guard. That was invisible while `DEFAULT_MOVING_YOUNG` was `false`.
+/// When it flipped to `true` (2026-07-28, `67de5400a`) the whole predicate
+/// became unconditionally `false` on the shipped default, silently disarming
+/// [`crate::VmHeap::mirror_pin_deferrable`]'s young-mirror deferral and
+/// re-opening `TestDefaultInstanceManager.testClassUnloading` for the third
+/// time — a fix still present in the tree, and inert. Compare
+/// `vm::memory::roots::conditional_loader_metadata`, which asks the same
+/// question and correctly never had the term.
+///
+/// Note also that `unregistered_jit_frame_on_stack()` is always `false` at the
+/// mirror call site: `collect_roots` clears it (and
+/// `force_non_moving_jit_roots`) before step 6 and only re-sets it at step 14's
+/// JIT scan. It is kept for callers that ask later in the pass; a `false` there
+/// is a false negative, which is the safe direction.
 pub fn young_marker_follows_side_tables() -> bool {
-    !crate::gc_flags().dbg_force_moving
-        && !moving_young_enabled()
-        && (is_active() || unregistered_jit_frame_on_stack() || major_gc_requested())
+    // The one switch that can push a cycle past `divert_non_moving` entirely.
+    if crate::gc_flags().dbg_force_moving {
+        return false;
+    }
+    // `explicit_full_gc`: certain, and independent of moving-young.
+    if major_gc_requested() {
+        return true;
+    }
+    // `has_conservative_roots && !moving_young`: certain only while
+    // moving-young is off.
+    !moving_young_enabled() && (is_active() || unregistered_jit_frame_on_stack())
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,6 +1376,65 @@ mod tests {
              config says moving-young is on — the codegen is the side that has \
              to emit the rewritable root map",
         );
+    }
+
+    /// An explicit `System.gc()` takes `divert_non_moving`'s `explicit_full_gc`
+    /// arm, which names no moving-young condition — so the side-table follow
+    /// must hold on BOTH published values of the gate.
+    ///
+    /// This is the regression test for the third recurrence of
+    /// `TestDefaultInstanceManager.testClassUnloading`: the predicate used to
+    /// factor `!moving_young_enabled()` across this arm too, so flipping
+    /// `DEFAULT_MOVING_YOUNG` to `true` disarmed
+    /// `VmHeap::mirror_pin_deferrable`'s young-mirror deferral everywhere at
+    /// once, with no test failing and the fix still sitting in the tree. Asserting
+    /// both gate values is the point — a one-sided assertion would have passed
+    /// before the flip and after it.
+    #[test]
+    fn explicit_full_gc_follows_side_tables_on_either_moving_young_gate() {
+        for on in [false, true] {
+            publish_moving_young_enabled(on);
+            assert!(
+                !young_marker_follows_side_tables(),
+                "no System.gc() pending and no JIT frame: with moving-young={on} \
+                 this thread cannot promise the non-moving young marker",
+            );
+            request_major_gc();
+            assert!(
+                young_marker_follows_side_tables(),
+                "an explicit System.gc() diverts to the non-moving young cycle on \
+                 its own (`divert_non_moving`'s `explicit_full_gc` term), so a \
+                 young class mirror is reachable through `mirror_pin` and must not \
+                 be rooted unconditionally — moving-young={on} is irrelevant here",
+            );
+            assert!(take_major_gc_request());
+        }
+    }
+
+    /// The other usable arm, and the one that DOES carry the guard: a live JIT
+    /// frame forces the non-moving sweep only while moving-young is off
+    /// (`has_conservative_roots && !moving_young`).
+    #[test]
+    fn conservative_jit_roots_follow_side_tables_only_without_moving_young() {
+        let _ = enter();
+        assert!(is_active());
+
+        publish_moving_young_enabled(false);
+        assert!(
+            young_marker_follows_side_tables(),
+            "conservative JIT roots divert to the non-moving sweep when \
+             moving-young is off",
+        );
+
+        publish_moving_young_enabled(true);
+        assert!(
+            !young_marker_follows_side_tables(),
+            "with moving-young on, a live JIT frame no longer forces the \
+             non-moving sweep — the cycle may relocate, and the moving closure \
+             seeds strictly from the direct root set",
+        );
+
+        let _ = leave();
     }
 
     #[test]

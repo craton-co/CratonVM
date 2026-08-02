@@ -1631,6 +1631,51 @@ fn kernel_select_poll(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed>
 // Probe-based fallback for platforms without kernel wait (or for `Dummy`)
 // ---------------------------------------------------------------------------
 
+/// Is this socket writable *right now*?
+///
+/// A zero-timeout one-fd poll, which is what `Selector` readiness for
+/// `OP_WRITE` actually means. Claiming writability without asking the kernel
+/// is not a conservative approximation — it is a false positive that a
+/// reactor cannot distinguish from the real thing, and it costs a full
+/// dispatch round trip every time the socket is in fact blocked (see
+/// `probe_handle`).
+///
+/// `POLLERR`/`POLLHUP` count as writable: the JDK reports a failed socket as
+/// ready so the next `write()` surfaces the error instead of parking.
+#[allow(dead_code)]
+fn os_handle_writable(os: i64) -> bool {
+    #[cfg(unix)]
+    {
+        let mut pfd = libc::pollfd {
+            fd: os as libc::c_int,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: single-entry pollfd array, zero timeout, fd owned by the
+        // caller's live `SelectableHandle`.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        rc > 0 && (pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP)) != 0
+    }
+    #[cfg(windows)]
+    {
+        let mut pfd = Wsapollfd {
+            fd: os as usize,
+            events: WSAPOLLWRNORM,
+            revents: 0,
+        };
+        // SAFETY: single-entry WSAPOLLFD array, zero timeout, socket owned by
+        // the caller's live `SelectableHandle`.
+        let rc = unsafe { WSAPoll(&mut pfd, 1, 0) };
+        rc > 0 && (pfd.revents & (WSAPOLLWRNORM | WSAPOLLERR | WSAPOLLHUP)) != 0
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = os;
+        // No syscall to ask with; keep the historical optimistic answer.
+        true
+    }
+}
+
 /// Probe a single SelectableHandle. Returns (readyOps bitmask, optional
 /// accepted stream if this is a listener and accept succeeded).
 #[allow(dead_code)]
@@ -1666,7 +1711,17 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
                     Err(_) => {}
                 }
             }
-            if interest & OP_WRITE != 0 {
+            // Ask the kernel. Answering "writable" unconditionally made every
+            // select() cycle report a *send-buffer-full* connection ready to
+            // write: Tomcat's Poller then dispatched a SocketProcessor that
+            // wrote zero bytes and re-armed OP_WRITE, and the next cycle did
+            // it again. On the WebSocket back-pressure workload that cost 3-11
+            // socket-processing tasks per message where HotSpot needs exactly
+            // one, which is what grew the connector pool to maxThreads.
+            // See docs/internal/fixed-suite-bugs/tomcat/wsremoteendpoint-server-close-never-completes-FIXED.md.
+            if interest & OP_WRITE != 0
+                && h.os_handle().map(os_handle_writable).unwrap_or(true)
+            {
                 ready |= OP_WRITE;
             }
         }
@@ -1680,7 +1735,12 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
                     Err(_) => {}
                 }
             }
-            if interest & OP_WRITE != 0 {
+            // Same kernel check as the stream arm above. A datagram socket is
+            // almost always writable, but "almost always" is not a readiness
+            // contract and a full send buffer must not be reported ready.
+            if interest & OP_WRITE != 0
+                && h.os_handle().map(os_handle_writable).unwrap_or(true)
+            {
                 ready |= OP_WRITE;
             }
         }

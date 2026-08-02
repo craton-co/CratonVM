@@ -111,7 +111,7 @@ fixed code in this investigation — 20 A/B + 8 standalone + 6 on the final
 binary — **0 hangs in 34 runs**.
 
 The `CLOSE_DELAY` column is a separate pre-existing defect, not a regression;
-see `docs/known-issues/tomcat/wsremoteendpoint-server-close-never-completes.md`.
+see `docs/internal/fixed-suite-bugs/tomcat/wsremoteendpoint-server-close-never-completes-FIXED.md`.
 Its raw 3-vs-7 is censored — the `before` arm's 9 hung runs never got the
 chance to exhibit a close delay. Conditioned on runs that completed, 3/11 (27%)
 vs 7/20 (35%), z ~= 0.45, p ~= 0.65: indistinguishable.

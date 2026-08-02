@@ -14150,6 +14150,15 @@ mod redefine_immunity_tests {
     fn layout_immunity_is_not_open_coded() {
         let src = include_str!("invoke.rs");
         let mut offenders = Vec::new();
+        // Which function each line belongs to. The exemption below used to be a
+        // hard-coded line band, `(5000..9800)`, which went stale the moment the
+        // file grew past it: `redefine_immune_forced_native` — the composing
+        // predicate the whole rule exists to funnel callers INTO — slid down to
+        // 9793-9822, so its own arms at 9801 and 9821 were reported as
+        // offenders and this gate has been failing for a reason that has
+        // nothing to do with what it polices. A red gate polices nothing.
+        // Track the enclosing function by name instead; it cannot drift.
+        let mut cur_fn = String::new();
         for (n, line) in src.lines().enumerate() {
             let code = line.trim_start();
             // Comments, and this test's own list of names (string literals).
@@ -14157,13 +14166,22 @@ mod redefine_immunity_tests {
                 continue;
             }
             // A definition is not a call site.
-            if code.starts_with("fn ") || code.starts_with("pub(super) fn ")
-                || code.starts_with("pub(crate) fn ")
+            if let Some(rest) = code
+                .strip_prefix("fn ")
+                .or_else(|| code.strip_prefix("pub(super) fn "))
+                .or_else(|| code.strip_prefix("pub(crate) fn "))
+                .or_else(|| code.strip_prefix("pub fn "))
             {
+                cur_fn = rest
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
                 continue;
             }
-            // The predicates compose each other inside this band.
-            if (5000..9800).contains(&n) {
+            // The predicates compose each other; only DISPATCH sites are
+            // policed.
+            if cur_fn.starts_with("redefine_immune_") {
                 continue;
             }
             for part in [

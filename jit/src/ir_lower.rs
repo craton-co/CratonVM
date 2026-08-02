@@ -6431,6 +6431,139 @@ fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
     None
 }
 
+/// Smallest executable buffer this backend will ask for.
+///
+/// Two pages. Raised from 4096 with the rest of the sizing below: under the old
+/// model the floor WAS the capacity for most compiles (the formula fell under
+/// it for any modest graph), so 4096 is where the overflows piled up.
+///
+/// Raising the floor ALONE does not work, and the census says so: `nodes*32 +
+/// calls*448 + 1024` with a 16 KiB floor still overflows 5 of 1664 while
+/// reserving 26 MiB — worse on both axes than fixing the formula and keeping
+/// the floor at 8 KiB.
+const IR_CODE_BUFFER_FLOOR: usize = 8 * 1024;
+
+/// How many bytes to reserve for a lowered graph of `nodes` nodes, `call_nodes`
+/// of which are calls.
+///
+/// **This is a capacity, not a prediction.** Getting it too high wastes address
+/// space in a region already capped by `COMMITTED_JIT_CODE_BYTES`; getting it
+/// too low does NOT produce a bug — `ExecutableBuffer::emit` is non-panicking
+/// and the caller discards an overflowed body — it silently drops the method to
+/// the single-pass backend. That failure is invisible except as throughput, so
+/// the bias here is deliberately toward over-reserving.
+///
+/// ## Where these numbers come from
+///
+/// Measured, not reasoned. `CRATONVM_DBG_IR_BUFSIZE=1` (below) censused
+/// **1664 IR compiles** across three workloads on 2026-08-01 — Spring Boot's
+/// `BasicErrorControllerDirectMockMvcTests` (595) and
+/// `BasicErrorControllerIntegrationTests` (1067), plus the whole
+/// `bench/CratonBench` CPU suite (2) — recording `wanted` against `capacity`
+/// for every one.
+///
+/// The old `nodes*32 + call_nodes*448 + 1024` **overflowed 155 of those 1664**
+/// (9.3%), under-shooting by up to **2.65x**. It was never measured; it was
+/// reasoned from "an arithmetic node emits well under 32 bytes", and that
+/// premise is fine — the error is entirely in the other two terms:
+///
+/// * **the per-call term.** 448 budgeted, 1141 actually required at worst. The
+///   278 call-free compiles in the census never wanted more than 1545 bytes
+///   total, so nodes were never the problem; calls always were.
+/// * **the constant.** 1024 does not pay for a prologue, an epilogue and the
+///   frame setup, so every small graph fell through to the floor and inherited
+///   whatever the floor happened to be.
+///
+/// This model overflows **0 of 1664**, and its tightest fit still has **1.24x**
+/// headroom, so it is not sitting on a knife edge. It reserves 13.8 MiB across
+/// that census against the old 6.6 MiB.
+///
+/// **That 2.1x matters and is the reason not to be more generous.**
+/// [`ExecutableBuffer::new`] adds the full CAPACITY to
+/// [`COMMITTED_JIT_CODE_BYTES`], not the bytes actually used, and that is the
+/// quantity the 256 MiB code-cache cap bounds — so over-reserving buys headroom
+/// with code cache. 13.8 MiB for a complete Spring Boot boot is ~5% of the cap;
+/// a 16 KiB floor on the old formula would have been 26 MiB and still not have
+/// worked.
+///
+/// [`ExecutableBuffer::wanted`] measures this exactly for this backend: it
+/// counts every byte codegen ASKED to emit, including writes dropped after an
+/// overflow, and this lowerer calls neither `rewind_to` nor `emit_checked`, so
+/// nothing inflates it or hides from it.
+fn ir_code_buffer_estimate(nodes: usize, call_nodes: usize) -> usize {
+    if legacy_ir_code_buffer_estimate() {
+        // The floor is part of the arm: 4096 was doing most of the work in the
+        // old sizing, so an A/B that kept the new floor would not be measuring
+        // the old behaviour.
+        return nodes
+            .saturating_mul(32)
+            .saturating_add(call_nodes.saturating_mul(448))
+            .saturating_add(1024)
+            .max(4096);
+    }
+    nodes
+        .saturating_mul(IR_BYTES_PER_NODE)
+        .saturating_add(call_nodes.saturating_mul(IR_BYTES_PER_CALL_NODE))
+        .saturating_add(IR_CODE_BUFFER_BASE)
+        .max(IR_CODE_BUFFER_FLOOR)
+}
+
+/// Per-node reservation. See [`ir_code_buffer_estimate`].
+const IR_BYTES_PER_NODE: usize = 64;
+/// Per-call-node reservation, on top of [`IR_BYTES_PER_NODE`]. This is the term
+/// the old estimate got badly wrong: it budgeted 448, and the census puts the
+/// true worst-case marginal cost of a call node at **1141 bytes**. A MIC plus a
+/// 4-way PIC dual-ABI inline-cache site, its deopt/guard stub and its safepoint
+/// spill run all hang off one call node.
+const IR_BYTES_PER_CALL_NODE: usize = 1536;
+/// Fixed per-method reservation: prologue, epilogue, frame setup and the
+/// per-method stubs, none of which are nodes.
+const IR_CODE_BUFFER_BASE: usize = 4096;
+
+/// A/B opt-out (`CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE=1`): restore the
+/// pre-2026-08-01 `nodes*32 + calls*448 + 1024` sizing and the 4096 floor.
+///
+/// It exists so the estimate change can be measured on ONE binary, both arms.
+/// Buffer sizing decides which methods the optimizing tier produces bodies for
+/// at all, and that tier is not uniformly faster than single-pass — a
+/// same-binary A/B is the only honest way to tell a throughput change caused by
+/// this from one caused by whatever else moved between two builds.
+fn legacy_ir_code_buffer_estimate() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE").is_some()
+    })
+}
+
+/// `CRATONVM_DBG_IR_BUFSIZE=1` — one line per IR compile that reaches
+/// emission, reporting what the sizing model predicted against what codegen
+/// actually asked for.
+///
+/// This is the instrument the estimate above was fitted with, and the one to
+/// re-run before changing it again. It reports EVERY compile, not just the
+/// overflowing ones: an estimate is only as good as its headroom on the
+/// compiles that succeeded, and a census of failures alone cannot show that.
+///
+/// `[ir-bufsize] nodes=N calls=C wanted=W capacity=C' ratio=… overflow=bool`
+fn report_ir_buffer_size(nodes: usize, call_nodes: usize, wanted: usize, capacity: usize) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_BUFSIZE").is_none() {
+        return;
+    }
+    // Integer permille, so the line stays greppable and needs no float
+    // formatting in a path that may run thousands of times.
+    let permille = if capacity == 0 {
+        0
+    } else {
+        wanted.saturating_mul(1000) / capacity
+    };
+    eprintln!(
+        "[ir-bufsize] nodes={nodes} calls={call_nodes} wanted={wanted} capacity={capacity} \
+         permille={permille} overflow={}",
+        wanted > capacity
+    );
+}
+
 // ── Public entry point ───────────────────────────────────────────────
 
 /// Lower the scheduled IR graph to x86-64 machine code.
@@ -6561,6 +6694,26 @@ pub fn lower_with_scalar_deopt(
 /// guard-surviving scalar-replacement map, and the two per-call-site lowering
 /// tables all flow in here. `pub(crate)` so the production compile path
 /// (`lib.rs`) can supply all of them at once.
+///
+/// **Sizes the code buffer by retrying, not by guessing harder.** The estimate
+/// below (`nodes * 32 + calls * 448 + 1024`) budgets one number for a call site
+/// whose real cost swings by several hundred bytes depending on which lowering
+/// it selects — a MIC + 4-way-PIC dual-ABI inline cache is the expensive end,
+/// and widening the PIC's inter-slot branch from `rel8` to `rel32` pushed it
+/// past the budget. The result was a silent de-optimization: `emit` drops the
+/// write, sets the sticky `overflowed` flag, and the method quietly stays
+/// interpreted forever. A single Spring Boot suite class produced **8072** such
+/// warnings in one run, every one of them from this estimate (the report that
+/// first noticed the flood,
+/// `docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
+/// attributed them to the single-pass backend's estimate — that one accounted
+/// for 10).
+///
+/// `ExecutableBuffer::wanted()` counts every byte codegen asked for, including
+/// the writes dropped after the overflow, so one retry at that size is exact
+/// rather than another guess. Raising the constant instead would have to
+/// over-reserve every ordinary method to cover the worst one, and every
+/// reserved byte counts against the code-cache cap.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_inner(
     graph: &Graph,
@@ -6601,6 +6754,7 @@ pub(crate) fn lower_inner(
 /// behaviour — `FrameState::caller` stays `None` at every deopt point.
 ///
 /// See `docs/jit/deopt-inline-scopes.md` for the producer side.
+///
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_inner_with_scopes(
     graph: &Graph,
@@ -6758,13 +6912,9 @@ pub(crate) fn lower_inner_with_scopes(
         .iter()
         .filter(|n| matches!(n.op, Op::Call { .. }))
         .count();
-    let estimated_size = graph
-        .nodes
-        .len()
-        .saturating_mul(32)
-        .saturating_add(call_nodes.saturating_mul(448))
-        .saturating_add(1024);
-    let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
+    let capacity = ir_code_buffer_estimate(graph.nodes.len(), call_nodes);
+    let mut buf = ExecutableBuffer::new(capacity)?;
+    buf.set_tag("ir-lower");
 
     let mut lowerer = Lowerer::new(
         graph,
@@ -7036,7 +7186,7 @@ pub(crate) fn lower_inner_with_scopes(
         crate::metrics::note_current_reloads(lowerer.ls_reloads);
     }
 
-    let buf = lowerer.buf;
+    let mut buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
     // non-panicking: on capacity exhaustion it sets a sticky `overflowed` flag
     // and DROPS the write, so an under-estimated buffer yields a silently
@@ -7046,10 +7196,20 @@ pub(crate) fn lower_inner_with_scopes(
     // Inline caches (~250 bytes/site) plus the widened invoke budget make the
     // estimate materially harder, so check it here and let the caller fall back
     // to single-pass, exactly like the unallocated-slot latch above.
+    report_ir_buffer_size(graph.nodes.len(), call_nodes, buf.wanted(), capacity);
     if buf.overflowed() {
+        // `needed` is `wanted()`, NOT `pos()`. `pos()` is the write cursor,
+        // which STOPS at capacity the moment the buffer overflows — so it
+        // reported `needed == capacity` on every single exhausted compile and
+        // told you nothing about how much more the method actually wanted. The
+        // whole 2026-08-01 census read `needed 4096 bytes, capacity 4096`
+        // seventeen times over and looked like a tie. `wanted()` keeps counting
+        // through the dropped writes, and this backend never calls `rewind_to`
+        // or `emit_checked`, so it is the exact requirement rather than a
+        // bound.
         return refuse(Bailout::new(BailoutReason::CodeBufferExhausted {
-            needed: buf.pos(),
-            capacity: estimated_size.max(4096),
+            needed: buf.wanted(),
+            capacity,
         }));
     }
     let _code_size = buf.pos();
@@ -10742,6 +10902,115 @@ mod tests {
             reads.len(),
             3,
             "expected exactly the install site and the two accessors"
+        );
+    }
+
+    // ── Code-buffer sizing ───────────────────────────────────────────
+    //
+    // `ir_code_buffer_estimate` decides which methods the optimizing tier gets
+    // to produce a body for at all: too small and the compile is silently
+    // discarded to single-pass, with nothing but a throughput change to show
+    // for it. These pin the model against the census that produced it, so a
+    // future "tighten this up" has to argue with the data rather than with a
+    // comment.
+
+    /// The extremes of the 2026-08-01 census: 1664 IR compiles across
+    /// `BasicErrorControllerDirectMockMvcTests`,
+    /// `BasicErrorControllerIntegrationTests` and `bench/CratonBench`, as
+    /// `(nodes, call_nodes, wanted)`. These four are the largest consumers plus
+    /// the tightest call-heavy small graph; every one of them OVERFLOWED the
+    /// pre-2026-08-01 estimate.
+    const CENSUS_EXTREMES: &[(usize, usize, usize)] = &[
+        (78, 15, 25969),
+        (36, 14, 22378),
+        (72, 9, 16688),
+        (9, 3, 4508),
+    ];
+
+    #[test]
+    fn code_buffer_estimate_covers_every_measured_extreme() {
+        for &(nodes, calls, wanted) in CENSUS_EXTREMES {
+            let cap = ir_code_buffer_estimate(nodes, calls);
+            assert!(
+                cap >= wanted,
+                "nodes={nodes} calls={calls} wants {wanted} bytes but the estimate \
+                 reserves only {cap}; this compile would be silently dropped to the \
+                 single-pass backend"
+            );
+        }
+    }
+
+    #[test]
+    fn code_buffer_estimate_keeps_headroom_over_the_measured_worst_case() {
+        // Covering the census exactly would be a knife edge — the next
+        // workload's worst case is not in it. The measured tightest fit is
+        // 1.24x; require at least 1.1x on the extremes so a change that
+        // technically still "covers" them but removes all margin fails here.
+        for &(nodes, calls, wanted) in CENSUS_EXTREMES {
+            let cap = ir_code_buffer_estimate(nodes, calls);
+            assert!(
+                cap * 10 >= wanted * 11,
+                "nodes={nodes} calls={calls}: {cap} bytes for a measured {wanted} is \
+                 under 1.1x headroom"
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_node_is_budgeted_above_its_measured_worst_marginal_cost() {
+        // The term the old estimate got wrong: it budgeted 448 bytes per call
+        // node, and the census puts the worst-case marginal cost at 1141.
+        // Derived from the model rather than asserted on the constant, so
+        // moving cost between the terms is allowed and starving calls is not.
+        //
+        // Measured well ABOVE the floor. The first draft of this test compared
+        // 1 call against 2, where both results are still clamped by
+        // `IR_CODE_BUFFER_FLOOR` — the marginal cost read as 0 and the test
+        // failed on a model that was perfectly fine. A floor hides exactly the
+        // term this is trying to pin.
+        let ten = ir_code_buffer_estimate(0, 10);
+        let eleven = ir_code_buffer_estimate(0, 11);
+        assert!(
+            ten > IR_CODE_BUFFER_FLOOR && eleven > IR_CODE_BUFFER_FLOOR,
+            "measure the marginal cost above the floor, not through it"
+        );
+        assert!(
+            eleven - ten >= 1141,
+            "a call node is budgeted {} bytes; the census measured 1141 worst-case",
+            eleven - ten
+        );
+    }
+
+    #[test]
+    fn the_floor_alone_does_not_substitute_for_the_formula() {
+        // `nodes*32 + calls*448 + 1024` with a raised floor was the tempting
+        // one-line fix. It does not work: this shape wants 25969 bytes, which
+        // no plausible floor covers, so the per-call term has to carry it.
+        let (nodes, calls, wanted) = (78usize, 15usize, 25969usize);
+        assert!(
+            ir_code_buffer_estimate(nodes, calls) >= wanted,
+            "the formula, not the floor, has to cover the call-heavy tail"
+        );
+        let legacy_shape = nodes * 32 + calls * 448 + 1024;
+        assert!(
+            legacy_shape < wanted,
+            "sanity: the old formula really was short here ({legacy_shape} < {wanted})"
+        );
+    }
+
+    #[test]
+    fn call_free_graphs_stay_cheap() {
+        // The census's 278 call-free compiles never wanted more than 1545
+        // bytes. They are the majority of compiles, so their reservation is
+        // what the code-cache cap actually pays for — the floor should be
+        // covering them, not a large per-node term.
+        assert!(
+            ir_code_buffer_estimate(32, 0) <= 16 * 1024,
+            "a call-free graph should not reserve more than a couple of pages"
+        );
+        assert!(
+            ir_code_buffer_estimate(32, 0) >= 1545,
+            "…but it must still cover the largest call-free compile measured"
         );
     }
 }
