@@ -1718,7 +1718,7 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
             // it again. On the WebSocket back-pressure workload that cost 3-11
             // socket-processing tasks per message where HotSpot needs exactly
             // one, which is what grew the connector pool to maxThreads.
-            // See docs/known-issues/tomcat/wsremoteendpoint-server-close-never-completes.md.
+            // See docs/internal/fixed-suite-bugs/tomcat/wsremoteendpoint-server-close-never-completes-FIXED.md.
             if interest & OP_WRITE != 0
                 && h.os_handle().map(os_handle_writable).unwrap_or(true)
             {
