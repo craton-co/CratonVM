@@ -671,7 +671,7 @@ Decomposed with `probes/DateFormatChainProbe.java` and
 * *"`DateFormatSymbols.getProviderInstance` fails codegen"* — true, and also
   **not the cause**, for the same reason: the `"ss"` path never reaches it and
   is still 870× off. See
-  [`jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md`](../../../known-issues/jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md),
+  [`jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md`](../../../known-issues/dateformatsymbols-getproviderinstance-compile-bail-20260731.md),
   which is worth fixing on its own merits and should stop being cited for this
   test.
 

@@ -6029,7 +6029,14 @@ impl GenerationalHeap {
             // values live in disjoint arenas, so a ref this remaps can never be
             // remapped a second time.
             crate::external_roots::remap_external_roots(&pointer_map);
-            let compact_map = Self::major_gc(roots, &young_from, &mut old_gen);
+            // H2-CID0: same reserved-TLAB-tail skip list the young sweep
+            // uses; `major_gc`'s young walks parse from-space too.
+            let young_skips = {
+                let base = young_from.base_ptr() as usize;
+                self.jit_tlab_skip_offsets(base, base + young_from.used())
+            };
+            let compact_map =
+                Self::major_gc(roots, &young_from, &mut old_gen, &young_skips);
             // CRITICAL FIX (heavy binary-trees GC corruption):
             //
             // Compose `pointer_map` with `compact_map` BEFORE merging. If a
@@ -9546,6 +9553,13 @@ impl GenerationalHeap {
         let young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
+        // H2-CID0: the reserved TLAB tails of forcibly-stopped in-JIT peers.
+        // `mark_young_to_old_refs` must skip them exactly as the young sweep
+        // does — see its comment for what walking one costs.
+        let young_skips = {
+            let base = young_from.base_ptr() as usize;
+            self.jit_tlab_skip_offsets(base, base + young_from.used())
+        };
         let mut root_shadow = roots.to_vec();
         // Seed this sweep from THIS cycle's promotion destinations.
         //
@@ -9620,7 +9634,13 @@ impl GenerationalHeap {
                 roots.len(),
             );
         }
-        let survivors = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
+        let survivors = Self::old_gen_gc(
+            &mut root_shadow,
+            &young_from,
+            &mut old_gen,
+            false,
+            &young_skips,
+        );
         (before.saturating_sub(old_gen.used()), survivors)
     }
 
@@ -9640,18 +9660,25 @@ impl GenerationalHeap {
         roots: &mut [ObjectRef],
         young_from: &Arena,
         old_gen: &mut OldGen,
+        young_skips: &[(usize, usize)],
     ) -> HashMap<usize, usize> {
-        Self::old_gen_gc(roots, young_from, old_gen, true)
+        Self::old_gen_gc(roots, young_from, old_gen, true, young_skips)
     }
 
     /// Mark old space from the complete root set and either compact it (when
     /// every root is rewritable) or reclaim dead blocks in place (when JIT
     /// roots are conservative).
+    ///
+    /// `young_skips` is the from-space skip list — the free list MERGED with
+    /// the reserved-TLAB-tail regions of forcibly-stopped in-JIT peers. Both
+    /// young walks below need it; see `mark_young_to_old_refs` for what goes
+    /// wrong when a reserved tail is walked as if it held objects.
     fn old_gen_gc(
         roots: &mut [ObjectRef],
         young_from: &Arena,
         old_gen: &mut OldGen,
         compact: bool,
+        young_skips: &[(usize, usize)],
     ) -> HashMap<usize, usize> {
         // ---- Mark phase ---- BFS from roots + young-gen cross-references ----
 
@@ -9764,7 +9791,13 @@ impl GenerationalHeap {
         }
 
         // Seed: young from-space references into old gen
-        Self::mark_young_to_old_refs(young_from, old_gen, &walked_bases, &mut worklist);
+        Self::mark_young_to_old_refs(
+            young_from,
+            old_gen,
+            &walked_bases,
+            young_skips,
+            &mut worklist,
+        );
 
         // `mark_young_to_old_refs` walks only real Java heap fields. Follow
         // the equivalent out-of-heap edges for all current young owners too;
@@ -10143,7 +10176,7 @@ impl GenerationalHeap {
         // ---- Cross-gen fixup ---- update young-gen refs into old gen ----
 
         if !compact_map.is_empty() {
-            Self::fixup_young_old_refs(young_from, &compact_map);
+            Self::fixup_young_old_refs(young_from, &compact_map, young_skips);
 
             // ---- Root fixup ---- update roots pointing into old gen ----
             for root in roots.iter_mut() {
@@ -10163,6 +10196,7 @@ impl GenerationalHeap {
         young_from: &Arena,
         old_gen: &OldGen,
         walked_bases: &[usize],
+        young_skips: &[(usize, usize)],
         worklist: &mut Vec<*mut u8>,
     ) {
         // Skip the zeroed holes the non-moving sweep leaves in from-space.
@@ -10175,7 +10209,44 @@ impl GenerationalHeap {
         // unmarked). The non-moving sweep itself skips holes the same way; every
         // linear from-space walker must too. (Cheney is immune: it resets
         // from-space each cycle, so holes never accumulate there.)
-        let free_blocks = young_from.free_blocks_sorted();
+        //
+        // H2-CID0 (2026-08-01): the skip list must ALSO carry the reserved
+        // TLAB tails of forcibly-stopped in-JIT peers (BUG-03), which is why it
+        // is passed in rather than read from `young_from` here.
+        //
+        // A reserved tail is the unallocated remainder of a TLAB whose owner
+        // was frozen mid-JIT. It is not on the free list and it holds no
+        // objects -- `sweep_young_non_moving` merges these regions into its own
+        // skip list for exactly that reason ("an un-retired tail is neither
+        // walked as objects nor reclaimed"). These two walks did not, so they
+        // parsed the tail's bytes as headers. When those bytes decode plausibly
+        // the walk strides off the object grid and keeps going: the REAL young
+        // objects after the tail can be read at wrong offsets.
+        //
+        // MEASURED, so the next reader does not over-claim this: a negative
+        // control (2026-08-01) shows the walk survives an unparseable reserved
+        // tail WITHOUT this merge, because the desync trips the anomaly path
+        // and the conservative word scan still finds every old-gen base in the
+        // stretch. So this is a CONSISTENCY fix -- every other linear
+        // from-space walker skips these regions, and parsing a tail that holds
+        // no objects is pointless work resting on that fallback -- not a
+        // demonstrated bug fix.
+        //
+        // Why the fallback matters so much here: `OldGen::close_live_set`
+        // (`5750caf5f`) closes the live set over references from marked
+        // OLD-GEN objects, so it cannot rescue a block whose only referrer is
+        // YOUNG -- the shape H2's `CacheLongKeyLIRS` has, holding its `Page` /
+        // `ByteBuffer` / `Chunk` payloads from entries that are still young.
+        // Nor would `CRATONVM_DBG_SWEEP_EDGES` see it: that assertion looks
+        // for references INTO young, never young->old.
+        let free_blocks: Vec<(usize, usize)> = if young_skips.is_empty() {
+            young_from.free_blocks_sorted()
+        } else {
+            let mut v = young_from.free_blocks_sorted();
+            v.extend_from_slice(young_skips);
+            v.sort_by_key(|&(off, _)| off);
+            v
+        };
         let mut free_iter = free_blocks.iter().peekable();
         let mut cursor: usize = 0;
         let base = young_from.base_ptr() as usize;
@@ -10353,13 +10424,54 @@ impl GenerationalHeap {
 
     /// After old-gen compaction, update references in young from-space that
     /// pointed to old-gen objects which have been relocated.
-    fn fixup_young_old_refs(young_from: &Arena, compact_map: &HashMap<usize, usize>) {
+    fn fixup_young_old_refs(
+        young_from: &Arena,
+        compact_map: &HashMap<usize, usize>,
+        young_skips: &[(usize, usize)],
+    ) {
         // Skip non-moving-sweep holes — same rationale as `mark_young_to_old_refs`:
         // a linear from-space walk must not stride into a reclaimed zeroed hole
         // (it would desync off the object grid and misread a live object's
         // interior cell, then `break` and leave the rest of from-space's
         // old-gen refs un-fixed-up after a compaction → dangling pointers).
-        let free_blocks = young_from.free_blocks_sorted();
+        //
+        // H2-CID0 (2026-08-01): the skip list must ALSO carry the reserved
+        // TLAB tails of forcibly-stopped in-JIT peers (BUG-03), which is why it
+        // is passed in rather than read from `young_from` here.
+        //
+        // A reserved tail is the unallocated remainder of a TLAB whose owner
+        // was frozen mid-JIT. It is not on the free list and it holds no
+        // objects -- `sweep_young_non_moving` merges these regions into its own
+        // skip list for exactly that reason ("an un-retired tail is neither
+        // walked as objects nor reclaimed"). These two walks did not, so they
+        // parsed the tail's bytes as headers. When those bytes decode plausibly
+        // the walk strides off the object grid and keeps going: the REAL young
+        // objects after the tail can be read at wrong offsets.
+        //
+        // MEASURED, so the next reader does not over-claim this: a negative
+        // control (2026-08-01) shows the walk survives an unparseable reserved
+        // tail WITHOUT this merge, because the desync trips the anomaly path
+        // and the conservative word scan still finds every old-gen base in the
+        // stretch. So this is a CONSISTENCY fix -- every other linear
+        // from-space walker skips these regions, and parsing a tail that holds
+        // no objects is pointless work resting on that fallback -- not a
+        // demonstrated bug fix.
+        //
+        // Why the fallback matters so much here: `OldGen::close_live_set`
+        // (`5750caf5f`) closes the live set over references from marked
+        // OLD-GEN objects, so it cannot rescue a block whose only referrer is
+        // YOUNG -- the shape H2's `CacheLongKeyLIRS` has, holding its `Page` /
+        // `ByteBuffer` / `Chunk` payloads from entries that are still young.
+        // Nor would `CRATONVM_DBG_SWEEP_EDGES` see it: that assertion looks
+        // for references INTO young, never young->old.
+        let free_blocks: Vec<(usize, usize)> = if young_skips.is_empty() {
+            young_from.free_blocks_sorted()
+        } else {
+            let mut v = young_from.free_blocks_sorted();
+            v.extend_from_slice(young_skips);
+            v.sort_by_key(|&(off, _)| off);
+            v
+        };
         let mut free_iter = free_blocks.iter().peekable();
         let mut cursor: usize = 0;
         let base = young_from.base_ptr() as usize;
@@ -16232,7 +16344,7 @@ mod tests {
             let mut old_gen = heap.old_gen.lock();
             let mut major_roots = vec![holder, victim];
             let _ =
-                GenerationalHeap::old_gen_gc(&mut major_roots, &young_from, &mut old_gen, false);
+                GenerationalHeap::old_gen_gc(&mut major_roots, &young_from, &mut old_gen, false, &[]);
         }
         let after = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
 
@@ -16674,7 +16786,7 @@ mod tests {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
             let old_used_before = old_gen.used();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
             let old_used_after = old_gen.used();
             assert!(
                 old_used_after < old_used_before,
@@ -16687,6 +16799,95 @@ mod tests {
         // Roots may have been relocated by compaction — use updated refs
         assert_eq!(heap.get_field(roots[0], 0).as_int(), Some(0));
         assert_eq!(heap.get_field(roots[1], 0).as_int(), Some(2));
+    }
+
+    /// H2-CID0 (2026-08-01) — the in-place old-gen sweep must not free an
+    /// old-gen object whose only referrer is a YOUNG object sitting after an
+    /// UNPARSEABLE stretch of from-space (here, a reserved TLAB tail).
+    ///
+    /// What this pins is `mark_young_to_old_refs`' conservative word-scan
+    /// fallback, and it is worth pinning because that fallback is the only
+    /// thing standing between a from-space walk desync and a use-after-free:
+    /// `OldGen::close_live_set` (`5750caf5f`) closes the live set over
+    /// references from marked OLD-GEN objects, so it cannot rescue a block
+    /// whose only referrer is young, and `CRATONVM_DBG_SWEEP_EDGES` only looks
+    /// for references INTO young, never young->old. Nothing else covers this
+    /// edge.
+    ///
+    /// NOTE, measured: this test passes both with and without the reserved-tail
+    /// merge in `mark_young_to_old_refs` (negative control run 2026-08-01), so
+    /// it does NOT pin that merge. The merge is a consistency fix — every other
+    /// linear from-space walker skips these regions — not a demonstrated bug
+    /// fix, and it must not be described as one.
+    #[test]
+    fn in_place_old_sweep_keeps_an_object_referenced_from_young_past_an_unparseable_stretch() {
+        let heap = GenerationalHeap::with_sizes(64 * 1024, 64 * 1024);
+        let monitors = NoOpMonitors;
+
+        // A long-lived old-gen payload, reachable ONLY from young below.
+        let payload = heap.alloc_object(ClassId::new(0), 2);
+        heap.set_field(payload, 0, Value::Int(0x5AFE));
+        let mut promote = vec![payload];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut promote, &monitors);
+        }
+        let payload = promote[0];
+        assert!(
+            heap.is_in_old(payload.as_ptr()),
+            "payload must be in old gen for this test to mean anything"
+        );
+
+        // Now build young: [filler][reserved tail][referrer -> payload].
+        // `filler` only exists to give the tail a plausible predecessor.
+        let filler = heap.alloc_object(ClassId::new(0), 4);
+        heap.set_field(filler, 0, Value::Int(1));
+        let tail_start = {
+            let from = heap.young_from.lock();
+            from.base_ptr() as usize + from.used()
+        };
+        // Reserve a span the way a frozen in-JIT peer's TLAB tail is reserved:
+        // allocate it, then publish it as a skip region. Its contents are
+        // whatever the mutator left — here, bytes that decode as an object
+        // LARGER than the span, which is exactly what desyncs a walker that
+        // does not skip it.
+        let tail_obj = heap.alloc_object(ClassId::new(0), 8);
+        let tail_end = {
+            let from = heap.young_from.lock();
+            from.base_ptr() as usize + from.used()
+        };
+        // SAFETY: `tail_obj` is a live young object; overwriting its header's
+        // slot count is precisely the "unparseable reserved tail" state.
+        unsafe {
+            let h = &mut *(tail_obj.as_ptr() as *mut ObjectHeader);
+            h.set_num_slots(64);
+        }
+
+        let referrer = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(referrer, 0, Value::Object(Some(payload)));
+        assert!(
+            !heap.is_in_old(referrer.as_ptr()),
+            "referrer must still be young"
+        );
+
+        heap.set_jit_tlab_skip_regions(&[(tail_start, tail_end)]);
+
+        // Sweep old gen in place with NO root naming the payload — the young
+        // referrer is the only path to it.
+        let (_freed, _survivors) = heap.sweep_old_gen_non_moving(&[], &HashMap::new());
+
+        assert_eq!(
+            heap.get_field(payload, 0).as_int(),
+            Some(0x5AFE),
+            "the in-place old sweep freed an object referenced from a young              object that sits after an unparseable stretch of from-space",
+        );
+        {
+            let old_gen = heap.old_gen.lock();
+            assert!(
+                old_gen.is_allocated_addr(payload.as_ptr()),
+                "the payload's block was returned to the old-gen free list                  while a young object still referenced it",
+            );
+        }
+        heap.set_jit_tlab_skip_regions(&[]);
     }
 
     #[test]
@@ -16728,7 +16929,7 @@ mod tests {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
             let _compact_map =
-                GenerationalHeap::major_gc(&mut major_roots, &young_from, &mut old_gen);
+                GenerationalHeap::major_gc(&mut major_roots, &young_from, &mut old_gen, &[]);
         }
 
         // Walk the chain from the (possibly relocated) root: A -> B -> C
@@ -17002,7 +17203,7 @@ mod tests {
             let mut old_gen = heap.old_gen.lock();
             let free_blocks_before = old_gen.free_block_count();
 
-            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
 
             // After compaction: exactly one free block (defragmented)
             assert_eq!(
@@ -17065,7 +17266,7 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
 
             // Only 3 live objects (A, B, C) — garbage should be freed
             assert_eq!(
@@ -17134,7 +17335,7 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
 
             // Used space should have decreased (half the objects freed)
             assert!(
@@ -17233,7 +17434,7 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
             assert!(
                 compact_map.is_empty(),
                 "No objects should move when they are already contiguous"
@@ -17267,7 +17468,7 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
 
             // Verify no forwarding pointers remain set
             for (obj_ptr, _) in old_gen.walk_objects() {
@@ -18025,7 +18226,7 @@ mod tests {
         }
         let young_from = heap.young_from.lock();
         let mut old_gen = heap.old_gen.lock();
-        let _pointer_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+        let _pointer_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
         drop(old_gen);
         drop(young_from);
         for (index, object) in roots.iter().copied().enumerate() {

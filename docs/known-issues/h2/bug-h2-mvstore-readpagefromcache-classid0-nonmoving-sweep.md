@@ -4,14 +4,29 @@
 > report point at it. The name is wrong; see *Status*.
 
 ## Status
-**RE-DIAGNOSED 2026-08-01 — the title of this doc is wrong.** Reproduced,
-and the reclaimed object is in the **old generation**, not a young-sweep span.
-The fix for that gap (`5750caf5f`, *close the live set before the in-place old
-sweep decides what is dead*) landed on `dev` the same day from a concurrent
-line of work and is merged here; a contemporaneous A/B soak against a pre-fix
-binary is what remains before this can be called closed. Everything below is
-measurement, not inference — including the parts that say a previous
-measurement was misread.
+**OPEN — re-diagnosed, not fixed.** Two things are settled that were not
+before, and one candidate fix was tested and ruled out.
+
+* **The generation is settled.** The reclaimed object is in the **old
+  generation**, not a non-moving-young-sweep span. This doc's title and its
+  entire "root-coverage gap in the young sweep" framing came from one
+  unchecked inference off the all-zero header; it is wrong. Measured at the
+  moment of failure, with no flag set in advance.
+* **The symptom is wider than this doc says.** `java.lang.Object cannot be
+  cast to X` is only the face a freed block wears *while it is still on the
+  free list*. Once the allocator re-serves it, the same stale reference reads a
+  perfectly valid object of an unrelated class. Both faces were caught in one
+  A/B window (below). Some fraction of this family has never looked like a GC
+  bug at all, which is a good reason it has outlived three sessions.
+* **`5750caf5f` does not close it.** *close the live set before the in-place
+  old sweep decides what is dead* is the right shape and targets the right
+  generation, but a contemporaneous 3-vs-3 A/B reproduced on **both** arms.
+* **The reserved-TLAB-tail hypothesis is refuted**, by negative control — see
+  *Ruled out* below.
+
+The root cause is not known. What this session leaves behind is a reproducer
+that works, a verdict line that needs no prior configuration, and four
+hypotheses closed with measurements instead of argument.
 
 ## Severity
 **HIGH** — silent. Before this session no guard fired: zero
@@ -96,16 +111,40 @@ through `sweep_old_gen_non_moving` instead of the compactor. Do **not** add
 
 ### Observed rate (2026-08-01, 16-core Azure host, `--Xmx 1g`, JIT on)
 
-| driver / binary | worker-hours | events |
-| --- | --- | --- |
-| `TestMVStoreCacheLoop`, `origin/dev` @ `c8a3ba181d` | ~6.3 | 2 (1 CCE + 1 SIGSEGV) |
-| `TestMVStoreCachePerformance` (stock), same binary | ~5.5 | 0 |
+`TestMVStoreCacheLoop`, six workers, ~50 min per worker-iteration:
 
+| binary | workers | events |
+| --- | --- | --- |
+| `origin/dev` @ `c8a3ba181d` (first pass) | 7 | 2 — 1 CCE, 1 SIGSEGV |
+| `c8a3ba181d` + `5750caf5f` + this branch | 3 | **2 SIGSEGV** |
+| `c8a3ba181d` + this branch (no `5750caf5f`) | 3 | **3 — 1 CCE, 2 SIGSEGV** |
+
+Both arms of that A/B ran on the same host in the same window, started
+together. `5750caf5f` is therefore **not** the fix.
+
+The stock `TestMVStoreCachePerformance` gave 0 events in 5 full runs (~5.5 h)
+over the same period, which is why the loop variant exists.
 `org.h2.test.synth.TestDiskFull` — offered by the now-retired
 `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up as a 2-second
-reproducer for this family — produced **0 SIGSEGV and 0 CCE in ~110 runs**
-across three binaries on the same day, so it is not a usable handle right now.
-See *Handed over from `TestDiskFull`* below.
+reproducer for this family — gave **0 SIGSEGV and 0 CCE in ~110 runs** across
+three binaries the same day, so it is not a usable handle right now. See
+*Handed over from `TestDiskFull`* below.
+
+### The two faces
+
+```
+java.lang.Object      cannot be cast to java.nio.ByteBuffer      (block still free)
+java.util.BitSet      cannot be cast to org.h2.mvstore.Chunk     (block re-served)
+org.h2.mvstore.Page$Leaf cannot be cast to org.h2.mvstore.Chunk  (block re-served)
+```
+
+plus `SIGSEGV` with `slot[rN]` reading eight zero words — the same all-zero
+header, reached from compiled code before any reporter runs. A run that dies at
+rc=139 is this defect, not a separate one.
+
+Anything gated on the receiver reading as `ClassId(0)` sees only the first
+line. Both `checkcast` reporters now consult the old-gen reclamation ring on
+*every* failing cast for that reason.
 
 ## The instrumentation was part of the problem
 
@@ -178,6 +217,18 @@ Each of these was a live hypothesis; none survived.
   re-resolved against the arena's own object grid, marked, and drained.
   `LATE_RESOLVE_*` measured **zero** on this workload: a closed hole, not an
   active one.
+* **Reserved TLAB tails desyncing the young→old seed walk.**
+  `mark_young_to_old_refs` and `fixup_young_old_refs` built their skip list
+  from the free list alone, so they parsed the reserved TLAB tails of
+  forcibly-stopped in-JIT peers as object headers — while
+  `sweep_young_non_moving` skips exactly those regions. That looked decisive:
+  the referrer would be YOUNG, which `OldGen::close_live_set` cannot rescue,
+  and `CRATONVM_DBG_SWEEP_EDGES` never looks young→old. **Refuted by negative
+  control**: a test that plants an unparseable reserved tail between a young
+  referrer and its old-gen payload passes with the merge reverted, because the
+  desync trips the anomaly path and the conservative word scan still finds
+  every old-gen base in the stretch. The merge landed anyway as a consistency
+  fix, and is labelled as one.
 * **Cross-thread root coverage** — refuted in *Session 2*; nothing here
   re-opens it.
 
@@ -196,6 +247,35 @@ over lists that are already built and already sorted):
    lets the allocator serve the same bytes twice and zero them under the first
    owner. Previously only a `CRATONVM_DBG_A2` diagnostic, and an
    O(dead × free) double loop.
+
+## What to try next
+
+In rough order of what the evidence supports.
+
+1. **Enlarge the old-gen reclamation ring, then reproduce.** The ring is 16 K
+   entries; an in-place old sweep frees thousands of blocks per cycle and the
+   failing read can be many cycles later, so it wraps before the `checkcast`
+   asks. The one reproduction that reached the widened reporter
+   (`Page$Leaf cannot be cast to Chunk`) got no ring hit for exactly that
+   reason. Sizing it in the hundreds of thousands would have named the victim
+   class and the freeing site outright — that is one build away and it is the
+   highest-value next step.
+2. **Add the young-side equivalent.** The ring only covers old-gen frees. The
+   young sweep's span zeroing is recorded by `zero_forensics`, but that is
+   flag-gated and mutex-backed. A lock-free, unconditional span ring (one
+   record per COALESCED span, not per object, so the cost stays bounded) would
+   make the reporter answer for both generations.
+3. **Instrument the free, not the read.** Everything above still diagnoses one
+   GC cycle too late. The decisive check is at the moment of reclamation: for
+   each block the in-place sweep is about to free, does any live YOUNG object
+   reference it? That is the young→old mirror of `close_live_set` and nothing
+   currently performs it — `close_live_set` closes over old-gen referrers only,
+   and `CRATONVM_DBG_SWEEP_EDGES` only ever looks for references INTO young.
+   Expensive as an always-on check; viable behind a gate for a repro run, and
+   it would name the exact cycle and referrer.
+4. **Do not re-derive the closed hypotheses.** The four in *Ruled out* each
+   cost a build-and-soak cycle; they are recorded with their measurements so
+   the next session does not pay for them again.
 
 ## Handed over from `TestDiskFull` (2026-08-01)
 

@@ -1,6 +1,15 @@
 # `TestDefaultInstanceManager.testClassUnloading` — off-by-one recurrence (FIXED)
 
-**Status:** FIXED and retired on 2026-07-27. Supersedes
+**Status:** FIXED and retired on 2026-07-27 — and **defect 1's guard was
+silently disarmed the very next day**. `67de5400a` (07-28) flipped
+`DEFAULT_MOVING_YOUNG` to `true`, which made
+`young_marker_follows_side_tables()` return `false` unconditionally on the
+shipped default, so the young-mirror deferral below stopped engaging at all. The
+test recurred deterministically on 07-31 and was re-closed on 08-01: see
+[defaultinstancemanager-third-recurrence-FIXED.md](defaultinstancemanager-third-recurrence-FIXED.md).
+Everything below remains an accurate account of the two defects and both fixes
+are still load-bearing; only the claim that defect 1's guard *engages* had an
+expiry date on it. Supersedes
 [defaultinstancemanager-classunloading-count-mismatch-FIXED.md](defaultinstancemanager-classunloading-count-mismatch-FIXED.md),
 whose 2026-07-14 fix was real but **incomplete** — see "Why the first fix
 looked sufficient" below. Retires

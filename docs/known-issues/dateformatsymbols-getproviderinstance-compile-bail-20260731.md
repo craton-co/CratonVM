@@ -1,7 +1,7 @@
 # `DateFormatSymbols.getProviderInstance` fails codegen
 
 **Status:** 🔴 **OPEN**, found 2026-07-31 while re-deriving
-[tomcat/32.4](../../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md).
+[tomcat/32.4](../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md).
 
 The VM classifies this one itself. `CRATONVM_DBG_JIT_METHOD_STATS=1` on
 `probes/DateFmtProbe`:
@@ -71,7 +71,7 @@ The obvious next thought is that the *other* compile-bails on that path make
    999  tier_fail_count=3  java/text/DecimalFormatSymbols.clone()
 ```
 
-**They are not the cause.** `probes/SdfOnlyProbe.java` runs
+**They are not the cause.** `../../probes/SdfOnlyProbe.java` runs
 `SimpleDateFormat.format` and nothing else, with pattern `"ss"` — a single
 2-digit numeric field, which reaches none of them — and costs **51 µs with
 `hot_but_stuck_in_interpreter=0`**: zero compile failures anywhere on the path,
@@ -80,8 +80,8 @@ own direct calls, not `SimpleDateFormat`'s — `DecimalFormat.format`'s 39 495 i
 close to that probe's own 40 000 explicit invocations.)
 
 The cost is the generic-dispatch round trips the format performs. See
-[30 § Adopted](../../internal/fixed-suite-bugs/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32-and-where-they-went)
-and [raw JIT-to-JIT](../../internal/jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md),
+[30 § Adopted](../internal/fixed-suite-bugs/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32-and-where-they-went)
+and [raw JIT-to-JIT](../internal/jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md),
 which now carries that work.
 
 So: fix this because a hot JDK method failing codegen is a real defect. Stop
