@@ -83,14 +83,22 @@ fn compile_jmx_probe(probe: &Path) -> bool {
         })
         .filter(|path| path.exists())
         .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "javac.exe" } else { "javac" }));
-    match Command::new(javac).arg(&source).current_dir(probe).status() {
-        Ok(status) if status.success() => true,
-        Ok(status) => {
-            eprintln!("[wave1_a_jmx] javac exited {status}");
-            false
+    match Command::new(javac).arg(&source).current_dir(probe).output() {
+        Ok(out) => {
+            // javac RAN and rejected the fixture: answering `false` here reads
+            // to the caller as "javac unavailable, skip", which makes this test
+            // a permanent vacuous pass.
+            assert!(
+                out.status.success(),
+                "[wave1_a_jmx] the checked-in probe fixture failed to compile — fix \
+                 the .java source. javac stderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            true
         }
+        // javac cannot be launched at all — the one legitimate skip.
         Err(error) => {
-            eprintln!("[wave1_a_jmx] failed to launch javac: {error}");
+            eprintln!("[wave1_a_jmx] failed to launch javac: {error}; skipping");
             false
         }
     }

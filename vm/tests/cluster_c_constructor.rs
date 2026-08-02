@@ -81,7 +81,8 @@ fn cratonvm_binary() -> Option<PathBuf> {
 }
 
 /// Compile `ConstructorProbe.java` via `javac` if any class file is missing.
-/// Best-effort: returns false if javac is unavailable or compilation fails.
+/// Returns false only when javac cannot be LAUNCHED; a javac that runs and
+/// rejects the fixture panics (see `probe_compile_guard.rs`).
 fn ensure_probe_compiled() -> bool {
     let dir = probe_dir();
     let class_file = dir.join("ConstructorProbe.class");
@@ -92,14 +93,29 @@ fn ensure_probe_compiled() -> bool {
     if !source.exists() {
         return false;
     }
-    let status = Command::new("javac")
+    let compile = Command::new("javac")
         .arg("--release")
         .arg("21")
         .arg("-d")
         .arg(&dir)
         .arg(&source)
-        .status();
-    matches!(status, Ok(s) if s.success()) && class_file.exists()
+        .output();
+    match compile {
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(_) => false,
+        // javac RAN and rejected the fixture: answering `false` here reads to
+        // the caller as "javac unavailable, skip", which makes this test a
+        // permanent vacuous pass.
+        Ok(o) => {
+            assert!(
+                o.status.success(),
+                "[cluster_c_constructor] the checked-in probe fixture failed to compile — fix the \
+                 .java source. javac stderr:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            class_file.exists()
+        }
+    }
 }
 
 /// Run `ConstructorProbe` through the cratonvm binary with a hard timeout.

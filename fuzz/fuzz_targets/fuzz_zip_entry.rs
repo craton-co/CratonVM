@@ -133,7 +133,7 @@ const TRAVERSAL_PROBES: [&str; 11] = [
 /// assertions below quietly weaker rather than failing. Loosening it
 /// produces a visible false failure. Making the real predicate `pub` and
 /// calling it directly is the fix — see
-/// `docs/known-issues/fuzzing-state.md`.
+/// `docs/known-issues/c2/fuzzing-state.md`.
 fn class_name_is_hostile(name: &str) -> bool {
     name.contains("..")
         || name.starts_with('/')

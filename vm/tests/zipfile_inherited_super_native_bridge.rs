@@ -81,9 +81,14 @@ fn compile_probe(java_home: &Path, classes: &Path) {
         .args(["--release", "21", "-d"])
         .arg(classes)
         .arg(&source)
-        .status()
+        .output()
         .expect("run javac");
-    assert!(status.success(), "javac failed");
+    assert!(
+        status.status.success(),
+        "[zipfile_inherited_super_native_bridge] the embedded probe failed to compile — fix the probe source. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
 }
 
 fn write_empty_jar(path: &Path) {

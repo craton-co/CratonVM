@@ -4,7 +4,7 @@
 located. Filed because it is what stopped
 `BasicErrorControllerIntegrationTests` from producing 14 *consecutive* clean
 runs on 2026-08-01 — the class itself is green (see
-[`../../internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md`](../../internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md))
+[`../../internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`](../../internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md))
 and this is a separate defect that was in the way.
 
 ## Symptom

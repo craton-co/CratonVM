@@ -1257,6 +1257,12 @@ fn reconstruct_serialized_lambda(ctx: &mut dyn NativeContext, addr: usize) -> Va
         ref_kind,
         &instantiated_descriptor,
         &capture_types,
+        // Serializable by construction: this proxy is being rebuilt FROM a
+        // `SerializedLambda` record, so the original call site must have been
+        // serializable for that record to exist at all. Without this the
+        // round-tripped lambda would come back with no `writeReplace()` and
+        // could not be serialized a second time.
+        true,
     );
 
     // Proxy registration failed (test mock / table full): still consume the

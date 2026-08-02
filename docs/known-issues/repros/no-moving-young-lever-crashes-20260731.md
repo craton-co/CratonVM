@@ -1,7 +1,7 @@
 # `CRATONVM_NO_MOVING_YOUNG=1` crashes — the diagnostic lever half the JIT docs measure with
 
 > **SUPERSEDED 2026-07-31** by
-> [`../jit-no-moving-young-opt-out-unpublishes-roots.md`](../jit-no-moving-young-opt-out-unpublishes-roots.md),
+> [`../jit-no-moving-young-opt-out-unpublishes-roots.md`](../jit/jit-no-moving-young-opt-out-unpublishes-roots.md),
 > which root-causes this lane from a Linux Hibernate repro found the same day.
 > Two independent faults, not one: (1) the flag also withdrew shadow-stack root
 > publication — both sides read `flags().jit.shadow_stack ||

@@ -2761,6 +2761,50 @@ impl Compiler {
         Some(start)
     }
 
+    /// Reserve the direct-call argument-service range, ABOVE the argument slots.
+    ///
+    /// A baked direct call has no dispatch-helper frame, so the cold
+    /// exception-table service needs the callee's Java arguments copied into a
+    /// contiguous frame range that outlives the CALL. The copy reads
+    /// `arg_slots[i]` and writes `base + (len-1-i)`.
+    ///
+    /// `pop_stack` rewinds `next_spill_offset` past a top-of-stack `Frame`
+    /// slot, but it still HANDS THE SLOT BACK and the popped `StackSlot`s stay
+    /// live until `emit_stack_arg_setup` marshals them. So a bare
+    /// `reserve_spill_slots` here is handed the argument slots themselves, and
+    /// that copy becomes a reversing copy into itself: with two int arguments
+    /// it stored arg0 over arg1 before the marshalling read it, and the callee
+    /// got arg0 in BOTH parameter slots — every comparison in it evaluating
+    /// `cmp a, a`. `docs/internal/fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md`.
+    ///
+    /// `args_frame_top` is `next_spill_offset` as it stood BEFORE the pops.
+    /// The overlap check afterwards is not redundant with the bump: it is what
+    /// makes this safe against a future change to either allocator. If the
+    /// range would alias an argument the reservation fails, the caller's
+    /// `and_then` yields `None`, and the direct call is emitted with no service
+    /// range — the cold path loses argument recovery, which is a degradation,
+    /// not a miscompile. `reset_spills` recycles the extra slots at the next
+    /// bytecode boundary.
+    fn reserve_direct_call_service_slots(
+        &mut self,
+        args_frame_top: i32,
+        arg_slots: &[StackSlot],
+    ) -> Option<i32> {
+        if self.next_spill_offset < args_frame_top {
+            self.next_spill_offset = args_frame_top;
+        }
+        let base = self.reserve_spill_slots(arg_slots.len())?;
+        let end = base.checked_add((arg_slots.len() as i32).checked_mul(8)?)?;
+        for slot in arg_slots {
+            if let StackSlot::Frame(off) = slot {
+                if *off >= base && *off < end {
+                    return None;
+                }
+            }
+        }
+        Some(base)
+    }
+
     fn spill_range_fits(&mut self, start: i32, slots: usize) -> bool {
         self.checked_spill_range_end(start, slots).is_some()
     }
@@ -19134,22 +19178,12 @@ impl Compiler {
                             // dispatch helper frame to recover them from when its own
                             // exception table must run.
                             let service_args_base = info_ptr.and_then(|_| {
-                                // Reserve ABOVE the argument slots. `pop_stack` reclaimed
-                                // them, so a bare `reserve_spill_slots` hands the SAME
-                                // slots back — and the copy below writes
-                                // `base + (len-1-i)` while reading `arg_slots[i]`, i.e. a
-                                // reversing copy into itself. With two int args that
-                                // stored arg0 over arg1 before `emit_stack_arg_setup`
-                                // read it, so the callee received arg0 in BOTH parameter
-                                // slots and every comparison in it evaluated `cmp a, a`.
-                                // The reservation also has to outlive the CALL for
-                                // `emit_inline_callee_deopt_check`, which the aliased
-                                // range could not. `reset_spills` recycles the extra
-                                // slots at the next bytecode boundary.
-                                if self.next_spill_offset < args_frame_top {
-                                    self.next_spill_offset = args_frame_top;
-                                }
-                                let base = self.reserve_spill_slots(arg_slots.len())?;
+                                // See `reserve_direct_call_service_slots`: this range MUST
+                                // sit above the argument slots `pop_stack` just handed
+                                // back, or the copy below reverses the arguments into
+                                // themselves and the callee gets arg0 in every slot.
+                                let base = self
+                                    .reserve_direct_call_service_slots(args_frame_top, &arg_slots)?;
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     self.load_slot_to_reg(R11, *slot);
                                     let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
@@ -20930,22 +20964,12 @@ impl Compiler {
                             // Preserve Java arguments for the cold direct-callee
                             // exception-table service before call marshalling.
                             let service_args_base = info_ptr.and_then(|_| {
-                                // Reserve ABOVE the argument slots. `pop_stack` reclaimed
-                                // them, so a bare `reserve_spill_slots` hands the SAME
-                                // slots back — and the copy below writes
-                                // `base + (len-1-i)` while reading `arg_slots[i]`, i.e. a
-                                // reversing copy into itself. With two int args that
-                                // stored arg0 over arg1 before `emit_stack_arg_setup`
-                                // read it, so the callee received arg0 in BOTH parameter
-                                // slots and every comparison in it evaluated `cmp a, a`.
-                                // The reservation also has to outlive the CALL for
-                                // `emit_inline_callee_deopt_check`, which the aliased
-                                // range could not. `reset_spills` recycles the extra
-                                // slots at the next bytecode boundary.
-                                if self.next_spill_offset < args_frame_top {
-                                    self.next_spill_offset = args_frame_top;
-                                }
-                                let base = self.reserve_spill_slots(arg_slots.len())?;
+                                // See `reserve_direct_call_service_slots`: this range MUST
+                                // sit above the argument slots `pop_stack` just handed
+                                // back, or the copy below reverses the arguments into
+                                // themselves and the callee gets arg0 in every slot.
+                                let base = self
+                                    .reserve_direct_call_service_slots(args_frame_top, &arg_slots)?;
                                 for (i, slot) in arg_slots.iter().enumerate() {
                                     self.load_slot_to_reg(R11, *slot);
                                     let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;

@@ -284,7 +284,7 @@ thread_local! {
     /// [`JvmThread::jit_pending_exception`], because a `thread_local!` is
     /// unreachable from a collecting thread and the throwable was therefore
     /// neither scanned nor remapped for the whole stash→drain window (see
-    /// `docs/known-issues/jit-signals-root-gap.md`). Every remaining field is a
+    /// `docs/jit-signals-root-gap.md`). Every remaining field is a
     /// plain scalar the collector has no interest in, which is why they may
     /// stay here and keep the one-TLS-access drain. **Do not add an
     /// `ObjectRef`, a `Value`, or a raw heap address to this struct** — put it
@@ -664,7 +664,7 @@ pub fn clear_jit_thread() {
 ///
 /// Scalars only — the pending throwable lives on
 /// [`JvmThread::jit_pending_exception`] so the collector can see and relocate
-/// it (`docs/known-issues/jit-signals-root-gap.md`).
+/// it (`docs/jit-signals-root-gap.md`).
 struct JitSignals {
     /// RBC.6 correctness fix — the bytecode pc of the `athrow` that produced
     /// the thread's `jit_pending_exception`, when statically known at
@@ -1718,7 +1718,7 @@ const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
 /// cross-VM hit therefore does not degrade to a slow path — it CALLs another
 /// VM's compiled body, or runs `java/util/HashMap`'s native against whatever
 /// class happens to hold that id in this VM. See
-/// `docs/known-issues/vm-jit-cache-keying.md`.
+/// `docs/vm-jit-cache-keying.md`.
 ///
 /// `vm_identity` is a monotonically issued counter (`vm_init.rs`
 /// `NEXT_VM_IDENTITY`), never an address, so it is never recycled — unlike a
@@ -5340,7 +5340,7 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
 /// the `OWNER` latch, and every other VM answers `is_initialized == false` and
 /// takes the authoritative `ensure_class_initialized_shared` path forever. That
 /// is a correct-but-slower outcome for VM #2, and no shared mutable state can
-/// give a wrong answer. See `docs/known-issues/vm-jit-cache-keying.md`.
+/// give a wrong answer. See `docs/vm-jit-cache-keying.md`.
 mod class_init_memo {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -6665,6 +6665,99 @@ pub unsafe extern "C" fn jit_checkcast(
         // the old fail-soft `0` — there the object's type is UNKNOWABLE, and
         // throwing would turn tolerated stale-reference reads into new
         // failures.
+        // H2-CID0 (2026-08-01): same flag-free reclaimed-memory verdict the
+        // interpreter's `checkcast` reporter emits. A compiled `checkcast` is
+        // where a hot accessor like `MVStore`'s `readPageFromCache` actually
+        // fails, and this path used to report nothing at all, so the run that
+        // reproduces produced no evidence. `java.lang.Object` is `ClassId(0)`,
+        // which is also the all-zero header the collector leaves over a
+        // reclaimed span; free-list membership tells the two apart.
+        // See docs/known-issues/h2/
+        // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+        // H2-CID0 follow-up: ask the reclamation ring on EVERY failing cast, not
+        // only when the receiver reads back as `ClassId(0)`. A block freed while
+        // still referenced only reads as `java.lang.Object` while it stays on
+        // the free list; once reused, the same stale reference sees a valid
+        // object of an unrelated class (observed: `java.util.BitSet cannot be
+        // cast to org.h2.mvstore.Chunk`). Same defect, one step later.
+        {
+            let addr = obj_ref.as_ptr() as usize;
+            if let Some((cid, kind, site, seq)) = cratonvm_gc::gen_heap::old_freed_lookup(addr) {
+                static F: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if F.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    let orig = vm
+                        .classes
+                        .class_manager
+                        .try_read()
+                        .and_then(|cm| {
+                            cm.get_class(cratonvm_types::ClassId::new(cid))
+                                .map(|c| c.name.to_string())
+                        })
+                        .unwrap_or_else(|| format!("class_id={cid}"));
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{addr:#x}"),
+                        actual_class_id = obj_class_id.as_u32(),
+                        target_class = %class_name,
+                        original_class = %orig,
+                        original_kind = kind,
+                        freed_by = if site == 1 {
+                            "in-place old-gen sweep"
+                        } else {
+                            "old-gen mark-compact"
+                        },
+                        free_seq = seq,
+                        "JIT checkcast receiver is an OLD-GEN block this process RECLAIMED while \
+                         it was still referenced. `original_class` is what the block held when it \
+                         was freed; `freed_by` names the mark phase with the gap.",
+                    );
+                }
+            }
+        }
+        if obj_class_id.as_u32() == 0 {
+            let addr = obj_ref.as_ptr() as usize;
+            if let Some((what, span, size)) = vm.mem.heap.reclaimed_hole_at(addr) {
+                static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{addr:#x}"),
+                        location = %what,
+                        span = format!("{span:#x}+{size:#x}"),
+                        target_class = %class_name,
+                        "JIT checkcast receiver points into RECLAIMED memory — a \
+                         still-referenced object was collected.",
+                    );
+                    // H2-CID0: name the victim, unconditionally.
+                    if let Some((cid, kind, site, seq)) =
+                        cratonvm_gc::gen_heap::old_freed_lookup(addr)
+                    {
+                        let orig = vm
+                            .classes
+                            .class_manager
+                            .try_read()
+                            .and_then(|cm| {
+                                cm.get_class(cratonvm_types::ClassId::new(cid))
+                                    .map(|c| c.name.to_string())
+                            })
+                            .unwrap_or_else(|| format!("class_id={cid}"));
+                        tracing::error!(
+                            target: "cratonvm::gc::guard",
+                            obj = format!("{addr:#x}"),
+                            original_class = %orig,
+                            original_kind = kind,
+                            freed_by = if site == 1 {
+                                "in-place old-gen sweep"
+                            } else {
+                                "old-gen mark-compact"
+                            },
+                            free_seq = seq,
+                            "…and the old-gen reclamation ring knows what that block held.",
+                        );
+                    }
+                }
+            }
+        }
         if let Some((thread, _jit_thread_guard)) = jit_thread_mut() {
             // Render an array receiver by its own descriptor. The header of a
             // reference array carries the COMPONENT class id, so the plain
@@ -6952,7 +7045,7 @@ pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     } else if let Some((thread, _guard)) = jit_thread_mut() {
         // The throwable is stashed on the `JvmThread` so the collector can
         // both keep it alive and relocate it before the interpreter's drain
-        // reads it back (`docs/known-issues/jit-signals-root-gap.md`).
+        // reads it back (`docs/jit-signals-root-gap.md`).
         set_jit_pending_exception_with_bci(
             thread,
             ObjectRef::from_raw(exc_ptr as usize as *mut u8),
@@ -11396,7 +11489,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Per-VM keying of the JIT dispatch memos
-    // (docs/known-issues/vm-jit-cache-keying.md)
+    // (docs/vm-jit-cache-keying.md)
     // -----------------------------------------------------------------------
 
     /// Serializes the tests that reset the two process-global, VM-owned
@@ -11412,7 +11505,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // The pending JIT exception is thread-resident, not TLS-resident
-    // (docs/known-issues/jit-signals-root-gap.md)
+    // (docs/jit-signals-root-gap.md)
     // -----------------------------------------------------------------------
 
     fn scratch_thread(id: u64) -> JvmThread {
@@ -13189,7 +13282,7 @@ pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 /// another VM's safepoint flag and write card marks into another VM's
 /// table. A missed card mark is a missed remembered-set update, which is a
 /// use-after-free, not a slowdown. See
-/// `docs/known-issues/vm-process-global-state.md`.
+/// `docs/known-issues/c2/vm-process-global-state.md`.
 ///
 /// Every production caller has its own `SharedVm` in scope and should use
 /// this. [`build_helpers`] remains for VM-less unit tests.

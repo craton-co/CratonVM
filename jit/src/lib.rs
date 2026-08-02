@@ -380,7 +380,7 @@ pub struct ExecutableBuffer {
     /// Four independent estimates allocate executable buffers, and the warning
     /// named none of them — so an overflow flood was attributed by arithmetic
     /// on the printed `len`, and got attributed to the WRONG one
-    /// (`docs/internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md`
+    /// (`docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`
     /// blamed the single-pass backend's estimate for a flood that was entirely
     /// the optimizing tier's).
     tag: &'static str,
@@ -10822,7 +10822,7 @@ fn virtual_object_info_for(
 /// optimizing tier is an optimization, never a requirement.
 ///
 /// This is the adapter the P0 "JIT correctness" lane of
-/// `docs/known-issues/deep-research-vm-c2.md` asks for: `verify_graph` returns
+/// `docs/known-issues/c2/deep-research-vm-c2.md` asks for: `verify_graph` returns
 /// `Result`, the compile path returns `Option`, and rather than change the
 /// signature of anything already in the pipeline the conversion happens here,
 /// at the call site. The bailout is *counted* (`bailout::bailout_counts`) so
@@ -11472,7 +11472,7 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
     // callee's handler frame from its incoming arguments and lost every other
     // local). Anyone reading a failure of this class as evidence against this
     // gate between 2026-07-31 and 2026-08-01 was reading the wrong defect; see
-    // docs/internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md.
+    // docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md.
     //
     // The class is not immune to two intermittent failures unrelated to this
     // gate — a stall in Spring Boot's two-thread `OnClassCondition` filtering
@@ -11487,7 +11487,7 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
     // callee's handler frame from its incoming arguments and lost every other
     // local). Anyone reading a failure of this class as evidence against this
     // gate between 2026-07-31 and 2026-08-01 was reading the wrong defect; see
-    // docs/internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md.
+    // docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md.
     //
     // The OPTIMIZING-TIER gate stays scoped as
     // `moving_young_relocates_compiled_frames()` — that one protects frames
@@ -12023,6 +12023,12 @@ thread_local! {
 /// own code reads a local (`a`) last assigned by the FIRST try's successful
 /// (non-exceptional) path. Without SOME such check, that method compiled
 /// and silently produced a wrong checksum.
+///
+/// (Everything above documents [`local_handler_reads_unsafe_local`], the
+/// private compile-time gate at the bottom of this block — not the public
+/// wrapper immediately below, which inherited the paragraphs when it was
+/// added.)
+
 /// VM-side view of [`local_handler_reads_unsafe_local`]: does resuming one of
 /// this method's handlers require the locals a PRECISE exceptional frame
 /// carries, rather than the `this`-plus-declared-parameters reconstruction the
@@ -12084,6 +12090,7 @@ fn local_handler_reads_unsafe_local(
     }
     false
 }
+
 
 /// Whether the precise-handler-frame relaxation of the RBC.6 gate is enabled.
 ///
@@ -13365,7 +13372,7 @@ fn try_compile_inner(
                 // Branchy-IR explicitly disabled (CRATONVM_NO_IR_BRANCHY) and
                 // reassoc off → fall through to the single-pass backend below.
             } else {
-                // P0 "JIT correctness" (docs/known-issues/deep-research-vm-c2.md):
+                // P0 "JIT correctness" (docs/known-issues/c2/deep-research-vm-c2.md):
                 // the IR verifier runs after every mutating pass when
                 // `ir_verify::verify_enabled()` (debug builds, or
                 // `CRATONVM_JIT_VERIFY_IR=1`), and unconditionally immediately

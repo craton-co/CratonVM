@@ -5,7 +5,7 @@ immediates, addressing, clobbers, flags, fixed registers, constraints, cost and
 encoding — plus a matcher over it and tests generated from it.
 
 **Why this exists.** The C2 review
-(`docs/known-issues/deep-research-vm-c2.md`, "Implement instruction selection,
+(`docs/known-issues/c2/deep-research-vm-c2.md`, "Implement instruction selection,
 scheduling, and register allocation") has a P0 lane:
 
 > Create declarative instruction patterns — describe operation, types,

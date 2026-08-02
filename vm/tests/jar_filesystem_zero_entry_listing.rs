@@ -116,8 +116,8 @@ fn compile_probe(java_home: &Path) -> Option<PathBuf> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
     let source = dir.join(format!("{CLASS_NAME}.java"));
-    std::fs::write(&source, SOURCE).ok()?;
-    Command::new(
+    std::fs::write(&source, SOURCE).expect("write probe source");
+    let out = match Command::new(
         java_home
             .join("bin")
             .join(if cfg!(windows) { "javac.exe" } else { "javac" }),
@@ -127,10 +127,24 @@ fn compile_probe(java_home: &Path) -> Option<PathBuf> {
     .arg("-d")
     .arg(&dir)
     .arg(&source)
-    .status()
-    .ok()?
-    .success()
-    .then_some(dir)
+    .output()
+    {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[jarfs-zero-entry] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    // javac RAN and rejected the source: the probe is broken, and skipping here
+    // would make this test a permanent vacuous pass.
+    assert!(
+        out.status.success(),
+        "[jarfs-zero-entry] the embedded probe failed to compile — fix the probe \
+         source. javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(dir)
 }
 
 #[test]

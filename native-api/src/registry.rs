@@ -218,6 +218,35 @@ pub struct LambdaSerialMetadata {
     pub capture_types: String,
 }
 
+/// Why (or whether) a `LambdaMetafactory`-spun proxy is `java.io.Serializable`.
+///
+/// The JDK decides this in `AbstractValidatingLambdaMetafactory`: a lambda is
+/// serializable when its call site passed `FLAG_SERIALIZABLE` **or** its
+/// functional interface already extends `Serializable`, and the spun class gets
+/// `Serializable` *added* to its interface list only in the first case. Each arm
+/// drives a different reflective surface, so the distinction is modelled here
+/// rather than flattened to a bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LambdaSerializability {
+    /// Not serializable: no `writeReplace()`, no `Serializable` in
+    /// `getInterfaces()`, and `(Serializable) lambda` throws
+    /// ClassCastException. This is the common case -- every plain
+    /// `metafactory` lambda over a non-`Serializable` interface, e.g.
+    /// `Supplier<String> s = () -> "x"`.
+    NotSerializable,
+    /// Serializable because the functional interface itself extends
+    /// `Serializable`. Gets a `writeReplace()`, but `getInterfaces()` still
+    /// reports only the functional interface -- `Serializable` is already
+    /// reachable through it, so the metafactory adds no marker.
+    ByInheritance,
+    /// Serializable because the call site passed `FLAG_SERIALIZABLE` -- an
+    /// `(Iface & Serializable)` intersection cast, which is how every JDK
+    /// `Comparator.comparing*` factory is written. Gets a `writeReplace()`
+    /// AND `java.io.Serializable` appended to `getInterfaces()` /
+    /// `getGenericInterfaces()`.
+    ByFlag,
+}
+
 /// Compute a fast 128-bit hash key for a native method triple.
 ///
 /// Returns a `(u64, u64)` pair. The two halves are produced by **two
@@ -557,6 +586,10 @@ pub trait NativeClassAccess {
         impl_ref_kind: u8,
         instantiated_descriptor: &str,
         capture_types: &str,
+        // Whether the call site passed `LambdaMetafactory.FLAG_SERIALIZABLE`.
+        // The reflective `metafactory` entry point has no flags word and passes
+        // `false`; such a lambda can still be serializable by inheritance.
+        serializable: bool,
     ) -> u32 {
         let _ = (
             functional_interface,
@@ -568,6 +601,7 @@ pub trait NativeClassAccess {
             impl_ref_kind,
             instantiated_descriptor,
             capture_types,
+            serializable,
         );
         0
     }
@@ -745,6 +779,18 @@ pub trait NativeClassAccess {
     /// the (un-loadable) synthetic `$$Lambda` proxy class by name.
     fn lambda_proxy_serial_metadata(&self, _class_id: ClassId) -> Option<LambdaSerialMetadata> {
         None
+    }
+
+    /// How this lambda proxy is (or is not) `java.io.Serializable`, per the
+    /// JDK's own `LambdaMetafactory` rule. `NotSerializable` for any class that
+    /// is not a lambda proxy.
+    ///
+    /// Real HotSpot spins a private `writeReplace()` and adds `Serializable` to
+    /// the proxy's interfaces only for serializable lambdas, so every reflective
+    /// `Class` surface must agree with this rather than assume all lambdas are
+    /// serializable (which is what CratonVM did before 2026-08-01).
+    fn lambda_proxy_serializability(&self, _class_id: ClassId) -> LambdaSerializability {
+        LambdaSerializability::NotSerializable
     }
 
     /// Get the ClassLoaderId for a loaded class.

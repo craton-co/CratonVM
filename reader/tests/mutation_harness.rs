@@ -10,7 +10,7 @@
 //! `fuzz_attribute_nesting`, …), but they require a nightly toolchain and
 //! `cargo fuzz`, so they do not run in CI and — as of this commit — no
 //! coverage-guided campaign has ever been run against them. See
-//! `docs/known-issues/class-file-parser-hardening.md`.
+//! `docs/known-issues/c2/class-file-parser-hardening.md`.
 //!
 //! What this file provides instead is an *exhaustive, deterministic*
 //! mutation sweep that runs as an ordinary `cargo test`: no `rand`, no
@@ -340,7 +340,7 @@ fn u32_length_extremes_never_panic_and_never_exhaust_memory() {
 // ---------------------------------------------------------------------------
 
 /// Pins the mutation arithmetic so the number quoted in
-/// `docs/known-issues/class-file-parser-hardening.md` cannot silently drift
+/// `docs/known-issues/c2/class-file-parser-hardening.md` cannot silently drift
 /// when the seed class changes.
 #[test]
 fn mutation_coverage_totals_are_exact() {
@@ -361,6 +361,6 @@ fn mutation_coverage_totals_are_exact() {
     assert_eq!(u32_subs, 860);
     assert_eq!(
         total, 2_819,
-        "total mutation count changed — update docs/known-issues/class-file-parser-hardening.md"
+        "total mutation count changed — update docs/known-issues/c2/class-file-parser-hardening.md"
     );
 }

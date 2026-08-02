@@ -105,13 +105,21 @@ fn private_method_in_abstract_class_is_not_retargeted() {
         .arg("-d")
         .arg(&out)
         .arg(&src)
-        .status();
+        .output();
     match compiled {
-        Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("[hib-dev-05] javac failed; skipping");
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[hib_dev_05] javac could not be executed: {e}; skipping");
             return;
         }
+        // javac RAN and rejected the source: the probe is broken, and skipping
+        // here would make this test a permanent vacuous pass.
+        Ok(o) => assert!(
+            o.status.success(),
+            "[hib_dev_05] the embedded probe failed to compile — fix the probe source. \
+             javac stderr:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
     }
 
     let mut cmd = Command::new(&bin);

@@ -257,13 +257,14 @@ pub(super) fn lambda_proxy_satisfies(
                 "[LOADER-TRACE] lambda_proxy_satisfies: obj_class_id={obj_class_id:?} iface_name={iface_name} target_class_id={target_class_id:?} target_name={target_name_dbg:?}"
             );
         }
-        // Lambdas produced by LambdaMetafactory.altMetafactory (used by e.g.
-        // `Comparator.comparing`, `Comparator.comparingInt`) always include
-        // `java.io.Serializable` as a marker interface. We don't currently track
-        // the altMetafactory flags, so accept Serializable universally — this
-        // matches the observable behavior of the real JDK's `altMetafactory`
-        // with FLAG_SERIALIZABLE and keeps the checkcast at pc=11 in
-        // `Comparator.comparing(Function)` from failing.
+        // `LambdaMetafactory.altMetafactory` with `FLAG_SERIALIZABLE` -- every JDK
+        // `Comparator.comparing*`, and any `(Iface & Serializable)` intersection
+        // cast -- adds `java.io.Serializable` to the spun proxy's interfaces. A
+        // plain `metafactory` lambda does NOT implement it: on real HotSpot
+        // `(Serializable) (Supplier<String>) () -> "x"` throws ClassCastException.
+        // This used to accept Serializable universally because the flag was not
+        // tracked, which made every CratonVM lambda look serializable. It is
+        // recorded now, so ask the one owner of the rule.
         let target_name = shared
             .classes
             .class_manager
@@ -272,7 +273,8 @@ pub(super) fn lambda_proxy_satisfies(
             .map(|c| c.name.to_string())
             .unwrap_or_default();
         if &*target_name == "java/io/Serializable" {
-            return true;
+            return shared.lambda_proxy_serializability(obj_class_id)
+                != cratonvm_native_api::LambdaSerializability::NotSerializable;
         }
         // A lambda proxy is defined for precisely this functional-interface
         // name. Its synthetic VM-only ClassId has no ClassStore hierarchy, and

@@ -125,21 +125,30 @@ fn compile_probe(java_home: Option<&str>) -> Option<PathBuf> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
     let src = dir.join(format!("{CLASS_NAME}.java"));
-    std::fs::write(&src, SOURCE).ok()?;
+    std::fs::write(&src, SOURCE).expect("write probe source");
 
-    let status = Command::new(javac_path(java_home))
+    let out = match Command::new(javac_path(java_home))
         .arg("--release")
         .arg("21")
         .arg("-d")
         .arg(&dir)
         .arg(&src)
-        .status()
-        .ok()?;
-    if status.success() && dir.join(format!("{CLASS_NAME}.class")).exists() {
-        Some(dir)
-    } else {
-        None
-    }
+        .output()
+    {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            eprintln!("[native_io_dis_read_fully_pin] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    assert!(
+        out.status.success() && dir.join(format!("{CLASS_NAME}.class")).exists(),
+        "[native_io_dis_read_fully_pin] the embedded probe failed to compile — fix the probe source. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(dir)
 }
 
 #[test]
