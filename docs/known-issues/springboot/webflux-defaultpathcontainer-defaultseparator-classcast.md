@@ -1,8 +1,12 @@
 ﻿# WebFlux/WebMvc `DefaultPathContainer$DefaultSeparator` checkcast вЂ” FIXED / RETIRED 2026-08-01
 
-**Status: CLOSED.** Three independent defects had to be settled, and none was
-the "stale/moved-GC reference or duplicate class identity" pair the original
-report guessed at:
+**Status: OPEN — REGRESSED 2026-08-01 (again).** See "Regression note
+(2026-08-01, again)" at the end of this doc: 3 of the 5 classes this closure's
+validation table lists as green are back to failing with the identical
+`DefaultSeparator` CCE, on a build where all three cited fix commits are
+genuine ancestors. Three independent defects had to be settled to reach this
+closure, and none was the "stale/moved-GC reference or duplicate class
+identity" pair the original report guessed at:
 
 1. the reported `ClassCastException` itself вЂ” the **in-place old-gen sweep
    returning a LIVE promoted object's block to the free list**, fixed on `dev`
@@ -362,3 +366,53 @@ flagged is the reason moving-young *declined* that cycle (a safety fallback to
 the non-moving sweep), not a fault report вЂ” so it is not the lead it looked
 like. Both defects above are independently sufficient to produce a wild read,
 and defect 2 in particular SIGSEGVs on the 5-slot shape all by itself.
+
+## Regression note (2026-08-01, again)
+
+Reran the 26-class FAIL/CRASH residual from the 2026-07-31 full-suite round
+against `dev` merged to `1b24cca1f` (branch
+`feat/spring-boot-residual-rerun-20260728`, binary
+`cratonvm-spring-boot-residual0728.exe`, 1 shard, `-Parallel 1`,
+`-TimeoutSec 1500`, `RunName=craton-rerun-20260801`). Confirmed `0b18f15eb`,
+`20cab92aa`, `c3dbb011a`, and `063be4f18` (this doc's cited fixes) are all
+genuine ancestors of `1b24cca1f` (`git merge-base --is-ancestor`), so this is
+not a stale-binary artifact.
+
+**2 of 5 classes still hold** — `GraphQlWebFluxAutoConfigurationTests` and
+`WebMvcHealthEndpointAdditionalPathIntegrationTests` were not both
+independently reverified this round (only the latter was in the 26-class
+list; it PASSed, 322.4s).
+
+**3 of 5 classes regressed with the identical signature**:
+
+- `IntegrationGraphEndpointWebIntegrationTests` — FAIL, 6 tests/3 failed,
+  118.0s. Same `ClassCastException: java.lang.Object cannot be cast to
+  org.springframework.http.server.DefaultPathContainer$DefaultSeparator` at
+  `DefaultPathContainer.createFromUrlPath(DefaultPathContainer.java:98)`. This
+  is a real recurrence of the CCE, not the unrelated JUnit
+  `displayName must not be null or blank` regression this doc's "One
+  unrelated regression arrived during the re-merge" section describes for the
+  same class — that failure mode is `containersFailed=2, tests=0` in ~1.3s;
+  today's run executed all 6 tests in 118s and failed 3 with the CCE.
+- `JerseyEndpointRequestIntegrationTests` — FAIL, 6 of 9 tests, 177.1s. Same
+  CCE, reached via `ServletRequestPathFilter.doFilter` →
+  `ServletRequestPathUtils.parseAndCache` → `RequestPath.parse` →
+  `DefaultPathContainer.createFromUrlPath`, both through a Jersey
+  `ResourceConfig` servlet and the plain `se1-actuator-endpoint` servlet.
+- `ManagementWebSecurityAutoConfigurationTests` — FAIL, 4 of 10 tests, 161.2s.
+  Same CCE, same call site.
+
+Logs (all under `craton-rerun-20260801/all-jit/logs/`):
+`module_spring-boot-integration.org.springframework.boot.integration.actuate.endpoint.Integ-cf6a6f777358.{out,err}.log`,
+`module_spring-boot-security.org.springframework.boot.security.autoconfigure.actuate.web.se-a0d9d711811f.{out,err}.log`,
+`module_spring-boot-security.org.springframework.boot.security.autoconfigure.actuate.w-f4cd03f47d82.{out,err}.log`.
+
+Not re-diagnosed at the source level this session. As with the companion
+`basicerrorcontroller-class-cluster-20260728.md` regression note filed the
+same round: `WebMvcHealthEndpointAdditionalPathIntegrationTests` passing while
+3 siblings sharing the exact same `DefaultPathContainer.createFromUrlPath`
+call site fail suggests the underlying GC fixes are real but don't cover
+every promotion/load pattern that reaches this map — worth comparing what
+each failing class's boot sequence does differently (Jersey servlet
+init order, security filter chain construction, WebFlux vs. servlet dispatch)
+against the passing class rather than assuming a fourth independent cause.
