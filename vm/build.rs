@@ -17,16 +17,34 @@
 //!
 //! A file is considered "modern" if its first 20 lines contain the marker
 //! comment `// JAVA21+`.
+//!
+//! A file whose header contains `// NEEDS-CLASSPATH` is a hand-run probe that
+//! compiles only against a third-party jar this build has no way to supply.
+//! It is skipped. Both passes compile their whole set in ONE `javac`
+//! invocation, so a single such file fails the entire pass and leaves every
+//! other fixture unstaged — which is not a loud failure, because the tests
+//! that read `CRATONVM_TEST_CLASSES_DIR` fall back to "no compiled classes,
+//! skip" (see `interpreter_tests::class_files_available`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Return `true` if the file's header contains `// JAVA21+`.
 fn is_modern_java(path: &Path) -> bool {
+    header_marker(path, "// JAVA21+")
+}
+
+/// Return `true` if the file's header contains `// NEEDS-CLASSPATH`, i.e. it
+/// cannot be compiled without a jar this build script does not have.
+fn needs_external_classpath(path: &Path) -> bool {
+    header_marker(path, "// NEEDS-CLASSPATH")
+}
+
+fn header_marker(path: &Path, marker: &str) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };
-    content.lines().take(20).any(|l| l.contains("// JAVA21+"))
+    content.lines().take(20).any(|l| l.contains(marker))
 }
 
 fn compile_files(
@@ -62,12 +80,73 @@ fn compile_files(
         // back on fail" passes must stay silent so `cargo doc` does
         // not pick them up as noise.
         if log_failure {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            println!("cargo:warning=javac failed ({extra_args:?}):\n{stderr}");
+            warn_javac_failure(javac, extra_args, files, &output);
         }
         return false;
     }
     true
+}
+
+/// Report a javac failure so the NEXT occurrence names the file.
+///
+/// One `cargo:warning=` per line, deliberately. The build-script protocol is
+/// LINE-oriented: cargo reads `cargo:warning=<rest of line>` and ignores every
+/// following line that is not itself a directive. The old code emitted
+/// `cargo:warning=javac failed ({extra_args:?}):\n{stderr}`, so cargo printed
+/// the header and silently dropped the whole compiler transcript — which read
+/// as "javac failed with empty stderr" and hid 17 real errors in one file for
+/// as long as nobody ran javac by hand.
+fn warn_javac_failure(
+    javac: &Path,
+    extra_args: &[&str],
+    files: &[PathBuf],
+    output: &std::process::Output,
+) {
+    // Cap the transcript: a broken batch can produce hundreds of lines, and
+    // cargo prints every warning on every build until it is fixed.
+    const MAX_LINES: usize = 40;
+
+    println!(
+        "cargo:warning=javac failed (status {}, {} file(s), args {extra_args:?}): {}",
+        output.status,
+        files.len(),
+        javac.display()
+    );
+
+    // Name the offending sources up front — javac reports them as
+    // `<path>:<line>: error: …`, and that first token is the whole answer most
+    // of the time.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut blamed: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains(": error:"))
+        .filter_map(|l| l.split(".java:").next())
+        .map(str::trim)
+        .collect();
+    blamed.sort_unstable();
+    blamed.dedup();
+    for file in blamed {
+        println!("cargo:warning=  javac error in: {file}.java");
+    }
+
+    // Then the transcript. `stdout` too: an empty stderr does not mean the
+    // tool said nothing, and that ambiguity is what made this diagnostic
+    // useless the first time.
+    for (stream, text) in [("stderr", &stderr), ("stdout", &String::from_utf8_lossy(&output.stdout))] {
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            continue;
+        }
+        for line in lines.iter().take(MAX_LINES) {
+            println!("cargo:warning=  [{stream}] {line}");
+        }
+        if lines.len() > MAX_LINES {
+            println!(
+                "cargo:warning=  [{stream}] … {} more line(s) suppressed",
+                lines.len() - MAX_LINES
+            );
+        }
+    }
 }
 
 /// Round-11 cross-cutting HIGH-6 (round-9 MED-10): cache the result of
@@ -171,13 +250,19 @@ fn main() {
     // exercise programs for the intrinsic table and the synthetic native
     // overlay respectively) — is picked up by this glob and compiled by the
     // legacy pass below, landing at `$OUT_DIR/test-classes/cratonvm/<Name>.class`.
-    let java_files: Vec<PathBuf> = std::fs::read_dir(&sources_dir)
+    let mut java_files: Vec<PathBuf> = std::fs::read_dir(&sources_dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "java"))
         .map(|e| e.path())
         .collect();
+
+    // Drop the hand-run probes that need a third-party jar. Each pass compiles
+    // its whole set in one javac invocation, so leaving one of these in fails
+    // the pass and stages NOTHING — every fixture-reading test then quietly
+    // skips instead of failing. See the `// NEEDS-CLASSPATH` marker.
+    java_files.retain(|f| !needs_external_classpath(f));
 
     if java_files.is_empty() {
         return;
