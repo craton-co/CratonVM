@@ -120,16 +120,21 @@ impl Mode {
         }
     }
 
+    /// `CRATONVM_JIT_ALLOW_PACKAGES` used to be arranged here on both arms. It
+    /// was the escape hatch for the static package-ban machinery, and
+    /// `d1979bec5` ("delete the static ban machinery outright") removed the
+    /// last reader — so setting it had become a no-op that still read like a
+    /// precondition. Dropped rather than re-declared: the flag no longer
+    /// exists, and a test arranging a variable nothing consumes is how a
+    /// green run stops meaning what its author thought it meant.
     fn apply_env(self, cmd: &mut Command) {
         match self {
             Mode::Interpreter => {
                 cmd.env("CRATONVM_DISABLE_JIT", "1");
-                cmd.env_remove("CRATONVM_JIT_ALLOW_PACKAGES");
                 cmd.env_remove("CRATONVM_JIT_THRESHOLD");
             }
             Mode::Jit => {
                 cmd.env_remove("CRATONVM_DISABLE_JIT");
-                cmd.env("CRATONVM_JIT_ALLOW_PACKAGES", "cratonvm/");
                 cmd.env("CRATONVM_JIT_THRESHOLD", "1");
             }
         }
