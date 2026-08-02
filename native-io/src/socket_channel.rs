@@ -3770,6 +3770,17 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         });
         r.register(c, "read", "(Ljava/nio/ByteBuffer;)I", sc_read);
         r.register(c, "write", "(Ljava/nio/ByteBuffer;)I", sc_write);
+        // The byte[] pair the `Socket` VIEW of a channel reads and writes
+        // through: `SocketAdaptor.getInputStream()` hands back a
+        // `sun.nio.ch.SocketInputStream` whose `implRead` calls
+        // `blockingRead`, and the output stream's `implWrite` calls
+        // `blockingWriteFully`. Both are declared on `SocketChannelImpl`,
+        // which our channel object is not, so without these the adapter's
+        // streams died with `NoSuchMethodError:
+        // java.nio.channels.SocketChannel.blockingRead([BIIJ)I` — an accepted
+        // Socket that could not be read from. Same shape as `blockingAccept`.
+        r.register(c, "blockingRead", "([BIIJ)I", sc_blocking_read);
+        r.register(c, "blockingWriteFully", "([BII)V", sc_blocking_write_fully);
         // Vectored (scattering read / gathering write). Abstract on
         // SocketChannel (inherited from Scattering/GatheringByteChannel); the
         // synthetic channel object has no concrete body, so register both the
@@ -3963,11 +3974,20 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
 
     // -- ServerSocket adapter (used by ServerSocketChannel.socket()) --
     // The wrapper returned by `ssc.socket()` has a back-ref to its parent
-    // SSC at SS_CHANNEL_REF. The bind / getLocalPort / accept / close /
+    // SSC at SS_CHANNEL_REF. The bind / getLocalPort / close /
     // getInetAddress methods detect this back-ref and delegate to the
-    // owning channel; without a back-ref we fall through to defaults so
-    // that plain `new ServerSocket()` use cases (handled elsewhere) are
+    // owning channel; without a back-ref they delegate OUT to the plain
+    // owner in native-builtins, so plain `new ServerSocket()` use cases are
     // not perturbed.
+    //
+    // `accept` is deliberately NOT one of the wrappers — it stays with
+    // net_phase_e's RE.2 native, which owns every plain ServerSocket's
+    // listener. Wrapping it here would make this crate the winner for every
+    // accept in the VM and put a cross-crate hop in front of the common case.
+    // Instead we hand RE.2 a way to bounce the adapter case back to us.
+    cratonvm_native_api::plain_server_socket::set_channel_backed_accept(
+        ss_adapter_channel_accept,
+    );
     let server_socket = "java/net/ServerSocket";
     r.register(
         server_socket,
@@ -4506,6 +4526,182 @@ fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // MockWebServer.close() then threw `AssertionError: Gave up waiting for
     // queue to shut down` on teardown.
     plain_server_socket_delegate(ctx, args, |ops| ops.close, |_| Ok(None))
+}
+
+/// `ServerSocket.accept()` for a `ServerSocketChannel.socket()` adapter.
+///
+/// Installed into `cratonvm_native_api::plain_server_socket` and called from
+/// net_phase_e's RE.2 `accept` native, which wins that triple but only
+/// understands plain sockets. `None` means "no channel back-ref, not mine".
+///
+/// Without this an adapter's `accept()` reported
+/// `IOException: ServerSocket not bound`: its listener is in THIS crate's
+/// channel registry, so RE.2 saw `listener_id = -1` and concluded the socket
+/// had never been bound. `timeout_ms` is the SO_TIMEOUT RE.2 holds for the
+/// adapter (it owns the unwrapped `setSoTimeout` too); `0` blocks
+/// indefinitely, matching `ServerSocketAdaptor.accept`.
+fn ss_adapter_channel_accept(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    timeout_ms: i32,
+) -> Option<MethodCallResult> {
+    let ssc = ss_back_ref(ctx, this)?;
+    let deadline = (timeout_ms > 0)
+        .then(|| std::time::Instant::now() + Duration::from_millis(timeout_ms as u64));
+    Some(ss_adapter_accept_on(ctx, ssc, deadline))
+}
+
+/// `SocketChannelImpl.blockingRead(byte[] b, int off, int len, long nanos)`.
+///
+/// The read side of the `Socket` a channel adapter hands out:
+/// `SocketAdaptor.getInputStream()` returns a `sun.nio.ch.SocketInputStream`,
+/// whose `implRead` calls this. It is declared on `SocketChannelImpl`, but
+/// CratonVM's `SocketChannel.open()` (and the channel produced by an accept)
+/// is an instance of the ABSTRACT `java.nio.channels.SocketChannel`, so the
+/// call landed on a receiver without the method:
+/// `NoSuchMethodError: java.nio.channels.SocketChannel.blockingRead([BIIJ)I`.
+/// Same shape as `blockingAccept` on the server side.
+///
+/// `nanos <= 0` means block indefinitely; a positive deadline that expires
+/// throws `SocketTimeoutException`, which is how `Socket.setSoTimeout` reaches
+/// a read on this path.
+fn sc_blocking_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_or_none(args, 0).ok_or_else(|| ioex("blockingRead: null channel"))?;
+    let arr = obj_or_none(args, 1).ok_or_else(|| ioex("blockingRead: null buffer"))?;
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let nanos = match args.get(4) {
+        Some(Value::Long(n)) => *n,
+        Some(Value::Int(n)) => i64::from(*n),
+        _ => 0,
+    };
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let id = read_reg_id(ctx, this).ok_or_else(|| ioex("blockingRead: channel not connected"))?;
+    let deadline =
+        (nanos > 0).then(|| std::time::Instant::now() + Duration::from_nanos(nanos as u64));
+
+    let mut buf = vec![0u8; len];
+    let arr_pin = ctx.pin_native_root(arr);
+    ctx.begin_blocking_region();
+    let outcome = loop {
+        match resolve_stream(id) {
+            StreamTarget::Ready(stream) => match try_read_nb(&stream, &mut buf) {
+                Ok(Some(n)) => break Ok(n),
+                Ok(None) => {}
+                Err(error) => break Err(map_err("blockingRead", error)),
+            },
+            StreamTarget::Connecting => {}
+            StreamTarget::Failed(error) => break Err(map_err("blockingRead", error)),
+            StreamTarget::Unavailable => break Err(ioex("blockingRead: channel not a stream")),
+        }
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() >= deadline {
+                break Err(RuntimeError::SocketTimeoutException {
+                    message: "Read timed out".into(),
+                }
+                .into());
+            }
+        }
+        std::thread::sleep(ADAPTER_READ_POLL);
+    };
+    ctx.end_blocking_region();
+
+    let n = match outcome {
+        Ok(n) => n,
+        Err(failed) => {
+            ctx.unpin_native_roots(arr_pin);
+            return Err(failed);
+        }
+    };
+    if n > 0 {
+        crate::net::socket_capture('r', id, &buf[..n as usize]);
+        // Reload through the pin: the wait above may have crossed a GC pause
+        // that relocated the array.
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.write_byte_array_from(arr, off, &buf[..n as usize]);
+    }
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Int(n)))
+}
+
+/// `SocketChannelImpl.blockingWriteFully(byte[] b, int off, int len)` — the
+/// write side of the same adapter stream. Writes every byte or throws; the
+/// JDK's `SocketOutputStream.implWrite` relies on "fully".
+fn sc_blocking_write_fully(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_or_none(args, 0).ok_or_else(|| ioex("blockingWriteFully: null channel"))?;
+    let arr = obj_or_none(args, 1).ok_or_else(|| ioex("blockingWriteFully: null buffer"))?;
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    if len == 0 {
+        return Ok(None);
+    }
+    let id =
+        read_reg_id(ctx, this).ok_or_else(|| ioex("blockingWriteFully: channel not connected"))?;
+    let mut data = vec![0u8; len];
+    let copied = ctx.read_byte_array_into(arr, off, &mut data);
+    data.truncate(copied);
+    if data.is_empty() {
+        return Ok(None);
+    }
+
+    ctx.begin_blocking_region();
+    let mut written = 0usize;
+    let result = loop {
+        if written == data.len() {
+            break Ok(());
+        }
+        match resolve_stream(id) {
+            StreamTarget::Ready(stream) => match try_write_nb(&stream, &data[written..]) {
+                Ok(Some(n)) if n > 0 => {
+                    written += n as usize;
+                    continue;
+                }
+                // Zero-length or WouldBlock: back off and retry, since this
+                // method must not return short.
+                Ok(_) => {}
+                Err(error) => break Err(map_err("blockingWriteFully", error)),
+            },
+            StreamTarget::Connecting => {}
+            StreamTarget::Failed(error) => break Err(map_err("blockingWriteFully", error)),
+            StreamTarget::Unavailable => {
+                break Err(ioex("blockingWriteFully: channel not a stream"))
+            }
+        }
+        std::thread::sleep(ADAPTER_READ_POLL);
+    };
+    ctx.end_blocking_region();
+    result?;
+    crate::net::socket_capture('w', id, &data);
+    Ok(None)
+}
+
+/// Back-off between attempts while an adapter read/write waits for the socket.
+/// Matches the accept loop's cadence — these paths are only reached by the
+/// `Socket` view of a channel, never by the hot NIO path.
+const ADAPTER_READ_POLL: Duration = Duration::from_millis(5);
+
+fn ss_adapter_accept_on(
+    ctx: &mut dyn NativeContext,
+    ssc: ObjectRef,
+    deadline: Option<std::time::Instant>,
+) -> MethodCallResult {
+    // The same primitive `blockingAccept(nanos)` uses: a bounded wait throws
+    // SocketTimeoutException on expiry rather than returning null.
+    let accepted = ssc_accept_impl(ctx, &[Value::Object(Some(ssc))], deadline)?;
+    let Some(Value::Object(Some(channel))) = accepted else {
+        // Only reachable with no deadline on a NON-blocking channel, where
+        // `ServerSocketChannel.accept()` legitimately answers null. The real
+        // `ServerSocketAdaptor.accept` refuses that configuration outright
+        // rather than hand back a null Socket for its caller to dereference.
+        return Err(ioex(
+            "accept: ServerSocket.accept() on a non-blocking ServerSocketChannel \
+             with no connection pending",
+        ));
+    };
+    // `ServerSocket.accept()` returns a `java.net.Socket`, not a SocketChannel.
+    sc_socket(ctx, &[Value::Object(Some(channel))])
 }
 
 // ---------------------------------------------------------------------------
