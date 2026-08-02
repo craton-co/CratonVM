@@ -1,3 +1,9 @@
+// Declares the package the corpus invokes it under (`cratonvm/
+// FPCompletenessTest`); see the note in PgoTest.java for why its absence made
+// all 22 of these tests fail with ClassNotFound once the fixtures were being
+// compiled rather than read from the committed .class beside this file.
+package cratonvm;
+
 public class FPCompletenessTest {
 
     // --- NaN / overflow conversions ---
