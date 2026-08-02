@@ -6672,6 +6672,25 @@ pub fn execute(
             Arc::from(method_name),
             Arc::from(method_descriptor),
         );
+        /// Announce a permanent `jit_skip_set` seal under `CRATONVM_DBG_JITC`.
+        ///
+        /// Sealing is STRICTLY STRONGER than a compile bail: a bail is retried
+        /// (up to `MAX_TIER_FAIL_RETRIES`) and is reported by the tier
+        /// manager, whereas a seal removes the method from every later path —
+        /// including the invocation-counter upgrade that reaches
+        /// `jit::try_compile`'s relaxed, dataflow-based gates. A sealed method
+        /// is not merely uncompiled, it is UNTRACKED: it appears nowhere in
+        /// `CRATONVM_DBG=jit-method-stats`, not even as hot-but-stuck, so
+        /// "this method is never even considered" had no observable signal at
+        /// all before this line.
+        fn note_jit_skip_seal(site: &str, key: &(Arc<str>, Arc<str>, Arc<str>)) {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                eprintln!(
+                    "[cratonvm-jitc] jit-skip-seal site={site} {}.{}{}",
+                    key.0, key.1, key.2
+                );
+            }
+        }
         let already_skipped = shared.jit.jit_skip_set.read().contains(&skip_key);
         // PERF FIX (2026-07-15, companion to the invoke-cache + jit-bail-list
         // memoization fixes): `already_skipped` (a single `jit_skip_set`
@@ -6865,6 +6884,7 @@ pub fn execute(
             // poison this method's entry for future calls where those flags
             // may differ.
             if static_skip_reason.is_some() || fjp_skip || native_skip {
+                note_jit_skip_seal("static-policy-or-native-shadow", &skip_key);
                 shared.jit.jit_skip_set.write().insert(skip_key.clone());
             }
         } else {
@@ -6996,6 +7016,7 @@ pub fn execute(
                             // RBC.4 — seal scan-rejected methods so this path
                             // doesn't re-run jit_scan on every uncached
                             // invocation.
+                            note_jit_skip_seal("early-jit-scan-reject", &skip_key);
                             shared.jit.jit_skip_set.write().insert(skip_key.clone());
                             return None;
                         }
@@ -7004,6 +7025,7 @@ pub fn execute(
                     // (mirrors jit::try_compile_inner); seal otherwise so the
                     // probe isn't re-run per call.
                     if scan.has_athrow && !code_attr.exception_table.is_empty() {
+                        note_jit_skip_seal("early-rbc6-athrow-with-handler", &skip_key);
                         shared.jit.jit_skip_set.write().insert(skip_key.clone());
                         return None;
                     }
@@ -7660,6 +7682,7 @@ pub fn execute(
                     // early-compiled; OSR handles such methods later.
                     if has_unsupported_ldc {
                         // Mark as skipped so we don't retry
+                        note_jit_skip_seal("early-unsupported-ldc", &skip_key);
                         shared.jit.jit_skip_set.write().insert(skip_key.clone());
                     }
 
@@ -7912,6 +7935,7 @@ pub fn execute(
                     // method returned None on purpose (to interpret until its
                     // invocation counter crosses the threshold) — sealing it here
                     // would set `already_skipped` and permanently stop that counter.
+                    note_jit_skip_seal("early-backend-bail", &skip_key);
                     shared.jit.jit_skip_set.write().insert(skip_key.clone());
                 }
                 if let Some(compiled) = compiled {
