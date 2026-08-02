@@ -1291,9 +1291,24 @@ fn fis_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
     if let Some(fd_obj) = fis_fd_object(ctx, this) {
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
-        return;
+        // Verify the write LANDED before trusting it. `set_field_by_name` is a
+        // silent no-op when the receiver's class has no field of that name,
+        // and CratonVM's synthetic `java/io/FileDescriptor` is
+        // `instance_fields(4)` — four `_fN` slots, no `fd`, no `handle`. So in
+        // synthetic mode `fis_ensure_fd_object` attached a descriptor that
+        // could not hold the id, both writes vanished, and `fis_get_fd`
+        // returned `None` for the rest of the stream's life: every `read()`
+        // answered -1 and every `available()` 0. That took out five `TckIo`
+        // corpus tests, and read as "the file is empty" rather than as a lost
+        // descriptor. The real-JDK layout does declare both fields, so this
+        // read-back never falls through there.
+        if matches!(ctx.get_field_by_name(fd_obj, "fd"), Value::Int(v) if v == fd as i32)
+            || matches!(ctx.get_field_by_name(fd_obj, "handle"), Value::Long(v) if v == fd as i64)
+        {
+            return;
+        }
     }
-    // Legacy synthetic layout: no `FileDescriptor` object — slot 0 is a
+    // Legacy synthetic layout: no usable `FileDescriptor` object — slot 0 is a
     // plain scratch slot, so stash the raw id there.
     ctx.set_field(this, 0, Value::Int(fd as i32));
 }
@@ -1797,7 +1812,15 @@ fn fos_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
     if let Some(fd_obj) = fos_fd_object(ctx, this) {
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
-        return;
+        // Same read-back as `fis_set_fd` — see the writeup there for the
+        // synthetic `FileDescriptor` that has neither field. The output side
+        // never hit it (nothing attaches a descriptor to a synthetic
+        // `FileOutputStream`), but the asymmetry was luck, not design.
+        if matches!(ctx.get_field_by_name(fd_obj, "fd"), Value::Int(v) if v == fd as i32)
+            || matches!(ctx.get_field_by_name(fd_obj, "handle"), Value::Long(v) if v == fd as i64)
+        {
+            return;
+        }
     }
     ctx.set_field(this, 0, Value::Int(fd as i32));
 }
