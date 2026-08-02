@@ -218,8 +218,12 @@ about a 0.6 % chance of seeing that if the rate were unchanged.
 is the arm that localised defect 2 to a *relocation*, not a liveness, failure.
 
 `dev` moved 40 commits during this work, so the branch was merged up and
-**re-verified on the merged tree**: `cratonvm-tlsec-merged`, **20/20 clean**.
-That is the binary these fixes actually ship as.
+**re-verified on the merged tree** (`dev` at `5c5caae8e`):
+`cratonvm-tlsec-merged`, **20/20 clean**. `dev` then moved 8 further commits
+before the integration merge; those are other sessions' already-verified work
+and touch none of these files, so the merge was settled with `cargo check`
+rather than another 20-run batch — the binary behind the 20/20 carries these
+fixes exactly as they landed.
 
 Neighbouring TLS classes, pre-fix (`cratonvm-tlsec-base`) vs post-fix
 (`cratonvm-tlsec-fix5`) — same pass/fail everywhere, all a little faster:
