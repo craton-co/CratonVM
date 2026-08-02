@@ -43,14 +43,30 @@ fn extended_interpreter_tests_enabled() -> bool {
 }
 
 fn require_extended_interpreter_tests(test_name: &str) -> bool {
-    if extended_interpreter_tests_enabled() {
-        true
-    } else {
+    if !extended_interpreter_tests_enabled() {
         eprintln!(
             "Skipping {test_name}: set CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1 to run extended interpreter corpus tests"
         );
-        false
+        return false;
     }
+    assert!(
+        cratonvm_vm::config::SYNTHETIC_JDK_COMPILED_IN,
+        "the extended interpreter corpus was opted into, but this test binary was \
+         built WITHOUT the `synthetic-jdk` Cargo feature.\n\
+         \n\
+         `test_vm()` builds a `VmConfig::default()`, whose JDK mode is \
+         `EMBEDDED_DEFAULT_JDK_MODE` = synthetic. In a default-feature build that \
+         registers none of the ~5,200 synthetic stubs AND suppresses boot-classpath \
+         discovery, so the corpus measures a VM with no class library at all — \
+         `config::require_synthetic_jdk` rejects exactly this state for the CLI. \
+         Run it and 214 of the 924 tests fail; with the feature, 40 do. Failing here \
+         rather than reporting that number is the whole point.\n\
+         \n\
+         Re-run as:\n  \
+         CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1 cargo test --release \\\n    \
+         -p cratonvm-vm --features synthetic-jdk --test interpreter_tests"
+    );
+    true
 }
 
 /// Create a VM configured for testing (classpath pointing to test resources).
@@ -58,6 +74,13 @@ fn test_vm() -> Vm {
     let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
     Vm::new(config)
 }
+
+// Every assertion below reports a mismatch through `vm.describe_result(&other)`
+// rather than `{other:?}`. `MethodCallResult`'s own `Debug` prints a thrown
+// exception as `Err(ExceptionThrown(ObjectRef { ptr: 0x… }))` — an address with
+// no class, no message and no stack, which is why 175 of this corpus's 214
+// failures were indistinguishable from one another and had to be re-run one at
+// a time through a hand-written Java probe to be grouped at all.
 
 /// Skip guard — returns early if .class files are not available.
 macro_rules! require_class_files {
@@ -80,7 +103,7 @@ fn test_simple_return() {
     let result = vm.invoke("cratonvm/SimpleReturn", "test", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -91,7 +114,7 @@ fn test_arithmetic_add() {
     let result = vm.invoke("cratonvm/Arithmetic", "test", "()I", &[]);
     match result {
         Ok(Some(Value::Int(30))) => {}
-        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(30))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -102,7 +125,7 @@ fn test_arithmetic_mul() {
     let result = vm.invoke("cratonvm/Arithmetic", "testMul", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -113,7 +136,7 @@ fn test_arithmetic_div() {
     let result = vm.invoke("cratonvm/Arithmetic", "testDiv", "()I", &[]);
     match result {
         Ok(Some(Value::Int(25))) => {}
-        other => panic!("Expected Ok(Some(Int(25))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(25))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -124,7 +147,7 @@ fn test_arithmetic_neg() {
     let result = vm.invoke("cratonvm/Arithmetic", "testNeg", "()I", &[]);
     match result {
         Ok(Some(Value::Int(-42))) => {}
-        other => panic!("Expected Ok(Some(Int(-42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(-42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -135,7 +158,7 @@ fn test_control_flow_if_else() {
     let result = vm.invoke("cratonvm/ControlFlow", "testIfElse", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -146,7 +169,7 @@ fn test_control_flow_loop() {
     let result = vm.invoke("cratonvm/ControlFlow", "testLoop", "()I", &[]);
     match result {
         Ok(Some(Value::Int(45))) => {}
-        other => panic!("Expected Ok(Some(Int(45))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(45))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -157,7 +180,7 @@ fn test_control_flow_while() {
     let result = vm.invoke("cratonvm/ControlFlow", "testWhile", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1024))) => {}
-        other => panic!("Expected Ok(Some(Int(1024))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1024))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -173,7 +196,7 @@ fn test_control_flow_switch() {
     );
     match result {
         Ok(Some(Value::Int(20))) => {}
-        other => panic!("Expected Ok(Some(Int(20))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(20))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -256,7 +279,7 @@ fn test_pattern_switch_exact_match() {
     let result = vm.invoke("cratonvm/PatternSwitch", "testExactMatch", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -270,7 +293,7 @@ fn test_pattern_switch_widening() {
     let result = vm.invoke("cratonvm/PatternSwitch", "testWidening", "()I", &[]);
     match result {
         Ok(Some(Value::Int(107))) => {}
-        other => panic!("Expected Ok(Some(Int(107))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(107))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -284,7 +307,7 @@ fn test_pattern_switch_narrowing() {
     let result = vm.invoke("cratonvm/PatternSwitch", "testNarrowing", "()I", &[]);
     match result {
         Ok(Some(Value::Int(15))) => {}
-        other => panic!("Expected Ok(Some(Int(15))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(15))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -298,7 +321,7 @@ fn test_pattern_switch_out_of_range() {
     let result = vm.invoke("cratonvm/PatternSwitch", "testOutOfRange", "()I", &[]);
     match result {
         Ok(Some(Value::Int(314))) => {}
-        other => panic!("Expected Ok(Some(Int(314))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(314))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -312,7 +335,7 @@ fn test_pattern_switch_null() {
     let result = vm.invoke("cratonvm/PatternSwitch", "testNull", "()I", &[]);
     match result {
         Ok(Some(Value::Int(99))) => {}
-        other => panic!("Expected Ok(Some(Int(99))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(99))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -328,7 +351,7 @@ fn test_record_pattern_simple() {
     let result = vm.invoke("cratonvm/RecordPatterns", "testSimpleRecord", "()I", &[]);
     match result {
         Ok(Some(Value::Int(7))) => {}
-        other => panic!("Expected Ok(Some(Int(7))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(7))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -342,7 +365,7 @@ fn test_record_pattern_nested() {
     let result = vm.invoke("cratonvm/RecordPatterns", "testNestedRecord", "()I", &[]);
     match result {
         Ok(Some(Value::Int(10))) => {}
-        other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(10))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -356,7 +379,7 @@ fn test_record_pattern_with_guard() {
     let result = vm.invoke("cratonvm/RecordPatterns", "testRecordWithGuard", "()I", &[]);
     match result {
         Ok(Some(Value::Int(2))) => {}
-        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(2))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -370,7 +393,7 @@ fn test_record_pattern_null() {
     let result = vm.invoke("cratonvm/RecordPatterns", "testRecordNull", "()I", &[]);
     match result {
         Ok(Some(Value::Int(77))) => {}
-        other => panic!("Expected Ok(Some(Int(77))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(77))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -384,7 +407,7 @@ fn test_record_pattern_in_box() {
     let result = vm.invoke("cratonvm/RecordPatterns", "testRecordInBox", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -400,7 +423,7 @@ fn test_guard_true() {
     let result = vm.invoke("cratonvm/PatternSwitch", "testGuardTrue", "()I", &[]);
     match result {
         Ok(Some(Value::Int(43))) => {}
-        other => panic!("Expected Ok(Some(Int(43))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(43))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -414,7 +437,7 @@ fn test_guard_false() {
     let result = vm.invoke("cratonvm/PatternSwitch", "testGuardFalse", "()I", &[]);
     match result {
         Ok(Some(Value::Int(103))) => {}
-        other => panic!("Expected Ok(Some(Int(103))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(103))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -428,7 +451,7 @@ fn test_guard_side_effect() {
     let result = vm.invoke("cratonvm/PatternSwitch", "testGuardSideEffect", "()I", &[]);
     match result {
         Ok(Some(Value::Int(56))) => {}
-        other => panic!("Expected Ok(Some(Int(56))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(56))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -444,7 +467,7 @@ fn test_sealed_exhaustive_circle() {
     let result = vm.invoke("cratonvm/SealedSwitch", "testExhaustive", "()I", &[]);
     match result {
         Ok(Some(Value::Int(5))) => {}
-        other => panic!("Expected Ok(Some(Int(5))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(5))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -458,7 +481,7 @@ fn test_sealed_exhaustive_rect() {
     let result = vm.invoke("cratonvm/SealedSwitch", "testExhaustiveRect", "()I", &[]);
     match result {
         Ok(Some(Value::Int(12))) => {}
-        other => panic!("Expected Ok(Some(Int(12))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(12))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -472,7 +495,7 @@ fn test_sealed_with_default() {
     let result = vm.invoke("cratonvm/SealedSwitch", "testWithDefault", "()I", &[]);
     match result {
         Ok(Some(Value::Int(12))) => {}
-        other => panic!("Expected Ok(Some(Int(12))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(12))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -492,7 +515,7 @@ fn test_record_canonical_ctor() {
     let result = vm.invoke("cratonvm/RecordRuntime", "testCanonicalCtor", "()I", &[]);
     match result {
         Ok(Some(Value::Int(30))) => {}
-        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(30))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -511,7 +534,7 @@ fn test_record_accessor_generation() {
     );
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -527,7 +550,7 @@ fn test_record_equals_true() {
     let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsTrue", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -541,7 +564,7 @@ fn test_record_equals_false() {
     let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsFalse", "()I", &[]);
     match result {
         Ok(Some(Value::Int(0))) => {}
-        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(0))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -555,7 +578,7 @@ fn test_record_equals_null() {
     let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsNull", "()I", &[]);
     match result {
         Ok(Some(Value::Int(0))) => {}
-        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(0))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -574,7 +597,7 @@ fn test_record_hashcode_consistent() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -593,7 +616,7 @@ fn test_record_hashcode_different() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -607,7 +630,7 @@ fn test_record_tostring() {
     let result = vm.invoke("cratonvm/RecordRuntime", "testToString", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -628,7 +651,7 @@ fn test_sealed_permitted_loads() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -642,7 +665,7 @@ fn test_sealed_multiple_permitted() {
     let result = vm.invoke("cratonvm/SealedVerify", "testMultiplePermitted", "()I", &[]);
     match result {
         Ok(Some(Value::Int(3))) => {}
-        other => panic!("Expected Ok(Some(Int(3))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(3))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -656,7 +679,7 @@ fn test_sealed_verify_with_default() {
     let result = vm.invoke("cratonvm/SealedVerify", "testSealedWithDefault", "()I", &[]);
     match result {
         Ok(Some(Value::Int(10))) => {}
-        other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(10))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -676,7 +699,7 @@ fn test_reflect_method_static() {
     let result = vm.invoke("cratonvm/ReflectMethod", "testStaticMethod", "()I", &[]);
     match result {
         Ok(Some(Value::Int(30))) => {}
-        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(30))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -690,7 +713,7 @@ fn test_reflect_method_instance() {
     let result = vm.invoke("cratonvm/ReflectMethod", "testInstanceMethod", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -704,7 +727,7 @@ fn test_reflect_method_string_return() {
     let result = vm.invoke("cratonvm/ReflectMethod", "testStringReturn", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -723,7 +746,7 @@ fn test_reflect_method_private_accessible() {
     );
     match result {
         Ok(Some(Value::Int(777))) => {}
-        other => panic!("Expected Ok(Some(Int(777))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(777))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -742,7 +765,7 @@ fn test_reflect_method_exception_wrapping() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -758,7 +781,7 @@ fn test_reflect_field_get_int() {
     let result = vm.invoke("cratonvm/ReflectField", "testGetIntField", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -772,7 +795,7 @@ fn test_reflect_field_get_string() {
     let result = vm.invoke("cratonvm/ReflectField", "testGetStringField", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -786,7 +809,7 @@ fn test_reflect_field_static() {
     let result = vm.invoke("cratonvm/ReflectField", "testStaticField", "()I", &[]);
     match result {
         Ok(Some(Value::Int(300))) => {}
-        other => panic!("Expected Ok(Some(Int(300))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(300))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -800,7 +823,7 @@ fn test_reflect_field_set_int() {
     let result = vm.invoke("cratonvm/ReflectField", "testSetIntField", "()I", &[]);
     match result {
         Ok(Some(Value::Int(123))) => {}
-        other => panic!("Expected Ok(Some(Int(123))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(123))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -821,7 +844,7 @@ fn test_reflect_constructor_noarg() {
     );
     match result {
         Ok(Some(Value::Int(10))) => {}
-        other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(10))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -840,7 +863,7 @@ fn test_reflect_constructor_param() {
     );
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -859,7 +882,7 @@ fn test_reflect_constructor_exception() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -880,7 +903,7 @@ fn test_reflect_annotation_class() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -899,7 +922,7 @@ fn test_reflect_annotation_method() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -913,7 +936,7 @@ fn test_reflect_annotation_absent() {
     let result = vm.invoke("cratonvm/ReflectAnnotation", "testNoAnnotation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -932,7 +955,7 @@ fn test_reflect_annotation_is_present() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -951,7 +974,7 @@ fn test_serialize_simple_round_trip() {
     let result = vm.invoke("cratonvm/SerializeBasic", "testSimpleRoundTrip", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -966,7 +989,7 @@ fn test_serialize_nested_object() {
     let result = vm.invoke("cratonvm/SerializeBasic", "testNestedObject", "()I", &[]);
     match result {
         Ok(Some(Value::Int(30))) => {}
-        other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(30))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -981,7 +1004,7 @@ fn test_serialize_transient_field() {
     let result = vm.invoke("cratonvm/SerializeBasic", "testTransientField", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1001,7 +1024,7 @@ fn test_serialize_non_serializable_throws() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1021,7 +1044,7 @@ fn test_context_class_loader() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1041,7 +1064,7 @@ fn test_parent_delegation() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1061,7 +1084,7 @@ fn test_set_context_class_loader() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1081,7 +1104,7 @@ fn test_class_get_class_loader() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1105,7 +1128,7 @@ fn test_bootstrap_class_loader_is_null() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1124,7 +1147,7 @@ fn test_string_bootstrap_loader() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1139,7 +1162,7 @@ fn test_loader_name() {
     let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoaderName", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1158,7 +1181,7 @@ fn test_platform_loader_name() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1178,7 +1201,7 @@ fn test_system_class_loader_chain() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1198,7 +1221,7 @@ fn test_load_class_delegation() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1218,7 +1241,7 @@ fn test_load_class_for_user_class() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1238,7 +1261,7 @@ fn test_class_loader_identity() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1258,7 +1281,7 @@ fn test_system_class_loader_identity() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1278,7 +1301,7 @@ fn test_loader_isolation() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1303,7 +1326,7 @@ fn test_custom_loader_override_invoked() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1324,7 +1347,7 @@ fn test_for_name_honors_custom_loader_override() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1348,7 +1371,7 @@ fn test_method_handle_static() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1368,7 +1391,7 @@ fn test_method_handle_virtual() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1388,7 +1411,7 @@ fn test_method_handle_constructor() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1403,7 +1426,7 @@ fn test_method_handle_bind_to() {
     let result = vm.invoke("cratonvm/MethodHandleTest", "testBindTo", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1418,7 +1441,7 @@ fn test_lookup_in() {
     let result = vm.invoke("cratonvm/MethodHandleTest", "testLookupIn", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1438,7 +1461,7 @@ fn test_var_handle_get_set() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1453,7 +1476,7 @@ fn test_var_handle_cas() {
     let result = vm.invoke("cratonvm/MethodHandleTest", "testVarHandleCAS", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1473,7 +1496,7 @@ fn test_method_handle_type() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1497,7 +1520,7 @@ fn test_method_handle_invoke_exact_round_trip() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1521,7 +1544,7 @@ fn test_var_handle_acquire_release() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1639,7 +1662,7 @@ fn test_tck_class_file_magic() {
     let result = vm.invoke("cratonvm/TckClassFile", "testMagicNumber", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1653,7 +1676,7 @@ fn test_tck_class_file_version() {
     let result = vm.invoke("cratonvm/TckClassFile", "testClassVersion", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1667,7 +1690,7 @@ fn test_tck_class_file_constant_pool() {
     let result = vm.invoke("cratonvm/TckClassFile", "testConstantPool", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1681,7 +1704,7 @@ fn test_tck_class_file_field_access() {
     let result = vm.invoke("cratonvm/TckClassFile", "testFieldAccess", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1695,7 +1718,7 @@ fn test_tck_class_file_method_access() {
     let result = vm.invoke("cratonvm/TckClassFile", "testMethodAccess", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1710,7 +1733,7 @@ fn test_tck_loading_class_loading() {
     let result = vm.invoke("cratonvm/TckLoading", "testClassLoading", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1724,7 +1747,7 @@ fn test_tck_loading_static_init() {
     let result = vm.invoke("cratonvm/TckLoading", "testStaticInit", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1738,7 +1761,7 @@ fn test_tck_loading_interface_init() {
     let result = vm.invoke("cratonvm/TckLoading", "testInterfaceInit", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1752,7 +1775,7 @@ fn test_tck_loading_array_creation() {
     let result = vm.invoke("cratonvm/TckLoading", "testArrayCreation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1766,7 +1789,7 @@ fn test_tck_loading_inheritance() {
     let result = vm.invoke("cratonvm/TckLoading", "testInheritance", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1781,7 +1804,7 @@ fn test_tck_instructions_int_arithmetic() {
     let result = vm.invoke("cratonvm/TckInstructions", "testIntArithmetic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1795,7 +1818,7 @@ fn test_tck_instructions_long_arithmetic() {
     let result = vm.invoke("cratonvm/TckInstructions", "testLongArithmetic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1814,7 +1837,7 @@ fn test_tck_instructions_float_arithmetic() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1828,7 +1851,7 @@ fn test_tck_instructions_comparisons() {
     let result = vm.invoke("cratonvm/TckInstructions", "testComparisons", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1842,7 +1865,7 @@ fn test_tck_instructions_tableswitch() {
     let result = vm.invoke("cratonvm/TckInstructions", "testTableswitch", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1856,7 +1879,7 @@ fn test_tck_instructions_lookupswitch() {
     let result = vm.invoke("cratonvm/TckInstructions", "testLookupswitch", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1870,7 +1893,7 @@ fn test_tck_instructions_field_ops() {
     let result = vm.invoke("cratonvm/TckInstructions", "testFieldOps", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1884,7 +1907,7 @@ fn test_tck_instructions_array_ops() {
     let result = vm.invoke("cratonvm/TckInstructions", "testArrayOps", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1898,7 +1921,7 @@ fn test_tck_instructions_invoke_virtual() {
     let result = vm.invoke("cratonvm/TckInstructions", "testInvokeVirtual", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1912,7 +1935,7 @@ fn test_tck_instructions_invoke_static() {
     let result = vm.invoke("cratonvm/TckInstructions", "testInvokeStatic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1931,7 +1954,7 @@ fn test_tck_instructions_exception_handling() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1945,7 +1968,7 @@ fn test_tck_instructions_checkcast() {
     let result = vm.invoke("cratonvm/TckInstructions", "testCheckcast", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1959,7 +1982,7 @@ fn test_tck_instructions_instanceof() {
     let result = vm.invoke("cratonvm/TckInstructions", "testInstanceof", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -1982,7 +2005,7 @@ fn test_s17_method_invoke_private() {
     );
     match result {
         Ok(Some(Value::Int(49))) => {}
-        other => panic!("Expected Ok(Some(Int(49))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(49))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2001,7 +2024,7 @@ fn test_s17_method_invoke_instance() {
     );
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2020,7 +2043,7 @@ fn test_s17_method_invoke_type_coercion() {
     );
     match result {
         Ok(Some(Value::Int(36))) => {}
-        other => panic!("Expected Ok(Some(Int(36))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(36))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2039,7 +2062,7 @@ fn test_s17_field_get_private() {
     );
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2060,7 +2083,7 @@ fn test_s17_field_get_own_private_final_reference_without_set_accessible() {
     );
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2079,7 +2102,7 @@ fn test_s17_field_set_private() {
     );
     match result {
         Ok(Some(Value::Int(999))) => {}
-        other => panic!("Expected Ok(Some(Int(999))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(999))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2098,7 +2121,7 @@ fn test_s17_field_static_get_set() {
     );
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2117,7 +2140,7 @@ fn test_s17_constructor_noarg() {
     );
     match result {
         Ok(Some(Value::Int(0))) => {}
-        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(0))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2136,7 +2159,7 @@ fn test_s17_constructor_with_args() {
     );
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2155,7 +2178,7 @@ fn test_s17_constructor_set_accessible() {
     );
     match result {
         Ok(Some(Value::Int(300))) => {}
-        other => panic!("Expected Ok(Some(Int(300))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(300))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2169,7 +2192,7 @@ fn test_s17_proxy_basic() {
     let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyBasic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2188,7 +2211,7 @@ fn test_s17_proxy_is_proxy_class() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2207,7 +2230,7 @@ fn test_s17_proxy_get_handler() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2226,7 +2249,7 @@ fn test_s17_get_declared_methods() {
     );
     match result {
         Ok(Some(Value::Int(0))) => {}
-        other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(0))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2245,7 +2268,7 @@ fn test_s17_get_declared_fields() {
     );
     match result {
         Ok(Some(Value::Int(2))) => {}
-        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(2))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2264,7 +2287,7 @@ fn test_s17_get_declared_constructors() {
     );
     match result {
         Ok(Some(Value::Int(2))) => {}
-        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(2))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2283,7 +2306,7 @@ fn test_s17_get_declared_method_by_name() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2302,7 +2325,7 @@ fn test_s17_method_modifiers() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2321,7 +2344,7 @@ fn test_s17_field_modifiers() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2340,7 +2363,7 @@ fn test_s17_method_return_type() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2359,7 +2382,7 @@ fn test_s17_method_parameter_types() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2378,7 +2401,7 @@ fn test_s17_method_parameter_count() {
     );
     match result {
         Ok(Some(Value::Int(2))) => {}
-        other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(2))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2392,7 +2415,7 @@ fn test_s17_field_type() {
     let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldType", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2411,7 +2434,7 @@ fn test_s17_field_declaring_class() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2430,7 +2453,7 @@ fn test_s17_method_declaring_class() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2453,7 +2476,7 @@ fn test_s18_custom_annotation_values() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2472,7 +2495,7 @@ fn test_s18_inherited_annotation() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2491,7 +2514,7 @@ fn test_s18_non_inherited_not_present() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2510,7 +2533,7 @@ fn test_s18_get_inherited_annotation() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2529,7 +2552,7 @@ fn test_s18_declared_annotations_no_inherited() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2548,7 +2571,7 @@ fn test_s18_overriding_inherited_annotation() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2567,7 +2590,7 @@ fn test_s18_method_annotation_present() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2586,7 +2609,7 @@ fn test_s18_method_annotation_identity() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2605,7 +2628,7 @@ fn test_s18_method_no_annotation() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2624,7 +2647,7 @@ fn test_s18_parameter_annotation_count() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2643,7 +2666,7 @@ fn test_s18_parameter_annotation_empty() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2666,7 +2689,7 @@ fn test_s19_class_type_params() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2685,7 +2708,7 @@ fn test_s19_multiple_type_params() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2704,7 +2727,7 @@ fn test_s19_bounded_type_param() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2723,7 +2746,7 @@ fn test_s19_generic_superclass() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2742,7 +2765,7 @@ fn test_s19_non_generic_superclass() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2761,7 +2784,7 @@ fn test_s19_method_type_params() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2780,7 +2803,7 @@ fn test_s19_method_generic_return_type() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2799,7 +2822,7 @@ fn test_s19_method_generic_param_types() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2818,7 +2841,7 @@ fn test_s19_field_generic_type() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2837,7 +2860,7 @@ fn test_s19_no_type_params() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2861,7 +2884,7 @@ fn test_s19_parameterized_superclass() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2882,7 +2905,7 @@ fn test_s19_parameterized_field() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2903,7 +2926,7 @@ fn test_s19_two_arg_parameterized_field() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2924,7 +2947,7 @@ fn test_s19_wildcard_extends_number() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2945,7 +2968,7 @@ fn test_s19_same_named_interface_type_variables() {
     );
     match result {
         Ok(Some(Value::Int(1))) => {}
-        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -2965,7 +2988,7 @@ macro_rules! s20_test {
             let result = vm.invoke("cratonvm/StreamComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3031,7 +3054,7 @@ macro_rules! s21_test {
             let result = vm.invoke("cratonvm/StringFormatComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3104,7 +3127,7 @@ macro_rules! s22_test {
             let result = vm.invoke("cratonvm/PropertiesComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3183,7 +3206,7 @@ macro_rules! s23_test {
             let result = vm.invoke("cratonvm/MemoryModelTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+                other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
             }
         }
     };
@@ -3199,7 +3222,7 @@ fn test_s23_thread_basic() {
     let result = vm.invoke("cratonvm/ThreadBasicTest", "testThreadBasic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -3236,7 +3259,7 @@ macro_rules! s23b_test {
             let result = vm.invoke("cratonvm/JmmComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3313,7 +3336,7 @@ macro_rules! s24_test {
             let result = vm.invoke("cratonvm/InterruptComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3438,7 +3461,7 @@ macro_rules! s25_test {
             let result = vm.invoke("cratonvm/VirtualThreadTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3499,7 +3522,7 @@ macro_rules! s27_test {
             let result = vm.invoke("cratonvm/FinalizerTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3529,7 +3552,7 @@ macro_rules! s32_test {
             let result = vm.invoke("cratonvm/EscapeAnalysisTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3563,7 +3586,7 @@ macro_rules! s31_test {
             let result = vm.invoke("cratonvm/InlineComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3619,7 +3642,7 @@ macro_rules! s33_test {
             let result = vm.invoke("cratonvm/InlineCacheTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3655,7 +3678,7 @@ macro_rules! s35_test {
             let result = vm.invoke("cratonvm/OsrComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3736,7 +3759,7 @@ macro_rules! s37_test_int {
             let result = vm.invoke("cratonvm/FPCompletenessTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3754,7 +3777,7 @@ macro_rules! s37_test_long {
             let result = vm.invoke("cratonvm/FPCompletenessTest", $method, "()J", &[]);
             match result {
                 Ok(Some(Value::Long(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Long({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Long({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3820,7 +3843,7 @@ macro_rules! s39_test {
             let result = vm.invoke("cratonvm/JdwpComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3884,7 +3907,7 @@ macro_rules! s44_test {
             let result = vm.invoke("cratonvm/JniComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -3961,7 +3984,7 @@ macro_rules! s46_test {
             let result = vm.invoke("cratonvm/TckLang", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -4120,7 +4143,7 @@ macro_rules! s50_test {
             let result = vm.invoke("cratonvm/TckReflect", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -4304,7 +4327,7 @@ macro_rules! s38_test {
             let result = vm.invoke("cratonvm/PgoTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -4350,7 +4373,7 @@ fn test_s45_hello_world_check() {
     let result = vm.invoke("cratonvm/HelloWorld", "check", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 }
 
@@ -4472,7 +4495,7 @@ fn test_s45_run_class_from_jar() {
     let result = vm.invoke("cratonvm/HelloWorld", "check", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
-        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+        other => panic!("Expected Ok(Some(Int(42))), got: {}", vm.describe_result(&other)),
     }
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -4529,7 +4552,7 @@ macro_rules! s47_test {
             let result = vm.invoke("cratonvm/TckUtil", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+                other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
             }
         }
     };
@@ -4613,7 +4636,7 @@ macro_rules! s49_test {
             let result = vm.invoke("cratonvm/JucComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+                other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
             }
         }
     };
@@ -4628,7 +4651,7 @@ macro_rules! s49_test {
             let result = vm.invoke("cratonvm/JucComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
-                other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
+                other => panic!("Expected Ok(Some(Int({}))), got: {}", $expected, vm.describe_result(&other)),
             }
         }
     };
@@ -4848,7 +4871,7 @@ macro_rules! s51_test {
             let result = vm.invoke("cratonvm/ScopedValueComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+                other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
             }
         }
     };
@@ -4938,7 +4961,7 @@ macro_rules! s48_test {
             let result = vm.invoke("cratonvm/TckIo", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+                other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
             }
         }
     };
@@ -5030,10 +5053,7 @@ macro_rules! new14_jdbc_test {
             let result = vm.invoke("cratonvm/TckJdbc", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
-                other => panic!(
-                    "TckJdbc::{} — expected Ok(Some(Int(1))), got: {other:?}",
-                    $method
-                ),
+                other => panic!("TckJdbc::{} — expected Ok(Some(Int(1))), got: {}", $method, vm.describe_result(&other)),
             }
         }
     };
@@ -5087,7 +5107,7 @@ macro_rules! s53_test {
             let result = vm.invoke("cratonvm/PatternComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
-                other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+                other => panic!("Expected Ok(Some(Int(1))), got: {}", vm.describe_result(&other)),
             }
         }
     };

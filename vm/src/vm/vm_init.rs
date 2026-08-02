@@ -7128,6 +7128,96 @@ impl Vm {
         )
     }
 
+    // ----- Failure diagnostics ----------------------------------------------
+
+    /// Render a thrown `Throwable` as `<binary class name>: <detailMessage>`.
+    ///
+    /// [`MethodCallFailed::ExceptionThrown`] carries only an [`ObjectRef`], so
+    /// its `Debug`/`Display` can print no more than a heap address. That is
+    /// unusable for a caller that has to group hundreds of failures by cause —
+    /// the extended interpreter corpus reported 175 of its 214 failures as an
+    /// undifferentiated `Err(ExceptionThrown(ObjectRef { .. }))` until this
+    /// existed. Resolving the class and the detail message needs the heap and
+    /// the class manager, which only the VM has; hence a method here rather
+    /// than a richer `Display` on the error type.
+    ///
+    /// Best-effort and non-throwing: it reads fields directly instead of
+    /// calling `toString()`, so it cannot recurse into further exceptions and
+    /// is safe to call from a test assertion path. An unresolvable class
+    /// renders as `<unknown class>` and a missing/undecodable message is
+    /// omitted.
+    pub fn describe_exception(&self, obj: ObjectRef) -> String {
+        let class_id = self.shared.mem.heap.class_id_of(obj);
+        let name = {
+            let cm = self.shared.classes.class_manager.read();
+            cm.get_class(class_id)
+                .map(|c| c.name.replace('/', "."))
+                .unwrap_or_else(|| "<unknown class>".to_string())
+        };
+        match self.exception_detail_message(obj) {
+            Some(msg) => format!("{name}: {msg}"),
+            None => name,
+        }
+    }
+
+    /// Read `Throwable.detailMessage` off `obj`, walking the superclass chain
+    /// by field *name* so an arbitrary subclass's own slots cannot be
+    /// mistaken for it.
+    fn exception_detail_message(&self, obj: ObjectRef) -> Option<String> {
+        let class_id = self.shared.mem.heap.class_id_of(obj);
+        let index = {
+            let cm = self.shared.classes.class_manager.read();
+            let mut walk = Some(class_id);
+            let mut found = None;
+            'outer: while let Some(cid) = walk {
+                let Some(cls) = cm.get_class(cid) else { break };
+                let mut instance = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        continue;
+                    }
+                    if &*f.name == "detailMessage" {
+                        found = Some(cls.first_field_index + instance);
+                        break 'outer;
+                    }
+                    instance += 1;
+                }
+                walk = cls.superclass;
+            }
+            found?
+        };
+        match self.shared.mem.heap.get_field(obj, index) {
+            Value::Object(Some(s)) => {
+                super::vm_object::read_java_string(&self.shared.mem.heap, s)
+            }
+            _ => None,
+        }
+    }
+
+    /// Render any [`MethodCallFailed`] for a human.
+    ///
+    /// `InternalError` delegates to the error's own `Display` (already
+    /// self-describing); `ExceptionThrown` goes through
+    /// [`Self::describe_exception`] instead of printing a bare pointer.
+    pub fn describe_failure(&self, err: &MethodCallFailed) -> String {
+        match err {
+            MethodCallFailed::InternalError(e) => format!("internal: {e}"),
+            MethodCallFailed::ExceptionThrown(obj) => {
+                format!("threw {}", self.describe_exception(*obj))
+            }
+        }
+    }
+
+    /// Render a whole [`MethodCallResult`] — the shape a test assertion wants
+    /// when the call did not produce what it expected.
+    pub fn describe_result(&self, result: &MethodCallResult) -> String {
+        match result {
+            Ok(Some(v)) => format!("returned {v:?}"),
+            Ok(None) => "returned void".to_string(),
+            Err(e) => self.describe_failure(e),
+        }
+    }
+
     // ----- Finalization (M19) ------------------------------------------------
 
     /// Run pending finalizers: dequeue objects from the finalizer thread and
@@ -7365,6 +7455,10 @@ impl std::fmt::Debug for Vm {
 pub fn release_vm_native_state(vm_identity: usize) {
     cratonvm_native_api::uninstall_capabilities(cratonvm_native_api::VmId::from_raw(vm_identity));
     cratonvm_native_builtins::security_manager::forget_vm_security_state(vm_identity);
+    // The built-in app/platform `ClassLoader` singletons. Same reasoning as the
+    // SecurityManager row above: raw heap `ObjectRef`s that must not outlive
+    // the heap, and must never be visible to a VM that reuses the identity.
+    cratonvm_native_builtins::classloader::forget_vm_loader_singletons(vm_identity);
     crate::runtime::instrument::forget_vm_transformers(vm_identity);
     // Without this a disposed VM's JVMTI row leaks its agent's callback
     // closures, and its listener flags keep every OTHER VM's interpreter on the

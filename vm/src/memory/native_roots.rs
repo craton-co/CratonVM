@@ -122,13 +122,19 @@ fn scan_collection_overlays(shared: &crate::vm::SharedVm, roots: &mut Vec<Object
 fn remap_collection_overlays(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
     cratonvm_gc::external_roots::remap_external_roots(map);
 }
-fn scan_loaders_and_jmx(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
-    cratonvm_native_builtins::classloader::gc_scan_loader_singleton_roots(roots);
+fn scan_loaders_and_jmx(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::classloader::gc_scan_loader_singleton_roots(
+        shared.vm_identity,
+        roots,
+    );
     #[cfg(feature = "management")]
     cratonvm_native_builtins::jmx::gc_scan_platform_mbean_server_root(roots);
 }
-fn remap_loaders_and_jmx(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
-    cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(map);
+fn remap_loaders_and_jmx(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(
+        shared.vm_identity,
+        map,
+    );
     #[cfg(feature = "management")]
     cratonvm_native_builtins::jmx::gc_update_platform_mbean_server_ref(map);
 }

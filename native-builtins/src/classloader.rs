@@ -93,37 +93,99 @@ fn cached_local_url_class_path(paths: &[String]) -> Arc<cratonvm_classloading::C
 // Singleton classloader instances (JVM spec: one instance per built-in loader)
 // ---------------------------------------------------------------------------
 
-fn platform_loader_store() -> &'static Mutex<Option<ObjectRef>> {
-    static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(None))
+/// The built-in loader singletons of ONE VM.
+///
+/// "One instance per built-in loader" is a *per-VM* invariant, not a
+/// per-process one. These were process-global `Mutex<Option<ObjectRef>>`
+/// cells, reset by `Vm::new`, which is correct only while VMs are created and
+/// disposed of strictly in sequence. A Rust test binary runs its `#[test]`
+/// functions on several threads, so two `Vm`s are routinely *concurrently*
+/// live — and then VM B's `Vm::new` wiped the cell VM A was using, VM A
+/// re-created its loader into the shared cell, and whichever VM read it next
+/// got a `ClassLoader` object allocated in the OTHER VM's heap. Reading a
+/// field off it (`classloader_parent` → `class_id_of`) then dereferenced a
+/// foreign, possibly freed, address: the SIGSEGV that made
+/// `cargo test --test interpreter_tests` unrunnable without
+/// `--test-threads=1`.
+///
+/// Keyed by [`NativeContext::vm_identity`], the same scheme
+/// `security_manager`'s `VmSecurityState` uses, and torn down from
+/// `release_vm_native_state`.
+#[derive(Clone, Copy, Default)]
+struct VmLoaderSingletons {
+    platform: Option<ObjectRef>,
+    app: Option<ObjectRef>,
+}
+
+static LOADER_SINGLETONS: OnceLock<Mutex<std::collections::HashMap<usize, VmLoaderSingletons>>> =
+    OnceLock::new();
+
+/// Run `f` with the singleton table locked.
+///
+/// The lock is never held across a Java allocation: `get_or_create_*_loader`
+/// allocates first and publishes afterwards, exactly as
+/// `security_manager::with_security_state` requires, because
+/// [`gc_scan_loader_singleton_roots`] takes this same lock at a safepoint.
+fn with_loader_singletons<R>(
+    f: impl FnOnce(&mut std::collections::HashMap<usize, VmLoaderSingletons>) -> R,
+) -> R {
+    let mut guard = LOADER_SINGLETONS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    f(&mut guard)
+}
+
+fn platform_loader_of(vm: usize) -> Option<ObjectRef> {
+    with_loader_singletons(|table| table.get(&vm).and_then(|row| row.platform))
+}
+
+fn set_platform_loader(vm: usize, value: Option<ObjectRef>) {
+    with_loader_singletons(|table| table.entry(vm).or_default().platform = value);
+}
+
+fn app_loader_of(vm: usize) -> Option<ObjectRef> {
+    with_loader_singletons(|table| table.get(&vm).and_then(|row| row.app))
+}
+
+fn set_app_loader(vm: usize, value: Option<ObjectRef>) {
+    with_loader_singletons(|table| table.entry(vm).or_default().app = value);
 }
 
 /// Temporary debug-only accessor (CRATONVM_DBG_OBSREG investigation).
-pub(crate) fn platform_loader_store_dbg() -> &'static Mutex<Option<ObjectRef>> {
-    platform_loader_store()
-}
-
-fn app_loader_store() -> &'static Mutex<Option<ObjectRef>> {
-    static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(None))
+pub(crate) fn platform_loader_dbg(vm: usize) -> Option<ObjectRef> {
+    platform_loader_of(vm)
 }
 
 /// Read-only accessor for the singleton app `ClassLoader` already created
 /// by [`get_or_create_app_loader`]. Returns `None` when boot hasn't yet
 /// touched any path that allocates the loader. Intended for VM-side
 /// rescues that need to substitute the canonical app loader without a
-/// `&mut NativeContext` (e.g. `interpreter::execute_checkcast`).
-pub fn peek_app_loader() -> Option<ObjectRef> {
-    *app_loader_store().lock().unwrap_or_else(|e| e.into_inner())
+/// `&mut NativeContext` (e.g. `interpreter::execute_checkcast`), which is
+/// why it takes the identity explicitly rather than a context.
+pub fn peek_app_loader(vm_identity: usize) -> Option<ObjectRef> {
+    app_loader_of(vm_identity)
 }
 
-/// Reset singleton loader instances. Called when creating a new VM to avoid
-/// stale ObjectRefs from a previous VM instance.
+/// Per-VM teardown: drop the built-in loader singletons held for
+/// `vm_identity`.
+///
+/// Called from `release_vm_native_state` when the last `Arc<SharedVm>` goes
+/// away. Without it the row — and the raw heap addresses in it — outlives the
+/// heap that produced them, and a later VM that reused the identity would
+/// inherit a dead `ClassLoader`.
+pub fn forget_vm_loader_singletons(vm_identity: usize) {
+    with_loader_singletons(|table| table.remove(&vm_identity));
+}
+
+/// Reset the process-wide (not yet VM-scoped) classloader side-tables.
+///
+/// Called when creating a new VM to avoid stale ObjectRefs from a previous VM
+/// instance. The built-in loader singletons are NOT reset here any more — they
+/// are keyed by `vm_identity` (see [`VmLoaderSingletons`]) and a fresh VM
+/// starts with an empty row by construction, so there is nothing to clear and
+/// nothing of a concurrently-live VM's to destroy.
 pub fn reset_loader_singletons() {
-    *platform_loader_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
-    *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
     closed_url_classloader_ids()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -160,27 +222,28 @@ pub fn reset_loader_singletons() {
 
 /// GC root scan for the singleton built-in class loaders.
 ///
-/// The app + platform `ClassLoader` synthetics live ONLY in the process-global
-/// `app_loader_store` / `platform_loader_store` mutexes (a Rust side-table, not
-/// a Java field or VM root table), so they are invisible to the frame / static
-/// / heap-object root scans. Without this, a moving young GC can reclaim or
-/// relocate the cached loader while `get_or_create_app_loader` keeps returning
-/// the stale `ObjectRef`; the freed slot is then reused by another allocation
-/// and a later `loader.loadClass(...)` dispatches on the wrong object — observed
-/// as BouncyCastle `ClassUtil.loadClass`'s receiver decaying to a String OID,
+/// The app + platform `ClassLoader` synthetics live ONLY in the
+/// [`LOADER_SINGLETONS`] side-table (not a Java field or VM root table), so
+/// they are invisible to the frame / static / heap-object root scans. Without
+/// this, a moving young GC can reclaim or relocate the cached loader while
+/// `get_or_create_app_loader` keeps returning the stale `ObjectRef`; the freed
+/// slot is then reused by another allocation and a later
+/// `loader.loadClass(...)` dispatches on the wrong object — observed as
+/// BouncyCastle `ClassUtil.loadClass`'s receiver decaying to a String OID,
 /// surfacing intermittently (heap-size dependent) as
 /// "Not able to load any cryptoProvider". Mirrors the `lang_math` /
 /// `lang_invoke` process-global cache root scans (`roots.rs` steps 15–17).
-pub fn gc_scan_loader_singleton_roots(out: &mut Vec<ObjectRef>) {
-    if let Some(o) = *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) {
-        out.push(o);
-    }
-    if let Some(o) = *platform_loader_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-    {
-        out.push(o);
-    }
+///
+/// `vm_identity` scopes the scan to the collecting VM's own row: handing one
+/// VM's loader address to another VM's collector as a root is exactly the
+/// cross-heap confusion the keying exists to prevent.
+pub fn gc_scan_loader_singleton_roots(vm_identity: usize, out: &mut Vec<ObjectRef>) {
+    with_loader_singletons(|table| {
+        if let Some(row) = table.get(&vm_identity) {
+            out.extend(row.app);
+            out.extend(row.platform);
+        }
+    });
     // Defining-loader side-table values are live ClassLoader objects reachable
     // only from this map. Legacy behavior roots them all (which is why a
     // user/isolated loader could never be collected — HIB-CV-24 Manifestation B).
@@ -203,7 +266,10 @@ pub fn gc_scan_loader_singleton_roots(out: &mut Vec<ObjectRef>) {
 /// [`gc_scan_loader_singleton_roots`]). After a moving collection the cached
 /// loader objects relocate; repoint the stored `ObjectRef`s to their new
 /// addresses so subsequent `getClassLoader()` calls return the live object.
-pub fn gc_update_loader_singleton_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_loader_singleton_refs(
+    vm_identity: usize,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
     if pointer_map.is_empty() {
         return;
     }
@@ -216,12 +282,12 @@ pub fn gc_update_loader_singleton_refs(pointer_map: &std::collections::HashMap<u
             }
         }
     };
-    remap(&mut app_loader_store().lock().unwrap_or_else(|e| e.into_inner()));
-    remap(
-        &mut platform_loader_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()),
-    );
+    with_loader_singletons(|table| {
+        if let Some(row) = table.get_mut(&vm_identity) {
+            remap(&mut row.app);
+            remap(&mut row.platform);
+        }
+    });
     // NOTE: the defining-loader side-table is reconciled (pruned + remapped)
     // earlier in the GC cycle by `gc_reconcile_defining_loaders`, which runs in
     // `process_references_after_gc` *before* this remap pass and uses the same
@@ -516,10 +582,8 @@ pub fn get_class_data(mirror: ObjectRef) -> Value {
 
 /// Get or create the singleton platform class loader.
 pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let existing = *platform_loader_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(obj) = existing {
+    let vm = ctx.vm_identity();
+    if let Some(obj) = platform_loader_of(vm) {
         return obj;
     }
     let mut obj = alloc_classloader(ctx, LOADER_PLATFORM);
@@ -536,9 +600,7 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Obje
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
     // Platform's parent is bootstrap (null); already set by alloc_classloader
     obj = ctx.read_native_pin(obj_pin, obj);
-    *platform_loader_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(obj);
+    set_platform_loader(vm, Some(obj));
     ctx.unpin_native_roots(obj_pin);
     obj
 }
@@ -596,8 +658,8 @@ pub(crate) fn latest_user_defined_loader_class(
 
 /// Get or create the singleton application (system) class loader.
 pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let existing = *app_loader_store().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(obj) = existing {
+    let vm = ctx.vm_identity();
+    if let Some(obj) = app_loader_of(vm) {
         // The singleton is a Rust-side cache.  If a moving collection ever
         // leaves an unremapped reference behind, its old heap slot can be
         // reused by an unrelated object (observed as String.findResources
@@ -614,7 +676,7 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
         if is_loader {
             return obj;
         }
-        *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        set_app_loader(vm, None);
     }
     let platform = get_or_create_platform_loader(ctx);
     let platform_pin = ctx.pin_native_root(platform);
@@ -650,7 +712,7 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
     obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_static_field_by_name("java/lang/ClassLoader", "scl", Value::Object(Some(obj)));
     obj = ctx.read_native_pin(obj_pin, obj);
-    *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
+    set_app_loader(vm, Some(obj));
     ctx.unpin_native_roots(platform_pin);
     obj
 }
@@ -2118,9 +2180,7 @@ fn cl_load_class_base_delegation_rooted(
         // the object's actual runtime class is the authoritative fallback.
         ctx.class_name_of_id(ctx.class_id_of_object(candidate))
             .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
-            || platform_loader_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            || platform_loader_of(ctx.vm_identity())
                 .is_some_and(|platform| platform.as_ptr() == candidate.as_ptr())
     });
     let receiver_has_find_class_override = receiver_overrides_find_class(ctx, this);
@@ -5786,9 +5846,7 @@ pub(crate) fn object_extends(ctx: &dyn NativeContext, obj: ObjectRef, target: &s
 pub(crate) fn is_platform_class_loader(ctx: &dyn NativeContext, loader: ObjectRef) -> bool {
     ctx.class_name_of_id(ctx.class_id_of_object(loader))
         .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
-        || platform_loader_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        || platform_loader_of(ctx.vm_identity())
             .is_some_and(|platform| platform.as_ptr() == loader.as_ptr())
 }
 
