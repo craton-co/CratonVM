@@ -193,6 +193,80 @@ const THREAD_FIELD_VIRTUAL: usize = 4;
 // 15.1 — ScopedValue natives
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// Which thread currently owns a ScopedValue's binding.
+//
+// The value itself stays in the `ScopedValue` object's own fields — that keeps
+// it GC-rooted for free and is what the field-index constants above describe.
+// But an object field is visible to EVERY thread, and a `ScopedValue` binding
+// is not: JEP 506 binds for the dynamic extent of `run`/`call` **on the
+// binding thread**, and an ordinary `new Thread(...)` started inside that
+// extent does NOT inherit it (only a `StructuredTaskScope` fork does).
+//
+// Without this table `ScopedValueComplete.testThreadVisibility` returned 100
+// from a plain child thread. Real JDK 25 returns 0; the fixture asserted the
+// CratonVM-specific field model as though it were the spec. So: `run`/`call`
+// record the identity hash of each ScopedValue they bind against the binding
+// thread, and every reader (`get`, `isBound`, `orElse`, `orElseThrow`) treats
+// the object field as authoritative ONLY for a thread that appears here.
+//
+// Identity hashes, not addresses: they survive a moving collection, so this
+// table needs no GC root scan or remap pass (same rationale as
+// `classloader::closed_url_classloader_ids`).
+//
+// Known limitation, narrower than the bug it replaces: two threads binding the
+// SAME `ScopedValue` at the same time still race on the single object field
+// pair. Each sees "bound" correctly, but the *value* is whichever binding ran
+// last. Fixing that needs per-thread values, which would take the values out
+// of the heap-rooted object field and require their own GC scan/remap hooks.
+// ---------------------------------------------------------------------------
+static SV_BINDING_OWNERS: cratonvm_native_api::vm_scoped::VmScoped<
+    std::collections::HashMap<u64, Vec<i32>>,
+> = cratonvm_native_api::vm_scoped::VmScoped::new();
+
+/// Per-VM teardown for the ScopedValue ownership table. Called from
+/// `release_vm_native_state`.
+pub fn forget_vm_scoped_value_owners(vm_identity: usize) {
+    SV_BINDING_OWNERS.forget(vm_identity);
+}
+
+/// Record that the calling thread has just bound `sv`.
+fn push_sv_owner(ctx: &mut dyn NativeContext, sv: ObjectRef) {
+    let (vm, thread, id) = (ctx.vm_identity(), ctx.thread_id(), ctx.identity_hash_code(sv));
+    SV_BINDING_OWNERS.with(vm, |table| table.entry(thread).or_default().push(id));
+}
+
+/// Drop the calling thread's most recent binding of `sv`.
+fn pop_sv_owner(ctx: &mut dyn NativeContext, sv: ObjectRef) {
+    let (vm, thread, id) = (ctx.vm_identity(), ctx.thread_id(), ctx.identity_hash_code(sv));
+    SV_BINDING_OWNERS.with(vm, |table| {
+        if let Some(stack) = table.get_mut(&thread) {
+            if let Some(pos) = stack.iter().rposition(|&entry| entry == id) {
+                stack.remove(pos);
+            }
+            if stack.is_empty() {
+                table.remove(&thread);
+            }
+        }
+    });
+}
+
+/// Whether `sv` is bound **for the calling thread** — the only sense in which
+/// a ScopedValue is ever bound.
+fn sv_is_bound_here(ctx: &mut dyn NativeContext, sv: ObjectRef) -> bool {
+    if !matches!(ctx.get_field(sv, SV_FIELD_IS_BOUND), Value::Int(1)) {
+        return false;
+    }
+    let (vm, thread, id) = (ctx.vm_identity(), ctx.thread_id(), ctx.identity_hash_code(sv));
+    SV_BINDING_OWNERS
+        .peek(vm, |table| {
+            table
+                .get(&thread)
+                .is_some_and(|stack| stack.contains(&id))
+        })
+        .unwrap_or(false)
+}
+
 /// `ScopedValue.<init>()V` — initialise an empty, unbound ScopedValue.
 fn native_sv_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
@@ -215,11 +289,7 @@ fn native_sv_new_instance(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 /// Throws if not bound (returns Err).
 fn native_sv_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bound = match ctx.get_field(this, SV_FIELD_IS_BOUND) {
-        Value::Int(b) => b,
-        _ => 0,
-    };
-    if bound == 0 {
+    if !sv_is_bound_here(ctx, this) {
         return Err(cratonvm_types::error::MethodCallFailed::InternalError(
             cratonvm_types::error::VmError::Runtime(
                 cratonvm_types::error::RuntimeError::NoSuchElementException {
@@ -235,20 +305,17 @@ fn native_sv_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// `ScopedValue.isBound()Z` — return 1 if bound, 0 otherwise.
 fn native_sv_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bound = ctx.get_field(this, SV_FIELD_IS_BOUND);
-    Ok(Some(bound))
+    Ok(Some(Value::Int(i32::from(sv_is_bound_here(ctx, this)))))
 }
 
 /// `ScopedValue.orElse(Ljava/lang/Object;)Ljava/lang/Object;`
 fn native_sv_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let default_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    match ctx.get_field(this, SV_FIELD_IS_BOUND) {
-        Value::Int(1) => {
-            let val = ctx.get_field(this, SV_FIELD_VALUE);
-            Ok(Some(val))
-        }
-        _ => Ok(Some(default_val)),
+    if sv_is_bound_here(ctx, this) {
+        Ok(Some(ctx.get_field(this, SV_FIELD_VALUE)))
+    } else {
+        Ok(Some(default_val))
     }
 }
 
@@ -258,12 +325,12 @@ fn native_sv_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 /// an exception and throws it.
 fn native_sv_or_else_throw(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    match ctx.get_field(this, SV_FIELD_IS_BOUND) {
-        Value::Int(1) => {
+    match sv_is_bound_here(ctx, this) {
+        true => {
             let val = ctx.get_field(this, SV_FIELD_VALUE);
             Ok(Some(val))
         }
-        _ => {
+        false => {
             // Invoke the Supplier.get() to produce the exception
             if let Some(Value::Object(Some(supplier))) = args.get(1) {
                 let exc_result = ctx.invoke_virtual(*supplier, "get", "()Ljava/lang/Object;", &[]);
@@ -375,10 +442,11 @@ fn native_carrier_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             (*sv_ref, old_bound, old_value)
         })
         .collect();
-    // Bind all scoped values
+    // Bind all scoped values — on THIS thread (see `SV_BINDING_OWNERS`).
     for (sv_ref, value) in &bindings {
         ctx.set_field(*sv_ref, SV_FIELD_IS_BOUND, Value::Int(1));
         ctx.set_field(*sv_ref, SV_FIELD_VALUE, *value);
+        push_sv_owner(ctx, *sv_ref);
     }
     // Invoke the Runnable
     let result = if let Some(Value::Object(Some(runnable))) = args.get(1) {
@@ -390,6 +458,7 @@ fn native_carrier_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     for (sv_ref, old_bound, old_value) in &prev_states {
         ctx.set_field(*sv_ref, SV_FIELD_IS_BOUND, *old_bound);
         ctx.set_field(*sv_ref, SV_FIELD_VALUE, *old_value);
+        pop_sv_owner(ctx, *sv_ref);
     }
     // Propagate any exception from the Runnable
     result?;
@@ -412,10 +481,11 @@ fn native_carrier_call(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             (*sv_ref, old_bound, old_value)
         })
         .collect();
-    // Bind all scoped values
+    // Bind all scoped values — on THIS thread (see `SV_BINDING_OWNERS`).
     for (sv_ref, value) in &bindings {
         ctx.set_field(*sv_ref, SV_FIELD_IS_BOUND, Value::Int(1));
         ctx.set_field(*sv_ref, SV_FIELD_VALUE, *value);
+        push_sv_owner(ctx, *sv_ref);
     }
     // Invoke the Callable
     let result = if let Some(Value::Object(Some(callable))) = args.get(1) {
@@ -427,6 +497,7 @@ fn native_carrier_call(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     for (sv_ref, old_bound, old_value) in &prev_states {
         ctx.set_field(*sv_ref, SV_FIELD_IS_BOUND, *old_bound);
         ctx.set_field(*sv_ref, SV_FIELD_VALUE, *old_value);
+        pop_sv_owner(ctx, *sv_ref);
     }
     // Propagate exception or return result
     result
@@ -3459,10 +3530,51 @@ mod jdk25_concurrency_tests {
         let sv = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
         ctx.set_field(sv, SV_FIELD_IS_BOUND, Value::Int(1));
         ctx.set_field(sv, SV_FIELD_VALUE, Value::Int(99));
+        // "Bound" now means bound *on this thread* — the object field alone is
+        // no longer enough (see `SV_BINDING_OWNERS`).
+        push_sv_owner(&mut ctx, sv);
 
         let result =
             native_sv_or_else_throw(&mut ctx, &[Value::Object(Some(sv)), Value::Object(None)]);
         assert_eq!(result.unwrap(), Some(Value::Int(99)));
+        pop_sv_owner(&mut ctx, sv);
+    }
+
+    /// JEP 506: a binding belongs to the thread that made it. The object field
+    /// says "bound" for every thread, so a reader that trusted it alone let a
+    /// plain child thread see the parent's value —
+    /// `ScopedValueComplete.testThreadVisibility` returned 100 where real JDK
+    /// 25 returns 0.
+    #[test]
+    fn a_scoped_value_binding_is_not_visible_to_another_thread() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let sv = alloc_concurrent_synthetic(&mut ctx, CLS_SCOPED_VALUE, SV_NUM_FIELDS);
+        ctx.set_field(sv, SV_FIELD_IS_BOUND, Value::Int(1));
+        ctx.set_field(sv, SV_FIELD_VALUE, Value::Int(100));
+
+        let vm = ctx.vm_identity();
+        let binder = ctx.thread_id();
+        push_sv_owner(&mut ctx, sv);
+        assert!(
+            sv_is_bound_here(&mut ctx, sv),
+            "the binding thread must see its own binding"
+        );
+
+        // Same VM, a different thread id: not bound, even though the object
+        // field still says it is.
+        SV_BINDING_OWNERS.with(vm, |table| {
+            let stack = table.remove(&binder).unwrap_or_default();
+            table.insert(binder.wrapping_add(1), stack);
+        });
+        assert!(
+            !sv_is_bound_here(&mut ctx, sv),
+            "another thread must NOT see the binding"
+        );
+        assert_eq!(
+            native_sv_is_bound(&mut ctx, &[Value::Object(Some(sv))]).unwrap(),
+            Some(Value::Int(0))
+        );
+        SV_BINDING_OWNERS.forget(vm);
     }
 
     #[test]

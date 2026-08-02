@@ -66,18 +66,27 @@ public class ReflectionComplete {
 
     // ---- Test 2: Field.get()/set() with accessibility override ----
 
+    // `Field.get` checks access against the CALLING class, and the caller here
+    // is ReflectionComplete itself — the very class that declares
+    // `privateField`. A class may always reflect on its own private members,
+    // so `f.get(obj)` SUCCEEDS with no `setAccessible(true)`; there is no
+    // IllegalAccessException to catch.
+    //
+    // This method used to `return -1` on that success path and expect 42. Real
+    // JDK 25 returns -1, so the expectation was wrong — and the very next test
+    // in this file already documents the correct rule for the same shape.
+    // Assert what the JDK actually guarantees: own-private access works, and
+    // `setAccessible(true)` is a no-op on top of it.
     public static int testFieldGetPrivate() throws Exception {
         ReflectionComplete obj = new ReflectionComplete();
         Field f = ReflectionComplete.class.getDeclaredField("privateField");
-        // Should fail without setAccessible
-        try {
-            f.get(obj);
-            return -1;
-        } catch (Exception e) {
-            // Expected: IllegalAccessException
-        }
+        int withoutSetAccessible = (Integer) f.get(obj);
         f.setAccessible(true);
-        return (Integer) f.get(obj); // 42
+        int withSetAccessible = (Integer) f.get(obj);
+        if (withoutSetAccessible != withSetAccessible) {
+            return -1;
+        }
+        return withSetAccessible; // 42
     }
 
     // A declaring class may reflectively read its own private-final field

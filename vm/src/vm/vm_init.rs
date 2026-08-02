@@ -7473,6 +7473,8 @@ pub fn release_vm_native_state(vm_identity: usize) {
     // The `java.lang.ClassValue` memoization cache (BUG-W). Its key is a pair
     // of 32-bit identity hashes, which two live VMs collide on readily.
     cratonvm_native_builtins::phases_late::forget_vm_classvalue_cache(vm_identity);
+    // Which thread owns each live `ScopedValue` binding.
+    cratonvm_native_builtins::jdk25_concurrency::forget_vm_scoped_value_owners(vm_identity);
     crate::runtime::instrument::forget_vm_transformers(vm_identity);
     // Without this a disposed VM's JVMTI row leaks its agent's callback
     // closures, and its listener flags keep every OTHER VM's interpreter on the
