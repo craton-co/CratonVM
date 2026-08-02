@@ -6620,6 +6620,15 @@ impl GenerationalHeap {
                 verified_spans.len(),
             );
         }
+        // CRATONVM_DBG_SWEEP_LIVENESS: snapshot the oracle's products so the
+        // root-hit classifier below can say what the mark phase saw. Cheap and
+        // flag-gated; avoids borrowing them out from under `mark_young`.
+        let (liveness_ranges, liveness_verified) = if gc_flags().dbg_sweep_liveness {
+            (young_object_ranges.clone(), verified_spans.clone())
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         report_phase("mark-oracle-walk");
 
         // ----- Mark phase -------------------------------------------------
@@ -7294,15 +7303,47 @@ impl GenerationalHeap {
             // drain is actually for. The bt18-critical drain is unaffected.
             let honour_movable = !crate::gc_quiescence::moving_young_coverage_incomplete();
             let mut pinned: FxHashSet<usize> = FxHashSet::default();
+            // A conservative root is frequently an INTERIOR word (a field
+            // address, a derived pointer, a spilled register mid-object), and
+            // `mark_young` retains the object it points into by resolving it
+            // through the exact-base oracle. Pinning only the raw address
+            // therefore leaves that resolved base promotable — and promotion
+            // moves it, while the raw stack/register word that kept it alive
+            // cannot be rewritten. The source is then freed and zeroed, and
+            // the next dereference through the root reads an all-zero header
+            // (`class_id=ClassId(0)`, `num_slots=0`). Pin the base too.
+            //
+            // Measured before this fix on `bench/BinTreesClassic 18` under
+            // `CRATONVM_NO_MOVING_YOUNG=1`: 13 of 16 runs had at least one root
+            // pointing into a span the sweep was about to zero, every one of
+            // them `side_marked_base=true header_marked=false forwarded=true`
+            // with a non-zero interior offset. Zero after it.
+            //
+            // Over-retention only: the object stays in young one more cycle.
+            let pin_base_of = |a: usize, pinned: &mut FxHashSet<usize>| {
+                pinned.insert(a);
+                // Same lookup `mark_young` performs. `young_object_ranges`
+                // holds a range only for objects that cover a conservative
+                // candidate, i.e. exactly these addresses.
+                if let Some(&(base, end)) = young_object_ranges
+                    .partition_point(|(start, _)| *start <= a)
+                    .checked_sub(1)
+                    .and_then(|idx| young_object_ranges.get(idx))
+                {
+                    if a < end {
+                        pinned.insert(base);
+                    }
+                }
+            };
             for r in roots.iter() {
                 let a = r.as_ptr() as usize;
                 if is_y(a) && !(honour_movable && crate::gc_quiescence::is_movable_jit_root(a)) {
-                    pinned.insert(a);
+                    pin_base_of(a, &mut pinned);
                 }
             }
             for &a in finalizer_addrs.iter() {
                 if is_y(a) {
-                    pinned.insert(a);
+                    pin_base_of(a, &mut pinned);
                 }
             }
 
@@ -9054,6 +9095,7 @@ impl GenerationalHeap {
                 }
             };
             let mut hits: Vec<(usize, u32, usize, usize)> = Vec::new();
+            let mut old_scanned: usize = 0;
             {
                 // Use the guard this function already holds (taken at the top,
                 // alongside `young_from`). `parking_lot::Mutex` is NOT
@@ -9062,6 +9104,7 @@ impl GenerationalHeap {
                 // already stopped, i.e. a silent whole-VM hang rather than a
                 // panic.
                 for (obj_ptr, _size) in old_gen.walk_objects() {
+                    old_scanned += 1;
                     // SAFETY: `walk_objects` yields valid old-gen object starts.
                     let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
                     // SAFETY: a walked old-gen object has a valid header and an
@@ -9100,12 +9143,111 @@ impl GenerationalHeap {
                     });
                 }
             }
+            // ---- ROOT -> doomed ----
+            //
+            // The heap-edge scan above cannot see a surviving reference that
+            // lives in a ROOT (thread stack, JIT frame/register word, native
+            // handle). That is where every remaining suspicion for the
+            // reclaimed-live-object bug sits, and the young->young half is
+            // vacuous outright whenever selective promotion moved all the
+            // survivors out. `roots`/`finalizer_addrs` are the exact set the
+            // mark phase was handed, so a hit here says the mark failed to
+            // retain something it was given — the interior-pointer-to-base
+            // mapping documented above being the prime candidate.
+            let mut root_hits: Vec<(usize, bool)> = Vec::new();
+            for r in roots.iter() {
+                let a = r.as_ptr() as usize;
+                if in_doomed(a) && root_hits.len() < 32 {
+                    root_hits.push((a, false));
+                }
+            }
+            for &a in finalizer_addrs.iter() {
+                if in_doomed(a) && root_hits.len() < 32 {
+                    root_hits.push((a, true));
+                }
+            }
+            if !root_hits.is_empty() {
+                eprintln!(
+                    "[SWEEP-LIVENESS root] {} root(s) point into a span this sweep is about to zero ({} roots + {} finalizer addrs examined)",
+                    root_hits.len(),
+                    roots.len(),
+                    finalizer_addrs.len(),
+                );
+                for (a, is_fin) in root_hits.iter().take(12) {
+                    let addr = *a;
+                    let covered = liveness_ranges
+                        .partition_point(|&(st, _)| st <= addr)
+                        .checked_sub(1)
+                        .and_then(|i| liveness_ranges.get(i))
+                        .filter(|&&(_, end)| addr < end)
+                        .copied();
+                    let in_verified = liveness_verified
+                        .partition_point(|&(st, _)| st <= addr)
+                        .checked_sub(1)
+                        .is_some_and(|i| addr < liveness_verified[i].1);
+                    // Which dead object did it land in, and is the root its
+                    // BASE or an interior word?
+                    let mut victim_desc = String::from("dead_obj=<none>");
+                    for &(off, sz, cid, kind, _n) in &dead_regions {
+                        let st = from_base + off;
+                        if addr >= st && addr < st + sz {
+                            victim_desc = format!(
+                                "dead_obj=0x{st:x} size={sz} class_id={cid} kind={kind} interior_off={}",
+                                addr - st
+                            );
+                            break;
+                        }
+                    }
+                    // Was it marked? `mark_young` side-marks the resolved
+                    // BASE, so ask the bitmap about both the base and the raw
+                    // candidate, and read the header's own mark bit.
+                    let base = covered.map(|(st, _)| st).unwrap_or(addr);
+                    let side_base = side_bits.contains(base);
+                    let side_raw = side_bits.contains(addr);
+                    // SAFETY: `base` is 8-aligned inside mapped from-space —
+                    // it came from the oracle's own object grid (or from a
+                    // candidate `in_young` already bounds-checked).
+                    // SAFETY: as above.
+                    let bh = unsafe { &*(base as *const ObjectHeader) };
+                    let hdr_marked = bh.gc_flags & GC_FLAG_MARKED != 0;
+                    let hdr_forwarded = bh.is_forwarded();
+                    let hdr_fwd = bh.forwarding_ptr as usize;
+                    let hdr_cid = bh.class_id.as_u32();
+                    let was_candidate = conservative_candidates.binary_search(&addr).is_ok();
+                    eprintln!(
+                        "[SWEEP-LIVENESS root]   victim=0x{addr:x} source={} covered={} in_verified_span={}                          side_marked_base={side_base} side_marked_raw={side_raw} header_marked={hdr_marked}                          forwarded={hdr_forwarded} fwd=0x{hdr_fwd:x} base_class_id={hdr_cid} was_candidate={was_candidate} {victim_desc}",
+                        if *is_fin { "finalizer" } else { "root" },
+                        match covered {
+                            Some((st, en)) => format!("0x{st:x}..0x{en:x}"),
+                            None => "none".to_string(),
+                        },
+                        in_verified,
+                    );
+                }
+            }
+
+            // Report on EVERY sweep, not only on a hit: otherwise a clean
+            // campaign is indistinguishable from one where this block never
+            // ran at all (no dead spans, flag not honoured, or the workload
+            // never took the non-moving path). `hits=0` with a nonzero
+            // `scanned` is the only form of "clean" worth quoting.
+            eprintln!(
+                "[SWEEP-LIVENESS young] cycle={} hits={} root_hits={} doomed_spans={} old_gen_scanned={} young_survivors_scanned={} roots={} finalizer_addrs={}",
+                sweep_zero_cycle,
+                hits.len(),
+                root_hits.len(),
+                spans.len(),
+                old_scanned,
+                young_referrers.len(),
+                roots.len(),
+                finalizer_addrs.len(),
+            );
             if !hits.is_empty() {
                 eprintln!(
                     "[SWEEP-LIVENESS young] {} live ref(s) point into {} young span(s) this sweep is about to zero ({} old-gen + {} young survivors scanned)",
                     hits.len(),
                     spans.len(),
-                    objects_live,
+                    old_scanned,
                     young_referrers.len(),
                 );
                 for (victim, cid, referrer, slot) in hits.iter().take(12) {
@@ -9985,6 +10127,15 @@ impl GenerationalHeap {
                         });
                     }
                 }
+                // Same reasoning as the young half: a per-sweep line so that
+                // "no output" cannot be mistaken for "checked and clean".
+                eprintln!(
+                    "[SWEEP-LIVENESS old] hits={} doomed_blocks={} old_gen_scanned={}{}",
+                    referenced_doomed.len(),
+                    doomed.len(),
+                    objects.len(),
+                    if sweep_rescue { " (rescuing)" } else { "" },
+                );
                 if !referenced_doomed.is_empty() {
                     eprintln!(
                         "[SWEEP-LIVENESS] {} of {} doomed old-gen blocks are STILL REFERENCED by a live old-gen object{}",
@@ -15157,6 +15308,66 @@ mod tests {
             freed_by_live > 0,
             "live_bytes_estimate must report the reclaimed bytes \
              (before={live_before}, after={live_after})"
+        );
+    }
+
+    /// Selective promotion pins by raw slot VALUE, and its safety argument
+    /// says so explicitly: "a conservative false positive pins a random
+    /// object; it can never mis-relocate one". That holds only while the root
+    /// IS an object base. A conservative root is frequently an INTERIOR word —
+    /// a field address, a derived pointer, a spilled register mid-object — and
+    /// `mark_young` keeps the object alive by resolving that word to its
+    /// containing base. Pinning only the raw word therefore left the resolved
+    /// base promotable, and promotion moved it while the raw stack/register
+    /// word that kept it alive could not be rewritten: the sweep then freed
+    /// and zeroed the source, and the next dereference through the root read
+    /// an all-zero header (`class_id=ClassId(0)`, `num_slots=0`).
+    ///
+    /// Measured on `bench/BinTreesClassic 18` under `CRATONVM_NO_MOVING_YOUNG=1`
+    /// before the fix: 13 of 16 runs had at least one root pointing into a span
+    /// the sweep was about to zero. 0 of 24 after.
+    #[test]
+    fn interior_conservative_root_pins_the_object_it_points_into() {
+        let heap = GenerationalHeap::with_sizes(1024 * 1024, 8 * 1024 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Four slots, so base + 16 is a real interior word of a real object.
+        let obj = heap.alloc_object(ClassId::new(7), 4);
+        let base = obj.as_ptr() as usize;
+        heap.set_field(obj, 0, Value::Int(0x5eed));
+
+        // The ONLY root is an interior pointer. This is what a conservative
+        // stack/register scan hands the collector; it cannot be rewritten, so
+        // the object it points into must not move.
+        // SAFETY: `base + 16` is 8-aligned and inside a live 4-slot object.
+        let interior = unsafe { ObjectRef::from_raw((base + 16) as *mut u8) };
+
+        crate::gc_quiescence::publish_moving_young_enabled(false);
+        // Enough cycles that `gc_age + 1 >= PROMOTION_AGE` is reached AND
+        // `promotion_age_reachable` has armed selective promotion.
+        for _ in 0..(PROMOTION_AGE as usize + 2) {
+            let mut roots = vec![interior];
+            crate::gc_quiescence::enter();
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+            crate::gc_quiescence::leave();
+        }
+        crate::gc_quiescence::publish_moving_young_enabled(true);
+
+        // SAFETY: `base` is the object's young address; the sweep either left
+        // it intact or forwarded/zeroed it, and either way the header word is
+        // mapped and readable.
+        let header = unsafe { &*(base as *const ObjectHeader) };
+        assert!(
+            !header.is_forwarded(),
+            "the object an interior conservative root points into was promoted \
+             (forwarding_ptr={:#x}); the root cannot be rewritten, so its young \
+             source is about to be zeroed under it",
+            header.forwarding_ptr as usize,
+        );
+        assert_eq!(
+            header.class_id.as_u32(),
+            7,
+            "the young source must still be a live object, not a zeroed span"
         );
     }
 

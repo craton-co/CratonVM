@@ -318,3 +318,95 @@ cheaper handle on it: 110 short-form runs here across three binaries produced
 - `7303483521` fixes the old-gen **fragmentation** consequence of the same
   regime. Unrelated cause, unrelated fix — that part of the original doc was
   right.
+
+## A different producer of the same face, found and FIXED (2026-08-02)
+
+**Not this doc's bug** — this one's victim is a young object, and the memory
+here is measured to be an old-gen free block. But it produces the identical
+`ClassId(0)` / all-zero-header face, it was live on `dev` the whole time, and it
+is now fixed, so rule it out before attributing a future occurrence.
+
+### The defect
+
+`sweep_young_non_moving`'s selective promotion pins by raw slot **value**:
+
+```rust
+for r in roots.iter() {
+    let a = r.as_ptr() as usize;
+    if is_y(a) && !(honour_movable && is_movable_jit_root(a)) {
+        pinned.insert(a);        // <- the ADDRESS THE ROOT HOLDS
+    }
+}
+…
+if marked && aged && !pinned.contains(&addr) { /* evacuate to old gen */ }
+                                    // ^ `addr` is the OBJECT BASE
+```
+
+and its safety comment states the invariant it believed it had: *"selective
+promotion is safe under exactly that regime because it pins by raw slot VALUE (a
+conservative false positive pins a random object; it can never mis-relocate
+one)."*
+
+That holds only while the root **is** an object base. A conservative root is
+frequently an **interior** word — a field address, a derived pointer, a spilled
+register mid-object — and `mark_young` keeps the object alive by resolving that
+word to its containing base through the exact-base oracle. So for an interior
+root the two sets disagree: the base is retained, `pinned` does not contain it,
+and selective promotion evacuates it to old gen. The raw stack/register word
+that kept it alive cannot be rewritten — that is the entire reason this
+collector path exists — so it goes on pointing at the young source, which the
+sweep frees and `zero_spans_parallel` zeroes. The next dereference through that
+root reads `class_id=ClassId(0) num_slots=0`.
+
+### Reproducer — 9 seconds, single-threaded
+
+```bash
+CRATONVM_NO_MOVING_YOUNG=1 CRATONVM_DBG_SWEEP_LIVENESS=1 \
+  <cratonvm-bin> --java-home /home/victor/jdk25 --Xmx 1g \
+  -c <bench-classes> BinTreesClassic 18
+```
+
+| build | runs | sweeps | runs with a root pointing into a doomed span |
+| --- | --- | --- | --- |
+| before | 16 | ~190 | **13** |
+| before | 20 | ~240 | **16** |
+| before | 36 | 432 | **14** |
+| after | 24 | 288 | **0** |
+| after (on the merged tree) | 20 | 240 | **0** |
+
+Every pre-fix hit read the same way, which is what named the mechanism:
+
+```
+[SWEEP-LIVENESS root] victim=0x2004ec0bfe0 covered=0x2004ec0bfd0..0x2004ec0c010
+    in_verified_span=true side_marked_base=true side_marked_raw=false
+    header_marked=false forwarded=true fwd=0x20010000670 was_candidate=true
+    dead_obj=0x2004ec0bfd0 … interior_off=16
+```
+
+`side_marked_base=true` (the mark phase retained it) + `forwarded=true` (promotion
+moved it anyway) + a non-zero `interior_off` (the root is not the base).
+
+### The fix
+
+Resolve each pinned root through the same oracle `mark_young` uses and pin the
+resolved base as well. Pure over-retention: the object stays in young one more
+cycle. `bench/BinTreesClassic` checksums unchanged at d=10/14/16/18 (135854,
+3222190, 14985902, **68332206** — the HotSpot-verified value) in both the default
+and forced-non-moving configurations, and an interleaved 8×2 A/B on bt18 shows no
+throughput cost (pre 2485 ms mean, post 2454 ms).
+
+Regression test: `gen_heap::tests::interior_conservative_root_pins_the_object_it_points_into`
+— verified to FAIL without the fix, with the `ClassId(0)` face itself
+(`the young source must still be a live object, not a zeroed span`).
+
+### Why nothing here caught it before
+
+`CRATONVM_DBG_SWEEP_EDGES`'s `is_unmarked_young` returns **false** for anything
+in the side-mark set, and these victims are side-marked — so a
+`root=0 young-survivor=0 old-gen=0` report is silent about this family by
+construction. The `CRATONVM_DBG_SWEEP_LIVENESS` assertion only looked at heap
+edges (old→young, young-survivor→young), never at the root set, and its
+young→young half is vacuous whenever selective promotion moved every survivor
+out (measured: `young_survivors_scanned=0` on every BinTrees cycle). Both gaps
+are now closed, and the assertion prints a per-sweep line even when it finds
+nothing, so a clean campaign is positive evidence rather than silence.
