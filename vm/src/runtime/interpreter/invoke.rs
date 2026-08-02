@@ -14149,39 +14149,66 @@ mod redefine_immunity_tests {
     #[test]
     fn layout_immunity_is_not_open_coded() {
         let src = include_str!("invoke.rs");
+
+        // The exemption is the RULE, located in the source: an arm may be named
+        // only inside the two aggregators, whose entire job is to compose them.
+        //
+        // Twice now this gate has been written as a proxy for that rule, and
+        // twice the proxy went stale against a growing file. First a hard-coded
+        // line band, `(5000..9800)`: `redefine_immune_forced_native` slid down
+        // to 9793-9822, so its own arms were reported as offenders and the gate
+        // failed for a reason that had nothing to do with what it polices.
+        // Then an enclosing-function tracker that recognised exactly four
+        // declaration spellings — a function written any other way never
+        // updated the name, so its body was attributed to whatever came before.
+        // That one failed OPEN, which is worse: dropping
+        //
+        //     pub(super) unsafe fn probe(class_name: &str) -> bool {
+        //         redefine_immune_synthetic_collection_native(class_name)
+        //     }
+        //
+        // straight after `redefine_immune_synthetic_collection_native` PASSED,
+        // because the stale name was that exempt predicate's.
+        //
+        // So: no line numbers, no declaration parsing, no carried state. Find
+        // the aggregator bodies and ask whether the call is inside one. If an
+        // aggregator is ever renamed this stops finding it and its own arms
+        // start failing — loud, and the right direction to fail in.
+        let aggregator_bodies: Vec<(usize, usize)> = [
+            "redefine_immune_layout_native",
+            "redefine_immune_forced_native",
+        ]
+        .iter()
+        .filter_map(|name| {
+            let start = src.find(&format!("fn {name}("))?;
+            // A top-level body ends at the first `}` in column 0 after it.
+            let end = src[start..]
+                .find("\n}")
+                .map_or(src.len(), |i| start + i + 2);
+            Some((start, end))
+        })
+        .collect();
+        assert_eq!(
+            aggregator_bodies.len(),
+            2,
+            "both aggregators must be findable, or this gate exempts nothing \
+             and polices everything"
+        );
+
         let mut offenders = Vec::new();
-        // Which function each line belongs to. The exemption below used to be a
-        // hard-coded line band, `(5000..9800)`, which went stale the moment the
-        // file grew past it: `redefine_immune_forced_native` — the composing
-        // predicate the whole rule exists to funnel callers INTO — slid down to
-        // 9793-9822, so its own arms at 9801 and 9821 were reported as
-        // offenders and this gate has been failing for a reason that has
-        // nothing to do with what it polices. A red gate polices nothing.
-        // Track the enclosing function by name instead; it cannot drift.
-        let mut cur_fn = String::new();
+        let mut offset = 0usize;
         for (n, line) in src.lines().enumerate() {
+            let line_start = offset;
+            offset += line.len() + 1; // `lines()` strips a single `\n`
             let code = line.trim_start();
             // Comments, and this test's own list of names (string literals).
-            if code.starts_with("//") || code.starts_with("///") || code.starts_with('"') {
+            if code.starts_with("//") || code.starts_with('"') {
                 continue;
             }
-            // A definition is not a call site.
-            if let Some(rest) = code
-                .strip_prefix("fn ")
-                .or_else(|| code.strip_prefix("pub(super) fn "))
-                .or_else(|| code.strip_prefix("pub(crate) fn "))
-                .or_else(|| code.strip_prefix("pub fn "))
-            {
-                cur_fn = rest
-                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                continue;
-            }
-            // The predicates compose each other; only DISPATCH sites are
-            // policed.
-            if cur_fn.starts_with("redefine_immune_") {
+            let inside_aggregator = aggregator_bodies
+                .iter()
+                .any(|&(start, end)| line_start >= start && line_start < end);
+            if inside_aggregator {
                 continue;
             }
             for part in [
@@ -14190,7 +14217,8 @@ mod redefine_immunity_tests {
                 "redefine_immune_jfr_native(",
                 "redefine_immune_synthetic_collection_native(",
             ] {
-                if code.contains(part) {
+                // An arm's own `fn` declaration is not a call site.
+                if code.contains(part) && !code.contains(&format!("fn {part}")) {
                     offenders.push(format!("line {}: {}", n + 1, code));
                 }
             }
