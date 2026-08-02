@@ -907,8 +907,22 @@ pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) 
             ),
         },
     };
+    // Pin `session` across the two `create_string` calls below. Each of them
+    // allocates, so each is a GC point, and a moving young collection there
+    // relocates the just-allocated session — after which every `set_field`
+    // below writes through a stale reference and the object handed back is
+    // whatever reused that address (the "java.lang.Object cannot be cast to
+    // ..." shape). Latent while `getSession()` returned the stored field and
+    // this ran only at socket-construction time; `new13_resolve_socket_session`
+    // now calls it lazily, on any thread, at arbitrary allocation pressure.
+    // `proto_str` needs the same treatment as `session`: it is created before
+    // the second `create_string`, which is itself a GC point.
+    let pin = ctx.pin_native_root(session);
     let proto_str = ctx.create_string(&proto);
+    let proto_pin = ctx.pin_native_root(proto_str);
     let cipher_str = ctx.create_string(&cipher);
+    let session = ctx.read_native_pin(pin, session);
+    let proto_str = ctx.read_native_pin(proto_pin, proto_str);
     ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(proto_str)));
     ctx.set_field(session, NEW13_SESS_CIPHER, Value::Object(Some(cipher_str)));
     ctx.set_field(session, NEW13_SESS_TLSID, Value::Int(tls_id));
@@ -919,6 +933,8 @@ pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) 
     if let Some(chain) = crate::servlet::s2_tls_peer_cert_chain_der(tls_id) {
         crate::t27_tls::record_client_peer_chain(ctx, session, chain);
     }
+    let session = ctx.read_native_pin(pin, session);
+    ctx.unpin_native_roots(pin);
     session
 }
 
