@@ -66,6 +66,24 @@ fn require_extended_interpreter_tests(test_name: &str) -> bool {
          CRATONVM_RUN_EXTENDED_INTERPRETER_TESTS=1 cargo test --release \\\n    \
          -p cratonvm-vm --features synthetic-jdk --test interpreter_tests"
     );
+    // The second gate must NOT stay a silent skip once the corpus has been
+    // asked for. `vm/build.rs` compiles every fixture in one `javac`
+    // invocation per pass, so a single unbuildable source leaves the whole
+    // staging directory empty — which is what happened, undetected, until
+    // `f715d1367`: opting in still printed a green `924 passed` that had run
+    // none of the corpus. An explicit request for the corpus that cannot be
+    // served is a failure, not a pass.
+    assert!(
+        class_files_available(),
+        "the extended interpreter corpus was opted into, but no compiled fixtures \
+         were staged: {}/cratonvm/SimpleReturn.class does not exist.\n\
+         \n\
+         `vm/build.rs` needs a `javac` (from `$JAVA_HOME/bin` if set, else PATH) \
+         and compiles all fixtures of a pass in ONE invocation, so one broken \
+         source stages nothing at all. Re-run the build and read the \
+         `cargo:warning=javac failed …` lines it prints.",
+        test_resources_dir()
+    );
     true
 }
 

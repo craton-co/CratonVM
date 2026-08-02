@@ -209,11 +209,14 @@ fn scan_osc_cache(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
 fn remap_osc_cache(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
     shared.classes.osc_cache.remap_roots(map);
 }
-fn scan_annotations(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
-    cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(roots);
+fn scan_annotations(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(
+        shared.vm_identity,
+        roots,
+    );
 }
-fn remap_annotations(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
-    cratonvm_native_builtins::lang_class::gc_update_annotation_proxy_refs(map);
+fn remap_annotations(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::lang_class::gc_update_annotation_proxy_refs(shared.vm_identity, map);
 }
 fn scan_http_handlers(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::net_phase_e::gc_scan_re10_handler_roots(roots);

@@ -2550,8 +2550,8 @@ fn proxy_module_number(loader_id: u32) -> u32 {
 /// CURRENT (post-relocation) address, or `0` if no proxy has been created.
 /// Reflection itself no longer goes through this raw form; it reads the
 /// tracked `ObjectRef` directly via `lang_class::proxy_last_interfaces`.
-pub fn proxy_last_interfaces_bits() -> u64 {
-    lang_class::proxy_last_interfaces()
+pub fn proxy_last_interfaces_bits(vm_identity: usize) -> u64 {
+    lang_class::proxy_last_interfaces(vm_identity)
         .map(|arr| arr.as_ptr() as u64)
         .unwrap_or(0)
 }
@@ -2979,7 +2979,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // could relocate/reclaim the array, leaving the shared-mirror
     // `getInterfaces()` reader to dereference a dangling pointer.
     if let Value::Object(Some(arr)) = interfaces {
-        lang_class::set_proxy_last_interfaces(arr);
+        lang_class::set_proxy_last_interfaces(ctx.vm_identity(), arr);
     }
     PROXY_INSTANCES_CREATED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
@@ -3854,7 +3854,7 @@ fn native_proxy_instance_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // readers (lang_class synthetic-mode `getInterfaces` fallback), mirroring
     // `native_proxy_new_instance`.
     if let Value::Object(Some(arr)) = interfaces {
-        lang_class::set_proxy_last_interfaces(arr);
+        lang_class::set_proxy_last_interfaces(ctx.vm_identity(), arr);
     }
 
     Ok(None)

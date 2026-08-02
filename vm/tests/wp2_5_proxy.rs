@@ -132,7 +132,8 @@ fn proxy_module_descriptor_param_count() {
 fn proxy_native_call_populates_last_interfaces_after_a_proxy_is_made() {
     // White-box: bumping the global counter from a unit test path
     // proves the symbol is exposed and the cache is reachable.
-    let bits_before = cratonvm_native_builtins::proxy_last_interfaces_bits();
+    let vm = cratonvm_vm::vm::SharedVm::new(cratonvm_vm::config::VmConfig::default());
+    let bits_before = cratonvm_native_builtins::proxy_last_interfaces_bits(vm.vm_identity);
     // Without an actual `newProxyInstance` call we can't write to the
     // cache (it's intentionally process-wide and only updated from the
     // native). We just sanity-check that the accessor compiles, links,

@@ -3,6 +3,7 @@
 
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
 
+use cratonvm_native_api::vm_scoped::VmScoped;
 use cratonvm_native_api::{
     AnnotationData, FieldMetadata, MethodMetadata, NativeContext, TypeArgAnnotations,
 };
@@ -10360,7 +10361,7 @@ pub(crate) fn native_class_get_interfaces(
                 // interfaces array (rooted + remapped by the annotation-proxy
                 // GC hooks) instead of the old raw `AtomicU64` pointer that
                 // was never rooted and could dangle after a moving GC.
-                if let Some(arr_ref) = proxy_last_interfaces() {
+                if let Some(arr_ref) = proxy_last_interfaces(ctx.vm_identity()) {
                     return Ok(Some(Value::Object(Some(arr_ref))));
                 }
                 // No proxy has been created yet вЂ” fall through and
@@ -10670,28 +10671,41 @@ fn annotation_desc_to_class_name(desc: &str) -> Option<&str> {
 // a stale `ObjectRef` (use-after-free).
 // ---------------------------------------------------------------------------
 
-fn annotation_proxy_cache() -> &'static Mutex<FxHashMap<(u32, String), ObjectRef>> {
-    static C: OnceLock<Mutex<FxHashMap<(u32, String), ObjectRef>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(FxHashMap::default()))
+/// Keyed by `vm_identity` because the rest of the key is a `ClassId`, and
+/// every VM mints those from zero: without the partition VM 2 looked up
+/// `(42, "Lfoo/Inherited;")`, hit VM 1's entry, and returned a proxy allocated
+/// in a heap that no longer existed. Sequentially that is a freed object;
+/// concurrently it is a live address in the *wrong* heap, and
+/// `safe_native_call`'s return-value `load_and_forward` segfaulted reading its
+/// header (`test_s50_ann_inheritedValue`, 2 runs in 3).
+static ANNOTATION_PROXY_CACHE: VmScoped<FxHashMap<(u32, String), ObjectRef>> = VmScoped::new();
+
+/// Per-proxy child roots, keyed the same way. The inner key is a raw heap
+/// address, which is likewise only meaningful inside one heap.
+static ANNOTATION_PROXY_CHILD_ROOTS: VmScoped<FxHashMap<usize, Vec<ObjectRef>>> = VmScoped::new();
+
+/// The most recently created proxy's interfaces array — one cell per VM, since
+/// the array itself is a heap object.
+static PROXY_LAST_INTERFACES: VmScoped<Option<ObjectRef>> = VmScoped::new();
+
+/// Per-VM teardown for the three side-tables above. Called from
+/// `release_vm_native_state`.
+pub fn forget_vm_annotation_proxies(vm_identity: usize) {
+    ANNOTATION_PROXY_CACHE.forget(vm_identity);
+    ANNOTATION_PROXY_CHILD_ROOTS.forget(vm_identity);
+    PROXY_LAST_INTERFACES.forget(vm_identity);
 }
 
-fn annotation_proxy_child_roots() -> &'static Mutex<FxHashMap<usize, Vec<ObjectRef>>> {
-    static C: OnceLock<Mutex<FxHashMap<usize, Vec<ObjectRef>>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(FxHashMap::default()))
+fn remember_annotation_proxy_child_roots(vm: usize, proxy: ObjectRef, roots: Vec<ObjectRef>) {
+    ANNOTATION_PROXY_CHILD_ROOTS.with(vm, |table| {
+        table.insert(proxy.as_ptr() as usize, roots);
+    });
 }
 
-fn remember_annotation_proxy_child_roots(proxy: ObjectRef, roots: Vec<ObjectRef>) {
-    annotation_proxy_child_roots()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(proxy.as_ptr() as usize, roots);
-}
-
-fn forget_annotation_proxy_child_roots(proxy: ObjectRef) {
-    annotation_proxy_child_roots()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&(proxy.as_ptr() as usize));
+fn forget_annotation_proxy_child_roots(vm: usize, proxy: ObjectRef) {
+    ANNOTATION_PROXY_CHILD_ROOTS.with(vm, |table| {
+        table.remove(&(proxy.as_ptr() as usize));
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -10712,28 +10726,19 @@ fn forget_annotation_proxy_child_roots(proxy: ObjectRef) {
 // `gc_update_annotation_proxy_refs`, wired into roots.rs + gc.rs). No new GC
 // wiring is needed вЂ” the array is now a tracked root and is repointed after
 // every relocation, so the read below is always valid.
-fn proxy_last_interfaces_cell() -> &'static Mutex<Option<ObjectRef>> {
-    static C: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(None))
-}
-
 /// Record the interfaces array of the most recently created proxy so a later
 /// `Class.getInterfaces()` on the shared `Proxy$Instance` mirror can return it
 /// (GC-tracked вЂ” see [`proxy_last_interfaces`]). Called from
 /// `lib.rs::native_proxy_new_instance`.
-pub fn set_proxy_last_interfaces(arr: ObjectRef) {
-    *proxy_last_interfaces_cell()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(arr);
+pub fn set_proxy_last_interfaces(vm_identity: usize, arr: ObjectRef) {
+    PROXY_LAST_INTERFACES.with(vm_identity, |cell| *cell = Some(arr));
 }
 
 /// Fetch the GC-tracked last-proxy interfaces array, if any. Returns the
 /// CURRENT (post-relocation) `ObjectRef` because the cell is remapped by
 /// [`gc_update_annotation_proxy_refs`].
-pub fn proxy_last_interfaces() -> Option<ObjectRef> {
-    *proxy_last_interfaces_cell()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+pub fn proxy_last_interfaces(vm_identity: usize) -> Option<ObjectRef> {
+    PROXY_LAST_INTERFACES.peek(vm_identity, |cell| *cell).flatten()
 }
 
 /// Build-or-fetch the cached annotation proxy for `ann` as seen on
@@ -10768,11 +10773,11 @@ fn cached_annotation_proxy_for_key(
     key: String,
     ann: &cratonvm_native_api::AnnotationData,
 ) -> ObjectRef {
+    let vm = ctx.vm_identity();
     let key = (holder_class_id.as_u32(), key);
-    if let Some(&cached) = annotation_proxy_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
+    if let Some(cached) = ANNOTATION_PROXY_CACHE
+        .peek(vm, |table| table.get(&key).copied())
+        .flatten()
     {
         return cached;
     }
@@ -10796,13 +10801,9 @@ fn cached_annotation_proxy_for_key(
         );
     }
     let proxy = create_annotation_proxy(ctx, ann, Some(holder_class_id), container_loader);
-    let mut guard = annotation_proxy_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let cached = *guard.entry(key).or_insert(proxy);
-    drop(guard);
+    let cached = ANNOTATION_PROXY_CACHE.with(vm, |table| *table.entry(key).or_insert(proxy));
     if cached.as_ptr() != proxy.as_ptr() {
-        forget_annotation_proxy_child_roots(proxy);
+        forget_annotation_proxy_child_roots(vm, proxy);
     }
     cached
 }
@@ -10843,28 +10844,17 @@ fn cached_method_annotation_proxy(
 /// GC root scan for the annotation-proxy cache (companion to
 /// [`gc_update_annotation_proxy_refs`]). Pushes every cached proxy so a moving
 /// young GC keeps them live and records their relocation.
-pub fn gc_scan_annotation_proxy_roots(out: &mut Vec<ObjectRef>) {
-    let guard = annotation_proxy_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    out.extend(guard.values().copied());
-    drop(guard);
-
-    let child_guard = annotation_proxy_child_roots()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    for roots in child_guard.values() {
-        out.extend(roots.iter().copied());
-    }
-    drop(child_guard);
-
+pub fn gc_scan_annotation_proxy_roots(vm_identity: usize, out: &mut Vec<ObjectRef>) {
+    ANNOTATION_PROXY_CACHE.peek(vm_identity, |table| out.extend(table.values().copied()));
+    ANNOTATION_PROXY_CHILD_ROOTS.peek(vm_identity, |table| {
+        for roots in table.values() {
+            out.extend(roots.iter().copied());
+        }
+    });
     // bug nb-lib-gckeys В§2: also root the last-proxy interfaces array so the
     // shared-mirror `Class.getInterfaces()` fallback never dereferences a
     // reclaimed/relocated array.
-    if let Some(arr) = *proxy_last_interfaces_cell()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-    {
+    if let Some(arr) = proxy_last_interfaces(vm_identity) {
         out.push(arr);
     }
 }
@@ -10872,53 +10862,51 @@ pub fn gc_scan_annotation_proxy_roots(out: &mut Vec<ObjectRef>) {
 /// Post-GC remap for the annotation-proxy cache (companion to
 /// [`gc_scan_annotation_proxy_roots`]). Repoints each cached `ObjectRef` to its
 /// new address after a moving collection.
-pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
+pub fn gc_update_annotation_proxy_refs(
+    vm_identity: usize,
+    pointer_map: &HashMap<usize, usize>,
+) {
     if pointer_map.is_empty() {
         return;
     }
-    let mut guard = annotation_proxy_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    for obj_ref in guard.values_mut() {
-        let old_addr = obj_ref.as_ptr() as usize;
-        if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            debug_assert!(new_addr != 0, "GC pointer map contains null address");
-            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-        }
-    }
-    drop(guard);
-
-    let mut child_guard = annotation_proxy_child_roots()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut remapped = FxHashMap::default();
-    for (proxy_addr, mut roots) in child_guard.drain() {
-        for root in roots.iter_mut() {
-            let old_addr = root.as_ptr() as usize;
+    ANNOTATION_PROXY_CACHE.with(vm_identity, |table| {
+        for obj_ref in table.values_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
         }
-        let new_proxy_addr = *pointer_map.get(&proxy_addr).unwrap_or(&proxy_addr);
-        remapped.insert(new_proxy_addr, roots);
-    }
-    *child_guard = remapped;
-    drop(child_guard);
+    });
+
+    ANNOTATION_PROXY_CHILD_ROOTS.with(vm_identity, |table| {
+        let mut remapped = FxHashMap::default();
+        for (proxy_addr, mut roots) in table.drain() {
+            for root in roots.iter_mut() {
+                let old_addr = root.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            let new_proxy_addr = *pointer_map.get(&proxy_addr).unwrap_or(&proxy_addr);
+            remapped.insert(new_proxy_addr, roots);
+        }
+        *table = remapped;
+    });
 
     // bug nb-lib-gckeys В§2: remap the last-proxy interfaces array alongside
     // the annotation-proxy cache (it shares this hook). Without the repoint
     // the shared-mirror `getInterfaces()` would hand back a stale pointer.
-    let mut cell = proxy_last_interfaces_cell()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(arr) = cell.as_mut() {
-        let old_addr = arr.as_ptr() as usize;
-        if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            debug_assert!(new_addr != 0, "GC pointer map contains null address");
-            *arr = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+    PROXY_LAST_INTERFACES.with(vm_identity, |cell| {
+        if let Some(arr) = cell.as_mut() {
+            let old_addr = arr.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *arr = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
         }
-    }
+    });
 }
 
 /// Annotation instances are materialised as REAL `$ProxyN` proxies by default,
@@ -11926,7 +11914,7 @@ fn create_annotation_proxy(
         }
     }
     ctx.unpin_native_roots(proxy_pin);
-    remember_annotation_proxy_child_roots(proxy, child_roots);
+    remember_annotation_proxy_child_roots(ctx.vm_identity(), proxy, child_roots);
     if let Some(pin) = container_loader_pin {
         ctx.unpin_native_roots(pin);
     }

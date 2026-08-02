@@ -7459,6 +7459,11 @@ pub fn release_vm_native_state(vm_identity: usize) {
     // SecurityManager row above: raw heap `ObjectRef`s that must not outlive
     // the heap, and must never be visible to a VM that reuses the identity.
     cratonvm_native_builtins::classloader::forget_vm_loader_singletons(vm_identity);
+    // The annotation-proxy cache, its per-proxy child roots, and the
+    // last-created-proxy interfaces array. Keyed by `ClassId`, which every VM
+    // mints from zero, so a surviving row is not merely a leak — it is a
+    // wrong-heap hit for the next VM.
+    cratonvm_native_builtins::lang_class::forget_vm_annotation_proxies(vm_identity);
     crate::runtime::instrument::forget_vm_transformers(vm_identity);
     // Without this a disposed VM's JVMTI row leaks its agent's callback
     // closures, and its listener flags keep every OTHER VM's interpreter on the
