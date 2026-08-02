@@ -397,7 +397,33 @@ pub(crate) fn attach_trust_managers_to_ctx(
     // manager is not fatal — the hints are an optimisation for the peer, and
     // an empty list is exactly the old behaviour — so errors are swallowed
     // rather than propagated out of `SSLContext.init`.
-    let issuers = capture_accepted_issuer_dns(ctx, &list);
+    // GC (FIXED 2026-08-01): `list` holds raw `ObjectRef`s that are NOT yet in
+    // `ctx_trust_managers_table`, so `gc_scan_tls_ctx_trust_manager_roots`
+    // cannot see them and `gc_update_tls_ctx_trust_manager_refs` cannot remap
+    // them. `capture_accepted_issuer_dns` runs three `invoke_virtual`s per
+    // manager and walks two arrays — it allocates freely. A moving young
+    // collection landing in there relocated every manager and left `list`
+    // naming the vacated slots, which then went into the table VERBATIM and
+    // stayed wrong for the whole life of that `SSLContext`. The next
+    // `checkServerTrusted` on it resolved the receiver's class as
+    // `java.lang.Object` — ClassId(0), the reclaimed-slot signature — and the
+    // handshake failed as `SSLHandshakeException: TrustManager rejected the
+    // peer certificate chain`, ~1 run in 20 of `TestSSLHostConfigCompat`.
+    //
+    // `CRATONVM_GC=-moving-young` is what localised it: 14/14 clean with the
+    // non-moving sweep, which relocates nothing. That also proves the entry is
+    // correctly ROOTED once it reaches the table (a sweep would have freed an
+    // unrooted manager just the same) — the gap was only ever this window
+    // before the insert.
+    let pins: Vec<usize> = list.iter().map(|tm| ctx.pin_native_root(*tm)).collect();
+    let issuers = capture_accepted_issuer_dns(ctx, &list, &pins);
+    // Re-read every manager through its pin before the table takes ownership.
+    for (i, tm) in list.iter_mut().enumerate() {
+        *tm = ctx.read_native_pin(pins[i], *tm);
+    }
+    if let Some(&base) = pins.first() {
+        ctx.unpin_native_roots(base);
+    }
     let mut table = ctx_trust_managers_table().lock();
     if list.is_empty() {
         table.remove(&key);
@@ -438,15 +464,29 @@ fn accepted_issuer_hints(ctx_key: Option<u64>) -> Vec<rustls::DistinguishedName>
 /// Capped, because a manager backed by the platform trust store legitimately
 /// returns ~150 roots and putting all of them in every `CertificateRequest`
 /// would bloat each handshake for no benefit to the callers this exists for.
-fn capture_accepted_issuer_dns(ctx: &mut dyn NativeContext, managers: &[ObjectRef]) -> Vec<Vec<u8>> {
+///
+/// `pins` holds one native-root pin per entry of `managers`, taken by the
+/// caller BEFORE this runs. Every `invoke_virtual` below allocates, so each
+/// manager is re-read through its pin at the top of the loop rather than
+/// dereferenced from the caller's raw copy — see `attach_trust_managers_to_ctx`
+/// for the defect that motivated it.
+fn capture_accepted_issuer_dns(
+    ctx: &mut dyn NativeContext,
+    managers: &[ObjectRef],
+    pins: &[usize],
+) -> Vec<Vec<u8>> {
     const MAX_ISSUER_HINTS: usize = 16;
     let mut out: Vec<Vec<u8>> = Vec::new();
-    for tm in managers {
+    for (mi, tm) in managers.iter().enumerate() {
         if out.len() >= MAX_ISSUER_HINTS {
             break;
         }
-        let certs = match ctx.invoke_virtual(
-            *tm,
+        let tm = match pins.get(mi) {
+            Some(&p) => ctx.read_native_pin(p, *tm),
+            None => *tm,
+        };
+        let certs0 = match ctx.invoke_virtual(
+            tm,
             "getAcceptedIssuers",
             "()[Ljava/security/cert/X509Certificate;",
             &[],
@@ -454,11 +494,16 @@ fn capture_accepted_issuer_dns(ctx: &mut dyn NativeContext, managers: &[ObjectRe
             Ok(Some(Value::Object(Some(arr)))) => arr,
             _ => continue,
         };
+        // `certs` outlives the allocating calls in the body below, so it is
+        // pinned too and re-read on every iteration.
+        let certs_pin = ctx.pin_native_root(certs0);
+        let certs = ctx.read_native_pin(certs_pin, certs0);
         let len = ctx.array_length(certs);
         for i in 0..len {
             if out.len() >= MAX_ISSUER_HINTS {
                 break;
             }
+            let certs = ctx.read_native_pin(certs_pin, certs0);
             let Value::Object(Some(cert)) = ctx.get_array_element(certs, i) else {
                 continue;
             };
@@ -482,6 +527,7 @@ fn capture_accepted_issuer_dns(ctx: &mut dyn NativeContext, managers: &[ObjectRe
                 out.push(der);
             }
         }
+        ctx.unpin_native_roots(certs_pin);
     }
     out
 }
