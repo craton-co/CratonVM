@@ -728,21 +728,39 @@ fn net_sockets() -> &'static RwLock<FxHashMap<i32, NetSocketHandle>> {
     REG.get_or_init(|| RwLock::new(FxHashMap::default()))
 }
 
-/// Per-fd desired blocking mode requested while the fd was still `Unbound`
-/// (no live OS socket to apply it to). `NioSocketImpl.connect(timeout)`
-/// calls `IOUtil.configureBlocking(fd, false)` BEFORE `Net.connect0` — the fd
-/// is deliberately flipped non-blocking ahead of the connect attempt, then
-/// `connect0`/`Net.poll` drive the timed-connect protocol. `net_connect0`
-/// used to always hand back a fresh, default-blocking `TcpStream`, silently
-/// dropping that request: every later `read0` on the connection then did a
-/// genuine blocking OS `read()` instead of returning `IOStatus.UNAVAILABLE`,
-/// so `NioSocketImpl.timedRead`'s configured `SO_TIMEOUT` never fired and the
-/// read blocked until the peer closed. Recorded here on every
-/// `configureBlocking` call (regardless of current registry state) and
-/// consumed by `net_connect0` right after the stream is created.
+/// Per-fd blocking mode as last requested through `IOUtil.configureBlocking`.
+///
+/// Two consumers:
+///
+/// 1. *Deferred application.* The request can arrive while the fd is still
+///    `Unbound` (no live OS socket to apply it to): `NioSocketImpl.connect(
+///    timeout)` calls `IOUtil.configureBlocking(fd, false)` BEFORE
+///    `Net.connect0` — the fd is deliberately flipped non-blocking ahead of the
+///    connect attempt, then `connect0`/`Net.poll` drive the timed-connect
+///    protocol. `net_connect0` used to always hand back a fresh,
+///    default-blocking `TcpStream`, silently dropping that request: every later
+///    `read0` on the connection then did a genuine blocking OS `read()` instead
+///    of returning `IOStatus.UNAVAILABLE`, so `NioSocketImpl.timedRead`'s
+///    configured `SO_TIMEOUT` never fired and the read blocked until the peer
+///    closed. `net_connect0` / `net_bind0` apply it once the socket exists.
+///
+/// 2. *Mode query.* [`net_accept`] must know whether the caller wants the JDK's
+///    non-blocking accept contract (return `IOStatus.UNAVAILABLE`) or a genuine
+///    blocking accept. Entries are therefore RETAINED after being applied —
+///    they are the record of the mode, not a one-shot to-do item — and dropped
+///    only when the fd is closed ([`close_net_fd`]).
 fn net_pending_nonblocking() -> &'static RwLock<FxHashMap<i32, bool>> {
     static PENDING: OnceLock<RwLock<FxHashMap<i32, bool>>> = OnceLock::new();
     PENDING.get_or_init(|| RwLock::new(FxHashMap::default()))
+}
+
+/// Whether `IOUtil.configureBlocking(fd, false)` is in effect for this fd.
+fn net_fd_is_nonblocking(fd: i32) -> bool {
+    net_pending_nonblocking()
+        .read()
+        .get(&fd)
+        .copied()
+        .unwrap_or(false)
 }
 
 /// Per-socket option store (SO_REUSEADDR / SO_KEEPALIVE / TCP_NODELAY / etc.).
@@ -832,6 +850,13 @@ fn net_listener_still_registered(fd: i32) -> bool {
     )
 }
 
+/// The error a blocked/parked accept reports once its `ServerSocket` is closed.
+/// `net_err` renders it as `java.net.SocketException`, matching HotSpot's
+/// blocked-accept-on-close.
+fn net_accept_closed_err() -> std::io::Error {
+    std::io::Error::new(ErrorKind::Interrupted, "server socket closed")
+}
+
 fn net_accept_close_aware(
     listener: &TcpListener,
     fd: i32,
@@ -842,10 +867,7 @@ fn net_accept_close_aware(
             Ok(pair) => return Ok(pair),
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 if !net_listener_still_registered(fd) {
-                    return Err(std::io::Error::new(
-                        ErrorKind::Interrupted,
-                        "server socket closed",
-                    ));
+                    return Err(net_accept_closed_err());
                 }
                 std::thread::sleep(NET_ACCEPT_CLOSE_POLL);
             }
@@ -1147,7 +1169,7 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // configureBlocking(false); bind(...)`) must carry over to the freshly
     // bound listener, or `accept0`'s WouldBlock/`Net.poll` protocol never
     // engages.
-    if let Some(nonblocking) = net_pending_nonblocking().write().remove(&fd) {
+    if let Some(nonblocking) = net_pending_nonblocking().read().get(&fd).copied() {
         dbgnet!("bind0 fd={fd:#x} applying deferred nonblocking={nonblocking}");
         listener
             .set_nonblocking(nonblocking)
@@ -1173,9 +1195,22 @@ fn net_listen(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult
 /// `accept(FileDescriptor fd, FileDescriptor newfd, InetSocketAddress[] isaa)
 ///    -> int`
 ///
-/// Blocks on `listener.accept()`, allocates a new fd for the returned stream,
-/// stores the peer port into `isaa[0]` (if the array was provided and has a
-/// synthetic layout), and returns the new fd.
+/// Accepts one connection, allocates a new fd for the returned stream, writes
+/// it into `newfd`, fills `isaa[0]` with the peer address and returns 1.
+///
+/// **Blocking mode is load-bearing.** `ServerSocket.setSoTimeout(ms)` +
+/// `accept()` reaches `NioSocketImpl.accept`, which for a non-zero timeout does
+/// `configureNonBlocking(fd)` and then loops in `timedAccept`: call
+/// `Net.accept`, and *only* when it answers `IOStatus.UNAVAILABLE` (-2) park in
+/// `Net.poll` for the remaining time and re-check the deadline —
+/// `SocketTimeoutException` is thrown from that loop, never by the native. This
+/// native used to block unconditionally (poll-until-connected), so the loop was
+/// entered exactly once and never came back: SO_TIMEOUT was silently inert and
+/// `accept()` on an idle port hung forever instead of timing out.
+///
+/// So: honour the mode the JDK asked for. Non-blocking → one attempt, then
+/// `-2`. Blocking (the no-timeout branch, which parks on `Net.poll` itself)
+/// → the close-aware blocking loop.
 fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
     // C26: `args[1]` (the new FileDescriptor object) is intentionally
@@ -1185,7 +1220,8 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // returned via the Int return value instead.
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("accept: FileDescriptor has no fd id"))?;
-    dbgnet!("accept fd={fd:#x} (blocking)");
+    let nonblocking = net_fd_is_nonblocking(fd);
+    dbgnet!("accept fd={fd:#x} nonblocking={nonblocking}");
 
     // AUDIT 2026-05-17: take the map read-lock briefly to clone the
     // per-listener `Arc<Mutex<_>>`, drop the map lock, then perform the
@@ -1206,19 +1242,43 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `end_blocking_region_refs` so a GC completing while this thread was
     // parked in accept() cannot leave them as vacated pre-move addresses.
     let mut largs = args.to_vec();
-    let (stream, peer) = {
+    let accepted = {
         let listener = listener_handle.lock();
-        // Bracket the unbounded blocking accept() in a GC-blocking region so a
-        // stop-the-world GC requested while this thread is parked in accept()
-        // does not deadlock `wait_for_all` (the acceptor reaches no interpreter
-        // safepoint). See the matching comment in socket_channel::ssc_accept.
-        // The loop is close-aware: close(fd) marks the registry entry Closed,
-        // which wakes us promptly even though this Arc keeps the OS listener
-        // alive until accept returns.
-        ctx.begin_blocking_region();
-        let res = net_accept_close_aware(&listener, fd);
-        ctx.end_blocking_region_refs(&mut largs);
-        res.map_err(|e| net_err("accept", e))?
+        if nonblocking {
+            // One attempt, no parking: the JDK owns the wait (`Net.poll`) and
+            // the deadline. Nothing here can block, so no blocking region.
+            listener.set_nonblocking(true).map_err(|e| net_err("accept", e))?;
+            match listener.accept() {
+                Ok(pair) => Some(pair),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // A close that races the retry loop must surface as a
+                    // SocketException, not as an endless UNAVAILABLE/poll spin.
+                    if !net_listener_still_registered(fd) {
+                        return Err(net_err("accept", net_accept_closed_err()));
+                    }
+                    None
+                }
+                Err(e) => return Err(net_err("accept", e)),
+            }
+        } else {
+            // Bracket the unbounded blocking accept() in a GC-blocking region so a
+            // stop-the-world GC requested while this thread is parked in accept()
+            // does not deadlock `wait_for_all` (the acceptor reaches no interpreter
+            // safepoint). See the matching comment in socket_channel::ssc_accept.
+            // The loop is close-aware: close(fd) marks the registry entry Closed,
+            // which wakes us promptly even though this Arc keeps the OS listener
+            // alive until accept returns.
+            ctx.begin_blocking_region();
+            let res = net_accept_close_aware(&listener, fd);
+            ctx.end_blocking_region_refs(&mut largs);
+            Some(res.map_err(|e| net_err("accept", e))?)
+        }
+    };
+    let Some((stream, peer)) = accepted else {
+        // IOStatus.UNAVAILABLE — "no connection pending", the signal
+        // `NioSocketImpl.timedAccept` needs to run its deadline check.
+        dbgnet!("accept fd={fd:#x} -> UNAVAILABLE");
+        return Ok(Some(Value::Int(-2)));
     };
     let _ = stream.set_nonblocking(false);
 
@@ -1320,7 +1380,7 @@ fn net_connect0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     // silently lost and the connection comes up in blocking mode, so
     // `net_read0` never returns `IOStatus.UNAVAILABLE` and the JDK's
     // SO_TIMEOUT read protocol never engages.
-    if let Some(nonblocking) = net_pending_nonblocking().write().remove(&fd) {
+    if let Some(nonblocking) = net_pending_nonblocking().read().get(&fd).copied() {
         dbgnet!("connect0 fd={fd:#x} applying deferred nonblocking={nonblocking}");
         stream
             .set_nonblocking(nonblocking)
@@ -1587,6 +1647,12 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// readiness faithfully, this leaves the stream's persistent blocking mode
 /// untouched, which matters because the JDK toggles it around timed connects
 /// and reads.
+///
+/// LISTENER fds go through here too: `NioSocketImpl.timedAccept` parks on
+/// `Net.poll(fd, POLLIN, remainingMillis)` between its `Net.accept` attempts.
+/// Answering `0` immediately for anything that is not a Stream (the old
+/// behaviour) turned that park into a busy-spin that burned a core for the
+/// whole SO_TIMEOUT.
 fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
     let events = int_arg(args, 1);
@@ -1601,6 +1667,10 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let map = net_sockets().read();
         match map.get(&fd) {
             Some(NetSocketHandle::Stream(stream)) => Arc::clone(stream),
+            Some(NetSocketHandle::Listener(listener)) => {
+                let listener = Arc::clone(listener);
+                return net_poll_listener(ctx, &listener, fd, events, timeout_millis);
+            }
             _ => return Ok(Some(Value::Int(0))),
         }
     };
@@ -1617,6 +1687,87 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     result
 }
 
+/// Longest single OS poll a listener wait is allowed to sit in. A
+/// `ServerSocket.close()` does not close the OS listener out from under a
+/// parked `Net.poll` (the registry entry is marked `Closed` while this Arc
+/// keeps the handle alive — see `net_accept_close_aware`), so slice the wait
+/// and re-check registration, exactly as the blocking accept loop does.
+const NET_LISTENER_POLL_SLICE_MS: i32 = 50;
+
+/// `Net.poll` for a listener fd: wait for an incoming connection.
+///
+/// Returns 1 (ready) both when a connection is pending and when the
+/// `ServerSocket` was closed underneath us — in the latter case the JDK's
+/// following `Net.accept` reports the close as a `SocketException`, which is
+/// what a blocked `accept()` must see.
+fn net_poll_listener(
+    ctx: &mut dyn NativeContext,
+    listener: &Mutex<TcpListener>,
+    fd: i32,
+    events: i32,
+    timeout_millis: i64,
+) -> MethodCallResult {
+    // poll(2) convention, matching the stream path: negative waits forever,
+    // 0 returns immediately, positive is a bound.
+    let deadline = (timeout_millis >= 0)
+        .then(|| std::time::Instant::now() + Duration::from_millis(timeout_millis as u64));
+    ctx.begin_blocking_region();
+    let result = loop {
+        if !net_listener_still_registered(fd) {
+            break Ok(true);
+        }
+        let slice = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break Ok(false);
+                }
+                (remaining.as_millis() as i64).min(i64::from(NET_LISTENER_POLL_SLICE_MS)) as i32
+            }
+            None => NET_LISTENER_POLL_SLICE_MS,
+        };
+        // Hold the listener lock only for the bounded poll — never across an
+        // unbounded wait, which would block a concurrent close/accept.
+        let polled = {
+            let guard = listener.lock();
+            net_poll_raw(net_raw_handle_of_listener(&guard), events, slice)
+        };
+        match polled {
+            Ok(true) => break Ok(true),
+            Ok(false) => {}
+            Err(e) => break Err(e),
+        }
+    };
+    ctx.end_blocking_region();
+    match result {
+        Ok(ready) => Ok(Some(Value::Int(i32::from(ready)))),
+        Err(error) => Err(net_err("poll", error)),
+    }
+}
+
+#[cfg(windows)]
+fn net_raw_handle_of_listener(listener: &TcpListener) -> NetRawHandle {
+    use std::os::windows::io::AsRawSocket;
+    listener.as_raw_socket() as NetRawHandle
+}
+
+#[cfg(unix)]
+fn net_raw_handle_of_listener(listener: &TcpListener) -> NetRawHandle {
+    use std::os::fd::AsRawFd;
+    listener.as_raw_fd()
+}
+
+#[cfg(not(any(windows, unix)))]
+fn net_raw_handle_of_listener(_listener: &TcpListener) -> NetRawHandle {
+    0
+}
+
+/// The OS-level socket handle `net_poll_raw` polls.
+#[cfg(windows)]
+type NetRawHandle = usize;
+#[cfg(not(windows))]
+type NetRawHandle = i32;
+
 /// Wait for the requested `sun.nio.ch.Net` event mask on one TCP stream.
 /// JDK's Windows `Net` constants intentionally match WSAPoll (`POLLIN=0x300`,
 /// `POLLOUT=0x10`); Unix constants match `poll(2)`. A readiness error/hangup
@@ -1625,7 +1776,12 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 #[cfg(windows)]
 fn net_poll_stream(stream: &TcpStream, events: i32, timeout: i32) -> std::io::Result<bool> {
     use std::os::windows::io::AsRawSocket;
+    net_poll_raw(stream.as_raw_socket() as NetRawHandle, events, timeout)
+}
 
+/// [`net_poll_stream`] on a bare OS handle, so listener fds can use it too.
+#[cfg(windows)]
+fn net_poll_raw(raw: NetRawHandle, events: i32, timeout: i32) -> std::io::Result<bool> {
     #[repr(C)]
     struct WsaPollFd {
         fd: usize,
@@ -1638,12 +1794,12 @@ fn net_poll_stream(stream: &TcpStream, events: i32, timeout: i32) -> std::io::Re
     }
 
     let mut pfd = WsaPollFd {
-        fd: stream.as_raw_socket() as usize,
+        fd: raw,
         events: events as i16,
         revents: 0,
     };
     // SAFETY: `pfd` is a valid one-element WSAPOLLFD array. The socket stays
-    // alive through the borrowed `TcpStream` for the duration of the call.
+    // alive through the borrowed socket the caller holds for the call.
     let count = unsafe { WSAPoll(&mut pfd, 1, timeout) };
     if count < 0 {
         let error = std::io::Error::last_os_error();
@@ -1662,7 +1818,12 @@ fn net_poll_stream(stream: &TcpStream, events: i32, timeout: i32) -> std::io::Re
 #[cfg(unix)]
 fn net_poll_stream(stream: &TcpStream, events: i32, timeout: i32) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
+    net_poll_raw(stream.as_raw_fd(), events, timeout)
+}
 
+/// [`net_poll_stream`] on a bare OS handle, so listener fds can use it too.
+#[cfg(unix)]
+fn net_poll_raw(raw: NetRawHandle, events: i32, timeout: i32) -> std::io::Result<bool> {
     #[repr(C)]
     struct PollFd {
         fd: i32,
@@ -1678,12 +1839,12 @@ fn net_poll_stream(stream: &TcpStream, events: i32, timeout: i32) -> std::io::Re
     }
 
     let mut pfd = PollFd {
-        fd: stream.as_raw_fd(),
+        fd: raw,
         events: events as i16,
         revents: 0,
     };
-    // SAFETY: `pfd` is a valid one-element pollfd array and the borrowed
-    // stream keeps its file descriptor alive for the call.
+    // SAFETY: `pfd` is a valid one-element pollfd array and the caller keeps
+    // the borrowed socket's file descriptor alive for the call.
     let count = unsafe { poll(&mut pfd, 1, timeout) };
     if count < 0 {
         Err(std::io::Error::last_os_error())
@@ -1693,7 +1854,12 @@ fn net_poll_stream(stream: &TcpStream, events: i32, timeout: i32) -> std::io::Re
 }
 
 #[cfg(not(any(windows, unix)))]
-fn net_poll_stream(_stream: &TcpStream, _events: i32, timeout: i32) -> std::io::Result<bool> {
+fn net_poll_stream(_stream: &TcpStream, events: i32, timeout: i32) -> std::io::Result<bool> {
+    net_poll_raw(0, events, timeout)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn net_poll_raw(_raw: NetRawHandle, _events: i32, timeout: i32) -> std::io::Result<bool> {
     if timeout > 0 {
         std::thread::sleep(Duration::from_millis(timeout as u64));
     }
@@ -3376,8 +3542,12 @@ mod tests {
         .unwrap();
         assert_eq!(result, Some(Value::Int(1)));
 
-        // The deferred request must be consumed, not left dangling.
-        assert!(net_pending_nonblocking().read().get(&fd).is_none());
+        // The request is RETAINED, not consumed: it is the record of the fd's
+        // blocking mode, which `net_accept` reads to decide between the JDK's
+        // non-blocking accept contract and a genuine blocking accept. It must
+        // not dangle past the fd, though — `close_net_fd` drops it (asserted
+        // below).
+        assert_eq!(net_pending_nonblocking().read().get(&fd), Some(&true));
 
         // And actually applied: reading with no data available must report
         // IOStatus.UNAVAILABLE (-2) promptly rather than blocking.
@@ -3394,8 +3564,47 @@ mod tests {
         .unwrap();
         assert_eq!(read_result, Some(Value::Int(-2)));
 
+        // Closing the fd is what drops the retained mode.
+        close_net_fd(fd);
+        assert!(net_pending_nonblocking().read().get(&fd).is_none());
+
         remove_fd(fd);
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn accept_on_a_nonblocking_listener_reports_unavailable_instead_of_blocking() {
+        // `NioSocketImpl.timedAccept` flips the fd non-blocking and then needs
+        // `Net.accept` to answer IOStatus.UNAVAILABLE (-2) so it can check its
+        // own deadline. Blocking here instead made SO_TIMEOUT inert and
+        // `ServerSocket.accept()` hang forever on an idle port.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = register_handle(NetSocketHandle::Listener(Arc::new(Mutex::new(listener))));
+        net_pending_nonblocking().write().insert(fd, true);
+
+        let mut ctx = MockNativeContext::new();
+        let fd_obj = ctx.alloc_object(0);
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd));
+        let newfd_obj = ctx.alloc_object(0);
+
+        let started = std::time::Instant::now();
+        let result = net_accept(
+            &mut ctx,
+            &[
+                Value::Object(Some(fd_obj)),
+                Value::Object(Some(newfd_obj)),
+                Value::Object(None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Some(Value::Int(-2)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a non-blocking accept must not park"
+        );
+
+        close_net_fd(fd);
+        remove_fd(fd);
     }
 
     #[test]

@@ -262,22 +262,49 @@ pub(crate) struct SockSide {
     pub pending_options: Vec<(i32, i32, i32)>,
 }
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 pub(crate) struct SsSide {
     pub port: i32,
     pub backlog: i32,
     pub closed: i32,
     pub listener_id: i32,
+    /// 1 when one of this surface's own `ServerSocket` constructors built the
+    /// receiver — i.e. it really is a plain `ServerSocket` whose whole state
+    /// lives here.
+    ///
+    /// A `ServerSocketChannel.socket()` adapter is also a `java.net.ServerSocket`
+    /// and also reaches these natives (native-io registers wrappers for some
+    /// methods but not `accept`/`setSoTimeout`), yet its state lives in
+    /// native-io's channel registry. It gets a side-table entry the moment
+    /// anything here writes one — `setSoTimeout` does — so "has an entry" is NOT
+    /// the same question. Only a `0` here means "not ours, do not answer for it".
+    pub constructed: i32,
+    /// 1 once a bind has succeeded. Distinct from `listener_id >= 0`, which
+    /// `close()` resets: `ServerSocket.isBound()` reports whether the socket
+    /// was *ever* bound and stays true afterwards ("this method will continue
+    /// to return true after the socket is closed"), and `getLocalPort()` /
+    /// `getLocalSocketAddress()` keep answering off the retained `port` /
+    /// `host` for exactly that reason.
+    pub bound: i32,
+    /// The bound local address, retained past `close()` alongside `port`.
+    pub host: String,
     /// SO_REUSEADDR as last requested through `setReuseAddress`. Java allows
     /// the option to be set on an UNBOUND `ServerSocket` (that is in fact the
     /// only ordering where it changes bind behaviour), and there is no OS
     /// handle to hold it before `re2_bind_listener` runs — so the requested
-    /// value is retained here and the getter falls back to it whenever the
-    /// live listener cannot answer. `-1` = never set by the caller.
+    /// value is retained here, applied to the socket the bind creates, and the
+    /// getter falls back to it whenever the live listener cannot answer.
+    /// `-1` = never set by the caller.
     pub reuse_address: i32,
     /// SO_RCVBUF as last requested through `setReceiveBufferSize`; same
     /// before-bind rationale as `reuse_address`. `-1` = never set.
     pub recv_buffer_size: i32,
+    /// SO_TIMEOUT (accept timeout) in ms, `0` = infinite. Held per RECEIVER,
+    /// not per listener id: `setSoTimeout` is legal on an unbound
+    /// `ServerSocket` (`new ServerSocket(); setSoTimeout(ms); bind(addr)`), and
+    /// a listener-id-keyed store dropped that value on the floor — the later
+    /// `accept()` then blocked forever instead of timing out.
+    pub so_timeout: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -589,15 +616,28 @@ fn ss_default() -> SsSide {
         backlog: 50,
         closed: 0,
         listener_id: -1,
+        constructed: 0,
+        bound: 0,
+        host: String::new(),
         reuse_address: -1,
         recv_buffer_size: -1,
+        so_timeout: 0,
     }
 }
 
 fn ss_get(ctx: &dyn NativeContext, this: ObjectRef) -> SsSide {
     let key = ctx.identity_hash_code(this);
     let t = ss_side_table().lock();
-    t.get(&key).copied().unwrap_or_else(ss_default)
+    t.get(&key).cloned().unwrap_or_else(ss_default)
+}
+
+/// Whether this receiver has an entry in the side table — i.e. whether the RE.2
+/// surface has ever handled it. Every RE.2 constructor writes one, so a `false`
+/// means the socket came from somewhere else (the phase-53 4-field surface) and
+/// its state has to be read from its object fields instead.
+fn ss_tracked(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(this);
+    ss_side_table().lock().contains_key(&key)
 }
 
 fn ss_set<F: FnOnce(&mut SsSide)>(ctx: &dyn NativeContext, this: ObjectRef, f: F) {
@@ -1057,6 +1097,37 @@ fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed 
         message: message.into(),
     }
     .into()
+}
+
+/// A real, catchable `java.net.SocketException`.
+///
+/// `RuntimeError` has no `SocketException` variant, and the distinction is not
+/// cosmetic: the JDK throws this concrete subtype for every "socket is closed"
+/// / "already bound" / "not bound" refusal, and callers catch it by type
+/// (okhttp's `MockWebServer` accept loop, Tomcat's aborted-upload swallow).
+/// A bare `IOException` whose message merely reads like one escapes that catch.
+///
+/// The freshly built exception is pinned before it is handed back: the caller's
+/// Java frame has no catch-local root for it yet, and `new_object_initialized`
+/// has already released its constructor pin.
+fn socket_ex<S: AsRef<str>>(
+    ctx: &mut dyn NativeContext,
+    message: S,
+) -> cratonvm_types::error::MethodCallFailed {
+    let jmsg = ctx.create_string(message.as_ref());
+    match ctx.new_object_initialized(
+        "java/net/SocketException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(jmsg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let exc_pin = ctx.pin_native_root(exc);
+            let exc = ctx.read_native_pin(exc_pin, exc);
+            cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)
+        }
+        Ok(_) => ioex(message.as_ref().to_string()),
+        Err(failed) => failed,
+    }
 }
 
 /// Classify a UDP `recv` failure the way the JDK does: an expired `SO_TIMEOUT`
@@ -4610,7 +4681,15 @@ fn re2_accept_into(
             };
         }
         AcceptOutcome::TimedOut => {
-            return Err(ioex("ServerSocket.accept failed: accept timed out"));
+            // Concrete `java.net.SocketTimeoutException`, which is what HotSpot
+            // throws when SO_TIMEOUT expires. An accept loop that catches the
+            // timeout to keep polling and catches plain IOException to shut
+            // down does the exact opposite of what it should if this is a bare
+            // IOException.
+            return Err(RuntimeError::SocketTimeoutException {
+                message: "Accept timed out".into(),
+            }
+            .into());
         }
         AcceptOutcome::Failed(e) => {
             return Err(ioex(format!("ServerSocket.accept failed: {e}")));
@@ -4662,12 +4741,25 @@ fn re2_bind_listener(
     port: i32,
     backlog: i32,
 ) -> MethodCallResult {
+    // Same two refusals the real `ServerSocket.bind` makes before it touches
+    // the impl. Without them a second bind silently replaced the listener
+    // (leaking the first and changing `getLocalPort()` under the caller), and
+    // binding a closed socket quietly succeeded.
+    {
+        let side = ss_get(ctx, this);
+        if side.closed != 0 {
+            return Err(socket_ex(ctx, "Socket is closed"));
+        }
+        if side.bound != 0 {
+            return Err(socket_ex(ctx, "Already bound"));
+        }
+    }
     let ip = resolve_host(host)?;
     let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
     // GAP I6: `java.net.ServerSocket` binds a `TcpListener` directly rather
     // than through `fd_table`, so it needs the bare endpoint gate.
     crate::capability_gate::gate_network(&*ctx, &addr.to_string())?;
-    let listener = TcpListener::bind(addr).map_err(|e| {
+    let listener = re2_bind_with_pending_options(ctx, this, addr).map_err(|e| {
         // Must be a concrete `java.net.BindException`, not a generic
         // IOException with "BindException" as a text prefix — real code
         // (Spring Boot's `PortInUseException.throwIfPortBindingException`)
@@ -4695,6 +4787,12 @@ fn re2_bind_listener(
         s.backlog = backlog.max(0);
         s.closed = 0;
         s.listener_id = listener_id;
+        // Reached only for a plain ServerSocket: this surface's own
+        // constructors, or the plain-bind handler native-io delegates to for a
+        // receiver with no channel back-ref. Either way the state is ours.
+        s.constructed = 1;
+        s.bound = 1;
+        s.host = actual_host.clone();
     });
     // Publish the actual bound port to the cross-crate identity-keyed registry. The
     // re2 side-table above is private to native-builtins, but the last-registered (and
@@ -4702,10 +4800,9 @@ fn re2_bind_listener(
     // (socket_channel `ss_wrapper_local_port`) and shadows ALL ServerSocket dispatch.
     // It cannot see our side-table, and an int written to object field 0 does NOT
     // round-trip (the real ServerSocket layout's low slots are reference-typed). The
-    // shared native-api table (keyed by GC-stable identity hash) is the channel that
-    // lets that winner return the real ephemeral port instead of 0 — without which
-    // `new ServerSocket(0).getLocalPort()` is 0 and any connect-to-advertised-port
-    // (Narayana's TransactionStatusManager recovery listener) fails / hangs.
+    // shared native-api table (keyed by GC-stable identity hash) is what lets that
+    // winner answer at all if it ever runs without the delegation hooks of
+    // `cratonvm_native_api::plain_server_socket` installed.
     cratonvm_native_api::server_socket_ports::record_addr(
         ctx.identity_hash_code(this),
         this,
@@ -4715,18 +4812,63 @@ fn re2_bind_listener(
     Ok(None)
 }
 
+/// Bind a listener with the socket options the caller set while it was still
+/// unbound applied FIRST.
+///
+/// `TcpListener::bind` gives no window to configure the socket between
+/// `socket()` and `bind()`, and SO_REUSEADDR is only meaningful in exactly that
+/// window — so `new ServerSocket(); setReuseAddress(true); bind(addr)` (the one
+/// ordering where the option changes anything, and the one JGroups/Netty use)
+/// silently lost the request: the getter read the fresh listener back and
+/// answered `false`. Build the socket by hand through `socket2` when there is a
+/// retained option to apply, and fall back to the plain path otherwise.
+fn re2_bind_with_pending_options(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    addr: SocketAddr,
+) -> std::io::Result<TcpListener> {
+    let side = ss_get(ctx, this);
+    if side.reuse_address < 0 && side.recv_buffer_size <= 0 {
+        return TcpListener::bind(addr);
+    }
+    let domain = match addr {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    if side.reuse_address >= 0 {
+        socket.set_reuse_address(side.reuse_address != 0)?;
+    }
+    if side.recv_buffer_size > 0 {
+        socket.set_recv_buffer_size(side.recv_buffer_size as usize)?;
+    }
+    socket.bind(&addr.into())?;
+    // `backlog` here is the OS listen queue; the Java-level value is recorded
+    // separately by the caller. -1 asks socket2 for the platform maximum,
+    // matching `TcpListener::bind`'s own choice.
+    socket.listen(side.backlog.max(0).max(50))?;
+    Ok(socket.into())
+}
+
 /// Plain `java.net.ServerSocket.bind(SocketAddress[, int])` handler. Handles
 /// both arities (backlog read from `args[2]` when present). Registered for both
-/// descriptors below AND installed as the cross-crate plain-bind hook
-/// ([`cratonvm_native_api::plain_server_socket_bind`]) so native-io's *winning*
+/// descriptors below AND installed as the plain-`ServerSocket` bind handler
+/// ([`cratonvm_native_api::plain_server_socket`]) so native-io's *winning*
 /// `ss_wrapper_bind` (which shadows this registration) delegates the
 /// no-channel-back-ref (plain `new ServerSocket()`) case back here instead of
 /// no-opping — without which `new ServerSocket().bind(addr)` never bound a
 /// listener and `getLocalPort()` stayed 0 (okhttp MockWebServer → port 0; BUG-04).
 fn re2_server_socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let sa = obj_arg(args, 1).map_err(|_| ioex("bind: null address"))?;
-    let (host, port) = read_inet_socket_address(ctx, sa)?;
+    // `bind(null)` is legal and means "an ephemeral port on the wildcard
+    // address" (`ServerSocket.bind`: "if the address is null, then the system
+    // will pick up an ephemeral port and a valid local address"). Refusing it
+    // with an IOException broke every caller that binds late without caring
+    // where.
+    let (host, port) = match obj_arg(args, 1) {
+        Ok(sa) => read_inet_socket_address(ctx, sa)?,
+        Err(_) => ("0.0.0.0".to_string(), 0),
+    };
     let backlog = args
         .get(2)
         .and_then(|v| v.as_int())
@@ -4739,8 +4881,8 @@ fn re2_server_socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// [`re2_accept_into`] observes the absence and throws `SocketException`,
 /// matching HotSpot's blocked-accept-on-close) and clears the SO_TIMEOUT.
 ///
-/// Also installed as the cross-crate plain-close hook
-/// ([`cratonvm_native_api::plain_server_socket_close`]) so native-io's *winning*
+/// Also installed as the plain-`ServerSocket` close handler
+/// ([`cratonvm_native_api::plain_server_socket`]) so native-io's *winning*
 /// `ss_wrapper_close` (which shadows this registration) delegates the
 /// no-channel-back-ref (plain `new ServerSocket()`) case back here instead of
 /// no-opping. Without this, a plain `ServerSocket.close()` released nothing, so
@@ -4749,12 +4891,15 @@ fn re2_server_socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// drain on teardown, then throws
 /// `AssertionError: Gave up waiting for queue to shut down` (BUG: it polluted
 /// every Spring HTTP-client test teardown). Mirrors the BUG-04 plain-bind hook.
+///
+/// `bound`, `port` and `host` are deliberately NOT cleared: a closed
+/// `ServerSocket` still reports `isBound() == true`, its former
+/// `getLocalPort()` and its former `getLocalSocketAddress()` on HotSpot.
 fn re2_server_socket_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let lid = ss_get(ctx, this).listener_id;
     if lid >= 0 {
         s2_registry().lock().listeners.remove(&lid);
-        re2_clear_accept_timeout(lid);
     }
     ss_set(ctx, this, |s| {
         s.closed = 1;
@@ -4771,15 +4916,24 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     if crate::vmflags().io.real_net_sockets {
         return;
     }
-    // Install the plain-`ServerSocket` bind hook for native-io's winning
-    // `ss_wrapper_bind` to delegate to (BUG-04). Done unconditionally here (the
-    // early-return above is the REAL_NET_SOCKETS path where native-io also defers
-    // to real bytecode, so the hook is simply never consulted).
-    cratonvm_native_api::plain_server_socket_bind::set(re2_server_socket_bind);
-    // Companion plain-close hook (see re2_server_socket_close): native-io's
-    // winning ss_wrapper_close delegates the plain ServerSocket case here so
-    // close() actually drops the listener and wakes a blocked accept().
-    cratonvm_native_api::plain_server_socket_close::set(re2_server_socket_close);
+    // Install the plain-`ServerSocket` handler set for native-io's winning
+    // `ss_wrapper_*` natives to delegate to (BUG-04). Every method native-io
+    // shadows is covered: answering some of them out of the
+    // `server_socket_ports` side table instead left `isClosed()` stuck at
+    // false, `isBound()` reverting after close, and `getLocalPort()` reporting
+    // 0 rather than -1 while unbound. Done unconditionally here — the
+    // early-return above is the REAL_NET_SOCKETS path, where native-io also
+    // defers to real bytecode and nothing consults this.
+    cratonvm_native_api::plain_server_socket::set(
+        cratonvm_native_api::plain_server_socket::PlainServerSocketOps {
+            bind: re2_server_socket_bind,
+            close: re2_server_socket_close,
+            local_port: re2_server_socket_local_port,
+            local_socket_address: re2_server_socket_local_address,
+            is_bound: re2_server_socket_is_bound,
+            is_closed: re2_server_socket_is_closed,
+        },
+    );
     let ss = "java/net/ServerSocket";
 
     r.register(ss, "<init>", "()V", |ctx, args| {
@@ -4793,6 +4947,8 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             s.backlog = 50;
             s.closed = 0;
             s.listener_id = -1;
+            s.constructed = 1;
+            s.bound = 0;
         });
         Ok(None)
     });
@@ -4804,11 +4960,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         re2_bind_listener(ctx, this, "0.0.0.0", port, 50)
     });
 
-    r.register(ss, "getLocalPort", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let p = ss_get(ctx, this).port;
-        Ok(Some(Value::Int(p)))
-    });
+    r.register(ss, "getLocalPort", "()I", re2_server_socket_local_port);
 
     r.register(ss, "<init>", "(II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -4850,10 +5002,19 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let s = ss_get(ctx, this);
         if s.closed != 0 {
-            return Err(ioex("Socket is closed"));
+            return Err(socket_ex(ctx, "Socket is closed"));
+        }
+        // Only refuse for a receiver this surface constructed. A
+        // `ServerSocketChannel.socket()` adapter also lands here (native-io does
+        // not wrap `accept`), and its bound state lives in the channel registry,
+        // not in `bound` — answering "not bound" for it would be a lie.
+        if s.constructed != 0 && s.bound == 0 {
+            // HotSpot: `SocketException: Socket is not bound`, not an
+            // IOException — callers catch the subtype.
+            return Err(socket_ex(ctx, "Socket is not bound"));
         }
         let lid = s.listener_id;
-        let timeout_ms = re2_accept_timeout_for(lid);
+        let timeout_ms = s.so_timeout;
         let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
         sock_set(ctx, sock, |x| {
             x.port = 0;
@@ -4865,20 +5026,23 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         re2_accept_into(ctx, lid, sock, timeout_ms)
     });
 
+    // SO_TIMEOUT is held per RECEIVER, not per listener id: `setSoTimeout` is
+    // legal on an UNBOUND ServerSocket (`new ServerSocket(); setSoTimeout(ms);
+    // bind(addr)`), where there is no listener id to key it by. Keying it by
+    // one meant that ordering silently discarded the timeout and the later
+    // `accept()` blocked forever.
     r.register(ss, "setSoTimeout", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if ms < 0 {
             return Err(iae(format!("negative SO_TIMEOUT: {ms}")));
         }
-        let lid = ss_get(ctx, this).listener_id;
-        re2_set_accept_timeout(lid, ms);
+        ss_set(ctx, this, |s| s.so_timeout = ms);
         Ok(None)
     });
     r.register(ss, "getSoTimeout", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let lid = ss_get(ctx, this).listener_id;
-        Ok(Some(Value::Int(re2_accept_timeout_for(lid))))
+        Ok(Some(Value::Int(ss_get(ctx, this).so_timeout)))
     });
 
     // setReuseAddress / getReuseAddress: the synthetic `ServerSocket` has no
@@ -4981,40 +5145,14 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     });
     r.register(ss, "close", "()V", re2_server_socket_close);
 
-    r.register(ss, "isBound", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let lid = ss_get(ctx, this).listener_id;
-        Ok(Some(Value::Int(if lid >= 0 { 1 } else { 0 })))
-    });
-    r.register(ss, "isClosed", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(ss_get(ctx, this).closed)))
-    });
+    r.register(ss, "isBound", "()Z", re2_server_socket_is_bound);
+    r.register(ss, "isClosed", "()Z", re2_server_socket_is_closed);
 
     r.register(
         ss,
         "getLocalSocketAddress",
         "()Ljava/net/SocketAddress;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let lid = ss_get(ctx, this).listener_id;
-            if lid < 0 {
-                return Ok(Some(Value::Object(None)));
-            }
-            let local = {
-                let reg = s2_registry().lock();
-                reg.listeners
-                    .get(&lid)
-                    .and_then(|l| l.local_addr().ok())
-                    .map(|a| (a.ip().to_string(), a.port() as i32))
-            };
-            match local {
-                Some((ip, port)) => Ok(Some(Value::Object(Some(
-                    alloc_inet_socket_address_resolved(ctx, &ip, &ip, port),
-                )))),
-                None => Ok(Some(Value::Object(None))),
-            }
-        },
+        re2_server_socket_local_address,
     );
 
     // `getInetAddress()` — the bound local address. This was previously
@@ -5028,16 +5166,30 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // synthetic surfaces coexist; see `reference_server_socket_gap`) — and fall
     // back to the wildcard address so the caller gets a usable, non-null
     // InetAddress (matching `new ServerSocket(port).getInetAddress()` == 0.0.0.0
-    // on HotSpot) instead of an NPE.
+    // on HotSpot) instead of an NPE. That fallback applies only to a socket
+    // that IS bound: on an unbound one the real method returns null, and
+    // handing back 0.0.0.0 there is a different lie.
     r.register(
         ss,
         "getInetAddress",
         "()Ljava/net/InetAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let mut lid = ss_get(ctx, this).listener_id;
-            if lid < 0 {
+            let side = ss_get(ctx, this);
+            let mut lid = side.listener_id;
+            // Only read the object field for a receiver this surface has never
+            // touched (a phase-53-constructed ServerSocket, which really does
+            // keep its listener id in slot 3). On a real-layout ServerSocket
+            // that slot is some unrelated JDK field, so reading it
+            // unconditionally invented a non-negative "listener id" for a
+            // freshly constructed socket — and `getInetAddress()` then answered
+            // 0.0.0.0 where the JDK returns null. This is the exact layout
+            // collision the side table exists to avoid.
+            if lid < 0 && !ss_tracked(ctx, this) {
                 lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
+            }
+            if side.bound == 0 && lid < 0 {
+                return Ok(Some(Value::Object(None)));
             }
             let ip = if lid >= 0 {
                 let reg = s2_registry().lock();
@@ -5048,31 +5200,83 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             } else {
                 None
             };
-            let ip = ip.unwrap_or_else(|| "0.0.0.0".to_string());
+            // Closed-but-once-bound: the listener is gone, but the address it
+            // held is retained and is still what the real method reports.
+            let ip = ip
+                .or_else(|| (!side.host.is_empty()).then(|| side.host.clone()))
+                .unwrap_or_else(|| "0.0.0.0".to_string());
             let ia = alloc_inet_address(ctx, &ip, &ip);
             Ok(Some(Value::Object(Some(ia))))
         },
     );
 }
 
-fn re2_accept_timeouts() -> &'static Mutex<HashMap<i32, i32>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<i32, i32>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+// ---------------------------------------------------------------------------
+// Plain-`ServerSocket` accessors.
+//
+// Named (not inline closures) because each is registered here AND installed in
+// `cratonvm_native_api::plain_server_socket` for native-io's winning
+// `ss_wrapper_*` natives to delegate to — one implementation, one set of
+// answers, whichever crate's registration wins.
+// ---------------------------------------------------------------------------
+
+/// `getLocalPort()` — the bound port, retained after `close()`; `-1` when the
+/// socket was never bound (`ServerSocket.getLocalPort`: "returns -1 if the
+/// socket is not bound yet").
+fn re2_server_socket_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let side = ss_get(ctx, this);
+    Ok(Some(Value::Int(if side.bound == 0 {
+        -1
+    } else {
+        side.port
+    })))
 }
-fn re2_set_accept_timeout(lid: i32, ms: i32) {
-    if lid < 0 {
-        return;
+
+/// `getLocalSocketAddress()` — `null` only while unbound. A closed socket still
+/// reports the address it was bound to, as on HotSpot.
+fn re2_server_socket_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let side = ss_get(ctx, this);
+    if side.bound == 0 || side.port <= 0 {
+        return Ok(Some(Value::Object(None)));
     }
-    re2_accept_timeouts().lock().insert(lid, ms);
+    // Prefer the live listener (authoritative), then the address recorded at
+    // bind time (the only source once the listener is gone).
+    let live = (side.listener_id >= 0)
+        .then(|| {
+            let reg = s2_registry().lock();
+            reg.listeners
+                .get(&side.listener_id)
+                .and_then(|l| l.local_addr().ok())
+                .map(|a| (a.ip().to_string(), a.port() as i32))
+        })
+        .flatten();
+    let (ip, port) = live.unwrap_or_else(|| {
+        let host = if side.host.is_empty() {
+            "0.0.0.0".to_string()
+        } else {
+            side.host.clone()
+        };
+        (host, side.port)
+    });
+    Ok(Some(Value::Object(Some(alloc_inet_socket_address_resolved(
+        ctx, &ip, &ip, port,
+    )))))
 }
-fn re2_accept_timeout_for(lid: i32) -> i32 {
-    if lid < 0 {
-        return 0;
-    }
-    *re2_accept_timeouts().lock().get(&lid).unwrap_or(&0)
+
+/// `isBound()` — true once a bind has succeeded, and true forever after,
+/// including past `close()` (JDK: "will continue to return true after the
+/// socket is closed").
+fn re2_server_socket_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Int(ss_get(ctx, this).bound)))
 }
-fn re2_clear_accept_timeout(lid: i32) {
-    re2_accept_timeouts().lock().remove(&lid);
+
+/// `isClosed()`.
+fn re2_server_socket_is_closed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Int(ss_get(ctx, this).closed)))
 }
 
 // ===========================================================================
