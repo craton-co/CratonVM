@@ -290,7 +290,7 @@ fn resolve_class_id_in_generic_scope(
     if let Some(declaring_class) = declaring_class {
         let loader_id = ctx.loader_id_of_class(declaring_class);
         let loader =
-            crate::classloader::defining_loader_for(declaring_class.as_u32()).or_else(|| {
+            crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class.as_u32()).or_else(|| {
                 (loader_id >= 3)
                     .then(|| crate::classloader::loader_object_for_namespace_id(loader_id as u32))
                     .flatten()

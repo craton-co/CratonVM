@@ -2282,6 +2282,7 @@ fn process_references_after_gc(
             pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
         };
         let dead_class_hints = cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            shared.vm_identity,
             &is_marked,
             pointer_map,
         );
@@ -5400,7 +5401,11 @@ fn g1_remark_process_references(
     crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
     let no_moves = std::collections::HashMap::new();
     let dead_class_hints =
-        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(is_marked, &no_moves);
+        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            shared.vm_identity,
+            is_marked,
+            &no_moves,
+        );
     let unloaded = crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
     if unloaded.classes_unloaded != 0 {
         tracing::debug!(

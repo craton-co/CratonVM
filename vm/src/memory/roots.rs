@@ -136,13 +136,13 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // JitEntryGuard so cross-thread STW scans see them too.
     for frame in &thread.frames {
         if let Some(loader) =
-            cratonvm_native_builtins::classloader::defining_loader_for(frame.class_id.as_u32())
+            cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, frame.class_id.as_u32())
         {
             roots.push(loader);
         }
     }
     for class_id in cratonvm_types::jit_activation::active_class_ids() {
-        if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(class_id) {
+        if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id) {
             roots.push(loader);
         }
     }

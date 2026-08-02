@@ -3675,7 +3675,7 @@ fn same_loader_already_defined_mirror(
     }
     if loader_id != 0 {
         if let Some(class_id) = ctx.class_id_defined_by_loader_exact(internal_name, loader_id) {
-            crate::classloader::register_defining_loader(class_id.as_u32(), loader_obj);
+            crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), loader_obj);
             return Some(ctx.get_class_mirror(class_id));
         }
     }
@@ -3775,7 +3775,7 @@ pub(crate) fn native_classloader_define_class1(
             // The JDK's Class.getClassLoader bytecode reads this instance
             // field directly. Keep it aligned with the VM's loader registry.
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), *loader_obj);
                 ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
@@ -3859,7 +3859,7 @@ pub(crate) fn native_classloader_define_class2(
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), *loader_obj);
                 ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))
@@ -3985,7 +3985,7 @@ pub(crate) fn native_classloader_define_class0(
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), *loader_obj);
                 ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
             Ok(Some(Value::Object(Some(mirror))))

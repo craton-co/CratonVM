@@ -54,7 +54,10 @@ pub fn unload_dead_class_metadata(
             .collect()
     };
     if dead_ids.is_empty() {
-        cratonvm_native_builtins::classloader::forget_unloaded_classes(dead_class_hints);
+        cratonvm_native_builtins::classloader::forget_unloaded_classes(
+            shared.vm_identity,
+            dead_class_hints,
+        );
         return ClassMetadataUnloadResult::default();
     }
 
@@ -63,7 +66,10 @@ pub fn unload_dead_class_metadata(
         cm.unload_user_classes(&dead_ids)
     };
     if unloaded.is_empty() {
-        cratonvm_native_builtins::classloader::forget_unloaded_classes(dead_class_hints);
+        cratonvm_native_builtins::classloader::forget_unloaded_classes(
+            shared.vm_identity,
+            dead_class_hints,
+        );
         return ClassMetadataUnloadResult::default();
     }
 
@@ -194,7 +200,7 @@ pub fn unload_dead_class_metadata(
                 .any(|class| class.name.as_ref() == class_name.as_ref())
         });
 
-    cratonvm_native_builtins::classloader::forget_unloaded_classes(&raw_ids);
+    cratonvm_native_builtins::classloader::forget_unloaded_classes(shared.vm_identity, &raw_ids);
     shared
         .debug
         .diagnostic_counters
@@ -264,7 +270,7 @@ pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &HashMap<u
     let mut entries: Vec<(usize, usize)> = Vec::new();
     for (&class_id, mirror_ref) in class_mirrors.iter() {
         if let Some(loader) =
-            cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32())
+            cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id.as_u32())
         {
             let old_mirror_addr = mirror_ref.as_ptr() as usize;
             let mirror_addr = pointer_map

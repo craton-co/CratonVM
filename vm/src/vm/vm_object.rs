@@ -1083,7 +1083,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // to the app loader and same-named class selection crosses loaders.
     if let (Some(idx), Some(loader)) = (
         slots.class_loader,
-        cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32()),
+        cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id.as_u32()),
     ) {
         shared
             .mem
@@ -1113,7 +1113,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // scanning). Built-in-loader classes need no entry: their mirrors stay
     // unconditionally rooted directly.
     if let Some(loader) =
-        cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32())
+        cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id.as_u32())
     {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
             let name = shared

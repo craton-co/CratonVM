@@ -16155,7 +16155,7 @@ pub fn register_essential_natives_with_shims(
         |ctx, _args| {
             let loader =
                 crate::classloader::latest_user_defined_loader_class(ctx).map(|class_id| {
-                    crate::classloader::defining_loader_for(class_id.as_u32())
+                    crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
                         .unwrap_or_else(|| crate::classloader::get_or_create_app_loader(ctx))
                 });
             Ok(Some(Value::Object(loader)))
@@ -24507,7 +24507,7 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         if element_type == cratonvm_types::ArrayElementType::Reference
             && ctx.loader_id_of_class(class_id) >= 3
         {
-            if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
+            if let Some(loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32()) {
                 let loader_pin = ctx.pin_native_root(loader);
                 let mirror = crate::lang_class::synthetic_class_mirror(ctx, &array_class_name);
                 let loader = ctx.read_native_pin(loader_pin, loader);
@@ -27246,7 +27246,7 @@ fn native_classloader_find_bootstrap_class(
         Ok(Some(Value::Object(Some(mirror)))) => {
             if ctx
                 .class_id_from_mirror(mirror)
-                .and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()))
+                .and_then(|cid| crate::classloader::defining_loader_for(ctx.vm_identity(), cid.as_u32()))
                 .is_some()
             {
                 return Ok(Some(Value::Object(None)));

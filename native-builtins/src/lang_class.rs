@@ -2200,7 +2200,7 @@ pub(crate) fn native_class_for_name(
                     if let Value::Object(Some(mirror_ref)) = mirror {
                         let cid = ctx.class_id_from_mirror(mirror_ref);
                         let defining_loader = cid.and_then(|id| {
-                            crate::classloader::defining_loader_for(id.as_u32())
+                            crate::classloader::defining_loader_for(ctx.vm_identity(), id.as_u32())
                         });
                         eprintln!(
                             "[S111-DBG] loadClass({}) mirror={:?} cid={:?} defining_loader={:?}",
@@ -3550,7 +3550,7 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
     declaring_class_id: ClassId,
 ) -> cratonvm_types::ObjectRef {
     let loader_faithful = crate::classloader::loader_aware_resolution()
-        || crate::classloader::defining_loader_for(declaring_class_id.as_u32()).is_some_and(
+        || crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32()).is_some_and(
             |loader| crate::classloader::url_classloader_isolated_from_app(ctx, loader),
         );
     // Arrays inherit the defining loader of their reference component
@@ -3576,7 +3576,7 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
                     .is_some()
             {
                 if let Some(loader) =
-                    crate::classloader::defining_loader_for(declaring_class_id.as_u32())
+                    crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32())
                 {
                     let loader_pin = ctx.pin_native_root(loader);
                     let mirror = synthetic_class_mirror(ctx, desc);
@@ -3605,7 +3605,7 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
             // it for an exact already-loaded lookup first, then initiate the
             // descriptor through that loader if necessary.
             if let Some(loader) =
-                crate::classloader::defining_loader_for(declaring_class_id.as_u32())
+                crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32())
             {
                 if let Some(mirror) =
                     crate::classloader::find_loaded_class_for_loader(ctx, loader, inner)
@@ -8153,7 +8153,7 @@ fn link_isolated_method_signatures(
     declaring_class_id: ClassId,
     methods: &[&MethodMetadata],
 ) -> Result<(), MethodCallFailed> {
-    let Some(loader) = crate::classloader::defining_loader_for(declaring_class_id.as_u32()) else {
+    let Some(loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), declaring_class_id.as_u32()) else {
         return Ok(());
     };
     if !crate::classloader::url_classloader_isolated_from_app(ctx, loader) {
@@ -10784,10 +10784,10 @@ pub fn proxy_last_interfaces(vm_identity: usize) -> Option<ObjectRef> {
 /// in the same namespace retains the authoritative loader identity.
 fn annotation_container_loader(ctx: &mut dyn NativeContext, holder_class_id: ClassId) -> Option<ObjectRef> {
     let holder_name = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
-    crate::classloader::defining_loader_for(holder_class_id.as_u32()).or_else(|| {
+    crate::classloader::defining_loader_for(ctx.vm_identity(), holder_class_id.as_u32()).or_else(|| {
         holder_name.starts_with("org/ehcache/xml/model/").then(|| {
             ctx.class_id_by_name_near("org/ehcache/xml/model/ConfigType", holder_class_id)
-                .and_then(|sibling| crate::classloader::defining_loader_for(sibling.as_u32()))
+                .and_then(|sibling| crate::classloader::defining_loader_for(ctx.vm_identity(), sibling.as_u32()))
                 .or_else(|| {
                     let id = ctx.loader_id_of_class(holder_class_id);
                     (id >= 3)
@@ -11018,7 +11018,7 @@ fn wrap_annotation_in_real_proxy(
     if let (Some(loader_obj), Some(pin)) = (annotation_loader, annotation_loader_pin) {
         let loader_cur = ctx.read_native_pin(pin, loader_obj);
         if crate::classloader::is_user_defined_loader(ctx, loader_cur) {
-            crate::classloader::register_defining_loader(proxy_cid.as_u32(), loader_cur);
+            crate::classloader::register_defining_loader(ctx.vm_identity(), proxy_cid.as_u32(), loader_cur);
         }
     }
     let n = ctx.class_num_total_fields(proxy_cid).max(3);
@@ -11843,7 +11843,7 @@ fn create_annotation_proxy(
         let (value_container_class_id, value_container_loader) = match default_owner {
             Some(owner) => (
                 Some(*owner),
-                crate::classloader::defining_loader_for(owner.as_u32()),
+                crate::classloader::defining_loader_for(ctx.vm_identity(), owner.as_u32()),
             ),
             None => (
                 container_class_id,
@@ -16687,7 +16687,7 @@ pub(crate) fn native_class_get_class_loader(
     // fallback below. Without this, ByteBuddy's `ByteArrayClassLoader.load`
     // sanity check (`Class.forName(name, false, cl).getClassLoader() == cl`)
     // fails with "Class already loaded" and Hibernate's proxy generation breaks.
-    if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
+    if let Some(loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32()) {
         // This reverse relation is written only by successful defineClass paths
         // and reconciled across GC; it is the authoritative loader identity.
         return Ok(Some(Value::Object(Some(loader))));
@@ -16944,7 +16944,7 @@ fn declaring_class_loader_aware(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
 ) -> Option<cratonvm_types::ClassId> {
-    let loader_obj = crate::classloader::defining_loader_for(class_id.as_u32())?;
+    let loader_obj = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())?;
 
     // Cheap short-circuit FIRST: if the VM's existing global-lookup answer
     // already belongs to the SAME defining loader as `class_id`, it's
@@ -16954,7 +16954,7 @@ fn declaring_class_loader_aware(
     // same-named-outer-class collision) and only pays for loader-driven
     // resolution when there's a genuine mismatch worth fixing.
     if let Some(existing) = ctx.declaring_class(class_id) {
-        if let Some(existing_loader) = crate::classloader::defining_loader_for(existing.as_u32()) {
+        if let Some(existing_loader) = crate::classloader::defining_loader_for(ctx.vm_identity(), existing.as_u32()) {
             if existing_loader.as_ptr() == loader_obj.as_ptr() {
                 return None;
             }
@@ -17277,7 +17277,7 @@ pub(crate) fn native_class_get_declared_classes(
                 // hits: `getDeclaredClasses()` is called on a freshly
                 // isolated outer `Class` whose defining loader was never
                 // separately registered.
-                let loader_obj = crate::classloader::defining_loader_for(class_id.as_u32())
+                let loader_obj = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
                     .or_else(|| {
                         let ns_id = ctx.loader_id_of_class(class_id);
                         (ns_id >= 3)

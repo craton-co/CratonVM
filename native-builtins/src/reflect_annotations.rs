@@ -2951,7 +2951,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     if let Some(cid) = generated_cid {
         if let Some(Value::Object(Some(loader_obj))) = args.first() {
             if crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
-                crate::classloader::register_defining_loader(cid.as_u32(), *loader_obj);
+                crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), *loader_obj);
             }
         }
     }
@@ -3028,7 +3028,7 @@ fn native_proxy_get_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             // loaders are recorded; built-in/null loaders keep the fallback.
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
                 if crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
-                    crate::classloader::register_defining_loader(cid.as_u32(), *loader_obj);
+                    crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), *loader_obj);
                 }
             }
             let mirror = ctx.get_class_mirror(cid);

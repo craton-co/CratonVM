@@ -176,6 +176,14 @@ pub fn peek_app_loader(vm_identity: usize) -> Option<ObjectRef> {
 /// inherit a dead `ClassLoader`.
 pub fn forget_vm_loader_singletons(vm_identity: usize) {
     with_loader_singletons(|table| table.remove(&vm_identity));
+    defining_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(vm, _), _| *vm != vm_identity);
+    orphaned_defining_loader_classes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(vm, _)| *vm != vm_identity);
 }
 
 /// Reset the process-wide (not yet VM-scoped) classloader side-tables.
@@ -252,10 +260,11 @@ pub fn gc_scan_loader_singleton_roots(vm_identity: usize, out: &mut Vec<ObjectRe
     // entry is pruned post-GC by `gc_reconcile_defining_loaders`. App/platform
     // singletons stay rooted above, so built-in loaders are unaffected.
     if !loader_unload_enabled() {
-        for o in defining_loader_store()
+        for (_, o) in defining_loader_store()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .values()
+            .iter()
+            .filter(|((vm, _), _)| *vm == vm_identity)
         {
             out.push(*o);
         }
@@ -319,6 +328,7 @@ pub fn gc_update_loader_singleton_refs(
 /// GC-rooted, hence always marked, so nothing is pruned and entries are merely
 /// remapped — preserving the legacy behavior.
 pub fn gc_reconcile_defining_loaders(
+    vm_identity: usize,
     is_marked: &dyn Fn(usize) -> bool,
     pointer_map: &std::collections::HashMap<usize, usize>,
 ) -> Vec<u32> {
@@ -327,7 +337,13 @@ pub fn gc_reconcile_defining_loaders(
     let mut map = defining_loader_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    map.retain(|_class_id, obj_ref| {
+    map.retain(|&(_vm, _class_id), obj_ref| {
+        if _vm != vm_identity {
+            // Another VM's row: not ours to mark, remap or prune. Its own
+            // collection will reconcile it, and this VM's relocation map says
+            // nothing about an address in that VM's heap.
+            return true;
+        }
         let old_addr = obj_ref.as_ptr() as usize;
         let alive = is_marked(old_addr);
         if dbg {
@@ -347,8 +363,8 @@ pub fn gc_reconcile_defining_loaders(
             orphaned_defining_loader_classes()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(*_class_id);
-            dead_class_ids.push(*_class_id);
+                .insert((_vm, _class_id));
+            dead_class_ids.push(_class_id);
             return false;
         }
         // Survivor: remap if it relocated (moving collection).
@@ -363,7 +379,8 @@ pub fn gc_reconcile_defining_loaders(
     // marks loaders at their current addresses and drops collected ones.
     let pins: Vec<(u32, usize)> = map
         .iter()
-        .map(|(&cid, obj_ref)| (cid, obj_ref.as_ptr() as usize))
+        .filter(|((vm, _), _)| *vm == vm_identity)
+        .map(|(&(_vm, cid), obj_ref)| (cid, obj_ref.as_ptr() as usize))
         .collect();
     cratonvm_types::loader_pin::replace_loader_pins(&pins);
 
@@ -393,7 +410,7 @@ pub fn gc_reconcile_defining_loaders(
 /// Drop temporary fail-closed orphan markers after the VM has tombstoned the
 /// corresponding class metadata. Keeping them after a completed unload would
 /// turn the safety set itself into an unbounded per-loader metadata leak.
-pub fn forget_unloaded_classes(class_ids: &[u32]) {
+pub fn forget_unloaded_classes(vm_identity: usize, class_ids: &[u32]) {
     if class_ids.is_empty() {
         return;
     }
@@ -401,7 +418,7 @@ pub fn forget_unloaded_classes(class_ids: &[u32]) {
     orphaned_defining_loader_classes()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|id| !ids.contains(id));
+        .retain(|(vm, id)| *vm != vm_identity || !ids.contains(id));
     for id in class_ids {
         cratonvm_types::loader_pin::remove_loader_pin(*id);
     }
@@ -469,8 +486,18 @@ fn class_data_store() -> &'static Mutex<std::collections::HashMap<ObjectRef, Val
 // only here, so it MUST be GC-rooted + remapped (see
 // `gc_scan_loader_singleton_roots` / `gc_update_loader_singleton_refs`).
 // ---------------------------------------------------------------------------
-fn defining_loader_store() -> &'static Mutex<std::collections::HashMap<u32, ObjectRef>> {
-    static INSTANCE: OnceLock<Mutex<std::collections::HashMap<u32, ObjectRef>>> = OnceLock::new();
+///
+/// Keyed by `(vm_identity, class_id)`. `ClassId`s are minted per VM from zero,
+/// so an unqualified key made VM B's class 42 report VM A's `ClassLoader`
+/// object — a live reference into a foreign heap, handed to
+/// `annotation_container_loader` and to the interpreter's loader-initiated
+/// resolution. It surfaced as an intermittent
+/// `ClassCastException: ? cannot be cast to …` (that `?` is
+/// `class_name_of_id` failing on a class id this VM has never heard of) across
+/// the proxy/annotation corpus tests, in a parallel run only.
+fn defining_loader_store() -> &'static Mutex<std::collections::HashMap<(usize, u32), ObjectRef>> {
+    static INSTANCE: OnceLock<Mutex<std::collections::HashMap<(usize, u32), ObjectRef>>> =
+        OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -484,18 +511,18 @@ fn defining_loader_store() -> &'static Mutex<std::collections::HashMap<u32, Obje
 /// Entries are never removed (matches real unloading: once a defining loader
 /// is gone, the class is gone from every OTHER loader's perspective forever;
 /// a new loader wanting the same simple name must define its own copy).
-fn orphaned_defining_loader_classes() -> &'static Mutex<std::collections::HashSet<u32>> {
-    static INSTANCE: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+fn orphaned_defining_loader_classes() -> &'static Mutex<std::collections::HashSet<(usize, u32)>> {
+    static INSTANCE: OnceLock<Mutex<std::collections::HashSet<(usize, u32)>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Whether `class_id`'s defining loader has been confirmed collected. See
 /// [`orphaned_defining_loader_classes`].
-pub(crate) fn is_defining_loader_orphaned(class_id: u32) -> bool {
+pub(crate) fn is_defining_loader_orphaned(vm: usize, class_id: u32) -> bool {
     orphaned_defining_loader_classes()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(&class_id)
+        .contains(&(vm, class_id))
 }
 
 /// Perf (silent-hang-no-signature-cluster throughput residual, 2026-07-13):
@@ -521,11 +548,11 @@ static ANY_DEFINING_LOADER_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// Record the user-defined `ClassLoader` object that defined `class_id`, so
 /// `Class.getClassLoader()` returns the exact instance instead of the app-loader
 /// fallback.
-pub fn register_defining_loader(class_id: u32, loader: ObjectRef) {
+pub fn register_defining_loader(vm: usize, class_id: u32, loader: ObjectRef) {
     defining_loader_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(class_id, loader);
+        .insert((vm, class_id), loader);
     ANY_DEFINING_LOADER_REGISTERED.store(true, Ordering::Release);
     // HIB-CV-24: mirror into the loader-pin registry the GC marker consults so a
     // live instance of this class keeps its defining loader alive (the
@@ -534,14 +561,14 @@ pub fn register_defining_loader(class_id: u32, loader: ObjectRef) {
 }
 
 /// Look up the user-defined `ClassLoader` object that defined `class_id`.
-pub fn defining_loader_for(class_id: u32) -> Option<ObjectRef> {
+pub fn defining_loader_for(vm: usize, class_id: u32) -> Option<ObjectRef> {
     if !ANY_DEFINING_LOADER_REGISTERED.load(Ordering::Acquire) {
         return None;
     }
     defining_loader_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&class_id)
+        .get(&(vm, class_id))
         .copied()
 }
 
@@ -1703,7 +1730,7 @@ pub(crate) fn proxy_hidden_from(
     if !is_generated_proxy_name(internal) {
         return false;
     }
-    match defining_loader_for(cid.as_u32()) {
+    match defining_loader_for(ctx.vm_identity(), cid.as_u32()) {
         Some(def) => !loader_can_see_defining(ctx, this, def),
         None => false,
     }
@@ -1799,7 +1826,7 @@ fn find_loaded_class_for_loader_inner(
             if ctx.loader_id_of_class(cid) > 2 {
                 return None;
             }
-            if let Some(def) = defining_loader_for(cid.as_u32()) {
+            if let Some(def) = defining_loader_for(ctx.vm_identity(), cid.as_u32()) {
                 if !loader_can_see_defining(ctx, this, def) {
                     return None;
                 }
@@ -1831,11 +1858,14 @@ fn find_loaded_class_for_loader_inner(
     // exact defining loader object per ClassId; consult that authoritative
     // relation so a parent fork loader can recover its own already-defined
     // class before delegating to a global same-named copy.
+    let vm = ctx.vm_identity();
     let defined_here: Vec<u32> = defining_loader_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .filter_map(|(&cid, loader)| (loader.as_ptr() == this.as_ptr()).then_some(cid))
+        .filter_map(|(&(row_vm, cid), loader)| {
+            (row_vm == vm && loader.as_ptr() == this.as_ptr()).then_some(cid)
+        })
         .collect();
     for cid in defined_here {
         let cid = cratonvm_types::ClassId::new(cid);
@@ -1845,7 +1875,7 @@ fn find_loaded_class_for_loader_inner(
     }
     // 2. A globally-known class THIS loader is the defining loader of.
     if let Some(cid) = ctx.class_id_by_name(internal_name) {
-        if let Some(def) = defining_loader_for(cid.as_u32()) {
+        if let Some(def) = defining_loader_for(ctx.vm_identity(), cid.as_u32()) {
             if def.as_ptr() == this.as_ptr() {
                 return Some(ctx.get_class_mirror(cid));
             }
@@ -2019,10 +2049,10 @@ pub(crate) fn cid_visible_mirror(
     // every OTHER loader's perspective (real unloading semantics) -- checked
     // BEFORE the live-registry lookup so a pruned entry never falls through
     // to "no restriction, visible to all" (see `is_defining_loader_orphaned`).
-    if is_defining_loader_orphaned(cid.as_u32()) {
+    if is_defining_loader_orphaned(ctx.vm_identity(), cid.as_u32()) {
         return None;
     }
-    if let Some(def) = defining_loader_for(cid.as_u32()) {
+    if let Some(def) = defining_loader_for(ctx.vm_identity(), cid.as_u32()) {
         if !loader_can_see_defining(ctx, this, def) {
             return None;
         }
@@ -2861,7 +2891,7 @@ pub(crate) fn cl_define_class_basic(
             // custom loader defines (e.g. Spring's OverridingClassLoader
             // redefining an eligible class under itself) would report the wrong
             // loader and classloader-isolation patterns silently break.
-            crate::classloader::register_defining_loader(cid.as_u32(), this);
+            crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), this);
             let count = match ctx.get_field(this, CL_CLASSES_LOADED) {
                 Value::Int(n) => n,
                 _ => 0,
@@ -3294,7 +3324,7 @@ pub(crate) fn define_class_via_full(
             if loader_aware_resolution() {
                 if let Value::Object(Some(loader_obj)) = loader {
                     if is_user_defined_loader(ctx, loader_obj) {
-                        register_defining_loader(cid.as_u32(), loader_obj);
+                        register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader_obj);
                     }
                 }
             }
@@ -6579,7 +6609,7 @@ pub(crate) fn ucl_try_define_local_class(
     let result = match define_result {
         Ok(Ok(cid)) => {
             let loader_live = ctx.read_native_pin(loader_pin, loader);
-            register_defining_loader(cid.as_u32(), loader_live);
+            register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader_live);
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
         }
@@ -9777,7 +9807,7 @@ mod classloader_tests {
         };
         let cid = ctx.ensure_class_initialized("MyMessenger").unwrap();
         ctx.set_loader_id_override(cid, 2);
-        register_defining_loader(cid.as_u32(), child_loader);
+        register_defining_loader(ctx.vm_identity(), cid.as_u32(), child_loader);
 
         assert!(
             find_loaded_class_for_loader(&mut ctx, app_loader, "MyMessenger").is_none(),

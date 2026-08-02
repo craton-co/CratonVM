@@ -207,7 +207,7 @@ fn inherit_lookup_loader(ctx: &mut dyn NativeContext, this_lookup: ObjectRef) ->
     // `PersistentAttributeInterceptable`). Gated + only fires for a user loader
     // that has actually been assigned a namespace → byte-identical gate-off.
     if crate::classloader::loader_aware_resolution() {
-        if let Some(loader_obj) = crate::classloader::defining_loader_for(cid.as_u32()) {
+        if let Some(loader_obj) = crate::classloader::defining_loader_for(ctx.vm_identity(), cid.as_u32()) {
             if let Some(ns) = crate::classloader::peek_loader_namespace_id(ctx, loader_obj) {
                 return ns;
             }
@@ -347,9 +347,9 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                 {
                     if let Some(lookup_cid) = crate::lang_class::mirror_class_id(ctx, mirror) {
                         if let Some(loader) =
-                            crate::classloader::defining_loader_for(lookup_cid.as_u32())
+                            crate::classloader::defining_loader_for(ctx.vm_identity(), lookup_cid.as_u32())
                         {
-                            crate::classloader::register_defining_loader(cid.as_u32(), loader);
+                            crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader);
                         }
                     }
                 }

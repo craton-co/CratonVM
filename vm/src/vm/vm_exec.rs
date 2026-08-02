@@ -5237,7 +5237,7 @@ impl<'a> NativeContextImpl<'a> {
             .collect();
         let dbg = crate::runtime::env_cache::dbg_stub_loader();
         for cid in frame_classes {
-            if cratonvm_native_builtins::classloader::defining_loader_for(cid.as_u32()).is_none() {
+            if cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, cid.as_u32()).is_none() {
                 continue;
             }
             let driven = crate::runtime::interpreter::drive_defining_loader_load(
