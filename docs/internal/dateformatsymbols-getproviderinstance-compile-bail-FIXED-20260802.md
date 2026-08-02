@@ -125,9 +125,31 @@ five reported compile failures to three. Fixed by this change:
 `DateFormatSymbols.initializeData` (a fourth, which the original list did
 not name).
 
+Throughput, three runs each, same binary pair, same Azure host at load
+average ~22 on 16 cores — a ratio, not an absolute, and not a number to
+quote anywhere else (see the standing caveat about wall-clock numbers on this shared host):
+
+| | ns/op |
+|---|---|
+| before (`ldc <Class>` uncompilable) | 48 156 / 48 561 / 45 673 |
+| after | 37 101 / 34 148 / 32 990 |
+| HotSpot control, same host | 468 / 749 / 328 |
+
+So ~1.4x, and still ~70x off HotSpot. That residual gap is the
+generic-dispatch cost named at the bottom of this doc, not a compile
+failure: nothing on this probe's path is uncompiled any more except the
+three RBC.6 refusals below.
+
 Suites: `cargo test -p cratonvm-jit -p cratonvm-jit-api` green (1806 + the
 integration fixtures); `cargo test -p cratonvm-vm --lib` green in both
-feature configurations (2378/0 plain, synthetic-jdk clean).
+feature configurations (2378/0 plain, 3894/0 synthetic-jdk); the JIT
+integration targets `jit_interp_differential`,
+`jit_local_exception_handler_tests`, `jit_arity_5plus`,
+`jit_category2_params`, `jit_null_receiver_npe`,
+`jit_collection_ctor_identity`, `differential`, `intrinsic_diff` and
+`jit_cold_new_cp` (which parses the stats report this change reformats) all
+green. `LdcClassProbe` also passes under `CRATONVM_DISABLE_JIT=1`, so the
+compiled and interpreted answers agree.
 
 ## What is left on this path, and who owns it
 
