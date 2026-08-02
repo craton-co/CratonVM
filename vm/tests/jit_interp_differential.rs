@@ -40,14 +40,18 @@
 //! | mode        | env                                                                |
 //! |-------------|--------------------------------------------------------------------|
 //! | interpreter | `CRATONVM_DISABLE_JIT=1`                                            |
-//! | jit         | `CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/`, `CRATONVM_JIT_THRESHOLD=1` |
+//! | jit         | `CRATONVM_JIT_THRESHOLD=1`                                          |
 //!
-//! The JIT mode lifts the blanket `cratonvm/*` skip-list ban (see
-//! `vm/src/jit/skip_list.rs`, the `package_allowed("cratonvm/", ...)` gate) and
-//! lowers the warmup threshold to 1 so the kernels in `JitDifferential.java`
-//! are compiled before their results are recorded — the fixture warms every
-//! kernel in a loop *before* replaying the edge-case matrix for exactly this
-//! reason.
+//! The JIT mode lowers the warmup threshold to 1 so the kernels in
+//! `JitDifferential.java` are compiled before their results are recorded — the
+//! fixture warms every kernel in a loop *before* replaying the edge-case matrix
+//! for exactly this reason.
+//!
+//! This mode also used to pass `CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/` to lift
+//! a blanket `cratonvm/*` skip-list ban. `d1979bec5` deleted the static ban
+//! machinery outright, taking the `package_allowed` gate and the variable's
+//! only reader with it, so there is no ban to lift and the variable reached
+//! nothing.
 //!
 //! ## Optional HotSpot triangulation
 //!
@@ -155,8 +159,7 @@ enum Mode {
     /// Pure interpreter — `CRATONVM_DISABLE_JIT=1`. This is the oracle.
     Interpreter,
     /// JIT enabled and forced to compile the fixture's `cratonvm/*` kernels
-    /// eagerly (`CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/`,
-    /// `CRATONVM_JIT_THRESHOLD=1`).
+    /// eagerly (`CRATONVM_JIT_THRESHOLD=1`).
     Jit,
 }
 
@@ -175,13 +178,16 @@ impl Mode {
         match self {
             Mode::Interpreter => {
                 cmd.env("CRATONVM_DISABLE_JIT", "1");
-                cmd.env_remove("CRATONVM_JIT_ALLOW_PACKAGES");
                 cmd.env_remove("CRATONVM_JIT_THRESHOLD");
             }
             Mode::Jit => {
                 cmd.env_remove("CRATONVM_DISABLE_JIT");
-                // Lift the blanket `cratonvm/*` JIT ban for the fixture.
-                cmd.env("CRATONVM_JIT_ALLOW_PACKAGES", "cratonvm/");
+                // The `CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/` line that stood
+                // here lifted the blanket `cratonvm/*` JIT ban. `d1979bec5`
+                // deleted the static ban machinery along with its last reader,
+                // so there is no blanket left to lift and the variable had
+                // become a no-op dressed as a precondition. Same removal as in
+                // `jit_collection_ctor_identity.rs`.
                 // Compile as soon as a method is warm so the replayed kernels
                 // run JIT'd, not interpreted.
                 cmd.env("CRATONVM_JIT_THRESHOLD", "1");

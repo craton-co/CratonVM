@@ -1,244 +1,320 @@
-# `MVStore.readPageFromCache` — `java.lang.Object cannot be cast to Page` under sustained non-moving young sweeps
+# `MVStore` cache read returns `java.lang.Object` — an OLD-GEN block reclaimed while still referenced
+
+> The filename still says `nonmoving-sweep` because code comments and a sibling
+> report point at it. The name is wrong; see *Status*.
 
 ## Status
-**OPEN — not fixed.** Pre-existing silent heap corruption. See
-*Session 2* below: the top suspicion is refuted and the repro did NOT
-reproduce in 26 runs on 2026-08-01, including on the exact commit that
-failed 8/20 the day before. Not caused by
-— and not fixed by — the old-gen coalescing change committed alongside this
-doc (`7303483521`); measured explicitly, see *Not the coalescer* below.
+**OPEN — re-diagnosed, not fixed.** Two things are settled that were not
+before, and one candidate fix was tested and ruled out.
 
-This is the residual recorded as "one unexplained repeat failure" in
-[`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md).
-It now has a repro that hits in **12–40 minutes at roughly a 40 % rate**,
-instead of once in nine hours.
+* **The generation is settled.** The reclaimed object is in the **old
+  generation**, not a non-moving-young-sweep span. This doc's title and its
+  entire "root-coverage gap in the young sweep" framing came from one
+  unchecked inference off the all-zero header; it is wrong. Measured at the
+  moment of failure, with no flag set in advance.
+* **The symptom is wider than this doc says.** `java.lang.Object cannot be
+  cast to X` is only the face a freed block wears *while it is still on the
+  free list*. Once the allocator re-serves it, the same stale reference reads a
+  perfectly valid object of an unrelated class. Both faces were caught in one
+  A/B window (below). Some fraction of this family has never looked like a GC
+  bug at all, which is a good reason it has outlived three sessions.
+* **`5750caf5f` does not close it.** *close the live set before the in-place
+  old sweep decides what is dead* is the right shape and targets the right
+  generation, but a contemporaneous 3-vs-3 A/B reproduced on **both** arms.
+* **The reserved-TLAB-tail hypothesis is refuted**, by negative control — see
+  *Ruled out* below.
+
+The root cause is not known. What this session leaves behind is a reproducer
+that works, a verdict line that needs no prior configuration, and four
+hypotheses closed with measurements instead of argument.
 
 ## Severity
-**HIGH** — silent. No guard fires: zero `gen_heap::set_field`/`get_field`
-out-of-bounds hits, zero `read_slot: corrupt Value cell` reports, no
-`SIGSEGV`. The first observable symptom is application-level nonsense.
+**HIGH** — silent. Before this session no guard fired: zero
+`gen_heap::set_field`/`get_field` out-of-bounds hits, zero
+`read_slot: corrupt Value cell` reports, and the first observable symptom was
+application-level nonsense on another thread, minutes later.
+
+## What was wrong with the previous diagnosis
+
+The two earlier sessions attributed this to a root-coverage gap in the
+**non-moving young sweep**, on the reasoning that the young sweep zeroes every
+span it reclaims and the failing receiver has an all-zero header. The inference
+step was never checked: `java.lang.Object` is `ClassId(0)`, and so is an
+ordinary `new Object()` whose identity hash has not been minted, and so is the
+zeroed tail of an old-gen compaction, and so is a freshly-zeroed block the
+allocator has not yet stamped a header on. Four different things produce the
+same face, and nothing on the failing path told them apart.
+
+It is now measured, not inferred. The receiver lives in an **old-generation
+free block**.
 
 ## Symptom
+
 ```
 java.lang.ClassCastException: java.lang.Object cannot be cast to org.h2.mvstore.Page
     at org/h2/mvstore/FileStore.readPageFromCache(FileStore.java:2089)
-    at org/h2/mvstore/FileStore.readPage(FileStore.java:1987)
-    at org/h2/mvstore/MVStore.readPage(MVStore.java:1158)
-    at org/h2/mvstore/MVMap.readPage(MVMap.java:632)
-    at org/h2/mvstore/Page$NonLeaf.getChildPage(Page.java:1178)
-    ...
-    at org/h2/mvstore/MVMap.get(MVMap.java:417)
 ```
 
-A reference that should point at an `org.h2.mvstore.Page` reads back as a
-bare `java.lang.Object`. `java.lang.Object` is `ClassId(0)` — the ALL-ZERO
-header shape. The non-moving young sweep **zeroes every span it reclaims**
-(`young_mark::zero_spans_parallel`) before publishing it to the free list,
-so "a live reference now points at a zeroed header" is the signature of an
-object that was swept while still reachable: a **premature reclamation**,
-i.e. a marking/root-coverage gap in the non-moving young sweep.
+and — same family, same run shape, caught this session:
+
+```
+java.lang.ClassCastException: java.lang.Object cannot be cast to java.nio.ByteBuffer
+    at org/h2/mvstore/cache/FilePathCache$FileCache.read(FilePathCache.java:95)
+```
+
+Both are `CacheLongKeyLIRS.get()` followed by the cast that generic erasure
+puts after it. The same corruption also surfaces as a bare `SIGSEGV` in the VM
+(observed `addr=0x5`, i.e. a field read through a zeroed header) with no Java
+exception at all — so a run that dies at rc=139 is the same defect, not a
+separate one.
+
+## What actually happens
+
+A live **old-generation** object — a cached `Page`, or a `ByteBuffer` held by
+`FilePathCache` — is returned to the old-gen free list while the LIRS cache
+still references it. `OldGen::free` leaves the bytes in place, so the stale
+reference keeps reading the real object until the allocator reuses the block;
+reuse zeroes it before writing the new header (`OldGen::allocate` is the sole
+zeroing point), and `OldGen::compact` zeroes its whole trailing region. Either
+way the next read through the still-live reference sees an all-zero header.
+
+By the time the failure happens the cache chain is entirely old→old:
+`FileStore.cache` → `CacheLongKeyLIRS` → `segments[]` → `Segment` →
+`entries[]` → `Entry` → `value`. A gap anywhere in `old_gen_gc`'s mark phase
+therefore frees the payload under a live parent — and, unlike the young sweep,
+the in-place old sweep has no side-mark escape hatch: it frees purely on
+`GC_FLAG_MARKED`.
 
 ## Repro
 
 ```bash
-cd apps/h2database/h2
+cd <fresh writable dir>          # H2 writes ./data
 CRATONVM_NO_MOVING_YOUNG=1 <cratonvm-bin> \
   --java-home /home/victor/jdk25 --Xmx 1g \
-  -c "target/classes:target/test-classes:$(cat craton-testcp.txt)" \
-  org.h2.test.store.TestMVStoreCachePerformance
+  -c "<probes>:<h2>/target/classes:<h2>/target/test-classes:$(cat <h2>/craton-testcp.txt)" \
+  org.h2.test.store.TestMVStoreCacheLoop
 ```
 
-`CRATONVM_NO_MOVING_YOUNG=1` **with the JIT on** is the whole trick. It
-forces `divert_non_moving` true on every cycle that has conservative JIT
-roots, so the workload runs the non-moving young sweep continuously
-instead of occasionally. That is the same regime the
-`xt-helper-window-conservative-scan` coverage fallback produces naturally
-when 10–100 reader threads sit blocked in a native read under a compiled
-frame — just held permanently instead of intermittently.
+`TestMVStoreCacheLoop` (`apps/h2database-suite-runner/probes/`) is
+`TestMVStoreCachePerformance` with the two single-threaded warm-up rounds kept
+and the two **10-thread** rounds LOOPED instead of moving on to the 100-thread
+ones. The stock class enters the failing regime once, ~730 s in, gives it 4 s
+of wall clock, and then leaves it for good. Looping keeps the heap state and
+the concurrency identical while multiplying exposure per run.
 
-Do **not** add `--nojit`: with no JIT frames there are no conservative
-roots, `divert_non_moving` stays false, and the collector takes the moving
-Cheney path regardless of the flag. That configuration does not reproduce.
+`CRATONVM_NO_MOVING_YOUNG=1` with the JIT on is still the trick — it holds the
+VM on the conservative-JIT-root path, which is what routes old-gen reclamation
+through `sweep_old_gen_non_moving` instead of the compactor. Do **not** add
+`--nojit`.
 
-Failures land in rounds 3–4 (`testCache(10, …)`), typically 730–1750 s.
+**Do NOT set `CRATONVM_DBG_SWEEP_ZERO=1`** — see the next section.
 
-## Observed rate
+### Observed rate (2026-08-01, 16-core Azure host, `--Xmx 1g`, JIT on)
 
-18 runs, 2026-07-31/08-01, Azure box, `--Xmx 1g`, JIT on,
-`CRATONVM_NO_MOVING_YOUNG=1`:
+`TestMVStoreCacheLoop`, six workers, ~50 min per worker-iteration:
 
-| arm | runs | CCE failures |
+| binary | workers | events |
 | --- | --- | --- |
-| old-gen coalescing ON | 8 | 4 |
-| old-gen coalescing OFF | 8 | 3 |
-| pristine `origin/dev` binary (no coalescing code at all) | 2 | 1 |
+| `origin/dev` @ `c8a3ba181d` (first pass) | 7 | 2 — 1 CCE, 1 SIGSEGV |
+| `c8a3ba181d` + `5750caf5f` + this branch | 3 | **2 SIGSEGV** |
+| `c8a3ba181d` + this branch (no `5750caf5f`) | 3 | **3 — 1 CCE, 2 SIGSEGV** |
 
-**~40 % overall.** Every failure carries exactly 4 `cannot be cast`
-lines (one per reader thread that trips over the same corrupted page).
+Both arms of that A/B ran on the same host in the same window, started
+together. `5750caf5f` is therefore **not** the fix.
 
-### Not the coalescer
-The first two samples happened to be a coalescing-ON failure against a
-coalescing-OFF pass, which looks alarming. It was small-sample noise:
-4/8 versus 4/10 across the full set (Fisher exact p ≈ 1.0), and the
-**pristine `origin/dev` binary, which contains none of the coalescing
-code, reproduces the identical signature**. The two are independent.
+The stock `TestMVStoreCachePerformance` gave 0 events in 5 full runs (~5.5 h)
+over the same period, which is why the loop variant exists.
+`org.h2.test.synth.TestDiskFull` — offered by the now-retired
+`bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up as a 2-second
+reproducer for this family — gave **0 SIGSEGV and 0 CCE in ~110 runs** across
+three binaries the same day, so it is not a usable handle right now. See
+*Handed over from `TestDiskFull`* below.
 
-## Session 2 (2026-08-01): top suspicion REFUTED, repro did not reproduce
+### The two faces
 
-**Still OPEN. Not fixed.** What this session establishes is mostly negative,
-which is worth more than another guess.
-
-### The dropped-peer suspicion is wrong
-
-Suspicion 1 below (`xt_root_scan` silently dropping a peer that misses its
-20 ms deadline, leaving its JIT-frame oops out of the root set) is
-**refuted**. The takeover pass does drop such a peer — but it is not the
-last word. `interpreter.rs`'s STW entry runs
-
-```rust
-loop {
-    take_over_pass(...);                 // freeze what it can, excuse those from the barrier
-    if gc_barrier.wait_for_all_timeout(WAIT_SLICE) { break; }
-    ...
-}
+```
+java.lang.Object      cannot be cast to java.nio.ByteBuffer      (block still free)
+java.util.BitSet      cannot be cast to org.h2.mvstore.Chunk     (block re-served)
+org.h2.mvstore.Page$Leaf cannot be cast to org.h2.mvstore.Chunk  (block re-served)
 ```
 
-The barrier still *expects* an unfrozen peer, so the loop iterates and
-retries until every counted mutator has either arrived cooperatively or
-been frozen. A `STATE_CANCELLED` peer is retried on the next round, not
-skipped, and the collection cannot begin while one is outstanding. This
-was measured, not just read: the new counter (below) shows unclassified
-peers occurring **1–2 per run**, in runs that pass.
+plus `SIGSEGV` with `slot[rN]` reading eight zero words — the same all-zero
+header, reached from compiled code before any reporter runs. A run that dies at
+rc=139 is this defect, not a separate one.
 
-Do not spend time here again.
+Anything gated on the receiver reading as `ClassId(0)` sees only the first
+line. Both `checkcast` reporters now consult the old-gen reclamation ring on
+*every* failing cast for that reason.
 
-### The repro is not reliable — 0/26 today
+## The instrumentation was part of the problem
 
-| binary | runs | CCE failures |
-| --- | --- | --- |
-| current `dev` + instrumentation | 18 | **0** |
-| `0cc13efa37` — the EXACT commit that failed 8/20 yesterday | 6+ | **0** |
+`CRATONVM_DBG_SWEEP_ZERO=1` — the flag the previous session added and
+recommended so that "the next occurrence self-diagnoses" — feeds
+`retain_dead_objects` in `sweep_young_non_moving`, and `retain_dead_objects` is
+one of the guards on the **parallel sweep prefix**. Setting it silently swaps
+the young collector from the 8-worker anchored parallel walk to the sequential
+one and stops dead spans being coalesced. `CRATONVM_DBG_A2`,
+`CRATONVM_DBG_SWEEP_CENSUS` and `CRATONVM_DBG_WATCHREF` do the same. The ring
+it populates also takes a process-global mutex per reclaimed object.
 
-Rebuilt yesterday's commit specifically to rule out "someone fixed it":
-only two JIT-perf commits had landed in between, and yesterday's binary
-passes today too. The variable is the **host**, not the code. Yesterday's
-failures came with 2000–3700 other logged-in users and load average
-300–379 from other tenants; today the box was quiet. Synthesising load
-with 24 CPU spinners (load average 33) did **not** reproduce it — so
-whatever the real trigger is, plain CPU contention is not it.
+That is a live candidate for *Session 2*'s central puzzle — ~40 % reproduction
+on plain runs on 2026-07-31, then **0/18 the next day on "current dev +
+instrumentation"**, concluded as "the variable is the host, not the code". The
+instrumented configuration is not the same code.
 
-Treat the "~40 % in 12–40 min" figure below as *observed once, under host
-conditions not reproducible on demand*, not as a recipe you can rely on.
+The replacement needs no flag set in advance.
+`GenerationalHeap::reclaimed_hole_at` asks the heap whether the failing
+receiver is inside a free-list hole, past the allocation frontier, or in the
+inactive semispace; a live `new Object()` is in none of those. It is reached
+only from the `checkcast` failure paths, so it costs nothing until something
+has already gone wrong. On the reproduction above it printed, with no prior
+configuration:
 
-### Correction: read the DISTRIBUTION, not the last decision
+```
+ERROR cratonvm::gc::guard: checkcast receiver points into RECLAIMED memory — a
+still-referenced object was collected. obj="0x20027fa39f8"
+location=old-gen FREE BLOCK (reclaimed) target_class=java.nio.ByteBuffer
+```
 
-`[GC] decision #N: ... young=MOVING` reports only the **most recent**
-cycle. Reading it as the run's behaviour briefly made this look like a
-moving-collector bug. The new histogram shows the truth:
+An unconditional, lock-free **old-gen reclamation ring** now records what each
+freed block held and which reclamation freed it (in-place sweep vs
+mark-compact), and the same reporter prints it — so the next occurrence names
+the mark-phase gap rather than describing its consequences.
 
-| conditions | moving cycles | non-moving cycles |
-| --- | --- | --- |
-| recipe, quiet host | ~40 | ~215 (`nonmoving-conservative-jit-roots`) |
-| recipe, 24 CPU spinners | ~380 | ~75 |
+## Ruled out, with measurements
 
-So the non-moving framing of this doc is right on a quiet host — but the
-mix **inverts** under CPU load, which is worth knowing before attributing
-anything measured under load.
+Each of these was a live hypothesis; none survived.
 
-### Tooling added this session (all permanent, all default-quiet)
+* **A young-side marking gap, and a card-table / write-barrier miss.**
+  `CRATONVM_DBG_SWEEP_EDGES` walks the whole old generation and the whole young
+  from-space after marking and before anything is zeroed, looking for a
+  surviving object that references a doomed one. It reports
+  `root=0 young-survivor=0 old-gen=0` on every cycle of this workload. (Its
+  case (1) had to be fixed first: it tested the RAW conservative candidate
+  rather than the base `mark_young` actually marks, so it produced 9–16 bogus
+  "mark filter rejected a live root" hits per cycle on a healthy run — enough
+  noise to hide a real one. Its young walk also lacked `merge_skips`, so a
+  reserved TLAB tail read as "arena already corrupt before this sweep".)
+* **The weak-reference path.** `CacheLongKeyLIRS.Entry.getValue()` is
+  `value == null ? reference.get() : value`, and `evictBlock()` converts every
+  evicted entry to a `WeakReference`, so the failing cast is frequently over
+  `Reference.get()` — and `access()` latches the result back into the strong
+  `value` field, which explains the doc's original "exactly 4 `cannot be cast`
+  lines, one per reader thread that trips over the same corrupted page".
+  `WeakRefLirsStress` reproduces that exact shape (a long-lived old-gen entry
+  array oscillating between strong and weak under 10 threads) and ran **153 M
+  reads / 76 M evict+resurrect cycles with zero corruption**. The clear/restore
+  machinery is sound under churn.
+* **Off-grid parallel-sweep anchors.** The parallel sweep prefix starts an
+  independent chain at each anchor and re-proves it only by landing on the next
+  one, which is probabilistic rather than a proof. The sequential walk now
+  validates every anchor against the grid it proves:
+  `SWEEP_ANCHOR_NOT_A_BASE` measured **zero**.
+* **Conservative candidates the anchor oracle cannot place.** A candidate in a
+  discarded anchor interval used to be side-marked at its RAW address, which
+  retains nothing when the address is object-interior — so the containing
+  object would be reclaimed with a conservative root pointing into it. Now
+  re-resolved against the arena's own object grid, marked, and drained.
+  `LATE_RESOLVE_*` measured **zero** on this workload: a closed hole, not an
+  active one.
+* **Reserved TLAB tails desyncing the young→old seed walk.**
+  `mark_young_to_old_refs` and `fixup_young_old_refs` built their skip list
+  from the free list alone, so they parsed the reserved TLAB tails of
+  forcibly-stopped in-JIT peers as object headers — while
+  `sweep_young_non_moving` skips exactly those regions. That looked decisive:
+  the referrer would be YOUNG, which `OldGen::close_live_set` cannot rescue,
+  and `CRATONVM_DBG_SWEEP_EDGES` never looks young→old. **Refuted by negative
+  control**: a test that plants an unparseable reserved tail between a young
+  referrer and its old-gen payload passes with the merge reverted, because the
+  desync trips the anomaly path and the conservative word scan still finds
+  every old-gen base in the stretch. The merge landed anyway as a consistency
+  fix, and is labelled as one.
+* **Cross-thread root coverage** — refuted in *Session 2*; nothing here
+  re-opens it.
 
-* `[GC] decision histogram: moving=N non_moving=M <reason>=k …` — the
-  per-reason distribution across the whole run. This is what corrected the
-  misreading above.
-* `[GC] xt_peer_scan: unclassified_peers=N cycles_with_unclassified=M` —
-  peers the cross-thread scan could not classify. This is what refuted
-  suspicion 1.
-* `CRATONVM_XT_PEER_DEADLINE_MS` (default 20) — the peer deadline is now
-  tunable, so "is the 20 ms bet the problem?" is a one-flag experiment
-  rather than a rebuild. (Tested at 5000; made no difference.)
-* The **sweep-ring reporter is now wired to `checkcast`**. The
-  "zeroed-a-live-object" ring (`CRATONVM_DBG_SWEEP_ZERO`) already existed
-  and already had a consumer — but only on the stale-RECEIVER (invoke)
-  path. A reclaimed object surfaces here as a failed **cast** first, so
-  setting the flag and reproducing produced silence. On a ring hit the
-  checkcast now reports the victim's ORIGINAL class plus the sweep cycle,
-  GC reason, initiating thread and blocked-thread count — i.e. it names
-  the root-coverage gap.
+## Young-sweep invariants added along the way
 
-  It speaks **only** on a ring hit. `java.lang.Object` is `ClassId(0)`,
-  which is also an ordinary `new Object()`, and nothing on that path
-  distinguishes the two for free (`zero_forensics` and the sweep ring are
-  both gated), so it deliberately does not guess — verified silent on a
-  plain `(String) new Object()`.
+Not the cause here, but they were missing and they are the same class of
+silent failure, so they are now checked unconditionally (one merge pass each
+over lists that are already built and already sorted):
 
-**So the next occurrence self-diagnoses**, provided it is run with
-`CRATONVM_DBG_SWEEP_ZERO=1`. That is the single highest-value thing to
-carry into the next attempt.
+1. **No live object inside a span the sweep is about to zero.** `side_sorted`
+   is the complete live set and `dead_regions` is every condemned span; they
+   must be disjoint, and can only overlap if the walk left the object grid.
+   A failing span is RETAINED rather than freed — a bounded leak and a loud
+   report instead of a silent use-after-free.
+2. **A span published to the free list is not already on it.** A double free
+   lets the allocator serve the same bytes twice and zero them under the first
+   owner. Previously only a `CRATONVM_DBG_A2` diagnostic, and an
+   O(dead × free) double loop.
 
-## Where to look
+## What to try next
 
-The non-moving young sweep marks from the full root set plus conservative
-JIT roots, and the documented safe direction is over-retention — a
-conservative false positive can only keep a dead object alive, never free
-a live one. Something in that chain is under-marking under sustained
-multi-threaded load. Candidates, in rough order of suspicion:
+In rough order of what the evidence supports.
 
-1. **Cross-thread root coverage.** 10–100 mutators, most blocked in a
-   native `read` under a compiled frame. `xt_root_scan`'s helper-window
-   pass scans a blocked peer's register file + `[rsp, region_end)`
-   conservatively — but only for peers in `blocked_os_tids`, and only
-   while `arm_slot`/`send_takeover_signal`/`wait_for_response(20ms)` all
-   succeed. Any peer that misses that 20 ms window is scanned by nothing.
-   `slot.clear()` on timeout silently drops the peer.
-2. **Side-marked survivors.** The sweep's `side_marked_survivor` arm keeps
-   an object without touching its header; the interaction between that set
-   and the disposition walk is where the identity-map fixes have
-   repeatedly landed.
-3. **Selective promotion.** Survivors evacuated young→old mid-sweep, with
-   the `evac_map` remap arriving after some consumer already read the old
-   address.
+1. **Enlarge the old-gen reclamation ring, then reproduce.** The ring is 16 K
+   entries; an in-place old sweep frees thousands of blocks per cycle and the
+   failing read can be many cycles later, so it wraps before the `checkcast`
+   asks. The one reproduction that reached the widened reporter
+   (`Page$Leaf cannot be cast to Chunk`) got no ring hit for exactly that
+   reason. Sizing it in the hundreds of thousands would have named the victim
+   class and the freeing site outright — that is one build away and it is the
+   highest-value next step.
+2. **Add the young-side equivalent.** The ring only covers old-gen frees. The
+   young sweep's span zeroing is recorded by `zero_forensics`, but that is
+   flag-gated and mutex-backed. A lock-free, unconditional span ring (one
+   record per COALESCED span, not per object, so the cost stays bounded) would
+   make the reporter answer for both generations.
+3. **Instrument the free, not the read.** Everything above still diagnoses one
+   GC cycle too late. The decisive check is at the moment of reclamation: for
+   each block the in-place sweep is about to free, does any live YOUNG object
+   reference it? That is the young→old mirror of `close_live_set` and nothing
+   currently performs it — `close_live_set` closes over old-gen referrers only,
+   and `CRATONVM_DBG_SWEEP_EDGES` only ever looks for references INTO young.
+   Expensive as an always-on check; viable behind a gate for a repro run, and
+   it would name the exact cycle and referrer.
+4. **Do not re-derive the closed hypotheses.** The four in *Ruled out* each
+   cost a build-and-soak cycle; they are recorded with their measurements so
+   the next session does not pay for them again.
 
-The first suspicion is directly testable: count peers examined versus
-peers that reached `STATE_PARKED` (`[xt-jit-roots] linux helper-window
-pass: examined N blocked peer(s), M window(s)`) and see whether the gap
-correlates with the failing runs. `CRATONVM_DBG_XT_JIT_ROOTS` prints it.
+## Handed over from `TestDiskFull` (2026-08-01)
+
+The sibling report `bug-h2-testdiskfull-classid0-corruption-segv-cce.md` was
+resolved and retired the same day by a concurrent line of work, and it hands
+this doc one residual. Both halves of that write-up corroborate the diagnosis
+above:
+
+* Its symptom 1 — the `class_id=ClassId(0) num_slots=0` guard bursts — was
+  fixed by `c0d09e2451` and `b86945eafe`, *"post-GC reference processing wrote
+  through stale **old-gen** addresses"* and *"the refproc staleness guard had
+  the same old-gen blind spot"*. Same generation, same shape, a fix that had
+  already landed. Its constant `0xe0` receiver-to-value delta turned out to be
+  `Reference`/referent pair spacing, not a miscomputed field offset.
+* Its residual is **one `SIGSEGV` in 330 runs on `dev@c8a3ba181d`** — the exact
+  binary this doc's reproduction ran on — with `r10` pointing at eight zero
+  words, i.e. an all-zero object header inside compiled code. Not root-caused
+  there because it did not recur; 203 further runs *armed with
+  `CRATONVM_DBG_SWEEP_ZERO=1`* produced no second occurrence and no ring hit,
+  which is the instrumentation confound described above showing up a third
+  time.
+
+`TestDiskFull` is therefore in the same family but is **not** currently a
+cheaper handle on it: 110 short-form runs here across three binaries produced
+0 `SIGSEGV` and 0 `ClassCastException`. `TestMVStoreCacheLoop` is.
 
 ## Related
-- Same family as [`reference_fork6_gcstress_jitfree_corruption`] and the
-  OSR non-moving-sweep corruptor — all "the non-moving young sweep freed
-  something live".
-- The `xt-helper-window` fallback that produces this regime naturally is
-  *correct* (a blocked peer's JIT-frame oops genuinely cannot be
-  rewritten); it should not be weakened to avoid this bug.
+- the retired `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up —
+  same signature; see *Handed over from `TestDiskFull`* above.
+- `c0d09e2451`, `b86945eafe` — post-GC reference processing writing through
+  stale OLD-GEN addresses, and the same blind spot in its staleness guard.
+  Already on `dev` before the reproduction here, so they do not close this, but
+  they are the same generation and the same shape.
+- `5750caf5f` — *close the live set before the in-place old sweep decides what
+  is dead*: the in-place sweep now runs the compactor's live-set fixpoint, and
+  the seven PRECISE mark push sites stop being screened by a plausibility test
+  written for conservative guesses. Its counters
+  (`OLDMARK_RESCUED_BY_WALK`, `OLD_SWEEP_CLOSURE_RESCUES`,
+  `OLD_SWEEP_ESCAPE_HITS`) are the ones to watch for a recurrence.
 - `7303483521` fixes the old-gen **fragmentation** consequence of the same
-  regime. Unrelated cause, unrelated fix.
-
-## Possible cheaper handle: `TestDiskFull` (2026-08-01, unconfirmed)
-
-While closing out the `TestDiskFull` corruption report, one run in **330** stock
-`org.h2.test.synth.TestDiskFull` runs on `dev@c8a3ba181d` died with a `SIGSEGV`
-whose registers carry this family's shape:
-
-```
-#  SIGSEGV at pc=0x7e65e95ad765, addr=0x0
-#  maps: fault pc IS MAPPED - perms are on the `here` line   (r-xp)
-#  slot[r10]: 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0        r10=0x2003a0dd800
-```
-
-`addr=0x0` with a mapped executable `pc` is a *data* fault inside compiled code,
-and `r10` points at eight zero words — an all-zero object header, i.e. a
-reference into a span the sweep zeroed. The run showed **zero**
-`gen_heap::set_field`/`get_field` guard hits and zero `corrupt Value cell`
-reports, which is this doc's "silent" signature and not the (now fixed)
-reference-processing one.
-
-Why this might matter: `TestDiskFull` runs in ~40–110 s, against 12–40 min for
-`TestMVStoreCachePerformance`. Against that, the rate here is **1 in 330** and it
-did **not** recur: 203 further runs armed with `CRATONVM_DBG_SWEEP_ZERO=1`
-produced neither a second crash nor a ring hit. So this is a single sample and a
-lead, not a repro. Note also that most `TestDiskFull` runs wedge or time out for
-a completely unrelated, non-VM reason — see
-`h2-testdiskfull-upstream-transaction-recovery-livelock.md` — so a `TIMEOUT` row
-for that class is not evidence of this bug.
-
-Harness: `docs/known-issues/repros/h2-testdiskfull-livelock/`.
+  regime. Unrelated cause, unrelated fix — that part of the original doc was
+  right.

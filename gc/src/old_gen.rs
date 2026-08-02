@@ -900,6 +900,19 @@ impl OldGen {
         for &(obj_ptr, total_size) in &objects {
             let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
             if header.gc_flags & GC_FLAG_MARKED == 0 {
+                // H2-CID0 (2026-08-01): remember what this address held before
+                // compaction drops it. The storage either ends up under a slid
+                // survivor or inside the zeroed tail Phase 4 writes, and in the
+                // latter case a still-live reference to it reads an all-zero
+                // header — `ClassId(0)`, i.e. `java.lang.Object`. Recording the
+                // class here is what lets the `checkcast` reporter say WHICH
+                // object was reclaimed instead of only WHERE.
+                crate::gen_heap::record_old_freed(
+                    obj_ptr as usize,
+                    header.class_id.as_u32(),
+                    header.kind as u8,
+                    crate::gen_heap::OLD_FREED_SITE_COMPACT,
+                );
                 continue; // Dead object — skip
             }
             let aligned = (write_cursor + 7) & !7;

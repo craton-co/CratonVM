@@ -20145,10 +20145,141 @@ fn execute_instruction(
                         // the flag and reproducing still produced silence. See
                         // docs/known-issues/h2/
                         // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+                        // H2-CID0 follow-up (2026-08-01): the `ClassId(0)` gate
+                        // below is too narrow. A block freed while still
+                        // referenced only reads back as `java.lang.Object`
+                        // while it stays on the free list; once the allocator
+                        // REUSES it the same stale reference sees a perfectly
+                        // valid object of some unrelated class, and the cast
+                        // fails with that class instead. Both faces were
+                        // observed in one A/B: `java.lang.Object cannot be cast
+                        // to java.nio.ByteBuffer` (still free) and
+                        // `java.util.BitSet cannot be cast to
+                        // org.h2.mvstore.Chunk` (reused). Gating the reporter on
+                        // `ClassId(0)` reports the first and stays silent on the
+                        // second, which is the same defect one step later in the
+                        // block's life.
+                        //
+                        // So ask on EVERY failing cast. Both queries are reached
+                        // only after a cast has already failed, and the
+                        // reclamation ring is bounded, so a match means the
+                        // address really was freed recently.
+                        {
+                            let addr = obj_ref.as_ptr() as usize;
+                            if let Some((cid, kind, site, seq)) =
+                                cratonvm_gc::gen_heap::old_freed_lookup(addr)
+                            {
+                                static F: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if F.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                    let orig = shared
+                                        .classes
+                                        .class_manager
+                                        .try_read()
+                                        .and_then(|cm| {
+                                            cm.class_store
+                                                .get(cratonvm_types::ClassId::new(cid))
+                                                .map(|c| c.name.to_string())
+                                        })
+                                        .unwrap_or_else(|| format!("class_id={cid}"));
+                                    let (old_alloc, young_surv, region) =
+                                        shared.mem.heap.liveness_arms(addr);
+                                    tracing::error!(
+                                        target: "cratonvm::gc::guard",
+                                        obj = format!("{addr:#x}"),
+                                        actual_class = %obj_binary,
+                                        target_class = %target_binary,
+                                        original_class = %orig,
+                                        original_kind = kind,
+                                        freed_by = if site == 1 {
+                                            "in-place old-gen sweep"
+                                        } else {
+                                            "old-gen mark-compact"
+                                        },
+                                        free_seq = seq,
+                                        region = %region,
+                                        old_gen_allocated = old_alloc,
+                                        young_survivor = young_surv,
+                                        "checkcast receiver is an OLD-GEN block this process \
+                                         RECLAIMED while it was still referenced. `original_class` \
+                                         is what the block held when it was freed; `actual_class` \
+                                         is whatever occupies it now (`java.lang.Object` means the \
+                                         block is still on the free list, anything else means the \
+                                         allocator has already re-served it). `freed_by` names the \
+                                         mark phase with the gap.",
+                                    );
+                                }
+                            }
+                        }
                         if obj_class_name == "java/lang/Object"
                             && target_class_name != "java/lang/Object"
                         {
                             let addr = obj_ref.as_ptr() as usize;
+                            // H2-CID0 (2026-08-01): the FLAG-FREE verdict.
+                            //
+                            // Everything else on this path needs a debug gate
+                            // to have been set before the run, which is never
+                            // true of the run that actually reproduces. Ask the
+                            // heap instead: is this address inside a free-list
+                            // hole, past the allocation frontier, or in the
+                            // inactive semispace? A live `new Object()` is in
+                            // none of those, so a hit is proof the collector
+                            // reclaimed an object that is still referenced —
+                            // and it costs nothing until a cast has already
+                            // failed.
+                            if let Some((what, span, size)) =
+                                shared.mem.heap.reclaimed_hole_at(addr)
+                            {
+                                static R: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                    tracing::error!(
+                                        target: "cratonvm::gc::guard",
+                                        obj = format!("{addr:#x}"),
+                                        location = %what,
+                                        span = format!("{span:#x}+{size:#x}"),
+                                        target_class = %target_binary,
+                                        "checkcast receiver points into RECLAIMED memory — a \
+                                         still-referenced object was collected. `java.lang.Object` \
+                                         here is the all-zero header the collector left behind, \
+                                         not a real Object.",
+                                    );
+                                    // H2-CID0: and WHAT was reclaimed. The
+                                    // old-gen ring is unconditional, so unlike
+                                    // the young sweep ring this answers on the
+                                    // FIRST occurrence rather than only on a
+                                    // re-run with the right flag pre-set.
+                                    if let Some((cid, kind, site, seq)) =
+                                        cratonvm_gc::gen_heap::old_freed_lookup(addr)
+                                    {
+                                        let orig = shared
+                                            .classes
+                                            .class_manager
+                                            .try_read()
+                                            .and_then(|cm| {
+                                                cm.class_store
+                                                    .get(cratonvm_types::ClassId::new(cid))
+                                                    .map(|c| c.name.to_string())
+                                            })
+                                            .unwrap_or_else(|| format!("class_id={cid}"));
+                                        tracing::error!(
+                                            target: "cratonvm::gc::guard",
+                                            obj = format!("{addr:#x}"),
+                                            original_class = %orig,
+                                            original_kind = kind,
+                                            freed_by = if site == 1 {
+                                                "in-place old-gen sweep"
+                                            } else {
+                                                "old-gen mark-compact"
+                                            },
+                                            free_seq = seq,
+                                            "…and the old-gen reclamation ring knows what that \
+                                             block held. The original class names the mark-phase \
+                                             gap that freed it while it was still referenced.",
+                                        );
+                                    }
+                                }
+                            }
                             if let Some((cid, kind, cycle, reason, initiator, blocked)) =
                                 cratonvm_gc::gen_heap::sweep_zero_lookup(addr)
                             {
@@ -20181,6 +20312,42 @@ fn execute_instruction(
                                          gap.",
                                     );
                                 }
+                            }
+                            // H2-CID0: the sweep ring above only knows the
+                            // NON-MOVING sweep's dead spans. An all-zero header
+                            // is equally the signature of a MOVING cycle that
+                            // failed to evacuate a live object and then reset
+                            // from-space over it, and the two demand different
+                            // investigations. `zero_forensics`
+                            // (`CRATONVM_DBG_ZERO_RANGES`) records BOTH sites,
+                            // so consult it too — separately, because the doc
+                            // this reporter serves attributes the fault to the
+                            // non-moving sweep on evidence that never
+                            // distinguished them. Gated by its own flag, so it
+                            // is silent unless asked for.
+                            for (age, site, tag, s, l) in
+                                cratonvm_gc::zero_forensics::probe(addr)
+                            {
+                                static Z: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
+                                    break;
+                                }
+                                tracing::error!(
+                                    target: "cratonvm::gc::guard",
+                                    obj = format!("{addr:#x}"),
+                                    zeroing_site = if site == 1 {
+                                        "non-moving-sweep-dead-span"
+                                    } else {
+                                        "moving-gc-fromspace-reset"
+                                    },
+                                    sweep_cycle = tag,
+                                    range = format!("{s:#x}+{l:#x}"),
+                                    events_ago = age,
+                                    target = %target_binary,
+                                    "checkcast receiver lies inside a range the collector ZEROED \
+                                     — the site names which collector reclaimed it.",
+                                );
                             }
                         }
                         return Err(RuntimeError::ClassCastException {

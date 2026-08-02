@@ -313,6 +313,184 @@ pub static SWEEP_BAD_FORWARD_HITS: AtomicU64 = AtomicU64::new(0);
 /// allocated from, so out-of-extent headers are rejected without marking.
 pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// H2-CID0 (2026-08-01) — non-moving young collections whose ANCHOR ORACLE left
+/// at least one conservative root candidate unresolved, so the late
+/// grid-resolution pass had to run.
+///
+/// The oracle maps a conservative candidate to the BASE of the object that
+/// contains it. It works interval by interval and discards an interval whose
+/// header chain does not land exactly on its upper anchor; every candidate in a
+/// discarded interval then fell back to being side-marked at its RAW address.
+/// The sweep matches side marks against object STARTS, so that fallback retains
+/// NOTHING for an interior candidate and the containing object is reclaimed —
+/// while a conservative root still points into it. That is a premature
+/// reclamation, and it is silent: the object's span is zeroed, so the next read
+/// through the stale reference sees an all-zero header, i.e. `ClassId(0)` /
+/// `java.lang.Object` (`docs/known-issues/h2/`
+/// `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`).
+///
+/// Non-zero here means the oracle's interval verification failed on a live
+/// heap; the accompanying `LATE_RESOLVE_BASES` is how many objects were saved.
+pub static LATE_RESOLVE_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — object bases recovered by the late grid-resolution pass. Each one
+/// is an object the sweep would otherwise have reclaimed with a conservative
+/// root pointing into it.
+pub static LATE_RESOLVE_BASES: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — candidates the late pass could not resolve either (the grid walk
+/// desynced before reaching them). These are handed to the sweep as spans it
+/// must not reclaim; over-retention, the safe direction.
+pub static LATE_RESOLVE_PINS: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — bounded report counter for the late-resolution warning.
+static LATE_RESOLVE_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — objects the sweep retained ONLY because an unresolvable
+/// conservative candidate pointed inside them. Non-zero means the grid walk
+/// could not reach the candidate at all, so this is the last line of defence.
+pub static LATE_PIN_RETENTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — sweep anchors that the SEQUENTIAL walk proved are NOT object
+/// bases.
+///
+/// The parallel sweep prefix splits the from-space at these offsets and walks
+/// each interval independently. Its whole soundness argument is "a bad anchor
+/// cannot corrupt, because each chunk re-proves its anchor by chaining onto the
+/// next one" — but that re-proof is probabilistic, not a proof: a walk that
+/// starts off-grid can mis-parse a run of objects and still land exactly on the
+/// upper anchor, and every object subsumed by a phantom header is then
+/// classified by the phantom's mark bit. An unmarked phantom spanning live
+/// objects reclaims and ZEROES them, which is precisely the all-zero-header
+/// (`ClassId(0)` / `java.lang.Object`) face this counter was added to explain.
+///
+/// Counted only on cycles where the sequential walk covered the whole arena
+/// (i.e. the parallel prefix did not run), because only then does the walk
+/// visit every base. Zero means every anchor really is an object base and the
+/// re-proof never has to save anything.
+pub static SWEEP_ANCHOR_NOT_A_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — cycles on which the parallel sweep prefix was attempted, and of
+/// those, how many it completed. A large abort count means chunks routinely
+/// disagree with the grid, which is the same evidence from the other side.
+pub static PAR_SWEEP_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+/// H2-CID0 — companion to [`PAR_SWEEP_ATTEMPTS`]: attempts that were accepted.
+pub static PAR_SWEEP_ACCEPTS: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — bounded report counter for the off-grid-anchor warning.
+static ANCHOR_OFF_GRID_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — reclaim spans the young non-moving sweep refused to free because a
+/// LIVE (side-marked, non-forwarded) object sat inside them.
+///
+/// Non-zero is a walk-grid break: a mis-sized header subsumed its neighbours
+/// and the phantom's own disposition condemned them. Before this check the span
+/// was zeroed and published, which is the silent premature reclamation behind
+/// the all-zero-header (`ClassId(0)` / `java.lang.Object`) family.
+pub static LIVE_IN_DEAD_SPANS: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — bounded report counter for [`LIVE_IN_DEAD_SPANS`].
+static LIVE_IN_DEAD_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — reclaim spans the sweep refused to publish because they already
+/// overlapped a free block. Publishing one is a double free: the allocator can
+/// hand the same bytes to two objects, and the second allocation zeroes them
+/// under the first.
+pub static DOUBLE_FREE_SPANS: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — bounded report counter for [`DOUBLE_FREE_SPANS`].
+static DOUBLE_FREE_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Old-generation reclamation ring (H2-CID0, 2026-08-01)
+//
+// `OldGen::free` returns a block to the free list and leaves the bytes in
+// place, so a still-live reference into it keeps reading the old object —
+// until the allocator reuses the block, and reuse ZEROES it before writing the
+// new header. That is how a prematurely reclaimed old-gen object comes back as
+// an all-zero `ClassId(0)` header, which renders as `java.lang.Object` and
+// fails a `checkcast` minutes later on another thread. By then the class is
+// gone, and the sweep-ring that would have known it
+// (`CRATONVM_DBG_SWEEP_ZERO`) only records the YOUNG sweep AND has to have
+// been enabled before the run.
+//
+// This ring is the old-gen answer, and it is ALWAYS ON: an in-place old sweep
+// only runs past 75 % occupancy, and a record is one relaxed `fetch_add` plus
+// four relaxed stores. Lock-free, so it cannot serialise a sweep the way the
+// young sweep-zero ring's mutex does.
+// ---------------------------------------------------------------------------
+
+/// [`record_old_freed`] site: the in-place old-gen sweep's free loop.
+pub const OLD_FREED_SITE_INPLACE_SWEEP: u8 = 1;
+/// [`record_old_freed`] site: mark-compact dropped the object (its storage
+/// became part of the zeroed tail, or was slid over).
+pub const OLD_FREED_SITE_COMPACT: u8 = 2;
+
+const OLD_FREED_RING_BITS: usize = 14; // 16K entries, ~256 KB
+const OLD_FREED_RING_LEN: usize = 1 << OLD_FREED_RING_BITS;
+
+struct OldFreedRec {
+    addr: AtomicU64,
+    class_id: std::sync::atomic::AtomicU32,
+    kind: std::sync::atomic::AtomicU8,
+    site: std::sync::atomic::AtomicU8,
+    seq: AtomicU64,
+}
+
+impl OldFreedRec {
+    const fn new() -> Self {
+        Self {
+            addr: AtomicU64::new(0),
+            class_id: std::sync::atomic::AtomicU32::new(0),
+            kind: std::sync::atomic::AtomicU8::new(0),
+            site: std::sync::atomic::AtomicU8::new(0),
+            seq: AtomicU64::new(0),
+        }
+    }
+}
+
+static OLD_FREED_RING: [OldFreedRec; OLD_FREED_RING_LEN] =
+    [const { OldFreedRec::new() }; OLD_FREED_RING_LEN];
+static OLD_FREED_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Record that an old-generation block is being reclaimed. See the module note
+/// above for why this is unconditional.
+#[inline]
+pub fn record_old_freed(addr: usize, class_id: u32, kind: u8, site: u8) {
+    let seq = OLD_FREED_NEXT.fetch_add(1, Ordering::Relaxed);
+    let r = &OLD_FREED_RING[(seq as usize) & (OLD_FREED_RING_LEN - 1)];
+    // Publish `addr` LAST: a reader that sees the address has already seen the
+    // rest of this record (the slot may still be torn against a wrapping
+    // writer, which is why `old_freed_lookup` is a diagnostic and not a proof).
+    r.class_id.store(class_id, Ordering::Relaxed);
+    r.kind.store(kind, Ordering::Relaxed);
+    r.site.store(site, Ordering::Relaxed);
+    r.seq.store(seq, Ordering::Relaxed);
+    r.addr.store(addr as u64, Ordering::Release);
+}
+
+/// Did an old-gen reclamation free a block at `addr`, and what did it hold?
+/// Returns `(class_id, kind, site, seq)` for the most recent matching record.
+pub fn old_freed_lookup(addr: usize) -> Option<(u32, u8, u8, u64)> {
+    let a = addr as u64;
+    let mut best: Option<(u32, u8, u8, u64)> = None;
+    for r in OLD_FREED_RING.iter() {
+        if r.addr.load(Ordering::Acquire) != a {
+            continue;
+        }
+        let seq = r.seq.load(Ordering::Relaxed);
+        if best.is_none_or(|(_, _, _, b)| seq > b) {
+            best = Some((
+                r.class_id.load(Ordering::Relaxed),
+                r.kind.load(Ordering::Relaxed),
+                r.site.load(Ordering::Relaxed),
+                seq,
+            ));
+        }
+    }
+    best
+}
+
 /// Old-gen mark-worklist entries whose `kind` byte is not a valid `ObjectKind`
 /// discriminant — i.e. the mark BFS was handed an address that is not an object
 /// base and decoded whatever bytes were there as an `ObjectHeader`.
@@ -3711,6 +3889,66 @@ impl GenerationalHeap {
         word0 != 0
     }
 
+    /// Is `addr` inside memory the collector has RECLAIMED — a free-list hole,
+    /// the unallocated tail of a semispace, or the inactive semispace?
+    ///
+    /// H2-CID0 (2026-08-01). A reference that reads back as `java.lang.Object`
+    /// is ambiguous on its face: `java.lang.Object` is `ClassId(0)`, and so is
+    /// the ALL-ZERO header the young sweep writes over every span it reclaims —
+    /// but an ordinary `new Object()` whose identity hash has not been minted
+    /// also has an all-zero first header word, so no amount of staring at the
+    /// header separates the two. That ambiguity is why
+    /// `docs/known-issues/h2/`
+    /// `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md` could
+    /// only self-diagnose when `CRATONVM_DBG_SWEEP_ZERO` had been set BEFORE
+    /// the run — i.e. never, in the report that matters.
+    ///
+    /// Free-list membership is not ambiguous. A live object is never inside a
+    /// free block, never past the allocation frontier, and never in the
+    /// inactive semispace. So this answers the question outright, costs
+    /// nothing unless something already went wrong (it is called from
+    /// exception paths only), and needs no flag to have been set in advance.
+    ///
+    /// Returns `(what, span_base, span_size)`; `span_size` is 0 for the
+    /// answers that are a region rather than a block.
+    pub fn reclaimed_hole_at(&self, addr: usize) -> Option<(&'static str, usize, usize)> {
+        {
+            let from = self.young_from.lock();
+            let base = from.base_ptr() as usize;
+            let used = from.used();
+            let cap = from.capacity();
+            if addr >= base && addr < base + cap {
+                if addr >= base + used {
+                    return Some(("young from-space, past the allocation frontier", base + used, 0));
+                }
+                let off = addr - base;
+                let blocks = from.free_blocks_sorted();
+                let i = blocks.partition_point(|&(o, _)| o <= off);
+                if i > 0 {
+                    let (o, sz) = blocks[i - 1];
+                    if off < o + sz {
+                        return Some(("young from-space FREE BLOCK (reclaimed)", base + o, sz));
+                    }
+                }
+                return None;
+            }
+        }
+        {
+            let to = self.young_to.lock();
+            let base = to.base_ptr() as usize;
+            if addr >= base && addr < base + to.capacity() {
+                return Some(("young TO-space (the inactive semispace)", base, 0));
+            }
+        }
+        {
+            let old = self.old_gen.lock();
+            if old.contains(addr as *const u8) && !old.is_allocated_addr(addr as *const u8) {
+                return Some(("old-gen FREE BLOCK (reclaimed)", addr, 0));
+            }
+        }
+        None
+    }
+
     /// Access the old generation directly (for concurrent sweep).
     /// Returns a lock guard.
     pub fn old_gen_lock(&self) -> parking_lot::MutexGuard<'_, OldGen> {
@@ -5791,7 +6029,14 @@ impl GenerationalHeap {
             // values live in disjoint arenas, so a ref this remaps can never be
             // remapped a second time.
             crate::external_roots::remap_external_roots(&pointer_map);
-            let compact_map = Self::major_gc(roots, &young_from, &mut old_gen);
+            // H2-CID0: same reserved-TLAB-tail skip list the young sweep
+            // uses; `major_gc`'s young walks parse from-space too.
+            let young_skips = {
+                let base = young_from.base_ptr() as usize;
+                self.jit_tlab_skip_offsets(base, base + young_from.used())
+            };
+            let compact_map =
+                Self::major_gc(roots, &young_from, &mut old_gen, &young_skips);
             // CRITICAL FIX (heavy binary-trees GC corruption):
             //
             // Compose `pointer_map` with `compact_map` BEFORE merging. If a
@@ -6428,6 +6673,27 @@ impl GenerationalHeap {
             overlay_owners: crate::external_roots::external_owner_addrs(),
             metadata_pins: cratonvm_types::metadata_pin::snapshot(),
         };
+        // ----- Oracle resolution accounting (H2-CID0, 2026-08-01) -----------
+        //
+        // `mark_young` resolves a CONSERVATIVE candidate to the BASE of the
+        // object containing it, because the sweep matches side marks against
+        // object STARTS: a side mark on an interior address retains nothing.
+        // When the anchor oracle cannot resolve a candidate (its interval's
+        // header chain failed to land on the upper anchor) the code below falls
+        // back to side-marking the RAW candidate address — which is correct
+        // only if the candidate happens to BE a base. For an interior
+        // candidate the containing object is left unmarked and the sweep
+        // reclaims it **while a conservative root still points into it**,
+        // silently inverting the collector's documented "a conservative false
+        // positive can only over-retain, never free a live object" invariant.
+        //
+        // Count the three outcomes, and remember every fallback address so the
+        // late-resolution pass after the mark closure can finish the job
+        // against the arena's own object grid (the same grid the sweep walks,
+        // and therefore the only authority on what is about to be freed).
+        let oracle_resolved = std::cell::Cell::new(0usize);
+        let oracle_dropped = std::cell::Cell::new(0usize);
+        let oracle_unresolved: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
         // mark_if_young: mark a candidate young pointer and enqueue it.
         // SAFETY contract: `ptr` is only dereferenced after `in_young`
         // confirms it lands inside the live from-space region.
@@ -6444,7 +6710,10 @@ impl GenerationalHeap {
                 .and_then(|idx| young_object_ranges.get(idx))
                 .filter(|&&(_, end)| addr < end);
             let (addr, ptr) = match covering {
-                Some(&(base, _end)) => (base, base as *mut u8),
+                Some(&(base, _end)) => {
+                    oracle_resolved.set(oracle_resolved.get() + 1);
+                    (base, base as *mut u8)
+                }
                 // Inside a PROVED span the walk was verified end to end: an
                 // uncovered candidate is free/gap space — not an object.
                 None if verified_spans
@@ -6452,13 +6721,21 @@ impl GenerationalHeap {
                     .checked_sub(1)
                     .is_some_and(|i| addr < verified_spans[i].1) =>
                 {
-                    return
+                    oracle_dropped.set(oracle_dropped.get() + 1);
+                    return;
                 }
                 // Outside every proved span (no anchor interval held this
                 // candidate, or that interval's chain failed to land) — fall
                 // back to validating the candidate address directly, the
                 // pre-oracle behaviour. See the `verified_spans` note above.
-                None => (addr, ptr),
+                //
+                // H2-CID0: record it. If this address is NOT an object base the
+                // mark below retains nothing, so the late-resolution pass after
+                // the closure re-resolves it against the arena object grid.
+                None => {
+                    oracle_unresolved.borrow_mut().push(addr);
+                    (addr, ptr)
+                }
             };
             // SAFETY: `in_young` confirmed `addr` is an 8-byte-aligned
             // address inside the live from-space region, so reading an
@@ -6806,6 +7083,77 @@ impl GenerationalHeap {
             |addr, work| scan_young_object(addr, &mark_ctx, &side_bits, work),
         );
         report_phase("mark-closure");
+
+        // ----- Late base resolution (H2-CID0, 2026-08-01) -------------------
+        //
+        // Every conservative candidate the anchor oracle could not resolve was
+        // side-marked at its RAW address. That retains the object only if the
+        // address happens to be a base — the sweep matches side marks against
+        // object STARTS. Resolve the remainder against the arena's own object
+        // grid (chained from offset 0, free-block aware: exactly the walk the
+        // sweep performs, and thus the authority on what it will reclaim),
+        // mark the covering bases, and drain the closure again so those
+        // objects' own references are traced too. Retaining an object without
+        // tracing it would only move the dangling reference one level down.
+        //
+        // Zero-cost on a healthy cycle: the walk runs only when the oracle
+        // actually left something unresolved.
+        //
+        // Whatever the grid walk itself cannot reach (it desynced before
+        // getting there) is handed to the sweep as `late_pins`: spans it must
+        // not reclaim. That is strictly over-retention, the safe direction.
+        let mut late_pins: Vec<usize> = Vec::new();
+        let mut late_resolved_bases = 0usize;
+        {
+            let mut unresolved = std::mem::take(&mut *oracle_unresolved.borrow_mut());
+            if phase_diag {
+                eprintln!(
+                    "[gcphase] oracle-outcome: resolved={} dropped-as-gap={} unresolved={}",
+                    oracle_resolved.get(),
+                    oracle_dropped.get(),
+                    unresolved.len(),
+                );
+            }
+            if !unresolved.is_empty() {
+                unresolved.sort_unstable();
+                unresolved.dedup();
+                let (bases, leftover) =
+                    resolve_candidate_bases(from_base, used_bytes, &exact_skips, &unresolved);
+                late_resolved_bases = bases.len();
+                for base in bases {
+                    mark_edge_precise(base, &mark_ctx, &side_bits, &mut worklist);
+                }
+                if !worklist.is_empty() {
+                    crate::young_mark::drain_parallel(
+                        std::mem::take(&mut worklist),
+                        mark_threads,
+                        |addr, work| scan_young_object(addr, &mark_ctx, &side_bits, work),
+                    );
+                }
+                late_pins = leftover;
+                if late_resolved_bases > 0 || !late_pins.is_empty() {
+                    LATE_RESOLVE_CYCLES.fetch_add(1, Ordering::Relaxed);
+                    LATE_RESOLVE_BASES.fetch_add(late_resolved_bases as u64, Ordering::Relaxed);
+                    LATE_RESOLVE_PINS.fetch_add(late_pins.len() as u64, Ordering::Relaxed);
+                    let n = LATE_RESOLVE_REPORTS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        tracing::warn!(
+                            target: "cratonvm::gc::guard",
+                            unresolved = unresolved.len(),
+                            resolved_bases = late_resolved_bases,
+                            pinned = late_pins.len(),
+                            "young non-moving sweep: the anchor oracle left conservative root \
+                             candidate(s) unresolved; they were side-marked at their RAW \
+                             address, which retains nothing when the address is object-INTERIOR. \
+                             Re-resolved against the arena object grid. Before this pass the \
+                             containing object(s) would have been reclaimed while a conservative \
+                             root pointed into them.",
+                        );
+                    }
+                }
+            }
+        }
+        report_phase("mark-late-resolve");
 
         // Sorted view of the side mark set for O(1)-amortized lockstep checks
         // in the linear walks below (same pattern as the free-block skip).
@@ -7621,9 +7969,26 @@ impl GenerationalHeap {
 
             let root_set: HashSet<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
 
+            // H2-CID0: a CONSERVATIVE root is an aligned stack/register word and
+            // may be object-INTERIOR. `mark_young` marks the containing object's
+            // BASE, not the candidate, so testing the raw candidate reports every
+            // interior root as an unmarked live root — 9-16 bogus (1) hits per
+            // cycle on a perfectly healthy H2 run, which is enough noise to hide
+            // a real one. Resolve through the same oracle the marker used before
+            // asking the question.
+            let resolved_base = |addr: usize| -> usize {
+                young_object_ranges
+                    .partition_point(|(start, _)| *start <= addr)
+                    .checked_sub(1)
+                    .and_then(|i| young_object_ranges.get(i))
+                    .filter(|&&(_, end)| addr < end)
+                    .map_or(addr, |&(base, _)| base)
+            };
+
             // (1) roots / finalizers that landed on an unmarked young object.
             let mut root_to_unmarked = 0usize;
-            for &addr in root_set.iter() {
+            for &raw_addr in root_set.iter() {
+                let addr = resolved_base(raw_addr);
                 if is_unmarked_young(addr) {
                     root_to_unmarked += 1;
                     if root_to_unmarked <= 8 {
@@ -7643,8 +8008,8 @@ impl GenerationalHeap {
                     }
                 }
             }
-            for &addr in finalizer_addrs.iter() {
-                if is_unmarked_young(addr) {
+            for &raw_addr in finalizer_addrs.iter() {
+                if is_unmarked_young(resolved_base(raw_addr)) {
                     root_to_unmarked += 1;
                 }
             }
@@ -7673,7 +8038,12 @@ impl GenerationalHeap {
             let mut unmarked_total = 0usize;
             let mut marked_total = 0usize;
             {
-                let existing_free_dbg = young_from.free_blocks_sorted();
+                // H2-CID0: `merge_skips`, not the bare free list. A reserved
+                // TLAB tail of a forcibly-stopped in-JIT peer is unallocated
+                // (all-zero) memory that the real sweep skips; walking it here
+                // produced "arena already corrupt before this sweep" on a
+                // healthy run and truncated the rest of the (2) scan.
+                let existing_free_dbg = merge_skips(young_from.free_blocks_sorted());
                 let mut free_it = existing_free_dbg.iter().peekable();
                 let used_dbg = young_from.used();
                 let mut c = 0usize;
@@ -7845,6 +8215,12 @@ impl GenerationalHeap {
         // whose headers were never written; the walk must retain them
         // without touching gc_flags/gc_age.
         let mut side_iter = side_sorted.iter().peekable();
+        // H2-CID0: conservative candidates that NEITHER the anchor oracle NOR
+        // the late grid walk could place. Lockstep exactly like `side_iter`:
+        // an object whose span contains one of these must not be reclaimed,
+        // because a conservative root points into it and the collector's
+        // invariant is that such a root can only ever over-retain.
+        let mut late_iter = late_pins.iter().peekable();
         // Debug diag: retain per-object walk history only under the explicit A2
         // forensic gate. The old default path retained every object (and a
         // later bounded-ring attempt still updated a deque per object), adding
@@ -7890,6 +8266,12 @@ impl GenerationalHeap {
             && !retain_dead_objects
             && !retain_full_walk
             && !watchref_dbg()
+            // H2-CID0: `late_pins` is the rare "a conservative root points into
+            // an object neither resolution pass could place" list. The chunk
+            // walk deliberately does not reimplement the sequential walk's
+            // policies; hand the whole sweep to it rather than teach two
+            // walkers the same retention rule.
+            && late_pins.is_empty()
             && sweep_anchors[0] == 0
             && sweep_anchors[sweep_anchors.len() - 1] <= used
             && sweep_anchors.windows(2).all(|w| w[0] < w[1])
@@ -7905,7 +8287,9 @@ impl GenerationalHeap {
                 old_hi,
                 watched: watched.as_ref(),
             };
+            PAR_SWEEP_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
             if let Some(chunks) = parallel_sweep_walk(&sweep_ctx, &sweep_anchors, sweep_threads) {
+                PAR_SWEEP_ACCEPTS.fetch_add(1, Ordering::Relaxed);
                 for chunk in chunks {
                     for (off, sz, cid, kind, count) in chunk.dead {
                         match dead_regions.last_mut() {
@@ -7937,6 +8321,21 @@ impl GenerationalHeap {
         }
         report_phase("sweep-walk-parallel-prefix");
 
+        // H2-CID0: anchor-validity probe. The parallel sweep prefix splits
+        // from-space at `sweep_anchors` and starts an independent chain at each
+        // one; its soundness rests entirely on those offsets being real walk
+        // positions. This walk visits every walk position in ascending order,
+        // so any anchor it strides past without landing on is an anchor that is
+        // NOT on the object grid — a chunk started there would parse phantom
+        // objects, and a phantom that reads as unmarked reclaims (and zeroes)
+        // every live object it subsumes.
+        //
+        // Only meaningful when this walk covers the whole arena, i.e. the
+        // parallel prefix did not already consume the front of it.
+        let seq_walk_covers_all = cursor == 0;
+        let mut anchor_probe = sweep_anchors.iter().peekable();
+        let mut anchors_off_grid = 0usize;
+
         while cursor < used {
             // Skip known free blocks ROBUSTLY. The free list (`existing_free`) is
             // sorted ascending and the walk advances `cursor` monotonically, so we
@@ -7965,6 +8364,21 @@ impl GenerationalHeap {
                     // A free block's end is ground truth — a fresh anchor.
                     dead_watermark = dead_regions.len();
                     continue;
+                }
+            }
+            // H2-CID0 anchor-validity probe (see `SWEEP_ANCHOR_NOT_A_BASE`).
+            // `cursor` is a walk position the grid actually reaches — an object
+            // start or a GAP-filler sentinel, both of which `sweep_chunk`
+            // handles. Anything the anchor list holds strictly below it was
+            // never reachable.
+            if seq_walk_covers_all {
+                while anchor_probe.peek().is_some_and(|&&a| a < cursor) {
+                    anchors_off_grid += 1;
+                    SWEEP_ANCHOR_NOT_A_BASE.fetch_add(1, Ordering::Relaxed);
+                    anchor_probe.next();
+                }
+                if anchor_probe.peek().is_some_and(|&&a| a == cursor) {
+                    anchor_probe.next();
                 }
             }
             // `cursor` is within `used`; the from-space region
@@ -8345,6 +8759,27 @@ impl GenerationalHeap {
                 false
             };
 
+            // H2-CID0: does an unplaceable conservative candidate point INSIDE
+            // this object? Same lockstep discipline as `side_iter`, and free
+            // (a single `is_empty` test) on every healthy cycle.
+            let late_pinned = if late_pins.is_empty() {
+                false
+            } else {
+                let abs = from_base + cursor;
+                while let Some(&&a) = late_iter.peek() {
+                    if a < abs {
+                        late_iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                let hit = late_iter.peek().is_some_and(|&&a| a < abs + total_size);
+                if hit && !side_marked_survivor && !header.is_forwarded() {
+                    LATE_PIN_RETENTIONS.fetch_add(1, Ordering::Relaxed);
+                }
+                hit
+            };
+
             if header.is_forwarded() {
                 // Evacuated to old gen by selective promotion: the live copy is
                 // in old gen and references were redirected in the fixup pass;
@@ -8409,8 +8844,11 @@ impl GenerationalHeap {
                         ));
                     }
                 }
-            } else if side_marked_survivor {
+            } else if side_marked_survivor || late_pinned {
                 // Side-marked survivor: pure retention, no header writes.
+                // `late_pinned` joins it here for the same reason — a
+                // conservative root points into this object, and the header
+                // may not be one we are allowed to write through.
                 objects_live += 1;
                 if gc_flags().dbg_sweep_liveness {
                     young_survivors.push(obj_ptr as usize);
@@ -8512,6 +8950,28 @@ impl GenerationalHeap {
         }
 
         report_phase("sweep-walk");
+
+        // H2-CID0: report the anchor-validity verdict. Reported here and not
+        // behind a debug gate because the failure it describes is silent: a
+        // chunk started off the object grid parses phantom objects, and an
+        // unmarked phantom reclaims and ZEROES every live object it subsumes.
+        // Bounded, and normally never emitted at all — on a sound anchor list
+        // this counter is exactly zero.
+        if anchors_off_grid > 0 {
+            let n = ANCHOR_OFF_GRID_REPORTS.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    off_grid = anchors_off_grid,
+                    anchors = sweep_anchors.len(),
+                    used,
+                    "young sweep: sweep anchor(s) are NOT on the object grid. The parallel \
+                     sweep prefix starts an independent chain at each anchor and only \
+                     re-proves it by landing on the next one, so a chunk beginning here can \
+                     parse phantom objects and reclaim every live object they subsume.",
+                );
+            }
+        }
 
         // Publish reclaimed regions to the arena's free list FIRST. Subsequent
         // `try_alloc_young_initialized` calls will satisfy allocations from
@@ -8656,6 +9116,88 @@ impl GenerationalHeap {
             }
         }
 
+        // ----- Invariant: no LIVE object inside a reclaimed span (H2-CID0) ---
+        //
+        // Since the Family-A hardening every mark lives in the side channel, so
+        // `side_sorted` IS the complete live set, and `dead_regions` is every
+        // span the walk decided to reclaim. The two must be disjoint. They can
+        // overlap only if the walk left the object grid: a mis-sized header
+        // subsumes its neighbours, and the phantom's own (unmarked) disposition
+        // then condemns every live object inside it.
+        //
+        // That failure is silent today. The span is zeroed before publication,
+        // so the next read through a still-live reference sees an all-zero
+        // header — `ClassId(0)`, which renders as `java.lang.Object` and
+        // surfaces minutes later on another thread as
+        // `java.lang.Object cannot be cast to <something>`
+        // (`docs/known-issues/h2/`
+        // `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`).
+        // Every existing guard stays quiet: the header is plausible, the extent
+        // fits, no slot goes out of bounds, nothing segfaults.
+        //
+        // Unconditional, because a check you have to enable is a check that is
+        // off in every bug report. It costs one merge pass over two lists that
+        // are already built and already sorted.
+        //
+        // A span that fails is RETAINED rather than freed — over-retention is
+        // always safe under this sweep, and it converts a silent
+        // use-after-free into a bounded leak plus a loud report.
+        if !dead_regions.is_empty() && !side_sorted.is_empty() {
+            let mut si = 0usize;
+            let mut violations = 0usize;
+            let mut first: Option<(usize, usize, u32)> = None;
+            dead_regions.retain(|&(off, sz, cid, _, _)| {
+                let start = from_base + off;
+                let end = start + sz;
+                while si < side_sorted.len() && side_sorted[si] < start {
+                    si += 1;
+                }
+                let mut live_inside = false;
+                let mut k = si;
+                while k < side_sorted.len() && side_sorted[k] < end {
+                    // An evacuated source is marked AND dead by construction:
+                    // selective promotion only ever evacuates objects the mark
+                    // just proved live, and the copy is already in old gen.
+                    // SAFETY: `side_sorted[k]` is an 8-aligned address inside
+                    // the live from-space region and nothing has been zeroed
+                    // yet, so its header is still readable.
+                    let h = unsafe { &*(side_sorted[k] as *const ObjectHeader) };
+                    if !h.is_forwarded() {
+                        live_inside = true;
+                        if first.is_none() {
+                            first = Some((side_sorted[k], sz, cid));
+                        }
+                        break;
+                    }
+                    k += 1;
+                }
+                if live_inside {
+                    violations += 1;
+                    return false;
+                }
+                true
+            });
+            if violations > 0 {
+                LIVE_IN_DEAD_SPANS.fetch_add(violations as u64, Ordering::Relaxed);
+                let n = LIVE_IN_DEAD_REPORTS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    let (victim, sz, cid) = first.unwrap_or((0, 0, 0));
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        spans = violations,
+                        victim = format!("{victim:#x}"),
+                        span_bytes = sz,
+                        span_head_class_id = cid,
+                        "young non-moving sweep was about to ZERO a span containing a LIVE \
+                         (marked) object — the walk left the object grid and a phantom header \
+                         subsumed it. The span has been RETAINED instead of freed. Without \
+                         this check the object's header would now read all-zero and the next \
+                         use of it would fail as `java.lang.Object cannot be cast to ...`.",
+                    );
+                }
+            }
+        }
+
         // Coalesce the newly-dead spans while they are still in walk order.
         // Publishing every object-sized hole first and sorting the arena free
         // list afterward made a bintrees18 collection allocate, sort, and merge
@@ -8673,6 +9215,55 @@ impl GenerationalHeap {
                 }
             }
             reclaimed_regions.push((off, sz));
+        }
+
+        // ----- Invariant: a reclaimed span is not ALREADY free (H2-CID0) -----
+        //
+        // `existing_free` is the free list as it stood at sweep start (merged
+        // with the reserved-TLAB-tail skips); `reclaimed_regions` is what this
+        // sweep is about to add. An overlap means the same bytes end up on the
+        // free list twice, so the allocator can serve them to two objects — and
+        // the second allocation ZEROES the block before writing its header,
+        // which lands the same all-zero-header face on a still-referenced
+        // object as a premature sweep does.
+        //
+        // This condition already had a diagnostic (`CRATONVM_DBG_A2`'s
+        // `DEAD-vs-EXISTING overlap`) but only behind a gate, and as an
+        // O(dead x free) double loop. Both lists are sorted and disjoint, so
+        // one merge pass answers it unconditionally; on a hit the span is
+        // dropped rather than published (over-retention, the safe direction).
+        if !reclaimed_regions.is_empty() && !existing_free.is_empty() {
+            let mut fi = 0usize;
+            let mut overlaps = 0usize;
+            let mut first: Option<(usize, usize)> = None;
+            reclaimed_regions.retain(|&(off, sz)| {
+                while fi < existing_free.len() && existing_free[fi].0 + existing_free[fi].1 <= off {
+                    fi += 1;
+                }
+                if fi < existing_free.len() && existing_free[fi].0 < off + sz {
+                    overlaps += 1;
+                    if first.is_none() {
+                        first = Some((off, sz));
+                    }
+                    return false;
+                }
+                true
+            });
+            if overlaps > 0 {
+                DOUBLE_FREE_SPANS.fetch_add(overlaps as u64, Ordering::Relaxed);
+                let n = DOUBLE_FREE_REPORTS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    let (off, sz) = first.unwrap_or((0, 0));
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        spans = overlaps,
+                        first_span = format!("{:#x}+{sz:#x}", from_base + off),
+                        "young non-moving sweep was about to publish a span that is ALREADY on \
+                         the free list — a double free. The allocator would serve the same \
+                         bytes twice and zero them under a live object. Span dropped.",
+                    );
+                }
+            }
         }
 
         // DoHead walk-desync hardening (2026-07-02): zeroing was deferred from
@@ -8962,6 +9553,13 @@ impl GenerationalHeap {
         let young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
+        // H2-CID0: the reserved TLAB tails of forcibly-stopped in-JIT peers.
+        // `mark_young_to_old_refs` must skip them exactly as the young sweep
+        // does — see its comment for what walking one costs.
+        let young_skips = {
+            let base = young_from.base_ptr() as usize;
+            self.jit_tlab_skip_offsets(base, base + young_from.used())
+        };
         let mut root_shadow = roots.to_vec();
         // Seed this sweep from THIS cycle's promotion destinations.
         //
@@ -9036,7 +9634,13 @@ impl GenerationalHeap {
                 roots.len(),
             );
         }
-        let survivors = Self::old_gen_gc(&mut root_shadow, &young_from, &mut old_gen, false);
+        let survivors = Self::old_gen_gc(
+            &mut root_shadow,
+            &young_from,
+            &mut old_gen,
+            false,
+            &young_skips,
+        );
         (before.saturating_sub(old_gen.used()), survivors)
     }
 
@@ -9056,18 +9660,25 @@ impl GenerationalHeap {
         roots: &mut [ObjectRef],
         young_from: &Arena,
         old_gen: &mut OldGen,
+        young_skips: &[(usize, usize)],
     ) -> HashMap<usize, usize> {
-        Self::old_gen_gc(roots, young_from, old_gen, true)
+        Self::old_gen_gc(roots, young_from, old_gen, true, young_skips)
     }
 
     /// Mark old space from the complete root set and either compact it (when
     /// every root is rewritable) or reclaim dead blocks in place (when JIT
     /// roots are conservative).
+    ///
+    /// `young_skips` is the from-space skip list — the free list MERGED with
+    /// the reserved-TLAB-tail regions of forcibly-stopped in-JIT peers. Both
+    /// young walks below need it; see `mark_young_to_old_refs` for what goes
+    /// wrong when a reserved tail is walked as if it held objects.
     fn old_gen_gc(
         roots: &mut [ObjectRef],
         young_from: &Arena,
         old_gen: &mut OldGen,
         compact: bool,
+        young_skips: &[(usize, usize)],
     ) -> HashMap<usize, usize> {
         // ---- Mark phase ---- BFS from roots + young-gen cross-references ----
 
@@ -9180,7 +9791,13 @@ impl GenerationalHeap {
         }
 
         // Seed: young from-space references into old gen
-        Self::mark_young_to_old_refs(young_from, old_gen, &walked_bases, &mut worklist);
+        Self::mark_young_to_old_refs(
+            young_from,
+            old_gen,
+            &walked_bases,
+            young_skips,
+            &mut worklist,
+        );
 
         // `mark_young_to_old_refs` walks only real Java heap fields. Follow
         // the equivalent out-of-heap edges for all current young owners too;
@@ -9508,6 +10125,22 @@ impl GenerationalHeap {
                             }
                         }
                     }
+                    // H2-CID0 (2026-08-01): remember WHAT was here. `OldGen::free`
+                    // leaves the bytes in place, so a dangling read of this block
+                    // returns the stale object until the allocator reuses it —
+                    // and reuse zeroes the block before writing the new header,
+                    // which is how a still-referenced old-gen object comes back as
+                    // an all-zero `ClassId(0)` header, i.e. `java.lang.Object`.
+                    // Always on, and cheap: an in-place old sweep only runs past
+                    // 75 % occupancy, and the record is one relaxed `fetch_add`
+                    // plus four relaxed stores. See
+                    // `docs/known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`.
+                    record_old_freed(
+                        obj_ptr as usize,
+                        header.class_id.as_u32(),
+                        header.kind as u8,
+                        OLD_FREED_SITE_INPLACE_SWEEP,
+                    );
                     // SAFETY: `obj_ptr`/`total_size` are exactly the (base, size) pair `walk_objects` yielded for this
                     // now-unmarked old-gen object, so returning that span to the free list is sound.
                     unsafe { old_gen.free(obj_ptr, total_size) };
@@ -9543,7 +10176,7 @@ impl GenerationalHeap {
         // ---- Cross-gen fixup ---- update young-gen refs into old gen ----
 
         if !compact_map.is_empty() {
-            Self::fixup_young_old_refs(young_from, &compact_map);
+            Self::fixup_young_old_refs(young_from, &compact_map, young_skips);
 
             // ---- Root fixup ---- update roots pointing into old gen ----
             for root in roots.iter_mut() {
@@ -9563,6 +10196,7 @@ impl GenerationalHeap {
         young_from: &Arena,
         old_gen: &OldGen,
         walked_bases: &[usize],
+        young_skips: &[(usize, usize)],
         worklist: &mut Vec<*mut u8>,
     ) {
         // Skip the zeroed holes the non-moving sweep leaves in from-space.
@@ -9575,7 +10209,44 @@ impl GenerationalHeap {
         // unmarked). The non-moving sweep itself skips holes the same way; every
         // linear from-space walker must too. (Cheney is immune: it resets
         // from-space each cycle, so holes never accumulate there.)
-        let free_blocks = young_from.free_blocks_sorted();
+        //
+        // H2-CID0 (2026-08-01): the skip list must ALSO carry the reserved
+        // TLAB tails of forcibly-stopped in-JIT peers (BUG-03), which is why it
+        // is passed in rather than read from `young_from` here.
+        //
+        // A reserved tail is the unallocated remainder of a TLAB whose owner
+        // was frozen mid-JIT. It is not on the free list and it holds no
+        // objects -- `sweep_young_non_moving` merges these regions into its own
+        // skip list for exactly that reason ("an un-retired tail is neither
+        // walked as objects nor reclaimed"). These two walks did not, so they
+        // parsed the tail's bytes as headers. When those bytes decode plausibly
+        // the walk strides off the object grid and keeps going: the REAL young
+        // objects after the tail can be read at wrong offsets.
+        //
+        // MEASURED, so the next reader does not over-claim this: a negative
+        // control (2026-08-01) shows the walk survives an unparseable reserved
+        // tail WITHOUT this merge, because the desync trips the anomaly path
+        // and the conservative word scan still finds every old-gen base in the
+        // stretch. So this is a CONSISTENCY fix -- every other linear
+        // from-space walker skips these regions, and parsing a tail that holds
+        // no objects is pointless work resting on that fallback -- not a
+        // demonstrated bug fix.
+        //
+        // Why the fallback matters so much here: `OldGen::close_live_set`
+        // (`5750caf5f`) closes the live set over references from marked
+        // OLD-GEN objects, so it cannot rescue a block whose only referrer is
+        // YOUNG -- the shape H2's `CacheLongKeyLIRS` has, holding its `Page` /
+        // `ByteBuffer` / `Chunk` payloads from entries that are still young.
+        // Nor would `CRATONVM_DBG_SWEEP_EDGES` see it: that assertion looks
+        // for references INTO young, never young->old.
+        let free_blocks: Vec<(usize, usize)> = if young_skips.is_empty() {
+            young_from.free_blocks_sorted()
+        } else {
+            let mut v = young_from.free_blocks_sorted();
+            v.extend_from_slice(young_skips);
+            v.sort_by_key(|&(off, _)| off);
+            v
+        };
         let mut free_iter = free_blocks.iter().peekable();
         let mut cursor: usize = 0;
         let base = young_from.base_ptr() as usize;
@@ -9753,13 +10424,54 @@ impl GenerationalHeap {
 
     /// After old-gen compaction, update references in young from-space that
     /// pointed to old-gen objects which have been relocated.
-    fn fixup_young_old_refs(young_from: &Arena, compact_map: &HashMap<usize, usize>) {
+    fn fixup_young_old_refs(
+        young_from: &Arena,
+        compact_map: &HashMap<usize, usize>,
+        young_skips: &[(usize, usize)],
+    ) {
         // Skip non-moving-sweep holes — same rationale as `mark_young_to_old_refs`:
         // a linear from-space walk must not stride into a reclaimed zeroed hole
         // (it would desync off the object grid and misread a live object's
         // interior cell, then `break` and leave the rest of from-space's
         // old-gen refs un-fixed-up after a compaction → dangling pointers).
-        let free_blocks = young_from.free_blocks_sorted();
+        //
+        // H2-CID0 (2026-08-01): the skip list must ALSO carry the reserved
+        // TLAB tails of forcibly-stopped in-JIT peers (BUG-03), which is why it
+        // is passed in rather than read from `young_from` here.
+        //
+        // A reserved tail is the unallocated remainder of a TLAB whose owner
+        // was frozen mid-JIT. It is not on the free list and it holds no
+        // objects -- `sweep_young_non_moving` merges these regions into its own
+        // skip list for exactly that reason ("an un-retired tail is neither
+        // walked as objects nor reclaimed"). These two walks did not, so they
+        // parsed the tail's bytes as headers. When those bytes decode plausibly
+        // the walk strides off the object grid and keeps going: the REAL young
+        // objects after the tail can be read at wrong offsets.
+        //
+        // MEASURED, so the next reader does not over-claim this: a negative
+        // control (2026-08-01) shows the walk survives an unparseable reserved
+        // tail WITHOUT this merge, because the desync trips the anomaly path
+        // and the conservative word scan still finds every old-gen base in the
+        // stretch. So this is a CONSISTENCY fix -- every other linear
+        // from-space walker skips these regions, and parsing a tail that holds
+        // no objects is pointless work resting on that fallback -- not a
+        // demonstrated bug fix.
+        //
+        // Why the fallback matters so much here: `OldGen::close_live_set`
+        // (`5750caf5f`) closes the live set over references from marked
+        // OLD-GEN objects, so it cannot rescue a block whose only referrer is
+        // YOUNG -- the shape H2's `CacheLongKeyLIRS` has, holding its `Page` /
+        // `ByteBuffer` / `Chunk` payloads from entries that are still young.
+        // Nor would `CRATONVM_DBG_SWEEP_EDGES` see it: that assertion looks
+        // for references INTO young, never young->old.
+        let free_blocks: Vec<(usize, usize)> = if young_skips.is_empty() {
+            young_from.free_blocks_sorted()
+        } else {
+            let mut v = young_from.free_blocks_sorted();
+            v.extend_from_slice(young_skips);
+            v.sort_by_key(|&(off, _)| off);
+            v
+        };
         let mut free_iter = free_blocks.iter().peekable();
         let mut cursor: usize = 0;
         let base = young_from.base_ptr() as usize;
@@ -12032,6 +12744,99 @@ fn scan_young_object(
             mark_edge_precise(metadata_addr, ctx, bits, worklist);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Late conservative-candidate base resolution (H2-CID0, 2026-08-01)
+// ---------------------------------------------------------------------------
+
+/// Resolve each address in `cands` to the BASE of the young from-space object
+/// that contains it, by chaining the arena's own object grid from offset 0.
+///
+/// This is the fallback for candidates the anchor oracle in
+/// `sweep_young_non_moving` could not place. The oracle is a subsampled walk:
+/// it chains each anchor interval independently and throws the interval away
+/// unless the chain lands exactly on the upper anchor. An anchor that is not
+/// really an object base (or an object whose extent straddles one) therefore
+/// discards a whole interval's worth of resolutions, and every candidate in it
+/// falls back to being side-marked at its RAW address — which retains nothing
+/// when the address is object-INTERIOR, because the sweep matches side marks
+/// against object STARTS.
+///
+/// This walk has no anchors to disagree with: it is the same linear chain the
+/// sweep itself performs (free/TLAB-skip aware, GAP-filler aware, and
+/// abandoning on the same header-plausibility failures), so where it resolves a
+/// candidate it resolves it to exactly the object the sweep is about to
+/// classify.
+///
+/// `cands` must be sorted ascending and hold ABSOLUTE addresses inside
+/// `[from_base, from_base + used)`. `free_blocks` is the merged
+/// free-list + reserved-TLAB-tail skip list, sorted ascending.
+///
+/// Returns `(bases, unreachable)` — the covering bases it proved (each at most
+/// once, ascending), and the candidates the walk never got to because it
+/// desynced first. The caller marks the former and pins the latter.
+fn resolve_candidate_bases(
+    from_base: usize,
+    used: usize,
+    free_blocks: &[(usize, usize)],
+    cands: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
+    let mut bases: Vec<usize> = Vec::new();
+    if cands.is_empty() {
+        return (bases, Vec::new());
+    }
+    let mut free_iter = free_blocks.iter().peekable();
+    let mut cursor = 0usize;
+    let mut ci = 0usize;
+    while cursor < used && ci < cands.len() {
+        // Same robust free/TLAB-skip resync the sweep walk uses.
+        if skip_free_blocks(&mut cursor, &mut free_iter).0 {
+            continue;
+        }
+        if cursor >= used {
+            break;
+        }
+        let ptr = (from_base + cursor) as *mut u8;
+        // SAFETY: `cursor < used` and free/TLAB ranges were skipped, so this is
+        // an allocator-written object boundary inside the mapped from-space.
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+            // SAFETY: offset 4 lies within the >= 8-byte gap.
+            let gap = unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
+            if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= used {
+                cursor += gap;
+                continue;
+            }
+            break;
+        }
+        let total = gen_object_total_size(header);
+        if total < HEADER_SIZE || cursor + total > used {
+            break;
+        }
+        // An object can never span a pre-existing free hole.
+        if let Some(&&(foff, _)) = free_iter.peek() {
+            if foff > cursor && foff < cursor + total {
+                break;
+            }
+        }
+        let start = from_base + cursor;
+        let end = start + total;
+        // Candidates below this object's start fell in free/gap space the walk
+        // just strode over — they are provably not object interiors, exactly as
+        // the oracle's verified-span drop concludes.
+        while ci < cands.len() && cands[ci] < start {
+            ci += 1;
+        }
+        if ci < cands.len() && cands[ci] < end {
+            bases.push(start);
+            while ci < cands.len() && cands[ci] < end {
+                ci += 1;
+            }
+        }
+        cursor += total;
+    }
+    (bases, cands[ci..].to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -15539,7 +16344,7 @@ mod tests {
             let mut old_gen = heap.old_gen.lock();
             let mut major_roots = vec![holder, victim];
             let _ =
-                GenerationalHeap::old_gen_gc(&mut major_roots, &young_from, &mut old_gen, false);
+                GenerationalHeap::old_gen_gc(&mut major_roots, &young_from, &mut old_gen, false, &[]);
         }
         let after = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
 
@@ -15981,7 +16786,7 @@ mod tests {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
             let old_used_before = old_gen.used();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
             let old_used_after = old_gen.used();
             assert!(
                 old_used_after < old_used_before,
@@ -15994,6 +16799,95 @@ mod tests {
         // Roots may have been relocated by compaction — use updated refs
         assert_eq!(heap.get_field(roots[0], 0).as_int(), Some(0));
         assert_eq!(heap.get_field(roots[1], 0).as_int(), Some(2));
+    }
+
+    /// H2-CID0 (2026-08-01) — the in-place old-gen sweep must not free an
+    /// old-gen object whose only referrer is a YOUNG object sitting after an
+    /// UNPARSEABLE stretch of from-space (here, a reserved TLAB tail).
+    ///
+    /// What this pins is `mark_young_to_old_refs`' conservative word-scan
+    /// fallback, and it is worth pinning because that fallback is the only
+    /// thing standing between a from-space walk desync and a use-after-free:
+    /// `OldGen::close_live_set` (`5750caf5f`) closes the live set over
+    /// references from marked OLD-GEN objects, so it cannot rescue a block
+    /// whose only referrer is young, and `CRATONVM_DBG_SWEEP_EDGES` only looks
+    /// for references INTO young, never young->old. Nothing else covers this
+    /// edge.
+    ///
+    /// NOTE, measured: this test passes both with and without the reserved-tail
+    /// merge in `mark_young_to_old_refs` (negative control run 2026-08-01), so
+    /// it does NOT pin that merge. The merge is a consistency fix — every other
+    /// linear from-space walker skips these regions — not a demonstrated bug
+    /// fix, and it must not be described as one.
+    #[test]
+    fn in_place_old_sweep_keeps_an_object_referenced_from_young_past_an_unparseable_stretch() {
+        let heap = GenerationalHeap::with_sizes(64 * 1024, 64 * 1024);
+        let monitors = NoOpMonitors;
+
+        // A long-lived old-gen payload, reachable ONLY from young below.
+        let payload = heap.alloc_object(ClassId::new(0), 2);
+        heap.set_field(payload, 0, Value::Int(0x5AFE));
+        let mut promote = vec![payload];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut promote, &monitors);
+        }
+        let payload = promote[0];
+        assert!(
+            heap.is_in_old(payload.as_ptr()),
+            "payload must be in old gen for this test to mean anything"
+        );
+
+        // Now build young: [filler][reserved tail][referrer -> payload].
+        // `filler` only exists to give the tail a plausible predecessor.
+        let filler = heap.alloc_object(ClassId::new(0), 4);
+        heap.set_field(filler, 0, Value::Int(1));
+        let tail_start = {
+            let from = heap.young_from.lock();
+            from.base_ptr() as usize + from.used()
+        };
+        // Reserve a span the way a frozen in-JIT peer's TLAB tail is reserved:
+        // allocate it, then publish it as a skip region. Its contents are
+        // whatever the mutator left — here, bytes that decode as an object
+        // LARGER than the span, which is exactly what desyncs a walker that
+        // does not skip it.
+        let tail_obj = heap.alloc_object(ClassId::new(0), 8);
+        let tail_end = {
+            let from = heap.young_from.lock();
+            from.base_ptr() as usize + from.used()
+        };
+        // SAFETY: `tail_obj` is a live young object; overwriting its header's
+        // slot count is precisely the "unparseable reserved tail" state.
+        unsafe {
+            let h = &mut *(tail_obj.as_ptr() as *mut ObjectHeader);
+            h.set_num_slots(64);
+        }
+
+        let referrer = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(referrer, 0, Value::Object(Some(payload)));
+        assert!(
+            !heap.is_in_old(referrer.as_ptr()),
+            "referrer must still be young"
+        );
+
+        heap.set_jit_tlab_skip_regions(&[(tail_start, tail_end)]);
+
+        // Sweep old gen in place with NO root naming the payload — the young
+        // referrer is the only path to it.
+        let (_freed, _survivors) = heap.sweep_old_gen_non_moving(&[], &HashMap::new());
+
+        assert_eq!(
+            heap.get_field(payload, 0).as_int(),
+            Some(0x5AFE),
+            "the in-place old sweep freed an object referenced from a young              object that sits after an unparseable stretch of from-space",
+        );
+        {
+            let old_gen = heap.old_gen.lock();
+            assert!(
+                old_gen.is_allocated_addr(payload.as_ptr()),
+                "the payload's block was returned to the old-gen free list                  while a young object still referenced it",
+            );
+        }
+        heap.set_jit_tlab_skip_regions(&[]);
     }
 
     #[test]
@@ -16035,7 +16929,7 @@ mod tests {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
             let _compact_map =
-                GenerationalHeap::major_gc(&mut major_roots, &young_from, &mut old_gen);
+                GenerationalHeap::major_gc(&mut major_roots, &young_from, &mut old_gen, &[]);
         }
 
         // Walk the chain from the (possibly relocated) root: A -> B -> C
@@ -16309,7 +17203,7 @@ mod tests {
             let mut old_gen = heap.old_gen.lock();
             let free_blocks_before = old_gen.free_block_count();
 
-            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
 
             // After compaction: exactly one free block (defragmented)
             assert_eq!(
@@ -16372,7 +17266,7 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
 
             // Only 3 live objects (A, B, C) — garbage should be freed
             assert_eq!(
@@ -16441,7 +17335,7 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
 
             // Used space should have decreased (half the objects freed)
             assert!(
@@ -16540,7 +17434,7 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
             assert!(
                 compact_map.is_empty(),
                 "No objects should move when they are already contiguous"
@@ -16574,7 +17468,7 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
 
             // Verify no forwarding pointers remain set
             for (obj_ptr, _) in old_gen.walk_objects() {
@@ -17332,7 +18226,7 @@ mod tests {
         }
         let young_from = heap.young_from.lock();
         let mut old_gen = heap.old_gen.lock();
-        let _pointer_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen);
+        let _pointer_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
         drop(old_gen);
         drop(young_from);
         for (index, object) in roots.iter().copied().enumerate() {

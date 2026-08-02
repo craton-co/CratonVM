@@ -2037,6 +2037,26 @@ impl VmHeap {
         }
     }
 
+    /// Is `addr` inside memory the collector has RECLAIMED?
+    ///
+    /// H2-CID0 — see [`GenerationalHeap::reclaimed_hole_at`] for why this
+    /// exists: it is the flag-free discriminator between an ordinary
+    /// `new Object()` and a reference into a span the collector freed and
+    /// zeroed, which are otherwise indistinguishable at the point a
+    /// `checkcast` fails with `java.lang.Object` as the actual class.
+    ///
+    /// G1/ZGC return `None`: their liveness is region/registry based and
+    /// `is_addr_live` already answers exactly, so there is no free-list view
+    /// to consult.
+    pub fn reclaimed_hole_at(&self, addr: usize) -> Option<(&'static str, usize, usize)> {
+        match self {
+            VmHeap::Generational(h) => h.reclaimed_hole_at(addr),
+            VmHeap::G1(_) => None,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
+        }
+    }
+
     /// Generational: is `addr` inside EITHER young semispace? Used by
     /// reference processing to detect stale PRE-GC Reference addresses
     /// (young + absent from the pointer map ⇒ did not survive the GC).
