@@ -420,6 +420,7 @@ fn compile_despec_arraycopy_with_dispatch(
         Vec::new(), // pic_slots
         Vec::new(), // ldc_info
         Vec::new(), // ldc_string_info
+        Vec::new(), // ldc_class_info
         Vec::new(), // ldc2w_info
         HashMap::new(),
         HashMap::new(),

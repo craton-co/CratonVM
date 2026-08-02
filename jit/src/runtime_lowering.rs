@@ -203,6 +203,52 @@ pub(crate) fn emit_new_object_cp_stub(
     cp_idx: u16,
     frame_record: usize,
 ) {
+    emit_cp_indexed_call(
+        buf,
+        context_offset,
+        target,
+        holder_class_id,
+        cp_idx,
+        frame_record,
+    );
+}
+
+/// Emit the constant-pool-indexed `ldc <Class>` call: `(vm, holder_class_id,
+/// cp_idx) -> mirror ObjectRef`, `0` after publishing a pending exception.
+///
+/// Shares [`emit_cp_indexed_call`] with the deferred-`new` stub because the
+/// two helpers deliberately have the same ABI — both defer a class resolution
+/// that must not run inside the compiler — but they stay separate entry points
+/// so each call site names the helper it actually calls.
+pub(crate) fn emit_ldc_class_cp_stub(
+    buf: &mut ExecutableBuffer,
+    context_offset: i32,
+    target: usize,
+    holder_class_id: u32,
+    cp_idx: u16,
+    frame_record: usize,
+) {
+    emit_cp_indexed_call(
+        buf,
+        context_offset,
+        target,
+        holder_class_id,
+        cp_idx,
+        frame_record,
+    );
+}
+
+/// `(vm_ptr, holder_class_id, cp_idx)` in the entry ABI's first three argument
+/// registers, an absolute `CALL`, then the post-call frame republish every
+/// helper that can run Java (and therefore GC) needs.
+fn emit_cp_indexed_call(
+    buf: &mut ExecutableBuffer,
+    context_offset: i32,
+    target: usize,
+    holder_class_id: u32,
+    cp_idx: u16,
+    frame_record: usize,
+) {
     emit_load_frame(buf, ENTRY_ABI_REGS[0], context_offset);
     emit_mov_imm64(buf, ENTRY_ABI_REGS[1], u64::from(holder_class_id));
     emit_mov_imm64(buf, ENTRY_ABI_REGS[2], u64::from(cp_idx));

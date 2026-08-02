@@ -645,6 +645,11 @@ struct Compiler {
     /// The bytes are owned by the compiled method; code materializes the Java
     /// object through `helpers.ldc_string` instead of baking an ObjectRef.
     ldc_string_info: Vec<(usize, *const u8, usize)>,
+    /// Class-`ldc` sites: `(bytecode_pc, referencing class id, CP index)`.
+    /// Served by `helpers.ldc_class_cp`, which resolves the target and
+    /// returns its mirror — the mirror is a heap object, so it can neither be
+    /// baked as an immediate nor resolved once at compile time.
+    ldc_class_info: Vec<(usize, u32, u16)>,
     /// Resolved ldc2_w constants: (bytecode_pc, i64 value).
     ldc2w_info: Vec<(usize, i64)>,
     /// Runtime helper function pointers for JIT callbacks.
@@ -1041,6 +1046,7 @@ struct Compiler {
     typecheck_info_idx: FxHashMap<usize, usize>,
     ldc_info_idx: FxHashMap<usize, usize>,
     ldc_string_info_idx: FxHashMap<usize, usize>,
+    ldc_class_info_idx: FxHashMap<usize, usize>,
     ldc2w_info_idx: FxHashMap<usize, usize>,
 
     /// Memo for `magic_signed_div32`: constant divisor → computed
@@ -2017,6 +2023,7 @@ impl Compiler {
             loop_unroll_hints: FxHashMap::default(),
             ldc_info: Vec::new(),
             ldc_string_info: Vec::new(),
+            ldc_class_info: Vec::new(),
             ldc2w_info: Vec::new(),
             branch_target_stack_depth: FxHashMap::default(),
             branch_target_stack_oop_marks: FxHashMap::default(),
@@ -2097,6 +2104,7 @@ impl Compiler {
             typecheck_info_idx: FxHashMap::default(),
             ldc_info_idx: FxHashMap::default(),
             ldc_string_info_idx: FxHashMap::default(),
+            ldc_class_info_idx: FxHashMap::default(),
             ldc2w_info_idx: FxHashMap::default(),
             magic_div_memo: FxHashMap::default(),
             magic_div64_memo: FxHashMap::default(),
@@ -2195,6 +2203,11 @@ impl Compiler {
         self.ldc_string_info_idx.reserve(self.ldc_string_info.len());
         for (i, e) in self.ldc_string_info.iter().enumerate() {
             self.ldc_string_info_idx.insert(e.0, i);
+        }
+        self.ldc_class_info_idx.clear();
+        self.ldc_class_info_idx.reserve(self.ldc_class_info.len());
+        for (i, e) in self.ldc_class_info.iter().enumerate() {
+            self.ldc_class_info_idx.insert(e.0, i);
         }
         self.ldc2w_info_idx.clear();
         self.ldc2w_info_idx.reserve(self.ldc2w_info.len());
@@ -12360,6 +12373,42 @@ impl Compiler {
         }
     }
 
+    /// Emit an `ldc <Class>` site: call `helpers.ldc_class_cp` and push the
+    /// returned mirror as an oop. Returns `false` when this pc is not a
+    /// class-`ldc` **or** the site cannot be served (the helper is unwired, or
+    /// this artifact has no VM context to pass it), leaving the caller to fall
+    /// through to the immediate/string arms or refuse the method.
+    ///
+    /// The mirror is re-fetched on every execution rather than baked, exactly
+    /// as `helpers.ldc_string` re-interns its String: both are heap objects a
+    /// relocating collector may move between two runs of this body.
+    fn emit_ldc_class(&mut self, pc: usize) -> bool {
+        let Some(&idx) = self.ldc_class_info_idx.get(&pc) else {
+            return false;
+        };
+        if self.helpers.ldc_class_cp == 0 || !self.needs_heap {
+            return false;
+        }
+        let (_, holder_class_id, cp_idx) = self.ldc_class_info[idx];
+        self.emit_pre_safepoint_spill();
+        crate::runtime_lowering::emit_ldc_class_cp_stub(
+            &mut self.buf,
+            self.heap_local_offset,
+            self.helpers.ldc_class_cp,
+            holder_class_id,
+            cp_idx,
+            self.helpers.frame_record,
+        );
+        // Resolution can load a class — arbitrary Java, hence a GC point — so
+        // this is a real safepoint, and its `0` return is a published pending
+        // exception (`NoClassDefFoundError` and friends), not a value.
+        self.emit_oop_map_for_safepoint();
+        self.emit_post_alloc_oom_check();
+        self.push_from_rax();
+        self.mark_top_as_oop();
+        true
+    }
+
     /// Emit the post-allocation OOM guard, immediately after an allocation
     /// helper (`newarray` / `new_object` / `anewarray_object`) returns with its
     /// result still in RAX. Those helpers return the `0`/null sentinel on heap
@@ -14069,8 +14118,15 @@ impl Compiler {
                     }
                 }
 
-                // ldc — load int/float/string constant from CP (1-byte index)
+                // ldc — load int/float/string/class constant from CP (1-byte index)
                 0x12 => {
+                    if self.emit_ldc_class(pc) {
+                        pc += 2;
+                        continue;
+                    }
+                    if self.ldc_class_info_idx.contains_key(&pc) {
+                        return false;
+                    }
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     if let Some(&idx) = self.ldc_string_info_idx.get(&pc) {
                         let (_, bytes, len) = self.ldc_string_info[idx];
@@ -14096,8 +14152,15 @@ impl Compiler {
                     }
                 }
 
-                // ldc_w — load int/float/string constant from CP (2-byte index)
+                // ldc_w — load int/float/string/class constant from CP (2-byte index)
                 0x13 => {
+                    if self.emit_ldc_class(pc) {
+                        pc += 3;
+                        continue;
+                    }
+                    if self.ldc_class_info_idx.contains_key(&pc) {
+                        return false;
+                    }
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     if let Some(&idx) = self.ldc_string_info_idx.get(&pc) {
                         let (_, bytes, len) = self.ldc_string_info[idx];
@@ -23231,6 +23294,9 @@ pub fn compile(
         mic_slots,
         pic_slots,
         ldc_info,
+        // ldc_string_info / ldc_class_info: the legacy/test wrapper has no
+        // constant pool to resolve either against, so never any.
+        Vec::new(),
         Vec::new(),
         ldc2w_info,
         branch_hints,
@@ -23727,6 +23793,10 @@ pub fn compile_with_param_slots(
     pic_slots: Vec<(usize, *const super::JitPICSlot)>,
     ldc_info: Vec<(usize, i64)>,
     ldc_string_info: Vec<(usize, *const u8, usize)>,
+    // Class-`ldc` sites — see `ldc_class_info` on the compiler struct. Served
+    // by the CP-indexed `ldc_class_cp` helper; disjoint from `ldc_info` and
+    // `ldc_string_info`.
+    ldc_class_info: Vec<(usize, u32, u16)>,
     ldc2w_info: Vec<(usize, i64)>,
     branch_hints: HashMap<usize, bool>,
     loop_unroll_hints: HashMap<usize, usize>,
@@ -23763,7 +23833,10 @@ pub fn compile_with_param_slots(
     // this is always consistent with an invokedynamic-free method there).
     indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
 ) -> Option<CompiledMethod> {
-    let needs_heap = needs_heap || !ldc_string_info.is_empty();
+    // A class-`ldc` calls a helper that takes the VM context as its first
+    // argument, exactly like a string-`ldc`, so it forces the context form of
+    // the artifact too.
+    let needs_heap = needs_heap || !ldc_string_info.is_empty() || !ldc_class_info.is_empty();
     let gc_inert_selfrec = gc_inert_selfrec_candidate(
         code,
         code_len,
@@ -23900,7 +23973,7 @@ pub fn compile_with_param_slots(
         multianewarray_info, field_info, typecheck_info, static_field_info,
         new_info, new_deferred_info, anewarray_info, anewarray_deferred_info,
         invoke_info, direct_calls, mic_slots, pic_slots,
-        ldc_info, ldc_string_info, ldc2w_info, branch_hints,
+        ldc_info, ldc_string_info, ldc_class_info, ldc2w_info, branch_hints,
         loop_unroll_hints, non_escaping_new, inline_sites, compact_field_info,
         indy_info,
     ) = match &loop_xform {
@@ -23908,7 +23981,7 @@ pub fn compile_with_param_slots(
             multianewarray_info, field_info, typecheck_info, static_field_info,
             new_info, new_deferred_info, anewarray_info, anewarray_deferred_info,
             invoke_info, direct_calls, mic_slots, pic_slots,
-            ldc_info, ldc_string_info, ldc2w_info, branch_hints,
+            ldc_info, ldc_string_info, ldc_class_info, ldc2w_info, branch_hints,
             loop_unroll_hints, non_escaping_new, inline_sites, compact_field_info,
             indy_info,
         ),
@@ -23965,6 +24038,7 @@ pub fn compile_with_param_slots(
             x.replicate_pc_keyed(&pic_slots),
             x.replicate_pc_keyed(&ldc_info),
             replicate_pc3(x, ldc_string_info),
+            replicate_pc3(x, ldc_class_info),
             x.replicate_pc_keyed(&ldc2w_info),
             x.replicate_pc_keyed(&branch_hints.into_iter().collect::<Vec<_>>())
                 .into_iter()
@@ -24963,6 +25037,7 @@ pub fn compile_with_param_slots(
     compiler.loop_unroll_hints = loop_unroll_hints.into_iter().collect();
     compiler.ldc_info = ldc_info;
     compiler.ldc_string_info = ldc_string_info;
+    compiler.ldc_class_info = ldc_class_info;
     compiler.ldc2w_info = ldc2w_info;
     compiler.fp_hoist_info = fp_hoist_info;
     compiler.fp_strength_reduction_pcs = fp_strength_reduction_pcs;
@@ -25067,6 +25142,16 @@ pub fn compile_with_param_slots(
 
     // Compile bytecode
     if !compiler.compile_bytecode(code, code_len) {
+        // Publish the refusing bytecode to the caller's bail-site record too:
+        // this line names the opcode but not the method, and `try_compile`'s
+        // `compile-bail` line names the method but not the opcode. Neither is
+        // a diagnosis on its own, and they are not even both printed on the
+        // same run for an OSR/callee compile.
+        crate::note_jit_bail_site_at(
+            "singlepass-codegen",
+            compiler.dbg_last_pc,
+            compiler.dbg_last_op,
+        );
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
             eprintln!(
                 "[cratonvm-jitc] codegen-bail pc={} op=0x{:02x}",
@@ -25081,6 +25166,7 @@ pub fn compile_with_param_slots(
     // instruction boundary (malformed/unverified bytecode) — reject the
     // method rather than leave an unpatched jump in executable code.
     if !compiler.patch_branches() {
+        crate::note_jit_bail_site("branch-target-not-an-instruction-boundary");
         return None;
     }
 
@@ -25109,6 +25195,7 @@ pub fn compile_with_param_slots(
             wanted = compiler.buf.wanted(),
             "JIT compile bailed: code buffer estimate too small; method stays interpreted"
         );
+        crate::note_jit_bail_site("code-buffer-estimate-too-small");
         return None;
     }
 
@@ -25216,7 +25303,12 @@ pub fn compile_with_param_slots(
         // just `<clinit>`. A null thread there would leave the site unable to
         // resolve at all.
         || !compiler.new_deferred_info.is_empty()
-        || !compiler.anewarray_deferred_info.is_empty();
+        || !compiler.anewarray_deferred_info.is_empty()
+        // `jit_ldc_class_cp` needs `jit_thread_mut()` for the same reason the
+        // two above do: the resolution it performs may run a user
+        // `ClassLoader.loadClass`, and a failure has to publish a pending
+        // exception on this thread.
+        || !compiler.ldc_class_info.is_empty();
     // Snapshot the frame partition and the label BEFORE `compiler.buf` is moved
     // into the artifact (which partially moves `compiler`).
     let frame_layout = compiler.frame_layout();
@@ -26222,6 +26314,9 @@ mod tests {
             // nothing for them.
             monitor_enter: 0,
             monitor_exit: 0,
+            // Unwired (0) — these tests build no class-`ldc` site, and 0 makes
+            // the backend refuse one rather than emit a null CALL.
+            ldc_class_cp: 0,
         }
     }
 
@@ -26361,13 +26456,14 @@ mod tests {
             Vec::new(), // new_deferred_info
             Vec::new(), // anewarray_info
             Vec::new(), // anewarray_deferred_info
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            Vec::new(), // invoke_info
+            Vec::new(), // direct_calls
+            Vec::new(), // mic_slots
+            Vec::new(), // pic_slots
+            Vec::new(), // ldc_info
+            Vec::new(), // ldc_string_info
+            Vec::new(), // ldc_class_info
+            Vec::new(), // ldc2w_info
             HashMap::new(),
             HashMap::new(),
             &helpers,
@@ -30222,10 +30318,11 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(), // mic_slots
                 Vec::new(), // pic_slots
-                Vec::new(),
+                Vec::new(), // ldc_info
                 Vec::new(), // ldc_string_info
-                Vec::new(),
+                Vec::new(), // ldc_class_info
                 Vec::new(), // ldc2w_info
                 HashMap::new(),
                 HashMap::new(),

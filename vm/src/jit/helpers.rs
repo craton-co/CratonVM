@@ -3991,6 +3991,57 @@ pub unsafe extern "C" fn jit_new_object_cp(
     jit_new_object(vm_ptr, i64::from(target_id.as_u32()), num_fields as i64)
 }
 
+/// CP-indexed `ldc <Class>` (0x12/0x13) slow path — see
+/// `jit_api::JitRuntimeHelpers::ldc_class_cp` for the ABI.
+///
+/// Resolves the target class through the same loader-faithful
+/// [`jit_resolve_cp_class`] the deferred-`new` helper uses, then returns its
+/// mirror. `0` means resolution failed and a pending exception is published.
+/// No `new`-style access check: JVMS resolves an `ldc` class reference but the
+/// allocation check belongs to `new`, and the interpreter's own `ldc` handler
+/// takes the mirror straight from `resolve_class_loader_aware`.
+///
+/// # Why the mirror is fetched per execution
+///
+/// It is an ordinary heap object, so a relocating collector can move it
+/// between two invocations of the same compiled body — a baked immediate would
+/// name freed or reused memory. Same reason [`jit_ldc_string`] re-interns its
+/// literal rather than baking an `ObjectRef`. `get_or_create_class_mirror` is
+/// a cached lookup, so the repeat cost is a map hit, not a re-creation.
+///
+/// Before this existed, an `ldc <Class>` had no representation anywhere in the
+/// JIT: the compile-time resolver returned `None`, which is the
+/// "permanently unrepresentable" answer, so the enclosing method was
+/// bail-listed and never compiled at any tier. See
+/// `docs/known-issues/jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md`.
+///
+/// SAFETY: called from JIT-compiled code; `vm_ptr` must be a valid `SharedVm`
+/// pointer and `holder_class_id`/`cp_idx` must be the compile-time-baked
+/// referencing class and constant-pool index of this `ldc` site.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_ldc_class_cp(
+    vm_ptr: i64,
+    holder_class_id: i64,
+    cp_idx: i64,
+) -> i64 {
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // Resolution can run a user `ClassLoader.loadClass`, i.e. arbitrary Java
+    // that can itself GC — cross the boundary before it, exactly as
+    // `jit_new_object_cp` does.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: see `jit_new_object_cp`.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let holder_cid = ClassId::new(holder_class_id as u32);
+    let target_id = match jit_resolve_cp_class(vm, holder_cid, cp_idx as u16, false) {
+        Ok(id) => id,
+        Err(sentinel) => return sentinel,
+    };
+    crate::vm::get_or_create_class_mirror(vm, target_id).as_ptr() as i64
+}
+
 /// CP-indexed `anewarray` (0xbd) slow path — the `anewarray` sibling of
 /// [`jit_new_object_cp`]. Resolves the COMPONENT class at run time and then
 /// falls into [`jit_anewarray_object`], which owns the negative-length and
@@ -13353,6 +13404,10 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // hand-built test tables can leave them 0.
         new_object_cp: jit_new_object_cp as *const () as usize,
         anewarray_object_cp: jit_anewarray_object_cp as *const () as usize,
+        // Same story for `ldc <Class>`: the mirror is a heap object and the
+        // target may not be loaded at compile time, so the site is served by a
+        // CP-indexed helper. Always wired in production.
+        ldc_class_cp: jit_ldc_class_cp as *const () as usize,
         // These two existed but were unreachable from the JIT: correct
         // implementations with no table slot, so `ir_lower` had nothing to call
         // and monitors could not be lowered at all.
@@ -13553,6 +13608,7 @@ const _: () = {
     let _: HelperFnAnewarrayObject = jit_anewarray_object;
     let _: HelperFnNewObjectCp = jit_new_object_cp;
     let _: HelperFnAnewarrayObjectCp = jit_anewarray_object_cp;
+    let _: HelperFnLdcClassCp = jit_ldc_class_cp;
     let _: HelperFnMultianewarray2d = jit_multianewarray_2d;
     let _: HelperFnTlabPostInit = jit_post_tlab_init;
 

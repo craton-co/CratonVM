@@ -1033,6 +1033,26 @@ pub struct JitRuntimeHelpers {
     pub monitor_enter: usize,
     /// `monitorexit`. See `monitor_enter`.
     pub monitor_exit: usize,
+    /// Constant-pool-indexed `ldc <Class>` (0x12/0x13 whose CP entry is a
+    /// `CONSTANT_Class`) — `extern "C" fn(vm_ptr: i64, holder_class_id: i64,
+    /// cp_idx: i64) -> i64`. Returns the target class's mirror `ObjectRef`,
+    /// or `0` after publishing a pending exception.
+    ///
+    /// CP-indexed rather than class-id-indexed for the same reason
+    /// [`Self::new_object_cp`] is: resolving the target can run a user
+    /// `ClassLoader.loadClass`, which must not happen inside the compiler, so
+    /// the *referencing* class id and the CP index are baked and resolution
+    /// happens at run time on the executing thread.
+    ///
+    /// Re-consulted on every execution, like [`Self::ldc_string`] and unlike
+    /// a baked immediate: a mirror is a heap object that a moving collector
+    /// can relocate between two invocations of the same compiled body.
+    ///
+    /// `0` = not wired (hand-built test tables) → the backend refuses a
+    /// class-`ldc` site and bails the compile, which is the pre-fix
+    /// behaviour. Appended at the END of the struct so all prior golden
+    /// offsets stay stable.
+    pub ldc_class_cp: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1203,6 +1223,9 @@ helper_fields! {
     // Optional: 0 makes `ir_lower` refuse a graph containing monitor ops.
     (monitor_enter,                  FieldKind::OptionalPtr),
     (monitor_exit,                   FieldKind::OptionalPtr),
+    // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site
+    // and bail the compile — the pre-fix behaviour.
+    (ldc_class_cp,                   FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1228,7 +1251,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 62,
+    JitRuntimeHelpers::NUM_FIELDS == 63,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1619,6 +1642,7 @@ mod tests {
             anewarray_object_cp: 0x11A0,
             monitor_enter: 0x11A8,
             monitor_exit: 0x11B0,
+            ldc_class_cp: 0x11B8,
         }
     }
 
@@ -1853,6 +1877,7 @@ mod tests {
             anewarray_object_cp: 0,
             monitor_enter: 0,
             monitor_exit: 0,
+            ldc_class_cp: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2028,8 +2053,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 62.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 62);
+        // And the macro-driven count is the canonical 63.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 63);
     }
 
     #[test]
@@ -2337,6 +2362,11 @@ mod tests {
                 "monitor_exit",
                 std::mem::offset_of!(JitRuntimeHelpers, monitor_exit),
             ),
+            (
+                62,
+                "ldc_class_cp",
+                std::mem::offset_of!(JitRuntimeHelpers, ldc_class_cp),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2391,7 +2421,7 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 42, "required-pointer count drifted");
-        assert_eq!(opt, 11, "optional-pointer count drifted");
+        assert_eq!(opt, 12, "optional-pointer count drifted");
         assert_eq!(off, 9, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
