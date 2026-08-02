@@ -131,7 +131,7 @@ pub fn forget_vm_class_name_caches(vm_identity: usize) {
 /// primitives like `[I`) the dotted form equals the slashed form and we
 /// still cache the `Arc<str>` clone of the input.
 pub(crate) fn dotted_class_name(vm: usize, class_id: ClassId, slashed: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
+    if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, vm, class_id) {
         return arc;
     }
     let dotted: Arc<str> = if let Some(primitive) = primitive_descriptor_name(slashed) {
@@ -141,7 +141,7 @@ pub(crate) fn dotted_class_name(vm: usize, class_id: ClassId, slashed: &str) -> 
     } else {
         Arc::from(slashed)
     };
-    cache_insert(&DOTTED_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, dotted)
+    cache_insert(&DOTTED_CLASS_NAME_CACHE, vm, class_id, dotted)
 }
 
 /// Render an array class's internal descriptor as `Class.getTypeName()` does:
@@ -281,15 +281,15 @@ fn array_descriptor_to_package_name(desc: &str) -> Option<String> {
 /// class-based mock (see jndirealmintegration-ldap-connection-npe residual /
 /// EasyMock investigation).
 pub(crate) fn simple_class_name(vm: usize, class_id: ClassId, raw: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id) {
+    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, vm, class_id) {
         return arc;
     }
     if raw.starts_with('[') {
         let simple: Arc<str> = Arc::from(array_descriptor_to_simple_name(raw).unwrap_or_default());
-        return cache_insert(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, simple);
+        return cache_insert(&SIMPLE_CLASS_NAME_CACHE, vm, class_id, simple);
     }
     let simple: Arc<str> = Arc::from(raw.rsplit(&['/', '.'][..]).next().unwrap_or(raw));
-    cache_insert(&SIMPLE_CLASS_NAME_CACHE, ctx.vm_identity(), class_id, simple)
+    cache_insert(&SIMPLE_CLASS_NAME_CACHE, vm, class_id, simple)
 }
 
 /// The class's OWN entry in its `InnerClasses` attribute, as
@@ -408,7 +408,7 @@ pub(crate) fn canonical_class_name(
 /// `Class.getPackageName()` (`java.lang` for primitive arrays); for
 /// default-package classes returns the empty string. Cached per `ClassId`.
 pub(crate) fn package_name_of(vm: usize, class_id: ClassId, slashed: &str) -> Arc<str> {
-    if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id) {
+    if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, vm, class_id) {
         return arc;
     }
     let pkg: Arc<str> = if slashed.starts_with('[') {
@@ -418,7 +418,7 @@ pub(crate) fn package_name_of(vm: usize, class_id: ClassId, slashed: &str) -> Ar
     } else {
         Arc::from("")
     };
-    cache_insert(&PACKAGE_NAME_CACHE, ctx.vm_identity(), class_id, pkg)
+    cache_insert(&PACKAGE_NAME_CACHE, vm, class_id, pkg)
 }
 
 // ---------------------------------------------------------------------------
