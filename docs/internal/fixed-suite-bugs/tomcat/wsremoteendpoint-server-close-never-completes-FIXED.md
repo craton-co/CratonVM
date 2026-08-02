@@ -219,6 +219,26 @@ against a HotSpot control in the same window:
 | TestAsyncMessagesPerformance | PASS (1) | **FAIL** — see below |
 | ~~TestWsRemoteEndpointImplClient~~ | *no such class* | *no such class* |
 
+Selector regression batch — the Tomcat classes that lean hardest on
+`Selector`/`OP_WRITE` readiness, since the fix removes a readiness the code used
+to receive for free (`probes/wsdead-netreg.sh`). `nosel` = dev, `sel` = dev plus
+the fix:
+
+| class | HotSpot | nosel | sel |
+|---|---|---|---|
+| TestNonBlockingAPI | PASS (44) | FAIL 1/44 | FAIL 1/44 |
+| TestIoTimeouts | PASS (2) | PASS (2) | PASS (2) |
+| TestAbstractProtocol | PASS (1) | PASS (1) | PASS (1) |
+| TestXxxEndpoint | PASS (3) | PASS (3) | PASS (3) |
+| TestCoyoteAdapter | PASS (20) | PASS (20) | PASS (20) |
+| TestTomcat | FAIL 5/26 | FAIL 5/26 | FAIL 5/26 |
+| TestHttp2Section_6_1 | PASS (14) | PASS (14) | PASS (14) |
+
+`sel` is identical to `nosel` on every row: no reactor is left parked by the
+removal. (`TestTomcat`'s 5 failures are environmental — HotSpot has them too.
+`TestNonBlockingAPI`'s single failure is a pre-existing CratonVM-only one on
+dev, unmoved by this branch.)
+
 `cargo test -p cratonvm-jit`: 92 passed, 0 failed. (The `E0061` at `x64.rs`
 that blocked this test build when `5fa4cdb6fb` landed is gone on current dev.)
 `cargo test -p cratonvm-native-io`: 376 passed, 1 failed —
