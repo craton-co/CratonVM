@@ -9744,4 +9744,362 @@ pub fn register_synthetic_aqs_natives(registry: &mut NativeMethodRegistry) {
             "()Ljava/lang/String;",
             native_sem_to_string,
         );
+
+        // --- ReentrantReadWriteLock ---
+        //
+        // Never had natives at all: `ClassManager` declares the layout
+        // (`ReentrantReadWriteLock` = 3 fields, `$ReadLock`/`$WriteLock` = 1)
+        // but nothing implemented it, so synthetic mode answered
+        // `NoSuchMethodError: ReentrantReadWriteLock.readLock()` — the last of
+        // the `JucComplete` lock failures.
+        let rwl = RWL_CLASS;
+        registry.register(rwl, "<init>", "()V", native_rwl_init);
+        registry.register(rwl, "<init>", "(Z)V", native_rwl_init_fair);
+        registry.register(
+            rwl,
+            "readLock",
+            "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$ReadLock;",
+            native_rwl_read_lock,
+        );
+        registry.register(
+            rwl,
+            "writeLock",
+            "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$WriteLock;",
+            native_rwl_write_lock,
+        );
+        registry.register(rwl, "isFair", "()Z", native_rwl_is_fair);
+        registry.register(rwl, "getReadLockCount", "()I", native_rwl_read_count);
+        registry.register(
+            rwl,
+            "isWriteLocked",
+            "()Z",
+            native_rwl_is_write_locked,
+        );
+        registry.register(rwl, "getWriteHoldCount", "()I", native_rwl_write_hold_count);
+        for view in [RWL_READ_VIEW, RWL_WRITE_VIEW] {
+            registry.register(view, "lock", "()V", native_rwl_view_lock);
+            registry.register(view, "lockInterruptibly", "()V", native_rwl_view_lock);
+            registry.register(view, "unlock", "()V", native_rwl_view_unlock);
+            registry.register(view, "tryLock", "()Z", native_rwl_view_try_lock);
+        }
+}
+
+// ---------------------------------------------------------------------------
+// ReentrantReadWriteLock — a reader/writer lock over the same monitor-parking
+// scheme the `ReentrantLock` natives above use.
+//
+// State lives in a side table keyed by the lock's identity hash, not in the
+// object's fields, for the reason spelled out on `rl_state_table`: the real
+// class's slots hold `Sync` references and writing scalars there does not
+// round-trip. The two *view* objects (`$ReadLock` / `$WriteLock`) ARE cached
+// in the owner's slots 0 and 1 — `rwl.readLock()` must return the same
+// instance every time, as HotSpot's final fields do — with slot 2 the `fair`
+// flag, matching `ClassManager`'s declared 3-field layout.
+//
+// Semantics implemented: multiple concurrent readers, one writer excluding all
+// readers, reentrant write holds, and write-while-holding-read refused (real
+// AQS throws no error but deadlocks; refusing is the honest approximation and
+// no fixture depends on it). Lock downgrading (write → read) works because a
+// writer may always take a read lock.
+// ---------------------------------------------------------------------------
+
+const RWL_CLASS: &str = "java/util/concurrent/locks/ReentrantReadWriteLock";
+const RWL_READ_VIEW: &str = "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock";
+const RWL_WRITE_VIEW: &str = "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock";
+
+/// Slot 0/1 cache the `$ReadLock` / `$WriteLock` views; slot 2 is `fair`.
+const RWL_FIELD_READ_VIEW: usize = 0;
+const RWL_FIELD_WRITE_VIEW: usize = 1;
+const RWL_FIELD_FAIR: usize = 2;
+/// A view's single slot points back at the owning `ReentrantReadWriteLock`.
+const RWL_VIEW_FIELD_OWNER: usize = 0;
+
+#[derive(Clone, Copy, Default)]
+struct RwlState {
+    /// Total read holds across all threads.
+    readers: i32,
+    /// Owning thread of the write lock, or `RL_UNOWNED`.
+    writer: i64,
+    /// Reentrant write hold count.
+    write_hold: i32,
+}
+
+fn rwl_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<RlKey, RwlState>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<RlKey, RwlState>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Drop every read/write-lock row belonging to `vm_identity`; the companion of
+/// `forget_vm_lock_state`, which calls it.
+pub fn forget_vm_rwl_state(vm_identity: usize) {
+    rwl_state_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(vm, _), _| *vm != vm_identity);
+}
+
+fn rwl_with<R>(key: RlKey, f: impl FnOnce(&mut RwlState) -> R) -> R {
+    let mut table = rwl_state_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    f(table.entry(key).or_default())
+}
+
+fn rwl_get(key: RlKey) -> RwlState {
+    rwl_state_table()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).copied())
+        .unwrap_or_default()
+}
+
+fn native_rwl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    rwl_init_common(ctx, args, false)
+}
+
+fn native_rwl_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let fair = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
+    rwl_init_common(ctx, args, fair)
+}
+
+fn rwl_init_common(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    fair: bool,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let key = rl_key(ctx, this);
+    rwl_with(key, |st| *st = RwlState::default());
+    if ctx.object_num_fields(this) > RWL_FIELD_FAIR {
+        ctx.set_field(this, RWL_FIELD_READ_VIEW, Value::Object(None));
+        ctx.set_field(this, RWL_FIELD_WRITE_VIEW, Value::Object(None));
+        ctx.set_field(this, RWL_FIELD_FAIR, Value::Int(i32::from(fair)));
+    }
+    Ok(None)
+}
+
+/// Return (creating on first call) the cached view object for `slot`.
+fn rwl_view(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    slot: usize,
+    class_name: &str,
+) -> MethodCallResult {
+    if ctx.object_num_fields(this) > slot {
+        if let Value::Object(Some(existing)) = ctx.get_field(this, slot) {
+            return Ok(Some(Value::Object(Some(existing))));
+        }
+    }
+    // Allocate first, publish afterwards: `alloc_concurrent_synthetic` can
+    // trigger a collection that moves `this`, and `this` is pinned as a native
+    // ARG — the pin is remapped, this Rust local is not. Re-read it through a
+    // pin around the allocation.
+    let this_pin = ctx.pin_native_root(this);
+    let view = alloc_concurrent_synthetic(ctx, class_name, 1);
+    let view_pin = ctx.pin_native_root(view);
+    let this = ctx.read_native_pin(this_pin, this);
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.set_field(view, RWL_VIEW_FIELD_OWNER, Value::Object(Some(this)));
+    if ctx.object_num_fields(this) > slot {
+        ctx.set_field(this, slot, Value::Object(Some(view)));
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(view))))
+}
+
+fn native_rwl_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    rwl_view(ctx, this, RWL_FIELD_READ_VIEW, RWL_READ_VIEW)
+}
+
+fn native_rwl_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    rwl_view(ctx, this, RWL_FIELD_WRITE_VIEW, RWL_WRITE_VIEW)
+}
+
+fn native_rwl_is_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if ctx.object_num_fields(this) > RWL_FIELD_FAIR {
+        if let Value::Int(v) = ctx.get_field(this, RWL_FIELD_FAIR) {
+            return Ok(Some(Value::Int(if v != 0 { 1 } else { 0 })));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_rwl_read_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = rl_key(ctx, this);
+    Ok(Some(Value::Int(rwl_get(key).readers)))
+}
+
+fn native_rwl_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = rl_key(ctx, this);
+    Ok(Some(Value::Int(i32::from(rwl_get(key).write_hold > 0))))
+}
+
+fn native_rwl_write_hold_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let tid = ctx.thread_id() as i64;
+    let key = rl_key(ctx, this);
+    let st = rwl_get(key);
+    Ok(Some(Value::Int(if st.writer == tid {
+        st.write_hold
+    } else {
+        0
+    })))
+}
+
+/// Resolve a `$ReadLock`/`$WriteLock` view to `(owner, is_write)`.
+fn rwl_view_target(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+) -> Option<(ObjectRef, bool)> {
+    let owner = match ctx.get_field(view, RWL_VIEW_FIELD_OWNER) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let is_write = ctx
+        .class_name_of_id(ctx.class_id_of_object(view))
+        .is_some_and(|name| name == RWL_WRITE_VIEW);
+    Some((owner, is_write))
+}
+
+/// Try to take the lock once. `None` means "would block".
+fn rwl_try_acquire(key: RlKey, tid: i64, is_write: bool) -> bool {
+    rwl_with(key, |st| {
+        if is_write {
+            let free = st.writer == RL_UNOWNED && st.readers == 0;
+            let reentrant = st.writer == tid;
+            if free || reentrant {
+                st.writer = tid;
+                st.write_hold += 1;
+                return true;
+            }
+            false
+        } else {
+            // A writer excludes readers, except itself (lock downgrading).
+            if st.writer == RL_UNOWNED || st.writer == tid {
+                st.readers += 1;
+                return true;
+            }
+            false
+        }
+    })
+}
+
+fn native_rwl_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let view = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let Some((owner, is_write)) = rwl_view_target(ctx, view) else {
+        return Ok(None);
+    };
+    let tid = ctx.thread_id() as i64;
+    let key = rl_key(ctx, owner);
+    loop {
+        if rwl_try_acquire(key, tid, is_write) {
+            return Ok(None);
+        }
+        // Park on the owner lock's monitor until a releaser notifies. The 5ms
+        // timeout re-checks defensively, exactly as `native_rl_lock` does.
+        ctx.monitor_enter(owner);
+        let still_blocked = {
+            let st = rwl_get(key);
+            if is_write {
+                (st.writer != RL_UNOWNED && st.writer != tid) || st.readers > 0
+            } else {
+                st.writer != RL_UNOWNED && st.writer != tid
+            }
+        };
+        if still_blocked {
+            if let Err(e) = monitor_wait_release(ctx, owner, Some(5)) {
+                if is_interrupted_exception(&e) {
+                    let self_thread = ctx.current_thread_object();
+                    ctx.thread_interrupt(self_thread);
+                    continue;
+                }
+                return Err(e);
+            }
+        } else {
+            ctx.monitor_exit(owner);
+        }
+    }
+}
+
+fn native_rwl_view_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let view = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let Some((owner, is_write)) = rwl_view_target(ctx, view) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let tid = ctx.thread_id() as i64;
+    let key = rl_key(ctx, owner);
+    Ok(Some(Value::Int(i32::from(rwl_try_acquire(
+        key, tid, is_write,
+    )))))
+}
+
+fn native_rwl_view_unlock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let view = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let Some((owner, is_write)) = rwl_view_target(ctx, view) else {
+        return Ok(None);
+    };
+    let tid = ctx.thread_id() as i64;
+    let key = rl_key(ctx, owner);
+    let released = rwl_with(key, |st| {
+        if is_write {
+            if st.writer != tid {
+                return false;
+            }
+            st.write_hold -= 1;
+            if st.write_hold <= 0 {
+                st.write_hold = 0;
+                st.writer = RL_UNOWNED;
+                return true;
+            }
+            false
+        } else {
+            if st.readers > 0 {
+                st.readers -= 1;
+            }
+            st.readers == 0
+        }
+    });
+    if released {
+        // Wake anyone parked in `native_rwl_view_lock`.
+        ctx.monitor_enter(owner);
+        let _ = ctx.monitor_notify_all(owner);
+        ctx.monitor_exit(owner);
+    }
+    Ok(None)
 }

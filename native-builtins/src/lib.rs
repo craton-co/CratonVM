@@ -29245,20 +29245,38 @@ struct RlState {
     fair: bool,
 }
 
-/// Side table: lock identity-hash → [`RlState`].
-fn rl_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, RlState>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, RlState>>> =
+/// Stable key for a lock object: `(vm_identity, monotonic identity-hash)`.
+///
+/// The VM half is not decoration. Identity hashes are 32-bit and minted per
+/// VM, so two `Vm`s in one test binary — sequential or concurrent — hand out
+/// the same hash for unrelated locks; without the partition a fresh
+/// `ReentrantLock` in VM 2 could be born already held by a thread of VM 1.
+pub(crate) type RlKey = (usize, i32);
+
+/// Side table: [`RlKey`] → [`RlState`].
+fn rl_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<RlKey, RlState>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<RlKey, RlState>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Stable key for a lock object — its monotonic identity-hash code.
-fn rl_key(ctx: &mut dyn NativeContext, lock: ObjectRef) -> i32 {
-    ctx.identity_hash_code(lock)
+/// Stable key for a lock object — see [`RlKey`].
+fn rl_key(ctx: &mut dyn NativeContext, lock: ObjectRef) -> RlKey {
+    (ctx.vm_identity(), ctx.identity_hash_code(lock))
+}
+
+/// Drop every lock-state row belonging to `vm_identity`. Called from
+/// `release_vm_native_state`.
+pub fn forget_vm_lock_state(vm_identity: usize) {
+    rl_state_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(vm, _), _| *vm != vm_identity);
+    crate::util_concurrent_ext::forget_vm_rwl_state(vm_identity);
 }
 
 /// Read the current [`RlState`] for a lock (default = unheld).
-fn rl_get(key: i32) -> RlState {
+fn rl_get(key: RlKey) -> RlState {
     rl_state_table()
         .lock()
         .ok()
@@ -29273,7 +29291,7 @@ fn rl_get(key: i32) -> RlState {
 /// Run `f` with exclusive access to a lock's [`RlState`], creating a
 /// default (unheld) entry on first touch. The whole closure runs under the
 /// side-table mutex, so a read-modify-write of the lock state is atomic.
-fn rl_with<R>(key: i32, f: impl FnOnce(&mut RlState) -> R) -> R {
+fn rl_with<R>(key: RlKey, f: impl FnOnce(&mut RlState) -> R) -> R {
     let mut t = rl_state_table().lock().unwrap_or_else(|e| e.into_inner());
     let st = t.entry(key).or_insert(RlState {
         owner: RL_UNOWNED,

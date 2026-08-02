@@ -1398,7 +1398,25 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(s) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    let path = validated_path(&path)?;
+    fis_open_path(ctx, this, &path, path_obj)
+}
+
+/// Open `path` for reading and wire the result into `this`.
+///
+/// Shared by `open0` / `<init>(String)` and `<init>(File)`. Takes the path as
+/// a `&str` rather than a `java.lang.String` on purpose: the `File` overload
+/// would otherwise have to `create_string` to call the other entry point, and
+/// that allocation can move `this` out from under the Rust local — the
+/// receiver is pinned as a native ARG and the collector remaps the pin, but
+/// not a bare copy of it. The first version of the `File` overload did exactly
+/// that and every `TckIo` read came back `-1`.
+fn fis_open_path(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    path: &str,
+    path_obj: Option<ObjectRef>,
+) -> MethodCallResult {
+    let path = validated_path(path)?;
     let fd = ctx
         .fd_table()
         .open_read(&path)
@@ -1426,7 +1444,7 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// `e2e_writeReadRoundtrip`), all of which open their file through a `File`.
 ///
 /// Resolves the path off the `File` exactly as `native_fos_init_file` does and
-/// then reuses `native_fis_open0`, so the fd layout and the constructor-field
+/// then reuses [`fis_open_path`], so the fd layout and the constructor-field
 /// backfill stay in one place.
 fn native_fis_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -1446,11 +1464,7 @@ fn native_fis_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
     };
     let path = read_file_path(ctx, file_obj).unwrap_or_default();
-    let path_str = ctx.create_string(&path);
-    native_fis_open0(
-        ctx,
-        &[Value::Object(Some(this)), Value::Object(Some(path_str))],
-    )
+    fis_open_path(ctx, this, &path, None)
 }
 
 fn native_fis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
