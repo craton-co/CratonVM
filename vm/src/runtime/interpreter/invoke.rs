@@ -2703,6 +2703,42 @@ pub(super) fn try_stackless_invoke(
         class_name
     };
 
+    // H2-CID0, CLONE face. `java.lang.Enum.clone()` and
+    // `java.lang.Thread.clone()` exist only to throw
+    // `CloneNotSupportedException`; both are `protected final`, so javac
+    // refuses to compile a call to either and no correct program reaches them.
+    // Arriving here means virtual dispatch was driven by a receiver whose class
+    // is not the one the call site named -- the stale/reclaimed-ObjectRef
+    // family, seen through `clone()` instead of through a `checkcast` or a
+    // `NoSuchMethodError`.
+    //
+    // This is the wiring the retired
+    // `bug-h2-testmultithread-concurrent-update-timeout` write-up asked for:
+    // `TestMultiThread.testConcurrentUpdate` failed 2 runs in 10
+    // with `General error: "java.lang.CloneNotSupportedException"` on `COMMIT`
+    // (H2's `Page.copy()` -> `Page.clone()`), and neither occurrence produced a
+    // verdict because nothing on the clone path asked the heap. The old-gen
+    // reclamation ring answers even after the allocator has re-served the
+    // block, which is the case where the receiver reads back as a VALID object
+    // of an unrelated class -- exactly how a `Page` becomes something whose
+    // `clone()` throws.
+    //
+    // Cost on a healthy run: one `&str` comparison per stackless invoke, which
+    // fails on length for every method whose name is not five bytes.
+    if method_name == "clone"
+        && (class_name == "java/lang/Enum" || class_name == "java/lang/Thread")
+    {
+        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+            crate::memory::reclaim_guard::report_reclaimed_receiver(
+                shared,
+                recv.as_ptr() as usize,
+                "clone dispatch",
+                &format!("{class_name}.{method_name}{descriptor}"),
+                shared.mem.heap.class_id_of(recv).as_u32(),
+            );
+        }
+    }
+
     // Cache the descriptor's return-type byte once for the write-side
     // coercion applied to every native callback's pushed return value.
     // Same class of bug as the read-side `getfield` coercion: a primitive
