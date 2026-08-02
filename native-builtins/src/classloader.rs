@@ -9645,7 +9645,7 @@ mod classloader_tests {
         let mut pointer_map = std::collections::HashMap::new();
         pointer_map.insert(from_addr, to_addr);
 
-        gc_reconcile_defining_loaders(&is_marked, &pointer_map);
+        gc_reconcile_defining_loaders(ctx.vm_identity(), &is_marked, &pointer_map);
 
         // Half 1 — PRUNE. The collected loader's entry is gone, so its address
         // can be recycled without the next loader inheriting its namespace.
