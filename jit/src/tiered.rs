@@ -1087,7 +1087,10 @@ pub fn dump_method_stats_to_stderr() {
     // whereas one with a non-zero `tier_fail_count` is a compiler failure.
     // Reporting both as `tier_fail_count=3` is what made an earlier
     // "1531 of 1642 hot methods never compile" reading unactionable.
-    let mut hot_but_stuck: Vec<(u64, bool, u32, bool, String)> = Vec::new();
+    // (invocations, queued, tier_fail_count, ineligible, display name, the
+    // refusal site the compiler recorded for it — see
+    // crate::jit_bail_reason_for).
+    let mut hot_but_stuck: Vec<(u64, bool, u32, bool, String, String)> = Vec::new();
     let mut ineligible_by_policy: u64 = 0;
     {
         let methods = core.methods.lock();
@@ -1115,6 +1118,12 @@ pub fn dump_method_stats_to_stderr() {
                                 state.method_key.method_name,
                                 state.method_key.descriptor
                             ),
+                            crate::jit_bail_reason_for(
+                                &state.method_key.class_name,
+                                &state.method_key.method_name,
+                                &state.method_key.descriptor,
+                            )
+                            .unwrap_or_else(|| "unrecorded".to_string()),
                         ));
                     }
                 }
@@ -1148,7 +1157,7 @@ pub fn dump_method_stats_to_stderr() {
         ineligible_by_policy,
         hot_but_stuck
             .iter()
-            .filter(|(_, _, fail, inelig, _)| *fail > 0 && !*inelig)
+            .filter(|(_, _, fail, inelig, _, _)| *fail > 0 && !*inelig)
             .count(),
     );
     if !hot_but_stuck.is_empty() {
@@ -1157,7 +1166,7 @@ pub fn dump_method_stats_to_stderr() {
             "[cratonvm] JIT method stats: top {} hot-but-stuck methods (invocations, queued, tier_fail_count, why, name):",
             hot_but_stuck.len().min(30)
         );
-        for (count, queued, fail, inelig, name) in hot_but_stuck.iter().take(30) {
+        for (count, queued, fail, inelig, name, reason) in hot_but_stuck.iter().take(30) {
             let why = if *inelig {
                 "ineligible-by-policy"
             } else if *fail > 0 {
@@ -1166,28 +1175,36 @@ pub fn dump_method_stats_to_stderr() {
                 "not-yet-attempted"
             };
             eprintln!(
-                "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {why:<20} {name}"
+                "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {why:<20} {name} reason={reason}"
             );
         }
-        // The compile failures are the only actionable entries here — a
-        // policy decline is stuck by design — but they are usually a tiny
-        // minority and get buried under the policy ones when the list is
-        // ranked by invocation count (measured on the Hibernate concurrency
-        // workload: 1513 policy declines vs 6 real failures, none of which
-        // appeared in the top 30). List them separately so the actionable set
-        // is never hidden by the expected one.
+        // The compile failures are the entries worth looking at — a policy
+        // decline is stuck by design — but they are usually a tiny minority
+        // and get buried under the policy ones when the list is ranked by
+        // invocation count (measured on the Hibernate concurrency workload:
+        // 1513 policy declines vs 6 real failures, none of which appeared in
+        // the top 30). List them separately so the actionable set is never
+        // hidden by the expected one.
+        //
+        // This list used to be headed "these are bugs". That over-claimed:
+        // `ineligible` covers only the tier manager's OWN declines, so a
+        // deliberate correctness gate INSIDE the compiler (an RBC.6 handler
+        // that reads a local the exceptional-frame handoff cannot restore, say)
+        // lands here looking like a defect. `reason=` is what tells the two
+        // apart, so print it and let the reader classify.
         let failures: Vec<_> = hot_but_stuck
             .iter()
-            .filter(|(_, _, fail, inelig, _)| *fail > 0 && !*inelig)
+            .filter(|(_, _, fail, inelig, _, _)| *fail > 0 && !*inelig)
             .collect();
         if !failures.is_empty() {
             eprintln!(
-                "[cratonvm] JIT method stats: {} hot method(s) whose COMPILE FAILED (not policy — these are bugs):",
+                "[cratonvm] JIT method stats: {} hot method(s) whose COMPILE FAILED \
+                 (the compiler was asked and refused; `reason=` names the refusing site):",
                 failures.len()
             );
-            for (count, queued, fail, _, name) in failures.iter().take(30) {
+            for (count, queued, fail, _, name, reason) in failures.iter().take(30) {
                 eprintln!(
-                    "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {name}"
+                    "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {name} reason={reason}"
                 );
             }
         }

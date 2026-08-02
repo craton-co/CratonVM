@@ -15149,6 +15149,9 @@ pub(super) fn compile_osr_artifact(
             // then interpreted its entire workload.
             let mut ldc_info2: Vec<(usize, i64)> = Vec::new();
             let mut ldc_string_info2: Vec<(usize, *const u8, usize)> = Vec::new();
+            // Class-`ldc` sites, served at run time by `helpers.ldc_class_cp`.
+            // Before this an OSR artifact refused any method containing one.
+            let mut ldc_class_info2: Vec<(usize, u32, u16)> = Vec::new();
             if !scan.ldc_ops.is_empty() {
                 let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
@@ -15171,7 +15174,11 @@ pub(super) fn compile_osr_artifact(
                                 None => return None,
                             }
                         }
-                        _ => return None, // wide-string/Class/other ldc — bail out of OSR
+                        Some(ConstantPoolEntry::ClassReference { .. }) => {
+                            ldc_class_info2.push((pc, class_id.as_u32(), cp_idx));
+                            continue;
+                        }
+                        _ => return None, // wide-string/MethodHandle/… — bail out of OSR
                     };
                     ldc_info2.push((pc, val));
                 }
@@ -15406,6 +15413,7 @@ pub(super) fn compile_osr_artifact(
                 ldc_string_info2, // wired (perf/halfgap-20260717) — see the
                 // resolve block above; bytes owned by owned_jit_strings2 →
                 // cm._jit_strings, same retention as the invoke-info strs.
+                ldc_class_info2,
                 ldc2w_info2,
                 std::collections::HashMap::new(), // branch_hints
                 std::collections::HashMap::new(), // loop_unroll_hints
@@ -17044,8 +17052,8 @@ pub(super) fn try_jit_upgrade_with_gate(
     // `ldc`, `SecP*Field` / `Mod` load reduction constants, the ASN.1 parser
     // statics load limit masks) failed codegen at the 0x12/0x13 arm on every
     // retry and stayed interpreted forever — the dominant cause of the
-    // BC-suite 34-64× interpreter gap. String/Class ldc returns None →
-    // compile bails (matches the OSR path's `_ => return None`).
+    // BC-suite 34-64× interpreter gap. A `MethodHandle`/`MethodType`/condy
+    // `ldc` still returns `None` → permanent compile bail.
     let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
@@ -17063,6 +17071,17 @@ pub(super) fn try_jit_upgrade_with_gate(
                     .constant_pool
                     .get_utf8(*string_index)
                     .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+            }
+            // `ldc <Class>`: the mirror is a heap object and the target class
+            // may not be loaded yet, so report the SITE — referencing class id
+            // plus CP index — and let `helpers.ldc_class_cp` resolve it and
+            // fetch the mirror at run time, the way the interpreter's own
+            // `ldc` handler does.
+            ConstantPoolEntry::ClassReference { .. } => {
+                Some(cratonvm_jit::JitLdcConstant::ClassMirror {
+                    holder_class_id: class_id.as_u32(),
+                    cp_idx,
+                })
             }
             _ => None,
         }
@@ -17472,6 +17491,14 @@ pub(super) fn try_jit_upgrade_with_gate(
                             .constant_pool
                             .get_utf8(*string_index)
                             .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+                    }
+                    // `ldc <Class>` — see the matching arm in the enclosing
+                    // method's resolver.
+                    ConstantPoolEntry::ClassReference { .. } => {
+                        Some(cratonvm_jit::JitLdcConstant::ClassMirror {
+                            holder_class_id: callee_cid.as_u32(),
+                            cp_idx,
+                        })
                     }
                     _ => None,
                 }
@@ -18469,8 +18496,8 @@ pub(super) fn try_jit_compile_callee_slow(
         val
     };
 
-    // RBC.2 — `ldc`/`ldc_w` int/float constants; see the matching resolver
-    // in `try_jit_upgrade_with_gate`. String/Class ldc → None → compile bail.
+    // RBC.2 — `ldc`/`ldc_w` int/float/String/Class constants; see the matching
+    // resolver in `try_jit_upgrade_with_gate`.
     let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
@@ -18488,6 +18515,17 @@ pub(super) fn try_jit_compile_callee_slow(
                     .constant_pool
                     .get_utf8(*string_index)
                     .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+            }
+            // `ldc <Class>`: the mirror is a heap object and the target class
+            // may not be loaded yet, so report the SITE — referencing class id
+            // plus CP index — and let `helpers.ldc_class_cp` resolve it and
+            // fetch the mirror at run time, the way the interpreter's own
+            // `ldc` handler does.
+            ConstantPoolEntry::ClassReference { .. } => {
+                Some(cratonvm_jit::JitLdcConstant::ClassMirror {
+                    holder_class_id: cid.as_u32(),
+                    cp_idx,
+                })
             }
             _ => None,
         }

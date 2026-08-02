@@ -106,7 +106,7 @@ use crate::JitRuntimeHelpers;
 /// `build_helpers`) and consumers (the JIT backends) that disagree on this
 /// number disagree on where the helpers live.
 ///
-/// `3` is the revision of the 62-field, 496-byte table shipped today. The
+/// `4` is the revision of the 63-field, 504-byte table shipped today. The
 /// full history is in [`ABI_REVISIONS`], which a const assertion ties to this
 /// constant, to [`NUM_HELPER_FIELDS`] and to [`JIT_HELPERS_ABI_SIZE`] — so
 /// appending a field without bumping this number no longer compiles.
@@ -114,7 +114,7 @@ use crate::JitRuntimeHelpers;
 /// (Revision `2` shipped the 60-field table; the `monitor_enter`/`monitor_exit`
 /// append that made it 62 did not bump this constant, because at the time
 /// nothing checked it. `ABI_REVISIONS` is that check.)
-pub const JIT_HELPERS_ABI_VERSION: u32 = 3;
+pub const JIT_HELPERS_ABI_VERSION: u32 = 4;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -676,6 +676,11 @@ helper_fn_slots! {
     // a contended acquire can move the object while the thread is parked.
     HelperFnMonitorEnter, monitor_enter, monitor_enter_fn, (i64, i64) -> i64;
     HelperFnMonitorExit, monitor_exit, monitor_exit_fn, (i64, i64) -> i64;
+    // Constant-pool-indexed `ldc <Class>` — (vm_ptr, holder_class_id, cp_idx)
+    // -> mirror ObjectRef, `0` after publishing a pending exception. Same
+    // shape as `new_object_cp` and for the same reason; see
+    // `JitRuntimeHelpers::ldc_class_cp`.
+    HelperFnLdcClassCp, ldc_class_cp, ldc_class_cp_fn, (i64, i64, i64) -> i64;
 }
 
 // ---------------------------------------------------------------------
@@ -787,6 +792,8 @@ helper_field_table! {
     // Optional: 0 makes `ir_lower` refuse monitor ops rather than drop them.
     (monitor_enter,                  Function, false),
     (monitor_exit,                   Function, false),
+    // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site.
+    (ldc_class_cp,                   Function, false),
 }
 
 // ---------------------------------------------------------------------
@@ -807,7 +814,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 62,
+    NUM_HELPER_FIELDS == 63,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -815,8 +822,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 496,
-    "JitRuntimeHelpers size changed (expected 62 * 8 = 496) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 504,
+    "JitRuntimeHelpers size changed (expected 63 * 8 = 504) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -974,6 +981,7 @@ pub const GOLDEN_HELPER_OFFSETS: [(&'static str, usize); NUM_HELPER_FIELDS] = [
     ("anewarray_object_cp", 472),
     ("monitor_enter", 480),
     ("monitor_exit", 488),
+    ("ldc_class_cp", 496),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1054,6 +1062,12 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         version: 3,
         num_fields: 62,
         size: 496,
+    },
+    // v4 — appended `ldc_class_cp`, so that an `ldc <Class>` compiles at all.
+    HelperAbiRevision {
+        version: 4,
+        num_fields: 63,
+        size: 504,
     },
 ];
 
@@ -1262,7 +1276,7 @@ const _: () = {
         }
         i += 1;
     }
-    assert!(functions == 53, "callable-slot count changed");
+    assert!(functions == 54, "callable-slot count changed");
     assert!(
         offsets == 4,
         "the number of displacement slots changed — an Offset slot is baked as \
@@ -1277,7 +1291,7 @@ const _: () = {
     );
     assert!(required == 42, "required-slot count changed");
     assert!(
-        optional_fns == 11,
+        optional_fns == 12,
         "the optional-callable count changed — every optional slot MUST have a \
          zero check at its emitter call site; confirm the new one does before \
          updating this number",
@@ -1620,6 +1634,7 @@ mod tests {
             ("anewarray_object_cp", offset_of!(H, anewarray_object_cp)),
             ("monitor_enter", offset_of!(H, monitor_enter)),
             ("monitor_exit", offset_of!(H, monitor_exit)),
+            ("ldc_class_cp", offset_of!(H, ldc_class_cp)),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -1650,15 +1665,15 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 496);
+        assert_eq!(core::mem::size_of::<H>(), 504);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 496);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 504);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 62);
-        assert_eq!(H::NUM_FIELDS, 62);
-        assert_eq!(H::NUM_HELPER_FN_FIELDS, 53);
-        assert_eq!(JIT_HELPERS_ABI_VERSION, 3);
+        assert_eq!(NUM_HELPER_FIELDS, 63);
+        assert_eq!(H::NUM_FIELDS, 63);
+        assert_eq!(H::NUM_HELPER_FN_FIELDS, 54);
+        assert_eq!(JIT_HELPERS_ABI_VERSION, 4);
     }
 
     /// The golden table is the only name→offset binding in the crate written
@@ -1683,7 +1698,7 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
-        assert_eq!(last_name, "monitor_exit");
+        assert_eq!(last_name, "ldc_class_cp");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
 
@@ -1696,9 +1711,9 @@ mod tests {
         assert_eq!(
             last,
             HelperAbiRevision {
-                version: 3,
-                num_fields: 62,
-                size: 496,
+                version: 4,
+                num_fields: 63,
+                size: 504,
             },
         );
         // Append-only history: each revision strictly grows the table.
@@ -1887,11 +1902,11 @@ mod tests {
             .filter(|d| d.kind == HelperKind::Constant)
             .count();
         let required = HELPER_FIELDS.iter().filter(|d| d.required).count();
-        assert_eq!(functions, 53, "callable slots");
+        assert_eq!(functions, 54, "callable slots");
         assert_eq!(offsets, 4, "displacement slots");
         assert_eq!(constants, 5, "baked-address slots");
         assert_eq!(required, 42, "required slots");
-        assert_eq!(functions - required, 11, "optional callable slots");
+        assert_eq!(functions - required, 12, "optional callable slots");
         assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
     }
 
@@ -2045,13 +2060,13 @@ mod tests {
     fn as_words_matches_the_struct_fields() {
         let mut h = H::default();
         h.newarray = 1;
-        // The LAST field, whatever it currently is — `monitor_exit`
-        // since the monitor helpers were appended.
-        h.monitor_exit = 2;
+        // The LAST field, whatever it currently is — `ldc_class_cp`
+        // since the class-`ldc` helper was appended.
+        h.ldc_class_cp = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 62);
+        assert_eq!(w.len(), 63);
     }
 
     /// Build a table with every *required* slot non-zero and every optional
