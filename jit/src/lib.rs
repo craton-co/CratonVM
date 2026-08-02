@@ -12303,16 +12303,39 @@ fn exc_table_c2_disabled() -> bool {
 /// MIC/`jit_invoke_dispatch` paths both end in
 /// `emit_post_invoke_exception_check`.
 ///
-/// `getfield`/`putfield` (0xb4/0xb5) are NOT here. They were added 2026-07-28
-/// in `5bf306bb0` alongside a precise null check, but that check has a single
-/// call site on the INLINED-CALLEE `putfield` path; the top-level arms keep an
-/// inline fast path that neither null-checks nor publishes a frame. Measured
-/// with `probes/Rbc6FieldProbe.java`: a `getfield` NPE inside a protected range
-/// let the handler read a non-parameter local as 0 instead of 38, and a
-/// `putfield` on a null receiver did not throw at all. Both are silent wrong
-/// answers, which is what RBC.6 exists to prevent. Re-admit them only together
-/// with a precise frame at the top-level field arms — see
-/// `docs/internal/fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md`.
+/// `getfield`/`putfield` (0xb4/0xb5) are here as of 2026-08-02, and the
+/// condition their old exclusion asked for — "a precise frame at the top-level
+/// field arms" — is what now holds. The exclusion was written when the only
+/// precise null check (`5bf306bb0`, 2026-07-28) had a single call site, on the
+/// INLINED-CALLEE `putfield` path. Both top-level arms grew one afterwards and
+/// nobody revisited this list:
+///
+/// * `putfield` — `cd451facc` ("a compiled putfield on a null receiver must
+///   throw NPE") put `emit_precise_null_check_field_store` at the top of the
+///   top-level `0xb5` arm, ahead of every inline/compact/helper sub-path, so a
+///   null receiver inside a protected range records a reason-10 frame at the
+///   trapping bci. The one arm it deliberately skips is the scalar-replaced
+///   store, whose "objectref" is a dummy with no receiver behind it and
+///   therefore cannot NPE.
+/// * `getfield` — a null receiver reaches `helpers.getfield` on EVERY
+///   sub-path (compact-inline, uniform-inline, resolved-helper and
+///   unresolved-helper), because both receiver checks that guard the inline
+///   loads — `emit_trusted_oop_receiver_check` and
+///   `emit_guarded_getfield_receiver_check` — begin with a null test that
+///   branches to the helper. Each of those calls is followed by
+///   `emit_post_invoke_exception_check`, which is precisely where the reason-9
+///   frame is built.
+///
+/// The single exception is the opt-in RAW inline `getfield`
+/// (`CRATONVM_JIT_INLINE_GETFIELD`), which keeps historical null-reads-as-0
+/// semantics: it neither throws nor publishes. `precise_field_ops_enabled`
+/// therefore withdraws this admission whenever that flag is on, so the two can
+/// never be combined.
+///
+/// `probes/Rbc6FieldProbe.java` is the acceptance test the old exclusion cited
+/// against these opcodes — five methods whose handler reads a non-parameter
+/// local written inside the `try`, differentially checked against HotSpot and
+/// `--nojit`.
 ///
 /// `invokedynamic` (0xba) is deliberately absent too: it lowers to an
 /// unconditional deopt trap, not to a call site that publishes a frame.
@@ -12320,7 +12343,32 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
     if matches!(op, 0xb6 | 0xb9) {
         return precise_virtual_invokes_enabled();
     }
+    if matches!(op, 0xb4 | 0xb5) {
+        return precise_field_ops_enabled();
+    }
     matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
+}
+
+/// Whether a protected `getfield`/`putfield` may be treated as publishing a
+/// precise exceptional frame — see the list above for why it does.
+///
+/// Two ways to say no:
+///
+/// * `CRATONVM_JIT_NO_PRECISE_FIELD_OPS=1`, so one binary can be A/B'd against
+///   its own pre-change behaviour. Comparing against a separately built branch
+///   would confound this with everything else that landed.
+/// * `CRATONVM_JIT_INLINE_GETFIELD=1` (the opt-in RAW inline `getfield`), whose
+///   null path leaves `RAX = 0` and returns the field as zero rather than
+///   throwing. It publishes no frame because it raises no exception at all, so
+///   admitting `getfield` while it is on would hand a handler a frame that is
+///   never built. Not cached here: `inline_getfield_enabled` does its own
+///   `OnceLock`, and this runs per protected opcode at COMPILE time, never on
+///   any hot path.
+fn precise_field_ops_enabled() -> bool {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_FIELD_OPS").is_some() {
+        return false;
+    }
+    !x64::inline_getfield_enabled()
 }
 
 /// Opt-out for admitting `invokevirtual`/`invokeinterface` above, so one
@@ -12343,10 +12391,29 @@ fn precise_exception_frame_sites_supported(
             .iter()
             .any(|entry| pc >= entry.start_pc as usize && pc < entry.end_pc as usize)
     };
+    // `ldc`/`ldc_w` (0x12/0x13) stay: a String constant allocates through
+    // `helpers.ldc_string` and a Class constant resolves through
+    // `helpers.ldc_class_cp` (which can run a user `ClassLoader.loadClass` and
+    // then throw), and neither publishes a precise frame — the class site's
+    // `0`-return guard branches to the SHARED sentinel stub.
+    //
+    // `ldc2_w` (0x14) is NOT in that family, despite having been lumped in with
+    // it. It can only push a `long` or a `double`. The one form that could run
+    // Java is a `CONSTANT_Dynamic` with a long/double descriptor — and
+    // `cp_ldc2w_resolver` accepts only `Long`/`Double` pool entries, answering
+    // `None` for everything else, which is a PERMANENT compile bail
+    // (`ldc2w-constant-unsupported`). So an `ldc2_w` that survives to codegen is
+    // a bare constant push: it cannot throw, allocate or GC, and admitting it
+    // here cannot produce a compiled body containing a throwing one, because
+    // that compile has already bailed. Keeping it excluded cost every
+    // `long`-arithmetic-inside-`try` method its compile — `probes/
+    // Rbc6FieldProbe.java`'s `getfieldLongHandlerLocal` is the witness: one
+    // `long 1000003L` literal in the protected range was the whole reason it
+    // stayed interpreted while its `int` twin compiled.
     let may_throw_without_precise_frame = |op: u8| {
         matches!(
             op,
-            0x12..=0x14 // ldc family (String/class resolution can allocate)
+            0x12 | 0x13 // ldc / ldc_w — String and Class constants
                 | 0x2e..=0x35 // array loads
                 | 0x4f..=0x56 // array stores
                 | 0x6c | 0x6d | 0x70 | 0x71 // integer divide/remainder
@@ -22332,46 +22399,60 @@ mod tests {
             &table,
         ));
 
-        // `getfield`/`putfield` remain excluded — the top-level field arms
-        // still keep an inline fast path that neither null-checks nor
-        // publishes a frame. One `getfield` inside the same protected range is
-        // enough to withhold coverage.
-        let mut with_field = code.clone();
-        with_field.splice(1..1, [0xb4, 0x00, 0x03]);
-        let field_table = vec![ExceptionTableEntry {
+        // One un-admitted throwing opcode anywhere in the same protected
+        // range is still enough to withhold coverage for the whole method —
+        // this list is a conjunction, not a majority vote. `aaload` (0x32) is
+        // the witness: its inline bounds/null check bails to the shared
+        // sentinel stub, which records no frame.
+        let mut with_aaload = code.clone();
+        with_aaload.splice(1..1, [0x32]);
+        let aaload_table = vec![ExceptionTableEntry {
             start_pc: 0,
-            end_pc: 16,
-            handler_pc: 16,
+            end_pc: 14,
+            handler_pc: 14,
             catch_type: 0,
         }];
         assert!(!precise_exception_frame_sites_supported(
-            &with_field,
-            with_field.len(),
-            &field_table,
+            &with_aaload,
+            with_aaload.len(),
+            &aaload_table,
         ));
     }
 
+    /// `getfield`/`putfield` inside a protected range no longer withhold
+    /// coverage (2026-08-02). The exclusion outlived its cause: both top-level
+    /// field arms grew a precise null trap after it was written — see
+    /// `precise_frame_publishing_opcode`'s own doc for which commit did which.
+    ///
+    /// This is a static-admission test. The behavioural acceptance tests are
+    /// `probes/Rbc6FieldProbe.java` (a handler reading a non-parameter local
+    /// after a field NPE) and `probes/SyncBlockFieldProbe.java` (javac's
+    /// `synchronized` cleanup handler releasing the monitor on the way out) —
+    /// re-run THOSE, not this, before touching the list again.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn protected_field_access_keeps_unsafe_handler_interpreted() {
+    fn protected_field_access_is_precise_exception_covered() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
 
         let code = vec![
             0x2a, // 0: aload_0
             0xb4, 0x00, 0x01, // 1: getfield #1
             0x57, // 4: pop
-            0xb1, // 5: return
-            0x4c, // 6: astore_1
-            0x2b, // 7: aload_1
-            0xbf, // 8: athrow
+            0x2a, // 5: aload_0
+            0x03, // 6: iconst_0
+            0xb5, 0x00, 0x02, // 7: putfield #2
+            0xb1, // 10: return
+            0x4c, // 11: astore_1
+            0x2b, // 12: aload_1
+            0xbf, // 13: athrow
         ];
         let table = vec![ExceptionTableEntry {
             start_pc: 0,
-            end_pc: 5,
-            handler_pc: 6,
+            end_pc: 11,
+            handler_pc: 11,
             catch_type: 0,
         }];
-        assert!(!precise_exception_frame_sites_supported(
+        assert!(precise_exception_frame_sites_supported(
             &code,
             code.len(),
             &table,
