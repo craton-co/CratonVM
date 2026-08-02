@@ -45756,34 +45756,35 @@ mod tests {
         );
     }
 
+    /// `AbstractMap.equals`/`hashCode` are DELIBERATELY not registered — see
+    /// `5857872622`. They were identity shims (and `hashCode` handed back the
+    /// receiver's raw heap address, which moves under a young collection), and
+    /// because `AbstractMap` is an abstract CLASS the native walk climbs into
+    /// them for every subclass that INHERITS rather than declares them:
+    /// `HashMap`, `TreeMap`, `LinkedHashMap`, `EnumMap` and every user
+    /// subclass. With the shims gone, real `AbstractMap` bytecode supplies the
+    /// correct entry-wise answer, and a bare synthetic stub falls through to
+    /// `Object.equals`.
+    ///
+    /// This test previously asserted the shim's identity answer and had been
+    /// failing since that deletion, unnoticed because `cargo test -p
+    /// cratonvm-vm --lib --features synthetic-jdk` did not compile. Inverted
+    /// rather than deleted, so re-registering the shim fails loudly here.
     #[test]
-    fn abstract_map_equals_p60() {
+    fn abstract_map_equals_is_deliberately_not_registered_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
-        let eq = call_native(
-            &shared,
-            &mut thread,
-            "java/util/AbstractMap",
-            "equals",
-            "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(map)), Value::Object(Some(map))],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(eq, Value::Int(1));
-        let map2 = shared.mem.heap.alloc_object(ClassId::new(0), 3);
-        let eq2 = call_native(
-            &shared,
-            &mut thread,
-            "java/util/AbstractMap",
-            "equals",
-            "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(map)), Value::Object(Some(map2))],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(eq2, Value::Int(0));
+        for (name, desc) in [("equals", "(Ljava/lang/Object;)Z"), ("hashCode", "()I")] {
+            assert!(
+                shared
+                    .natives
+                    .native_methods
+                    .find("java/util/AbstractMap", name, desc)
+                    .is_none(),
+                "java/util/AbstractMap.{name}{desc} is registered again — an \
+                 identity shim on an abstract class intercepts every Map \
+                 subclass that inherits it (see 5857872622)"
+            );
+        }
     }
 
     #[test]
@@ -74970,8 +74971,13 @@ public class SkippedTest {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: fs,
+            // Derived from `reason`, exactly as every producer in
+            // `ir_lower.rs` does. A bounds-check guard fires BEFORE the array
+            // access it protects, so the interpreter must re-execute it.
+            semantics: ResumeSemantics::for_reason(DeoptReason::BoundsCheck),
         };
         assert_eq!(dp.bci, 42);
+        assert_eq!(dp.semantics, ResumeSemantics::REEXECUTE);
         assert_eq!(dp.frame_state.locals.len(), 2);
         assert_eq!(dp.frame_state.stack.len(), 1);
     }
@@ -74999,6 +75005,7 @@ public class SkippedTest {
                     monitors: vec![],
                     caller: None,
                 },
+                semantics: ResumeSemantics::for_reason(DeoptReason::BoundsCheck),
             });
             assert_eq!(cm.deopt_points.len(), 1);
         }
