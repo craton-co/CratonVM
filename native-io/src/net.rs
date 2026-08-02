@@ -3542,8 +3542,12 @@ mod tests {
         .unwrap();
         assert_eq!(result, Some(Value::Int(1)));
 
-        // The deferred request must be consumed, not left dangling.
-        assert!(net_pending_nonblocking().read().get(&fd).is_none());
+        // The request is RETAINED, not consumed: it is the record of the fd's
+        // blocking mode, which `net_accept` reads to decide between the JDK's
+        // non-blocking accept contract and a genuine blocking accept. It must
+        // not dangle past the fd, though — `close_net_fd` drops it (asserted
+        // below).
+        assert_eq!(net_pending_nonblocking().read().get(&fd), Some(&true));
 
         // And actually applied: reading with no data available must report
         // IOStatus.UNAVAILABLE (-2) promptly rather than blocking.
@@ -3560,8 +3564,47 @@ mod tests {
         .unwrap();
         assert_eq!(read_result, Some(Value::Int(-2)));
 
+        // Closing the fd is what drops the retained mode.
+        close_net_fd(fd);
+        assert!(net_pending_nonblocking().read().get(&fd).is_none());
+
         remove_fd(fd);
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn accept_on_a_nonblocking_listener_reports_unavailable_instead_of_blocking() {
+        // `NioSocketImpl.timedAccept` flips the fd non-blocking and then needs
+        // `Net.accept` to answer IOStatus.UNAVAILABLE (-2) so it can check its
+        // own deadline. Blocking here instead made SO_TIMEOUT inert and
+        // `ServerSocket.accept()` hang forever on an idle port.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = register_handle(NetSocketHandle::Listener(Arc::new(Mutex::new(listener))));
+        net_pending_nonblocking().write().insert(fd, true);
+
+        let mut ctx = MockNativeContext::new();
+        let fd_obj = ctx.alloc_object(0);
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd));
+        let newfd_obj = ctx.alloc_object(0);
+
+        let started = std::time::Instant::now();
+        let result = net_accept(
+            &mut ctx,
+            &[
+                Value::Object(Some(fd_obj)),
+                Value::Object(Some(newfd_obj)),
+                Value::Object(None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Some(Value::Int(-2)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a non-blocking accept must not park"
+        );
+
+        close_net_fd(fd);
+        remove_fd(fd);
     }
 
     #[test]
