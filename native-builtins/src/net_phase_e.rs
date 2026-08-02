@@ -619,6 +619,15 @@ fn ss_get(ctx: &dyn NativeContext, this: ObjectRef) -> SsSide {
     t.get(&key).cloned().unwrap_or_else(ss_default)
 }
 
+/// Whether this receiver has an entry in the side table — i.e. whether the RE.2
+/// surface has ever handled it. Every RE.2 constructor writes one, so a `false`
+/// means the socket came from somewhere else (the phase-53 4-field surface) and
+/// its state has to be read from its object fields instead.
+fn ss_tracked(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(this);
+    ss_side_table().lock().contains_key(&key)
+}
+
 fn ss_set<F: FnOnce(&mut SsSide)>(ctx: &dyn NativeContext, this: ObjectRef, f: F) {
     let key = ctx.identity_hash_code(this);
     let mut t = ss_side_table().lock();
@@ -5147,7 +5156,15 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let side = ss_get(ctx, this);
             let mut lid = side.listener_id;
-            if lid < 0 {
+            // Only read the object field for a receiver this surface has never
+            // touched (a phase-53-constructed ServerSocket, which really does
+            // keep its listener id in slot 3). On a real-layout ServerSocket
+            // that slot is some unrelated JDK field, so reading it
+            // unconditionally invented a non-negative "listener id" for a
+            // freshly constructed socket — and `getInetAddress()` then answered
+            // 0.0.0.0 where the JDK returns null. This is the exact layout
+            // collision the side table exists to avoid.
+            if lid < 0 && !ss_tracked(ctx, this) {
                 lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
             }
             if side.bound == 0 && lid < 0 {

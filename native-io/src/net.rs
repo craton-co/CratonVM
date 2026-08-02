@@ -1707,7 +1707,9 @@ fn net_poll_listener(
     events: i32,
     timeout_millis: i64,
 ) -> MethodCallResult {
-    let deadline = (timeout_millis > 0)
+    // poll(2) convention, matching the stream path: negative waits forever,
+    // 0 returns immediately, positive is a bound.
+    let deadline = (timeout_millis >= 0)
         .then(|| std::time::Instant::now() + Duration::from_millis(timeout_millis as u64));
     ctx.begin_blocking_region();
     let result = loop {
