@@ -5710,59 +5710,12 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
     registry.register(sl_rv, "unlock", "()V", native_stamped_read_view_unlock);
 }
 
-fn native_rwl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    ctx.set_field(this, 0, Value::Int(0)); // readers
-    ctx.set_field(this, 1, Value::Int(0)); // writer
-    ctx.set_field(this, 2, Value::Int(0)); // fair
-    Ok(None)
-}
-
-fn native_rwl_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let fair = match args.get(1) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    ctx.set_field(this, 0, Value::Int(0));
-    ctx.set_field(this, 1, Value::Int(0));
-    ctx.set_field(this, 2, Value::Int(fair));
-    Ok(None)
-}
-
-fn native_rwl_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let lock = alloc_concurrent_synthetic(
-        ctx,
-        "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock",
-        1,
-    );
-    ctx.set_field(lock, 0, Value::Object(Some(this)));
-    Ok(Some(Value::Object(Some(lock))))
-}
-
-fn native_rwl_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let lock = alloc_concurrent_synthetic(
-        ctx,
-        "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock",
-        1,
-    );
-    ctx.set_field(lock, 0, Value::Object(Some(this)));
-    Ok(Some(Value::Object(Some(lock))))
-}
+// The four `native_rwl_*` stubs that used to sit here were dead code: nothing
+// registered them, they stored the reader/writer counts in the object's own
+// slots (which the real class uses for its `Sync`/view references), and there
+// was no `lock`/`unlock` for the views they handed out. The working
+// implementation lives at the bottom of this file next to
+// `register_synthetic_aqs_natives`, which registers it.
 
 // Pattern-A fix (bug nb-lib-gckeys §1): key the StampedLock state table by a
 // GC-stable identity (see `gc_stable_lock_key`) instead of the raw, moving

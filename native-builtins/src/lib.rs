@@ -30232,7 +30232,7 @@ fn cslm_subrange(
 /// Release a `ReentrantLock` for a thread that is about to `await()` on one
 /// of its conditions. Returns the saved hold count to restore on re-acquire,
 /// or `None` if the caller does not own the lock.
-fn rl_release_for_await(key: i32, tid: i64) -> Option<i32> {
+fn rl_release_for_await(key: RlKey, tid: i64) -> Option<i32> {
     rl_with(key, |st| {
         if st.owner != tid {
             return None;
@@ -30337,7 +30337,7 @@ fn cond_await_millis(
 fn reacquire_lock_after_await(
     ctx: &mut dyn NativeContext,
     mut lock_ref: ObjectRef,
-    lock_key: i32,
+    lock_key: RlKey,
     tid: i64,
     saved_hold: i32,
 ) -> MethodCallResult {
