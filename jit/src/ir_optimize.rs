@@ -2168,6 +2168,13 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
                     // IllegalMonitorStateException.
                     | Op::MonitorEnter
                     | Op::MonitorExit
+                    // A guard's whole purpose is the deopt it takes when its
+                    // condition fails; it produces no value, so nothing else
+                    // roots it. Deleting the zero-divisor guard the builder
+                    // anchors at an `idiv`/`ldiv` would silently drop the
+                    // ArithmeticException that division owes — see
+                    // `IrBuilder::add_div_zero_guard`.
+                    | Op::Guard { .. }
             )
         })
         .map(|(id, _)| id as NodeId)

@@ -3013,6 +3013,48 @@ impl OsrEntryPlan {
 }
 
 impl CompiledMethod {
+    /// Stamp `key` (`"<class>.<method>:<descriptor>"`) into every deopt
+    /// snapshot this artifact publishes that does not already carry one.
+    ///
+    /// The optimizing IR lowerer cannot name the method it is compiling —
+    /// `ir_lower::resolve_frame_state` records `method_key: String::new()` and
+    /// its doc comment says the VM caller fills it in. Nothing ever did, and an
+    /// identity-less snapshot is not merely untidy: `try_resume_trapped_callee`
+    /// refuses it outright (*"no usable stash identity"*), so the `i64::MIN`
+    /// deopt sentinel keeps travelling up through the compiled callers until
+    /// some **unrelated** outer method's first-call tier-up sink consumes the
+    /// foreign frame, fails its own `deopt_frame_matches_method` check and
+    /// raises `precise deoptimization unavailable … refusing side-effecting
+    /// replay` — naming a bci that does not exist in the method it blames. That
+    /// is the `org/h2/mvstore/MVMap.evaluateMemoryForKey … at bci 123` failure
+    /// (bci 123 is the `ldiv` in `org.h2.util.MemoryEstimator.estimateMemory`,
+    /// which is 31 bytes long in `evaluateMemoryForKey`).
+    ///
+    /// Only empty keys are filled, so a backend that already stamps its own
+    /// (the single-pass x64 emitter) and the per-scope keys an inlined
+    /// `caller` chain carries are both left exactly as they were.
+    ///
+    /// Mutating the `String` inside a `Box<DeoptimizationPoint>` does not move
+    /// the box, so the `imm64` payload addresses already baked into the emitted
+    /// deopt stubs stay valid. Both lists are stamped: the boxes are what the
+    /// stubs hand to `ir_deopt_entry`, and the by-value `deopt_points` are what
+    /// the VM's resume sinks search for the trap's reason.
+    pub fn stamp_deopt_method_key(&mut self, key: &str) {
+        if key.is_empty() {
+            return;
+        }
+        for p in &mut self.deopt_points {
+            if p.frame_state.method_key.is_empty() {
+                p.frame_state.method_key.push_str(key);
+            }
+        }
+        for p in &mut self._deopt_point_boxes {
+            if p.frame_state.method_key.is_empty() {
+                p.frame_state.method_key.push_str(key);
+            }
+        }
+    }
+
     /// The precise entry contract at `entry_pc`, if this artifact has one.
     ///
     /// Prefers the `OsrExit`-tagged point (that IS the loop-boundary snapshot
@@ -13622,6 +13664,17 @@ fn try_compile_inner(
                             compiled._direct_callee_entries.sort_unstable();
                             compiled._direct_callee_entries.dedup();
                         }
+                        // The lowerer leaves every frame state identity-less
+                        // and documents that the caller fills it in; this is
+                        // that caller. Without the stamp an optimizing-tier
+                        // deopt cannot be resumed by the call site that
+                        // triggered it and instead surfaces as a hard
+                        // `InternalError` against an unrelated outer method —
+                        // see `CompiledMethod::stamp_deopt_method_key`.
+                        compiled.stamp_deopt_method_key(&format!(
+                            "{}.{}:{}",
+                            cached.class_name, cached.method_name, cached.method_descriptor
+                        ));
                         // Backend-routing introspection (tests only): this body was
                         // produced by the optimizing IR pipeline. A method that
                         // bailed out of IR to single-pass never reaches here, so it

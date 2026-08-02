@@ -3051,7 +3051,7 @@ fn reloc_emit_enabled() -> bool {
                 let bpc = node.bytecode_pc;
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 self.load_to_rcx(self.slot_of(node.inputs[1]));
-                self.emit_div_zero_guard(ty, bpc);
+                let zero_after = self.emit_div_zero_guard(ty, bpc);
                 // JVMS MIN/-1 overflow guard: materialise MIN and skip the IDIV
                 // (a raw IDIV on MIN/-1 raises #DE).
                 let ovf_after = self.emit_div_overflow_guard(ty, /* is_rem */ false);
@@ -3067,6 +3067,11 @@ fn reloc_emit_enabled() -> bool {
                     self.buf.emit(&[0x48, 0xF7, 0xF9]);
                 }
                 self.patch_div_overflow_after(ovf_after);
+                // Same continuation for the zero-divisor skip, when this
+                // division's trap is owned by a control-anchored `Op::Guard`.
+                if let Some(p) = zero_after {
+                    self.patch_div_overflow_after(p);
+                }
                 self.store_rax(slot);
             }
             Op::Rem => {
@@ -3097,7 +3102,7 @@ fn reloc_emit_enabled() -> bool {
                 let bpc = node.bytecode_pc;
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 self.load_to_rcx(self.slot_of(node.inputs[1]));
-                self.emit_div_zero_guard(ty, bpc);
+                let zero_after = self.emit_div_zero_guard(ty, bpc);
                 // JVMS MIN/-1 overflow guard: materialise remainder 0 and skip
                 // the IDIV (a raw IDIV on MIN/-1 raises #DE).
                 let ovf_after = self.emit_div_overflow_guard(ty, /* is_rem */ true);
@@ -3112,6 +3117,11 @@ fn reloc_emit_enabled() -> bool {
                 // MOV RAX, RDX
                 self.buf.emit(&[0x48, 0x89, 0xD0]);
                 self.patch_div_overflow_after(ovf_after);
+                // Same continuation for the zero-divisor skip, when this
+                // remainder's trap is owned by a control-anchored `Op::Guard`.
+                if let Some(p) = zero_after {
+                    self.patch_div_overflow_after(p);
+                }
                 self.store_rax(slot);
             }
             Op::MonitorEnter | Op::MonitorExit => {
@@ -4208,18 +4218,32 @@ fn reloc_emit_enabled() -> bool {
         }
     }
 
-    /// Emit a div-by-zero deopt guard for an `Op::Div`/`Op::Rem` whose divisor
-    /// was just loaded into RCX. If the divisor is zero, deopt to the
-    /// interpreter at this bci, which re-executes the `idiv`/`irem` and throws
-    /// `ArithmeticException` — instead of the raw `IDIV` faulting (#DE/SIGFPE),
-    /// the latent crash this fixes. Only emitted when the bci has a safepoint
-    /// snapshot (so the reconstructed frame carries the operand stack the
-    /// interpreter needs to re-execute the division); a hand-built graph with
-    /// no snapshot keeps the bare `IDIV`.
-    fn emit_div_zero_guard(&mut self, ty: IrType, bytecode_pc: Option<usize>) {
+    /// Keep a zero divisor away from the raw `IDIV` (which would raise
+    /// `#DE`/`SIGFPE`) for an `Op::Div`/`Op::Rem` whose dividend is in RAX and
+    /// divisor in RCX. Only emitted when the bci has a safepoint snapshot; a
+    /// hand-built graph with no snapshot keeps the bare `IDIV`.
+    ///
+    /// Two shapes, chosen by whether the builder anchored an `Op::Guard` at
+    /// this bci (see `ir::IrBuilder::add_div_zero_guard`):
+    ///
+    /// * **Guard present** (every graph the bytecode front end builds) — the
+    ///   ArithmeticException is that guard's job, and the guard is
+    ///   control-anchored, so it fires on exactly the paths the bytecode
+    ///   reaches. This node, by contrast, is a *floating* one the scheduler may
+    ///   have hoisted above the branch that guards the division, so it must not
+    ///   trap: materialise a placeholder and `JMP` past the `IDIV`, exactly as
+    ///   [`Self::emit_div_overflow_guard`] does for `MIN / -1`. The placeholder
+    ///   is only ever read on a path where the division did not happen in the
+    ///   source program, so its value is dead. Returns the position of the
+    ///   forward `JMP` rel32 the caller must patch to the post-`IDIV`
+    ///   continuation.
+    /// * **No guard** (hand-built optimizer fixtures) — unchanged: deopt at
+    ///   this bci and let the interpreter re-execute the division and throw.
+    ///   Returns `None`.
+    fn emit_div_zero_guard(&mut self, ty: IrType, bytecode_pc: Option<usize>) -> Option<usize> {
         let bci = match bytecode_pc {
             Some(b) if self.graph.safepoints.iter().any(|s| s.bci == b) => b,
-            _ => return,
+            _ => return None,
         };
         // TEST ECX,ECX (int) / TEST RCX,RCX (long): ZF=1 when divisor == 0.
         if ty == IrType::Int {
@@ -4227,7 +4251,31 @@ fn reloc_emit_enabled() -> bool {
         } else {
             self.buf.emit(&[0x48, 0x85, 0xC9]);
         }
-        self.emit_deopt_if_zero(bci, DeoptReason::DivByZero);
+        let anchored = self
+            .graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::Guard { bci: g } if g == bci));
+        if !anchored {
+            self.emit_deopt_if_zero(bci, DeoptReason::DivByZero);
+            return None;
+        }
+        // JNZ do_div (divisor != 0 → the real division).
+        self.buf.emit(&[0x0F, 0x85]);
+        let jnz = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        // Divisor == 0: XOR EAX,EAX (zeroes the full RAX for both widths and
+        // for both quotient and remainder) and jump past the `IDIV`.
+        self.buf.emit(&[0x31, 0xC0]);
+        self.buf.emit_byte(0xE9);
+        let after_patch = self.buf.pos();
+        self.buf.emit(&[0, 0, 0, 0]);
+        let do_div = self.buf.pos();
+        let rel = do_div as i32 - (jnz as i32 + 4);
+        // div-zero JNZ -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, jnz, rel);
+        Some(after_patch)
     }
 
     /// Emit the JVMS `MIN_VALUE / -1` overflow guard for an `Op::Div`/`Op::Rem`
@@ -4643,12 +4691,26 @@ fn reloc_emit_enabled() -> bool {
     /// carrying this bci. Returns `None` (⇒ the producer bails to `Undefined`)
     /// when the block can't be uniquely identified.
     fn deopt_block_for_bci(&self, bci: usize) -> Option<usize> {
+        // An `Op::Guard` at this bci OWNS the deopt: since
+        // `ir::IrBuilder::add_div_zero_guard`, a division's zero-divisor trap
+        // is the control-anchored guard's, and the floating `Op::Div` beside it
+        // no longer traps at all. The two sit in different blocks in exactly
+        // the case that anchoring exists to fix — the scheduler hoisted the
+        // division — so consulting both would report "ambiguous" and give up
+        // on a program point that is in fact unambiguous.
+        let anchored = self
+            .graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::Guard { bci: gb } if gb == bci));
         let mut found: Option<usize> = None;
         for (id, n) in self.graph.nodes.iter().enumerate() {
-            // The deopt at `bci` fires from a div/rem zero/overflow guard (whose
-            // node carries `bytecode_pc == bci`) or an explicit `Op::Guard { bci }`.
+            // The deopt at `bci` fires from an explicit `Op::Guard { bci }`, or
+            // — for a graph with no guard at this bci — from the div/rem
+            // zero/overflow guard the lowerer emits at the node carrying
+            // `bytecode_pc == bci`.
             let is_deopt_here = match &n.op {
-                Op::Div | Op::Rem => n.bytecode_pc == Some(bci),
+                Op::Div | Op::Rem => !anchored && n.bytecode_pc == Some(bci),
                 Op::Guard { bci: gb } => *gb == bci,
                 _ => false,
             };
@@ -8373,6 +8435,66 @@ mod tests {
             .frame_state
             .locals
             .clone()
+    }
+
+    /// A division the bytecode reaches on only one arm must deopt from its
+    /// control-anchored `Op::Guard`, not from the floating `Op::Div` the
+    /// scheduler placed wherever its operands happened to be available.
+    ///
+    /// Before this, `MemoryEstimator.estimateMemory` (H2's `MVMap` key/value
+    /// size estimator) had its `ldiv` hoisted above the branch that guarantees
+    /// a positive divisor, and the lowerer's own guard then deopted on a path
+    /// the interpreter never takes — which the interpreter faithfully resumed
+    /// into, throwing `ArithmeticException: / by zero` out of a program that
+    /// cannot divide by zero.
+    #[test]
+    fn a_guarded_divisions_trap_comes_from_the_guard_not_the_floating_div() {
+        // 0: iload_0  1: ifne +7 (→8)  4: iload_1  5: iload_2  6: idiv
+        // 7: ireturn  8: iconst_0  9: ireturn
+        let code = [
+            0x1a, 0x9a, 0x00, 0x07, 0x1b, 0x1c, 0x6c, 0xac, 0x03, 0xac, 0, 0,
+        ];
+        let graph = crate::ir::IrBuilder::new(3, 3)
+            .build(&code, 10)
+            .expect("IR build failed");
+        let schedule = ir_schedule::schedule(&graph);
+        let cm = lower_inner(
+            &graph,
+            &schedule,
+            3,
+            3,
+            &no_helpers(),
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("lower");
+
+        let at_div: Vec<_> = cm
+            ._deopt_point_boxes
+            .iter()
+            .filter(|p| p.bci == 6)
+            .collect();
+        assert_eq!(
+            at_div.len(),
+            1,
+            "one deopt point at the idiv's bci, not one per emitter"
+        );
+        assert_eq!(
+            at_div[0].reason,
+            DeoptReason::UncommonTrap,
+            "the surviving trap is the control-anchored Op::Guard's; a \
+             `DivByZero` here means the floating div still deopts"
+        );
+        assert!(
+            !cm._deopt_point_boxes
+                .iter()
+                .any(|p| p.reason == DeoptReason::DivByZero),
+            "the lowerer must not emit its own div-by-zero deopt once the \
+             builder anchored a guard"
+        );
     }
 
     #[test]

@@ -3796,6 +3796,52 @@ impl IrBuilder {
         self.graph.add(Op::Const(val), IrType::Long, vec![], None)
     }
 
+    /// Anchor an integer `idiv`/`ldiv`/`irem`/`lrem`'s zero-divisor trap to the
+    /// control token in effect at `pc`.
+    ///
+    /// `Op::Div` / `Op::Rem` are **floating** data nodes: `add_data` gives them
+    /// two value inputs and no control edge, so `ir_schedule::find_best_block`
+    /// places them in the deepest block their operands are available in. That
+    /// block can *dominate* the branch the bytecode guards the division with —
+    /// which is fine for a pure node (the result is simply dead on the paths
+    /// Java would not have computed it) but not for the trap: the lowerer's
+    /// own `emit_div_zero_guard` then deopts, at this bci, on a path the
+    /// interpreter never reaches, and the interpreter faithfully re-executes
+    /// the division it is parked on and throws.
+    ///
+    /// Measured shape (`org.h2.util.MemoryEstimator.estimateMemory`, H2's
+    /// `TestMultiThread`): `sum = (sum * counter + delta + (counter >> 1)) /
+    /// counter` sits under `if (initialized == 0)`, where `counter` has just
+    /// been incremented back to a positive value; on the *other* arm `counter`
+    /// is `-1`, so the hoisted `ldiv` divides by zero and the method dies with
+    /// `ArithmeticException: / by zero` (or, before the deopt frames carried an
+    /// identity, with `InternalError: … refusing side-effecting replay` blamed
+    /// on an unrelated caller).
+    ///
+    /// `Op::Guard` carries `[ctrl, cond]`, so the scheduler pins it to the
+    /// block the division really belongs to, and it deopts at exactly this bci
+    /// when `cond` is false. With the guard in place the lowerer stops trapping
+    /// on the speculative copy and materialises a placeholder result instead —
+    /// see `ir_lower::emit_div_zero_guard`, which keys off the presence of this
+    /// node so a graph built without one keeps its old behaviour.
+    ///
+    /// No-op in unreachable code (no live control token), which is also where
+    /// no safepoint snapshot is recorded and where the lowerer therefore emits
+    /// no guard either.
+    fn add_div_zero_guard(&mut self, divisor: NodeId, ty: IrType, pc: usize) {
+        let Some(ctrl) = self.ctrl_opt() else {
+            return;
+        };
+        let zero = if ty == IrType::Long {
+            self.lconst(0)
+        } else {
+            self.iconst(0)
+        };
+        let cond = self.add_data(Op::Cmp(CmpOp::Ne), IrType::Int, vec![divisor, zero], pc);
+        self.graph
+            .add(Op::Guard { bci: pc }, IrType::Void, vec![ctrl, cond], Some(pc));
+    }
+
     /// FP value tier (inc 30): a `float` constant, stored as its raw 32-bit
     /// IEEE-754 bit pattern (zero-extended into the `u64` payload). Typed
     /// `IrType::Float` so the lowerer marshals it through XMM. No dedup — GVN
@@ -4363,6 +4409,7 @@ impl IrBuilder {
                 0x6c => {
                     let b = self.pop();
                     let a = self.pop();
+                    self.add_div_zero_guard(b, IrType::Int, pc);
                     let r = self.add_data(Op::Div, IrType::Int, vec![a, b], pc);
                     self.push(r);
                     pc += 1;
@@ -4374,6 +4421,7 @@ impl IrBuilder {
                 0x6d => {
                     let b = self.pop();
                     let a = self.pop();
+                    self.add_div_zero_guard(b, IrType::Long, pc);
                     let r = self.add_data(Op::Div, IrType::Long, vec![a, b], pc);
                     self.push(r);
                     pc += 1;
@@ -4382,6 +4430,7 @@ impl IrBuilder {
                 0x70 => {
                     let b = self.pop();
                     let a = self.pop();
+                    self.add_div_zero_guard(b, IrType::Int, pc);
                     let r = self.add_data(Op::Rem, IrType::Int, vec![a, b], pc);
                     self.push(r);
                     pc += 1;
@@ -4390,6 +4439,7 @@ impl IrBuilder {
                 0x71 => {
                     let b = self.pop();
                     let a = self.pop();
+                    self.add_div_zero_guard(b, IrType::Long, pc);
                     let r = self.add_data(Op::Rem, IrType::Long, vec![a, b], pc);
                     self.push(r);
                     pc += 1;
@@ -6302,6 +6352,119 @@ mod tests {
         );
         assert_eq!(graph.nodes[load.inputs[2] as usize].op, Op::Param(0));
         assert_eq!(graph.nodes[load.inputs[3] as usize].op, Op::Const(0));
+    }
+
+    /// `static int f(int flag, int n, int d) { if (flag != 0) return 0; return n / d; }`
+    ///
+    /// The `idiv` is reachable only on the not-taken arm, so its
+    /// ArithmeticException must be anchored there — `Op::Guard`'s control input
+    /// has to be the `If`'s projection, not the method entry. `Op::Div` itself
+    /// is a floating node the scheduler is free to hoist into any block its
+    /// operands are available in, which is exactly why the trap may not ride
+    /// along with it.
+    #[test]
+    fn idiv_zero_divisor_trap_is_anchored_to_the_branch_that_reaches_it() {
+        // 0: iload_0  1: ifne +7 (→8)  4: iload_1  5: iload_2  6: idiv
+        // 7: ireturn  8: iconst_0  9: ireturn
+        let code = [
+            0x1a, 0x9a, 0x00, 0x07, 0x1b, 0x1c, 0x6c, 0xac, 0x03, 0xac, 0, 0,
+        ];
+        let graph = IrBuilder::new(3, 3)
+            .build(&code, 10)
+            .expect("IR build failed");
+
+        let guards: Vec<&Node> = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, Op::Guard { bci: 6 }))
+            .collect();
+        assert_eq!(
+            guards.len(),
+            1,
+            "exactly one zero-divisor guard for the single idiv"
+        );
+        let guard = guards[0];
+        assert_eq!(guard.ty, IrType::Void);
+        assert_eq!(guard.inputs.len(), 2, "Op::Guard is [ctrl, cond]");
+
+        // Anchored inside the conditional: the control edge is the token the
+        // not-taken arm runs under (the builder gives the fall-through target
+        // its own `Merge`), never the method's entry control — which is the
+        // whole point, since the entry dominates both arms and a trap parked
+        // there fires on the path that returns 0 without dividing.
+        let ctrl_id = guard.inputs[0];
+        let ctrl = &graph.nodes[ctrl_id as usize];
+        assert_eq!(ctrl.ty, IrType::Control, "guard input 0 is a control edge");
+        let entry_ctrl = graph
+            .nodes
+            .iter()
+            .position(|n| {
+                n.op == Op::Proj(0)
+                    && n.ty == IrType::Control
+                    && n.input_opt(0) == Some(graph.entry)
+            })
+            .expect("the graph has an entry control projection");
+        assert_ne!(
+            ctrl_id as usize, entry_ctrl,
+            "the trap must not be anchored at the method entry"
+        );
+        assert!(
+            graph.nodes.iter().any(|n| n.op == Op::If),
+            "the fixture really does branch"
+        );
+
+        // The condition is `divisor != 0`, over the same node the division
+        // divides by.
+        let cond = &graph.nodes[guard.inputs[1] as usize];
+        assert_eq!(cond.op, Op::Cmp(CmpOp::Ne));
+        let div = graph
+            .nodes
+            .iter()
+            .find(|n| n.op == Op::Div)
+            .expect("the idiv builds an Op::Div");
+        assert_eq!(cond.inputs[0], div.inputs[1], "guards the actual divisor");
+        assert_eq!(graph.nodes[cond.inputs[1] as usize].op, Op::Const(0));
+    }
+
+    /// The same anchoring for `ldiv`, `irem` and `lrem`, and the `Long` form
+    /// compares against a `Long`-typed zero (a 32-bit compare would read only
+    /// half of a 64-bit divisor).
+    #[test]
+    fn every_integer_division_opcode_anchors_its_zero_divisor_trap() {
+        for (opcode, div_pc, is_long, op) in [
+            // 0: lload_0  1: lload_2  2: ldiv  3: lreturn
+            (0x6du8, 2usize, true, Op::Div),
+            // irem / lrem, same shape
+            (0x70u8, 2usize, false, Op::Rem),
+            (0x71u8, 2usize, true, Op::Rem),
+        ] {
+            let code = if is_long {
+                [0x1e, 0x20, opcode, 0xad, 0, 0]
+            } else {
+                [0x1a, 0x1b, opcode, 0xac, 0, 0]
+            };
+            let Some(graph) = IrBuilder::new(4, 4).build(&code, 4) else {
+                continue; // a shape this front end declines is not this test's business
+            };
+            let guard = graph
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, Op::Guard { bci } if bci == div_pc))
+                .unwrap_or_else(|| panic!("no zero-divisor guard for opcode {opcode:#x}"));
+            let cond = &graph.nodes[guard.inputs[1] as usize];
+            assert_eq!(cond.op, Op::Cmp(CmpOp::Ne), "opcode {opcode:#x}");
+            let zero = &graph.nodes[cond.inputs[1] as usize];
+            assert_eq!(zero.op, Op::Const(0), "opcode {opcode:#x}");
+            assert_eq!(
+                zero.ty,
+                if is_long { IrType::Long } else { IrType::Int },
+                "opcode {opcode:#x}: the zero must be as wide as the divisor"
+            );
+            assert!(
+                graph.nodes.iter().any(|n| n.op == op),
+                "opcode {opcode:#x} still builds its arithmetic node"
+            );
+        }
     }
 
     #[test]
