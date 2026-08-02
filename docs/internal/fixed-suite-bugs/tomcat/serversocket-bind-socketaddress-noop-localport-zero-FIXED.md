@@ -192,17 +192,35 @@ None of the three is attributable to the change:
 this box always has. That is another reason the serial interleaved re-run,
 not the sharded counts, is the evidence.)
 
-## Known residual (separate, pre-existing, non-default mode)
+## The one residual — also FIXED, 2026-08-02
 
-Under `CRATONVM_REAL=-net-sockets` only, the `ServerSocketChannel.socket()`
-adapter still cannot accept: `accept()` throws
-`IOException: ServerSocket not bound` where HotSpot throws
-`SocketTimeoutException`. Same crate split as this doc — native-io wraps six
+When this doc was retired, one gap was left open and filed separately: under
+`CRATONVM_REAL=-net-sockets` only, the `ServerSocketChannel.socket()` adapter
+could not accept at all (`IOException: ServerSocket not bound`, where HotSpot
+accepts or times out). Same crate split as this doc — native-io wraps six
 `ServerSocket` methods for the back-ref case but not `accept`/`setSoTimeout`,
-so those reach RE.2, which only understands plain sockets. It behaves
-identically before and after this branch, no suite runs that mode, and the
-default mode is correct. Filed separately; the fix shape is the original
-doc's "option 2", for which `PlainServerSocketOps` is now half the plumbing.
+so those reached RE.2, which only understands plain sockets and saw
+`listener_id = -1`.
+
+Closed on branch `fix/ssc-adapter-accept-synthetic-20260802` with the original
+doc's **option 2**: a narrow reverse hook,
+`plain_server_socket::set_channel_backed_accept`, installed by native-io and
+consulted by RE.2's `accept` for any receiver RE.2 did not construct itself.
+`None` means "no back-ref, not mine". The alternative — wrapping `accept` in
+native-io like the other six — was rejected: it would make that crate the
+winner for EVERY accept in the VM and put a cross-crate hop in front of the
+common plain-socket case, all for one legacy non-default surface.
+
+That fix immediately exposed two more of the same shape, in **both** modes:
+`SocketChannelImpl.blockingRead([BIIJ)I` and `blockingWriteFully([BII)V` were
+unregistered, so the accepted `Socket`'s streams
+(`sun.nio.ch.SocketInputStream.implRead` / `SocketOutputStream.implWrite`)
+died with `NoSuchMethodError`. An accepted socket that cannot be read from is
+not a working accept, so both were registered in the same change.
+
+`vm/tests/server_socket_adaptor_accept.rs` now pins the whole adapter path in
+both socket modes: a timed accept that must throw `SocketTimeoutException`
+rather than hang, plus PING/PONG exchanges with and without a timeout set.
 
 ---
 

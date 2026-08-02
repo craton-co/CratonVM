@@ -5004,10 +5004,30 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         if s.closed != 0 {
             return Err(socket_ex(ctx, "Socket is closed"));
         }
-        // Only refuse for a receiver this surface constructed. A
-        // `ServerSocketChannel.socket()` adapter also lands here (native-io does
-        // not wrap `accept`), and its bound state lives in the channel registry,
-        // not in `bound` — answering "not bound" for it would be a lie.
+        // A `ServerSocketChannel.socket()` adapter is also a
+        // `java.net.ServerSocket` and also lands here: native-io wraps six
+        // ServerSocket methods for the channel case, but not `accept`. Its
+        // listener lives in native-io's channel registry, so nothing in this
+        // surface's state describes it — `listener_id` is -1 and `bound` is 0,
+        // which produced `IOException: ServerSocket not bound` where HotSpot
+        // accepts (or times out). Hand it back to the crate that owns the
+        // channel, carrying the SO_TIMEOUT this surface DOES hold for it
+        // (`setSoTimeout` is not wrapped either, so the value was stored here).
+        //
+        // Only for receivers this surface did not construct: a plain
+        // ServerSocket is never channel-backed, so the hook would just be a
+        // wasted lookup for it.
+        if s.constructed == 0 {
+            if let Some(accept_on_channel) =
+                cratonvm_native_api::plain_server_socket::channel_backed_accept()
+            {
+                if let Some(result) = accept_on_channel(ctx, this, s.so_timeout) {
+                    return result;
+                }
+            }
+        }
+        // Only refuse for a receiver this surface constructed — for anything
+        // else `bound` says nothing (see above).
         if s.constructed != 0 && s.bound == 0 {
             // HotSpot: `SocketException: Socket is not bound`, not an
             // IOException — callers catch the subtype.
