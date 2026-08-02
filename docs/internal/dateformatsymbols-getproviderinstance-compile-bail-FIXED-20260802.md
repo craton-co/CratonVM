@@ -173,11 +173,15 @@ neither null-checks nor publishes a frame: a protected `getfield` NPE let
 the handler read a non-parameter local as `0` instead of `38`, and a
 `putfield` on a null receiver did not throw at all.
 
-That residual now has its own doc:
-[known-issues/jit/rbc6-protected-field-ops-block-synchronized-blocks-20260802.md](../known-issues/jit/rbc6-protected-field-ops-block-synchronized-blocks-20260802.md).
-Note that `31-synchronized-code-never-jit-compiled-FIXED.md` still claims
-`getfield`/`putfield` "are therefore admitted at the relevant precise-frame
-sites" — that claim is stale for this shape.
+**Update, same day: that residual is closed too.** It turned out not to need
+the codegen work this section anticipated — the precise null traps had already
+been built at both top-level field arms and only the admission list was stale.
+`getfield`/`putfield` are admitted again, all three methods above compile, and
+`DateFormatPatternProbe` now reports `hot_but_stuck_in_interpreter=0`: nothing
+on this probe's path is left uncompiled. See
+[rbc6-protected-field-ops-FIXED-20260802.md](rbc6-protected-field-ops-FIXED-20260802.md),
+which also carries the correction to
+`31-synchronized-code-never-jit-compiled-FIXED.md`.
 
 ## Reproduction (historical)
 
