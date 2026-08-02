@@ -138,3 +138,76 @@ powershell -NoProfile -ExecutionPolicy Bypass -File apps\spring-boot-suite-runne
 
 The `-ClassList` TSV needs a literal `module<TAB>class` header row; a headerless
 file silently drops its first class.
+
+---
+
+## Addendum, 2026-08-01: the gate was run, and item 3 has a probe
+
+Added by `fix/basicerrorcontroller-jit-20260801`, which reached the same
+handler-frame diagnosis independently from this class while the fix above was
+landing from `LiquibaseAutoConfigurationTests` and devtools. Its implementation
+was dropped in favour of `843b780baa` — that one also repairs slot 0 from the
+caller's arguments, which this one did not and which matters, since the reason-9
+snapshot records `this` as `Undefined` whenever liveness says the bytecode has
+no further read of it (exactly what the real `BindConverter.convert` frame does:
+`getfield delegates` at bci 3 is its last use). What it contributes instead:
+
+### The acceptance gate, run and MET
+
+This report existed because
+`jit/src/lib.rs::direct_jit_callee_calls_enabled()`'s stated acceptance was
+unrunnable. It has now been run, on one binary, Linux x86-64, real JDK 25,
+Spring Boot 4.1.0-SNAPSHOT, 3 concurrent:
+
+| arm | runs | clean |
+|---|---|---|
+| default flags | 14 | **14 consecutive** |
+| `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` (gate-closed control) | 2 | **2** |
+
+Both arms clean is what settles the question the gate asks.
+
+**A 14-run gate on this class will not always come back clean**, and that is
+worth knowing before someone reads a red run as a regression. Earlier rounds on
+the same branch lost one run to a stall (`main` parked in `Thread.join()` inside
+Spring Boot's two-thread `OnClassCondition` filtering) and one to a SIGSEGV in
+an unmapped code buffer — about 2 events in 54 runs. Both are filed:
+`docs/known-issues/springboot/onclasscondition-join-never-returns-20260801.md`
+and `docs/known-issues/jit/sigsegv-in-unmapped-code-buffer-20260801.md`, each
+with its sample size stated. Arm `--stack-dump-on-timeout` when running the
+gate; the first stall was killed by the harness with no dump and cost the
+information.
+
+### Item 3 (`DeferredLogFactory.getLog`) now has a negative probe
+
+This document records the receiver mix-up as never root-caused. It still is —
+but it is now also unreproduced against a driver built for its exact shape.
+`probes/SelfOverloadReceiverProbe.java` drives an interface `default` method
+forwarding to a same-named abstract overload of itself, with a lambda capturing
+the `Class` argument, at a polymorphic call site, for 400 000 iterations. Clean
+on HotSpot 25 and on CratonVM at the default threshold and at
+`CRATONVM_JIT_THRESHOLD=5`. Zero `NoSuchMethodError` of any kind also appeared
+across five full runs of this class on four different binaries, including the
+unfixed one.
+
+That is not a root cause and does not retire the item — the advice above stands:
+if it returns, treat it as a separate defect. It does mean the next person
+starts with a driver instead of a signature.
+
+### Localisation, for the next report of this shape
+
+The defect was narrowed by JIT admission alone, on one binary (dev
+`b56da0bba1`), before any source was read:
+
+| arm | result |
+|---|---|
+| HotSpot 25 | PASS 26/26 |
+| CratonVM, JIT on, default flags | **FAIL 26 tests / 23 failed** |
+| `CRATONVM_JIT_DENY=org/springframework/boot/context/properties/bind/` | PASS 26/26 |
+| `CRATONVM_JIT_DENY=java/util/` | FAIL 23 — not the JDK collections |
+| `CRATONVM_JIT_DENY=BindConverter.convert` | PASS 26/26 |
+| `CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES=1` | PASS 26/26 |
+
+`CRATONVM_JIT_DENY` bisecting a package down to a single method, then a
+behaviour flag naming the mechanism, took this from "23 tests fail" to
+"`run_jit_callee_handler` for a method the precise-frame relaxation admits"
+without a disassembler.

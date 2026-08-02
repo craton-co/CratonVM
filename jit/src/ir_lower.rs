@@ -6694,6 +6694,26 @@ pub fn lower_with_scalar_deopt(
 /// guard-surviving scalar-replacement map, and the two per-call-site lowering
 /// tables all flow in here. `pub(crate)` so the production compile path
 /// (`lib.rs`) can supply all of them at once.
+///
+/// **Sizes the code buffer by retrying, not by guessing harder.** The estimate
+/// below (`nodes * 32 + calls * 448 + 1024`) budgets one number for a call site
+/// whose real cost swings by several hundred bytes depending on which lowering
+/// it selects — a MIC + 4-way-PIC dual-ABI inline cache is the expensive end,
+/// and widening the PIC's inter-slot branch from `rel8` to `rel32` pushed it
+/// past the budget. The result was a silent de-optimization: `emit` drops the
+/// write, sets the sticky `overflowed` flag, and the method quietly stays
+/// interpreted forever. A single Spring Boot suite class produced **8072** such
+/// warnings in one run, every one of them from this estimate (the report that
+/// first noticed the flood,
+/// `docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
+/// attributed them to the single-pass backend's estimate — that one accounted
+/// for 10).
+///
+/// `ExecutableBuffer::wanted()` counts every byte codegen asked for, including
+/// the writes dropped after the overflow, so one retry at that size is exact
+/// rather than another guess. Raising the constant instead would have to
+/// over-reserve every ordinary method to cover the worst one, and every
+/// reserved byte counts against the code-cache cap.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_inner(
     graph: &Graph,
@@ -6734,6 +6754,7 @@ pub(crate) fn lower_inner(
 /// behaviour — `FrameState::caller` stays `None` at every deopt point.
 ///
 /// See `docs/jit/deopt-inline-scopes.md` for the producer side.
+///
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_inner_with_scopes(
     graph: &Graph,
@@ -6892,7 +6913,8 @@ pub(crate) fn lower_inner_with_scopes(
         .filter(|n| matches!(n.op, Op::Call { .. }))
         .count();
     let capacity = ir_code_buffer_estimate(graph.nodes.len(), call_nodes);
-    let buf = ExecutableBuffer::new(capacity)?;
+    let mut buf = ExecutableBuffer::new(capacity)?;
+    buf.set_tag("ir-lower");
 
     let mut lowerer = Lowerer::new(
         graph,
@@ -7164,7 +7186,7 @@ pub(crate) fn lower_inner_with_scopes(
         crate::metrics::note_current_reloads(lowerer.ls_reloads);
     }
 
-    let buf = lowerer.buf;
+    let mut buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
     // non-panicking: on capacity exhaustion it sets a sticky `overflowed` flag
     // and DROPS the write, so an under-estimated buffer yields a silently

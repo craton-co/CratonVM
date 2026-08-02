@@ -2472,6 +2472,18 @@ unsafe fn route_implicit_exc_through_callee(
     // Re-entering at bytecode 0 replays every prefix side effect (and was the
     // source of the old finally/counter leak).
     if let Some((thread, _guard)) = jit_thread_mut() {
+        // Drop any exceptional frame the abandoned compiled attempt published
+        // BEFORE materializing the exception. `create_exception_object`
+        // allocates on the Java heap and can therefore run a young collection,
+        // and a `ReconstructedFrame` is not a GC root — its object words would
+        // survive as stale addresses. `run_jit_callee_handler` reads that frame
+        // (that is how a handler recovers its non-parameter locals), so leaving
+        // a pre-allocation frame standing here would hand it relocated
+        // pointers. Without one it applies its `handler_reads_non_param_local`
+        // guard instead and refuses rather than reconstructing a params-only
+        // frame it cannot justify — which is exactly the conservative answer
+        // for this branch.
+        cratonvm_jit::deopt::clear_exceptional_frame();
         let exc = match (aioobe, npe) {
             (Some((index, length)), _) => {
                 let msg = format!("Index {index} out of bounds for length {length}");

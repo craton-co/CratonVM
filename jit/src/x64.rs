@@ -24003,6 +24003,32 @@ pub fn compile_with_param_slots(
     // exhausted otherwise modest 10 KiB buffers, leaving hot methods in the
     // interpreter. Keep enough headroom for those sites; the code-cache cap
     // remains the global bound on retained executable memory.
+    //
+    // 512 -> 1024 (2026-08-01). Widening the PIC's inter-slot branch from
+    // `rel8` to `rel32` grew every inline-cache site, and 512 stopped covering
+    // them. Measured on one Spring Boot suite class: TEN methods overflowed per
+    // run, and in every one of them `inline_extra` was 0 and the whole shortfall
+    // sat in this term. Solving each for the per-invoke cost the body actually
+    // needed — `(wanted - code_len * 96 - 8192) / invokes`, which OVER-attributes
+    // (the `code_len * 96` term also pays for the invoke bytecodes) — gives:
+    //
+    //     MapperListener.containerEvent           68 invokes   957 B/invoke
+    //     AbstractBeanDefinition.<init>           83 invokes   824
+    //     OnBeanCondition.getMatchingBeans        34 invokes   728
+    //     ObjectCreateRule.begin                  22 invokes   674
+    //     ResolvableType.getNested                 6 invokes   642
+    //     ClassFileAnnotationMetadata.resolveTypeName 7 invokes 640
+    //     StringUtils.collectionToDelimitedString 16 invokes   578
+    //     AbstractAutowireCapableBeanFactory.populateBean 34   547
+    //     DateTimeFormatterBuilder$NumberPrinterParser.format 36 531
+    //     jdk.internal.classfile.impl.ClassImpl.forEach 21     515
+    //
+    // 1024 covers the worst of them with margin. Unlike the optimizing tier —
+    // which now measures the shortfall and re-runs the lowering at that size
+    // (`ir_lower::lower_inner`) — this backend cannot retry: it consumes six
+    // one-shot thread-local staging requests before the buffer is allocated,
+    // and re-entering it would find them gone. The estimate has to be right the
+    // first time here, so it errs high.
     let inline_extra: usize = inline_sites
         .values()
         .map(|s| s.callee_code_len.saturating_mul(64))
@@ -24010,9 +24036,10 @@ pub fn compile_with_param_slots(
     let estimated_size = code_len
         .saturating_mul(96)
         .saturating_add(8192)
-        .saturating_add(invoke_info.len().saturating_mul(512))
+        .saturating_add(invoke_info.len().saturating_mul(1024))
         .saturating_add(inline_extra);
-    let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
+    let mut buf = ExecutableBuffer::new(estimated_size.max(4096))?;
+    buf.set_tag("x64-single-pass");
 
     // Size operand-stack spills from the reader/verifier max_stack when the
     // production path supplies it. Keep the local estimator as a defensive floor
