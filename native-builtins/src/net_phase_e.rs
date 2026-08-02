@@ -268,6 +268,17 @@ pub(crate) struct SsSide {
     pub backlog: i32,
     pub closed: i32,
     pub listener_id: i32,
+    /// 1 when one of this surface's own `ServerSocket` constructors built the
+    /// receiver — i.e. it really is a plain `ServerSocket` whose whole state
+    /// lives here.
+    ///
+    /// A `ServerSocketChannel.socket()` adapter is also a `java.net.ServerSocket`
+    /// and also reaches these natives (native-io registers wrappers for some
+    /// methods but not `accept`/`setSoTimeout`), yet its state lives in
+    /// native-io's channel registry. It gets a side-table entry the moment
+    /// anything here writes one — `setSoTimeout` does — so "has an entry" is NOT
+    /// the same question. Only a `0` here means "not ours, do not answer for it".
+    pub constructed: i32,
     /// 1 once a bind has succeeded. Distinct from `listener_id >= 0`, which
     /// `close()` resets: `ServerSocket.isBound()` reports whether the socket
     /// was *ever* bound and stays true afterwards ("this method will continue
@@ -605,6 +616,7 @@ fn ss_default() -> SsSide {
         backlog: 50,
         closed: 0,
         listener_id: -1,
+        constructed: 0,
         bound: 0,
         host: String::new(),
         reuse_address: -1,
@@ -4775,6 +4787,10 @@ fn re2_bind_listener(
         s.backlog = backlog.max(0);
         s.closed = 0;
         s.listener_id = listener_id;
+        // Reached only for a plain ServerSocket: this surface's own
+        // constructors, or the plain-bind handler native-io delegates to for a
+        // receiver with no channel back-ref. Either way the state is ours.
+        s.constructed = 1;
         s.bound = 1;
         s.host = actual_host.clone();
     });
@@ -4931,6 +4947,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             s.backlog = 50;
             s.closed = 0;
             s.listener_id = -1;
+            s.constructed = 1;
             s.bound = 0;
         });
         Ok(None)
@@ -4987,7 +5004,11 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         if s.closed != 0 {
             return Err(socket_ex(ctx, "Socket is closed"));
         }
-        if s.bound == 0 {
+        // Only refuse for a receiver this surface constructed. A
+        // `ServerSocketChannel.socket()` adapter also lands here (native-io does
+        // not wrap `accept`), and its bound state lives in the channel registry,
+        // not in `bound` — answering "not bound" for it would be a lie.
+        if s.constructed != 0 && s.bound == 0 {
             // HotSpot: `SocketException: Socket is not bound`, not an
             // IOException — callers catch the subtype.
             return Err(socket_ex(ctx, "Socket is not bound"));
