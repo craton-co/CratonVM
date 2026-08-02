@@ -6690,52 +6690,6 @@ pub fn lower_with_scalar_deopt(
     )
 }
 
-thread_local! {
-    /// Set by [`lower_inner_sized`] when it refuses because the code buffer ran
-    /// out: the exact byte count codegen asked to emit. Read once by
-    /// [`lower_inner`], which retries at that size.
-    ///
-    /// One-shot, and cleared before each attempt, so a refusal for any OTHER
-    /// reason cannot leave a stale size behind to trigger a pointless retry of
-    /// an unrelated later method on this worker thread.
-    static IR_CODE_BUFFER_WANTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// How many times [`lower_inner`] has re-run the lowering at a measured size.
-///
-/// Without this the retry is unfalsifiable: a retry that never fires and a
-/// retry that fires and succeeds produce the SAME log — the first attempt's
-/// (quiet) overflow and nothing else.
-pub static IR_CODE_BUFFER_RETRIES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// A/B opt-out (`CRATONVM_JIT_NO_IR_CODE_BUFFER_RETRY=1`): refuse the compile on
-/// a short code-buffer estimate instead of re-running the lowering at the size
-/// the first attempt measured, i.e. the pre-2026-08-01 behaviour.
-///
-/// It exists because the retry is the only change in its branch that allocates
-/// and unmaps EXTRA executable memory, and because two intermittent failures —
-/// a stall in Spring Boot's two-thread `OnClassCondition` filtering, and one
-/// SIGSEGV executing an unmapped code buffer — appeared on a tree carrying it
-/// and not on a same-sized control without it. Neither has been pinned on the
-/// retry, and neither sample is large enough to pin anything; this flag is how
-/// the next person compares the two behaviours on ONE binary rather than two.
-/// See `docs/known-issues/springboot/onclasscondition-join-never-returns-20260801.md`
-/// and `docs/known-issues/jit/sigsegv-in-unmapped-code-buffer-20260801.md`.
-fn ir_code_buffer_retry_disabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IR_CODE_BUFFER_RETRY").is_some()
-    })
-}
-
-/// Hard ceiling on a retry. A method whose body genuinely needs more than this
-/// is better left to the single-pass backend than handed several megabytes of
-/// committed executable memory — `COMMITTED_JIT_CODE_BYTES` (the code-cache
-/// cap) counts every byte reserved here, not just the bytes emitted.
-const IR_CODE_BUFFER_RETRY_CAP: usize = 4 * 1024 * 1024;
-
 /// Shared lowering body: profile-guided branch hints, the optional
 /// guard-surviving scalar-replacement map, and the two per-call-site lowering
 /// tables all flow in here. `pub(crate)` so the production compile path
@@ -6801,91 +6755,8 @@ pub(crate) fn lower_inner(
 ///
 /// See `docs/jit/deopt-inline-scopes.md` for the producer side.
 ///
-/// **This is also where the code buffer gets sized by measurement instead of by
-/// guesswork.** The estimate in the body budgets one number per call node, but a
-/// call site's real cost swings by hundreds of bytes depending on which lowering
-/// it selects, and widening the PIC's inter-slot branch from `rel8` to `rel32`
-/// pushed the expensive end past it. Overflowing is silent: `emit` drops the
-/// write, sets the sticky `overflowed` flag, and the method stays interpreted
-/// forever. One Spring Boot suite class produced 8072 such warnings in a single
-/// run, every one of them from this estimate.
-///
-/// So run the body once at the estimate, and if it refuses for a code-buffer
-/// overflow, run it again at the size `ExecutableBuffer::wanted()` measured.
-/// `wanted` counts every byte codegen asked for, dropped writes included, so the
-/// retry is exact rather than another guess. Raising the constant instead would
-/// over-reserve every ordinary method to cover the worst one, and every reserved
-/// byte counts against the code-cache cap.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_inner_with_scopes(
-    graph: &Graph,
-    schedule: &Schedule,
-    num_params: usize,
-    num_locals: usize,
-    helpers: &JitRuntimeHelpers,
-    branch_hints: &HashMap<usize, bool>,
-    sr_map: Option<&ScalarReplacementMap>,
-    direct_calls: &HashMap<usize, (usize, bool)>,
-    ic_slots: &HashMap<usize, (usize, usize)>,
-    compact_fields: &HashMap<usize, (u32, bool, u8)>,
-    inline_scopes: &InlineScopeTable,
-) -> Option<CompiledMethod> {
-    IR_CODE_BUFFER_WANTED.with(|c| c.set(0));
-    let first = lower_inner_sized(
-        graph,
-        schedule,
-        num_params,
-        num_locals,
-        helpers,
-        branch_hints,
-        sr_map,
-        direct_calls,
-        ic_slots,
-        compact_fields,
-        inline_scopes,
-        0,
-    );
-    if first.is_some() {
-        return first;
-    }
-    let wanted = IR_CODE_BUFFER_WANTED.with(|c| c.replace(0));
-    // A refusal for any other reason leaves this at 0 — no retry, byte-for-byte
-    // the old behaviour.
-    if wanted == 0 || wanted > IR_CODE_BUFFER_RETRY_CAP || ir_code_buffer_retry_disabled() {
-        return None;
-    }
-    // `wanted` is a lower bound on its own terms (`rewind_to` does not take
-    // bytes back off it, so it can also over-count); the eighth is headroom for
-    // encodings that widen once the displacements they patch sit further apart
-    // in the larger buffer.
-    let retry = wanted
-        .saturating_add(wanted / 8)
-        .saturating_add(256)
-        .min(IR_CODE_BUFFER_RETRY_CAP);
-    IR_CODE_BUFFER_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_COMPILES").is_some() {
-        eprintln!("[ir] code-buffer retry: estimate short, re-lowering at {retry} bytes");
-    }
-    lower_inner_sized(
-        graph,
-        schedule,
-        num_params,
-        num_locals,
-        helpers,
-        branch_hints,
-        sr_map,
-        direct_calls,
-        ic_slots,
-        compact_fields,
-        inline_scopes,
-        retry,
-    )
-}
-
-/// [`lower_inner_with_scopes`]'s body, with an explicit code-buffer floor so the
-/// retry can re-run it at the size the first attempt measured.
-#[allow(clippy::too_many_arguments)]
-fn lower_inner_sized(
     graph: &Graph,
     schedule: &Schedule,
     num_params: usize,
@@ -6908,10 +6779,6 @@ fn lower_inner_sized(
     // Which inlined callee each `graph.safepoints` entry belongs to, and the
     // caller scopes above it. Empty ⇒ flat, caller-less deopt frames.
     inline_scopes: &InlineScopeTable,
-    // Code-buffer floor. 0 on the first attempt (the estimate below decides);
-    // the size the first attempt measured on a retry. See
-    // [`lower_inner_with_scopes`].
-    min_capacity: usize,
 ) -> Option<CompiledMethod> {
     // A monitor in the graph must REFUSE the compile, not fall through.
     //
@@ -7045,14 +6912,9 @@ fn lower_inner_sized(
         .iter()
         .filter(|n| matches!(n.op, Op::Call { .. }))
         .count();
-    let capacity = ir_code_buffer_estimate(graph.nodes.len(), call_nodes).max(min_capacity);
+    let capacity = ir_code_buffer_estimate(graph.nodes.len(), call_nodes);
     let mut buf = ExecutableBuffer::new(capacity)?;
     buf.set_tag("ir-lower");
-    // The first attempt's overflow is a measurement the retry consumes, not a
-    // failure; only a retry that ALSO overflows is worth a warning. With the
-    // retry opted out there is no second attempt, so the overflow is a method
-    // silently leaving the optimizing tier again and has to be audible.
-    buf.set_quiet_overflow(min_capacity == 0 && !ir_code_buffer_retry_disabled());
 
     let mut lowerer = Lowerer::new(
         graph,
@@ -7344,13 +7206,7 @@ fn lower_inner_sized(
         // seventeen times over and looked like a tie. `wanted()` keeps counting
         // through the dropped writes, and this backend never calls `rewind_to`
         // or `emit_checked`, so it is the exact requirement rather than a
-        // bound. It is also the exact size the retry re-runs at.
-        IR_CODE_BUFFER_WANTED.with(|c| c.set(buf.wanted()));
-        // Nothing points into this buffer — it is discarded here, before any
-        // `CompiledMethod` could carry it to the cache — so keep its unmap out
-        // of the recent-frees ring, whose non-zero-active-count invariant is a
-        // use-after-free detector and not a counter.
-        buf.mark_never_published();
+        // bound.
         return refuse(Bailout::new(BailoutReason::CodeBufferExhausted {
             needed: buf.wanted(),
             capacity,

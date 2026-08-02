@@ -352,29 +352,6 @@ pub struct ExecutableBuffer {
     /// bail is indistinguishable from a method the JIT declined for any other
     /// reason. See [`wanted`](Self::wanted).
     wanted: usize,
-    /// This buffer was abandoned before anything could point at it, so its
-    /// unmap must not be recorded in the recent-frees ring.
-    ///
-    /// The ring pairs every unmap with `ACTIVE_JIT_EXECUTIONS`, and a non-zero
-    /// count there means "released while a thread was inside compiled code" —
-    /// the signature of a release path bypassing the `defer_jit_owner`
-    /// retirement queue, and how the 2026-07-28 retirement-unmaps-executing-code
-    /// defect was caught. A discarded compile attempt is freed on a compiler
-    /// thread while mutators are running, so it would record a non-zero count
-    /// while being perfectly safe — no cache entry, no baked direct call, no
-    /// trampoline points into it. Recording it would make the invariant read
-    /// false and put a bogus range in front of the next crash report.
-    never_published: bool,
-    /// Suppress the per-patch overflow warnings on this buffer.
-    ///
-    /// An overflow is only newsworthy where it ENDS a compile. The optimizing
-    /// tier's first attempt re-runs at the size it just measured, so its
-    /// overflow is a measurement, not a failure — and it is not a rare one: a
-    /// single Spring Boot suite class emitted 8072 of these lines from that one
-    /// attempt, drowning every other warning in the run and reading, to whoever
-    /// found them, like a defect. The retry leaves this clear, so a buffer that
-    /// overflows even at its measured size still says so.
-    quiet_overflow: bool,
     /// Which sizing heuristic allocated this buffer, for the overflow warning.
     ///
     /// Four independent estimates allocate executable buffers, and the warning
@@ -411,27 +388,8 @@ impl ExecutableBuffer {
             capacity,
             overflowed: false,
             wanted: 0,
-            quiet_overflow: false,
-            never_published: false,
             tag: "untagged",
         })
-    }
-
-    /// Mark this buffer as abandoned before publication, so its unmap stays out
-    /// of the recent-frees ring. See [`never_published`].
-    ///
-    /// [`never_published`]: Self::never_published
-    #[inline]
-    pub fn mark_never_published(&mut self) {
-        self.never_published = true;
-    }
-
-    /// Suppress this buffer's overflow warnings. See [`quiet_overflow`].
-    ///
-    /// [`quiet_overflow`]: Self::quiet_overflow
-    #[inline]
-    pub fn set_quiet_overflow(&mut self, quiet: bool) {
-        self.quiet_overflow = quiet;
     }
 
     /// Name the sizing heuristic that allocated this buffer. Shown by the
@@ -579,10 +537,7 @@ impl ExecutableBuffer {
             // identical lines. The actionable diagnostic (method, code_len,
             // capacity, wanted) is logged once per method by the compile
             // driver's "code buffer estimate too small" bail.
-            // `quiet_overflow` suppresses even that one line, for a caller
-            // to whom an overflow is a measurement rather than a failure
-            // -- see its field doc.
-            if !self.overflowed && !self.quiet_overflow {
+            if !self.overflowed {
                 tracing::warn!(
                     offset = offset,
                     len = self.len,
@@ -615,10 +570,7 @@ impl ExecutableBuffer {
     pub fn try_patch_byte(&mut self, offset: usize, value: u8) -> Result<(), CompileError> {
         if offset >= self.len {
             // First overflow only; see `try_patch_i32` for why.
-            // `quiet_overflow` suppresses even that one line, for a caller
-            // to whom an overflow is a measurement rather than a failure
-            // -- see its field doc.
-            if !self.overflowed && !self.quiet_overflow {
+            if !self.overflowed {
                 tracing::warn!(
                     offset = offset,
                     len = self.len,
@@ -749,11 +701,6 @@ pub fn jit_code_cache_cap_refusals() -> u64 {
     JIT_CODE_CACHE_CAP_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Number of times the optimizing tier re-ran a lowering because its code-buffer
-/// estimate was short. Diagnostic only; see `ir_lower::lower_inner`.
-pub fn ir_code_buffer_retries() -> u64 {
-    ir_lower::IR_CODE_BUFFER_RETRIES.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// Returns `true` if retained JIT code has reached the configured cap, meaning
 /// new compilation should be refused (the method stays in the interpreter).
@@ -830,13 +777,11 @@ impl Drop for ExecutableBuffer {
         // thread was inside compiled code — which is precisely the bug the
         // `defer_jit_owner` retirement queue above exists to prevent, so a
         // non-zero value here means some release path is still bypassing it.
-        if !self.never_published {
-            record_code_free(
-                self.ptr as usize,
-                self.capacity,
-                ACTIVE_JIT_EXECUTIONS.get(),
-            );
-        }
+        record_code_free(
+            self.ptr as usize,
+            self.capacity,
+            ACTIVE_JIT_EXECUTIONS.get(),
+        );
         if never_free_code_enabled() {
             return;
         }

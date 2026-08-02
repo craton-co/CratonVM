@@ -63,7 +63,6 @@ Same class, same host and fixture, 3 concurrent, 2026-08-01:
 | pristine `origin/dev` `5443fae920` | 34 | **0** |
 | the `fix/basicerrorcontroller-jit-20260801` branch, before merging dev | 20 | 2 |
 | the same branch merged with dev | 54 | 1 |
-| the same, with `CRATONVM_JIT_NO_IR_CODE_BUFFER_RETRY=1` | 20 | 0 |
 
 **Not load-gated, contrary to a first reading.** The first two occurrences
 happened while the shared 16-core host was carrying an external load average
@@ -74,9 +73,9 @@ change the odds; it is not the mechanism.
 Three events in 74 runs of the branch against **0** in 34 of pristine dev
 **does not distinguish the two trees**: at a ~4% rate a 34-run control comes up
 empty about a quarter of the time. A same-binary A/B of the branch's only
-JIT-churn change (the optimizing tier's code-buffer retry, 20 interleaved
-on/off pairs) came back 20/20 clean on BOTH arms, so that change is not the
-trigger either. Anyone tempted to blame — or clear — a specific change on these
+JIT-churn change at the time (an optimizing-tier code-buffer retry, since
+removed, 20 interleaved on/off pairs) came back 20/20 clean on BOTH arms, so
+that change was not the trigger either. Anyone tempted to blame — or clear — a specific change on these
 numbers should collect a much larger control first.
 
 ## Where to look first

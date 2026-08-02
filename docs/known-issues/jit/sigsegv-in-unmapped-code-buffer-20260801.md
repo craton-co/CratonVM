@@ -37,21 +37,23 @@ ring pairs every unmap with `ACTIVE_JIT_EXECUTIONS`, and a non-zero value is
 supposed to mean a buffer was released while a thread was inside compiled code —
 the signature of a release path bypassing `defer_jit_owner`.
 
-**In this binary that inference did not hold.** The run was on a branch whose
-optimizing-tier code-buffer retry drops a discarded compile attempt directly,
-on a compiler thread, while mutators are running compiled code. Nothing points
-into such a buffer — no cache entry, no baked direct call, no trampoline, so no
-thread can be inside it — but it was still recorded in the ring with a non-zero
-active count, and its address is then free for the next `mmap` to reuse. So the
-"RECENTLY FREED code buffer" the report names may be a discarded compile attempt
-that merely *occupied that address later*, while the thread was stranded by an
-earlier free of a genuinely published body.
+**In this binary that inference did not hold, and the reason generalises.**
+The run carried an experimental optimizing-tier code-buffer *retry* that dropped
+a discarded compile attempt directly, on a compiler thread, while mutators were
+running compiled code. Nothing points into such a buffer — no cache entry, no
+baked direct call, no trampoline, so no thread can be inside it — but it was
+still recorded in the ring with a non-zero active count, and its address is then
+free for the next `mmap` to reuse. So the "RECENTLY FREED code buffer" the
+report names may be a buffer that merely *occupied that address later*, while
+the thread was stranded by an earlier free of a genuinely published body.
 
-The confound is closed: a discarded attempt is now marked
-`ExecutableBuffer::mark_never_published()` and stays out of the ring, so the
-next occurrence's attribution means what it says. **Re-read the ring's
-invariant before drawing conclusions from any crash captured before
-2026-08-01.**
+That retry was removed before merge (dev's census-fitted estimate made it fire
+zero times), so the ring is back to recording only buffers something could have
+pointed into. **The lesson outlives the retry**: any future code that frees an
+`ExecutableBuffer` outside the `defer_jit_owner` retirement queue silently
+breaks this ring's invariant and, with it, the sharpest tool the codebase has
+for use-after-free in JIT code. Re-read the invariant before drawing
+conclusions from this crash.
 
 ## Rate, and what it does and does not distinguish
 
@@ -61,13 +63,13 @@ Same class, same host and fixture, 3 concurrent:
 |---|---|---|---|
 | pristine `origin/dev` `5443fae920` | 34 | **0** | 0 |
 | branch merged with dev | 54 | **1** | 1 |
-| the same, with `CRATONVM_JIT_NO_IR_CODE_BUFFER_RETRY=1` | 20 | 0 | 0 |
 | branch before merging dev | 20 | 0 | 2 |
 
 One event in 54 against zero in controls of comparable size distinguishes
 nothing: at a 2% rate a 20- or 34-run control comes up empty most of the time.
-A same-binary A/B of the code-buffer retry — the only change on that branch that
-allocates and unmaps extra executable memory — was 20/20 clean on both arms. Do not read the control as exoneration of either tree, and do not read
+A same-binary A/B of that branch's only extra-executable-memory change — the
+retry, 20 interleaved on/off pairs — was 20/20 clean on both arms, which is why
+nothing here is attributed to it. Do not read the control as exoneration of either tree, and do not read
 the single event as a regression. What can be said is narrower and still
 useful: the shape is the retirement-unmaps-executing-code family, that family
 had a fix land on 2026-07-28, and it has now been seen again.
