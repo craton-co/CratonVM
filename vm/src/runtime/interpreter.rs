@@ -7587,6 +7587,7 @@ pub fn execute(
                     // those will be handled by OSR which can wire callees as direct calls.
                     let mut ldc_info_early: Vec<(usize, i64)> = Vec::new();
                     let mut ldc_string_info_early: Vec<(usize, *const u8, usize)> = Vec::new();
+                    let mut ldc_class_info_early: Vec<(usize, u32, u16)> = Vec::new();
                     let mut has_unsupported_ldc = false;
                     if !scan.ldc_ops.is_empty() {
                         let cm_lock = shared.classes.class_manager.read();
@@ -7629,8 +7630,25 @@ pub fn execute(
                                             None => has_unsupported_ldc = true,
                                         }
                                     }
-                                    // Wide-string / Class / other ldc kinds - still
-                                    // unwired on this path (as on the OSR path).
+                                    // `ldc <Class>`: recorded as a site and
+                                    // served at run time by
+                                    // `helpers.ldc_class_cp`. Recorded even if
+                                    // that helper turns out to be unwired — the
+                                    // backend then refuses the method, which is
+                                    // a bail, whereas `has_unsupported_ldc`
+                                    // additionally inserts it into
+                                    // `jit_skip_set` and so would block the
+                                    // hot-path compile too.
+                                    Some(ConstantPoolEntry::ClassReference { .. }) => {
+                                        ldc_class_info_early.push((
+                                            pc_ldc,
+                                            class_id.as_u32(),
+                                            cp_idx,
+                                        ));
+                                    }
+                                    // Wide-string / MethodHandle / condy ldc
+                                    // kinds - still unwired on this path (as on
+                                    // the OSR path).
                                     _ => {
                                         has_unsupported_ldc = true;
                                     }
@@ -7749,6 +7767,7 @@ pub fn execute(
                         ldc_info_early,
                         ldc_string_info_early, // wired 2026-07-18 — see the
                         // StringReference arm in the ldc resolver above.
+                        ldc_class_info_early,
                         ldc2w_info_early,
                         std::collections::HashMap::new(), // branch_hints
                         std::collections::HashMap::new(), // loop_unroll_hints

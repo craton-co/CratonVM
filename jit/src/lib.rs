@@ -5969,6 +5969,18 @@ mod inline_selection_tests {
 pub enum JitLdcConstant {
     Immediate(i64),
     String(String),
+    /// A `CONSTANT_Class` entry: `ldc <Class>` pushes that class's mirror.
+    ///
+    /// Carries the *referencing* class id and the CP index rather than a
+    /// resolved class id, for the same two reasons [`JitNewSite::Deferred`]
+    /// does — the target may not be loaded yet, and loading it is a user
+    /// `ClassLoader.loadClass` that must not run inside the compiler. The
+    /// mirror is fetched at run time by `helpers.ldc_class_cp`, which is also
+    /// what keeps it correct under a relocating collector.
+    ClassMirror {
+        holder_class_id: u32,
+        cp_idx: u16,
+    },
 }
 
 /// Compile-time resolution of a `new` (0xbb) / `anewarray` (0xbd)
@@ -10897,6 +10909,111 @@ pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
 }
 
+/// Last recorded refusal site per method, keyed exactly like [`jit_bail_list`].
+///
+/// The thread-local [`JIT_BAIL_SITE`] answers "why did the compile that just
+/// ran bail?", which only helps somebody already watching `CRATONVM_DBG_JITC`
+/// at the moment it happened. The place a permanently-uncompilable hot method
+/// is actually *noticed* is the end-of-run
+/// `CRATONVM_DBG=jit-method-stats` table, which runs long after every compile
+/// worker has moved on — so the reason has to outlive the compile. Same
+/// key/collision argument as the bail-list above: a collision at worst
+/// mislabels one diagnostic line.
+static JIT_BAIL_REASONS: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<u64, (&'static str, u32, u32)>>,
+> = std::sync::OnceLock::new();
+
+fn jit_bail_reasons(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, (&'static str, u32, u32)>> {
+    JIT_BAIL_REASONS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+fn record_jit_bail_reason(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    site: (&'static str, u32, u32),
+) {
+    let h = compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
+    jit_bail_reasons().write().insert(h, site);
+}
+
+/// The refusal site last recorded for this method, rendered for a report
+/// line, or `None` if no compile of it ever bailed.
+pub fn jit_bail_reason_for(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<String> {
+    let h = compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
+    let site = *jit_bail_reasons().read().get(&h)?;
+    Some(format_jit_bail_site(Some(site)))
+}
+
+thread_local! {
+    /// Why the compile currently running on this thread refused the method.
+    ///
+    /// `(site, bytecode_pc, opcode)`; the pc/opcode pair is `(0, 0)` for the
+    /// sites that are not a single bytecode's fault.
+    ///
+    /// # Why this exists
+    ///
+    /// `try_compile` reported a failed compile as
+    /// `compile-bail <method> backend_attempted=<bool>` and nothing else.
+    /// `backend_attempted` reads like "the backend ran and gave up", but it is
+    /// really a *permanence* flag: three constant-pool resolver misses set it
+    /// too, precisely so the method lands on the bail-list instead of being
+    /// retried forever. So the one bit that looked like a classification
+    /// conflated "codegen has a hole" with "this CP entry is a shape the
+    /// compiler never accepts", and a permanently-interpreted hot JDK method
+    /// was indistinguishable from a transient resolver miss — which is exactly
+    /// how `java/text/DateFormatSymbols.getProviderInstance` (a plain
+    /// `ldc <Class>`) sat unexplained. See
+    /// `docs/known-issues/jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md`.
+    ///
+    /// One-shot per compile: `try_compile` clears it on entry so a bail can
+    /// only ever report its own cause, never a previous method's.
+    static JIT_BAIL_SITE: std::cell::Cell<Option<(&'static str, u32, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Record why this compile is about to bail. Cheap enough (one `Cell` store)
+/// to run unconditionally, so the reason is available whether or not
+/// `CRATONVM_DBG_JITC` was set when the compile started.
+pub fn note_jit_bail_site(site: &'static str) {
+    JIT_BAIL_SITE.with(|c| c.set(Some((site, 0, 0))));
+}
+
+/// [`note_jit_bail_site`] for a refusal attributable to one bytecode — the
+/// single-pass backend's per-opcode `return false` arms.
+pub fn note_jit_bail_site_at(site: &'static str, pc: usize, opcode: u8) {
+    JIT_BAIL_SITE.with(|c| c.set(Some((site, pc as u32, u32::from(opcode)))));
+}
+
+/// Take (and clear) the recorded bail site.
+pub fn take_jit_bail_site() -> Option<(&'static str, u32, u32)> {
+    JIT_BAIL_SITE.with(|c| c.take())
+}
+
+/// Render a taken bail site for a diagnostic line.
+fn format_jit_bail_site(site: Option<(&'static str, u32, u32)>) -> String {
+    match site {
+        Some((s, 0, 0)) => s.to_string(),
+        Some((s, pc, op)) => format!("{s}(pc={pc},op=0x{op:02x})"),
+        None => "unrecorded".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OSR entry-point reject memo
 // ---------------------------------------------------------------------------
@@ -11805,6 +11922,10 @@ pub fn try_compile_with_invokespecial_resolver(
     // Consume the per-compile self-call identity proof FIRST — even an
     // early bail below must not leak a stale `true` into a later compile.
     let self_call_identity_stable = SELF_CALL_IDENTITY_STABLE.with(|c| c.replace(false));
+    // Same one-shot discipline for the bail-site record: clear whatever the
+    // previous compile on this worker thread left behind, so a bail below can
+    // only ever report its own cause.
+    let _ = take_jit_bail_site();
     let _compile_stack_guard = JitCompileStackGuard::enter(cached);
 
     // Inner pipeline: returns None on either a transient resolver miss
@@ -11851,11 +11972,34 @@ pub fn try_compile_with_invokespecial_resolver(
             &cached.method_descriptor,
         );
     }
-    if result.is_none() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
-        eprintln!(
-            "[cratonvm-jitc] compile-bail {}.{}{} backend_attempted={}",
-            cached.class_name, cached.method_name, cached.method_descriptor, backend_attempted
-        );
+    if result.is_none() {
+        // Take once and use for both sinks: the trace line below (only when
+        // `CRATONVM_DBG_JITC` is on) and the per-method store the end-of-run
+        // stats table reads (always, so the reason survives the compile).
+        let site = take_jit_bail_site();
+        if let Some(site) = site {
+            record_jit_bail_reason(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+                site,
+            );
+        }
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            // `reason=` is the point of this line. `backend_attempted` alone
+            // says only whether the bail is permanent (see `JIT_BAIL_SITE`),
+            // which is not a diagnosis — a resolver that cannot represent an
+            // `ldc <Class>` and a backend that ran out of code buffer both
+            // print `true`.
+            eprintln!(
+                "[cratonvm-jitc] compile-bail {}.{}{} backend_attempted={} reason={}",
+                cached.class_name,
+                cached.method_name,
+                cached.method_descriptor,
+                backend_attempted,
+                format_jit_bail_site(site),
+            );
+        }
     }
     // DBG (env-gated): dump the emitted machine code for a specific method so
     // its prologue/epilogue + body can be disassembled offline. Set
@@ -12407,9 +12551,33 @@ fn try_compile_inner(
     macro_rules! jitc_bail {
         ($site:expr) => {
             return {
+                crate::note_jit_bail_site($site);
                 if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
                     eprintln!(
                         "[cratonvm-jitc] resolver-bail site={} {}.{}{}",
+                        $site, cached.class_name, cached.method_name, cached.method_descriptor
+                    );
+                }
+                None
+            }
+        };
+    }
+
+    /// A bail the compiler will never take back: the offending property is
+    /// fixed by the class file, so retrying cannot change the answer. Sets
+    /// `backend_attempted`, which is what routes the method onto the permanent
+    /// bail-list — the flag's real meaning, despite its name.
+    ///
+    /// Named exactly like [`jitc_bail`] so the two read the same in a trace;
+    /// the `permanent-bail` prefix is what tells them apart.
+    macro_rules! jitc_permanent_bail {
+        ($site:expr) => {
+            return {
+                *backend_attempted = true;
+                crate::note_jit_bail_site($site);
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                    eprintln!(
+                        "[cratonvm-jitc] permanent-bail site={} {}.{}{}",
                         $site, cached.class_name, cached.method_name, cached.method_descriptor
                     );
                 }
@@ -12440,8 +12608,7 @@ fn try_compile_inner(
             // attempts on `DefiniteLengthInputStream.readAllIntoByteArray`
             // in ONE asn1 RegressionTest run. Route through the existing
             // permanent bail-list machinery.
-            *backend_attempted = true;
-            return None;
+            jitc_permanent_bail!("jit-scan-reject")
         }
     };
     drop(metrics_scan);
@@ -13865,11 +14032,24 @@ fn try_compile_inner(
     // codegen arm bails per-site instead.
     let mut ldc_info: Vec<(usize, i64)> = Vec::new();
     let mut ldc_string_info: Vec<(usize, *const u8, usize)> = Vec::new();
+    let mut ldc_class_info: Vec<(usize, u32, u16)> = Vec::new();
     if !scan.ldc_ops.is_empty() {
         if let Some(resolver) = cp_ldc_resolver {
             for &(pc, cp_idx) in &scan.ldc_ops {
                 match resolver(cp_idx) {
                     Some(JitLdcConstant::Immediate(v)) => ldc_info.push((pc, v)),
+                    Some(JitLdcConstant::ClassMirror {
+                        holder_class_id,
+                        cp_idx,
+                    }) => {
+                        // The helper is `OptionalPtr`: a hand-built test table
+                        // leaves it 0, and then this site keeps the historical
+                        // whole-compile bail rather than emitting a CALL to 0.
+                        if helpers.ldc_class_cp == 0 {
+                            jitc_bail!("ldc_class_helper_unwired")
+                        }
+                        ldc_class_info.push((pc, holder_class_id, cp_idx));
+                    }
                     Some(JitLdcConstant::String(text)) => {
                         let boxed: Box<str> = text.into_boxed_str();
                         let ptr = boxed.as_ptr();
@@ -13892,8 +14072,7 @@ fn try_compile_inner(
                         // diagnostic-free hang: TestResponsePerformance's
                         // trivial `getRequestURI() { return "..."; }` bailed
                         // on every one of ~1M hot-loop calls).
-                        *backend_attempted = true;
-                        return None;
+                        jitc_permanent_bail!("ldc-constant-unsupported")
                     }
                 }
             }
@@ -13915,8 +14094,7 @@ fn try_compile_inner(
                     // RBC.7 twin: a non-Long/Double constant at this ldc2_w
                     // index is likewise fixed by the bytecode — permanent
                     // bail, not a transient miss. See the ldc arm above.
-                    *backend_attempted = true;
-                    return None;
+                    jitc_permanent_bail!("ldc2w-constant-unsupported")
                 }
             };
             ldc2w_info.push((pc, val));
@@ -14998,6 +15176,7 @@ fn try_compile_inner(
         pic_slots,
         ldc_info,
         ldc_string_info,
+        ldc_class_info,
         ldc2w_info,
         branch_hints,
         loop_unroll_hints,
