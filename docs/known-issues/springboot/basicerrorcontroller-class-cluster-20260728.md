@@ -1,12 +1,15 @@
 # `BasicErrorControllerIntegrationTests` comparator crash and residuals
 
-**Status: FIXED — 2026-08-01.** Reported 2026-07-28, fixed 2026-07-29,
-regressed 2026-07-31, and closed here. This file is the record for the whole
-cluster: it absorbs the two companion reports filed on the same class,
-`springboot-basicerrorcontroller-checkcast-abort-20260731.md` (the GC root
-cause) and `basicerrorcontroller-jit-only-failure-20260731.md` (the `<local5>`
-arm, and why this class was not a usable acceptance gate). Both are retired
-alongside it, bodies intact, in this directory.
+**Status: OPEN — REGRESSED 2026-08-01 (again).** Reported 2026-07-28, fixed
+2026-07-29, regressed 2026-07-31, closed again 2026-08-01 — see "Regression
+note (2026-08-01, again)" below for evidence that 3 of the 4 classes this
+closure validated are back to failing with the identical signature on a build
+where every cited fix commit is a genuine ancestor. This file is the record
+for the whole cluster: it absorbs the two companion reports filed on the same
+class, `springboot-basicerrorcontroller-checkcast-abort-20260731.md` (the GC
+root cause) and `basicerrorcontroller-jit-only-failure-20260731.md` (the
+`<local5>` arm, and why this class was not a usable acceptance gate). Both are
+retired alongside it, bodies intact, in this directory.
 
 Two independent defects were behind the five affected classes, and **neither is
 the one the original 2026-07-28 report named**:
@@ -307,3 +310,53 @@ re-filed: the `DeferredLogFactory.getLog(Class)` receiver mix-up
 receiver) was last seen on a binary at `351218f44`, has not been observed since
 `7f1b1f263`, and was never root-caused. If it reappears, it is a separate
 defect — do not assume the handler-frame fix here covers it.
+
+## Regression note (2026-08-01, again)
+
+Reran the 26-class FAIL/CRASH residual from the 2026-07-31 full-suite round
+against `dev` merged to `1b24cca1f` (branch
+`feat/spring-boot-residual-rerun-20260728`, binary
+`cratonvm-spring-boot-residual0728.exe`, 1 shard, `-Parallel 1`,
+`-TimeoutSec 1500`, `RunName=craton-rerun-20260801`). Confirmed:
+`0b18f15eb`, `20cab92aa`, and `c3dbb011a` (this doc's cited GC fixes) are all
+genuine ancestors of `1b24cca1f` (`git merge-base --is-ancestor`), so this is
+not a stale-binary artifact.
+
+**1 of 4 classes still holds** — `BasicErrorControllerIntegrationTests`:
+PASS, 546.4s (with the 1800s timeout override).
+
+**3 of 4 regressed with the identical signature**:
+
+- `BasicErrorControllerDirectMockMvcTests` — FAIL, 82.5s.
+  `java.lang.ClassCastException: java.lang.Object cannot be cast to
+  org.springframework.boot.autoconfigure.condition.ConditionEvaluationReport$ConditionAndOutcomes`
+  at `ConditionEvaluationReport.getConditionAndOutcomesBySource(ConditionEvaluationReport.java:116)`,
+  same as before.
+- `OAuth2ResourceServerAutoConfigurationTests` — FAIL, 323.5s. Same
+  `ConditionAndOutcomes` CCE, this time via the write path
+  (`ConditionEvaluationReport.recordConditionEvaluation`).
+- `CloudFoundryActuatorAutoConfigurationTests` — FAIL, 364.9s. Same CCE, same
+  write path, `DispatcherServletAutoConfiguration`.
+- `JettyServletWebServerFactoryTests` — FAIL, 917.5s. Still hits the
+  companion `NoSuchMethodError:
+  java/lang/String$CaseInsensitiveComparator.apply` →
+  `checkcast: not an object reference` abort at `HttpCookie.from`, the exact
+  call site this doc's closure named as fixed.
+
+Logs:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260801/all-jit/logs/module_spring-boot-webmvc.org.springframework.boot.webmvc.autoconfigure.error.BasicErrorCo-b9aa5200ce0f.{out,err}.log`,
+`.../module_spring-boot-security-oauth2-resource-server.org.springframework.boot.security.oauth-2a3a654baeda.{out,err}.log`,
+`.../module_spring-boot-cloudfoundry.org.springframework.boot.cloudfoundry.autoconfigure.a-7729cc9d2f53.{out,err}.log`,
+`.../module_spring-boot-jetty.org.springframework.boot.jetty.servlet.JettyServletWebServerFactoryTests.{out,err}.log`
+(all under `craton-rerun-20260801/all-jit/logs/`).
+
+Not re-diagnosed at the source level this session (this was a rerun-and-triage
+pass, not a debugging session). Given the closure's own framing — this
+signature is a reclaimed/stale-`ObjectRef` print, not a genuine typing bug —
+whoever picks this up should treat it as the same GC family reappearing under
+a load/promotion pattern the 2026-08-01 fixes didn't cover, per this doc's own
+"Regression note" pattern from 07-31, rather than assume a fourth independent
+cause. `BasicErrorControllerIntegrationTests` passing while its 3 siblings
+fail suggests the fix is real but incomplete, not fake — worth comparing what
+GC pressure/promotion pattern each sibling class's boot sequence produces
+against the one class that now reliably passes.
