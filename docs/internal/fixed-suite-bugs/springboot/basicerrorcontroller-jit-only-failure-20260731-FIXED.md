@@ -29,7 +29,7 @@ Two items from this document did NOT close with it:
   it is a separate defect — do not assume the handler-frame fix covers it.
 * The code-buffer overflow flood is re-filed, with a corrected attribution
   (it is the optimizing IR tier's estimate, not `x64.rs`'s), as
-  `docs/known-issues/jit-ir-tier-code-buffer-overflow-flood-20260801.md`.
+  `docs/internal/fixed-suite-bugs/jit-ir-tier-code-buffer-estimate-20260801-FIXED.md` (FIXED 2026-08-01: the estimate was the IR tier's and is now fitted to a 1664-compile census).
 
 ---
 
