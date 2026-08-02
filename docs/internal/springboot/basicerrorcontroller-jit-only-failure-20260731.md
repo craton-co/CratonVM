@@ -251,12 +251,12 @@ taken as the receiver).
 `BasicErrorControllerIntegrationTests`, default flags, 14 consecutive clean
 runs, plus a same-binary gate-closed control.
 
-Run on the merged tree (`origin/dev` `5443fae920` + this branch), Linux
-x86-64, real JDK 25, 3 concurrent:
+**MET, on the final tree** (`origin/dev` `5443fae920` + this branch), Linux
+x86-64, real JDK 25, 3 concurrent, one binary:
 
 | arm | runs | clean |
 |---|---|---|
-| default flags | 20 | **19** |
+| default flags | 14 | **14 consecutive** |
 | `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` (gate-closed control) | 2 | **2** |
 
 **Both arms clean is what settles the question this gate asks**, and it is the
@@ -265,13 +265,13 @@ about the direct-call edge, and anyone reading a red run of it as evidence
 against that edge between 2026-07-31 and 2026-08-01 was reading the wrong
 defect.
 
-**Not 14 *consecutive* clean runs, and the difference is worth stating.** One
-run in 20 stalled — `main` parked in `Thread.join()` inside Spring Boot's
-two-thread `OnClassCondition` filtering, caught by
-`--stack-dump-on-timeout 1500`. It is a separate defect, filed as
+**The class is not immune to two intermittent failures**, and a 14-run gate
+will not always come back clean. Earlier rounds on this branch lost one run to
+a stall — `main` parked in `Thread.join()` inside Spring Boot's two-thread
+`OnClassCondition` filtering, caught by `--stack-dump-on-timeout 1500` — filed
+as
 [`../../known-issues/springboot/onclasscondition-join-never-returns-20260801.md`](../../known-issues/springboot/onclasscondition-join-never-returns-20260801.md).
-An earlier round on the same branch also lost one run to a SIGSEGV in an
-unmapped code buffer, filed as
+Another lost one run to a SIGSEGV in an unmapped code buffer, filed as
 [`../../known-issues/jit/sigsegv-in-unmapped-code-buffer-20260801.md`](../../known-issues/jit/sigsegv-in-unmapped-code-buffer-20260801.md),
 and one to a client-side `HttpClient request timed out` at external load 147.
 

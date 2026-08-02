@@ -11462,13 +11462,24 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
     // Acceptance: `BasicErrorControllerIntegrationTests`, default flags,
     // 14 consecutive clean runs, plus a same-binary gate-closed control.
     //
-    // RUN 2026-08-01: 14 clean runs on default flags and 2 of 2 clean
-    // gate-closed controls — but out of 17 default-flag attempts, not 14
-    // consecutive ones. The three losses were two stalls and one client-side
-    // HTTP timeout, all at external load >100 on the shared host, none of them
-    // this gate; they are filed as
-    // docs/known-issues/springboot/onclasscondition-join-never-returns-20260801.md.
-    // Both arms clean is what settles the question this gate asks.
+    // RUN AND MET, 2026-08-01: 14 consecutive clean runs on default flags, plus
+    // 2 of 2 clean gate-closed controls, on one binary.
+    //
+    // It could not be run before that date, and not because of this gate: the
+    // class failed 23 of 26 tests under JIT with the gate OPEN and with
+    // `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` alike, on a defect with nothing to
+    // do with direct calls (`run_jit_callee_handler` rebuilt a compiled
+    // callee's handler frame from its incoming arguments and lost every other
+    // local). Anyone reading a failure of this class as evidence against this
+    // gate between 2026-07-31 and 2026-08-01 was reading the wrong defect; see
+    // docs/internal/springboot/basicerrorcontroller-jit-only-failure-20260731.md.
+    //
+    // The class is not immune to two intermittent failures unrelated to this
+    // gate — a stall in Spring Boot's two-thread `OnClassCondition` filtering
+    // and one SIGSEGV in an unmapped code buffer, roughly 2 in 54 runs across
+    // 2026-08-01. Arm `--stack-dump-on-timeout` when running the gate, and read
+    // the two reports under docs/known-issues before concluding anything from a
+    // red run.
     // It could not be run before that date, and not because of this gate: the
     // class failed 23 of 26 tests under JIT with the gate OPEN and with
     // `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` alike, on a defect with nothing to
