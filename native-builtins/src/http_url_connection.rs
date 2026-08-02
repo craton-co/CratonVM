@@ -2575,9 +2575,17 @@ fn perform(
                 }
                 crate::t27_tls::run_client_trust_check_for_chain(ctx, tm_ctx_key, peer_chain)
                     .map_err(|_| {
+                        // Keep the reason. This `Result<_, String>` cannot carry
+                        // the Java exception the check actually raised, so the
+                        // check records it on a thread-local for exactly this
+                        // hand-off — without it every rejection reads the same,
+                        // whether the TrustManager genuinely refused the chain
+                        // or the VM faulted underneath it.
+                        let detail = crate::t27_tls::take_last_trust_rejection_detail()
+                            .unwrap_or_else(|| "no exception detail available".to_string());
                         format!(
                             "{TLS_HANDSHAKE_FAILURE_SENTINEL}TrustManager rejected the peer \
-                             certificate chain"
+                             certificate chain: {detail}"
                         )
                     })?;
             }

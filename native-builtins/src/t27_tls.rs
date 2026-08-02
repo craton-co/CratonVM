@@ -8030,6 +8030,7 @@ fn engine_run_trust_check(
         );
     }
     let mut rejected = false;
+    let mut rejection: Option<String> = None;
     for (i, _tm) in trust_managers.iter().enumerate() {
         let arr_now = ctx.read_native_pin(base, arr);
         let auth_now = ctx.read_native_pin(base + 1, auth_type_str);
@@ -8054,7 +8055,31 @@ fn engine_run_trust_check(
                 }
             );
         }
-        if result.is_err() {
+        if let Err(e) = result {
+            // Name WHY, unconditionally — not only under `CRATONVM_DBG=tls-auth`.
+            // "TrustManager rejected the peer certificate chain" on its own is
+            // indistinguishable between the three things that reach it: the
+            // TrustManager genuinely refusing the chain, an `AbstractMethodError`
+            // from a bare-interface stub, and a VM-level fault (a
+            // `ClassCastException` naming `java.lang.Object` is the signature of
+            // a reclaimed object, per the GC notes). Chasing an intermittent
+            // rejection without this costs a rebuild, and the debug flag's own
+            // `eprintln`s perturb the timing enough to hide a race — measured:
+            // 2 failures in 24 runs with the flag off, 0 in 10 with it on.
+            rejection = Some(match &e {
+                cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) => {
+                    let cls = ctx
+                        .class_name_of_id(ctx.class_id_of_object(*exc))
+                        .unwrap_or_else(|| "<unknown class>".to_string());
+                    match ctx.invoke_virtual(*exc, "getMessage", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => {
+                            format!("{cls}: {}", ctx.read_string(s).unwrap_or_default())
+                        }
+                        _ => cls,
+                    }
+                }
+                other => format!("{other:?}"),
+            });
             rejected = true;
             break;
         }
@@ -8062,13 +8087,35 @@ fn engine_run_trust_check(
     ctx.unpin_native_roots(base);
 
     if rejected {
+        let detail = rejection.unwrap_or_else(|| "no exception detail available".to_string());
+        set_last_trust_rejection_detail(&detail);
         return Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLHandshakeException",
-            "TrustManager rejected the peer certificate chain",
+            &format!("TrustManager rejected the peer certificate chain: {detail}"),
         ));
     }
     Ok(())
+}
+
+thread_local! {
+    /// Why the most recent `engine_run_trust_check` on this thread rejected.
+    /// `http_url_connection::perform` cannot carry a Java exception out through
+    /// its `Result<_, String>`, so it reads this back to keep the reason in the
+    /// message it does surface instead of flattening every rejection to one
+    /// indistinguishable sentence.
+    static LAST_TRUST_REJECTION: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn set_last_trust_rejection_detail(detail: &str) {
+    LAST_TRUST_REJECTION.with(|c| *c.borrow_mut() = Some(detail.to_string()));
+}
+
+/// Consume the reason recorded by the most recent TrustManager rejection on
+/// this thread, if any. See [`LAST_TRUST_REJECTION`].
+pub(crate) fn take_last_trust_rejection_detail() -> Option<String> {
+    LAST_TRUST_REJECTION.with(|c| c.borrow_mut().take())
 }
 
 /// Client-socket variant of the post-handshake TrustManager consultation:
