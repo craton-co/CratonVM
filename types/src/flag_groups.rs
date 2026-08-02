@@ -322,6 +322,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "invspecial", on_key: Some("CRATONVM_DBG_INVSPECIAL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-bailout", on_key: Some("CRATONVM_DBG_IR_BAILOUT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-call", on_key: Some("CRATONVM_DBG_IR_CALL"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "ir-bufsize", on_key: Some("CRATONVM_DBG_IR_BUFSIZE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-compiles", on_key: Some("CRATONVM_DBG_IR_COMPILES"), off_key: None, off_word: None },
     // The trace half of `jit/ir-linear-scan`; same token name in the group that
     // owns tracing, exactly like `ir-long` and `xt-jit-root-scan` below.
@@ -364,6 +365,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "letsgo", on_key: Some("CRATONVM_DBG_LETSGO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lhm-evict", on_key: Some("CRATONVM_DBG_LHM_EVICT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "licm", on_key: Some("CRATONVM_DBG_LICM"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "linkage", on_key: Some("CRATONVM_DBG_LINKAGE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "linkage-bt", on_key: Some("CRATONVM_DBG_LINKAGE_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "linker", on_key: Some("CRATONVM_DBG_LINKER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loadclass", on_key: Some("CRATONVM_DBG_LOADCLASS"), off_key: None, off_word: None },
@@ -438,6 +440,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "picocli-style", on_key: Some("CRATONVM_DBG_PICOCLI_STYLE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "popint", on_key: Some("CRATONVM_DBG_POPINT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "precise", on_key: Some("CRATONVM_DBG_PRECISE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "promo-seed", on_key: Some("CRATONVM_DBG_PROMO_SEED"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "proxy", on_key: Some("CRATONVM_DBG_PROXY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "prune", on_key: None, off_key: Some("CRATONVM_DBG_NO_PRUNE"), off_word: None },
     // Was the bare `CRATONVM_DBG`, which is now the group variable itself. It
@@ -620,6 +623,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-call-virtual", on_key: Some("CRATONVM_JIT_IR_CALL_VIRTUAL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-deopt-resume", on_key: Some("CRATONVM_IR_DEOPT_RESUME"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-direct-call", on_key: Some("CRATONVM_JIT_IR_DIRECT_CALL"), off_key: None, off_word: None },
+    // A/B opt-out: `-ir-buffer-estimate` restores the legacy code-buffer sizing
+    // (`ir_lower.rs`), whose under-estimate floods "code buffer estimate too
+    // small" bails. Declared as the OFF half of a default-on knob, so the
+    // supported spelling is `CRATONVM_JIT=-ir-buffer-estimate`.
+    E { group: Group::JIT, token: "ir-buffer-estimate", on_key: None, off_key: Some("CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE"), off_word: None },
     E { group: Group::JIT, token: "ir-fp", on_key: Some("CRATONVM_JIT_IR_FP"), off_key: None, off_word: None },
     // Default-**OFF**, unlike its neighbour `ir-reloc-emit`. `ir_lower::
     // linear_scan_enabled` answers `false` for `Err(_)`, so unsetting the key is

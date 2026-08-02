@@ -255,3 +255,52 @@ The per-reason histogram (`[GC] moving_young_fallback_reason:` under
 `CRATONVM_DBG=gc-stats`) is what turned this delivery from archaeology into
 three successive one-line answers, and it is the first thing to read if
 moving-young ever appears to stop engaging again.
+
+## The other direction: what the flip disarmed elsewhere (added 2026-08-01)
+
+Everything above asks "is moving-young engaging?". The symmetric question —
+**"what stopped engaging because moving-young started?"** — was not asked, and
+it had already cost a defect by the time this section was written.
+
+`gc_quiescence::young_marker_follows_side_tables` gates the young class-mirror
+deferral, and it read `!moving_young_enabled() && (… || major_gc_requested())`.
+The `major_gc_requested()` disjunct mirrors `divert_non_moving`'s
+`explicit_full_gc` term, which carries no moving-young condition at all — an
+explicit `System.gc()` takes the non-moving young marker either way. Factoring
+the guard across it meant that the moment `DEFAULT_MOVING_YOUNG` became `true`
+the predicate was unconditionally `false`, every young class mirror was rooted
+directly again, and `TestDefaultInstanceManager.testClassUnloading` broke for
+the third time — one day after being fixed and verified 3/3. See
+`fixed-suite-bugs/tomcat/defaultinstancemanager-third-recurrence-FIXED.md`.
+
+Two things about that are worth carrying forward:
+
+1. **The nominal window makes it sharper, not softer.** Between `67de5400a` and
+   this delivery the flag was `true` while `cycles=0` — every cycle still ran
+   the non-moving sweep, which *does* follow `mirror_pin`. So the marker was
+   following the side tables while the root gatherer had already stopped
+   trusting that it would. "Is the flag on?" and "will this cycle relocate?" are
+   different questions, and a predicate that asks the first while meaning the
+   second is wrong even when the flag is telling the truth.
+2. **The evidence sweep above cannot catch this class.** It is thorough on
+   throughput, differential output and crash-freedom, and class unloading
+   appears in none of it — a retention regression is silent in every lane
+   listed. `TestDefaultInstanceManager.testClassUnloading` belongs in the
+   regression set for any future change to this default.
+
+The mirror image of the same class was found the day before, on 2026-07-31:
+three root-visibility mechanisms (full-GPR safepoint spill, scratch flush,
+shadow publication) were live *only* because this default is on, so
+`CRATONVM_NO_MOVING_YOUNG=1` withdrew all three at once and faulted within
+seconds (`known-issues/jit/jit-no-moving-young-opt-out-unpublishes-roots.md`).
+Both directions, two days apart, same root shape: a fix keyed on this flag for
+correlation rather than for meaning.
+
+A full sweep of `moving_young_enabled()` was done on 2026-08-01 — 8 sites in
+`gc/`, `vm/` and `jit/`. Seven are correct: the four `conservative_roots`
+entries are early-outs of moving-young-specific machinery, and `x64.rs`'s
+`precise_maps && !moving_young_enabled()` reload gate is a deliberate either/or
+(the moving path reloads registers from GC-rewritten shadow entries in
+`emit_shadow_reload` instead). Only the mirror-deferral predicate was rot. The
+checklist now lives on `DEFAULT_MOVING_YOUNG` itself, where the next person to
+edit the constant will see it.

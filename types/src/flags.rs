@@ -541,6 +541,44 @@ pub enum BlockedAccessMode {
 /// Keep this `true`: `CRATONVM_NO_MOVING_YOUNG` is the supported compatibility
 /// opt-out and the regression tests below pin both sides of that contract.
 ///
+/// # Flipping this value silently rewires unrelated fixes — check these first
+///
+/// "Switches them together" is the feature and also the hazard. Several fixes
+/// that have nothing to do with compaction are keyed on this flag, so a flip
+/// changes whether they engage **without touching a line of their code and
+/// without failing a test**. Three casualties are on record, in both
+/// directions:
+///
+/// * **on ⇒ a fix stopped engaging.** `gc_quiescence::young_marker_follows_
+///   side_tables` guarded the young class-mirror deferral behind
+///   `!moving_young_enabled()`, but the collector term it mirrors for an
+///   explicit `System.gc()` (`divert_non_moving`'s `explicit_full_gc`) carries
+///   no such condition. Flipping this to `true` in `67de5400a` made the
+///   predicate unconditionally `false`, re-opening
+///   `TestDefaultInstanceManager.testClassUnloading` for a third time, one day
+///   after it was fixed and verified. Class unloading appears in no lane of the
+///   flip's own evidence sweep.
+/// * **off ⇒ a fix stopped engaging.** The mirror image, found 2026-07-31: the
+///   full-GPR safepoint spill, the scratch flush and shadow publication — three
+///   ROOT-VISIBILITY mechanisms, none of them moving-specific — were live only
+///   because this default is on, so `CRATONVM_NO_MOVING_YOUNG=1` withdrew all
+///   three at once and the opt-out lane faulted on a zeroed heap slot within
+///   seconds. See `docs/known-issues/jit/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+/// * **on, but nominally.** For two days after the flip the constant was `true`
+///   while every cycle still diverted to the non-moving sweep
+///   (`cycles=0 coverage_fallbacks=66`). Anything keyed on the FLAG changed
+///   behaviour immediately; anything keyed on the actual collector decision did
+///   not. Those are not the same question — see
+///   `docs/internal/default-moving-young-enabled-20260730.md`.
+///
+/// Before changing this value, re-read every site — the sweep is
+/// `rg 'moving_young_enabled\(\)' gc/ vm/ jit/` (8 sites as of 2026-08-01) —
+/// and for each ask **which** question it means: "will this cycle relocate?"
+/// (correctly flag-keyed) or "will some marker follow the loader-scoped side
+/// tables / is this oop published?" (a different question that merely
+/// correlated). Then run a class-unloading lane, not just the throughput and
+/// differential lanes.
+///
 /// See `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
 pub const DEFAULT_MOVING_YOUNG: bool = true;
 
@@ -2373,6 +2411,16 @@ mod tests {
         // Every opt-in flag is off…
         // `moving_young` is no longer an opt-in. Pin the shipped default
         // directly so an accidental reversion cannot hide behind the constant.
+        //
+        // If you are here because this assertion failed, read
+        // `DEFAULT_MOVING_YOUNG`'s doc comment before changing it: this flag is
+        // read by fixes that have nothing to do with compaction, and flipping
+        // it has twice disarmed one of them silently, in both directions,
+        // without failing any other test. A green suite is not evidence that a
+        // flip was safe — the last one shipped with the whole tomcat,
+        // hibernate, gc, jit and HotSpot-differential sweep green and still
+        // re-opened a class-unloading defect that had been fixed the day
+        // before.
         assert!(DEFAULT_MOVING_YOUNG);
         assert!(f.gc.moving_young);
         assert!(!f.gc.card_table_only);
