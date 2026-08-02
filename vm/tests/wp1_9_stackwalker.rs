@@ -291,7 +291,8 @@ fn run_stackwalker_probe(probe: &str, timeout: Duration) -> (String, String) {
         .arg(&cp)
         .arg(format!("cratonvm.{probe}"))
         .env_remove("CRATONVM_DISABLE_JIT")
-        .env("CRATONVM_JIT_ALLOW_PACKAGES", "cratonvm/")
+        // `CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/` was dropped here: `d1979bec5`
+        // deleted the static package-ban machinery and its last reader.
         .env("CRATONVM_JIT_THRESHOLD", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

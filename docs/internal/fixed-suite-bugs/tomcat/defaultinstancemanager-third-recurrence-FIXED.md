@@ -74,6 +74,21 @@ Defect 2 of the 07-27 pair (a parked thread's JIT memo caches pinning its last
 working set, fixed in `deposit_root_snapshot`) was unaffected and still holds.
 This was defect 1 alone, re-opened.
 
+### The flip was nominal for two days, which sharpens the point
+
+`docs/internal/default-moving-young-enabled-20260730.md` records that from
+`67de5400a` until 07-30 the constant was `true` while **no cycle actually
+moved** — `cycles=0 coverage_fallbacks=66` on `BinTreesClassic 18`; three
+separate defects kept diverting every collection to the non-moving sweep.
+
+So during that window the young marker really was `mark_young_precise_object`,
+really was following `mirror_pin` — and the root gatherer had already stopped
+believing it would. The predicate was not merely pessimistic about a future
+moving cycle; it was wrong about the collector running right then. "Is the flag
+on?" and "will this cycle relocate?" are different questions, and a predicate
+that asks the first while meaning the second is wrong even while the flag is
+telling the truth.
+
 ## Fix
 
 `gc/src/gc_quiescence.rs` — `young_marker_follows_side_tables()` is now written
@@ -163,13 +178,38 @@ and after it, and caught nothing.
 
 ## Audit
 
-Every other `!moving_young_enabled()` read in the tree was checked for the same
-shape. The remaining ones (`jit/src/x64.rs`, `jit/src/x64/licm.rs`,
-`vm/src/jit/conservative_roots.rs`) are codegen / root-publishing decisions that
-correctly key on the flag — "will this cycle relocate" is exactly their
-question. The two `conservative_roots.rs` sites that once carried an exemption
-of this shape had it removed in the arch-2026-07-26 `moving-young-precise-roots`
-work. No second instance of this rot remains.
+All 8 `moving_young_enabled()` reads in `gc/`, `vm/` and `jit/` were examined,
+not grepped past. Seven are correct:
+
+| site | verdict |
+|---|---|
+| `conservative_roots.rs` ×4 (475, 1613, 1897, 2215) | early-outs of moving-young-specific machinery; return the safe value when the flag is off |
+| `licm.rs::self_call_moving_proof_enabled` | genuinely moving-specific (elides a self-call spill only when relocation is in play) |
+| `x64.rs::moving_young_safepoint_coverage_complete` | *is* the per-frame relocation proof |
+| `x64.rs:4104` `precise_maps && !moving_young_enabled()` | **looked like rot and is not** — see below |
+| `gc_quiescence::young_marker_follows_side_tables` | **the defect fixed here** |
+
+The reload gate deserved the second look. `emit_post_safepoint_reload` exists to
+repair register invisibility after objects move, and disabling it exactly when
+the moving collector is on reads as inverted — the more so because
+`invoke.rs:15302` documents a real corruption caused by that reload skipping an
+oop parameter "so a moving young GC during that call rewrote the canonical frame
+slot but left the register stale". It is nevertheless correct: under
+moving-young `collect_live_oop_homes` publishes every live oop *including
+`ShadowHome::Reg` register homes* as rewritable roots, the GC rewrites those
+shadow entries, and `emit_shadow_reload` (`x64.rs:3892`) loads them back into
+the registers. Two mechanisms for one job, correctly switched — the frame-slot
+reload for the precise-maps path, the shadow reload for the moving path.
+
+The mirror image of this rot was found on 2026-07-31 at a neighbouring site:
+three root-visibility mechanisms live *only* because the default is on, all
+three withdrawn together by `CRATONVM_NO_MOVING_YOUNG=1`
+(`known-issues/jit/jit-no-moving-young-opt-out-unpublishes-roots.md`). Two
+instances in two days, opposite directions, one root shape: a fix keyed on this
+flag for correlation rather than for meaning. The checklist that follows from
+that now lives on `DEFAULT_MOVING_YOUNG`'s own doc comment and on the
+`empty_source_matches_all_documented_defaults` pin assertion, so the next person
+to edit the constant meets it before the flip rather than three days after.
 
 ## Reproduction
 

@@ -97,12 +97,13 @@ impl Mode {
         match self {
             Mode::Interpreter => {
                 cmd.env("CRATONVM_DISABLE_JIT", "1");
-                cmd.env_remove("CRATONVM_JIT_ALLOW_PACKAGES");
                 cmd.env_remove("CRATONVM_JIT_THRESHOLD");
             }
             Mode::Jit => {
                 cmd.env_remove("CRATONVM_DISABLE_JIT");
-                cmd.env("CRATONVM_JIT_ALLOW_PACKAGES", "cratonvm/");
+                // `CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/` was dropped here:
+                // `d1979bec5` deleted the static package-ban machinery and its
+                // last reader, so the variable no longer reaches anything.
                 cmd.env("CRATONVM_JIT_THRESHOLD", "1");
             }
         }
