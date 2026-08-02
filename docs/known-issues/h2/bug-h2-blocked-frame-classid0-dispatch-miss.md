@@ -121,6 +121,32 @@ ring and changes timing. It is NOT one of the flags that feed
 under it against 1/1 without it is too small a sample to say it does not perturb
 the race. Prefer an uninstrumented run now that the verdict is unconditional.
 
+**Hunted again 2026-08-02 with the verdict in place: 0 in a further 10 runs**
+(dev `5a18a9db1c`, ~1 hour of class runtime, no debug flags). So the rate is
+1 in 16, not 1 in 6 — the first estimate was one event over a small sample and
+should not be quoted as a rate. The verdict has therefore **not yet fired on a
+real occurrence**; what is verified is that the new call site is live and safe
+(a provoked `NoSuchMethodError` on a healthy receiver reaches it, takes no heap
+locks, prints nothing, and the error is still thrown and caught exactly as
+HotSpot does).
+
+Those 10 runs need
+`CRATONVM_JIT_DENY=MVMap.evaluateMemoryForKey,MVMap.evaluateMemoryForValue`,
+because dev tip otherwise dies in under 3 seconds — see
+`../jit/unresumable-unconditional-trap-mvmap-20260802.md`. The deny forces two
+one-line methods to stay interpreted and is not otherwise load-bearing here.
+
+**A cheaper handle on what is probably the same defect.** Two of those same ten
+runs failed with `CloneNotSupportedException` on a `COMMIT` in
+`testConcurrentUpdate`, at 77 s and 112 s. `Object.clone()` throws that when the
+receiver's class is not `Cloneable` — and a zeroed header resolves to
+`java.lang.Object`, which is not. If that is this family's third face it is
+**20 % in under two minutes** against this page's 1-in-16, which makes it the
+better thing to instrument first. `reclaim_guard` is not wired into the clone
+path, so those two occurrences produced no verdict; wiring it there is the
+cheap next step. Tracked on
+`bug-h2-testmultithread-concurrent-update-timeout.md`.
+
 `docs/internal/repros/h2-blocked-frame-roots/BlockedFrameRootProbe.java` is a
 reduced driver — `main` parked in `Future.get()` over the same enhanced-for
 while N workers allocate hard, with a canary object and the `jobs` list checked

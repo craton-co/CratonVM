@@ -100,6 +100,45 @@ candidates for the 4→25 doubling:
 The native-registry cluster is the same one the insert profile named (~5.6%
 there); it is a constant factor, not a scaling one.
 
+## The `CloneNotSupportedException` residual DOES reproduce — in the real class
+
+The retired insert page recorded this residual as *"not reproduced, 0 of 8"*.
+That was measured on a standalone 25-thread INSERT probe. Running the real class
+on `dev` @ `5a18a9db1c`, ten runs:
+
+```
+ExecutionException: org.h2.jdbc.JdbcSQLNonTransientException:
+  General error: "java.lang.CloneNotSupportedException"; SQL statement: COMMIT
+    at org/h2/test/db/TestMultiThread.testConcurrentUpdate(TestMultiThread.java:382)
+    at java/util/concurrent/FutureTask.get(FutureTask.java:207)
+```
+
+| outcome | runs | time |
+| --- | --- | --- |
+| pass | 8 | ~360 s each |
+| **`CloneNotSupportedException` on `COMMIT`** | **2** | **77 s and 112 s** |
+
+**2 in 10, both in `testConcurrentUpdate`, both on `COMMIT`, both inside two
+minutes** — a method and a workload the INSERT probe never exercised. The probe
+negative was a true negative *about the probe*, and was recorded as such;
+quoting it as "the residual does not reproduce" would have been wrong. Same
+lesson as the rest of this file: run the real class.
+
+This is now the best handle on this family anyone has had: a **correctness**
+failure at 20 % in under two minutes, in a named method on a named statement —
+against the ~1-in-16 dispatch-miss face and the 1-event-per-3-worker-hours
+old-gen face. **Start here.**
+
+Worth noting what a `CloneNotSupportedException` IS on this VM: `Object.clone()`
+throws it when the receiver's class is not `Cloneable`, and a receiver whose
+header has been zeroed resolves to `java.lang.Object`, which is not `Cloneable`.
+So this may be a third face of
+`bug-h2-blocked-frame-classid0-dispatch-miss.md` rather than a clone bug —
+exactly the shape of the already-fixed
+`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
+Not established; `reclaim_guard` is **not** wired into the clone path, so the
+occurrence above produced no verdict. Wiring it there is the cheap next step.
+
 ## What is already ruled out (do not redo)
 
 * **There is no `org/h2/` JIT package ban to lift.** Measured 2026-08-02 with
