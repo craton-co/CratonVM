@@ -2653,6 +2653,14 @@ pub(crate) fn make_x509_mirror(
     // Fallback: synthetic mirror (subject/issuer = alias, DER in slot 3). Reached
     // only if the real DER parse fails (e.g. an unimplemented DerValue native).
     let cert_obj = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4);
+    // `arr` and `cert_obj` are both live across `create_string` below, which
+    // allocates and can therefore relocate either of them under a moving young
+    // collection — pin both and re-read through the pins. Same Family-1 shape
+    // as the chain-array fill in `t27_tls::engine_run_trust_check`; a store
+    // through a stale ref is silently DROPPED by the heap guard, which here
+    // would leave the mirror with a null DER and no subject/issuer.
+    let arr_pin = ctx.pin_native_root(arr);
+    let cert_pin = ctx.pin_native_root(cert_obj);
     // Field layout matches what `phases_early.rs` uses for the
     // `getCertificate` path: 0=subject string, 1=issuer string, 2=cert_id,
     // 3=DER (byte[]). Subject + issuer here are alias strings — the real
@@ -2660,13 +2668,16 @@ pub(crate) fn make_x509_mirror(
     // can call once it has the DER. We keep the alias as a stand-in so
     // tests asserting on `getName()` see something stable.
     let alias_str = ctx.create_string(alias);
+    let cert_obj = ctx.read_native_pin(cert_pin, cert_obj);
     ctx.set_field(cert_obj, 0, Value::Object(Some(alias_str)));
     ctx.set_field(cert_obj, 1, Value::Object(Some(alias_str)));
     ctx.set_field(cert_obj, 2, Value::Int(0));
 
     // Stash the DER (reuse the byte[] built above) so consumers can call
     // `Certificate.getEncoded()` or pass the bytes to a TLS/`X509TrustManager`.
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(cert_obj, 3, Value::Object(Some(arr)));
+    ctx.unpin_native_roots(arr_pin);
     cert_obj
 }
 

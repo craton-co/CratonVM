@@ -689,16 +689,35 @@ fn huc_real_perform(
     let mut body = original_body.clone();
     let mut current_url = url_str.to_string();
     let mut final_resp = None;
+    // `perform` parks this thread in a GC-blocking region for every socket
+    // wait (see its STW-TAKEOVER-FIX note), so a moving collection can relocate
+    // `this` mid-exchange. The raw native local would then name a stale slot on
+    // the next redirect hop, or when `huc_client_tls_restrictions`/`perform`
+    // reads the connection's own fields. Pin it and re-read the forwarded
+    // address at the top of each hop — the pin also covers
+    // `huc_client_tls_restrictions`, which allocates and runs bytecode.
+    let this_pin = ctx.pin_native_root(this);
     for redirect_count in 0..=20 {
+        let this = ctx.read_native_pin(this_pin, this);
         let parsed = match parse_url(&current_url) {
             Ok(p) => p,
-            Err(_) => return Ok(-1),
+            Err(_) => {
+                ctx.unpin_native_roots(this_pin);
+                return Ok(-1);
+            }
         };
         let tls_restrictions = if parsed.scheme == "https" {
-            huc_client_tls_restrictions(ctx, &parsed.host, parsed.port)?
+            match huc_client_tls_restrictions(ctx, &parsed.host, parsed.port) {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Err(e);
+                }
+            }
         } else {
             None
         };
+        let this = ctx.read_native_pin(this_pin, this);
         let resp = perform_with_retry(
             ctx,
             Some(this),
@@ -733,6 +752,7 @@ fn huc_real_perform(
             }
         }
     }
+    ctx.unpin_native_roots(this_pin);
     let resp = final_resp.unwrap_or_else(|| Ok((310, Vec::new(), Vec::new())));
     match resp {
         Ok((status, headers, body)) => {
@@ -2134,6 +2154,125 @@ fn huc_unverified_peer_message(host: &str) -> String {
     )
 }
 
+/// The part of an https exchange that happens once the TLS handshake — and
+/// every Java-facing gate hanging off it — is complete: write the request,
+/// read the response, drain any post-handshake control records.
+///
+/// Extracted from [`perform`] so its caller can run the whole thing inside one
+/// `begin_blocking_region()`/`end_blocking_region()` bracket without an early
+/// `return` ever escaping between the two (a thread that leaves a blocking
+/// region unclosed stays permanently marked GC-blocked — the mirror image of
+/// the deadlock the bracket exists to prevent; the `SSLSocketOutputStream`
+/// drain loop in `phases_late/ssl_security.rs` carries the same warning).
+/// Nothing here touches the Java heap or takes a `NativeContext`, which is
+/// what makes parking across it sound — see the STW-TAKEOVER-FIX note at the
+/// call site.
+fn https_post_handshake_exchange(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    req: &[u8],
+    head: bool,
+) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    // FIX (tls-handshake-enforcement-gap, doc 21): a TLS 1.3 client finishes
+    // its own side of the handshake before the server has accepted it, so a
+    // server that rejects (e.g. a REQUIRED client certificate that was not
+    // presented) sends its alert and closes while we are already past
+    // `is_handshaking()`. That surfaces here as a failing FIRST write/flush —
+    // before a single request byte has been acknowledged, let alone a response
+    // byte read — and was reported as a bare `IOException`. Real JSSE raises
+    // `SSLHandshakeException`; `TestSslHandshakeFailure
+    // .testMissingClientCertificate` asserts exactly that type. Only this
+    // first write is reclassified: any later write failure happens on a
+    // connection the server already accepted and is a genuine transport error.
+    stream.write_all(req).map_err(|e| {
+        format!(
+            "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
+             TLS handshake, before the request could be sent — the peer likely \
+             rejected the handshake: write: {e}"
+        )
+    })?;
+    stream.flush().map_err(|e| {
+        format!(
+            "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
+             TLS handshake, before the request could be sent — the peer likely \
+             rejected the handshake: flush: {e}"
+        )
+    })?;
+    // A TLS 1.3 client considers ITS side of the handshake finished (and so
+    // `is_handshaking()` above already flipped false) as soon as it has sent
+    // its own Finished — the server can still reject afterwards (e.g. a
+    // required-but-missing client certificate: `NoCertificatesPresented`)
+    // and close the connection without ever sending an HTTP response. Real
+    // JSSE surfaces that as `SSLHandshakeException`/`SSLException`, not a
+    // silent empty/malformed response, so a connection that closes before
+    // a single response byte arrives — immediately after our own optimistic
+    // handshake completion — is classified the same way here rather than
+    // falling through to `huc_real_perform`'s generic "-1" contract (which
+    // is correct for a genuinely malformed-but-present HTTP response, not
+    // for zero bytes at all).
+    let response = read_response(stream, head).map_err(|e| {
+        if e == "connection closed before response head" {
+            format!(
+                "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection closed immediately after the \
+                 TLS handshake with no response — the peer likely rejected the handshake \
+                 (e.g. a required client certificate was not presented): {e}"
+            )
+        } else if e.contains("received fatal alert") {
+            // FIX (tls-handshake-enforcement-gap, doc 21): the peer rejected
+            // the connection with a TLS alert instead of closing silently —
+            // e.g. `CertificateRequired` from a
+            // `certificateVerification="required"` connector when the client
+            // presented none (`TestSslHandshakeFailure
+            // .testMissingClientCertificate`). No response byte has been read
+            // at this point, so this is a rejected handshake, not a mid-stream
+            // transport error, and real JSSE raises `SSLHandshakeException`
+            // for it. Without this it fell through to the generic
+            // `IOException` wrapper — the exact type mismatch that test
+            // asserts on.
+            format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}{e}")
+        } else {
+            e
+        }
+    })?;
+    // TLS 1.3 tickets are post-handshake messages. The response body may
+    // finish before the server's NewSessionTicket has been read; consume any
+    // immediately available control records so the shared ClientConfig retains
+    // the ticket for the next URL connection.
+    let old_timeout = stream.sock.read_timeout().ok().flatten();
+    let _ = stream
+        .sock
+        .set_read_timeout(Some(Duration::from_millis(100)));
+    let mut drain_err: Option<String> = None;
+    while stream.conn.wants_read() {
+        match stream.conn.read_tls(&mut stream.sock) {
+            Ok(0) => break,
+            Ok(_) => {
+                if let Err(e) = stream.conn.process_new_packets() {
+                    drain_err =
+                        Some(format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}post-handshake TLS: {e}"));
+                    break;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                break;
+            }
+            Err(e) => {
+                drain_err = Some(format!("post-handshake TLS read: {e}"));
+                break;
+            }
+        }
+    }
+    let _ = stream.sock.set_read_timeout(old_timeout);
+    match drain_err {
+        Some(e) => Err(e),
+        None => Ok(response),
+    }
+}
+
 fn perform(
     ctx: &mut dyn NativeContext,
     connection: Option<ObjectRef>,
@@ -2312,34 +2451,65 @@ fn perform(
             .map_err(|e| format!("rustls ClientConnection::new: {e}"))?;
         let mut stream: StreamOwned<ClientConnection, TcpStream> = StreamOwned::new(conn, tcp);
         let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
-        // The ENTIRE https exchange below — initial handshake, request write,
-        // and response read — runs with an active native-context published
-        // and WITHOUT any begin_blocking_region()/end_blocking_region()
-        // wrapping. Both are deliberate, for the same reason:
-        // `JavaKeyManagerResolver::resolve` (-> `KeyManager.
-        // chooseClientAlias`/`getPrivateKey`) can fire not just during the
-        // initial handshake but ALSO from a server-triggered mid-connection
-        // TLS renegotiation — e.g. Tomcat's `SSLAuthenticator` only learns a
-        // request needs `CLIENT-CERT` auth after parsing the HTTP request
-        // line, which happens well after the initial handshake completed, so
-        // it renegotiates on the same connection instead of requesting a
-        // cert upfront (unless `preemptiveAuthentication` is set). rustls
-        // handles that renegotiation transparently inside `StreamOwned`'s
-        // `Read`/`Write` impls — i.e. inside `read_response`'s `stream.
-        // read()` calls below, NOT inside the explicit handshake loop — so
-        // the active-context window and the "don't GC-park" rule both have
-        // to cover that too, not just the loop. A loopback exchange is fast,
-        // so never GC-parking for this whole branch (a GC during these few
-        // milliseconds simply waits for this thread, like any other ordinary
-        // native call) is the safe, low-risk trade-off — see
-        // `set_active_native_context`'s doc for the deadlock this replaces
-        // (an earlier version toggled the blocking region on/off around just
-        // the initial loop's `process_new_packets` calls; that repeated
-        // toggling deadlocked the interpreter's class-loading/vtable-install
-        // locking the first time it exercised a fresh class load from inside
-        // the loop).
-        let active_ctx_guard = crate::t27_tls::set_active_native_context(ctx);
+        // STW-TAKEOVER-FIX (2026-08-01, doc
+        // `tomcat/testsslhostconfigcompat-testhostec-read-timeout`): EVERY
+        // blocking socket wait below is bracketed by
+        // `begin_blocking_region()`/`end_blocking_region{,_refs}()`, and the
+        // active native-context window is closed as soon as the handshake is
+        // over. Both corrections replace a premise this block used to assert
+        // and that is measurably false.
+        //
+        // What this used to say: the whole https exchange ran with NO blocking
+        // region at all, reasoning that "a loopback exchange is fast, so a GC
+        // during these few milliseconds simply waits for this thread, like any
+        // other ordinary native call". It is not fast when the peer is another
+        // thread in THIS SAME VM — an embedded Tomcat under test is exactly
+        // that. A stop-the-world cross-thread JIT takeover requested by any
+        // other thread parks every mutator except this one; this one is parked
+        // in `recv()` and so can never reach a safepoint, can never be forcibly
+        // taken over (it is not in JIT code either), and the server thread that
+        // owes us the next TLS flight — or the HTTP response — is itself parked
+        // at that same barrier. Neither side can move until the socket's
+        // `SO_RCVTIMEO` fires, and `TomcatBaseTest` sets that to 300 s.
+        // Reproduced as `TestSSLHostConfigCompat` failing ~40% of runs with a
+        // 300 440 ms `testHostEC[JSSE-KEYSTORE]` and exactly one stderr line
+        // `STW cross-thread JIT takeover is still waiting for cooperative
+        // mutators rounds=64 pending=1 taken=0`. The plain-HTTP branch at the
+        // bottom of this same function already carried this fix, with this
+        // rationale, since 2026-07-14; only the https branch was exempted.
+        //
+        // Why bracketing is sound here when an earlier attempt deadlocked: the
+        // regions cover ONLY socket syscalls — `read_tls`/`write_tls` during
+        // the handshake, and the request write plus `read_response` after it.
+        // They never cover `process_new_packets()`, which is the one place
+        // rustls can call back into Java (`JavaKeyManagerResolver::resolve` ->
+        // `KeyManager.chooseClientAlias`/`getPrivateKey`). Running bytecode
+        // while marked GC-parked is precisely what `set_active_native_context`'s
+        // doc forbids, and the earlier attempt that deadlocked the
+        // class-loading/vtable-install locks had put the region around
+        // `process_new_packets` itself — i.e. exactly backwards.
+        //
+        // Why the active-context window can close after the handshake: the old
+        // comment held it open across `read_response` for a server-triggered
+        // mid-connection renegotiation (Tomcat's `SSLAuthenticator` learns a
+        // request needs `CLIENT-CERT` only after parsing the request line).
+        // rustls 0.23 categorically REFUSES renegotiation on both sides — a
+        // post-handshake `HelloRequest` is answered with a `no_renegotiation`
+        // alert and never processed (`rustls/src/common_state.rs::process_msg`;
+        // root-caused from the dependency's own source in `docs/internal/
+        // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`,
+        // "Residual #2 follow-up"). So no Java callback can fire from inside
+        // `read_response`; keeping the window open there would buy nothing and
+        // would be the one thing that makes the post-handshake region unsound.
+        //
+        // `connection` is an `ObjectRef` still used after the handshake (by
+        // `huc_verify_hostname`), so it rides through `end_blocking_region_refs`
+        // to pick up any relocation from a moving GC that ran while parked —
+        // same pattern as `phases_late::net_channels`' blocking `SocketChannel`
+        // reads.
+        let mut connection = connection;
         let outcome = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+            let active_ctx_guard = crate::t27_tls::set_active_native_context(ctx);
             while stream.conn.is_handshaking() {
                 if std::time::Instant::now() > deadline {
                     return Err(format!(
@@ -2347,7 +2517,14 @@ fn perform(
                     ));
                 }
                 if stream.conn.wants_write() {
-                    stream.conn.write_tls(&mut stream.sock).map_err(|e| {
+                    let mut blocked_refs = [Value::Object(connection)];
+                    ctx.begin_blocking_region();
+                    let written = stream.conn.write_tls(&mut stream.sock);
+                    ctx.end_blocking_region_refs(&mut blocked_refs);
+                    if let Value::Object(o) = blocked_refs[0] {
+                        connection = o;
+                    }
+                    written.map_err(|e| {
                         format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake write: {e}")
                     })?;
                 }
@@ -2363,7 +2540,14 @@ fn perform(
                     // (t27_tls.rs), which has no such deadline, live-locked forever
                     // on exactly this gap once a real cipher restriction could
                     // actually cause a server to reject and close.
-                    let n = stream.conn.read_tls(&mut stream.sock).map_err(|e| {
+                    let mut blocked_refs = [Value::Object(connection)];
+                    ctx.begin_blocking_region();
+                    let read = stream.conn.read_tls(&mut stream.sock);
+                    ctx.end_blocking_region_refs(&mut blocked_refs);
+                    if let Value::Object(o) = blocked_refs[0] {
+                        connection = o;
+                    }
+                    let n = read.map_err(|e| {
                         format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake read: {e}")
                     })?;
                     if n == 0 {
@@ -2391,9 +2575,17 @@ fn perform(
                 }
                 crate::t27_tls::run_client_trust_check_for_chain(ctx, tm_ctx_key, peer_chain)
                     .map_err(|_| {
+                        // Keep the reason. This `Result<_, String>` cannot carry
+                        // the Java exception the check actually raised, so the
+                        // check records it on a thread-local for exactly this
+                        // hand-off — without it every rejection reads the same,
+                        // whether the TrustManager genuinely refused the chain
+                        // or the VM faulted underneath it.
+                        let detail = crate::t27_tls::take_last_trust_rejection_detail()
+                            .unwrap_or_else(|| "no exception detail available".to_string());
                         format!(
                             "{TLS_HANDSHAKE_FAILURE_SENTINEL}TrustManager rejected the peer \
-                             certificate chain"
+                             certificate chain: {detail}"
                         )
                     })?;
             }
@@ -2432,96 +2624,20 @@ fn perform(
                     peer_chain_der,
                 )?;
             }
-            // FIX (tls-handshake-enforcement-gap, doc 21): a TLS 1.3 client
-            // finishes its own side of the handshake before the server has
-            // accepted it, so a server that rejects (e.g. a REQUIRED client
-            // certificate that was not presented) sends its alert and closes
-            // while we are already past `is_handshaking()`. That surfaces
-            // here as a failing FIRST write/flush — before a single request
-            // byte has been acknowledged, let alone a response byte read —
-            // and was reported as a bare `IOException`. Real JSSE raises
-            // `SSLHandshakeException`; `TestSslHandshakeFailure
-            // .testMissingClientCertificate` asserts exactly that type. Only
-            // this first write is reclassified: any later write failure
-            // happens on a connection the server already accepted and is a
-            // genuine transport error.
-            stream.write_all(&req).map_err(|e| {
-                format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
-                         TLS handshake, before the request could be sent — the peer likely \
-                         rejected the handshake: write: {e}")
-            })?;
-            stream.flush().map_err(|e| {
-                format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
-                         TLS handshake, before the request could be sent — the peer likely \
-                         rejected the handshake: flush: {e}")
-            })?;
-            // A TLS 1.3 client considers ITS side of the handshake finished (and so
-            // `is_handshaking()` above already flipped false) as soon as it has sent
-            // its own Finished — the server can still reject afterwards (e.g. a
-            // required-but-missing client certificate: `NoCertificatesPresented`)
-            // and close the connection without ever sending an HTTP response. Real
-            // JSSE surfaces that as `SSLHandshakeException`/`SSLException`, not a
-            // silent empty/malformed response, so a connection that closes before
-            // a single response byte arrives — immediately after our own optimistic
-            // handshake completion — is classified the same way here rather than
-            // falling through to `huc_real_perform`'s generic "-1" contract (which
-            // is correct for a genuinely malformed-but-present HTTP response, not
-            // for zero bytes at all).
-            let response = read_response(&mut stream, head).map_err(|e| {
-                if e == "connection closed before response head" {
-                    format!(
-                        "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection closed immediately after the \
-                         TLS handshake with no response — the peer likely rejected the handshake \
-                         (e.g. a required client certificate was not presented): {e}"
-                    )
-                } else if e.contains("received fatal alert") {
-                    // FIX (tls-handshake-enforcement-gap, doc 21): the peer
-                    // rejected the connection with a TLS alert instead of
-                    // closing silently — e.g. `CertificateRequired` from a
-                    // `certificateVerification="required"` connector when the
-                    // client presented none (`TestSslHandshakeFailure
-                    // .testMissingClientCertificate`). No response byte has
-                    // been read at this point, so this is a rejected
-                    // handshake, not a mid-stream transport error, and real
-                    // JSSE raises `SSLHandshakeException` for it. Without
-                    // this it fell through to the generic `IOException`
-                    // wrapper — the exact type mismatch that test asserts on.
-                    format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}{e}")
-                } else {
-                    e
-                }
-            })?;
-            // TLS 1.3 tickets are post-handshake messages. The response body
-            // may finish before the server's NewSessionTicket has been read;
-            // consume any immediately available control records so the shared
-            // ClientConfig retains the ticket for the next URL connection.
-            let old_timeout = stream.sock.read_timeout().ok().flatten();
-            let _ = stream
-                .sock
-                .set_read_timeout(Some(Duration::from_millis(100)));
-            while stream.conn.wants_read() {
-                match stream.conn.read_tls(&mut stream.sock) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        stream.conn.process_new_packets().map_err(|e| {
-                            format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}post-handshake TLS: {e}")
-                        })?;
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) =>
-                    {
-                        break;
-                    }
-                    Err(e) => return Err(format!("post-handshake TLS read: {e}")),
-                }
-            }
-            let _ = stream.sock.set_read_timeout(old_timeout);
-            Ok(response)
+            // The handshake is over and every Java-facing gate above it (the
+            // `TrustManager` consultation and endpoint identification) has
+            // run, so no bytecode can execute for the rest of this exchange —
+            // close the active native-context window and park properly for the
+            // request write and the response read. See this branch's
+            // STW-TAKEOVER-FIX note above for why both halves of that are
+            // required, and why `read_response` in particular can no longer
+            // call back into Java.
+            drop(active_ctx_guard);
+            ctx.begin_blocking_region();
+            let exchange = https_post_handshake_exchange(&mut stream, &req, head);
+            ctx.end_blocking_region();
+            exchange
         })();
-        drop(active_ctx_guard);
         outcome
     } else {
         let mut s = tcp;

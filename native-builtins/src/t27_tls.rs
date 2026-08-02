@@ -397,7 +397,33 @@ pub(crate) fn attach_trust_managers_to_ctx(
     // manager is not fatal — the hints are an optimisation for the peer, and
     // an empty list is exactly the old behaviour — so errors are swallowed
     // rather than propagated out of `SSLContext.init`.
-    let issuers = capture_accepted_issuer_dns(ctx, &list);
+    // GC (FIXED 2026-08-01): `list` holds raw `ObjectRef`s that are NOT yet in
+    // `ctx_trust_managers_table`, so `gc_scan_tls_ctx_trust_manager_roots`
+    // cannot see them and `gc_update_tls_ctx_trust_manager_refs` cannot remap
+    // them. `capture_accepted_issuer_dns` runs three `invoke_virtual`s per
+    // manager and walks two arrays — it allocates freely. A moving young
+    // collection landing in there relocated every manager and left `list`
+    // naming the vacated slots, which then went into the table VERBATIM and
+    // stayed wrong for the whole life of that `SSLContext`. The next
+    // `checkServerTrusted` on it resolved the receiver's class as
+    // `java.lang.Object` — ClassId(0), the reclaimed-slot signature — and the
+    // handshake failed as `SSLHandshakeException: TrustManager rejected the
+    // peer certificate chain`, ~1 run in 20 of `TestSSLHostConfigCompat`.
+    //
+    // `CRATONVM_GC=-moving-young` is what localised it: 14/14 clean with the
+    // non-moving sweep, which relocates nothing. That also proves the entry is
+    // correctly ROOTED once it reaches the table (a sweep would have freed an
+    // unrooted manager just the same) — the gap was only ever this window
+    // before the insert.
+    let pins: Vec<usize> = list.iter().map(|tm| ctx.pin_native_root(*tm)).collect();
+    let issuers = capture_accepted_issuer_dns(ctx, &list, &pins);
+    // Re-read every manager through its pin before the table takes ownership.
+    for (i, tm) in list.iter_mut().enumerate() {
+        *tm = ctx.read_native_pin(pins[i], *tm);
+    }
+    if let Some(&base) = pins.first() {
+        ctx.unpin_native_roots(base);
+    }
     let mut table = ctx_trust_managers_table().lock();
     if list.is_empty() {
         table.remove(&key);
@@ -438,15 +464,29 @@ fn accepted_issuer_hints(ctx_key: Option<u64>) -> Vec<rustls::DistinguishedName>
 /// Capped, because a manager backed by the platform trust store legitimately
 /// returns ~150 roots and putting all of them in every `CertificateRequest`
 /// would bloat each handshake for no benefit to the callers this exists for.
-fn capture_accepted_issuer_dns(ctx: &mut dyn NativeContext, managers: &[ObjectRef]) -> Vec<Vec<u8>> {
+///
+/// `pins` holds one native-root pin per entry of `managers`, taken by the
+/// caller BEFORE this runs. Every `invoke_virtual` below allocates, so each
+/// manager is re-read through its pin at the top of the loop rather than
+/// dereferenced from the caller's raw copy — see `attach_trust_managers_to_ctx`
+/// for the defect that motivated it.
+fn capture_accepted_issuer_dns(
+    ctx: &mut dyn NativeContext,
+    managers: &[ObjectRef],
+    pins: &[usize],
+) -> Vec<Vec<u8>> {
     const MAX_ISSUER_HINTS: usize = 16;
     let mut out: Vec<Vec<u8>> = Vec::new();
-    for tm in managers {
+    for (mi, tm) in managers.iter().enumerate() {
         if out.len() >= MAX_ISSUER_HINTS {
             break;
         }
-        let certs = match ctx.invoke_virtual(
-            *tm,
+        let tm = match pins.get(mi) {
+            Some(&p) => ctx.read_native_pin(p, *tm),
+            None => *tm,
+        };
+        let certs0 = match ctx.invoke_virtual(
+            tm,
             "getAcceptedIssuers",
             "()[Ljava/security/cert/X509Certificate;",
             &[],
@@ -454,11 +494,16 @@ fn capture_accepted_issuer_dns(ctx: &mut dyn NativeContext, managers: &[ObjectRe
             Ok(Some(Value::Object(Some(arr)))) => arr,
             _ => continue,
         };
+        // `certs` outlives the allocating calls in the body below, so it is
+        // pinned too and re-read on every iteration.
+        let certs_pin = ctx.pin_native_root(certs0);
+        let certs = ctx.read_native_pin(certs_pin, certs0);
         let len = ctx.array_length(certs);
         for i in 0..len {
             if out.len() >= MAX_ISSUER_HINTS {
                 break;
             }
+            let certs = ctx.read_native_pin(certs_pin, certs0);
             let Value::Object(Some(cert)) = ctx.get_array_element(certs, i) else {
                 continue;
             };
@@ -482,6 +527,7 @@ fn capture_accepted_issuer_dns(ctx: &mut dyn NativeContext, managers: &[ObjectRe
                 out.push(der);
             }
         }
+        ctx.unpin_native_roots(certs_pin);
     }
     out
 }
@@ -7978,19 +8024,36 @@ fn engine_run_trust_check(
         cratonvm_types::ClassId::new(0),
         pending.peer_chain_der.len(),
     );
+    // Pin the chain array BEFORE it is filled, not after. `make_x509_mirror`
+    // allocates a `byte[]` and runs the real `sun.security.x509.X509CertImpl`
+    // constructor, and `create_string` below allocates too — any of which can
+    // trigger a moving young collection that relocates `arr`. The old code
+    // took its pin only after the fill loop, so a collection between two
+    // iterations left `arr` naming a stale slot: the `set_array_element` that
+    // followed was DROPPED by the heap guard (`gen_heap: out-of-bounds ...
+    // dropped`), the chain reached `X509TrustManagerImpl.checkServerTrusted`
+    // with a null element, and the handshake failed as
+    // `SSLHandshakeException: TrustManager rejected the peer certificate
+    // chain`. Observed on `TestSSLHostConfigCompat.testHostEC[JSSE-KEYSTORE]`
+    // once the sibling STW-takeover fix (`http_url_connection::perform`)
+    // stopped that same window from deadlocking instead. Family-1 shape: a
+    // native local held live across an allocation.
+    let base = ctx.pin_native_root(arr);
+    let mut arr = arr;
     for (i, der) in pending.peer_chain_der.iter().enumerate() {
         let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der);
+        // No allocation between this re-read and the store.
+        arr = ctx.read_native_pin(base, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
     }
     let auth_type_str = ctx.create_string(auth_type);
 
-    // Pin the chain array, the authType string, and every TrustManager we're
-    // about to call — each `invoke_virtual` below can allocate/GC, and a
-    // stale ObjectRef from an earlier loop iteration would silently resolve
-    // to a reused slot after a move (see `pin_native_root`'s doc). Mirrors
-    // the existing multi-call pin pattern in `net_phase_e.rs`'s
-    // group-collector native.
-    let base = ctx.pin_native_root(arr);
+    // Pin the authType string and every TrustManager we're about to call —
+    // each `invoke_virtual` below can allocate/GC, and a stale ObjectRef from
+    // an earlier loop iteration would silently resolve to a reused slot after
+    // a move (see `pin_native_root`'s doc). Mirrors the existing multi-call
+    // pin pattern in `net_phase_e.rs`'s group-collector native. `base + 1` is
+    // the authType pin because these two pins are taken back to back.
     let _ = ctx.pin_native_root(auth_type_str);
     let tm_pins: Vec<usize> = trust_managers
         .iter()
@@ -8013,6 +8076,7 @@ fn engine_run_trust_check(
         );
     }
     let mut rejected = false;
+    let mut rejection: Option<String> = None;
     for (i, _tm) in trust_managers.iter().enumerate() {
         let arr_now = ctx.read_native_pin(base, arr);
         let auth_now = ctx.read_native_pin(base + 1, auth_type_str);
@@ -8037,7 +8101,31 @@ fn engine_run_trust_check(
                 }
             );
         }
-        if result.is_err() {
+        if let Err(e) = result {
+            // Name WHY, unconditionally — not only under `CRATONVM_DBG=tls-auth`.
+            // "TrustManager rejected the peer certificate chain" on its own is
+            // indistinguishable between the three things that reach it: the
+            // TrustManager genuinely refusing the chain, an `AbstractMethodError`
+            // from a bare-interface stub, and a VM-level fault (a
+            // `ClassCastException` naming `java.lang.Object` is the signature of
+            // a reclaimed object, per the GC notes). Chasing an intermittent
+            // rejection without this costs a rebuild, and the debug flag's own
+            // `eprintln`s perturb the timing enough to hide a race — measured:
+            // 2 failures in 24 runs with the flag off, 0 in 10 with it on.
+            rejection = Some(match &e {
+                cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) => {
+                    let cls = ctx
+                        .class_name_of_id(ctx.class_id_of_object(*exc))
+                        .unwrap_or_else(|| "<unknown class>".to_string());
+                    match ctx.invoke_virtual(*exc, "getMessage", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => {
+                            format!("{cls}: {}", ctx.read_string(s).unwrap_or_default())
+                        }
+                        _ => cls,
+                    }
+                }
+                other => format!("{other:?}"),
+            });
             rejected = true;
             break;
         }
@@ -8045,13 +8133,35 @@ fn engine_run_trust_check(
     ctx.unpin_native_roots(base);
 
     if rejected {
+        let detail = rejection.unwrap_or_else(|| "no exception detail available".to_string());
+        set_last_trust_rejection_detail(&detail);
         return Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLHandshakeException",
-            "TrustManager rejected the peer certificate chain",
+            &format!("TrustManager rejected the peer certificate chain: {detail}"),
         ));
     }
     Ok(())
+}
+
+thread_local! {
+    /// Why the most recent `engine_run_trust_check` on this thread rejected.
+    /// `http_url_connection::perform` cannot carry a Java exception out through
+    /// its `Result<_, String>`, so it reads this back to keep the reason in the
+    /// message it does surface instead of flattening every rejection to one
+    /// indistinguishable sentence.
+    static LAST_TRUST_REJECTION: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn set_last_trust_rejection_detail(detail: &str) {
+    LAST_TRUST_REJECTION.with(|c| *c.borrow_mut() = Some(detail.to_string()));
+}
+
+/// Consume the reason recorded by the most recent TrustManager rejection on
+/// this thread, if any. See [`LAST_TRUST_REJECTION`].
+pub(crate) fn take_last_trust_rejection_detail() -> Option<String> {
+    LAST_TRUST_REJECTION.with(|c| c.borrow_mut().take())
 }
 
 /// Client-socket variant of the post-handshake TrustManager consultation:
