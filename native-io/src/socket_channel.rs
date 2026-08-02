@@ -347,6 +347,27 @@ fn accept_close_aware(
     }
 }
 
+/// [`accept_close_aware`] with a wall-clock bound. `Ok(None)` means the
+/// deadline expired with no connection pending; the caller turns that into
+/// `SocketTimeoutException`.
+fn accept_until_deadline(
+    id: i32,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<(TcpStream, SocketAddr)>> {
+    loop {
+        match accept_close_aware(id, false)? {
+            Some(pair) => return Ok(Some(pair)),
+            None => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                std::thread::sleep(remaining.min(ACCEPT_CLOSE_POLL));
+            }
+        }
+    }
+}
+
 fn lingering_channel_close(_id: i32, stream: &TcpStream) {
     // EXPERIMENT (2026-07-11, re-test on SB-CRASH-04 fix): shutdown(Write)
     // ONLY, no background drain thread. See task #11 notes for rationale.
@@ -3282,7 +3303,40 @@ fn ssc_finish_bind(
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// `ServerSocketChannelImpl.blockingAccept(long nanos)` — the timed accept the
+/// JDK's own `ServerSocketAdaptor.accept()` calls when the adapter carries a
+/// SO_TIMEOUT, i.e. `ServerSocketChannel.socket().setSoTimeout(ms)` then
+/// `accept()`. That is Tomcat's `NioEndpoint.initServerSocket` shape.
+///
+/// It is declared on `ServerSocketChannelImpl`, but CratonVM's
+/// `ServerSocketChannel.open()` hands back an instance of the ABSTRACT
+/// `java.nio.channels.ServerSocketChannel`, so the adapter's call landed on a
+/// receiver that has no such method: `NoSuchMethodError:
+/// java.nio.channels.ServerSocketChannel.blockingAccept(J)` where HotSpot
+/// throws `SocketTimeoutException`. Register it on our channel object, exactly
+/// as `localAddress()` is registered above and for the same reason.
+fn ssc_blocking_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let nanos = match args.get(1) {
+        Some(Value::Long(n)) => *n,
+        Some(Value::Int(n)) => i64::from(*n),
+        _ => 0,
+    };
+    // `nanos <= 0` is the JDK's "no timeout" spelling; fall through to the
+    // ordinary blocking accept.
+    let deadline =
+        (nanos > 0).then(|| std::time::Instant::now() + Duration::from_nanos(nanos as u64));
+    ssc_accept_impl(ctx, args, deadline)
+}
+
 fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    ssc_accept_impl(ctx, args, None)
+}
+
+fn ssc_accept_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    deadline: Option<std::time::Instant>,
+) -> MethodCallResult {
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
         None => return Err(ioex("accept: null channel")),
@@ -3331,7 +3385,16 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // nonblocking poll loop over the REGISTRY's listener (never a private
         // duplicate — see `accept_close_aware`), so `close()` both wakes this
         // path and closes the OS socket in the same instant.
-        let res = if blocking {
+        let res = if let Some(deadline) = deadline {
+            // Timed accept (`blockingAccept(nanos)`): the same close-aware poll
+            // loop, bounded. Expiry is a `SocketTimeoutException`, NOT a null
+            // return — a null would tell `ServerSocketAdaptor.accept()` that a
+            // blocking accept produced no socket, which it asserts against.
+            ctx.begin_blocking_region();
+            let res = accept_until_deadline(id, deadline);
+            ctx.end_blocking_region();
+            res
+        } else if blocking {
             ctx.begin_blocking_region();
             let res = accept_close_aware(id, true);
             ctx.end_blocking_region();
@@ -3340,7 +3403,14 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             accept_close_aware(id, false)
         };
         match res {
-            Ok(pair) => pair,
+            Ok(Some(pair)) => Some(pair),
+            Ok(None) if deadline.is_some() => {
+                return Err(RuntimeError::SocketTimeoutException {
+                    message: "Accept timed out".into(),
+                }
+                .into());
+            }
+            Ok(None) => None,
             Err(e) => return Err(map_err("accept", e)),
         }
     };
@@ -3833,6 +3903,14 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "accept",
             "()Ljava/nio/channels/SocketChannel;",
             ssc_accept,
+        );
+        // The timed sibling `ServerSocketAdaptor.accept()` calls when the
+        // adapter has a SO_TIMEOUT — see `ssc_blocking_accept`.
+        r.register(
+            c,
+            "blockingAccept",
+            "(J)Ljava/nio/channels/SocketChannel;",
+            ssc_blocking_accept,
         );
         r.register(
             c,
