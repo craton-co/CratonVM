@@ -550,9 +550,24 @@ pub(crate) const NEW13_SESS_TLSID: usize = 2;
 pub(crate) fn new13_build_connector(
     extra_root_ders: &[Vec<u8>],
     danger_skip_native_verify: bool,
+    max_protocol: Option<native_tls::Protocol>,
 ) -> Result<native_tls::TlsConnector, String> {
     let mut builder = native_tls::TlsConnector::builder();
     builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+    // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): honour a
+    // version-pinned `SSLContext.getInstance(...)`. Before this, the protocol
+    // string was validated, stored on the SSLContext object, and then never
+    // consulted again — so `SSLContext.getInstance("TLSv1.2")` produced a
+    // socket that happily negotiated TLS 1.3, and `getEnabledProtocols()`
+    // reported `[TLSv1.3]` where stock JDK 25 reports `[TLSv1.2]`. That is
+    // not a cosmetic difference: a caller pins the version precisely because
+    // the two protocols differ behaviourally (TLS 1.3 has no renegotiation
+    // and no post-handshake `HandshakeCompletedEvent`), so silently upgrading
+    // it changes the semantics the caller asked for. See
+    // `new13_ctx_max_protocol` for why only the 1.2 ceiling is honoured.
+    if let Some(max) = max_protocol {
+        builder.max_protocol_version(Some(max));
+    }
     if danger_skip_native_verify {
         // FIX (netty-https-client-trust): the owning SSLContext was init'd
         // with REAL Java TrustManager objects (e.g. HttpClient5's
@@ -647,6 +662,73 @@ pub(crate) fn p68_extract_trust_manager_roots(
     None
 }
 
+/// Map an `SSLContext.getInstance(<name>)` protocol string to the TLS version
+/// CEILING that context implies, in JSSE terms: a version-specific context's
+/// default enabled-protocol set is that version alone (stock JDK 25 with
+/// `getInstance("TLSv1.2")` reports `getEnabledProtocols() == [TLSv1.2]`),
+/// whereas the version-agnostic names leave the ceiling open.
+///
+/// Only the TLS 1.2 ceiling is expressible here. `"TLSv1"` and `"TLSv1.1"`
+/// would need a ceiling *below* `new13_build_connector`'s deliberate
+/// `min_protocol_version(Tlsv12)` floor, which would make the connector build
+/// fail outright (max < min). That floor is an intentional security posture,
+/// not an oversight, so those two names keep their existing behaviour — the
+/// context is honoured up to the floor and no further. `"TLS"`, `"TLSv1.3"`,
+/// `"SSL"` and `"Default"` impose no ceiling, which is also JSSE's behaviour.
+pub(crate) fn new13_ctx_max_protocol(protocol_name: &str) -> Option<native_tls::Protocol> {
+    match protocol_name {
+        "TLSv1.2" => Some(native_tls::Protocol::Tlsv12),
+        _ => None,
+    }
+}
+
+/// Read the JSSE protocol name the `SSLContext` owning the `SSLSocketFactory`
+/// at `args[0]` was pinned to, if that name implies a version ceiling we can
+/// honour. Same factory-field-0 back-reference `p68_factory_trust_roots`
+/// (immediately below) uses.
+///
+/// Returns `None` — "no ceiling", the pre-existing behaviour — for a factory
+/// with no owning context, a version-agnostic context, or a field 0 that
+/// isn't an `SSLContext` at all. That last case is real: as
+/// `net_phase_e::createSocket`'s own FIX comment records, field 0 of a
+/// user-defined `SSLSocketFactory` SUBCLASS is whatever that class declares
+/// first. Filtering through `new13_ctx_max_protocol` is what makes this safe
+/// — a field that does not read back as one of the known protocol names
+/// yields `None` rather than a bogus pin.
+pub(crate) fn p68_factory_pinned_protocol_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<String> {
+    let this = match args.first() {
+        Some(Value::Object(Some(this))) => *this,
+        _ => return None,
+    };
+    if ctx.object_num_fields(this) == 0 {
+        return None;
+    }
+    let sslctx = match ctx.get_field(this, 0) {
+        Value::Object(Some(sslctx)) => sslctx,
+        _ => return None,
+    };
+    if ctx.object_num_fields(sslctx) == 0 {
+        return None;
+    }
+    let name = match ctx.get_field(sslctx, NEW13_CTX_PROTOCOL) {
+        Value::Object(Some(s)) => ctx.read_string(s)?,
+        _ => return None,
+    };
+    new13_ctx_max_protocol(&name).map(|_| name)
+}
+
+/// The `native_tls` form of `p68_factory_pinned_protocol_name`, for the
+/// connector-based (immediate-connect) client path.
+pub(crate) fn p68_factory_max_protocol(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<native_tls::Protocol> {
+    p68_factory_pinned_protocol_name(ctx, args).as_deref().and_then(new13_ctx_max_protocol)
+}
+
 /// FIX (es-restclient-https): look up the custom trust anchors (if any)
 /// stashed on `args[0]` (the `SSLSocketFactory` `this`) by `getSocketFactory`.
 /// Returns an empty Vec when the factory carries no custom scope (the common
@@ -710,10 +792,16 @@ pub(crate) fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value
 /// stashed here, keyed by the socket's GC-stable identity hash (see
 /// `t27_tls::gc_stable_objref_key`'s doc comment for why identity hash and
 /// not a raw pointer), and consumed (removed) by `new13_ssl_socket_connect`.
+///
+/// The owning context's TLS version ceiling (`p68_factory_max_protocol`) rides
+/// along for the same reason: it too is only readable from `args[0]` at
+/// `createSocket()` time, and the deferred `connect()` must still honour it.
+type PendingSslConnectCtx = (Vec<Vec<u8>>, Option<u64>, Option<native_tls::Protocol>);
+
 pub(crate) fn pending_ssl_socket_connect_ctx_table(
-) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u64, (Vec<Vec<u8>>, Option<u64>)>> {
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u64, PendingSslConnectCtx>> {
     static T: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<u64, (Vec<Vec<u8>>, Option<u64>)>>,
+        parking_lot::Mutex<rustc_hash::FxHashMap<u64, PendingSslConnectCtx>>,
     > = std::sync::OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
@@ -723,17 +811,18 @@ pub(crate) fn stash_pending_ssl_socket_connect_ctx(
     sock: ObjectRef,
     extra_roots: Vec<Vec<u8>>,
     java_tm_key: Option<u64>,
+    max_protocol: Option<native_tls::Protocol>,
 ) {
     let key = ctx.identity_hash_code(sock) as u32 as u64;
     pending_ssl_socket_connect_ctx_table()
         .lock()
-        .insert(key, (extra_roots, java_tm_key));
+        .insert(key, (extra_roots, java_tm_key, max_protocol));
 }
 
 pub(crate) fn take_pending_ssl_socket_connect_ctx(
     ctx: &dyn NativeContext,
     sock: ObjectRef,
-) -> (Vec<Vec<u8>>, Option<u64>) {
+) -> PendingSslConnectCtx {
     let key = ctx.identity_hash_code(sock) as u32 as u64;
     pending_ssl_socket_connect_ctx_table()
         .lock()
@@ -771,8 +860,15 @@ pub(crate) fn new13_ssl_socket_connect(
         }
     };
     let (host, port) = crate::net_phase_e::read_inet_socket_address(ctx, sa)?;
-    let (extra_roots, java_tm_key) = take_pending_ssl_socket_connect_ctx(ctx, this);
-    let tls_id = new13_connect_and_handshake(ctx, &host, port as u16, &extra_roots, java_tm_key)?;
+    let (extra_roots, java_tm_key, max_protocol) = take_pending_ssl_socket_connect_ctx(ctx, this);
+    let tls_id = new13_connect_and_handshake(
+        ctx,
+        &host,
+        port as u16,
+        &extra_roots,
+        java_tm_key,
+        max_protocol,
+    )?;
     let _ = new13_finish_socket(ctx, this, &host, port as u16, tls_id);
     Ok(None)
 }
@@ -782,12 +878,34 @@ pub(crate) fn new13_ssl_socket_connect(
 pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRef {
     let session =
         alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", NEW13_SSL_SESS_FIELDS);
+    // Two stream registries back an `SSLSocket` here: `s2_registry` (the
+    // native-tls client streams) and `t27_tls`'s rustls registry (the
+    // layered/server streams AND, since it became the live registration,
+    // `net_phase_e`'s `SSLSocketFactory.createSocket(String, int)`). Consult
+    // both before falling back — querying only the first meant a
+    // rustls-backed id silently reported the hard-coded pair below as if it
+    // had actually been negotiated.
+    //
+    // Note the id spaces differ: a rustls-backed socket carries
+    // `RUSTLS_SOCK_ID_BASE + rid`, while `rustls_session_info` is keyed by the
+    // raw `rid`. Passing the offset id through unadjusted is a silent miss
+    // that lands on the fabricated fallback, which is exactly how a TLS 1.3
+    // connection came to report `TLS_AES_128_GCM_SHA256` regardless of the
+    // suite it had really negotiated.
+    let rustls_info = if tls_id >= crate::servlet::RUSTLS_SOCK_ID_BASE {
+        crate::t27_tls::rustls_session_info(tls_id - crate::servlet::RUSTLS_SOCK_ID_BASE)
+    } else {
+        crate::t27_tls::rustls_session_info(tls_id)
+    };
     let (proto, cipher) = match crate::servlet::s2_tls_session_info(tls_id) {
         Some((p, c, _, _)) => (p, c),
-        None => (
-            String::from("TLSv1.3"),
-            String::from("TLS_AES_128_GCM_SHA256"),
-        ),
+        None => match rustls_info {
+            Some((p, c, _, _)) => (p, c),
+            None => (
+                String::from("TLSv1.3"),
+                String::from("TLS_AES_128_GCM_SHA256"),
+            ),
+        },
     };
     let proto_str = ctx.create_string(&proto);
     let cipher_str = ctx.create_string(&cipher);
@@ -853,7 +971,8 @@ pub(crate) fn p68_create_socket_inet_address(
     }
     let extra_roots = p68_factory_trust_roots(ctx, args);
     let java_tm_key = p68_factory_java_tm_key(ctx, args);
-    new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
+    let max_protocol = p68_factory_max_protocol(ctx, args);
+    new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key, max_protocol)
 }
 
 /// NEW-13: real, blocking TCP-connect + TLS client handshake shared by
@@ -869,6 +988,7 @@ pub(crate) fn new13_connect_and_handshake(
     port: u16,
     extra_root_ders: &[Vec<u8>],
     java_tm_key: Option<u64>,
+    max_protocol: Option<native_tls::Protocol>,
 ) -> Result<i32, MethodCallFailed> {
     #[cfg(unix)]
     let legacy_dsa_context = extra_root_ders.iter().any(|der| {
@@ -877,7 +997,7 @@ pub(crate) fn new13_connect_and_handshake(
             .and_then(|cert| cert.public_key().ok())
             .is_some_and(|key| key.dsa().is_ok())
     });
-    let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some())
+    let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some(), max_protocol)
         .map_err(|msg| RuntimeError::IOException { message: msg })?;
     // FIX (netty-client-socket-write-after-close): this is a real, blocking
     // TCP connect + full TLS handshake (same shape as net_phase_e.rs's own
@@ -956,8 +1076,10 @@ pub(crate) fn new13_do_create_socket(
     port: u16,
     extra_root_ders: &[Vec<u8>],
     java_tm_key: Option<u64>,
+    max_protocol: Option<native_tls::Protocol>,
 ) -> MethodCallResult {
-    let tls_id = new13_connect_and_handshake(ctx, host, port, extra_root_ders, java_tm_key)?;
+    let tls_id =
+        new13_connect_and_handshake(ctx, host, port, extra_root_ders, java_tm_key, max_protocol)?;
     let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
     let sock = new13_finish_socket(ctx, sock, host, port, tls_id);
     if crate::nbflags().dbg_tls_sock {
@@ -1121,6 +1243,26 @@ fn ssl_sock_auth_get(ctx: &dyn NativeContext, this: ObjectRef) -> (i32, i32, i32
         .unwrap_or((0, 0, 0))
 }
 
+/// `HandshakeCompletedListener`s registered on an `SSLSocket`, keyed by the
+/// socket's identity hash (same keying `ssl_sock_auth_state` above uses).
+///
+/// The value is a list of `(listener identity hash, global-root handle)`. The
+/// handle — not a raw `ObjectRef` — is what makes this safe: these references
+/// are stored by one native call and consumed by a later one, across which a
+/// moving collection can relocate the listener. `add_global_root` keeps the
+/// object reachable and remaps it; `resolve_global_root` hands back the
+/// current address. The identity hash rides along so
+/// `removeHandshakeCompletedListener` can find the right entry without
+/// resolving every root.
+#[allow(clippy::type_complexity)]
+fn handshake_listeners(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u64, Vec<(i32, usize)>>> {
+    static T: std::sync::OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashMap<u64, Vec<(i32, usize)>>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
 fn ssl_sock_auth_update<F: FnOnce(&mut (i32, i32, i32))>(
     ctx: &dyn NativeContext,
     this: ObjectRef,
@@ -1261,7 +1403,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // currently-requested protocol. A failure here surfaces
             // immediately to the caller as a KeyManagementException-shaped
             // IOException.
-            if let Err(msg) = new13_build_connector(extra_roots.as_deref().unwrap_or(&[]), false) {
+            let init_max_protocol = match ctx.get_field(this, NEW13_CTX_PROTOCOL) {
+                Value::Object(Some(s)) => ctx
+                    .read_string(s)
+                    .as_deref()
+                    .and_then(new13_ctx_max_protocol),
+                _ => None,
+            };
+            if let Err(msg) = new13_build_connector(
+                extra_roots.as_deref().unwrap_or(&[]),
+                false,
+                init_max_protocol,
+            ) {
                 return Err(RuntimeError::IOException {
                     message: format!("SSLContext.init: {}", msg),
                 }
@@ -1447,11 +1600,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(ssf, "createSocket", "()Ljava/net/Socket;", |ctx, args| {
         let extra_roots = p68_factory_trust_roots(ctx, args);
         let java_tm_key = p68_factory_java_tm_key(ctx, args);
+        let max_protocol = p68_factory_max_protocol(ctx, args);
         let sock =
             alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
         ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(-1));
         ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
-        stash_pending_ssl_socket_connect_ctx(ctx, sock, extra_roots, java_tm_key);
+        stash_pending_ssl_socket_connect_ctx(ctx, sock, extra_roots, java_tm_key, max_protocol);
         Ok(Some(Value::Object(Some(sock))))
     });
     // NEW-13.3: SSLSocketFactory.createSocket(String host, int port) → SSLSocket.
@@ -1489,7 +1643,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
-            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
+            let max_protocol = p68_factory_max_protocol(ctx, args);
+            new13_do_create_socket(
+                ctx,
+                &host,
+                port_i as u16,
+                &extra_roots,
+                java_tm_key,
+                max_protocol,
+            )
         },
     );
     // `SSLSocketFactory` redeclares the `InetAddress` forms abstract even
@@ -1532,7 +1694,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
-            new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
+            let max_protocol = p68_factory_max_protocol(ctx, args);
+            new13_do_create_socket(
+                ctx,
+                &host,
+                port as u16,
+                &extra_roots,
+                java_tm_key,
+                max_protocol,
+            )
         },
     );
     r.register(
@@ -1624,6 +1794,25 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 java_tm_key,
             )
             .map_err(|message| RuntimeError::IOException { message })?;
+            // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE], second
+            // path): the immediate-connect overloads honour a version-pinned
+            // `SSLContext.getInstance(...)` via `p68_factory_max_protocol` ->
+            // native-tls, but this deferred overload hands the handshake to
+            // rustls instead, which never saw that ceiling — a socket from a
+            // `TLSv1.2` context still negotiated TLS 1.3. Seed the pending
+            // entry's enabled-protocol list, the same field
+            // `setEnabledProtocols` writes and `protocol_versions_for`
+            // consumes, so both paths agree.
+            if let Value::Object(Some(proto_ref)) = ctx.get_field(ssl_context, NEW13_CTX_PROTOCOL) {
+                if let Some(name) = ctx.read_string(proto_ref) {
+                    if new13_ctx_max_protocol(&name).is_some() {
+                        crate::t27_tls::set_pending_layered_socket_protocols(
+                            pending_id,
+                            vec![name],
+                        );
+                    }
+                }
+            }
             let socket = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let host_obj = ctx.create_string(&host);
             let pending_tls_id = crate::servlet::PENDING_LAYERED_SOCK_ID_BASE + pending_id;
@@ -1713,7 +1902,151 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             crate::t27_tls::record_client_peer_chain(ctx, session, chain);
         }
         ctx.set_field(socket, NEW13_SOCK_SESSION, Value::Object(Some(session)));
+        // A real handshake just completed on this socket — this is the one
+        // place in the SSLSocket bridge where that is true after Java has had
+        // any chance to register a listener (`createSocket(host, port)`
+        // handshakes before it returns the socket, so a listener added
+        // afterwards has, correctly, missed it). Stock JSSE signals exactly
+        // here; see `new13_fire_handshake_completed`.
+        new13_fire_handshake_completed(ctx, socket);
         Ok(real_tls_id)
+    }
+
+    /// Resolve this `SSLSocket`'s `SSLSession`, rebuilding it from the live
+    /// TLS stream when the stored field reads back as null.
+    ///
+    /// FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): `getSession()`
+    /// used to return `ctx.get_field(this, NEW13_SOCK_SESSION)` raw, and on
+    /// the `createSocket(String, int)` path that field reads back **null** —
+    /// so a plain client socket answered `getSession() == null` where JSSE
+    /// guarantees a non-null session. `new13_finish_socket` does write the
+    /// field, but as its own FIX comment records, `alloc_concurrent_synthetic`
+    /// sizes this object with the REAL `javax/net/ssl/SSLSocket` layout and
+    /// the layout guard silently drops writes whose slot type does not match;
+    /// the same hazard that already forced `NEW13_SOCK_TLSID` into
+    /// `net_phase_e`'s side table applies to the session slot.
+    ///
+    /// So do what the tls-id resolution already does: treat the field as a
+    /// fast path and fall back to the authoritative source. `new13_resolve_tls_id`
+    /// finds the stream via the side table, and `new13_alloc_ssl_session`
+    /// rebuilds an equivalent session from it. The rebuilt object is written
+    /// back to the field on the chance the slot is usable on this layout, but
+    /// nothing depends on that write landing.
+    ///
+    /// Returns `Value::Object(None)` only when there is genuinely no stream
+    /// (an unconnected socket) — the one case where JSSE itself would hand
+    /// back an invalid session rather than a real one.
+    fn new13_resolve_socket_session(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+        let stored = ctx.get_field(this, NEW13_SOCK_SESSION);
+        if matches!(stored, Value::Object(Some(_))) {
+            return stored;
+        }
+        let tls_id = new13_resolve_tls_id(ctx, this);
+        if tls_id < 0 {
+            return Value::Object(None);
+        }
+        let pin = ctx.pin_native_root(this);
+        let session = new13_alloc_ssl_session(ctx, tls_id);
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        ctx.set_field(this, NEW13_SOCK_SESSION, Value::Object(Some(session)));
+        Value::Object(Some(session))
+    }
+
+    /// Deliver a `HandshakeCompletedEvent` to every listener registered on
+    /// `socket`, for a handshake that has genuinely just completed.
+    ///
+    /// Call this only where new key material was actually negotiated. It is
+    /// deliberately NOT called from `startHandshake()` on an established
+    /// connection — see the `addHandshakeCompletedListener` registration.
+    ///
+    /// Deviation from stock JSSE, recorded because it is observable: the real
+    /// JDK dispatches this from a fresh thread named
+    /// `HandshakeCompletedNotify-Thread` (`sun.security.ssl.TransportContext.
+    /// finishHandshake`), whereas this delivers synchronously on the thread
+    /// that completed the handshake. A listener therefore sees a different
+    /// `Thread.currentThread().getName()`, and a listener that blocks will
+    /// block the handshaking call rather than a throwaway notifier thread.
+    /// Synchronous delivery is chosen over spawning a Java thread from a
+    /// native because it needs no `Runnable` shim class and cannot leak a
+    /// thread when a listener throws; the event contents are identical.
+    fn new13_fire_handshake_completed(ctx: &mut dyn NativeContext, socket: ObjectRef) {
+        let socket_key = ctx.identity_hash_code(socket) as u32 as u64;
+        // Copy the handles out and release the lock BEFORE re-entering Java:
+        // `handshakeCompleted` is arbitrary application code that can call
+        // back into `add`/`removeHandshakeCompletedListener` on this same
+        // socket, which would deadlock on a held non-reentrant mutex.
+        let handles: Vec<usize> = match handshake_listeners().lock().get(&socket_key) {
+            Some(entry) => entry.iter().map(|(_, handle)| *handle).collect(),
+            None => return,
+        };
+        if handles.is_empty() {
+            return;
+        }
+        let pin = ctx.pin_native_root(socket);
+        let socket = ctx.read_native_pin(pin, socket);
+        let session = new13_resolve_socket_session(ctx, socket);
+        let socket = ctx.read_native_pin(pin, socket);
+        // Pin the session too: `new_object_initialized` below allocates and
+        // can therefore collect, and a raw `ObjectRef` sitting in `session`
+        // across that point is exactly the stale-reference hazard
+        // `pin_native_root` exists for.
+        let session = match session {
+            Value::Object(Some(session)) => {
+                let session_pin = ctx.pin_native_root(session);
+                Value::Object(Some(ctx.read_native_pin(session_pin, session)))
+            }
+            other => other,
+        };
+        let socket = ctx.read_native_pin(pin, socket);
+        // `HandshakeCompletedEvent` is a real JDK class with real bytecode;
+        // running its constructor is what makes `getSource()`/`getSession()`/
+        // `getCipherSuite()` work for free rather than needing a synthetic
+        // stand-in with hand-maintained field indices.
+        let event = ctx.new_object_initialized(
+            "javax/net/ssl/HandshakeCompletedEvent",
+            "(Ljavax/net/ssl/SSLSocket;Ljavax/net/ssl/SSLSession;)V",
+            &[Value::Object(Some(socket)), session],
+        );
+        let event = match event {
+            Ok(Some(Value::Object(Some(event)))) => event,
+            _ => {
+                ctx.unpin_native_roots(pin);
+                return;
+            }
+        };
+        let event_pin = ctx.pin_native_root(event);
+        for handle in handles {
+            let Some(listener) = ctx.resolve_global_root(handle) else {
+                continue;
+            };
+            let event = ctx.read_native_pin(event_pin, event);
+            // A listener that throws must not abort the handshake or swallow
+            // the remaining listeners — stock JSSE runs them on a detached
+            // notifier thread, where a throw is likewise invisible to the
+            // handshaking code.
+            let _ = ctx.invoke_virtual(
+                listener,
+                "handshakeCompleted",
+                "(Ljavax/net/ssl/HandshakeCompletedEvent;)V",
+                &[Value::Object(Some(event))],
+            );
+        }
+        ctx.unpin_native_roots(pin);
+    }
+
+    /// Release the global roots held for `socket`'s handshake listeners.
+    /// Called from `close()` so a long-lived process that opens many TLS
+    /// sockets does not accumulate permanently-reachable listener objects.
+    fn new13_drop_handshake_listeners(ctx: &mut dyn NativeContext, socket: ObjectRef) {
+        let socket_key = ctx.identity_hash_code(socket) as u32 as u64;
+        let handles = match handshake_listeners().lock().remove(&socket_key) {
+            Some(entry) => entry,
+            None => return,
+        };
+        for (_, handle) in handles {
+            ctx.remove_global_root(handle);
+        }
     }
 
     // SSLSocket methods
@@ -1727,7 +2060,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // Real JSSE: getSession() implicitly starts the handshake if one
             // hasn't run yet.
             ensure_layered_handshake_started(ctx, this)?;
-            let session = ctx.get_field(this, 4);
+            let session = new13_resolve_socket_session(ctx, this);
             if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getSession sock={:?} -> {:?}",
@@ -1744,31 +2077,61 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ensure_layered_handshake_started(ctx, this)?;
         Ok(None)
     });
-    // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): these two real
-    // JDK SSLSocket methods had no native registration at all, so calling
-    // either threw `AbstractMethodError: ... has no Code attribute` (the
-    // abstract class has no bytecode of its own) — a VM-crash-shaped error
-    // for what should be an ordinary, always-legal listener registration
-    // call. Honest no-op registration (matching the real
-    // `addHandshakeCompletedListener` null-check contract): we do NOT fire
-    // stored listeners on a later `startHandshake()` call, because rustls
-    // (this VM's TLS backend) does not implement TLS renegotiation at the
-    // protocol level at all — a permanent upstream design choice, same
-    // class of gap as the already-documented rustls DHE/CBC limitations.
-    // Registering these as real (if inert) methods turns the crash into a
-    // clean, honest test assertion failure (listener never completes)
-    // instead of an uncatchable AbstractMethodError.
+    // These two real JDK `SSLSocket` methods originally had no native
+    // registration at all, so calling either threw `AbstractMethodError: ...
+    // has no Code attribute` (the abstract class has no bytecode of its own).
+    // That was first patched into an inert no-op pair, which stopped the
+    // crash but left a worse contract: a listener could be registered and was
+    // then *never* invoked, on any code path, for any handshake — including
+    // the ordinary initial one that has nothing to do with renegotiation.
+    //
+    // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): store the
+    // listeners for real and dispatch a genuine `HandshakeCompletedEvent`
+    // whenever a handshake actually completes on the socket (see
+    // `new13_fire_handshake_completed`, called from
+    // `ensure_layered_handshake_started`).
+    //
+    // What still does NOT fire is a `startHandshake()` on an
+    // already-established connection — i.e. a client-initiated renegotiation.
+    // That is deliberate and is a property of the TLS backend, not an
+    // oversight: rustls does not implement TLS 1.2 renegotiation, and its own
+    // manual (`vendor/rustls-cbc/src/manual/tlsvulns.rs`) lists that omission
+    // as its mitigation for CVE-2009-3555 and 3SHAKE. Firing the event
+    // anyway would tell the application that fresh key material had been
+    // derived when none had. See
+    // `docs/internal/fixed-suite-bugs/tomcat/testssl-client-initiated-renegotiation-FIXED.md`.
     r.register(
         ssl_sock,
         "addHandshakeCompletedListener",
         "(Ljavax/net/ssl/HandshakeCompletedListener;)V",
-        |_ctx, args| {
-            if matches!(args.get(1), Some(Value::Object(None)) | None) {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: "listener is null".to_string(),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let listener = match args.get(1) {
+                Some(Value::Object(Some(listener))) => *listener,
+                _ => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "listener is null".to_string(),
+                    }
+                    .into())
                 }
-                .into());
+            };
+            let listener_key = ctx.identity_hash_code(listener);
+            // A global root, not a bare ObjectRef: this reference outlives the
+            // current native call and is consumed by a later one, so a moving
+            // collection in between would otherwise leave a stale pointer —
+            // the `add_global_root` doc comment describes exactly this case.
+            let handle = ctx.add_global_root(listener);
+            let socket_key = ctx.identity_hash_code(this) as u32 as u64;
+            let mut table = handshake_listeners().lock();
+            let entry = table.entry(socket_key).or_default();
+            // Real JSSE stores listeners in a `HashSet`, so re-adding the same
+            // listener is idempotent rather than double-registering it.
+            if entry.iter().any(|(key, _)| *key == listener_key) {
+                drop(table);
+                ctx.remove_global_root(handle);
+                return Ok(None);
             }
+            entry.push((listener_key, handle));
             Ok(None)
         },
     );
@@ -1776,14 +2139,48 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ssl_sock,
         "removeHandshakeCompletedListener",
         "(Ljavax/net/ssl/HandshakeCompletedListener;)V",
-        |_ctx, args| {
-            if matches!(args.get(1), Some(Value::Object(None)) | None) {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: "listener is null".to_string(),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let listener = match args.get(1) {
+                Some(Value::Object(Some(listener))) => *listener,
+                _ => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "listener is null".to_string(),
+                    }
+                    .into())
                 }
-                .into());
+            };
+            let listener_key = ctx.identity_hash_code(listener);
+            let socket_key = ctx.identity_hash_code(this) as u32 as u64;
+            let removed = {
+                let mut table = handshake_listeners().lock();
+                match table.get_mut(&socket_key) {
+                    Some(entry) => {
+                        match entry.iter().position(|(key, _)| *key == listener_key) {
+                            Some(pos) => {
+                                let (_, handle) = entry.remove(pos);
+                                if entry.is_empty() {
+                                    table.remove(&socket_key);
+                                }
+                                Some(handle)
+                            }
+                            None => None,
+                        }
+                    }
+                    None => None,
+                }
+            };
+            match removed {
+                Some(handle) => {
+                    ctx.remove_global_root(handle);
+                    Ok(None)
+                }
+                // Real JSSE throws for a listener that was never added.
+                None => Err(RuntimeError::IllegalArgumentException {
+                    message: "listener not registered".to_string(),
+                }
+                .into()),
             }
-            Ok(None)
         },
     );
     // connect(SocketAddress[, int timeout]) — the other half of the zero-arg
@@ -2153,8 +2550,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // Report the protocol actually negotiated (stored on the
             // session) alongside TLSv1.2 so callers checking membership
             // against either standard name succeed.
+            //
+            // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): read the
+            // session through `new13_resolve_socket_session` rather than the
+            // raw field. The raw read returns null on the
+            // `createSocket(String, int)` path (see that helper's comment),
+            // and the `unwrap_or` below then fabricated `"TLSv1.3"` — which is
+            // how a socket built from an `SSLContext.getInstance("TLSv1.2")`
+            // came to report `[TLSv1.3]`. The fabricated value was reported
+            // whatever the connection had actually negotiated, so it was a
+            // guess presented as a fact, not merely an imprecise default.
             let negotiated =
-                if let Value::Object(Some(session)) = ctx.get_field(this, NEW13_SOCK_SESSION) {
+                if let Value::Object(Some(session)) = new13_resolve_socket_session(ctx, this) {
                     match ctx.get_field(session, NEW13_SESS_PROTO) {
                         Value::Object(Some(s)) => ctx.read_string(s),
                         _ => None,
@@ -2283,6 +2690,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(ssl_sock, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Drop any handshake-listener global roots first: they keep the
+        // listener objects permanently reachable, and a closed socket will
+        // never fire another event. Unconditional (not gated on `tls_id >= 0`
+        // below) so a second close(), or a socket closed before it ever
+        // handshaked, still releases them.
+        new13_drop_handshake_listeners(ctx, this);
         let tls_id = new13_resolve_tls_id(ctx, this);
         if crate::nbflags().dbg_tls_sock {
             eprintln!(
@@ -5322,7 +5735,7 @@ pub(crate) mod new13_tests {
         // NEW-13.2 DoD: the default connector build (no custom KM/TM) must
         // succeed on every platform supported by native-tls, otherwise
         // SSLContext.init would fail even for the trivial null-TM path.
-        let c = new13_build_connector(&[], false);
+        let c = new13_build_connector(&[], false, None);
         assert!(c.is_ok(), "connector build failed: {:?}", c.err());
     }
 
@@ -5332,7 +5745,7 @@ pub(crate) mod new13_tests {
         // unexpected TrustManager) must be skipped rather than failing the
         // whole connector build — `new13_build_connector` logs and continues.
         let garbage = vec![0xFFu8, 0x00, 0x01, 0x02];
-        let c = new13_build_connector(&[garbage], false);
+        let c = new13_build_connector(&[garbage], false, None);
         assert!(
             c.is_ok(),
             "connector build must tolerate an unparseable extra root: {:?}",
