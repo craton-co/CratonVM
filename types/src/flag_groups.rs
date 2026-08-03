@@ -583,6 +583,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "arith-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_ARITH_LICM"), off_word: None },
     E { group: Group::JIT, token: "bce", on_key: None, off_key: Some("CRATONVM_JIT_NO_BCE"), off_word: None },
     E { group: Group::JIT, token: "bg-compile", on_key: Some("CRATONVM_BG_COMPILE"), off_key: None, off_word: None },
+    // The bytecode loop rewriter (`x64::plan_bytecode_loop_xform`: peel,
+    // unroll, guarded versioning). Default-**OFF**, and arming it also turns
+    // the native byte-copy unroller off — the two are exact complements, and
+    // both firing on one loop would put `(k+1)^2` bodies behind one back-edge
+    // poll. Sufficient on its own since `loop-02` retired the `deopt-real`
+    // whole-compile refusal: this token alone now reaches loops under the
+    // default configuration, and pairing it with `-deopt-real` measures the
+    // deopt-real-off configuration rather than the transform. See
+    // `docs/jit/loop-rewriter-wiring.md`.
+    E { group: Group::JIT, token: "bytecode-loop-xform", on_key: Some("CRATONVM_JIT_BYTECODE_LOOP_XFORM"), off_key: None, off_word: None },
     // Default-ON: `x64::escape_analysis::bulk_byte_loops_enabled` reads
     // `0`/`false`/`off` (trimmed, case-insensitive) as the kill switch.
     E { group: Group::JIT, token: "bulk-byte-loops", on_key: Some("CRATONVM_JIT_BULK_BYTE_LOOPS"), off_key: None, off_word: Some("0") },
@@ -609,6 +619,10 @@ pub const INVENTORY: &[E] = &[
     // Default-ON: `x64::licm::gc_inert_selfrec_enabled` reads `0`/`false`/`off`.
     E { group: Group::JIT, token: "gc-inert-selfrec", on_key: Some("CRATONVM_JIT_GC_INERT_SELFREC"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "getfield-helper", on_key: Some("CRATONVM_JIT_GETFIELD_HELPER"), off_key: None, off_word: None },
+    // Presence-parsed kill switch for the inline (helper-free) compiled
+    // `getstatic` load, exactly like `getfield-helper` above: setting it
+    // routes every static read back through `jit_getstatic`.
+    E { group: Group::JIT, token: "getstatic-helper", on_key: Some("CRATONVM_JIT_GETSTATIC_HELPER"), off_key: None, off_word: None },
     // PGO-02: guarded monomorphic-virtual-call inlining (splice the callee
     // body behind a receiver class-id guard, miss falls to normal dispatch,
     // never a deopt). Default-OFF until soaked — see

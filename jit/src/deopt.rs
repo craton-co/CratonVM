@@ -414,6 +414,59 @@ pub struct VirtualObjectState {
 /// The walk is bounded by [`MAX_SCOPE_CHAIN`]: a chain longer than that is
 /// treated as unresumable rather than walked further, because a chain that deep
 /// is a metadata defect and refusing costs only a whole-method re-run.
+/// Which slot makes [`frame_state_is_resumable`] answer `false` — `"local 3
+/// (Unsupported)"`, `"stack 1 (MaterializationRequired)"`, `depth`-prefixed
+/// when the offender is in an inlined caller scope. `None` iff the state is
+/// resumable.
+///
+/// Exists because the refusal it feeds used to read
+/// `"reconstructs an unresumable frame"` and stop there. That names the
+/// symptom and hides the cause: a frame is unresumable because ONE value has
+/// no interpreter encoding, and which one it is decides the whole diagnosis —
+/// an `Unsupported` **stack** entry means the operand stack had no width
+/// source at that bci (the `uses_long_float_double` fallback in
+/// `build_and_record_deopt_point`), while an `Unsupported` **local** means the
+/// local's kind or liveness could not be established. Those are different
+/// defects with different fixes, and the message could not tell them apart.
+pub fn first_unresumable_slot(fs: &FrameState) -> Option<String> {
+    let mut scope = Some(fs);
+    let mut depth = 0usize;
+    while let Some(f) = scope {
+        let at = |depth: usize, what: &str, i: usize, v: &FrameValue| {
+            let scope_tag = if depth == 0 {
+                String::new()
+            } else {
+                format!("caller-scope-{depth} ")
+            };
+            format!("{scope_tag}{what} {i} ({v:?})")
+        };
+        for (i, v) in f.locals.iter().enumerate() {
+            if value_blocks_resume(v) {
+                return Some(at(depth, "local", i, v));
+            }
+        }
+        for (i, v) in f.stack.iter().enumerate() {
+            if value_blocks_resume(v) {
+                // Depth matters as much as the index: "stack 0 of 1" is a call
+                // whose own argument could not be typed, "stack 0 of 3" is a
+                // value sitting UNDER the arguments, and the two want different
+                // fixes.
+                return Some(format!("{} of {}", at(depth, "stack", i, v), f.stack.len()));
+            }
+        }
+        depth += 1;
+        if depth >= MAX_SCOPE_CHAIN {
+            return if f.caller.is_none() {
+                None
+            } else {
+                Some(format!("scope chain deeper than {MAX_SCOPE_CHAIN}"))
+            };
+        }
+        scope = f.caller.as_deref();
+    }
+    None
+}
+
 pub fn frame_state_is_resumable(fs: &FrameState) -> bool {
     let mut scope = Some(fs);
     let mut seen = 0usize;
@@ -8197,4 +8250,44 @@ mod frame_state_interning_tests {
         assert_eq!(it.locals_len(real), 4);
         assert_eq!(it.stats().states, 1);
     }
+
+    /// The unresumable-frame refusal has to name the slot: an `Unsupported`
+    /// STACK entry means the operand stack had no width source at that bci, an
+    /// `Unsupported` LOCAL means the local's kind or liveness was unknown, and
+    /// those are different defects. Reading "reconstructs an unresumable frame"
+    /// alone, the first cost a full instrumented rebuild to tell apart.
+    #[test]
+    fn first_unresumable_slot_names_the_offender() {
+        let fs = FrameState {
+            method_key: String::from("T.m()V"),
+            bci: 0,
+            locals: vec![FrameValue::Int(1), FrameValue::Int(2)],
+            stack: vec![FrameValue::Int(3)],
+            monitors: Vec::new(),
+            caller: None,
+        };
+        assert_eq!(first_unresumable_slot(&fs), None);
+        assert!(frame_state_is_resumable(&fs));
+
+        let mut with_stack = fs.clone();
+        with_stack.stack = vec![FrameValue::Int(3), FrameValue::Unsupported];
+        let msg = first_unresumable_slot(&with_stack).expect("stack 1 blocks the resume");
+        assert!(msg.starts_with("stack 1 "), "{msg}");
+        assert!(msg.ends_with(" of 2"), "depth belongs in the message: {msg}");
+
+        let mut with_local = fs.clone();
+        with_local.locals = vec![FrameValue::Int(1), FrameValue::Unsupported];
+        let msg = first_unresumable_slot(&with_local).expect("local 1 blocks the resume");
+        assert!(msg.starts_with("local 1 "), "{msg}");
+
+        // Locals are scanned before the stack, so a frame with both names the
+        // local — the same order `frame_state_is_resumable` walks.
+        let mut both = fs;
+        both.locals = vec![FrameValue::Unsupported];
+        both.stack = vec![FrameValue::Unsupported];
+        assert!(first_unresumable_slot(&both)
+            .expect("blocked")
+            .starts_with("local 0 "));
+    }
+
 }

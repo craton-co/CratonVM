@@ -122,6 +122,12 @@ cannot check this and does not try. `None` is always safe and costs one guard.
 
 * `jit/src/scev.rs` — the implementation and its tests.
 * `docs/jit/vectorization-gate.md` — the consumer whose "what an emitter still
-  needs" item 2 and "out of scope" list this closes. Its refusal-rate figures
-  predate this shape.
+  needs" item 2 and "out of scope" list this closed. It now **asks** for the
+  witness, and its refusal-rate figure has been re-measured against a corpus
+  that contains this class (12 of 29).
+* `docs/known-issues/c2/loop-01-peeling-and-versioning.md` — the second
+  consumer. `x64::licm::plan_loop_version` emits this guard as *bytecode*
+  (`encode_preheader_guard`), which is why the addend is folded into a
+  compile-time threshold rather than materialised: there is no 64-bit compare to
+  emit and no constant pool to put one in.
 * `docs/jit/range-analysis.md` — the surrounding proof model.

@@ -357,6 +357,12 @@ pub struct ExecutableBuffer {
     /// bail is indistinguishable from a method the JIT declined for any other
     /// reason. See [`wanted`](Self::wanted).
     wanted: usize,
+    /// AUDIT: set once the owning `CompiledMethod` has been published into a
+    /// dispatch surface, i.e. once a raw pointer into this buffer can be held
+    /// by generated code. A free of a buffer with this bit clear is harmless
+    /// whatever `ACTIVE_JIT_EXECUTIONS` reads; a free of one with it set is
+    /// only safe if the retirement queue authorised it.
+    published: bool,
     /// Which sizing heuristic allocated this buffer, for the overflow warning.
     ///
     /// Four independent estimates allocate executable buffers, and the warning
@@ -393,8 +399,15 @@ impl ExecutableBuffer {
             capacity,
             overflowed: false,
             wanted: 0,
+            published: false,
             tag: "untagged",
         })
+    }
+
+    /// AUDIT: mark this buffer as reachable by generated code.
+    #[inline]
+    pub fn mark_published(&mut self) {
+        self.published = true;
     }
 
     /// Name the sizing heuristic that allocated this buffer. Shown by the
@@ -782,10 +795,39 @@ impl Drop for ExecutableBuffer {
         // thread was inside compiled code — which is precisely the bug the
         // `defer_jit_owner` retirement queue above exists to prevent, so a
         // non-zero value here means some release path is still bypassing it.
+        let authorised = reclaim_is_authorised();
+        let mut flags = 0usize;
+        if self.published {
+            flags |= CODE_FREE_PUBLISHED;
+            PUBLISHED_CODE_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !authorised {
+                // THE invariant this module exists to keep. A published body's
+                // mapping may only be returned from inside a reclamation the
+                // retirement queue proved safe; every other path releases it
+                // without having asked whether a thread is executing it, which
+                // is a use-after-free of executable memory.
+                let n = UNQUEUED_PUBLISHED_CODE_FREES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 32 && dbg_jit_code_free_enabled() {
+                    eprintln!(
+                        "[jit-unqueued-free] PUBLISHED body base={:#x} len={:#x} \
+released OUTSIDE the retirement queue; active_jit_executions={}\n{}",
+                        self.ptr as usize,
+                        self.capacity,
+                        ACTIVE_JIT_EXECUTIONS.get(),
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
+        if authorised {
+            flags |= CODE_FREE_AUTHORISED;
+        }
         record_code_free(
             self.ptr as usize,
             self.capacity,
             ACTIVE_JIT_EXECUTIONS.get(),
+            flags,
         );
         if never_free_code_enabled() {
             return;
@@ -825,17 +867,95 @@ static RECENT_FREE_LEN: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
 static RECENT_FREE_ACTIVE: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
+/// Bit 0: the buffer belonged to a *published* body, i.e. one a dispatch
+/// surface could hand a raw pointer to. Bit 1: the release was authorised by
+/// the retirement queue's quiescence proof.
+///
+/// Both are needed to read `RECENT_FREE_ACTIVE` correctly, and neither used to
+/// be recorded. `active_jit_executions` alone cannot distinguish a genuine
+/// bypass from (a) a discarded compile attempt, which nothing can point into,
+/// or (b) a perfectly legal reclamation whose `munmap` merely happened after
+/// some *other* thread entered compiled code — the count is sampled at the
+/// unmap, not at the decision. A crash report that names only the count
+/// therefore reads as damning when it is not; see
+/// `docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
+static RECENT_FREE_FLAGS: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
+
+/// `RECENT_FREE_FLAGS` bit: the buffer belonged to a published body.
+pub const CODE_FREE_PUBLISHED: usize = 1;
+/// `RECENT_FREE_FLAGS` bit: the retirement queue authorised the release.
+pub const CODE_FREE_AUTHORISED: usize = 2;
 static RECENT_FREE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn record_code_free(base: usize, len: usize, active_executions: usize) {
+thread_local! {
+    /// AUDIT: non-zero while this thread is inside a reclamation the retirement
+    /// queue authorised (`defer_jit_owner`'s quiescent fast path, or the drain).
+    /// Nested drops inherit it, which is correct: a `CompiledMethod` reclaimed
+    /// under the queue also reclaims the callee roots and inline-cache owners it
+    /// held.
+    static AUTHORISED_RECLAIM_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct AuthorisedReclaim;
+
+impl AuthorisedReclaim {
+    fn enter() -> Self {
+        AUTHORISED_RECLAIM_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        AuthorisedReclaim
+    }
+}
+
+impl Drop for AuthorisedReclaim {
+    fn drop(&mut self) {
+        AUTHORISED_RECLAIM_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+fn reclaim_is_authorised() -> bool {
+    AUTHORISED_RECLAIM_DEPTH
+        .try_with(|d| d.get() != 0)
+        .unwrap_or(false)
+}
+
+/// AUDIT: published bodies whose mapping was released.
+static PUBLISHED_CODE_FREES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// AUDIT: published bodies released by a path the retirement queue never saw.
+/// **Every one of these is a potential use-after-free of executable memory**:
+/// nothing on that path asked whether a thread was inside the body.
+static UNQUEUED_PUBLISHED_CODE_FREES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Published bodies unmapped, and how many of those bypassed the retirement
+/// queue.
+pub fn published_code_free_audit() -> (usize, usize) {
+    (
+        PUBLISHED_CODE_FREES.load(std::sync::atomic::Ordering::Relaxed),
+        UNQUEUED_PUBLISHED_CODE_FREES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `CRATONVM_DBG_JIT_CODE_FREE=1` — name the release site of every executable
+/// buffer, and of every published body released outside the retirement queue.
+fn dbg_jit_code_free_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_CODE_FREE").is_some())
+}
+
+fn record_code_free(base: usize, len: usize, active_executions: usize, flags: usize) {
     use std::sync::atomic::Ordering;
     // DIAG (`CRATONVM_DBG_JIT_CODE_FREE=1`): name the release site. Executable
     // buffers are unmapped a handful of times per process, so capturing a
     // backtrace here is free in practice and it is the only way to tell WHICH
     // owner dropped last — the crash it explains reports only an address.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_CODE_FREE").is_some() {
+    if dbg_jit_code_free_enabled() {
         eprintln!(
-            "[jit-code-free] base={base:#x} len={len:#x} active_jit_executions={active_executions}\n{}",
+            "[jit-code-free] base={base:#x} len={len:#x} active_jit_executions={active_executions} \
+published={} authorised={}\n{}",
+            flags & CODE_FREE_PUBLISHED != 0,
+            flags & CODE_FREE_AUTHORISED != 0,
             std::backtrace::Backtrace::force_capture()
         );
     }
@@ -846,6 +966,7 @@ fn record_code_free(base: usize, len: usize, active_executions: usize) {
     RECENT_FREE_BASE[i].store(0, Ordering::Relaxed);
     RECENT_FREE_LEN[i].store(len, Ordering::Relaxed);
     RECENT_FREE_ACTIVE[i].store(active_executions, Ordering::Relaxed);
+    RECENT_FREE_FLAGS[i].store(flags, Ordering::Relaxed);
     RECENT_FREE_BASE[i].store(base, Ordering::Release);
 }
 
@@ -855,10 +976,17 @@ pub fn code_frees_total() -> usize {
 }
 
 /// Was `addr` inside one of the last [`RECENT_CODE_FREES`] executable buffers
-/// this process unmapped? Returns `(base, len, active_jit_executions_at_free)`.
+/// this process unmapped? Returns
+/// `(base, len, active_jit_executions_at_free, flags)`, where `flags` carries
+/// [`CODE_FREE_PUBLISHED`] and [`CODE_FREE_AUTHORISED`].
+///
+/// Read the flags before the count. An unpublished buffer is one nothing could
+/// point into, and an authorised release already carries a quiescence proof —
+/// in both cases a non-zero `active_jit_executions_at_free` says nothing,
+/// because the count is sampled at the `munmap` rather than at the decision.
 ///
 /// Async-signal-safe: atomic loads only.
-pub fn recent_code_free_covering(addr: usize) -> Option<(usize, usize, usize)> {
+pub fn recent_code_free_covering(addr: usize) -> Option<(usize, usize, usize, usize)> {
     use std::sync::atomic::Ordering;
     for i in 0..RECENT_CODE_FREES {
         let base = RECENT_FREE_BASE[i].load(Ordering::Acquire);
@@ -867,7 +995,12 @@ pub fn recent_code_free_covering(addr: usize) -> Option<(usize, usize, usize)> {
         }
         let len = RECENT_FREE_LEN[i].load(Ordering::Relaxed);
         if addr >= base && addr < base.saturating_add(len) {
-            return Some((base, len, RECENT_FREE_ACTIVE[i].load(Ordering::Relaxed)));
+            return Some((
+                base,
+                len,
+                RECENT_FREE_ACTIVE[i].load(Ordering::Relaxed),
+                RECENT_FREE_FLAGS[i].load(Ordering::Relaxed),
+            ));
         }
     }
     None
@@ -968,7 +1101,14 @@ impl OopMapEntry {
 // `CompiledMethod` stays alive through cache, direct-call, inline-cache, and
 // active-reader ownership. Its final Drop unregisters the range before unmap.
 
-type JitCodeRange = (usize, usize, usize);
+/// `(start, end, cm_ptr, owner)`.
+///
+/// `owner` is what makes [`pin_jit_code_range_owner`] lock-free, and it exists
+/// because a *pin* — not a bare `cm_ptr` — is what the JIT-dispatch helper needs
+/// before it calls a raw entry. `cm_ptr` is retained beside it for the root
+/// walkers, which run under their own quiescence rules and want no refcount
+/// traffic per stack word.
+type JitCodeRange = (usize, usize, usize, std::sync::Weak<CompiledMethod>);
 
 /// Copy-on-write code-range registry.
 ///
@@ -1030,14 +1170,38 @@ pub fn jit_code_ranges_generation() -> u64 {
 /// Register `[entry, entry+len)` → `cm_ptr` (the `Arc<CompiledMethod>` inner
 /// address). No-op for empty/zero ranges. Stage 5.
 pub fn register_jit_code_range(entry: usize, len: usize, cm_ptr: usize) {
+    register_jit_code_range_inner(entry, len, cm_ptr, std::sync::Weak::new())
+}
+
+/// Register a range together with a weak handle on its owner, so
+/// [`pin_jit_code_range_owner`] can retain the body without taking a lock.
+///
+/// This is the form the two publication sites use. The bare
+/// [`register_jit_code_range`] remains for synthetic ranges (tests) that have no
+/// `Arc` to downgrade; pinning one of those falls back to the locking path.
+pub fn register_jit_code_range_owned(entry: usize, len: usize, owner: &Arc<CompiledMethod>) {
+    register_jit_code_range_inner(
+        entry,
+        len,
+        Arc::as_ptr(owner) as usize,
+        Arc::downgrade(owner),
+    )
+}
+
+fn register_jit_code_range_inner(
+    entry: usize,
+    len: usize,
+    cm_ptr: usize,
+    owner: std::sync::Weak<CompiledMethod>,
+) {
     if entry == 0 || len == 0 || cm_ptr == 0 {
         return;
     }
     let registry = jit_code_ranges();
     if let Ok(_writer) = registry.writer.lock() {
         let mut next = (**registry.snapshot.load()).clone();
-        next.push((entry, entry.saturating_add(len), cm_ptr));
-        next.sort_unstable_by_key(|&(start, _, _)| start);
+        next.push((entry, entry.saturating_add(len), cm_ptr, owner));
+        next.sort_unstable_by_key(|&(start, _, _, _)| start);
         registry.snapshot.store(std::sync::Arc::new(next));
         // Release: any cached snapshot taken with Acquire after this point must
         // see the push above (ordinary Mutex unlock already provides this, but
@@ -1056,7 +1220,7 @@ pub fn unregister_jit_code_range(entry: usize) {
     let registry = jit_code_ranges();
     if let Ok(_writer) = registry.writer.lock() {
         let mut next = (**registry.snapshot.load()).clone();
-        next.retain(|&(e, _, _)| e != entry);
+        next.retain(|(e, _, _, _)| *e != entry);
         registry.snapshot.store(std::sync::Arc::new(next));
         JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -1108,7 +1272,7 @@ pub fn jit_code_ranges_snapshot() -> Vec<(usize, usize)> {
         .snapshot
         .load()
         .iter()
-        .map(|&(e, end, _)| (e, end))
+        .map(|(e, end, _, _)| (*e, *end))
         .collect()
 }
 
@@ -1117,9 +1281,9 @@ pub fn jit_code_ranges_snapshot() -> Vec<(usize, usize)> {
 /// a lock-free binary search. Stage 5.
 pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
     let ranges = jit_code_ranges().snapshot.load();
-    let candidate = ranges.partition_point(|&(entry, _, _)| entry <= addr);
-    let &(entry, end, cm) = ranges.get(candidate.checked_sub(1)?)?;
-    (addr >= entry && addr < end).then_some(cm)
+    let candidate = ranges.partition_point(|(entry, _, _, _)| *entry <= addr);
+    let (entry, end, cm, _) = ranges.get(candidate.checked_sub(1)?)?;
+    (addr >= *entry && addr < *end).then_some(*cm)
 }
 
 /// Resolve `addr` to a *retained* owner of the compiled body containing it.
@@ -1137,20 +1301,29 @@ pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
 /// makes the metadata and the code buffer valid for as long as it is held.
 /// `None` means "no live body covers this address", which is the safe answer.
 ///
-/// Costs one mutex acquisition on `jit_entry_owners` over the lock-free range
-/// search, so it belongs on the per-frame paths (a root scan naming one frame),
-/// not on the per-stack-word conservative sweep — that one wants
-/// [`snapshot_code_ranges_into`], which hands out no owner pointer at all.
+/// Costs one `Weak::upgrade` — an atomic increment — over the lock-free range
+/// search, so it is affordable on the per-dispatch path that calls a raw entry,
+/// not just on the per-frame ones. It is NOT for the per-stack-word
+/// conservative sweep; that one wants [`snapshot_code_ranges_into`], which
+/// hands out no owner at all.
 pub fn pin_jit_code_range_owner(addr: usize) -> Option<Arc<CompiledMethod>> {
     let entry = {
         let ranges = jit_code_ranges().snapshot.load();
-        let candidate = ranges.partition_point(|&(entry, _, _)| entry <= addr);
-        let &(entry, end, _) = ranges.get(candidate.checked_sub(1)?)?;
-        if addr < entry || addr >= end {
+        let candidate = ranges.partition_point(|(entry, _, _, _)| *entry <= addr);
+        let (entry, end, _, owner) = ranges.get(candidate.checked_sub(1)?)?;
+        if addr < *entry || addr >= *end {
             return None;
         }
-        entry
+        // Fast path: the range was registered by `put`/`put_osr`, which carry
+        // the owner. A live body upgrades with one atomic increment.
+        if let Some(pinned) = owner.upgrade() {
+            return Some(pinned);
+        }
+        *entry
     };
+    // Either the body is gone (the honest `None`), or this range was registered
+    // without an owner — the synthetic ranges unit tests install. Both are rare
+    // enough to pay `jit_entry_owners`'s lock.
     resolve_jit_entry_owner(entry)
 }
 
@@ -1168,7 +1341,7 @@ pub fn pin_jit_code_range_owner(addr: usize) -> Option<Arc<CompiledMethod>> {
 pub fn snapshot_code_ranges_into(buf: &mut Vec<(usize, usize)>) {
     buf.clear();
     let ranges = jit_code_ranges().snapshot.load();
-    buf.extend(ranges.iter().map(|&(e, end, _)| (e, end)));
+    buf.extend(ranges.iter().map(|(e, end, _, _)| (*e, *end)));
 }
 
 /// DBG (spring-bug-11): code-range → method-name table for naming a JIT frame in
@@ -2214,49 +2387,58 @@ impl CompiledMethod {
     /// The compiled code must match the expected signature.
     #[inline]
     pub unsafe fn try_call(&self, args: &[i64]) -> Result<i64, CompileError> {
-        validate_code_ptr(self.entry).map_err(CompileError::InvalidCodePtr)?;
+        // Read the entry ONCE and both validate and call THAT value.
+        //
+        // `validate_code_ptr(self.entry)` followed by `transmute(self.entry)`
+        // is a time-of-check/time-of-use hole: the two are separate loads, the
+        // optimiser is free to reload, and the pointer is written through raw
+        // pointers by paths this `&self` does not synchronise with. Whatever
+        // produces a null there, the one guarantee worth having is that the
+        // pointer we jump to is the pointer we checked.
+        let entry = self.entry;
+        validate_code_ptr(entry).map_err(CompileError::InvalidCodePtr)?;
         match args.len() {
             0 => {
-                let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(entry);
                 Ok(f())
             }
             1 => {
-                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(args[0]))
             }
             2 => {
-                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(args[0], args[1]))
             }
             3 => {
-                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2]))
             }
             4 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2], args[3]))
             }
             5 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2], args[3], args[4]))
             }
             6 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2], args[3], args[4], args[5]))
             }
             7 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     args[0], args[1], args[2], args[3], args[4], args[5], args[6],
                 ))
             }
             8 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
                 ))
@@ -2291,45 +2473,48 @@ impl CompiledMethod {
         vm_ptr: i64,
         args: &[i64],
     ) -> Result<i64, CompileError> {
-        validate_code_ptr(self.entry).map_err(CompileError::InvalidCodePtr)?;
+        // Read the entry ONCE — see [`CompiledMethod::try_call`] for why
+        // validating one load and calling another is not the same check.
+        let entry = self.entry;
+        validate_code_ptr(entry).map_err(CompileError::InvalidCodePtr)?;
         match args.len() {
             0 => {
-                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(vm_ptr))
             }
             1 => {
-                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0]))
             }
             2 => {
-                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1]))
             }
             3 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1], args[2]))
             }
             4 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1], args[2], args[3]))
             }
             5 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1], args[2], args[3], args[4]))
             }
             6 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5],
                 ))
             }
             7 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
                 ))
@@ -3111,11 +3296,11 @@ impl CompiledMethod {
                     format!("deopt point at bci {} holds monitors", p.bci),
                 ));
             }
-            if !deopt::frame_state_is_resumable(fs) {
+            if let Some(slot) = deopt::first_unresumable_slot(fs) {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
                     format!(
-                        "deopt point at bci {} ({:?}) reconstructs an unresumable frame",
+                        "deopt point at bci {} ({:?}) reconstructs an unresumable frame: {slot}",
                         p.bci, p.reason
                     ),
                 ));
@@ -8795,6 +8980,7 @@ fn drain_deferred_jit_owners_if_quiescent() {
     }
     let retired = std::mem::take(&mut *queue);
     drop(queue);
+    let _authorised = AuthorisedReclaim::enter();
     drop(retired);
 }
 
@@ -8807,6 +8993,7 @@ fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
         return;
     }
     if ACTIVE_JIT_EXECUTIONS.is_zero() {
+        let _authorised = AuthorisedReclaim::enter();
         drop(owner);
         return;
     }
@@ -8829,6 +9016,106 @@ pub fn jit_execution_leave() {
     // common "some other thread is still in JIT" case costs one load.
     if ACTIVE_JIT_EXECUTIONS.is_zero() {
         drain_deferred_jit_owners_if_quiescent();
+    }
+}
+
+/// Hand a compiled artifact to the retirement queue.
+///
+/// The public face of `defer_jit_owner`. **Every** long-lived holder of an
+/// `Arc<CompiledMethod>` that backs a raw entry pointer must release it through
+/// here rather than by dropping the `Arc`: a plain drop that happens to be the
+/// last one unmaps the body without asking whether a thread is inside it, which
+/// is exactly the use-after-free the queue exists to prevent. Prefer
+/// [`RetainedCode`], which cannot forget.
+pub fn retire_jit_owner(owner: Option<Arc<CompiledMethod>>) {
+    defer_jit_owner(owner);
+}
+
+/// An `Arc<CompiledMethod>` held as the keep-alive for a raw entry pointer,
+/// whose release goes through the retirement queue **by construction**.
+///
+/// The distinction matters only on the last reference, and only for a body a
+/// thread can be executing — but that is precisely the case a per-call-site or
+/// per-thread dispatch cache produces. Such a cache is evicted by the very
+/// thread dispatching through it (a generation flush, a staleness eviction, a
+/// replacement), so the eviction can run while that thread is *inside* the body
+/// whose only remaining owner the cache entry is. Dropping the `Arc` there
+/// unmaps the code under the thread's own return address.
+///
+/// Wrapping the field makes the routing structural: `clear`, `remove`,
+/// map-replacement, `Vec` truncation and thread-exit teardown all release
+/// through [`retire_jit_owner`] without any of those call sites knowing they
+/// had an obligation.
+pub struct RetainedCode(Option<Arc<CompiledMethod>>);
+
+impl RetainedCode {
+    /// Take ownership of a compiled artifact as a raw-entry keep-alive.
+    pub fn new(owner: Arc<CompiledMethod>) -> Self {
+        Self(Some(owner))
+    }
+
+    /// The underlying artifact.
+    pub fn arc(&self) -> &Arc<CompiledMethod> {
+        self.0.as_ref().expect("RetainedCode is only empty while dropping")
+    }
+}
+
+impl Clone for RetainedCode {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl std::ops::Deref for RetainedCode {
+    type Target = CompiledMethod;
+    fn deref(&self) -> &CompiledMethod {
+        self.arc()
+    }
+}
+
+impl std::fmt::Debug for RetainedCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RetainedCode(entry={:#x})", self.entry_ptr() as usize)
+    }
+}
+
+impl From<Arc<CompiledMethod>> for RetainedCode {
+    fn from(owner: Arc<CompiledMethod>) -> Self {
+        Self::new(owner)
+    }
+}
+
+impl Drop for RetainedCode {
+    fn drop(&mut self) {
+        let Some(owner) = self.0.take() else {
+            return;
+        };
+        // The per-call-site invoke cache is *cloned* on every cached dispatch,
+        // so this drop is a hot path. A drop that is provably not the last
+        // reference cannot unmap anything, and the retirement queue has nothing
+        // to say about it — one relaxed load instead of a striped-counter walk.
+        //
+        // Two concurrent last-two drops can both read `> 1` and neither route.
+        // That is not a hole here, because the safety of a plain last drop does
+        // not rest on this test: `pin_jit_code_range_owner` makes every thread
+        // inside a compiled body hold an owning reference to it, so a reference
+        // count that reaches zero already proves no thread is inside. The queue
+        // remains the backstop, and `published_code_free_audit` counts any
+        // release that skipped it.
+        //
+        // The one caveat, stated because it is invisible at this call site: the
+        // JIT->JIT dispatch pin resolves through the code-range registry, which
+        // `put`/`put_osr` populate only when precise JIT maps OR the
+        // cross-thread root scan are on. Both default ON, and opting out of
+        // BOTH (`CRATONVM_NO_PRECISE_JIT_MAPS=1` with
+        // `CRATONVM_XT_JIT_ROOT_SCAN=0`) leaves that one entry path unpinned —
+        // as it was before this existed, so no regression, but the ownership
+        // argument above is then weaker than the queue alone.
+        if Arc::strong_count(&owner) > 1 {
+            drop(owner);
+            return;
+        }
+        defer_jit_owner(Some(owner));
     }
 }
 
@@ -9275,6 +9562,7 @@ flushed at epoch {barrier}",
         // `JitEntryGuard` reads to keep this class's defining loader alive
         // while one of these frames is on a stack.
         compiled.owner_class_id = declaring_class_id.as_u32();
+        compiled._buffer.mark_published();
         let arc = Arc::new(compiled);
         // Stage 5 — register this method's code range for the GC RBP-chain
         // walker. Enabled when the precise gate is on (the registry is consulted
@@ -9284,11 +9572,7 @@ flushed at epoch {barrier}",
         // would make every peer look "not in JIT" and the scan a no-op). The
         // default path keeps zero bookkeeping overhead.
         if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
-            register_jit_code_range(
-                arc.entry_ptr() as usize,
-                arc.code_len(),
-                Arc::as_ptr(&arc) as usize,
-            );
+            register_jit_code_range_owned(arc.entry_ptr() as usize, arc.code_len(), &arc);
         }
         // DBG (spring-bug-11): record entry→name so a crash report can name the
         // faulting JIT method. Gated; no overhead unless CRATONVM_DBG_JIT_NAMES.
@@ -9368,13 +9652,10 @@ flushed at epoch {barrier}",
         }
         // See the matching note in `put`.
         compiled.owner_class_id = declaring_class_id.as_u32();
+        compiled._buffer.mark_published();
         let arc = Arc::new(compiled);
         if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
-            register_jit_code_range(
-                arc.entry_ptr() as usize,
-                arc.code_len(),
-                Arc::as_ptr(&arc) as usize,
-            );
+            register_jit_code_range_owned(arc.entry_ptr() as usize, arc.code_len(), &arc);
         }
         if jit_names_enabled() {
             register_jit_method_name(
@@ -14397,13 +14678,38 @@ fn try_compile_inner(
             // roots.  Route through the checked re-entrant bridge instead;
             // it installs a distinct JitEntryGuard for the actual callee.
             let direct_jit_callee_calls_enabled = direct_jit_callee_calls_enabled();
-            // PGO-02: virtual/interface sites (0 | 2) now go through the SAME
-            // plan_inline call as static/special (3 | 1) below — the metrics-
-            // only pre-tally that used to stand in for a real admission attempt
-            // here (measuring "how much GuardNotEmittable is costing") is gone;
-            // `inline_tally.record(&plan)` below now records every invoke kind's
-            // real verdict, admitted or refused, uniformly.
-            if !is_recursive_call && matches!(invoke_kind, 0..=3) {
+            // PGO-02: virtual/interface sites (0 | 2) go through the SAME
+            // plan_inline call as static/special (3 | 1) below, but ONLY when
+            // `class_id_name_resolver` is `Some` — i.e. only when
+            // CRATONVM_JIT_GUARDED_VIRTUAL_INLINE is actually on. This flag is
+            // documented (jit/src/lib.rs's `InlineBackendCaps` doc comment,
+            // vm/src/runtime/env_cache.rs's `jit_guarded_virtual_inline`) as
+            // "default-off, unsoaked" and behavior-preserving when off, but
+            // admitting 0|2 unconditionally broke that: `plan_inline` calls
+            // `classify_receiver_shape` (previously reached for these sites
+            // only under the removed `metrics::enabled()`-gated pre-tally)
+            // before it ever consults `caps.guarded_inline_body_at_virtual_sites`,
+            // so flag-off callers paid for and ran that admission machinery on
+            // every virtual/interface call site in every compiled method for
+            // the first time — confirmed via bisect
+            // (f697d618ea, this same plumbing commit with zero codegen behind
+            // it) to be the cause of a javac-self-hosting internal
+            // AssertionError (`Check$SuperThisChecker`, 100% reproducible on
+            // Spring AOT chunk 9) that has nothing to do with the feature this
+            // flag gates. Gating virtual/interface admission on the resolver
+            // being present restores the exact pre-PGO-02 code path (this
+            // whole `if` skipped for 0|2) when the flag is off, matching
+            // static/special's own unconditional admission, which this bug
+            // never touched. The metrics-only pre-tally this replaced is not
+            // restored — losing that one measurement when the feature is off
+            // is an acceptable trade for not running unaudited machinery on
+            // every unrelated JIT compile.
+            let virtual_interface_inline_admitted = class_id_name_resolver.is_some();
+            if !is_recursive_call
+                && (invoke_kind == 3
+                    || invoke_kind == 1
+                    || (virtual_interface_inline_admitted && matches!(invoke_kind, 0 | 2)))
+            {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
                     if let Some(resolver_fn) = inline_resolver.as_ref() {
@@ -20568,6 +20874,123 @@ mod tests {
         if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
             unregister_jit_code_range(new_cm.entry_ptr() as usize);
         }
+    }
+
+    /// Drive a published body down to a single owner and hand that owner to
+    /// the caller, together with its entry address.
+    ///
+    /// `ACTIVE_JIT_EXECUTIONS` is process-global and this suite runs in
+    /// parallel, so "the cache released its reference" is not observable on the
+    /// first try — a sibling test's execution epoch can hold the drain off.
+    /// Pump the quiescence check until the count settles.
+    fn sole_owner_of_a_published_body(
+        cache: &JitCache,
+        class: &Arc<str>,
+        method: &Arc<str>,
+        desc: &Arc<str>,
+        cid: cratonvm_types::ClassId,
+    ) -> (Arc<CompiledMethod>, usize) {
+        let mut buf = ExecutableBuffer::new(64).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            CompiledMethod::new(buf),
+        );
+        let cm = cache
+            .get(class, method, desc, cid)
+            .expect("published body");
+        let entry = cm.entry_ptr() as usize;
+        register_jit_code_range(entry, cm.code_len(), Arc::as_ptr(&cm) as usize);
+        cache.remove(class, method, desc, cid);
+        for _ in 0..500 {
+            if Arc::strong_count(&cm) == 1 {
+                break;
+            }
+            jit_execution_enter();
+            jit_execution_leave();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            Arc::strong_count(&cm),
+            1,
+            "the retirement queue should have released the cache's reference"
+        );
+        (cm, entry)
+    }
+
+    /// The last owner of a published body is regularly a **per-thread dispatch
+    /// cache entry**, and such a cache is evicted by the very thread that
+    /// dispatches through it — a generation flush, a staleness eviction, a
+    /// replacement. So the eviction can run while a frame of that body is on
+    /// that thread's own stack, and a bare `Arc` drop there unmaps executable
+    /// memory with no quiescence proof behind it.
+    ///
+    /// [`RetainedCode`] is what makes the release structural instead of a rule
+    /// every container has to remember. Measured on
+    /// `BasicErrorControllerIntegrationTests` before it existed: 50 published
+    /// bodies per run released outside the queue, seven of them with
+    /// `active_jit_executions` at 1, 2 or 3 — the crash signature of
+    /// `docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
+    #[test]
+    fn retained_code_releases_a_published_body_through_the_queue() {
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("RetainedCodeQueueClass");
+        let method: Arc<str> = Arc::from("m");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(1);
+        let (cm, entry) = sole_owner_of_a_published_body(&cache, &class, &method, &desc, cid);
+
+        let held = RetainedCode::new(cm);
+        jit_execution_enter();
+        drop(held);
+        assert!(
+            lookup_jit_code_range(entry).is_some(),
+            "the last owner must not unmap a published body while a thread is inside compiled code"
+        );
+        jit_execution_leave();
+
+        assert!(
+            eventually(|| lookup_jit_code_range(entry).is_none()),
+            "and must release it once JIT execution is quiescent"
+        );
+    }
+
+    /// The counter behind [`published_code_free_audit`] is the *enforcement* of
+    /// the rule above, and it has to be able to fail: a plain `Arc` drop that
+    /// happens to be the last reference to a published body must be recorded.
+    ///
+    /// Both counters are process-global and monotone, so a sibling test can only
+    /// push them higher — never hide the increment this test causes itself.
+    #[test]
+    fn the_free_audit_records_a_release_that_skipped_the_queue() {
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("UnqueuedReleaseAuditClass");
+        let method: Arc<str> = Arc::from("m");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(1);
+        let (cm, entry) = sole_owner_of_a_published_body(&cache, &class, &method, &desc, cid);
+
+        let (published_before, unqueued_before) = published_code_free_audit();
+        // A bare `Arc`, dropped by hand: exactly the shape the two thread-local
+        // dispatch caches used to have.
+        drop(cm);
+        let (published_after, unqueued_after) = published_code_free_audit();
+
+        assert!(
+            published_after > published_before,
+            "the release of a published body must be counted"
+        );
+        assert!(
+            unqueued_after > unqueued_before,
+            "and a release that never reached the retirement queue must be counted as one"
+        );
+        assert!(
+            lookup_jit_code_range(entry).is_none(),
+            "the unqueued release really did unmap it — which is why it is counted"
+        );
     }
 
     #[test]
