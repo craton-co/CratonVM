@@ -37,11 +37,14 @@ was exactly as harmful as described. It was deleted — along with the
 Two corrections to the report, both worth recording because they cost time to
 re-derive:
 
-* The code is in `gc/src/gen_heap.rs::collect_garbage_inner`, not
-  `gc/src/heap.rs::collect_young_if_threshold`. `gen_heap.rs` keeps a
-  commented-out copy of the exact expression (`let fail_closed_non_moving =
-  is_active() && !gc_flags().allow_moving_young;`) as the historical record,
-  which is what makes a text search still find it.
+* The code is in `gc/src/gen_heap.rs::collect_garbage_inner`. Neither
+  `Heap::collect_young_if_threshold` nor `fail_closed_non_moving` exists in
+  `gc/src/heap.rs` — nor anywhere else; the only names a text search finds
+  today are in a commented-out copy of the exact expression (`let
+  fail_closed_non_moving = is_active() && !gc_flags().allow_moving_young;`)
+  that `gen_heap.rs` keeps as the historical record. The item's "TODO in
+  gc/src/heap.rs" is not there either; that file's TODOs are all NUMA
+  multi-arena work.
 * The fix was **not** "remove or alter the `!allow_moving_young` clause" so
   that the flag permits moving. Both the term *and the flag* were deleted. The
   reasoning is in the source and is the right one: a flag whose only job is to
