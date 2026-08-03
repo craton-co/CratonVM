@@ -163,3 +163,19 @@ classes on JDK 25 at all, so those 8 classes are permanently red in a HotSpot
 control run and must not be scored as CratonVM regressions. The same doc
 records two `run-one.ps1` defects found on the way (it passed none of the
 suite's `--add-opens`/`tomcat.test.*` JVM args, and its exit code was always 0).
+
+## WebSocket-over-TLS `[JSSE]` client connect fixed, 2026-08-03
+
+`SSLEngine.wrap()` treated the caller's source buffer as application data for
+one flight of the handshake: `do_wrap` gated on `!conn.is_handshaking()`, but
+`handshake_status_of` keeps answering NEED_WRAP past that point (group 21's
+TLS-1.2 server-flight fix), so a caller obeying NEED_WRAP had its buffer
+drained — and the bytes ENCRYPTED onto the wire. Tomcat's WebSocket client
+passes a static 16921-byte `DUMMY`, so `wrap` reported `bytesConsumed=16384`,
+tripping `AsyncChannelWrapperSecure`'s "Bytes were consumed from the input
+during a write", and the never-rewound `DUMMY` carried the damage into later
+connections. Gated on `handshake_finished_reported` instead. Both `[JSSE]`
+classes go FAIL → PASS and are the ONLY rows that move across a 16-class TLS
+set run on two binaries; the residual `TestSsl` / `TestClientCert` failures are
+the pre-existing renegotiation ones, identical on both arms. Write-up:
+[websocket-jsse-wrap-consumed-app-data-during-handshake-FIXED](websocket-jsse-wrap-consumed-app-data-during-handshake-FIXED.md).
