@@ -19154,20 +19154,29 @@ pub fn register_essential_natives_with_shims(
     }
 
     fn timezone_default_ref(ctx: &mut dyn NativeContext) -> cratonvm_types::Value {
+        // Fallback id when `TimeZone.setDefault(...)` has never run this
+        // process: honour the embedder's `user.timezone` system property
+        // (set at VM init from `-Duser.timezone`/the environment) instead of
+        // hardcoding "UTC", so a configured startup zone is visible before
+        // any Java code calls `setDefault`.
+        let fallback_id = cratonvm_types::flags::runtime_var("user.timezone")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "UTC".to_string());
         if let Some(class_id) = ctx.class_id_by_name("java/util/TimeZone") {
             if let Some(field_index) = ctx.static_field_index_by_name(class_id, "defaultTimeZone") {
                 let current = ctx.get_static_field(class_id, field_index);
                 if matches!(current, Value::Object(Some(_))) {
                     return current;
                 }
-                let fallback = alloc_synth_timezone(ctx, "UTC");
+                let fallback = alloc_synth_timezone(ctx, &fallback_id);
                 if matches!(fallback, Value::Object(Some(_))) {
                     ctx.set_static_field(class_id, field_index, fallback);
                 }
                 return fallback;
             }
         }
-        alloc_synth_timezone(ctx, "UTC")
+        alloc_synth_timezone(ctx, &fallback_id)
     }
 
     /// Localized display name for a synthetic TimeZone, honouring its `ID` and
@@ -19528,25 +19537,35 @@ pub fn register_essential_natives_with_shims(
         },
     );
 
-    // `TimeZone.getDefault()` — the VM runs on UTC unless the embedder says
-    // otherwise (`user.timezone`), and returning null here made every
-    // `TimeZone.getDefault().getID()` NPE.
-    registry.register(
-        "java/util/TimeZone",
-        "getDefault",
-        "()Ljava/util/TimeZone;",
-        |ctx, _args| {
-            let id = cratonvm_types::flags::runtime_var("user.timezone")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "UTC".to_string());
-            let tz = alloc_concurrent_synthetic(ctx, "java/util/TimeZone", 1);
-            let s = ctx.create_string(&id);
-            ctx.set_field(tz, 0, Value::Object(Some(s)));
-            let _ = ctx.set_field_by_name(tz, "ID", Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(tz))))
-        },
-    );
+    // `TimeZone.getDefault()` is intentionally NOT re-registered here.
+    //
+    // REGRESSION 2026-08-03: this spot used to carry a second
+    // `registry.register("java/util/TimeZone", "getDefault", ...)` (added
+    // 2026-07-31, `98878a6dd`) that allocated a fresh synthetic TimeZone from
+    // the `user.timezone` system property on every call. `register()` is
+    // documented last-registration-wins on the exact (class, method,
+    // descriptor) triple (see `NativeMethodRegistry::register`), and the real
+    // implementation — `timezone_default_ref` above, registered earlier in
+    // this same function at the `"getDefault"` site next to `getDefaultRef`
+    // — reads the actual `TimeZone.defaultTimeZone` static field, which is
+    // what `TimeZone.setDefault(...)`'s real bytecode writes. The later
+    // registration silently shadowed it, so every `TimeZone.getDefault()`
+    // call after a `setDefault(...)` (and everything built on it —
+    // `ZoneId.systemDefault()` above, every JDBC/native path that consults
+    // the JVM default zone) went back to reporting the VM's *startup* zone
+    // instead of whatever the running program had set. Hibernate's
+    // `Timezones.withDefaultTimeZone()`-based temporal tests
+    // (confirmed on `OffsetDateTimeTest`: `failed=0` -> `failed=60`,
+    // identically under the JIT and `--nojit`) went back to reporting
+    // timezone-offset-sized value corruption — this is native-registration
+    // shadowing, not a JIT or GC defect. `timezone_default_ref` now also
+    // honours `user.timezone` as its
+    // own fallback (used only before the first `setDefault` call), so the
+    // duplicate's one legitimate feature is preserved without reintroducing
+    // the shadow. Lesson: "this native looks wrong / returns null" is never
+    // grounds for a fresh `register()` call on a triple without first
+    // grepping whether an earlier one already owns it — the earlier one may
+    // be the correct implementation, and the later call always wins silently.
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
         "getZoneInfo",
