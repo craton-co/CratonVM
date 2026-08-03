@@ -32,8 +32,9 @@ use std::collections::HashMap;
 
 use crate::gc_flags;
 use crate::heap::{
-    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, GC_FLAG_MARKED, HEADER_SIZE,
-    REF_ELEMENT_SIZE, SLOT_SIZE,
+    array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
+    ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, GC_FLAG_MARKED, HEADER_SIZE,
+    OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size};
 use cratonvm_types::{ObjectRef, Value};
@@ -118,6 +119,23 @@ fn min_satisfying_bucket(size: usize) -> usize {
 /// fragmentation fix is load-bearing or an inert lever.
 pub static COALESCE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BLOCKS_MERGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times [`OldGen::scan_region`]/[`OldGen::scan_region_filtered`]
+/// found an invalid `ObjectKind`/`ArrayElementType` tag byte at what should
+/// have been an object boundary and stopped that scan stripe instead of
+/// trusting it.
+///
+/// A non-zero value means the walk desynced from real object headers and
+/// landed on payload bytes (a stale free-list sliver, a mis-sized prior
+/// object, an unparsed TLAB tail, ...). Before this guard existed, that same
+/// desync read the payload byte as a typed `#[repr(u8)]` enum — instant UB
+/// for a discriminant outside the declared set, which optimized code can
+/// lower to a hardware trap (`HIB-DCAST-LATEPHASE.1`,
+/// `docs/internal/fixed-suite-bugs/source-debug-jit-conservative-root-invalid-header-tag-sigill.md`
+/// fixed the same class of bug for the conservative-root validators but
+/// never reached this walk). This counter turns that silent-until-it-traps
+/// failure mode into something a regression test or a log can see.
+pub static WALK_DESYNC_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// GCAUD-2: how many old-gen compactions were ABANDONED because Phase 0's
 /// live-set closure escaped the object walk (see
@@ -786,6 +804,67 @@ impl OldGen {
         objects
     }
 
+    /// Validate the `ObjectKind`/`ArrayElementType` tag bytes at `ptr` before
+    /// any walker constructs a typed `&ObjectHeader` there.
+    ///
+    /// `scan_region`/`scan_region_filtered` derive object boundaries purely
+    /// from arithmetic (`offset += total_size`), trusting that the cursor
+    /// always lands on a real header. When that trust is violated — by any
+    /// of the several walk-desync causes this file documents elsewhere, or
+    /// one not yet found — the cursor lands on arbitrary payload bytes
+    /// (a Java `int`/`long`/pointer field, leftover free-list bytes, ...).
+    /// `ObjectHeader::kind`/`element_type` are `#[repr(u8)]` enums with only
+    /// a handful of valid discriminants; loading an out-of-range byte into
+    /// either as a *typed* enum is immediate undefined behaviour, and
+    /// optimized code is free to lower that UB into a hardware trap rather
+    /// than doing anything resembling "the wrong thing but not crashing" —
+    /// which is exactly the `SIGILL` in `OldGen::compact` this fixes
+    /// (`HIB-DCAST-LATEPHASE.1`; faulting RVA was identical across repeated
+    /// crashes, i.e. a deterministic trap site, not stack-smash noise).
+    ///
+    /// Mirrors the fix already applied to the conservative-root validators
+    /// in `gen_heap.rs`/`g1.rs` (see
+    /// `docs/internal/fixed-suite-bugs/source-debug-jit-conservative-root-invalid-header-tag-sigill.md`):
+    /// read the raw tag bytes and validate them through
+    /// `object_kind_from_tag`/`array_element_type_from_tag` *before* ever
+    /// forming a `&ObjectHeader` reference and touching the typed field.
+    ///
+    /// Returns the validated `ObjectKind` on success. Returns `None` — and
+    /// bumps [`WALK_DESYNC_HITS`] — when either tag byte is not a valid
+    /// discriminant; the caller must treat this exactly like the existing
+    /// `HumongousFiller`/implausible-size guards and stop scanning the
+    /// current stripe rather than trust the cursor further.
+    fn validate_header_tags_or_desync(ptr: *mut u8, offset: usize) -> Option<ObjectKind> {
+        // SAFETY: `ptr` is `base + offset` where `offset` falls inside the
+        // `[start_offset, end_offset)` sub-range of an allocated region within
+        // `self.data` that the caller is scanning, so the two single-byte tag
+        // reads at the fixed header offsets are in-bounds. Reading a `u8`
+        // through a raw pointer has no validity requirement beyond
+        // in-bounds-and-readable, so this cannot itself be the UB the rest of
+        // this function exists to avoid.
+        let kind_tag = unsafe { *ptr.add(OBJECT_KIND_OFFSET) };
+        let elem_tag = unsafe { *ptr.add(ARRAY_ELEMENT_TYPE_OFFSET) };
+        let kind = object_kind_from_tag(kind_tag);
+        let element_type = array_element_type_from_tag(elem_tag);
+        match (kind, element_type) {
+            (Some(kind), Some(_)) => Some(kind),
+            _ => {
+                WALK_DESYNC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    offset,
+                    kind_tag,
+                    elem_tag,
+                    "old-gen walk: invalid ObjectKind/ArrayElementType tag at a walk \
+                     boundary — the walk has desynced from real object headers; \
+                     stopping this scan stripe instead of reading a corrupt header as \
+                     a typed enum. See \
+                     docs/internal/fixed-suite-bugs/source-debug-jit-conservative-root-invalid-header-tag-sigill.md."
+                );
+                None
+            }
+        }
+    }
+
     /// Like [`Self::scan_region`], but only pushes objects whose start
     /// offset lies within one of `dirty_ranges`. Every object boundary is
     /// still visited so the cursor advances correctly; the filter only
@@ -801,13 +880,17 @@ impl OldGen {
         let mut offset = start_offset;
         while offset < end_offset {
             let ptr = (base + offset) as *mut u8;
+            let Some(kind) = Self::validate_header_tags_or_desync(ptr, offset) else {
+                break;
+            };
             // SAFETY: `offset` is a valid object boundary within an
-            // allocated region of the data buffer (see `scan_region`).
+            // allocated region of the data buffer (see `scan_region`), and
+            // the kind/element_type tag bytes were just validated above.
             let header = unsafe { &*(ptr as *const ObjectHeader) };
-            if header.kind == ObjectKind::HumongousFiller {
+            if kind == ObjectKind::HumongousFiller {
                 break;
             }
-            let raw_size = if header.kind == ObjectKind::Array {
+            let raw_size = if kind == ObjectKind::Array {
                 HEADER_SIZE
                     + array_data_size(header.array_length() as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
@@ -844,6 +927,10 @@ impl OldGen {
         let mut offset = start_offset;
         while offset < end_offset {
             let ptr = (base + offset) as *mut u8;
+            let Some(kind) = Self::validate_header_tags_or_desync(ptr, offset) else {
+                break;
+            };
+            // SAFETY: the kind/element_type tag bytes were just validated above.
             let header = unsafe { &*(ptr as *const ObjectHeader) };
             // Round-9 gc CRIT-1: HumongousFiller is a synthetic walker
             // sentinel installed by the regional GC (see `g1.rs` and
@@ -851,10 +938,10 @@ impl OldGen {
             // old-gen layout, but defensively skip the rest of the
             // current scan stripe instead of mis-parsing it as a real
             // object (which would corrupt the offset cursor).
-            if header.kind == ObjectKind::HumongousFiller {
+            if kind == ObjectKind::HumongousFiller {
                 break;
             }
-            let raw_size = if header.kind == ObjectKind::Array {
+            let raw_size = if kind == ObjectKind::Array {
                 HEADER_SIZE
                     + array_data_size(header.array_length() as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
@@ -1168,6 +1255,26 @@ impl OldGen {
     /// are filtered out, matching the bounds gate Phase 2 uses, so a caller
     /// only ever sees old-gen referents.
     ///
+    /// `total_size` MUST be the size `walk_objects` computed for this exact
+    /// object (`HEADER_SIZE + object_body_size(..)` at walk time) and is used
+    /// to cap every arm's iteration count — the same pattern
+    /// `mark_young_to_old_refs` already uses (`max_slots = body_bytes /
+    /// SLOT_SIZE`). `HIB-DCAST-LATEPHASE.1`: this function used to re-read
+    /// `header.array_length()`/`header.num_slots()` fresh at call time and
+    /// trust them completely, with no cap at all. A caller may run this on an
+    /// object well after `walk_objects` validated it — `close_live_set_over_old_gen`'s
+    /// Phase 0 fixpoint, for one, calls this from a `for &(obj_ptr, _size) in
+    /// objects` loop with `_size` unused — and a header field that reads
+    /// differently on that later pass than it did during the walk (this file
+    /// and its siblings document several distinct causes of exactly that) hits
+    /// an UNBOUNDED `for slot_idx in 0..num_slots` stride into unmapped
+    /// memory: the deterministic `SIGSEGV` inside this function's inlined
+    /// legacy-object arm, reached via `close_live_set_over_old_gen`, against
+    /// the real `DefaultCatalogAndSchemaTest` workload. Capping by the
+    /// WALKED size — ground truth this function does not need to re-derive
+    /// or guess at — closes that regardless of why the live re-read
+    /// disagrees.
+    ///
     /// The header is *not* borrowed across the `f` callback: the four scalar
     /// fields needed to drive the walk are copied out up front via
     /// `read_unaligned` on raw field pointers. This matters because a caller
@@ -1176,27 +1283,38 @@ impl OldGen {
     /// header — holding a live `&ObjectHeader` across that write would alias a
     /// `&mut` to the same bytes. Reading scalars up front keeps the borrow
     /// short and the walk sound under a self-loop.
-    fn for_each_old_gen_ref(obj_ptr: *mut u8, data: &[u8], mut f: impl FnMut(usize)) {
+    fn for_each_old_gen_ref(
+        obj_ptr: *mut u8,
+        total_size: usize,
+        data: &[u8],
+        mut f: impl FnMut(usize),
+    ) {
         let data_start = data.as_ptr() as usize;
         let data_end = data_start + data.len();
+        let body_bytes = total_size.saturating_sub(HEADER_SIZE);
 
         // Snapshot the layout-driving fields (incl. the compact oop-map Arc),
         // then drop the reference before any callback runs (see the aliasing
         // note above — `f` may mutate the object's header/fields).
-        let (kind, element_type, array_length, num_slots, compact) = unsafe {
+        let (kind, element_type, array_length, num_slots, is_compact, compact) = unsafe {
             let h = &*(obj_ptr as *const ObjectHeader);
             (
                 h.kind,
                 h.element_type,
                 h.array_length(),
                 h.num_slots(),
+                crate::is_compact_object(h),
                 crate::heap::compact_oop_scan(h),
             )
         };
 
         if kind == ObjectKind::Array {
             if element_type == ArrayElementType::Reference {
-                for i in 0..array_length as usize {
+                // Cap by the WALKED size, not the freshly-read `array_length`
+                // — see this function's doc comment.
+                let max_elems = body_bytes / ref_element_size();
+                let elems = (array_length as usize).min(max_elems);
+                for i in 0..elems {
                     let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
                     let raw: u64 = unsafe { read_ref_slot(slot) };
                     if raw != 0 {
@@ -1207,24 +1325,43 @@ impl OldGen {
                     }
                 }
             }
-        } else if let Some((layout, body)) = compact {
-            // Compact object: 8-byte reference slots at the oop-map offsets.
-            for &off in &layout.ref_offsets {
-                let off = off as usize;
-                if off + ref_field_size() > body {
-                    break;
-                }
-                let slot = unsafe { obj_ptr.add(HEADER_SIZE + off) };
-                let raw: u64 = unsafe { read_ref_slot(slot) };
-                if raw != 0 {
-                    let ref_ptr = raw as usize;
-                    if ref_ptr >= data_start && ref_ptr < data_end {
-                        f(ref_ptr);
+        } else if is_compact {
+            // HIB-DCAST-LATEPHASE.1: `compact_oop_scan` returns `None` both
+            // for "this is a legacy object" (its documented contract) and,
+            // via its internal `class_layout_for_fields(..)?`, for "this IS
+            // a compact object (`GC_FLAG_COMPACT` set) but its class's
+            // layout is not registered right now". Gating on `is_compact`
+            // (the header bit, independent of the registry) rather than
+            // `compact.is_some()` keeps the second case from falling into
+            // the legacy arm below, which would misread this object's
+            // packed compact body under the legacy `num_slots * SLOT_SIZE`
+            // formula and stride past its real extent — a `SIGSEGV` reached
+            // this way against the real `DefaultCatalogAndSchemaTest`
+            // workload. A compact object whose layout cannot be resolved has
+            // no provably-safe reference slots to visit; skip it.
+            if let Some((layout, body)) = compact {
+                // Compact object: 8-byte reference slots at the oop-map offsets.
+                for &off in &layout.ref_offsets {
+                    let off = off as usize;
+                    if off + ref_field_size() > body {
+                        break;
+                    }
+                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + off) };
+                    let raw: u64 = unsafe { read_ref_slot(slot) };
+                    if raw != 0 {
+                        let ref_ptr = raw as usize;
+                        if ref_ptr >= data_start && ref_ptr < data_end {
+                            f(ref_ptr);
+                        }
                     }
                 }
             }
         } else {
-            for slot_idx in 0..num_slots as usize {
+            // Cap by the WALKED size, not the freshly-read `num_slots` — see
+            // this function's doc comment.
+            let max_slots = body_bytes / SLOT_SIZE;
+            let slots = (num_slots as usize).min(max_slots);
+            for slot_idx in 0..slots {
                 let slot = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                 let value = unsafe { std::ptr::read(slot as *const Value) };
                 if let Value::Object(Some(ref_obj)) = value {
@@ -1314,7 +1451,7 @@ impl OldGen {
         // from 0→1, so this terminates in at most `objects.len()` passes.
         loop {
             let mut promoted_any = false;
-            for &(obj_ptr, _size) in objects {
+            for &(obj_ptr, size) in objects {
                 // Snapshot the marked bit; don't hold a header borrow while the
                 // closure below may write the same header (self-loop case).
                 let is_marked =
@@ -1322,7 +1459,7 @@ impl OldGen {
                 if !is_marked {
                     continue; // only trace *live* referrers
                 }
-                Self::for_each_old_gen_ref(obj_ptr, data, |ref_ptr| {
+                Self::for_each_old_gen_ref(obj_ptr, size, data, |ref_ptr| {
                     // GCAUD-2: `for_each_old_gen_ref` filters only on the
                     // backing store's [start, end) range — no alignment, no
                     // object-start validation. Writing a mark bit through an
@@ -1765,6 +1902,60 @@ mod tests {
         assert_eq!(objects[0].1, obj_size1);
         assert_eq!(objects[1].0, p2);
         assert_eq!(objects[1].1, obj_size2);
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`: a walk that desyncs from real object
+    /// boundaries lands on arbitrary bytes. Before this fix `scan_region`
+    /// read those bytes as a typed `ObjectKind` unconditionally — instant UB
+    /// for a tag outside `{0, 1, 2}`, which optimized code lowered to a
+    /// `SIGILL` inside `OldGen::compact` (deterministic faulting RVA across
+    /// repeated crashes against the real `DefaultCatalogAndSchemaTest`
+    /// workload). This corrupts only the raw tag byte of an otherwise
+    /// legitimately-allocated object, mirroring the regression style already
+    /// used for the conservative-root validators (see
+    /// `docs/internal/fixed-suite-bugs/source-debug-jit-conservative-root-invalid-header-tag-sigill.md`),
+    /// and asserts the walk stops at the corrupted header instead of
+    /// trusting it.
+    #[test]
+    fn walk_objects_stops_at_a_desynced_invalid_kind_tag_instead_of_trapping() {
+        let mut og = OldGen::new(4096);
+
+        let obj_size1 = HEADER_SIZE + 2 * SLOT_SIZE;
+        let p1 = og.alloc(obj_size1, 8).unwrap();
+        unsafe {
+            let header = &mut *(p1 as *mut ObjectHeader);
+            header.set_num_slots(2);
+        }
+
+        let obj_size2 = HEADER_SIZE + SLOT_SIZE;
+        let p2 = og.alloc(obj_size2, 8).unwrap();
+        unsafe {
+            let header = &mut *(p2 as *mut ObjectHeader);
+            header.set_num_slots(1);
+        }
+
+        // 0xFF is not a declared ObjectKind discriminant (0=Object, 1=Array,
+        // 2=HumongousFiller).
+        // SAFETY: `p2 + OBJECT_KIND_OFFSET` is the `kind` byte of a live
+        // allocation from this OldGen; writing a raw `u8` there does not
+        // require the resulting value to be a valid `ObjectKind`.
+        unsafe {
+            std::ptr::write(p2.add(OBJECT_KIND_OFFSET), 0xFFu8);
+        }
+
+        let before = WALK_DESYNC_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let objects = og.walk_objects();
+        let after = WALK_DESYNC_HITS.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            objects,
+            vec![(p1, obj_size1)],
+            "the walk must stop at the corrupted header, not trust it"
+        );
+        assert!(
+            after > before,
+            "expected the desync guard to fire and bump WALK_DESYNC_HITS"
+        );
     }
 
     /// Dangling-ref guard (Phase 0): a MARKED object that references an
