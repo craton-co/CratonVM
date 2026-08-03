@@ -3,7 +3,8 @@
 **Retired 2026-08-03.** Every opcode the lane owned now has an
 `IrBuilder::build` arm and a lowering, and the measured refusal count for all
 seven is **zero**. The brief this replaces was
-`docs/known-issues/c2/cov-02-array-element-access.md`.
+`docs/known-issues/c2/cov-02-array-element-access.md`, now archived at
+`docs/known-issues/c2/archive/cov-02-array-element-access.md`.
 
 ## What the lane claimed, and what was true
 
@@ -16,7 +17,9 @@ had been sitting on `ir_lower`'s `UNLOWERABLE` list, constructed only by
 `#[cfg(test)]` code, since the IR tier was built. Nothing had to be designed;
 three arms and two emitters had to be written.
 
-Two deltas against the brief, both recorded here rather than left in prose:
+Three deltas against the brief, recorded here rather than left in prose. The
+third is in "How it is verified" below, because it is a property of the test
+rather than of the finding.
 
 1. **"`CRATONVM_DBG=ir-compiles` before/after on `AutoConfigurationSorterTests`
    (43 of the 77 events are there)" is wrong.** Four of the 43 `arraylength`
@@ -94,7 +97,7 @@ another, both deliberately:
    every later safepoint. See delta 2 above for what that is and is not worth
    today.
 
-### Two things worth copying rather than re-deriving
+### Three things worth copying rather than re-deriving
 
 * **Every emitted instruction is byte-identical to the single-pass twin** in
   `jit/src/x64/arrays.rs`. That is not tidiness: `jit/tests/ir_vs_singlepass.rs`

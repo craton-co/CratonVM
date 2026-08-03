@@ -122,7 +122,7 @@ pre-session numbers from `header-shrink.md` §6.6 are in parentheses):
 | `jit/src/lib.rs:3236` (3186) | `(HEADER_SIZE + body_off) as i32` — compact string field **payload** address | disp32 |
 | `jit/src/lib.rs:3210` (3226) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32` — legacy string field cell | disp32 |
 
-**2026-08-03, COV-02** (`docs/known-issues/c2/cov-02-array-element-access.md`)
+**2026-08-03, COV-02** (`docs/internal/cov-02-array-element-access-RETIRED-20260803.md`)
 added three more `ir_lower.rs` sites, all **disp8**, all checked by
 `disp::disp8_const` rather than narrowed with a raw cast:
 

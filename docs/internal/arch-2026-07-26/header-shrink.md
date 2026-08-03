@@ -355,7 +355,7 @@ inventory before anyone attempts 16. This session added
 
 **2026-08-03, COV-02.** `ir_lower.rs` gained the integral and reference array
 element access it never had
-(`docs/known-issues/c2/cov-02-array-element-access.md`), which is three more
+(`docs/internal/cov-02-array-element-access-RETIRED-20260803.md`), which is three more
 emission sites — and none of them is a raw narrowing cast:
 
 - `emit_gpr_array_elem_load` / `emit_gpr_array_elem_store` — one
