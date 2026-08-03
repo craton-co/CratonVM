@@ -2172,17 +2172,38 @@ impl GenerationalHeap {
             // this point. Not a functional change: only executed on the
             // already-panicking path, gated behind the same debug flag.
             let fwd_ptr = header.forwarding_address();
+            // 2026-08-03: `is_forwarded()` is a bare `!fwd_ptr.is_null()` check
+            // with no validation of what it points at — the same trust this
+            // diagnostic itself used to extend to `fwd_ptr` before dereferencing
+            // it below. When the header under suspicion is not a genuine
+            // forwarding marker but a corrupted one (garbage bytes that happen
+            // to leave `forwarding_ptr` non-null — the same corruption class
+            // `old_gen_mark_candidate_plausible` screens for elsewhere), that
+            // deref reads unmapped memory and SIGSEGVs the diagnostic itself
+            // instead of reporting the corruption it exists to catch. Route
+            // through `is_object_address` (lock-free, bounds+alignment+tag
+            // validated) exactly like every other "is this byte pattern a real
+            // object base" check in this file, and report an implausible target
+            // as data rather than crashing on it.
             let (fwd_class_id, fwd_kind) = if !fwd_ptr.is_null() {
-                // SAFETY: `fwd_ptr` is a non-null forwarding address (checked above) installed by evacuation,
-                // pointing at the object's live relocated header; read-only, diagnostic-only (stale-objref debug) path.
-                let fwd_header = unsafe { &*(fwd_ptr as *const ObjectHeader) };
-                // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`.
-                // `fwd_ptr` came out of a header this very diagnostic suspects,
-                // so its target is not trustworthy enough to decode as an enum.
-                (
-                    fwd_header.class_id.as_u32(),
-                    format!("0x{:02x}", fwd_header.kind as u8),
-                )
+                match self.is_object_address(fwd_ptr as usize) {
+                    Some(fwd_obj) => {
+                        // SAFETY: `is_object_address` validated `fwd_ptr` as a
+                        // plausible object base inside a managed region before
+                        // returning it; read-only, diagnostic-only (stale-objref
+                        // debug) path.
+                        let fwd_header = unsafe { &*(fwd_obj.as_ptr() as *const ObjectHeader) };
+                        // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`.
+                        (
+                            fwd_header.class_id.as_u32(),
+                            format!("0x{:02x}", fwd_header.kind as u8),
+                        )
+                    }
+                    None => (
+                        u32::MAX,
+                        format!("<implausible-forward 0x{:x}>", fwd_ptr as usize),
+                    ),
+                }
             } else {
                 (u32::MAX, "<null-forward>".to_string())
             };
@@ -2200,11 +2221,34 @@ impl GenerationalHeap {
                 use std::fmt::Write as _;
                 if let Some(old) = self.old_gen.try_lock() {
                     let card_base = self.card_table.base_addr();
-                    'oldscan: for (optr, _sz) in old.walk_objects() {
+                    'oldscan: for (optr, sz) in old.walk_objects() {
                         // SAFETY: walk_objects yields valid object starts.
                         let oh = unsafe { &*(optr as *const ObjectHeader) };
+                        // Re-derive this object's total size from the header
+                        // `for_each_ref_slot` is about to trust (`num_slots`/
+                        // `array_length`) and compare it against `sz`, the size
+                        // `walk_objects` already validated fits this object's
+                        // slot in the region a moment ago. This is the same
+                        // "the caller must not trust a header `for_each_ref_slot`
+                        // hasn't screened" gap `get_header_diagnostics`'s
+                        // `fwd_ptr` deref had — a header this diagnostic reads a
+                        // second time, on a heap the panic path does not hold a
+                        // GC-exclusive lock over, can read differently than the
+                        // walk that produced `sz`. Trusting it blindly here made
+                        // `for_each_ref_slot` stride `num_slots`/`array_length`
+                        // slots past a plausible-looking `optr` and SIGSEGV the
+                        // diagnostic itself, exactly like the `fwd_ptr` case
+                        // above. Skip (report nothing for this object) rather
+                        // than crash — the same "over-retain / under-report, but
+                        // never dereference blind" tradeoff as everywhere else in
+                        // this holder scan.
+                        if gen_object_total_size(oh) != sz {
+                            continue 'oldscan;
+                        }
                         let mut hits: Vec<usize> = Vec::new();
-                        // SAFETY: header/object pair valid for the walk.
+                        // SAFETY: header/object pair valid for the walk; `sz`
+                        // re-check above confirms the header is self-consistent
+                        // with what `walk_objects` measured for this slot.
                         unsafe {
                             for_each_ref_slot(optr, oh, |raw, idx| {
                                 if raw as usize == stale_usize {
