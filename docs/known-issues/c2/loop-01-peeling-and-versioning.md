@@ -160,6 +160,37 @@ bci's OSR entry lands inside the fallback copy — after the guard and all four
 guarded bodies — while the header's lands before them. `pc_to_native` is
 non-decreasing in pc, so that comparison is a statement about position.
 
+## What executing it found
+
+Adding `CRATONVM_JIT=bytecode-loop-xform` (see
+[Reachability](#reachability) for why `deopt-real=0` is needed with it) made
+this the first configuration in which any of these transforms runs. The first
+real workload put through it threw `NullPointerException`, deterministically,
+while every unit test passed.
+
+`LoopXform::osr_entry_pc` answered the loop header's OSR entry with the
+pre-header **guard**, reasoning that re-evaluating it there is exactly what a
+fall-through entry does. True of the bytecode; false of the machine code. An OSR
+entry is only valid at a pc whose compiled state the entry trampoline can
+reconstruct from the interpreter frame, and the emitter publishes that state at
+loop headers — the guard is in the prologue's straight-line code, where a local
+can still live in a register the trampoline does not seed. The loop ran with a
+null receiver.
+
+Every bci in the region, header included, now enters the fallback copy, which is
+a loop header. `probes/LoopVersionOsrProbe.java` is the reproducer and the
+bisect: the failure needed a versioned artifact **and** the OSR door **and** a
+second loop in the method, and each of those three is a separate method in the
+probe that was correct on its own.
+
+Two things this says beyond the bug itself. The transform lane's own acceptance
+criterion — "prove it fired by something only a transformed artifact has" — is
+necessary but not sufficient: the artifact was correct, its *entry contract* was
+not. And a bytecode-level transform can be provably sound as a bytecode
+rewrite (the step-sequence equivalence tests all passed) and still be wrong,
+because the coordinate change it publishes is consumed by machine-level
+machinery with preconditions the bytecode does not express.
+
 ## Premises that did not hold
 
 Three, found while implementing this, in the spirit of the campaign's rule 1:
@@ -205,4 +236,18 @@ Not built, and each is a lane rather than an increment:
   cannot express — it is a lower bound, not an equality) plus a cross-loop
   dependence test.
 
-And, before any of them: `loop-02`, without which none of this executes.
+And, before any of them: `loop-02`, without which none of this executes on a
+default configuration.
+
+## Running it
+
+```bash
+CRATONVM_JIT='bytecode-loop-xform,deopt-real=0' CRATONVM_DBG='jit-gen' \
+  cratonvm --java-home <jdk> -cp probes LoopXformProbe
+```
+
+`[JIT_GEN] bytecode loop rewrite: kind=… versioned=… …` is one line per rewrite;
+`bytecode loop rewrite refused: …` is one per refusal. Both tokens are needed —
+the first arms the rewriter (and turns the native byte-copy unroller off in the
+same motion), the second clears the whole-compile refusal that would otherwise
+fire before any loop is looked at.

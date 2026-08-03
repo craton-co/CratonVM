@@ -40819,14 +40819,16 @@ mod loop_unroll_admission {
     /// above), so this compiles the bytes the planner produced *as* the method
     /// and asserts a property of the resulting machine code that no
     /// untransformed artifact can have: mapped back into interpreter-bci space,
-    /// the OSR entry for a mid-body bci lands inside the FALLBACK copy, which
-    /// sits after the guard and all four guarded bodies — while the header's
-    /// entry sits before them, on the guard. `pc_to_native` is non-decreasing
-    /// in pc, so comparing native offsets compares positions.
+    /// EVERY OSR entry in the region — the header's included — lands inside the
+    /// FALLBACK copy, which sits after the guard and all four guarded bodies.
+    /// `pc_to_native` is non-decreasing in pc, so that comparison is a
+    /// statement about position.
     ///
     /// The edit that would trip it: dropping the `versioning` arm of
     /// `osr_entry_pc`, which would answer with a guarded copy and make
-    /// `mid < fallback_off`.
+    /// `mid < fallback_off`. Pointing the header at the guard instead — which
+    /// is what it did until the transform was executed on real code — trips it
+    /// at `rebuilt[4]`.
     #[test]
     fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
         let _armed = Armed::new();
@@ -40868,9 +40870,11 @@ mod loop_unroll_admission {
 
         let fallback_off = out_osr[v.fallback_base];
         assert!(fallback_off >= 0, "the fallback copy was emitted");
-        assert!(
-            rebuilt[4] < fallback_off,
-            "the header's entry is the guard, ahead of both versions"
+        assert_eq!(
+            rebuilt[4], fallback_off,
+            "the header's OSR entry is the fallback copy's first byte — NOT the \
+             guard, which is not a loop header and so is not a pc the OSR \
+             trampoline can reconstruct a compiled state for"
         );
         for bci in [9usize, 10, 11, 12, 13, 16] {
             assert!(

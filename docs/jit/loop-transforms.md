@@ -79,9 +79,15 @@ header. The guard's bytes carry that bci but are **not images** of it
 (`outputs_for_bci` skips them), so no pc-keyed side table is replicated onto
 synthetic bytecode.
 
-OSR enters the **fallback**, except at the header itself, where it enters the
-guard and re-selects a version exactly as a fall-through entry does. Entering a
-guarded copy at a mid-body bci would skip the guard.
+OSR enters the **fallback**, at every bci in the region including the header.
+Not a guarded copy — entering one skips the guard — and not the guard either,
+even though re-evaluating it there is exactly what a fall-through entry does.
+An OSR entry is only valid at a pc whose compiled state the entry trampoline can
+reconstruct from the interpreter frame, and the emitter publishes that state at
+loop *headers*; the guard sits in the prologue's straight-line code, where a
+local can still live in a register the trampoline does not seed. Answering the
+header with the guard produced a null receiver on a real workload — see
+`probes/LoopVersionOsrProbe.java`.
 
 For peel and unroll the guard is a profitability filter only — both are legal at
 every trip count. See `docs/known-issues/c2/loop-01-peeling-and-versioning.md`.

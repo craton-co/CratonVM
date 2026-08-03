@@ -3368,11 +3368,14 @@ pub(crate) enum LoopXformRefusal {
 ///   [`LoopXform::outputs_for_bci`] skips them, so replicating a pc-keyed side
 ///   table never lands a field resolution or an inline cache on synthetic
 ///   bytecode.
-/// * **OSR enters the fallback, never the fast version** — except at the header
-///   itself, where entering the guard re-evaluates it and picks a version,
-///   exactly as a fall-through entry does. Entering the fast version at a
-///   mid-body bci would skip the guard, which is the whole point of having one.
-///   [`LoopXform::osr_entry_pc`] answers that.
+/// * **OSR enters the fallback, and never anything else.** Not the transformed
+///   copies — entering one skips the guard, which is the whole point of having
+///   one — and not the guard either, even at the header, where re-evaluating it
+///   would be correct at the bytecode level. An OSR entry is only valid at a pc
+///   whose compiled state the entry trampoline can reconstruct from the
+///   interpreter frame, and the emitter publishes that state at loop headers;
+///   the guard sits in the prologue's straight-line code. See
+///   [`LoopXform::osr_entry_pc`], which carries the failure that taught this.
 /// * **Both loops still poll.** The fast path's back edge and the fallback's are
 ///   each checked with [`emits_safepoint_poll_at`] on the emitted bytes.
 ///
@@ -3648,17 +3651,25 @@ impl LoopXform {
             return Some(bci + self.suffix_shift);
         }
         if let Some(v) = &self.versioning {
-            // The header's image is the GUARD. Entering there re-evaluates it
-            // and takes whichever version it selects, which is exactly what a
-            // fall-through entry does — and it is the only way an OSR entry can
-            // ever reach the transformed version at all.
-            if bci == self.header {
-                return Some(v.guard_pc);
-            }
-            // Every other bci in the region enters the FALLBACK copy: it is the
-            // one image that is valid without the guard having run, and it is a
-            // full image of the region — back edge included — so every bci in
-            // the region round-trips, with none of unroll's back-edge gap.
+            // EVERY bci in the region, the header included, enters the FALLBACK
+            // copy. It is a full image of the region — back edge included — so
+            // every bci round-trips, with none of unroll's back-edge gap.
+            //
+            // The header does NOT enter the guard, and that is not a missed
+            // optimisation but the fix for a wrong-code bug this returned
+            // before it was executed on real code. Re-evaluating the guard on
+            // entry looks like exactly what a fall-through entry does, and at
+            // the bytecode level it is. At the MACHINE level it is not: an OSR
+            // entry is only valid at a pc whose compiled state the entry
+            // trampoline can reconstruct from the interpreter frame, and the
+            // emitter publishes that state at loop headers, not at arbitrary
+            // straight-line pcs. The guard sits in the method's prologue, where
+            // a local can legitimately live in a register the trampoline does
+            // not seed — entering there ran the loop with a null `this` for the
+            // receiver stored just above it.
+            //
+            // Cost: an OSR-entered method runs the untouched loop rather than
+            // the transformed one. Only entering costs that, not calling.
             return Some(v.fallback_base + (bci - self.header));
         }
         match self.kind {
@@ -6171,7 +6182,7 @@ mod loop_xform_tests {
     }
 
     #[test]
-    fn osr_into_a_versioned_loop_takes_the_guard_or_the_fallback() {
+    fn osr_into_a_versioned_loop_lands_in_the_fallback_and_never_the_guard() {
         let code = shape_a();
         let (len, header, back_edge) = (23usize, 4usize, 18usize);
         for kind in [LoopXformKind::Peel, LoopXformKind::Unroll] {
@@ -6188,11 +6199,14 @@ mod loop_xform_tests {
                 )
                 .expect("versioned");
                 let v = x.versioning.clone().expect("versioned");
-                // The header enters the GUARD. Re-evaluating it is what makes
-                // the transformed version reachable from an OSR entry at all,
-                // and it is exactly what a fall-through entry does.
-                assert_eq!(x.osr_entry_pc(header), Some(v.guard_pc));
-                // Every other bci in the region enters the FALLBACK: entering a
+                // The header enters the FALLBACK, not the guard. Entering the
+                // guard is correct bytecode and wrong machine code: the guard
+                // is not a loop header, so it is not a pc the OSR trampoline
+                // can reconstruct a compiled state for. This assertion is the
+                // regression test for the null receiver that produced.
+                assert_eq!(x.osr_entry_pc(header), Some(v.fallback_base));
+                assert_ne!(x.osr_entry_pc(header), Some(v.guard_pc));
+                // …and so does every other bci in the region: entering a
                 // transformed copy would skip the guard, which is the whole
                 // point of having one.
                 let mut pc = header + bytecode_len_at(&code, header);
@@ -6202,10 +6216,20 @@ mod loop_xform_tests {
                     assert_eq!(x.bci_at(entry), Some(pc));
                     assert!(entry >= x.steady_state_base() && entry <= x.back_edge_pc());
                     assert!(
-                        entry < x.fast_base() || entry >= v.fallback_base,
+                        entry >= v.fallback_base,
                         "{kind:?} k={k} bci={pc}: OSR entered a guarded copy"
                     );
                     pc += bytecode_len_at(&code, pc);
+                }
+                // No OSR entry anywhere in the method resolves into the guard.
+                let (gfrom, gto) = x.guard_span().expect("versioned");
+                for bci in 0..len {
+                    if let Some(entry) = x.osr_entry_pc(bci) {
+                        assert!(
+                            entry < gfrom || entry >= gto,
+                            "{kind:?} k={k} bci={bci}: OSR entry {entry} is inside the guard"
+                        );
+                    }
                 }
                 // Versioning has no back-edge gap whatever the fast side is:
                 // the fallback is a full image of the region, back edge

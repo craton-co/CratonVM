@@ -269,16 +269,61 @@ compile nevertheless recorded a `deopt_points` entry, `compile_with_param_slots`
 interpreter resume point. The three refusals above make that vector provably
 empty; the check exists so a future emit path cannot silently break it.
 
+## What executing it found
+
+`CRATONVM_JIT='bytecode-loop-xform,deopt-real=0'` is the first configuration in
+which any of this runs. The first workload put through it —
+`bench/StringRegexOnly.java` — threw `NullPointerException` at `sb.append(i)`,
+deterministically, from n = 20,000 up.
+
+The bisect (`probes/LoopVersionOsrProbe.java` is the reproducer, and its comment
+is the argument) needed three things at once:
+
+* a **versioned** artifact — the same loop with an unprovable trip count gets an
+  unversioned unroll and was always correct;
+* entry through the **OSR** door — the same versioned artifact entered by
+  invocation count was correct;
+* a **second loop** in the method, so the OSR request lands on a header whose
+  compiled state matters.
+
+Cause: `LoopXform::osr_entry_pc` answered the loop header's OSR entry with the
+pre-header **guard**, on the reasoning that re-evaluating it there is exactly
+what a fall-through entry does. That is true of the bytecode and false of the
+machine code. An OSR entry is only valid at a pc whose compiled state the entry
+trampoline can reconstruct from the interpreter frame, and the emitter publishes
+that state at loop headers — the `[osr-meta] published_entries` list is exactly
+that set, and the guard's pc is not in it. The guard sits in the method's
+prologue, where a local can still live in a register the trampoline does not
+seed, so the loop ran with a null receiver.
+
+Fix: every bci in the region, header included, enters the fallback copy — which
+*is* a loop header. The cost is that an OSR-entered method runs the untouched
+loop rather than the transformed one; only entering costs that, not calling.
+
+This is the case for the flag existing. Every unit test passed throughout.
+
+## What IS validated
+
+* Both compile doors, on real Java: the invocation-count door and the OSR door,
+  each producing a versioned artifact whose answers match HotSpot's exactly
+  (`probes/LoopXformProbe.java`, `probes/LoopVersionOsrProbe.java`,
+  `bench/StringRegexOnly.java`, `bench/HashMapOnly.java`).
+* `cargo test -p cratonvm-jit --test '*'` with the rewriter armed and
+  `deopt_real` off: 196 tests, all passing, with the transform firing during the
+  run (confirmed with `CRATONVM_DBG=jit-gen`, not assumed — a vacuous pass here
+  would look identical).
+* `cargo test -p cratonvm-vm --lib` armed: no regression against the unarmed
+  run.
+
 ## What is NOT validated
 
-* No suite has run with the rewriter armed. No stress harness, no sanitizer,
-  no benchmark A/B. The unit tests in `x64.rs::loop_unroll_admission` are the
-  only evidence.
-* The end-to-end test compiles one helper-free integer loop and checks the
-  published OSR metadata is `orig_code_len + 1` long with `-1` across the
-  back-edge gap. It does **not** execute the compiled code.
-* Nothing has exercised a rewritten method through a real GC pause, a real
-  deopt, a real OSR entry, or a real exception.
+* No application suite (Tomcat, H2, Spring Boot) has run with the rewriter
+  armed, and no sanitizer or GC-stress configuration has. The workloads above
+  are single-threaded and allocate little.
+* No benchmark A/B. Wall-clock on the shared Azure host spreads far too wide to
+  read a transform this size, and the only honest meter there is callgrind.
+* Nothing has exercised a rewritten method through a real GC pause or a real
+  deopt. A real OSR entry is now covered, and that is where the one bug was.
 * Inline-cache sharing across copies is *argued*, not measured. If it is ever
   wrong, the symptom is a megamorphic slot where the native unroller would have
   had `k+1` monomorphic ones — slower, not incorrect.
