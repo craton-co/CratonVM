@@ -116,6 +116,11 @@ Write it up before starting it, not after.
 
 ## Addendum — the `CRATONVM_JIT_FORCE_C2=1` arm
 
+> Measured **before** `cov-01` landed. Its "default" column is therefore the
+> pre-`cov-01` tier, and the `0xb2` / `0x12` / `0x13` rows in its opcode table
+> are now zero in both arms — see the next section. Its *conclusions* are
+> unaffected and one of them was the reason to run `cov-01` first.
+
 Run the same day, same binary, same ten workloads, to answer the question the
 `cov-*` lanes rest on: **is a C2 body better than the C1 body it replaces?** If
 it is not, widening IR coverage makes things worse faster, and this project has
@@ -185,6 +190,13 @@ The curve scales by roughly 1.5x and the ranking is unchanged;
 `cov-01`/`cov-02` ordering holds for the full population, not just the promoted
 subset.
 
+That prediction was then tested rather than left standing: `cov-01` landed the
+same day and took its three rows to zero on the default arm, which moved
+`cov-02` to the whole of the remaining opcode gap — exactly the ordering this
+table said to expect. Nobody has re-run the force-c2 arm since; when someone
+does, the `0xb2` / `0x12` / `0x13` rows should be zero there too, and that is a
+cheap check on whether this arm still measures what it says.
+
 The whole-method conjuncts do **not** scale uniformly, and two of them move up:
 
 | conjunct | default | force-c2 | ratio |
@@ -218,6 +230,133 @@ say the `cov-*` programme is not self-defeating; it is not enough to say it
 pays. Settling it needs `run-cratonbench-gate.sh` on a quiet host — and per
 `meas-02`, a workload that actually reaches the tier, which CratonBench does
 not.
+
+## Re-measured after `cov-01` landed, same day
+
+`cov-01` closed (`docs/internal/cov-01-constants-and-statics-RETIRED-20260803.md`).
+Its three opcodes are at **zero**. Everything below is the same command on the
+same workload — `ConditionalOnPropertyTests`, default configuration,
+`CRATONVM_DBG=ir-compiles` — with the arms **interleaved, two runs each and in
+both orders**. Interleaving matters even for counts: tiering is time-driven, so
+the number of compile requests a run issues drifts by a few, and a
+block-per-arm layout would attribute that drift to the change.
+
+| | base | after `cov-01` |
+|---|---:|---:|
+| admitted to the optimizing pipeline | 694–695 | 694–695 |
+| **bodies the optimizing backend produced** | **410** | **501–502** |
+| `IrBuilder::build returned None` | 281–282 | **180** |
+
+**+91 bodies, +22%**, from 155 opcode-gap events removed. The two numbers do
+not match, and the gap is the thing to read: a method that stops failing on
+`0x12` immediately fails on whatever it meets next. Most of them met `cov-04`.
+
+All three Spring workloads, same protocol, `cov-01` opcode-gap events
+(`0x12` + `0x13` + `0xb2`) in the last column:
+
+| workload | bodies before | bodies after | Δ | gaps before → after | tests |
+|---|---:|---:|---:|---|---|
+| `ConditionalOnPropertyTests` | 410 | 501–502 | **+91 (+22%)** | 155 → **0** | 38/38 |
+| `AutoConfigurationSorterTests` | 123–124 | 142 | **+18 (+15%)** | 23 → **0** | 18/18 |
+| `ConditionalOnClassTests` | 57–58 | 63 | **+6 (+10%)** | 12–13 → **0** | 5/5 |
+| **total** | **590–592** | **706–707** | **+116 (+20%)** | 190–191 → **0** | — |
+
+The 590–592 figure is the same 592 the headline table reports for all ten
+workloads, because the bench phases contribute two bodies and the three Spring
+classes contribute the rest. Every arm passes its tests and none crashed.
+
+### `cov-01` **and** `cov-02` together — the number to size the next lane from
+
+The two lanes landed the same day, independently, so neither table above
+includes the other's work. Measured on the merged tree, same protocol, against
+a `cov-02`-only baseline:
+
+| `ConditionalOnPropertyTests` | `cov-02` only | both lanes |
+|---|---:|---:|
+| admitted | 696–697 | 695 |
+| **bodies** | **442–443** | **537–538** |
+| `build returned None` | 247 | **136** |
+
+`cov-01` is worth **+95 bodies on top of `cov-02`** — measured, not inferred
+from the two independent deltas. Against the original survey's 410, the two
+lanes together are **+128, +31%**.
+
+**The opcode gap is now essentially closed.** Ten events remain on this
+workload, down from 196:
+
+| opcode | mnemonic | events | lane |
+|---|---|---:|---|
+| `0xbc` | `newarray` | 4 | `cov-06` |
+| `0x53` | `aastore` | 4 | `cov-02`'s one deliberate exception |
+| `0xb3` | `putstatic` | 1 | nobody (the SATB pre-barrier) |
+| `0x5c` | `dup2` | 1 | nobody |
+
+Everything else the builder still refuses is **structural**, and two thirds of
+it is one lane's:
+
+| site | what it is | events | lane |
+|---|---|---:|---|
+| `ir.rs:5456` | `invokespecial` that is neither resolvable nor a trivial `<init>` | **72** | `cov-04` |
+| `ir.rs:5337` | `putfield` whose type tag is not `I/Z/B/C/S` | 38 | `cov-03` |
+| `ir.rs:5516` | an invoke with no `invoke_info` at that pc | 9 | `cov-04` |
+| `ir.rs:5293` | `getfield` of a `long`/`float`/`double` | 5 | `cov-03` |
+| `ir.rs:5471` | `invokespecial <init>` whose receiver is not a fresh `new` | 1 | `cov-04` |
+| `ir.rs:5381` | a `new` with no entry in `new_info` | 1 | nobody |
+
+So the binding constraint the README opens with has **changed**: it is no
+longer "opcode coverage in `IrBuilder::build`". It is `cov-04` (82 events),
+`cov-03` (43), and the four `ir_compatible` conjuncts, which no opcode lane
+touches.
+
+| opcode | mnemonic | before | after | lane |
+|---|---|---:|---:|---|
+| `0xb2` | `getstatic` | 72 | **0** | ~~`cov-01`~~ |
+| `0x12` | `ldc` | 77 | **0** | ~~`cov-01`~~ |
+| `0x13` | `ldc_w` | 6 | **0** | ~~`cov-01`~~ |
+| `0xbe` | `arraylength` | 28 | 31 | `cov-02` |
+| `0x32` | `aaload` | 10 | 12 | `cov-02` |
+| `0x2e` | `iaload` | 3 | 6 | `cov-02` |
+| `0xbc` | `newarray` | 1 | 3 | `cov-06` |
+| `0x5a` | `dup_x1` | 1 | 1 | `cov-02` |
+| `0x33` | `baload` | 1 | 1 | `cov-02` |
+| `0xb3` | `putstatic` | 0 | **1** | nobody |
+
+**The whole remaining opcode gap is `cov-02`'s** — 51 of 55 events. `putstatic`
+appears for the first time: it was always there, hidden behind the `getstatic`
+in the same method, and `cov-01` deliberately does not own it (a static
+reference WRITE owes an SATB pre-barrier that no collector `set_field` barrier
+covers, which is why the single-pass backend keeps writes on their helpers).
+
+The structural refusals are where the shortfall went. Line numbers are
+post-change:
+
+| site | what it is | before | after | lane |
+|---|---|---:|---:|---|
+| `ir.rs:5331` | `invokespecial` that is neither resolvable nor a trivial `<init>` | 36 | **71** | `cov-04` |
+| `ir.rs:5212` | `putfield` whose type tag is not `I/Z/B/C/S` | 33 | 38 | `cov-03` |
+| `ir.rs:5391` | an invoke with no `invoke_info` at that pc | 8 | 9 | `cov-04` |
+| `ir.rs:5168` | `getfield` of a `long`/`float`/`double` | 5 | 5 | `cov-03` |
+| `ir.rs:5346` | `invokespecial <init>` whose receiver is not a fresh `new` | 1 | 1 | `cov-04` |
+| `ir.rs:5256` | a `new` with no entry in `new_info` | 0 | **1** | nobody |
+
+`cov-04`'s largest refusal **doubled without anyone touching it** — 36 to 71.
+That is this directory's own re-run rule playing out one level down from where
+it was written: lifting a refusal admits the methods that were hiding behind
+it, and they fail on whatever they meet next. `cov-04` is now the single
+largest thing between the optimizing tier and the 180 methods it still
+declines, and it is the lane the README already says cannot be sized from a
+survey.
+
+`ir_compatible`'s whole-method conjuncts moved by 1–2 events each, i.e. not at
+all: they are decided before the builder runs, so `cov-01` could not have moved
+them and did not.
+
+One knock-on outside the tier, recorded because it is the shape to expect from
+every remaining `cov-*` lane: a method moving from C1 to C2 takes it **out of
+reach of every single-pass-only capability**. `vm/tests/pgo02_guarded_virtual_inline.rs`
+was passing because the IR builder refused `getstatic`, so its
+`getstatic; invokevirtual` fixture stayed on the single-pass backend where
+guarded monomorphic inlining is planned. It now pins that tier explicitly.
 
 ## What this survey does NOT say
 

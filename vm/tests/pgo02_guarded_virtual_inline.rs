@@ -90,7 +90,30 @@ fn test_pgo02_guarded_virtual_inline() {
 
     enable_profiling(true);
     let result = with_process_overrides(
-        &[("CRATONVM_JIT_GUARDED_VIRTUAL_INLINE", Some("1"))],
+        &[
+            ("CRATONVM_JIT_GUARDED_VIRTUAL_INLINE", Some("1")),
+            // Pin these methods to the SINGLE-PASS backend, which is the only
+            // one that has the capability under test: guarded monomorphic
+            // inlining is planned by `x64`'s inliner and reported through
+            // `CompiledMethod::inline_tally`, and the optimizing (IR) backend
+            // serves a virtual site from a MIC/PIC cascade instead and records
+            // no tally at all.
+            //
+            // This used to happen by accident. Every entry point here is
+            // `getstatic <A>; invokevirtual tag`, and until cov-01 the IR
+            // builder had no `0xb2` arm — so the optimizing tier refused these
+            // methods and the C1 artifact was what stayed in the cache. Once
+            // `getstatic` lowered, `callA` was compiled by C2 on the next
+            // promotion, its `inline_tally` was empty, and this test failed
+            // with "speculative_sites == 0". The dependency was real; it was
+            // just never written down.
+            //
+            // `CRATONVM_JIT_IR_CALL_VIRTUAL=0` is the declared opt-out for
+            // `invokevirtual`/`invokeinterface` on the IR path. With it off the
+            // builder has no `invoke_info` for those sites and bails the whole
+            // method, which is exactly the routing this file needs.
+            ("CRATONVM_JIT_IR_CALL_VIRTUAL", Some("0")),
+        ],
         run_all_checks,
     );
     enable_profiling(false);
@@ -140,6 +163,19 @@ fn check_guard_hit() -> Result<(), String> {
         .read()
         .get("cratonvm/PgoGuardedVirtualInline", "callA", "(I)I", class_id)
         .ok_or_else(|| "check_guard_hit: callA never JIT-compiled".to_string())?;
+    // State the tier dependency instead of relying on it. `inline_tally` is a
+    // single-pass artifact's record; an IR artifact leaves it zeroed, so
+    // without this rung the assertion below cannot tell "the guard did not
+    // fire" from "a different backend compiled the method and was never asked
+    // to plan an inline". Those are opposite conclusions.
+    if compiled.used_ir_backend {
+        return Err(
+            "check_guard_hit: callA was compiled by the OPTIMIZING (IR) backend, which \
+             plans no guarded inlines and records no inline_tally — the pin in \
+             `test_pgo02_guarded_virtual_inline` did not take"
+                .to_string(),
+        );
+    }
     if compiled.inline_tally.speculative_sites == 0 {
         return Err(format!(
             "check_guard_hit: callA compiled but speculative_sites == 0              (tally={:?}) — the guard never actually fired, correctness above              only proves normal dispatch works",

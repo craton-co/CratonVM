@@ -2884,10 +2884,16 @@ pub(super) fn try_jit_upgrade_with_gate(
         let class = cm.get_class(class_id)?;
         match class.constant_pool.get(cp_idx)? {
             ConstantPoolEntry::Integer(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+                Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: *v as i64,
+    is_float: false,
+})
             }
             ConstantPoolEntry::Float(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+                Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: v.to_bits() as i64,
+    is_float: true,
+})
             }
             ConstantPoolEntry::StringReference { string_index }
                 if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
@@ -3316,10 +3322,16 @@ pub(super) fn try_jit_upgrade_with_gate(
                 let class = cm.get_class(callee_cid)?;
                 match class.constant_pool.get(cp_idx)? {
                     ConstantPoolEntry::Integer(v) => {
-                        Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+                        Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: *v as i64,
+    is_float: false,
+})
                     }
                     ConstantPoolEntry::Float(v) => {
-                        Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+                        Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: v.to_bits() as i64,
+    is_float: true,
+})
                     }
                     ConstantPoolEntry::StringReference { string_index }
                         if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
@@ -4362,10 +4374,16 @@ pub(super) fn try_jit_compile_callee_slow(
         let class = cm.get_class(cid)?;
         match class.constant_pool.get(cp_idx)? {
             ConstantPoolEntry::Integer(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+                Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: *v as i64,
+    is_float: false,
+})
             }
             ConstantPoolEntry::Float(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+                Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: v.to_bits() as i64,
+    is_float: true,
+})
             }
             ConstantPoolEntry::StringReference { string_index }
                 if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
