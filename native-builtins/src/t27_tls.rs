@@ -3024,7 +3024,12 @@ pub(crate) fn rustls_client_connect(
     port: u16,
 ) -> Result<i32, String> {
     let addr = format!("{}:{}", host, port);
-    let tcp = TcpStream::connect(&addr).map_err(|e| format!("connect {}: {}", addr, e))?;
+    // Fold IPv4-mapped destinations (`::ffff:a.b.c.d`) to plain IPv4 — on
+    // Windows an AF_INET6 socket cannot reach one (WSAEADDRNOTAVAIL). `host`
+    // itself is left alone: below it is the SNI name, not just a dial target.
+    // See `outbound_policy::normalize_connect_addr`.
+    let tcp = cratonvm_native_io::outbound_policy::connect_str_normalized(&addr)
+        .map_err(|e| format!("connect {}: {}", addr, e))?;
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
     let server_name = ServerName::try_from(host.to_string())

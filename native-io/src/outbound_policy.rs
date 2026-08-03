@@ -484,6 +484,34 @@ pub fn normalize_connect_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+/// `TcpStream::connect(target)` with [`normalize_connect_addr`] applied to
+/// every resolved candidate.
+///
+/// Drop-in replacement for `TcpStream::connect(&host_port_string)` at sites
+/// that dial a host taken from a URL or config. `TcpStream::connect(&str)`
+/// resolves and iterates internally, so there is no way to fold the addresses
+/// without taking the resolution over — hence this helper rather than a
+/// one-line `.map()` like the sites that already resolve for themselves.
+///
+/// No policy check: this exists purely for the address fold, and the callers
+/// are paths that historically did not consult the outbound policy. Use
+/// [`policy_connect`] when the policy should apply.
+pub fn connect_str_normalized(target: &str) -> std::io::Result<std::net::TcpStream> {
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in target.to_socket_addrs()?.map(normalize_connect_addr) {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("no addresses resolved for {target}"),
+        )
+    }))
+}
+
 /// Connect to `target` (a `host:port` string) with the policy + timeout
 /// applied. On policy reject the caller gets `Err` with an
 /// "outbound policy" message; on connect error / DNS failure / timeout
