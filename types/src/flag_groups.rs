@@ -618,6 +618,11 @@ pub const INVENTORY: &[E] = &[
     // Default-ON: `x64::licm::gc_inert_selfrec_enabled` reads `0`/`false`/`off`.
     E { group: Group::JIT, token: "gc-inert-selfrec", on_key: Some("CRATONVM_JIT_GC_INERT_SELFREC"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "getfield-helper", on_key: Some("CRATONVM_JIT_GETFIELD_HELPER"), off_key: None, off_word: None },
+    // PGO-02: guarded monomorphic-virtual-call inlining (splice the callee
+    // body behind a receiver class-id guard, miss falls to normal dispatch,
+    // never a deopt). Default-OFF until soaked — see
+    // docs/feature-designs/profile-guided-inlining.md.
+    E { group: Group::JIT, token: "guarded-virtual-inline", on_key: Some("CRATONVM_JIT_GUARDED_VIRTUAL_INLINE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "helpful-npe-opcodes", on_key: Some("CRATONVM_HELPFUL_NPE_OPCODES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inclusive-bce", on_key: Some("CRATONVM_JIT_INCLUSIVE_BCE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-allow-static", on_key: Some("CRATONVM_INLINE_ALLOW_STATIC"), off_key: None, off_word: None },

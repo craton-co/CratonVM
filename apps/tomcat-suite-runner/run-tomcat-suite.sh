@@ -31,6 +31,10 @@
 #   CLASSLIST     default class-list file if not passed positionally
 #   TIMEOUT_SEC   per-class hang timeout (default: 300)
 #   MAX_HEAP      -Xmx / --Xmx (default: 2g)
+#   HTTPD_PATH    Apache httpd binary for org.apache.tomcat.integration.httpd.*
+#                 (default: whatever `command -v httpd` finds). Debian names it
+#                 apache2, so on Debian either symlink it onto PATH as httpd or
+#                 set HTTPD_PATH=/usr/sbin/apache2.
 #
 # Example - all 6 shards of a craton run:
 #   for i in 0 1 2 3 4 5; do
@@ -51,6 +55,16 @@ JAVA_HOME25="${JAVA_HOME25:-/home/victor/jdk25}"
 CLASSLIST="${5:-${CLASSLIST:-$TC_ROOT/.suite/all-tests.txt}}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-300}"
 MAX_HEAP="${MAX_HEAP:-2g}"
+HTTPD_PATH="${HTTPD_PATH:-$(command -v httpd 2>/dev/null || true)}"
+
+# org.apache.tomcat.integration.httpd.* proxies real traffic through an httpd
+# each test starts itself. Without a binary every class in that family fails
+# with a connection-refused to the proxy port - identically on HotSpot, so it
+# reads like a VM defect when it is only a missing fixture.
+# Always one argument (never an empty word, which `set -u` + an empty array
+# would make awkward): TesterHttpd falls back to a bare "httpd" on PATH when
+# the property is empty.
+HTTPD_PROP="-Dtomcat.test.httpd.path=$HTTPD_PATH"
 
 # Fixture precondition check (VERIFY-01, docs/known-issues/c2/verify-01-differential-harness.md):
 # a missing/unbuilt CATALINA_BASE-equivalent (output/build - conf/, webapps/)
@@ -120,6 +134,20 @@ run_one() {
       else
         heap="10g"
       fi
+    elif [ "$cls" = "org.apache.tomcat.integration.httpd.TestChunkedTransferEncodingWithProxy" ]; then
+      # Same shape without the naming convention: PAYLOAD_SIZE is literally
+      # 10 * 1024 * 1024 * 100 = 1 GiB and TomcatBaseTest.postUrl needs a second
+      # buffer of the same size. HotSpot fits that in the 2g default (26.6 s
+      # measured); the fixed Xmx/2 old-gen cap above means CratonVM cannot, and
+      # the class OOMs at exactly "native primitive array of length 1048576000".
+      # 4g clears it (110 s measured). `--Xmx 2g -XX:+UseG1GC` also passes but
+      # takes 275 s, close enough to the 300 s default timeout to score as a
+      # HANG, so prefer the heap bump.
+      if [[ "$MAX_HEAP" =~ ^([0-9]+)[gG]$ ]] && [ "${BASH_REMATCH[1]}" -ge 4 ]; then
+        heap="$MAX_HEAP"
+      else
+        heap="4g"
+      fi
     fi
     timeout "${TIMEOUT_SEC}s" "$CRATONVM_EXE" \
       --java-home "$JAVA_HOME25" --Xmx "$heap" $gc_flag \
@@ -128,6 +156,7 @@ run_one() {
       -Dtomcat.test.temp="$TC_ROOT/output/test-tmp" \
       -Dtomcat.test.tomcatbuild="$TC_ROOT/output/build" \
       -Dtomcat.test.relaxTiming=true \
+      "$HTTPD_PROP" \
       --add-opens java.base/java.lang=ALL-UNNAMED \
       --add-opens java.base/java.io=ALL-UNNAMED \
       --add-opens java.base/java.util=ALL-UNNAMED \
@@ -140,6 +169,7 @@ run_one() {
       -Dtomcat.test.temp="$TC_ROOT/output/test-tmp" \
       -Dtomcat.test.tomcatbuild="$TC_ROOT/output/build" \
       -Dtomcat.test.relaxTiming=true \
+      "$HTTPD_PROP" \
       --add-opens java.base/java.lang=ALL-UNNAMED \
       --add-opens java.base/java.io=ALL-UNNAMED \
       --add-opens java.base/java.util=ALL-UNNAMED \

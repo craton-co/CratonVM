@@ -1,11 +1,12 @@
 # A machine level for the JIT, and the instruction selector that needs one
 
-**Status: increment 0 landed, increments 1–4 ON HOLD — and the hold is the
-result, not a pause.** Shadow instruction selection runs on demand
-(`CRATONVM_JIT=ir-isel-shadow`, default off, emits nothing) and has now measured
-what the pattern table can actually cover on real compiles: **15.7–19.0% of
-scheduled nodes**, with the two rules the whole migration was *for* firing
-**zero** times. The next step is not a machine level; it is six pattern rows.
+**Status: increments 0 and 1 landed and measured; 2–4 CLOSED as not worth
+building.** Shadow instruction selection (`CRATONVM_JIT=ir-isel-shadow`, default
+off, emits nothing) measured the tiler's real coverage at **15.7–19.0%**, with
+the two rules the migration was *for* firing **zero** times. Closing the named
+gap — eight anchored 32-bit immediate rows — then moved it to **19.3%**, and
+`AluImm` fired **once** across 719 methods. The rules do not match the shape of
+the IR the optimizer produces, which is not a problem a machine level fixes.
 
 Consolidates the `hir-01` and `hir-02` lanes of
 `docs/known-issues/c2/deep-research-vm-c2.md`, which asked for an HIR/LIR/MIR
@@ -237,15 +238,70 @@ Also proved: `covers()` held on all **1 911** blocks. The invariant the
 three-defect argument below rests on is real on real code, not just on
 hand-built graphs.
 
-### Increment 1 — **the 32-bit rows, not a machine level** · next
+### Increment 1 — the 32-bit immediate rows · **DONE 2026-08-03, and the answer is +0.3 points**
 
-Reordered by the measurement. Close `instruction-selection.md` §6 item 2: the
-32-bit immediate and `LEA` rows, each anchored to the byte sequence
-`ir_lower::lower_data_node` already emits for `Ty::I32` — never to an invented
-one. Then re-run `CRATONVM_JIT=ir-isel-shadow` and compare.
+Eight rows added — `add/sub_r32_imm8`, `add/sub_r32_imm32`,
+`and/or/xor_r32_imm8`, `cmp_r32_imm8` — each anchored to a byte literal
+`x64.rs`'s constant-folding fast path already emits (the `iadd`/`isub`/`iand`/
+`ior`/`ixor`/`if_icmp` const arms, EAX destination, no REX). Plus the half that
+makes them load-bearing: `MInst::pattern_name` now maps `AluRI`/`CmpRI` at
+`Ty::I32`, without which `require_encodable` discards the tile whatever the
+table holds.
 
-If coverage does not move materially, **the lane is done and the number is the
-deliverable.** Spend the effort on `pgo` or `loop` instead.
+Same workload, same flag, before and after:
+
+| | before | after |
+|---|---|---|
+| methods / nodes | 718 / 4 136 | 719 / 4 138 |
+| **nodes covered** | **785 (19.0%)** | **797 (19.3%)** |
+| `AluImm` tiles | 0 | **1** |
+| `Unencodable` refusals | 104 | **57** |
+| `CmpBranch` / `TestBranch` | 33 / 53 | 44 / 42 |
+| `covers()` violations | 0 | 0 |
+
+**The gap was real and closing it bought almost nothing.** `Unencodable`
+halved, so the rows are being reached; `AluImm` then fired **once** across 719
+methods. The genuine gain is elsewhere and smaller than it looks: `cmp_r32_imm8`
+let eleven branches move from `TestBranch` (which buys nothing) to `CmpBranch`
+(which fuses), and that is most of the +12 nodes.
+
+The reason is `ir_optimize`. It runs *before* selection and folds constants, so
+by the time the tiler sees the graph an `Add(x, Const)` is mostly already gone.
+The rows were missing, but the population that wanted them is nearly empty on
+optimized IR — a fact no amount of reading the table would have produced.
+
+### Increment 1b — `Rule::Lea` at `Ty::I32` · not built, and the evidence says do not bother yet
+
+The other half of `instruction-selection.md` §6 item 2. **The proof it was
+blocked on is now available**, and it is simpler than the doc expected:
+
+> `ir_lower`'s `Int` arms already leave the high half of the destination slot
+> unspecified, and inconsistently so. `Op::Add`/`Mul` at `IrType::Int` emit
+> 32-bit ops (`ADD EAX, ECX`), which x86-64 **zero**-extends into RAX;
+> `Op::Const` at `IrType::Int` emits `emit_mov_rax_imm64`, which for a negative
+> `int` **sign**-extends. `Op::Return` then copies the whole 64-bit slot. So the
+> high half of an `int` slot is already two different things depending on which
+> arm produced it, and the caller already truncates by descriptor — which is the
+> only reason the tree is green.
+
+A 32-bit `LEA` zero-extends, exactly like `ADD EAX, ECX`. It therefore leaves
+the same high half the majority of existing `Int` arms leave and introduces no
+new observability question. The `lea_r32_m` row is anchored too — `x64.rs`
+already emits `8D 04 40` / `8D 04 80` / `8D 04 C0` (`LEA EAX, [RAX+RAX*n]`) in
+its small-multiply fast path.
+
+It is unbuilt anyway, because increment 1 just measured what closing the *other*
+half of the same gap was worth: **+0.3 points**. Build it if something changes
+that prior; do not build it because the list says so.
+
+### The verdict
+
+**The lane is done and the number is the deliverable.** Two increments, both
+measured: the tiler covers **19.3%** of scheduled nodes on real optimized Java
+IR, and the named, actionable gap in the pattern table was worth three tenths of
+a point. The rules do not match the shape of the IR the optimizer produces —
+which is a different problem from a missing row, and not one a machine level
+fixes either. Spend the effort on `pgo` or `loop`.
 
 ### Increment 2 — emit one rule, byte-identical *(only if increment 1 moves the number)*
 

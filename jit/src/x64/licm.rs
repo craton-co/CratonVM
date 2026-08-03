@@ -2830,7 +2830,6 @@ pub(super) fn poll_bearing_opcode(op: u8) -> bool {
 
 /// `true` when an opcode's fall-through successor exists (i.e. control can
 /// reach the next instruction in linear order).
-#[allow(dead_code)]
 pub(super) fn opcode_falls_through(op: u8) -> bool {
     !matches!(op, 0xa7 | 0xa9 | 0xaa | 0xab | 0xac..=0xb1 | 0xbf | 0xc8)
 }
@@ -2842,7 +2841,6 @@ pub(super) fn opcode_falls_through(op: u8) -> bool {
 /// statically known (`jsr`/`jsr_w`/`ret`) or the encoding is malformed or
 /// points outside `[0, code_len)`. Callers must treat `false` as opaque, not
 /// as "no targets": guessing here is how a transform loses an edge.
-#[allow(dead_code)]
 pub(super) fn branch_targets_at(
     code: &[u8],
     pc: usize,
@@ -2955,6 +2953,68 @@ pub(super) fn branch_targets_at(
         }
         _ => true,
     }
+}
+
+/// Bytecode PCs reachable from the method entry along ORDINARY control flow —
+/// fall-through plus explicit branch/switch edges.
+///
+/// Exception-table handler entries are deliberately NOT roots. The x86-64
+/// backend has no in-method handler dispatch: an implicit exception leaves
+/// through the `i64::MIN` sentinel and `athrow` lowers to the same, so a
+/// compiled body is only ever resumed at one of its own handlers by the
+/// interpreter (`route_jit_signal_exception` / `run_jit_callee_handler` both
+/// rebuild an interpreter frame for it). Every handler body is therefore dead
+/// code in the emitted image, and this map says so.
+///
+/// The optimizing tier settled the same question first and for the same
+/// reason: `ir::IrBuilder::build` skips every PC outside
+/// `ir::normally_reachable_pcs`, which is this walk over the verifier's CFG.
+/// Walking handler bodies there produced orphan nodes; walking them here
+/// produced a revived merge with no operand stack. Two tiers, one contract.
+///
+/// Returns `None` — "refuse, do not guess" — when any instruction's successor
+/// set is not statically known (`jsr` / `ret` / `jsr_w`) or an encoding is
+/// malformed. Callers must then keep whatever conservative behaviour they had.
+///
+/// Sized `code_len + 1` to match the emitter's own `branch_targets` map, so the
+/// two are indexed by the same `pc`.
+pub(super) fn compute_reachable_pcs(code: &[u8], code_len: usize) -> Option<Vec<bool>> {
+    if code_len > code.len() {
+        return None;
+    }
+    let mut reachable = vec![false; code_len + 1];
+    if code_len == 0 {
+        return Some(reachable);
+    }
+    reachable[0] = true;
+    let mut work = vec![0usize];
+    let mut targets: Vec<usize> = Vec::new();
+    while let Some(pc) = work.pop() {
+        // A branch INTO the middle of an instruction decodes garbage from here
+        // on. That cannot corrupt what the emitter reads (it only ever indexes
+        // this map at real instruction boundaries) and the walk stays bounded
+        // by `code_len`; such a method is rejected afterwards by
+        // `patch_branches`, which finds the target has no native offset.
+        let len = bytecode_len_at(code, pc).max(1);
+        targets.clear();
+        if !branch_targets_at(code, pc, code_len, &mut targets) {
+            return None;
+        }
+        for &t in &targets {
+            if !reachable[t] {
+                reachable[t] = true;
+                work.push(t);
+            }
+        }
+        if opcode_falls_through(code[pc]) {
+            let next = pc + len;
+            if next < code_len && !reachable[next] {
+                reachable[next] = true;
+                work.push(next);
+            }
+        }
+    }
+    Some(reachable)
 }
 
 /// `true` when the emitter will emit a cooperative safepoint poll at `pc`.
@@ -4401,6 +4461,96 @@ mod loop_xform_tests {
         step_pcs: Vec<usize>,
         outcome: Outcome,
         heap: Vec<i32>,
+    }
+
+    /// An exception-handler body is not reachable along ordinary control flow,
+    /// so nothing inside it is — including the merge point of a branch the
+    /// handler body makes to itself. This is the whole content of the
+    /// handler-body-merge refusal: the emitter's branch-target map said `true`
+    /// for that merge, and "some instruction branches here" is not
+    /// "control can reach here".
+    #[test]
+    fn a_handler_bodys_own_branch_targets_are_not_reachable() {
+        //  0: iload_0
+        //  1: ireturn
+        //  2: iload_0           <- handler body (exception-table target)
+        //  3: aload_1
+        //  4: ifnonnull 11
+        //  7: iconst_0
+        //  8: goto 12
+        // 11: iconst_1
+        // 12: iadd
+        // 13: ireturn
+        let code = [
+            0x1a, 0xac, 0x1a, 0x2b, 0xc7, 0x00, 0x07, 0x03, 0xa7, 0x00, 0x04, 0x04, 0x60, 0xac,
+        ];
+        let r = compute_reachable_pcs(&code, code.len()).expect("statically known control flow");
+        assert_eq!(&r[..2], &[true, true], "the live prefix is reachable");
+        assert!(
+            r[2..code.len()].iter().all(|&b| !b),
+            "nothing after the `ireturn` is reachable: {r:?}"
+        );
+
+        // The emitter's own question answers differently for the two merges,
+        // which is exactly why it could not be used for this.
+        let targets = compute_branch_targets(&code, code.len());
+        assert!(targets[11] && targets[12]);
+    }
+
+    /// Both edges of a conditional, and the fall-through of everything that
+    /// has one, are reachable; a `goto` has no fall-through.
+    #[test]
+    fn reachability_follows_both_edges_and_stops_at_a_goto() {
+        //  0: iload_0
+        //  1: ifeq 7
+        //  4: goto 8
+        //  7: iconst_1          (reached only by the `ifeq`)
+        //  8: ireturn
+        let code = [0x1a, 0x99, 0x00, 0x06, 0xa7, 0x00, 0x04, 0x04, 0xac];
+        let r = compute_reachable_pcs(&code, code.len()).expect("statically known control flow");
+        assert_eq!(
+            &r[..code.len()],
+            &[true, true, false, false, true, false, false, true, true],
+            "only instruction boundaries on a real path are marked"
+        );
+    }
+
+    /// Every arm of a switch is an edge, and the switch itself has no
+    /// fall-through.
+    #[test]
+    fn reachability_follows_every_switch_arm() {
+        //  0: iconst_0
+        //  1: nop; nop          (align the tableswitch operands to 4)
+        //  3: tableswitch { 0: +21 (24), 1: +23 (26), default: +25 (28) }
+        // 24: iconst_1; ireturn
+        // 26: iconst_2; ireturn
+        // 28: iconst_3; ireturn
+        let mut code: Vec<u8> = vec![0x03, 0x00, 0x00, 0xaa];
+        code.extend_from_slice(&25i32.to_be_bytes()); // default -> 28
+        code.extend_from_slice(&0i32.to_be_bytes()); // low
+        code.extend_from_slice(&1i32.to_be_bytes()); // high
+        code.extend_from_slice(&21i32.to_be_bytes()); // case 0 -> 24
+        code.extend_from_slice(&23i32.to_be_bytes()); // case 1 -> 26
+        code.extend_from_slice(&[0x04, 0xac, 0x05, 0xac, 0x06, 0xac]);
+        assert_eq!(code.len(), 30);
+        let r = compute_reachable_pcs(&code, code.len()).expect("statically known control flow");
+        for pc in [0usize, 1, 2, 3, 24, 25, 26, 27, 28, 29] {
+            assert!(r[pc], "pc {pc} is on a real path");
+        }
+        for pc in 4..24usize {
+            assert!(!r[pc], "pc {pc} is switch payload, not an instruction");
+        }
+    }
+
+    /// `jsr`/`ret` have no statically known successor set. The analysis refuses
+    /// rather than under-approximating reachability, because an
+    /// under-approximation here deletes live code.
+    #[test]
+    fn opaque_control_flow_refuses_rather_than_guessing() {
+        let jsr = [0xa8, 0x00, 0x03, 0xac]; // jsr +3; ireturn
+        assert!(compute_reachable_pcs(&jsr, jsr.len()).is_none());
+        let ret = [0xa9, 0x01]; // ret 1
+        assert!(compute_reachable_pcs(&ret, ret.len()).is_none());
     }
 
     /// Target PC of the 2-byte-offset branch at `pc`, or its fall-through.

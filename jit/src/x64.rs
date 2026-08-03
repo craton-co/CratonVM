@@ -682,7 +682,24 @@ struct Compiler {
     branch_target_stack_oop_marks: FxHashMap<usize, Vec<bool>>,
     /// Set to true when an internal error (e.g. stack underflow) is detected
     /// during compilation.  `compile_bytecode` checks this and bails out.
+    ///
+    /// Raise it through [`Compiler::fail`], never by assignment — the flag on
+    /// its own says nothing about WHAT refused (see `failed_site`).
     failed: bool,
+    /// The FIRST site that raised `failed`, with the bytecode pc/opcode current
+    /// at that moment.
+    ///
+    /// `failed` is a flag consulted only after the whole dispatch loop has run,
+    /// so a refusal through it used to be attributed to
+    /// `dbg_last_pc`/`dbg_last_op` — the last bytecode the emitter touched,
+    /// which for a method that walks on to its `ireturn` is just the last
+    /// instruction and names nothing. `Rbc6FieldProbe.getfieldRefHandlerLocal`
+    /// reported `singlepass-codegen(pc=36,op=0xac)`, an arm that has no
+    /// `return false` of its own, for an operand-stack underflow one
+    /// instruction earlier. Every raising site now names itself and that name
+    /// reaches the `compile-bail` line, the way `note_jit_bail_site` works
+    /// everywhere else.
+    failed_site: Option<(&'static str, usize, u8)>,
     /// Bitmask of scratch XMM registers (2-7) currently in use on the simulated stack.
     /// Bit N corresponds to SCRATCH_XMMS[N]. Used to allocate scratch XMMs for
     /// FP intermediate persistence across bytecodes.
@@ -730,6 +747,9 @@ struct Compiler {
     sr_monitor_scalar_ops: std::collections::HashSet<usize>,
     /// Inline sites: bytecode PC → resolved InlineSite for inlining callee bytecode.
     inline_sites: FxHashMap<usize, crate::InlineSite>,
+    // PGO-02: see the `inline_guard_class_ids` parameter doc on
+    // `compile_with_param_slots`.
+    inline_guard_class_ids: FxHashMap<usize, u32>,
     /// Compile-time resolved `java/lang/String` field layout, for the String
     /// call-site intrinsics. `None` ⇒ String layout unavailable (intrinsic
     /// codegen bails to normal dispatch). See `crate::StringFieldLayout`.
@@ -2028,6 +2048,7 @@ impl Compiler {
             branch_target_stack_depth: FxHashMap::default(),
             branch_target_stack_oop_marks: FxHashMap::default(),
             failed: false,
+            failed_site: None,
             helpers,
             scratch_xmm_in_use: 0,
             fp_hoist_info: Vec::new(),
@@ -2043,6 +2064,7 @@ impl Compiler {
             sr_monitor_at: FxHashMap::default(),
             sr_monitor_scalar_ops: std::collections::HashSet::new(),
             inline_sites: FxHashMap::default(),
+            inline_guard_class_ids: FxHashMap::default(),
             string_layout: None,
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
@@ -2750,18 +2772,32 @@ impl Compiler {
         box_ptr
     }
 
+    /// Raise the compile-wide failure flag, naming the site that raised it.
+    ///
+    /// Only the FIRST call records a site: the dispatch loop deliberately keeps
+    /// walking after a failure (several handlers push placeholders so
+    /// downstream opcodes keep a plausible stack height), so anything raised
+    /// afterwards is a consequence, not the cause.
+    #[cold]
+    fn fail(&mut self, site: &'static str) {
+        if self.failed_site.is_none() {
+            self.failed_site = Some((site, self.dbg_last_pc, self.dbg_last_op));
+        }
+        self.failed = true;
+    }
+
     fn checked_spill_range_end(&mut self, start: i32, slots: usize) -> Option<i32> {
         let bytes = slots.checked_mul(8).and_then(|n| i32::try_from(n).ok());
         let Some(bytes) = bytes else {
-            self.failed = true;
+            self.fail("singlepass-codegen/spill-range-byte-count-overflow");
             return None;
         };
         let Some(end) = start.checked_add(bytes) else {
-            self.failed = true;
+            self.fail("singlepass-codegen/spill-range-end-overflow");
             return None;
         };
         if start < self.base_spill_offset || end > self.spill_limit_offset {
-            self.failed = true;
+            self.fail("singlepass-codegen/spill-range-exhausted");
             return None;
         }
         Some(end)
@@ -2905,7 +2941,7 @@ impl Compiler {
         let slot = match self.stack.pop() {
             Some(s) => s,
             None => {
-                self.failed = true;
+                self.fail("singlepass-codegen/operand-stack-underflow-pop");
                 return StackSlot::Frame(0);
             }
         };
@@ -3336,7 +3372,7 @@ impl Compiler {
                 // This should be unreachable because the caller uses the same
                 // predicate. Fail compilation closed if future call-site
                 // refactoring breaks that pairing.
-                self.failed = true;
+                self.fail("singlepass-codegen/self-call-moving-proof-unpublishable");
                 return;
             }
             // Match the metadata state normally established by
@@ -4201,7 +4237,7 @@ impl Compiler {
         match self.stack.last().copied() {
             Some(s) => s,
             None => {
-                self.failed = true;
+                self.fail("singlepass-codegen/operand-stack-underflow-peek");
                 StackSlot::Frame(0)
             }
         }
@@ -4236,7 +4272,7 @@ impl Compiler {
             }
         }
         if next > self.spill_limit_offset {
-            self.failed = true;
+            self.fail("singlepass-codegen/spill-cursor-past-limit");
             return;
         }
         self.next_spill_offset = next;
@@ -4321,7 +4357,7 @@ impl Compiler {
                     // bail defensively rather than corrupt if that invariant
                     // is ever broken.)
                     if parked {
-                        self.failed = true;
+                        self.fail("singlepass-codegen/parallel-move-second-park");
                         return;
                     }
                     let mut walk = pending[0].0;
@@ -4339,7 +4375,7 @@ impl Compiler {
                             None => {
                                 // No blocker found for an all-blocked move —
                                 // inconsistent state; bail safely.
-                                self.failed = true;
+                                self.fail("singlepass-codegen/parallel-move-no-blocker");
                                 return;
                             }
                         }
@@ -5115,7 +5151,7 @@ impl Compiler {
             return;
         }
         let Some(disps) = stack_bang_frame_probe_disps(frame_size) else {
-            self.failed = true;
+            self.fail("singlepass-codegen/stack-bang-probe-unrepresentable");
             return;
         };
         for disp in disps {
@@ -8187,7 +8223,7 @@ impl Compiler {
             (16, true) => 0xBF,  // MOVSX r64, r/m16
             (16, false) => 0xB7, // MOVZX r64, r/m16
             _ => {
-                self.failed = true;
+                self.fail("singlepass-codegen/movsx-source-width-unsupported");
                 return;
             }
         };
@@ -13145,6 +13181,32 @@ impl Compiler {
         // (getstatic cache removed — every getstatic calls the helper at
         // runtime for JMM thread-safety.)
 
+        // The map above answers "does SOME instruction branch here", which is
+        // not the same question as "can control reach here". The walk below
+        // revives dead code at every branch target, so a target whose only
+        // predecessors are themselves dead came back to life with no recorded
+        // state — `expected_depth` fell back to 0 and the operand stack was
+        // rebuilt empty.
+        //
+        // The population that hits it is EXCEPTION HANDLER BODIES. The backend
+        // has no in-method handler dispatch, so a handler body is dead code in
+        // the emitted image; but a branch INSIDE one (a ternary, an `if`, a
+        // loop) still marks its own targets, and the walk cannot tell those
+        // apart from a live join. `Rbc6FieldProbe.getfieldRefHandlerLocal` —
+        // `catch (NPE e) { return scratch + (seen == null ? 0 : 1); }` —
+        // revived at the ternary's merge with an empty stack, so the `iadd`
+        // there underflowed and refused the whole method. The revived block was
+        // also published as an OSR entry point, described by a stack model that
+        // never applied to it.
+        //
+        // Compute real reachability and revive only there. Nothing live is
+        // lost: the first PC of every reachable run is either PC 0 or a branch
+        // target, which is exactly where a revival happens, and a fall-through
+        // successor of a reachable instruction is reachable by construction. A
+        // `None` result means opaque control flow (`jsr`/`ret`, malformed
+        // encodings) — keep the historical behaviour there rather than guess.
+        let reachable = compute_reachable_pcs(code, code_len);
+
         let mut dead = false; // true after unconditional control transfer
 
         let mut pc = 0;
@@ -13162,19 +13224,32 @@ impl Compiler {
             if branch_targets[pc] {
                 self.slot_mirror = None;
             }
-            // DCE: if we're in dead code and this PC isn't a branch target, skip it
+            // DCE: if we're in dead code and this PC isn't reachable, skip it
             if dead {
-                if branch_targets[pc] {
-                    dead = false; // reachable via branch
-                                  // At merge points after unconditional branches, reconstruct
-                                  // the simulated stack using canonical frame offsets. The
-                                  // predecessor path called canonicalize_stack() before the
-                                  // goto, so values live at base_spill + i*8.
-                    let expected_depth = self
-                        .branch_target_stack_depth
-                        .get(&pc)
-                        .copied()
-                        .unwrap_or(0);
+                let revive = match &reachable {
+                    Some(r) => r[pc],
+                    None => branch_targets[pc],
+                };
+                if revive {
+                    // Reachable via a branch. At merge points after
+                    // unconditional branches, reconstruct the simulated stack
+                    // using canonical frame offsets: the predecessor path
+                    // called `canonicalize_stack` before the goto, so values
+                    // live at `base_spill + i*8`.
+                    dead = false;
+                    // A revived PC is reachable, so an emitted branch named
+                    // it — and every branch-emitting arm records the operand
+                    // stack live at its target through
+                    // `record_branch_target_depth`. The one shape that could
+                    // still land here unrecorded is a PC reached ONLY by a
+                    // LATER (backward) branch, which has not been emitted yet;
+                    // the historical `unwrap_or(0)` rebuilt an empty stack for
+                    // it and compiled on, which is a silent wrong-code path,
+                    // not a conservative one. Refuse instead — and say so.
+                    let Some(&expected_depth) = self.branch_target_stack_depth.get(&pc) else {
+                        self.fail("singlepass-codegen/revived-merge-depth-unrecorded");
+                        return false;
+                    };
                     if !self.set_spill_depth(expected_depth) {
                         return false;
                     }
@@ -14905,7 +14980,7 @@ impl Compiler {
                 0x5a => {
                     if dupx_codegen_disabled() || dup_x1_codegen_disabled() || self.stack.len() < 2
                     {
-                        self.failed = true;
+                        self.fail("singlepass-codegen/dup_x1-unsupported-shape");
                         let _ = self.push_stack();
                     } else {
                         let a_slot = self.peek_stack();
@@ -14948,7 +15023,7 @@ impl Compiler {
                         // Unprovable form (or malformed height) — stay
                         // interpreted; placeholder keeps the model height
                         // plausible until the post-loop `failed` check.
-                        self.failed = true;
+                        self.fail("singlepass-codegen/dup_x2-unprovable-form");
                         let _ = self.push_stack();
                     } else {
                         let a_slot = self.peek_stack();
@@ -15026,7 +15101,7 @@ impl Compiler {
                             // placeholders so downstream opcode handlers keep a
                             // plausible stack height until the post-loop `failed`
                             // check discards this compilation.
-                            self.failed = true;
+                            self.fail("singlepass-codegen/dup2-unprovable-top-width");
                             let _ = self.push_stack();
                             let _ = self.push_stack();
                         }
@@ -16312,6 +16387,20 @@ impl Compiler {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
+                    // Every arm of a switch is a branch target, and needs the
+                    // operand stack live at it recorded exactly the way the
+                    // `if`/`goto` arms record theirs — the dead-code merge
+                    // reconstruction reads both the depth and the oop marks
+                    // from this map. Nothing recorded them before: an arm
+                    // revived from dead code fell back to depth 0 with
+                    // all-`false` marks, which is a guess in the depth and the
+                    // very unsoundness `branch_target_stack_oop_marks`
+                    // documents in the marks. The key is already popped here,
+                    // so `self.stack` is exactly what every arm sees.
+                    self.record_branch_target_depth(def_target);
+                    for &target in &targets {
+                        self.record_branch_target_depth(target);
+                    }
 
                     if count <= 4 {
                         // Small table: CMP chain (compact code, few comparisons)
@@ -16452,6 +16541,20 @@ impl Compiler {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
+                    // Every arm of a switch is a branch target, and needs the
+                    // operand stack live at it recorded exactly the way the
+                    // `if`/`goto` arms record theirs — the dead-code merge
+                    // reconstruction reads both the depth and the oop marks
+                    // from this map. Nothing recorded them before: an arm
+                    // revived from dead code fell back to depth 0 with
+                    // all-`false` marks, which is a guess in the depth and the
+                    // very unsoundness `branch_target_stack_oop_marks`
+                    // documents in the marks. The key is already popped here,
+                    // so `self.stack` is exactly what every arm sees.
+                    self.record_branch_target_depth(def_target);
+                    for &(_, target) in &pairs {
+                        self.record_branch_target_depth(target);
+                    }
 
                     if npairs <= 6 {
                         // Small: linear CMP chain (fast for few entries)
@@ -17513,7 +17616,7 @@ impl Compiler {
                                 // its simulated stack no longer matches. Bail
                                 // out of JIT compilation; the interpreter can
                                 // execute the ordinary invoke path safely.
-                                self.failed = true;
+                                self.fail("singlepass-codegen/lambda-int-to-double-stack-shape");
                                 return false;
                             };
                             let lambda_slot = self.stack[self.stack.len() - 2];
@@ -18638,7 +18741,7 @@ impl Compiler {
                                     // Spill region exhausted — bail the whole
                                     // compile (always safe: the method falls
                                     // back to the interpreter).
-                                    self.failed = true;
+                                    self.fail("singlepass-codegen/arraycopy-args-spill-exhausted");
                                     return false;
                                 }
                                 None => {
@@ -19741,6 +19844,128 @@ impl Compiler {
                         if self.try_emit_inline(pc) {
                             pc += 3;
                             continue;
+                        }
+                    }
+
+                    // PGO-02 (docs/feature-designs/profile-guided-inlining.md):
+                    // guarded MONOMORPHIC virtual/interface inline. `inline_sites`
+                    // + `inline_guard_class_ids` are populated TOGETHER, only for
+                    // an admitted `InlineVerdict::Monomorphic` plan, only when
+                    // `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is on (see
+                    // `InlineBackendCaps` in jit/src/lib.rs) — with the flag off
+                    // `inline_guard_class_ids` is always empty and this whole
+                    // block costs one HashMap probe. Splices the callee body via
+                    // the SAME `try_emit_inline` the invokespecial check above
+                    // already uses, behind a receiver class-id guard; the miss
+                    // edge falls through UNCHANGED to the normal dispatch code
+                    // below (MIC/PIC/`jit_invoke_dispatch`) — never a deopt (see
+                    // the design doc's §3 deopt-safety argument: no caller
+                    // scopes are populated, so this relies on — and does not
+                    // change — the existing guarantee that nothing inside an
+                    // inlined body publishes a deopt point).
+                    let mut guarded_virtual_done_patch: Option<usize> = None;
+                    if op != 0xb7 {
+                        if let (Some(guard_class_id), Some(site)) = (
+                            self.inline_guard_class_ids.get(&pc).copied(),
+                            self.inline_sites.get(&pc).cloned(),
+                        ) {
+                            let recv_depth = site.callee_num_args;
+                            if recv_depth >= 1 && self.stack.len() >= recv_depth {
+                                let recv_slot = self.stack[self.stack.len() - recv_depth];
+
+                                // Full state snapshot from BEFORE any guard byte
+                                // is emitted — mirrors try_emit_inline's own
+                                // checkpoint set exactly (see its comment on the
+                                // groovyjarjarasm-asm-handler-getexceptiontablesize
+                                // fix for why every one of these fields matters),
+                                // so a rewind on either failure path below is
+                                // indistinguishable from never having attempted
+                                // this guard at all.
+                                let buf_checkpoint = self.buf.pos();
+                                let stack_checkpoint = self.stack.clone();
+                                let oop_marks_checkpoint = self.stack_oop_marks.clone();
+                                let spill_checkpoint = self.next_spill_offset;
+                                let exception_check_stubs_checkpoint =
+                                    self.exception_check_stubs.len();
+                                let deopt_stubs_checkpoint = self.deopt_stubs.len();
+                                let forward_patches_checkpoint = self.forward_patches.len();
+                                let jump_table_patches_checkpoint =
+                                    self.jump_table_patches.len();
+                                let self_call_patches_checkpoint = self.self_call_patches.len();
+                                let bounds_check_stubs_checkpoint =
+                                    self.bounds_check_stubs.len();
+                                let null_check_store_stubs_checkpoint =
+                                    self.null_check_store_stubs.len();
+
+                                // Guard: null receiver -> miss. Class mismatch ->
+                                // miss. Peeked, not popped — try_emit_inline does
+                                // its own popping on the hit path below, and the
+                                // miss path needs the receiver+args untouched for
+                                // the normal-dispatch code that runs next.
+                                self.load_slot_to_reg(RAX, recv_slot);
+                                self.emit_test_r64_r64(RAX);
+                                let mut miss_patches: Vec<usize> = Vec::with_capacity(2);
+                                miss_patches.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // CMP DWORD [RAX+0], guard_class_id — identical
+                                // encoding to the String/CRC32 intrinsic guard
+                                // above (81 /7 id, ModRM 0x78 = mod00 /7 rm=RAX).
+                                self.buf.emit(&[0x81, 0x78, 0x00]);
+                                self.buf.emit(&guard_class_id.to_le_bytes());
+                                miss_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                if self.try_emit_inline(pc) {
+                                    // Hit: skip the about-to-be-emitted
+                                    // normal-dispatch bytes entirely.
+                                    guarded_virtual_done_patch =
+                                        Some(self.emit_jmp_rel32_patch());
+                                    // Land every guard-miss branch right here —
+                                    // the start of the UNCHANGED normal-dispatch
+                                    // code that is about to run next.
+                                    for p in miss_patches {
+                                        self.patch_rel32_to_here(p);
+                                    }
+                                    // The inline body already consumed the
+                                    // receiver+args and pushed its result via the
+                                    // same push_from_rax / push_from_rax_as_xmm0
+                                    // convention the normal-dispatch code below
+                                    // also uses. Restore the compiler's SYMBOLIC
+                                    // state (not the already-emitted bytes) to
+                                    // exactly what it was before the guard, so
+                                    // that code — the only Rust-level
+                                    // continuation from here, run unconditionally
+                                    // — pops the SAME receiver+args positions and
+                                    // pushes the canonical result shape for every
+                                    // bytecode that follows, regardless of which
+                                    // machine-code path a given execution
+                                    // actually takes at runtime.
+                                    self.stack = stack_checkpoint;
+                                    self.stack_oop_marks = oop_marks_checkpoint;
+                                    self.next_spill_offset = spill_checkpoint;
+                                } else {
+                                    // try_emit_inline already rolled back its OWN
+                                    // side effects (see its doc comment); rewind
+                                    // the guard bytes and their checkpointed
+                                    // state too, so the fall-through below is
+                                    // byte-identical to never having attempted
+                                    // this guard.
+                                    self.buf.rewind_to(buf_checkpoint);
+                                    self.stack = stack_checkpoint;
+                                    self.stack_oop_marks = oop_marks_checkpoint;
+                                    self.next_spill_offset = spill_checkpoint;
+                                    self.exception_check_stubs
+                                        .truncate(exception_check_stubs_checkpoint);
+                                    self.deopt_stubs.truncate(deopt_stubs_checkpoint);
+                                    self.forward_patches.truncate(forward_patches_checkpoint);
+                                    self.jump_table_patches
+                                        .truncate(jump_table_patches_checkpoint);
+                                    self.self_call_patches
+                                        .truncate(self_call_patches_checkpoint);
+                                    self.bounds_check_stubs
+                                        .truncate(bounds_check_stubs_checkpoint);
+                                    self.null_check_store_stubs
+                                        .truncate(null_check_store_stubs_checkpoint);
+                                }
+                            }
                         }
                     }
 
@@ -22197,6 +22422,9 @@ impl Compiler {
                             }
                         }
                     }
+                    if let Some(done) = guarded_virtual_done_patch {
+                        self.patch_rel32_to_here(done);
+                    }
                     if op == 0xb9 {
                         pc += 5;
                     } else {
@@ -23304,6 +23532,9 @@ pub fn compile(
         helpers,
         non_escaping_new,
         inline_sites,
+        // PGO-02: legacy/test wrapper never plans a guarded virtual inline
+        // (it has no profile-driven admission path at all).
+        HashMap::new(),
         string_layout,
         &[],
         0,
@@ -23984,6 +24215,14 @@ pub fn compile_with_param_slots(
     helpers: &JitRuntimeHelpers,
     non_escaping_new: std::collections::HashSet<usize>,
     inline_sites: HashMap<usize, crate::InlineSite>,
+    // PGO-02: guard_class_id for every Monomorphic-admitted virtual/interface
+    // inline site, keyed by the same pc as `inline_sites`. See
+    // `docs/feature-designs/profile-guided-inlining.md`. Deliberately NOT
+    // threaded through the loop-unroll pc-replication tuple a few lines below
+    // (unlike `inline_sites` itself) — a replicated pc without an entry here
+    // just falls back to normal dispatch for that unrolled copy, which is
+    // always correct, only not optimized.
+    inline_guard_class_ids: HashMap<usize, u32>,
     // Compile-time resolved `java/lang/String` field layout for the String
     // call-site intrinsics (length/charAt/hashCode/…). `None` means "String
     // layout unavailable" — String-intrinsic codegen (added by a later
@@ -25252,6 +25491,7 @@ pub fn compile_with_param_slots(
     compiler.scalar_field_ops = sr_plan.field_ops;
     compiler.scalar_init_skips = sr_plan.init_skips;
     compiler.inline_sites = inline_sites.into_iter().collect();
+    compiler.inline_guard_class_ids = inline_guard_class_ids.into_iter().collect();
     // String call-site intrinsics: hand the resolved String field layout to
     // the compiler so intrinsic codegen can emit inline field loads.
     compiler.string_layout = string_layout;
@@ -25323,6 +25563,10 @@ pub fn compile_with_param_slots(
     // Emit prologue
     compiler.emit_prologue();
     if compiler.failed {
+        let (site, pc, op) = compiler
+            .failed_site
+            .unwrap_or(("singlepass-prologue", 0, 0));
+        crate::note_jit_bail_site_at(site, pc, op);
         return None;
     }
     let entry_offset = 0; // prologue starts at offset 0
@@ -25335,16 +25579,19 @@ pub fn compile_with_param_slots(
         // `compile-bail` line names the method but not the opcode. Neither is
         // a diagnosis on its own, and they are not even both printed on the
         // same run for an OSR/callee compile.
-        crate::note_jit_bail_site_at(
+        //
+        // A refusal raised through the `failed` FLAG names its own site and the
+        // pc/op live when it was raised; the flag is only checked after the
+        // whole dispatch loop, so `dbg_last_pc`/`dbg_last_op` would name
+        // whatever instruction happened to be last instead.
+        let (site, pc, op) = compiler.failed_site.unwrap_or((
             "singlepass-codegen",
             compiler.dbg_last_pc,
             compiler.dbg_last_op,
-        );
+        ));
+        crate::note_jit_bail_site_at(site, pc, op);
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
-            eprintln!(
-                "[cratonvm-jitc] codegen-bail pc={} op=0x{:02x}",
-                compiler.dbg_last_pc, compiler.dbg_last_op
-            );
+            eprintln!("[cratonvm-jitc] codegen-bail site={site} pc={pc} op=0x{op:02x}");
         }
         return None;
     }
@@ -26695,6 +26942,7 @@ mod tests {
             &helpers,
             std::collections::HashSet::new(),
             HashMap::new(),
+            HashMap::new(), // inline_guard_class_ids (PGO-02)
             None,
             &[0],
             1,
@@ -30555,6 +30803,7 @@ mod tests {
                 helpers,
                 std::collections::HashSet::new(),
                 HashMap::new(),
+                HashMap::new(), // inline_guard_class_ids (PGO-02)
                 None, // string_layout
                 &[],
                 0,
@@ -36900,6 +37149,117 @@ mod tests {
         code.push(0);
         code.push(0);
         (code, code_len)
+    }
+
+    /// `compile_switch_method`'s shape with the locals a handler-body fixture
+    /// needs. The bytecode under test never runs; only the compiler's decision
+    /// about it is asserted.
+    fn compile_probe_method(
+        code: &[u8],
+        num_params: usize,
+        max_locals: usize,
+    ) -> Option<CompiledMethod> {
+        compile(
+            code,
+            code.len(),
+            num_params,
+            max_locals,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+    }
+
+    /// A dead region containing a branch of its own must not refuse the method.
+    ///
+    /// The backend has no in-method exception-handler dispatch, so a handler
+    /// body is dead code in the emitted image — but a branch INSIDE one still
+    /// marks its own targets, and the DCE walk revived at every branch target
+    /// regardless of whether anything reachable could get there. It came back
+    /// with no recorded operand-stack depth, rebuilt an empty stack, and then
+    /// underflowed on the merge's `iadd`, refusing the whole method.
+    ///
+    /// Shape transcribed from `Rbc6FieldProbe.getfieldRefHandlerLocal`'s
+    /// handler — `catch (NPE e) { return scratch + (seen == null ? 0 : 1); }`
+    /// — whose ternary is the branch in question. See
+    /// `docs/internal/singlepass-codegen-refuses-handler-body-merge-FIXED-20260803.md`.
+    #[test]
+    fn a_dead_region_with_an_internal_branch_does_not_refuse_the_method() {
+        //  0: iload_0
+        //  1: ireturn           <- everything below is unreachable
+        //  2: iload_0
+        //  3: aload_1
+        //  4: ifnonnull 11
+        //  7: iconst_0
+        //  8: goto 12
+        // 11: iconst_1
+        // 12: iadd              <- the merge that underflowed
+        // 13: ireturn
+        let code = [
+            0x1a, 0xac, 0x1a, 0x2b, 0xc7, 0x00, 0x07, 0x03, 0xa7, 0x00, 0x04, 0x04, 0x60, 0xac,
+        ];
+        assert!(
+            compile_probe_method(&code, 2, 2).is_some(),
+            "a branch inside an unreachable region must not refuse the method"
+        );
+
+        // The live prefix alone compiles, so the refusal really did come from
+        // the dead tail and not from `iload_0; ireturn`.
+        assert!(compile_probe_method(&code[..2], 2, 2).is_some());
+    }
+
+    /// The same shape reached through a `goto` over the dead region, which is
+    /// how a `try`/`catch` actually lays out: the live path jumps past the
+    /// handler, so the handler body sits between two live PCs.
+    #[test]
+    fn a_dead_region_between_two_live_ones_is_skipped_whole() {
+        //  0: goto 14           (over the "handler")
+        //  3: iload_0           <- unreachable from here ...
+        //  4: aload_1
+        //  5: ifnonnull 12
+        //  8: iconst_0
+        //  9: goto 13
+        // 12: iconst_1
+        // 13: iadd              <- ... to here
+        // 14: iconst_2          <- live again
+        // 15: ireturn
+        let code = [
+            0xa7, 0x00, 0x0e, 0x1a, 0x2b, 0xc7, 0x00, 0x07, 0x03, 0xa7, 0x00, 0x04, 0x04, 0x60,
+            0x05, 0xac,
+        ];
+        assert!(compile_probe_method(&code, 2, 2).is_some());
+    }
+
+    /// A refusal raised through the `failed` FLAG names the site that raised
+    /// it, not whatever opcode the walk happened to reach afterwards.
+    ///
+    /// `dup2` at PC 0 has no preceding instruction, so its top-of-stack width
+    /// is unprovable and the arm raises the flag. The walk then runs on to the
+    /// `ireturn`, which is exactly the misattribution this records: the old
+    /// reason string was `singlepass-codegen(pc=1,op=0xac)`.
+    #[test]
+    fn a_flag_refusal_names_the_site_that_raised_it() {
+        let code = [0x5c, 0xac]; // dup2; ireturn
+        let _ = crate::take_jit_bail_site(); // clear anything a prior test left
+        assert!(compile_probe_method(&code, 0, 1).is_none());
+        let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
+        assert_eq!(site, "singlepass-codegen/dup2-unprovable-top-width");
     }
 
     fn compile_switch_method(code: &[u8], code_len: usize) -> Option<CompiledMethod> {
