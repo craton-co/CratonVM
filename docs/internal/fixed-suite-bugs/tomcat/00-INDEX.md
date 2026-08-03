@@ -185,6 +185,7 @@ fd as a `BufferedReader`. Now **9/9 on both VMs**. Regression witness:
 the shared failure is the *last* one. Until the fixture is actually up, it is
 an untested hypothesis, not a verdict.
 
+
 ## IPv4-mapped IPv6 destinations unreachable on Windows, 2026-08-03
 
 [teststartupipv6connectors-ipv6-mapped-ipv4-FIXED-20260803](teststartupipv6connectors-ipv6-mapped-ipv4-FIXED-20260803.md).
@@ -204,3 +205,20 @@ named only `HttpURLConnection`; a probe over four connect surfaces found
 `SocketChannel.connect` broken too. **And the dead-copy trap bit again** — the
 first fix went into `http_client::open_connection`, which `HttpURLConnection`
 does not use; `http_url_connection.rs` has its own connect loop, twice.
+
+## WebSocket-over-TLS `[JSSE]` client connect fixed, 2026-08-03
+
+`SSLEngine.wrap()` treated the caller's source buffer as application data for
+one flight of the handshake: `do_wrap` gated on `!conn.is_handshaking()`, but
+`handshake_status_of` keeps answering NEED_WRAP past that point (group 21's
+TLS-1.2 server-flight fix), so a caller obeying NEED_WRAP had its buffer
+drained — and the bytes ENCRYPTED onto the wire. Tomcat's WebSocket client
+passes a static 16921-byte `DUMMY`, so `wrap` reported `bytesConsumed=16384`,
+tripping `AsyncChannelWrapperSecure`'s "Bytes were consumed from the input
+during a write", and the never-rewound `DUMMY` carried the damage into later
+connections. Gated on `handshake_finished_reported` instead. Both `[JSSE]`
+classes go FAIL → PASS and are the ONLY rows that move across a 16-class TLS
+set run on two binaries; the residual `TestSsl` / `TestClientCert` failures are
+the pre-existing renegotiation ones, identical on both arms. Write-up:
+[websocket-jsse-wrap-consumed-app-data-during-handshake-FIXED](websocket-jsse-wrap-consumed-app-data-during-handshake-FIXED.md).
+

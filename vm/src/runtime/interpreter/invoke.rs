@@ -13618,7 +13618,7 @@ pub(super) fn execute_invokestatic_cached(
                     // same declaring class, so a future redefine bumps the
                     // same counter and invalidates the upgraded JIT entry.
                     let jit_target = CachedInvokeTarget::Jit {
-                        compiled: compiled.clone(),
+                        compiled: compiled.clone().into(),
                         num_params: cached.num_params,
                         return_type: ret,
                         needs_heap: heap,
@@ -15532,6 +15532,7 @@ pub(super) fn compile_osr_artifact(
     // back-edge does not re-run the whole pipeline to the same conclusion; the
     // artifact stays cached and other PCs are unaffected.
     if !osr_reused && !compiled.can_osr_enter(entry_pc) {
+        cratonvm_jit::metrics::record_osr_event("osr_refused_entry");
         crate::jit::mark_osr_entry_rejected(
             &class_name,
             &method_name,
@@ -15725,6 +15726,7 @@ pub(super) fn try_osr(
             // again. A state-dependent refusal (a slot's type, the local count,
             // live operands) must NOT be memoed — the next trip over the back-edge
             // carries different locals and may well be admissible.
+            cratonvm_jit::metrics::record_osr_event("osr_refused_entry");
             let permanent = cratonvm_jit::osr_refusal_is_permanent(&b);
             if permanent {
                 crate::jit::mark_osr_entry_rejected(
@@ -15793,6 +15795,12 @@ pub(super) fn try_osr(
     };
 
     crate::jit::helpers::restore_jit_thread(saved_jit_thread);
+
+    // An entry was taken. Counted here rather than before the call so a panic
+    // inside compiled code is not reported as a successful entry, and counted
+    // unconditionally because the whole point of `osr_entered` is to be the
+    // denominator `osr_exited` is read against.
+    cratonvm_jit::metrics::record_osr_event("osr_entered");
 
     // FIX (OSR uncommon-trap fallthrough, HHH-15895 `InPredicateTest`):
     // `jit_uncommon_trap` (used by, among others, the invokedynamic 0xba arm's
@@ -16043,6 +16051,13 @@ pub(super) fn try_osr(
     //     it was — correct only when the bail precedes any committed loop iteration
     //     (the unconditional-at-header trigger). The validated Step-8 default.
     if result_i64 == i64::MIN {
+        // The entered frame is leaving compiled code without a value. This is
+        // the event the doc leads with: an OSR bail that resumes at the wrong
+        // interpreter state re-runs loop iterations, which is a wrong-answer
+        // bug that no termination test can see. Counting it does not fix that
+        // — it makes "entered and immediately left, every time" visible in a
+        // default run, which is the shape of the livelock.
+        cratonvm_jit::metrics::record_osr_event("osr_exited");
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
             dbg_deopt_sink("osr-exit", &rframe, "");
             // Identity gate (jit-invokedynamic-groovy-regression): the stash
@@ -16881,7 +16896,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             let ret = crate::jit::return_type(&cached.method_descriptor);
             let heap = compiled.needs_heap();
             return Some(CachedInvokeTarget::Jit {
-                compiled,
+                compiled: compiled.into(),
                 num_params: cached.num_params,
                 return_type: ret,
                 needs_heap: heap,
@@ -17850,7 +17865,7 @@ pub(super) fn try_jit_upgrade_with_gate(
     );
 
     Some(CachedInvokeTarget::Jit {
-        compiled: compiled_arc,
+        compiled: compiled_arc.into(),
         num_params: cached.num_params,
         return_type: ret,
         needs_heap: heap,
@@ -22952,7 +22967,9 @@ pub(super) fn execute_invokevirtual_cached(
                             if found.is_none() {
                                 cached.record_jit_probe_miss(jit_generation);
                             }
-                            found
+                            // See the interpreter's twin: released on the
+                            // mutator, and regularly the last owner.
+                            found.map(cratonvm_jit::RetainedCode::new)
                         }
                         .or_else(|| {
                             // Warmup counter mirroring execute_invokestatic_cached.

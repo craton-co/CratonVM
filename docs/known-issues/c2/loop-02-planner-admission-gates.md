@@ -1,8 +1,12 @@
 # LOOP-02 — revisit the four whole-compile refusals
 
-**Status:** not started. **Owns:** `jit/src/x64.rs`'s
-`plan_bytecode_loop_xform` region only — coordinate with `seam-01`, which wants
-to move that file.
+**Status:** not started. **Owns:** `jit/src/x64/loop_rewrite.rs` only.
+
+That file did not exist when this doc was written: `plan_bytecode_loop_xform`
+and the rest of the planning lived in `jit/src/x64.rs`, and this lane was told
+to coordinate with `seam-01` before touching it. `seam-01` closed 2026-08-03
+and the coordination is no longer needed — the planning is now a 366-line file
+of its own, and this lane owns all of it.
 
 ## The finding
 

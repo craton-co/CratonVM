@@ -6422,6 +6422,99 @@ mod tests {
         assert_eq!(client.negotiated_alpn.as_deref(), Some("h2"));
         assert_eq!(server.negotiated_alpn.as_deref(), Some("h2"));
     }
+
+    #[test]
+    fn wrap_consumes_no_app_data_before_finished_is_reported() {
+        // REGRESSION (websocket-jsse-ssl-bytes-consumed-during-write): rustls
+        // reports `is_handshaking() == false` one flight BEFORE the engine has
+        // told the caller the handshake ended. `handshake_status_of` keeps
+        // answering NEED_WRAP through that window on purpose (the TLS 1.2
+        // server-flight fix), so a caller that correctly obeys NEED_WRAP calls
+        // `wrap(src, dst)` while, from its point of view, it is still
+        // handshaking -- and JSSE's contract says such a wrap consumes NOTHING
+        // from `src`.
+        //
+        // Gating app-data consumption on `!is_handshaking()` alone made the
+        // engine treat `src` as application data in that window. Tomcat's
+        // WebSocket client passes a 16921-byte STATIC
+        // `AsyncChannelWrapperSecure.DUMMY`, so the engine drained 16384 bytes
+        // of zeros out of it, ENCRYPTED them onto the wire mid-upgrade, and
+        // reported bytesConsumed=16384 -- tripping
+        // `AsyncChannelWrapperSecure.checkResult`'s "Bytes were consumed from
+        // the input during a write" and killing every wss:// connect. DUMMY is
+        // never rewound, so the damage leaked into later connections too.
+        let mut client = super::EngineState::default();
+        let mut server = super::EngineState::default();
+        client.is_client = true;
+        client.peer_host = Some("localhost".to_string());
+        client.client_config = Some(
+            super::build_client_config(
+                {
+                    let mut roots = RootCertStore::empty();
+                    for c in parse_cert_chain_pem(CA_CRT_PEM).unwrap() {
+                        roots.add(c).unwrap();
+                    }
+                    roots
+                },
+                &[],
+                None,
+            )
+            .unwrap(),
+        );
+        server.is_client = false;
+        server.server_config = Some(
+            super::build_server_config_single_cert(SERVER_CRT_PEM, SERVER_KEY_PEM, &[], false, None)
+                .unwrap(),
+        );
+        super::engine_begin(&mut client).expect("client begin");
+        super::engine_begin(&mut server).expect("server begin");
+
+        for _ in 0..32 {
+            let _ = super::engine_wrap_pump(&mut client, &[], 65536);
+            let buf = std::mem::take(&mut client.outbound);
+            if !buf.is_empty() {
+                let _ = super::engine_unwrap_pump(&mut server, &buf);
+            }
+            let _ = super::engine_wrap_pump(&mut server, &[], 65536);
+            let buf2 = std::mem::take(&mut server.outbound);
+            if !buf2.is_empty() {
+                let _ = super::engine_unwrap_pump(&mut client, &buf2);
+            }
+            if !client.conn.as_ref().unwrap().is_handshaking() {
+                break;
+            }
+        }
+
+        // The exact window: rustls is done, the caller has NOT been told.
+        // Nothing in the pumps sets `handshake_finished_reported`; only
+        // `do_wrap`/`do_unwrap` do, when they hand a FINISHED result back.
+        assert!(
+            !client.conn.as_ref().unwrap().is_handshaking(),
+            "client handshake did not complete"
+        );
+        assert!(
+            !client.handshake_finished_reported,
+            "precondition: FINISHED has not been reported to the caller yet"
+        );
+
+        let dummy = vec![0u8; 16921];
+        let (consumed, _) = super::engine_wrap_pump(&mut client, &dummy, 65536);
+        assert_eq!(
+            consumed, 0,
+            "wrap() consumed the caller's buffer before reporting FINISHED; \
+             Tomcat's AsyncChannelWrapperSecure asserts bytesConsumed == 0 for \
+             every handshake-time wrap"
+        );
+
+        // Once FINISHED has been reported, an ordinary application write must
+        // still work -- the fix must not wedge the post-handshake path.
+        client.handshake_finished_reported = true;
+        let (consumed_after, _) = super::engine_wrap_pump(&mut client, &dummy, 65536);
+        assert!(
+            consumed_after > 0,
+            "application data must be consumed once the handshake is reported finished"
+        );
+    }
 }
 
 // Temporarily suppress `dead_code` on the inline integration helpers — they
@@ -7825,14 +7918,22 @@ fn engine_wrap_pump(
     app_bytes: &[u8],
     dst_remaining: usize,
 ) -> (usize, usize) {
+    // Read before the `&mut state.conn` borrow below starts.
+    let finished_reported = state.handshake_finished_reported;
     let conn = match state.conn.as_mut() {
         Some(c) => c,
         None => return (0, 0),
     };
 
     // Phase 1: feed app data into rustls writer (post-handshake only).
+    // `handshake_finished_reported` for the same reason `do_wrap`'s
+    // `needs_app_data` uses it: `!is_handshaking()` goes true one flight before
+    // the caller is told the handshake ended, and anything written in that
+    // window is plaintext the peer is not expecting yet. `do_wrap` already
+    // hands us an empty `app_bytes` there; this keeps the invariant local so a
+    // future caller of this helper cannot reintroduce the same bug.
     let mut consumed = 0usize;
-    if !app_bytes.is_empty() && !conn.is_handshaking() {
+    if !app_bytes.is_empty() && finished_reported && !conn.is_handshaking() {
         if let Ok(n) = conn.writer().write(app_bytes) {
             consumed = n;
         }
@@ -8929,14 +9030,37 @@ fn do_wrap(
         }
     }
 
-    // Step 1: read app data from src ByteBuffers (only relevant when not handshaking).
+    // Step 1: read app data from src ByteBuffers (only once the handshake is
+    // OVER as far as the CALLER is concerned).
+    //
+    // The gate is `handshake_finished_reported`, not `!conn.is_handshaking()`.
+    // Those two are not the same instant: `handshake_status_of` deliberately
+    // keeps answering NEED_WRAP after `is_handshaking()` flips false, until the
+    // engine's own final flight has been drained (the TLS 1.2 server-flight fix
+    // in `handshake_status_of`). A caller that correctly obeys that NEED_WRAP
+    // calls `wrap(src, dst)` while still handshaking from its point of view --
+    // and JSSE's contract says such a wrap consumes NOTHING from `src`.
+    //
+    // Gating on `!is_handshaking()` alone made that wrap treat `src` as
+    // application data. Tomcat's WebSocket client hands it a 16921-byte
+    // `AsyncChannelWrapperSecure.DUMMY`, so the engine drained 16384 bytes of
+    // zeros out of it, ENCRYPTED them onto the wire mid-upgrade, and reported
+    // `bytesConsumed=16384` -- which is exactly the invariant
+    // `AsyncChannelWrapperSecure.checkResult` asserts, so the connect died with
+    // "Bytes were consumed from the input during a write". `DUMMY` is `static`
+    // and nobody rewinds it, so the position damage leaked into every later
+    // connection in the same JVM (the second engine found only 537 bytes left).
+    //
+    // Tomcat's server-side NIO path passes an empty buffer to its handshake
+    // wraps, which is why nothing but the WebSocket client ever noticed.
     let mut app_bytes = Vec::new();
     let mut consumed_app = 0usize;
     let needs_app_data = with_engine(id, |s| {
-        s.conn
-            .as_ref()
-            .map(|c| !c.is_handshaking())
-            .unwrap_or(false)
+        s.handshake_finished_reported
+            && s.conn
+                .as_ref()
+                .map(|c| !c.is_handshaking())
+                .unwrap_or(false)
     })
     .unwrap_or(false);
     if needs_app_data {

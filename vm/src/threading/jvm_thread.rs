@@ -474,7 +474,18 @@ pub struct JvmThread {
 
     /// Thread-local invoke cache — maps (caller_class, cp_index) to resolved targets.
     /// No locking needed since each thread owns its cache.
-    pub invoke_cache: InvokeCache<Arc<crate::jit::CompiledMethod>>,
+    ///
+    /// The JIT arm holds [`cratonvm_jit::RetainedCode`] rather than a bare
+    /// `Arc<CompiledMethod>`. This cache is evicted by the thread that
+    /// dispatches through it — `get` auto-evicts a stale entry, `put`
+    /// replaces one, `evict`/`clear` drop whole call sites — and those
+    /// evictions can run *while a frame of the evicted body is on this very
+    /// stack*. Once the JIT cache has retired the body, this entry is its last
+    /// owner, so a plain `Arc` drop would `munmap` the code under the
+    /// thread's own return address. Measured on
+    /// `BasicErrorControllerIntegrationTests`: released at
+    /// `active_jit_executions` = 2 and 3.
+    pub invoke_cache: InvokeCache<cratonvm_jit::RetainedCode>,
 
     /// Thread-local cache for the vtable-fast native-shadow guard.
     ///
