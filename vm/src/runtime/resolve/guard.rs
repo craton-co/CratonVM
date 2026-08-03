@@ -251,7 +251,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter/invoke.rs",
         "find_method_recursive(",
-        16,
+        12,
         "migration step 3a: invoke dispatch. Was 27 before the SEAM-02 split \
          moved this cluster into three files; the other 11 are the \
          `jit_bridge.rs` (8) and `native_override.rs` (3) rows below. Nothing \
@@ -268,23 +268,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "vm/src/runtime/interpreter/invoke.rs",
-        "find_field_recursive(",
-        5,
-        "migration step 3a: field peeks from the invoke paths (escape \
-         analysis, getter/setter inlining).",
-    ),
-    (
-        "vm/src/runtime/interpreter/invoke.rs",
-        "resolve_field_ref(",
-        1,
-        "migration step 3a: these become `MemberResolver::field_ref`. Each is \
-         a one-line change but each also changes the error type at the call \
-         site, so they move as one commit with a full suite behind it. Was 11; \
-         the SEAM-02 split moved 10 of them into `jit_bridge.rs` (row below), \
-         so 1 + 10 = 11.",
-    ),
-    (
-        "vm/src/runtime/interpreter/invoke.rs",
         "resolve_method_metadata(",
         2,
         "migration step 3a: the two in-module callers of the method core. \
@@ -297,6 +280,31 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         4,
         "migration step 3a: direct cache probes on the invoke fast paths. \
          `MemberResolver::probe_method_ref` is the replacement.",
+    ),
+    (
+        "vm/src/runtime/interpreter/lambda.rs",
+        "find_method_recursive(",
+        4,
+        "migration step 3a: lambda dispatch resolving the implementation \
+         method a bootstrap captured. Relocated by the SEAM-02 split, not \
+         added: 12 (invoke) + 8 (jit_bridge) + 3 (native_override) + 4 here \
+         = 27, the pre-split total.",
+    ),
+    (
+        "vm/src/runtime/interpreter/lambda.rs",
+        "find_field_recursive(",
+        5,
+        "migration step 3a: field peeks on the lambda fast paths (the \
+         captured-argument and tdigest getter shortcuts). All 5 of \
+         invoke.rs's field peeks moved here, so that row is gone rather \
+         than zeroed.",
+    ),
+    (
+        "vm/src/runtime/interpreter/lambda.rs",
+        "resolve_field_ref(",
+        1,
+        "migration step 3a: the last of invoke.rs's field-ref bypasses; the \
+         other 10 are in jit_bridge.rs. 1 + 10 = 11, the pre-split total.",
     ),
     // The `new`-path `check_class_access` moved to `jit_bridge.rs` with
     // `resolve_jit_new_site` in the SEAM-02 split; its row moved with it (see
