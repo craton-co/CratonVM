@@ -4049,6 +4049,110 @@ fn test_getfield_guarded_inline_fast_and_fallback() {
     assert_eq!(result, 424242, "null receiver must route to the helper");
 }
 
+/// Inline (helper-free) `getstatic`: with a resolver wired, the default `0xb2`
+/// arm emits the two-load direct form and leaves NO call to `jit_getstatic`
+/// behind; a site the resolver declines keeps the helper.
+///
+/// Both directions are asserted from ONE registration on purpose:
+/// `set_static_base_resolver` deliberately latches its context for the life of
+/// the process (a second VM must never re-point it at its own statics), so the
+/// test resolver instead answers for exactly one `(class, field)` pair and
+/// declines everything else — which also keeps it inert for any other test in
+/// this binary that compiles a `getstatic`.
+#[test]
+fn test_getstatic_inline_direct_load_and_fallback() {
+    use std::sync::atomic::AtomicPtr;
+
+    /// Marker helper: returns a constant no direct load of the block below
+    /// could produce, so routing is observable.
+    unsafe extern "C" fn marker_getstatic(_vm: i64, _cid: i64, _idx: i64) -> i64 {
+        424_242
+    }
+
+    /// Stands in for `jit_resolve_static_base`. `ctx` IS the address of the
+    /// base-pointer cell here, so the test needs no VM.
+    unsafe extern "C" fn test_resolver(ctx: i64, class_id: i64, field_index: i64) -> i64 {
+        if class_id == 0x5EED && field_index == 1 {
+            ctx
+        } else {
+            0
+        }
+    }
+
+    // A leaked statics block plus the `AtomicPtr` cell that names it — the same
+    // two-level shape `StaticsIndex` publishes.
+    static CELL_ADDR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cell_addr = *CELL_ADDR.get_or_init(|| {
+        let block: &'static mut [Value] =
+            Box::leak(vec![Value::Int(1), Value::Int(-7), Value::Int(2)].into_boxed_slice());
+        let cell: &'static AtomicPtr<Value> =
+            Box::leak(Box::new(AtomicPtr::new(block.as_mut_ptr())));
+        // Cast: the address the backend bakes as an immediate.
+        cell as *const AtomicPtr<Value> as usize
+    });
+    set_static_base_resolver(test_resolver as *const () as usize, cell_addr);
+
+    // getstatic #1 ; ireturn
+    let code: Vec<u8> = vec![0xb2, 0x00, 0x01, 0xac, 0, 0];
+    let code_len = 4;
+    let mut helpers = test_helpers();
+    helpers.getstatic = marker_getstatic as *const () as usize;
+
+    let build = |field_index: usize| {
+        compile(
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(), // multianewarray_info
+            Vec::new(), // field_info
+            Vec::new(), // typecheck_info
+            // static_field_info: (pc, class_id, field_index, type_tag, volatile)
+            vec![(0usize, 0x5EEDu32, field_index, b'I', false)],
+            Vec::new(), // new_info
+            Vec::new(), // anewarray_info
+            Vec::new(), // invoke_info
+            Vec::new(), // direct_calls
+            Vec::new(), // mic_slots
+            Vec::new(), // pic_slots
+            Vec::new(), // ldc_info
+            Vec::new(), // ldc2w_info
+            HashMap::new(),
+            HashMap::new(),
+            &helpers,
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .expect("test JIT compile")
+    };
+
+    // 1. Resolved site → direct load of slot 1, sign-extended.
+    let inlined = build(1);
+    // SAFETY: JIT-compiled machine code from valid bytecode in an executable
+    // mmap region, as in every other codegen test here.
+    let v = unsafe { inlined.try_call(&[0]).expect("test JIT call") };
+    assert_eq!(
+        v, -7,
+        "a resolved getstatic must read the block directly (MOVSXD of the Int payload)"
+    );
+    assert_eq!(
+        calls_to(&inlined, helpers.getstatic),
+        0,
+        "an inlined getstatic must leave no CALL to jit_getstatic"
+    );
+
+    // 2. Declined site (field 0) → the helper still owns it.
+    let fallback = build(0);
+    // SAFETY: as above.
+    let v = unsafe { fallback.try_call(&[0]).expect("test JIT call") };
+    assert_eq!(
+        v, 424_242,
+        "a site the resolver declines must keep the jit_getstatic path"
+    );
+}
+
 // -----------------------------------------------------------------------
 // G1-2 — the inline reference-store fast paths must not elide the
 // collector's post-write barrier on a backend that publishes no region
@@ -10869,6 +10973,106 @@ fn a_flag_refusal_names_the_site_that_raised_it() {
     assert!(compile_probe_method(&code, 0, 1).is_none());
     let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
     assert_eq!(site, "singlepass-codegen/dup2-unprovable-top-width");
+}
+
+/// `return cond ? x : helper()` — the `else` arm's call sits immediately
+/// before the shared `xreturn`, and the `then` arm's `goto` lands on it.
+///
+/// Both tail-call forms USED to swallow that `xreturn`: they emit no code for
+/// its PC, so `pc_to_native` stayed -1 there, and `patch_branches` then
+/// rejected the whole method with `branch-target-not-an-instruction-boundary`
+/// — a reason that blames malformed bytecode for what is ordinary javac
+/// output. See
+/// `docs/internal/jit-tailcall-swallows-shared-return-FIXED-20260803.md`.
+///
+///     0: iload_0
+///     1: ifeq 8
+///     4: iconst_1
+///     5: goto 12          <- the edge onto the return
+///     8: iload_0
+///     9: invokestatic
+///    12: ireturn          <- swallowed by the tail form
+const TAILCALL_OVER_SHARED_RETURN: [u8; 13] = [
+    0x1a, 0x99, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x07, 0x1a, 0xb8, 0x00, 0x01, 0xac,
+];
+
+/// The self-recursive tail form (an `invokestatic` with no `invoke_info` and no
+/// `direct_call` is a self-call here, as every other test in this file relies
+/// on).
+#[test]
+fn a_self_tail_call_may_not_swallow_a_branch_targeted_return() {
+    assert!(
+        compile_probe_method(&TAILCALL_OVER_SHARED_RETURN, 1, 1).is_some(),
+        "the `goto`'s target is the `ireturn` the tail form consumes"
+    );
+}
+
+/// The sibling tail form — reached only when the callee is ALREADY compiled,
+/// which is why this never reproduced from a cold standalone probe and only
+/// showed up inside a warm Spring context.
+#[test]
+fn a_sibling_tail_call_may_not_swallow_a_branch_targeted_return() {
+    assert!(
+        compile_with_direct_call(&TAILCALL_OVER_SHARED_RETURN, 1, 1, 9, direct_callee_i()).is_some(),
+        "a direct-callable callee must not let the tail form eat the shared return"
+    );
+}
+
+/// Without the branch onto it, the same call/return pair is still the fusible
+/// shape and must keep compiling — the guard is about the merge, not about
+/// tail calls.
+#[test]
+fn a_tail_call_over_an_unshared_return_still_compiles() {
+    let code = [0x1a, 0xb8, 0x00, 0x01, 0xac]; // iload_0; invokestatic; ireturn
+    assert!(compile_probe_method(&code, 1, 1).is_some());
+    assert!(compile_with_direct_call(&code, 1, 1, 1, direct_callee_i()).is_some());
+}
+
+/// A one-`int`-arg callee returning `int`. `entry` is never executed — only
+/// emitted as the JMP/CALL target.
+fn direct_callee_i() -> crate::JitDirectCall {
+    crate::JitDirectCall {
+        entry: 0x1000,
+        needs_context: false,
+        num_params: 1,
+        return_type: b'I',
+        guard_class_id: 0,
+    }
+}
+
+/// `compile_probe_method` with one direct-callable callee wired at `at_pc`.
+fn compile_with_direct_call(
+    code: &[u8],
+    num_params: usize,
+    max_locals: usize,
+    at_pc: usize,
+    callee: crate::JitDirectCall,
+) -> Option<CompiledMethod> {
+    compile(
+        code,
+        code.len(),
+        num_params,
+        max_locals,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(at_pc, callee)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
 }
 
 fn compile_switch_method(code: &[u8], code_len: usize) -> Option<CompiledMethod> {

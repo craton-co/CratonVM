@@ -3651,77 +3651,53 @@ impl Compiler {
                     pc += 1;
                 }
 
-                // getstatic (0xb2) — always call helper for thread safety
+                // getstatic (0xb2) — a direct load, or the helper
                 //
-                // MED-2 (round-2 JIT review) — HotSpot inlines non-volatile
-                // getstatic as a single `MOV reg, [imm64]` against the class's
-                // static-area slot, because both the class_id and the slot
-                // address are known at JIT compile time. CratonVM cannot
-                // currently emit that form. Bail rationale (see round-1 TLAB
-                // bail at 10783-10807 for the same pattern):
+                // HotSpot emits a plain load for a `getstatic`, because both
+                // the class and the slot address are known at compile time.
+                // CratonVM called `jit_getstatic` for every static read
+                // instead, and that CALL — not the read — was the whole cost:
+                // ~35 ns against HotSpot's ~1. See
+                // `docs/internal/jit-getstatic-costs-a-helper-call-FIXED-20260803.md`.
                 //
-                //   1. Slot storage is `SharedVm.classes.statics:
-                //      RwLock<HashMap<ClassId, Vec<Value>>>` (see
-                //      `vm/src/vm/vm_object.rs::get_static_shared` at line
-                //      472). The slot address is NOT stable:
-                //        * the `Vec<Value>` is grown by `resize` in
-                //          `set_static_shared` (vm_object.rs:498) — any prior
-                //          `&v[idx]` pointer dangles after the grow,
-                //        * the HashMap entry is created lazily on first
-                //          write (line 485), so a getstatic at warmup time
-                //          may see no entry at all,
-                //        * concurrent writers hold the RwLock write guard;
-                //          a JIT inline `MOV [imm64]` would race the
-                //          interpreter's `set_static_shared`.
-                //      The slot pointer would therefore have to be embedded
-                //      as an immediate yet remain valid across the program's
-                //      lifetime — neither holds today.
+                // MED-2 (round-2 JIT review) named three blockers for emitting
+                // the load. All three are gone:
                 //
-                //   2. Even if the storage were a stably-addressed array,
-                //      the `Value` enum is a tagged union (Int/Long/Float/
-                //      Double/Object), not a raw machine word. The JIT would
-                //      have to read both the tag and the payload to know
-                //      how to push to its operand stack — multi-step,
-                //      atomicity-fragile, and dependent on the enum layout.
+                //   1. "Slot storage is a `Vec<Value>` inside an `RwLock`ed
+                //      `HashMap`, so the address is not stable." It is now a
+                //      `StaticsBlock` — one leaked, never-freed allocation per
+                //      class — mirrored by the lock-free `StaticsIndex`.
+                //   2. "The `Value` enum is a tagged union, not a machine
+                //      word." Its layout is pinned by
+                //      `types::heap_types::field_cell_layout_matches_value_enum`,
+                //      and the inline `getfield` arms have been reading field
+                //      cells through `FIELD_CELL_PAYLOAD*_OFFSET` since July.
+                //      A static cell is the same 16 bytes.
+                //   3. "The `jit` crate has no `vm` dependency, so it cannot
+                //      resolve a slot address at compile time." It does not
+                //      need one. The VM registers a resolver function pointer
+                //      plus its own `SharedVm` pointer through a process-global
+                //      setter (`set_static_base_resolver`), exactly as it
+                //      registers the savebase watch helpers — no
+                //      `JitRuntimeHelpers` field, no golden offset, no ABI
+                //      revision bump, because generated code never calls it.
+                //      Only this backend does, while emitting.
                 //
-                //   3. The `jit` crate has no dependency on the `vm` crate
-                //      (see `jit/Cargo.toml` — only types, reader, jit-api).
-                //      So even doing the resolution at JIT compile time
-                //      would require either (a) a new field on
-                //      `JitRuntimeHelpers` that exposes a fn-pointer
-                //      `resolve_static_slot(class_id, field_index) ->
-                //      *const Value`, or (b) plumbing the resolved slot
-                //      addresses into the per-bci `static_field_info` from
-                //      the caller in vm/src/jit/. Both require edits beyond
-                //      this file; this task is constrained to `jit/src/x64.rs`
-                //      only.
+                // What is baked is the address of the class's base-POINTER
+                // cell, not of the block: see `try_emit_inline_getstatic` for
+                // the emitted shape and `StaticsIndex::base_cell_addr` for why
+                // that one extra dependent load buys immunity to every
+                // republication path.
                 //
-                // To wire inlining later, the prerequisites are:
-                //   * Change `SharedVm.classes.statics` to use a stable allocation
-                //     for each class's static area (e.g. `Box<[AtomicU64]>`
-                //     allocated once per `<clinit>` and pinned for the
-                //     class's life). Volatile fields then use
-                //     `MOV [imm64]` + MFENCE; non-volatile use plain
-                //     `MOV [imm64]` (x86 already gives acquire ordering
-                //     for aligned 8-byte loads).
-                //   * Add a `JitRuntimeHelpers` field exposing the slot
-                //     resolver, or pre-resolve at JIT compile time and
-                //     extend `static_field_info` to carry the slot ptr.
-                //   * Match the static slot type to the field's JVM type
-                //     (use type_tag) so the inline MOV writes the right
-                //     width (32 for int/float, 64 for long/double/ref).
+                // The helper below still owns every site the resolver declines
+                // — a class not yet initialized at compile time (an inline load
+                // runs no `<clinit>`), `java/lang/System` (the `out`/`err`/`in`
+                // bootstrap intercept), anything not yet published, a second VM
+                // in this process, and everything when
+                // `CRATONVM_JIT=getstatic-helper` is set.
                 //
-                // Expected speedup once wired: a JIT-compiled hot loop with
-                // a getstatic+putstatic pair drops from ~2 CALLs + arg
-                // marshalling (~12-18 cycles round trip) to two MOVs
-                // (~3-4 cycles). HotSpot publishes this as the dominant
-                // static-field-access optimization; we expect a 4-6x
-                // speedup on static-field-heavy microbenchmarks
-                // (Counter.increment(), shared lazy-init flags, etc.).
-                //
-                // Until then, every static access stays on the helper
-                // path below. This is correct (the helper takes the
-                // RwLock and reads `Value` properly) but slow.
+                // `putstatic` (0xb3) deliberately stays on its helpers; see the
+                // note there.
                 0xb2 => {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let (_, class_id_raw, field_index, type_tag, is_volatile) = self
@@ -3729,6 +3705,20 @@ impl Compiler {
                         .get(&pc)
                         .map(|&i| self.static_field_info[i])
                         .unwrap_or((pc, 0, 0, b'I', false));
+
+                    // Direct load, no helper CALL — the structural fix this
+                    // opcode's long bail comment above describes. It emits the
+                    // value push, the oop mark and the volatile fence itself,
+                    // so the whole helper sequence below is skipped.
+                    if self.try_emit_inline_getstatic(
+                        class_id_raw,
+                        field_index,
+                        type_tag,
+                        is_volatile,
+                    ) {
+                        pc += 3;
+                        continue;
+                    }
 
                     self.flush_scratch_registers();
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
@@ -3774,15 +3764,21 @@ impl Compiler {
 
                 // putstatic (0xb3) — write static field via type-specific helper
                 //
-                // MED-2 (round-2 JIT review): same bail as 0xb2 above. The
-                // symmetric inline form would be `MOV [imm64], reg`, but
-                // (a) `SharedVm.classes.statics` slot addresses aren't stable
-                // (the Vec resizes; the HashMap entry is created lazily),
-                // (b) writes need to go through `set_static_shared` so the
-                // GC and finalizer paths see the new object reference, and
-                // (c) the `jit` crate has no `vm` dependency to resolve the
-                // slot pointer at JIT compile time. See the long bail comment
-                // on the 0xb2 handler above for the full unblocking plan.
+                // The three MED-2 blockers listed on the 0xb2 arm above are
+                // gone, and the same baked base-pointer cell would address a
+                // write just as well. The write side is NOT symmetric, though,
+                // and deliberately stays on the helper: `set_static_shared`
+                // fires the SATB pre-barrier for an overwritten reference —
+                // statics live in this Rust-side table, not the heap, so no
+                // collector `set_field` barrier covers them and a missed one is
+                // a hidden-pointer SATB hole (final remark misses the old
+                // referent, cleanup frees a live region) — and it is also what
+                // creates or grows a class's block on first touch. Inlining
+                // reads costs that machinery nothing; inlining writes would
+                // have to reproduce all of it. Reads were the measured problem
+                // (see the 0xb2 arm's doc); a primitive-only inline `putstatic`
+                // is the tractable next step if static WRITES ever show up on a
+                // hot path.
                 0xb3 => {
                     self.flush_scratch_registers();
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
@@ -6264,7 +6260,27 @@ impl Compiler {
                             //      are NOT targeted (already branched
                             //      above), so the callee is a normal
                             //      JIT-compiled method.
+                            //   4. `pc + 3` is NOT a branch target. The
+                            //      tail form CONSUMES the `xreturn` — it emits
+                            //      no code for that PC and leaves
+                            //      `pc_to_native[pc + 3]` unset — so any other
+                            //      edge into it becomes unresolvable and
+                            //      `patch_branches` rejects the whole method
+                            //      with `branch-target-not-an-instruction-
+                            //      boundary`, a reason whose message blames
+                            //      malformed bytecode. It is the ordinary
+                            //      shape `return (x != null ? x : missing())`:
+                            //      the `else` arm's call sits immediately
+                            //      before the shared `areturn`, and the `then`
+                            //      arm's `goto` lands on it. Fusing would also
+                            //      be wrong on its own terms — the other edge
+                            //      arrives with its own value on the operand
+                            //      stack and expects a plain return, not "load
+                            //      args and JMP to the callee". This is the
+                            //      same precondition the const-arith peepholes
+                            //      state: never fuse across a merge point.
                             let tail_op_matches = pc + 3 < code_len
+                                && !branch_targets[pc + 3]
                                 && match (ret_type, code[pc + 3]) {
                                     (b'I' | b'Z' | b'B' | b'S' | b'C', 0xAC) => true,
                                     (b'J', 0xAD) => true,
@@ -6510,8 +6526,14 @@ impl Compiler {
                         // frame down, so a throw from the self-recursive callee
                         // would bypass the handler covering this pc
                         // (see `pc_is_protected`).
+                        // Never when the `xreturn` is a branch target: the
+                        // tail form consumes that PC without emitting it, so
+                        // another edge into it has no native offset to be
+                        // patched to (see the sibling-tail arm above for the
+                        // full argument).
                         let is_tail_call = pc + 3 < code_len
                             && matches!(code[pc + 3], 0xac..=0xb0) // ireturn..areturn
+                            && !branch_targets[pc + 3]
                             && !self.pc_is_protected(pc);
 
                         // jit-invokedynamic-groovy-regression fix: a method
