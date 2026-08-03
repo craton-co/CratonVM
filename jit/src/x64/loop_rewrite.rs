@@ -414,7 +414,42 @@ pub(super) fn plan_bytecode_loop_xform(
 ) -> Result<LoopXform, LoopRewriteRefusal> {
     use LoopRewriteRefusal as R;
 
+    // ── Tally, before anything can short-circuit ──────────────────────
+    //
+    // Every one of the four conditions is recorded on every compile it holds
+    // for, INDEPENDENTLY of whether an earlier one already refuses. Counting
+    // "which refusal fired" instead would report `deopt_real` for 100% of
+    // compiles — it is default-ON and process-wide — and would hide the other
+    // three permanently, which is the state this lane exists to get out of.
+    // The four counts therefore overlap and must not be summed;
+    // `metrics::LOOP_XFORM_EVENTS` says so where a reader will find it.
+    //
+    // Cost on the default path: one relaxed increment per condition that
+    // holds, per compile. Compiles are thousands per run, not millions.
+    use crate::metrics::record_loop_xform_event as tally;
+    tally("loop_xform_compiles");
+    if shape.deopt_real {
+        tally("loop_xform_deopt_real");
+    }
+    if shape.precise_exception_frames {
+        tally("loop_xform_precise_exception_frames");
+    }
+    if shape.has_indy {
+        tally("loop_xform_invokedynamic");
+    }
+    if shape.has_inline_sites {
+        tally("loop_xform_inline_sites");
+    }
+    let eligible = !(shape.deopt_real
+        || shape.precise_exception_frames
+        || shape.has_indy
+        || shape.has_inline_sites);
+    if eligible {
+        tally("loop_xform_eligible");
+    }
+
     if !bytecode_loop_xform_rewrites_bytecode() {
+        tally("loop_xform_not_armed");
         return Err(R::NotArmed);
     }
     // Whole-compile refusals, cheapest first. Each names a construct that
@@ -512,6 +547,10 @@ pub(super) fn plan_bytecode_loop_xform(
             Err(e) => last_refusal = Some(e),
         }
     }
+    tally(match last_refusal {
+        Some(_) => "loop_xform_planner_refused",
+        None => "loop_xform_no_candidate_loop",
+    });
     Err(last_refusal.map(R::Planner).unwrap_or(R::NoCandidateLoop))
 }
 
