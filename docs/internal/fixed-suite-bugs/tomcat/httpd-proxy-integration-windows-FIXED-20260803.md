@@ -160,24 +160,27 @@ HotSpot = Adoptium JDK 25.0.3.9. CratonVM = `cratonvm-httpdproxy-20260803.exe`
 (release, JIT on, real JDK) with the suite's four `CRATONVM_*` variables.
 "before" = the same binary built from the parent commit.
 
-| Class | HotSpot | CratonVM before | CratonVM after |
-|---|---|---|---|
-| TestBasicProxy | PASS 9.0 s | FAIL — NPE | **PASS 18.9 s** |
-| TestChunkedTransferEncodingWithProxy | PASS 26.6 s @2g | FAIL — NPE | **PASS 110 s @4g** (OOM @2g, see above) |
-| TestErrorHandling | PASS 8.0 s | FAIL — NPE ×2 | **PASS 17.9 s** |
-| TestFullReverseProxy | PASS 11.0 s | FAIL — NPE | **PASS 13.6 s** |
-| TestLargePayloadWithProxy | PASS 8.3 s | FAIL — NPE ×2 | **PASS 19.8 s** |
-| TestRemoteIpValveWithProxy | PASS 4.4 s | FAIL — NPE | **PASS 12.0 s** |
-| TestSSLValveWithProxy01 | PASS 4.7 s | FAIL — NPE | **PASS 10.4 s** |
-| TestSSLValveWithProxy02 | PASS 5.0 s | FAIL — NPE | **PASS 10.3 s** |
-| TestSessionWithProxy | PASS 9.0 s | FAIL — NPE ×2 | **PASS 15.4 s** |
+| Class | HotSpot | CratonVM before | CratonVM after, JIT | CratonVM after, `--nojit` |
+|---|---|---|---|---|
+| TestBasicProxy | PASS 9.0 s | FAIL — NPE | **PASS 18.9 s** | **PASS 16.5 s** |
+| TestChunkedTransferEncodingWithProxy | PASS 26.6 s @2g | FAIL — NPE | **PASS 110 s @4g** (OOM @2g, see above) | **PASS 264 s @4g** |
+| TestErrorHandling | PASS 8.0 s | FAIL — NPE ×2 | **PASS 17.9 s** | **PASS 22.4 s** |
+| TestFullReverseProxy | PASS 11.0 s | FAIL — NPE | **PASS 13.6 s** | **PASS 18.9 s** |
+| TestLargePayloadWithProxy | PASS 8.3 s | FAIL — NPE ×2 | **PASS 19.8 s** | **PASS 28.1 s** |
+| TestRemoteIpValveWithProxy | PASS 4.4 s | FAIL — NPE | **PASS 12.0 s** | **PASS 15.8 s** |
+| TestSSLValveWithProxy01 | PASS 4.7 s | FAIL — NPE | **PASS 10.4 s** | **PASS 18.0 s** |
+| TestSSLValveWithProxy02 | PASS 5.0 s | FAIL — NPE | **PASS 10.3 s** | **PASS 19.7 s** |
+| TestSessionWithProxy | PASS 9.0 s | FAIL — NPE ×2 | **PASS 15.4 s** | **PASS 22.4 s** |
 
-**9/9 PASS on both VMs.** JIT-off (`--nojit`) results are recorded in the branch
-history alongside this run.
+**9/9 PASS on both VMs, JIT on and off.**
 
-The CratonVM wall times run 2-3x HotSpot's. That is the known embedded-server
+CratonVM's wall times run 2-3x HotSpot's. That is the known embedded-server
 throughput wall (group 04 / 30), not anything this family introduced — every
-class is well inside the 300 s suite timeout.
+class is well inside the 300 s suite timeout except the chunked one under
+`--nojit`, which the runner's per-class rule already covers.
+
+Rust-side regression check: `cargo test --release -p cratonvm-native-io` — 378
+passed, 0 failed.
 
 ## Reproducing
 
