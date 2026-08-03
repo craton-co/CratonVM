@@ -180,7 +180,14 @@ class is well inside the 300 s suite timeout except the chunked one under
 `--nojit`, which the runner's per-class rule already covers.
 
 Rust-side regression check: `cargo test --release -p cratonvm-native-io` — 378
-passed, 0 failed.
+passed, 0 failed; `-p cratonvm-native-builtins` — 3250 passed, 0 failed across
+its five test binaries. (That second run's `--doc` phase fails to link against
+four unrelated crates. Pre-existing: the doctest is in `net_phase_e.rs`, last
+touched 2026-08-02 by an unrelated commit, and this change adds no doctest at
+all — its only fenced block is a `text` block.)
+
+Re-verified end to end on the post-merge tree (`e1ecbcf30`, which picked up
+another session's JIT/OSR work): 9/9 PASS again, probe 10/10.
 
 ## Reproducing
 
