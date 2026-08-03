@@ -89,6 +89,11 @@ pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
 pub mod ir_schedule;
+// The OSR entry-metadata contract, as executable checks — see
+// `docs/feature-designs/jit-osr-entry-metadata.md`. Kept out of this file
+// deliberately: it must be testable against synthetic vectors, and a check
+// that can only be handed a real `CompiledMethod` cannot be.
+pub mod osr_contract;
 pub mod ir_verify;
 pub mod loop_analysis;
 pub mod metrics;
@@ -4936,20 +4941,29 @@ pub struct InlineBackendCaps {
 }
 
 impl InlineBackendCaps {
-    /// What `x64::compile` can do TODAY, verified against the source:
+    /// What `x64::compile` can do, verified against the source (updated
+    /// 2026-08-03, PGO-02):
     ///
-    ///  * `invokestatic` consults `inline_sites` (x64.rs:17274) and
-    ///    `invokespecial` does too (x64.rs:19463, whose own comment reads
-    ///    "invokespecial only — virtual/interface not eligible"), so
-    ///    statically bound splicing is real;
-    ///  * the `0xb6 | 0xb7 | 0xb9` arm never consults `inline_sites` for
-    ///    `0xb6`/`0xb9`, and its plain direct-call path (x64.rs:20716) emits an
-    ///    unconditional `CALL` with no receiver test — the `guard_class_id`
-    ///    compare exists only inside the String and CRC32 intrinsic ladders.
+    ///  * `invokestatic` consults `inline_sites` and `invokespecial` does
+    ///    too (statically bound DirectBind splicing, pre-existing);
+    ///  * the `0xb6 | 0xb7 | 0xb9` arm's `op == 0xb6 || op == 0xb9` case NOW
+    ///    ALSO consults `inline_sites` plus a companion
+    ///    `inline_guard_class_ids` map, when both carry an entry for the
+    ///    pc — populated together, only for an admitted `Monomorphic`
+    ///    verdict. See `docs/feature-designs/profile-guided-inlining.md` §5
+    ///    for the exact guard-then-splice lowering and why a miss falls
+    ///    through to the SAME unguarded direct-call path below rather than a
+    ///    deopt (the `guard_class_id` compare inside the String/CRC32
+    ///    intrinsic ladders is a separate, pre-existing mechanism this does
+    ///    not touch).
     ///
-    /// So a speculative plan has nowhere to be emitted and is refused. See
-    /// `docs/jit/profile-guided-inlining.md` for the exact backend edit that
-    /// would flip the second flag.
+    /// `guarded_inline_body_at_virtual_sites` below is still hard-coded
+    /// `false`: the flip to `true` happens at the `plan_inline` call site in
+    /// `try_compile_inner`, derived from whether a `class_id_name_resolver`
+    /// was threaded in — which the VM only does when
+    /// `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is set (default-off, unsoaked).
+    /// Every caller that doesn't opt in gets this const fn's `false`,
+    /// byte-for-byte the pre-PGO-02 behavior.
     pub const fn single_pass_x64() -> InlineBackendCaps {
         InlineBackendCaps {
             inline_body_at_static_sites: true,
@@ -12021,6 +12035,7 @@ pub fn try_compile(
         ir_emit_virtual_calls,
         ir_emit_fp,
         cp_invokedynamic_descriptor_resolver,
+        None,
     )
 }
 
@@ -12145,6 +12160,16 @@ pub fn try_compile_with_invokespecial_resolver(
     // whatever bytecode follows. `None` (resolver absent, or it returns `None`
     // for a given site) bails the whole compile — see `try_compile_inner`.
     cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    // PGO-02: maps a receiver CLASS ID (not a CP index - the runtime
+    // identity a guarded speculative inline's receiver class-id check
+    // resolved against) to its class name, so a Monomorphic/Bimorphic
+    // InlinePlan can record a SpeculatedReceiver invalidation dependency
+    // (plan_inline refuses via NoInvalidationDependency without one - the
+    // fail-closed rule in docs/feature-designs/profile-guided-inlining.md).
+    // `None` (resolver absent, or it returns `None` for a given id) refuses
+    // every speculative virtual/interface inline at that site; static/
+    // special DirectBind sites are unaffected (no receiver dependency).
+    class_id_name_resolver: Option<&dyn Fn(u32) -> Option<String>>,
 ) -> Option<CompiledMethod> {
     // Open the compilation scope FIRST, before any constant-pool resolver runs.
     // Every `CompiledMethod` built under it — including one built by a nested
@@ -12269,6 +12294,7 @@ pub fn try_compile_with_invokespecial_resolver(
         ir_emit_virtual_calls,
         ir_emit_fp,
         cp_invokedynamic_descriptor_resolver,
+        class_id_name_resolver,
         &mut backend_attempted,
         self_call_identity_stable,
     );
@@ -12800,7 +12826,17 @@ fn try_compile_inner(
     ir_emit_fp: bool,
     // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
     // its target descriptor. See `try_compile`.
+    // PGO-02: maps a receiver CLASS ID (not a CP index - the runtime
+    // identity a guarded speculative inline's receiver class-id check
+    // resolved against) to its class name, so a Monomorphic/Bimorphic
+    // InlinePlan can record a SpeculatedReceiver invalidation dependency
+    // (plan_inline refuses via NoInvalidationDependency without one - the
+    // fail-closed rule in docs/feature-designs/profile-guided-inlining.md).
+    // `None` (resolver absent, or it returns `None` for a given id) refuses
+    // every speculative virtual/interface inline at that site; static/
+    // special DirectBind sites are unaffected (no receiver dependency).
     cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    class_id_name_resolver: Option<&dyn Fn(u32) -> Option<String>>,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -14518,6 +14554,19 @@ fn try_compile_inner(
     let mut pic_slots: Vec<(usize, *const JitPICSlot)> = Vec::new();
     let mut owned_pic_slots: Vec<Box<JitPICSlot>> = Vec::new();
     let mut inline_sites: HashMap<usize, InlineSite> = HashMap::new();
+    // PGO-02: guard_class_id for every admitted Monomorphic virtual/
+    // interface inline plan, keyed by the same pc as inline_sites. Kept as
+    // a separate map rather than a new InlineSite field because
+    // vm/src/runtime/interpreter/invoke.rs constructs InlineSite with an
+    // exhaustive struct literal (adding a field there would break the vm
+    // crate). NOT threaded through the loop-unroll pc replication below
+    // (unlike inline_sites itself) - a loop-unrolled copy of a guarded
+    // virtual call site simply won't find an entry here and falls back to
+    // normal dispatch, which is always correct, just not optimized. Bimorphic
+    // is deliberately not carried here yet either: this increment is scoped
+    // to plan_inline's Monomorphic verdict only ("the narrowest speculation
+    // that is worth anything" - see the retired pgo-02 doc).
+    let mut inline_guard_class_ids: HashMap<usize, u32> = HashMap::new();
     // jit-inlining-and-ir-calls: HotSpot-shaped inlining budget. `hot_loops` is
     // derived once from the profile plus the bytecode; a caller that executes
     // any hot loop gets the larger whole-method budget, and each site inside
@@ -14617,44 +14666,13 @@ fn try_compile_inner(
             // roots.  Route through the checked re-entrant bridge instead;
             // it installs a distinct JitEntryGuard for the actual callee.
             let direct_jit_callee_calls_enabled = direct_jit_callee_calls_enabled();
-            // C2-review P1 — virtual/interface sites are NOT admitted for
-            // inlining (the single-pass backend has no guarded inline lowering
-            // for them; see `InlineBackendCaps::single_pass_x64`), but their
-            // receiver shape is readable from the profile alone and is the
-            // evidence that decides whether that backend work is worth doing.
-            // Classify and tally, without paying for a callee resolution.
-            //
-            // Gated on `metrics::enabled()` because `classify_receiver_shape`
-            // ranks the receiver map, which allocates: this is a measurement,
-            // and a measurement must not tax the compile path it measures. Off
-            // (the process default) it is one relaxed atomic load per virtual
-            // site.
-            if matches!(invoke_kind, 0 | 2) && metrics::enabled() {
-                let refusal = match classify_receiver_shape(
-                    profile.and_then(|p| p.receivers.get(&pc)),
-                ) {
-                    ReceiverShape::Unprofiled => InlineRefusal::NoProfileEvidence,
-                    ReceiverShape::Cold { observations, .. } => {
-                        InlineRefusal::ColdSite { observations }
-                    }
-                    ReceiverShape::Megamorphic { types, .. } => {
-                        if types > INLINE_MEGAMORPHIC_TYPE_CEILING {
-                            InlineRefusal::Megamorphic { types }
-                        } else {
-                            InlineRefusal::ReceiverNotDominant { types }
-                        }
-                    }
-                    // A shape this policy WOULD speculate on, refused only
-                    // because the backend cannot emit the guard. This counter
-                    // is the whole point of the arm: it measures the size of
-                    // the opportunity currently being left on the table.
-                    ReceiverShape::Monomorphic { .. } | ReceiverShape::Bimorphic { .. } => {
-                        InlineRefusal::GuardNotEmittable
-                    }
-                };
-                inline_tally.record_refusal(&refusal);
-            }
-            if !is_recursive_call && (invoke_kind == 3 || invoke_kind == 1) {
+            // PGO-02: virtual/interface sites (0 | 2) now go through the SAME
+            // plan_inline call as static/special (3 | 1) below — the metrics-
+            // only pre-tally that used to stand in for a real admission attempt
+            // here (measuring "how much GuardNotEmittable is costing") is gone;
+            // `inline_tally.record(&plan)` below now records every invoke kind's
+            // real verdict, admitted or refused, uniformly.
+            if !is_recursive_call && matches!(invoke_kind, 0..=3) {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
                     if let Some(resolver_fn) = inline_resolver.as_ref() {
@@ -14679,13 +14697,18 @@ fn try_compile_inner(
                             // `plan_inline`, together with the depth,
                             // recursion, exception-range and dependency rules
                             // this site had none of. For a statically bound
-                            // callee — the only kind that reaches here, see the
-                            // enclosing `invoke_kind` test — the admission
+                            // callee (`invoke_kind` 3 | 1) the admission
                             // decision is the SAME size/expansion/budget
                             // arithmetic as before, so an unprofiled compile
                             // inlines exactly as it did; what is new is that a
                             // refusal now says why, and that the dependencies
-                            // are taken from the plan rather than assumed.
+                            // are taken from the plan rather than assumed. For
+                            // a virtual/interface callee (0 | 2, PGO-02) the
+                            // policy additionally requires a dominant receiver
+                            // shape and a resolvable invalidation dependency —
+                            // see `classify_receiver_shape` / `receiver_class_namer`
+                            // below — before it will even consider the guard the
+                            // backend caps must also allow.
                             let site_hot = call_site_is_hot(pc, &inline_hot_loops, profile);
                             let callee_triple = (
                                 site.class_name.clone(),
@@ -14723,16 +14746,41 @@ fn try_compile_inner(
                                     pc,
                                 ),
                                 precise_exception_frames,
-                                caps: InlineBackendCaps::single_pass_x64(),
-                                // No class-id → name resolver is threaded into
-                                // this function, so a speculative plan could
-                                // not record its receiver dependency anyway.
-                                // Moot today: the caps above already refuse
-                                // every speculative site.
-                                receiver_class_namer: None,
+                                // PGO-02: `class_id_name_resolver` doubles as the
+                                // feature's on/off gate — the VM call sites pass
+                                // `None` unless CRATONVM_JIT_GUARDED_VIRTUAL_INLINE
+                                // is set (default-off), so an absent resolver both
+                                // disables guarded virtual/interface speculation
+                                // AND is the reason plan_inline would refuse one
+                                // anyway (no invalidation dependency could be
+                                // recorded). Static/special DirectBind sites are
+                                // unaffected either way — they never consult this.
+                                caps: InlineBackendCaps {
+                                    guarded_inline_body_at_virtual_sites:
+                                        class_id_name_resolver.is_some(),
+                                    ..InlineBackendCaps::single_pass_x64()
+                                },
+                                receiver_class_namer: class_id_name_resolver,
                             });
                             inline_tally.record(&plan);
-                            if plan.is_admitted() {
+                            // PGO-02: the backend only has codegen for
+                            // Monomorphic guarded splicing this increment
+                            // (InlineBackendCaps has ONE flag covering both
+                            // Monomorphic and Bimorphic, but there is no
+                            // Bimorphic emitter yet — see
+                            // docs/feature-designs/profile-guided-inlining.md).
+                            // A Bimorphic admission is plan_inline's own true
+                            // verdict (tallied above as such), but recording
+                            // inline_sites/a dependency for a splice the
+                            // backend will never actually emit would be a
+                            // permanent, pointless invalidation liability —
+                            // treat it as not-actionable here instead.
+                            let backend_can_emit = plan.is_admitted()
+                                && !matches!(plan.verdict, InlineVerdict::Bimorphic { .. });
+                            if backend_can_emit {
+                                if let InlineVerdict::Monomorphic { guard_class_id } = plan.verdict {
+                                    inline_guard_class_ids.insert(pc, guard_class_id);
+                                }
                                 inline_budget_remaining =
                                     inline_budget_remaining.saturating_sub(plan.expansion_cost);
                                 if site.needs_heap {
@@ -15572,6 +15620,7 @@ fn try_compile_inner(
         helpers,
         std::collections::HashSet::new(), // non_escaping_new — escape analysis done inside x64 too
         inline_sites,
+        inline_guard_class_ids,
         string_layout,
         &param_jvm_slots,
         param_slot_span,
