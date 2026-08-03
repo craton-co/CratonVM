@@ -149,3 +149,326 @@ impl Compiler {
                                                    // `over:` is the next emitted instruction.
     }
 }
+
+/// Publish this compile's OSR **entry** metadata onto `cm`, or publish none.
+///
+/// Lifted out of `compile_with_param_slots` (SEAM-01). It was ~280 statements
+/// in the middle of a 2,200-line function, and it is the part of that function
+/// with the least margin for a misreading: it builds four vectors across
+/// **three** coordinate spaces — interpreter bci, output pc, local index — and
+/// moves two of them between spaces when the bytecode loop rewriter is armed.
+///
+/// Everything it reads is a parameter and everything it writes goes through
+/// `cm`, so the extraction is mechanical; the argument list is long because the
+/// dependency was long, not because the split introduced one.
+///
+/// Fails closed, per `docs/feature-designs/jit-osr-entry-metadata.md`: if
+/// `osr_contract::check_at_publication` rejects the set, every OSR field is
+/// cleared rather than published half-agreeing. `can_osr_enter` then refuses
+/// every pc and the method runs to completion in the interpreter, which is
+/// always valid. It clears rather than returning early because the caller still
+/// has non-OSR state to publish (oop maps, deopt points, frame layout, the
+/// epoch guard); an early return would turn a metadata disagreement into a
+/// much larger regression than the one it prevents.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn publish_entry_metadata(
+    cm: &mut CompiledMethod,
+    code: &[u8],
+    code_len: usize,
+    orig_code_len: usize,
+    loop_xform: &Option<LoopXform>,
+    osr_entry_native: Vec<i32>,
+    local_assignments: &[Option<u8>],
+    xmm_assignments: &[Option<u8>],
+    osr_block_live_in: &[(usize, u64)],
+    num_locals: usize,
+    num_reg_locals: usize,
+    kernel_reg_homes: bool,
+    kernel_reg_homes_osr_requested: bool,
+    method_label: &str,
+) {
+    // Store OSR metadata for On-Stack Replacement entry.
+    //
+    // OSR uses `osr_entry_native` rather than the branch-patch `pc_to_native`:
+    // for loop headers carrying LICM-hoisted preheader code the two differ —
+    // `pc_to_native[header]` points *after* the preheader (so in-loop
+    // back-edges skip it) while `osr_entry_native[header]` points *before* it
+    // (so a cold OSR entry runs the hoist initialisation). For every other PC
+    // the two are identical.
+    //
+    // Pure-kernel GPR local homes: publish NO OSR entries for such a body.
+    // Its non-reference locals live exclusively in callee-saved registers,
+    // and the OSR trampoline's frame-seeded entry contract is exactly the
+    // "OSR transition" the kernel-homes safety argument excludes. The OSR
+    // pipeline compiles its own separate, memory-homed artifact
+    // (`compile_osr_artifact` never requests kernel homes), so loop-hot
+    // methods still get OSR service.
+    //
+    // Coordinate change, artifact half. `osr_entry_native` is written by the
+    // emitter at the pc it is emitting, so under a bytecode rewrite it is
+    // indexed by OUTPUT pc while the runtime indexes the published vector by
+    // INTERPRETER bci. It cannot merely be translated on read: a bci inside a
+    // transformed region has SEVERAL native offsets and picking the wrong one
+    // re-runs iterations. `LoopXform::rebuild_pc_to_native` applies
+    // `osr_entry_pc`'s steady-state choice pointwise and leaves the `-1`
+    // sentinel wherever there is no valid image (the unrolled back-edge gap),
+    // where entering compiled code is not valid at all and `can_osr_enter`
+    // must refuse. The identity — the same vector, moved — when unarmed.
+    let osr_entry_native = match loop_xform {
+        Some(x) => {
+            let mut v = x.rebuild_pc_to_native(&osr_entry_native, orig_code_len);
+            // Enforce the refusal independently of who filled the vector.
+            //
+            // `rebuild_pc_to_native` leaves the sentinel wherever `osr_entry_pc`
+            // answers `None`, so on the path where it is the sole producer this
+            // loop is a no-op. It is here because it was NOT the sole producer:
+            // the emitter also writes `osr_entry_native` while emitting, once
+            // per copy, and the back-edge bci is written by the LAST copy. That
+            // left a live entry at a bci with no steady-state image — entering
+            // there resumes a "back edge next" frame at the top of a fresh body
+            // and runs one extra iteration. Caught by
+            // `a_rewritten_compile_publishes_osr_metadata_in_interpreter_bci_space`
+            // the first time the suite was run against the wired rewriter.
+            //
+            // Stated as an invariant rather than a repair: after this, no bci
+            // that `osr_entry_pc` refuses carries an offset, whatever produced
+            // the vector.
+            for (bci, slot) in v.iter_mut().enumerate() {
+                if x.osr_entry_pc(bci).is_none() {
+                    *slot = -1;
+                }
+            }
+            v
+        }
+        None => osr_entry_native,
+    };
+    cm.osr_pc_to_native = if kernel_reg_homes && !kernel_reg_homes_osr_requested {
+        // Method-entry kernel homes: same length, every entry -1 —
+        // `can_osr_enter` refuses every pc (the method-entry body was never
+        // built for trampoline entry).
+        Some(vec![-1; osr_entry_native.len()])
+    } else {
+        // Ordinary bodies AND OSR-tier kernel-homed bodies publish real
+        // entries: the OSR trampoline seeds every local into its
+        // `osr_local_assignments` register (or frame slot for `None`/ref
+        // locals), which for a kernel-homed body is exactly its homes.
+        Some(osr_entry_native)
+    };
+    cm.osr_num_locals = num_locals;
+    cm.osr_num_reg_locals = num_reg_locals;
+
+    // --- OSR soundness: drop register assignments for long/double high-half
+    // slots ---------------------------------------------------------------
+    // A `long`/`double` JVM local at index N reserves index N+1 as its dead
+    // "high half". The JIT models 64-bit values as a single register, so it
+    // never reads index N+1 — but the graph-colouring allocator still hands
+    // that dead slot a physical register, and freely reuses one register for
+    // *several* dead high-halves AND a live local (they never interfere, so
+    // colouring is legal for the running code).
+    //
+    // The OSR trampoline, however, copies every `jit_locals[i]` into
+    // `local_assignments[i]`'s register in ascending index order. When a dead
+    // high-half index shares a register with a live local at a *lower* index,
+    // the trampoline's write of the high-half's garbage value (the interpreter
+    // supplies 0 for the unused slot) clobbers the live local that was already
+    // loaded. For a `long` loop counter this reset the counter to 0 mid-loop,
+    // producing a wrong result; for a pointer-typed local it corrupts a heap
+    // reference and segfaults.
+    //
+    // Fix: null out the OSR register assignment for every high-half slot.
+    // The high-half carries no live value, so the trampoline simply spills its
+    // garbage to a frame slot nobody reads — and the live local keeps its
+    // register. This only touches the OSR metadata copy; the running code's
+    // `reg_for_local` (which never asks for a high-half) is unaffected.
+    let mut osr_local_assignments = local_assignments.to_vec();
+    // ES-tdigest OSR fix: the high-half nulling and the per-PC dead mask below
+    // must cover XMM-resident (float/double) locals exactly like GPR-resident
+    // ones. DualPivotQuicksort.sort coalesces several disjoint-live-range
+    // double locals (pivots, run temporaries) onto one XMM register; an OSR
+    // entry at a PC where one of them is dead loaded the dead local's garbage
+    // over the live owner's XMM value (the GPR-only mask said "safe"), so
+    // Arrays.sort(double[]) silently mis-sorted / threw garbage-index AIOOBE
+    // once the sort loop OSR-entered.
+    let mut osr_xmm_assignments = xmm_assignments.to_vec();
+    {
+        let high_halves = wide_local_high_halves(code, code_len);
+        for &hh in &high_halves {
+            if hh < osr_local_assignments.len() {
+                osr_local_assignments[hh] = None;
+            }
+            if hh < osr_xmm_assignments.len() {
+                osr_xmm_assignments[hh] = None;
+            }
+        }
+    }
+    // Per-OSR-entry-PC "dead local" mask. The OSR trampoline loads locals into
+    // their (graph-colouring-coalesced) registers in index order; a local that
+    // is DEAD at the entry PC but shares a register with a LIVE local would
+    // clobber the live one when loaded (e.g. an `int[]` arg and a later-loop
+    // accumulator colour to the same callee-saved register because their live
+    // ranges don't overlap — entering the first loop then reading the array
+    // gets the accumulator's value, a null/garbage pointer → spurious NPE →
+    // OSR deopt → back-off → the loops never sustain JIT). The previously-fixed
+    // category-2 high-half clobber is one instance; this generalises it to any
+    // pair of real locals. For each basic-block start PC (OSR entries are
+    // loop-header block starts), mark the register-resident locals NOT live
+    // there so the trampoline skips loading them, leaving each shared register
+    // to its live owner.
+    let reg_resident: u64 = osr_local_assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.is_some())
+        .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
+    // XMM-resident locals participate in the same graph-colouring coalescing
+    // as GPR-resident ones, so they need the same dead-at-entry protection
+    // (liveness tracks d/f locals at their base index via dload/dstore).
+    let xmm_resident: u64 = osr_xmm_assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.is_some())
+        .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
+    // The mask must name the dead locals that are actually *hazardous*, not
+    // every dead local. `osr_enter` declines any entry whose mask is non-zero
+    // (a deliberate 2026-07-04 conservatism: the trampoline's skip-the-load
+    // avoided clobbering the live owner, but the resulting coalesced state
+    // transition was not proven safe -- see
+    // docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md). The
+    // hazard that argument rests on is *sharing*: a dead local whose register
+    // is also some live local's home. A dead local that owns its register
+    // outright has no coalesced state to reconstruct -- nothing reads it before
+    // the loop redefines it -- so flagging it only costs OSR entries.
+    //
+    // The blanket form cost a lot of them. `org/h2/compress/CompressLZF.
+    // compress(Ljava/nio/ByteBuffer;I[BI)I` -- the single hottest method in
+    // H2's `TestFileSystem` `nioMemLZF:` case -- was refused at its main loop
+    // header (`entry_pc=220`, mask `0x201`: `this` and one temporary, neither
+    // sharing a register with anything live) and so never ran compiled at all
+    // (2026-07-27).
+    //
+    // Set CRATONVM_JIT_OSR_DEAD_MASK_BLANKET=1 to restore the old
+    // flag-every-dead-local behaviour.
+    let blanket_dead_mask =
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET").is_some();
+    let resident = reg_resident | xmm_resident;
+    // `local <-> home register` lookup, GPR and XMM kept apart: they are
+    // different register files and can never alias each other.
+    let gpr_home = |i: usize| osr_local_assignments.get(i).copied().flatten();
+    let xmm_home = |i: usize| osr_xmm_assignments.get(i).copied().flatten();
+    let mut osr_dead_mask = vec![0u64; code_len + 1];
+    for &(pc, live_in) in osr_block_live_in {
+        if pc >= osr_dead_mask.len() {
+            continue;
+        }
+        let dead = resident & !live_in;
+        if blanket_dead_mask || dead == 0 {
+            osr_dead_mask[pc] = dead;
+            continue;
+        }
+        let live_resident = resident & live_in;
+        let mut hazardous = 0u64;
+        for i in 0..64 {
+            if (dead >> i) & 1 == 0 {
+                continue;
+            }
+            let (dg, dx) = (gpr_home(i), xmm_home(i));
+            for j in 0..64 {
+                if (live_resident >> j) & 1 == 0 {
+                    continue;
+                }
+                let shares = (dg.is_some() && dg == gpr_home(j))
+                    || (dx.is_some() && dx == xmm_home(j));
+                if shares {
+                    hazardous |= 1u64 << i;
+                    break;
+                }
+            }
+        }
+        osr_dead_mask[pc] = hazardous;
+    }
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_META").is_some() {
+        // Report the mask that is actually published, alongside the blanket
+        // "every dead register-resident local" set it is refined from, so the
+        // two can be compared directly. Printing a separately recomputed
+        // blanket value made this diagnostic silently disagree with the real
+        // metadata once the refinement landed.
+        let mut blanket: Vec<(usize, u64)> = Vec::new();
+        let mut published: Vec<(usize, u64)> = Vec::new();
+        for &(pc, live_in) in osr_block_live_in {
+            let b = (reg_resident | xmm_resident) & !live_in;
+            if b != 0 {
+                blanket.push((pc, b));
+            }
+            let p = osr_dead_mask.get(pc).copied().unwrap_or(0);
+            if p != 0 {
+                published.push((pc, p));
+            }
+        }
+        if !blanket.is_empty() || !published.is_empty() {
+            eprintln!(
+                "[osr-meta] gpr_resident={reg_resident:#x} xmm_resident={xmm_resident:#x} \
+                 blanket_entries={blanket:x?} published_entries={published:x?} \
+                 unblocked={}",
+                blanket.len() - published.len()
+            );
+        }
+    }
+    // Indexed by the same interpreter bci as `osr_pc_to_native` above, so it
+    // needs the same coordinate change and the same image choice — a mask
+    // read for one copy while the entry jumps into another would skip loading
+    // a local that IS live at the entry it actually takes. A bci with no
+    // steady-state image keeps a zero mask, which is never read: the entry is
+    // already refused by the `-1` in `osr_pc_to_native`.
+    let osr_dead_mask = match loop_xform {
+        Some(x) => {
+            let mut rebuilt = vec![0u64; orig_code_len + 1];
+            for (bci, slot) in rebuilt.iter_mut().enumerate() {
+                if let Some(image) = x.osr_entry_pc(bci) {
+                    *slot = osr_dead_mask.get(image).copied().unwrap_or(0);
+                }
+            }
+            rebuilt
+        }
+        None => osr_dead_mask,
+    };
+    // ── The OSR entry-metadata contract ──────────────────────────────
+    //
+    // Everything above built four vectors in THREE different coordinate spaces
+    // (interpreter bci, output pc, local index) and moved two of them between
+    // spaces. `osr_contract::check_at_publication` is the one place that says,
+    // in code rather than in a comment, that the results agree.
+    //
+    // Fail closed, per `docs/feature-designs/jit-osr-entry-metadata.md`: on a
+    // violation publish NO OSR metadata at all rather than a set whose pieces
+    // disagree. `can_osr_enter` then answers false everywhere and the method
+    // runs to completion in the interpreter, which is always valid. Over-
+    // refusal costs an optimisation; under-refusal re-runs loop iterations or
+    // resumes with the wrong locals.
+    //
+    // The check that matters is the length of the two bci-indexed vectors:
+    // `can_osr_enter_with` reads the dead mask through `.unwrap_or(0)`, so a
+    // short mask reads as "no dead locals" for every bci in the tail and admits
+    // entries that must be refused. Nothing downstream can notice.
+    let osr_metadata_agrees = crate::osr_contract::check_at_publication(
+        cm.osr_pc_to_native.as_deref().unwrap_or(&[]),
+        &osr_dead_mask,
+        &osr_local_assignments,
+        &osr_xmm_assignments,
+        num_locals,
+        method_label,
+    );
+    //
+    // Clearing the fields rather than returning early: everything below this
+    // point publishes NON-OSR state (oop maps, deopt points, frame layout, the
+    // epoch guard). An early return would drop all of it and turn a metadata
+    // disagreement into a much larger regression than the one it prevents.
+    if osr_metadata_agrees {
+        cm.osr_dead_mask = Some(osr_dead_mask);
+        cm.osr_local_assignments = Some(osr_local_assignments);
+        cm.osr_xmm_assignments = Some(osr_xmm_assignments);
+    } else {
+        cm.osr_pc_to_native = None;
+        cm.osr_dead_mask = None;
+        cm.osr_local_assignments = None;
+        cm.osr_xmm_assignments = None;
+    }
+}
