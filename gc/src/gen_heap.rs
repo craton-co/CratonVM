@@ -12656,6 +12656,20 @@ fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative
         return false;
     }
     if kind_byte == ObjectKind::Array as u8 {
+        // HIB-DCAST-LATEPHASE.1: validate the raw `element_type` tag byte
+        // too, before `gen_object_total_size(header)` below reads
+        // `header.element_type` as a TYPED enum for its `array_data_size`
+        // call. Only `kind_byte` was screened here — `element_type` was not
+        // — so an Array-kind candidate whose `element_type` byte is not one
+        // of `ArrayElementType`'s declared discriminants reached that typed
+        // read unvalidated: instant UB the moment it is loaded, which
+        // optimized code lowered into a `SIGILL` reached this way against
+        // the real `DefaultCatalogAndSchemaTest` workload.
+        // SAFETY: as above; `ARRAY_ELEMENT_TYPE_OFFSET` is inside the header.
+        let elem_tag = unsafe { *ptr.add(ARRAY_ELEMENT_TYPE_OFFSET) };
+        if array_element_type_from_tag(elem_tag).is_none() {
+            return false;
+        }
         if header.array_length() > i32::MAX as u32 {
             return false;
         }
@@ -16998,6 +17012,39 @@ mod tests {
         );
         // Outside the arena entirely.
         assert!(!og.is_allocated_addr(std::ptr::null()));
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`: `old_gen_mark_candidate_plausible` validated
+    /// the raw `kind` tag byte but not `element_type` before calling
+    /// `gen_object_total_size(header)`, which reads `header.element_type` as
+    /// a TYPED enum for an Array-kind candidate. An out-of-range
+    /// `element_type` byte is instant UB the moment that typed read
+    /// happens — a `SIGILL` reached this way against the real
+    /// `DefaultCatalogAndSchemaTest` workload. Corrupts only the raw
+    /// `element_type` byte of an otherwise-plausible Array-kind allocation
+    /// and asserts the screen rejects it instead of trapping.
+    #[test]
+    fn old_gen_mark_candidate_plausible_rejects_an_invalid_array_element_type_tag() {
+        let mut og = OldGen::new(4096);
+        let obj = og
+            .alloc(HEADER_SIZE + 4 * REF_ELEMENT_SIZE, 8)
+            .expect("alloc");
+        // SAFETY: `obj` is a live block of this OldGen.
+        unsafe {
+            let h = &mut *(obj as *mut ObjectHeader);
+            h.kind = ObjectKind::Array;
+            h.shape = 4; // array_length
+        }
+        // 0xFF is not a declared ArrayElementType discriminant.
+        // SAFETY: `obj + ARRAY_ELEMENT_TYPE_OFFSET` is the `element_type`
+        // byte of a live allocation; writing a raw `u8` there does not
+        // require the resulting value to be a valid `ArrayElementType`.
+        unsafe {
+            std::ptr::write(obj.add(ARRAY_ELEMENT_TYPE_OFFSET), 0xFFu8);
+        }
+
+        // Must not crash.
+        assert!(!old_gen_mark_candidate_plausible(obj, &og, false));
     }
 
     /// GCAUD-8 — at a PRECISE push site the plausibility screen must not have

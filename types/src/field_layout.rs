@@ -917,19 +917,38 @@ pub fn is_compact_object(header: &ObjectHeader) -> bool {
     header.gc_flags & GC_FLAG_COMPACT != 0
 }
 
-/// A legacy-object body size this function returns in place of `num_slots *
-/// SLOT_SIZE` when `num_slots` exceeds [`MAX_PLAUSIBLE_LEGACY_SLOTS`].
+/// The body size [`object_body_size`] returns whenever it cannot establish a
+/// *real* size for this object: a legacy `num_slots` past
+/// [`MAX_PLAUSIBLE_LEGACY_SLOTS`], or a compact object whose class layout is
+/// not registered for its `(class_id, field_count)`.
 ///
 /// `HIB-DCAST-LATEPHASE.1`: chosen so `HEADER_SIZE + object_body_size(..)`
 /// cannot overflow `usize` and so no real old-gen/region/semispace arena can
 /// ever contain an object this large — every caller's own "does this extent
-/// fit in the arena" bounds check therefore rejects it, the same way a `0`
-/// body size makes [`gen_object_total_size`] callers re-sync on a corrupt
-/// header. (`0` doesn't work here: `HEADER_SIZE + 0 == HEADER_SIZE` passes a
-/// `total < HEADER_SIZE` check, which is exactly the "sized as a plausible
-/// stride" hazard `gen_object_total_size`'s own GCAUD-3 note describes for a
-/// different sentinel.)
-const IMPLAUSIBLE_LEGACY_BODY_SIZE: usize = 1 << 40; // 1 TiB
+/// fit in the arena" bounds check therefore rejects it and stops the walk,
+/// the same way a `0` *total* size makes [`gen_object_total_size`]'s callers
+/// re-sync on a corrupt header.
+///
+/// Plain `0` does not work as this function's corrupt-signal: it only
+/// returns the *body*, which every caller adds to `HEADER_SIZE` before
+/// checking — `HEADER_SIZE + 0 == HEADER_SIZE` passes a `total <
+/// HEADER_SIZE` check outright. That is exactly the "sized as a plausible
+/// stride, no caller re-syncs" hazard `gen_object_total_size`'s own GCAUD-3
+/// note describes for its `HumongousFiller`-sentinel case, and it is what
+/// made the compact branch's original `.unwrap_or(0)` dangerous: a compact
+/// object whose layout could not be resolved was reported as a valid
+/// **zero-byte body**, so `OldGen::scan_region`'s walk credited it only
+/// `HEADER_SIZE` bytes and advanced its cursor into the middle of that
+/// object's *real*, larger body — decoding live field bytes as a brand-new
+/// header. When those bytes happened to carry a plausible-looking (but
+/// still garbage) `num_slots` under [`MAX_PLAUSIBLE_LEGACY_SLOTS`], the walk
+/// accepted a second bogus object too, and scanning ITS "slots" is what
+/// produced the `SIGSEGV` this constant was introduced to close (a walk
+/// wedged inside `OldGen::close_live_set_over_old_gen`'s `for_each_old_gen_ref`
+/// call, reproducing at the identical instruction under two different
+/// causes before both were found) against the real
+/// `DefaultCatalogAndSchemaTest` workload.
+const IMPLAUSIBLE_BODY_SIZE: usize = 1 << 40; // 1 TiB
 
 /// Total instance-field body size in bytes (excludes `HEADER_SIZE`), honouring
 /// this object's layout. Object total size = `HEADER_SIZE + object_body_size`.
@@ -946,10 +965,22 @@ pub fn object_body_size(header: &ObjectHeader) -> usize {
         // of the layout cache — the Cheney collector reaches it once per copied
         // object, from `object_total_size` inside `forward_object`, which the
         // scan loops call from inside their own `with_class_layout` closure.
+        //
+        // HIB-DCAST-LATEPHASE.1: a compact object's `GC_FLAG_COMPACT` bit is
+        // only ever set at allocation time, when a layout for its exact
+        // `(class_id, field_count)` was successfully resolved — and the
+        // registry is append-only (entries are never removed, only added;
+        // see `class_layout_for_fields`'s doc), so a genuinely live compact
+        // object's layout should always still be there. A lookup miss here
+        // means this is not that object at all — a walk that has already
+        // desynced onto arbitrary bytes, or a genuinely stale/dangling
+        // pointer — not a legitimately-empty class, so `unwrap_or` must NOT
+        // report a confident size. See [`IMPLAUSIBLE_BODY_SIZE`] for why the
+        // fallback is "impossibly large" rather than `0`.
         with_class_layout(header.class_id.as_u32(), header.num_slots(), |layout| {
             layout.body_size as usize
         })
-        .unwrap_or(0)
+        .unwrap_or(IMPLAUSIBLE_BODY_SIZE)
     } else {
         // HIB-DCAST-LATEPHASE.1: defensive cap, mirroring the `num_slots >
         // (1 << 24)` screen `gen_object_total_size` (gc/src/gen_heap.rs) has
@@ -962,13 +993,12 @@ pub fn object_body_size(header: &ObjectHeader) -> usize {
         // header with a huge `num_slots`, `num_slots * SLOT_SIZE` is still
         // small enough to fit before the arena's end (especially near a
         // large free tail), and the object is accepted as valid. A later
-        // reference-slot scan then strides through tens of millions of
-        // `Value` cells — past the object's real extent, and eventually past
-        // the arena itself — into unmapped memory: a `SIGSEGV` reached this
-        // way against the real `DefaultCatalogAndSchemaTest` workload.
+        // reference-slot scan then strides through millions of `Value`
+        // cells — past the object's real extent, and eventually past the
+        // arena itself — into unmapped memory.
         let num_slots = header.num_slots() as usize;
         if num_slots > MAX_PLAUSIBLE_LEGACY_SLOTS {
-            return IMPLAUSIBLE_LEGACY_BODY_SIZE;
+            return IMPLAUSIBLE_BODY_SIZE;
         }
         num_slots * SLOT_SIZE
     }
@@ -1007,7 +1037,7 @@ mod tests {
             0,
             33_000_000, // far past the 1<<24 (~16.7M) cap
         );
-        assert_eq!(object_body_size(&header), IMPLAUSIBLE_LEGACY_BODY_SIZE);
+        assert_eq!(object_body_size(&header), IMPLAUSIBLE_BODY_SIZE);
         assert!(
             HEADER_SIZE.checked_add(object_body_size(&header)).is_some(),
             "HEADER_SIZE + object_body_size(..) must not overflow"
@@ -1027,6 +1057,36 @@ mod tests {
             4,
         );
         assert_eq!(object_body_size(&header), 4 * SLOT_SIZE);
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`: a compact object (`GC_FLAG_COMPACT` set)
+    /// whose class layout is not registered for its `(class_id,
+    /// field_count)` must NOT be reported as a confident zero-byte body.
+    /// The old `.unwrap_or(0)` made `HEADER_SIZE + object_body_size(..)`
+    /// come out to exactly `HEADER_SIZE`, which passes every caller's `total
+    /// < HEADER_SIZE` corruption check — so `OldGen::scan_region`'s walk
+    /// credited such an object only its header and advanced into the middle
+    /// of its real, larger body, decoding live field bytes as a brand-new
+    /// (bogus) header. Asserts the fallback is the same "impossibly large,
+    /// no arena can contain it" sentinel the legacy branch's cap uses.
+    #[test]
+    fn object_body_size_refuses_to_guess_zero_for_an_unresolved_compact_layout() {
+        let mut header = ObjectHeader::new(
+            ClassId::new(999_999), // no layout ever registered for this id
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            0,
+            4,
+        );
+        header.gc_flags |= GC_FLAG_COMPACT;
+        assert_eq!(object_body_size(&header), IMPLAUSIBLE_BODY_SIZE);
+        assert_ne!(
+            HEADER_SIZE + object_body_size(&header),
+            HEADER_SIZE,
+            "must not report a total that equals exactly HEADER_SIZE -- that \
+             passes every caller's `total < HEADER_SIZE` corruption check"
+        );
     }
 
     #[test]
