@@ -611,6 +611,36 @@ impl ExecutableBuffer {
         Ok(())
     }
 
+    /// Patch a `rel8` branch displacement, or discard the compile.
+    ///
+    /// The one rule this enforces is that a displacement which does not fit in
+    /// an `i8` must NEVER be written truncated. `rel as u8` is not a near-miss:
+    /// it turns an out-of-range forward branch into a backward one, and on x86
+    /// the landing site is normally the middle of an earlier instruction. The
+    /// inline-PIC cascade shipped exactly that — `JNE -128` into the body of
+    /// the pre-call spill/shadow-push run, which then ran as an unguarded
+    /// infinite push loop (`docs/internal/jit-raw-jit-to-jit-shadow-stack-
+    /// overflow-FIXED-20260731.md`), and the same wrap reappeared as a
+    /// deterministic SIGILL in the `CRATONVM_NO_MOVING_YOUNG=1` lane, whose
+    /// larger slot bodies pushed the same branch past 127 bytes.
+    ///
+    /// Marking the buffer overflowed makes the driver's
+    /// `if buf.overflowed() { return None; }` discard the half-emitted method
+    /// and fall back to the interpreter, which is always valid. Every emitter
+    /// that patches a short branch goes through here — `jit`'s only remaining
+    /// `try_patch_byte(.., .. as u8)` is the one inside this function, which
+    /// `rel8_displacement_patches_all_go_through_the_range_checked_helper`
+    /// pins.
+    pub fn patch_rel8_or_bail(&mut self, patch: usize, rel: i64) {
+        match i8::try_from(rel) {
+            // Cast: rel8 displacement, range-checked immediately above.
+            Ok(v) => {
+                self.try_patch_byte(patch, v as u8).ok();
+            }
+            Err(_) => self.mark_overflowed(),
+        }
+    }
+
     // task #44: the deprecated panicking `patch_i32` / `patch_byte` shims
     // have been removed. Every internal codegen site was migrated to the
     // `try_patch_*` variants in task #20 (commit acd57f2). A workspace grep

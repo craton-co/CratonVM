@@ -896,7 +896,7 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // 1-3 s on a pristine dev build, and the Windows `DateSymbolsProbe` repro.
     // Restoring publication with `CRATONVM_SHADOW_STACK=1` and changing nothing
     // else made the same runs clean, which is the single-variable proof.
-    // See `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+    // See `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
     //
     // The DEFAULT path is unchanged: moving-young is on by default, so this
     // already evaluated true. `CRATONVM_JIT_MY_SHADOW_EMISSION=0` remains the
@@ -1003,13 +1003,16 @@ pub fn moving_young_enabled() -> bool {
 /// worth carrying a risk for.
 ///
 /// What it does carry is ROOT VISIBILITY — it spills operand-stack values
-/// living in caller-saved scratch registers, which the callee-saved blind
-/// spill never covers, into the frame slots the conservative scan reads. The
-/// call site gates it additionally on `moving_young_enabled()`; making it
-/// unconditional was tried as a fix for the crashing non-moving lane and
-/// **reverted** (it turned that lane's clean shadow-on configuration into a
-/// deterministic SIGILL). See the call site and
-/// `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+/// living in caller-saved scratch registers into frame slots, and rewrites
+/// `Compiler::stack` so the PRECISE map names them. The call site gates it
+/// additionally on `moving_young_enabled()`. Making it unconditional was tried
+/// as a fix for the crashing non-moving lane and reverted after that lane
+/// SIGILL'd; **that attribution was wrong** — the SIGILL was the inline-PIC
+/// cascade's `rel8` truncation (`7f1b1f263`), which any code-size growth
+/// reproduced, and the experiment re-ran clean on 2026-08-03 once it was
+/// fixed. The term stays because the full-GPR blind spill covers the
+/// non-moving lane conservatively, not because this crashes. See the call site
+/// and `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
 pub fn scratch_flush_at_safepoint_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SCRATCH_FLUSH") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),

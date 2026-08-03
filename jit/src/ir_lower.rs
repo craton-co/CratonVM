@@ -2223,21 +2223,23 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit_byte(0x00);
             // .nan: XOR EAX,EAX
             let nan_off = self.buf.pos();
-            self.buf
-                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8)
-                .ok();
+            // Range-checked, not truncated: see
+            // `ExecutableBuffer::patch_rel8_or_bail`. This sequence is
+            // fixed-size and comfortably inside rel8 today, so the helper can
+            // only fire on a genuine codegen bug — which is exactly the case
+            // the single-pass backend's identical `as u8` patches did not
+            // survive.
+            let rel = |target: usize, patch: usize| (target as i64) - (patch as i64) - 1;
+            self.buf.patch_rel8_or_bail(jp_patch, rel(nan_off, jp_patch));
             self.buf.emit(&[0x31, 0xC0]);
             // .done:
             let done_off = self.buf.pos();
             self.buf
-                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8)
-                .ok();
+                .patch_rel8_or_bail(jne_patch, rel(done_off, jne_patch));
             self.buf
-                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8)
-                .ok();
+                .patch_rel8_or_bail(jbe_patch, rel(done_off, jbe_patch));
             self.buf
-                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8)
-                .ok();
+                .patch_rel8_or_bail(jmp_patch, rel(done_off, jmp_patch));
         } else {
             // MOV RCX, 0x8000000000000000 ; CMP RAX, RCX
             self.buf.emit(&[0x48, 0xB9]);
@@ -2275,21 +2277,18 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit_byte(0x00);
             // .nan: XOR RAX,RAX
             let nan_off = self.buf.pos();
-            self.buf
-                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8)
-                .ok();
+            // Range-checked, not truncated — see the `!is_long` arm above.
+            let rel = |target: usize, patch: usize| (target as i64) - (patch as i64) - 1;
+            self.buf.patch_rel8_or_bail(jp_patch, rel(nan_off, jp_patch));
             self.buf.emit(&[0x48, 0x31, 0xC0]);
             // .done:
             let done_off = self.buf.pos();
             self.buf
-                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8)
-                .ok();
+                .patch_rel8_or_bail(jne_patch, rel(done_off, jne_patch));
             self.buf
-                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8)
-                .ok();
+                .patch_rel8_or_bail(jbe_patch, rel(done_off, jbe_patch));
             self.buf
-                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8)
-                .ok();
+                .patch_rel8_or_bail(jmp_patch, rel(done_off, jmp_patch));
         }
     }
 

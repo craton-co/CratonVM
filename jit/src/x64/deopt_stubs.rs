@@ -549,13 +549,12 @@ impl Compiler {
             (0..=i64::from(i8::MAX)).contains(&rel),
             "inline callee-deopt check body overflowed rel8 ({rel} bytes)"
         );
-        if let Ok(rel8) = u8::try_from(rel) {
-            self.buf.try_patch_byte(jne_patch, rel8).ok();
-        } else {
-            // Cannot encode the skip — mark the buffer so the compile bails
-            // rather than emitting a branch into the middle of the call.
-            self.buf.mark_overflowed();
-        }
+        // `u8::try_from` was the wrong range: it accepts 128..=255, which the
+        // CPU reads as a NEGATIVE rel8 — a backward branch into the body this
+        // jump exists to skip, i.e. the same shape as the PIC cascade's
+        // `JNE -128`. `patch_rel8_or_bail` range-checks against `i8` and marks
+        // the buffer (compile discarded) when it does not fit.
+        Self::patch_rel8_or_bail(&mut self.buf, jne_patch, rel);
     }
 
     /// Emit out-of-line bounds check failure stubs at the end of the method.

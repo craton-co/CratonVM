@@ -140,6 +140,67 @@ fn rel8_patch_out_of_range_bails_instead_of_truncating() {
         127,
         "the bail must leave the displacement byte alone"
     );
+    // Negative displacements are ordinary (every backward branch is one), and
+    // the range is `i8`, not `u8`. `u8::try_from` was the check one site used
+    // and it accepts 128..=255 — which the CPU reads back as -128..=-1, a
+    // backward branch, i.e. the exact failure this helper exists to stop.
+    Compiler::patch_rel8_or_bail(&mut buf, patch, -128);
+    assert_eq!(buf.as_slice()[patch], 0x80, "an in-range negative rel8 fits");
+    let mut buf2 = ExecutableBuffer::new(4096).expect("test buffer");
+    buf2.emit(&[0x75, 0x00]);
+    let p2 = buf2.pos() - 1;
+    Compiler::patch_rel8_or_bail(&mut buf2, p2, 200);
+    assert!(
+        buf2.overflowed(),
+        "200 is not a rel8: `u8::try_from` would have accepted it and encoded -56"
+    );
+}
+
+/// Every `rel8` displacement in this crate is written by the range-checked
+/// helper, in BOTH backends.
+///
+/// The PIC cascade's `rel as u8` was not the only one — `ir_lower` carried
+/// eight more of the identical shape, and `arith`/`deopt_stubs`/`frames` each
+/// hand-rolled their own range check next to a raw cast. A hand-rolled check
+/// is not wrong today; it is a place for the next one to be added without one.
+/// So the rule is mechanical and greppable: in an EMITTER source, a
+/// `try_patch_byte` call may not cast its value. `lib.rs` is deliberately not
+/// scanned — it holds `patch_rel8_or_bail`, the one place the cast is correct
+/// because it sits behind `i8::try_from`.
+///
+/// Needles are assembled at runtime so this test's own text does not match.
+#[test]
+fn rel8_displacement_patches_all_go_through_the_range_checked_helper() {
+    let sources: [(&str, &str); 9] = [
+        ("x64.rs", include_str!("../x64.rs")),
+        ("x64/bytecode_walk.rs", include_str!("bytecode_walk.rs")),
+        ("x64/emit.rs", include_str!("emit.rs")),
+        ("x64/arith.rs", include_str!("arith.rs")),
+        ("x64/frames.rs", include_str!("frames.rs")),
+        ("x64/deopt_stubs.rs", include_str!("deopt_stubs.rs")),
+        ("x64/safepoint.rs", include_str!("safepoint.rs")),
+        ("x64/driver.rs", include_str!("driver.rs")),
+        ("ir_lower.rs", include_str!("../ir_lower.rs")),
+    ];
+    let call = format!("try_patch{}byte(", "_");
+    let cast = format!(" as {}8", "u");
+    let mut offenders: Vec<String> = Vec::new();
+    for (name, src) in sources {
+        for (i, line) in src.lines().enumerate() {
+            if line.contains(&call) && line.contains(&cast) {
+                offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a rel8 displacement must go through `ExecutableBuffer::patch_rel8_or_bail`, which \
+         marks the buffer overflowed (compile discarded) instead of truncating. Truncation \
+         retargets the branch — the inline-PIC cascade's wrapped `JNE -128` landed inside \
+         the pre-call spill run and ran as an infinite shadow push (SIGSEGV), and as a \
+         SIGILL in the CRATONVM_NO_MOVING_YOUNG lane. Offending sites:\n{}",
+        offenders.join("\n")
+    );
 }
 
 /// The relocation-safety gates must ask "can a relocating collection see a
