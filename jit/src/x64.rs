@@ -25580,9 +25580,47 @@ pub fn compile_with_param_slots(
         }
         None => osr_dead_mask,
     };
-    cm.osr_dead_mask = Some(osr_dead_mask);
-    cm.osr_local_assignments = Some(osr_local_assignments);
-    cm.osr_xmm_assignments = Some(osr_xmm_assignments);
+    // ── The OSR entry-metadata contract ──────────────────────────────
+    //
+    // Everything above built four vectors in THREE different coordinate spaces
+    // (interpreter bci, output pc, local index) and moved two of them between
+    // spaces. `osr_contract::check_at_publication` is the one place that says,
+    // in code rather than in a comment, that the results agree.
+    //
+    // Fail closed, per `docs/feature-designs/jit-osr-entry-metadata.md`: on a
+    // violation publish NO OSR metadata at all rather than a set whose pieces
+    // disagree. `can_osr_enter` then answers false everywhere and the method
+    // runs to completion in the interpreter, which is always valid. Over-
+    // refusal costs an optimisation; under-refusal re-runs loop iterations or
+    // resumes with the wrong locals.
+    //
+    // The check that matters is the length of the two bci-indexed vectors:
+    // `can_osr_enter_with` reads the dead mask through `.unwrap_or(0)`, so a
+    // short mask reads as "no dead locals" for every bci in the tail and admits
+    // entries that must be refused. Nothing downstream can notice.
+    let osr_metadata_agrees = crate::osr_contract::check_at_publication(
+        cm.osr_pc_to_native.as_deref().unwrap_or(&[]),
+        &osr_dead_mask,
+        &osr_local_assignments,
+        &osr_xmm_assignments,
+        compiler.num_locals,
+        &method_label,
+    );
+    //
+    // Clearing the fields rather than returning early: everything below this
+    // point publishes NON-OSR state (oop maps, deopt points, frame layout, the
+    // epoch guard). An early return would drop all of it and turn a metadata
+    // disagreement into a much larger regression than the one it prevents.
+    if osr_metadata_agrees {
+        cm.osr_dead_mask = Some(osr_dead_mask);
+        cm.osr_local_assignments = Some(osr_local_assignments);
+        cm.osr_xmm_assignments = Some(osr_xmm_assignments);
+    } else {
+        cm.osr_pc_to_native = None;
+        cm.osr_dead_mask = None;
+        cm.osr_local_assignments = None;
+        cm.osr_xmm_assignments = None;
+    }
     cm.osr_frame_size = compiler.frame_size;
     cm.osr_callee_saved_base = compiler.callee_saved_base;
     // HIB-CV-20 OSR caller-corruption fix: hand the trampoline the EXACT

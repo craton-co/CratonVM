@@ -5183,7 +5183,8 @@ fn is_value_ty(ty: IrType) -> bool {
 /// enforced by `every_ir_op_is_lowered_or_declared_unlowerable` and the two
 /// tests beside it, which read this function's body, `lower_data_node`'s arms
 /// and `ir::Op`'s own declaration out of the source and compare all three. See
-/// `docs/jit/lowering-contract.md` §7 for why three enumerations of one set is
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`
+/// ("The cheap alternative") for why three enumerations of one set is
 /// the shape that produced the monitor defect.
 fn op_defines_result_slot(op: &Op) -> bool {
     matches!(
@@ -6168,15 +6169,38 @@ fn verify_slot_colouring(
 /// prologue, and it is the first thing to revisit — see the doc.
 const IR_LOWER_LS_XMMS: [u8; 4] = [2, 3, 4, 5];
 
+/// `CRATONVM_JIT_IR_ISEL_SHADOW` — run the instruction selector over this
+/// compile's blocks, count what it would have produced, and **discard it**.
+///
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+/// increment 0. Default **off**. Turning it
+/// on changes no emitted byte — `shadow_selection_changes_no_emitted_byte`
+/// pins that — and costs one tiling pass per compile. It exists to replace the
+/// contract's ten-shape synthetic coverage figure with one taken over real
+/// compiles, because that number is what decides whether the rest of the
+/// HIR/MIR migration is worth its cost.
+///
+/// Report the result with `CRATONVM_DBG=ir-isel`.
+fn isel_shadow_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ISEL_SHADOW") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// `CRATONVM_DBG=ir-isel` — print one shadow-selection line per compile.
+fn isel_shadow_reporting() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_ISEL").is_some()
+}
+
 /// `CRATONVM_JIT_IR_LINEAR_SCAN=1` — run the linear-scan allocator and use its
 /// result as a register read cache. Default OFF.
 ///
-/// Declared-flag note: the name must also be listed in
-/// `types/src/flag_groups.rs` for `-XX:` options and `with_thread_overrides` to
-/// reach it. Until it is, `runtime_var` falls through to a live `std::env`
-/// read, which still honours the environment but is invisible to the flag
-/// snapshot. Tests do not depend on either — they drive [`LsForce`] — so a
-/// declaration change cannot silently make them vacuous.
+/// Declared in `types/src/flag_groups.rs` as `jit/ir-linear-scan`, so `-XX:`
+/// options and `flags::with_thread_overrides` reach it. (This comment used to
+/// say the declaration was still missing; it landed, and the tests never
+/// depended on either spelling — they drive [`LsForce`] — so nothing here went
+/// vacuous in the meantime.)
 fn linear_scan_enabled() -> bool {
     #[cfg(test)]
     {
@@ -6919,7 +6943,8 @@ pub(crate) fn lower_inner_with_scopes(
     // The general form of the original hazard — an `ir::Op` variant with no arm
     // at all — is now handled where it arises, by that final arm, instead of
     // needing a new hand-written guard here per op. See
-    // `docs/jit/lowering-contract.md` §7.
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+    // "The cheap alternative".
     if (helpers.monitor_enter == 0 || helpers.monitor_exit == 0)
         && graph
             .nodes
@@ -7125,6 +7150,23 @@ pub(crate) fn lower_inner_with_scopes(
             }
             Ok(None) => {}
             Err(bailout) => return refuse(bailout),
+        }
+    }
+
+    // ── Shadow instruction selection (default OFF, emits nothing) ────
+    //
+    // Placed here, after every refusal above, so the population it measures is
+    // exactly the population that gets a compiled body — measuring methods the
+    // lowerer then refuses would inflate the figure with code nobody runs.
+    //
+    // Deliberately NOT fail-closed, which is the one place in this file that is
+    // true. See `isel::shadow_select_method`: a flag whose documented effect is
+    // a count must not decide what compiles, or the count describes a different
+    // program. A `covers()` violation is counted and printed, not raised.
+    if isel_shadow_enabled() {
+        let stats = crate::x64::isel::shadow_select_method(graph, schedule);
+        if isel_shadow_reporting() {
+            eprintln!("[ir-isel] {}", stats.summary_line());
         }
     }
 
@@ -10824,9 +10866,154 @@ mod tests {
     /// A value live across a helper call must not keep a caller-saved register.
     ///
     /// FP `Op::Rem` is the sharp case: it lowers to `CALL jit_drem`, and
+    // ── Shadow instruction selection ─────────────────────────────────
+    //
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+    // increment 0.
+    //
+    // Increment 0's whole claim is "turning this on changes no emitted byte".
+    // These are what hold it up. Note they drive the flag through
+    // `flags::with_thread_overrides` and NOT `std::env::set_var`: the flag is
+    // declared (`types/src/flag_groups.rs`, `jit/ir-isel-shadow`), so the
+    // override mechanism reaches it, and a process-wide env write would race
+    // every other test in this binary.
+
+    /// Compile the same method with the shadow pass off and on, and compare
+    /// **the emitted bytes**.
+    ///
+    /// Not "compare the result", not "both compiled" — the bytes. A shadow pass
+    /// that perturbed slot numbering, buffer sizing or safepoint ids would still
+    /// produce a working method and would still have broken the one property
+    /// that makes increment 0 free.
+    ///
+    /// The exact edit that trips it: make the shadow block do anything to
+    /// `lowerer` (allocate a slot, bump `next_sp_id`, touch the buffer).
+    #[test]
+    fn shadow_selection_changes_no_emitted_byte() {
+        // Enabling the flag mutates the process-global shadow counters, so this
+        // test owes the same lock as the two that read them.
+        let _guard = crate::x64::isel::SHADOW_TEST_LOCK.lock();
+        // int f(int a, int b) { return (a + b) * a; } — arithmetic, one block,
+        // the shape `isel`'s ALU and LEA rules actually fire on, so the shadow
+        // pass has real work to do rather than trivially selecting nothing.
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0xac, 0, 0];
+
+        let bytes = |on: bool| -> Vec<u8> {
+            let value = if on { Some("1") } else { None };
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_ISEL_SHADOW", value)],
+                || {
+                    let cm = compile_via_ir(&code, 4, 2, 2).expect("compiles either way");
+                    // SAFETY: the artifact is alive for the duration of this
+                    // borrow, and `code_len` is what the emitter wrote.
+                    unsafe {
+                        std::slice::from_raw_parts(cm.entry_ptr() as *const u8, cm.code_len())
+                            .to_vec()
+                    }
+                },
+            )
+        };
+
+        let off = bytes(false);
+        let on = bytes(true);
+        assert!(!off.is_empty(), "precondition: the method compiled to bytes");
+        assert_eq!(
+            off.len(),
+            on.len(),
+            "shadow selection changed the emitted length"
+        );
+        assert_eq!(off, on, "shadow selection changed the emitted bytes");
+    }
+
+    /// With the flag on, the pass actually ran — and covered every node.
+    ///
+    /// Without this the byte-identity test above passes vacuously: a shadow
+    /// pass that never executes also changes no byte. So this asserts the
+    /// counters moved, that `covers()` held on every block, and that the
+    /// coverage figure is a real fraction rather than the "no nodes" zero.
+    #[test]
+    fn shadow_selection_runs_and_covers_every_scheduled_node() {
+        let _guard = crate::x64::isel::SHADOW_TEST_LOCK.lock();
+        crate::x64::isel::reset_shadow_totals();
+
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0xac, 0, 0];
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_IR_ISEL_SHADOW", Some("1"))],
+            || {
+                compile_via_ir(&code, 4, 2, 2).expect("compiles");
+            },
+        );
+
+        let (methods, stats) = crate::x64::isel::shadow_totals();
+        assert_eq!(methods, 1, "exactly one method should have been shadowed");
+        assert!(stats.blocks > 0, "no blocks were selected");
+        assert!(stats.nodes > 0, "no data nodes were offered to the selector");
+        assert!(stats.tiles >= stats.blocks, "every block yields >= 1 tile");
+        assert_eq!(
+            stats.coverage_failures, 0,
+            "`BlockSelection::covers` failed on {} block(s) — that is an `isel` \
+             bug, not a measurement",
+            stats.coverage_failures
+        );
+        assert!(
+            stats.matched_tiles > 0,
+            "no rule fired on `(a + b) * a`; the corpus this test uses was \
+             chosen because the ALU rules match it, so zero means the selector \
+             regressed, not that the method is unusual"
+        );
+        let pct = stats.coverage_pct();
+        assert!(
+            pct > 0.0 && pct <= 100.0,
+            "coverage {pct} is not a fraction"
+        );
+    }
+
+    /// With the flag OFF — the default, and every compile today — the pass does
+    /// not run at all.
+    ///
+    /// The counter, not the bytes: "changed no byte" and "did not execute" are
+    /// different claims and increment 0 makes both.
+    #[test]
+    fn shadow_selection_is_off_by_default() {
+        let _guard = crate::x64::isel::SHADOW_TEST_LOCK.lock();
+        crate::x64::isel::reset_shadow_totals();
+
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0xac, 0, 0];
+        compile_via_ir(&code, 4, 2, 2).expect("compiles");
+
+        let (methods, stats) = crate::x64::isel::shadow_totals();
+        assert_eq!(methods, 0, "the shadow pass ran without being asked");
+        assert_eq!(stats, crate::x64::isel::ShadowStats::default());
+    }
+
+    /// The flag is DECLARED, so `-XX:` and the test override mechanism reach it.
+    ///
+    /// Rule 4 of `docs/known-issues/c2/README.md`: an undeclared flag is
+    /// invisible to both, and the declaration sweep has already had to be re-run
+    /// once because a flag was added 21 minutes after it closed at zero. The
+    /// two tests above would still pass with an undeclared flag — `runtime_var`
+    /// falls through to a live `std::env` read — so this checks the property
+    /// they cannot.
+    #[test]
+    fn the_shadow_flag_is_declared() {
+        let declared: Vec<&str> = cratonvm_types::flag_groups::INVENTORY
+            .iter()
+            .filter_map(|e| e.on_key)
+            .collect();
+        assert!(
+            declared.contains(&"CRATONVM_JIT_IR_ISEL_SHADOW"),
+            "`CRATONVM_JIT_IR_ISEL_SHADOW` is not in `types/src/flag_groups.rs`"
+        );
+        assert!(
+            declared.contains(&"CRATONVM_DBG_IR_ISEL"),
+            "`CRATONVM_DBG_IR_ISEL` is not in `types/src/flag_groups.rs`"
+        );
+    }
+
     // ── The three `ir::Op` enumerations, checked against each other ──
     //
-    // `docs/jit/lowering-contract.md` §7. One set of operations is enumerated
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+    // "The cheap alternative". One set of operations is enumerated
     // in three places, in two different vocabularies:
     //
     //   1. `lower_data_node`'s match arms          — 48 of 53 `ir::Op` variants
