@@ -221,7 +221,10 @@ workers, no debug flags beyond `CRATONVM_DBG=cce-bt`.
 | phase | binary | runs | family events | other |
 | --- | --- | --- | --- | --- |
 | 1 | `12769bb23c` (JIT fix, no clone verdict) | 9 | 2 — `CloneNotSupportedException` ×4 in one run, `ClassCastException` ×12 in another | 1 `TimeoutException`, 6 clean |
-| 2 | `583021945b` (+ clone verdict) | 9 | 1 — `CloneNotSupportedException` ×12, **with a verdict** | 1 `TimeoutException`, 7 clean |
+| 2 | `583021945b` (+ clone verdict) | 18 | 2 — `CloneNotSupportedException` ×12 **with a verdict**, and `ClassCastException` ×4 | 1 `TimeoutException`, 15 clean |
+
+27 runs, 4 family events, ~1 in 7. `rootdead=0` and `audit=0` on every one of
+the 27.
 
 `TimeoutException` is the separate throughput defect tracked on
 `bug-h2-testmultithread-concurrent-update-timeout.md`, not this one.

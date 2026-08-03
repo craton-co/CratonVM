@@ -57,8 +57,14 @@ confound that was corrupting the evidence.
 
 | arm | worker-hours | causal (`INTERIOR conservative root` freed/dropped) | reclaim verdicts | `cannot be cast` reaching Java |
 | --- | --- | --- | --- | --- |
-| FIX | 0.92 | 0 | 0 | 0 |
-| CTL | 0.91 | 1 | 3 | 4 |
+| FIX | 1.77 | **0** | 1 | 4 |
+| CTL | 1.77 | 1 | 3 | 4 |
+
+**Read the CAUSAL column, not the last two.** The mechanism this branch closed
+fires only in the control arm, and it is zero-by-construction in the fix arm.
+What the last two columns say is that **the family survives the fix** — which
+is the point of the *Status* section above, and the A/B makes it sharper rather
+than softer.
 
 The control arm reproduced this page's headline symptom outright, with the
 whole chain visible in one run:
@@ -78,11 +84,36 @@ ERROR …gc::guard: …and the old-gen reclamation ring knows what that block he
 → java.lang.ClassCastException: java.lang.Object cannot be cast to java.nio.ByteBuffer
 ```
 
-That is cause, verdict and user-visible symptom in one arm, and none of it in
-the other. It is the strongest evidence this page has ever had, and it is still
-**not** a closure: the FIX-arm residual quoted in *Status* was found in a longer
-(7 worker-hour) soak, and this A/B is one worker-hour per arm. Run it longer
-before drawing the line.
+That is cause, verdict and user-visible symptom in one arm, and the causal step
+is absent from the other — the strongest evidence this page has had that the
+interior-root mechanism is real and closed.
+
+And in the same window the FIX arm produced its own occurrence, which is the
+more important half:
+
+```
+checkcast receiver is an OLD-GEN block this process RECLAIMED while it was
+still referenced.
+  obj="0x2002ab98b90"  actual_class=java.lang.Integer  target_class=org.h2.mvstore.Chunk
+  original_class=org/h2/mvstore/SFChunk  freed_block="0x2002ab98ab8+0x150"
+  interior_off=216   interior_root_pointed_in=false
+  freed_by="in-place old-gen sweep"
+→ java.lang.ClassCastException: java.lang.Integer cannot be cast to org.h2.mvstore.Chunk
+```
+
+**Two independent FIX-arm witnesses now agree on the residual's shape**: this
+one (`SFChunk`, 336 bytes) and the ~8 KB `Object[]` quoted in *Status*. Both say
+`freed_by="in-place old-gen sweep"` and both say
+`interior_root_pointed_in=false`. So the remaining gap is:
+
+* on the **in-place** arm, not the compactor (which is default-off since
+  2026-08-03 anyway);
+* **not** the interior-conservative-root mechanism — these blocks had no
+  interior root;
+* reaching the reader as the *re-served* face (`actual_class` is a live,
+  unrelated object) rather than the all-zero-header face, which is why anything
+  gated on `ClassId(0)` stays silent for it. The reclamation ring is what
+  answers, because it records what the block held at the moment it was freed.
 
 ### Old-gen compaction became default-OFF on 2026-08-03 — read the A/B accordingly
 
