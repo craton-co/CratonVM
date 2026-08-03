@@ -1009,8 +1009,9 @@ pub fn moving_young_enabled() -> bool {
 /// as a fix for the crashing non-moving lane and reverted after that lane
 /// SIGILL'd; **that attribution was wrong** — the SIGILL was the inline-PIC
 /// cascade's `rel8` truncation (`7f1b1f263`), which any code-size growth
-/// reproduced, and the experiment re-ran clean on 2026-08-03 once it was
-/// fixed. The term stays because the full-GPR blind spill covers the
+/// reproduced, and the experiment re-ran clean 3/3 on 2026-08-03 once it was
+/// fixed — interleaved with a pre-fix positive control that SIGILL'd 2/2 in
+/// the same batch. The term stays because the full-GPR blind spill covers the
 /// non-moving lane conservatively, not because this crashes. See the call site
 /// and `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
 pub fn scratch_flush_at_safepoint_enabled() -> bool {

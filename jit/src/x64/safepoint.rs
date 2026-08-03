@@ -72,7 +72,9 @@ impl Compiler {
         // few lines below (fixed in `7f1b1f263`); ANY change that pushed a PIC
         // slot body past 127 bytes reproduced it, and this one did. Re-tested
         // 2026-08-03 with the truncation fixed — term removed,
-        // `CRATONVM_GC=-moving-young`, Hibernate `ZonedDateTimeTest`: clean.
+        // `CRATONVM_GC=-moving-young`, Hibernate `ZonedDateTimeTest`, run
+        // INTERLEAVED with a pre-fix build as a positive control: control
+        // SIGILL 2/2 (1st and 5th), this variant clean 3/3.
         //
         // The term nevertheless STAYS, now for a reason about this mechanism
         // rather than about a crash: in the non-moving lane the full-GPR blind

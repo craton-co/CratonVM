@@ -143,9 +143,22 @@ did not budget for".
 **That attribution was wrong, and wrong in a way that would have cost the next
 person the same week.** The experiment grew the emitted code; growing the
 emitted code pushed a PIC slot body past 127 bytes; the truncated branch fired.
-Any unrelated change of comparable size would have "reproduced" it. Re-run on
-2026-08-03 with the truncation fixed — the `moving_young_enabled()` term
-removed, `CRATONVM_GC=-moving-young`, same class — the lane does not SIGILL.
+Any unrelated change of comparable size would have "reproduced" it.
+
+Re-run on 2026-08-03 with the truncation fixed — the `moving_young_enabled()`
+term removed, everything else at `dev`, `CRATONVM_GC=-moving-young`, same
+class. Interleaved against the doc-era build as a **positive control**, so a
+clean arm cannot be a quiet-window artefact. The control fires at ~30 s, so the
+240 s cut-off is ~8× the crash point:
+
+| arm | order | result |
+|---|---|---|
+| doc-era build (`58de18d5b`) | 1st and 5th | **SIGILL 2/2** |
+| `dev` + flush unconditional | 2nd, 4th, 6th | no SIGILL **3/3** |
+| `dev` unmodified | 3rd | no SIGILL 1/1 |
+
+Adding the earlier interleaved A/B, the doc-era arm is SIGILL **5/5** and no
+build carrying `7f1b1f263` has SIGILL'd once.
 
 The term still stays, for a reason about the mechanism rather than about a
 crash: in the non-moving lane the full-GPR blind spill
