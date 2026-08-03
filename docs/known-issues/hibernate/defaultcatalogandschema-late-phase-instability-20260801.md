@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔴 OPEN — pre-existing, present on `origin/dev` @ `cc8167f94` with no local changes. |
+| **Status** | 🔴 OPEN — pre-existing, present on `origin/dev` @ `cc8167f94` with no local changes. 2026-08-03: `OldGen::compact` (the leading coalescer-adjacent suspect below) is RULED OUT — see the dated section near the end. The crash signature (`num_slots=33554433`/`0x02000001`) is confirmed identical to the one in [`map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md) (the `--nojit` sibling, now resolved for its own narrower scope by disabling `compact()` — which does **not** fix this doc's crash, proving the corruption is shared and upstream of both old-gen reclamation strategies). |
 | **ID** | `HIB-DCAST-LATEPHASE.1` |
 | **Found** | 2026-08-01, while re-verifying `HIB-GCOVERHEAD-HALFFULL.1` against the `dev` tip. |
 | **Two faults, not one** | (a) *test failures / truncated runs* — pre-existing, reproduces on pure `dev` with no local changes; (b) *VM crashes* — appear only when selective promotion is enabled **on this tip**, and never on base `32f9db9a2`. See the table. |
@@ -133,6 +133,93 @@ matches the object's real extent and that remainders never overlap, and re-run.
 That is a cheap, targeted next step and it does not need the 27-minute class:
 `probes/GcPromoteProbe.java` promotes megabytes per cycle and can be pushed into
 old-gen sweeping with a smaller `--Xmx`.
+
+## 2026-08-03 — `OldGen::compact()` ruled out; the corruption is in the shared mark-phase BFS
+
+Session on `fix/hib-mapresize-chain-cursor-retire-20260803`, working the
+`--nojit` sibling doc
+([`map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md)),
+produced two things directly relevant here.
+
+**The actual corrupted bytes, finally.** A raw header dump added to
+`scan_region`'s break-on-implausible-header path (`gc/src/old_gen.rs`)
+captured, identical byte-for-byte at the identical old-gen offset across two
+independent `--nojit` runs:
+
+```
+class_id=16 kind=Object gc_age=2 gc_flags=0x03(OLD_GEN|MARKED)
+identity_hash=0x014df581 shape/num_slots=0x02000001 (33554433)
+forwarding_ptr=null mark_word=0
+```
+
+Every field looks like a genuine, correctly-marked live object — `gc_flags`
+especially — **except `shape`**, which is nonsense for any real class.
+Deterministic (not a race), and the header's plausible fields rule out
+generic memory garbage: this is one specific field being written wrong.
+
+**`OldGen::compact()` was the leading suspect (this doc's own #1 next step,
+above) and code review of its Phase 1-3 found nothing.** So it was bisected
+out instead: a lever forcing every old-gen major GC through the in-place
+(non-compacting) arm, tested on the `--nojit` sibling's own repro. Three
+independent runs (two via the lever, one via the resulting production
+default) all completed **cleanly at exact HotSpot parity** — where every
+prior run, of any kind, on that reproducer had crashed. `OldGen::compact` is
+now **disabled by default** on that branch
+(`oldgen_compact_enabled()`/`CRATONVM_OLDGEN_COMPACT=1`), and it fixed that
+doc's own narrower `--nojit` scope.
+
+**It does not fix this doc.** A run of `DefaultCatalogAndSchemaTest` under
+JIT-on, real JDK, on the SAME binary with `compact()` disabled, still
+crashed:
+
+```
+EXCEPTION_ACCESS_VIOLATION at old_gen_gc+0xFA3 (gen_heap.rs:10060,
+  Self::scan_object_for_old_refs — inside the mark-phase BFS)
+gc young-gen actual: 2 moving cycle(s), 30 cycle(s) diverted to the NON-MOVING sweep
+```
+
+with `old-gen mark: rejecting object ... num_slots=33554433 — corrupt header,
+not scanned` logged eleven lines earlier in the same run — the identical
+signature. `scan_object_for_old_refs` runs inside `old_gen_gc`'s mark phase,
+which is **shared** by both the compacting and non-compacting arms and runs
+*before* the branch between them is even reached — so this is direct proof
+the corruption is not produced by `compact()`, does not depend on which
+old-gen reclamation strategy the caller requests, and predates the point in
+the collection cycle where that choice is made.
+
+**Why the `--nojit` sibling doc's fix "worked" anyway.** Disabling
+`compact()` did not remove the corruption — it stopped that specific
+`--nojit` reproducer from *walking into* an already-corrupted object during
+mark or sweep. `gc young-gen actual: ... 30 cycle(s) diverted to the
+NON-MOVING sweep` above shows this JIT-on workload spends nearly all its
+old-gen time in the in-place sweep regardless of `compact()`'s setting, so
+"disable compact()" was never going to touch its crash rate — consistent
+with what was actually observed. The `--nojit` and JIT-on lanes evidently
+differ in whether/when they reach the corrupted object, not in whether the
+corruption exists. That difference (workload shape, timing, promotion
+volume — not yet measured) is the next thing to explain, not `compact()`.
+
+**Where this leaves the coalescer hypothesis at the top of this doc.** Still
+not directly tested here (only inferred safe by the shared-mark-phase
+argument above, and by the `--nojit` sibling's own finding that
+`CRATONVM_NO_OLDGEN_COALESCE=1` did not prevent ITS crash either, just
+changed SIGSEGV to a different fault). Worth an explicit, paired
+`CRATONVM_NO_OLDGEN_COALESCE=1` run on **this** doc's own JIT-on reproducer
+before fully retiring that lead, but it is now a secondary lead behind
+"what corrupts a header before/during the mark-phase BFS, shared by every
+old-gen collection path."
+
+**Next, concretely:** the literal ASCII text bytes this investigation keeps
+finding where a pointer or header should be (`kind=0x3a` originally,
+`"TestTask"` in one `--nojit` crash's shadow-stack dump this session — Java
+9+ compact/Latin-1 strings store ASCII with no interleaved zero bytes, which
+is exactly that shape) is the strongest unchased lead in either doc. Grep for
+raw byte-level writes into old-gen memory that do not go through
+`set_field`/the allocator; this reads like a type-confusion or wrong-stride
+copy, not a GC-rooting bug, which is consistent with every GC-side detector
+in both docs' histories (mark-phase plausibility screens, the
+freed-while-referenced `SWEEP-LIVENESS` assertion, the walk-coverage guard)
+coming back clean or only catching the symptom downstream.
 
 ## Cost
 

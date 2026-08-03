@@ -326,8 +326,8 @@ pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
 /// while a conservative root still points into it. That is a premature
 /// reclamation, and it is silent: the object's span is zeroed, so the next read
 /// through the stale reference sees an all-zero header, i.e. `ClassId(0)` /
-/// `java.lang.Object` (`docs/known-issues/h2/`
-/// `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`).
+/// `java.lang.Object`. See docs/gc/old-sweep-liveness.md section 7 for the
+/// old-generation twin of this, which was the H2 `MVStore` cache defect.
 ///
 /// Non-zero here means the oracle's interval verification failed on a live
 /// heap; the accompanying `LATE_RESOLVE_BASES` is how many objects were saved.
@@ -401,6 +401,25 @@ pub static DOUBLE_FREE_SPANS: AtomicU64 = AtomicU64::new(0);
 /// H2-CID0 — bounded report counter for [`DOUBLE_FREE_SPANS`].
 static DOUBLE_FREE_REPORTS: AtomicU64 = AtomicU64::new(0);
 
+/// H2-CID0 — bounded report counter for [`COMPACT_DROPPED_INTERIOR_ROOT`].
+static COMPACT_INTERIOR_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 — bounded report counter for [`COMPACT_DOWNGRADED_INTERIOR_ROOT`].
+static COMPACT_DOWNGRADE_REPORTS: AtomicU64 = AtomicU64::new(0);
+/// H2-CID0-BLOCKED — spans the young non-moving sweep was about to free while
+/// a ROOT still pointed into them. Every one is a use-after-free the mark
+/// phase let through; they are retained instead. See the invariant in
+/// `sweep_young_non_moving`.
+pub static ROOT_IN_DEAD_SPANS: AtomicU64 = AtomicU64::new(0);
+/// Bounded report counter for [`ROOT_IN_DEAD_SPANS`].
+static ROOT_IN_DEAD_REPORTS: AtomicU64 = AtomicU64::new(0);
+/// H2-CID0-BLOCKED — the benign half of the same measurement: a root pointing
+/// at a young source selective promotion EVACUATED. Not a violation (the copy
+/// is live in old gen and the root is rewritten), counted so a campaign can
+/// tell "the check never had anything to look at" from "the check looked and
+/// everything it saw was a promotion".
+pub static ROOT_IN_EVACUATED_SPANS: AtomicU64 = AtomicU64::new(0);
+
 // ---------------------------------------------------------------------------
 // Old-generation reclamation ring (H2-CID0, 2026-08-01)
 //
@@ -426,14 +445,33 @@ pub const OLD_FREED_SITE_INPLACE_SWEEP: u8 = 1;
 /// became part of the zeroed tail, or was slid over).
 pub const OLD_FREED_SITE_COMPACT: u8 = 2;
 
-const OLD_FREED_RING_BITS: usize = 14; // 16K entries, ~256 KB
+/// Ring capacity, as a power of two.
+///
+/// H2-CID0 follow-up (2026-08-02): this was 14 (16 K entries), and 16 K is far
+/// too small to answer the question the ring exists for. An in-place old sweep
+/// frees thousands of blocks per cycle and the failing read is many cycles
+/// later, so the record naming the victim had always been overwritten by the
+/// time a `checkcast` asked — the one reproduction that reached the widened
+/// reporter (`Page$Leaf cannot be cast to Chunk`) got no ring hit for exactly
+/// that reason. 1 M entries x 32 B = 32 MB of BSS, untouched (and therefore
+/// unmapped) until something is actually freed.
+const OLD_FREED_RING_BITS: usize = 20;
 const OLD_FREED_RING_LEN: usize = 1 << OLD_FREED_RING_BITS;
 
 struct OldFreedRec {
     addr: AtomicU64,
+    /// Block extent, so a lookup can answer for an INTERIOR address too. The
+    /// receiver a failing `checkcast` holds is frequently not the freed block's
+    /// base — a field address, an array element, a derived pointer — and an
+    /// exact-address ring answered `None` for every one of those.
+    size: AtomicU64,
     class_id: std::sync::atomic::AtomicU32,
     kind: std::sync::atomic::AtomicU8,
     site: std::sync::atomic::AtomicU8,
+    /// [`OLD_FREED_FLAG_WATCHED`] | [`OLD_FREED_FLAG_INTERIOR_ROOT`] — WHY the
+    /// mark could plausibly have missed this block. The reclaiming collector
+    /// knows both facts and the reader, minutes later, can recover neither.
+    flags: std::sync::atomic::AtomicU8,
     seq: AtomicU64,
 }
 
@@ -441,13 +479,27 @@ impl OldFreedRec {
     const fn new() -> Self {
         Self {
             addr: AtomicU64::new(0),
+            size: AtomicU64::new(0),
             class_id: std::sync::atomic::AtomicU32::new(0),
             kind: std::sync::atomic::AtomicU8::new(0),
             site: std::sync::atomic::AtomicU8::new(0),
+            flags: std::sync::atomic::AtomicU8::new(0),
             seq: AtomicU64::new(0),
         }
     }
 }
+
+/// [`record_old_freed`] flag: at reclamation time this block was a WATCHED
+/// referent — some `java.lang.ref.Reference` named it. An unmarked watched
+/// block is *expected*: weak reachability is not reachability. What must then
+/// hold is that post-GC reference processing CLEARS every `Reference` to it,
+/// and a stale non-null `Reference.get()` is what a set flag here points at.
+pub const OLD_FREED_FLAG_WATCHED: u8 = 0x1;
+/// [`record_old_freed`] flag: an INTERIOR conservative root pointed into this
+/// block when it was reclaimed. On the in-place arm the pin makes this
+/// unreachable; on the compacting arm it would mean conservative roots reach a
+/// collector that assumes precise ones.
+pub const OLD_FREED_FLAG_INTERIOR_ROOT: u8 = 0x2;
 
 static OLD_FREED_RING: [OldFreedRec; OLD_FREED_RING_LEN] =
     [const { OldFreedRec::new() }; OLD_FREED_RING_LEN];
@@ -456,15 +508,17 @@ static OLD_FREED_NEXT: AtomicU64 = AtomicU64::new(0);
 /// Record that an old-generation block is being reclaimed. See the module note
 /// above for why this is unconditional.
 #[inline]
-pub fn record_old_freed(addr: usize, class_id: u32, kind: u8, site: u8) {
+pub fn record_old_freed(addr: usize, size: usize, class_id: u32, kind: u8, site: u8, flags: u8) {
     let seq = OLD_FREED_NEXT.fetch_add(1, Ordering::Relaxed);
     let r = &OLD_FREED_RING[(seq as usize) & (OLD_FREED_RING_LEN - 1)];
     // Publish `addr` LAST: a reader that sees the address has already seen the
     // rest of this record (the slot may still be torn against a wrapping
     // writer, which is why `old_freed_lookup` is a diagnostic and not a proof).
+    r.size.store(size as u64, Ordering::Relaxed);
     r.class_id.store(class_id, Ordering::Relaxed);
     r.kind.store(kind, Ordering::Relaxed);
     r.site.store(site, Ordering::Relaxed);
+    r.flags.store(flags, Ordering::Relaxed);
     r.seq.store(seq, Ordering::Relaxed);
     r.addr.store(addr as u64, Ordering::Release);
 }
@@ -490,6 +544,189 @@ pub fn old_freed_lookup(addr: usize) -> Option<(u32, u8, u8, u64)> {
     }
     best
 }
+
+/// Like [`old_freed_lookup`], but answers for an address anywhere INSIDE a
+/// freed block, not only at its base.
+///
+/// Returns `(class_id, kind, site, seq, base, size)` for the most recent
+/// covering record. A failing `checkcast` holds whatever reference the Java
+/// code had, which is the object base far less often than it looks — an array
+/// element, a `Reference` referent slot, a derived pointer from compiled code.
+/// The exact-address form answered `None` for all of those and the reporter
+/// stayed silent about a block it had a full record for.
+pub fn old_freed_lookup_covering(addr: usize) -> Option<(u32, u8, u8, u64, usize, usize, u8)> {
+    let a = addr as u64;
+    let mut best: Option<(u32, u8, u8, u64, usize, usize, u8)> = None;
+    for r in OLD_FREED_RING.iter() {
+        let base = r.addr.load(Ordering::Acquire);
+        if base == 0 {
+            continue;
+        }
+        let size = r.size.load(Ordering::Relaxed);
+        if a < base || a >= base.saturating_add(size.max(1)) {
+            continue;
+        }
+        let seq = r.seq.load(Ordering::Relaxed);
+        if best.is_none_or(|(_, _, _, b, _, _, _)| seq > b) {
+            best = Some((
+                r.class_id.load(Ordering::Relaxed),
+                r.kind.load(Ordering::Relaxed),
+                r.site.load(Ordering::Relaxed),
+                seq,
+                base as usize,
+                size as usize,
+                r.flags.load(Ordering::Relaxed),
+            ));
+        }
+    }
+    best
+}
+
+// ---------------------------------------------------------------------------
+// Young-generation span-reclamation ring (H2-CID0, 2026-08-02)
+//
+// The old-gen ring above answers "what was in this block, and which
+// reclamation freed it" for ONE generation. The young non-moving sweep zeroes
+// and publishes coalesced dead spans, and its existing forensic records
+// (`record_swept`, `zero_forensics::record`) are both flag-gated AND
+// mutex-backed — so they have to have been armed before the run that
+// reproduces, and arming them silently swaps the collector off its parallel
+// sweep prefix (`retain_dead_objects`) and takes a process-global lock per
+// reclaimed object. The instrument changed the thing it measured, which is a
+// documented cause of this family's "reproduces on plain runs, never on
+// instrumented ones" history.
+//
+// This ring is unconditional and lock-free, and records ONE entry per
+// COALESCED span rather than per object — a sweep publishes tens of spans, not
+// millions of objects — so the cost stays bounded no matter the workload.
+// ---------------------------------------------------------------------------
+
+const YOUNG_FREED_RING_BITS: usize = 16; // 64 K spans, ~2 MB
+const YOUNG_FREED_RING_LEN: usize = 1 << YOUNG_FREED_RING_BITS;
+
+struct YoungFreedRec {
+    base: AtomicU64,
+    size: AtomicU64,
+    cycle: AtomicU64,
+    seq: AtomicU64,
+}
+
+impl YoungFreedRec {
+    const fn new() -> Self {
+        Self {
+            base: AtomicU64::new(0),
+            size: AtomicU64::new(0),
+            cycle: AtomicU64::new(0),
+            seq: AtomicU64::new(0),
+        }
+    }
+}
+
+static YOUNG_FREED_RING: [YoungFreedRec; YOUNG_FREED_RING_LEN] =
+    [const { YoungFreedRec::new() }; YOUNG_FREED_RING_LEN];
+static YOUNG_FREED_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Record that the young non-moving sweep zeroed and published `[base, base +
+/// size)`. Unconditional — see the module note above for why the gated
+/// alternatives cannot answer.
+#[inline]
+pub fn record_young_span_freed(base: usize, size: usize, cycle: u64) {
+    let seq = YOUNG_FREED_NEXT.fetch_add(1, Ordering::Relaxed);
+    let r = &YOUNG_FREED_RING[(seq as usize) & (YOUNG_FREED_RING_LEN - 1)];
+    r.size.store(size as u64, Ordering::Relaxed);
+    r.cycle.store(cycle, Ordering::Relaxed);
+    r.seq.store(seq, Ordering::Relaxed);
+    // Publish `base` LAST, as in the old-gen ring.
+    r.base.store(base as u64, Ordering::Release);
+}
+
+/// Did the young sweep reclaim a span covering `addr`? Returns
+/// `(base, size, cycle, seq)` for the most recent covering record.
+pub fn young_freed_lookup(addr: usize) -> Option<(usize, usize, u64, u64)> {
+    let a = addr as u64;
+    let mut best: Option<(usize, usize, u64, u64)> = None;
+    for r in YOUNG_FREED_RING.iter() {
+        let base = r.base.load(Ordering::Acquire);
+        if base == 0 {
+            continue;
+        }
+        let size = r.size.load(Ordering::Relaxed);
+        if a < base || a >= base.saturating_add(size.max(1)) {
+            continue;
+        }
+        let seq = r.seq.load(Ordering::Relaxed);
+        if best.is_none_or(|(_, _, _, b)| seq > b) {
+            best = Some((
+                base as usize,
+                size as usize,
+                r.cycle.load(Ordering::Relaxed),
+                seq,
+            ));
+        }
+    }
+    best
+}
+
+/// H2-CID0 (2026-08-02) — conservative roots that are INTERIOR words of a live
+/// old-generation object, and so pinned the object they point into.
+///
+/// Non-zero means the hole this counter was added for is live in the workload:
+/// before the pin, every one of these was a live old-gen object with no mark
+/// bit. See the seed loop in [`GenerationalHeap::old_gen_gc`].
+pub static OLDMARK_INTERIOR_ROOT_PINS: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 (2026-08-02) — blocks the in-place old sweep freed even though an
+/// interior conservative root pointed into them.
+///
+/// **Zero by construction** unless `CRATONVM_GC_NO_OLD_INTERIOR_PINS` is set,
+/// which disables the pin while keeping the accounting: that is the negative
+/// control, and it is what turns "the pin fires a lot" into "without the pin
+/// these exact blocks are freed under a live root".
+pub static OLD_SWEEP_FREED_INTERIOR_PINNED: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 (2026-08-02) — blocks the old-gen MARK-COMPACT dropped that were
+/// WATCHED referents at the time.
+///
+/// Not a defect on its own: weak reachability is not reachability, so dropping
+/// a watched block is the normal outcome for a dead weak referent. It is the
+/// number to read beside a `checkcast` verdict, because a stale non-null
+/// `Reference.get()` over a dropped block means the post-GC CLEAR did not
+/// happen for it.
+pub static COMPACT_DROPPED_WATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 (2026-08-02) — blocks the old-gen MARK-COMPACT dropped that an
+/// INTERIOR conservative root pointed into.
+///
+/// This was *predicted* to be zero — "the compacting arm runs only from the
+/// moving young cycle, whose collector rewrites every root it is handed" — and
+/// the H2 `MVStore` workload refuted the prediction on the first run. It is
+/// what turned this family's diagnosis from "which sweep freed it" into "the
+/// compactor is deciding liveness from a root set it cannot rewrite".
+///
+/// Now zero by construction: a cycle whose root set contains an interior
+/// address does not compact at all (see [`COMPACT_DOWNGRADED_INTERIOR_ROOT`]).
+/// Non-zero again means the downgrade regressed.
+pub static COMPACT_DROPPED_INTERIOR_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// H2-CID0 (2026-08-02) — major collections that asked to COMPACT and were
+/// downgraded to the in-place sweep because a root was an interior address.
+///
+/// The cost side of the fix. Compare against `[GC] generational: major=N`: if
+/// this is a small fraction the generation still gets compacted regularly, and
+/// if it is most of them the in-place sweep's coalescer is carrying the
+/// fragmentation (`[GC] oldgen_coalesce`).
+pub static COMPACT_DOWNGRADED_INTERIOR_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// Old-gen free-list entries that OVERLAP their neighbour, observed by the
+/// coalescer (which already sorts the list, so this costs one comparison per
+/// block).
+///
+/// A free list can only contain overlapping blocks if something double-freed or
+/// over-freed a span. The allocator would then serve the same bytes to two
+/// objects and zero them under the first owner — the same all-zero-header face
+/// as a premature free, from the other direction. The young sweep has had this
+/// check since `DOUBLE_FREE_SPANS`; old gen had none.
+pub static OLD_FREE_LIST_OVERLAPS: AtomicU64 = AtomicU64::new(0);
 
 /// Old-gen mark-worklist entries whose `kind` byte is not a valid `ObjectKind`
 /// discriminant — i.e. the mark BFS was handed an address that is not an object
@@ -579,6 +816,43 @@ fn promo_seed_dbg() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PROMO_SEED").is_some())
+}
+
+/// 2026-08-03 (`HIB-MAPRESIZE-STALE.1`, see
+/// docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md
+/// Follow-up 4): whether `OldGen::compact` (the sliding mark-compact
+/// collector) is permitted to run at all. Default **disabled** —
+/// `major_gc` now runs the in-place, non-compacting arm of `old_gen_gc`
+/// unconditionally instead.
+///
+/// This was found by bisection, not by reading: `walk_objects` covering
+/// hundreds of MB fewer bytes than `used_bytes` (fixed defensively in
+/// `OldGen::compact`'s new walk-coverage guard, see `COMPACT_WALK_GAP_HITS`)
+/// proved real corruption was already present the FIRST time compaction ran
+/// in a session — but forcing every old-gen major GC through the
+/// non-compacting arm instead (`CRATONVM_DBG_FORCE_OLDGEN_NO_COMPACT=1`, the
+/// flag this replaced) made `DefaultCatalogAndSchemaTest` complete cleanly,
+/// twice, at exact parity with HotSpot (`found=132`) — where every prior
+/// compact-enabled run of the same class crashed or came up short. That
+/// implicates something in `compact`'s own Phase 1-3 (forwarding-pointer
+/// assignment / reference-slot rewrite / slide), not just the walk-coverage
+/// gap, but the exact mechanism was not found by code review (Phase 1-3 and
+/// the overlay `pointer_map` remap in
+/// `native_collections::gc_update_collection_overlay_refs` were both
+/// audited; both look correct in isolation).
+///
+/// `compact` still exists, still self-tests, and is not deleted: a future
+/// session that finds the real bug can flip this back with
+/// `CRATONVM_OLDGEN_COMPACT=1` to re-enable it (or remove this gate once
+/// fixed). Until then, over-retaining memory the in-place sweep's own
+/// `coalesce_free_blocks` fallback cannot fully defragment is judged the
+/// safer failure mode than the memory corruption this replaces — the same
+/// "over-retention over corruption" direction every other fail-safe check
+/// added during this investigation already takes.
+fn oldgen_compact_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_OLDGEN_COMPACT").is_some())
 }
 
 /// DBG: optional young-GC stress threshold (bytes). Read from
@@ -2172,17 +2446,38 @@ impl GenerationalHeap {
             // this point. Not a functional change: only executed on the
             // already-panicking path, gated behind the same debug flag.
             let fwd_ptr = header.forwarding_address();
+            // 2026-08-03: `is_forwarded()` is a bare `!fwd_ptr.is_null()` check
+            // with no validation of what it points at — the same trust this
+            // diagnostic itself used to extend to `fwd_ptr` before dereferencing
+            // it below. When the header under suspicion is not a genuine
+            // forwarding marker but a corrupted one (garbage bytes that happen
+            // to leave `forwarding_ptr` non-null — the same corruption class
+            // `old_gen_mark_candidate_plausible` screens for elsewhere), that
+            // deref reads unmapped memory and SIGSEGVs the diagnostic itself
+            // instead of reporting the corruption it exists to catch. Route
+            // through `is_object_address` (lock-free, bounds+alignment+tag
+            // validated) exactly like every other "is this byte pattern a real
+            // object base" check in this file, and report an implausible target
+            // as data rather than crashing on it.
             let (fwd_class_id, fwd_kind) = if !fwd_ptr.is_null() {
-                // SAFETY: `fwd_ptr` is a non-null forwarding address (checked above) installed by evacuation,
-                // pointing at the object's live relocated header; read-only, diagnostic-only (stale-objref debug) path.
-                let fwd_header = unsafe { &*(fwd_ptr as *const ObjectHeader) };
-                // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`.
-                // `fwd_ptr` came out of a header this very diagnostic suspects,
-                // so its target is not trustworthy enough to decode as an enum.
-                (
-                    fwd_header.class_id.as_u32(),
-                    format!("0x{:02x}", fwd_header.kind as u8),
-                )
+                match self.is_object_address(fwd_ptr as usize) {
+                    Some(fwd_obj) => {
+                        // SAFETY: `is_object_address` validated `fwd_ptr` as a
+                        // plausible object base inside a managed region before
+                        // returning it; read-only, diagnostic-only (stale-objref
+                        // debug) path.
+                        let fwd_header = unsafe { &*(fwd_obj.as_ptr() as *const ObjectHeader) };
+                        // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`.
+                        (
+                            fwd_header.class_id.as_u32(),
+                            format!("0x{:02x}", fwd_header.kind as u8),
+                        )
+                    }
+                    None => (
+                        u32::MAX,
+                        format!("<implausible-forward 0x{:x}>", fwd_ptr as usize),
+                    ),
+                }
             } else {
                 (u32::MAX, "<null-forward>".to_string())
             };
@@ -2200,11 +2495,34 @@ impl GenerationalHeap {
                 use std::fmt::Write as _;
                 if let Some(old) = self.old_gen.try_lock() {
                     let card_base = self.card_table.base_addr();
-                    'oldscan: for (optr, _sz) in old.walk_objects() {
+                    'oldscan: for (optr, sz) in old.walk_objects() {
                         // SAFETY: walk_objects yields valid object starts.
                         let oh = unsafe { &*(optr as *const ObjectHeader) };
+                        // Re-derive this object's total size from the header
+                        // `for_each_ref_slot` is about to trust (`num_slots`/
+                        // `array_length`) and compare it against `sz`, the size
+                        // `walk_objects` already validated fits this object's
+                        // slot in the region a moment ago. This is the same
+                        // "the caller must not trust a header `for_each_ref_slot`
+                        // hasn't screened" gap `get_header_diagnostics`'s
+                        // `fwd_ptr` deref had — a header this diagnostic reads a
+                        // second time, on a heap the panic path does not hold a
+                        // GC-exclusive lock over, can read differently than the
+                        // walk that produced `sz`. Trusting it blindly here made
+                        // `for_each_ref_slot` stride `num_slots`/`array_length`
+                        // slots past a plausible-looking `optr` and SIGSEGV the
+                        // diagnostic itself, exactly like the `fwd_ptr` case
+                        // above. Skip (report nothing for this object) rather
+                        // than crash — the same "over-retain / under-report, but
+                        // never dereference blind" tradeoff as everywhere else in
+                        // this holder scan.
+                        if gen_object_total_size(oh) != sz {
+                            continue 'oldscan;
+                        }
                         let mut hits: Vec<usize> = Vec::new();
-                        // SAFETY: header/object pair valid for the walk.
+                        // SAFETY: header/object pair valid for the walk; `sz`
+                        // re-check above confirms the header is self-consistent
+                        // with what `walk_objects` measured for this slot.
                         unsafe {
                             for_each_ref_slot(optr, oh, |raw, idx| {
                                 if raw as usize == stale_usize {
@@ -3897,11 +4215,10 @@ impl GenerationalHeap {
     /// the ALL-ZERO header the young sweep writes over every span it reclaims —
     /// but an ordinary `new Object()` whose identity hash has not been minted
     /// also has an all-zero first header word, so no amount of staring at the
-    /// header separates the two. That ambiguity is why
-    /// `docs/known-issues/h2/`
-    /// `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md` could
-    /// only self-diagnose when `CRATONVM_DBG_SWEEP_ZERO` had been set BEFORE
-    /// the run — i.e. never, in the report that matters.
+    /// header separates the two. That ambiguity is why the H2 `MVStore` cache
+    /// investigation could only self-diagnose when `CRATONVM_DBG_SWEEP_ZERO`
+    /// had been set BEFORE the run — i.e. never, in the report that matters.
+    /// Both reclamation rings above are unconditional for that reason.
     ///
     /// Free-list membership is not ambiguous. A live object is never inside a
     /// free block, never past the allocation frontier, and never in the
@@ -6703,6 +7020,13 @@ impl GenerationalHeap {
         let oracle_resolved = std::cell::Cell::new(0usize);
         let oracle_dropped = std::cell::Cell::new(0usize);
         let oracle_unresolved: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
+        // H2-CID0-BLOCKED attribution: the ADDRESSES the verified-span branch
+        // concludes are gap space, so the root-in-dead-span invariant at the
+        // bottom of this function can say whether a root it caught was dropped
+        // there, left unresolved, or resolved and then lost somewhere else.
+        // Bounded so a pathological cycle cannot grow it without limit.
+        let oracle_dropped_addrs: std::cell::RefCell<Vec<usize>> =
+            std::cell::RefCell::new(Vec::new());
         // mark_if_young: mark a candidate young pointer and enqueue it.
         // SAFETY contract: `ptr` is only dereferenced after `in_young`
         // confirms it lands inside the live from-space region.
@@ -6731,6 +7055,12 @@ impl GenerationalHeap {
                     .is_some_and(|i| addr < verified_spans[i].1) =>
                 {
                     oracle_dropped.set(oracle_dropped.get() + 1);
+                    {
+                        let mut d = oracle_dropped_addrs.borrow_mut();
+                        if d.len() < 8192 {
+                            d.push(addr);
+                        }
+                    }
                     return;
                 }
                 // Outside every proved span (no anchor interval held this
@@ -7113,8 +7443,17 @@ impl GenerationalHeap {
         // not reclaim. That is strictly over-retention, the safe direction.
         let mut late_pins: Vec<usize> = Vec::new();
         let mut late_resolved_bases = 0usize;
+        // H2-CID0-BLOCKED attribution, read by the root-in-dead-span invariant.
+        let mut unresolved_snapshot: Vec<usize> = Vec::new();
+        let mut dropped_snapshot: Vec<usize> =
+            std::mem::take(&mut *oracle_dropped_addrs.borrow_mut());
+        dropped_snapshot.sort_unstable();
+        dropped_snapshot.dedup();
         {
             let mut unresolved = std::mem::take(&mut *oracle_unresolved.borrow_mut());
+            unresolved_snapshot = unresolved.clone();
+            unresolved_snapshot.sort_unstable();
+            unresolved_snapshot.dedup();
             if phase_diag {
                 eprintln!(
                     "[gcphase] oracle-outcome: resolved={} dropped-as-gap={} unresolved={}",
@@ -9272,8 +9611,7 @@ impl GenerationalHeap {
         // header — `ClassId(0)`, which renders as `java.lang.Object` and
         // surfaces minutes later on another thread as
         // `java.lang.Object cannot be cast to <something>`
-        // (`docs/known-issues/h2/`
-        // `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`).
+        // (docs/gc/old-sweep-liveness.md §7).
         // Every existing guard stays quiet: the header is plausible, the extent
         // fits, no slot goes out of bounds, nothing segfaults.
         //
@@ -9336,6 +9674,181 @@ impl GenerationalHeap {
                          this check the object's header would now read all-zero and the next \
                          use of it would fail as `java.lang.Object cannot be cast to ...`.",
                     );
+                }
+            }
+        }
+
+        // ----- Invariant: no ROOT points into a reclaimed span --------------
+        //
+        // H2-CID0-BLOCKED (2026-08-02). The invariant above compares the dead
+        // spans against `side_sorted`, the MARK's own live set, so it can only
+        // catch a walk that left the object grid. It is blind to the failure
+        // this family is actually made of: the mark was handed a root, did not
+        // retain what the root points at, and the sweep now reclaims it. From
+        // the sweep's point of view that object is simply unmarked, and every
+        // guard stays quiet.
+        //
+        // `roots` + `finalizer_addrs` are the exact set the mark phase was
+        // given at the top of this function, so this question is decidable
+        // right here and it is not an approximation: if one of them points
+        // into a span about to be zeroed, marking dropped it. There is no
+        // benign reading — even a conservative false positive is supposed to
+        // OVER-retain, which is the collector's own stated invariant ("a
+        // conservative false-positive root only over-retains, it can never
+        // cause a live object to be freed").
+        //
+        // So the span is RETAINED rather than freed, exactly as the invariant
+        // above does: over-retention is always safe under this sweep, and it
+        // converts a silent use-after-free — read back minutes later on
+        // another thread as `NoSuchMethodError java/lang/Object.hasNext()Z`,
+        // `CloneNotSupportedException`, `java.lang.Object cannot be cast to X`
+        // or a bare SIGSEGV — into a bounded leak plus a report that names the
+        // reclaimed object's CLASS, which no reader-side guard can recover
+        // once the span has been zeroed.
+        //
+        // Unconditional: one sort of the young-resident roots plus one merge
+        // pass over two ascending lists. `CRATONVM_DBG_SWEEP_LIVENESS` prints
+        // the same finding with the oracle's internals attached, but a check
+        // you have to enable is a check that is off in every bug report — and
+        // this family has been chased across three sessions on runs that were
+        // not armed.
+        if !dead_regions.is_empty() {
+            let mut root_addrs: Vec<usize> = roots
+                .iter()
+                .map(|r| r.as_ptr() as usize)
+                .chain(finalizer_addrs.iter().copied())
+                .filter(|&a| a >= from_base && a < from_end)
+                .collect();
+            root_addrs.sort_unstable();
+            root_addrs.dedup();
+            if !root_addrs.is_empty() {
+                let mut ri = 0usize;
+                let mut violations = 0usize;
+                let mut evacuated = 0usize;
+                let mut first_dropped = false;
+                let mut first_unresolved = false;
+                let mut first_late_pinned = false;
+                let mut first_root_side_marked = false;
+                let mut first_resolved_base = 0usize;
+                let mut first_resolved_base_side_marked = false;
+                let mut first_span_objects = 0usize;
+                let mut first: Option<(usize, usize, usize, u32, u8, bool)> = None;
+                // The base of the object a root points into, as the mark's own
+                // oracle resolves it. A dead span is a RUN of consecutive dead
+                // objects carrying the FIRST one's header, so the span head is
+                // frequently a DIFFERENT object than the root's — and the two
+                // can disagree about the only question that matters here.
+                let base_of = |a: usize, start: usize, end: usize| -> usize {
+                    young_object_ranges
+                        .partition_point(|(st, _)| *st <= a)
+                        .checked_sub(1)
+                        .and_then(|i| young_object_ranges.get(i))
+                        .filter(|&&(b, e)| a < e && b >= start && b < end)
+                        .map_or(start, |&(b, _)| b)
+                };
+                dead_regions.retain(|&(off, sz, cid, kind, nobj)| {
+                    let start = from_base + off;
+                    let end = start + sz;
+                    while ri < root_addrs.len() && root_addrs[ri] < start {
+                        ri += 1;
+                    }
+                    let mut k = ri;
+                    let mut violation: Option<(usize, usize)> = None;
+                    while k < root_addrs.len() && root_addrs[k] < end {
+                        let a = root_addrs[k];
+                        let base = base_of(a, start, end);
+                        // An EVACUATED source is dead by construction and is
+                        // not a violation: selective promotion only evacuates
+                        // objects the mark just proved live, the copy is
+                        // already in old gen, and the root still pointing at
+                        // the young source is either a precise one the pointer
+                        // map rewrites or a shadow-published movable JIT root
+                        // whose owner reloads it. The same exclusion the
+                        // `side_sorted` invariant above makes, for the same
+                        // reason — without it this fires on every promoted
+                        // root, retains its source, and the young generation
+                        // stops draining (the GC-overhead-on-a-half-full-heap
+                        // failure).
+                        //
+                        // It must be asked of the ROOT'S object, not of the
+                        // span head. Measured 2026-08-02: every hit under
+                        // `CRATONVM_DBG_GC_STRESS` was a promoted object
+                        // sharing a dead run with an unpromoted neighbour, and
+                        // reading the run's head header called all of them
+                        // violations.
+                        //
+                        // SAFETY: `base` is an 8-aligned young-from-space
+                        // object base — either from the oracle's own object
+                        // grid or the span start this sweep's walk produced —
+                        // and nothing has been zeroed yet.
+                        let h = unsafe { &*(base as *const ObjectHeader) };
+                        if h.is_forwarded() {
+                            evacuated += 1;
+                            k += 1;
+                            continue;
+                        }
+                        violation = Some((a, base));
+                        break;
+                    }
+                    if let Some((a, base)) = violation {
+                        violations += 1;
+                        if first.is_none() {
+                            first = Some((a, start, sz, cid, kind, side_bits.contains(start)));
+                            first_dropped = dropped_snapshot.binary_search(&a).is_ok();
+                            first_unresolved = unresolved_snapshot.binary_search(&a).is_ok();
+                            first_late_pinned = late_pins.binary_search(&a).is_ok();
+                            first_root_side_marked = side_bits.contains(a);
+                            first_span_objects = nobj;
+                            first_resolved_base = base;
+                            first_resolved_base_side_marked = side_bits.contains(base);
+                        }
+                        return false;
+                    }
+                    true
+                });
+                if evacuated > 0 {
+                    ROOT_IN_EVACUATED_SPANS.fetch_add(evacuated as u64, Ordering::Relaxed);
+                }
+                if violations > 0 {
+                    ROOT_IN_DEAD_SPANS.fetch_add(violations as u64, Ordering::Relaxed);
+                    let n = ROOT_IN_DEAD_REPORTS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        let (root, start, sz, cid, kind, side) =
+                            first.unwrap_or((0, 0, 0, 0, 0, false));
+                        tracing::error!(
+                            target: "cratonvm::gc::guard",
+                            spans = violations,
+                            root = format!("{root:#x}"),
+                            span = format!("{start:#x}+{sz:#x}"),
+                            interior_off = root.wrapping_sub(start),
+                            span_head_class_id = cid,
+                            span_head_kind = kind,
+                            span_head_side_marked = side,
+                            // Which arm of the conservative-root oracle let it
+                            // through. `oracle_dropped_as_gap` means
+                            // `mark_young`'s verified-span branch concluded the
+                            // address was free/gap space and returned without
+                            // marking anything — and, unlike the unresolved
+                            // arm, without handing it to the late-resolution
+                            // pass either.
+                            oracle_dropped_as_gap = first_dropped,
+                            oracle_left_unresolved = first_unresolved,
+                            late_pinned = first_late_pinned,
+                            oracle_dropped_total = oracle_dropped.get(),
+                            root_side_marked = first_root_side_marked,
+                            span_objects = first_span_objects,
+                            oracle_resolved_base = format!("{first_resolved_base:#x}"),
+                            oracle_resolved_base_side_marked = first_resolved_base_side_marked,
+                            sweep_cycle = sweep_zero_cycle,
+                            roots = roots.len(),
+                            "young non-moving sweep was about to zero a span a ROOT still \
+                             points into — the mark phase was handed this address and did not \
+                             retain what it points at. The span has been RETAINED instead of \
+                             freed. `span_head_class_id` is the class of the object at the \
+                             head of the span; a non-zero `interior_off` means the root is an \
+                             interior word rather than the object base.",
+                        );
+                    }
                 }
             }
         }
@@ -9446,6 +9959,10 @@ impl GenerationalHeap {
                 // stw-residual-close forensics: site 1 = non-moving sweep
                 // dead-span zero+freelist, tagged with the sweep cycle.
                 crate::zero_forensics::record(1, sweep_zero_cycle, obj_addr, sz);
+                // H2-CID0: and the unconditional, lock-free twin of that
+                // record, so a later wild receiver can be attributed to a young
+                // span without the run having been armed in advance.
+                record_young_span_freed(obj_addr, sz, sweep_zero_cycle as u64);
                 young_from.add_free_block(off, sz);
             }
         } else if !dead_regions.is_empty() {
@@ -9804,7 +10321,17 @@ impl GenerationalHeap {
         old_gen: &mut OldGen,
         young_skips: &[(usize, usize)],
     ) -> HashMap<usize, usize> {
-        Self::old_gen_gc(roots, young_from, old_gen, true, young_skips)
+        // See `oldgen_compact_enabled`: compaction is disabled by default as
+        // of 2026-08-03 pending root-cause attribution of the corruption it
+        // was found to cause (docs/known-issues/hibernate/
+        // map-resize-unpinned-chain-cursors-nojit-segv-20260731.md).
+        Self::old_gen_gc(
+            roots,
+            young_from,
+            old_gen,
+            oldgen_compact_enabled(),
+            young_skips,
+        )
     }
 
     /// Mark old space from the complete root set and either compact it (when
@@ -9901,6 +10428,95 @@ impl GenerationalHeap {
         // pointer `0x0000020000000000` = hash(0)‖array_length(512) read
         // from a corrupted victim's header) to be the mechanism behind the
         // pre-xt-activation background DoHead crash face.
+        // H2-CID0 (2026-08-02) — INTERIOR conservative roots.
+        //
+        // Both screens below ask the same question: "is this address an object
+        // BASE?" A conservative root frequently is not. It is a field address,
+        // an array element, a derived pointer, or a register spilled
+        // mid-object — and the young collector has an entire exact-base oracle
+        // for precisely that reason: `mark_young` resolves an interior word to
+        // the object that CONTAINS it and keeps that object alive. Old gen had
+        // no such resolution, so an old-gen object whose only surviving
+        // reference was an interior word in a register or a stack slot was
+        // never marked, and this sweep frees purely on `GC_FLAG_MARKED`.
+        //
+        // That is the same defect `b5fc69a6fc` fixed one generation over (see
+        // `tests::interior_conservative_root_pins_the_object_it_points_into`),
+        // and BOTH old-gen reclamation arms have it. `CRATONVM_NO_MOVING_YOUNG=1`
+        // with the JIT ON — the H2 `MVStore` reproduction's configuration — puts
+        // the in-place sweep on the cycles `has_conservative_roots` catches and
+        // lets every OTHER cycle fall through to the compactor, which is where
+        // the measured victim was actually lost. Full argument and
+        // measurements: docs/gc/old-sweep-liveness.md section 7.
+        //
+        // Pinning is pure over-retention: the object does not move, and a
+        // false positive retains one block for one cycle, which is what
+        // conservative marking does anyway.
+        //
+        // On the COMPACTING arm a mark would not be enough — the object would
+        // be slid and the interior word could not be rewritten — so that arm
+        // does not get a pin, it gets DOWNGRADED to this one. The first version
+        // of this fix instead argued the compacting arm could not see such a
+        // root (`major_gc` runs from the moving young cycle, whose collector
+        // rewrites every root it is handed); `COMPACT_DROPPED_INTERIOR_ROOT`
+        // refuted that on the first H2 run. See the downgrade below.
+        let no_interior_pins =
+            cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_OLD_INTERIOR_PINS").is_some();
+        let mut interior_pins: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for root in roots.iter() {
+            if let Some((base, extent)) =
+                old_gen_interior_root_base(root.as_ptr(), &walked_bases, &walked_objects)
+            {
+                if interior_pins.insert(base) {
+                    let n = OLDMARK_INTERIOR_ROOT_PINS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        note_interior_old_root(root.as_ptr(), base, extent);
+                    }
+                }
+            }
+        }
+
+        // H2-CID0 (2026-08-02) — an interior root FORBIDS compaction.
+        //
+        // The first version of this fix marked the containing object and left
+        // the compacting arm alone, on the argument that `major_gc` runs only
+        // from the moving young cycle and the moving collector rewrites every
+        // root it is handed, so a conservative interior word cannot reach it.
+        // `COMPACT_DROPPED_INTERIOR_ROOT` refuted that on the first H2
+        // `MVStore` run: the compactor was dropping blocks an interior root
+        // pointed into, and marking them would not have been enough anyway —
+        // it would have SLID them, and the one word that still names the object
+        // cannot be rewritten.
+        //
+        // So do not compact this cycle. The in-place sweep is precisely the
+        // collector for an un-rewritable root set: it reclaims dead blocks
+        // where they lie, retains the pinned ones, and coalesces the free list
+        // afterwards, so the generation still shrinks and the fragmentation the
+        // compactor exists to fix is still bounded. Compaction resumes on the
+        // next cycle whose roots are all object bases.
+        //
+        // `CRATONVM_GC_NO_OLD_INTERIOR_PINS=1` keeps the pre-fix behaviour
+        // (compact anyway, pin nothing) so the counters above stay meaningful
+        // as a negative control.
+        let compact = if compact && !interior_pins.is_empty() && !no_interior_pins {
+            COMPACT_DOWNGRADED_INTERIOR_ROOT.fetch_add(1, Ordering::Relaxed);
+            let n = COMPACT_DOWNGRADE_REPORTS.fetch_add(1, Ordering::Relaxed);
+            if n < 4 {
+                tracing::warn!(
+                    interior_roots = interior_pins.len(),
+                    "old-gen major GC: {} root(s) are INTERIOR words of live old-gen objects, \
+                     so this cycle reclaims IN PLACE instead of compacting — a slid object \
+                     would leave those roots dangling and they cannot be rewritten. See \
+                     docs/gc/old-sweep-liveness.md section 7.",
+                    interior_pins.len(),
+                );
+            }
+            false
+        } else {
+            compact
+        };
+
         for root in roots.iter() {
             let ptr = root.as_ptr();
             // `conservative = true`: these are register/stack-scanned GUESSES,
@@ -9917,6 +10533,35 @@ impl GenerationalHeap {
             // sweep would free it. The oracle is safe for the conservative half
             // too: a walked base IS an object, so admitting one can only
             // over-retain, which is what conservative marking does anyway.
+            // H2-CID0 (2026-08-02): containment in the DERIVED object grid is
+            // asked FIRST, because it outranks the byte-plausibility heuristic
+            // below on exactly the addresses where the two can disagree. An
+            // address strictly inside a walked object is not an object base —
+            // the screen calling it one writes `GC_FLAG_MARKED` into that
+            // object's payload and then decodes the payload as an
+            // `ObjectHeader` — and a zeroed body reads as a perfectly plausible
+            // `num_slots=0` header, so this is the common case rather than a
+            // corner one.
+            if let Some((base, _extent)) =
+                old_gen_interior_root_base(ptr, &walked_bases, &walked_objects)
+            {
+                // The RESOLUTION always wins over the screens below: an interior
+                // address is not an object base whatever its bytes say, and
+                // letting the screen call it one writes a mark bit into the
+                // containing object's PAYLOAD and then decodes that payload as
+                // a header. Retaining is sufficient here because the block above
+                // has already guaranteed this cycle does not move anything.
+                if !no_interior_pins {
+                    // SAFETY: `base` is an object base `walk_objects` yielded,
+                    // so its header is valid and mutable.
+                    let header = unsafe { &mut *(base as *mut ObjectHeader) };
+                    if header.gc_flags & GC_FLAG_MARKED == 0 {
+                        header.gc_flags |= GC_FLAG_MARKED;
+                        worklist.push(base as *mut u8);
+                    }
+                }
+                continue;
+            }
             if old_gen_mark_candidate_plausible(ptr, old_gen, true)
                 || rescue_mark_candidate_by_walk(ptr, old_gen, &walked_bases)
             {
@@ -9971,8 +10616,14 @@ impl GenerationalHeap {
             // above. Major GC also uses stable pre-compaction addresses, so it
             // can reclaim an unreachable old collection and its side-table
             // graph together instead of treating every entry as a global root.
+            // Owner identity: the index is keyed by ADDRESS, so a recycled
+            // block hands this BFS the previous tenant's overlay refs. The
+            // header here is already validated (this object is marked), so
+            // pass its class id and let the provider reject a stale entry.
+            // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
+            let owner_class = Some(unsafe { &*(obj_ptr as *const ObjectHeader) }.class_id.as_u32());
             for overlay_ref in
-                crate::external_roots::external_roots_for_owner(obj_ptr as usize)
+                crate::external_roots::external_roots_for_owner(obj_ptr as usize, owner_class)
             {
                 mark_and_push_old_gen(
                     overlay_ref.as_ptr(),
@@ -10045,6 +10696,22 @@ impl GenerationalHeap {
             None
         };
 
+        // H2-CID0 (2026-08-02): every address the reference processor holds.
+        // Needed by BOTH arms now — the `!compact` arm to prove watched
+        // survivors, and the compacting arm to say whether a block it is about
+        // to drop was weakly referenced (see `COMPACT_DROPPED_WATCHED`).
+        let watched = crate::gc_quiescence::watched_referents_snapshot();
+        let drop_flags_for = |addr: usize| -> u8 {
+            let mut f = 0u8;
+            if watched.as_ref().is_some_and(|w| w.contains(&addr)) {
+                f |= OLD_FREED_FLAG_WATCHED;
+            }
+            if interior_pins.contains(&addr) {
+                f |= OLD_FREED_FLAG_INTERIOR_ROOT;
+            }
+            f
+        };
+
         if !compact {
             // Watched addresses (every address the reference processor holds —
             // see `ReferenceProcessor::all_tracked_addrs`) need an explicit
@@ -10053,7 +10720,6 @@ impl GenerationalHeap {
             // from "the address is inside old gen". Emit an identity entry for
             // each watched survivor, mirroring what `OldGen::compact` already
             // does for watched objects that happen not to move.
-            let watched = crate::gc_quiescence::watched_referents_snapshot();
             let mut watched_survivors: HashMap<usize, usize> = HashMap::new();
             // GCAUD-8: the grid derived before the mark. Nothing since then has
             // allocated or freed in old gen, so re-walking would return the
@@ -10284,13 +10950,33 @@ impl GenerationalHeap {
                     // an all-zero `ClassId(0)` header, i.e. `java.lang.Object`.
                     // Always on, and cheap: an in-place old sweep only runs past
                     // 75 % occupancy, and the record is one relaxed `fetch_add`
-                    // plus four relaxed stores. See
-                    // `docs/known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`.
+                    // plus five relaxed stores. See docs/gc/old-sweep-liveness.md.
+                    if interior_pins.contains(&(obj_ptr as usize)) {
+                        // Only reachable with `CRATONVM_GC_NO_OLD_INTERIOR_PINS`
+                        // set: the pin above marks these, so the free loop never
+                        // sees one otherwise. That makes this the negative
+                        // control for the pin rather than dead code.
+                        let n = OLD_SWEEP_FREED_INTERIOR_PINNED.fetch_add(1, Ordering::Relaxed);
+                        if n < 8 {
+                            tracing::error!(
+                                target: "cratonvm::gc::guard",
+                                obj = format!("{:#x}", obj_ptr as usize),
+                                class_id = header.class_id.as_u32(),
+                                size = total_size,
+                                "in-place old-gen sweep is freeing a block an INTERIOR \
+                                 conservative root points into. That root cannot be rewritten, \
+                                 so the next allocation reuses and ZEROES the block under it — \
+                                 the ClassId(0) / java.lang.Object face.",
+                            );
+                        }
+                    }
                     record_old_freed(
                         obj_ptr as usize,
+                        total_size,
                         header.class_id.as_u32(),
                         header.kind as u8,
                         OLD_FREED_SITE_INPLACE_SWEEP,
+                        drop_flags_for(obj_ptr as usize),
                     );
                     // SAFETY: `obj_ptr`/`total_size` are exactly the (base, size) pair `walk_objects` yielded for this
                     // now-unmarked old-gen object, so returning that span to the free list is sound.
@@ -10322,7 +11008,72 @@ impl GenerationalHeap {
 
         // ---- Compact phase ---- sliding compaction of old gen ----
 
-        let compact_map = old_gen.compact();
+        // H2-CID0 (2026-08-02): the reclamation ring's `freed_by` said
+        // `old-gen mark-compact` for the H2 `MVStore` victim, which moved the
+        // question from "which sweep" to "which referrer did the mark miss".
+        // `close_live_set_over_old_gen` (Phase 0, inside `compact`) already
+        // covers every referrer that is a MARKED old-gen object, so only two
+        // candidates remain that it structurally cannot: a `Reference` (weak
+        // reachability, where the defect would be a missing CLEAR rather than a
+        // missing mark) and an interior conservative root. Record both per
+        // dropped block so the reader, minutes later, gets the answer instead
+        // of the question.
+        let mut drop_flags: HashMap<usize, u8> = HashMap::new();
+        {
+            let (mut n_watched, mut n_interior) = (0usize, 0usize);
+            for &(obj_ptr, _size) in &walked_objects {
+                // SAFETY: `walk_objects` yielded this as a valid object start.
+                let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if h.gc_flags & GC_FLAG_MARKED != 0 {
+                    continue;
+                }
+                let f = drop_flags_for(obj_ptr as usize);
+                if f != 0 {
+                    if f & OLD_FREED_FLAG_WATCHED != 0 {
+                        n_watched += 1;
+                    }
+                    if f & OLD_FREED_FLAG_INTERIOR_ROOT != 0 {
+                        n_interior += 1;
+                    }
+                    drop_flags.insert(obj_ptr as usize, f);
+                }
+            }
+            if n_watched > 0 {
+                COMPACT_DROPPED_WATCHED.fetch_add(n_watched as u64, Ordering::Relaxed);
+            }
+            if n_interior > 0 {
+                COMPACT_DROPPED_INTERIOR_ROOT.fetch_add(n_interior as u64, Ordering::Relaxed);
+                let n = COMPACT_INTERIOR_REPORTS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        blocks = n_interior,
+                        "old-gen mark-compact is dropping {n_interior} block(s) an INTERIOR \
+                         conservative root points into. The compacting arm is supposed to run \
+                         only with a precise, rewritable root set; this says otherwise, and a \
+                         mark would not be enough — the block would have to be PINNED.",
+                    );
+                }
+            }
+        }
+        // H2-CID0 (2026-08-02) — WHO still points at what this compaction is
+        // about to drop.
+        //
+        // Every other instrument in this family reports a consequence: the ring
+        // says what the block held, `reclaimed_hole_at` says the address is in a
+        // free hole, `SWEEP_EDGES` says nothing at all. None of them names the
+        // referrer, and the referrer is the whole question — `close_live_set`
+        // structurally covers only referrers that are MARKED old-gen objects.
+        //
+        // So word-scan for the doomed bases: the whole old-gen backing store
+        // (classifying each hit by the object grid and its mark bit), the young
+        // SURVIVOR space (`young_from` is post-swap here), and the root slice.
+        // A Bloom-style prefilter keeps the common case to one shift, one
+        // multiply and one bit test per word.
+        if compact_referrers_dbg() {
+            report_compact_referrers(&walked_objects, old_gen, young_from, roots);
+        }
+        let compact_map = old_gen.compact_with_drop_flags(&drop_flags);
 
         // ---- Cross-gen fixup ---- update young-gen refs into old gen ----
 
@@ -12519,6 +13270,177 @@ fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative
     total >= HEADER_SIZE && old_gen.contains(unsafe { ptr.add(total - 1) })
 }
 
+/// `CRATONVM_DBG_COMPACT_REFERRERS=1` — word-scan the heap for referrers of
+/// every block an old-gen compaction is about to drop. Off by default: the scan
+/// is O(heap / 8) per compaction.
+fn compact_referrers_dbg() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_REFERRERS").is_some()
+}
+
+/// See [`compact_referrers_dbg`]. Reports the first few (victim, referrer)
+/// pairs with enough context to name the mark source that missed the edge.
+fn report_compact_referrers(
+    walked: &[(*mut u8, usize)],
+    old_gen: &OldGen,
+    young_from: &Arena,
+    roots: &[ObjectRef],
+) {
+    use std::collections::HashSet;
+    let doomed: HashSet<usize> = walked
+        .iter()
+        .filter(|&&(p, _)| {
+            // SAFETY: `walk_objects` yielded `p` as a valid object start.
+            unsafe { (*(p as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED == 0 }
+        })
+        .map(|&(p, _)| p as usize)
+        .collect();
+    if doomed.is_empty() {
+        eprintln!("[compact-referrers] nothing doomed this cycle");
+        return;
+    }
+    // Bloom-style prefilter: 4 M bits over the doomed set.
+    const FILTER_WORDS: usize = 1 << 16;
+    let mut filter = vec![0u64; FILTER_WORDS];
+    let hash = |a: usize| -> usize {
+        ((a >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 42) as usize & ((FILTER_WORDS * 64) - 1)
+    };
+    for &d in &doomed {
+        let h = hash(d);
+        filter[h >> 6] |= 1u64 << (h & 63);
+    }
+    let bases: Vec<usize> = walked.iter().map(|&(p, _)| p as usize).collect();
+    let marked_at = |addr: usize| -> Option<bool> {
+        bases.binary_search(&addr).ok().map(|_| {
+            // SAFETY: a walked base.
+            unsafe { (*(addr as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED != 0 }
+        })
+    };
+    // Which walked object CONTAINS this address, if any.
+    let owner_of = |addr: usize| -> Option<(usize, bool)> {
+        let i = bases.partition_point(|&b| b <= addr);
+        if i == 0 {
+            return None;
+        }
+        let (base, size) = (bases[i - 1], walked[i - 1].1);
+        (addr < base + size).then(|| {
+            // SAFETY: a walked base.
+            let m = unsafe { (*(base as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED != 0 };
+            (base, m)
+        })
+    };
+
+    let mut hits = 0usize;
+    let mut printed = 0usize;
+    let mut report = |victim: usize, at: usize, region: &str| {
+        hits += 1;
+        if printed >= 16 {
+            return;
+        }
+        printed += 1;
+        // SAFETY: `victim` is a walked base.
+        let vh = unsafe { &*(victim as *const ObjectHeader) };
+        let owner = owner_of(at)
+            .map(|(b, m)| format!("{b:#x} marked={m} off={}", at - b))
+            .unwrap_or_else(|| "-".to_string());
+        eprintln!(
+            "[compact-referrers] DOOMED 0x{victim:x} class_id={} kind={} <- word at 0x{at:x} \
+             in {region} (containing object: {owner})",
+            vh.class_id.as_u32(),
+            vh.kind as u8,
+        );
+    };
+
+    // 1. Roots.
+    for (i, r) in roots.iter().enumerate() {
+        let a = r.as_ptr() as usize;
+        if doomed.contains(&a) {
+            report(a, i, "ROOT SLICE (index)");
+        }
+    }
+    // 2. The whole old-gen backing store, and 3. the young survivor space.
+    let scans: [(usize, usize, &str); 2] = [
+        (old_gen.base_ptr() as usize, old_gen.capacity(), "old-gen"),
+        (young_from.base_ptr() as usize, young_from.used(), "young-survivor"),
+    ];
+    for (base, len, region) in scans {
+        let mut off = 0usize;
+        while off + 8 <= len {
+            // SAFETY: `[base+off, base+off+8)` is inside a mapped arena.
+            let w = unsafe { *((base + off) as *const u64) } as usize;
+            if w != 0 {
+                let h = hash(w);
+                if filter[h >> 6] & (1u64 << (h & 63)) != 0 && doomed.contains(&w) {
+                    // A doomed block referencing itself, or a word inside the
+                    // doomed block itself, is not a referrer.
+                    let self_ref = region == "old-gen"
+                        && owner_of(base + off).is_some_and(|(b, _)| b == w);
+                    if !self_ref {
+                        report(w, base + off, region);
+                    }
+                }
+            }
+            off += 8;
+        }
+    }
+    eprintln!(
+        "[compact-referrers] doomed={} referrer_words={} (printed {printed})",
+        doomed.len(),
+        hits,
+    );
+}
+
+/// H2-CID0 (2026-08-02) — resolve an INTERIOR conservative root to the old-gen
+/// object that CONTAINS it.
+///
+/// `walked_bases` / `walked` are [`OldGen::walk_objects`]' ascending output for
+/// this pause, so containment here is a derivation off the object grid rather
+/// than a guess about a header's bytes — the same standard
+/// [`rescue_mark_candidate_by_walk`] holds itself to.
+///
+/// Returns `None` for an address that is not STRICTLY inside an object: an
+/// exact base is the other paths' business, and an address in a free block or
+/// an alignment gap belongs to no object at all. Deliberately does NOT require
+/// 8-alignment — a derived pointer into a `byte[]` is a perfectly ordinary
+/// unaligned interior word, and the object it names is just as live.
+#[inline]
+fn old_gen_interior_root_base(
+    ptr: *mut u8,
+    walked_bases: &[usize],
+    walked: &[(*mut u8, usize)],
+) -> Option<(usize, usize)> {
+    let a = ptr as usize;
+    let i = walked_bases.partition_point(|&b| b <= a);
+    if i == 0 {
+        return None;
+    }
+    let base = walked_bases[i - 1];
+    let size = walked[i - 1].1;
+    (a > base && a < base + size).then_some((base, size))
+}
+
+/// Cold reporter for the first few interior conservative roots into old gen.
+///
+/// The counter alone only reaches a log through the shutdown summary, and the
+/// runs that matter here are killed or crash before it. This says, from any
+/// run, whether the workload actually produces interior old-gen roots — the
+/// precondition for the defect the pin closes.
+#[cold]
+#[inline(never)]
+fn note_interior_old_root(root: *mut u8, base: usize, size: usize) {
+    // SAFETY: `base` is an object base `walk_objects` yielded, so its header is
+    // mapped and readable.
+    let header = unsafe { &*(base as *const ObjectHeader) };
+    tracing::warn!(
+        "old-gen mark: conservative root {root:p} is an INTERIOR word of the live object at \
+         {base:#x}+{size:#x} (interior_off={}, class_id={}, kind={}) — pinning the containing \
+         object. Without this the in-place sweep frees it under a root it cannot rewrite; see \
+         docs/gc/old-sweep-liveness.md section 7",
+        root as usize - base,
+        header.class_id.as_u32(),
+        header.kind as u8,
+    );
+}
+
 /// GCAUD-8 — the fail-closed second opinion on a rejected mark candidate.
 ///
 /// `walked_bases` is the ascending list of object starts
@@ -12861,7 +13783,12 @@ fn scan_young_object(
         .as_ref()
         .is_some_and(|owners| owners.contains(&obj_addr))
     {
-        for overlay_ref in crate::external_roots::external_roots_for_owner(obj_addr) {
+        // Same owner-identity check as the old-gen BFS: reject an overlay
+        // entry left behind by a previous tenant of this address.
+        for overlay_ref in crate::external_roots::external_roots_for_owner(
+            obj_addr,
+            Some(header.class_id.as_u32()),
+        ) {
             mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist);
         }
     }
@@ -15371,6 +16298,196 @@ mod tests {
         );
     }
 
+    /// H2-CID0 (2026-08-02) — the OLD-GENERATION twin of
+    /// [`interior_conservative_root_pins_the_object_it_points_into`].
+    ///
+    /// `old_gen_gc`'s root seed asked one question of every root: "is this an
+    /// object BASE?" — `old_gen_mark_candidate_plausible`, and since GCAUD-8 a
+    /// second opinion from `rescue_mark_candidate_by_walk`, which is also an
+    /// exact-base test. A conservative root frequently is not a base: it is a
+    /// field address, an array element, a derived pointer, or a register
+    /// spilled mid-object. The young collector resolves those through an
+    /// exact-base oracle and keeps the containing object alive; old gen had no
+    /// resolution at all, and the in-place sweep frees purely on
+    /// `GC_FLAG_MARKED`.
+    ///
+    /// So an old-gen object whose only surviving reference was an interior word
+    /// in a register was freed, the allocator reused and zeroed the block, and
+    /// the next dereference through that root read `ClassId(0)` /
+    /// `num_slots=0` — `java.lang.Object`. The COMPACTING arm has the same hole
+    /// and needs a different answer; see
+    /// `an_interior_conservative_root_forbids_old_gen_compaction`. That is the
+    /// reproduction in
+    /// docs/gc/old-sweep-liveness.md section 7, whose H2 `MVStore` reproduction
+    /// needs `CRATONVM_NO_MOVING_YOUNG=1` **with the JIT on** precisely
+    /// because that is the configuration in which this sweep runs against
+    /// conservative roots.
+    ///
+    /// The garbage object is the positive control in the same run: a sweep that
+    /// retained everything would pass the first assertion for the wrong reason.
+    #[test]
+    fn interior_conservative_root_retains_the_old_gen_object_it_points_into() {
+        let heap = GenerationalHeap::with_sizes(4 * 1024, 64 * 1024);
+        let monitors = NoOpMonitors;
+
+        let live = heap.alloc_object(ClassId::new(11), 4);
+        let garbage = heap.alloc_object(ClassId::new(12), 4);
+
+        // Age both into old gen through the ordinary moving path.
+        let mut roots = vec![live, garbage];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let (live, garbage) = (roots[0], roots[1]);
+        assert!(
+            heap.is_in_old(live.as_ptr()) && heap.is_in_old(garbage.as_ptr()),
+            "precondition: both objects must have been promoted",
+        );
+        let live_addr = live.as_ptr() as usize;
+        let garbage_addr = garbage.as_ptr() as usize;
+
+        // The ONLY root naming `live` is an INTERIOR word of it — what a
+        // conservative register/stack scan hands the collector, and what it
+        // cannot rewrite afterwards.
+        // SAFETY: `live_addr + 32` is inside a live 4-slot object.
+        let interior = unsafe { ObjectRef::from_raw((live_addr + 32) as *mut u8) };
+        let (reclaimed, _survivors) =
+            heap.sweep_old_gen_non_moving(&[interior], &HashMap::new());
+
+        let bases: Vec<usize> = heap
+            .old_gen_lock()
+            .walk_objects()
+            .iter()
+            .map(|&(p, _)| p as usize)
+            .collect();
+        assert!(
+            bases.contains(&live_addr),
+            "the sweep freed the old-gen object an INTERIOR conservative root \
+             points into (live=0x{live_addr:x}); the root cannot be rewritten, so \
+             the next allocation reuses and zeroes the block under it",
+        );
+        assert!(
+            !bases.contains(&garbage_addr),
+            "POSITIVE CONTROL: unrooted garbage (0x{garbage_addr:x}) must still be \
+             reclaimed — a sweep that retains everything passes every negative test",
+        );
+        assert!(reclaimed > 0, "the sweep must still reclaim real garbage");
+        assert!(
+            crate::gen_heap::OLDMARK_INTERIOR_ROOT_PINS.load(Ordering::Relaxed) > 0,
+            "the interior root must have been RESOLVED, not merely tolerated by a \
+             sweep that freed nothing",
+        );
+    }
+
+    /// H2-CID0 (2026-08-02) — the half of the defect that actually reached H2.
+    ///
+    /// Marking is enough on the in-place arm because nothing moves. It is NOT
+    /// enough on the COMPACTING arm: the compactor would slide the object and
+    /// the interior word — a register, a stack slot — cannot be rewritten. The
+    /// first version of this fix argued the compacting arm could not see such a
+    /// root, because `major_gc` runs from the moving young cycle whose collector
+    /// rewrites every root it is handed. `COMPACT_DROPPED_INTERIOR_ROOT`
+    /// refuted that on the first `TestMVStoreCacheLoop` run, and the old-gen
+    /// reclamation ring named the victim it had already cost:
+    ///
+    /// ```text
+    /// original_class=java/nio/ByteBuffer  freed_by="old-gen mark-compact"
+    /// ```
+    ///
+    /// So a cycle whose root set contains an interior address does not compact
+    /// at all; it reclaims in place, which is the collector for an
+    /// un-rewritable root set. This test pins that: `live` is named ONLY by an
+    /// interior word, `hole` in front of it is garbage (so a compaction would
+    /// have real work and would slide `live` down over it), and `trailing` is
+    /// the positive control that must still be reclaimed — a collector that
+    /// simply refused to do anything would pass the first assertion for the
+    /// wrong reason.
+    #[test]
+    fn an_interior_conservative_root_forbids_old_gen_compaction() {
+        let heap = GenerationalHeap::with_sizes(4 * 1024, 64 * 1024);
+        let monitors = NoOpMonitors;
+
+        // Allocation order matters: `hole` must precede `live` so that dropping
+        // it leaves a gap a sliding compaction would pull `live` into.
+        let hole = heap.alloc_object(ClassId::new(31), 4);
+        let live = heap.alloc_object(ClassId::new(32), 4);
+        let keeper = heap.alloc_object(ClassId::new(33), 4);
+        let trailing = heap.alloc_object(ClassId::new(34), 4);
+
+        let mut roots = vec![hole, live, keeper, trailing];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let (hole, live, keeper, trailing) = (roots[0], roots[1], roots[2], roots[3]);
+        for obj in [hole, live, keeper, trailing] {
+            assert!(
+                heap.is_in_old(obj.as_ptr()),
+                "precondition: every object must have been promoted",
+            );
+        }
+        let live_addr = live.as_ptr() as usize;
+        let trailing_addr = trailing.as_ptr() as usize;
+        let downgrades_before = COMPACT_DOWNGRADED_INTERIOR_ROOT.load(Ordering::Relaxed);
+
+        // The ONLY root naming `live` is an interior word of it. `hole` and
+        // `trailing` are dropped entirely.
+        // SAFETY: `HEADER_SIZE` is 32 and the object has 4 slots, so
+        // `live_addr + 40` is strictly inside it.
+        let interior = unsafe { ObjectRef::from_raw((live_addr + 40) as *mut u8) };
+        let mut major_roots = vec![interior, keeper];
+        {
+            let young_from = heap.young_from.lock();
+            let mut old_gen = heap.old_gen.lock();
+            // `old_gen_gc(compact = true)` rather than `major_gc`, deliberately.
+            // `major_gc` asks `oldgen_compact_enabled()`, which since 2026-08-03
+            // is default-OFF process-wide (pending root-cause attribution of the
+            // corruption compaction was found to cause — see its doc comment).
+            // Routing through it would make this test pass for the wrong reason:
+            // the object would sit still because nothing compacts at all, and
+            // the downgrade this test exists to prove would never be exercised.
+            // It is also a `OnceLock` env gate, so a test cannot turn it on
+            // without racing every other test in the process. Ask the compacting
+            // arm directly instead.
+            let _ = GenerationalHeap::old_gen_gc(
+                &mut major_roots,
+                &young_from,
+                &mut old_gen,
+                true,
+                &[],
+            );
+        }
+
+        // SAFETY: the collector either left the object alone or slid/zeroed the
+        // address; either way the header word is mapped and readable.
+        let header = unsafe { &*(live_addr as *const ObjectHeader) };
+        assert_eq!(
+            header.class_id.as_u32(),
+            32,
+            "the old-gen object an INTERIOR conservative root points into was \
+             relocated or reclaimed by the compaction (address 0x{live_addr:x} now \
+             reads class_id={}); that root cannot be rewritten, so it is now \
+             dangling — the ClassId(0) face",
+            header.class_id.as_u32(),
+        );
+        let bases: Vec<usize> = heap
+            .old_gen_lock()
+            .walk_objects()
+            .iter()
+            .map(|&(p, _)| p as usize)
+            .collect();
+        assert!(
+            !bases.contains(&trailing_addr),
+            "POSITIVE CONTROL: unrooted garbage (0x{trailing_addr:x}) must still be \
+             reclaimed — a major GC that declined to do anything would pass the \
+             first assertion for the wrong reason",
+        );
+        assert!(
+            COMPACT_DOWNGRADED_INTERIOR_ROOT.load(Ordering::Relaxed) > downgrades_before,
+            "the cycle must have been DOWNGRADED to the in-place sweep, not merely \
+             have happened not to move anything",
+        );
+    }
+
     /// xt-helper-window fragmentation regression, at the level the defect
     /// actually bites: the IN-PLACE old-gen sweep is the only old-gen
     /// reclamation that runs while a live JIT frame's roots are conservative,
@@ -16799,7 +17916,7 @@ mod tests {
             }
         }
 
-        fn roots_for_owner(owner_addr: usize) -> Vec<ObjectRef> {
+        fn roots_for_owner(owner_addr: usize, _class_id: Option<u32>) -> Vec<ObjectRef> {
             let owner = OWNER.load(Ordering::Relaxed);
             if owner != 0 && owner == owner_addr {
                 held()
@@ -17414,7 +18531,15 @@ mod tests {
             let mut old_gen = heap.old_gen.lock();
             let free_blocks_before = old_gen.free_block_count();
 
-            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
+            // `major_gc` now defaults to the non-compacting arm (`compact()`
+            // is disabled by default as of 2026-08-03 pending root-cause
+            // attribution — see `oldgen_compact_enabled`'s doc comment).
+            // This test specifically exercises `compact()`'s own
+            // defragmentation behavior, so call `old_gen_gc` directly with
+            // `compact=true` rather than going through the production
+            // default.
+            let compact_map =
+                GenerationalHeap::old_gen_gc(&mut roots, &young_from, &mut old_gen, true, &[]);
 
             // After compaction: exactly one free block (defragmented)
             assert_eq!(
@@ -17542,11 +18667,15 @@ mod tests {
             .map(|(_, o)| o)
             .collect();
 
-        // Run mark-compact via major GC
+        // Run mark-compact via major GC. `major_gc` now defaults to the
+        // non-compacting arm (see `oldgen_compact_enabled`'s doc comment);
+        // this test specifically exercises `compact()`'s own
+        // defragmentation, so call `old_gen_gc` directly with `compact=true`.
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
+            let _compact_map =
+                GenerationalHeap::old_gen_gc(&mut roots, &young_from, &mut old_gen, true, &[]);
 
             // Used space should have decreased (half the objects freed)
             assert!(

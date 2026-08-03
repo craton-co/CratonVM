@@ -588,6 +588,72 @@ mod tests {
         assert_eq!(mask_at(&code, &[], 0) & 0b100, 0b100);
     }
 
+    /// H2-CID0-BLOCKED regression: the enhanced-for iterator must stay live at
+    /// the call the thread parks in.
+    ///
+    /// `for (Future<Void> job : jobs) job.get(5, MINUTES);` — javac emits a
+    /// synthetic `Iterator` local (slot 9 in
+    /// `TestMultiThread.testConcurrentUpdate`) that is read only at the loop
+    /// head, i.e. only across the BACKWARD branch from after the blocking
+    /// call. A liveness analysis that did not reach a fixpoint over that back
+    /// edge would report the slot dead exactly where the thread parks — and
+    /// this mask is what `Frame::scan_local_objects` filters the blocked-thread
+    /// root snapshot with, so a `false` here means the collector reclaims a
+    /// live iterator and the owner wakes to
+    /// `NoSuchMethodError java/lang/Object.hasNext()Z`. The whole enclosing
+    /// range is also inside a `try`, whose handler never reads the slot, so
+    /// the exception successor must not be allowed to kill it either.
+    ///
+    /// Byte offsets mirror the real method (loop head 7, `Future.get` at 37).
+    #[test]
+    fn enhanced_for_iterator_is_live_at_the_blocking_call() {
+        #[rustfmt::skip]
+        let code = [
+            0x19, 0x08,                    //  0: aload 8      (jobs)
+            0xb6, 0x01, 0x0c,              //  2: invokevirtual iterator
+            0x3a, 0x09,                    //  5: astore 9     (the iterator)
+            0x19, 0x09,                    //  7: aload 9      <- loop head
+            0xb9, 0x01, 0x10, 0x01, 0x00,  //  9: invokeinterface hasNext
+            0x99, 0x00, 0x20,              // 14: ifeq -> 46
+            0x19, 0x09,                    // 17: aload 9
+            0xb9, 0x01, 0x15, 0x01, 0x00,  // 19: invokeinterface next
+            0xc0, 0x01, 0x17,              // 24: checkcast Future
+            0x3a, 0x0a,                    // 27: astore 10    (job)
+            0x19, 0x0a,                    // 29: aload 10
+            0x14, 0x01, 0x4c,              // 31: ldc2_w 5L
+            0xb2, 0x01, 0x4e,              // 34: getstatic MINUTES
+            0xb9, 0x01, 0x51, 0x04, 0x00,  // 37: invokeinterface Future.get
+            0x57,                          // 42: pop
+            0xa7, 0xff, 0xdc,              // 43: goto -> 7
+            0xb1,                          // 46: return
+            0x3a, 0x0b,                    // 47: astore 11    (handler)
+            0x19, 0x0b,                    // 49: aload 11
+            0xbf,                          // 51: athrow
+        ];
+        let table = [ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 46,
+            handler_pc: 47,
+            catch_type: 0,
+        }];
+        let arc: Arc<[u8]> = Arc::from(code.to_vec().into_boxed_slice());
+        let iterator = 1u64 << 9;
+        for pc in [37usize, 42, 43] {
+            let mask = live_locals_mask(&arc, &table, 12, [pc, pc]);
+            assert_ne!(
+                mask & iterator,
+                0,
+                "the enhanced-for iterator (slot 9) must be live at pc={pc}: a blocked \
+                 thread's root snapshot is filtered by this mask, and dropping it is a \
+                 use-after-free the owner sees as ClassId(0)",
+            );
+        }
+        // `job` (slot 10) is genuinely dead once `get()` has consumed it — the
+        // analysis is doing real work here, not returning ALL_LIVE.
+        let at_pop = live_locals_mask(&arc, &table, 12, [42, 42]);
+        assert_eq!(at_pop & (1u64 << 10), 0, "slot 10 is dead after the call");
+    }
+
     /// Unknown / mis-decoding bytecode falls back to all-live rather than
     /// under-approximating.
     #[test]

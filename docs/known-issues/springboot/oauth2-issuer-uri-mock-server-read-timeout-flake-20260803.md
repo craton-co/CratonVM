@@ -1,115 +1,99 @@
-# OAuth2 issuer-URI test: a CratonVM-only, JIT-only spurious read timeout
+# OAuth2 issuer-URI test: CratonVM blows a 500 ms localhost HTTP budget
 
-**Status:** 🔴 **OPEN**, CratonVM defect. Mechanism not yet located.
+**Status:** 🔴 **OPEN**, CratonVM defect. The timeout is REAL, not spurious —
+the read waited out its full budget and no response had arrived.
 
-**This doc replaces an earlier version that called this a host-load artifact of
-the test harness. That conclusion was wrong** — it was reached by comparing
-CratonVM against CratonVM, which can only ever answer "did my change cause it",
-never "is this us". The control that decides it is HotSpot on the same host, and
-it was never run. It has been now.
+Two earlier versions of this doc were wrong and are superseded:
 
-## Symptom
+1. "host-load artifact of the harness" — decided by CratonVM-vs-CratonVM, which
+   cannot answer *is this ours*. HotSpot on the same host is **11/11 clean**,
+   including at load average 47 while CratonVM failed at 16.
+2. "spurious `SocketTimeoutException`, probably the poll layer" — measured and
+   false. See below.
 
-`OAuth2ResourceServerAutoConfigurationTests`, always the same single test of 52:
+## The measurement that settled it
+
+Instrumenting every read-timeout site in
+`native-builtins/src/http_url_connection.rs` with elapsed-vs-configured, run
+under 10 added CPU burners, it fired on the **first** run:
 
 ```
-autoConfigurationShouldConfigureResourceServerUsingOAuthIssuerUri()
-  => JwtDecoderInitializationException: Failed to lazily resolve the supplied JwtDecoder
-  Caused by: IllegalArgumentException: Unable to resolve the Configuration with the
-             provided Issuer of "http://localhost:<port>/test"
-  Caused by: ResourceAccessException: I/O error on GET request for
-             "http://localhost:<port>/test/.well-known/openid-configuration": Read timed out
-  Caused by: java.net.SocketTimeoutException: Read timed out
+[HUC-DIAG] site=read_io_err/response read waited=507ms configured=500ms pooled=false
+                url=http://localhost:44017/test/.well-known/openid-configuration
+[HUC-DIAG] site=raise3               waited=1948ms configured=500ms pooled=false
 ```
 
-The test starts an in-VM `MockWebServer`, enqueues exactly four responses
-(404, 404, the OIDC config, the JWK set) and has Spring Security fetch the
-discovery document. The URI named is the **first** of the three discovery
-candidates — and `JwtDecoderProviderConfigurationUtils.getConfiguration` only
-continues to the next candidate on a **4xx**; a `ResourceAccessException` aborts
-immediately. So the very first request times out, with all four responses
-already sitting in the mock's queue.
+Two facts, both surprising:
 
-## It is ours
+* **The configured read timeout is 500 ms, not the 30 s I assumed.** Every OIDC
+  discovery request in the class runs with `read_timeout_ms=Some(500)`.
+* **The wait is real.** 507 ms against a 500 ms budget. Nothing is short-cutting
+  the timeout; CratonVM genuinely did not have a response after 500 ms for a
+  round trip to a `MockWebServer` **inside the same VM**.
 
-| arm | runs | failures |
-| --- | --- | --- |
-| **HotSpot** (`/data/hsrun.sh`, same host, same class) | 11 | **0** |
-| CratonVM, JIT | ~25 | ~12 |
-| CratonVM, `--nojit` | 8 | **0** |
+So the defect is **latency**, not timeout handling: a localhost HTTP exchange
+that must complete within 500 ms sometimes doesn't.
 
-Interleaved (arms alternating inside one window, so both see the same load —
-`/data/data/otout/il2.summary`): HotSpot passed in all six rounds **including at
-load average 47**, while CratonVM failed at load 16. Load is not the variable.
+Corroborating: `probes/MockWebHangProbe.java` (same request shape, 150
+iterations, suite env) shows CratonVM worst-case **179 ms** vs HotSpot **99 ms**
+with nothing else running — already ~2x, and the suite adds JIT compilation and
+GC on top.
 
-A second interleave, JIT vs `--nojit` on the same binary
-(`otout/il3.summary`): JIT 2 failures in 5, `--nojit` 0 in 5.
+## Established
 
-## What is established
+| | |
+| --- | --- |
+| HotSpot, same host, interleaved | 11/11 PASS (incl. load 47) |
+| CratonVM, JIT | ~12 failures in ~25 runs |
+| CratonVM, `--nojit` | **0** failures in 8 |
+| the test alone (`OneMethodRunner`) | 6/6 PASS, ~9s |
+| effective read timeout | 500 ms, on JIT **and** `--nojit` |
 
-* **JIT-dependent.** `--nojit` has never failed it (0/8).
-* **Needs the whole class.** Run alone via `OneMethodRunner`, the test passes
-  6/6 at ~9s each. The ~30 preceding tests — each starting and closing its own
-  `MockWebServer` on a fresh ephemeral port — are part of the trigger.
-* **The timeout is 30s** (`sun.net.client.defaultReadTimeout`, defaulted to
-  `"30000"` in `JwtDecoderProviderConfigurationUtils`'s static initializer),
-  **but a failing run is not 30s longer than a passing one** (107s vs 92/99s).
-  Either the wait is not really 30s, or it overlaps work that a passing run
-  also does. Unresolved, and the most useful thing to measure next.
-* **No TCP connection survives the stall.** A 1Hz `ss -tanp` poll across a
-  failing run caught established CratonVM connections in only 6 samples of
-  ~106, none persisting. A 30-second blocking read should have been visible.
+`--nojit` being clean while the 500 ms budget is identical points at
+**compilation-time stalls** (background compile, deopt, or the GC they drive)
+on the thread serving or consuming the response — not at wrong configuration.
 
-## Eliminated
+## Where the 500 ms comes from — unresolved, and a warning
 
-* **`sun/nio/ch/Net.poll` is not on this path at all** — an instrumented build
-  logged 173 `[NET]` operations (socket/bind/accept/read/write/close) and
-  **zero** poll calls across a failing run. Any reasoning that starts from the
-  JDK's `NioSocketImpl.timedRead`/`park` is reasoning about code that does not
-  run here. (I nearly drew a conclusion from a clean `SHORT-FALSE=0` counter
-  before checking the counter's site was reachable — see
-  [[reference_inert_lever_is_not_an_elimination]].)
-* **The client is CratonVM's own native `HttpURLConnection`**
-  (`native-builtins/src/http_url_connection.rs`, ~4900 lines), not the JDK's
-  Java one. It uses a blocking socket with `SO_RCVTIMEO`, maps
-  `WouldBlock`/`TimedOut` to `READ_TIMEOUT_SENTINEL`, and raises
-  `SocketTimeoutException` from `huc_real_perform`. Three sites raise it
-  (`cached`, `streaming`, `buffered` — lines 600 / 654 / 791).
-* **The obvious shape does not reproduce standalone.** `probes/MockWebHangProbe.java`
-  drives one `MockWebServer` and three sequential `HttpURLConnection` GETs
-  (404/404/200, 30s timeout), 150 iterations, with the suite's exact env
-  (`CRATONVM_REAL=net-sockets,aqs`, `CRATONVM_JIT=rootsnap-cache`, `--Xmx 4g`):
-  **0 slow iterations, worst 179ms**. HotSpot: worst 99ms.
+CratonVM's own exception stack blamed
+`SimpleClientHttpRequestFactory.prepareConnection` →
+`JwtDecoderProviderConfigurationUtils.getConfiguration`, i.e. Spring Security's
+static `RestTemplate`. That attribution is **wrong**:
 
-## Where to look next
+* that factory holds `readTimeout=30000` on both VMs, dumped from inside the
+  suite after the test runs;
+* `-Dsun.net.client.defaultReadTimeout=7777` does not change the 500;
+* installing a `SimpleClientHttpRequestFactory` subclass into that
+  `RestTemplate` and running the test, **`prepareConnection` is never called —
+  on HotSpot either**. The discovery requests do not go through it.
 
-`perform`'s **plain-HTTP keep-alive pool**, keyed `(host, port)`. Every
-`MockWebServer` in the class is `localhost:<ephemeral port>`; over 52 tests the
-kernel recycles ports, so a pooled socket can key to a port whose original peer
-is gone. `try_pooled_request` bounds only the FIRST byte by
-`POOL_PROBE_TIMEOUT` and then hands off to `read_response_with_prefix` under
-the caller's full `read_timeout`; its errors do fall back to a fresh connect
-(`Err(_) => pool_clear(...)`), so the fallback looks right on inspection — but
-it is the one piece of state that persists ACROSS tests, which is exactly the
-property the repro needs.
+**Do not trust a VM-generated Java stack as the sole attribution here** — it
+cost several hours. The 500 ms client has not been identified; it is some other
+`RestClient`/factory inside Spring Security 7.1's `withIssuerLocation` path.
+Whether HotSpot runs the same 500 ms budget is therefore **not yet proven**, and
+that is the one remaining fork:
 
-The measurement that would settle it: instrument the three
-`socket_timeout_ex("Read timed out")` sites with elapsed-vs-configured and a
-pooled/fresh flag. That build exists in this branch's history; it produced no
-output only because the flake did not fire in the four runs it got. **Run it
-under load** (the failure rate tracks something that varied between 0% and 100%
-across the day) rather than in a quiet window.
+* if HotSpot also budgets 500 ms → pure CratonVM latency defect, as framed here;
+* if HotSpot budgets more → there is *also* a configuration path we get wrong.
+
+## Next step
+
+Identify the client by instrumenting `huc_set_read_timeout` to dump the *caller
+object's* class rather than relying on the stack, or by running the class under
+a HotSpot agent that logs `HttpURLConnection.setReadTimeout`. Then measure the
+CratonVM-side stall directly: timestamp request-write and response-first-byte in
+`perform`, and correlate with `[cratonvm-jitc]` compile activity in the same
+window.
 
 ## Reproducing
 
+The flake needs the whole class *and* load. Under 10 CPU burners it fired on the
+first run; in a quiet window it can pass 6 times running.
+
 ```bash
-# both arms, alternating, same window
-/data/hsrun.sh module/spring-boot-security-oauth2-resource-server \
-  org.springframework.boot.security.oauth2.server.resource.autoconfigure.OAuth2ResourceServerAutoConfigurationTests /tmp/hs 1
-/data/sbrun.sh <exe> jit module/spring-boot-security-oauth2-resource-server \
-  org.springframework.boot.security.oauth2.server.resource.autoconfigure.OAuth2ResourceServerAutoConfigurationTests /tmp/cv 1 1200
+# instrumented hunt loop used above
+/tmp/hunt.sh          # burners + suite until a [HUC-DIAG] line appears
 ```
 
-Never run the arms as two consecutive blocks — see
-[[feedback_interleave_ab_arms_never_run_them_in_separate_blocks]], which this
-investigation is the origin of.
+Arms must be interleaved, never run as consecutive blocks — see
+[[feedback_interleave_ab_arms_never_run_them_in_separate_blocks]].

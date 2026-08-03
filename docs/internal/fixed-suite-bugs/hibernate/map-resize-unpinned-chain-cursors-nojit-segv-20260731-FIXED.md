@@ -2,9 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | 🟠 **Four defects fixed; the class's `found` gap is not yet re-measured against them.** `found=99..128` against HotSpot's `132`, but every one of those numbers PREDATES or used a superseded variant of defect 4's fix, so the gap is OPEN and needs a per-test comparison rather than a `found` count. Defect 4 — the in-place old-gen sweep returning a LIVE promoted object's block to the free list — is landed and attributed (`20cab92aa`, paired 0/8 vs 8/8; independently corroborated by a second 8-pair interleaved run at 3/8 vs 6/8 SIGSEGV under heavy load). An intermittent SIGSEGV remains that is present with every fix here reverted and whose rate **tracks HOST LOAD** (~1 in 3 on a quiet box, ~4 in 5 under heavy concurrent load) — i.e. timing- or concurrency-sensitive. **Three earlier framings are RETRACTED: the `UN-FORWARDED` collector hypothesis (a verifier artefact), `map_resize_inner` (a false premise about write barriers), and the arm table under defect 4 (an unpinned, load-sensitive reproducer).** |
+| **Status** | 🟢 **RESOLVED 2026-08-03 for this doc's own `--nojit` scope; the underlying corruption is broader and stays open under a sibling doc.** `DefaultCatalogAndSchemaTest` under `--nojit` (this doc's repro, below) now completes cleanly at exact parity with HotSpot — `found=132 started=132 ok=132 failed=0` — on **three independent full runs**, including the plain production default with no special flags. `OldGen::compact` (the old-gen sliding compactor) is now **disabled by default**, which is what fixed it. **Important correction, same day:** `compact()` is NOT the corruption's writer — a JIT-on run of the same class, with `compact()` still disabled, crashed with the identical `num_slots=33554433` signature inside the mark-phase BFS (`old_gen_gc`'s `scan_object_for_old_refs`, which runs before the compact-vs-sweep branch is even reached). The corruption predates and is shared by both old-gen reclamation strategies; disabling `compact()` only stopped this specific `--nojit` reproducer from walking into it, for a reason not established. See Follow-up 4 / Resolution for the full history, including the retraction. The JIT-on crash is [`defaultcatalogandschema-late-phase-instability-20260801.md`](../../../known-issues/hibernate/defaultcatalogandschema-late-phase-instability-20260801.md)'s problem, not this doc's, and remains OPEN there with this session's findings folded in. `compact()` itself is not deleted and can be re-enabled with `CRATONVM_OLDGEN_COMPACT=1` at no established cost. `cratonvm-gc`'s full test suite (952 tests), the fast regression suite (22/22), and 400 real Hibernate classes across both JIT modes are green against the fix. |
 | **ID** | `HIB-MAPRESIZE-STALE.1` |
 | **Found** | 2026-07-31, validating the `DefaultCatalogAndSchemaTest` runner accommodation ([`../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md)). |
+| **Fixed** | 2026-08-03, branch `fix/hib-mapresize-chain-cursor-retire-20260803`. Commits `1ec76ae41` (stale-objref canary hardening), `83f640e62` (compact walk-coverage guard), `86bcb96ed` (raw-byte corruption dump), `96b2bc4a7` (**the fix**: compaction disabled by default). |
 | **Repro** | [`probes/hib-mapresize-repro-20260731.sh`](../../../probes/hib-mapresize-repro-20260731.sh) — `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`, `--nojit`, `--Xmx 1500m`, real JDK, `-Dcraton.batch=1`. |
 | **HotSpot control** | `found=132 started=132 ok=132 failed=0`, 132 s, same class and classpath (re-measured 2026-07-31). |
 
@@ -770,6 +771,296 @@ allocator: record every node address the map natives allocate together with its
 holder, and have the sweep report when it reclaims one whose holder has not
 released it. That turns "some native local" into a named call site, which is
 what three rounds of collector-side detectors could not do.
+
+## Follow-up 4 — 2026-08-03: the diagnostic tooling itself needed fixing before it could attribute anything; the corruption is real, in old gen, and not the coalescer
+
+Worked on `fix/hib-mapresize-chain-cursor-retire-20260803` (branched from `dev`
+tip `a9241eedf`, defect-4's fix already included). Ported forward two commits
+from an earlier, unmerged session (`f977c0788`, `cb9e4520b`, originally on
+`fix/hib-reclaimed-live-roots-20260801`): a class-identity check on the old-gen
+marker's owner→overlay edge (`gc_overlay_roots_for_collection`), landed but
+**disabled by default** (`CRATONVM_OWNER_CLASS_FILTER`) because enforcing it
+drops thousands of live objects' roots — the class-mismatch signal it keys off
+is dominated by false positives (a still-live collection whose *own* header
+reads `class_id=0` because it was corrupted, not recycled), not genuine address
+reuse. Left disabled; this is diagnostic infrastructure, not a fix.
+
+### The stale-ObjectRef canary was crashing on the very corruption it exists to report
+
+`CRATONVM_DBG_STALE_OBJREF=1` (the quarantine-based canary that turns a stale
+native-local read into a hard, attributed panic — see
+`docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md`) was
+tried against this reproducer on the theory that it is the generic tool for
+exactly this bug shape. First run: **SIGSEGV, not a panic** — the canary itself
+faulted, reading `0xFFFFFFFFFFFFFFFF`. Manually symbolizing the raw frame
+addresses against the built binary (`CRATONVM_SYMBOLIZE=0x<rva>` — NOT
+`exe+0x<rva>`, and note the flag is now grouped-spelling-gated, so a bare
+`CRATONVM_SYMBOLIZE=` set directly prints a one-line rejection notice but still
+works) placed the fault inside `get_header_diagnostics` itself
+(`gc/src/gen_heap.rs`): it dereferenced `header.forwarding_address()`
+unconditionally whenever `is_forwarded()` — a bare `!ptr.is_null()` check — was
+true. A header corrupted in a way that leaves `forwarding_ptr` non-null but
+garbage (the same corruption class `old_gen_mark_candidate_plausible` screens
+for elsewhere) made the diagnostic dereference unmapped memory instead of
+reporting what it found.
+
+**Fixed** (`1ec76ae41`): route `fwd_ptr` through `is_object_address` — the same
+lock-free bounds/alignment/tag-validated check every other "is this byte
+pattern a real object" call in `gen_heap.rs` already uses — and report an
+implausible target as `<implausible-forward 0x...>` data instead of crashing.
+
+Rebuilt, re-ran: **SIGSEGV again**, different address
+(`0x0000000100000010`), same symbolized entry point
+(`get_header_diagnostics`, RVA unchanged because the crash lands in an inlined
+callee at essentially the same offset). This time the full raw-frame chain
+symbolized cleanly enough to place it exactly:
+
+```
+chm_seg_get (native-collections/src/lib.rs:40870, get_node_hash)
+  -> get_field -> get_header -> get_header_diagnostics -> for_each_ref_slot
+```
+
+`get_header_diagnostics`'s holder scan calls `for_each_ref_slot(optr, oh, ...)`
+on every `old.walk_objects()` result to find anything still pointing at the
+stale address. `for_each_ref_slot` (`gc/src/gen_heap.rs`) blindly trusts
+`header.num_slots()` / `array_length()` with **zero** bound checking — unlike
+`walk_objects`/`scan_region`, which validate a candidate's implied size fits
+its free-list-bounded region before ever including it in the walk. A header
+that reads differently on this second, lock-free pass (the panic path holds no
+GC-exclusive lock; it takes `old_gen.try_lock()` only around the scan itself)
+than it did during the walk that produced it made the slot loop stride off
+into unmapped memory.
+
+**Fixed** (same commit): re-derive each walked object's total size via
+`gen_object_total_size(oh)` and skip it (`continue 'oldscan`) if that disagrees
+with the size `walk_objects` already validated for that slot, rather than
+trusting the header a second time. `cratonvm-gc`'s full test suite passed after
+each of the two fixes, independently.
+
+### With both fixed, the canary survives and reproducibly names one site
+
+Two full runs (2335 s and — the third, `CRATONVM_NO_OLDGEN_COALESCE=1` combined
+— 2116 s before a different crash, see below) both produced a **clean Rust
+panic** instead of a crash:
+
+```
+CRATONVM_DBG_STALE_OBJREF: stale ObjectRef detected at 0x1e7395a50a0 — this
+object was evacuated by a moving GC to 0x1e7a7f2bb10 (class_id=4294967295
+kind=<implausible-forward 0x1e7a7f2bb10>), but native/interpreter code
+dereferenced the OLD address.
+Holder scan:
+  NO heap holder found — the stale copy lived only in a frame/register/native
+  local (root-remap gap), or its holder was itself already collected (native
+  invoked from org/junit/platform/launcher/TestPlan.getTestIdentifier(...))
+```
+
+Two things this establishes:
+
+1. **The "forwarding target" is itself implausible** (`<implausible-forward>`,
+   not a real object). The suspect header's `forwarding_ptr` field is not a
+   genuine relocation record — it is corrupted. This is the same shape as the
+   `num_slots=33554433` / `kind=0xe7` / `kind=0x3a` (ASCII `:`) corruption
+   logged elsewhere in the very same runs (see below): different header
+   fields, same underlying "garbage bytes sitting where a header belongs"
+   phenomenon.
+2. **"NO heap holder" both times, from the same Java call site,
+   `TestPlan.getTestIdentifier`.** A genuine Family-1 unpinned-native-local bug
+   was the leading hypothesis reaching this doc — but every native on this call
+   path (`native_map_get` → `native_chm_get`/`native_lhm_get`/
+   `native_hashmap_get_exact` → `chm_seg_get`/`lhm_find_node`) was re-read line
+   by line this session and each already pins `this`/the search key/the
+   bucket-chain node around every `hashCode()`/`equals()` dispatch, refreshing
+   from the pin before every subsequent dereference — including
+   `chm_seg_get`'s snapshot-the-whole-chain-then-pin-every-entry dance, which
+   looks elaborate but is correct. **This is not a missed pin.** The object
+   being read was already corrupted before the native ever touched it; the
+   native/`get_field`/`get_header` chain is just where the corruption is first
+   *observed*, the same role `native_map_put_evict_pinned` played for defect 1
+   before that investigation retracted it as "a victim site, not the source."
+
+### The coalescer is not the (or not the only) mechanism for this lane
+
+The sibling JIT-on doc
+([`defaultcatalogandschema-late-phase-instability-20260801.md`](defaultcatalogandschema-late-phase-instability-20260801.md))
+logs the *identical* corruption signature (`num_slots=33554432`-ish, rejected
+`external-overlay(BFS owner)` candidates) and its leading, untested hypothesis
+was `OldGen::coalesce_free_blocks` merging a free block over live promoted
+data. Tested here: `CRATONVM_NO_OLDGEN_COALESCE=1` (still with the canary on).
+Result: **still crashes**, but differently — `EXCEPTION_ILLEGAL_INSTRUCTION`
+(SIGILL, not SIGSEGV) at `old_gen_gc+0x5371`, symbolized cleanly inside
+`OldGen::compact()` itself (`gen_heap.rs:10375`), no Rust panic message (so a
+genuine trap/bad jump, not `panic!`/`assert!` — release profile here is
+`panic = "unwind"` with default `overflow-checks = false`, so an `unwrap`/
+`assert` failure would have printed, and didn't). Two `old-gen mark: rejecting
+external-overlay(BFS owner)` warnings fired 2 seconds before the crash, and the
+crash report's shadow-stack dump nearby contains the literal ASCII bytes
+`"TestTask"` (`0x6B73615474736554` read as a `u64`) sitting where a
+pointer-sized slot should be — a second, independent instance of "text written
+over memory that should hold a pointer," the same phenomenon the ORIGINAL
+version of this doc found in arm C (`kind=0x3a`, ASCII `:`).
+
+**Why this is a real negative result, not just "n=1 didn't help":**
+`CRATONVM_NO_OLDGEN_COALESCE` only gates `OldGen::coalesce_free_blocks`, which
+is called from exactly two places — `OldGen::alloc`'s last-ditch retry, and the
+in-place (non-compacting) old-gen sweep's post-free coalesce pass. `--nojit`
+means there is never a live JIT frame, so `has_conservative_roots` is false and
+`old_gen_gc` takes the **compacting** branch essentially every time (the
+in-place-sweep branch this doc spent most of its history on is the
+`--nojit`-when-a-JIT-frame-is-live case, which cannot arise under `--nojit`
+proper). `OldGen::compact()` "rebuilds the free list as a single trailing block
+and so has never needed" coalescing (its own doc comment). So disabling the
+coalescer could not have touched the code path that actually crashed here —
+the negative result is expected, not surprising, and it means **the coalescer
+hypothesis from the JIT-on doc does not explain this `--nojit` lane**, even
+though the corruption *signature* the two docs log is identical. Either the
+two lanes share a root cause reachable through a different intermediate
+mechanism (most likely: something written during `old_gen.compact()`'s own
+slide/fixup phases, or during a moving-young promotion that feeds it), or they
+are two independent writers producing coincidentally similar garbage. Not yet
+distinguished.
+
+### What is established, and what is not
+
+Established:
+- The residual corruption is real, reproducible, and lives in old-gen object
+  headers (not a GC-root/rooting gap — the marker's owner-class check, the
+  freed-while-referenced sweep-liveness assertion, and now the stale-ObjectRef
+  canary have all been pointed at it and none found a rooting explanation).
+- It is not a Family-1 unpinned-native-local bug on the `TestPlan` /
+  `ConcurrentHashMap`/`LinkedHashMap` get-path — that path is correctly pinned
+  throughout.
+- It is not (solely, or not at all, for this lane) the old-gen coalescer.
+- `SWEEP-LIVENESS` (the freed-while-referenced assertion) does not fire on
+  this reproducer, consistent with the JIT-on doc's own finding: whatever
+  writes this garbage is not "the sweep reclaimed a block something still
+  points at."
+
+Not yet established: the actual writer. Two concrete leads for whoever
+continues this:
+1. **The literal ASCII bytes appearing where pointers belong** (`kind=0x3a`
+   originally, `"TestTask"` this session) are the strongest single clue in the
+   whole investigation and have never been chased to a source. Something is
+   writing STRING/text data into memory that a pointer-typed slot or an
+   object header later reads. Grep for raw byte-level writes into old-gen
+   memory that do not go through `set_field`/the allocator (a `String`
+   backing-array write, a JNI byte-copy, a `Vec<u8>` resize that reuses old
+   gen's backing buffer) — this smells like a **type confusion / wrong-stride
+   copy**, not a GC-rooting bug, and the doc's whole history of GC-side
+   detectors (five of them, all clean) is consistent with that: none of them
+   were built to look for a writer outside the GC's own protocol.
+2. **`OldGen::compact()`'s own phases** (forwarding-address assignment,
+   reference-slot rewrite, the slide, free-list rebuild) are the one thing
+   provably on the call stack of the SIGILL crash and have not yet been
+   audited this session the way `sweep_old_gen_non_moving` was for defect 4.
+   Start there before `coalesce_free_blocks` again.
+
+### Resolution — 2026-08-03: `--nojit` lane fixed; `OldGen::compact()` is NOT the writer (retracted below)
+
+Two more fixes closed the walk-coverage gap the corruption exposed
+(`83f640e62`: `compact()` now verifies `walk_objects`'s total covers
+`used_bytes` before proceeding, abandoning — over-retaining — otherwise; this
+is what surfaced `COMPACT_WALK_GAP_HITS`, `walked_bytes=178451208` against
+`used_bytes` growing past `620876304` on the live repro, a stable ~70%
+shortfall that never moved across GC cycles) and finally exposed the actual
+corrupted bytes (`86bcb96ed`: a raw dump at `scan_region`'s break point).
+
+**The bytes, decoded**, identical byte-for-byte and at the identical old-gen
+offset across two fully independent runs:
+
+```
+class_id=16 kind=Object(0) element_type=0 gc_age=2 gc_flags=0x03(OLD_GEN|MARKED)
+identity_hash=0x014df581 shape/num_slots=0x02000001 (33554433)
+forwarding_ptr=null mark_word=0
+```
+
+Every field is exactly what a genuinely live, correctly-marked old-gen object
+should have — `gc_flags` in particular is precisely the bit pattern a
+mark phase sets on a real survivor — **except `shape`**, which claims 33.5
+million fields for a class no real Java type has anywhere near. Deterministic
+(same bytes, same offset, two independent runs) rules out a race; the
+`gc_flags`/`identity_hash` plausibility rules out random memory garbage. One
+field of an otherwise-perfect header is wrong.
+
+**Code review of the obvious suspects found nothing.** `compact()`'s Phase
+1 (forwarding-address assignment), Phase 2 (`update_refs_in_object` /
+`forward_ref_slots`, which rewrites reference slots in place), and Phase 3
+(the slide, `std::ptr::copy` with a proven `dest <= src` invariant that
+cannot overwrite a not-yet-copied object) were each read start to finish.
+So was `native_collections::gc_update_collection_overlay_refs`, the overlay
+`pointer_map` remap — its own long comment already documents and fixes the
+historically similar "`pointer_map` contains both `A→B` and `B→C`" chaining
+hazard for `overlay_owner_keys` (rebuilding into a fresh map rather than
+mutating in place). Nothing wrong was found in any of them by inspection.
+
+**Bisected empirically instead.** Added a lever forcing every old-gen major
+GC through the in-place (non-compacting) arm regardless of what the caller
+requested — i.e. `compact()` never runs at all. Two full runs of
+`DefaultCatalogAndSchemaTest` with the lever on both completed **cleanly, at
+exact HotSpot parity**:
+
+```
+rc=0 elapsed=1051s  found=132 started=132 ok=132 failed=0
+rc=0 elapsed=1472s  found=132 started=132 ok=132 failed=0
+```
+
+against **100% crash/corruption across every compact-enabled run this
+session** (and every run in this doc's entire history before it). A third
+run with the lever's logic promoted to the actual production default (no
+special flags at all) reproduced the same clean result a third time
+(`rc=0 elapsed=1330s found=132`).
+
+**Fixed** (`96b2bc4a7`): `OldGen::compact` is disabled by default.
+`GenerationalHeap::major_gc` now consults `oldgen_compact_enabled()`
+(`CRATONVM_OLDGEN_COMPACT=1` to opt back in) instead of always requesting
+compaction; `old_gen_gc`'s two other call sites already passed `compact=false`
+explicitly and are unaffected. `compact()` itself is untouched and still
+fully tested (two tests that exercised its defragmentation behavior via
+`major_gc` now call `old_gen_gc` directly with `compact=true`, so they still
+cover it regardless of the production default). `cratonvm-gc`: 952 tests
+passed, 0 failed. Fast regression suite: 22/22, including `RMapGcStress`,
+`RMapResizeGc`, `ROverlaySystemGcStress` — every GC-stress reproducer this
+doc's history produced.
+
+**RETRACTED same day: `compact()` is not the writer.** A same-class run under
+JIT-ON, with compaction disabled by the fix below (`CRATONVM_OLDGEN_COMPACT`
+unset — its default), still crashed: `EXCEPTION_ACCESS_VIOLATION` at
+`old_gen_gc+0xFA3` (`gen_heap.rs:10060`, `Self::scan_object_for_old_refs`
+inside the mark-phase BFS — code that runs identically whether `compact` ends
+up `true` or `false`, and runs *before* that branch is even reached), with
+the identical `num_slots=33554433` signature logged eleven lines earlier.
+`gc young-gen actual: 2 moving cycle(s), 30 cycle(s) diverted to the
+NON-MOVING sweep` — under JIT-on this workload spends nearly all its old-gen
+time in the in-place sweep anyway, which `compact()` being disabled does not
+touch. **So the corruption is not produced by `compact()` at all** — it
+predates old_gen_gc's mark phase, is shared by both reclamation strategies,
+and disabling `compact()` merely stopped this specific `--nojit` reproducer
+from *walking into* it, for a reason not established (workload/timing
+difference between the two lanes, not a difference in whether the bug can
+fire). The exact statement responsible for writing `shape=0x02000001` was
+**not** identified by code review of `compact()` — correctly, as it turns
+out, since `compact()` was never the culprit. This JIT-on crash is the same
+symptom [`defaultcatalogandschema-late-phase-instability-20260801.md`](../../../known-issues/hibernate/defaultcatalogandschema-late-phase-instability-20260801.md)
+already tracks; that doc has been updated with this session's findings
+(compact() ruled out there too, the mark-phase-BFS location, and the
+shared-mechanism argument) and remains OPEN. `compact()` is disabled, not
+deleted, specifically so a future session investigating *that* doc can
+re-enable it (`CRATONVM_OLDGEN_COMPACT=1`) without cost — it was never shown
+to be part of the problem, only empirically NOT necessary for this doc's own
+`--nojit` reproducer to pass. The two literal-ASCII-text findings above
+(`kind=0x3a`, `"TestTask"`) remain the strongest unchased lead for whoever
+picks up the real investigation, now correctly filed against the sibling
+doc instead of this one.
+
+**Fragmentation tradeoff, acknowledged not resolved.** `compact()` exists to
+defragment old gen; the in-place sweep's own `coalesce_free_blocks` fallback
+provides some of that without sliding, and neither of the three validating
+runs (`--Xmx 1500m`, the class's standard heap) hit an `OutOfMemoryError` —
+but a workload that fragments old gen harder than this class might behave
+differently. Over-retention/fragmentation is judged the strictly safer
+failure mode than memory corruption, consistent with every other "over-retain
+rather than corrupt" decision this investigation and its predecessors made,
+but it is a real cost, not a free lunch, and worth watching for in a broader
+suite run.
 
 ## Related
 
