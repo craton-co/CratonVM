@@ -89,8 +89,10 @@ And refuse to widen `ir_compatible` in this lane. Its conjuncts belong to
 arms are disjoint and hundreds of lines apart, but the file is 365 KB and a
 long-lived branch will conflict. Rebase daily; land increments, not lanes.
 
-`cov-04` **closed 2026-08-03** and has already moved this lane's numbers —
-`ldc` 90 → **100**, `getstatic` 91 → **94**, `ldc_w` 7 → **8** — because the
-methods it unblocked reach their next gap here. Still 69% of the opcode bucket,
-still the largest, but re-derive before quoting a count. Details in
+`cov-02` and `cov-04` both **closed 2026-08-03**, and between them this lane is
+now almost the entire opcode gap. Measured on the merged tree: `ldc`
+92 → **102**, `getstatic` 93 → **96**, `ldc_w` 7 → **8** — `cov-04`'s unblocked
+methods reach their next gap here — while every `cov-02` row went to zero. So
+`getstatic` + `ldc`/`ldc_w` is no longer 69% of the bucket; it is **96% of it**
+(206 of 214). Re-derive before quoting a count. Details in
 [`docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).

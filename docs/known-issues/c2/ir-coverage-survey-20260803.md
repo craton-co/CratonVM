@@ -62,11 +62,13 @@ from a workload that does not reach it.
 
 `getstatic` + `ldc`/`ldc_w` is **189 of 273 — 69%** of every opcode gap.
 
-> **Stale since `cov-04` landed (2026-08-03).** Re-measured on the same three
-> workloads with the invoke terms removed, this table reads 285 events, not 273:
-> `ldc` 90→**100**, `getstatic` 91→**94**, `ldc_w` 7→**8**, `aaload` 18→**19**,
-> `dup_x1` 6→**7**. The rest are unchanged. `cov-01` is still 69% and still the
-> largest bucket, but re-derive before sizing anything from these rows.
+> **Stale since `cov-02` and `cov-04` landed (2026-08-03).** Re-measured on the
+> same three workloads with both lanes in, this table reads **214** events, not
+> 273, and every `cov-02` row is **zero**: `ldc` 92→**102**, `getstatic`
+> 93→**96**, `ldc_w` 7→**8**, `newarray` `0xbc` **5**, `0x53` **2**, `0x5c`
+> **1**. `getstatic` + `ldc`/`ldc_w` is therefore no longer 69% of the bucket —
+> it is **96% of it** (206 of 214), and `cov-01` is now very nearly the whole
+> opcode gap. Re-derive before sizing anything from these rows.
 
 ### The asymmetry worth staring at
 
@@ -105,10 +107,12 @@ where a method died; it does not record why, and a row that reads like an
 opcode-shaped gap can be neither.
 
 > **Also stale since `cov-04` landed.** With the four `cov-04` rows at zero the
-> table reads 66 events, not 112, and `ir.rs:5085` is **59**, not 37 — it is now
-> the largest builder refusal in the corpus by a wide margin. The methods that
-> were hiding behind the invoke terms are constructors, and constructors write
-> reference fields, which is `cov-03`'s row.
+> table reads **67** events, not 112, and only three rows survive: `ir.rs:5085`
+> is **60** (not 37), the `getfield` row is **6**, and one new event is a `new`
+> whose site is `JitNewSite::Deferred`. `cov-03` therefore owns 66 of the 67 —
+> the largest builder refusal in the corpus by a wide margin, larger than every
+> other structural refusal combined. The methods that were hiding behind the
+> invoke terms are constructors, and constructors write reference fields.
 
 `ir.rs:5085` is the second asymmetry. The `getfield` arm was taught to handle
 reference fields, and its own comment records why: *"This was the single largest

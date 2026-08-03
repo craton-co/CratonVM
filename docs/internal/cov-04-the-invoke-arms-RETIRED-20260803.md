@@ -149,55 +149,76 @@ allocations.
 
 ## The verification
 
-`CRATONVM_DBG=ir-compiles`, the same three workloads, base and fixed binaries
-interleaved with the arm order flipped between rounds. Every number below is a
+`CRATONVM_DBG=ir-compiles`, the same three workloads, two rounds, both arms
+every round with the arm order flipped between them. Every number below is a
 count, so the host's load does not enter into it.
 
-Two rounds, three workloads each, both arms every round:
+**The base arm is `origin/dev` at `86a296cab`, which already carries `cov-02`.**
+`cov-02` landed while this lane was open and edits the same match statement, so
+measuring against the pre-`cov-02` tree would have credited this lane with its
+neighbour's 65 bodies. The pre-merge A/B against `48fba3a31` agreed on every
+conclusion below (invoke refusals 69 → 0, bodies +30); this is the one that
+describes the tree that will exist.
 
 | | base r1 | base r2 | fix r1 | fix r2 |
 |---|---:|---:|---:|---:|
-| compile requests | 1,943 | 1,937 | 1,942 | 1,942 |
-| admitted to the optimizing pipeline | 976 | 974 | 976 | 978 |
-| **bodies the optimizing backend produced** | **590** | **590** | **619** | **621** |
-| builder refusals, all sites | 112 | 110 | 66 | 66 |
-| **invoke refusals** | **69** | **67** | **0** | **0** |
-| opcode-gap events | 269 | 269 | 285 | 285 |
+| compile requests | 1,940 | 1,942 | 1,938 | 1,942 |
+| admitted to the optimizing pipeline | 976 | 977 | 974 | 975 |
+| **bodies the optimizing backend produced** | **655** | **656** | **683** | **683** |
+| builder refusals, all sites | 112 | 112 | 67 | 67 |
+| **invoke refusals** | **69** | **69** | **0** | **0** |
+| opcode-gap events | 200 | 200 | 214 | 215 |
 
-**The invoke arms refuse nothing on this corpus any more** — `5303`, `5345` and
-`5395` are all zero in both fixed rounds — and **bodies rose by 30**, from 590 to
-620. All twelve runs pass (`failed=0 aborted=0 containersFailed=0`) in both
-arms.
+**The invoke arms refuse nothing on this corpus any more** — `5428`, `5470` and
+`5520` are all zero in both fixed rounds — and **bodies rose by 28**, 655 → 683.
+All twelve runs pass (`failed=0 aborted=0 containersFailed=0`) in both arms.
 
-The other half, which the brief insists be quoted: of the ~68 methods that
-stopped failing here, roughly 30 became a body and the rest moved to the next
-gap they meet.
+The other half, which the brief insists be quoted: of the 69 methods that
+stopped failing here, 28 became a body and the rest moved to the next gap they
+meet.
 
 | where the rest went | base | fix |
 |---|---:|---:|
-| `ir.rs:5085`→`5135` `putfield` of a non-`I/Z/B/C/S` tag (`cov-03`) | 37 | 59 |
-| `ldc` `0x12` (`cov-01`) | 90 | 100 |
-| `getstatic` `0xb2` (`cov-01`) | 91 | 94 |
+| `putfield` of a non-`I/Z/B/C/S` tag (`cov-03`; `ir.rs:5210`→`5260`) | 37 | **60** |
+| `ldc` `0x12` (`cov-01`) | 92 | 102 |
+| `getstatic` `0xb2` (`cov-01`) | 93 | 96 |
 | `ldc_w` `0x13` (`cov-01`) | 7 | 8 |
-| `aaload` `0x32` / `dup_x1` `0x5a` (`cov-02`) | 18 / 6 | 19 / 7 |
-| `ir.rs:5179` a `new` whose site is `JitNewSite::Deferred` | 0 | 1 |
+| a `new` whose site is `JitNewSite::Deferred` (`ir.rs:5304`) | 0 | 1 |
 
 Which is the ranking-shift the directory's own re-run rule predicts: `cov-03`'s
-`putfield` row grew by 22 and is now the single largest builder refusal in the
-corpus, because the methods hiding behind the invoke terms are constructors and
-constructors write reference fields. Run-to-run variation on these counts is
+`putfield` row grew by 23 and is now the largest builder refusal in the corpus
+by a wide margin — larger than every other structural refusal combined —
+because the methods that were hiding behind the invoke terms are constructors,
+and constructors write reference fields. Run-to-run variation on these counts is
 ±1–2 events.
 
 Bail line numbers move with the edit. In the fixed binary the invoke bails are
-`ir.rs:5303` (`0xb7` — the `5204`/`5219` pair merged, since a receiver that is
-not a fresh `Op::New` is now a call rather than a refusal), `ir.rs:5345`
-(`0xb6`/`0xb8`) and `ir.rs:5395` (`0xb9`).
+`ir.rs:5428` (`0xb7` — the old `5204`/`5219` pair merged, since a receiver that
+is not a fresh `Op::New` is now a call rather than a refusal), `ir.rs:5470`
+(`0xb6`/`0xb8`) and `ir.rs:5520` (`0xb9`).
 
 The brief asks for both halves to be quoted, and warns that a method which stops
 failing here and immediately fails on the next unlowered opcode is a real
 outcome and is not a body. That is most of what happened, and it was expected:
-`getstatic` + `ldc` is 69% of the remaining opcode gap (`cov-01`, 189 events)
-and is untouched.
+`getstatic` + `ldc` is now **96% of the whole remaining opcode gap** (206 of
+214) with `cov-02` closed, and it is untouched.
+
+### Correctness across a wider corpus
+
+The change admits a whole new population — every method containing a `new` —
+to the optimizing tier, so the three-workload A/B is not enough on its own. The
+**79-class Spring Boot regression list** (`/data/data/regr-list.tsv`) was run on
+both arms, interleaved per class with the arm order flipped between classes:
+
+| verdict | base | fix |
+|---|---:|---:|
+| PASS | 65 | 65 |
+| FAIL (all pre-existing, identical set) | 12 | 12 |
+| NOSUMMARY | 1 | 1 |
+| no classpath built | 1 | 1 |
+
+**Zero verdict mismatches across all 79.** Not one class changes state in
+either direction.
 
 Unit coverage, `jit/tests/ir_vs_singlepass.rs`:
 
@@ -215,9 +236,9 @@ Unit coverage, `jit/tests/ir_vs_singlepass.rs`:
   because the first alone would also pass on a builder that silently dropped
   every `<init>`.
 
-Each test names the exact edit that trips it, per this directory's rule 5.
-`cargo test --release -p cratonvm-jit --lib` is 1,868 / 0, and
-`--test ir_vs_singlepass` is 95 / 0.
+Each test names the exact edit that trips it, per this directory's rule 5. On
+the merged tree `cargo test --release -p cratonvm-jit --lib` is 1,868 / 0 and
+`--test ir_vs_singlepass` is 109 / 0 (this lane's three plus `cov-02`'s).
 
 ### One trap worth naming
 

@@ -7,10 +7,12 @@
 
 > **Re-measure before quoting the survey's 43.** `cov-04` closed 2026-08-03,
 > and the two terms it removed admitted a population of **constructors** to the
-> builder — which is the code that writes reference fields. The `putfield` row
-> went **37 → 59**, making it the largest builder refusal in the corpus by a
-> wide margin, larger than every other structural refusal combined. The line
-> numbers moved as well; re-derive both. See
+> builder — which is the code that writes reference fields. Measured on the
+> merged tree, the `putfield` row went **37 → 60** and this lane now owns
+> **66 of the 67** remaining builder refusals: every other structural refusal
+> in the corpus is gone. It is the largest single refusal anywhere below
+> `ir_compatible`. The line numbers moved as well (`0xb4` at `ir.rs:5216`,
+> `0xb5` at `ir.rs:5260` on the merged tree); re-derive both. See
 > [`docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).
 
 ## The finding

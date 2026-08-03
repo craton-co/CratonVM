@@ -114,11 +114,18 @@ carry into the neighbouring lanes:
    read and had been true when written. Rule 1 applies to a term's *comment*
    just as much as to a report's claim.
 
-Measured after: invoke refusals 69 → **0**, bodies 590 → **620**, and
-`cov-03`'s `putfield` row grew 37 → **59**, which makes it the largest builder
-refusal in the corpus. That is the re-run rule below firing — the methods that
-were hiding behind the invoke terms are constructors, and constructors write
-reference fields.
+Measured after, against `origin/dev` **with `cov-02` already in it**: invoke
+refusals 69 → **0**, bodies 655 → **683**, and `cov-03`'s `putfield` row grew
+37 → **60**, which makes it the largest builder refusal in the corpus by a wide
+margin — larger than every other structural refusal combined. That is the
+re-run rule below firing: the methods that were hiding behind the invoke terms
+are constructors, and constructors write reference fields. Correctness: the
+79-class Spring Boot regression list, both arms interleaved, **zero verdict
+mismatches** (65 PASS / 12 pre-existing FAIL, identical sets).
+
+With `cov-02` and `cov-04` both closed, `getstatic` + `ldc` is **96% of the
+whole remaining opcode gap** (206 of 214), and the only two structural refusals
+left are `cov-03`'s.
 
 **A third re-run trigger, alongside `cov-05`/`cov-06`/`cov-07`:** `cov-04` has
 already moved the `cov-01`/`cov-02`/`cov-03` rankings. Re-derive them before
