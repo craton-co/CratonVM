@@ -47,6 +47,7 @@ fn backend_sources() -> String {
         include_str!("operand_stack.rs"),
         include_str!("frames.rs"),
         include_str!("safepoint.rs"),
+        include_str!("deopt_stubs.rs"),
         include_str!("tests.rs"),
         include_str!("flag_and_header_contracts.rs"),
         include_str!("loop_unroll_admission.rs"),
