@@ -13572,7 +13572,7 @@ pub(super) fn execute_invokestatic_cached(
                     // same declaring class, so a future redefine bumps the
                     // same counter and invalidates the upgraded JIT entry.
                     let jit_target = CachedInvokeTarget::Jit {
-                        compiled: compiled.clone(),
+                        compiled: compiled.clone().into(),
                         num_params: cached.num_params,
                         return_type: ret,
                         needs_heap: heap,
@@ -16834,7 +16834,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             let ret = crate::jit::return_type(&cached.method_descriptor);
             let heap = compiled.needs_heap();
             return Some(CachedInvokeTarget::Jit {
-                compiled,
+                compiled: compiled.into(),
                 num_params: cached.num_params,
                 return_type: ret,
                 needs_heap: heap,
@@ -17769,7 +17769,7 @@ pub(super) fn try_jit_upgrade_with_gate(
     );
 
     Some(CachedInvokeTarget::Jit {
-        compiled: compiled_arc,
+        compiled: compiled_arc.into(),
         num_params: cached.num_params,
         return_type: ret,
         needs_heap: heap,
@@ -22841,7 +22841,9 @@ pub(super) fn execute_invokevirtual_cached(
                             if found.is_none() {
                                 cached.record_jit_probe_miss(jit_generation);
                             }
-                            found
+                            // See the interpreter's twin: released on the
+                            // mutator, and regularly the last owner.
+                            found.map(cratonvm_jit::RetainedCode::new)
                         }
                         .or_else(|| {
                             // Warmup counter mirroring execute_invokestatic_cached.
