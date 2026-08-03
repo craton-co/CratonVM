@@ -14625,7 +14625,46 @@ fn try_compile_inner(
                             continue;
                         }
                     }
-                    if direct_jit_callee_calls_enabled {
+                    // STATICALLY BOUND ONLY (`invokespecial` / `invokestatic`).
+                    //
+                    // `callee_compiler` is asked about the constant-pool
+                    // RESOLVED (class, method, descriptor). For an
+                    // `invokevirtual` / `invokeinterface` that names the STATIC
+                    // receiver type, not the runtime one — so binding its
+                    // compiled entry here, with `guard_class_id: 0` and no
+                    // receiver check at all, calls THAT body for every
+                    // receiver, including one whose class overrides the method.
+                    //
+                    // The CRC32 note further down this ladder already states
+                    // the assumption ("this invokestatic/invokespecial path
+                    // never resolves a CRC32 intrinsic (those are
+                    // `invokevirtual` only), so `guard_class_id` is 0") — it
+                    // was simply never enforced, and the enclosing
+                    // `matches!(invoke_kind, 0..=3)` lets 0 and 2 in.
+                    //
+                    // Virtual and interface sites are NOT unhandled: they have
+                    // their own block below (`invoke_kind == 0 || == 2`), where
+                    // every direct bind is either a `final` class, a helper
+                    // that re-checks the receiver's exact class itself, or a
+                    // `guard_class_id` the codegen compares at runtime — and
+                    // failing all of those they fall through to the MIC/PIC
+                    // inline cache, which is class-id guarded by construction.
+                    //
+                    // Measured: H2's `org.h2.value.VersionedValue.
+                    // getCurrentValue()` returns `(T) this` (H2's "a raw value
+                    // is its own VersionedValue" trick) and
+                    // `VersionedValueCommitted` overrides it with
+                    // `return value`. Once the BASE was compiled, every
+                    // `v.getCurrentValue()` in `VersionedValueType.write` —
+                    // static type `VersionedValue` — reached the base body and
+                    // returned the WRAPPER, which the caller casts to the
+                    // payload type: `ClassCastException:
+                    // VersionedValueUncommitted cannot be cast to
+                    // org.h2.value.Value`, deterministically, single-threaded,
+                    // inside 1000 rows of a plain JDBC `MERGE` loop. The
+                    // callee filters (no natives, no non-empty exception table)
+                    // are why this only bites a small overridable method.
+                    if direct_jit_callee_calls_enabled && matches!(invoke_kind, 1 | 3) {
                         if let Some(compiler) = callee_compiler.as_ref() {
                             if let Some((entry, callee_needs_ctx)) =
                                 compiler(&class_name, &method_name, &descriptor)
@@ -14723,7 +14762,13 @@ fn try_compile_inner(
                         ));
                         continue;
                     }
-                } else if direct_jit_callee_calls_enabled {
+                } else if direct_jit_callee_calls_enabled
+                    // Same static-binding restriction as the bind above:
+                    // a bailed-inline virtual site must fall through to
+                    // the class-id-guarded MIC/PIC, not to an unguarded
+                    // raw CALL into the statically resolved body.
+                    && matches!(invoke_kind, 1 | 3)
+                {
                     // INLINE-BAIL FALLBACK (tomcat doc 04, 2026-07-27).
                     //
                     // A site planned for inlining used to get NO direct call,
