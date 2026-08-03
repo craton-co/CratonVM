@@ -9,24 +9,26 @@
 // Run it twice and diff the output. The two runs must agree exactly:
 //
 //   cratonvm --java-home <jdk> -cp probes LoopXformProbe
-//   CRATONVM_JIT='bytecode-loop-xform,deopt-real=0' \
-//   CRATONVM_DBG='jit-gen' \
+//   CRATONVM_JIT='bytecode-loop-xform' CRATONVM_DBG='jit-gen' \
 //     cratonvm --java-home <jdk> -cp probes LoopXformProbe
 //
-// BOTH tokens are needed. `bytecode-loop-xform` arms the rewriter (and turns
-// the native byte-copy unroller off in the same motion — the two are exact
-// complements). `deopt-real=0` clears the first of the four whole-compile
-// refusals in `plan_bytecode_loop_xform`, which is default-ON and would
-// otherwise refuse every compile before it looked at a loop.
+// ONE token. `bytecode-loop-xform` arms the rewriter (and turns the native
+// byte-copy unroller off in the same motion — the two are exact complements).
+// It used to additionally need `deopt-real=0`, which cleared the first of four
+// whole-compile refusals in `plan_bytecode_loop_xform`; `loop-02` retired that
+// refusal, so adding it now measures the deopt-real-off configuration rather
+// than the transform. Both spellings are worth running — they were, and they
+// agree.
 //
 // `CRATONVM_DBG=jit-gen` prints one line per rewrite:
 //
 //   [JIT_GEN] bytecode loop rewrite: kind=Unroll versioned=true header=… …
 //
 // Every method here is deliberately call-free and `invokedynamic`-free in its
-// loop, because inline sites and indy are two of the other three whole-compile
-// refusals. A loop that quietly acquired either would make this probe report
-// "no rewrite" for a reason that has nothing to do with the loop.
+// loop. Indy is no longer a refusal (`probes/IndyDeoptProbe.java` covers that
+// shape on purpose), but inline sites still are — a loop that quietly acquired
+// a call would make this probe report "no rewrite" for a reason that has
+// nothing to do with the loop.
 public class LoopXformProbe {
 
     // The shape guarded versioning exists for: a runtime limit, so the

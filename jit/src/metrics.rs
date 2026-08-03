@@ -1419,17 +1419,26 @@ pub fn record_osr_event(event: &str) {
 /// Bytecode loop-rewriter admission, counted per compile that reaches
 /// `x64::loop_rewrite::plan_bytecode_loop_xform`.
 ///
-/// ## Why the four refusal conditions are counted INDEPENDENTLY
+/// ## Why the four conditions are counted INDEPENDENTLY
 ///
-/// The planner evaluates them in a fixed order and returns on the first, so a
-/// "which refusal fired" tally answers a question nobody asked: `deopt_real` is
-/// default-ON and process-wide, so it would account for **100%** of refusals
-/// and hide the other three permanently. Each condition is therefore recorded
-/// on every compile that reaches the planner, whether or not an earlier one has
-/// already refused. The four counts **overlap by construction** — a method with
-/// an `invokedynamic` compiled under `deopt_real` bumps both — and must not be
-/// summed. `loop_xform_eligible` is the count of compiles where none of them
-/// held.
+/// They were once four whole-compile REFUSALS evaluated in a fixed order,
+/// returning on the first — so a "which refusal fired" tally answered a
+/// question nobody asked: `deopt_real` is default-ON and process-wide, so it
+/// would have accounted for **100%** of refusals and hidden the other three
+/// permanently. Counting them independently is what retired three of them:
+/// `DeoptimizationPoint::bci` is now published through the rewrite's own
+/// provenance map (`Compiler::orig_bci`), which removed `deopt_real`, precise
+/// exception frames and `invokedynamic` as refusals in one move. Only
+/// `inline_sites` still refuses.
+///
+/// The four rows stay, still recorded on every compile that reaches the
+/// planner whether or not something else refuses, because they now answer a
+/// different question: how much of the compile population each construct
+/// covers — i.e. how much the translation bought. They **overlap by
+/// construction** — a method with an `invokedynamic` compiled under
+/// `deopt_real` bumps both — and must not be summed. `loop_xform_eligible` is
+/// the count of compiles no whole-compile refusal held for, which today is
+/// exactly `loop_xform_compiles - loop_xform_inline_sites`.
 ///
 /// ## They are properties of the METHOD, not of the rewriter
 ///
@@ -1440,17 +1449,16 @@ pub fn record_osr_event(event: &str) {
 /// which is the honest answer rather than a gap.
 ///
 /// See `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
-pub const LOOP_XFORM_EVENTS: [&str; 10] = [
+pub const LOOP_XFORM_EVENTS: [&str; 12] = [
     // Denominator: compiles that reached the planner at all.
     "loop_xform_compiles",
-    // The four whole-compile refusal conditions, each counted on every compile
-    // it holds for. Overlapping; do not sum.
+    // The four conditions, each counted on every compile it holds for.
+    // Overlapping; do not sum. Only the last of them still REFUSES.
     "loop_xform_deopt_real",
     "loop_xform_precise_exception_frames",
     "loop_xform_invokedynamic",
     "loop_xform_inline_sites",
-    // None of the four held. This is the population a narrowing effort would
-    // be trying to grow.
+    // No whole-compile refusal held. `compiles - inline_sites` today.
     "loop_xform_eligible",
     // …and of those, the ones that got no further because nothing armed the
     // rewriter. On a default run this equals `loop_xform_compiles`.
@@ -1463,10 +1471,24 @@ pub const LOOP_XFORM_EVENTS: [&str; 10] = [
     "loop_xform_planner_refused",
     // A transform was produced and the emitter compiled rewritten bytecode.
     "loop_xform_applied",
+    // …and was then DISCARDED, because its recorded deopt points could not be
+    // published as interpreter resume points. Fail-closed: the method stays
+    // interpreted. Any non-zero value here is a defect in the coordinate
+    // change, not a tuning signal — see
+    // `x64::loop_rewrite::rewritten_deopt_points_are_publishable`.
+    "loop_xform_deopt_bci_unpublishable",
+    // Two images of one bytecode published deopt points whose frame SHAPES
+    // differ (a slot's kind, the operand-stack depth, a monitor). Reported, not
+    // refused: the only bci-keyed reader of those fields is the OSR entry
+    // contract, which re-verifies every one of them against the live
+    // interpreter frame. Non-zero is normal — see `PointDifference`.
+    "loop_xform_deopt_frames_diverge",
 ];
 
 /// One relaxed counter per [`LOOP_XFORM_EVENTS`] entry.
 static LOOP_XFORM_COUNTERS: [AtomicU64; LOOP_XFORM_EVENTS.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

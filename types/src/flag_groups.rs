@@ -587,9 +587,10 @@ pub const INVENTORY: &[E] = &[
     // unroll, guarded versioning). Default-**OFF**, and arming it also turns
     // the native byte-copy unroller off — the two are exact complements, and
     // both firing on one loop would put `(k+1)^2` bodies behind one back-edge
-    // poll. Note it is not sufficient on its own: `deopt-real` is default-ON
-    // and is the first whole-compile refusal, so executing a transformed method
-    // needs `CRATONVM_JIT='bytecode-loop-xform,-deopt-real'`. See
+    // poll. Sufficient on its own since `loop-02` retired the `deopt-real`
+    // whole-compile refusal: this token alone now reaches loops under the
+    // default configuration, and pairing it with `-deopt-real` measures the
+    // deopt-real-off configuration rather than the transform. See
     // `docs/jit/loop-rewriter-wiring.md`.
     E { group: Group::JIT, token: "bytecode-loop-xform", on_key: Some("CRATONVM_JIT_BYTECODE_LOOP_XFORM"), off_key: None, off_word: None },
     // Default-ON: `x64::escape_analysis::bulk_byte_loops_enabled` reads

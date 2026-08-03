@@ -128,6 +128,33 @@ impl Compiler {
         // Cast: buffer position/length to encoding offset (i32/u32)
         let native_offset = self.buf.pos() as u32;
 
+        // ── THE COORDINATE CHANGE ────────────────────────────────────────
+        //
+        // `bci` is an EMITTER pc. Under a bytecode loop rewrite it indexes the
+        // REWRITTEN method, and every use of it below — `sr_local_prov_at`,
+        // `local_oop_reached`/`local_oop_masks`, `local_liveness`,
+        // `local_kinds_refined`, `indy_stack_arg_types`, `sr_monitor_at` — is
+        // an analysis OF that rewritten method, so all of them keep it. So do
+        // the callers' `*_box_ptr_by_bci` keys and `emit_deopt_stubs`' stub
+        // sharing, which must stay per-copy.
+        //
+        // `DeoptimizationPoint::bci` and `FrameState::bci` are different: they
+        // are the two fields the VM RESUMES AT, range-tests against the
+        // method's interpreter exception table, and matches against
+        // `osr_pc_to_native`'s (interpreter-space) keys. They — and only they —
+        // are published through `orig_bci`, which is the identity whenever
+        // nothing was rewritten, so an ordinary compile is unchanged.
+        //
+        // Resuming a copy at its original bci is exactly right: copy `j` of an
+        // unrolled body IS iteration `i + j`, executing the same bytecode with
+        // the same abstract frame, so the interpreter continuing at that bci
+        // continues the same computation. `compile_with_param_slots` re-derives
+        // this translation from `deopt_point_pcs` and discards the method if it
+        // does not hold — including for the versioning guard's synthetic bytes,
+        // which are an image of no instruction at all.
+        // Cast: bytecode index to u32 (non-negative, fits)
+        let resume_bci = self.orig_bci(bci) as u32;
+
         // Phase B: locals holding a live scalar-replaced object at this bci →
         // `local_index → new_pc`. Emitted as `VirtualObject` (first occurrence) /
         // `VirtualObjectRef` (a shared later occurrence) below, so a guard deopt
@@ -404,8 +431,8 @@ impl Compiler {
 
         let point = DeoptimizationPoint {
             native_offset,
-            // Cast: bytecode/native offset to u32 (non-negative, fits)
-            bci: bci as u32,
+            // Interpreter-bci space; see "THE COORDINATE CHANGE" above.
+            bci: resume_bci,
             reason,
             action: DeoptAction::Reinterpret,
             // Behaviour-preserving: `for_reason` is exactly the per-`DeoptReason`
@@ -428,8 +455,8 @@ impl Compiler {
                 // for legacy/test wrappers that pass no key (the consumers
                 // treat an empty key as "never matches" → safe re-run).
                 method_key: self.method_key.clone(),
-                // Cast: bytecode/native offset to u32 (non-negative, fits)
-                bci: bci as u32,
+                // Interpreter-bci space; see "THE COORDINATE CHANGE" above.
+                bci: resume_bci,
                 locals,
                 stack,
                 monitors,
@@ -449,6 +476,10 @@ impl Compiler {
         let box_ptr: *const crate::deopt::DeoptimizationPoint = std::ptr::addr_of!(*boxed);
         self.deopt_boxes.push(boxed);
         self.deopt_points.push(point);
+        // The emitter pc this point was recorded at, kept in step with
+        // `deopt_points` so the coordinate change above can be re-derived and
+        // checked at finalize rather than trusted.
+        self.deopt_point_pcs.push(bci);
         box_ptr
     }
 
@@ -720,7 +751,15 @@ impl Compiler {
     /// no frame left to catch into and the exception escapes to this method's
     /// caller instead — the wrong handler, silently.
     pub(super) fn pc_is_protected(&self, pc: usize) -> bool {
-        let pc = pc as u32;
+        // `pc` is an EMITTER pc; `protected_ranges` was published by the
+        // bytecode front-end from the method's INTERPRETER exception table and
+        // is deliberately not rewritten. Ask the question about the original
+        // instruction: under a loop rewrite every copy of a bytecode inside a
+        // `try` maps back to the one bci the range covers, which is the answer
+        // each copy needs. Identity — and byte-identical — on an ordinary
+        // compile, where `orig_bci` is `pc`.
+        // Cast: bci fits u32
+        let pc = self.orig_bci(pc) as u32;
         self.protected_ranges
             .iter()
             .any(|(start, end)| pc >= *start && pc < *end)

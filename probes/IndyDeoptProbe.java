@@ -6,6 +6,15 @@
 //
 //   cratonvm --java-home <jdk> -cp probes IndyDeoptProbe          # control
 //   CRATONVM_JIT='deopt-real=0' cratonvm … IndyDeoptProbe         # suspect
+//
+// Reused by `loop-02` for a second purpose: `concatLoop` is a loop with an
+// `invokedynamic` INSIDE it, which is the shape that says whether the bytecode
+// loop rewriter's bci translation holds for the one snapshot path that is not
+// gated on `deopt_real`. Run it armed —
+// `CRATONVM_JIT='bytecode-loop-xform'` — and it must still match `java`. It is
+// also the method whose two unrolled copies legitimately disagree about local
+// 3's oop-ness at the indy, which is what scoped
+// `rewritten_deopt_points_are_publishable`'s copy-agreement check.
 public class IndyDeoptProbe {
 
     interface F {
