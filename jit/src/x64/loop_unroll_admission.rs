@@ -593,9 +593,6 @@ fn the_rewriter_is_off_by_default_and_armed_per_thread() {
 
 #[test]
 fn planning_refuses_unless_armed() {
-    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
-    // this module's tests run concurrently. See `TALLY_LOCK`.
-    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let code = shape_int_accum_loop();
     assert_eq!(
         plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
@@ -641,10 +638,9 @@ fn planning_refuses_unless_armed() {
 /// condition.
 #[test]
 fn the_tally_counts_all_four_conditions_not_just_the_one_that_refuses() {
-    // Serialised against the other tally test: these are process-wide
-    // counters and the module's tests run concurrently.
-    let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    crate::metrics::reset_loop_xform_counts_for_test();
+    // Counted PER THREAD: the globals are bumped by every compile in this
+    // crate's test binary. See `metrics::LoopXformCapture`.
+    let tally = crate::metrics::LoopXformCapture::start();
     let code = shape_int_accum_loop();
     // Every condition true at once. Only the last of them refuses, and the
     // tally must still see all four — that independence is what measured the
@@ -665,13 +661,7 @@ fn the_tally_counts_all_four_conditions_not_just_the_one_that_refuses() {
             "inline sites are the only whole-compile refusal left"
         );
     }
-    let counts = |name: &str| -> u64 {
-        crate::metrics::loop_xform_counts()
-            .into_iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, c)| c)
-            .unwrap_or_else(|| panic!("no such counter: {name}"))
-    };
+    let counts = |name: &str| tally.count(name);
     assert_eq!(counts("loop_xform_compiles"), 1);
     for name in [
         "loop_xform_deopt_real",
@@ -694,7 +684,7 @@ fn the_tally_counts_all_four_conditions_not_just_the_one_that_refuses() {
 
     // …and a compile with none of the four set is `eligible`, whether or not
     // anything is armed. That is what makes the row a property of the METHOD.
-    crate::metrics::reset_loop_xform_counts_for_test();
+    tally.reset();
     assert_eq!(
         plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
         LoopRewriteRefusal::NotArmed
@@ -710,25 +700,17 @@ fn the_tally_counts_all_four_conditions_not_just_the_one_that_refuses() {
     ] {
         assert_eq!(counts(name), 0, "{name}");
     }
-    crate::metrics::reset_loop_xform_counts_for_test();
 }
 
 /// The loop-level rows, which need the rewriter armed.
 #[test]
 fn the_tally_separates_no_candidate_loop_from_a_structural_refusal() {
-    let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let counts = |name: &str| -> u64 {
-        crate::metrics::loop_xform_counts()
-            .into_iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, c)| c)
-            .unwrap_or_else(|| panic!("no such counter: {name}"))
-    };
+    let tally = crate::metrics::LoopXformCapture::start();
+    let counts = |name: &str| tally.count(name);
     let _armed = Armed::new();
 
     // A method with no loop the planner will take: counted as
     // `no_candidate_loop`, not as a planner refusal.
-    crate::metrics::reset_loop_xform_counts_for_test();
     let none = vec![0x03u8, 0xac]; // iconst_0; ireturn
     assert_eq!(
         plan_bytecode_loop_xform(&none, 2, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
@@ -741,7 +723,7 @@ fn the_tally_separates_no_candidate_loop_from_a_structural_refusal() {
     // …and a method the planner selects a loop in but the rewriter refuses:
     // the irreducible fixture, which is either skipped as a candidate or
     // refused structurally. Whichever it is, exactly one of the two rows moves.
-    crate::metrics::reset_loop_xform_counts_for_test();
+    tally.reset();
     let irr = shape_irreducible();
     assert!(plan_bytecode_loop_xform(&irr, 21, &[], &HashMap::new(), accum_shape_ok()).is_err());
     assert_eq!(
@@ -750,18 +732,7 @@ fn the_tally_separates_no_candidate_loop_from_a_structural_refusal() {
         "exactly one outcome row per refused compile"
     );
     assert_eq!(counts("loop_xform_applied"), 0);
-    crate::metrics::reset_loop_xform_counts_for_test();
 }
-
-/// Serialises every test in this module that reaches
-/// `plan_bytecode_loop_xform`, directly or through a compile helper.
-///
-/// `LOOP_XFORM_COUNTERS` is process-wide and Rust runs a module's tests
-/// concurrently, so a test asserting a count sees every other test's increments
-/// — and the flakiness looks like a counting bug, not like a missing lock. It
-/// is not enough for the two tests that ASSERT counts to hold this: the
-/// PRODUCERS have to as well, which is every test below that plans or compiles.
-static TALLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Three of the four conditions no longer refuse, and the fourth still does.
 ///
@@ -777,9 +748,6 @@ static TALLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// measurement in `loop-02` exists to have gotten out of.
 #[test]
 fn planning_admits_the_three_translated_constructs_and_still_refuses_inlining() {
-    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
-    // this module's tests run concurrently. See `TALLY_LOCK`.
-    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     for (label, shape) in [
@@ -833,9 +801,6 @@ fn planning_admits_the_three_translated_constructs_and_still_refuses_inlining() 
 /// half-rewritten, and reports the rewriter's own reason.
 #[test]
 fn planning_reports_the_structural_refusal() {
-    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
-    // this module's tests run concurrently. See `TALLY_LOCK`.
-    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     // Irreducible: the cycle is entered at both of its blocks. Header 7,
     // back edge 17, body 10 — inside the profitability band, so the band
@@ -869,9 +834,6 @@ fn planning_reports_the_structural_refusal() {
 /// The profitability band is the native unroller's, PGO arm included.
 #[test]
 fn the_pgo_hint_sets_the_factor_exactly_as_the_native_unroller_does() {
-    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
-    // this module's tests run concurrently. See `TALLY_LOCK`.
-    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     // Factor 2 ⇒ 1 extra copy, overriding the static heuristic's 3.
@@ -995,9 +957,6 @@ fn a_pointer_payload_is_shared_across_the_copies() {
 /// describing a different method.
 #[test]
 fn the_fixture_loop_is_what_the_planner_is_offered() {
-    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
-    // this module's tests run concurrently. See `TALLY_LOCK`.
-    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let code = shape_int_accum_loop();
     assert_eq!(code.len(), 21);
     assert_eq!(detect_loops(&code, 21), vec![(4usize, 16usize)]);
@@ -1018,9 +977,6 @@ fn the_fixture_loop_is_what_the_planner_is_offered() {
 /// loop out of that edge's reach, so the hoists can be kept.
 #[test]
 fn the_planner_peels_a_bypassable_header_instead_of_skipping_it() {
-    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
-    // this module's tests run concurrently. See `TALLY_LOCK`.
-    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_bypassable_header();
     let (len, header, back_edge) = (30usize, 11usize, 25usize);
@@ -1075,9 +1031,6 @@ fn the_planner_peels_a_bypassable_header_instead_of_skipping_it() {
 /// unconditional now: the answer must not depend on that flag any more.
 #[test]
 fn the_wired_compile_path_reaches_a_loop_under_the_default_configuration() {
-    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
-    // this module's tests run concurrently. See `TALLY_LOCK`.
-    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     let real_shape = LoopRewriteShape {
@@ -1143,9 +1096,8 @@ fn shape_accum_loop_then_indy() -> Vec<u8> {
 /// about the translation rather than about this fixture's numbers.
 #[test]
 fn a_transformed_methods_published_deopt_bcis_are_interpreter_bcis() {
-    // `loop_xform_applied` is a process-wide counter and this module's tests
-    // run concurrently.
-    let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Counted per thread; see `metrics::LoopXformCapture`.
+    let tally = crate::metrics::LoopXformCapture::start();
     let code = shape_accum_loop_then_indy();
     const INDY_BCI: u32 = 19;
 
@@ -1165,17 +1117,11 @@ fn a_transformed_methods_published_deopt_bcis_are_interpreter_bcis() {
         assert!(boundaries.contains(&p.bci), "unarmed: bci {} is not an instruction", p.bci);
     }
 
-    crate::metrics::reset_loop_xform_counts_for_test();
+    tally.reset();
     let applied = {
         let _armed = Armed::new();
         let cm = compile_indy_fixture(&code).expect("the armed fixture compiles");
-        let counts = |name: &str| -> u64 {
-            crate::metrics::loop_xform_counts()
-                .into_iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, c)| c)
-                .unwrap_or_else(|| panic!("no such counter: {name}"))
-        };
+        let counts = |name: &str| tally.count(name);
         assert_eq!(
             counts("loop_xform_applied"),
             1,
@@ -1189,7 +1135,6 @@ fn a_transformed_methods_published_deopt_bcis_are_interpreter_bcis() {
         );
         cm
     };
-    crate::metrics::reset_loop_xform_counts_for_test();
 
     assert!(
         applied.deopt_points.iter().any(|p| p.bci == INDY_BCI),
@@ -1284,9 +1229,6 @@ fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
 /// resumes arbitrary bytecode.
 #[test]
 fn the_publishability_check_refuses_a_point_the_translation_cannot_describe() {
-    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
-    // this module's tests run concurrently. See `TALLY_LOCK`.
-    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     let x = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())
@@ -1434,9 +1376,6 @@ fn test_deopt_point(bci: u32) -> crate::deopt::DeoptimizationPoint {
 /// at `rebuilt[4]`.
 #[test]
 fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
-    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
-    // this module's tests run concurrently. See `TALLY_LOCK`.
-    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     let x = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())
@@ -1558,20 +1497,15 @@ fn the_osr_gap_is_refused_and_the_compile_path_does_not_yet_reach_it() {
     // disables the native byte-copy unroller, so "the code length changed"
     // does not prove a bytecode transform happened. `loop_xform_applied` is
     // what proves it.
-    let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let baseline = compile_accum_fixture()
         .expect("the helper-free fixture must compile on the default path");
-    crate::metrics::reset_loop_xform_counts_for_test();
+    let tally = crate::metrics::LoopXformCapture::start();
     let armed = {
         let _armed = Armed::new();
         compile_accum_fixture().expect("the armed fixture must still compile")
     };
-    let applied = crate::metrics::loop_xform_counts()
-        .into_iter()
-        .find(|(n, _)| *n == "loop_xform_applied")
-        .map(|(_, c)| c)
-        .expect("the counter exists");
-    crate::metrics::reset_loop_xform_counts_for_test();
+    let applied = tally.count("loop_xform_applied");
+    drop(tally);
     assert_eq!(
         applied, 1,
         "the wired path must now produce a rewritten artifact for this fixture",

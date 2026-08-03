@@ -1510,6 +1510,72 @@ static LOOP_XFORM_COUNTERS: [AtomicU64; LOOP_XFORM_EVENTS.len()] = [
 pub fn record_loop_xform_event(event: &str) {
     if let Some(idx) = LOOP_XFORM_EVENTS.iter().position(|e| *e == event) {
         LOOP_XFORM_COUNTERS[idx].fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        LOOP_XFORM_CAPTURE.with(|c| {
+            if let Some(v) = c.borrow_mut().as_mut() {
+                v[idx] += 1;
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Installed by [`LoopXformCapture`]; `None` on every thread that has not
+    /// asked to count.
+    static LOOP_XFORM_CAPTURE: std::cell::RefCell<Option<Vec<u64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A per-thread view of [`record_loop_xform_event`], for tests that assert
+/// counts.
+///
+/// [`LOOP_XFORM_COUNTERS`] is process-wide, and in this crate's test binary
+/// EVERY compile bumps it — `x64::tests` alone puts thousands of methods
+/// through `compile_with_param_slots`, concurrently. So a test asserting
+/// `loop_xform_compiles == 1` against the globals is asserting against every
+/// other test's work, and serialising the asserting module does not help
+/// because the producers are in other modules. It fails rarely, which is worse
+/// than failing often: the symptom is one unrelated count off by one.
+///
+/// The planner runs on its caller's thread, so counting there is exact and
+/// needs no lock. Nothing outside `#[cfg(test)]` is compiled.
+#[cfg(test)]
+pub(crate) struct LoopXformCapture(());
+
+#[cfg(test)]
+impl LoopXformCapture {
+    /// Start counting THIS thread's events from zero. Dropping the guard stops
+    /// counting; the global counters are untouched throughout.
+    pub(crate) fn start() -> Self {
+        LOOP_XFORM_CAPTURE.with(|c| *c.borrow_mut() = Some(vec![0; LOOP_XFORM_EVENTS.len()]));
+        LoopXformCapture(())
+    }
+
+    /// This thread's count for `event`. Panics on an unknown name rather than
+    /// answering zero, which is how a renamed row would otherwise pass.
+    pub(crate) fn count(&self, event: &str) -> u64 {
+        let idx = LOOP_XFORM_EVENTS
+            .iter()
+            .position(|e| *e == event)
+            .unwrap_or_else(|| panic!("no such counter: {event}"));
+        LOOP_XFORM_CAPTURE.with(|c| c.borrow().as_ref().map_or(0, |v| v[idx]))
+    }
+
+    /// Forget everything counted so far and keep counting.
+    pub(crate) fn reset(&self) {
+        LOOP_XFORM_CAPTURE.with(|c| {
+            if let Some(v) = c.borrow_mut().as_mut() {
+                v.iter_mut().for_each(|x| *x = 0);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for LoopXformCapture {
+    fn drop(&mut self) {
+        LOOP_XFORM_CAPTURE.with(|c| *c.borrow_mut() = None);
     }
 }
 
@@ -1524,14 +1590,9 @@ pub fn loop_xform_counts() -> Vec<(&'static str, u64)> {
         .collect()
 }
 
-/// Drop every loop-rewriter count. Test-only, for the same reason
-/// [`reset_scheduling_counts_for_test`] is.
-#[cfg(test)]
-pub(crate) fn reset_loop_xform_counts_for_test() {
-    for counter in LOOP_XFORM_COUNTERS.iter() {
-        counter.store(0, Ordering::Relaxed);
-    }
-}
+// There is deliberately no `reset_loop_xform_counts_for_test`. Zeroing a
+// process-wide counter that every concurrent test is incrementing does not make
+// a count assertable — see [`LoopXformCapture`], which is what to use instead.
 
 /// Read every OSR event's count, including zero-valued ones, in
 /// [`OSR_EVENTS`] order. Relaxed loads: a sample, not an atomic snapshot.

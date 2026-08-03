@@ -136,23 +136,29 @@ code. Neither has been measured, and cannot be — see below.
 ## Reachability
 
 **Read this before building a fourth transform.** The wired path
-(`compile_with_param_slots` → `plan_bytecode_loop_xform`) refuses *every*
-compile today, and not because of any loop:
+(`compile_with_param_slots` → `plan_bytecode_loop_xform`) is off by default but
+no longer unreachable. Two things gated it, and one is gone:
 
-* the rewriter is armed by a thread-local that nothing in the VM sets
-  (`set_bytecode_loop_rewriter_armed`), **and**
-* even when armed, `plan_bytecode_loop_xform`'s first whole-compile refusal is
-  `DeoptRealEnabled`, and `crate::deopt_real_enabled()` defaults to **on**.
+* the rewriter is armed by a thread-local nothing in the VM sets
+  (`set_bytecode_loop_rewriter_armed`) or by
+  `CRATONVM_JIT=bytecode-loop-xform` — still the case, deliberately;
+* even when armed, `plan_bytecode_loop_xform`'s first whole-compile refusal was
+  `DeoptRealEnabled` and `crate::deopt_real_enabled()` defaults to **on** — so
+  arming was not enough. `loop-02` retired that refusal (and
+  `PreciseExceptionFrames` and `InvokedynamicPresent` with it) by publishing
+  `DeoptimizationPoint::bci` through the rewrite's provenance map. Arming is now
+  sufficient: 95–98% of Spring Boot compiles are eligible, where it was 0%.
 
-So a fourth transform would be a fourth piece of code that cannot run. The four
-whole-compile refusals are `loop-02`'s lane, and narrowing one means
-implementing the bci translation it was protecting — not deleting the gate.
-`the_wired_compile_path_is_refused_before_any_loop_is_looked_at` pins the fact;
-it used to be a comment in one test, which three other tests silently depended
-on.
+So a fourth transform would run once armed. `InlineSitesPresent` is the one
+whole-compile refusal left, and narrowing it means implementing the bci
+translation it protects — not deleting the gate.
+`the_wired_compile_path_reaches_a_loop_under_the_default_configuration` pins
+the fact; it used to be the opposite assertion, and it was a comment in one
+test that three other tests silently depended on.
 
-This is also why "prove the transform fired by something only a transformed
-artifact has" cannot be done through `compile()` on the wired path.
+Compiling planner output *as* a method is still the sharper instrument for a
+pure-provenance question — it isolates the emitter from the planner — which is
+why the test below does it that way.
 `a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy`
 does it the only way available: it compiles the planner's rewritten bytes *as*
 the method and asserts that, mapped back into interpreter-bci space, a mid-body
@@ -162,8 +168,8 @@ non-decreasing in pc, so that comparison is a statement about position.
 
 ## What executing it found
 
-Adding `CRATONVM_JIT=bytecode-loop-xform` (see
-[Reachability](#reachability) for why `deopt-real=0` is needed with it) made
+Adding `CRATONVM_JIT=bytecode-loop-xform` (which at the time also needed
+`deopt-real=0` — see [Reachability](#reachability); it no longer does) made
 this the first configuration in which any of these transforms runs. The first
 real workload put through it threw `NullPointerException`, deterministically,
 while every unit test passed.
@@ -236,18 +242,19 @@ Not built, and each is a lane rather than an increment:
   cannot express — it is a lower bound, not an equality) plus a cross-loop
   dependence test.
 
-And, before any of them: `loop-02`, without which none of this executes on a
-default configuration.
+`loop-02` used to sit before all of them, because none of this executed under a
+default configuration. It closed on 2026-08-03.
 
 ## Running it
 
 ```bash
-CRATONVM_JIT='bytecode-loop-xform,deopt-real=0' CRATONVM_DBG='jit-gen' \
+CRATONVM_JIT='bytecode-loop-xform' CRATONVM_DBG='jit-gen' \
   cratonvm --java-home <jdk> -cp probes LoopXformProbe
 ```
 
 `[JIT_GEN] bytecode loop rewrite: kind=… versioned=… …` is one line per rewrite;
-`bytecode loop rewrite refused: …` is one per refusal. Both tokens are needed —
-the first arms the rewriter (and turns the native byte-copy unroller off in the
-same motion), the second clears the whole-compile refusal that would otherwise
-fire before any loop is looked at.
+`bytecode loop rewrite refused: …` is one per refusal;
+`bytecode loop rewrite DISCARDED: …` is one per artifact thrown away because its
+deopt points could not be published in interpreter-bci space, and should never
+appear. One token — the second one this used to need, `deopt-real=0`, now
+measures the deopt-real-off configuration rather than the transform.
