@@ -800,6 +800,11 @@ run_reliability postflight || RELIABILITY_RC=$?
 if [ "$CALIBRATE" = 1 ]; then
     echo; echo "# calibrated baseline body:"; printf "$CAL_OUT"
     echo "# full distributions: $RESULTS/summary.tsv (+ .json); raw samples: $RESULTS/samples.tsv"
+    # Calibration is the moment the reach matters most: a baseline is a
+    # commitment that future deltas against it will be read as meaning
+    # something, and this says what they will be able to mean.
+    echo
+    print_reach_note
     if [ "$RELIABILITY_RC" != 0 ]; then
         echo "REFUSED: the reliability gate rejected this calibration run (exit $RELIABILITY_RC)." >&2
         echo "         Do NOT record these numbers as a baseline — see" >&2
