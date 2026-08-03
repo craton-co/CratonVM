@@ -148,7 +148,7 @@ is not specific to the hanging class — it is the general ceiling, and this
 workload is simply the one that cannot absorb it.
 
 **This is the open blocker, and it is bigger than this doc.** It belongs with
-[`tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md`](../tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md),
+[`tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md`](../../tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md),
 which tracks the same family (JIT admission bans, `invokedynamic` lowered to a
 trap). Next step for whoever picks this up: find why `complete_task` reports
 `success=false` for a 5-byte getter — that one answer probably unlocks a large
