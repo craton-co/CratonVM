@@ -1,6 +1,36 @@
 # HIR-01 — settle the lowering contract before splitting the IR
 
-**Status:** not started. **Blocks:** `hir-02`. **Owns:** `docs/` only —
+> **RETIRED 2026-08-03.** The contract this lane asked for is
+> **`docs/jit/lowering-contract.md`**. Read that; what follows is the brief it
+> answers, kept for the questions it posed and the standard it set.
+>
+> Summary of the answer, so nobody has to re-derive it:
+>
+> * **Four levels, not three** — bytecode, `ir::Graph`, a missing machine list,
+>   and encoding. The report's "HIR" already exists and it is the bytecode.
+> * **Level 2 is missing as an artifact, not as a design.** `isel`,
+>   `allocate_linear_scan` and `vec_emit` are three finished components that all
+>   dead-end on the same absence: no value in this compiler means "an
+>   instruction whose operands are values, not addresses".
+> * **The oop-map obligation lives with whoever assigns registers**, and the
+>   rule — no reference register-resident at a GC safepoint — is already
+>   discharged twice, differently, by the two production backends. Deopt has a
+>   register bank; GC does not, and that asymmetry is load-bearing.
+> * **The three-defect test scores one of three.** The monitor defect becomes
+>   unrepresentable; the escape-analysis and dead-store defects are level-1
+>   analysis bugs a lowering contract does not touch. So the migration is
+>   **not** justified as a correctness investment — it is justified, or not, by
+>   the coverage measurement the first increment produces.
+> * **Increment 0 emits nothing** and is where the decision gets made. Measured
+>   for the contract: `isel` covers 38.2% of scheduled nodes on an integer
+>   corpus, and `Rule::AluImm` fires zero times because the table has no
+>   32-bit immediate rows.
+>
+> Three stale claims in neighbouring docs were found and corrected while
+> answering this; see §8 of the contract.
+
+**Status:** RETIRED — answered by `docs/jit/lowering-contract.md`.
+**Blocks:** `hir-02` (now unblocked). **Owns:** `docs/` only —
 this lane writes a contract, not code.
 
 ## The claim to check first
