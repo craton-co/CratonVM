@@ -7,7 +7,7 @@ the GC-overhead limit mis-scoring every productive young sweep as "freed 0".
 
 A **residual** remains: with the OOM gone the class no longer fails on a
 heap error, but it still cannot finish inside a suite timeout — see
-[30](30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md), which
+[30](../../tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md), which
 root-causes that part and stays OPEN.
 
 ## Symptom (as originally filed)
@@ -132,7 +132,7 @@ OK (1 test)
 8.4 hours against HotSpot's 41.2 s, so the class still cannot fit a suite
 timeout — but the defect this doc is about is gone, and what remains is purely
 throughput, tracked in
-[30](30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md).
+[30](../../tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md).
 Pre-fix, the same class died with `OutOfMemoryError` before 10 000 000
 iterations (154-598 s).
 

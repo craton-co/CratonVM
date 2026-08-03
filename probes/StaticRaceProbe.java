@@ -81,10 +81,11 @@ public final class StaticRaceProbe {
     public static void main(String[] args) throws Exception {
         int seconds = args.length > 0 ? Integer.parseInt(args[0]) : 5;
 
-        // Tier the readers up by INVOCATION count, not by loop iterations: a
-        // once-invoked hot loop can only reach compiled code via OSR, and OSR
-        // entry is refused today. See
-        // docs/known-issues/jit/osr-entry-unresumable-exit-refuses-hot-counted-loops-20260803.md
+        // Tier the readers up by INVOCATION count, not by loop iterations, so
+        // they run compiled from entry rather than depending on an OSR entry at
+        // the loop header. (OSR entry was refused outright until 2026-08-03 --
+        // docs/internal/osr-entry-unresumable-exit-FIXED-20260803.md -- which is
+        // why the probes here all warm this way.)
         for (int w = 0; w < 1200; w++) {
             sink += readRef(200);
             sink += readLong(200);
