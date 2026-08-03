@@ -114,6 +114,90 @@ unconditional trap that publishes a resume snapshot, and giving the IR tier a
 second lowering for it is a much larger question than the 44 events justify.
 Write it up before starting it, not after.
 
+## Re-measured after `cov-01` landed, same day
+
+`cov-01` closed (`docs/internal/cov-01-constants-and-statics-RETIRED-20260803.md`).
+Its three opcodes are at **zero**. Everything below is the same command on the
+same workload — `ConditionalOnPropertyTests`, default configuration,
+`CRATONVM_DBG=ir-compiles` — with the arms **interleaved, two runs each and in
+both orders**. Interleaving matters even for counts: tiering is time-driven, so
+the number of compile requests a run issues drifts by a few, and a
+block-per-arm layout would attribute that drift to the change.
+
+| | base | after `cov-01` |
+|---|---:|---:|
+| admitted to the optimizing pipeline | 694–695 | 694–695 |
+| **bodies the optimizing backend produced** | **410** | **501–502** |
+| `IrBuilder::build returned None` | 281–282 | **180** |
+
+**+91 bodies, +22%**, from 155 opcode-gap events removed. The two numbers do
+not match, and the gap is the thing to read: a method that stops failing on
+`0x12` immediately fails on whatever it meets next. Most of them met `cov-04`.
+
+All three Spring workloads, same protocol, `cov-01` opcode-gap events
+(`0x12` + `0x13` + `0xb2`) in the last column:
+
+| workload | bodies before | bodies after | Δ | gaps before → after | tests |
+|---|---:|---:|---:|---|---|
+| `ConditionalOnPropertyTests` | 410 | 501–502 | **+91 (+22%)** | 155 → **0** | 38/38 |
+| `AutoConfigurationSorterTests` | 123–124 | 142 | **+18 (+15%)** | 23 → **0** | 18/18 |
+| `ConditionalOnClassTests` | 57–58 | 63 | **+6 (+10%)** | 12–13 → **0** | 5/5 |
+| **total** | **590–592** | **706–707** | **+116 (+20%)** | 190–191 → **0** | — |
+
+The 590–592 figure is the same 592 the headline table reports for all ten
+workloads, because the bench phases contribute two bodies and the three Spring
+classes contribute the rest. Every arm passes its tests and none crashed.
+
+| opcode | mnemonic | before | after | lane |
+|---|---|---:|---:|---|
+| `0xb2` | `getstatic` | 72 | **0** | ~~`cov-01`~~ |
+| `0x12` | `ldc` | 77 | **0** | ~~`cov-01`~~ |
+| `0x13` | `ldc_w` | 6 | **0** | ~~`cov-01`~~ |
+| `0xbe` | `arraylength` | 28 | 31 | `cov-02` |
+| `0x32` | `aaload` | 10 | 12 | `cov-02` |
+| `0x2e` | `iaload` | 3 | 6 | `cov-02` |
+| `0xbc` | `newarray` | 1 | 3 | `cov-06` |
+| `0x5a` | `dup_x1` | 1 | 1 | `cov-02` |
+| `0x33` | `baload` | 1 | 1 | `cov-02` |
+| `0xb3` | `putstatic` | 0 | **1** | nobody |
+
+**The whole remaining opcode gap is `cov-02`'s** — 51 of 55 events. `putstatic`
+appears for the first time: it was always there, hidden behind the `getstatic`
+in the same method, and `cov-01` deliberately does not own it (a static
+reference WRITE owes an SATB pre-barrier that no collector `set_field` barrier
+covers, which is why the single-pass backend keeps writes on their helpers).
+
+The structural refusals are where the shortfall went. Line numbers are
+post-change:
+
+| site | what it is | before | after | lane |
+|---|---|---:|---:|---|
+| `ir.rs:5331` | `invokespecial` that is neither resolvable nor a trivial `<init>` | 36 | **71** | `cov-04` |
+| `ir.rs:5212` | `putfield` whose type tag is not `I/Z/B/C/S` | 33 | 38 | `cov-03` |
+| `ir.rs:5391` | an invoke with no `invoke_info` at that pc | 8 | 9 | `cov-04` |
+| `ir.rs:5168` | `getfield` of a `long`/`float`/`double` | 5 | 5 | `cov-03` |
+| `ir.rs:5346` | `invokespecial <init>` whose receiver is not a fresh `new` | 1 | 1 | `cov-04` |
+| `ir.rs:5256` | a `new` with no entry in `new_info` | 0 | **1** | nobody |
+
+`cov-04`'s largest refusal **doubled without anyone touching it** — 36 to 71.
+That is this directory's own re-run rule playing out one level down from where
+it was written: lifting a refusal admits the methods that were hiding behind
+it, and they fail on whatever they meet next. `cov-04` is now the single
+largest thing between the optimizing tier and the 180 methods it still
+declines, and it is the lane the README already says cannot be sized from a
+survey.
+
+`ir_compatible`'s whole-method conjuncts moved by 1–2 events each, i.e. not at
+all: they are decided before the builder runs, so `cov-01` could not have moved
+them and did not.
+
+One knock-on outside the tier, recorded because it is the shape to expect from
+every remaining `cov-*` lane: a method moving from C1 to C2 takes it **out of
+reach of every single-pass-only capability**. `vm/tests/pgo02_guarded_virtual_inline.rs`
+was passing because the IR builder refused `getstatic`, so its
+`getstatic; invokevirtual` fixture stayed on the single-pass backend where
+guarded monomorphic inlining is planned. It now pins that tier explicitly.
+
 ## What this survey does NOT say
 
 * Nothing here is a **timing**. Every number is a count, so the loaded host

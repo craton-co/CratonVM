@@ -39,7 +39,12 @@ five methods it admits. The binding constraint is **opcode coverage in
 `IrBuilder::build` and four whole-method conjuncts in `ir_compatible`**, not
 gating and not tiering. Three findings shape the `cov-*` lanes:
 
-* **`getstatic` + `ldc`/`ldc_w` is 69% of every opcode gap** (189 of 273).
+* ~~**`getstatic` + `ldc`/`ldc_w` is 69% of every opcode gap** (189 of 273).~~
+  **Closed 2026-08-03** — all three are at zero, `+91` bodies (`+22%`) on
+  `ConditionalOnPropertyTests`, and the remaining opcode gap is `cov-02`'s
+  alone. See the re-measurement in
+  [`ir-coverage-survey-20260803.md`](ir-coverage-survey-20260803.md) and
+  [`docs/internal/cov-01-constants-and-statics-RETIRED-20260803.md`](../../internal/cov-01-constants-and-statics-RETIRED-20260803.md).
 * **A `float[]` element can be lowered and an `int[]` element cannot.**
   `IrBuilder::build` has arms for `faload`/`daload`/`fastore`/`dastore` and for
   no integral or reference array access at all. Those four are what an FP
@@ -62,10 +67,10 @@ read each lane's "first increment".
 
 | Lane | Owns | Events | Notes |
 |---|---|---:|---|
-| [`cov-01`](cov-01-constants-and-statics.md) | `ir.rs` arms `0x12`/`0x13`/`0xb2` | 189 | largest opcode bucket; the caller already supplies every table it needs |
-| [`cov-02`](cov-02-array-element-access.md) | `ir.rs` arms `0x2e`/`0x32`/`0x33`/`0x34`/`0x54`/`0x5a`/`0xbe` | 77 | `arraylength` alone is 43 and is the cheapest thing in this directory |
+| ~~`cov-01`~~ **CLOSED 2026-08-03** | `ir.rs` arms `0x12`/`0x13`/`0xb2` | 189 → **0** | [`docs/internal/cov-01-constants-and-statics-RETIRED-20260803.md`](../../internal/cov-01-constants-and-statics-RETIRED-20260803.md). **+91 bodies (+22%)** on `ConditionalOnPropertyTests` |
+| [`cov-02`](cov-02-array-element-access.md) | `ir.rs` arms `0x2e`/`0x32`/`0x33`/`0x34`/`0x54`/`0x5a`/`0xbe` | 77 → **51 of 55** | **now the entire opcode gap.** `arraylength` alone is 31 and is the cheapest thing in this directory |
 | [`cov-03`](cov-03-field-stores-and-wide-fields.md) | `ir.rs` arms `0xb4`/`0xb5` | 43 | `getfield` learned about references; `putfield` twenty lines below did not |
-| [`cov-04`](cov-04-the-invoke-arms.md) | `ir.rs` invoke arms + `<init>` elision | 69 | **cannot be sized from the survey** — first increment is a grouping, not code |
+| [`cov-04`](cov-04-the-invoke-arms.md) | `ir.rs` invoke arms + `<init>` elision | 69 → **81** | **now the largest refusal of any kind.** Its `invokespecial` site doubled, 36 → 71, when `cov-01` landed. Still **cannot be sized from the survey** — first increment is a grouping, not code |
 | [`cov-05`](cov-05-checkcast-and-instanceof.md) | one `ir_compatible` conjunct | 306 | biggest refusal anywhere; `instanceof` first, `checkcast` needs `cov-07`'s answer |
 | [`cov-06`](cov-06-array-allocation.md) | two `ir_compatible` conjuncts + `0xbc`/`0xbd`/`0xc5` | 141 | the conjunct exists *because* the arm is missing — one piece of work, not two |
 | [`cov-07`](cov-07-athrow.md) | one `ir_compatible` conjunct | 89 | framed as a question; **"keep the refusal" is a legitimate outcome** |
@@ -84,6 +89,24 @@ on whatever opcode gap they meet next — so the `cov-01`/`cov-02` rankings will
 move, and the shortfall between "admitted rose by N" and "bodies rose by less
 than N" is the result, not a regression.
 
+**`cov-01` proved that rule one level down, and it was not a conjunct lane.**
+155 opcode-gap events went away and only 91 bodies appeared; the difference
+surfaced in `cov-04`, whose largest refusal doubled from 36 to 71 without
+anyone touching it. So: **re-run the survey after ANY lane lands**, not only
+the three conjunct ones. The post-`cov-01` tables are in
+[`ir-coverage-survey-20260803.md`](ir-coverage-survey-20260803.md).
+
+It also produced a second-order effect worth expecting from every remaining
+lane: **a method moving from C1 to C2 leaves the reach of every
+single-pass-only capability.** `vm/tests/pgo02_guarded_virtual_inline.rs` was
+green because the IR builder refused `getstatic`, which kept its
+`getstatic; invokevirtual` fixture on the backend where guarded monomorphic
+inlining is planned. When `getstatic` lowered, the fixture was compiled by C2,
+its `inline_tally` was empty, and the test failed. The test now pins the tier
+it means. Nothing in the *product* regressed — the flag it drives is
+default-off, and the IR tier serves that site from a MIC/PIC cascade — but the
+next lane should expect the same class of surprise and check for it.
+
 ## The residuals the closed lanes left
 
 Named here because a residual inside a "closed" row does not read like work.
@@ -98,6 +121,10 @@ restores the nine original briefs.
 | `osr-02` | the exit-state differential (its forcing lever, `CRATONVM_OSR_EXIT_AFTER=N`, already exists) | `docs/feature-designs/jit-osr-exit-and-recompile.md` | nobody |
 | `loop-01` | unswitching, interchange, fusion — but the binding constraint is now the loop band and structural admission (`no_candidate_loop` is 94%+ of eligible compiles), not the gates `loop-02` retired | `loop-01-peeling-and-versioning.md` | nobody |
 | `verify-01` | still stands as the harness every lane above wants | `docs/internal/verify-01-differential-harness-RETIRED-20260803.md` | nobody |
+| `cov-01` | `J`/`D`/`F` statics are refused — statics have no `ir_emit_long`/`ir_emit_fp` equivalent | `docs/internal/cov-01-constants-and-statics-RETIRED-20260803.md` | nobody |
+| `cov-01` | `putstatic` (`0xb3`) has no IR lowering; 1 measured event, deliberately out of scope (the SATB pre-barrier) | same | nobody |
+| `cov-01` | the "fails to rewrite" half of the reference-root test is unreachable until `JIT_PUBLISHES_RELOCATION_CONTRACT` flips | same | nobody |
+| `cov-01` | guarded virtual inlining (`pgo-02`, default-off) no longer reaches a `getstatic; invokevirtual` method — that shape is C2's now | `docs/feature-designs/profile-guided-inlining.md` §8 | nobody |
 
 
 ## The five review lanes, as the review framed them
