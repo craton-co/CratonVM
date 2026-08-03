@@ -1,98 +1,153 @@
-# Every AQS-mediated thread handoff is 13-23x slower than HotSpot
+# AQS is 13-26x HotSpot on handoffs — because it is call-dense, not because of the spin
 
 | | |
 |---|---|
-| **Status** | OPEN |
-| **Severity** | high — this is a VM-wide primitive, not one library's problem |
+| **Status** | OPEN — root cause identified; there is no AQS-specific defect |
+| **Severity** | high — AQS is a VM-wide primitive, but the fix is not in AQS |
 | **Discovered** | 2026-08-03, root-causing `TestAsyncMessagesPerformance` SEQ2 |
 | **Owns** | the residue of the retired [`websocket-async-send-interframe-latency`](../../internal/fixed-suite-bugs/tomcat/websocket-async-send-interframe-latency-CLOSED-20260803.md) doc |
+| **Real owner of the fix** | the per-call dispatch floor — see *Where this actually belongs* |
 
-## The measurement
+> **This document's first revision was wrong**, and is corrected below. It
+> blamed `AbstractQueuedSynchronizer.acquire`'s pre-park spin (up to 255
+> `Thread.onSpinWait()` rounds). That was inference from the handoff numbers,
+> never measured. Measuring the *uncontended* path — no contention, no spin, no
+> parking whatsoever — accounts for essentially the whole gap on its own.
 
-Quiet host, interleaved, both arm orders, medians of 3. `probes/HandoffLayersProbe.java`
-and `probes/ExecDispatchProbe.java`; `dev` @ `a64f3a5b4` plus the invoke-cache
-fix in this branch.
+## The measurement that settles it
 
-| one-way handoff | HotSpot | CratonVM | ratio |
+`probes/AqsBreakdownProbe.java`. Single-threaded, uncontended, quiet host.
+**Nothing here spins or parks.**
+
+| | HotSpot | CratonVM | ratio |
 |---|---|---|---|
-| `LockSupport.unpark` → `park` returns | 0.7 us | 2.3 us | 3x |
-| `Object.notify` → `wait` returns | 2.7 us | 9.7 us | 4x |
-| **`Condition.signal` → `await` returns** | **7.4 us** | **96.9 us** | **13x** |
-| `LinkedBlockingQueue.put` → `take` returns | 3.2 us | 83.5 us | 26x |
-| **`ThreadPoolExecutor.execute` → task entered** | **7.9 us** | **167.1 us** | **21x** |
+| empty instance call (the scale) | 0.6 ns | 431 ns | 719x |
+| **`ReentrantLock` lock+unlock, uncontended** | **14.8 ns** | **10,502 ns** | **710x** |
+| `ReentrantLock` tryLock+unlock | 13.9 ns | 7,958 ns | 573x |
+| `ReentrantLock` FAIR lock+unlock | 14.0 ns | 9,480 ns | 677x |
+| `Semaphore` acquire+release (permits free) | 16.4 ns | 6,612 ns | 403x |
+| `Condition.signal` (no waiter) | 13.7 ns | 8,922 ns | 651x |
+| `CountDownLatch.await` (already zero) | 0.5 ns | 276 ns | 553x |
+| `synchronized` block, uncontended | 16.0 ns | **754 ns** | **47x** |
+| `AtomicInteger.compareAndSet` | 4.5 ns | 616 ns | 137x |
+| `AtomicInteger.get` | 0.3 ns | 969 ns | 3230x |
+| `Thread.onSpinWait` | 36.9 ns | 130 ns | 3.5x |
 
-The shape is the point: the two primitives CratonVM implements directly
-(`park`/`unpark`, monitor `wait`/`notify`) are within 3-4x. Everything built on
-`AbstractQueuedSynchronizer`'s `ConditionObject` is an order of magnitude worse.
-That covers every `BlockingQueue`, every `ThreadPoolExecutor`, every
-`ReentrantLock` condition — i.e. essentially all thread handoff in real Java
-code.
+An uncontended `ReentrantLock.lock()` + `unlock()` costs **10.5 us**. The
+handoff figures this doc opened with (`Condition.signal -> await` 96.9 us,
+`ThreadPoolExecutor.execute -> task` 167 us — `probes/HandoffLayersProbe.java`,
+`probes/ExecDispatchProbe.java`) are roughly ten and sixteen of those. The spin
+was never the story.
 
-## Why
+## Why: AQS is call-dense, and calls cost ~500-850 ns
 
-`AbstractQueuedSynchronizer.acquire` spins before it parks, doubling its budget
-each time it has to park (`spins = postSpins = (byte)((postSpins << 1) | 1)`)
-until it saturates around 255 rounds. Each round runs interpreted bytecode plus
-a `Thread.onSpinWait()` call and a `tryAcquire` CAS. On HotSpot the whole spin
-is ~11 us and usually acquires without parking at all; on CratonVM the same 255
-rounds cost hundreds of microseconds, so the spin is pure overhead — the lock
-has long been free.
+The uncontended `lock()`/`unlock()` pair is **16 nested calls** (JDK 25 source):
 
-One contributor is now fixed (see the branch this doc lands on): the
-invokestatic inline cache had been globally suppressed since the 2026-07-04
-`loader_aware_resolution` default flip, so `Thread.onSpinWait()` cost 807 ns per
-call instead of 109 ns. That moved `Condition.signal → await` from 118.5 us to
-96.9 us — real, and nowhere near enough.
+```
+lock()   -> Sync.lock() -> NonfairSync.initialTryLock()
+                             -> Thread.currentThread()
+                             -> compareAndSetState(0,1) -> U.compareAndSetInt()
+                             -> setExclusiveOwnerThread(current)
+unlock() -> Sync.release(1) -> Sync.tryRelease(1)
+                                 -> getState()
+                                 -> getExclusiveOwnerThread()
+                                 -> Thread.currentThread()
+                                 -> setExclusiveOwnerThread(null)
+                                 -> setState(c)
+                             -> signalNext(head)
+```
 
-What remains is the general per-call floor. Measured in the same probe:
+Sixteen calls at the ~490-850 ns this VM charges per call is 8-13.5 us — the
+entire measurement, with nothing left over to explain. HotSpot inlines all
+sixteen into ~15 ns. `synchronized` is only 47x rather than 710x for exactly
+this reason: a monitor is one bytecode the VM implements directly, not sixteen
+Java calls.
 
-| | HotSpot | CratonVM |
-|---|---|---|
-| empty static call, user class | 0.2 ns | 166 ns |
-| `Thread.onSpinWait()` (empty JDK static, now intrinsified) | 44 ns | 109 ns |
+**The methods are not the problem, and they do compile.**
+`CRATONVM_DBG=jit-compiled` shows `ReentrantLock.lock`, `ReentrantLock.unlock`,
+`ReentrantLock$Sync.lock`, `NonfairSync.initialTryLock` and `AQS.release` all
+compiled — and the number is still 10 us. Compilation is not the lever; the
+cost is *between* the compiled methods.
 
-An interpreted call is ~800x HotSpot's inlined one. Until that closes, ~255
-spin rounds cannot cost less than tens of microseconds, and an AQS handoff
-cannot approach HotSpot's single-digit microseconds.
+## Levers ruled out — all measured, none moved it
+
+| lever | result |
+|---|---|
+| OSR starving callees of the hotness signal | **No.** `CRATONVM_JIT=tier-osr-backedge=2000000000` (OSR off) leaves the numbers unchanged, and the tracked-invocation count stays at ~500 either way. |
+| the `java/util/` virtual tier-up exclusion | **No.** `execute_invokevirtual_cached` does suppress tier-up when the receiver class `starts_with("java/util/")`, which does swallow all of `java.util.concurrent` — but a user subclass of `ReentrantLock` (receiver outside `java/util`, identical inherited bodies, `probes/JavaUtilTierUpExclusionProbe.java`) is **2.6x slower**, not faster. |
+| JIT admission / "hot method never compiles" | **No.** The lock methods compile — see above. |
+| `CRATONVM_JIT=direct-callee-calls` | inert (3 interleaved rounds, within noise) |
+| `CRATONVM_JIT=ir-direct-call` | inert |
+| `CRATONVM_JIT=guarded-virtual-inline` | inert |
+
+## Where this actually belongs
+
+The per-call dispatch floor. An empty *instance* call is 431 ns here against
+HotSpot's 0.6 ns inlined, and `invokevirtual` from compiled code takes the
+generic dispatch helper (992 ns monomorphic / 6027 ns polymorphic, measured
+elsewhere). Until that closes, no amount of AQS-specific work can help: the
+JDK's concurrency classes are written as many small methods precisely because
+every other JVM inlines them away.
+
+Every candidate below reduces to that same floor — which is the finding, not an
+evasion. In descending order of expected value:
+
+1. **Inlining.** Nothing in the ruled-out list actually splices a callee body
+   into its caller. `docs/feature-designs/profile-guided-inlining.md` §8 still
+   has bimorphic splicing and a deopt-capable guard open. Sixteen calls going
+   to zero is the whole gap.
+2. **The trivial atomic accessors are now a pessimization.** The schema-2
+   census shows the *whole* `java.util.concurrent.atomic` package implemented
+   natively — `AtomicInteger` 17 entries, `AtomicLong` 17, `AtomicIntegerArray`
+   26, every `*FieldUpdater`, `LongAdder`, `DoubleAdder` — on top of 241
+   `jdk/internal/misc/Unsafe` natives. That is deliberate and the CAS/arithmetic
+   members plausibly must stay that way. But `AtomicInteger.get()` costs
+   **969 ns**, *more than an empty bytecode call (431 ns)*, for a body that is
+   `return value;` on a volatile int: for the plain `get`/`set` accessors the
+   native is now strictly worse than the bytecode it replaces, and being native
+   it can never be compiled or inlined. Narrow and testable — but note it does
+   not escape item 1: 969 ns *is* the native-call floor, so this trims a
+   constant rather than removing the wall. It also needs the real `value` field
+   to be live on these synthetic-layout objects, which is unverified.
+3. The `java/util/` tier-up exclusion is miscalibrated even though it is not
+   the bottleneck here: its comment ties it to a Spring *collections* graph,
+   and `java.util.concurrent.*` is caught by the prefix as collateral. Worth
+   narrowing on its own merits, with its own measurement.
 
 ## What this blocks
 
-- `org.apache.tomcat.websocket.server.TestAsyncMessagesPerformance.testAsyncTiming`
-  — SEQ2 gives a 500 us budget to the gap between two async WebSocket messages.
-  The server's completion path (`WsRemoteEndpointImplServer.clearHandler` →
-  `socketWrapper.execute(OnResultRunnable)` → `semaphore.release()` → the
-  endpoint thread's `semaphore.acquire()` returns → next `sendBinary`) contains
-  **two** AQS handoffs, so it cannot fit. Measured: 476-491 breaches of 500,
-  against HotSpot's 0-2.
-- Anything else whose latency budget is a thread handoff. The
-  `SmokeTests` concurrency ceiling and the H2 `INSERT`+`commit` throughput gap
-  are plausible relatives; not yet confirmed against this measurement.
+- `TestAsyncMessagesPerformance.testAsyncTiming` — SEQ2's 500 us budget spans
+  two AQS handoffs; 476-491 breaches of 500 against HotSpot's 0-2.
+- Any latency budget denominated in thread handoffs. The `SmokeTests`
+  concurrency ceiling and H2's single-threaded `INSERT`+`commit` gap are
+  plausible relatives, not yet confirmed against this measurement.
 
 ## Reproduction
 
 ```powershell
 $jdk = 'C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot'
-& "$jdk\bin\javac.exe" -d out probes\HandoffLayersProbe.java probes\ExecDispatchProbe.java
-& "$jdk\bin\java.exe" -cp out HandoffLayersProbe        # HotSpot control
-& <cratonvm.exe> --java-home $jdk -cp out HandoffLayersProbe
+& "$jdk\bin\javac.exe" -d out probes\AqsBreakdownProbe.java probes\HandoffLayersProbe.java
+& "$jdk\bin\java.exe" -cp out AqsBreakdownProbe            # HotSpot control
+& <cratonvm.exe> --java-home $jdk -cp out AqsBreakdownProbe
 ```
 
-Run the arms **interleaved and in both orders**, on a quiet host. Under
-background load every number in the table above roughly triples and the
-CratonVM/HotSpot ratio changes — an early pass of this investigation reported
-`execute` at 558 us for exactly that reason.
+Interleave the arms and run both orders on a quiet host. Under background load
+every number roughly triples and the ratios shift.
 
-## Next steps
+## Two traps this investigation walked into
 
-1. The per-call floor is the whole story now. `empty static (user class)` at
-   166 ns interpreted is the number to attack; see the compiled-dispatch work in
-   `docs/internal/jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md`
-   for the JIT-side counterpart (992 ns mono / 6027 ns poly `invokevirtual`).
-2. `AbstractQueuedSynchronizer.acquire` is not JIT-compiled
-   (`CRATONVM_DBG=jit-compiled` shows only its leaf helpers — `signalNext`,
-   `ConditionNode.block`, `Node.getAndUnsetStatus`). Whether `acquire` is
-   admissible, and what it costs compiled, is unmeasured.
-3. `tryAcquire`'s CAS runs once per spin round through
-   `Unsafe.compareAndSetInt`. Its per-call cost was never isolated; it is the
-   other half of the spin-round budget and may be the larger half now that
-   `onSpinWait` is 109 ns.
+Both are recorded in the probes' own comments, because both produced confident
+wrong numbers first.
+
+1. **The harness cost more than the thing measured.** The first cut drove each
+   operation through a `(int) -> void` lambda so the bench loop could be a
+   one-liner. A lambda's `invokeinterface` costs ~2.2 us here, so every row came
+   back at 2-3 us and `AtomicInteger.get` "measured" 3021 ns. Every benchmark is
+   now an inline loop in its own method.
+2. **A shared call site goes polymorphic.** Testing base-vs-subclass through one
+   `lockUnlock(ReentrantLock, int)` made its `lock.lock()` site bimorphic, and a
+   poly site costs ~6x a monomorphic one — the entire reason the subclass first
+   appeared 2.5x slower. Each receiver class now has its own loop method.
+
+Same lesson twice: on a VM whose call floor is ~500 ns, any abstraction inside a
+microbenchmark is part of the measurement.
