@@ -159,7 +159,15 @@ Channel attribution over the first 32 (the backtrace print cap):
 | `DispatchCache` (`DISPATCH_CACHE` / `VIRTUAL_DISPATCH_CACHE`) | 3 | 3 |
 
 Tests: 26/26 on both arms. `cargo test -p cratonvm-jit --lib` 1810/1810,
-`cargo test -p cratonvm-vm --lib` 2372/2372.
+`cargo test -p cratonvm-vm --lib` 2372/2372, `cargo check --workspace
+--all-targets` clean, `cargo clippy -p cratonvm-jit -p cratonvm-vm` clean.
+
+Stability, fixed binary, 12 consecutive runs of the same class: 12/12 with
+`EXIT=0`, 26/26 tests, and zero unqueued releases. That is **not** evidence
+about the SIGSEGV — see §6 — since 12 runs at a 2% rate come up empty most of
+the time. It is evidence that routing the releases through the queue introduces
+no stall, no retention blow-up and no test regression, which is the thing a run
+of that size can actually settle.
 
 Throughput, `probes/CallFloorProbe 20000000 2000`, three interleaved pairs
 (INVOKE ns/op):

@@ -9076,6 +9076,15 @@ impl Drop for RetainedCode {
         // count that reaches zero already proves no thread is inside. The queue
         // remains the backstop, and `published_code_free_audit` counts any
         // release that skipped it.
+        //
+        // The one caveat, stated because it is invisible at this call site: the
+        // JIT->JIT dispatch pin resolves through the code-range registry, which
+        // `put`/`put_osr` populate only when precise JIT maps OR the
+        // cross-thread root scan are on. Both default ON, and opting out of
+        // BOTH (`CRATONVM_NO_PRECISE_JIT_MAPS=1` with
+        // `CRATONVM_XT_JIT_ROOT_SCAN=0`) leaves that one entry path unpinned —
+        // as it was before this existed, so no regression, but the ownership
+        // argument above is then weaker than the queue alone.
         if Arc::strong_count(&owner) > 1 {
             drop(owner);
             return;
