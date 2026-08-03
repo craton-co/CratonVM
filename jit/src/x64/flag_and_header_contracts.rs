@@ -42,6 +42,7 @@ use super::*;
 fn backend_sources() -> String {
     [
         include_str!("../x64.rs"),
+        include_str!("bytecode_walk.rs"),
         include_str!("tests.rs"),
         include_str!("flag_and_header_contracts.rs"),
         include_str!("loop_unroll_admission.rs"),
