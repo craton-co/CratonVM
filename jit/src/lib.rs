@@ -23506,16 +23506,28 @@ mod layout_constant_inventory {
         // does not share the disp8 backwards-addressing hazard, but it does
         // bake the header size into machine code.
         //
-        // cov-01 added one site, `emit_inline_getstatic`, which accounts for
-        // the fifth `SLOT_SIZE`, the fourth `FIELD_CELL_PAYLOAD32_OFFSET` and
-        // both `FIELD_CELL_PAYLOAD64_OFFSET`s (the `use` list and the site).
-        // It addresses a STATICS block, which has no object header — hence no
-        // new `HEADER_SIZE` — and reaches the cell as
-        // `field_index * SLOT_SIZE + payload_offset` from the block base, the
-        // same 16-byte `Value` cell shape `field_cell_layout_matches_value_enum`
-        // pins. It is a disp32 site (`48 8B 80 disp32` / `48 63 80 disp32`), so
-        // it does not share the disp8 backwards-addressing hazard.
-        ("ir_lower.rs", [8, 3, 5, 0, 0, 0, 4, 2]),
+        // COV-02 added two more of each of the first two. `HEADER_SIZE`
+        // 8 -> 10: `emit_gpr_array_elem_load` and `emit_gpr_array_elem_store`,
+        // one shared displacement apiece covering every integral/reference
+        // element width (int, long, byte, char, short, ref — wide and narrow).
+        // That is deliberately ONE site per emitter rather than one per width;
+        // the header shrink has fewer places to visit, and both go through
+        // `disp::disp8_const`, so an oversized header is a build failure rather
+        // than a read before the object. `ARRAY_LENGTH_OFFSET` 3 -> 4: the
+        // `arraylength` lowering's own length load, alongside the bounds
+        // check's.
+        //
+        // cov-01 added one site on top of that, `emit_inline_getstatic`, which
+        // accounts for the fifth `SLOT_SIZE`, the fourth
+        // `FIELD_CELL_PAYLOAD32_OFFSET` and both `FIELD_CELL_PAYLOAD64_OFFSET`s
+        // (the `use` list and the site). It addresses a STATICS block, which
+        // has no object header — hence no new `HEADER_SIZE` — and reaches the
+        // cell as `field_index * SLOT_SIZE + payload_offset` from the block
+        // base, the same 16-byte `Value` cell shape
+        // `field_cell_layout_matches_value_enum` pins. It is a disp32 site
+        // (`48 8B 80 disp32` / `48 63 80 disp32`), so it does not share the
+        // disp8 backwards-addressing hazard the three array sites have.
+        ("ir_lower.rs", [10, 4, 5, 0, 0, 0, 4, 2]),
     ];
 
     fn source(file: &str) -> &'static str {

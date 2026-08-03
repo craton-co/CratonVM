@@ -4355,7 +4355,597 @@ fn try_catch_nonparam_handler_local_stays_single_pass() {
     }
 }
 
-// в”Ђв”Ђ cov-01 increments 2-4: the constant-pool constants that are calls в”Ђв”Ђв”Ђв”Ђ
+// ── COV-02: integral / reference array element access, arraylength, dup_x1 ──
+//
+// `docs/known-issues/c2/cov-02-array-element-access.md`. Before this lane
+// `IrBuilder::build` had arms for `faload`/`daload`/`fastore`/`dastore` and for
+// no integral or reference array access at all — the arms an FP kernel needs,
+// not the arms Java uses. These cases are the differential the doc asks for:
+// same method, both backends, same answer, plus the host anchor.
+//
+// The corpus is deliberately built from SYNTHETIC array buffers (the same trick
+// `make_f32_array` uses for the FP arms) rather than real heap objects: the
+// element layout the two backends emit is `HEADER_SIZE + index * width` with
+// the length at `ARRAY_LENGTH_OFFSET`, and that is all either one reads.
+
+/// Build a synthetic primitive array: `length` at `ARRAY_LENGTH_OFFSET`, then
+/// `elems.len()` elements of `width` bytes packed from `HEADER_SIZE`, each
+/// element's low `width` bytes taken from the corresponding `i64` (little
+/// endian — the same truncation the store opcodes perform).
+fn make_prim_array(width: usize, elems: &[i64]) -> Vec<u8> {
+    let mut buf = vec![0u8; HEADER_SIZE + elems.len() * width];
+    buf[ARRAY_LENGTH_OFFSET..ARRAY_LENGTH_OFFSET + 4]
+        .copy_from_slice(&(elems.len() as u32).to_le_bytes());
+    for (i, &v) in elems.iter().enumerate() {
+        let off = HEADER_SIZE + i * width;
+        buf[off..off + width].copy_from_slice(&v.to_le_bytes()[..width]);
+    }
+    buf
+}
+
+/// Compile `code` both ways and assert IR == single-pass == `want` for each
+/// `(args, want)`, with the IR side actually taking the IR backend.
+///
+/// The `used_ir_backend` assertion is the anti-vacuity check: without it a
+/// builder arm that silently refuses would compare single-pass against
+/// single-pass and pass. That is exactly how the getfield corpus in this file
+/// was vacuous before the compact-layout refusal was moved.
+fn check_array(
+    name: &str,
+    descriptor: &str,
+    code: Vec<u8>,
+    max_locals: u16,
+    num_params: u16,
+    cases: &[(Vec<i64>, i64)],
+) {
+    let helpers = dummy_helpers();
+    let cm = cached(name, descriptor, code, max_locals, num_params);
+    let ir = compile_opt(&cm, &helpers, true)
+        .unwrap_or_else(|| panic!("{name}: optimize=true (IR pipeline) failed to compile"));
+    assert!(
+        ir.used_ir_backend,
+        "{name}: the IR pipeline fell back to single-pass, so this case would \
+         compare single-pass with itself"
+    );
+    let sp = compile_opt(&cm, &helpers, false)
+        .unwrap_or_else(|| panic!("{name}: optimize=false (single-pass) failed to compile"));
+    for (args, want) in cases {
+        // SAFETY: both bodies are JIT-compiled array access over a live,
+        // correctly laid-out synthetic array whose address is arg0, with an
+        // in-bounds index. No runtime helper is reachable on the non-faulting
+        // path.
+        let r_sp = unsafe { sp.try_call(args) }
+            .unwrap_or_else(|e| panic!("{name}: single-pass call {args:?}: {e:?}"));
+        let r_ir = unsafe { ir.try_call(args) }
+            .unwrap_or_else(|e| panic!("{name}: IR call {args:?}: {e:?}"));
+        assert_eq!(
+            r_ir, r_sp,
+            "{name}: IR vs single-pass DIVERGE for {args:?}: IR={r_ir}, single-pass={r_sp}"
+        );
+        assert_eq!(
+            r_ir, *want,
+            "{name}: both backends agree but disagree with host for {args:?}"
+        );
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_iaload() {
+    // static int get(int[] a, int i) { return a[i]; }
+    //   aload_0; iload_1; iaload; ireturn
+    let elems: Vec<i64> = vec![7, -1, i32::MAX as i64, i32::MIN as i64, 0];
+    let arr = make_prim_array(4, &elems);
+    let base = arr.as_ptr() as i64;
+    let cases: Vec<(Vec<i64>, i64)> = elems
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (vec![base, i as i64], v))
+        .collect();
+    check_array(
+        "iaload",
+        "([II)I",
+        vec![0x2a, 0x1b, 0x2e, 0xac],
+        2,
+        2,
+        &cases,
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_baload_sign_extends() {
+    // static int get(byte[] a, int i) { return a[i]; }  — JVMS: SIGN-extends.
+    // 0xFF must read back as -1, not 255. This is the one place an
+    // "int[] and byte[] are the same shape" shortcut produces wrong code.
+    let raw: Vec<i64> = vec![0x00, 0x01, 0x7f, 0x80, 0xff];
+    let want: Vec<i64> = vec![0, 1, 127, -128, -1];
+    let arr = make_prim_array(1, &raw);
+    let base = arr.as_ptr() as i64;
+    let cases: Vec<(Vec<i64>, i64)> = want
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (vec![base, i as i64], v))
+        .collect();
+    check_array(
+        "baload",
+        "([BI)I",
+        vec![0x2a, 0x1b, 0x33, 0xac],
+        2,
+        2,
+        &cases,
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_caload_zero_extends() {
+    // static int get(char[] a, int i) { return a[i]; }  — JVMS: ZERO-extends.
+    // 0xFFFF must read back as 65535, the mirror image of `baload` above.
+    let raw: Vec<i64> = vec![0x0000, 0x0041, 0x7fff, 0x8000, 0xffff];
+    let want: Vec<i64> = vec![0, 65, 32767, 32768, 65535];
+    let arr = make_prim_array(2, &raw);
+    let base = arr.as_ptr() as i64;
+    let cases: Vec<(Vec<i64>, i64)> = want
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (vec![base, i as i64], v))
+        .collect();
+    check_array(
+        "caload",
+        "([CI)I",
+        vec![0x2a, 0x1b, 0x34, 0xac],
+        2,
+        2,
+        &cases,
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_saload_sign_extends() {
+    // static int get(short[] a, int i) { return a[i]; }  — JVMS: SIGN-extends,
+    // so 0xFFFF is -1 here and 65535 for `caload` above. Same width, opposite
+    // rule: the pair is what makes a width-only lowering visibly wrong.
+    let raw: Vec<i64> = vec![0x0000, 0x0041, 0x7fff, 0x8000, 0xffff];
+    let want: Vec<i64> = vec![0, 65, 32767, -32768, -1];
+    let arr = make_prim_array(2, &raw);
+    let base = arr.as_ptr() as i64;
+    let cases: Vec<(Vec<i64>, i64)> = want
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (vec![base, i as i64], v))
+        .collect();
+    check_array(
+        "saload",
+        "([SI)I",
+        vec![0x2a, 0x1b, 0x35, 0xac],
+        2,
+        2,
+        &cases,
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_aaload() {
+    // static Object get(Object[] a, int i) { return a[i]; }
+    //   aload_0; iload_1; aaload; areturn
+    //
+    // The elements are plausible 8-aligned pointer-shaped words; both backends
+    // return the raw pointer. The IR node is `IrType::Ref`, which is what makes
+    // `emit_safepoint_map` publish the result slot as a relocatable root — the
+    // moving-GC half of that claim is an E2E fixture, not something a unit test
+    // over a synthetic buffer can observe.
+    let elems: Vec<i64> = vec![0, 0x1000, 0x7fff_fff8, 0x2000_0000, 0x8];
+    let arr = make_prim_array(8, &elems);
+    let base = arr.as_ptr() as i64;
+    let cases: Vec<(Vec<i64>, i64)> = elems
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (vec![base, i as i64], v))
+        .collect();
+    check_array(
+        "aaload",
+        "([Ljava/lang/Object;I)Ljava/lang/Object;",
+        vec![0x2a, 0x1b, 0x32, 0xb0],
+        2,
+        2,
+        &cases,
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_arraylength() {
+    // static int len(int[] a) { return a.length; }
+    //   aload_0; arraylength; ireturn
+    //
+    // 43 of this lane's 77 measured events, and the cheapest: one 32-bit load
+    // at a fixed header offset behind a null check.
+    let a0 = make_prim_array(4, &[]);
+    let a3 = make_prim_array(4, &[1, 2, 3]);
+    let a9 = make_prim_array(4, &[0; 9]);
+    check_array(
+        "arraylength",
+        "([I)I",
+        vec![0x2a, 0xbe, 0xac],
+        1,
+        1,
+        &[
+            (vec![a0.as_ptr() as i64], 0),
+            (vec![a3.as_ptr() as i64], 3),
+            (vec![a9.as_ptr() as i64], 9),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_arraylength_of_a_loaded_element() {
+    // static int f(int[] a, int i) { return a[i] + a.length; }
+    //   aload_0; iload_1; iaload; aload_0; arraylength; iadd; ireturn
+    // Two array ops in one method: the element read is in the memory-token
+    // chain and the length read is not, so this is where a scheduler that
+    // reordered them would show up.
+    let arr = make_prim_array(4, &[10, 20, 30, 40]);
+    let base = arr.as_ptr() as i64;
+    check_array(
+        "elem_plus_len",
+        "([II)I",
+        vec![0x2a, 0x1b, 0x2e, 0x2a, 0xbe, 0x60, 0xac],
+        2,
+        2,
+        &[
+            (vec![base, 0], 14),
+            (vec![base, 1], 24),
+            (vec![base, 3], 44),
+        ],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_dup_x1() {
+    // static int f(int a, int b) { … }
+    //   iload_0; iload_1; dup_x1; isub; isub; ireturn
+    //   stack after dup_x1 (bottom→top): b, a, b
+    //   isub → b, (a - b)
+    //   isub → b - (a - b)
+    let code = vec![0x1a, 0x1b, 0x5a, 0x64, 0x64, 0xac];
+    // Anti-vacuity. `check` alone would pass with the arm MISSING: a builder
+    // refusal falls back to single-pass, and the differential would then be
+    // comparing single-pass with itself. The edit that trips this assertion is
+    // deleting the `0x5a` arm from `IrBuilder::build`.
+    assert!(
+        compile_opt(
+            &cached("dup_x1", "(II)I", code.clone(), 2, 2),
+            &dummy_helpers(),
+            true,
+        )
+        .expect("dup_x1 must compile through the IR pipeline")
+        .used_ir_backend,
+        "dup_x1 must reach the IR backend, or this differential is vacuous"
+    );
+    check(
+        "dup_x1",
+        "(II)I",
+        code,
+        2,
+        2,
+        &[
+            (vec![10, 3], 3 - (10 - 3)),
+            (vec![0, 0], 0),
+            (vec![-5, 7], 7 - (-5 - 7)),
+            (vec![100, 1], 1 - (100 - 1)),
+        ],
+    );
+}
+
+/// Compile an array-STORE method both ways, run each backend against its own
+/// fresh array, and compare the resulting element bytes.
+fn check_array_store(
+    name: &str,
+    descriptor: &str,
+    code: Vec<u8>,
+    max_locals: u16,
+    num_params: u16,
+    width: usize,
+    len: usize,
+    cases: &[(usize, i64)],
+) {
+    let helpers = dummy_helpers();
+    let cm = cached(name, descriptor, code, max_locals, num_params);
+    let ir = compile_opt(&cm, &helpers, true)
+        .unwrap_or_else(|| panic!("{name}: optimize=true (IR pipeline) failed to compile"));
+    assert!(
+        ir.used_ir_backend,
+        "{name}: the IR pipeline fell back to single-pass — vacuous comparison"
+    );
+    let sp = compile_opt(&cm, &helpers, false)
+        .unwrap_or_else(|| panic!("{name}: optimize=false (single-pass) failed to compile"));
+    for &(i, v) in cases {
+        let read_back = |m: &CompiledMethod| -> Vec<u8> {
+            let mut arr = make_prim_array(width, &vec![0i64; len]);
+            let args = [arr.as_mut_ptr() as i64, i as i64, v];
+            // SAFETY: JIT-compiled array store over a live synthetic array,
+            // in-bounds index, value in a GPR. No helper reached.
+            unsafe { m.try_call(&args) }.unwrap();
+            let off = HEADER_SIZE + i * width;
+            arr[off..off + width].to_vec()
+        };
+        let got_sp = read_back(&sp);
+        let got_ir = read_back(&ir);
+        assert_eq!(got_ir, got_sp, "{name}: IR vs single-pass DIVERGE at {i}");
+        // Host anchor: the element must hold the value's low `width` bytes.
+        assert_eq!(
+            got_ir,
+            v.to_le_bytes()[..width].to_vec(),
+            "{name}: both backends agree but disagree with host at {i}"
+        );
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_iastore() {
+    // static void set(int[] a, int i, int v) { a[i] = v; }
+    //   aload_0; iload_1; iload_2; iastore; return
+    check_array_store(
+        "iastore",
+        "([III)V",
+        vec![0x2a, 0x1b, 0x1c, 0x4f, 0xb1],
+        3,
+        3,
+        4,
+        5,
+        &[(0, 9), (2, -1), (4, i32::MIN as i64)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_bastore_truncates() {
+    // static void set(byte[] a, int i, int v) { a[i] = (byte)v; }
+    // The store TRUNCATES to the element width — 0x1FF must land as 0xFF.
+    check_array_store(
+        "bastore",
+        "([BII)V",
+        vec![0x2a, 0x1b, 0x1c, 0x54, 0xb1],
+        3,
+        3,
+        1,
+        5,
+        &[(0, 0x7f), (2, 0x1ff), (4, -1)],
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_castore_and_sastore_truncate() {
+    // `castore` and `sastore` share one 16-bit store in both backends.
+    for (name, op) in [("castore", 0x55u8), ("sastore", 0x56u8)] {
+        check_array_store(
+            name,
+            "([CII)V",
+            vec![0x2a, 0x1b, 0x1c, op, 0xb1],
+            3,
+            3,
+            2,
+            5,
+            &[(0, 0x41), (2, 0x1_ffff), (4, -1)],
+        );
+    }
+}
+
+// ── The fault paths: null array, negative index, index == length ────────────
+//
+// The doc's third requirement, and the one that cannot be answered by comparing
+// return values alone: the two backends signal a fault through DIFFERENT
+// channels, so "the same exception with the same bci" has to be read out of
+// each channel separately.
+//
+//  * single-pass, out of bounds: an out-of-line stub calls
+//    `helpers.throw_aioobe(index, length, array_ptr, bci)` and returns the
+//    `i64::MIN` sentinel through the epilogue. The bci is an ARGUMENT.
+//  * single-pass, null array: an out-of-line stub calls
+//    `helpers.jit_npe_with_action(action)` and returns the same sentinel. It
+//    passes an element-type action code and **no bci at all**.
+//  * IR, either fault: an inline guard deopts. `ir_deopt_entry` stashes a
+//    `ReconstructedFrame` (whose `bci` is the trapping bytecode) in a
+//    thread-local and returns the sentinel; the interpreter then re-executes
+//    the opcode and throws the real exception with the method's own handler
+//    semantics.
+//
+// So `bci` is directly comparable for AIOOBE and is **not published by the
+// single-pass NPE path** — a premise delta against the doc, recorded here in
+// the test rather than in prose. What both paths do share, and what these
+// cases assert, is: the sentinel return, the fault CLASS, and (for AIOOBE) the
+// bci and the reported index/length.
+
+use std::cell::Cell;
+
+thread_local! {
+    /// `(index, length, bci)` from the last single-pass AIOOBE stub call.
+    static SP_AIOOBE: Cell<Option<(i64, i64, i64)>> = const { Cell::new(None) };
+    /// The action code from the last single-pass NPE stub call.
+    static SP_NPE: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
+/// # Safety
+/// Called only from JIT-compiled code through the helper table; reads no
+/// pointer arguments.
+unsafe extern "C" fn rec_throw_aioobe(index: i64, length: i64, _arr: i64, bci: i64) -> i64 {
+    SP_AIOOBE.with(|c| c.set(Some((index, length, bci))));
+    i64::MIN
+}
+
+/// # Safety
+/// Same contract as [`rec_throw_aioobe`].
+unsafe extern "C" fn rec_npe_with_action(action: i64) -> i64 {
+    SP_NPE.with(|c| c.set(Some(action)));
+    i64::MIN
+}
+
+/// `dummy_helpers()` with the two fault stubs replaced by recorders instead of
+/// the panicking "unwired helper" stub, so the fault paths are reachable.
+fn fault_helpers() -> JitRuntimeHelpers {
+    let mut h = dummy_helpers();
+    h.throw_aioobe = rec_throw_aioobe as *const () as usize;
+    h.jit_npe_with_action = rec_npe_with_action as *const () as usize;
+    h
+}
+
+/// Both backends must take the fault path for `args`: the call returns the
+/// `i64::MIN` deopt/exception sentinel, single-pass reports the fault through
+/// the recorder named by `aioobe`, and the IR side stashes a reconstructed
+/// frame at `bci`.
+fn check_fault(
+    name: &str,
+    descriptor: &str,
+    code: Vec<u8>,
+    max_locals: u16,
+    num_params: u16,
+    args: &[i64],
+    bci: u32,
+    aioobe: Option<(i64, i64)>,
+) {
+    let helpers = fault_helpers();
+    let cm = cached(name, descriptor, code, max_locals, num_params);
+    let ir = compile_opt(&cm, &helpers, true)
+        .unwrap_or_else(|| panic!("{name}: optimize=true (IR pipeline) failed to compile"));
+    assert!(ir.used_ir_backend, "{name}: IR fell back to single-pass");
+    let sp = compile_opt(&cm, &helpers, false)
+        .unwrap_or_else(|| panic!("{name}: optimize=false (single-pass) failed to compile"));
+
+    SP_AIOOBE.with(|c| c.set(None));
+    SP_NPE.with(|c| c.set(None));
+    let _ = cratonvm_jit::deopt::take_last_deopt();
+
+    // SAFETY: a JIT-compiled array access whose guard is about to fire. The
+    // guard runs BEFORE the element address is formed, so the null or
+    // out-of-range argument is never dereferenced.
+    let r_sp = unsafe { sp.try_call(args) }.unwrap();
+    assert_eq!(
+        r_sp,
+        i64::MIN,
+        "{name}: single-pass must return the sentinel on the fault path"
+    );
+    match aioobe {
+        Some((want_index, want_len)) => {
+            let got = SP_AIOOBE.with(|c| c.get());
+            assert_eq!(
+                got,
+                Some((want_index, want_len, bci as i64)),
+                "{name}: single-pass AIOOBE (index, length, bci)"
+            );
+            assert!(
+                SP_NPE.with(|c| c.get()).is_none(),
+                "{name}: single-pass must not also report an NPE"
+            );
+        }
+        None => {
+            assert!(
+                SP_NPE.with(|c| c.get()).is_some(),
+                "{name}: single-pass must report the NPE through jit_npe_with_action"
+            );
+            assert!(
+                SP_AIOOBE.with(|c| c.get()).is_none(),
+                "{name}: single-pass must not also report an AIOOBE"
+            );
+        }
+    }
+
+    // SAFETY: as above, for the IR body.
+    let r_ir = unsafe { ir.try_call(args) }.unwrap();
+    assert_eq!(
+        r_ir,
+        i64::MIN,
+        "{name}: IR must return the deopt sentinel on the fault path"
+    );
+    let frame = cratonvm_jit::deopt::take_last_deopt()
+        .unwrap_or_else(|| panic!("{name}: the IR guard did not deopt"));
+    assert_eq!(
+        frame.bci, bci,
+        "{name}: the IR deopt must name the trapping bytecode, so the \
+         interpreter re-executes THIS opcode and throws with this method's \
+         handler semantics"
+    );
+}
+
+#[test]
+fn ir_vs_singlepass_iaload_faults() {
+    // aload_0; iload_1; iaload(bci 2); ireturn
+    let code = vec![0x2a, 0x1b, 0x2e, 0xac];
+    let arr = make_prim_array(4, &[1, 2, 3, 4]);
+    let base = arr.as_ptr() as i64;
+    // index == length: the classic off-by-one.
+    check_fault(
+        "iaload_at_length",
+        "([II)I",
+        code.clone(),
+        2,
+        2,
+        &[base, 4],
+        2,
+        Some((4, 4)),
+    );
+    // A negative index. Both backends reject it with the SAME unsigned compare
+    // (a negative index has a huge unsigned value), which is why one CMP
+    // covers both ends of the range.
+    check_fault(
+        "iaload_negative",
+        "([II)I",
+        code.clone(),
+        2,
+        2,
+        &[base, -1],
+        2,
+        Some((-1, 4)),
+    );
+    // A null array.
+    check_fault("iaload_null", "([II)I", code, 2, 2, &[0, 0], 2, None);
+}
+
+#[test]
+fn ir_vs_singlepass_iastore_faults() {
+    // aload_0; iload_1; iload_2; iastore(bci 3); return
+    let code = vec![0x2a, 0x1b, 0x1c, 0x4f, 0xb1];
+    let arr = make_prim_array(4, &[0; 3]);
+    let base = arr.as_ptr() as i64;
+    check_fault(
+        "iastore_at_length",
+        "([III)V",
+        code.clone(),
+        3,
+        3,
+        &[base, 3, 42],
+        3,
+        Some((3, 3)),
+    );
+    check_fault(
+        "iastore_negative",
+        "([III)V",
+        code.clone(),
+        3,
+        3,
+        &[base, -7, 42],
+        3,
+        Some((-7, 3)),
+    );
+    check_fault("iastore_null", "([III)V", code, 3, 3, &[0, 0, 42], 3, None);
+}
+
+#[test]
+fn ir_vs_singlepass_arraylength_null_faults() {
+    // aload_0; arraylength(bci 1); ireturn
+    //
+    // `arraylength` has no index and therefore no bounds check — a null
+    // receiver is its ONLY fault, and it is the one this VM shipped without:
+    // the raw `MOV EAX, [RAX + ARRAY_LENGTH_OFFSET]` dereferenced low memory
+    // and SIGSEGV'd (the crash handler re-raises rather than throwing).
+    check_fault(
+        "arraylength_null",
+        "([I)I",
+        vec![0x2a, 0xbe, 0xac],
+        1,
+        1,
+        &[0],
+        1,
+        None,
+    );
+}
+
+// ── cov-01 increments 2-4: the constant-pool constants that are calls ────
 //
 // `ldc <String>`, `ldc <Class>` and `getstatic` are constants in the bytecode's
 // sense and runtime calls in the machine's: each names a constant-pool SITE
@@ -4364,13 +4954,13 @@ fn try_catch_nonparam_handler_local_stays_single_pass() {
 // because `<clinit>` is a side effect the constant owes on first touch.
 //
 // `getstatic` alone was 92 of the 273 opcode-gap events measured on 2026-08-03
-// (`docs/known-issues/c2/ir-coverage-survey-20260803.md`) вЂ” the largest single
+// (`docs/known-issues/c2/ir-coverage-survey-20260803.md`) — the largest single
 // opcode in the survey.
 
 /// `jit_ldc_string(vm, bytes, len)` stand-in. Returns a value derived from BOTH
 /// pointer arguments (the literal's first byte and its length) so a site that
 /// baked the wrong address or the wrong length is distinguishable from one that
-/// baked the right ones вЂ” a stub returning a constant would pass either way.
+/// baked the right ones — a stub returning a constant would pass either way.
 ///
 /// # Safety
 /// `bytes`/`len` are the literal the compiler baked, owned by the artifact.
@@ -4416,7 +5006,7 @@ fn call_with_dummy_context(m: &CompiledMethod, args: &[i64]) -> i64 {
 
 #[test]
 fn ir_vs_singlepass_string_ldc() {
-    // cov-01 inc 2. Object f() { return "hello"; }  вЂ”  ldc #1 ; areturn
+    // cov-01 inc 2. Object f() { return "hello"; }  —  ldc #1 ; areturn
     let code = vec![0x12, 0x01, 0xb0];
     let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         match cp {
@@ -4446,7 +5036,7 @@ fn ir_vs_singlepass_string_ldc() {
 
 #[test]
 fn ir_vs_singlepass_class_ldc() {
-    // cov-01 inc 3. Object f() { return Foo.class; }  вЂ”  ldc #1 ; areturn
+    // cov-01 inc 3. Object f() { return Foo.class; }  —  ldc #1 ; areturn
     let code = vec![0x12, 0x01, 0xb0];
     let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         match cp {
@@ -4479,7 +5069,7 @@ fn ir_vs_singlepass_class_ldc() {
 fn string_ldc_with_the_helper_unwired_stays_on_single_pass() {
     // The fail-closed rung for `Op::ConstString`. `helpers.ldc_string` is 0 only
     // in a synthetic table like this one, but `lower_inner` must refuse rather
-    // than emit `CALL 0` вЂ” the same guard, and the same history, as the monitor
+    // than emit `CALL 0` — the same guard, and the same history, as the monitor
     // helper's.
     //
     // The edit that trips it: delete the `ldc_string` row from `lower_inner`'s
@@ -4487,8 +5077,8 @@ fn string_ldc_with_the_helper_unwired_stays_on_single_pass() {
     //
     // Deliberately not CALLED: the single-pass body this falls back to would
     // itself emit a call to address 0. That asymmetry is the single-pass
-    // backend's вЂ” it treats `ldc_string` as always wired, which in production it
-    // is вЂ” and is not this lane's to change.
+    // backend's — it treats `ldc_string` as always wired, which in production it
+    // is — and is not this lane's to change.
     let code = vec![0x12, 0x01, 0xb0];
     let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         match cp {
@@ -4544,12 +5134,12 @@ fn compile_getstatic(
 
 #[test]
 fn ir_vs_singlepass_getstatic_through_the_helper() {
-    // cov-01 inc 4, the HELPER route вЂ” the one every site takes when the
+    // cov-01 inc 4, the HELPER route — the one every site takes when the
     // declaring class is not already initialised at compile time, which is what
     // `resolve_static_base` reports with no VM registered (this binary has
     // none, except for the single pair the direct-route test below registers).
     //
-    //   int f() { return Holder.VALUE; }  вЂ”  getstatic #1 ; ireturn
+    //   int f() { return Holder.VALUE; }  —  getstatic #1 ; ireturn
     let code = vec![0xb2, 0x00, 0x01, 0xac];
     let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
         match cp {
@@ -4564,7 +5154,7 @@ fn ir_vs_singlepass_getstatic_through_the_helper() {
     let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass getstatic");
     assert!(
         ir.used_ir_backend,
-        "cov-01: a getstatic must reach the optimizing backend вЂ” it was the \
+        "cov-01: a getstatic must reach the optimizing backend — it was the \
          largest single opcode gap in the survey"
     );
     let expected = 424_242 + 0x11 + 3;
@@ -4599,7 +5189,7 @@ fn ir_vs_singlepass_getstatic_through_the_helper() {
 
 #[test]
 fn ir_vs_singlepass_getstatic_direct_load() {
-    // cov-01 inc 4, the DIRECT route вЂ” the two dependent loads that replace the
+    // cov-01 inc 4, the DIRECT route — the two dependent loads that replace the
     // helper call when `resolve_static_base` accepts the site. This is the only
     // hand-written instruction encoding this lane adds, so it is driven rather
     // than inspected: the marker helper returns a value no direct load of the
@@ -4610,7 +5200,7 @@ fn ir_vs_singlepass_getstatic_direct_load() {
     // `FIELD_CELL_PAYLOAD{32,64}_OFFSET` biases the two encodings use.
     //
     // The resolver answers for exactly one class id and declines everything
-    // else, so it stays inert for every other test in this binary вЂ” the same
+    // else, so it stays inert for every other test in this binary — the same
     // discipline `x64::tests::test_getstatic_inline_direct_load_and_fallback`
     // uses, and necessary for the same reason: `set_static_base_resolver`
     // latches its context for the life of the process.
@@ -4650,7 +5240,7 @@ fn ir_vs_singlepass_getstatic_direct_load() {
     let mut helpers = dummy_helpers();
     helpers.getstatic = marker_getstatic as *const () as usize;
 
-    // 1. int-category, slot 1 в†’ MOVSXD of the 32-bit payload.
+    // 1. int-category, slot 1 → MOVSXD of the 32-bit payload.
     {
         let code = vec![0xb2, 0x00, 0x01, 0xac];
         let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
@@ -4672,7 +5262,7 @@ fn ir_vs_singlepass_getstatic_direct_load() {
         assert_eq!(call_with_dummy_context(&sp, &[]) as i32, -7);
     }
 
-    // 2. A site the resolver DECLINES keeps the helper, on both backends вЂ” the
+    // 2. A site the resolver DECLINES keeps the helper, on both backends — the
     //    control that proves rung 1 is measuring the ROUTE and not merely that
     //    getstatic works at all.
     {
@@ -4691,7 +5281,7 @@ fn ir_vs_singlepass_getstatic_direct_load() {
         assert_eq!(call_with_dummy_context(&sp, &[]) as i32, expected);
     }
 
-    // 3. Reference-typed, slot 2 в†’ the 64-bit payload, no sign extension. The
+    // 3. Reference-typed, slot 2 → the 64-bit payload, no sign extension. The
     //    value is a `Value::Long`'s payload rather than a real oop: what is
     //    under test is the DISPLACEMENT and the width, and a genuine object
     //    reference would need a heap this harness does not have.
@@ -4746,7 +5336,7 @@ fn wide_and_fp_statics_stay_on_single_pass() {
         };
         let cm = cached("gsw", desc, code, 2, 0);
         match compile_getstatic(&cm, &helpers, true, &statics) {
-            None => { /* refused outright вЂ” also acceptable, and fail-closed. */ }
+            None => { /* refused outright — also acceptable, and fail-closed. */ }
             Some(compiled) => assert!(
                 !compiled.used_ir_backend,
                 "cov-01: a `{}` static must bail the optimizing builder",
@@ -4762,7 +5352,7 @@ fn a_volatile_static_agrees_on_both_backends() {
     // after the load. The fence itself is not observable from a single-threaded
     // call; what this pins is that the volatile flag does not change the VALUE,
     // because the failure mode a mis-placed fence insertion produces in a
-    // hand-written encoder is a desynced instruction stream вЂ” a wrong result or
+    // hand-written encoder is a desynced instruction stream — a wrong result or
     // a crash, not a quietly missing barrier.
     let code = vec![0xb2, 0x00, 0x01, 0xac];
     let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
