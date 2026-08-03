@@ -82,7 +82,7 @@ same exception appeared under WebFlux, WebMvc and Jersey: they share
 ## Defect 1 вЂ” the in-place old-gen sweep freed a live promoted object
 
 Root cause is defect 4 of
-[`map-resize-unpinned-chain-cursors-nojit-segv-20260731.md`](../../../known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md):
+[`map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md):
 `sweep_young_non_moving` commits selective youngв†’old promotions and records them
 in `result.0.pointer_map`, but leaves the roots on their **pre-promotion young
 addresses**. `sweep_old_gen_non_moving` marks from that slice and `old_gen_gc`'s

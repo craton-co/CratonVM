@@ -238,7 +238,9 @@ fn overlay_roots_are_scoped_to_the_marked_collection_owner() {
     __test_tm_fast_put_str(&ctx, live_owner, "live", Value::Object(Some(live_value)));
     __test_tm_fast_put_str(&ctx, dead_owner, "dead", Value::Object(Some(dead_value)));
 
-    let roots = gc_overlay_roots_for_collection(live_owner.as_ptr() as usize);
+    // `None`: this mock harness does not model class identity, so the
+    // owner-recycling check is not what this case exercises.
+    let roots = gc_overlay_roots_for_collection(live_owner.as_ptr() as usize, None);
     assert!(roots.iter().any(|r| r.as_ptr() == live_value.as_ptr()));
     assert!(
         roots.iter().all(|r| r.as_ptr() != dead_value.as_ptr()),
