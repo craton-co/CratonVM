@@ -1098,6 +1098,24 @@ impl Compiler {
             } else {
                 None
             };
+            // Fail closed if the frame did not reserve the region this path is
+            // about to spill 32 registers into. `Compiler::new` reserves it on
+            // the same condition that selects this path, so this is unreachable
+            // — and it is checked anyway because the two conditions live in
+            // different files and drifted apart once already, with the stub
+            // writing over the caller's return address (see the `deopt_regs_size`
+            // comment in `x64.rs`). Bailing the compile costs one interpreted
+            // method; the alternative cost a corrupted stack.
+            if frame_box_ptr.is_some() && self.deopt_regs_base == 0 {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                    eprintln!(
+                        "[cratonvm-jitc] compile-bail deopt-stub-without-saved-regs \
+                         reason={reason} site_pc={site_pc}"
+                    );
+                }
+                self.buf.mark_overflowed();
+                return;
+            }
             if let Some(box_ptr) = frame_box_ptr {
                 let base = self.deopt_regs_base;
                 // deopt-osr Step 9 follow-up (a): allocate (once) the artifact's
@@ -1235,5 +1253,78 @@ impl Compiler {
             let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
             self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
+    }
+}
+
+#[cfg(test)]
+mod spill_region_contract {
+    //! The frame reservation and the stub's spill must agree.
+    //!
+    //! They live in different files and drifted apart once, with the stub
+    //! writing 32 registers over the caller's saved `rbp` and return address.
+    //! `probes/IndyDeoptProbe.java` is the executable reproducer; this is the
+    //! same contract at unit scale, checkable in the configuration that
+    //! actually broke.
+
+    use crate::x64::deopt_spill_region_reserved as reserved;
+
+    /// The reasons `emit_deopt_stubs` takes the REGISTER-SPILLING path for when
+    /// `deopt_real` is off. Transcribed from its
+    /// `crate::deopt_real_enabled() || matches!(reason, 8 | 9 | 10)`.
+    const SPILLS_WITHOUT_DEOPT_REAL: [i64; 3] = [8, 9, 10];
+
+    /// Which compile-time property covers each of those reasons.
+    ///
+    /// Reason 8 is the unconditional `invokedynamic` trap; 9 and 10 are the
+    /// precise-exception-frame stubs. A reason with no covering property is a
+    /// stub that can spill into a region the frame never reserved.
+    fn covered_by(reason: i64) -> Option<&'static str> {
+        match reason {
+            8 => Some("has_indy_sites"),
+            9 | 10 => Some("precise_exception_frames"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn every_stub_that_spills_without_deopt_real_has_a_frame_reservation() {
+        for reason in SPILLS_WITHOUT_DEOPT_REAL {
+            let property = covered_by(reason).unwrap_or_else(|| {
+                panic!(
+                    "reason {reason} spills 32 registers with `deopt_real` off and \
+                     nothing reserves the region it spills into"
+                )
+            });
+            // …and the reservation predicate really does answer `true` for that
+            // property alone, with `deopt_real` OFF. This is the assertion the
+            // bug failed: `has_indy_sites` was not a term in it at all.
+            let (pef, indy) = (property == "precise_exception_frames", property == "has_indy_sites");
+            assert!(
+                reserved(false, pef, indy),
+                "reason {reason}: {property} does not reserve the spill region"
+            );
+        }
+    }
+
+    /// The default path is untouched: nothing to spill, nothing reserved.
+    #[test]
+    fn a_method_with_nothing_to_spill_reserves_nothing() {
+        assert!(!reserved(false, false, false));
+        // …and `deopt_real` on its own still reserves, which is what makes the
+        // production frame byte-identical to what it was.
+        assert!(reserved(true, false, false));
+    }
+
+    /// The edit that would trip this suite: dropping `has_indy_sites` from
+    /// `deopt_spill_region_reserved`, or adding a reason to the stub's
+    /// `matches!(reason, ...)` without a covering property here.
+    #[test]
+    fn the_contract_is_stated_in_both_directions() {
+        assert!(reserved(false, false, true), "an indy method must reserve");
+        assert!(reserved(false, true, false), "a precise-frame method must reserve");
+        for reason in SPILLS_WITHOUT_DEOPT_REAL {
+            assert!(covered_by(reason).is_some(), "reason {reason} uncovered");
+        }
+        assert!(covered_by(2).is_none(), "reason 2 spills only under deopt_real");
     }
 }

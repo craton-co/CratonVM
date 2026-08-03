@@ -716,6 +716,12 @@ struct Compiler {
     /// reaches the `compile-bail` line, the way `note_jit_bail_site` works
     /// everywhere else.
     failed_site: Option<(&'static str, usize, u8)>,
+    /// Set by `patch_branches` when it rejects the method: the branch target
+    /// PC that had no native offset, and the nearest emitted PC at or below it.
+    /// The refusal named neither before, and its message asserted a cause
+    /// ("malformed bytecode a verifier would reject") that is demonstrably
+    /// wrong for real javac output.
+    pub(crate) unresolved_branch_target: Option<(usize, i64)>,
     /// Bitmask of scratch XMM registers (2-7) currently in use on the simulated stack.
     /// Bit N corresponds to SCRATCH_XMMS[N]. Used to allocate scratch XMMs for
     /// FP intermediate persistence across bytecodes.
@@ -1649,6 +1655,40 @@ mod deopt_snapshot_tests {
     }
 }
 
+/// Does this method's frame need the 256-byte `SavedRegisters` region that the
+/// frame-deopt stub spills 16 GPRs and 16 XMMs into?
+///
+/// **This must cover every stub `emit_deopt_stubs` takes the spilling path
+/// for.** That path is selected by
+///
+/// ```text
+/// deopt_real_enabled() || matches!(reason, 8 | 9 | 10)
+/// ```
+///
+/// Reasons 9 and 10 are the precise-exception-frame stubs, which
+/// `precise_exception_frames` covers. Reason 8 is the unconditional
+/// `invokedynamic` trap, which is emitted whether or not `deopt_real` is on —
+/// and it was covered by neither, which is not a missed optimisation but a
+/// stack-corrupting bug: with the region unreserved `deopt_regs_base` is 0, so
+/// the stub's `[rbp - (base - r*8)]` stores become `[rbp]`, `[rbp+8]`, … and
+/// walk UP over the saved `rbp` and the return address. The epilogue's `ret`
+/// then jumps to whatever register landed on the return slot.
+///
+/// Kept as a free function so the contract can be tested with `deopt_real`
+/// OFF — the only configuration the divergence was visible in, and one no
+/// in-process test can reach, because `deopt_real_enabled()` latches a
+/// process-wide `OnceLock`.
+///
+/// See `probes/IndyDeoptProbe.java` and
+/// `docs/known-issues/jit/deopt-real-off-null-entry-sigsegv-20260803.md`.
+pub(crate) fn deopt_spill_region_reserved(
+    deopt_real: bool,
+    precise_exception_frames: bool,
+    has_indy_sites: bool,
+) -> bool {
+    deopt_real || precise_exception_frames || has_indy_sites
+}
+
 impl Compiler {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1672,6 +1712,12 @@ impl Compiler {
         reserve_stack_floor: bool,
         gc_inert_selfrec: bool,
         precise_exception_frames: bool,
+        // Does this method contain an `invokedynamic`? The `0xba` lowering
+        // emits a frame-deopt stub (reason 8) that spills 32 registers into the
+        // `SavedRegisters` region, and it does so whether or not
+        // `deopt_real_enabled()` — so the frame has to reserve that region on
+        // the same condition. See `deopt_regs_size` below.
+        has_indy_sites: bool,
         protected_ranges: Vec<(u32, u32)>,
     ) -> Self {
         // Compact arrays: byte[] uses 1-byte elements, int[] uses 4-byte, ref[] uses 8-byte.
@@ -1943,7 +1989,33 @@ impl Compiler {
         // [rbp - (deopt_regs_base - r*8)] (ascending with r from
         // &gpr[0] = [rbp - deopt_regs_base]); the XMM half follows the GPR half in
         // `#[repr(C)]` order, so xmm[n] at [rbp - (deopt_regs_base - 128 - n*8)].
-        let deopt_regs_size = if crate::deopt_real_enabled() || precise_exception_frames {
+        // The condition MUST cover every stub that spills into this region.
+        // `emit_deopt_stubs` takes the spilling path when
+        //
+        //     deopt_real_enabled() || matches!(reason, 8 | 9 | 10)
+        //
+        // and reasons 9/10 are the precise-exception-frame stubs, which
+        // `precise_exception_frames` already covers. Reason 8 — the
+        // unconditional `invokedynamic` trap — was covered by neither, and that
+        // is a stack-corrupting bug rather than a missing optimisation: with the
+        // region unreserved `deopt_regs_base` is 0, so the stub's
+        // `[rbp - (base - r*8)]` stores become `[rbp]`, `[rbp+8]`, … — walking
+        // UP into the caller's frame, over the saved `rbp` and the return
+        // address. The epilogue's `ret` then jumps to whatever register landed
+        // on the return slot (`rcx`), which is how
+        // `CRATONVM_JIT='deopt-real=0'` turned a hot lambda into a SIGSEGV at a
+        // constant, unmapped address. Reproducer:
+        // `probes/IndyDeoptProbe.java`;
+        // `docs/known-issues/jit/deopt-real-off-null-entry-sigsegv-20260803.md`.
+        //
+        // Byte-identical whenever `deopt_real_enabled()` (the default) or when
+        // the method has no `invokedynamic`: the region was already reserved in
+        // the first case and is not needed in the second.
+        let deopt_regs_size = if deopt_spill_region_reserved(
+            crate::deopt_real_enabled(),
+            precise_exception_frames,
+            has_indy_sites,
+        ) {
             32 * 8
         } else {
             0
@@ -2085,6 +2157,7 @@ impl Compiler {
             branch_target_stack_oop_marks: FxHashMap::default(),
             failed: false,
             failed_site: None,
+            unresolved_branch_target: None,
             helpers,
             scratch_xmm_in_use: 0,
             fp_hoist_info: Vec::new(),
@@ -2428,16 +2501,48 @@ impl Compiler {
     // this module, so that is not reachable from outside the backend.
 
 
+    /// Record which target `patch_branches` could not resolve, plus the
+    /// highest PC at or below it that the emitter actually placed. The pair
+    /// distinguishes the two ways this happens: a `nearest` strictly below the
+    /// target means the walk stepped OVER it (something consumed the target's
+    /// PC without emitting it), and `-1` means nothing below it was emitted at
+    /// all (the target sits in a region the walk never entered).
+    #[cold]
+    fn note_unresolved_branch_target(&mut self, target_pc: usize) {
+        if self.unresolved_branch_target.is_some() {
+            return;
+        }
+        let nearest = (0..=target_pc.min(self.pc_to_native.len().saturating_sub(1)))
+            .rev()
+            .find(|&p| self.pc_to_native[p] >= 0)
+            .map_or(-1i64, |p| p as i64);
+        self.unresolved_branch_target = Some((target_pc, nearest));
+    }
+
     /// Patch all forward branches and jump-table entries.
     ///
     /// Returns `false` when any recorded branch/table target has no native
-    /// offset (`pc_to_native[target_pc] < 0` or out of range). Every target
-    /// the scan pass collects is revived and emitted by the dead-code walk,
-    /// so an unresolved target means the bytecode branches to a PC that is
-    /// not an instruction boundary (e.g. into the middle of a `goto`'s
-    /// operand bytes) — malformed bytecode that a classfile verifier would
-    /// reject, but which CratonVM can still meet via unverified/synthetic
-    /// code. Previously such patches were silently SKIPPED, leaving the
+    /// offset (`pc_to_native[target_pc] < 0` or out of range).
+    ///
+    /// **Do not read that as "malformed bytecode".** This comment used to say
+    /// an unresolved target meant the method branched into the middle of an
+    /// instruction — something a classfile verifier would reject, reachable
+    /// only through unverified/synthetic code. That claim was wrong, and it
+    /// cost real compiles: every FUSING lowering in the emitter consumes a PC
+    /// without emitting it, and if that PC is a branch target the edge onto it
+    /// is unresolvable here. The tail-call forms swallowed the `xreturn` at
+    /// `pc + 3` and refused five ordinary Spring/bytebuddy methods this way
+    /// (`ResolvableType.isAssignableFrom`, `TypeMappedAnnotations.get`, …),
+    /// blaming their bytecode. See
+    /// `docs/internal/jit-tailcall-swallows-shared-return-FIXED-20260803.md`.
+    ///
+    /// So when this fires, suspect a fusion before you suspect the classfile:
+    /// `note_unresolved_branch_target` records the target and the nearest PC
+    /// the emitter actually placed, and `CRATONVM_DBG_JITC=1` prints both.
+    /// A `nearest` a few bytes below the target names the instruction whose
+    /// arm over-advanced `pc`.
+    ///
+    /// Previously such patches were silently SKIPPED, leaving the
     /// emitted rel32 placeholder `0`: the branch fell through (or, when the
     /// branch was the last emitted instruction, execution ran off the body
     /// into the out-of-line stubs — observed as a STATUS_ACCESS_VIOLATION
@@ -2453,6 +2558,7 @@ impl Compiler {
                 -1
             };
             if target_native < 0 {
+                self.note_unresolved_branch_target(target_pc);
                 return false; // unresolved target — reject the method
             }
             // rel32 = target - (patch_offset + 4)
@@ -2473,6 +2579,7 @@ impl Compiler {
                 -1
             };
             if target_native < 0 {
+                self.note_unresolved_branch_target(target_pc);
                 return false; // unresolved table target — reject the method
             }
             let rel = target_native - table_base as i32; // Cast: x86-64 rel32 displacement

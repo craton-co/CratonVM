@@ -251,29 +251,25 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter/invoke.rs",
         "find_method_recursive(",
-        27,
-        "migration step 3a: invoke dispatch. The single largest bypass \
-         cluster in the tree.",
+        3,
+        "migration step 3a: invoke dispatch. The SEAM-02 split distributed \
+         this cluster across several interpreter files; the per-needle totals \
+         are pinned by `the_split_did_not_change_the_interpreter_budget` \
+         below, so no row here has to restate the distribution.",
     ),
     (
-        "vm/src/runtime/interpreter/invoke.rs",
-        "find_field_recursive(",
-        5,
-        "migration step 3a: field peeks from the invoke paths (escape \
-         analysis, getter/setter inlining).",
-    ),
-    (
-        "vm/src/runtime/interpreter/invoke.rs",
-        "resolve_field_ref(",
-        11,
-        "migration step 3a: these become `MemberResolver::field_ref`. Each is \
-         a one-line change but each also changes the error type at the call \
-         site, so they move as one commit with a full suite behind it.",
+        "vm/src/runtime/interpreter/native_override.rs",
+        "find_method_recursive(",
+        3,
+        "migration step 3a: the override policy's share of the invoke-dispatch \
+         cluster — the superclass walk that gives an abstract-class native its \
+         reach has to find the method it is overriding. Relocated by the \
+         SEAM-02 split, not added.",
     ),
     (
         "vm/src/runtime/interpreter/invoke.rs",
         "resolve_method_metadata(",
-        2,
+        1,
         "migration step 3a: the two in-module callers of the method core. \
          They stay until 3a lands, at which point the core becomes private to \
          `runtime::resolve` again.",
@@ -281,15 +277,96 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter/invoke.rs",
         ".resolution_cache",
-        4,
+        2,
         "migration step 3a: direct cache probes on the invoke fast paths. \
          `MemberResolver::probe_method_ref` is the replacement.",
     ),
     (
-        "vm/src/runtime/interpreter/invoke.rs",
+        "vm/src/runtime/interpreter/dispatch_virtual.rs",
+        "find_method_recursive(",
+        8,
+        "migration step 3a: virtual and interface dispatch — the vtable \
+         fast path, the general cached path, and the native-shadow consult \
+         each resolve the target they are about to call. Relocated by the \
+         SEAM-02 split, not added.",
+    ),
+    (
+        "vm/src/runtime/interpreter/dispatch_virtual.rs",
+        ".resolution_cache",
+        2,
+        "migration step 3a: direct cache probes on the virtual fast paths. \
+         MemberResolver::probe_method_ref is the replacement. Relocated by \
+         the SEAM-02 split, not added.",
+    ),
+    (
+        "vm/src/runtime/interpreter/dispatch_static.rs",
+        "find_method_recursive(",
+        1,
+        "migration step 3a: static dispatch resolving its target once \
+         before the call-site cache takes over. Relocated by the SEAM-02 \
+         split, not added.",
+    ),
+    (
+        "vm/src/runtime/interpreter/dispatch_static.rs",
+        "resolve_method_metadata(",
+        1,
+        "migration step 3a: one of the two in-module callers of the method \
+         core. They stay until 3a lands, at which point the core becomes \
+         private to runtime::resolve again.",
+    ),
+    (
+        "vm/src/runtime/interpreter/lambda.rs",
+        "find_method_recursive(",
+        4,
+        "migration step 3a: lambda dispatch resolving the implementation \
+         method a bootstrap captured. Relocated by the SEAM-02 split, not \
+         added: 12 (invoke) + 8 (jit_bridge) + 3 (native_override) + 4 here \
+         = 27, the pre-split total.",
+    ),
+    (
+        "vm/src/runtime/interpreter/lambda.rs",
+        "find_field_recursive(",
+        5,
+        "migration step 3a: field peeks on the lambda fast paths (the \
+         captured-argument and tdigest getter shortcuts). All 5 of \
+         invoke.rs's field peeks moved here, so that row is gone rather \
+         than zeroed.",
+    ),
+    (
+        "vm/src/runtime/interpreter/lambda.rs",
+        "resolve_field_ref(",
+        1,
+        "migration step 3a: the last of invoke.rs's field-ref bypasses; the \
+         other 10 are in jit_bridge.rs. 1 + 10 = 11, the pre-split total.",
+    ),
+    // The `new`-path `check_class_access` moved to `jit_bridge.rs` with
+    // `resolve_jit_new_site` in the SEAM-02 split; its row moved with it (see
+    // below). No row remains here, because a row with no site is permission
+    // nobody is using — which is exactly what `the_allowlist_has_no_dead_rows`
+    // refuses to let sit in this table.
+    (
+        "vm/src/runtime/interpreter/jit_bridge.rs",
+        "find_method_recursive(",
+        8,
+        "migration step 3a: the JIT bridge's share of the invoke-dispatch cluster — \
+         callee resolution for a compile request, the OSR artifact's own \
+         lookup, and the native-shadow probes. Relocated by the split, not \
+         added: see the arithmetic on the `invoke.rs` row above.",
+    ),
+    (
+        "vm/src/runtime/interpreter/jit_bridge.rs",
+        "resolve_field_ref(",
+        10,
+        "migration step 3a: field peeks the compiler needs before it can bake an offset \
+         — the getter/setter inline sites and the elidable-construction \
+         analysis. Relocated by the split, not added.",
+    ),
+    (
+        "vm/src/runtime/interpreter/jit_bridge.rs",
         "access_control::check_",
         1,
-        "migration step 3a: `check_class_access` on the `new` path.",
+        "migration step 3a: `check_class_access` on the `new` path, which is inside \
+         `resolve_jit_new_site`. Relocated by the split, not added.",
     ),
     (
         "vm/src/runtime/interpreter.rs",
@@ -306,9 +383,17 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter.rs",
         "access_control::check_",
-        2,
+        1,
         "migration step 3b: `check_class_access` for `new` (the one member of \
          the access-control surface that IS wired) plus one probe.",
+    ),
+    (
+        "vm/src/runtime/interpreter/opcodes.rs",
+        "access_control::check_",
+        1,
+        "migration step 3b: check_class_access on the new opcode arm, which \
+         moved to opcodes.rs with execute_instruction. Relocated by the \
+         SEAM-02 split, not added.",
     ),
     (
         "vm/src/runtime/interpreter/field_access.rs",
@@ -556,6 +641,50 @@ fn the_allowlist_has_no_dead_rows() {
         stale.len(),
         stale.join("\n  ")
     );
+}
+
+/// A file split may move bypass sites between files. It may not create them.
+///
+/// Every SEAM-02 step relocates rows in `ALLOWED`, and the first few restated
+/// the arithmetic ("16 + 8 + 3 = 27") in a reason string that the next step
+/// made stale. The invariant is per-needle and per-subtree, not per-row, so
+/// state it once here and let the rows carry only their justification.
+///
+/// The numbers below are the pre-split totals, measured on the unmodified tree
+/// at the commit this lane branched from. **A migration lowers them; nothing
+/// raises them.** If you are migrating sites to `MemberResolver`, lower the
+/// number here in the same commit as the row you shrink — that is the ratchet.
+///
+/// The exact edit that trips this: add a bypass to any interpreter file and
+/// give it a row, without taking the count off another row.
+#[test]
+fn the_split_did_not_change_the_interpreter_budget() {
+    // (needle, total permitted across `vm/src/runtime/interpreter*`)
+    const INTERPRETER_TOTALS: &[(&str, usize)] = &[
+        ("find_method_recursive(", 29),
+        ("find_field_recursive(", 5),
+        ("resolve_field_ref(", 13),
+        ("resolve_method_metadata(", 2),
+        (".resolution_cache", 9),
+        ("access_control::check_", 3),
+    ];
+    for (needle, expected) in INTERPRETER_TOTALS {
+        let total: usize = ALLOWED
+            .iter()
+            .filter(|(path, n, _, _)| {
+                n == needle && path.replace('\\', "/").contains("/runtime/interpreter")
+            })
+            .map(|(_, _, allowed, _)| *allowed)
+            .sum();
+        assert_eq!(
+            total, *expected,
+            "the interpreter's `{needle}` bypass budget is {total}, and the \
+             pre-SEAM-02 total was {expected}. A file split moves these \
+             between rows; it does not change the sum. If this is a real \
+             migration to `MemberResolver`, lower the expected total here in \
+             the same commit."
+        );
+    }
 }
 
 /// Every row must carry a reason, and the reason must not be a shrug.

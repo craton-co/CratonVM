@@ -142,6 +142,9 @@ fn push_stack_refuses_to_cross_spill_limit() {
         false,
         false,
         false,
+        // No `invokedynamic` in this fixture, so no register-spilling
+        // frame-deopt stub and nothing to reserve a spill region for.
+        false,
         Vec::new(),
     );
 
@@ -11038,6 +11041,106 @@ fn a_flag_refusal_names_the_site_that_raised_it() {
     assert!(compile_probe_method(&code, 0, 1).is_none());
     let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
     assert_eq!(site, "singlepass-codegen/dup2-unprovable-top-width");
+}
+
+/// `return cond ? x : helper()` — the `else` arm's call sits immediately
+/// before the shared `xreturn`, and the `then` arm's `goto` lands on it.
+///
+/// Both tail-call forms USED to swallow that `xreturn`: they emit no code for
+/// its PC, so `pc_to_native` stayed -1 there, and `patch_branches` then
+/// rejected the whole method with `branch-target-not-an-instruction-boundary`
+/// — a reason that blames malformed bytecode for what is ordinary javac
+/// output. See
+/// `docs/internal/jit-tailcall-swallows-shared-return-FIXED-20260803.md`.
+///
+///     0: iload_0
+///     1: ifeq 8
+///     4: iconst_1
+///     5: goto 12          <- the edge onto the return
+///     8: iload_0
+///     9: invokestatic
+///    12: ireturn          <- swallowed by the tail form
+const TAILCALL_OVER_SHARED_RETURN: [u8; 13] = [
+    0x1a, 0x99, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x07, 0x1a, 0xb8, 0x00, 0x01, 0xac,
+];
+
+/// The self-recursive tail form (an `invokestatic` with no `invoke_info` and no
+/// `direct_call` is a self-call here, as every other test in this file relies
+/// on).
+#[test]
+fn a_self_tail_call_may_not_swallow_a_branch_targeted_return() {
+    assert!(
+        compile_probe_method(&TAILCALL_OVER_SHARED_RETURN, 1, 1).is_some(),
+        "the `goto`'s target is the `ireturn` the tail form consumes"
+    );
+}
+
+/// The sibling tail form — reached only when the callee is ALREADY compiled,
+/// which is why this never reproduced from a cold standalone probe and only
+/// showed up inside a warm Spring context.
+#[test]
+fn a_sibling_tail_call_may_not_swallow_a_branch_targeted_return() {
+    assert!(
+        compile_with_direct_call(&TAILCALL_OVER_SHARED_RETURN, 1, 1, 9, direct_callee_i()).is_some(),
+        "a direct-callable callee must not let the tail form eat the shared return"
+    );
+}
+
+/// Without the branch onto it, the same call/return pair is still the fusible
+/// shape and must keep compiling — the guard is about the merge, not about
+/// tail calls.
+#[test]
+fn a_tail_call_over_an_unshared_return_still_compiles() {
+    let code = [0x1a, 0xb8, 0x00, 0x01, 0xac]; // iload_0; invokestatic; ireturn
+    assert!(compile_probe_method(&code, 1, 1).is_some());
+    assert!(compile_with_direct_call(&code, 1, 1, 1, direct_callee_i()).is_some());
+}
+
+/// A one-`int`-arg callee returning `int`. `entry` is never executed — only
+/// emitted as the JMP/CALL target.
+fn direct_callee_i() -> crate::JitDirectCall {
+    crate::JitDirectCall {
+        entry: 0x1000,
+        needs_context: false,
+        num_params: 1,
+        return_type: b'I',
+        guard_class_id: 0,
+    }
+}
+
+/// `compile_probe_method` with one direct-callable callee wired at `at_pc`.
+fn compile_with_direct_call(
+    code: &[u8],
+    num_params: usize,
+    max_locals: usize,
+    at_pc: usize,
+    callee: crate::JitDirectCall,
+) -> Option<CompiledMethod> {
+    compile(
+        code,
+        code.len(),
+        num_params,
+        max_locals,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(at_pc, callee)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
 }
 
 fn compile_switch_method(code: &[u8], code_len: usize) -> Option<CompiledMethod> {

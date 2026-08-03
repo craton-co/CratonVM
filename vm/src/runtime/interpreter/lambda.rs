@@ -1,0 +1,2216 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! `invokedynamic` lambda dispatch, and the coercions it needs.
+//!
+//! A lambda call site does not name a method. It names a bootstrap that
+//! produced a synthetic class implementing a functional interface, and
+//! this VM has to get from the call site's descriptor to the
+//! implementation method the bootstrap captured — then make the
+//! arguments fit, which is where most of the file goes.
+//!
+//! The coercion is not incidental. The SAM descriptor and the
+//! implementation descriptor differ legally: a generic SAM erases to
+//! `Object`, so an `int` argument at the call site arrives boxed and the
+//! implementation wants it unboxed, or widened, or both. Getting that
+//! wrong produces a `ClassCastException` naming two types that look
+//! compatible, which is why `cce_display_class_name` and
+//! `lambda_arg_provably_not_instance` exist: the message is the only
+//! thing the user sees.
+//!
+//! `try_lambda_dispatch` is the entry point; everything else here
+//! either feeds it or is one of its fast paths.
+
+use super::*;
+
+/// LambdaMetafactory argument adaptation (`samMethodType` → `instantiatedMethodType`).
+///
+/// When a functional-interface SAM has erased parameters (commonly `Object`,
+/// from an unbounded type variable) but the lambda is *instantiated* with a more
+/// specific type argument, javac's generated bridge method inserts a `checkcast`
+/// to the instantiated parameter type before calling the implementation method —
+/// throwing `ClassCastException` for an incompatible runtime argument (e.g.
+/// `Map<String,Object>.forEach((k, v) -> …)` where a non-`String` key was stored
+/// through a raw reference). CratonVM dispatches the lambda body *directly* from
+/// [`try_lambda_dispatch`] / `NativeContextImpl::invoke_virtual`, bypassing that
+/// synthetic bridge, so this helper replays the cast.
+///
+/// Only SAM-supplied args (`args[num_captures..]`) are checked, each against the
+/// corresponding `instantiatedMethodType` parameter. Conservative posture (never
+/// a spurious `ClassCastException`): a `null` argument, a primitive parameter, a
+/// non-narrowing (instantiated == erased) parameter, an unloaded target type, or
+/// any case we can't decide without risk all pass without throwing.
+pub(super) fn checkcast_lambda_instantiated_args(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    handles: &[Option<usize>],
+    sam_desc: &str,
+    inst_desc: &str,
+    args: &[Value],
+    num_captures: usize,
+) -> Result<(), MethodCallFailed> {
+    let (sam_params, _) = split_method_descriptor(sam_desc);
+    let (inst_params, _) = split_method_descriptor(inst_desc);
+    for (sam_idx, inst_tok) in inst_params.iter().enumerate() {
+        // Only a reference instantiated param can carry a checkcast.
+        if !is_reference_desc(inst_tok) {
+            continue;
+        }
+        // No narrowing vs the erased SAM param → the bridge inserts no cast.
+        if sam_params
+            .get(sam_idx)
+            .map(|s| s == inst_tok)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        // SAM-supplied args follow the captures in `args`.
+        //
+        // GC-safety: `args` is a plain Rust Vec copy handed to us by the
+        // caller, not itself a GC root -- only `thread.native_pin_roots`
+        // (which the caller pinned every object arg into before this call)
+        // is remapped by a moving GC. A prior loop iteration's
+        // `lambda_arg_provably_not_instance` call can trigger a GC via its
+        // proxy/annotation-satisfies helpers, which leaves any later
+        // `args[idx]` read here pointing at a stale, already-evacuated
+        // address. Read the CURRENT address back through the caller's pin
+        // (`handles`) instead of the raw `args` slice. Confirmed live via
+        // CRATONVM_DBG_STALE_OBJREF during WildFly parallel-extension-add --
+        // see docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        let idx = num_captures + sam_idx;
+        let obj_ref = match handles.get(idx).copied().flatten() {
+            Some(h) => thread.native_pin_roots[h],
+            None => match args.get(idx) {
+                Some(Value::Object(Some(o))) => *o,
+                // null (a `checkcast` of null always succeeds), primitive, or missing.
+                _ => continue,
+            },
+        };
+        if lambda_arg_provably_not_instance(shared, obj_ref, inst_tok) {
+            let obj_class_name = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(shared.mem.heap.class_id_of(obj_ref))
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let obj_display_name = cce_display_class_name(shared, obj_ref, &obj_class_name);
+            let target_binary = inst_tok
+                .strip_prefix('L')
+                .and_then(|d| d.strip_suffix(';'))
+                .unwrap_or(inst_tok)
+                .replace('/', ".");
+            // CRATONVM_DBG_CCE_BT: same attribution hook as the `checkcast`
+            // opcode, plus whether this argument was read through the pinned
+            // path (`via_pin`) — re-establishing the 2026-07-15 session's
+            // temporary instrumentation permanently (that session measured
+            // via_pin=true on every captured stale read here).
+            if crate::runtime::interpreter::dbg_cce_bt_enabled() {
+                let via_pin = handles.get(idx).copied().flatten().is_some();
+                eprintln!(
+                    "CRATONVM_DBG_CCE_BT: site=lambda_instantiated_args obj={} @0x{:x} target={} via_pin={via_pin}",
+                    obj_display_name.replace('/', "."),
+                    obj_ref.as_ptr() as usize,
+                    target_binary
+                );
+            }
+            // Same dotted-name shape as the `checkcast` opcode (tools such as
+            // mockk's `JvmAutoHinter` parse this text).
+            return Err(RuntimeError::ClassCastException {
+                message: format!(
+                    "{} cannot be cast to {}",
+                    obj_display_name.replace('/', "."),
+                    target_binary
+                ),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Return the Java-visible class name for a failed cast.
+///
+/// The immutable `Map.of` factories and `Collections.unmodifiableMap` use the
+/// same native storage stamp. `Object.getClass()` deliberately translates that
+/// stamp to the corresponding JDK implementation class, but a VM-generated
+/// `ClassCastException` previously exposed the private stamp instead. Besides
+/// being observably unlike HotSpot, that broke `LambdaSafe`: it identifies an
+/// erased-generic mismatch by comparing the exception prefix with
+/// `argument.getClass().getName()`.
+///
+/// Keep this mapping in lockstep with `native-builtins`' `getClass()` mapping
+/// for maps. The backing map's physical slot layout follows the loaded JDK
+/// class, so resolve its `size` field rather than assuming a fixed slot.
+pub(super) fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_name: &str) -> String {
+    // An array receiver must render as its own type, not its component's.
+    // The header word of a reference array holds the COMPONENT class id, so
+    // the caller's `class_id_of` -> `class.name` lookup yields
+    // `java/lang/String` for a `String[]` and produces the nonsensical, and
+    // actively misleading, `java.lang.String cannot be cast to
+    // java.lang.String` (the TestObjectDataType failure, chased for a session
+    // as a class-identity split). HotSpot renders the descriptor instead:
+    // `[Ljava.lang.String;`.
+    if let Some(desc) = array_descriptor_of(shared, obj_ref) {
+        return desc;
+    }
+    if raw_name != "cratonvm/internal/UnmodifiableMap" {
+        return raw_name.to_string();
+    }
+    if !matches!(shared.mem.heap.get_field(obj_ref, 1), Value::Int(1)) {
+        return "java/util/Collections$UnmodifiableMap".to_string();
+    }
+    let backing = match shared.mem.heap.get_field(obj_ref, 0) {
+        Value::Object(Some(backing)) => backing,
+        _ => return "java/util/ImmutableCollections$MapN".to_string(),
+    };
+    let size = {
+        let class_id = shared.mem.heap.class_id_of(backing);
+        let cm = shared.classes.class_manager.read();
+        find_field_recursive(class_id, "size", &cm.class_store)
+            .map(|(field_index, _, _)| shared.mem.heap.get_field(backing, field_index))
+    };
+    if matches!(size, Some(Value::Int(1))) {
+        "java/util/ImmutableCollections$Map1".to_string()
+    } else {
+        "java/util/ImmutableCollections$MapN".to_string()
+    }
+}
+
+/// `true` iff `obj_ref` is *provably* not an instance of the reference
+/// descriptor `desc_tok` (`L...;` or `[...`). Fails open (returns `false`)
+/// whenever the answer can't be established without risk — an unloaded target,
+/// an array-vs-non-array shape we can't decide, or a non-class descriptor — so a
+/// genuine instance is never rejected. Only consults already-loaded classes (no
+/// class loading → no GC, no stale `obj_ref`).
+pub(super) fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_tok: &str) -> bool {
+    // Array instantiated type: decide via the array-assignability rules.
+    if desc_tok.starts_with('[') {
+        return match array_descriptor_of(shared, obj_ref) {
+            Some(src) => !array_is_assignable_to(shared, &src, desc_tok),
+            None => false, // not an array — fail open
+        };
+    }
+    let target = match desc_tok.strip_prefix('L').and_then(|d| d.strip_suffix(';')) {
+        Some(t) => t,
+        None => return false,
+    };
+    if target == "java/lang/Object" {
+        return false;
+    }
+    let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
+    // Lambda proxies use VM-only synthetic class IDs which intentionally do not
+    // have ClassStore metadata.  Without a real class graph we cannot prove a
+    // mismatch against the erased bridge parameter, so preserve this helper's
+    // fail-open contract and let the normal lambda dispatch validate it.
+    if shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(obj_class_id)
+        .is_none()
+    {
+        return false;
+    }
+    // The bridge this is standing in for holds a real `checkcast`, and a
+    // `checkcast` RESOLVES its target class (JVMS §5.4.3.1) before comparing.
+    // So must this: "not loaded yet" is a statement about the class store, not
+    // about the object, and answering `false` there skips the cast entirely for
+    // every instantiated type whose first mention IS this call site.
+    //
+    // Spring's `ApplicationListener.forPayload` is exactly that shape. Its
+    // lambda's instantiated parameter is `PayloadApplicationEvent`, which
+    // nothing has referenced when the first `ContextRefreshedEvent` is
+    // multicast — so the cast was skipped, the body ran on the wrong event, and
+    // `event.getPayload()` raised `NoSuchMethodError`.
+    // `SimpleApplicationEventMulticaster.doInvokeListener` catches
+    // `ClassCastException` for precisely this case ("possibly a lambda-defined
+    // listener which we could not resolve the generic event type for") and
+    // suppresses it; a `NoSuchMethodError` walks straight past that catch and
+    // fails the context refresh
+    // (`DevToolsR2dbcAutoConfigurationTests$Pooled`,
+    // `probes/SpringForPayloadListenerProbe.java` — whose `preload` argument
+    // resolves the type up front and made the same run pass, which is what
+    // identified this branch).
+    //
+    // A load that FAILS still fails open: an instantiated type that is not on
+    // the classpath at all is the one case where guessing is worse than
+    // deferring, and it leaves the pre-existing behaviour untouched.
+    let loaded_target = {
+        let cm = shared.classes.class_manager.read();
+        cm.get_loaded_class_id(target)
+    };
+    let loaded_target = match loaded_target {
+        Some(tcid) => tcid,
+        // Resolve it, exactly as the bridge's `checkcast` would on first
+        // execution. `load_class_concurrent` loads and links without running
+        // `<clinit>`, which is the resolution a `checkcast` performs.
+        None => match shared.load_class_concurrent(target) {
+            Ok(tcid) => tcid,
+            Err(_) => return false,
+        },
+    };
+    let (target_cid, is_sub, target_is_interface) = {
+        let cm = shared.classes.class_manager.read();
+        (
+            loaded_target,
+            obj_class_id == loaded_target || cm.is_subclass_of(obj_class_id, loaded_target),
+            cm.get_class(loaded_target)
+                .map(|c| c.is_interface())
+                .unwrap_or(false),
+        )
+    };
+    // The lambda bridge descriptor carries a binary name only.  In a forked
+    // class-loader run the loader-blind lookup above may select the app copy
+    // of that name even though the value (and the bridge that owns it) use a
+    // child-defined copy.  Consult the value's exact defining namespace before
+    // calling the mismatch proven; this is the same identity rule used by the
+    // loader-aware checkcast path.  Restrict it to user loaders so ordinary
+    // bootstrap/application delegation remains unchanged.
+    let loader_scoped_is_sub = if crate::runtime::env_cache::loader_aware_resolution() {
+        let cm = shared.classes.class_manager.read();
+        cm.get_loader_id(obj_class_id)
+            .filter(|loader| matches!(loader, cratonvm_types::ClassLoaderId::UserDefined(_)))
+            .and_then(|loader| cm.class_defined_by_loader_exact(target, loader))
+            .is_some_and(|scoped_target| cm.is_subclass_of(obj_class_id, scoped_target))
+    } else {
+        false
+    };
+    // AOTSVC-1: the checks above only prove a match via ClassId identity
+    // (`is_sub`) or an exact defining-loader-namespace lookup
+    // (`loader_scoped_is_sub`, which requires the object's OWN loader to have
+    // already resolved `target` under its own namespace). Neither covers the
+    // case exercised by `AotServices.factories().load(...)`-style SPI
+    // discovery (Spring's `SpringFactoriesLoader.instantiateFactory`):
+    // `ClassUtils.forName(implementationName, TCCL)` + `Constructor.newInstance`
+    // allocate the service object using the EXACT ClassId resolved through the
+    // caller's classloader argument, but never drive that same loader's
+    // `loadClass` for the interface types the service implements — so
+    // `class_defined_by_loader_exact(target, obj's loader)` can miss even
+    // though the object's own `interfaces` list (populated at define/link time
+    // from its own class file) already carries a same-named entry. This is the
+    // identical name-vs-identity gap `loader_aware_name_assignable` already
+    // closes for the ordinary bytecode `checkcast` opcode — reuse it here so
+    // direct lambda dispatch (which bypasses that opcode, see this function's
+    // caller) gets the same loader-faithful answer instead of a false
+    // `ClassCastException` for a same-named, different-loader interface copy
+    // (e.g. `TestRuntimeHintsRegistrar` under `@CompileWithForkedClassLoader`).
+    if is_sub
+        || loader_scoped_is_sub
+        || lambda_proxy_satisfies(shared, obj_class_id, target_cid)
+        || synthetic_implements(shared, obj_class_id, target)
+        || proxy_instance_satisfies_target(shared, obj_ref, target)
+        || annotation_proxy_satisfies_target(shared, obj_ref, target)
+        || loader_aware_name_assignable(shared, obj_class_id, target_cid, target)
+    {
+        return false;
+    }
+    // Loader-split carve-out (gated): under loader-faithful resolution the same
+    // logical type can exist as several per-loader copies (a Hibernate
+    // bytecode-enhanced entity and its un-enhanced global copy, distinct
+    // `ClassId`s sharing a name). `get_loaded_class_id(target)` picks only ONE,
+    // so a lambda-arg `checkcast` to that type (e.g. adapting the receiver of a
+    // `ImmutableEntity::getName` method reference) would spuriously reject an
+    // instance of the OTHER copy — `X cannot be cast to X`. Treat an object
+    // whose class NAME equals the target's as an instance. Gate-off unchanged;
+    // only same-named cross-loader pairs are affected, never distinct types.
+    if crate::runtime::env_cache::loader_aware_resolution() {
+        let same_name = shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(obj_class_id)
+            .map(|c| &*c.name == target)
+            .unwrap_or(false);
+        if same_name {
+            return false;
+        }
+    }
+    // Provenance carve-out: a bare `java/lang/Object` receiver (`cid == 0`, or a
+    // synthetic alloc that lost its class identity and now reports
+    // `java/lang/Object`) carries no interface table, so we cannot prove it does
+    // NOT implement an interface target. Many VM-synthesised objects that really
+    // do implement marker interfaces (`java/io/Serializable`, `Comparable`, a
+    // functional interface, …) on HotSpot land here. Only a *concrete-class*
+    // target can be soundly rejected for such an object (e.g. `Object` → `String`
+    // in the motivating `Map<String,Object>.forEach` case). For an interface
+    // target, fail open. This never weakens the class-narrowing fix.
+    //
+    // Some early synthetic stubs are later used as interface edges before their
+    // own `ACC_INTERFACE` metadata is trustworthy. Elasticsearch's
+    // `Writeable$Writer.write` bridge is one such path: the target
+    // `Writeable` id is present in implementors' `interfaces` lists, but a
+    // concurrently observed value can carry the bare `Object` stamp. Treat that
+    // target as interface-like too, matching the conservative posture above.
+    let obj_is_bare = obj_class_id == ClassId::new(0)
+        || shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(obj_class_id)
+            .map(|c| &*c.name == "java/lang/Object")
+            .unwrap_or(true);
+    if obj_is_bare && (target_is_interface || target_used_as_interface(shared, target_cid)) {
+        return false;
+    }
+    true
+}
+
+pub(super) fn target_used_as_interface(shared: &SharedVm, target_cid: ClassId) -> bool {
+    let cm = shared.classes.class_manager.read();
+    let is_interface = cm
+        .class_store()
+        .iter()
+        .any(|class| class.interfaces.iter().any(|iface| *iface == target_cid));
+    is_interface
+}
+
+/// Widen a primitive value from `from_tok` to `to_tok` per JVM numeric promotion.
+pub(super) fn widen_primitive(from_tok: &str, to_tok: &str, v: Value) -> Value {
+    let as_i32 = |v: &Value| -> Option<i32> {
+        match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        }
+    };
+    match (from_tok, to_tok, &v) {
+        ("I" | "B" | "S" | "C" | "Z", "J", _) => {
+            if let Some(i) = as_i32(&v) {
+                // Widening: i32 -> i64 (sign-extended, JVM i2l)
+                return Value::Long(i as i64);
+            }
+        }
+        ("I" | "B" | "S" | "C" | "Z", "F", _) => {
+            if let Some(i) = as_i32(&v) {
+                // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
+                return Value::Float(i as f32);
+            }
+        }
+        ("I" | "B" | "S" | "C" | "Z", "D", _) => {
+            if let Some(i) = as_i32(&v) {
+                // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
+                return Value::Double(i as f64);
+            }
+        }
+        // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
+        ("J", "F", Value::Long(l)) => return Value::Float(*l as f32),
+        // Cast: integer-to-float numeric conversion (JVM i2f/i2d/l2f/l2d semantics)
+        ("J", "D", Value::Long(l)) => return Value::Double(*l as f64),
+        // Cast: numeric/representation conversion
+        ("F", "D", Value::Float(f)) => return Value::Double(*f as f64),
+        _ => {}
+    }
+    v
+}
+
+/// Coerce the return value from the impl descriptor back to the SAM descriptor.
+pub fn coerce_return(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    sam_ret: &str,
+    impl_ret: &str,
+    v: Option<Value>,
+) -> Result<Option<Value>, MethodCallFailed> {
+    if sam_ret == "V" {
+        return Ok(None);
+    }
+    let raw = match v {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    if sam_ret == impl_ret {
+        return Ok(Some(raw));
+    }
+    // SAM expects reference (Object/Integer/etc), impl returned primitive — box.
+    if is_reference_desc(sam_ret) && is_primitive_desc(impl_ret) {
+        let ch = impl_ret.chars().next().ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "empty primitive descriptor token in coerce_return".to_string(),
+            })
+        })?;
+        let boxed = box_primitive(shared, thread, ch, raw)?;
+        return Ok(Some(boxed));
+    }
+    // SAM expects primitive, impl returned reference — unbox.
+    if is_primitive_desc(sam_ret) && is_reference_desc(impl_ret) {
+        let ch = sam_ret.chars().next().ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "empty primitive descriptor token in coerce_return".to_string(),
+            })
+        })?;
+        return Ok(Some(unbox_wrapper(shared, ch, raw)));
+    }
+    // Both primitive: maybe widen.
+    if is_primitive_desc(sam_ret) && is_primitive_desc(impl_ret) {
+        return Ok(Some(widen_primitive(impl_ret, sam_ret, raw)));
+    }
+    Ok(Some(raw))
+}
+
+/// Coerce arguments passed to a lambda SAM invocation to match the impl
+/// method's descriptor.
+///
+/// `sam_desc` and `impl_desc` are method descriptors. `call_args` are the
+/// SAM-level args (no captures). `captures_and_args` is `captures ++
+/// call_args`. For `InvokeVirtual`/`InvokeInterface`, the first element of
+/// `captures_and_args` is the receiver and should NOT be coerced against
+/// impl_desc params (impl_desc params describe method params, not the
+/// receiver). `receiver_present` distinguishes these cases.
+pub fn coerce_lambda_args(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    sam_desc: &str,
+    impl_desc: &str,
+    inst_desc: &str,
+    args: &mut Vec<Value>,
+    receiver_present: bool,
+    num_captures: usize,
+) -> Result<(), MethodCallFailed> {
+    let (sam_params, _sam_ret) = split_method_descriptor(sam_desc);
+    let (impl_params, _impl_ret) = split_method_descriptor(impl_desc);
+
+    // The SAM's params correspond to args[num_captures..].
+    // The impl's params correspond to args[receiver_skip..] where
+    // receiver_skip = 1 if receiver_present else 0.
+    // Number of non-receiver impl args should equal (total - receiver_skip).
+    let receiver_skip = if receiver_present { 1 } else { 0 };
+    if args.len() < receiver_skip {
+        return Ok(());
+    }
+
+    // GC-safety: the instantiated-type checkcast below can LOAD classes and
+    // `coerce_arg` BOXES primitives — both allocate and can trigger a moving
+    // young GC while `args` sits in this raw Rust Vec, invisible to the
+    // collector (native stale-local family). Pin every object entry into
+    // `native_pin_roots` (which the GC remaps), refresh the Vec from the pins
+    // after every potentially-allocating step, and keep each pin tracking the
+    // CURRENT object for its index as entries are coerced. Pins are truncated
+    // on every exit path.
+    let pin_base = thread.native_pin_roots.len();
+    let mut handles: Vec<Option<usize>> = Vec::with_capacity(args.len());
+    for a in args.iter() {
+        if let Value::Object(Some(o)) = a {
+            handles.push(Some(thread.native_pin_roots.len()));
+            thread.native_pin_roots.push(*o);
+        } else {
+            handles.push(None);
+        }
+    }
+
+    // LambdaMetafactory argument adaptation: replay the `checkcast` to each
+    // instantiated parameter type that the (bypassed) synthetic SAM bridge would
+    // have performed, so a narrowed type variable still raises
+    // `ClassCastException` for an incompatible argument. Runs before the
+    // box/unbox coercion below, mirroring the bridge's cast-then-adapt order.
+    if let Err(e) = checkcast_lambda_instantiated_args(
+        shared,
+        thread,
+        &handles,
+        sam_desc,
+        inst_desc,
+        args,
+        num_captures,
+    ) {
+        thread.native_pin_roots.truncate(pin_base);
+        return Err(e);
+    }
+    for (j, h) in handles.iter().enumerate() {
+        if let Some(h) = *h {
+            args[j] = Value::Object(Some(thread.native_pin_roots[h]));
+        }
+    }
+
+    // The SAM-supplied args start at index num_captures in `args` (captures
+    // come first). Captures themselves may also need boxing if bound as the
+    // impl's receiver or first params, but for now we focus on the SAM args,
+    // which is where the primitive/reference mismatch occurs.
+    let impl_non_recv = &impl_params[..];
+    // We want to coerce each arg[i] against the corresponding impl param.
+    for i in 0..args.len() {
+        if i < receiver_skip {
+            continue;
+        }
+        let impl_idx = i - receiver_skip;
+        if impl_idx >= impl_non_recv.len() {
+            break;
+        }
+        // Determine what the caller's "expected" type was. For SAM-supplied
+        // args (i >= num_captures), use sam_params[i - num_captures]. For
+        // capture args (i < num_captures), we assume they match impl type
+        // already (captures are erased at capture time).
+        let sam_tok: String = if i >= num_captures {
+            let sam_idx = i - num_captures;
+            if sam_idx < sam_params.len() {
+                sam_params[sam_idx].clone()
+            } else {
+                impl_non_recv[impl_idx].clone()
+            }
+        } else {
+            impl_non_recv[impl_idx].clone()
+        };
+        let impl_tok = &impl_non_recv[impl_idx];
+        let coerced = match coerce_arg(shared, thread, &sam_tok, impl_tok, args[i]) {
+            Ok(v) => v,
+            Err(e) => {
+                thread.native_pin_roots.truncate(pin_base);
+                return Err(e);
+            }
+        };
+        // Keep this index's pin tracking the (possibly freshly boxed) object.
+        match coerced {
+            Value::Object(Some(o)) => {
+                if let Some(h) = handles[i] {
+                    thread.native_pin_roots[h] = o;
+                } else {
+                    handles[i] = Some(thread.native_pin_roots.len());
+                    thread.native_pin_roots.push(o);
+                }
+            }
+            _ => handles[i] = None,
+        }
+        args[i] = coerced;
+        // coerce_arg may have allocated (boxing) — refresh every pinned entry.
+        for (j, h) in handles.iter().enumerate() {
+            if let Some(h) = *h {
+                args[j] = Value::Object(Some(thread.native_pin_roots[h]));
+            }
+        }
+    }
+    thread.native_pin_roots.truncate(pin_base);
+    Ok(())
+}
+
+/// Bug B: distinguish the SAM from a same-name, same-arity *overloaded default*
+/// method on the functional interface. A functional interface may declare
+/// default methods named like the SAM with the same arity but different
+/// parameter types — e.g. `AnnotationFilter`'s SAM `matches(String)` plus
+/// defaults `matches(Class)` / `matches(Annotation)`. The arity guard in
+/// `try_lambda_dispatch` can't tell them apart, so `FILTER.matches(someClass)`
+/// was wrongly routed into the `matches(String)` lambda body (passing a Class
+/// where a String was expected → the lambda always returned false).
+///
+/// Returns `false` when the call is such an overloaded default (so the caller
+/// falls through and runs the real default method, which converts the argument
+/// and re-invokes the SAM). Only CONCRETE (non-`Object`) reference SAM params
+/// are checked; generic/erased (`Object`) and primitive params are skipped, so
+/// the hot stream/lambda path stays byte-identical. A param is treated as
+/// compatible unless the runtime arg is a non-null object provably NOT an
+/// instance of the SAM param type (mirrors the `instanceof` opcode's checks).
+pub(crate) fn lambda_args_sam_compatible(
+    shared: &SharedVm,
+    sam_descriptor: &str,
+    args: &[Value],
+) -> bool {
+    let (params, _ret) = split_method_descriptor(sam_descriptor);
+    for (i, pd) in params.iter().enumerate() {
+        if pd.starts_with('[') {
+            // Array-typed SAM param. This was previously covered by the
+            // `!pd.starts_with('L')` catch-all below (arrays don't start
+            // with 'L'), which unconditionally skipped it -- "never
+            // second-guess". That silently let a same-named, same-arity
+            // interface DEFAULT method whose one differing parameter is a
+            // scalar reference where the real SAM wants an array (e.g.
+            // JRuby 10.x's `BlockCallback` -- abstract SAM
+            // `call(ThreadContext, IRubyObject[], Block)` plus five
+            // default overloads sharing the name "call", including
+            // `call(ThreadContext, IRubyObject, Block)`) get misjudged as
+            // SAM-compatible. `try_lambda_dispatch` then fed the raw
+            // scalar argument directly into the array-typed lambda body
+            // instead of falling through to the real default method (which
+            // wraps the scalar into a 1-element array before re-invoking
+            // the SAM) -- observed as `RubyEnumerable.packEnumValues`
+            // calling `arraylength` on a bare `RubySymbol` during
+            // `Enumerable#partition`'s per-element block callback
+            // (JRubyScriptTemplateTests GC-ARRAY-GUARD investigation,
+            // 2026-07-15). A present, non-null, non-array argument here is
+            // provably NOT an instance of this SAM param -> treat as an
+            // overloaded default, same as the concrete-class mismatch case
+            // below.
+            if let Some(Value::Object(Some(a))) = args.get(i) {
+                if shared.mem.heap.kind_of(*a) != cratonvm_types::ObjectKind::Array {
+                    return false;
+                }
+            }
+            continue; // null / missing / genuinely an array -- don't second-guess further
+        }
+        if !pd.starts_with('L') || pd.as_str() == "Ljava/lang/Object;" {
+            continue; // generic/erased or non-reference param -- never second-guess
+        }
+        let arg = match args.get(i) {
+            Some(Value::Object(Some(a))) => *a,
+            _ => continue, // null / primitive / missing — don't second-guess
+        };
+        let target = &pd[1..pd.len() - 1];
+        let arg_cid = shared.mem.heap.class_id_of(arg);
+        let (target_cid, base) = {
+            let cm = shared.classes.class_manager.read();
+            match cm.get_loaded_class_id(target) {
+                Some(tcid) => (tcid, arg_cid == tcid || cm.is_subclass_of(arg_cid, tcid)),
+                None => continue, // SAM param type not loaded — can't judge → compatible
+            }
+        };
+        if base
+            || loader_aware_name_assignable(shared, arg_cid, target_cid, target)
+            || lambda_proxy_satisfies(shared, arg_cid, target_cid)
+            || synthetic_implements(shared, arg_cid, target)
+            || proxy_instance_satisfies_target(shared, arg, target)
+            || annotation_proxy_satisfies_target(shared, arg, target)
+        {
+            continue;
+        }
+        return false; // arg provably not an instance of a concrete SAM param → overloaded default
+    }
+    true
+}
+
+/// Loader-faithful dispatch target for a lambda's implementation method.
+///
+/// The `invokedynamic` that materialised this lambda lives in the class recorded
+/// in `lambda_proxy_hosts` (its enclosing/defining class). Resolve the impl
+/// method's owner through THAT class's loader (JVMS §5.4.3 initiating loader) so
+/// a lambda whose enclosing class was defined by a child / bytecode-enhancing
+/// loader dispatches to that loader's copy of the impl method — not the flat
+/// global copy the by-name `invoke_shared`/`load_class` path would pick. This
+/// mirrors the `invokespecial`/`invokevirtual` divergence override already
+/// applied to ordinary bytecode dispatch (search "dispatch_override").
+///
+/// Concrete failure without this: a Hibernate `@BytecodeEnhanced` test's
+/// `s -> { new Continent(); ... }` lambda ran the UN-enhanced host copy, so
+/// `new Continent` resolved the un-enhanced entity and the reflective
+/// `Field.set` on it mismatched the enhanced mapped class.
+///
+/// Returns the loader-local `ClassId` only when it diverges from the by-name
+/// resolution; `None` (gate off, built-in host loader, or no per-loader copy)
+/// keeps the legacy name-based dispatch byte-for-byte.
+pub(crate) fn lambda_impl_dispatch_override(
+    shared: &SharedVm,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Option<ClassId> {
+    if !crate::runtime::env_cache::loader_aware_resolution() {
+        return None;
+    }
+    let host = *shared
+        .classes
+        .lambda_proxy_hosts
+        .read()
+        .get(&call_site.proxy_class_id)?;
+    let name = &call_site.impl_handle.class_name;
+    lookup_loader_initiated(shared, host, name).filter(|cid| *cid != ClassId::new(0))
+}
+
+/// Like [`lambda_impl_dispatch_override`], but for the call site that actually
+/// EXECUTES a static method-reference lambda's impl method (as opposed to the
+/// read-only callers above that only ever consult an already-populated cache).
+///
+/// A static method reference (e.g. `EnvironmentPostProcessorsFactory::
+/// fromSpringFactories`) captured by a `@CompileWithForkedClassLoader`-style
+/// isolated loader's own class can be the VERY FIRST reference to its impl
+/// owner from that loader's namespace — before any other bytecode (`new`,
+/// `checkcast`, `invokestatic`) has driven that loader's `loadClass` and
+/// populated `initiating_resolution_cache`/the loader's exact-class index.
+/// `lambda_impl_dispatch_override`'s `lookup_loader_initiated` only reads that
+/// cache; on a cold miss it returns `None` and the caller falls through to the
+/// loader-blind `invoke_shared(class_name, ...)`, which resolves to whichever
+/// same-named class the FLAT global store already holds (typically an
+/// unrelated, earlier-loaded Application-loader copy) — running the wrong
+/// loader's impl method body entirely, not just naming the wrong `Class`
+/// object. Concrete failure: `SpringApplication`'s
+/// `EnvironmentPostProcessorApplicationListener` (fork-loader-defined)
+/// constructs `postProcessorsFactory = EnvironmentPostProcessorsFactory::
+/// fromSpringFactories` and calls `.apply(classLoader)` before anything else
+/// in the fork ever touches `EnvironmentPostProcessorsFactory` by name; the
+/// resulting `new SpringFactoriesEnvironmentPostProcessorsFactory(...)` ran
+/// under the Application loader's copy, so a sibling SPI implementation
+/// (`CloudFoundryVcapEnvironmentPostProcessor`, correctly fork-loader-defined)
+/// failed `Class.equals` against it and its constructor's `DeferredLogFactory`
+/// argument resolved to `null`.
+///
+/// Actively drives the host loader's `loadClass` (same as the `New`/`Ldc`
+/// resolution path's gate-on branch) on a cache miss, instead of only
+/// consulting what's already cached. Falls back to the passive check (and
+/// then to `None`, preserving legacy behavior) whenever the gate is off, the
+/// host loader is built-in, or driving the loader fails to produce a class.
+pub(crate) fn lambda_impl_dispatch_override_driven(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Option<ClassId> {
+    if let Some(cid) = lambda_impl_dispatch_override(shared, call_site) {
+        return Some(cid);
+    }
+    if !crate::runtime::env_cache::loader_aware_resolution() {
+        return None;
+    }
+    let host = *shared
+        .classes
+        .lambda_proxy_hosts
+        .read()
+        .get(&call_site.proxy_class_id)?;
+    if !matches!(
+        shared.classes.class_manager.read().get_loader_id(host),
+        Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+    ) {
+        return None;
+    }
+    let name = &call_site.impl_handle.class_name;
+    drive_defining_loader_load(shared, thread, host, name).filter(|cid| *cid != ClassId::new(0))
+}
+
+/// Resolve a lambda implementation that is private in its declaring class.
+///
+/// LambdaMetafactory may encode a private synthetic lambda body as an
+/// `InvokeVirtual` method handle. That handle is nevertheless bound to the
+/// resolved owner method: virtual dispatch on the captured object's concrete
+/// subclass is incorrect when that subclass happens to declare a same-named
+/// synthetic `lambda$...` method. Preserve the declaring class in that case.
+pub(crate) fn lambda_private_impl_dispatch_class(
+    shared: &SharedVm,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Option<ClassId> {
+    let owner_id = lambda_impl_dispatch_override(shared, call_site).or_else(|| {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id(&call_site.impl_handle.class_name)
+    })?;
+    let cm = shared.classes.class_manager.read();
+    let (method, declaring_id) = crate::classloading::find_method_recursive(
+        owner_id,
+        &call_site.impl_handle.member_name,
+        &call_site.impl_handle.descriptor,
+        &cm.class_store,
+    )?;
+    method
+        .access_flags
+        .contains(MethodAccessFlags::PRIVATE)
+        .then_some(declaring_id)
+}
+
+/// Try to run a concrete default method declared by a lambda proxy's
+/// functional interface.
+///
+/// Lambda proxy ids are synthetic and do not live in the class store. Calls to
+/// non-SAM interface defaults normally reach the real functional interface via
+/// direct dispatch, but an invoke through a superinterface can resolve to that
+/// superinterface's abstract declaration first. Groovy's
+/// `CompilationUnit$PhaseOperation.doPhaseOperation(CompilationUnit)` is one
+/// such shape: the receiver is an `ISourceUnitOperation`/
+/// `IPrimaryClassNodeOperation` lambda, while the resolved declaration is the
+/// abstract parent interface.
+pub(super) fn try_lambda_default_method_dispatch(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    obj_class_id: ClassId,
+    method_name: &str,
+    method_descriptor: &str,
+    full_args: &[Value],
+) -> Result<Option<Option<Value>>, MethodCallFailed> {
+    let (interface_name, interface_id_hint) = {
+        let proxies = shared.classes.lambda_proxies.read();
+        match proxies.get(&obj_class_id) {
+            Some(call_site) => (
+                call_site.functional_interface.clone(),
+                call_site.functional_interface_id,
+            ),
+            None => return Ok(None),
+        }
+    };
+
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LAMBDA_DISPATCH").is_some() {
+        eprintln!(
+            "[DBG_LAMBDA] default-dispatch proxy={:?} method={}{} hint={:?}",
+            obj_class_id, method_name, method_descriptor, interface_id_hint
+        );
+    }
+    let declaring_id = {
+        let cm = shared.classes.class_manager.read();
+        // Prefer the loader-resolved interface captured at bootstrap time:
+        // a bare name lookup returns an arbitrary copy when several loaders
+        // define the same interface, executing the default method in the
+        // wrong loader's context.
+        let Some(interface_id) =
+            interface_id_hint.or_else(|| cm.get_loaded_class_id(&interface_name))
+        else {
+            return Ok(None);
+        };
+        match crate::classloading::find_method_recursive(
+            interface_id,
+            method_name,
+            method_descriptor,
+            &cm.class_store,
+        ) {
+            Some((method, declaring_id)) if method.code().is_some() && !method.is_abstract() => {
+                Some(declaring_id)
+            }
+            _ => None,
+        }
+    };
+
+    let Some(declaring_id) = declaring_id else {
+        return Ok(None);
+    };
+    crate::vm::invoke_on_class_shared_no_retarget(
+        shared,
+        thread,
+        declaring_id,
+        method_name,
+        method_descriptor,
+        full_args,
+    )
+    .map(Some)
+}
+
+/// Key for the two thread-local dispatch caches below:
+/// `(vm_identity, proxy ClassId, receiver ClassId)`.
+///
+/// The `vm_identity` component is load-bearing, not decoration. A `ClassId` is
+/// unique only *within* one VM, and one OS thread can run bytecode in two VMs
+/// (the inline test modules build a `SharedVm` per test on one thread; a host
+/// thread can be attached to two `Vm`s). Keyed on the two `ClassId`s alone, a
+/// lookup in VM B hit VM A's entry for the numerically-equal ids and dispatched
+/// VM A's cached method body — or VM A's cached field index — against VM B's
+/// classes.
+///
+/// The `RedefineGate` does NOT catch that. Its staleness handle comes from the
+/// class manager of whichever VM populated the entry, so consulted from VM B it
+/// reports VM A's (unchanged) redefine generation and answers "fresh". The gate
+/// guards against redefinition, not against identity collision; only the key
+/// can do the latter.
+///
+/// See `docs/known-issues/c2/vm-process-global-state-round-2.md`.
+type VmScopedClassPairKey = (usize, u32, u32);
+
+thread_local! {
+    pub(super) static LAMBDA_IMPL_BYTECODE_CACHE: std::cell::RefCell<
+        rustc_hash::FxHashMap<VmScopedClassPairKey, (Arc<CachedBytecodeMethod>, RedefineGate)>
+    > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+// TDigest's private numeric kernels adapt a captured `TDigestDoubleArray.get(int)`
+// through `Function<Integer, Double>`. Cache only getters whose entire body is
+// the verifier-safe `aload_0; getfield [D; iload_1; daload; dreturn` shape.
+// This is an interpreter superinstruction, not a semantic shortcut: any other
+// lambda/accessor continues through the normal dispatch path.
+thread_local! {
+    pub(super) static TDIGEST_DOUBLE_GET_FIELD_CACHE: std::cell::RefCell<
+        rustc_hash::FxHashMap<VmScopedClassPairKey, (usize, RedefineGate)>
+    > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+pub(super) fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef, index: i32) -> Option<f64> {
+    let proxy_class_id = shared.mem.heap.class_id_of(proxy);
+    let call_site = shared
+        .classes
+        .lambda_proxies
+        .read()
+        .get(&proxy_class_id)
+        .cloned()?;
+    if call_site.functional_interface.as_ref() != "java/util/function/Function"
+        || call_site.sam_method_name.as_ref() != "apply"
+        || call_site.sam_descriptor.as_ref() != "(Ljava/lang/Object;)Ljava/lang/Object;"
+        || call_site.capture_types.len() != 1
+        || call_site.impl_handle.member_name.as_ref() != "get"
+        || call_site.impl_handle.descriptor.as_ref() != "(I)D"
+        || !matches!(
+            call_site.impl_handle.kind,
+            MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface
+        )
+    {
+        return None;
+    }
+    let receiver = match shared.mem.heap.get_field(proxy, 0) {
+        Value::Object(Some(receiver)) => receiver,
+        _ => return None,
+    };
+    let receiver_class_id = shared.mem.heap.class_id_of(receiver);
+    let key = (
+        shared.vm_identity,
+        proxy_class_id.as_u32(),
+        receiver_class_id.as_u32(),
+    );
+    let field_index = TDIGEST_DOUBLE_GET_FIELD_CACHE
+        .with(|cache| {
+            let mut cache = cache.borrow_mut();
+            match cache.get(&key) {
+                Some((field_index, gate)) if !gate.is_stale() => Some(*field_index),
+                Some(_) => {
+                    cache.remove(&key);
+                    None
+                }
+                None => None,
+            }
+        })
+        .or_else(|| {
+            let (declaring_id, field_cp_index, gate) = {
+                let cm = shared.classes.class_manager.read();
+                let (method, declaring_id) = crate::classloading::find_method_recursive(
+                    receiver_class_id,
+                    "get",
+                    "(I)D",
+                    &cm.class_store,
+                )?;
+                let code = method.code()?;
+                if code.code.len() != 7
+                    || code.code[0] != 0x2a
+                    || code.code[1] != 0xb4
+                    || code.code[4] != 0x1b
+                    || code.code[5] != 0x31
+                    || code.code[6] != 0xaf
+                {
+                    return None;
+                }
+                (
+                    declaring_id,
+                    ((code.code[2] as u16) << 8) | code.code[3] as u16,
+                    RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id)),
+                )
+            };
+            let field = resolve_field_ref(shared, declaring_id, field_cp_index).ok()?;
+            if field.is_static || field.desc_byte != b'[' {
+                return None;
+            }
+            TDIGEST_DOUBLE_GET_FIELD_CACHE.with(|cache| {
+                cache.borrow_mut().insert(key, (field.field_index, gate));
+            });
+            Some(field.field_index)
+        })?;
+    if index < 0 {
+        return None;
+    }
+    let array = match shared.mem.heap.get_field(receiver, field_index) {
+        Value::Object(Some(array)) => array,
+        _ => return None,
+    };
+    match shared
+        .mem
+        .heap
+        .get_array_element(array, index as usize)
+        .ok()?
+    {
+        Value::Double(value) => Some(value),
+        _ => None,
+    }
+}
+
+pub(super) fn try_invoke_cached_lambda_impl(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    proxy_class_id: ClassId,
+    receiver_class_id: ClassId,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Result<Option<Option<Value>>, MethodCallFailed> {
+    let key = (
+        shared.vm_identity,
+        proxy_class_id.as_u32(),
+        receiver_class_id.as_u32(),
+    );
+    let cached = LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        match cache.get(&key) {
+            Some((cached, gate)) if !gate.is_stale() => Some(Arc::clone(cached)),
+            Some(_) => {
+                cache.remove(&key);
+                None
+            }
+            None => None,
+        }
+    });
+    let cached = match cached {
+        Some(c) if &*c.method_name == method_name && &*c.method_descriptor == descriptor => c,
+        Some(_) => return Ok(None),
+        None => {
+            let cm = shared.classes.class_manager.read();
+            let store = cm.class_store();
+            let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
+                receiver_class_id,
+                method_name,
+                descriptor,
+                store,
+            ) else {
+                return Ok(None);
+            };
+            let Some(class) = store.get(declaring_id) else {
+                return Ok(None);
+            };
+            // Cached bytecode bypasses native dispatch, which must retain precedence.
+            if shared
+                .natives
+                .native_methods
+                .find(&class.name, method_name, descriptor)
+                .is_some()
+            {
+                return Ok(None);
+            }
+            if method.is_static() || method.is_synchronized() || method.is_native() {
+                return Ok(None);
+            }
+            let Some(code_attr) = method.code() else {
+                return Ok(None);
+            };
+            let c = Arc::new(CachedBytecodeMethod {
+                declaring_class_id: declaring_id,
+                class_name: Arc::clone(&class.name),
+                method_name: Arc::from(method_name),
+                method_descriptor: Arc::from(descriptor),
+                source_file: class.source_file.as_deref().map(Arc::from),
+                code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+                exception_table: Arc::from(code_attr.exception_table.as_slice()),
+                max_stack: code_attr.max_stack,
+                max_locals: code_attr.max_locals,
+                num_params: count_method_params(descriptor) as u16,
+                is_synchronized: false,
+                is_static: false,
+                force_native_cache: std::sync::OnceLock::new(),
+                native_callback_cache: std::sync::OnceLock::new(),
+                invoc_key: std::sync::OnceLock::new(),
+                jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+                quickened: std::sync::OnceLock::new(),
+            });
+            let gate = RedefineGate::snapshot(cm.class_redefine_generation_handle(declaring_id));
+            drop(cm);
+            LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(key, (Arc::clone(&c), gate));
+            });
+            c
+        }
+    };
+    if args.len() != cached.num_params as usize + 1 {
+        return Ok(None);
+    }
+    // TDigest's lambda adapter repeatedly invokes the concrete array accessor
+    // `(I)D`. When that leaf is already compiled and has no dispatch helpers,
+    // enter it directly instead of materializing an interpreter frame per get.
+    // Other lambda implementations retain the generic cached-frame path below.
+    if !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
+        && &*cached.method_name == "get"
+        && &*cached.method_descriptor == "(I)D"
+    {
+        let compiled = {
+            let cache = shared.jit.jit_cache.read();
+            cache.get(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+                cached.declaring_class_id,
+            )
+        };
+        if let Some(compiled) = compiled {
+            if !compiled.has_dispatch {
+                let raw = match (args.get(0), args.get(1)) {
+                    (Some(Value::Object(Some(receiver))), Some(Value::Int(index))) => {
+                        let vm_ptr = shared as *const _ as i64;
+                        let jit_args = [receiver.as_ptr() as i64, *index as i64];
+                        let _guard =
+                            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(
+                                &*compiled,
+                            );
+                        // SAFETY: the compiled entry's ABI and optional context
+                        // are selected from its own verified metadata above.
+                        unsafe {
+                            if compiled.needs_context() {
+                                compiled.try_call_with_context(vm_ptr, &jit_args)
+                            } else {
+                                compiled.try_call(&jit_args)
+                            }
+                        }
+                        .ok()
+                    }
+                    _ => None,
+                };
+                if let Some(bits) = raw {
+                    return Ok(Some(Some(Value::Double(f64::from_bits(bits as u64)))));
+                }
+            }
+        }
+    }
+    thread.refill_pools_from_shared(
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+    let frame = Frame::new_pooled_cached(
+        cached,
+        args,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    execute_prebuilt_frame(shared, thread, frame).map(Some)
+}
+
+/// Try to dispatch a method call on a lambda proxy object.
+///
+/// Returns:
+/// - `Ok(Some(Some(value)))` — lambda handled the call and produced a return value
+/// - `Ok(Some(None))` — lambda handled the call (void return)
+/// - `Ok(None)` — not a lambda proxy, fall through to normal dispatch
+///
+/// WP2.5: also called from `proxy_invoke_handler_shared` when the
+/// `InvocationHandler` is itself a lambda — the synthetic lambda
+/// proxy's class_id is not in the class store, so the standard
+/// `invoke_or_native` fallback would mis-route to the abstract
+/// `java/lang/reflect/InvocationHandler.invoke` (which has no Code
+/// attribute).
+thread_local! {
+    pub(super) static LAMBDA_DISPATCH_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn lambda_dispatch_active() -> bool {
+    LAMBDA_DISPATCH_DEPTH.with(|depth| depth.get() != 0)
+}
+
+pub(crate) fn try_lambda_dispatch(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    obj_ref: ObjectRef,
+    obj_class_id: ClassId,
+    method_name: &str,
+    method_descriptor: &str,
+    call_args: &[Value],
+) -> Result<Option<Option<Value>>, MethodCallFailed> {
+    // S-bytebuddy r4 — independent recursion guard for lambda dispatch.
+    // Lambda SAM implementations can re-enter `try_lambda_dispatch` via
+    // `invoke_or_native` / `invoke_shared` when the impl body itself
+    // invokes another lambda (the common `stream.map(x -> ...).filter(y
+    // -> ...)` shape). The aggregate EXEC_DEPTH guard catches this only
+    // after the Rust stack has grown by ~10 frames per turn. A dedicated
+    // counter trips much earlier with a tight cap.
+    thread_local! {
+        static LAMBDA_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    struct LambdaDepthGuard;
+    impl Drop for LambdaDepthGuard {
+        fn drop(&mut self) {
+            LAMBDA_DEPTH.with(|d| {
+                let v = d.get();
+                d.set(v.saturating_sub(1));
+            });
+        }
+    }
+    let ldepth = LAMBDA_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if ldepth > 2_000 {
+        LAMBDA_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v.saturating_sub(1));
+        });
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::StackOverflowError,
+        )));
+    }
+    let _lambda_depth_guard = LambdaDepthGuard;
+
+    struct LambdaDispatchGuard;
+    impl Drop for LambdaDispatchGuard {
+        fn drop(&mut self) {
+            LAMBDA_DISPATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    LAMBDA_DISPATCH_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let _lambda_dispatch_guard = LambdaDispatchGuard;
+
+    // Look up the lambda proxy metadata for this ClassId.
+    let call_site = {
+        let proxies = shared.classes.lambda_proxies.read();
+        match proxies.get(&obj_class_id) {
+            Some(lcs) => lcs.clone(),
+            None => return Ok(None), // Not a lambda proxy
+        }
+    };
+    if crate::runtime::env_cache::lambda_dbg() {
+        eprintln!(
+            "[cratonvm-dbg] lambda dispatch entry: cid={} sam={}.{} impl={}.{}{} kind={:?}",
+            obj_class_id,
+            call_site.functional_interface,
+            method_name,
+            call_site.impl_handle.class_name,
+            call_site.impl_handle.member_name,
+            call_site.impl_handle.descriptor,
+            call_site.impl_handle.kind,
+        );
+    }
+
+    // A functional interface may declare same-named default overloads of its
+    // SAM. Dispatching a lambda by method name, arity, or runtime argument
+    // assignability is unsound: null is assignable to both `InetAddress` and
+    // `InetSocketAddress`, so the latter default could be skipped entirely.
+    // The bytecode call-site descriptor is the authoritative identity. Only the
+    // exact SAM descriptor may enter the lambda body; any other descriptor must
+    // fall through to ordinary interface/default-method dispatch.
+    if method_name == &*call_site.sam_method_name && method_descriptor != &*call_site.sam_descriptor
+    {
+        return Ok(None);
+    }
+
+    // Only intercept calls to the SAM (single abstract method). Default
+    // methods on the functional interface (e.g. Function.andThen,
+    // Predicate.and) are dispatched directly via the native registry on
+    // the functional interface class.
+    if method_name != &*call_site.sam_method_name {
+        // RScala.1 bridge: Scala 3 produces lambdas whose functional
+        // interface is `scala/runtime/java8/JFunctionN$mcXYZ$sp`, which
+        // declares the SAM as a primitive-specialized method (e.g.
+        // `apply$mcII$sp(I)I`). The Scala stdlib's `Function1` has a
+        // default `apply$mcII$sp(int)` that boxes + calls `apply(Object)`,
+        // while `JFunction1$mcII$sp` has a default `apply(Object)` that
+        // unboxes + calls `apply$mcII$sp(int)`. Without picking the
+        // maximally-specific default, they ping-pong until StackOverflow.
+        // Bridge here: if a non-SAM method is `apply` on a Scala
+        // specialized function interface, unbox args → call SAM → box.
+        if method_name == "apply"
+            && call_site
+                .functional_interface
+                .starts_with("scala/runtime/java8/JFunction")
+            && call_site.sam_method_name.starts_with("apply$mc")
+        {
+            // Parse the specialization tag from the SAM name, e.g.
+            // "apply$mcII$sp" → ("I","I") for (I)I.
+            // Format: apply$mc<RET><ARG...>$sp.
+            let tag = call_site
+                .sam_method_name
+                .strip_prefix("apply$mc")
+                .and_then(|s| s.strip_suffix("$sp"));
+            if let Some(tag) = tag {
+                // First char = return type, rest = arg types.
+                let mut chars = tag.chars();
+                let ret_ch = chars.next().unwrap_or('V');
+                let arg_chars: Vec<char> = chars.collect();
+
+                // Unbox each argument (call_args are all boxed Object).
+                let mut unboxed: Vec<Value> = Vec::with_capacity(arg_chars.len());
+                for (i, &ac) in arg_chars.iter().enumerate() {
+                    let v = call_args.get(i).copied().unwrap_or(Value::Object(None));
+                    let u = match (ac, v) {
+                        ('I' | 'Z' | 'B' | 'S' | 'C', Value::Object(Some(b))) => {
+                            shared.mem.heap.get_field(b, 0)
+                        }
+                        ('J', Value::Object(Some(b))) => shared.mem.heap.get_field(b, 0),
+                        ('F', Value::Object(Some(b))) => shared.mem.heap.get_field(b, 0),
+                        ('D', Value::Object(Some(b))) => shared.mem.heap.get_field(b, 0),
+                        (_, other) => other,
+                    };
+                    unboxed.push(u);
+                }
+
+                // Reenter lambda dispatch with the SAM method name and
+                // unboxed args. Note: call_args we pass are the SAM's
+                // primitive args (captures are read inside).
+                let sam_name = call_site.sam_method_name.clone();
+                // Drop call_site borrow before recursing indirectly.
+                // Recursion depth is bounded (one hop to SAM path).
+                drop(call_site);
+                // Reborrow fresh to avoid use-after-move.
+                let lcs = {
+                    let proxies = shared.classes.lambda_proxies.read();
+                    proxies.get(&obj_class_id).cloned()
+                };
+                let lcs = match lcs {
+                    Some(l) => l,
+                    None => {
+                        crate::runtime::diagnostics::record_swallow(
+                            shared,
+                            "lambda-dispatch",
+                            "proxy-lost-mid-dispatch",
+                            &format!("class_id={} method={}", obj_class_id, method_name),
+                        );
+                        return Ok(None);
+                    }
+                };
+
+                // Execute the SAM path directly (mirrors the code below).
+                let num_captures = lcs.capture_types.len();
+                let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + unboxed.len());
+                for i in 0..num_captures {
+                    full_args.push(shared.mem.heap.get_field(obj_ref, i));
+                }
+                full_args.extend(unboxed);
+                let _ = sam_name; // sam path uses lcs.impl_handle
+
+                // Dispatch to the implementation handle.
+                let result_val = match lcs.impl_handle.kind {
+                    MethodHandleKind::InvokeStatic => {
+                        if let Some(impl_cid) = lambda_impl_dispatch_override(shared, &lcs) {
+                            crate::vm::invoke_on_class_shared_no_retarget(
+                                shared,
+                                thread,
+                                impl_cid,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )?
+                        } else {
+                            invoke_shared(
+                                shared,
+                                thread,
+                                &lcs.impl_handle.class_name,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )?
+                        }
+                    }
+                    MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface => {
+                        if full_args.is_empty() {
+                            crate::runtime::diagnostics::record_swallow(
+                                shared,
+                                "lambda-dispatch",
+                                "virtual-no-receiver",
+                                &format!(
+                                    "class={} member={}",
+                                    lcs.impl_handle.class_name, lcs.impl_handle.member_name
+                                ),
+                            );
+                            return Ok(None);
+                        }
+                        let rcv_id_opt = match &full_args[0] {
+                            Value::Object(Some(r)) => Some(shared.mem.heap.class_id_of(*r)),
+                            _ => None,
+                        };
+                        let receiver_class = match rcv_id_opt {
+                            Some(rcv) => shared
+                                .classes
+                                .class_manager
+                                .read()
+                                .get_class(rcv)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_else(|| lcs.impl_handle.class_name.to_string()),
+                            None => lcs.impl_handle.class_name.to_string(),
+                        };
+                        // Loader-faithful (gated): dispatch on the receiver's exact
+                        // class_id when it diverges from the by-name global copy.
+                        let vov = if crate::runtime::env_cache::loader_aware_resolution() {
+                            rcv_id_opt.filter(|rcv| {
+                                *rcv != ClassId::new(0)
+                                    && !shared.classes.lambda_proxies.read().contains_key(rcv)
+                                    && {
+                                        let cm = shared.classes.class_manager.read();
+                                        cm.get_class(*rcv)
+                                            .map(|c| &*c.name == receiver_class.as_str())
+                                            .unwrap_or(false)
+                                            && cm.get_loaded_class_id(&receiver_class) != Some(*rcv)
+                                    }
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(rcv_cid) = vov {
+                            invoke_on_class_shared(
+                                shared,
+                                thread,
+                                rcv_cid,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )?
+                        } else {
+                            invoke_or_native(
+                                shared,
+                                thread,
+                                &receiver_class,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )?
+                        }
+                    }
+                    other => {
+                        crate::runtime::diagnostics::record_swallow(
+                            shared,
+                            "lambda-dispatch",
+                            "unsupported-handle-kind",
+                            &format!(
+                                "kind={:?} class={} member={}",
+                                other, lcs.impl_handle.class_name, lcs.impl_handle.member_name
+                            ),
+                        );
+                        return Ok(None);
+                    }
+                };
+
+                // Box the primitive return to match apply(Object)Object
+                // by invoking the respective `valueOf` static.
+                let box_one = |shared: &SharedVm,
+                               thread: &mut JvmThread,
+                               cls: &str,
+                               desc: &str,
+                               prim: Value|
+                 -> Result<Value, MethodCallFailed> {
+                    let r = invoke_shared(shared, thread, cls, "valueOf", desc, &[prim])?;
+                    Ok(r.unwrap_or(Value::Object(None)))
+                };
+                let raw = result_val.unwrap_or(Value::Object(None));
+                let boxed = match (ret_ch, raw) {
+                    ('V', _) => Some(Value::Object(None)),
+                    ('Z', Value::Int(i)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Boolean",
+                        "(Z)Ljava/lang/Boolean;",
+                        Value::Int(i),
+                    )?),
+                    ('B', Value::Int(i)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Byte",
+                        "(B)Ljava/lang/Byte;",
+                        Value::Int(i),
+                    )?),
+                    ('S', Value::Int(i)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Short",
+                        "(S)Ljava/lang/Short;",
+                        Value::Int(i),
+                    )?),
+                    ('C', Value::Int(i)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Character",
+                        "(C)Ljava/lang/Character;",
+                        Value::Int(i),
+                    )?),
+                    ('I', Value::Int(i)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Integer",
+                        "(I)Ljava/lang/Integer;",
+                        Value::Int(i),
+                    )?),
+                    ('J', Value::Long(l)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Long",
+                        "(J)Ljava/lang/Long;",
+                        Value::Long(l),
+                    )?),
+                    ('F', Value::Float(f)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Float",
+                        "(F)Ljava/lang/Float;",
+                        Value::Float(f),
+                    )?),
+                    ('D', Value::Double(d)) => Some(box_one(
+                        shared,
+                        thread,
+                        "java/lang/Double",
+                        "(D)Ljava/lang/Double;",
+                        Value::Double(d),
+                    )?),
+                    (_, v) => Some(v),
+                };
+                return Ok(Some(boxed));
+            }
+        }
+
+        // Build full args with receiver prepended.
+        let mut full_args = Vec::with_capacity(1 + call_args.len());
+        full_args.push(Value::Object(Some(obj_ref)));
+        full_args.extend_from_slice(call_args);
+
+        // Try common descriptor patterns for default methods.
+        let iface = &call_site.functional_interface;
+        let descriptors = [
+            format!("(L{iface};)L{iface};"), // andThen/compose/and/or
+            format!("()L{iface};"),          // negate/identity
+        ];
+        for desc in &descriptors {
+            if let Some(callback) = shared.natives.native_methods.find(iface, method_name, desc) {
+                let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+                // Widening: small integer index -> usize (non-negative, fits in pointer width)
+                let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
+                let result = callback(&mut ctx, &full_args);
+                cratonvm_native_api::native_ring::record_exit(_ring_idx);
+                let result = result?;
+                return Ok(Some(result));
+            }
+        }
+        // Not found in native registry — fall through to normal dispatch
+        return Ok(None);
+    }
+
+    // Read captured values from the proxy object's fields.
+    let num_captures = call_site.capture_types.len();
+    let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + call_args.len());
+    for i in 0..num_captures {
+        full_args.push(shared.mem.heap.get_field(obj_ref, i));
+    }
+    // Append the invocation arguments (passed by the caller after the receiver).
+    full_args.extend_from_slice(call_args);
+
+    // Dispatch based on the implementation method handle kind.
+    let sam_desc = call_site.sam_descriptor.clone();
+    let impl_desc = call_site.impl_handle.descriptor.clone();
+    let inst_desc = call_site.instantiated_descriptor.clone();
+    let (_sam_params_tmp, sam_ret) = split_method_descriptor(&sam_desc);
+    let (_impl_params_tmp, impl_ret) = split_method_descriptor(&impl_desc);
+    match call_site.impl_handle.kind {
+        MethodHandleKind::InvokeStatic => {
+            // Static method: all args are parameters (no receiver).
+            coerce_lambda_args(
+                shared,
+                thread,
+                &sam_desc,
+                &impl_desc,
+                &inst_desc,
+                &mut full_args,
+                false,
+                num_captures,
+            )?;
+            if crate::runtime::env_cache::lambda_dbg() {
+                eprintln!(
+                    "[cratonvm-dbg] lambda static-pre-invoke: {}.{}{} args={}",
+                    call_site.impl_handle.class_name,
+                    call_site.impl_handle.member_name,
+                    call_site.impl_handle.descriptor,
+                    full_args.len(),
+                );
+            }
+            let result = if let Some(impl_cid) =
+                lambda_impl_dispatch_override_driven(shared, thread, &call_site)
+            {
+                // Loader-faithful: the enclosing class was defined by a user
+                // loader whose copy of the impl owner diverges from the global
+                // one; dispatch on the exact loader-local class (static → no
+                // receiver retarget).
+                crate::vm::invoke_on_class_shared_no_retarget(
+                    shared,
+                    thread,
+                    impl_cid,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )?
+            } else {
+                invoke_shared(
+                    shared,
+                    thread,
+                    &call_site.impl_handle.class_name,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )?
+            };
+            if crate::runtime::env_cache::lambda_dbg() {
+                eprintln!(
+                    "[cratonvm-dbg] lambda static-post-invoke: {}.{}{} result={:?}",
+                    call_site.impl_handle.class_name,
+                    call_site.impl_handle.member_name,
+                    call_site.impl_handle.descriptor,
+                    result.is_some(),
+                );
+            }
+            Ok(Some(coerce_return(
+                shared, thread, &sam_ret, &impl_ret, result,
+            )?))
+        }
+        MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface => {
+            // Virtual/interface: first arg is receiver, rest are parameters.
+            if full_args.is_empty() {
+                return Err(VmError::Internal {
+                    message: "lambda dispatch: InvokeVirtual/InvokeInterface with no args"
+                        .to_string(),
+                }
+                .into());
+            }
+            // Coerce args (keep receiver at [0] unchanged for virtual dispatch).
+            coerce_lambda_args(
+                shared,
+                thread,
+                &sam_desc,
+                &impl_desc,
+                &inst_desc,
+                &mut full_args,
+                true,
+                num_captures,
+            )?;
+            let private_impl_class = lambda_private_impl_dispatch_class(shared, &call_site);
+            // Round 7 — if the receiver is itself a lambda proxy whose SAM
+            // matches the impl_handle's member name, recurse through
+            // try_lambda_dispatch directly. Without this, downstream
+            // `invoke_or_native` falls back to the cp interface name (because
+            // class_manager.get_class fails on lambda-proxy class_ids), then
+            // resolves the abstract interface declaration with no Code attribute
+            // and surfaces an AbstractMethodError. Concrete tripwire: Spring
+            // Boot's `CacheOverrides.close()` does
+            // `forEach(CacheOverride::close)` and the iterated items are
+            // themselves NOOP `CacheOverride` lambdas declared as static
+            // fields on `SoftReferenceConfigurationPropertyCache` — every
+            // item is a lambda proxy, never a concrete CacheOverride.
+            if let Value::Object(Some(r)) = &full_args[0] {
+                let rcv_class_id = shared.mem.heap.class_id_of(*r);
+                let recv_is_lambda = shared
+                    .classes
+                    .lambda_proxies
+                    .read()
+                    .contains_key(&rcv_class_id);
+                if recv_is_lambda {
+                    let inner = try_lambda_dispatch(
+                        shared,
+                        thread,
+                        *r,
+                        rcv_class_id,
+                        &call_site.impl_handle.member_name,
+                        &call_site.impl_handle.descriptor,
+                        &full_args[1..],
+                    )?;
+                    if let Some(inner_v) = inner {
+                        return Ok(Some(coerce_return(
+                            shared, thread, &sam_ret, &impl_ret, inner_v,
+                        )?));
+                    }
+                }
+            }
+            // Resolve the actual class of the receiver for virtual dispatch.
+            let recv_class_id_opt = match &full_args[0] {
+                Value::Object(Some(r)) => Some(shared.mem.heap.class_id_of(*r)),
+                _ => None,
+            };
+            // Diagnostic (CRATONVM_DBG_LAMBDA): when a lambda dispatch receiver
+            // resolves to an unknown/zero class (the stale-captured-reference
+            // family — NoSuchMethodError like "java/lang/Object.get(I)D"),
+            // dump the raw pointer, its class id, the load_and_forward result,
+            // and a FRESH re-read of the proxy's capture field. Discriminates
+            // "stale baked into the proxy field" (fresh re-read returns the
+            // same dead pointer) from a transient Rust-local staleness.
+            if crate::runtime::env_cache::lambda_dbg() {
+                if let (Some(cid), Value::Object(Some(r))) = (recv_class_id_opt, &full_args[0]) {
+                    if cid == ClassId::new(0) {
+                        let fwd = shared.mem.heap.load_and_forward(*r);
+                        let fwd_cid = shared.mem.heap.class_id_of(fwd);
+                        let fresh = shared.mem.heap.get_field(obj_ref, 0);
+                        let (fresh_ptr, fresh_cid) = match fresh {
+                            Value::Object(Some(f)) => {
+                                (f.as_ptr() as usize, Some(shared.mem.heap.class_id_of(f)))
+                            }
+                            _ => (0, None),
+                        };
+                        eprintln!(
+                            "[lambda-nsme-diag] recv={:p} cid={:?} fwd={:p} fwd_cid={:?} \
+                             proxy={:p} fresh_field=0x{:x} fresh_cid={:?} impl={}.{}{}",
+                            r.as_ptr(),
+                            cid,
+                            fwd.as_ptr(),
+                            fwd_cid,
+                            obj_ref.as_ptr(),
+                            fresh_ptr,
+                            fresh_cid,
+                            call_site.impl_handle.class_name,
+                            call_site.impl_handle.member_name,
+                            call_site.impl_handle.descriptor,
+                        );
+                    }
+                }
+            }
+            let receiver_class = match recv_class_id_opt {
+                Some(rcv_class_id) => shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(rcv_class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_else(|| call_site.impl_handle.class_name.to_string()),
+                None => call_site.impl_handle.class_name.to_string(),
+            };
+            // Loader-faithful (gated): when the receiver's runtime class diverges
+            // from the by-name global resolution — a per-loader (e.g. bytecode-
+            // enhanced) copy — dispatch on the receiver's EXACT class_id so the
+            // lambda body runs that loader's copy. `invoke_or_native` otherwise
+            // collapses `receiver_class` (a name) to the global copy, running the
+            // un-enhanced lambda body (`new Country` → un-enhanced entity →
+            // reflective `Field.set` mismatch). Mirrors the ordinary
+            // invoke_virtual divergence override.
+            let virtual_override = if crate::runtime::env_cache::loader_aware_resolution() {
+                recv_class_id_opt.filter(|rcv| {
+                    *rcv != ClassId::new(0)
+                        && !shared.classes.lambda_proxies.read().contains_key(rcv)
+                        && {
+                            let cm = shared.classes.class_manager.read();
+                            // Only when `receiver_class` truly names the receiver's
+                            // own real class (not the impl-handle fallback for a
+                            // lambda-proxy / generic-ClassId receiver) AND that name
+                            // globally resolves to a DIFFERENT (per-loader) copy.
+                            cm.get_class(*rcv)
+                                .map(|c| &*c.name == receiver_class.as_str())
+                                .unwrap_or(false)
+                                && cm.get_loaded_class_id(&receiver_class) != Some(*rcv)
+                        }
+                })
+            } else {
+                None
+            };
+            // A private instance lambda body is encoded by javac as an
+            // InvokeVirtual handle, but it retains invokespecial semantics:
+            // resolve it on the handle's declaring class, not by walking the
+            // captured receiver's hierarchy. Synthetic lambda names are not
+            // unique across a hierarchy (for example both Spring Data's
+            // AnnotationBasedPersistentProperty and AbstractPersistentProperty
+            // have lambda$new$2), so receiver-based lookup can execute a
+            // different private body with the same name and descriptor.
+            let impl_owner_id = lambda_impl_dispatch_override(shared, &call_site).or_else(|| {
+                shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_loaded_class_id(&call_site.impl_handle.class_name)
+            });
+            let private_impl_owner = impl_owner_id.filter(|owner_id| {
+                shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(*owner_id)
+                    .and_then(|class| {
+                        class.find_method(
+                            &call_site.impl_handle.member_name,
+                            &call_site.impl_handle.descriptor,
+                        )
+                    })
+                    .is_some_and(|method| method.access_flags.contains(MethodAccessFlags::PRIVATE))
+            });
+            // Keep the existing loader-faithful private implementation owner
+            // when it is available; otherwise use the declaring owner found
+            // above for private synthetic lambda methods.
+            let exact_impl_owner = private_impl_class.or(private_impl_owner);
+            let cached_result = if exact_impl_owner.is_none() {
+                recv_class_id_opt
+                    .filter(|rcv| *rcv != ClassId::new(0))
+                    .map(|rcv| {
+                        try_invoke_cached_lambda_impl(
+                            shared,
+                            thread,
+                            obj_class_id,
+                            rcv,
+                            &call_site.impl_handle.member_name,
+                            &call_site.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            let result = if let Some(owner_id) = exact_impl_owner {
+                crate::vm::invoke_on_class_shared_no_retarget(
+                    shared,
+                    thread,
+                    owner_id,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )
+            } else if let Some(result) = cached_result {
+                Ok(result)
+            } else if let Some(rcv_cid) = virtual_override {
+                invoke_on_class_shared(
+                    shared,
+                    thread,
+                    rcv_cid,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )
+            } else if let Some(rcv_cid) = recv_class_id_opt.filter(|rcv| {
+                *rcv != ClassId::new(0)
+                    && !shared.classes.lambda_proxies.read().contains_key(rcv)
+                    && shared
+                        .classes
+                        .class_manager
+                        .read()
+                        .get_class(*rcv)
+                        .is_some()
+            }) {
+                // The captured receiver is already a loaded, concrete object.
+                // Dispatch by its ClassId instead of converting it back to a class
+                // name and re-entering invoke_shared's class-loader path for every
+                // SAM call. invoke_on_class_shared keeps the normal native
+                // precedence, virtual retargeting, monitor, and exception rules.
+                invoke_on_class_shared(
+                    shared,
+                    thread,
+                    rcv_cid,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )
+            } else {
+                invoke_or_native(
+                    shared,
+                    thread,
+                    &receiver_class,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )
+            };
+            // If receiver's class didn't have the SAM method, fall back to the
+            // class specified in the lambda call site. Handles objects with
+            // generic ClassId (stub/Object) targeting a specific class.
+            //
+            // HIB-CV-31 FIX: the retry must fire ONLY when the SAM itself failed
+            // to resolve on the receiver — i.e. the `NoSuchMethodError` names
+            // exactly `(receiver_class, member_name)`. The old guard fired for
+            // ANY `NoSuchMethodError`, including one raised deep INSIDE a
+            // successfully-dispatched `onFlush` body (e.g. H2's `IOUtils.readFully`
+            // calling `in.read()` on a corrupted `InputStream` reference →
+            // `java/lang/Object.read()I` NSME). Because `receiver_class`
+            // (`DefaultFlushEventListener`) != `impl_handle.class_name`
+            // (the abstract `FlushEventListener`), the old guard re-dispatched
+            // `onFlush` onto the abstract interface — which has no Code attribute
+            // — fabricating a misleading `AbstractMethodError` that both masked
+            // the real in-body error and reported a phantom dispatch failure.
+            // Constraining the NSME to the SAM's own (class, method) makes the
+            // retry serve only its intended case (generic-ClassId receiver) and
+            // lets genuine in-body linkage errors propagate unchanged.
+            let result = match &result {
+                Err(MethodCallFailed::InternalError(VmError::Linkage(
+                    LinkageError::NoSuchMethodError {
+                        class_name: nsme_class,
+                        method_name: nsme_method,
+                        ..
+                    },
+                ))) if receiver_class.as_str() != &*call_site.impl_handle.class_name
+                    && nsme_class.as_str() == receiver_class.as_str()
+                    && nsme_method.as_str() == &*call_site.impl_handle.member_name =>
+                {
+                    invoke_or_native(
+                        shared,
+                        thread,
+                        &call_site.impl_handle.class_name,
+                        &call_site.impl_handle.member_name,
+                        &call_site.impl_handle.descriptor,
+                        &full_args,
+                    )
+                }
+                _ => result,
+            };
+            let r = result?;
+            Ok(Some(coerce_return(shared, thread, &sam_ret, &impl_ret, r)?))
+        }
+        MethodHandleKind::InvokeSpecial => {
+            // Special: dispatch on the declaring class (no virtual lookup).
+            //
+            // `invokespecial` always targets an instance method (private or
+            // super-call); the lambda capture list therefore begins with the
+            // bound `this`, which sits at `full_args[0]` once captures are
+            // prepended.  `coerce_lambda_args` must skip that slot — passing
+            // `receiver_present=false` here causes the argument-to-parameter
+            // index map to slide by one, leaving the last SAM-supplied arg
+            // unconverted.  Concrete failure: Flink's `getRawValueFromOption`
+            // lambda binds `getRawValue(String, Z)` from a
+            // `BiFunction<String, Boolean, ...>`; with the off-by-one the
+            // trailing `Boolean` reaches the impl's `boolean` slot still
+            // boxed, and `iload_2` later raises
+            // "expected int on stack, got ref(...)".
+            coerce_lambda_args(
+                shared,
+                thread,
+                &sam_desc,
+                &impl_desc,
+                &inst_desc,
+                &mut full_args,
+                true,
+                num_captures,
+            )?;
+            // Loader-faithful owner resolution (gated): prefer the enclosing
+            // loader's copy of the impl class when it diverges from the global.
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .classes
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
+            // A REF_invokeSpecial lambda target is statically bound to its
+            // implementation owner.  In particular, an Interface.crate::runtime::m
+            // method reference must reach that interface default method even
+            // when the receiver overrides m.  Retargeting here can resolve a
+            // same-named synthetic lambda helper on the receiver instead and
+            // recurse through the default method indefinitely.
+            let result = crate::vm::invoke_on_class_shared_no_retarget(
+                shared,
+                thread,
+                class_id,
+                &call_site.impl_handle.member_name,
+                &call_site.impl_handle.descriptor,
+                &full_args,
+            )?;
+            Ok(Some(coerce_return(
+                shared, thread, &sam_ret, &impl_ret, result,
+            )?))
+        }
+        MethodHandleKind::NewInvokeSpecial => {
+            // Constructor reference: allocate object, call <init>, return the object.
+            // Loader-faithful owner resolution (gated), same rationale as above.
+            //
+            // Residual 4 (2026-07-20, docs/known-issues/springboot/
+            // core-spring-boot-test-config-data-and-classpath-scan-cluster.md):
+            // this used the PASSIVE-only `lambda_impl_dispatch_override` (cache
+            // read, never drives a cold miss) with a loader-blind
+            // `load_class(name)` fallback — the exact InvokeStatic gap already
+            // fixed by `lambda_impl_dispatch_override_driven` (see that
+            // function's own doc comment), just never mirrored onto this sibling
+            // MethodHandleKind. A constructor-reference lambda
+            // (`SomeType::new`, e.g. Spring AOT's generated
+            // `AotApplicationContextInitializer::new` factory) whose impl class
+            // is the very FIRST thing touched from a fork loader's namespace hit
+            // the same loader-blind fallback and minted an Application-loader
+            // copy instead of the fork's own. (Independently fixed upstream on
+            // origin/dev with the same shape; kept in sync here.)
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .classes
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
+            // Array-constructor reference (`SomeType[]::new`, e.g. as an
+            // `IntFunction<SomeType[]>` — the mechanism behind
+            // `Collection.toArray(SomeType[]::new)` and any direct user code).
+            // `load_class` already resolves an array-shaped impl class name
+            // (e.g. "[Ljava/nio/ByteBuffer;") to its synthesized array
+            // ClassId (JVMS 5.3.3 — array classes are never loaded from a
+            // class file), but everything below this point assumes a
+            // REGULAR object: it allocates `num_total_fields` (0 for an
+            // array class) object slots and dispatches `<init>`, which does
+            // not exist for arrays. That produced a zero-field object
+            // wearing the array's ClassId — no length header, no element
+            // storage, and the requested length (the sole `IntFunction`
+            // argument) silently discarded — which a later `checkcast` to
+            // the real array type then rejects
+            // (`ClassCastException: ... cannot be cast to [Lyour/Type;`).
+            // Detect the array case up front and dispatch to real array
+            // allocation instead.
+            let array_info = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .and_then(|c| c.array_info.clone());
+            if let Some(array_info) = array_info {
+                let length =
+                    full_args
+                        .first()
+                        .and_then(Value::as_int)
+                        .ok_or_else(|| VmError::Internal {
+                            message: "array-constructor-reference: missing length arg".to_string(),
+                        })?;
+                if length < 0 {
+                    return Err(RuntimeError::NegativeArraySizeException { size: length }.into());
+                }
+                let (element_type, component_class_id) = if array_info.array_dimension == 1 {
+                    match &*array_info.leaf_component_name {
+                        "boolean" => (ArrayElementType::Boolean, ClassId::new(0)),
+                        "char" => (ArrayElementType::Char, ClassId::new(0)),
+                        "float" => (ArrayElementType::Float, ClassId::new(0)),
+                        "double" => (ArrayElementType::Double, ClassId::new(0)),
+                        "byte" => (ArrayElementType::Byte, ClassId::new(0)),
+                        "short" => (ArrayElementType::Short, ClassId::new(0)),
+                        "int" => (ArrayElementType::Int, ClassId::new(0)),
+                        "long" => (ArrayElementType::Long, ClassId::new(0)),
+                        _ => (ArrayElementType::Reference, array_info.component_class_id),
+                    }
+                } else {
+                    (ArrayElementType::Reference, array_info.component_class_id)
+                };
+                let arr = gc_alloc_array(
+                    shared,
+                    thread,
+                    component_class_id,
+                    element_type,
+                    length as usize,
+                )?;
+                maybe_gc(shared, thread);
+                return Ok(Some(Some(Value::Object(Some(arr)))));
+            }
+            ensure_class_initialized_shared(shared, thread, class_id)?;
+            // Use `num_total_fields` (inherited + declared instance fields),
+            // matching the `New` opcode. `c.fields.len()` is wrong here: it
+            // counts this class's declared fields *including statics* while
+            // omitting inherited instance fields, so a subclass constructor
+            // reference would under-allocate and trip the GC `get_field`
+            // bounds guard on any inherited-field access.
+            let num_fields = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.num_total_fields)
+                .unwrap_or(0);
+            let new_obj = gc_alloc_object(shared, thread, class_id, num_fields)?;
+            // Build <init> args: [new_obj, ...full_args]. The constructor body
+            // can allocate and trigger a moving GC; the Java frame/locals are
+            // remapped, but this Rust local `new_obj` is not. Pin the receiver
+            // across `<init>` and return the forwarded object ref, mirroring the
+            // MethodHandle `newInvokeSpecial` path in `vm_exec.rs`.
+            let new_obj_pin = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(new_obj);
+            let init_result = (|| -> Result<(), MethodCallFailed> {
+                let mut init_args = Vec::with_capacity(1 + full_args.len());
+                init_args.push(Value::Object(Some(new_obj)));
+                init_args.extend_from_slice(&full_args);
+                invoke_on_class_shared(
+                    shared,
+                    thread,
+                    class_id,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &init_args,
+                )?;
+                Ok(())
+            })();
+            let forwarded = thread
+                .native_pin_roots
+                .get(new_obj_pin)
+                .copied()
+                .unwrap_or(new_obj);
+            thread.native_pin_roots.truncate(new_obj_pin);
+            init_result?;
+            Ok(Some(Some(Value::Object(Some(forwarded)))))
+        }
+        MethodHandleKind::GetField => {
+            // Field getter: first arg is the object, return the field value.
+            if full_args.is_empty() {
+                return Err(VmError::Internal {
+                    message: "lambda dispatch: GetField with no args".to_string(),
+                }
+                .into());
+            }
+            match &full_args[0] {
+                Value::Object(Some(target_ref)) => {
+                    // We need to resolve the field index. For simplicity, do a field lookup.
+                    let target_class_id = shared.mem.heap.class_id_of(*target_ref);
+                    let field_index = {
+                        let cm = shared.classes.class_manager.read();
+                        find_field_recursive(
+                            target_class_id,
+                            &call_site.impl_handle.member_name,
+                            &cm.class_store,
+                        )
+                        .map(|(idx, _, _)| idx)
+                        .ok_or_else(|| VmError::Internal {
+                            message: format!(
+                                "lambda dispatch: field {} not found",
+                                call_site.impl_handle.member_name
+                            ),
+                        })?
+                    };
+                    let value = shared.mem.heap.get_field(*target_ref, field_index);
+                    Ok(Some(Some(value)))
+                }
+                _ => Err(VmError::Internal {
+                    message: "lambda dispatch: GetField on null".to_string(),
+                }
+                .into()),
+            }
+        }
+        MethodHandleKind::GetStatic => {
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .classes
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
+            ensure_class_initialized_shared(shared, thread, class_id)?;
+            let field_index = {
+                let cm = shared.classes.class_manager.read();
+                find_field_recursive(
+                    class_id,
+                    &call_site.impl_handle.member_name,
+                    &cm.class_store,
+                )
+                .map(|(idx, _, _)| idx)
+                .ok_or_else(|| VmError::Internal {
+                    message: format!(
+                        "lambda dispatch: static field {} not found",
+                        call_site.impl_handle.member_name
+                    ),
+                })?
+            };
+            let value = crate::vm::get_static_shared(shared, class_id, field_index);
+            Ok(Some(Some(value)))
+        }
+        MethodHandleKind::PutField => {
+            if full_args.len() < 2 {
+                return Err(VmError::Internal {
+                    message: "lambda dispatch: PutField needs object + value".to_string(),
+                }
+                .into());
+            }
+            match &full_args[0] {
+                Value::Object(Some(target_ref)) => {
+                    let target_class_id = shared.mem.heap.class_id_of(*target_ref);
+                    let field_index = {
+                        let cm = shared.classes.class_manager.read();
+                        find_field_recursive(
+                            target_class_id,
+                            &call_site.impl_handle.member_name,
+                            &cm.class_store,
+                        )
+                        .map(|(idx, _, _)| idx)
+                        .ok_or_else(|| VmError::Internal {
+                            message: format!(
+                                "lambda dispatch: field {} not found",
+                                call_site.impl_handle.member_name
+                            ),
+                        })?
+                    };
+                    shared
+                        .mem
+                        .heap
+                        .set_field(*target_ref, field_index, full_args[1]);
+                    Ok(Some(None))
+                }
+                _ => Err(VmError::Internal {
+                    message: "lambda dispatch: PutField on null".to_string(),
+                }
+                .into()),
+            }
+        }
+        MethodHandleKind::PutStatic => {
+            if full_args.is_empty() {
+                return Err(VmError::Internal {
+                    message: "lambda dispatch: PutStatic needs a value".to_string(),
+                }
+                .into());
+            }
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .classes
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
+            ensure_class_initialized_shared(shared, thread, class_id)?;
+            let field_index = {
+                let cm = shared.classes.class_manager.read();
+                find_field_recursive(
+                    class_id,
+                    &call_site.impl_handle.member_name,
+                    &cm.class_store,
+                )
+                .map(|(idx, _, _)| idx)
+                .ok_or_else(|| VmError::Internal {
+                    message: format!(
+                        "lambda dispatch: static field {} not found",
+                        call_site.impl_handle.member_name
+                    ),
+                })?
+            };
+            crate::vm::set_static_shared(shared, class_id, field_index, full_args[0]);
+            Ok(Some(None))
+        }
+    }
+}

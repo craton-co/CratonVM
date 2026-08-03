@@ -1259,6 +1259,11 @@ pub fn compile_with_param_slots(
         reserve_stack_floor,
         gc_inert_selfrec && reserve_stack_floor,
         precise_exception_frames,
+        // The `0xba` lowering emits a frame-deopt stub that spills 32 registers
+        // into the `SavedRegisters` region, and it does so whether or not
+        // `deopt_real_enabled()`. The frame therefore has to reserve that region
+        // on the same condition — see `deopt_regs_size` in `x64.rs`.
+        !indy_info.is_empty(),
         protected_ranges,
     );
     KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
@@ -1681,7 +1686,23 @@ pub fn compile_with_param_slots(
     // instruction boundary (malformed/unverified bytecode) — reject the
     // method rather than leave an unpatched jump in executable code.
     if !compiler.patch_branches() {
-        crate::note_jit_bail_site("branch-target-not-an-instruction-boundary");
+        // Name the target. `pc` here is the branch target with no native
+        // offset and `op` the byte at it — enough to check against a `javap -c`
+        // listing whether the target really is off-boundary (it usually is
+        // not: see `docs/internal/jit-tailcall-swallows-shared-return-FIXED-20260803.md`).
+        let (target, nearest) = compiler.unresolved_branch_target.unwrap_or((0, -1));
+        let target_op = code.get(target).copied().unwrap_or(0);
+        crate::note_jit_bail_site_at(
+            "branch-target-not-an-instruction-boundary",
+            target,
+            target_op,
+        );
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!(
+                "[cratonvm-jitc] branch-target-unresolved target={target} op=0x{target_op:02x} \
+                 nearest_emitted_at_or_below={nearest} code_len={code_len}"
+            );
+        }
         return None;
     }
 
