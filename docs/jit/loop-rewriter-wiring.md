@@ -13,6 +13,8 @@ Everything here lives in `jit/src/x64.rs` and `jit/src/x64/licm.rs`.
 | Piece | State |
 |---|---|
 | `plan_loop_unroll` as the native unroller's admission oracle | wired (unchanged) |
+| `plan_loop_peel` reachable from the planner | **wired** (the bypassable-header arm) |
+| `plan_loop_version` reachable from the planner | **wired** (all three arms) |
 | Compiling `xform.code` instead of `code` | **wired**, opt-in |
 | Replicating the pc-keyed side tables | **wired**, all 21, one expression |
 | Translating baked-in bcis via `bci_at` | **wired**, 4 sites |
@@ -61,11 +63,44 @@ One, because a `LoopXform` describes one rewrite and the primitives in
 `detect_loops` order wins (innermost-first for a nest). Every other loop is
 shifted correctly by the rewriter and simply not duplicated.
 
-The profitability band is character-for-character the native unroller's,
-including its PGO arm and its "a PGO refusal does not fall back to the static
-heuristic" behaviour. So arming changes *which machinery* unrolls a loop, not
-*which loops* are eligible. Legality is `plan_loop_unroll`'s 17 refusals, as
-it already was for the native unroller.
+Three arms, in the order they are tried:
+
+1. **Peel**, for a loop whose header is *bypassable* — one an external branch
+   can enter. The planner used to skip such a loop outright, because every
+   speculating transform in this backend drops its pre-header when it sees one.
+   After peel(1) the steady-state copy is entered only by fall-through and its
+   own back edge, so the loop the emitter finds has a single entry and keeps its
+   hoists.
+2. **Unroll at the PGO factor**, when a profiled trip count is available.
+3. **Unroll at the static heuristic's factor.**
+
+The unroll band is character-for-character the native unroller's, including its
+PGO arm and its "a PGO refusal does not fall back to the static heuristic"
+behaviour. So arming changes *which machinery* unrolls a loop, not *which loops*
+are eligible. Legality is `plan_loop_unroll`'s structural refusals, as it
+already was for the native unroller.
+
+Every arm goes through `plan_versioned`, which asks
+`loop_analysis::analyze_counted_loop_at` + `CountedLoop::prove_trip_count_at_least`
+for a `trip >= copies + 1` witness and, when it gets one that
+`encode_preheader_guard` can emit, produces a **versioned** artifact: the
+transform behind a pre-header check, an untouched copy of the loop on the
+failing edge. `Static`, `Refused` and any versioning refusal fall back to the
+plain transform, which is byte-for-byte what this emitted before versioning
+existed — the guard is a profitability filter, not what makes peel or unroll
+legal.
+
+### Reachability: this is dead code today, twice over
+
+The opt-in is a thread-local nothing in the VM sets. **And** even when armed,
+the first whole-compile refusal — `DeoptRealEnabled` — fires on every compile,
+because `crate::deopt_real_enabled()` defaults to on. So an armed process still
+produces no transformed artifact unless `CRATONVM_DEOPT_REAL` is explicitly
+off, and no unit test can arrange that (the flag snapshot is latched
+process-wide and this one is additionally cached in a `OnceLock`).
+
+`the_wired_compile_path_is_refused_before_any_loop_is_looked_at` pins it.
+Narrowing those four refusals is `loop-02`'s lane.
 
 `compile_with_param_slots` then
 
@@ -152,6 +187,19 @@ so the rebuilt map stays single-valued.
 Immutable, caller-owned, outlive the compile. Sharing one target across copies
 is indistinguishable from the single-copy case.
 
+### Not replicated at all: the versioning guard's bytes (0)
+
+A versioned rewrite inserts a pre-header check that is not a copy of anything.
+Its bytes carry the loop header's bci — provenance must stay total, or
+`Compiler::orig_bci` has nothing to answer with — but `outputs_for_bci` skips
+them, so no table entry is ever replicated onto them. Keying a field resolution
+or an inline cache to a synthetic `iload` would be silent, which is the same
+failure mode this whole census exists to prevent.
+
+That the guard *needs* no entry is a property of what it may contain:
+`encode_preheader_guard` emits only `iload`, an integer constant push and one
+`if_icmp*`. None of those consults any of the 21 tables.
+
 ### Replicated, payload is a MUTABLE pointer — sound, argued (2)
 
 `mic_slots` (`*const JitMICSlot`), `pic_slots` (`*const JitPICSlot`).
@@ -231,19 +279,27 @@ empty; the check exists so a future emit path cannot silently break it.
 * Inline-cache sharing across copies is *argued*, not measured. If it is ever
   wrong, the symptom is a megamorphic slot where the native unroller would have
   had `k+1` monomorphic ones — slower, not incorrect.
-* The peel path (`plan_loop_peel`) is not reachable from here. Only
-  `plan_loop_unroll` is wired; the `rebuild_pc_to_native` /
-  `osr_dead_mask` code paths handle peel correctly by construction
-  (`osr_entry_pc` answers the steady-state copy for both kinds) but no peel
-  has ever been compiled.
+* No peel and no versioned method has been compiled by the VM, because no
+  compile reaches the planner (see "Reachability"). Both are compiled by tests
+  — `a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy`
+  puts the planner's rewritten bytes through the real emitter and checks the
+  published OSR metadata — but that is a unit test, not a workload.
+* Versioning's *profitability* claim is unmeasured and unmeasurable today: it
+  trades one body of code for not entering a duplicated body when the loop may
+  not run. Nothing has A/B'd it because nothing runs it.
 
-## Follow-ups this change deliberately did not take
+## Follow-ups
 
 1. `#[derive(Clone)]` on `JitDirectCall` in `jit/src/lib.rs`, which would
    delete the packed-tuple detour.
 2. Translating `DeoptimizationPoint::bci` at `build_and_record_deopt_point`,
    which would retire `DeoptRealEnabled`, `PreciseExceptionFrames` and
-   `InvokedynamicPresent` in one move. That is the largest remaining piece.
-3. `loop-transform-wiring.md` still describes the pre-wiring state and lists
-   `OopMapEntry::bytecode_pc` as needing translation. It should be superseded
-   by this file.
+   `InvokedynamicPresent` in one move. That is the largest remaining piece, and
+   until it lands nothing here executes — see "Reachability" above and
+   `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
+3. ~~`loop-transform-wiring.md` still describes the pre-wiring state~~ — it now
+   carries a superseded banner pointing here.
+4. Versioning emits ONE guard. A transform needing a guard *set* (every
+   `VecPlan::guards` entry, say) needs `plan_loop_version` to take a slice and
+   chain the failing edges to one fallback label. The refusal
+   `GuardNotEncodable` on `StrideInRange` is the case that wants it first.

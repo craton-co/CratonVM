@@ -1,7 +1,13 @@
-# Loop transforms: peeling and unrolling at the bytecode level
+# Loop transforms: peeling, unrolling and guarded versioning at the bytecode level
 
-Status: implemented in `jit/src/x64/licm.rs` (analysis + rewriter + tests);
-**not yet wired into `compile_with_param_slots`** — see "Wiring" below.
+Status: implemented in `jit/src/x64/licm.rs` (analysis + rewriter + tests) and
+wired into `compile_with_param_slots` behind a thread-local opt-in —
+[`loop-rewriter-wiring.md`](loop-rewriter-wiring.md) is the wiring's status of
+record. All three transforms are reachable from `plan_bytecode_loop_xform`.
+
+Nothing in the VM arms the opt-in, and an armed compile is refused anyway while
+`deopt_real` is on; see that file's "Reachability" note and
+`docs/known-issues/c2/loop-02-planner-admission-gates.md`.
 
 ## Why bytecode-to-bytecode
 
@@ -40,6 +46,45 @@ Every copy carries the body's own exit branches, so there is **no trip-count
 precondition**. Trip counts 0 and 1 are not special cases: with 0 the first
 copy's exit test fires before any body effect, which is the instruction the
 original would have executed anyway.
+
+## The third transform: guarded versioning
+
+`plan_loop_version(…, kind, guard)` emits a pre-header check and lays down
+**two** images of the loop — `kind`'s transform on the guarded path, an
+untouched copy of the original on the failing edge:
+
+```text
+    original            version(guard, unroll(k))
+    ────────            ─────────────────────────
+    H: body             G: <guard>   ──(fails)──┐
+       goto H           F: body      (copy 0)   │
+                           …                    │
+                           body     (copy k)    │
+                           goto F               │
+                        B: body     ◀───────────┘
+                           goto B
+```
+
+Nothing falls into `B` from above: the region always ends in an unconditional
+`goto`, which is precondition 1, so the fallback is reachable only through the
+guard's branch and its own back edge.
+
+`encode_preheader_guard` emits `iload`/`iload_<n>`, one integer constant push
+and one `if_icmp*`, and refuses every other shape (`GuardNotEncodable`,
+`GuardIsConstant`). That list is what makes the guard's provenance — the loop
+header's bci — sound: nothing it emits can throw, allocate, call, poll or write
+a local, so none of the four sites that bake a bci into machine code can name a
+guard PC, and the operand stack at the guard's first byte is the stack at the
+header. The guard's bytes carry that bci but are **not images** of it
+(`outputs_for_bci` skips them), so no pc-keyed side table is replicated onto
+synthetic bytecode.
+
+OSR enters the **fallback**, except at the header itself, where it enters the
+guard and re-selects a version exactly as a fall-through entry does. Entering a
+guarded copy at a mid-body bci would skip the guard.
+
+For peel and unroll the guard is a profitability filter only — both are legal at
+every trip count. See `docs/known-issues/c2/loop-01-peeling-and-versioning.md`.
 
 ## Preconditions
 
@@ -144,10 +189,17 @@ the guard previously had to drop becomes legal again. Unrolling does **not**
 have that property — its copy 0 *is* the header — and the test says so
 explicitly, so nobody assumes otherwise.
 
-## Wiring (partially done — the verdict is consumed, the bytes are not)
+## Wiring
 
-Full status lives in [`loop-transform-wiring.md`](loop-transform-wiring.md).
-The short version: **the transform is no longer analysis-only.**
+Full status lives in [`loop-rewriter-wiring.md`](loop-rewriter-wiring.md), which
+supersedes [`loop-transform-wiring.md`](loop-transform-wiring.md). The rewritten
+bytes ARE compiled when the opt-in is armed, all 21 pc-keyed side tables are
+replicated in one expression, and the four bci-baking sites go through
+`Compiler::orig_bci`.
+
+The list below is the original plan, kept because its step 3 is the load-bearing
+one and its reasoning is still the reason the wiring looks the way it does. Its
+"NOT DONE" markers are historical.
 
 To consume this, `compile_with_param_slots` (`jit/src/x64.rs`) would:
 
