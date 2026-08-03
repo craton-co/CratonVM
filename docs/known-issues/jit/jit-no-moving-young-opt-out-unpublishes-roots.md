@@ -3,7 +3,7 @@
 **Status: 🟡 PARTIALLY FIXED 2026-07-31.** The first of two independent faults
 in this lane is fixed; the second is isolated to a named mechanism and stays
 open below. Supersedes
-[`repros/no-moving-young-lever-crashes-20260731.md`](../repros/no-moving-young-lever-crashes-20260731.md),
+[`repros/no-moving-young-lever-crashes-20260731.md`](../no-moving-young-lever-crashes-20260731.md),
 which found the same lane broken from a different workload the same day.
 
 ## Why the lane matters

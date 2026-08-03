@@ -1,7 +1,7 @@
 # `CRATONVM_NO_MOVING_YOUNG=1` crashes — the diagnostic lever half the JIT docs measure with
 
 > **SUPERSEDED 2026-07-31** by
-> [`../jit-no-moving-young-opt-out-unpublishes-roots.md`](../jit/jit-no-moving-young-opt-out-unpublishes-roots.md),
+> [`../jit-no-moving-young-opt-out-unpublishes-roots.md`](jit/jit-no-moving-young-opt-out-unpublishes-roots.md),
 > which root-causes this lane from a Linux Hibernate repro found the same day.
 > Two independent faults, not one: (1) the flag also withdrew shadow-stack root
 > publication — both sides read `flags().jit.shadow_stack ||
@@ -14,13 +14,13 @@
 > gate was ruled out here independently.
 
 **Status:** 🔴 **OPEN**, found 2026-07-31 while re-deriving
-[tomcat/32](../../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md).
+[tomcat/32](../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md).
 
 Not a default-configuration defect — nothing ships with this set. It matters
 because `CRATONVM_NO_MOVING_YOUNG=1` is the **standard A/B lever** for anything
 moving-young-related, named in `moving_young_disables_optimizing_tier`'s own
 warning text and used to produce the cost tables in
-[the retired moving-young gate doc](../../internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md)
+[the retired moving-young gate doc](../internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md)
 and in tomcat/32's 07-30 revision. While it crashes, **none of those tables can
 be reproduced or extended**, and any new measurement that reaches for it will
 look like an unrelated failure.
