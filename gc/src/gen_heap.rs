@@ -10852,6 +10852,40 @@ impl GenerationalHeap {
             // the first actually promoted something, i.e. only when the mark was
             // wrong). Same shape and order as the compactor's Phase 0.
             let (rescued, escaped) = old_gen.close_live_set(&objects);
+
+            // H2-CID0 residual (2026-08-03) — WHO still points at what this
+            // IN-PLACE sweep is about to free.
+            //
+            // Deliberately AFTER `close_live_set`, so the doomed set this scans
+            // is the one that actually gets freed rather than the raw mark
+            // result the closure then rescues. Every other instrument on this
+            // arm reports a consequence — the ring says what the block held,
+            // `reclaimed_hole_at` says the address is in a hole, the
+            // `SWEEP_LIVENESS` block above reports the pre-closure gap — and
+            // none of them names the surviving REFERRER, which is the whole
+            // question. `close_live_set` structurally cannot: it closes over
+            // MARKED OLD-GEN referrers only, so a young referrer or a bare root
+            // is invisible to it.
+            //
+            // Three outcomes, and they point at three different defects:
+            //   * referrer is a MARKED old-gen object -> the mark BFS missed an
+            //     edge it was handed (close_live_set should have caught it);
+            //   * referrer is in the YOUNG survivor space or the root slice ->
+            //     `mark_young_to_old_refs` / the root seed missed it;
+            //   * NO referrer anywhere -> the surviving reference is not in the
+            //     heap or the root slice at all (a JIT spill slot, a native side
+            //     table, a thread this cycle did not cover), which is a
+            //     different bug entirely and would retire the "mark-phase gap"
+            //     framing.
+            //
+            // A doomed block referenced only from ANOTHER doomed block is
+            // reported with `marked=false` on the containing object: that is
+            // the whole-subgraph-condemned-together case the promotion-seed
+            // comment above warns about, and it is why silence from a
+            // heap-edge-only detector is not evidence the mark was complete.
+            if doomed_referrers_dbg() {
+                report_doomed_referrers("sweep", &objects, old_gen, young_from, roots);
+            }
             if rescued > 0 {
                 OLD_SWEEP_CLOSURE_RESCUES.fetch_add(rescued as u64, Ordering::Relaxed);
                 tracing::warn!(
@@ -11070,8 +11104,8 @@ impl GenerationalHeap {
         // SURVIVOR space (`young_from` is post-swap here), and the root slice.
         // A Bloom-style prefilter keeps the common case to one shift, one
         // multiply and one bit test per word.
-        if compact_referrers_dbg() {
-            report_compact_referrers(&walked_objects, old_gen, young_from, roots);
+        if doomed_referrers_dbg() {
+            report_doomed_referrers("compact", &walked_objects, old_gen, young_from, roots);
         }
         let compact_map = old_gen.compact_with_drop_flags(&drop_flags);
 
@@ -13273,13 +13307,15 @@ fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative
 /// `CRATONVM_DBG_COMPACT_REFERRERS=1` — word-scan the heap for referrers of
 /// every block an old-gen compaction is about to drop. Off by default: the scan
 /// is O(heap / 8) per compaction.
-fn compact_referrers_dbg() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_REFERRERS").is_some()
+fn doomed_referrers_dbg() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SWEEP_REFERRERS").is_some()
+        || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_REFERRERS").is_some()
 }
 
 /// See [`compact_referrers_dbg`]. Reports the first few (victim, referrer)
 /// pairs with enough context to name the mark source that missed the edge.
-fn report_compact_referrers(
+fn report_doomed_referrers(
+    label: &str,
     walked: &[(*mut u8, usize)],
     old_gen: &OldGen,
     young_from: &Arena,
@@ -13295,7 +13331,7 @@ fn report_compact_referrers(
         .map(|&(p, _)| p as usize)
         .collect();
     if doomed.is_empty() {
-        eprintln!("[compact-referrers] nothing doomed this cycle");
+        eprintln!("[{label}-referrers] nothing doomed this cycle");
         return;
     }
     // Bloom-style prefilter: 4 M bits over the doomed set.
@@ -13309,12 +13345,6 @@ fn report_compact_referrers(
         filter[h >> 6] |= 1u64 << (h & 63);
     }
     let bases: Vec<usize> = walked.iter().map(|&(p, _)| p as usize).collect();
-    let marked_at = |addr: usize| -> Option<bool> {
-        bases.binary_search(&addr).ok().map(|_| {
-            // SAFETY: a walked base.
-            unsafe { (*(addr as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED != 0 }
-        })
-    };
     // Which walked object CONTAINS this address, if any.
     let owner_of = |addr: usize| -> Option<(usize, bool)> {
         let i = bases.partition_point(|&b| b <= addr);
@@ -13329,63 +13359,129 @@ fn report_compact_referrers(
         })
     };
 
-    let mut hits = 0usize;
+    // Categorise, do not just print the first N. The first sixteen words of an
+    // ascending address scan are the sixteen LOWEST addresses, which says
+    // nothing about whether any LIVE thing points into the doomed set — and
+    // that is the only question worth asking here. On a real workload the
+    // doomed set is a condemned subgraph tens of thousands of objects wide, so
+    // doomed->doomed edges outnumber the interesting ones by ~10^5:1 and drown
+    // them completely (measured: 1_298_639 "referrer words" of which every one
+    // of the printed sixteen was doomed->doomed).
+    //
+    // Only three categories are defects, and each names a different mark source:
+    //   live_old  a MARKED old-gen object still points at a doomed block — the
+    //             mark BFS was handed the referrer and did not follow this edge,
+    //             and `close_live_set` (which runs before this scan) did not
+    //             rescue it either;
+    //   young     a young-space word points at a doomed block —
+    //             `mark_young_to_old_refs` missed a young->old edge;
+    //   root      a root points straight at a doomed block — the root seed
+    //             dropped it.
+    // The other two are expected and are counted only so the interesting ones
+    // can be read as a fraction of a known total:
+    //   dead_old  doomed->doomed, i.e. a subgraph condemned together;
+    //   unowned   a word in old-gen backing store that is inside no walked
+    //             object at all (free-list space, padding, a reserved tail).
+    let mut live_old = 0usize;
+    let mut dead_old = 0usize;
+    let mut unowned = 0usize;
+    let mut young = 0usize;
+    let mut root_hits = 0usize;
     let mut printed = 0usize;
-    let mut report = |victim: usize, at: usize, region: &str| {
-        hits += 1;
-        if printed >= 16 {
-            return;
-        }
-        printed += 1;
+
+    let describe = |victim: usize| -> String {
         // SAFETY: `victim` is a walked base.
         let vh = unsafe { &*(victim as *const ObjectHeader) };
-        let owner = owner_of(at)
-            .map(|(b, m)| format!("{b:#x} marked={m} off={}", at - b))
-            .unwrap_or_else(|| "-".to_string());
-        eprintln!(
-            "[compact-referrers] DOOMED 0x{victim:x} class_id={} kind={} <- word at 0x{at:x} \
-             in {region} (containing object: {owner})",
+        format!(
+            "class_id={} kind={} num_slots={}",
             vh.class_id.as_u32(),
             vh.kind as u8,
-        );
+            vh.num_slots(),
+        )
     };
 
     // 1. Roots.
     for (i, r) in roots.iter().enumerate() {
         let a = r.as_ptr() as usize;
         if doomed.contains(&a) {
-            report(a, i, "ROOT SLICE (index)");
+            root_hits += 1;
+            if printed < 24 {
+                printed += 1;
+                eprintln!(
+                    "[{label}-referrers] DEFECT root[{i}] points at DOOMED {a:#x} ({})",
+                    describe(a),
+                );
+            }
         }
     }
-    // 2. The whole old-gen backing store, and 3. the young survivor space.
-    let scans: [(usize, usize, &str); 2] = [
-        (old_gen.base_ptr() as usize, old_gen.capacity(), "old-gen"),
-        (young_from.base_ptr() as usize, young_from.used(), "young-survivor"),
+
+    // 2. Old-gen backing store, then 3. the young space.
+    let scans: [(usize, usize, bool); 2] = [
+        (old_gen.base_ptr() as usize, old_gen.capacity(), true),
+        (young_from.base_ptr() as usize, young_from.used(), false),
     ];
-    for (base, len, region) in scans {
+    for (base, len, is_old) in scans {
         let mut off = 0usize;
         while off + 8 <= len {
             // SAFETY: `[base+off, base+off+8)` is inside a mapped arena.
             let w = unsafe { *((base + off) as *const u64) } as usize;
-            if w != 0 {
-                let h = hash(w);
-                if filter[h >> 6] & (1u64 << (h & 63)) != 0 && doomed.contains(&w) {
-                    // A doomed block referencing itself, or a word inside the
-                    // doomed block itself, is not a referrer.
-                    let self_ref = region == "old-gen"
-                        && owner_of(base + off).is_some_and(|(b, _)| b == w);
-                    if !self_ref {
-                        report(w, base + off, region);
+            if w == 0 {
+                off += 8;
+                continue;
+            }
+            let h = hash(w);
+            if filter[h >> 6] & (1u64 << (h & 63)) == 0 || !doomed.contains(&w) {
+                off += 8;
+                continue;
+            }
+            let at = base + off;
+            if is_old {
+                match owner_of(at) {
+                    // A word INSIDE the doomed block itself is not a referrer.
+                    Some((owner, _)) if owner == w => {}
+                    Some((owner, true)) => {
+                        live_old += 1;
+                        if printed < 24 {
+                            printed += 1;
+                            eprintln!(
+                                "[{label}-referrers] DEFECT live old-gen object {owner:#x} \
+                                 (marked) slot+{} points at DOOMED {w:#x} ({})",
+                                at - owner,
+                                describe(w),
+                            );
+                        }
                     }
+                    Some((_, false)) => dead_old += 1,
+                    None => unowned += 1,
+                }
+            } else {
+                young += 1;
+                if printed < 24 {
+                    printed += 1;
+                    eprintln!(
+                        "[{label}-referrers] DEFECT young word {at:#x} points at DOOMED \
+                         {w:#x} ({})",
+                        describe(w),
+                    );
                 }
             }
             off += 8;
         }
     }
+
+    // Report what was actually SCANNED beside what was found. A zero in the
+    // young or root column is only an elimination if that scan covered
+    // something: `young_from.used()` can be near zero right after a young
+    // sweep, and a short root slice would make `root=0` vacuous. Without these
+    // three numbers the line is an inert-lever reading dressed up as evidence.
     eprintln!(
-        "[compact-referrers] doomed={} referrer_words={} (printed {printed})",
+        "[{label}-referrers] doomed={} DEFECTS(live_old={live_old} young={young} \
+         root={root_hits}) benign(dead_old={dead_old} unowned={unowned}) \
+         scanned(old_bytes={} young_bytes={} roots={})",
         doomed.len(),
-        hits,
+        old_gen.capacity(),
+        young_from.used(),
+        roots.len(),
     );
 }
 
