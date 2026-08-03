@@ -4,29 +4,135 @@
 > report point at it. The name is wrong; see *Status*.
 
 ## Status
-**OPEN — re-diagnosed, not fixed.** Two things are settled that were not
-before, and one candidate fix was tested and ruled out.
+**OPEN — one named mechanism closed, the family is not.** Updated 2026-08-03
+on `fix/h2-classid0-close-20260803`.
 
-* **The generation is settled.** The reclaimed object is in the **old
-  generation**, not a non-moving-young-sweep span. This doc's title and its
-  entire "root-coverage gap in the young sweep" framing came from one
-  unchecked inference off the all-zero header; it is wrong. Measured at the
-  moment of failure, with no flag set in advance.
-* **The symptom is wider than this doc says.** `java.lang.Object cannot be
-  cast to X` is only the face a freed block wears *while it is still on the
-  free list*. Once the allocator re-serves it, the same stale reference reads a
-  perfectly valid object of an unrelated class. Both faces were caught in one
-  A/B window (below). Some fraction of this family has never looked like a GC
-  bug at all, which is a good reason it has outlived three sessions.
-* **`5750caf5f` does not close it.** *close the live set before the in-place
-  old sweep decides what is dead* is the right shape and targets the right
-  generation, but a contemporaneous 3-vs-3 A/B reproduced on **both** arms.
-* **The reserved-TLAB-tail hypothesis is refuted**, by negative control — see
-  *Ruled out* below.
+* **A root cause was found, fixed, and differentially tested.** `old_gen_gc`'s
+  root seed asked only ever "is this address an object BASE?", of every root,
+  twice — and a conservative root is frequently an *interior* word. Old gen had
+  no resolution for that at all, so an old-gen object whose only surviving
+  reference was an interior word got **no mark bit**, and the in-place sweep
+  frees purely on `GC_FLAG_MARKED`. The compacting arm was additionally
+  *assumed* unreachable with conservative roots and measured not to be. Full
+  argument, counters and the negative control: `docs/gc/old-sweep-liveness.md`
+  §7. Two regression tests, one per reclamation arm, each verified to FAIL
+  under `CRATONVM_GC_NO_OLD_INTERIOR_PINS=1` — the second with this family's
+  own face, `address 0x… now reads class_id=0`.
+* **It is not the whole defect.** On a 2026-08-03 A/B soak the FIX arm still
+  produced a live occurrence, and the verdict says it was **not** interior-rooted:
 
-The root cause is not known. What this session leaves behind is a reproducer
-that works, a verdict line that needs no prior configuration, and four
-hypotheses closed with measurements instead of argument.
+  ```
+  receiver is an OLD-GEN block this process RECLAIMED while it was still referenced.
+    obj=0x20028f6a4e8  site="JIT checkcast"  target_class=java/lang/String
+    original_class=java/lang/Object  original_kind=1        <- an ARRAY
+    freed_block="0x20028f691c8+0x2020"  interior_off=4896
+    interior_root_pointed_in=false
+    freed_by="in-place old-gen sweep"   free_seq=1888514
+  ```
+
+  An `Object[]` of ~8 KB, freed by the in-place old sweep under a live
+  reference, then re-served — surfacing to Java as
+  `java.lang.Integer cannot be cast to java.lang.String`. So at least one more
+  mark-phase gap remains, and it is on the in-place arm.
+* **Every earlier measurement in this family needs re-taking.** A JIT
+  miscompile that hands the WRONG OBJECT back from a virtual call was live on
+  `origin/dev` for the whole history of this investigation and is fixed on this
+  branch (`12769bb23c`, see
+  `../../internal/fixed-suite-bugs/jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`).
+  At the reader end a wrong-object return is **indistinguishable** from a stale
+  reference. It is not the explanation for the verdict quoted above — that one
+  is the heap's own free-list answer, not an inference off a cast — but it is a
+  live alternative explanation for any occurrence recorded without one.
+
+The root cause of the residual is not known. What this session leaves behind is
+one mechanism closed with tests, a reproduction that still works, verdicts that
+need no prior configuration on three faces instead of one, and the removal of a
+confound that was corrupting the evidence.
+
+### The 2026-08-03 A/B, on a binary with the JIT confound removed
+
+`TestMVStoreCacheLoop`, one worker per arm, same host and window, `--Xmx 1g`,
+`CRATONVM_GC=-moving-young`, JIT on. CTL is `CRATONVM_GC_NO_OLD_INTERIOR_PINS=1`
+— the pin disabled, the accounting kept.
+
+| arm | worker-hours | causal (`INTERIOR conservative root` freed/dropped) | reclaim verdicts | `cannot be cast` reaching Java |
+| --- | --- | --- | --- | --- |
+| FIX | 1.77 | **0** | 1 | 4 |
+| CTL | 1.77 | 1 | 3 | 4 |
+
+**Read the CAUSAL column, not the last two.** The mechanism this branch closed
+fires only in the control arm, and it is zero-by-construction in the fix arm.
+What the last two columns say is that **the family survives the fix** — which
+is the point of the *Status* section above, and the A/B makes it sharper rather
+than softer.
+
+The control arm reproduced this page's headline symptom outright, with the
+whole chain visible in one run:
+
+```
+ERROR …gc::guard: in-place old-gen sweep is freeing a block an INTERIOR
+  conservative root points into. That root cannot be rewritten, so the next
+  allocation reuses and ZEROES the block under it — the ClassId(0) /
+  java.lang.Object face.  obj="0x2001d790498" class_id=0 size=4128
+…
+ERROR …gc::guard: checkcast receiver points into RECLAIMED memory
+  obj="0x20027f9f078" location=old-gen FREE BLOCK (reclaimed)
+  target_class=java.nio.ByteBuffer
+ERROR …gc::guard: …and the old-gen reclamation ring knows what that block held.
+  original_class=java/nio/ByteBuffer  freed_by="old-gen mark-compact"
+  free_seq=1832115
+→ java.lang.ClassCastException: java.lang.Object cannot be cast to java.nio.ByteBuffer
+```
+
+That is cause, verdict and user-visible symptom in one arm, and the causal step
+is absent from the other — the strongest evidence this page has had that the
+interior-root mechanism is real and closed.
+
+And in the same window the FIX arm produced its own occurrence, which is the
+more important half:
+
+```
+checkcast receiver is an OLD-GEN block this process RECLAIMED while it was
+still referenced.
+  obj="0x2002ab98b90"  actual_class=java.lang.Integer  target_class=org.h2.mvstore.Chunk
+  original_class=org/h2/mvstore/SFChunk  freed_block="0x2002ab98ab8+0x150"
+  interior_off=216   interior_root_pointed_in=false
+  freed_by="in-place old-gen sweep"
+→ java.lang.ClassCastException: java.lang.Integer cannot be cast to org.h2.mvstore.Chunk
+```
+
+**Two independent FIX-arm witnesses now agree on the residual's shape**: this
+one (`SFChunk`, 336 bytes) and the ~8 KB `Object[]` quoted in *Status*. Both say
+`freed_by="in-place old-gen sweep"` and both say
+`interior_root_pointed_in=false`. So the remaining gap is:
+
+* on the **in-place** arm, not the compactor (which is default-off since
+  2026-08-03 anyway);
+* **not** the interior-conservative-root mechanism — these blocks had no
+  interior root;
+* reaching the reader as the *re-served* face (`actual_class` is a live,
+  unrelated object) rather than the all-zero-header face, which is why anything
+  gated on `ClassId(0)` stays silent for it. The reclamation ring is what
+  answers, because it records what the block held at the moment it was freed.
+
+### Old-gen compaction became default-OFF on 2026-08-03 — read the A/B accordingly
+
+`major_gc` now asks `oldgen_compact_enabled()` (`CRATONVM_OLDGEN_COMPACT`),
+which is **off by default** pending root-cause attribution of a separate
+corruption compaction was found to cause. That lands after the A/B above was
+run, and it changes which arms of this page are reachable in production:
+
+* the control-arm verdict quoted above names `freed_by="old-gen mark-compact"`
+  — a path a default-configured build **no longer runs**;
+* the FIX-arm residual quoted in *Status* names `freed_by="in-place old-gen
+  sweep"` — which is still the live path, and is therefore where the remaining
+  gap has to be looked for.
+
+The interior-root fix's compacting half is not thereby moot: it is the
+correctness precondition for turning compaction back on, and its regression
+test now drives `old_gen_gc(compact = true)` directly rather than through
+`major_gc`, so it keeps testing the downgrade rather than silently passing
+because nothing compacts.
 
 ## Severity
 **HIGH** — silent. Before this session no guard fired: zero

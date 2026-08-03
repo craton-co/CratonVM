@@ -1511,72 +1511,116 @@ pub fn record_loop_xform_event(event: &str) {
     if let Some(idx) = LOOP_XFORM_EVENTS.iter().position(|e| *e == event) {
         LOOP_XFORM_COUNTERS[idx].fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
-        LOOP_XFORM_CAPTURE.with(|c| {
-            if let Some(v) = c.borrow_mut().as_mut() {
-                v[idx] += 1;
-            }
-        });
+        LoopXformCapture::note(idx, 1);
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Installed by [`LoopXformCapture`]; `None` on every thread that has not
-    /// asked to count.
-    static LOOP_XFORM_CAPTURE: std::cell::RefCell<Option<Vec<u64>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// A per-thread view of [`record_loop_xform_event`], for tests that assert
-/// counts.
+/// Define a per-thread capture of one of this module's process-global event
+/// tables, for tests that assert exact counts.
 ///
-/// [`LOOP_XFORM_COUNTERS`] is process-wide, and in this crate's test binary
-/// EVERY compile bumps it — `x64::tests` alone puts thousands of methods
-/// through `compile_with_param_slots`, concurrently. So a test asserting
-/// `loop_xform_compiles == 1` against the globals is asserting against every
-/// other test's work, and serialising the asserting module does not help
-/// because the producers are in other modules. It fails rarely, which is worse
-/// than failing often: the symptom is one unrelated count off by one.
+/// **Why these tables need one.** Every counter here is process-wide and
+/// monotone, which is right for a production run and useless for a test
+/// assertion: Rust runs a crate's tests on a thread pool, so a test asserting
+/// `count == 1` is asserting against every other test's work as well. Two ways
+/// of papering over that have already been tried in this crate and neither
+/// holds:
 ///
-/// The planner runs on its caller's thread, so counting there is exact and
-/// needs no lock. Nothing outside `#[cfg(test)]` is compiled.
-#[cfg(test)]
-pub(crate) struct LoopXformCapture(());
+///  * **zero the table first.** A sibling can bump it between the reset and the
+///    read, and does.
+///  * **hold a lock while asserting.** That only serialises the tests that
+///    ASSERT. The tests that PRODUCE are elsewhere — `x64::tests` compiles
+///    thousands of methods, `tiered::tests` drops compilation requests — and
+///    none of them takes the lock. This is what made
+///    `drops_reach_the_process_wide_scheduling_counters` fail about 1 run in 20
+///    at `--test-threads=32`, reporting `Some(5)` for a count of 1.
+///
+/// Both failure modes are rare, which is worse than frequent: the symptom is
+/// one unrelated number off by a few, on a test that looks unconnected to
+/// whatever change is being reviewed.
+///
+/// Every producer this matters for runs on its caller's thread, so counting
+/// there is exact and needs no lock at all. The generated struct is a guard:
+/// `start()` installs a fresh per-thread vector, `Drop` removes it, and the
+/// global counters are untouched throughout — a sink reading the real table
+/// still sees every event.
+///
+/// Nothing it generates is compiled outside `#[cfg(test)]` — the macro itself
+/// is unconditional so the invocations below need no `cfg` of their own. The
+/// recorder pays one thread-local check per event in test builds and nothing
+/// in release.
+macro_rules! per_thread_event_capture {
+    (
+        $(#[$meta:meta])*
+        struct $name:ident, events $events:ident, tls $tls:ident
+    ) => {
+        #[cfg(test)]
+        thread_local! {
+            /// Installed by the capture guard; `None` on every thread that has
+            /// not asked to count.
+            static $tls: std::cell::RefCell<Option<Vec<u64>>> =
+                const { std::cell::RefCell::new(None) };
+        }
 
-#[cfg(test)]
-impl LoopXformCapture {
-    /// Start counting THIS thread's events from zero. Dropping the guard stops
-    /// counting; the global counters are untouched throughout.
-    pub(crate) fn start() -> Self {
-        LOOP_XFORM_CAPTURE.with(|c| *c.borrow_mut() = Some(vec![0; LOOP_XFORM_EVENTS.len()]));
-        LoopXformCapture(())
-    }
+        $(#[$meta])*
+        #[cfg(test)]
+        pub(crate) struct $name(());
 
-    /// This thread's count for `event`. Panics on an unknown name rather than
-    /// answering zero, which is how a renamed row would otherwise pass.
-    pub(crate) fn count(&self, event: &str) -> u64 {
-        let idx = LOOP_XFORM_EVENTS
-            .iter()
-            .position(|e| *e == event)
-            .unwrap_or_else(|| panic!("no such counter: {event}"));
-        LOOP_XFORM_CAPTURE.with(|c| c.borrow().as_ref().map_or(0, |v| v[idx]))
-    }
-
-    /// Forget everything counted so far and keep counting.
-    pub(crate) fn reset(&self) {
-        LOOP_XFORM_CAPTURE.with(|c| {
-            if let Some(v) = c.borrow_mut().as_mut() {
-                v.iter_mut().for_each(|x| *x = 0);
+        #[cfg(test)]
+        impl $name {
+            /// Start counting THIS thread's events from zero. Dropping the
+            /// guard stops counting.
+            pub(crate) fn start() -> Self {
+                $tls.with(|c| *c.borrow_mut() = Some(vec![0; $events.len()]));
+                $name(())
             }
-        });
-    }
+
+            /// This thread's count for `event`. Panics on an unknown name
+            /// rather than answering zero, which is how a renamed row would
+            /// otherwise pass.
+            pub(crate) fn count(&self, event: &str) -> u64 {
+                let idx = $events
+                    .iter()
+                    .position(|e| *e == event)
+                    .unwrap_or_else(|| panic!("no such counter: {event}"));
+                $tls.with(|c| c.borrow().as_ref().map_or(0, |v| v[idx]))
+            }
+
+            /// Forget everything counted so far and keep counting.
+            #[allow(dead_code)]
+            pub(crate) fn reset(&self) {
+                $tls.with(|c| {
+                    if let Some(v) = c.borrow_mut().as_mut() {
+                        v.iter_mut().for_each(|x| *x = 0);
+                    }
+                });
+            }
+
+            /// Add `n` to this thread's capture of row `idx`, if capturing.
+            /// Called from the recorder, which already resolved the index.
+            fn note(idx: usize, n: u64) {
+                $tls.with(|c| {
+                    if let Some(v) = c.borrow_mut().as_mut() {
+                        v[idx] += n;
+                    }
+                });
+            }
+        }
+
+        #[cfg(test)]
+        impl Drop for $name {
+            fn drop(&mut self) {
+                $tls.with(|c| *c.borrow_mut() = None);
+            }
+        }
+    };
 }
 
-#[cfg(test)]
-impl Drop for LoopXformCapture {
-    fn drop(&mut self) {
-        LOOP_XFORM_CAPTURE.with(|c| *c.borrow_mut() = None);
-    }
+per_thread_event_capture! {
+    /// A per-thread view of [`record_loop_xform_event`]. See
+    /// [`per_thread_event_capture`] for why the global table cannot be
+    /// asserted on directly; the planner runs on its caller's thread, so this
+    /// is exact.
+    struct LoopXformCapture, events LOOP_XFORM_EVENTS, tls LOOP_XFORM_CAPTURE
 }
 
 /// Read every loop-rewriter event's count, including zero-valued ones, in
@@ -1674,7 +1718,21 @@ pub fn record_scheduling_events(event: &str, n: u64) {
     }
     if let Some(idx) = scheduling_index(event) {
         SCHEDULING_COUNTERS[idx].fetch_add(n, Ordering::Relaxed);
+        #[cfg(test)]
+        SchedulingCapture::note(idx, n);
     }
+}
+
+per_thread_event_capture! {
+    /// A per-thread view of [`record_scheduling_event`]. See
+    /// [`per_thread_event_capture`].
+    ///
+    /// The producer that matters here is `TieredCompilationManager`'s own
+    /// drain, which runs on the thread that called `next_fresh_task` — so a
+    /// test driving a manager it constructed counts exactly its own drops.
+    /// The compile WORKER thread also records, and a test that means to
+    /// observe a worker's drops must therefore still read the global table.
+    struct SchedulingCapture, events SCHEDULING_EVENTS, tls SCHEDULING_CAPTURE
 }
 
 /// Count one occurrence of `event`.
@@ -1713,8 +1771,13 @@ pub fn scheduling_dropped_total() -> u64 {
         + scheduling_count(SCHEDULING_EVENTS[3]).unwrap_or(0)
 }
 
-/// Zero every scheduling counter, so a test can assert on exact values without
-/// being perturbed by a sibling test in the same process.
+/// Zero every scheduling counter.
+///
+/// Only for a test that must read the GLOBAL table — `summary()` carries that
+/// table, so the summary-plumbing test cannot use [`SchedulingCapture`]. For
+/// "did my own thread's event get counted", use the capture: resetting a
+/// counter every other test is incrementing does not make it assertable, which
+/// is the whole argument in [`per_thread_event_capture`].
 ///
 /// `pub(crate)` and test-only: these counters are monotone by contract in a
 /// real run, and a production reset would make "how many requests has this

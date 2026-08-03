@@ -8,6 +8,17 @@
 | **Owns** | the residue of the retired [`websocket-async-send-interframe-latency`](../../internal/fixed-suite-bugs/tomcat/websocket-async-send-interframe-latency-CLOSED-20260803.md) doc |
 | **Real owner of the fix** | the per-call dispatch floor — see *Where this actually belongs* |
 
+> **CORRECTED TWICE. Read
+> [`native-call-funnel-is-the-per-call-floor`](native-call-funnel-is-the-per-call-floor-20260803.md)
+> first — it supersedes the causal claim below.** Revision 2 argued the gap was
+> "16 Java calls at a 431 ns per-call floor". Both halves were wrong: an
+> ordinary Java call converges to **8.4 ns** (the 431 ns was a single
+> unconverged warm-up pass), and the real cost is the **five NATIVE calls** an
+> uncontended lock/unlock makes — censused exactly:
+> `Thread.currentThread()` x2, `setExclusiveOwnerThread` x2,
+> `Unsafe.compareAndSetInt` x1 — each entering a ~330-810 ns funnel. The
+> measurement table below stands; the explanation under it does not.
+
 > **This document's first revision was wrong**, and is corrected below. It
 > blamed `AbstractQueuedSynchronizer.acquire`'s pre-park spin (up to 255
 > `Thread.onSpinWait()` rounds). That was inference from the handoff numbers,

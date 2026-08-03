@@ -1,16 +1,58 @@
 # `NoSuchMethodError java/lang/Object.hasNext()Z` — a live iterator reads back as `ClassId(0)`
 
 ## Status
-**OPEN (2026-08-02).** Reproduced on `dev` @ `750a95f8e3` with a receiver dump.
-Split out of `bug-h2-testmultithread-concurrent-update-timeout.md`, where it was
-a two-paragraph aside; it is a silent memory-safety defect and deserves its own
-page.
+**OPEN, and for the first time reproducible on demand.** Updated 2026-08-03 on
+`fix/h2-classid0-close-20260803`; originally filed 2026-08-02 against `dev` @
+`750a95f8e3`.
 
-Sibling face, same family, already root-caused from the other end:
-`bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`. **Read that page
-before this one** — it establishes that `java.lang.Object` / `ClassId(0)` has
-**four** possible causes and that guessing between them has already cost two
-sessions.
+Three things changed on 2026-08-03, and the third is the one to read first.
+
+1. **The reproduction was impossible, and now is not.**
+   `org.h2.test.db.TestMultiThread` — the only vehicle this page has — failed
+   **100 % of runs in 2-9 s** on `origin/dev` @ `c3187d54b4`, against the ~450 s
+   it needs to reach `testConcurrentUpdate` at all. Every rate quoted below,
+   and every "0 in N runs" hunt, was measured against a class dying in its
+   first four seconds. The cause had nothing to do with GC: an `invokevirtual`
+   was bound to the compiled entry of the method its CONSTANT POOL resolved,
+   with no receiver guard, so calls reached a base body instead of the
+   override. Fixed in `12769bb23c`; see
+   `../../internal/fixed-suite-bugs/jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`.
+2. **The family reproduces at ~1 run in 6, on faces other than this page's
+   name.** 18 runs post-unblock produced 3 events: `CloneNotSupportedException`
+   twice and `[Lorg.h2.mvstore.Page$PageReference; cannot be cast to [J` once —
+   and **zero** `NoSuchMethodError java/lang/Object.hasNext()Z`. Which bytecode
+   touches a bad receiver first is incidental; chasing the named face is what
+   made this look like 1-in-16.
+3. **The clone face now has a verdict, and it says NOT RECLAIMED MEMORY.** The
+   first occurrence to reach the new reporter:
+
+   ```
+   ERROR cratonvm::gc::guard: clone() dispatched to java.lang.Thread.clone,
+     which only ever throws.
+     obj="0x2001956f3e8" receiver_kind=Object receiver_class_id=29
+   ```
+
+   `receiver_kind=Object` — the caller was in `Arrays.copyOf(long[], int)`
+   doing `original.clone()`, so the receiver must be an **array**, and the
+   object at that address is an ordinary `java.lang.Thread`. And
+   `report_reclaimed_receiver` printed **nothing** after it: the address is not
+   in a free-list hole, not past the allocation frontier, not in the inactive
+   semispace, and **neither reclamation ring has a covering record**.
+
+   So for this occurrence the receiver is not a collected object read through a
+   stale reference. It is a **live, unrelated object that the caller's
+   reference should never have pointed at** — the same shape as the JIT defect
+   fixed in (1), which is a wrong-object-from-a-virtual-call bug, not a GC bug.
+   That does not prove the same root cause, but it does mean this page's
+   premise — "a still-referenced object is read back as an all-zero header" —
+   is **not established for the clone face**, and the GC framing should not be
+   assumed for the others either until each has its own verdict.
+
+Sibling page, same family, old-gen face:
+`bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`. It is **also
+still open**: its own interior-conservative-root mechanism was found and fixed
+this session, and its residual reproduced anyway on a block that was *not*
+interior-rooted. Read it for the four things `ClassId(0)` can mean.
 
 ## Severity
 **HIGH** — silent. A still-referenced object is read back as an all-zero header.
@@ -94,6 +136,13 @@ neither this page nor its sibling could get from the run that reproduces.
 
 ## Reproducing
 
+> **Superseded rates below.** Everything in this section was measured before
+> `12769bb23c`, i.e. against a `TestMultiThread` that died in its first four
+> seconds for a reason unrelated to this defect. The command is still correct;
+> the "1 in 6" and "1 in 16" numbers are not. Use the 2026-08-03 campaign
+> table further down, and count all four faces rather than the
+> `NoSuchMethodError` one alone.
+
 ```bash
 cd <fresh writable dir>          # H2 writes ./data
 CRATONVM_DBG_CCE_BT=1 <cratonvm> --java-home /home/victor/jdk25 --Xmx 1g \
@@ -164,6 +213,79 @@ frames on the parked thread — the fallback reason names exactly that
 (`compiled-frame-oop-not-published`) — and that difference is the next thing to
 put into a probe.
 
+## 2026-08-03 campaign — what was measured, and what it eliminated
+
+All on `fix/h2-classid0-close-20260803`, `--Xmx 1g`, 16-core Azure host, two
+workers, no debug flags beyond `CRATONVM_DBG=cce-bt`.
+
+| phase | binary | runs | family events | other |
+| --- | --- | --- | --- | --- |
+| 1 | `12769bb23c` (JIT fix, no clone verdict) | 9 | 2 — `CloneNotSupportedException` ×4 in one run, `ClassCastException` ×12 in another | 1 `TimeoutException`, 6 clean |
+| 2 | `583021945b` (+ clone verdict) | 18 | 2 — `CloneNotSupportedException` ×12 **with a verdict**, and `ClassCastException` ×4 | 1 `TimeoutException`, 15 clean |
+
+27 runs, 4 family events, ~1 in 7. `rootdead=0` and `audit=0` on every one of
+the 27.
+
+`TimeoutException` is the separate throughput defect tracked on
+`bug-h2-testmultithread-concurrent-update-timeout.md`, not this one.
+
+### Eliminated, with measurements
+
+* **The per-bci live-local mask is not the gap.** The synthetic enhanced-for
+  `Iterator` local is read only across the loop's BACK EDGE from after the
+  blocking call, so an analysis that did not reach a fixpoint over that edge
+  would call it dead exactly where the thread parks — and that mask is what
+  `Frame::scan_local_objects` filters the blocked-thread root snapshot with.
+  `local_liveness::tests::enhanced_for_iterator_is_live_at_the_blocking_call`
+  models the real method's bytecode (loop head 7, `Future.get` at 37, the whole
+  range inside a `try` whose handler never reads the slot) and asserts slot 9
+  live at pc 37/42/43. It **passes**, and it is differential: slot 10 (`job`)
+  is correctly dead at pc 42, so the analysis is doing real work rather than
+  returning `ALL_LIVE`.
+* **The young sweep is not dropping a published root.** The new
+  root-in-dead-span invariant compares `roots` + `finalizer_addrs` — the exact
+  set the mark phase was handed — against every span the sweep is about to
+  zero, and RETAINS any span a live (non-forwarded) root points into. It
+  measured **zero** across the whole campaign (`rootdead=0` on all 18 runs).
+  That is an elimination, not a silence: the check runs unconditionally and
+  prints when it fires.
+* **The blocked-frame slot audit found nothing** (`audit=0` on all 18 runs).
+  It checks every live local and stack slot of every frame at blocked-region
+  entry and at wake for `class_id == 0 && kind == Object`, and asks the heap
+  whether such an address is in a reclaimed hole.
+
+### Instrumentation added (all unconditional)
+
+* `audit_frames_for_reclaimed_slots`, filtered by the collector's OWN liveness
+  mask — a *dead* local pointing into a reclaimed span is the filter working as
+  designed — and gated on `class_id == 0 && kind == Object`, because a
+  primitive array header also carries class id 0 and without the kind test
+  every `long[]` local flags on every wake. Cost is bounded to one frame walk
+  per COLLECTION per thread rather than one per blocking call (`f2a19c30af`).
+* A lock-free **young-span reclamation ring**, one record per COALESCED span.
+  The pre-existing `record_swept` is gated on `CRATONVM_DBG_SWEEP_ZERO`, which
+  also swaps the young collector off its parallel sweep prefix — the instrument
+  changed the thing it measured, which is this family's entire "reproduces
+  plain, never instrumented" history.
+* The **clone-face verdict** described in *Status* (`583021945b`).
+
+## What to try next
+
+1. **Find where the reference goes wrong, not where it is read.** The verdict
+   says the clone-face receiver is a live `java.lang.Thread` at an address the
+   caller's `long[]` reference should never hold. Work backwards from
+   `BitSetHelper.flip` → `Arrays.copyOf(long[], int)`: which load produced it?
+   `CRATONVM_JIT_BISECT_ONLY` narrowed the sibling JIT defect to two classes in
+   about ten runs and is the tool for this too.
+2. **Re-take anything measured before `12769bb23c`.** A wrong-object return
+   from a virtual call is not distinguishable, at the reader end, from a stale
+   reference, and that defect was live for this family's whole history.
+3. **Count all four faces**, not the one in this page's title —
+   `NoSuchMethodError` on an `Object` receiver, `CloneNotSupportedException`,
+   `cannot be cast`, and `SIGSEGV`. The family is ~4× more visible that way.
+4. **Do not re-derive the eliminations above.** Each cost a build-and-soak
+   cycle and each is recorded with its measurement.
+
 ## Related
 
 * `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md` — same family,
@@ -172,3 +294,7 @@ put into a probe.
   — the same all-zero receiver reaching `Thread.clone`.
 * `bug-h2-testmultithread-concurrent-update-timeout.md` — the class this was
   found in, whose own problem is throughput, not this.
+* `../../internal/fixed-suite-bugs/jit-invokevirtual-bound-to-resolved-base-entry-FIXED.md`
+  — the JIT miscompile that made this page's reproduction impossible, and the
+  reason a wrong-object return has to be excluded before a stale reference is
+  assumed.

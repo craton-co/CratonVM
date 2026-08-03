@@ -15,7 +15,7 @@ import org.h2.util.Task;
  * rounds instead of moving on to the 100-thread ones.
  *
  * Rounds 3 and 4 are where
- * docs/known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md
+ * the retired bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep write-up
  * reproduces; the stock class reaches them once, ~730 s in, and then leaves the
  * regime for good. Looping them keeps the heap state (a store closed and
  * rebuilt each round, old gen carrying the previous rounds' debris) and the
