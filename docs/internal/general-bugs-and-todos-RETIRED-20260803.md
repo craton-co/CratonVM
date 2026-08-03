@@ -341,7 +341,80 @@ appears after the run has already failed), plus
 
 ## Measurements
 
-<!-- MEASUREMENTS -->
+All on the shared Azure Linux host (16 cores), against JDK 25.0.3+9. The host
+carries other people's builds; every comparison below is **interleaved in both
+orders within each round**, which is the only thing that makes a shared host's
+numbers comparable at all. Spreads are quoted, not hidden — see the caveat at
+the end.
+
+### Item 2 — the descendant walk
+
+`cargo test --release -p cratonvm-classloading --lib -- --ignored --nocapture
+descendant_walk_scaling`, reproducible on any machine:
+
+```
+descendant walk over 20000 classes x 2000 upgrades
+  index : 571.495µs (10000 descendants visited)
+  scan  : 63.324098ms (40010000 classes probed)
+  ratio : 110.8x
+```
+
+The shape is the real one — a JDK stub being upgraded has a handful of
+descendants among tens of thousands of loaded classes — so the old scan paid
+the whole class count on every upgrade to produce a five-element answer. The
+item asked for "~50% cut in layout lookup time"; this part of it is 110x, and
+the `ClassId -> layout` lookup the item actually named was already O(1) before
+this work started.
+
+### Item 1 — BinaryTrees and Sieve
+
+`bench/CratonBench.java`, phases `bintrees` (the classic depth-18 binary-trees
+kernel) and `sieve` (100,000-limit sieve x 20,000 reps), isolated-process, 3
+rounds x 2 orders x 2 binaries = 6 samples per cell. Checksums were identical
+in **every** cell (`68332206` / `9592`), which is the half of this that is not
+noise-sensitive.
+
+Median ms, moving-young ON (the shipped default) vs OFF
+(`CRATONVM_GC=-moving-young`):
+
+| phase | OFF | ON | ON/OFF |
+|---|---:|---:|---:|
+| bintrees | ~2020 | ~3600–4950 | **~2.1x** |
+| sieve | ~2580–2920 | ~2680–3070 | ~1.1x |
+
+**This is the documented state, not a regression.**
+`docs/moving-young-throughput.md` measured bt18 at 1363 ms default vs 2905 ms
+moving-young — **2.1x** — after replacing the `young_object_starts` hash set
+with a bitmap, and recorded that as the copying collector's accepted cost. The
+retest lands on the same 2.1x, on both binaries, with matching checksums.
+
+What the item's bug actually did was different in kind: the deleted
+`!allow_moving_young` term made *every* JIT-active cycle take the non-moving
+sweep no matter what the flag said, so the copying collector could not be
+selected at all. That is gone. What is left is the copying collector costing
+what a copying collector costs — and it is the collector that completes bt18
+at `-Xmx512m`, which the default sweep cannot run at all.
+
+### No regression from this branch
+
+`fix2` (this branch) was first compared against a binary built from
+`origin/dev` **before** the 11 commits this branch later merged — including
+`fix(jit): give the operand stack a type model, closing the OSR veto`, which
+lands directly on the recursion-and-allocation loop `bintrees` is. That
+comparison is not attributable and is not reported. The control below is
+`origin/dev` HEAD built from the same tree, so the only difference is this
+branch.
+
+<!-- CONTROL -->
+
+### Caveat on the timings
+
+`bintrees` with moving-young on ranged 2368–6388 ms across samples of the
+*same* binary and arm — a 2.7x spread, on a host running other people's cargo
+builds at load 10–27. The ON/OFF ratio survives that because it is large,
+consistent in sign across every round and both orders, and independently
+documented at the same value. Any difference of a similar size to the spread
+itself should be treated as unmeasured on this host, not as measured-and-small.
 
 ---
 
