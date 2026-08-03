@@ -4096,7 +4096,7 @@ fn try_catch_nonparam_handler_local_stays_single_pass() {
 // ---------------------------------------------------------------------------
 // cov-04 — the invoke arms: a real `<init>` CALL, and the elision that outranks it
 //
-// `docs/known-issues/c2/cov-04-the-invoke-arms.md`. The census on the three
+// `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`. The census on the three
 // Spring Boot workloads found that EVERY refusal in the `0xb7` arm was an
 // `<init>` — 29 a `super(...)`/`this(...)` chain call in a compiled
 // constructor, 23 a `new X(args)` site — and none was a non-`<init>`

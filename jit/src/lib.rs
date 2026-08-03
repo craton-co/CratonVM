@@ -13509,9 +13509,10 @@ fn try_compile_inner(
         // ON; it can no longer force it off. See the design doc for the matching
         // `vm/src/runtime/env_cache.rs` cleanup.
         let ir_emit_virtual_calls = ir_virtual_calls_enabled(ir_emit_virtual_calls);
-        // cov-04 census. The four invoke bails in `IrBuilder::build` report a
-        // line number and a bytecode pc; neither says *which callee*, and the
-        // whole first increment of `docs/known-issues/c2/cov-04-the-invoke-arms.md`
+        // cov-04 census. The invoke bails in `IrBuilder::build` report a line
+        // number and a bytecode pc; neither says *which callee*, and the whole
+        // first increment of
+        // `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`
         // was "group them by callee before writing code". Under
         // `CRATONVM_DBG=ir-compiles` (or `jitc`) hand the builder a
         // diagnostic-only `pc → "0xNN cn.mn desc"` map so each bail names its
@@ -13548,8 +13549,13 @@ fn try_compile_inner(
                 cached.method_descriptor,
                 scan.invoke_ops.len(),
                 scan.new_ops.len(),
+                // `new_ops` is reported but is NOT part of `call_eligible` any
+                // more (cov-04 increment 2). It stays in the line because it is
+                // what the pre-fix measurement keyed on, so the two runs remain
+                // comparable — but this field must keep matching the predicate
+                // below, or the census reports a gate that is not the gate.
                 scan.anewarray_ops.len(),
-                scan.new_ops.is_empty() && scan.anewarray_ops.is_empty(),
+                scan.anewarray_ops.is_empty(),
             );
         }
         if (ir_emit_calls || ir_emit_special_calls || ir_emit_virtual_calls)

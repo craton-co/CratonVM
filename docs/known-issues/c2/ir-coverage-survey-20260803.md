@@ -62,6 +62,12 @@ from a workload that does not reach it.
 
 `getstatic` + `ldc`/`ldc_w` is **189 of 273 — 69%** of every opcode gap.
 
+> **Stale since `cov-04` landed (2026-08-03).** Re-measured on the same three
+> workloads with the invoke terms removed, this table reads 285 events, not 273:
+> `ldc` 90→**100**, `getstatic` 91→**94**, `ldc_w` 7→**8**, `aaload` 18→**19**,
+> `dup_x1` 6→**7**. The rest are unchanged. `cov-01` is still 69% and still the
+> largest bucket, but re-derive before sizing anything from these rows.
+
 ### The asymmetry worth staring at
 
 `IrBuilder::build` **does** have arms for `0x30 faload`, `0x31 daload`,
@@ -81,12 +87,28 @@ fixture's node mix"* — showing up in the code rather than in a plan.
 
 | site | what it is | events | lane |
 |---|---|---:|---|
-| `ir.rs:5204` | `invokespecial` that is neither a resolvable call nor a trivial `<init>` to elide | 53 | `cov-04` |
+| `ir.rs:5204` | `invokespecial` that is neither a resolvable call nor a trivial `<init>` to elide | 53 | ~~`cov-04`~~ CLOSED |
 | `ir.rs:5085` | `putfield` whose type tag is not `I/Z/B/C/S` — **every reference field store** | 37 | `cov-03` |
-| `ir.rs:5264` | an invoke with no `invoke_info` at that pc | 13 | `cov-04` |
+| `ir.rs:5264` | an invoke with no `invoke_info` at that pc | 13 | ~~`cov-04`~~ CLOSED |
 | `ir.rs:5041` | `getfield` of a `long`/`float`/`double` | 6 | `cov-03` |
-| `ir.rs:5314` | — | 2 | `cov-04` |
-| `ir.rs:5219` | — | 1 | `cov-04` |
+| `ir.rs:5314` | — | 2 | ~~`cov-04`~~ CLOSED |
+| `ir.rs:5219` | — | 1 | ~~`cov-04`~~ CLOSED |
+
+**The four `cov-04` rows are one cause, not four, and this table says so
+misleadingly.** Closed 2026-08-03 —
+[`docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).
+All 69 events are an `<init>`: two whole-method terms discarded the method's
+entire `invoke_info` map, and the builder then bailed at whichever invoke came
+first in bytecode order. That is why `5264`'s callees are `StringBuilder.append`
+and `Class.getName` — sites that were never the problem. A bail site records
+where a method died; it does not record why, and a row that reads like an
+opcode-shaped gap can be neither.
+
+> **Also stale since `cov-04` landed.** With the four `cov-04` rows at zero the
+> table reads 66 events, not 112, and `ir.rs:5085` is **59**, not 37 — it is now
+> the largest builder refusal in the corpus by a wide margin. The methods that
+> were hiding behind the invoke terms are constructors, and constructors write
+> reference fields, which is `cov-03`'s row.
 
 `ir.rs:5085` is the second asymmetry. The `getfield` arm was taught to handle
 reference fields, and its own comment records why: *"This was the single largest

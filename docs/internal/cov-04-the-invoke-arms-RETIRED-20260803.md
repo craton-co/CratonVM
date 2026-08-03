@@ -1,72 +1,284 @@
-# COV-04 — the largest structural refusal is an `invokespecial` the builder will not model
+# COV-04 — RETIRED 2026-08-03. All 68 invoke refusals were a constructor
 
-**Status:** not started. **Independent of every other lane.**
-**Owns:** the `0xb7` / `0xb9` arms and the `<init>`-elision path of
-`IrBuilder::build` in `jit/src/ir.rs` (`ir.rs:5152` onward, and the bail sites
-at 5204, 5219, 5264, 5314). Not `ir_compatible`, not `plan_inline`.
+Was `docs/known-issues/c2/cov-04-the-invoke-arms.md`. Owned the `0xb7` / `0xb9`
+arms and the `<init>`-elision path of `IrBuilder::build`, and the invoke
+eligibility loop in `jit/src/lib.rs` that feeds them.
 
-## The measurement
+The brief opened by refusing to size itself — *"this doc deliberately does not
+guess the split"* — and made the first increment a grouping rather than code.
+That was the right call, and the grouping it asked for contradicted both of the
+two cases it offered.
 
-69 events, the largest structural bucket:
+## What the lane shipped
 
-| site | what it is | events |
-|---|---|---:|
-| `ir.rs:5204` | `invokespecial` that is neither a resolvable call nor a trivial `<init>` this pass may elide | 53 |
-| `ir.rs:5264` | an invoke with **no `invoke_info` entry at that pc** | 13 |
-| `ir.rs:5314` | — (read the site; 2 events) | 2 |
-| `ir.rs:5219` | — (read the site; 1 event) | 1 |
+| | |
+|---|---|
+| increment 0 | the grouping the brief demanded, plus the diagnostic that makes it a `grep` |
+| increment 1 | a compiled constructor's `super(...)` / `this(...)` chain call lowers to a real `Op::Call` |
+| increment 2 | a method containing a `new` may lower its calls at all — the `call_eligible` term that forbade it had outlived its reason |
+| tests | three in `jit/tests/ir_vs_singlepass.rs`: one per shape, plus the transform that must not be lost |
 
-## Read `ir.rs:5204` before planning anything
+## Increment 0 — the grouping
 
-The bail sits on the *else* of "was this call resolvable", inside the
-scalar-new `<init>` elision path, and it refuses when
-`!self.trivial_init_pcs.contains(&pc)`. So 53 of these are not "an opcode is
-missing" — they are "this `invokespecial` is a real call and the builder's
-only other option here is to elide it, which it may not".
+`CRATONVM_DBG=ir-compiles` over the three Spring Boot workloads that carry 1,947
+of the survey's 1,954 compile requests (`ConditionalOnPropertyTests`,
+`AutoConfigurationSorterTests`, `ConditionalOnClassTests`, module
+`core/spring-boot-autoconfigure`, default configuration, one run each). It
+reproduces the survey's bail histogram to within one event, so it is measuring
+the same thing:
 
-That means the honest first question is **which** of the two it is:
+| site (survey line no.) | survey | this run |
+|---|---:|---:|
+| `ir.rs:5204` `invokespecial`, neither resolvable call nor trivial `<init>` | 53 | 52 |
+| `ir.rs:5264` `0xb6`/`0xb8` with no `invoke_info` | 13 | 13 |
+| `ir.rs:5314` `0xb9` with no `invoke_info` | 2 | 2 |
+| `ir.rs:5219` elidable `<init>` whose receiver is not a fresh `Op::New` | 1 | 1 |
 
-* a superclass or private `invokespecial` that *should* lower to an ordinary
-  call and the arm simply does not have that path; or
-* a constructor the elision analysis correctly declines, where the right answer
-  is a real call to `<init>` and the builder has no way to emit one.
+### Every one of the 52 is an `<init>`
 
-Answer it by grouping the 53 by callee before writing code. `CRATONVM_DBG=ir-compiles`
-prints the method the bail came from; the callee is one `javap` away. **Do not
-size this lane before that grouping exists** — the two cases have completely
-different work behind them, and this doc deliberately does not guess the split.
+The brief asked which of two things the 53 were:
 
-`ir.rs:5264` is different and much simpler: the caller supplied no
-`invoke_info` for that pc, so the site was never resolved at compile time. The
-single-pass backend treats that as "bail the method" too (see the `0xba` arm's
-`return false` on an unresolvable indy). Whether 13 events is worth a deferred
-path is a judgement, but the *finding* — that the two backends already agree
-here — should be stated rather than rediscovered.
+> * a superclass or private `invokespecial` that *should* lower to an ordinary
+>   call and the arm simply does not have that path; or
+> * a constructor the elision analysis correctly declines, where the right
+>   answer is a real call to `<init>` and the builder has no way to emit one.
 
-## The first increment
+**The first case has zero events.** Grouped by callee, all 52 name an `<init>`;
+not one is a private or `super.m()` `invokespecial`. That case was already
+handled — inc 24 gave the arm an ordinary-call path for a non-`<init>`
+`invokespecial`, and on this corpus it never fails.
 
-The grouping above, written into this doc, and nothing else. This is the one
-lane in the `cov-*` set whose work cannot be estimated from the survey, and
-starting it with code is how a lane spends a week on the smaller half.
+The second case is closer, but the split inside it is the finding. Joining each
+bail to the reason its method lost `invoke_info` — keyed on the compiling
+method's own name, which the diagnostic now prints on the bail line, **not** on
+log adjacency — gives:
 
-After that, whichever of the two cases is larger, as its own increment.
+| group | why `invoke_info` was absent | events | sites |
+|---|---|---:|---|
+| **A** — a `super(...)` / `this(...)` chain call in a compiled **constructor** | `is_special && mn == "<init>"` discarded `invoke_info` for the whole method | **29** | all at `5204` |
+| **B** — the method contains a `new` | `call_eligible = scan.new_ops.is_empty()` discarded `invoke_info` for the whole method | **39** | 23 @ `5204`, 13 @ `5264`, 2 @ `5314`, 1 @ `5219` |
 
-## How to verify
+68 events, none unmatched. (The same split falls out of the cruder
+nearest-preceding-log-line join, to the event — but that agreement is the check,
+not the method.)
 
-* `CRATONVM_DBG=ir-compiles`: `refused at ir.rs:5204` falls and
-  `optimizing backend produced a body` rises. As everywhere in this set, quote
-  both — a method that stops failing here and immediately fails on the next
-  unlowered opcode is a real outcome and it is not a body.
-* `jit/tests/ir_vs_singlepass.rs` for each shape the increment admits.
-* An `<init>` that this lane starts *calling* rather than eliding must still
-  run every side effect the elision path was allowed to skip. The existing
-  defence-in-depth comment at the elision site ("eliding a `<init>` whose
-  receiver is `this` or a parameter would skip a real superclass constructor
-  and hide any escape it performs") is the hazard, from the other direction.
+Group A is a case the brief did not have. Its receiver is `this`, a parameter;
+there is no `new` anywhere in the method, so eliding was never one of two
+options — it was structurally impossible, and the term was refusing the only
+lowering there was. 35 compiles were disabled that way; 79 were disabled by
+group B's term.
 
-## What to refuse
+Worth noting because it is the sort of thing a coarser join gets wrong: 33 of
+the 52 have a constructor as the *caller*, but only 29 are group A. The other
+four are constructors that also contain a `new`, so their cause is group B's
+term, not group A's.
 
-Any `invokespecial` whose callee identity is not established at compile time,
-and any elision this lane cannot prove is on a fresh `Op::New` it emitted
-itself. Both are refused today. The lane makes the refusal narrower or it does
-nothing; it never makes it a guess.
+### `ir.rs:5264` is not what it looked like
+
+The brief read the 13 as *"the caller supplied no `invoke_info` for that pc, so
+the site was never resolved at compile time"*, and asked whether a deferred path
+was worth building. It is not, because that is not what happened. The callees at
+those 13 sites are `StringBuilder.append`, `Class.getName`,
+`CollectionUtils.newLinkedHashSet`, `RootBeanDefinition.hasMethodOverrides` —
+ordinary, resolvable, shape-compatible methods. Every one is in a method that
+lost `invoke_info` wholesale to group B's term, and the builder reached the
+virtual/static invoke before it reached the constructor.
+
+Across every invoke-bearing admitted compile in the corpus there are exactly
+**two** reasons `invoke_info` is ever absent — group A's term and group B's —
+and **zero** events for any of the other four (`cp_invoke_resolver` declining a
+CP index, `static_call_shape` refusing a descriptor, a gate being off, a
+self-recursive wide return). So the two backends do *not* "already agree here":
+the IR tier was losing sites the single-pass backend compiles without comment.
+
+## Increment 1 — group A: call the constructor
+
+`is_special && mn == "<init>"` is gone from the eligibility loop. Its comment
+justified itself with *"a `<init>`-bearing method also has a `new`, so
+`call_eligible` is already false"* — false for 35 of the compiles it disabled,
+which were constructors with no `new` at all.
+
+A `<init>` now takes `invoke_kind == 1`, the statically-bound non-virtual
+dispatch, which is **exactly what the single-pass backend already emits** for
+every constructor call its own elision rewrite declines (`jit/src/lib.rs`, the
+`cp_elidable_init_resolver` rewrite's `else` arm). No new call shape and no new
+runtime path: `jit_invoke_dispatch` kind 1 → `invoke_special_shared`, the
+interpreter's own invokespecial semantics.
+
+A `<init>` is deliberately excluded from the IR **direct**-call path. That path
+bakes a callee entry this compile resolved by running `callee_compiler`, and
+making every constructor site eagerly compile its callee is a compile-time and
+recursion-cycle change this lane did not measure. Constructors keep helper
+dispatch.
+
+The `0xb7` arm is now ordered *elision first, call second*, and the
+elidable-but-receiver-is-not-a-fresh-`New` case falls through to the call
+instead of bailing (that was the single `5219` event). The ordering matters: an
+`Op::Call` arg-escapes its reference inputs, so taking the call where elision
+applies would pin an allocation that scalar replacement was about to remove.
+
+The brief's hazard — *"an `<init>` that this lane starts calling rather than
+eliding must still run every side effect the elision path was allowed to skip"* —
+points the safe way round. Calling runs everything; only eliding can skip.
+
+## Increment 2 — group B: a method with a `new` may have calls
+
+```rust
+let call_eligible = scan.new_ops.is_empty() && scan.anewarray_ops.is_empty();
+```
+
+The `new_ops` term's stated reason was *"a surviving `New` would need the
+allocation path the lowerer lacks"*. `ir_lower` has that path: its `Op::New` arm
+goes through the shared compact-layout / TLAB-aware `jit_new_object` stub — the
+same helper the single-pass `0xbb` uses — and `ir_lower` already refuses the
+graph when `helpers.new_object == 0` rather than calling through address zero.
+The premise expired; the term did not.
+
+It is the single largest cause of an invoke refusal in the corpus: 79 compiles,
+39 of the 68 bails, including *all* of `5264` and `5314`.
+
+`anewarray` stays. `IrBuilder::build` has no `0xbd` arm at all and
+`ir_compatible` refuses such methods a stage earlier anyway — that conjunct is
+`cov-06`'s, and this lane did not touch it.
+
+Soundness of the newly-admitted shape rests on one existing rule: an allocation
+that reaches an `Op::Call` as an argument is `ArgEscape` in
+`build_connection_graph`, so it is really allocated rather than scalar-replaced.
+The `new`-plus-non-elidable-`<init>` test asserts exactly that, by counting
+allocations.
+
+## The verification
+
+`CRATONVM_DBG=ir-compiles`, the same three workloads, base and fixed binaries
+interleaved with the arm order flipped between rounds. Every number below is a
+count, so the host's load does not enter into it.
+
+Two rounds, three workloads each, both arms every round:
+
+| | base r1 | base r2 | fix r1 | fix r2 |
+|---|---:|---:|---:|---:|
+| compile requests | 1,943 | 1,937 | 1,942 | 1,942 |
+| admitted to the optimizing pipeline | 976 | 974 | 976 | 978 |
+| **bodies the optimizing backend produced** | **590** | **590** | **619** | **621** |
+| builder refusals, all sites | 112 | 110 | 66 | 66 |
+| **invoke refusals** | **69** | **67** | **0** | **0** |
+| opcode-gap events | 269 | 269 | 285 | 285 |
+
+**The invoke arms refuse nothing on this corpus any more** — `5303`, `5345` and
+`5395` are all zero in both fixed rounds — and **bodies rose by 30**, from 590 to
+620. All twelve runs pass (`failed=0 aborted=0 containersFailed=0`) in both
+arms.
+
+The other half, which the brief insists be quoted: of the ~68 methods that
+stopped failing here, roughly 30 became a body and the rest moved to the next
+gap they meet.
+
+| where the rest went | base | fix |
+|---|---:|---:|
+| `ir.rs:5085`→`5135` `putfield` of a non-`I/Z/B/C/S` tag (`cov-03`) | 37 | 59 |
+| `ldc` `0x12` (`cov-01`) | 90 | 100 |
+| `getstatic` `0xb2` (`cov-01`) | 91 | 94 |
+| `ldc_w` `0x13` (`cov-01`) | 7 | 8 |
+| `aaload` `0x32` / `dup_x1` `0x5a` (`cov-02`) | 18 / 6 | 19 / 7 |
+| `ir.rs:5179` a `new` whose site is `JitNewSite::Deferred` | 0 | 1 |
+
+Which is the ranking-shift the directory's own re-run rule predicts: `cov-03`'s
+`putfield` row grew by 22 and is now the single largest builder refusal in the
+corpus, because the methods hiding behind the invoke terms are constructors and
+constructors write reference fields. Run-to-run variation on these counts is
+±1–2 events.
+
+Bail line numbers move with the edit. In the fixed binary the invoke bails are
+`ir.rs:5303` (`0xb7` — the `5204`/`5219` pair merged, since a receiver that is
+not a fresh `Op::New` is now a call rather than a refusal), `ir.rs:5345`
+(`0xb6`/`0xb8`) and `ir.rs:5395` (`0xb9`).
+
+The brief asks for both halves to be quoted, and warns that a method which stops
+failing here and immediately fails on the next unlowered opcode is a real
+outcome and is not a body. That is most of what happened, and it was expected:
+`getstatic` + `ldc` is 69% of the remaining opcode gap (`cov-01`, 189 events)
+and is untouched.
+
+Unit coverage, `jit/tests/ir_vs_singlepass.rs`:
+
+* `ir_invokespecial_super_constructor_chain_is_called` — group A. The dispatch
+  stub writes `n * 3` into the receiver's field; the method reads it back. `0`
+  means the call was never emitted; anything else means the receiver/argument
+  pair is wrong.
+* `ir_new_with_non_elidable_constructor_allocates_and_calls_init` — group B.
+  `new Corpus(n)` then `sink(c)`; the constructor writes `n * 5` and `sink`
+  reads it back, and the allocation counter must advance once per invocation.
+* `ir_elidable_trivial_init_on_fresh_new_is_still_elided` — the transform the
+  lane must not lose, as a two-armed comparison: with the site elidable the
+  dispatch helper must never run; with the identical bytecode declined by the
+  elision analysis it must run once per invocation. The second arm exists
+  because the first alone would also pass on a builder that silently dropped
+  every `<init>`.
+
+Each test names the exact edit that trips it, per this directory's rule 5.
+`cargo test --release -p cratonvm-jit --lib` is 1,868 / 0, and
+`--test ir_vs_singlepass` is 95 / 0.
+
+### One trap worth naming
+
+`ir_lower::tests::the_op_representatives_cover_every_declared_variant` failed
+during this lane with an `ir::Op` set of **90** names — `Absent`, `Acquire`,
+`EDGE`, `THREAD` — instead of the real 53. Nothing to do with the change. The
+edits were made in a **Windows** worktree, where `core.autocrlf=true` puts CRLF
+on disk (the `.gitattributes` header says so), and the file was `scp`'d to the
+Linux build host. `include_str!("ir.rs")` then read CRLF, so that scanner's
+`"\n}\n"` block terminator never matched and its "enum body" ran to the end of
+the file.
+
+Two things follow. Sync a remote build worktree with
+`git fetch && git reset --hard FETCH_HEAD`, never `scp` — that also proves the
+host is building the pushed content. And when checking whether a blob really
+carries CRLF, use `git cat-file -p`: `git show HEAD:<path>` applies the
+working-tree EOL filter and reports the opposite. Release binaries are
+unaffected — every `include_str!` in the crate is under `#[cfg(test)]` — so the
+A/B above stands; only the test run had to be repeated from a clean checkout.
+This is a sibling of the six text-scanning gates `seam-01` found, from a
+direction that has nothing to do with moving code.
+
+## Residuals
+
+* **A `new` whose only uses are its own field ops is still allocated.** Found
+  while writing the elision test; not caused by this lane — with the site
+  elidable the graph is identical to the one the pre-`cov-04` builder produced,
+  because elision has always won that case. Repro is in the test:
+  `new Corpus(); c.f0 = n; return c.f0` with an elidable `<init>` reaches
+  `jit_new_object` once per invocation instead of being scalar-replaced.
+  Whether escape analysis should catch this shape is the EA owner's question;
+  `CRATONVM_DBG_SCALAR_NEW=1` reports what it decided.
+* **`<init>` sites keep helper dispatch**, by choice (increment 1). Binding them
+  directly is a measurable follow-up, not a gap.
+* **A constructor with a `long` / `double` / `float` parameter** is still
+  refused by `static_call_shape`, and one refused site still discards
+  `invoke_info` for the whole method. Zero events in this corpus — all four
+  remaining non-emittable reasons scored zero — so there is nothing to size it
+  from.
+* **The all-or-nothing discard itself.** One non-emittable invoke costs the
+  method every other invoke's lowering. It is not *wrong* (the builder bails on
+  any invoke it cannot lower, so the method was lost either way), and it now
+  measures at zero, but it is why the two terms this lane removed cost 68 events
+  rather than being confined to the sites that caused them.
+
+## Reproducing
+
+```bash
+CRATONVM_DBG=ir-compiles <cratonvm> ... SbRunner org.springframework.boot.autoconfigure.condition.ConditionalOnPropertyTests
+```
+
+Three line kinds carry everything above:
+
+* `[ir] invoke-plan <method>: sites=N new_ops=N anewarray_ops=N gates(...) call_eligible=B`
+  — one per invoke-bearing compile, before the builder runs.
+* `[ir] invoke-plan <method>: NO invoke_info — <reason>` — which of the six
+  conditions discarded the map, and at which pc.
+* `[ir] IrBuilder::build refused at ir.rs:NNNN (bytecode pc N) in <caller> callee <0xNN cn.mn desc>`
+  — the bail, now naming both ends. The caller is what makes the join to the
+  reason line exact rather than an assumption about log interleaving.
+
+All three are diagnostic-only and cost nothing with the flag off: the invoke
+label map is not built, the constant-pool resolver is not called for it, and
+`IrBuilder`'s two extra fields stay empty.
