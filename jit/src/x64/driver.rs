@@ -147,14 +147,6 @@ pub fn compile(
     )
 }
 
-/// Compile a method to native code with an explicit parameter→JVM-slot map.
-///
-/// `param_jvm_slots[i]` is the JVM local slot of the i-th incoming JIT
-/// argument (`this` first for instance methods, then declared params), and
-/// `param_slot_span` is the total JVM slots the parameters occupy (category-2
-/// counted as 2). These let the prologue place long/double parameters in the
-/// slots the body actually reads. Pass `&[]` / `0` for the legacy
-/// "arg index == slot" behavior (see the [`compile`] wrapper).
 #[allow(clippy::too_many_arguments)]
 /// Prove that every hot recursive edge in this body is GC-inert.
 ///
@@ -238,6 +230,14 @@ pub(super) fn gc_inert_selfrec_candidate(
     pc == code_len && self_calls != 0 && saw_return
 }
 
+/// Compile a method to native code with an explicit parameter→JVM-slot map.
+///
+/// `param_jvm_slots[i]` is the JVM local slot of the i-th incoming JIT
+/// argument (`this` first for instance methods, then declared params), and
+/// `param_slot_span` is the total JVM slots the parameters occupy (category-2
+/// counted as 2). These let the prologue place long/double parameters in the
+/// slots the body actually reads. Pass `&[]` / `0` for the legacy
+/// "arg index == slot" behavior (see the [`compile`] wrapper).
 #[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
     code: &[u8],
