@@ -14,10 +14,10 @@ here — which lanes have a **first increment** rather than a finished lane.
 | Lane | Docs | Why it is untouched |
 |---|---|---|
 | HIR/LIR/MIR | ~~`hir-01`~~ ~~`hir-02`~~ **both closed 2026-08-03** | Consolidated into `docs/feature-designs/jit-machine-level-and-instruction-selection.md`. Four levels, not three; the report's "HIR" is the bytecode. Increment 0 (shadow selection, emits nothing) landed and measured **15.7–19.0%** coverage on real compiles with `Rule::Lea`/`AluImm` firing **zero** times — so the next step is six 32-bit pattern rows, not a machine level. |
-| Profile-guided inlining | ~~`pgo-01`~~, `pgo-02` | `pgo-01`'s first increment shipped 2026-08-03 — see `docs/internal/pgo-01-call-site-evidence-gap-RETIRED-20260803.md`. The *policy* still is not fed: `pgo-02`'s speculation has no guard/deopt pairing yet. |
-| OSR | ~~`osr-01`~~ **closed 2026-08-03**, `osr-02` | The metadata contract is executable and enforced — `docs/feature-designs/jit-osr-entry-metadata.md`. Two findings: there are **three** coordinate spaces, not the two the brief names, and the second compile door (`compile_osr_artifact` calling `x64::compile` directly) is still open and is now the whole remaining item. `osr-02`, the exit/recompile story, is untouched. |
+| Profile-guided inlining | ~~`pgo-01`~~, ~~`pgo-02`~~ | Both lanes' first increments shipped 2026-08-03 — see `docs/feature-designs/profile-guided-inlining.md`. Monomorphic guarded virtual/interface inlining is real (behind `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE`, default-off); Bimorphic and a deopt-capable guard remain open. |
+| OSR | ~~`osr-01`~~ ~~`osr-02`~~ **both closed 2026-08-03** | The metadata contract is executable and enforced — `docs/feature-designs/jit-osr-entry-metadata.md`. Two findings: there are **three** coordinate spaces, not the two the brief names, and the second compile door (`compile_osr_artifact` calling `x64::compile` directly) is still open and is now the whole remaining item. `osr-02` → `docs/feature-designs/jit-osr-exit-and-recompile.md`: the per-pc livelock memo was **already built** (and is finer-grained than the brief asks — only *artifact-level* refusals may be memoed), and OSR lifecycle counters now make a silent exit distinguishable from never having entered. The exit-state differential is the remaining item; its forcing lever (`CRATONVM_OSR_EXIT_AFTER=N`) already exists. |
 | Loop transforms | `loop-01`, `loop-02` | One transform (bytecode unroll) is wired behind an opt-in. Everything else is unbuilt, and the planner refuses most compiles for reasons nobody has revisited. |
-| `x64.rs` / `invoke.rs` seams | `seam-01`, `seam-02` | 40k and 24k lines. The split is mechanical but every lane in the wave collided on these two files. |
+| `x64.rs` / `invoke.rs` seams | ~~`seam-01`~~ **closed 2026-08-03**, `seam-02` | `x64.rs` is split: 40,588 lines to 2,503 across seventeen verified commits — `docs/internal/seam-01-x64-backend-split-RETIRED-20260803.md`. The differ it was verified with is checked in as `jit/tests/x64_artifact_corpus.rs` and is reusable by any lane touching the backend. `invoke.rs`, 24k lines, is untouched. |
 
 Plus `verify-01`, which is not a lane — it is the harness every lane above
 needs in order to prove it did not regress anything. Its first increment
@@ -51,6 +51,17 @@ shipped or narrowly avoided.
    would trip each new check.
 6. **Do not trust a handover's census.** The JVMTI lane's handover said ~15
    call sites in one file; the real count was 28 across two. Re-derive counts.
+
+`seam-01` closing on 2026-08-03 added two data points to rule 1, both in the
+direction the rule warns about. Its doc named two hazards to expect during the
+split; **neither occurred**. The `private_interfaces` warning it predicted for
+the loop-rewrite refusal enum cannot fire — the enum's only payload type was
+widened to the same visibility as the enum some time after the warning was
+seen — and no test turned out to depend on file-private access, because a child
+module can see its parent's private items. What *did* break the build on the
+first commit was not in the doc at all: two tests that read the backend's own
+source text with `include_str!`, one of them an emission-site inventory the
+object-header shrink navigates by.
 
 ## Sequencing
 
