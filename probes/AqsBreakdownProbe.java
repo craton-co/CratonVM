@@ -28,11 +28,45 @@ public class AqsBreakdownProbe {
 
     private static final int WARMUP = 200_000;
     private static final int ROUNDS = 2_000_000;
+    /**
+     * Each rung is measured this many times and every pass is printed.
+     *
+     * A single warm-up-then-measure pass is not enough on this VM and the first
+     * cut of this probe was wrong because of it: it reported an "empty instance
+     * call" at 431 ns, which a 6-pass run shows converging to 8.6 ns by pass 2.
+     * That inflated figure was then used to argue the AQS gap was "just 16
+     * calls at the per-call floor" — it is not; `ReentrantLock` holds flat at
+     * ~16 us across all six passes while an ordinary call is single-digit ns.
+     * Read the LAST pass, and distrust any rung that has not gone flat.
+     */
+    private static final int PASSES = 4;
 
     private static long sink;
 
     private static void report(String label, long nanos, int n) {
         System.out.printf("%-46s %9.1f ns/op%n", label, nanos / (double) n);
+    }
+
+    /** A rung: run `n` iterations, return elapsed nanos. */
+    private interface Rung {
+        long run(int n);
+    }
+
+    /**
+     * Run one rung `PASSES` times and print every pass on one line.
+     *
+     * The lambda here is NOT inside any timing loop — it is called once per
+     * pass, and each implementation contains its own inline loop. That
+     * distinction matters on this VM: an earlier version of this probe put the
+     * lambda call *inside* the loop, where its ~2.2 us invokeinterface swamped
+     * every measurement.
+     */
+    private static void pass(String label, Rung r) {
+        System.out.printf("%-46s", label);
+        for (int i = 0; i < PASSES; i++) {
+            System.out.printf("%11.1f", r.run(ROUNDS) / (double) ROUNDS);
+        }
+        System.out.println();
     }
 
     private static long lockUnlock(ReentrantLock lock, int n) {
@@ -157,20 +191,38 @@ public class AqsBreakdownProbe {
             System.out.println("(unreachable)");
         }
 
-        report("empty instance call (the scale)", emptyCall(p, ROUNDS), ROUNDS);
+        System.out.printf("%-46s", "rung");
+        for (int i = 1; i <= PASSES; i++) {
+            System.out.printf("%11d", i);
+        }
+        System.out.println("   (ns/op per pass; read the LAST)");
+
+        pass("empty instance call (the scale)", n -> emptyCall(p, n));
         System.out.println();
-        report("ReentrantLock lock+unlock (uncontended)", lockUnlock(lock, ROUNDS), ROUNDS);
-        report("ReentrantLock tryLock+unlock", tryLockUnlock(lock, ROUNDS), ROUNDS);
-        report("ReentrantLock FAIR lock+unlock", lockUnlock(fair, ROUNDS), ROUNDS);
-        report("Semaphore acquire+release (permits free)", semaphore(sem, ROUNDS), ROUNDS);
-        report("CountDownLatch.await (already zero)", latchAwait(open, ROUNDS), ROUNDS);
-        report("Condition.signal (no waiter)", signalNoWaiter(lock, cond, ROUNDS), ROUNDS);
+        pass("ReentrantLock lock+unlock (uncontended)", n -> lockUnlock(lock, n));
+        pass("ReentrantLock tryLock+unlock", n -> tryLockUnlock(lock, n));
+        pass("ReentrantLock FAIR lock+unlock", n -> lockUnlock(fair, n));
+        pass("Semaphore acquire+release (permits free)", n -> {
+            try {
+                return semaphore(sem, n);
+            } catch (InterruptedException e) {
+                throw new IllegalStateException(e);
+            }
+        });
+        pass("CountDownLatch.await (already zero)", n -> {
+            try {
+                return latchAwait(open, n);
+            } catch (InterruptedException e) {
+                throw new IllegalStateException(e);
+            }
+        });
+        pass("Condition.signal (no waiter)", n -> signalNoWaiter(lock, cond, n));
         System.out.println();
-        report("synchronized block (uncontended)", syncBlock(monitor, ROUNDS), ROUNDS);
+        pass("synchronized block (uncontended)", n -> syncBlock(monitor, n));
         System.out.println();
-        report("AtomicInteger.compareAndSet (tryAcquire CAS)", cas(ai, ROUNDS), ROUNDS);
-        report("AtomicInteger.get", atomicGet(ai, ROUNDS), ROUNDS);
-        report("Thread.onSpinWait", spinWait(ROUNDS), ROUNDS);
+        pass("AtomicInteger.compareAndSet (tryAcquire CAS)", n -> cas(ai, n));
+        pass("AtomicInteger.get", n -> atomicGet(ai, n));
+        pass("Thread.onSpinWait", AqsBreakdownProbe::spinWait);
 
         if (sink == 42) {
             System.out.println("(unreachable)");
