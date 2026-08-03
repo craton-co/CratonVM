@@ -74,6 +74,13 @@ $JdkHome= 'C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot'
 $JAVA   = Join-Path $JdkHome 'bin\java.exe'
 $CpFile = Join-Path $Work 'cp.txt'
 $AllList= Join-Path $Work 'all-tests.txt'
+# Apache httpd for the 9 org.apache.tomcat.integration.httpd.* classes, which
+# proxy real traffic through an httpd each test starts itself. Windows has no
+# httpd on PATH and TesterHttpd looks for a literal "httpd" unless
+# -Dtomcat.test.httpd.path points at one, so without this all 9 fail with a
+# connection-refused to the proxy port - on HotSpot exactly as on CratonVM.
+# Provision with: pwsh apps\tomcat-suite-runner\setup-httpd-windows.ps1
+$Httpd  = 'C:\craton\tools\Apache24\bin\httpd.exe'
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 
 function Write-Info($m) { Write-Host "[suite] $m" -ForegroundColor Cyan }
@@ -90,6 +97,8 @@ function ConvertTo-HeapBytes([string]$h) {
   return 0
 }
 
+# Per-class heap overrides.
+#
 # Tests whose name contains "LargeHeap" deliberately allocate multi-GiB
 # payloads (e.g. TestEncryptInterceptorLargeHeap encrypts a 1 GiB array). The
 # suite-wide default -Xmx (2g) OOMs them on BOTH CratonVM and HotSpot, so a
@@ -98,10 +107,23 @@ function ConvertTo-HeapBytes([string]$h) {
 # >=8g; CratonVM >=10g after the humongous-cap GC fix). Never downgrade a
 # larger user-supplied -MaxHeap.
 $LargeHeapXmx = '12g'
+# TestChunkedTransferEncodingWithProxy is the same shape without the naming
+# convention: PAYLOAD_SIZE is literally 10 * 1024 * 1024 * 100 = 1 GiB, and
+# TomcatBaseTest.postUrl needs a second buffer of the same size. HotSpot fits
+# that in the 2g default (26.6 s measured); CratonVM's default Generational
+# collector caps old-gen at Xmx/2, so a 1 GiB humongous array cannot land and
+# the class OOMs at exactly `native primitive array of length 1048576000`.
+# 4g clears it (110 s measured). `-Xmx2g -XX:+UseG1GC` also passes - CratonVM's
+# own G1 has no fixed split - but takes 275 s, close enough to the 300 s default
+# timeout to score as a HANG, so prefer the heap bump.
+$ChunkedProxyXmx = '4g'
 function Resolve-ClassHeap([string]$cls, [string]$defaultHeap) {
-  if ($cls -notmatch 'LargeHeap') { return $defaultHeap }
-  if ((ConvertTo-HeapBytes $defaultHeap) -ge (ConvertTo-HeapBytes $LargeHeapXmx)) { return $defaultHeap }
-  return $LargeHeapXmx
+  $want = if ($cls -match 'LargeHeap') { $LargeHeapXmx }
+          elseif ($cls -eq 'org.apache.tomcat.integration.httpd.TestChunkedTransferEncodingWithProxy') { $ChunkedProxyXmx }
+          else { return $defaultHeap }
+  # Never downgrade a larger user-supplied -MaxHeap.
+  if ((ConvertTo-HeapBytes $defaultHeap) -ge (ConvertTo-HeapBytes $want)) { return $defaultHeap }
+  return $want
 }
 
 # ---------------------------------------------------------------------------
@@ -307,6 +329,9 @@ function Invoke-Mode {
     '--add-opens','java.base/java.util=ALL-UNNAMED',
     '--add-opens','java.base/java.util.concurrent=ALL-UNNAMED'
   )
+  # Inert for every class except org.apache.tomcat.integration.httpd.*.
+  if (Test-Path $Httpd) { $jvmArgs += "-Dtomcat.test.httpd.path=$Httpd" }
+  else { Write-Warning "[suite] httpd not found at $Httpd - the 9 org.apache.tomcat.integration.httpd.* classes will fail with connection-refused. Run setup-httpd-windows.ps1." }
   if ($Vm -eq 'craton') {
     if ($NoJit)     { $jvmArgs += '--nojit' }
     if ($Synthetic) { $jvmArgs += '--synthetic-jdk' }

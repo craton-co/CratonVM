@@ -28,7 +28,21 @@ Needs a Tomcat checkout with:
   (`apt-get install ant`) by hand,
 - a class list at `$TC_ROOT/.suite/all-tests.txt` (one FQCN per line, **no
   CRLF** - if generated on Windows and `scp`'d over, run
-  `sed -i 's/\r$//' all-tests.txt` first or every class name fails to resolve).
+  `sed -i 's/\r$//' all-tests.txt` first or every class name fails to resolve),
+- an **Apache httpd binary** for the 9 `org.apache.tomcat.integration.httpd.*`
+  classes. Each of them starts its own httpd reverse proxy in front of the
+  embedded Tomcat under test; with no binary they all fail with a
+  connection-refused to the proxy port, on HotSpot exactly as on CratonVM.
+  The script passes `-Dtomcat.test.httpd.path="$HTTPD_PATH"`, defaulting to
+  `command -v httpd`. Debian names the binary `apache2`
+  (`apt-get install apache2`), so either symlink it onto `PATH` as `httpd` or
+  set `HTTPD_PATH=/usr/sbin/apache2`. On Windows there is no httpd at all:
+  run `pwsh apps/tomcat-suite-runner/setup-httpd-windows.ps1`, which unpacks a
+  SHA-256-verified Apache Lounge build into a local directory (no service, no
+  `PATH` change) and applies `fixtures/httpd-ready-timeout.patch` - upstream
+  `TesterHttpd` allows httpd 1000 ms to bind its listener, ample on Linux but
+  consistently short of the 1.0-1.5 s that MPM WinNT startup measures, so on
+  Windows all 9 fail ~1 s in even with a good httpd installed.
 
 None of this setup is automated by the script itself (mirrors the `.ps1`
 harness's `-Setup` step, which isn't reproduced here) - reuse an existing

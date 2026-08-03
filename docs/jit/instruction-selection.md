@@ -2,8 +2,10 @@
 
 **Status:** component landed and **compiled**, not wired. Nothing in the
 production pipeline calls it. See [Wiring](#wiring) for what the call site has
-to do, and `docs/jit/lowering-contract.md` §5 for the increment order that
-wiring should follow.
+to do, and
+`docs/feature-designs/jit-machine-level-and-instruction-selection.md` for the
+increment order that wiring should follow — which, as of 2026-08-03, puts the
+32-bit rows of §6 item 2 *before* any wiring at all.
 
 **Where:** `jit/src/x64/isel.rs`, below the `// IR-level instruction selection`
 banner. The memory-ordering rule it depends on is in `jit/src/ir_schedule.rs`.
@@ -33,14 +35,21 @@ Two related components are in the same state and for the same reason — no
 consumer exists for "an instruction whose operands are values, not addresses":
 `jit/src/regalloc.rs::allocate_linear_scan` (used only as a write-through read
 cache) and `jit/src/x64/vec_emit.rs::emit_vector_loop` (no caller at all).
-`docs/jit/lowering-contract.md` §0 is the joint statement of that gap.
+`docs/feature-designs/jit-machine-level-and-instruction-selection.md` is the
+joint statement of that gap.
 
-**Measured coverage.** Over a ten-shape integer/branch/loop corpus,
-`select_block` covers 38.2% of scheduled data nodes with a real rule; the rest
-fall to `Rule::Generic`. `Rule::AluImm` fires **zero** times — every attempt is
-refused `Unencodable/AluImm/UnknownPattern`, because the table has no 32-bit
-immediate rows. That ranks §6's gap list: the 32-bit rows first. Probe and
-caveats: `docs/jit/lowering-contract.md`, appendix.
+**Measured coverage, on real compiles.** Shadow selection
+(`CRATONVM_JIT=ir-isel-shadow`, default off, emits nothing) ran over 850 Spring
+Boot methods on 2026-08-03: `select_block` covers **15.7–19.0%** of scheduled
+data nodes; the rest fall to `Rule::Generic`. **`Rule::AluImm` and `Rule::Lea`
+fire ZERO times** — the table is 64-bit and Java arithmetic is 32-bit. Of the
+four rules that do fire, `TestBranch` (60 tiles) is byte-for-byte what
+`ir_lower` already emits.
+
+An earlier ten-shape synthetic corpus said 38.2% and fired `Lea` once. It was
+double the truth and named the wrong rules. That ranks §6's gap list
+unambiguously: **the 32-bit rows first, before any production wiring.** Full
+figures: `docs/feature-designs/jit-machine-level-and-instruction-selection.md`.
 
 ---
 

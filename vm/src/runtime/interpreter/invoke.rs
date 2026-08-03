@@ -16,8 +16,9 @@ pub(super) fn execute_invoke(
     frame_idx: usize,
     cp_index: u16,
     is_special: bool,
+    pc: usize,
 ) -> Result<CachedCallResult, MethodCallFailed> {
-    execute_invoke_kind(shared, thread, frame_idx, cp_index, is_special, false)
+    execute_invoke_kind(shared, thread, frame_idx, cp_index, is_special, false, pc)
 }
 
 /// JEP 358 — a [`CpResolver`] backed by the live constant pool of
@@ -319,6 +320,7 @@ pub(super) fn execute_invoke_kind(
     cp_index: u16,
     is_special: bool,
     is_interface: bool,
+    pc: usize,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     dbg_invoke_stats_record(3);
     let current_class_id = thread.frames[frame_idx].class_id;
@@ -326,6 +328,27 @@ pub(super) fn execute_invoke_kind(
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
     let method_owner_name = Arc::clone(&method_class_name);
+
+    // PGO-01 (docs/known-issues/c2/pgo-01-call-site-evidence-gap.md):
+    // call-site evidence for invokespecial. invokevirtual/invokeinterface are
+    // NOT recorded here — they are covered by the receiver-type profile
+    // instead (see MethodProfile's doc comment on `receivers` vs
+    // `call_sites`), and double-recording both would double-count a single
+    // call-site execution against two different evidence sources. Recorded
+    // once, here, right after resolution succeeds — this function is only
+    // reached on a genuine miss from the fast cached dispatch
+    // (execute_invokevirtual_cached), so by this point the invokespecial
+    // instruction is definitely executing, not merely being probed. NOT
+    // placed at every downstream successful-dispatch return point, of which
+    // this function has many (native, JIT, lambda-proxy, default-method
+    // rescue…) — see MethodProfile::call_sites's doc comment for the explicit
+    // concurrency contract: this is a heuristic hotness signal for the
+    // inliner, not a correctness input, so the small over/under-count this
+    // early-return placement can produce on a resolution error is acceptable.
+    if is_special && crate::jit::profile::is_profiling_enabled() {
+        let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
+        shared.jit.profile_store.record_call_site_borrowed(cid, mn, md, pc);
+    }
 
     if crate::runtime::env_cache::dbg_loader_trace()
         && method_owner_name.contains("RootReference")
@@ -12327,11 +12350,22 @@ pub(super) fn execute_invokestatic(
     thread: &mut JvmThread,
     frame_idx: usize,
     cp_index: u16,
+    pc: usize,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let current_class_id = thread.frames[frame_idx].class_id;
 
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
+
+    // PGO-01: call-site evidence — same placement rationale as
+    // execute_invoke_kind's is_special arm (record once, early, right after
+    // resolution succeeds; this is the slow path, only reached on a cache
+    // miss from execute_invokestatic_cached, so the instruction is
+    // definitely executing by this point).
+    if crate::jit::profile::is_profiling_enabled() {
+        let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
+        shared.jit.profile_store.record_call_site_borrowed(cid, mn, md, pc);
+    }
 
     // Skip class init if this is a registered native method (avoids initialization hangs).
     // Walk the superclass chain because the constant pool may reference a subclass
@@ -13386,6 +13420,7 @@ pub(super) fn execute_invokestatic_cached(
     thread: &mut JvmThread,
     frame_idx: usize,
     cp_index: u16,
+    pc: usize,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
     let continuation_interpreted = matches!(thread.kind, crate::threading::ThreadKind::Virtual);
@@ -13430,6 +13465,17 @@ pub(super) fn execute_invokestatic_cached(
                 eprintln!("MODSTATIC: invokestatic_cached HIT {}.{}", mcn, mn);
             }
         }
+    }
+
+    // PGO-01: call-site evidence. Placed here, after every early
+    // `return Ok(CacheMiss)` above (JVMTI redefine eviction, stale-owner
+    // eviction, continuation-interpreted eviction) and right before the
+    // dispatch match below — every remaining path through this match
+    // actually dispatches (Handled/FramePushed), so this is "the call site
+    // fired," not "we merely consulted the cache."
+    if crate::jit::profile::is_profiling_enabled() {
+        let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
+        shared.jit.profile_store.record_call_site_borrowed(cid, mn, md, pc);
     }
 
     match target {
@@ -15420,6 +15466,7 @@ pub(super) fn compile_osr_artifact(
                 &helpers,
                 scan.non_escaping_new.clone(), // escape analysis results
                 std::collections::HashMap::new(), // inline_sites
+                std::collections::HashMap::new(), // inline_guard_class_ids (PGO-02, no guarded plan from this scan-based fast path)
                 None, // string_layout — String intrinsics land in a later wave
                 &param_jvm_slots,
                 param_slot_span,
@@ -16997,6 +17044,18 @@ pub(super) fn try_jit_upgrade_with_gate(
         let cm = shared.classes.class_manager.read();
         resolve_jit_new_site(&cm, class_id, cp_idx)
     };
+    // PGO-02: receiver class-id -> class-name resolver for a guarded
+    // speculative virtual/interface inline plan's SpeculatedReceiver
+    // invalidation dependency (plan_inline's fail-closed rule — see
+    // docs/feature-designs/profile-guided-inlining.md). `None` (id not
+    // loaded, or unloaded between profiling and compiling) refuses
+    // that one speculation rather than recording an unmatchable
+    // name-less dependency.
+    let class_id_namer = |cid: u32| -> Option<String> {
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(cratonvm_types::ClassId::new(cid))
+            .map(|c| c.name.to_string())
+    };
     // activate-ir-optimizer: elidable-`<init>` resolver for `new` scalar
     // replacement. Now default-ON (soaked: bt10/14/16/18 == HotSpot, POJO probes
     // == HotSpot, 802 jit + 20 differential tests green). `CRATONVM_JIT_SCALAR_NEW=0`
@@ -17432,6 +17491,18 @@ pub(super) fn try_jit_upgrade_with_gate(
                 let cm = shared.classes.class_manager.read();
                 resolve_jit_new_site(&cm, callee_cid, cp_idx)
             };
+            // PGO-02: receiver class-id -> class-name resolver for a guarded
+                // speculative virtual/interface inline plan's SpeculatedReceiver
+                // invalidation dependency (plan_inline's fail-closed rule — see
+                // docs/feature-designs/profile-guided-inlining.md). `None` (id not
+                // loaded, or unloaded between profiling and compiling) refuses
+                // that one speculation rather than recording an unmatchable
+                // name-less dependency.
+            let c_class_id_namer = |cid: u32| -> Option<String> {
+                let cm = shared.classes.class_manager.read();
+                cm.get_class(cratonvm_types::ClassId::new(cid))
+                    .map(|c| c.name.to_string())
+            };
             // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
             // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
             let c_scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
@@ -17573,6 +17644,11 @@ pub(super) fn try_jit_upgrade_with_gate(
                 // invokedynamic-uncommon-trap fix: resolves an invokedynamic
                 // CP index to its target descriptor for the callee's pool.
                 Some(&c_indy_descriptor_resolver),
+                if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+                    Some(&c_class_id_namer)
+                } else {
+                    None
+                },
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -17721,6 +17797,11 @@ pub(super) fn try_jit_upgrade_with_gate(
         // to an unconditional uncommon-trap deopt instead of bailing the
         // whole method.
         Some(&indy_descriptor_resolver),
+        if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+            Some(&class_id_namer)
+        } else {
+            None
+        },
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -18456,6 +18537,18 @@ pub(super) fn try_jit_compile_callee_slow(
         let cm = shared.classes.class_manager.read();
         resolve_jit_new_site(&cm, cid, cp_idx)
     };
+    // PGO-02: receiver class-id -> class-name resolver for a guarded
+    // speculative virtual/interface inline plan's SpeculatedReceiver
+    // invalidation dependency (plan_inline's fail-closed rule — see
+    // docs/feature-designs/profile-guided-inlining.md). `None` (id not
+    // loaded, or unloaded between profiling and compiling) refuses
+    // that one speculation rather than recording an unmatchable
+    // name-less dependency.
+    let class_id_namer = |namer_cid: u32| -> Option<String> {
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(cratonvm_types::ClassId::new(namer_cid))
+            .map(|c| c.name.to_string())
+    };
     // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
     // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
     let scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
@@ -18736,6 +18829,11 @@ pub(super) fn try_jit_compile_callee_slow(
         // to an unconditional uncommon-trap deopt instead of bailing the
         // whole method.
         Some(&indy_descriptor_resolver),
+        if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+            Some(&class_id_namer)
+        } else {
+            None
+        },
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
@@ -22373,6 +22471,19 @@ pub(super) fn execute_invokevirtual_cached(
                 cn, mn, site_pc, cp_index, is_special, tname
             );
         }
+    }
+
+    // PGO-01: call-site evidence for invokespecial's fast cached path (this
+    // function also serves invokevirtual/invokeinterface, which are NOT
+    // recorded here — they already have receiver-type coverage below, and
+    // this function's own is_special branches are how invokespecial reaches
+    // this cache at all, per "Static cache entries: invokespecial uses
+    // Bytecode/Native" elsewhere in this function). Same placement rationale
+    // as execute_invokestatic_cached: after every early CacheMiss eviction
+    // above, right before the dispatch match.
+    if is_special && crate::jit::profile::is_profiling_enabled() {
+        let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
+        shared.jit.profile_store.record_call_site_borrowed(cid, mn, md, site_pc);
     }
 
     match target {

@@ -233,7 +233,8 @@ from rows with no addressing subtlety to rows whose length is load-bearing.
 | 7 | `jmp_rel32`, `jcc_rel32` | The call sites want the patch offset, not just the bytes; migrate them to `Encoded::imm_offset` in one change so no site computes the offset by hand. |
 | — | `cmov_r64_r64`, `movq_xmm_r64`, `movq_r64_xmm`, `movsd/movss_xmm_xmm`, `pxor_xmm_self`, `sqrtsd_xmm_xmm`, `mov_r64_imm64_full`, `mov_r64_r64_store_form` | Migrate opportunistically with whatever wave touches their call sites. |
 
-**Not the same migration as `docs/jit/lowering-contract.md` §5.** That one
+**Not the same migration as
+`docs/feature-designs/jit-machine-level-and-instruction-selection.md`.** That one
 builds a machine level *above* this table, so `ir_lower` stops selecting and
 encoding in one breath. This one retires `x64.rs`'s hand-written emitters
 *onto* the table without changing who calls them. They are independent and can
