@@ -3110,6 +3110,10 @@ impl SharedVm {
                 anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
                 statics: RwLock::new(FxHashMap::default()),
                 statics_index: crate::vm::realms::class_realm::StaticsIndex::new(),
+                // u32::MAX = "java/lang/System not prepared yet"; a real
+                // ClassId can never be u32::MAX (see AUTOBOX_CLASS_ID's
+                // reserved-range note in `types`).
+                system_class_id: AtomicU32::new(u32::MAX),
                 resolution_cache: RwLock::new(ResolutionCache::new()),
                 // Round 8 audit fix (CRIT #2): reflective lookup cache.
                 link_resolver: LinkResolver::new(),
