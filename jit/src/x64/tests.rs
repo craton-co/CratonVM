@@ -4150,6 +4150,74 @@ fn test_getstatic_inline_direct_load_and_fallback() {
     );
 }
 
+/// An OSR-exit map belongs at a loop header — at EVERY bytecode boundary it is
+/// what made OSR impossible.
+///
+/// `deopt-osr` Step 7 emitted one per non-dead pc, so a method's `deopt_points`
+/// held a snapshot taken mid-expression, with a partially-built operand stack.
+/// `CompiledMethod::osr_exit_policy` is an artifact-wide veto — one unresumable
+/// point refuses OSR entry at every pc — and a mid-expression stack entry is
+/// unresumable in any method that touches a `long`/`float`/`double`, because
+/// the operand stack has no per-entry width source there. Net effect: every
+/// counted loop in such a method was refused `osr-entry-unresumable-exit`, and
+/// a once-invoked method with a hot loop never left the interpreter (~90 ns/op
+/// vs ~1.6 compiled — `probes/StaticFieldProbe.java` measured the interpreter
+/// for two full rounds of a known-issue doc because of it).
+///
+/// The loop below is deliberately the simplest counted shape; the assertion is
+/// that exactly ONE map is recorded, at the back-edge target.
+#[test]
+fn osr_exit_maps_are_emitted_at_loop_headers_only() {
+    // 0: iconst_0        1: istore_0
+    // 2: iload_0   <-- back-edge target (the only loop header)
+    // 3: iconst_1        4: iadd         5: istore_0
+    // 6: goto -4  (to 2)
+    // 9: return
+    let code: Vec<u8> = vec![
+        0x03, 0x3b, 0x1a, 0x04, 0x60, 0x3b, 0xa7, 0xff, 0xfc, 0xb1, 0, 0,
+    ];
+    let code_len = 10;
+    let helpers = test_helpers();
+    let compiled = compile(
+        &code,
+        code_len,
+        0,
+        1,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None,
+    )
+    .expect("test JIT compile");
+
+    if !crate::deopt_real_enabled() {
+        // `CRATONVM_DEOPT_REAL=0` builds no OSR-exit metadata at all; the
+        // assertion below would then pass vacuously, so say so instead.
+        assert!(compiled.osr_exit_points.is_empty());
+        return;
+    }
+    assert_eq!(
+        compiled.osr_exit_points,
+        vec![2],
+        "exactly one OSR-exit map, at the back-edge target — not one per pc"
+    );
+}
+
 // -----------------------------------------------------------------------
 // G1-2 — the inline reference-store fast paths must not elide the
 // collector's post-write barrier on a backend that publishes no region

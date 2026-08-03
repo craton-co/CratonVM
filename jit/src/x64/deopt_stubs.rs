@@ -50,6 +50,35 @@ impl Compiler {
     /// and reason-6 bails to the frame-deopt trampoline when a snapshot is found.
     /// Idempotent: a second call for the same `bci` is a no-op.
     /// Only called when `deopt_real_enabled()`; production builds are unaffected.
+    /// Index every ordinary invoke site's argument type tags by bci, from the
+    /// descriptors already in `invoke_info`. One pass, before the walk.
+    ///
+    /// `indy_arg_type_tags` produces ONE TAG PER COMPACT SLOT, which is the
+    /// same shape as this backend's abstract operand stack (a `long` occupies
+    /// one entry, not two) — that correspondence is what makes the tags
+    /// index-alignable with `self.stack`, and it is already pinned by
+    /// `indy_arg_type_tags_one_tag_per_compact_slot`.
+    ///
+    /// Receiver-inclusive by construction without special-casing it: the tags
+    /// cover only the descriptor's parameters, and they are aligned to the TOP
+    /// of the stack, so an instance call's receiver sits below the tagged range
+    /// and keeps its oop-mark-derived encoding.
+    pub(super) fn index_invoke_arg_types(&mut self) {
+        for &(pc, info) in &self.invoke_info {
+            if info.is_null() {
+                continue;
+            }
+            // SAFETY: `invoke_info` holds pointers to `JitInvokeInfo` boxes the
+            // caller keeps alive for the whole compile (they are also baked
+            // into the emitted code as call-site metadata).
+            let descriptor = unsafe { (*info).descriptor };
+            let tags = crate::indy_arg_type_tags(descriptor);
+            if !tags.is_empty() {
+                self.invoke_stack_arg_types.insert(pc, tags);
+            }
+        }
+    }
+
     pub(super) fn snapshot_pre_intrinsic_call(&mut self, bci: usize, reason: crate::deopt::DeoptReason) {
         if self.deopt_box_ptr_by_bci.contains_key(&bci) {
             return;
@@ -264,7 +293,38 @@ impl Compiler {
         // the first (deepest) global stack index these tags cover; `None`
         // outside an indy trap bci (the ordinary case), so behavior there is
         // unchanged. See `indy_stack_arg_types`'s doc comment.
-        let indy_arg_types = self.indy_stack_arg_types.get(&bci);
+        //
+        // Generalized 2026-08-03 from invokedynamic to EVERY invoke: the same
+        // "top `tags.len()` entries are this call's arguments" fact holds at a
+        // `ReceiverTypeChanged` guard, which snapshots before the arg pops. See
+        // `invoke_stack_arg_types`.
+        let indy_arg_types = self
+            .indy_stack_arg_types
+            .get(&bci)
+            .or_else(|| self.invoke_stack_arg_types.get(&bci))
+            // Alignment cross-check. The tags are positional, so a vector that
+            // does not line up with the abstract stack would type the WRONG
+            // entries — a truncated long or a mistyped FP on resume, which is
+            // precisely the silent corruption the coarse `Unsupported` fallback
+            // exists to avoid. The oop marks are an INDEPENDENT per-entry
+            // opinion the emitter maintains for the GC, so make the two agree
+            // or use neither: every tagged entry must be a ref exactly when its
+            // mark says ref. Any disagreement discards the whole vector for
+            // this bci and leaves the pre-existing behaviour in place.
+            //
+            // This catches a stale/misaligned vector for any call whose
+            // signature mixes references and primitives, and any instance call
+            // (its receiver is a ref sitting immediately below the tags).
+            .filter(|tags| {
+                let base = n.saturating_sub(tags.len());
+                tags.len() <= n
+                    && tags.iter().enumerate().all(|(k, &tag)| {
+                        let is_ref_tag = tag == b'L';
+                        self.stack_oop_marks
+                            .get(base + k)
+                            .is_none_or(|&m| m == is_ref_tag)
+                    })
+            });
         let indy_arg_base = indy_arg_types.map(|tags| n.saturating_sub(tags.len()));
         let mut stack = Vec::with_capacity(n);
         for i in 0..n {

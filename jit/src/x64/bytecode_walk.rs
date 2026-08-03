@@ -195,6 +195,26 @@ impl Compiler {
         // encodings) — keep the historical behaviour there rather than guess.
         let reachable = compute_reachable_pcs(code, code_len);
 
+        // Back-edge targets — the only bcis that get an OSR-exit map (see the
+        // Step-7 emission site below for why "every pc" was wrong).
+        //
+        // Computed from `code` HERE rather than taken from the driver's own
+        // `detect_loops` result on purpose: when the bytecode loop rewriter is
+        // armed, `pc` in this walk is an OUTPUT pc and the driver's headers are
+        // INPUT bcis. Deriving the set from the same slice the walk iterates
+        // makes the coordinate spaces agree by construction instead of by
+        // review. `detect_loops` is a linear scan, so this costs one extra pass
+        // over the bytecode and only when OSR-exit metadata is being built at
+        // all.
+        let osr_exit_map_headers: FxHashSet<usize> = if crate::deopt_real_enabled() {
+            super::escape_analysis::detect_loops(code, code_len)
+                .into_iter()
+                .map(|(header, _back_edge)| header)
+                .collect()
+        } else {
+            FxHashSet::default()
+        };
+
         let mut dead = false; // true after unconditional control transfer
 
         let mut pc = 0;
@@ -393,14 +413,51 @@ impl Compiler {
                                                                        // trampoline initializes the cached thread/watermark slots before
                                                                        // jumping here.
 
-                    // deopt-osr Step 7: this PC is an OSR-vetted loop boundary
-                    // (outside every LICM-hoisted body — the `else` branch), so
-                    // emit an OSR-exit map capturing the loop-body interpreter
-                    // state here. Emit-and-discard: Step 8 will resume the loop
-                    // body at this bci on a mid-loop bail. Gated on
-                    // `deopt_real_enabled()` so production (deopt off) builds no
-                    // OSR-exit metadata and stays byte-identical.
-                    if crate::deopt_real_enabled() {
+                    // deopt-osr Step 7: emit an OSR-exit map capturing the
+                    // loop-body interpreter state at this loop header.
+                    // Emit-and-discard: Step 8 will resume the loop body at this
+                    // bci on a mid-loop bail. Gated on `deopt_real_enabled()` so
+                    // a deopt-off build carries no OSR-exit metadata and stays
+                    // byte-identical.
+                    //
+                    // *** `osr_exit_map_headers` is the whole reason OSR works
+                    // at all. *** This arm's own doc has always said "a
+                    // loop-boundary bci", but the condition it sat under is
+                    // `pc < osr_entry_native.len()` minus the LICM-hoisted
+                    // interiors — i.e. essentially EVERY pc. So a map was
+                    // recorded at every instruction boundary, including the ones
+                    // with a non-empty operand stack mid-expression.
+                    //
+                    // That is fatal, because `CompiledMethod::osr_exit_policy`
+                    // is an artifact-wide veto: ONE unresumable deopt point
+                    // refuses OSR entry at EVERY pc of the method. And a
+                    // mid-expression map is unresumable almost by construction —
+                    // the operand stack has no per-entry width source, so in any
+                    // method that touches a `long`/`float`/`double`
+                    // (`uses_long_float_double`) every non-oop stack entry is
+                    // recorded `FrameValue::Unsupported` rather than risk a
+                    // truncated long on resume (see `build_and_record_deopt_point`).
+                    //
+                    // Net effect before this gate: every counted loop in every
+                    // method with a `long` accumulator was refused
+                    // `osr-entry-unresumable-exit`, naming the first bci with a
+                    // non-empty stack — usually bci 1. A once-invoked method
+                    // whose loop is hot then never left the interpreter: ~90
+                    // ns/op against ~1.6 compiled, and identical under
+                    // `--nojit`. `probes/StaticFieldProbe.java` and
+                    // `probes/VirtOnlyProbe.java` were both measuring the
+                    // interpreter because of it.
+                    //
+                    // A loop header is the only bci this metadata is ever
+                    // consulted at: OSR entry happens at back-edge targets
+                    // (`osr_entry_frame_state(entry_pc)`), and the sole reason-7
+                    // stub emitter is the Step-8 test trigger, which picks
+                    // `loops.iter().map(header).min()`. If Step 8 ever routes
+                    // real bails at arbitrary bcis, this set has to grow to
+                    // cover those sites — and the operand-stack width gap above
+                    // has to be closed first, or the new points will veto the
+                    // artifact exactly as these did.
+                    if crate::deopt_real_enabled() && osr_exit_map_headers.contains(&pc) {
                         self.emit_osr_exit_map_at(pc);
                     }
                 }

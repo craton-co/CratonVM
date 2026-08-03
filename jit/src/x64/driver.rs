@@ -1447,6 +1447,9 @@ pub fn compile_with_param_slots(
     compiler.anewarray_info = anewarray_info;
     compiler.anewarray_deferred_info = anewarray_deferred_info;
     compiler.invoke_info = invoke_info;
+    // Index the call-site argument tags before the walk: the deopt snapshots
+    // built during it consult the index by bci. See `invoke_stack_arg_types`.
+    compiler.index_invoke_arg_types();
     compiler.indy_info = indy_info;
     compiler.direct_calls = direct_calls;
     // deopt-osr Step 8 (test trigger): under CRATONVM_OSR_EXIT_TEST + CRATONVM_DEOPT_REAL,

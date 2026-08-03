@@ -3284,11 +3284,11 @@ impl CompiledMethod {
                     format!("deopt point at bci {} holds monitors", p.bci),
                 ));
             }
-            if !deopt::frame_state_is_resumable(fs) {
+            if let Some(slot) = deopt::first_unresumable_slot(fs) {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
                     format!(
-                        "deopt point at bci {} ({:?}) reconstructs an unresumable frame",
+                        "deopt point at bci {} ({:?}) reconstructs an unresumable frame: {slot}",
                         p.bci, p.reason
                     ),
                 ));

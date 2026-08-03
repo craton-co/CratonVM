@@ -1072,6 +1072,26 @@ struct Compiler {
     /// arguments) instead of the coarse per-method `wide_fp` gate. See
     /// `indy_arg_type_tags`'s doc comment for the motivating bug.
     indy_stack_arg_types: FxHashMap<usize, Vec<u8>>,
+
+    /// The same thing for ORDINARY invokes (`invoke{virtual,special,static,
+    /// interface}`), keyed by call-site bci and derived once from
+    /// `invoke_info`'s descriptors by [`Compiler::index_invoke_arg_types`].
+    ///
+    /// Why this exists: a call-site guard (`ReceiverTypeChanged`, reason 6)
+    /// snapshots the frame BEFORE the argument pops, so the operand stack still
+    /// holds `[.., receiver, args]`. Without a width source those argument
+    /// entries fall to the coarse per-method `wide_fp` gate and are recorded
+    /// `FrameValue::Unsupported` — and ONE unsupported entry anywhere in the
+    /// artifact makes `osr_exit_policy` refuse OSR entry for the whole method.
+    ///
+    /// Measured on the regression-suite corpus (2026-08-03): after the
+    /// loop-header fix, **every** remaining `osr-entry-unresumable-exit`
+    /// refusal was a `ReceiverTypeChanged` snapshot blocked by exactly one
+    /// stack entry, and every one of those entries was a call argument — e.g.
+    /// `RJitGc.main`'s `invokestatic Double.doubleToLongBits(D)J`, whose sole
+    /// stack entry is a `double`. The tags were already available; only
+    /// invokedynamic was using them.
+    invoke_stack_arg_types: FxHashMap<usize, Vec<u8>>,
     direct_calls_idx: FxHashMap<usize, usize>,
     mic_slots_idx: FxHashMap<usize, usize>,
     pic_slots_idx: FxHashMap<usize, usize>,
@@ -2132,6 +2152,7 @@ impl Compiler {
             invoke_info_idx: FxHashMap::default(),
             indy_info_idx: FxHashMap::default(),
             indy_stack_arg_types: FxHashMap::default(),
+            invoke_stack_arg_types: FxHashMap::default(),
             direct_calls_idx: FxHashMap::default(),
             mic_slots_idx: FxHashMap::default(),
             pic_slots_idx: FxHashMap::default(),
