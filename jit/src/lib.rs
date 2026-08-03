@@ -6208,7 +6208,18 @@ mod inline_selection_tests {
 /// `ObjectRef`: the latter can relocate between compiled invocations.
 #[derive(Clone, Debug)]
 pub enum JitLdcConstant {
-    Immediate(i64),
+    /// A `CONSTANT_Integer` or `CONSTANT_Float` entry, already reduced to the
+    /// machine word both backends push.
+    ///
+    /// `is_float` (cov-01) records which of the two it was. The single-pass
+    /// backend does not read it — it pushes `bits` with `MOV imm64` and lets
+    /// the CONSUMING opcode pick the width, exactly as it does for `ldc2_w`.
+    /// The IR builder has no consuming opcode to ask: it must type the node it
+    /// creates, and an `Op::Const`/`Int` holding a float bit pattern is a
+    /// mistyped φ and a mistyped deopt slot. So this flag is the same shape
+    /// `cp_ldc2w_resolver`'s `(bits, is_double)` already has, for the same
+    /// reason.
+    Immediate { bits: i64, is_float: bool },
     String(String),
     /// A `CONSTANT_Class` entry: `ldc <Class>` pushes that class's mirror.
     ///
@@ -13403,6 +13414,39 @@ fn try_compile_inner(
                 }
             }
         }
+        // cov-01 increment 1: resolve `ldc`/`ldc_w` (0x12/0x13) constants for
+        // the IR builder. `getstatic` + `ldc`/`ldc_w` was 189 of the 273
+        // opcode-gap events measured on 2026-08-03 — 69% of every opcode the
+        // optimizing builder had no arm for
+        // (`docs/known-issues/c2/ir-coverage-survey-20260803.md`).
+        //
+        // Increment 1 is the IMMEDIATE case only — the `int` and `float`
+        // constants `ldc_info` already carries as an `i64`. That is a constant
+        // node and nothing else: no memory edge, no safepoint, no GC
+        // interaction, no new refusal. An `int` constant is admitted
+        // unconditionally (a pure `Op::Const`/`Int`); a `float` constant only
+        // under `ir_emit_fp`, mirroring the `ldc2_w` gate directly above — the
+        // builder would otherwise emit an `Op::ConstF`/`Float` into a graph the
+        // FP tier is switched off for.
+        //
+        // A pc that is absent (no resolver, a String/Class/condy entry, or a
+        // float with the FP gate off) makes the builder's 0x12/0x13 arm bail
+        // that method to single-pass — the pre-existing behaviour, only
+        // narrower.
+        if !scan.ldc_ops.is_empty() {
+            if let Some(resolver) = cp_ldc_resolver {
+                let mut imm: std::collections::HashMap<usize, (i64, bool)> =
+                    std::collections::HashMap::new();
+                for &(pc, cp_idx) in &scan.ldc_ops {
+                    if let Some(JitLdcConstant::Immediate { bits, is_float }) = resolver(cp_idx) {
+                        if !is_float || ir_emit_fp {
+                            imm.insert(pc, (bits, is_float));
+                        }
+                    }
+                }
+                builder.set_ldc_info(imm);
+            }
+        }
         // Thread the resolved instance-field layout (pc → (field_index,
         // type_tag)) into the builder so it can lower an int-category
         // `getfield` into `Op::Load`. A field the resolver can't resolve is
@@ -14474,7 +14518,10 @@ fn try_compile_inner(
         if let Some(resolver) = cp_ldc_resolver {
             for &(pc, cp_idx) in &scan.ldc_ops {
                 match resolver(cp_idx) {
-                    Some(JitLdcConstant::Immediate(v)) => ldc_info.push((pc, v)),
+                    // The single-pass backend ignores `is_float`: it pushes the
+                    // bits and the consuming opcode picks the width. See the
+                    // variant's doc for why the IR builder cannot.
+                    Some(JitLdcConstant::Immediate { bits, .. }) => ldc_info.push((pc, bits)),
                     Some(JitLdcConstant::ClassMirror {
                         holder_class_id,
                         cp_idx,

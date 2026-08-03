@@ -640,6 +640,249 @@ fn ir_vs_singlepass_long_ldc2w_constant() {
     }
 }
 
+// ── cov-01: `ldc` / `ldc_w` (0x12 / 0x13) ────────────────────────────────
+//
+// `ldc` + `ldc_w` + `getstatic` was 189 of the 273 opcode-gap events measured
+// on 2026-08-03 (`docs/known-issues/c2/ir-coverage-survey-20260803.md`) — 69%
+// of every opcode `IrBuilder::build` had no arm for. Increment 1 is the
+// IMMEDIATE case: an `int` or `float` constant the caller's `cp_ldc_resolver`
+// already reduced to bits.
+
+/// [`compile_opt`] plus a `cp_ldc_resolver`, so the IR builder can lower
+/// `ldc` / `ldc_w`. `fp` turns the `ir_emit_fp` gate on — a `float` constant is
+/// admitted only under it, exactly as a `double` `ldc2_w` is.
+fn compile_ldc(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    fp: bool,
+    ldc: &dyn Fn(u16) -> Option<cratonvm_jit::JitLdcConstant>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(ldc),
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        optimize,
+        false,
+        false,
+        false,
+        false,
+        fp,
+        None,
+    )
+}
+
+#[test]
+fn ir_vs_singlepass_int_ldc_constant() {
+    // cov-01 inc 1. int f(int a) { return a * C1 + C2; }
+    //   iload_0; ldc #1; imul; ldc_w #2; iadd; ireturn
+    //
+    // Both widths in one body on purpose: `ldc` is 2 bytes and `ldc_w` is 3,
+    // and a wrong `pc` advance in either arm desyncs the abstract walk rather
+    // than producing a wrong number, so a shared-length bug would show up as a
+    // build failure on one backend and not the other.
+    const C1: i32 = 1_000_003;
+    const C2: i32 = -2_000_000_011;
+    let code = vec![
+        0x1a, // iload_0 (a)
+        0x12, 0x01, // ldc #1 (C1)
+        0x68, // imul
+        0x13, 0x00, 0x02, // ldc_w #2 (C2)
+        0x60, // iadd
+        0xac, // ireturn
+    ];
+    let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+        match cp {
+            1 => Some(cratonvm_jit::JitLdcConstant::Immediate {
+                bits: C1 as i64,
+                is_float: false,
+            }),
+            2 => Some(cratonvm_jit::JitLdcConstant::Immediate {
+                bits: C2 as i64,
+                is_float: false,
+            }),
+            _ => None,
+        }
+    };
+    let helpers = dummy_helpers();
+    let cm = cached("ildc", "(I)I", code, 2, 1);
+    let ir = compile_ldc(&cm, &helpers, true, false, &ldc).expect("IR int ldc");
+    let sp = compile_ldc(&cm, &helpers, false, false, &ldc).expect("single-pass int ldc");
+    assert!(
+        ir.used_ir_backend,
+        "cov-01: an int `ldc` must reach the optimizing backend, not fall through"
+    );
+    for a in [3i32, 0, -7, i32::MAX, i32::MIN, 65_536] {
+        let r_ir = unsafe { ir.try_call(&[a as i64]) }.unwrap() as i32;
+        let r_sp = unsafe { sp.try_call(&[a as i64]) }.unwrap() as i32;
+        let host = a.wrapping_mul(C1).wrapping_add(C2);
+        assert_eq!(r_ir, r_sp, "int ldc IR vs single-pass for a={a}");
+        assert_eq!(r_ir, host, "int ldc vs host for a={a}");
+    }
+}
+
+#[test]
+fn ir_vs_singlepass_float_ldc_constant() {
+    // cov-01 inc 1, the float half. int f(int a) { return (int)(a * 2.5f); }
+    //   iload_0; i2f; ldc #1 (2.5f); fmul; f2i; ireturn
+    //
+    // Returns an int so the GPR `try_call` ABI is exact; the FP work stays
+    // internal. The point of the case is the TYPE: `is_float` has to reach the
+    // builder, because `is_float_opcode` does not list `ldc` and the value is
+    // otherwise indistinguishable from an int with the same bit pattern.
+    const C: f32 = 2.5;
+    let code = vec![
+        0x1a, // iload_0 (a)
+        0x86, // i2f
+        0x12, 0x01, // ldc #1 (2.5f)
+        0x6a, // fmul
+        0x8b, // f2i
+        0xac, // ireturn
+    ];
+    let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+        match cp {
+            1 => Some(cratonvm_jit::JitLdcConstant::Immediate {
+                bits: C.to_bits() as i64,
+                is_float: true,
+            }),
+            _ => None,
+        }
+    };
+    let helpers = dummy_helpers();
+    let cm = cached("fldc", "(I)I", code, 2, 1);
+    let ir = compile_ldc(&cm, &helpers, true, true, &ldc).expect("IR float ldc");
+    let sp = compile_ldc(&cm, &helpers, false, true, &ldc).expect("single-pass float ldc");
+    assert!(
+        ir.used_ir_backend,
+        "cov-01: a float `ldc` must reach the optimizing backend under the FP gate"
+    );
+    for a in [3i32, 0, -7, 1000, -1_000_001] {
+        let r_ir = unsafe { ir.try_call(&[a as i64]) }.unwrap() as i32;
+        let r_sp = unsafe { sp.try_call(&[a as i64]) }.unwrap() as i32;
+        let host = (a as f32 * C) as i32;
+        assert_eq!(r_ir, r_sp, "float ldc IR vs single-pass for a={a}");
+        assert_eq!(r_ir, host, "float ldc vs host for a={a}");
+    }
+}
+
+#[test]
+fn float_ldc_stays_on_single_pass_with_the_fp_gate_off() {
+    // The fail-closed half, and the edit that trips it: delete the
+    // `!is_float || ir_emit_fp` guard in `try_compile`'s cov-01 feed and this
+    // method reaches the optimizing backend with an `Op::ConstF`/`Float` node
+    // in a graph the FP tier is switched off for.
+    //
+    // `is_float_opcode` does NOT list `ldc`, so `fp_in_body` is false for a
+    // body that contains NO other FP opcode — which is exactly why this method
+    // is ADMITTED to the optimizing pipeline (through the int clause) and has
+    // to be refused by the builder rather than by admission. The `pop` keeps
+    // the body FP-opcode-free while still containing the constant; without it
+    // the refusal would come from the admission gate and the test would pass
+    // vacuously with the guard deleted.
+    //
+    // `float f(){ 2.5f; return 0; }` — ldc #1; pop; iconst_0; ireturn.
+    let code = vec![
+        0x12, 0x01, // ldc #1 (2.5f)
+        0x57, // pop
+        0x03, // iconst_0
+        0xac, // ireturn
+    ];
+    let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+        match cp {
+            1 => Some(cratonvm_jit::JitLdcConstant::Immediate {
+                bits: 2.5f32.to_bits() as i64,
+                is_float: true,
+            }),
+            _ => None,
+        }
+    };
+    let helpers = dummy_helpers();
+    let cm = cached("fldcoff", "()I", code.clone(), 1, 0);
+    let off = compile_ldc(&cm, &helpers, true, false, &ldc)
+        .expect("the method still compiles — on the single-pass backend");
+    assert!(
+        !off.used_ir_backend,
+        "cov-01: a float `ldc` with the FP gate off must bail to single-pass"
+    );
+    // The positive control for the same body: with the gate ON it IS lowered.
+    // Without this rung, "the gate is off" and "the builder cannot lower this
+    // shape at all" are indistinguishable and the assertion above proves
+    // nothing about the guard.
+    let cm_on = cached("fldcon", "()I", code, 1, 0);
+    let on = compile_ldc(&cm_on, &helpers, true, true, &ldc).expect("IR body under the FP gate");
+    assert!(
+        on.used_ir_backend,
+        "cov-01: the same body must reach the optimizing backend with the FP gate on"
+    );
+    assert_eq!(unsafe { on.try_call(&[]) }.unwrap() as i32, 0);
+}
+
+#[test]
+fn string_and_class_ldc_stay_on_single_pass() {
+    // The other fail-closed half. A `String` / `Class` `ldc` is not an
+    // immediate: its value is materialised by a runtime helper that interns
+    // (String) or resolves and may run `<clinit>` (Class). Increment 1 must
+    // leave both to the single-pass backend rather than invent a constant —
+    // "a constant materialised without its resolution side effects is a
+    // wrong-code bug, not a missing optimisation".
+    //
+    // The edit that trips it: give the builder's 0x12 arm a fallback that
+    // pushes anything at all for a pc absent from `ldc_info`.
+    for (label, entry) in [
+        (
+            "String",
+            cratonvm_jit::JitLdcConstant::String("hello".to_string()),
+        ),
+        (
+            "Class",
+            cratonvm_jit::JitLdcConstant::ClassMirror {
+                holder_class_id: 1,
+                cp_idx: 1,
+            },
+        ),
+    ] {
+        let code = vec![
+            0x12, 0x01, // ldc #1
+            0xb0, // areturn
+        ];
+        let ldc = {
+            let entry = entry.clone();
+            move |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
+                if cp == 1 {
+                    Some(entry.clone())
+                } else {
+                    None
+                }
+            }
+        };
+        let mut helpers = dummy_helpers();
+        // `ldc_class_cp` is an OptionalPtr; the single-pass Class arm bails the
+        // whole compile when it is 0, so wire it to the same inert stub the
+        // rest of this harness uses — nothing calls it, the method is never
+        // invoked.
+        helpers.ldc_class_cp = helpers.new_object;
+        let cm = cached("sldc", "()Ljava/lang/Object;", code, 1, 0);
+        let compiled = compile_ldc(&cm, &helpers, true, false, &ldc)
+            .unwrap_or_else(|| panic!("{label} ldc: expected a single-pass body"));
+        assert!(
+            !compiled.used_ir_backend,
+            "cov-01: a {label} `ldc` must bail the optimizing builder to single-pass"
+        );
+    }
+}
+
 #[test]
 fn ir_vs_singlepass_long_ldiv() {
     // long signed division. long f(long a, long b) { return a / b; }

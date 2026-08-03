@@ -3525,6 +3525,17 @@ pub struct IrBuilder {
     /// single-pass. `is_double` selects the lowering: a `long` constant becomes
     /// `Op::Const(Long)` (`lconst`), a `double` constant `Op::ConstF` (`dconst`).
     ldc2w_info: HashMap<usize, (i64, bool)>,
+    /// cov-01: resolved `ldc` / `ldc_w` (0x12 / 0x13) IMMEDIATE constants
+    /// (`pc → (bits, is_float)`). Set by [`Self::set_ldc_info`]; a pc not
+    /// present bails to single-pass, which is what every String / Class /
+    /// `MethodHandle` / condy site does — those are not immediates and the
+    /// builder must not invent one for them.
+    ///
+    /// `is_float` selects the node exactly as `ldc2w_info`'s `is_double` does:
+    /// an `int` constant becomes `Op::Const`/`Int` (`iconst`), a `float`
+    /// constant `Op::ConstF`/`Float` (`fconst`). The caller only inserts a
+    /// float entry when the FP tier is on.
+    ldc_info: HashMap<usize, (i64, bool)>,
 }
 
 impl IrBuilder {
@@ -3573,6 +3584,7 @@ impl IrBuilder {
             invoke_info: HashMap::new(),
             tdigest_scalar_kernel: false,
             ldc2w_info: HashMap::new(),
+            ldc_info: HashMap::new(),
         }
     }
 
@@ -3580,6 +3592,13 @@ impl IrBuilder {
     /// be called before [`Self::build`]; an `ldc2_w` pc not present bails.
     pub fn set_ldc2w_info(&mut self, info: HashMap<usize, (i64, bool)>) {
         self.ldc2w_info = info;
+    }
+
+    /// cov-01: supply resolved `ldc` / `ldc_w` IMMEDIATE constants
+    /// (`pc → (bits, is_float)`). Must be called before [`Self::build`]; a pc
+    /// not present makes that `ldc` bail the method to single-pass.
+    pub fn set_ldc_info(&mut self, info: HashMap<usize, (i64, bool)>) {
+        self.ldc_info = info;
     }
 
     /// The data type for a merge / loop-carried `Op::Phi`, derived from its
@@ -5607,6 +5626,45 @@ impl IrBuilder {
                     };
                     self.push(c);
                     pc += 3;
+                }
+                // ldc (0x12, 1-byte CP index) / ldc_w (0x13, 2-byte CP index) —
+                // cov-01 increment 1, the IMMEDIATE case.
+                //
+                // `ldc` + `ldc_w` + `getstatic` was 189 of the 273 opcode-gap
+                // events measured on 2026-08-03 — 69% of every opcode
+                // `IrBuilder::build` had no arm for at all
+                // (`docs/known-issues/c2/ir-coverage-survey-20260803.md`).
+                //
+                // A resolved `int` / `float` constant is a constant node and
+                // nothing else — no memory edge, no safepoint, no GC
+                // interaction — so it is typed and pushed exactly the way the
+                // `ldc2_w` arm above types its `long` / `double`. `is_float`
+                // comes from the resolver rather than from the opcode because
+                // `ldc` is polymorphic and `is_float_opcode` does NOT list it:
+                // a method whose only FP is `ldc 1.5f` is admitted through the
+                // int clause, so the builder cannot infer the width from
+                // admission either. See `JitLdcConstant::Immediate`.
+                //
+                // Every non-immediate site — String, Class, `MethodHandle`,
+                // `MethodType`, condy — is simply absent from `ldc_info` and
+                // bails the method to single-pass, which DOES compile all of
+                // them. That is the fail-closed half of this arm and it is the
+                // point: a constant materialised without its resolution side
+                // effects (interning, class loading, `<clinit>`) is a
+                // wrong-code bug, not a missing optimisation.
+                0x12 | 0x13 => {
+                    let width = if op == 0x12 { 2 } else { 3 };
+                    let (bits, is_float) = match self.ldc_info.get(&pc) {
+                        Some(&v) => v,
+                        None => return ir_build_bail(line!(), pc),
+                    };
+                    let c = if is_float {
+                        self.fconst(f32::from_bits(bits as u32))
+                    } else {
+                        self.iconst(bits)
+                    };
+                    self.push(c);
+                    pc += width;
                 }
 
                 // tableswitch / lookupswitch — lower as a CMP-equality chain
