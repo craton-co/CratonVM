@@ -581,6 +581,43 @@ fn promo_seed_dbg() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PROMO_SEED").is_some())
 }
 
+/// 2026-08-03 (`HIB-MAPRESIZE-STALE.1`, see
+/// docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md
+/// Follow-up 4): whether `OldGen::compact` (the sliding mark-compact
+/// collector) is permitted to run at all. Default **disabled** —
+/// `major_gc` now runs the in-place, non-compacting arm of `old_gen_gc`
+/// unconditionally instead.
+///
+/// This was found by bisection, not by reading: `walk_objects` covering
+/// hundreds of MB fewer bytes than `used_bytes` (fixed defensively in
+/// `OldGen::compact`'s new walk-coverage guard, see `COMPACT_WALK_GAP_HITS`)
+/// proved real corruption was already present the FIRST time compaction ran
+/// in a session — but forcing every old-gen major GC through the
+/// non-compacting arm instead (`CRATONVM_DBG_FORCE_OLDGEN_NO_COMPACT=1`, the
+/// flag this replaced) made `DefaultCatalogAndSchemaTest` complete cleanly,
+/// twice, at exact parity with HotSpot (`found=132`) — where every prior
+/// compact-enabled run of the same class crashed or came up short. That
+/// implicates something in `compact`'s own Phase 1-3 (forwarding-pointer
+/// assignment / reference-slot rewrite / slide), not just the walk-coverage
+/// gap, but the exact mechanism was not found by code review (Phase 1-3 and
+/// the overlay `pointer_map` remap in
+/// `native_collections::gc_update_collection_overlay_refs` were both
+/// audited; both look correct in isolation).
+///
+/// `compact` still exists, still self-tests, and is not deleted: a future
+/// session that finds the real bug can flip this back with
+/// `CRATONVM_OLDGEN_COMPACT=1` to re-enable it (or remove this gate once
+/// fixed). Until then, over-retaining memory the in-place sweep's own
+/// `coalesce_free_blocks` fallback cannot fully defragment is judged the
+/// safer failure mode than the memory corruption this replaces — the same
+/// "over-retention over corruption" direction every other fail-safe check
+/// added during this investigation already takes.
+fn oldgen_compact_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_OLDGEN_COMPACT").is_some())
+}
+
 /// DBG: optional young-GC stress threshold (bytes). Read from
 /// `CRATONVM_DBG_GC_STRESS`, or `CRATONVM_GC_STRESS` as an accepted alias
 /// (the latter is what several handoff/repro docs use; without the alias the
@@ -9848,7 +9885,17 @@ impl GenerationalHeap {
         old_gen: &mut OldGen,
         young_skips: &[(usize, usize)],
     ) -> HashMap<usize, usize> {
-        Self::old_gen_gc(roots, young_from, old_gen, true, young_skips)
+        // See `oldgen_compact_enabled`: compaction is disabled by default as
+        // of 2026-08-03 pending root-cause attribution of the corruption it
+        // was found to cause (docs/known-issues/hibernate/
+        // map-resize-unpinned-chain-cursors-nojit-segv-20260731.md).
+        Self::old_gen_gc(
+            roots,
+            young_from,
+            old_gen,
+            oldgen_compact_enabled(),
+            young_skips,
+        )
     }
 
     /// Mark old space from the complete root set and either compact it (when
@@ -17469,7 +17516,15 @@ mod tests {
             let mut old_gen = heap.old_gen.lock();
             let free_blocks_before = old_gen.free_block_count();
 
-            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
+            // `major_gc` now defaults to the non-compacting arm (`compact()`
+            // is disabled by default as of 2026-08-03 pending root-cause
+            // attribution — see `oldgen_compact_enabled`'s doc comment).
+            // This test specifically exercises `compact()`'s own
+            // defragmentation behavior, so call `old_gen_gc` directly with
+            // `compact=true` rather than going through the production
+            // default.
+            let compact_map =
+                GenerationalHeap::old_gen_gc(&mut roots, &young_from, &mut old_gen, true, &[]);
 
             // After compaction: exactly one free block (defragmented)
             assert_eq!(
@@ -17597,11 +17652,15 @@ mod tests {
             .map(|(_, o)| o)
             .collect();
 
-        // Run mark-compact via major GC
+        // Run mark-compact via major GC. `major_gc` now defaults to the
+        // non-compacting arm (see `oldgen_compact_enabled`'s doc comment);
+        // this test specifically exercises `compact()`'s own
+        // defragmentation, so call `old_gen_gc` directly with `compact=true`.
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
+            let _compact_map =
+                GenerationalHeap::old_gen_gc(&mut roots, &young_from, &mut old_gen, true, &[]);
 
             // Used space should have decreased (half the objects freed)
             assert!(
