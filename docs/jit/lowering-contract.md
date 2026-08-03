@@ -115,15 +115,20 @@ of that match's arm list — its doc says "Must stay in step with
 *different vocabulary*: it inspects bytecode opcodes (`scan.anewarray_ops`,
 `scan.typecheck_ops`, `scan.has_athrow`), not `Op` variants.
 
-Cross-checking the three lists by hand today: they agree. No op claims a result
-slot without a lowering arm, and every op with an arm but no slot is a control
-or void node (`Store`, `MonitorEnter`, `MonitorExit`, `Guard`, `Start`,
-`Return`, `If`, `Merge`, `Region`, `Proj`, `Dead`). **Nothing in the tree checks
-this.** It was checked by running a script for this document.
+Cross-checking the three lists: they agree. No op claims a result slot without
+a lowering arm, and every op with an arm but no slot is a control or void node
+(`Store`, `MonitorEnter`, `MonitorExit`, `Guard`, `Start`, `Return`, `If`,
+`Merge`, `Region`, `Proj`, `Dead`).
 
 That is the whole structural argument in one paragraph: three enumerations of
-the same set, two of them in the emitter's vocabulary and one in the bytecode's,
-kept in agreement by a comment.
+the same set, two of them in the emitter's vocabulary and one in the bytecode's.
+When this contract was written they were kept in agreement by a comment, and the
+cross-check above was a script run once by hand. **§7 landed 2026-08-03**: lists
+(1) and (2) are now checked against each other and against `ir::Op`'s own
+declaration on every build, and the catch-all refuses instead of falling
+through. List (3) still cannot be checked against them — it answers a different
+question about a different type, which is exactly why the catch-all's old claim
+was unverifiable where it was written.
 
 ---
 
@@ -416,7 +421,9 @@ when a value-typed input's op is absent from `op_defines_result_slot`
 nothing checks it — which is exactly why this op and not another was the one
 that could compile to silence. The tree's answer was a hand-written guard at the
 top of `lower_inner_with_scopes` (`ir_lower.rs:6859`), one op-specific check
-added after the fact.
+added after the fact. §7 has since replaced the *pattern* of that guard with the
+general form: the catch-all itself refuses, so the next op in this position
+needs no new guard.
 
 At level 2 this shape cannot be written. `select_block` returns a tile for every
 node — `Tile::generic(root)` when nothing matches — and `BlockSelection::covers`
@@ -478,26 +485,96 @@ Justify the migration on §5's coverage measurement, or not at all.
 
 ---
 
-## 7. What to do instead, if increment 0 says stop
+## 7. The cheap alternative — **DONE 2026-08-03**
 
-Two cheap changes get most of §6.1's benefit without any of the migration, and
-they belong to whoever owns `ir_lower.rs` regardless of what the HIR lane does:
+Two changes get most of §6.1's benefit without any of the migration. Both
+landed; this section is now the record, not the proposal.
 
-1. **Make the three op enumerations agree mechanically.** A test that asserts
-   every `ir::Op` variant is either named in `lower_data_node`'s arms or listed
-   in an explicit `UNLOWERABLE` constant, and that `op_defines_result_slot`'s
-   set equals the value-producing subset of the first. The lists agree today —
-   verified by script for this document, not by any test. The exact edit that
-   would trip it: add an `Op` variant and no arm.
-2. **Replace `_ => {}` with a refusal.** The catch-all's own comment says "bail
-   in `ir_compatible` prevents reaching here", and `ir_compatible` is written in
-   the bytecode's vocabulary, not `Op`'s (`ir.rs:6066`). Turning the arm into a
-   `refuse(Bailout::UnsupportedShape)` makes that claim checked instead of
-   asserted, and costs nothing when it is true.
+**1. The three op enumerations agree mechanically.** Four tests in
+`ir_lower.rs`'s test module, under the banner "The three `ir::Op` enumerations,
+checked against each other":
 
-Neither is this lane's to write. Both are recorded here because the contract's
-own analysis is what identified them, and because a reader who takes only §6
-away should take these too.
+* `declared_lowering` is an **exhaustive match with no wildcard arm**. Adding an
+  `ir::Op` variant stops the crate compiling until somebody classifies it. That
+  is the primary forcing function and it fires at *build* time.
+* `the_op_representatives_cover_every_declared_variant` scans `ir.rs`'s own
+  `pub enum Op` block and compares it with the test's representative list — the
+  case exhaustiveness cannot catch, because *deleting* a variant makes an arm
+  unreachable, not missing.
+* `every_ir_op_is_lowered_or_declared_unlowerable` scans `lower_data_node`'s
+  arms at match-arm depth and requires each variant to be either armed or on the
+  explicit `UNLOWERABLE` list.
+* `op_defines_result_slot_matches_the_arms_that_allocate` compares
+  `op_defines_result_slot`'s body against the classification in both directions.
+  Over-claiming is the direction that matters: an op listed there whose arm
+  never calls `alloc_slot` makes `slot_of` return a zero offset — `[rbp - 0]`,
+  the saved caller frame pointer, read as a value.
+
+**2. `lower_data_node`'s catch-all refuses.** `_ => {}` is now an `other` arm
+that latches `BailoutReason::UnsupportedShape("ir_lower: op has no lowering
+arm")`, naming the node and its op. Latched rather than returned because the
+function is infallible by signature; `lower_inner_with_scopes` takes the latch
+after the last block and discards the artifact — the channel `alloc_slot` and
+`slot_of` already use.
+
+The same change corrected a stale comment it would otherwise have contradicted:
+the monitor guard at the top of `lower_inner_with_scopes` still said the monitor
+ops had "no lowering arm here" and that the catch-all "is `_ => {}`". Both had
+stopped being true — there is a real `Op::MonitorEnter | Op::MonitorExit` arm,
+driven by `a_synchronized_region_lowers_through_the_monitor_helper`. What the
+guard actually still covers is narrower: monitor ops plus a helper table with no
+monitor entry.
+
+### The mutations, run rather than described
+
+Rule 5 of `docs/known-issues/c2/README.md` asks for the exact edit that trips
+each check. All four were applied to the tree, run, and reverted:
+
+| Mutation | Predicted | Observed |
+|---|---|---|
+| catch-all reverted to `_ => {}` | test failure | test failure — the graph compiles to a body |
+| new `ir::Op` variant, unclassified | **compile error** | compile error at `declared_lowering` |
+| `op_defines_result_slot` drops `Op::Xor` | test failure | test failure |
+| `ArrayLength` classified lowerable, no arm | test failure | test failure, naming `["ArrayLength"]` |
+
+The first is also the anti-vacuity proof for
+`an_op_with_no_lowering_arm_refuses_instead_of_emitting_nothing`: an `is_none()`
+assertion passes for *any* refusal, so what makes it a test of the catch-all
+specifically is that reverting the catch-all makes it fail.
+
+### Why refusing changed nothing
+
+The five variants with no arm are unreachable from a real compile, verified
+before the change and confirmed after:
+
+* `I2B`, `I2C`, `I2S` are constructed **nowhere in the crate**. `IrBuilder`
+  decomposes `i2b`/`i2c`/`i2s` (0x91–0x93) into `Shl`/`Shr`/`And` — `Op::Shr`
+  being the arithmetic shift (`SAR`), which is what makes `(x << 24) >> 24`
+  sign-extend rather than zero-extend.
+* `ArrayLength` and `NewArray` are constructed only in `#[cfg(test)]` code;
+  `IrBuilder` has no `arraylength` / `newarray` / `anewarray` opcode arm, and
+  `ir_compatible` refuses array allocation outright.
+
+Empirically: two Spring Boot test classes were run on Azure Linux against a
+release binary built from `origin/dev` and one built from this change, with
+`CRATONVM_DBG=ir-bailout,ir-compiles`:
+
+| | `BinderTests` | `ConfigurationPropertiesTests` |
+|---|---|---|
+| tests | 32 pass / 0 fail, both arms | 114 pass / 0 fail, both arms |
+| IR-tier admissions | 338 before, 337 after | 2 061 before, **2 061** after |
+| distinct methods the lowerer refused | 2, **identical set** | 5, **identical set** |
+| refusals reading "op has no lowering arm" | **0** | **0** |
+
+Every refusal in both arms was the pre-existing `unallocated_value` bail, on the
+same methods, for the same nodes. Across 2 399 admissions the new arm never
+fired — which is what "costs nothing when the claim it replaces is true" has to
+mean to be worth writing down.
+
+Note the admission counts are *not* required to match exactly (337 vs 338 on the
+smaller class): which methods get hot enough to admit depends on thread timing.
+The set of methods the lowerer *refused* is the load-insensitive comparison, and
+that one is identical.
 
 ---
 
