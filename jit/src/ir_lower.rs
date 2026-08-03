@@ -295,6 +295,31 @@ struct Lowerer<'a> {
     /// inline store is kept for the legacy (uniform-slot) layout, where it
     /// avoids a call per field write.
     putfield_int: usize,
+    /// COV-03 — address of `jit_putfield_object`, the ONLY lowering a reference
+    /// field store has.
+    ///
+    /// It is not an alternative to an inline path the way `putfield_int` is: it
+    /// carries the SATB pre-barrier on the overwritten reference and the
+    /// collector's own post-write barrier (G1's remembered-set edge included),
+    /// and it is the identical helper the single-pass backend's reference
+    /// `putfield` arms fall back to (`x64::objects::emit_ref_putfield_helper_call`).
+    /// A missing barrier is invisible until a concurrent or generational
+    /// collection, so this tier does not get its own inline reference store —
+    /// `lower_inner` refuses any graph with an `Op::Store(MemKind::Ref)` when
+    /// this address is absent.
+    ///
+    /// Unlike every other `putfield_*` helper it takes the VM context pointer as
+    /// its first argument, which is why `scan_frame_needs` marks a reference
+    /// store `needs_context`.
+    putfield_object: usize,
+    /// COV-03 — `jit_putfield_{long,float,double}`, the compact-layout-correct
+    /// wide-field stores. Same `(obj_ptr, field_index, bits)` ABI as
+    /// `putfield_int`, no context argument; the value rides a GPR as raw bits
+    /// (`f32::to_bits` zero-extended / `f64::to_bits`), which is exactly how the
+    /// FP frame slots already hold it.
+    putfield_long: usize,
+    putfield_float: usize,
+    putfield_double: usize,
     /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
     /// nodes use the same shared runtime-lowering stub as the baseline tier.
     new_object: usize,
@@ -704,6 +729,10 @@ impl<'a> Lowerer<'a> {
             drem: helpers.jit_drem,
             getfield: helpers.getfield,
             putfield_int: helpers.putfield_int,
+            putfield_object: helpers.putfield_object,
+            putfield_long: helpers.putfield_long,
+            putfield_float: helpers.putfield_float,
+            putfield_double: helpers.putfield_double,
             new_object: helpers.new_object,
             monitor_enter: helpers.monitor_enter,
             monitor_exit: helpers.monitor_exit,
@@ -2917,6 +2946,57 @@ fn reloc_emit_enabled() -> bool {
         self.store_rax(slot);
     }
 
+    /// COV-03 — the `i64::MIN` sentinel check for a *helper* that returns a
+    /// value in RAX and may instead return the deopt/NPE sentinel.
+    ///
+    /// The same two-shape decision `emit_call_return_check` makes, minus the
+    /// post-call frame/shadow republication a dispatched Java call needs and a
+    /// leaf helper does not: `jit_getfield` reaches no safepoint, so nothing has
+    /// moved and no oop needs copying back.
+    ///
+    /// * `Int`/`Ref`/anything else — `i64::MIN` is never a legitimate result (no
+    ///   plausible heap pointer equals it), so `CMP ; JE bail`.
+    /// * `Long`/`Double`/`Float` — `Long.MIN_VALUE`, and the `-0.0` bit pattern,
+    ///   ARE legitimate results bit-identical to the sentinel. On that (rare)
+    ///   branch, peek the out-of-band signal via `jit_dispatch_threw` and bail
+    ///   only when a genuine exception/deopt is pending; otherwise keep the real
+    ///   value. `jit_getfield` sets the pending-NPE flag before returning the
+    ///   sentinel, which is one of the signals that peek reports.
+    ///
+    /// Leaves RAX holding the value to spill in both shapes.
+    fn emit_helper_sentinel_check(&mut self, ty: IrType) {
+        self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        if !matches!(ty, IrType::Long | IrType::Double | IrType::Float) {
+            self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub
+            let exc_patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            self.call_exc_patches.push(exc_patch);
+            return;
+        }
+        // JNE .keep — common path: not the sentinel, keep the real RAX.
+        self.buf.emit(&[0x0F, 0x85]);
+        let keep_patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        // Cold: RAX == i64::MIN. MOV RAX, dispatch_threw ; CALL RAX (RAX = 0/1).
+        self.emit_mov_reg_imm64(RAX, self.dispatch_threw as u64);
+        self.buf.emit(&[0xFF, 0xD0]);
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX — ZF=1 ⇒ no signal
+        // Restore the sentinel/value before branching: the shared bail stub
+        // returns RAX unchanged, and the keep path needs the genuine value.
+        // `MOV` does not disturb ZF.
+        self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+        self.buf.emit(&[0x0F, 0x85]); // JNE bail_stub
+        let patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.call_exc_patches.push(patch);
+        let keep_off = self.buf.pos();
+        let rel = keep_off as i32 - (keep_patch as i32 + 4);
+        // ir_lower helper-sentinel keep -- tolerated on an overflowed buffer;
+        // see `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, keep_patch, rel);
+    }
+
     /// fib44-fix follow-up: patch every direct self-recursive `CALL` (invoke_kind
     /// 4) so its rel32 targets this method's own entry — code offset 0.
     fn patch_self_calls(&mut self) {
@@ -3474,14 +3554,15 @@ fn reloc_emit_enabled() -> bool {
                 Self::patch_or_bail(&mut self.buf, jnz_patch, rel);
             }
             // getfield read — `Op::Load`. The builder emits
-            // `Op::Load(MemKind::Int)` for the int-category fields and
-            // `Op::Load(MemKind::Ref)` for reference fields; both read through
-            // the checked `jit_getfield` helper, which returns the int payload
-            // or the raw pointer according to the receiver's registered layout.
-            // The inline fallback below is int-only and layout-naive, and
-            // `lower_inner` refuses any graph that would need it for a
-            // reference load. inputs = [ctrl, mem, base, offset] where `offset`
-            // is a `Const(field_index)`.
+            // `Op::Load(MemKind::Int)` for the int-category fields,
+            // `Op::Load(MemKind::Ref)` for reference fields and (COV-03)
+            // `Long`/`Float`/`Double` for the wide ones; all read through the
+            // checked `jit_getfield` helper, which returns the int payload, the
+            // raw pointer, the long payload or the FP bit pattern according to
+            // the receiver's registered layout. The inline fallback below is
+            // int-only and layout-naive, and `lower_inner` refuses any graph
+            // that would need it for a reference or wide load. inputs = [ctrl,
+            // mem, base, offset] where `offset` is a `Const(field_index)`.
             Op::Load(_) => {
                 let slot = self.alloc_slot(id);
                 let base = node.inputs[2];
@@ -3513,20 +3594,26 @@ fn reloc_emit_enabled() -> bool {
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                                                   // The checked `jit_getfield` helper returns the `i64::MIN`
                                                   // deopt/NPE sentinel (with the pending-NPE flag set) on a bad
-                                                  // receiver instead of a legitimate field value. `Op::Load`
-                                                  // only ever represents an int-category field (see the doc
-                                                  // comment above), where `i64::MIN` can never be a genuine
-                                                  // result, so a plain compare-and-bail is unambiguous — mirrors
-                                                  // the non-J/D branch of `Op::Call`'s post-dispatch check
-                                                  // below. Without this, a bad receiver silently corrupts
-                                                  // execution instead of throwing (crash → hang conversion).
-                    self.emit_mov_reg_imm64(R10, i64::MIN as u64);
-                    self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
-                    self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub
-                    let exc_patch = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    self.call_exc_patches.push(exc_patch);
+                                                  // receiver instead of a legitimate field value. For an
+                                                  // int-category or reference field `i64::MIN` can never be a
+                                                  // genuine result (no plausible heap pointer equals it), so a
+                                                  // plain compare-and-bail is unambiguous. For a `J`/`D` field
+                                                  // it CAN be — `Long.MIN_VALUE`, and `-0.0`, whose bits are
+                                                  // exactly `i64::MIN` — so COV-03 reuses the same out-of-band
+                                                  // `jit_dispatch_threw` peek `Op::Call` already uses for a
+                                                  // `J`/`D` return. Without either, a bad receiver silently
+                                                  // corrupts execution instead of throwing (crash → hang
+                                                  // conversion).
+                    self.emit_helper_sentinel_check(node.ty);
                     self.store_rax(slot);
+                    // A `Float`/`Double` result arrives in RAX as raw bits and
+                    // its home word now holds them; republish into the value's
+                    // XMM register, exactly as `Op::ConstF` / FP `Op::Param` do.
+                    match node.ty {
+                        IrType::Float => self.publish_fp_from_slot(id, slot, false),
+                        IrType::Double => self.publish_fp_from_slot(id, slot, true),
+                        _ => {}
+                    }
                 } else {
                     // Byte displacement of the field's 32-bit Int payload within
                     // the object: HEADER_SIZE + field_index*SLOT_SIZE +
@@ -3552,16 +3639,19 @@ fn reloc_emit_enabled() -> bool {
                     self.store_rax(slot);
                 }
             }
-            // putfield write — `Op::Store`. The IR builder emits only
-            // `Op::Store(MemKind::Int)` (int-category instance fields). Inline
-            // the heap write: a null receiver DEOPTS (the interpreter then
-            // re-executes this putfield and throws NullPointerException), else
-            // write a `Value::Int(value)` cell (discriminant 0 + the 32-bit
-            // payload, high qword cleared so no stale ref/garbage survives —
-            // mirroring the scalar-replace store and the real helper).
-            // inputs = [ctrl, mem, base, offset, value]; produces no value
-            // (a pure memory-ordering token), so no slot is allocated.
-            Op::Store(_) => {
+            // putfield write — `Op::Store`. `MemKind` selects the lowering:
+            // `Int` is the inline heap write below (or `jit_putfield_int` under
+            // compact layout), `Ref` is ALWAYS `jit_putfield_object` (COV-03 —
+            // the barrier), and `Long`/`Float`/`Double` are the matching
+            // `jit_putfield_*` helper. The inline int write: a null receiver
+            // DEOPTS (the interpreter then re-executes this putfield and throws
+            // NullPointerException), else write a `Value::Int(value)` cell
+            // (discriminant 0 + the 32-bit payload, high qword cleared so no
+            // stale ref/garbage survives — mirroring the scalar-replace store
+            // and the real helper). inputs = [ctrl, mem, base, offset, value];
+            // produces no value (a pure memory-ordering token), so no slot is
+            // allocated.
+            Op::Store(kind) => {
                 let base = node.inputs[2];
                 let offset_node = node.inputs[3];
                 let value = node.inputs[4];
@@ -3573,6 +3663,60 @@ fn reloc_emit_enabled() -> bool {
                 let pay_off = tag_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
                 let high_off = tag_off + 8; // the 8-byte payload region (Long/ref)
                 let bci = node.bytecode_pc.unwrap_or(0);
+                // COV-03 — a REFERENCE store. There is no inline route and no
+                // layout-conditional choice to make: `jit_putfield_object` is
+                // the single-pass backend's own full-barrier fallback, it is
+                // compact-aware in its own right, and it is what carries the
+                // SATB pre-barrier on the OLD reference plus the collector's
+                // post-write barrier. A missing barrier is invisible until a
+                // concurrent or generational collection reclaims a still-live
+                // object, so this tier does not get a barrier-free fast path
+                // until it can prove the same premises `x64::objects` proves
+                // (mapped, genuinely compact, YOUNG receiver whose old field is
+                // null, with live region bounds published).
+                //
+                // The null check stays INLINE and deopts, for the same reason
+                // the int path's does: the helper returns silently on an
+                // implausible receiver, so calling it unguarded would convert a
+                // NullPointerException into a dropped store.
+                if matches!(kind, MemKind::Ref) {
+                    self.load_to_rax(self.slot_of(base));
+                    self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                    self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+                    // jit_putfield_object(vm_ptr, obj_ptr, field_index, val).
+                    // Unlike every other putfield helper it takes the context
+                    // pointer; `scan_frame_needs` reserves the slot for it.
+                    self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+                    self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+                    self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
+                    self.load_reg_from_frame(CALL_ARG_REGS[3], self.slot_of(value));
+                    self.emit_mov_reg_imm64(RAX, self.putfield_object as u64);
+                    self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                    return;
+                }
+                // COV-03 — a WIDE store (`J`/`F`/`D`). Same shape as the compact
+                // int store: inline null check + deopt, then the width's own
+                // `(obj_ptr, field_index, bits)` helper, which resolves the
+                // packed offset and writes a correctly-tagged cell. An FP value
+                // rides a GPR as raw bits, which is how its frame slot already
+                // holds it, so the ordinary integer slot load is the marshal.
+                let wide_helper = match kind {
+                    MemKind::Long => Some(self.putfield_long),
+                    MemKind::Float => Some(self.putfield_float),
+                    MemKind::Double => Some(self.putfield_double),
+                    _ => None,
+                };
+                if let Some(helper) = wide_helper {
+                    self.load_to_rax(self.slot_of(base));
+                    self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                    self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+                    self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(base));
+                    self.emit_mov_reg_imm64(CALL_ARG_REGS[1], field_index as i64 as u64);
+                    self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(value));
+                    self.emit_mov_reg_imm64(RAX, helper as u64);
+                    self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                    return;
+                }
                 // Compact layout packs field offsets, so the uniform
                 // `field_index * SLOT_SIZE` displacement below is wrong for a
                 // compact object. Route the write through `jit_putfield_int`,
@@ -5001,6 +5145,17 @@ fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
             needs_context = true;
         }
         if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
+            needs_context = true;
+        }
+        // COV-03: `jit_putfield_object` is the one putfield helper that takes
+        // the VM context pointer (it needs the heap to run the SATB and card
+        // barriers). Without this the lowering would load arg0 from an
+        // unreserved `context_slot_off` — the single-pass backend's identical
+        // `needs_heap` bug, which handed the helper a stack address to
+        // dereference as a `SharedVm` (Tomcat's `Catalina.setParentClassLoader`,
+        // a bare `aload_0; aload_1; putfield; return` with no other heap op).
+        // The wide `putfield_{long,float,double}` helpers take no context.
+        if matches!(n.op, Op::Store(MemKind::Ref)) {
             needs_context = true;
         }
         if matches!(n.op, Op::New { .. }) {
@@ -6984,25 +7139,72 @@ pub(crate) fn lower_inner_with_scopes(
     if cratonvm_types::compact_ref_fields_enabled() {
         let needs_getfield_helper = helpers.getfield == 0
             && graph.nodes.iter().any(|n| matches!(n.op, Op::Load(_)));
+        // Only an INT store has an inline lowering to fall back to, so only an
+        // int store is what this compact-layout clause is about. Every other
+        // `MemKind` is helper-only in both layouts and is refused
+        // unconditionally below — checking `putfield_int` for them would refuse
+        // a reference store for the absence of a helper it never calls.
         let needs_putfield_helper = helpers.putfield_int == 0
-            && graph.nodes.iter().any(|n| matches!(n.op, Op::Store(_)));
+            && graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::Store(MemKind::Int)));
         if needs_getfield_helper || needs_putfield_helper {
             return None;
         }
     }
-    // A REFERENCE field read has only one correct lowering: the helper. The
-    // inline displacement fallback decodes a 16-byte int cell at
+    // A REFERENCE or WIDE field read has only one correct lowering: the helper.
+    // The inline displacement fallback decodes a 16-byte int cell at
     // `HEADER_SIZE + index*SLOT_SIZE`, which for a reference slot yields the
     // discriminant word rather than the pointer — a fabricated address the
-    // frame would then publish as a root. Refuse the graph outright rather
-    // than emit it, independently of the compact-layout switch above.
-    if helpers.getfield == 0
-        && graph
-            .nodes
-            .iter()
-            .any(|n| matches!(n.op, Op::Load(MemKind::Ref)))
+    // frame would then publish as a root — and for a `J`/`F`/`D` slot yields a
+    // sign-extended half of the payload. Refuse the graph outright rather than
+    // emit it, independently of the compact-layout switch above.
+    //
+    // A wide read additionally needs `jit_dispatch_threw`: `Long.MIN_VALUE`,
+    // and the `-0.0` bit pattern, are bit-identical to the helper's deopt/NPE
+    // sentinel, and without the out-of-band peek the lowering must either drop
+    // a real NPE or bail on a legitimate value. Neither is acceptable, so
+    // refuse instead. `Float` is included for the same reason the `J`/`D`/`F`
+    // branch of `emit_call_return_check` includes it: the disambiguation is one
+    // shape, keyed on the value's WIDTH CLASS rather than on a claim about what
+    // `jit_getfield` happens to zero-extend today.
+    if graph.nodes.iter().any(|n| {
+        matches!(
+            n.op,
+            Op::Load(MemKind::Ref | MemKind::Long | MemKind::Float | MemKind::Double)
+        )
+    }) && helpers.getfield == 0
     {
         return None;
+    }
+    if helpers.dispatch_threw == 0
+        && graph.nodes.iter().any(|n| {
+            matches!(
+                n.op,
+                Op::Load(MemKind::Long | MemKind::Float | MemKind::Double)
+            )
+        })
+    {
+        return None;
+    }
+    // COV-03 — every non-int field STORE is helper-only, and each width has its
+    // own helper. A reference store's helper is the one that carries the write
+    // barrier; emitting the store without it is the failure this lane is most
+    // careful about (invisible until a concurrent or generational collection,
+    // and it surfaces as a lost object, not as a fault at the store). Refuse
+    // rather than substitute.
+    for n in &graph.nodes {
+        let missing = match n.op {
+            Op::Store(MemKind::Ref) => helpers.putfield_object == 0,
+            Op::Store(MemKind::Long) => helpers.putfield_long == 0,
+            Op::Store(MemKind::Float) => helpers.putfield_float == 0,
+            Op::Store(MemKind::Double) => helpers.putfield_double == 0,
+            _ => false,
+        };
+        if missing {
+            return None;
+        }
     }
 
     // ── Resource bounds, decided before anything is reserved ─────────
@@ -7769,6 +7971,173 @@ mod tests {
             .count();
         assert_eq!(calls, 2, "monitorenter and monitorexit must each call the helper");
     }
+    /// COV-03 — build the one-line `void set(Corpus o, X v) { o.f = v; }` graph
+    /// for field descriptor `tag`, with both wide-field gates on.
+    ///   aload_0; <x>load_1; putfield #2; return
+    fn ref_or_wide_putfield_graph(tag: u8, load_op: u8, param_ty: IrType) -> Graph {
+        let code = [0x2a, load_op, 0x01, 0xb5, 0x00, 0x02, 0xb1, 0, 0];
+        let mut b = IrBuilder::new(2, 4);
+        b.set_param_types(&[IrType::Ref, param_ty]);
+        let mut fi = std::collections::HashMap::new();
+        fi.insert(3usize, (0usize, tag));
+        b.set_field_info(fi);
+        b.set_wide_field_gates(true, true);
+        b.build(&code, 7)
+            .unwrap_or_else(|| panic!("the builder must accept a {} putfield", tag as char))
+    }
+
+    /// COV-03, the soundness half. A reference field store has exactly ONE
+    /// correct lowering — `jit_putfield_object`, which carries the SATB
+    /// pre-barrier on the overwritten reference and the collector's post-write
+    /// barrier. With no helper address the graph must be REFUSED, never lowered
+    /// to a barrier-free store: a missing barrier is invisible until a
+    /// concurrent or generational collection, and it surfaces as a lost object
+    /// rather than as a fault at the store.
+    ///
+    /// The second half is the one a refusal test cannot give you: with the
+    /// helper wired, the emitted artifact must actually CALL it. "The graph was
+    /// accepted" and "the barrier is in the code" are different claims.
+    #[test]
+    fn a_reference_putfield_lowers_only_through_the_barrier_helper() {
+        // aload_0; aload_1; putfield #2; return
+        let graph = ref_or_wide_putfield_graph(b'L', 0x19, IrType::Ref);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::Store(MemKind::Ref))),
+            "the builder must emit Op::Store(MemKind::Ref)"
+        );
+        let schedule = ir_schedule::schedule(&graph);
+
+        assert!(
+            lower(&graph, &schedule, 2, 4, &no_helpers()).is_none(),
+            "a reference store with no `putfield_object` helper must be REFUSED, \
+             never lowered to a store without its write barrier"
+        );
+
+        unsafe extern "C" fn fake_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {}
+        let mut helpers = no_helpers();
+        helpers.putfield_object = fake_putfield_object as *const () as usize;
+        // `putfield_int` too: with compact layout on, `lower_inner` refuses an
+        // INT store without it — and the `Const(field_index)` offset node this
+        // graph carries is not an int store, so this only proves the refusal is
+        // per-kind rather than blanket.
+        helpers.putfield_int = fake_putfield_object as *const () as usize;
+        let cm = lower(&graph, &schedule, 2, 4, &helpers)
+            .expect("a reference store WITH the barrier helper must compile");
+        assert!(
+            contains_seq(
+                cm.code_bytes(),
+                &(helpers.putfield_object as u64).to_le_bytes()
+            ),
+            "the artifact must bake the `jit_putfield_object` address — the write \
+             barrier is the whole reason this store has no inline lowering"
+        );
+        // The helper takes the VM context pointer as arg0, so the frame must
+        // reserve and the ABI must demand it. Without this the lowering would
+        // load arg0 from an unreserved slot and hand the helper a stack address
+        // to dereference as a `SharedVm` (the single-pass backend's identical
+        // `needs_heap` bug on `Catalina.setParentClassLoader`).
+        assert!(
+            cm.needs_context(),
+            "a reference putfield must make the artifact `needs_context`"
+        );
+    }
+
+    /// COV-03 — the same per-kind refusal for the wide widths, each of which
+    /// has its own helper. Wired one at a time so a graph is never accepted on
+    /// the strength of a DIFFERENT width's helper being present.
+    #[test]
+    fn a_wide_putfield_lowers_only_through_its_own_width_helper() {
+        unsafe extern "C" fn fake_putfield(_obj: i64, _idx: i64, _val: i64) {}
+        let addr = fake_putfield as *const () as usize;
+        for (tag, load_op, ty) in [
+            (b'J', 0x16u8, IrType::Long),
+            (b'F', 0x17, IrType::Float),
+            (b'D', 0x18, IrType::Double),
+        ] {
+            let graph = ref_or_wide_putfield_graph(tag, load_op, ty);
+            let schedule = ir_schedule::schedule(&graph);
+            assert!(
+                lower(&graph, &schedule, 2, 4, &no_helpers()).is_none(),
+                "a {} store with no width helper must be refused",
+                tag as char
+            );
+            let mut helpers = no_helpers();
+            match tag {
+                b'J' => helpers.putfield_long = addr,
+                b'F' => helpers.putfield_float = addr,
+                _ => helpers.putfield_double = addr,
+            }
+            let cm = lower(&graph, &schedule, 2, 4, &helpers)
+                .unwrap_or_else(|| panic!("a {} store with its helper must compile", tag as char));
+            assert!(
+                contains_seq(cm.code_bytes(), &(addr as u64).to_le_bytes()),
+                "the {} store must CALL its width helper",
+                tag as char
+            );
+        }
+    }
+
+    /// COV-03 — a wide field READ needs `jit_dispatch_threw`, because
+    /// `Long.MIN_VALUE` and the `-0.0` bit pattern are bit-identical to
+    /// `jit_getfield`'s deopt/NPE sentinel. Without the out-of-band peek the
+    /// lowering would have to either drop a real NPE or bail on a legitimate
+    /// value, so it refuses instead.
+    ///
+    /// A REFERENCE read is the control: no plausible heap pointer equals
+    /// `i64::MIN`, so it keeps the plain compare-and-bail and must NOT start
+    /// demanding the peek.
+    #[test]
+    fn a_wide_field_read_refuses_without_the_sentinel_disambiguator() {
+        unsafe extern "C" fn fake_getfield(_vm: i64, _obj: i64, _idx: i64) -> i64 {
+            0
+        }
+        extern "C" fn fake_dispatch_threw() -> i64 {
+            0
+        }
+        for (tag, ret, needs_peek) in [
+            (b'J', 0xadu8, true),
+            (b'D', 0xaf, true),
+            (b'F', 0xae, true),
+            (b'L', 0xb0, false),
+        ] {
+            // aload_0; getfield #2; <x>return
+            let code = [0x2a, 0xb4, 0x00, 0x02, ret, 0, 0];
+            let mut b = IrBuilder::new(1, 1);
+            b.set_param_types(&[IrType::Ref]);
+            let mut fi = std::collections::HashMap::new();
+            fi.insert(1usize, (0usize, tag));
+            b.set_field_info(fi);
+            b.set_wide_field_gates(true, true);
+            let graph = b.build(&code, 5).expect("wide getfield builds when gated");
+            let schedule = ir_schedule::schedule(&graph);
+
+            let mut helpers = no_helpers();
+            helpers.getfield = fake_getfield as *const () as usize;
+            assert_eq!(
+                lower(&graph, &schedule, 1, 1, &helpers).is_none(),
+                needs_peek,
+                "{}: refusal without `dispatch_threw` should be {needs_peek}",
+                tag as char
+            );
+
+            helpers.dispatch_threw = fake_dispatch_threw as *const () as usize;
+            let cm = lower(&graph, &schedule, 1, 1, &helpers)
+                .unwrap_or_else(|| panic!("{} read must compile once wired", tag as char));
+            assert_eq!(
+                contains_seq(
+                    cm.code_bytes(),
+                    &(helpers.dispatch_threw as u64).to_le_bytes()
+                ),
+                needs_peek,
+                "{}: the sentinel peek must be emitted iff the width can collide",
+                tag as char
+            );
+        }
+    }
+
     fn compile_via_ir_no_opt(
         code: &[u8],
         code_len: usize,

@@ -1742,6 +1742,193 @@ fn ir_vs_singlepass_putfield_two_fields() {
     );
 }
 
+// ── COV-03: REFERENCE putfield ─────────────────────────────────────────
+//
+// `getfield` learned about reference fields; `putfield` twenty lines below it
+// did not. This section is the differential half of closing that: a method that
+// stores a reference field, reads it back, and returns it must give the same
+// answer from both backends.
+//
+// The layout both backends must agree on is the legacy 16-byte `Value` cell —
+// `Value::Object`'s tag dword (4) at `FIELD_CELL_TAG_OFFSET`, the raw pointer at
+// `FIELD_CELL_PAYLOAD64_OFFSET` — because that is what the single-pass backend's
+// inline reference `getfield` reads (`MOV RAX, [RAX + cell + 8]`) for a
+// non-compact receiver, which is what `make_object` builds. The stubs below
+// implement exactly that, so single-pass's INLINE read and the IR tier's HELPER
+// read are being compared against the same bytes rather than against each
+// other's private conventions.
+//
+// The reference STORE goes through `jit_putfield_object` on both sides — that is
+// the point: it is the only lowering either backend has for a reference field
+// write, because it is the one that carries the SATB pre-barrier and the
+// collector's post-write barrier.
+
+/// `jit_getfield` for a REFERENCE field in the synthetic legacy-layout objects:
+/// the raw pointer at `FIELD_CELL_PAYLOAD64_OFFSET`. Null receiver → 0, matching
+/// both the real helper's null path and the inline lowering's.
+///
+/// # Safety
+/// Same contract as [`legacy_getfield`].
+unsafe extern "C" fn legacy_getfield_ref(_vm: i64, obj: i64, idx: i64) -> i64 {
+    if obj == 0 {
+        return 0;
+    }
+    let at = (obj as *const u8).add(HEADER_SIZE + idx as usize * SLOT_SIZE + 8);
+    std::ptr::read_unaligned(at as *const i64)
+}
+
+/// `jit_putfield_object` for the same buffers. Writes the `Value::Object` tag
+/// (4) and the raw pointer, which is the cell shape the single-pass inline
+/// reference read decodes. No barrier is modelled — there is no collector here;
+/// what this harness proves is that both backends route the store through THIS
+/// helper and agree on the bytes. That the helper carries the barriers is
+/// asserted separately, on the emitted artifact, in `ir_lower`'s
+/// `a_reference_putfield_lowers_only_through_the_barrier_helper`.
+///
+/// # Safety
+/// Same contract as [`legacy_getfield`]; `val` is 0 or a live object address.
+unsafe extern "C" fn legacy_putfield_object(_vm: i64, obj: i64, idx: i64, val: i64) {
+    if obj == 0 {
+        return;
+    }
+    let base = (obj as *mut u8).add(HEADER_SIZE + idx as usize * SLOT_SIZE);
+    std::ptr::write_unaligned(base as *mut u32, 4); // Value::Object tag
+    std::ptr::write_unaligned(base.add(8) as *mut i64, val);
+}
+
+fn ref_field_helpers() -> JitRuntimeHelpers {
+    let mut h = dummy_helpers();
+    h.getfield = legacy_getfield_ref as *const () as usize;
+    h.putfield_object = legacy_putfield_object as *const () as usize;
+    h
+}
+
+/// Read the 64-bit reference payload of field `i` from a synthetic object.
+fn read_ref_field(buf: &[u64], i: usize) -> i64 {
+    let off = HEADER_SIZE + i * SLOT_SIZE + 8;
+    let base = buf.as_ptr() as *const u8;
+    // SAFETY: off + 8 is within the buffer by make_object's construction.
+    unsafe { std::ptr::read_unaligned(base.add(off) as *const i64) }
+}
+
+/// The COV-03 differential: `static Object setget(Corpus o, Object v) { o.r = v;
+/// return o.r; }`. A reference store followed by a reference read of the same
+/// field — the exact shape the lane's brief names — run through both backends
+/// against their own fresh objects, comparing the returned reference AND the
+/// resulting field bytes.
+#[test]
+fn ir_vs_singlepass_reference_putfield_then_getfield() {
+    // aload_0; aload_1; putfield #2; aload_0; getfield #2; areturn
+    let code = vec![
+        0x2a, 0x2b, 0xb5, 0x00, 0x02, // o.r = v
+        0x2a, 0xb4, 0x00, 0x02, 0xb0, // return o.r
+    ];
+    let resolver = |cp: u16| if cp == 2 { Some((0usize, b'L')) } else { None };
+    let helpers = ref_field_helpers();
+    let cm = cached(
+        "ref_setget",
+        "(Lpkg/Corpus;Ljava/lang/Object;)Ljava/lang/Object;",
+        code,
+        2,
+        2,
+    );
+    let ir = compile_opt_fields(&cm, &helpers, &resolver, true)
+        .expect("ref_setget: optimize=true (IR pipeline) failed to compile");
+    let sp = compile_opt_fields(&cm, &helpers, &resolver, false)
+        .expect("ref_setget: optimize=false (single-pass) failed to compile");
+
+    // The values stored: a live object address, and null.
+    let target = make_object(&[7]);
+    let dummy_vm = [0u8; 64];
+    for value in [target.as_ptr() as i64, 0i64] {
+        let run = |m: &CompiledMethod| -> (i64, i64) {
+            let mut obj = make_object(&[0]);
+            let args = [obj.as_mut_ptr() as i64, value];
+            // SAFETY: `m` is JIT-compiled from valid field bytecode; `obj` is a
+            // live, exclusively-owned, correctly-laid-out receiver and `value`
+            // is 0 or the address of the live `target` buffer. The only helpers
+            // reachable are the two live stubs above; the context pointer is a
+            // live 64-byte buffer neither stub reads.
+            let r = unsafe {
+                if m.needs_context() {
+                    m.try_call_with_context(dummy_vm.as_ptr() as i64, &args)
+                } else {
+                    m.try_call(&args)
+                }
+            }
+            .unwrap_or_else(|e| panic!("ref_setget: call value={value:#x}: {e:?}"));
+            (r, read_ref_field(&obj, 0))
+        };
+        let (r_sp, cell_sp) = run(&sp);
+        let (r_ir, cell_ir) = run(&ir);
+        assert_eq!(
+            r_ir, r_sp,
+            "ref_setget: returned reference DIVERGES for value={value:#x}: IR={r_ir:#x}, sp={r_sp:#x}",
+        );
+        assert_eq!(
+            cell_ir, cell_sp,
+            "ref_setget: stored cell DIVERGES for value={value:#x}: IR={cell_ir:#x}, sp={cell_sp:#x}",
+        );
+        assert_eq!(
+            r_ir, value,
+            "ref_setget: both backends agree but disagree with the host for \
+             value={value:#x}: got {r_ir:#x}",
+        );
+        assert_eq!(
+            cell_ir, value,
+            "ref_setget: the store did not land for value={value:#x}: cell={cell_ir:#x}",
+        );
+    }
+    drop(target);
+}
+
+/// The write-only case: the store's memory result is never read back inside the
+/// method, so nothing but the post-call object state proves it happened. This is
+/// what a dropped reference store looks like — and a dropped reference store is
+/// also what a missing write barrier looks like to the collector, one
+/// collection later.
+#[test]
+fn ir_vs_singlepass_reference_putfield_pure_write() {
+    // aload_0; aload_1; putfield #2; return
+    let code = vec![0x2a, 0x2b, 0xb5, 0x00, 0x02, 0xb1];
+    let resolver = |cp: u16| if cp == 2 { Some((0usize, b'L')) } else { None };
+    let helpers = ref_field_helpers();
+    let cm = cached("ref_set", "(Lpkg/Corpus;Ljava/lang/Object;)V", code, 2, 2);
+    let ir = compile_opt_fields(&cm, &helpers, &resolver, true)
+        .expect("ref_set: optimize=true (IR pipeline) failed to compile");
+    let sp = compile_opt_fields(&cm, &helpers, &resolver, false)
+        .expect("ref_set: optimize=false (single-pass) failed to compile");
+    let target = make_object(&[1]);
+    let dummy_vm = [0u8; 64];
+    for value in [target.as_ptr() as i64, 0i64] {
+        let run = |m: &CompiledMethod| -> i64 {
+            let mut obj = make_object(&[0]);
+            let args = [obj.as_mut_ptr() as i64, value];
+            // SAFETY: as in `ir_vs_singlepass_reference_putfield_then_getfield`.
+            unsafe {
+                if m.needs_context() {
+                    m.try_call_with_context(dummy_vm.as_ptr() as i64, &args)
+                } else {
+                    m.try_call(&args)
+                }
+            }
+            .unwrap_or_else(|e| panic!("ref_set: call value={value:#x}: {e:?}"));
+            read_ref_field(&obj, 0)
+        };
+        let cell_sp = run(&sp);
+        let cell_ir = run(&ir);
+        assert_eq!(
+            cell_ir, cell_sp,
+            "ref_set: stored cell DIVERGES for value={value:#x}: IR={cell_ir:#x}, sp={cell_sp:#x}",
+        );
+        assert_eq!(
+            cell_ir, value,
+            "ref_set: the store was dropped for value={value:#x}: cell={cell_ir:#x}",
+        );
+    }
+    drop(target);
+}
+
 // ── Gap B: invokestatic → Op::Call via the invoke_dispatch helper ──────
 //
 // The IR builder lowers an int-only `invokestatic` in an oop-free method to
