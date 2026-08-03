@@ -74,6 +74,13 @@ $JdkHome= 'C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot'
 $JAVA   = Join-Path $JdkHome 'bin\java.exe'
 $CpFile = Join-Path $Work 'cp.txt'
 $AllList= Join-Path $Work 'all-tests.txt'
+# Apache httpd for the 9 org.apache.tomcat.integration.httpd.* classes, which
+# proxy real traffic through an httpd each test starts itself. Windows has no
+# httpd on PATH and TesterHttpd looks for a literal "httpd" unless
+# -Dtomcat.test.httpd.path points at one, so without this all 9 fail with a
+# connection-refused to the proxy port - on HotSpot exactly as on CratonVM.
+# Provision with: pwsh apps\tomcat-suite-runner\setup-httpd-windows.ps1
+$Httpd  = 'C:\craton\tools\Apache24\bin\httpd.exe'
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 
 function Write-Info($m) { Write-Host "[suite] $m" -ForegroundColor Cyan }
@@ -307,6 +314,9 @@ function Invoke-Mode {
     '--add-opens','java.base/java.util=ALL-UNNAMED',
     '--add-opens','java.base/java.util.concurrent=ALL-UNNAMED'
   )
+  # Inert for every class except org.apache.tomcat.integration.httpd.*.
+  if (Test-Path $Httpd) { $jvmArgs += "-Dtomcat.test.httpd.path=$Httpd" }
+  else { Write-Warning "[suite] httpd not found at $Httpd - the 9 org.apache.tomcat.integration.httpd.* classes will fail with connection-refused. Run setup-httpd-windows.ps1." }
   if ($Vm -eq 'craton') {
     if ($NoJit)     { $jvmArgs += '--nojit' }
     if ($Synthetic) { $jvmArgs += '--synthetic-jdk' }
