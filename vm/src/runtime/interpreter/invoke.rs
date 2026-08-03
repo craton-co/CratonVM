@@ -1697,6 +1697,56 @@ pub(super) fn execute_invoke_kind(
         }
     }
 
+    // H2-CID0, CLONE face (2026-08-03). `java.lang.Thread.clone()` is
+    // `new CloneNotSupportedException / dup / invokespecial / athrow` and
+    // nothing else, so a dispatch that lands there is never something the
+    // program asked for: no library clones a Thread. Every observed arrival is
+    // a receiver whose header does not say what the caller's reference should
+    // point at — `Arrays.copyOf(long[], int)` doing `original.clone()` on a
+    // `long[]`, reaching `Thread.clone` instead of the array clone.
+    //
+    // Two different defects produce it, and this reporter is what tells them
+    // apart. Array receivers carry their COMPONENT class id in the header, and
+    // dispatching on that without an array check routes `someArray.m()` into
+    // the component class's body — the defect fixed 2026-07-31 (see
+    // `bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`).
+    // The other is this family: the receiver's block was reclaimed while still
+    // referenced and re-served, so the header now describes whatever occupies
+    // it. Only the second leaves a record in the reclamation rings, and
+    // `report_reclaimed_receiver` asks them.
+    //
+    // Costs nothing on a healthy run: the whole check is two string compares
+    // that fail, and it is only reached at a dispatch terminal. See
+    // `docs/known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md`,
+    // whose "what to try next" asked for exactly this — the two
+    // `CloneNotSupportedException` occurrences it recorded produced no verdict
+    // because nothing on the clone path consulted the heap.
+    if &*invoke_class == "java/lang/Thread"
+        && &*method_name == "clone"
+        && &*method_descriptor == "()Ljava/lang/Object;"
+    {
+        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+            let addr = recv.as_ptr() as usize;
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                obj = format!("{addr:#x}"),
+                receiver_kind = ?shared.mem.heap.kind_of(recv),
+                receiver_class_id = shared.mem.heap.class_id_of(recv).as_u32(),
+                "clone() dispatched to java.lang.Thread.clone, which only ever throws. \
+                 The receiver's header does not describe what the caller is holding — \
+                 either an array dispatched through its COMPONENT class id, or a block \
+                 that was reclaimed while still referenced and then re-served.",
+            );
+            crate::memory::reclaim_guard::report_reclaimed_receiver(
+                shared,
+                addr,
+                "Thread.clone dispatch",
+                "java/lang/Thread.clone()Ljava/lang/Object;",
+                shared.mem.heap.class_id_of(recv).as_u32(),
+            );
+        }
+    }
+
     // Annotation proxy dispatch: method calls on annotation proxies
     //
     // S111r18 — gate the dispatch on `kind == Object`. A reference array

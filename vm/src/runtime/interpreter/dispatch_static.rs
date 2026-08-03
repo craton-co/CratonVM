@@ -1302,6 +1302,39 @@ pub(super) fn execute_invokestatic_cached(
                 std::hint::spin_loop();
                 return Ok(CachedCallResult::Handled);
             }
+            // `Thread.currentThread()` is answered from the thread's own
+            // mirror field, without entering `safe_native_call`.
+            //
+            // Measured (`probes/NativeShapeProbe.java`): a no-argument static
+            // native costs ~330-410 ns here against 8.4 ns for an ordinary
+            // Java call, and ~98% of that is the funnel — arg pinning, the
+            // GC-forwarding barrier, two thread-state transitions, the native
+            // ring buffer, `catch_unwind` and the GC-pressure probes. None of
+            // it is needed to hand back a field that is already a GC root:
+            // there is no argument to pin, nothing here allocates or collects,
+            // and it cannot throw.
+            //
+            // The JDK leans on this constantly — `probes/LockNativeCensusProbe`
+            // censuses **two** calls per uncontended `ReentrantLock`
+            // lock/unlock pair, alongside two `setExclusiveOwnerThread` and one
+            // `Unsafe.compareAndSetInt`.
+            //
+            // `java_thread_obj` is `None` only before this thread's mirror has
+            // been built; that first call falls through to the ordinary path so
+            // `current_thread_object`'s allocating slow path still runs. The
+            // mirror is a per-thread GC root that the collector remaps, and
+            // pushing it onto the operand stack roots it again, with no
+            // allocation in between.
+            if kind == cratonvm_native_api::InterpIntrinsic::ThreadCurrentThread {
+                if let Some(obj) = thread.java_thread_obj {
+                    INTRINSIC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    push_invoke_return_value(
+                        &mut thread.frames[frame_idx].stack,
+                        Value::Object(Some(obj)),
+                    )?;
+                    return Ok(CachedCallResult::Handled);
+                }
+            }
             let mut arg_buf = [Value::Uninitialized; MAX_INTRINSIC_ARGS];
             let args = pop_coerced_invoke_args_intrinsic(
                 shared,

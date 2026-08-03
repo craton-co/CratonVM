@@ -1714,6 +1714,30 @@ impl Frame {
         self.scan_local_objects_inner(roots, heap, true);
     }
 
+    /// The per-bci live-local mask [`Self::scan_local_objects`] filters this
+    /// frame's roots with, at its current pc. Bit `i` set = slot `i` may still
+    /// be read; slots at index >= 64 are outside the mask and always live.
+    ///
+    /// Exposed so a diagnostic can ask the collector's own question instead of
+    /// a weaker one. `audit_frames_for_reclaimed_slots` needs exactly this:
+    /// a frame local that is DEAD and points into a reclaimed span is the
+    /// liveness filter working as designed (the `PreparedStatement` a seed loop
+    /// finished with, still in slot 8 for the rest of the method), and
+    /// reporting it would bury the case that matters — a LIVE local whose
+    /// object the collector took anyway.
+    pub(crate) fn live_locals_mask_here(&self) -> u64 {
+        if crate::runtime::env_cache::no_local_liveness() {
+            crate::runtime::local_liveness::ALL_LIVE
+        } else {
+            crate::runtime::local_liveness::live_locals_mask(
+                &self.code,
+                self.exception_table(),
+                self.max_locals,
+                [self.pc, self.last_instr_pc],
+            )
+        }
+    }
+
     /// Variant used by the non-moving ForkJoin stress snapshot path.
     ///
     /// It keeps the exact same kind/tag filtering as [`Self::scan_local_objects`]
