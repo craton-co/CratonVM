@@ -63,7 +63,11 @@ live", nothing joining them. That is the gap, stated concretely.
 **And the migration is not justified by defect prevention.** §6 runs the
 three-defect test hir-01 specifies and the honest score is **one of three**.
 The recommendation in §5 is therefore conditional on a measurement, not on
-safety.
+safety — and **§5.1 is that measurement, taken 2026-08-03**: 15.7–19.0% of
+scheduled nodes on real Spring compiles, with the two rules the migration was
+for (`Lea`, `AluImm`) firing **zero** times because the pattern table is 64-bit
+and Java arithmetic is 32-bit. The answer for now is *stop and fix the table*,
+not *build the level*.
 
 ---
 
@@ -326,11 +330,16 @@ plan verification, and the granularity is **per node, not per method**.
 
 ### The increments
 
-**Increment 0 — shadow selection. Emits nothing. Off by default.**
+**Increment 0 — shadow selection. Emits nothing. Off by default. LANDED
+2026-08-03, and its answer is in §5.1.**
 
 Run `select_block` per block inside `lower_inner_with_scopes`, assert
 `BlockSelection::covers`, count what fired, discard the result, and emit through
 the existing path unchanged. Zero emitted-byte difference by construction.
+
+Wired as `CRATONVM_JIT=ir-isel-shadow` (declared), reported by
+`CRATONVM_DBG=ir-isel`. The pass is `isel::shadow_select_method`; the call site
+is nine lines in `lower_inner_with_scopes`.
 
 What it produces that is independently useful, *even if levels never split*:
 
@@ -402,6 +411,78 @@ to 2–4. **Increment 0 is the decision point**: if the coverage measured on rea
 suite methods is small, or the rules that fire are ones `ir_lower` already emits
 optimally, the honest answer is to stop, keep the number in the doc, and spend
 the effort on `pgo` or `loop` instead.
+
+---
+
+## 5.1 What increment 0 measured — and why increment 1 should wait
+
+Run 2026-08-03 on Azure Linux, release binary, `CRATONVM_JIT=ir-isel-shadow`
+plus `CRATONVM_DBG=ir-isel`, over two Spring Boot test classes. Every method the
+optimizing tier actually compiled, tiled and counted:
+
+| | `ConfigurationPropertiesTests` | `BinderTests` |
+|---|---|---|
+| methods shadowed | 718 | 132 |
+| blocks | 1 653 | 258 |
+| scheduled data nodes | 4 136 | 696 |
+| tiles | 4 917 | 828 |
+| tiles firing a real rule | 443 | 64 |
+| **nodes covered by a real rule** | **785 (19.0%)** | **109 (15.7%)** |
+| `covers()` violations | **0** | **0** |
+
+Rules that fired, both classes summed — and this is the part that decides the
+lane:
+
+| Rule | Tiles | Worth |
+|---|---|---|
+| `TestZeroBranch` | 284 | `CMP r, 0` → `TEST r, r`. Real, and small: one or two bytes a branch. |
+| `AluReg` | 123 | The two-address form. A real win — it drops a frame round trip. |
+| `TestBranch` | 60 | **Nothing.** §2 documents it as byte-for-byte what `ir_lower::lower_terminator` already emits. |
+| `CmpBranch` | 40 | Compare-and-branch fusion. The largest per-site win here. |
+| `Lea` | **0** | — |
+| `AluImm` | **0** | — |
+| `AluFoldedLoad` | **0** | `fold_loads` is off; `AddrSource::Opaque` (§6 item 4). |
+| `CmpSetCc` | **0** | No `SETcc` row (§6 item 6). |
+
+### The finding
+
+**The two rules the migration was supposed to be *for* fire zero times on real
+code.** `Rule::Lea` — address-mode folding, the headline item in
+`instruction-selection.md` §1 — never matched once across 850 methods.
+`Rule::AluImm` never matched either, and was refused 119 times as
+`Unencodable`. They fail for the same reason: **the pattern table is 64-bit and
+Java arithmetic is 32-bit.** `Rule::Lea` refuses `Ty::I32` outright, and there
+are no `*_r32_imm*` rows.
+
+What is left is 60 tiles that buy nothing and ~450 that buy a byte or a frame
+round trip on branches. That is not a case for building a machine level.
+
+The synthetic ten-shape corpus said 38.2%. Real code says 15.7–19.0%, and the
+composition is worse than the headline: the synthetic corpus fired `Lea` once
+and real code never does, because hand-written integer arithmetic in a test
+fixture is not what a Spring method spends its nodes on. **Trusting the
+synthetic figure would have justified increments 1–4 on a number that was
+double the truth and pointed at the wrong rules.** That is what increment 0 was
+for.
+
+### The recommendation
+
+**Do not start increment 1. Close the 32-bit gap first, then re-run this
+measurement.** Concretely, `instruction-selection.md` §6 item 2 (the 32-bit
+immediate and `LEA` rows): anchor them to the byte sequences
+`ir_lower::lower_data_node` emits for `Ty::I32`, and re-measure with the same
+flag. If coverage does not move materially, the lane is done and the number is
+the deliverable — spend the effort on `pgo` or `loop` instead.
+
+The measurement is now cheap and repeatable, which is the other thing increment
+0 bought: it is one flag on a release binary, not a bespoke probe.
+
+### What the run also proved
+
+`covers()` held on every one of 1 911 blocks. The invariant §6.1 rests on — the
+one that makes the monitor defect unrepresentable at level 2 — is not merely
+tested on hand-built graphs; it holds on every block of every method two real
+Spring test classes compile.
 
 ---
 

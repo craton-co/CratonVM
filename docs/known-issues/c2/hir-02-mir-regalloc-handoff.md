@@ -1,9 +1,27 @@
 # HIR-02 — give the instruction selector somewhere to send its output
 
-**Status:** not started, **unblocked**. **Depends on:** `hir-01`'s contract —
-settled 2026-08-03 as `docs/jit/lowering-contract.md`. **Read §5 of that before
-this file**: it reorders the increments below and puts a step that emits *no
-bytes* first.
+**Status:** increment 0 **DONE 2026-08-03**; increments 1–4 **on hold, and
+the hold is the finding.** **Depends on:** `hir-01`'s contract —
+settled 2026-08-03 as `docs/jit/lowering-contract.md`. **Read §5 and §5.1 of
+that before this file**: they reorder the increments below, and §5.1 is the
+measurement that says not to start the next one yet.
+
+> **Increment 0's answer.** Shadow selection (`CRATONVM_JIT=ir-isel-shadow`,
+> default off, emits nothing) ran over 850 real Spring Boot compiles.
+> `select_block` covers **15.7–19.0%** of scheduled data nodes — not the 38.2%
+> the synthetic corpus predicted — and of the four rules that fire, one
+> (`TestBranch`, 60 tiles) is byte-for-byte what `ir_lower` already emits.
+> **`Rule::Lea` and `Rule::AluImm` fire ZERO times**, because the pattern table
+> is 64-bit and Java arithmetic is 32-bit.
+>
+> So the first increment below should NOT be "give the selector somewhere to
+> send its output". It should be `instruction-selection.md` §6 item 2 — the
+> 32-bit rows — followed by re-running the same flag. Building a machine level
+> to carry tiles that mostly say `Generic` is the migration cost without the
+> migration's benefit.
+>
+> `covers()` held on all 1 911 blocks, which is the one piece of good news: the
+> invariant the contract's §6.1 argument rests on is real on real code.
 **Owns:** `jit/src/x64/isel.rs`, a new `jit/src/mir.rs` (or whatever `hir-01`
 names it), `jit/src/regalloc.rs`.
 

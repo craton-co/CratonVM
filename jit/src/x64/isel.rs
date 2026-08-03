@@ -2647,6 +2647,7 @@ pub fn render(p: &Pattern, d: &Decoded) -> String {
 // `docs/jit/instruction-selection.md` for what the production wiring has to do
 // and what is still unvalidated.
 
+use crate::ir_schedule::Schedule;
 use crate::ir::{is_memory_token_slot, CmpOp, Graph, IrType, NodeId, Op as IrOp, Reorder,
     ReorderBlock};
 
@@ -4325,6 +4326,317 @@ fn admit(t: Tile, opts: &SelectOptions, notes: &mut Vec<Note>) -> Option<Tile> {
             None
         }
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Shadow selection — `docs/jit/lowering-contract.md` §5, increment 0
+// ---------------------------------------------------------------------------
+//
+// Run the tiler over a real compile's blocks, check its own invariant, count
+// what fired, and **throw the result away**. Not one emitted byte changes.
+//
+// Why a pass that emits nothing is the first increment, and not a shortcut to
+// one that does: the contract's three-defect test scored one of three, so the
+// HIR/MIR migration is not justified as a correctness investment. What decides
+// whether to continue is a number nobody has — how much of a real method the
+// pattern table can actually cover — and this is the cheapest honest way to get
+// it. If the answer is small, the right move is to stop and keep the number.
+//
+// Measured on ten synthetic shapes for the contract: 38.2% of scheduled data
+// nodes, with `Rule::AluImm` firing **zero** times because the table has no
+// 32-bit immediate rows. That corpus is not real code — it has no field access,
+// no calls, and `ir_optimize` never ran on it. This pass replaces it with the
+// real population.
+//
+// ## Why this does not refuse the compile
+//
+// Everything else new in this backend fails closed. This deliberately does not,
+// and the reason is that it is a *measurement*: a flag whose only documented
+// effect is a count must not be able to change which methods get compiled, or
+// the number it reports is a number about a different program. So a
+// `covers()` violation — an `isel` bug, and the exact failure the invariant
+// exists to catch — is counted and reported, loudly, and the compile proceeds
+// through the unchanged path.
+//
+// `shadow_selection_changes_no_emitted_byte` is what holds that claim up.
+// Increment 1, which emits tiles, is where fail-closed comes back.
+
+/// One method's shadow-selection result.
+///
+/// Counts only. Nothing here names a node, because nothing downstream may act
+/// on it — see the module note above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShadowStats {
+    /// Blocks the selector was run over.
+    pub blocks: u64,
+    /// Scheduled data nodes offered to it (`Block::nodes`, summed).
+    pub nodes: u64,
+    /// Tiles it produced, including `Rule::Generic` ones.
+    pub tiles: u64,
+    /// Tiles that fired a rule other than [`Rule::Generic`].
+    pub matched_tiles: u64,
+    /// Data nodes covered by a matched tile — the headline figure. A tile's
+    /// `covered` list can hold more than its root (that is what absorption is),
+    /// so this is not `matched_tiles`.
+    pub covered_nodes: u64,
+    /// Blocks where [`BlockSelection::covers`] came back false.
+    ///
+    /// **Always zero, or there is a bug in `isel`.** Counted rather than
+    /// asserted because this pass may not change what compiles.
+    pub coverage_failures: u64,
+    /// Per-rule tile counts, indexed by [`rule_index`].
+    pub rules: [u64; RULE_COUNT],
+    /// Per-note refusal counts, indexed by [`note_index`].
+    pub notes: [u64; NOTE_COUNT],
+}
+
+/// Number of [`Rule`] variants. A new variant is a compile error in
+/// [`rule_index`], which is the point.
+pub const RULE_COUNT: usize = 9;
+/// Number of [`Note`] variants; same discipline as [`RULE_COUNT`].
+pub const NOTE_COUNT: usize = 4;
+
+/// Stable histogram slot for a rule. **Exhaustive on purpose** — adding a
+/// [`Rule`] variant must not silently land in another variant's bucket.
+pub fn rule_index(rule: Rule) -> usize {
+    match rule {
+        Rule::Generic => 0,
+        Rule::Lea => 1,
+        Rule::AluImm => 2,
+        Rule::AluReg => 3,
+        Rule::AluFoldedLoad => 4,
+        Rule::CmpBranch => 5,
+        Rule::TestZeroBranch => 6,
+        Rule::TestBranch => 7,
+        Rule::CmpSetCc => 8,
+    }
+}
+
+/// Human name for histogram slot `i`, parallel to [`rule_index`].
+pub fn rule_name(i: usize) -> &'static str {
+    [
+        "Generic",
+        "Lea",
+        "AluImm",
+        "AluReg",
+        "AluFoldedLoad",
+        "CmpBranch",
+        "TestZeroBranch",
+        "TestBranch",
+        "CmpSetCc",
+    ]
+    .get(i)
+    .copied()
+    .unwrap_or("?")
+}
+
+/// Stable histogram slot for a refusal note. Exhaustive, as [`rule_index`].
+pub fn note_index(note: &Note) -> usize {
+    match note {
+        Note::Address { .. } => 0,
+        Note::Fold { .. } => 1,
+        Note::Unencodable { .. } => 2,
+        Note::WideImmediate { .. } => 3,
+    }
+}
+
+/// Human name for note slot `i`, parallel to [`note_index`].
+pub fn note_name(i: usize) -> &'static str {
+    ["Address", "Fold", "Unencodable", "WideImmediate"]
+        .get(i)
+        .copied()
+        .unwrap_or("?")
+}
+
+impl ShadowStats {
+    /// Fraction of scheduled data nodes a real rule covered, as a percentage.
+    ///
+    /// This is the figure increment 0 exists to produce. Zero nodes reads as
+    /// `0.0` rather than NaN: a method with nothing to select is not 100%
+    /// covered, and a NaN in a summary line is how a metric gets ignored.
+    pub fn coverage_pct(&self) -> f64 {
+        if self.nodes == 0 {
+            return 0.0;
+        }
+        100.0 * self.covered_nodes as f64 / self.nodes as f64
+    }
+
+    /// Fold `other` into `self`. Used by callers aggregating several methods
+    /// without going through the process totals (the tests do this).
+    pub fn add(&mut self, other: &ShadowStats) {
+        self.blocks += other.blocks;
+        self.nodes += other.nodes;
+        self.tiles += other.tiles;
+        self.matched_tiles += other.matched_tiles;
+        self.covered_nodes += other.covered_nodes;
+        self.coverage_failures += other.coverage_failures;
+        for i in 0..RULE_COUNT {
+            self.rules[i] += other.rules[i];
+        }
+        for i in 0..NOTE_COUNT {
+            self.notes[i] += other.notes[i];
+        }
+    }
+
+    /// One line, in the shape the aggregation script reads.
+    pub fn summary_line(&self) -> String {
+        let mut s = format!(
+            "blocks={} nodes={} tiles={} matched={} covered={} ({:.1}%) covfail={}",
+            self.blocks,
+            self.nodes,
+            self.tiles,
+            self.matched_tiles,
+            self.covered_nodes,
+            self.coverage_pct(),
+            self.coverage_failures,
+        );
+        for i in 0..RULE_COUNT {
+            if self.rules[i] != 0 {
+                s.push_str(&format!(" {}={}", rule_name(i), self.rules[i]));
+            }
+        }
+        for i in 0..NOTE_COUNT {
+            if self.notes[i] != 0 {
+                s.push_str(&format!(" note:{}={}", note_name(i), self.notes[i]));
+            }
+        }
+        s
+    }
+}
+
+// The process-wide accumulator.
+//
+// Plain atomics rather than a `Mutex<ShadowStats>`: this runs inside the
+// compiler, on whatever thread the broker picked, and a compile must never
+// block on a diagnostic. Relaxed ordering makes the totals a *sample* — the
+// same contract `bailout::bailout_counts` documents — which is what a coverage
+// figure needs and all it needs.
+mod totals {
+    use super::{NOTE_COUNT, RULE_COUNT};
+    use std::sync::atomic::AtomicU64;
+
+    pub(super) static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static NODES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static TILES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static MATCHED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static COVERED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static COVFAIL: AtomicU64 = AtomicU64::new(0);
+    pub(super) static METHODS: AtomicU64 = AtomicU64::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RULES: [AtomicU64; RULE_COUNT] = [ZERO; RULE_COUNT];
+    pub(super) static NOTES: [AtomicU64; NOTE_COUNT] = [ZERO; NOTE_COUNT];
+}
+
+/// Methods this process has shadow-selected, and their summed stats.
+pub fn shadow_totals() -> (u64, ShadowStats) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut s = ShadowStats {
+        blocks: totals::BLOCKS.load(Relaxed),
+        nodes: totals::NODES.load(Relaxed),
+        tiles: totals::TILES.load(Relaxed),
+        matched_tiles: totals::MATCHED.load(Relaxed),
+        covered_nodes: totals::COVERED.load(Relaxed),
+        coverage_failures: totals::COVFAIL.load(Relaxed),
+        ..ShadowStats::default()
+    };
+    for i in 0..RULE_COUNT {
+        s.rules[i] = totals::RULES[i].load(Relaxed);
+    }
+    for i in 0..NOTE_COUNT {
+        s.notes[i] = totals::NOTES[i].load(Relaxed);
+    }
+    (totals::METHODS.load(Relaxed), s)
+}
+
+/// **Test support.** Serialises every test that touches the shadow counters.
+///
+/// The accumulator is process-global and the test binary is threaded, so a test
+/// that resets it and then asserts `methods == 1` will read another test's
+/// compile if the two overlap — which is exactly what happened the first time
+/// these were run (`left: 2, right: 1`). Any test that enables
+/// `CRATONVM_JIT_IR_ISEL_SHADOW` or reads [`shadow_totals`] must hold this,
+/// including one that only asserts the counters stayed at zero.
+///
+/// Deliberately its own lock and not `metrics::METRICS_TEST_LOCK`: these tests
+/// have nothing to do with metrics, and a reader should not have to work out
+/// why a byte-comparison test takes a metrics lock.
+#[cfg(test)]
+pub static SHADOW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Zero the accumulator. Tests only — two tests reading one global would
+/// otherwise see each other's counts. Hold [`SHADOW_TEST_LOCK`] across the
+/// reset AND the read.
+#[cfg(test)]
+pub fn reset_shadow_totals() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for c in [
+        &totals::BLOCKS,
+        &totals::NODES,
+        &totals::TILES,
+        &totals::MATCHED,
+        &totals::COVERED,
+        &totals::COVFAIL,
+        &totals::METHODS,
+    ] {
+        c.store(0, Relaxed);
+    }
+    for c in totals::RULES.iter().chain(totals::NOTES.iter()) {
+        c.store(0, Relaxed);
+    }
+}
+
+/// Tile one method's blocks, count, discard.
+///
+/// Returns this method's stats and folds them into the process totals. The
+/// caller emits through the unchanged path either way; nothing in the return
+/// value may reach the emitter.
+///
+/// `SelectOptions::default()` is deliberate and not a placeholder: it is
+/// `require_encodable: true` (refuse a tile the table cannot encode) and
+/// `fold_loads: false` (the load-fold gate is sound but its address half is
+/// still `AddrSource::Opaque`). Measuring with `fold_loads: true` would report
+/// coverage no production wiring could take.
+pub fn shadow_select_method(graph: &Graph, schedule: &Schedule) -> ShadowStats {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let opts = SelectOptions::default();
+    let mut m = ShadowStats::default();
+    for block in &schedule.blocks {
+        let sel = select_block(graph, &block.nodes, block.terminator, &opts);
+        m.blocks += 1;
+        m.nodes += block.nodes.len() as u64;
+        m.tiles += sel.tiles.len() as u64;
+        if !sel.covers(&block.nodes) {
+            m.coverage_failures += 1;
+        }
+        for t in &sel.tiles {
+            m.rules[rule_index(t.rule)] += 1;
+            if t.rule != Rule::Generic {
+                m.matched_tiles += 1;
+                m.covered_nodes += t.covered.len() as u64;
+            }
+        }
+        for n in &sel.notes {
+            m.notes[note_index(n)] += 1;
+        }
+    }
+
+    totals::METHODS.fetch_add(1, Relaxed);
+    totals::BLOCKS.fetch_add(m.blocks, Relaxed);
+    totals::NODES.fetch_add(m.nodes, Relaxed);
+    totals::TILES.fetch_add(m.tiles, Relaxed);
+    totals::MATCHED.fetch_add(m.matched_tiles, Relaxed);
+    totals::COVERED.fetch_add(m.covered_nodes, Relaxed);
+    totals::COVFAIL.fetch_add(m.coverage_failures, Relaxed);
+    for i in 0..RULE_COUNT {
+        totals::RULES[i].fetch_add(m.rules[i], Relaxed);
+    }
+    for i in 0..NOTE_COUNT {
+        totals::NOTES[i].fetch_add(m.notes[i], Relaxed);
+    }
+    m
 }
 
 // ---------------------------------------------------------------------------
