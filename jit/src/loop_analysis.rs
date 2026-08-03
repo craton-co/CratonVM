@@ -878,6 +878,29 @@ pub fn analyze_counted_loop(
     form: LoopForm,
     resolve: &dyn Fn(u16) -> Option<MinMax>,
 ) -> Option<CountedLoop> {
+    analyze_counted_loop_at(code, code_len, header_pc, back_edge_pc, form, resolve).map(|(l, _)| l)
+}
+
+/// [`analyze_counted_loop`], also reporting the PC of the exit test it
+/// recognised.
+///
+/// The PC is not a diagnostic. `form` is the caller's *assertion* that the test
+/// dominates the body, and it cannot be derived from `(header, back_edge)`
+/// alone — but it can be CHECKED once the test has been found: a test at the
+/// header runs before every body execution, because the header dominates the
+/// region and the back edge targets the header. A caller that asserts
+/// [`LoopForm::PreTested`] and then finds the test somewhere in the middle of
+/// the body has asserted something false, and every trip count derived from it
+/// is one too many. Returning the PC is what lets that caller fail closed
+/// instead of trusting its own guess.
+pub fn analyze_counted_loop_at(
+    code: &[u8],
+    code_len: usize,
+    header_pc: usize,
+    back_edge_pc: usize,
+    form: LoopForm,
+    resolve: &dyn Fn(u16) -> Option<MinMax>,
+) -> Option<(CountedLoop, usize)> {
     if header_pc >= code_len || back_edge_pc >= code_len {
         return None;
     }
@@ -926,21 +949,24 @@ pub fn analyze_counted_loop(
                             let init = constant_iv_init(code, code_len, header_pc, end, candidate)
                                 .map(IntRange::constant)
                                 .unwrap_or_else(IntRange::unknown);
-                            return Some(CountedLoop {
-                                header_pc,
-                                back_edge_pc,
-                                iv: AffineIv {
-                                    local: candidate,
-                                    init,
-                                    stride,
+                            return Some((
+                                CountedLoop {
+                                    header_pc,
+                                    back_edge_pc,
+                                    iv: AffineIv {
+                                        local: candidate,
+                                        init,
+                                        stride,
+                                    },
+                                    cmp,
+                                    bound,
+                                    bound_range: IntRange::unknown(),
+                                    form,
+                                    modified_locals,
+                                    heap_stable,
                                 },
-                                cmp,
-                                bound,
-                                bound_range: IntRange::unknown(),
-                                form,
-                                modified_locals,
-                                heap_stable,
-                            });
+                                pc,
+                            ));
                         }
                     }
                 }
