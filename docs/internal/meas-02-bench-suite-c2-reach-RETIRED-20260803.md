@@ -33,12 +33,14 @@ the brief measured. The brief's verification clause — "it reads 0–3 for the
 current seven phases; if it reads anything else, this lane's premise has
 changed" — is satisfied.
 
-Reproducibility, for whoever re-takes this: the reach was measured twice
-across all ten phases. `bodies` was identical both times for every phase.
-`requests` moved once, on the candidate's `bind` phase (9 then 10), because
-tier promotion is invocation-count driven against a background compiler.
-Treat single-digit `requests` differences as noise; do not treat a `bodies`
-difference that way.
+Reproducibility, for whoever re-takes this: the seven CratonBench phases were
+measured twice and were identical both times, cell for cell. So were the
+candidate's three, at their final sizes. An earlier draft of the candidate,
+sized closer to `c2_threshold`, was *not* — `bind` measured 9/5/2 then 10/6/2
+— which is what §4 sizes against. Tier promotion is invocation-count driven
+against a background compiler, so a workload sized near the threshold has
+run-to-run play in its request count; one sized an order of magnitude past it
+does not.
 
 ## 2. What a results directory now records
 
@@ -57,6 +59,31 @@ presence.
   that licenses, not just the number.
 * `compare.py` names the phases whose delta is not evidence about the tier, and
   reports "not recorded" separately from a measured zero.
+
+### Acceptance
+
+Three checks, because "the code is written" is not one:
+
+1. **A stub VM** reproducing three shapes — a phase with reach, a phase with a
+   genuine reach of zero, and a phase whose `[ir] admission` line has been
+   reworded. The first two record correctly; the third is marked
+   `SCRAPE-BROKEN` on its own manifest line and in the run's tally. Without
+   the third case the consistency checks would be untested, and a check that
+   cannot fail is worse than no check.
+2. **The real gate against the real binary**, `--phases fib,stringregex,bintrees`:
+   `ir_reach_fib requests=1 admitted=1 bodies=1`, `ir_reach_stringregex 1/0/0`,
+   `ir_reach_bintrees 3/1/1` — identical, phase for phase, to what
+   `c2-reach.sh` measured independently. Two tools, one answer.
+3. **`reliability-gate.sh postflight` against the v2 directory**, which parsed
+   every column it needs and refused the run for CPU migration and load —
+   i.e. for the reasons it should, not for the schema.
+
+On (3): the reliability gate reports the measured process leaving its pinned
+CPU (`fib(rep 1 ran on 8,13)`) on every phase, under `taskset -c 13`, at a
+1-min load of ~10. Whether that is real migration, contention, or something
+about how the affinity is applied was not determined — it is out of this
+lane and it is the gate correctly refusing either way. It does mean nobody
+gets a citable run on this host while it is loaded.
 
 ### `compiles_c2` is not this number
 
@@ -282,5 +309,25 @@ Every one of these is unowned.
   is a counter in the VM's own shutdown summary, which would need a change in
   `jit/` — a different lane's file, and not worth taking while four `cov-*`
   lanes are editing it.
+* **The reliability gate refuses every run on this host for CPU migration**,
+  under `taskset -c 13`, at load ~10 (see §2 Acceptance). Cause not
+  determined. Out of this lane, but it is what stands between the gate and a
+  citable number today, now that the gate can compile its benchmark again.
 * **`javac` is 17 and `java` is 21 on the bench host.** Noticed while fixing
   §3.1, not investigated. The gate records both in its manifest.
+
+## 8. Re-run any of this
+
+```bash
+# any workload's C2 reach, with the consistency checks
+bash regression-suite/perf/c2-reach.sh -Exe /abs/path/to/cratonvm --label bintrees -- \
+    -Xmx8g -cp /tmp/classes CratonBench bintrees
+
+# the candidate
+javac -encoding UTF-8 -d /tmp/c2cls bench/CratonBenchC2.java
+bash regression-suite/perf/c2-reach.sh -Exe /abs/path/to/cratonvm --label dispatch -- \
+    -Xmx8g -cp /tmp/c2cls CratonBenchC2 dispatch
+
+# the gate, which now records reach for every phase it runs
+bash regression-suite/perf/run-cratonbench-gate.sh -Exe /abs/path/to/cratonvm
+```
