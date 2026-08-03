@@ -52,18 +52,35 @@ each `.class` entry of a JAR and run Tomcat's own
 | **BCEL-parse them** | **2.1 ms** | **481.7 ms** | **226x** |
 | per class | 16.4 µs | 3705 µs | 226x |
 
+**Re-verified on merged dev `36df168e4`** (29 commits later, including the x64
+backend split), three interleaved rounds per VM back-to-back on the same host
+state, `taglibs-standard-impl` parse only:
+
+| round | HotSpot | CratonVM |
+|---|---|---|
+| 1 | 21.7 µs/class | 5440.1 µs/class |
+| 2 | 11.7 µs/class | 5077.3 µs/class |
+| 3 | 23.0 µs/class | 4959.6 µs/class |
+
+Median-to-median **234x**. Take the ratio, not the absolute microseconds: this
+is a shared, variably-loaded host, and HotSpot's own column swings 2x across
+the three rounds because the whole parse is only ~2 ms there.
+
 So the JAR/zip/inflate path is fine (`probes/JarEntryReadCostProbe.java`: 30.5
 vs 62.7 MiB/s entry reads, raw `Inflater` 938 vs 1254 MiB/s — both under 2x).
 The cost is the per-byte class-file parse.
 
 ## Root cause: the parse is never compiled
 
-`--nojit` costs the **same** as the default:
+`--nojit` costs the **same** as the default — on both the original build and
+merged dev `36df168e4`:
 
 | | JIT on | `--nojit` |
 |---|---|---|
-| `taglibs-standard-impl` parse | 444.9 ms | 437.8 ms |
-| `taglibs-standard-spec` parse | 87.0 ms | 92.1 ms |
+| `taglibs-standard-impl` parse (first measurement) | 444.9 ms | 437.8 ms |
+| `taglibs-standard-spec` parse (first measurement) | 87.0 ms | 92.1 ms |
+| `taglibs-standard-impl` parse (merged `36df168e4`) | 702.7 ms | 708.3 ms |
+| `taglibs-standard-spec` parse (merged `36df168e4`) | 181.8 ms | 155.1 ms |
 
 `CRATONVM_DBG=jit-compiled` over the whole scan (468 class parses) lists
 **eight** compiled methods in total:
@@ -79,6 +96,9 @@ org/apache/tomcat/util/bcel/classfile/ConstantUtf8.getTag()B
 org/apache/tomcat/util/bcel/classfile/Utility.compactClassName(…)
 ```
 
+Byte-for-byte the same list on merged dev `36df168e4`, still with a
+`grep -c '<init>'` of **0**.
+
 **Zero `<init>` methods** — in a workload whose whole shape is "construct one
 object per constant-pool entry". `ClassParser.parse`, `ConstantPool.<init>`,
 `Constant.readConstant`, `ConstantUtf8.<init>`, `AnnotationEntry.<init>`,
@@ -89,21 +109,38 @@ them at all, so they do not even register as stuck.
 
 `probes/SingleByteReadCostProbe.java` prices the layers the parser sits on
 (loops in named static methods, called directly — see the harness note in that
-file, it matters):
+file, it matters). On merged dev `36df168e4`:
 
-| operation | HotSpot | CratonVM | ratio |
-|---|---|---|---|
-| static call returning a field | 0.0 ns | 589.9 ns | — |
-| `ReentrantLock` lock/unlock, uncontended | 15.2 ns | 17254.2 ns | 1135x |
-| `synchronized` enter/exit, uncontended | 4.8 ns | 1189.4 ns | 248x |
-| `ByteArrayInputStream.read()` | 0.3 ns | 864.3 ns | — |
-| `BufferedInputStream.read()` | 18.8 ns | 5062.1 ns | 269x |
-| `DataInputStream.readUnsignedByte` over `BufferedInputStream` | 19.9 ns | 15422.3 ns | 775x |
+| operation | HotSpot | CratonVM |
+|---|---|---|
+| static call returning a field | 0.0 ns | 594.8 ns |
+| `ReentrantLock` lock/unlock, uncontended | 15.2 ns | 18189.5 ns |
+| `synchronized` enter/exit, uncontended | 4.8 ns | 1365.0 ns |
+| `ByteArrayInputStream.read()` | 0.3 ns | 972.0 ns |
+| `BufferedInputStream.read()` | 18.8 ns | 5424.1 ns |
+| `DataInputStream.readUnsignedByte` over `BufferedInputStream` | 19.9 ns | 16412.7 ns |
 
-For contrast, `probes/CallFloorProbe.java` on the same binary shows compiled
-call sites at 9.8–41.7 ns/op — i.e. **when this VM compiles a method it is
-within a few x of HotSpot**; the 226x is entirely "this code never got
-compiled".
+> ⚠️ **Read this table for the ratios BETWEEN its own rows, not as absolute
+> per-op costs, and do not quote its "static call returning a field" row as this
+> VM's call floor.** `probes/CallFloorProbe.java` on the *same binary, same
+> session* prices compiled call sites at **4.3 ns** (arith, no call), **11.9 ns**
+> (invokestatic leaf), 42.5 ns (invokevirtual), 49.3 ns (invokeinterface) — so
+> the 594.8 ns here is ~50x what the same operation costs in a probe that is
+> definitely running compiled.
+>
+> Both probes' loops *are* compiled: `CRATONVM_DBG=jit-compiled,osr` shows
+> `SingleByteReadCostProbe.floorLoop()J` OSR-compiled and `floor()I` compiled.
+> But the OSR trace shows it **re-entering repeatedly** — at i=2000, 3000, 5000,
+> 9000, 17000, the per-pc exponential back-off running to its 5-attempt cap —
+> which means the compiled body keeps falling back to the interpreter. That is
+> an unexplained second effect, plausibly the same family as this doc's, and it
+> is why these absolutes are not trustworthy. `AnnotationScanCostProbe` is this
+> doc's load-bearing measurement precisely because it times Tomcat's own code
+> with no harness loop of ours in the middle.
+
+The `CallFloorProbe` contrast is the useful part: **when this VM compiles a
+method it is within a few x of HotSpot.** The 234x is "this code never got
+compiled", not "the compiler emits bad code".
 
 ## What this is NOT
 
