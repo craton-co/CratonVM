@@ -66,6 +66,24 @@ HTTPD_PATH="${HTTPD_PATH:-$(command -v httpd 2>/dev/null || true)}"
 # the property is empty.
 HTTPD_PROP="-Dtomcat.test.httpd.path=$HTTPD_PATH"
 
+# Fixture precondition check (VERIFY-01, docs/known-issues/c2/verify-01-differential-harness.md):
+# a missing/unbuilt CATALINA_BASE-equivalent (output/build - conf/, webapps/)
+# or unbuilt test classes makes every class fail the same way
+# (FileNotFoundException/ClassNotFoundError before the test itself runs),
+# which reads exactly like a real regression sweep across the whole suite.
+# Fail loudly once, up front, instead of producing 645 identical wrong
+# results (this is the CATALINA_BASE gap verify-01 named explicitly).
+die_fixture() { echo "ERROR: $*" >&2; exit 1; }
+_missing=()
+{ [ -d "$TC_ROOT/output/testclasses" ] && [ -n "$(ls -A "$TC_ROOT/output/testclasses" 2>/dev/null)" ]; } || _missing+=("$TC_ROOT/output/testclasses (compiled test classes - ant test-compile)")
+[ -d "$TC_ROOT/output/build/conf" ] || _missing+=("$TC_ROOT/output/build/conf (CATALINA_BASE conf/ - ant deploy)")
+[ -d "$TC_ROOT/output/build/webapps" ] || _missing+=("$TC_ROOT/output/build/webapps (CATALINA_BASE webapps/ - ant deploy)")
+[ -s "$CP_FILE" ] || _missing+=("$CP_FILE (classpath file)")
+[ -s "$CLASSLIST" ] || _missing+=("$CLASSLIST (class list)")
+if [ "${#_missing[@]}" -gt 0 ]; then
+  die_fixture "Tomcat fixture incomplete under TC_ROOT=$TC_ROOT - missing or empty: ${_missing[*]}. See run-tomcat-suite.md."
+fi
+
 OUTDIR="$TC_ROOT/.suite/results/$RUN_NAME/shard-$SHARD_IDX"
 mkdir -p "$OUTDIR"
 CP="$(cat "$CP_FILE"):$HAMCREST_JAR"

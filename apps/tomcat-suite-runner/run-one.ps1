@@ -6,6 +6,15 @@
   hand-assembling the classpath + the four CRATONVM_* suite variables every
   time, and getting one of them wrong silently changes the number.
 
+  "Exactly the suite's environment" means the JVM ARGUMENTS too, not just the
+  env vars: run-tomcat-suite.ps1's Invoke-Mode passes four --add-opens flags
+  and the tomcat.test.* system properties, and a repro that omits them is a
+  different experiment. Omitting --add-opens=java.base/java.lang made every
+  EasyMock-based class (TestSSLValve, TestJNDIRealm, TestLoadBalancerDraining-
+  Valve, ...) fail here with "must be defined in the same package as
+  org.easymock.internal.ClassProxyFactory" while passing under the suite
+  runner - a pure launch-environment artifact that reads like a real defect.
+
   ASCII-only on purpose: Windows PowerShell 5.1 reads a BOM-less UTF-8 script
   as ANSI, and a stray non-ASCII byte inside a comment breaks the parse.
 
@@ -57,11 +66,29 @@ if ($Vm -eq 'hotspot') {
 # proxy per test; TesterHttpd looks for a literal "httpd" on PATH unless this
 # property points at one, and Windows has no httpd on PATH. See
 # setup-httpd-windows.ps1, which unpacks the tree this default points at.
-# Inert for every other class (nothing else reads the property), so it is set
-# unconditionally rather than behind a switch.
+# Inert for every other class (nothing else reads the property), so it is
+# appended unconditionally rather than behind a switch.
 $Httpd = 'C:\craton\tools\Apache24\bin\httpd.exe'
-$argv = @("-Xmx$MaxHeap")
+
+# Keep this list byte-for-byte in step with $jvmArgs in run-tomcat-suite.ps1's
+# Invoke-Mode - it is the whole point of this script.
+$argv = @(
+  "-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.net.preferIPv4Stack=true',
+  "-Dtomcat.test.basedir=$TC\output\build",
+  "-Dtomcat.test.temp=$TC\output\test-tmp",
+  "-Dtomcat.test.tomcatbuild=$TC\output\build",
+  '-Dtomcat.test.relaxTiming=true',
+  '--add-opens','java.base/java.lang=ALL-UNNAMED',
+  '--add-opens','java.base/java.io=ALL-UNNAMED',
+  '--add-opens','java.base/java.util=ALL-UNNAMED',
+  '--add-opens','java.base/java.util.concurrent=ALL-UNNAMED'
+)
 if (Test-Path $Httpd) { $argv += "-Dtomcat.test.httpd.path=$Httpd" }
+if ($Vm -eq 'craton') {
+  if ($NoJit) { $argv += '--nojit' }
+} elseif ($NoJit) {
+  $argv += '-Xint'
+}
 $argv += @('-cp', $cp)
 if ($Class) { $argv += @('org.junit.runner.JUnitCore', $Class) }
 else        { $argv += @($Main) + $Args2 }
@@ -75,15 +102,26 @@ try {
   } else {
     $p = Start-Process -FilePath $exePath -ArgumentList $argv -NoNewWindow -PassThru
   }
+  # Touching .Handle caches the native process handle in the returned object.
+  # Without it, Start-Process -PassThru gives back a Process whose .ExitCode
+  # reads back as $null once the child is gone, so this script printed "rc="
+  # and then `exit $null` -> exit 0, unconditionally. Any caller that scores
+  # on the exit code alone read a FAILING class as a PASS; run-doc04-
+  # residuals.ps1 survived only because it re-reads the JUnit banner from the
+  # log, but its `$rc -eq 124` HANG arm could never fire either.
+  $null = $p.Handle
   if (-not $p.WaitForExit($TimeoutSec * 1000)) {
     $sw.Stop()
     Write-Host ('[run-one] TIMEOUT after ' + $TimeoutSec + ' s - killing pid ' + $p.Id)
+    try { & taskkill /F /T /PID $p.Id 2>$null | Out-Null } catch {}
     try { $p.Kill() } catch {}
     exit 124
   }
   $sw.Stop()
   $label = $Class + $Main
   $secs  = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-  Write-Host ('[run-one] ' + $label + ' rc=' + $p.ExitCode + ' wall=' + $secs + 's')
-  exit $p.ExitCode
+  $rc    = $p.ExitCode
+  if ($null -eq $rc) { $rc = 125 }   # never silently degrade to 0
+  Write-Host ('[run-one] ' + $label + ' rc=' + $rc + ' wall=' + $secs + 's')
+  exit $rc
 } finally { Pop-Location }
