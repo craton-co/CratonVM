@@ -64,13 +64,14 @@ fn maybe_dump_shutdown_reports() {
         // for the same reason: it is what the compiler did, read at exit. The
         // counters themselves are always collected (they do not consult
         // `metrics::enabled()`), so this prints real numbers from a default
-        // run — which is the measurement
-        // `docs/known-issues/c2/loop-02-planner-admission-gates.md` asks for
-        // before any of the four gates is narrowed.
+        // run — which is the measurement that retired three of the four gates
+        // (`docs/known-issues/c2/loop-02-planner-admission-gates.md`) and is
+        // what would say immediately if one of them got back in the way.
         //
         // The four condition rows OVERLAP: a method with an `invokedynamic`
         // compiled under `deopt_real` is in both. Read each against
-        // `loop_xform_compiles`; never sum them.
+        // `loop_xform_compiles`; never sum them. Only `loop_xform_inline_sites`
+        // still refuses; the other three are counted and admitted.
         let tally = cratonvm_jit::metrics::loop_xform_counts();
         let row = tally
             .iter()

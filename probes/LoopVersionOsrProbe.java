@@ -7,8 +7,11 @@ import java.util.regex.Pattern;
 // Regression reproducer for the wrong-code failure guarded loop versioning
 // shipped with, and the bisect that localised it.
 //
-//   CRATONVM_JIT='bytecode-loop-xform,deopt-real=0' \
+//   CRATONVM_JIT='bytecode-loop-xform' \
 //     cratonvm --java-home <jdk> -cp probes LoopVersionOsrProbe
+//
+// `deopt-real=0` was required until `loop-02` retired that whole-compile
+// refusal. Both spellings still reproduce the shape and both must match `java`.
 //
 // All three methods must print the same values as `java` does. Before the fix,
 // `versioned` threw NullPointerException at `sb.append(i)` while `plain` and

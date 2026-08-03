@@ -394,6 +394,9 @@ pub fn region_bounds_are_live(bounds_addr: usize) -> bool {
     // crate's tests, from a `static [AtomicUsize; 6]`. Both are valid,
     // aligned and initialised for the six atomic loads below, and the loads
     // race-freely pair with the collector's `Release` stores.
+    //
+    // SAFETY: see above — `bounds_addr` is a `'static [AtomicUsize; 6]`, valid,
+    // aligned and initialised for the six atomic loads that follow.
     let words = unsafe { &*(bounds_addr as *const [AtomicUsize; 6]) };
     // words = [yf_base, yf_end, yt_base, yt_end, og_base, og_end]
     (0..3).any(|i| {
@@ -724,6 +727,11 @@ pub fn inline_rbp_tls_disp() -> usize {
             // On the System V x86-64 ABI, fs:[0] is the thread-control-block
             // self pointer. Do not trust that convention blindly: the raw
             // sentinel read below proves the derived address before use.
+            //
+            // SAFETY: `fs:[0]` is the one segment-relative address the ABI
+            // guarantees mapped on every thread with a TCB. If the convention
+            // did not hold this is a wrong number, never a dereference — only
+            // the sentinel probe below acts on it.
             let fs_base = unsafe { read_fs_qword(0) };
             let cell_addr = cell as *const std::cell::Cell<usize> as usize;
             let delta = (cell_addr as i128) - (fs_base as i128);
@@ -734,6 +742,13 @@ pub fn inline_rbp_tls_disp() -> usize {
                 return 0;
             }
             let old = cell.replace(0x5242_504C_494E_5558);
+            // SAFETY: reads back the address the line above just wrote a
+            // sentinel to. `cell` is a live thread-local owned by this thread
+            // and `delta32` is `cell_addr - fs_base` (checked to fit an `i32`),
+            // so `fs:[delta32]` is the same 8 aligned bytes `cell` occupies iff
+            // the fs-base convention holds — which is precisely what the
+            // sentinel comparison below decides. Runs once at startup, behind
+            // `precise_inline_frame_record_enabled()`, never on a hot path.
             let probed = unsafe { read_fs_qword(delta32 as isize) };
             cell.set(old);
             if probed == 0x5242_504C_494E_5558 {
@@ -801,6 +816,16 @@ pub fn inline_rbp_tls_mirror_write(value: usize) -> bool {
 
 /// Read the 8-byte value at `gs:[disp]` (Windows TEB-relative). Used only by
 /// the [`inline_rbp_tls_disp`] startup probe.
+///
+/// # Safety
+///
+/// `disp` must name 8 readable, 8-byte-aligned bytes relative to this thread's
+/// TEB. The caller earns that by deriving `disp` from a live thread-local's
+/// address and proving it with a sentinel round-trip before trusting it.
+//
+// SAFETY: one aligned 8-byte load and nothing else; `nostack`,
+// `preserves_flags` and `readonly` all hold for a bare `mov`. An unmapped
+// `gs:[disp]` faults — it cannot corrupt.
 #[cfg(windows)]
 #[inline]
 pub(super) unsafe fn read_gs_qword(disp: usize) -> usize {
@@ -816,6 +841,17 @@ pub(super) unsafe fn read_gs_qword(disp: usize) -> usize {
 
 /// Read the 8-byte value at `fs:[offset]` on Linux x86-64. Used only by the
 /// sentinel probe for [`inline_rbp_tls_disp`].
+///
+/// # Safety
+///
+/// `offset` must name 8 readable, 8-byte-aligned bytes relative to this
+/// thread's TCB. `offset == 0` is always sound (the TCB self-pointer); any
+/// other value must be proven by the sentinel round-trip in
+/// [`inline_rbp_tls_disp`] before its result is used.
+//
+// SAFETY: one aligned 8-byte load and nothing else; `nostack`,
+// `preserves_flags` and `readonly` all hold for a bare `mov`. An unmapped
+// `fs:[offset]` faults — it cannot corrupt.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[inline]
 pub(super) unsafe fn read_fs_qword(offset: isize) -> usize {
@@ -1232,6 +1268,11 @@ pub fn resolve_static_base(class_id_raw: u32, field_index: usize) -> Option<usiz
     // `SharedVm` outlives every compilation.
     let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = unsafe { std::mem::transmute(raw) };
     // Cast: `usize`/`u32` inputs to the C ABI's i64 parameters.
+    //
+    // SAFETY: `f` and `ctx` were published together by
+    // `set_static_base_resolver` and read back under `Acquire`, so the pointer
+    // matches the signature transmuted above and `ctx` is the `SharedVm` that
+    // resolver expects. Both outlive every compilation.
     let addr = unsafe { f(ctx as i64, class_id_raw as i64, field_index as i64) };
     if addr == 0 {
         None

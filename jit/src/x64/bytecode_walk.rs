@@ -382,7 +382,23 @@ impl Compiler {
                     .arith_hoist_info
                     .iter()
                     .any(|h| h.loop_header < pc && pc < h.loop_end);
-                if inside_aaload_hoisted || inside_arith_hoisted {
+                // A versioned rewrite's pre-header guard is SYNTHETIC: its
+                // bytes are an image of no original instruction, so there is no
+                // bci for an entry there to be published under, and part-way
+                // through the guard the abstract operand stack is not the
+                // header's. That is not a new claim — `LoopXform::osr_entry_pc`
+                // already answers the header's OSR entry with the fallback copy
+                // for exactly this reason, after a versioned artifact entered at
+                // the guard ran its loop with a null receiver
+                // (`probes/LoopVersionOsrProbe.java`). What is new is that
+                // eligibility ALSO gates the OSR-EXIT snapshot below, and since
+                // the `deopt_real` refusal was retired that snapshot is live: an
+                // exit map recorded on the guard would publish the header's bci
+                // with the guard's frame under it.
+                let inside_synthetic_guard = self
+                    .synthetic_guard_span
+                    .is_some_and(|(from, to)| pc >= from && pc < to);
+                if inside_aaload_hoisted || inside_arith_hoisted || inside_synthetic_guard {
                     self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
                 } else {
                     self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding

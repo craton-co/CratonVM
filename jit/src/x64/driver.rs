@@ -569,7 +569,13 @@ pub fn compile_with_param_slots(
                 .into_iter()
                 .collect::<HashMap<usize, crate::InlineSite>>(),
             replicate_pc3(x, compact_field_info),
-            // Always empty here — `InvokedynamicPresent` refuses the transform.
+            // NOT empty any more. `InvokedynamicPresent` used to refuse the
+            // transform outright; since the deopt bci translation landed, a
+            // method with an `invokedynamic` is rewritten like any other and
+            // every copy of a `0xba` site needs its own entry here — the site
+            // lowers to an unconditional trap that records a resume snapshot,
+            // and a copy without an entry would bail the whole compile
+            // (`indy_info_idx` miss ⇒ `return false`).
             replicate_pc5(x, indy_info),
         ),
     };
@@ -1322,6 +1328,8 @@ pub fn compile_with_param_slots(
     // call, so no post-pass over the finished `CompiledMethod` could reach
     // them. `None` (the identity) on every unarmed compile.
     compiler.bci_provenance = loop_xform.as_ref().map(|x| x.bci_of.clone());
+    // …and which of those output pcs are an image of nothing. See the field.
+    compiler.synthetic_guard_span = loop_xform.as_ref().and_then(|x| x.guard_span());
     // deopt-osr Step 9 follow-up (c): per-bci de-spec. Drop any speculative-BCE
     // guard whose loop header was recorded in the de-spec registry (a guard that
     // repeatedly deopted past the per-bci give-up threshold). Those headers fall
@@ -1732,21 +1740,41 @@ pub fn compile_with_param_slots(
         return None;
     }
 
-    // Fail-closed backstop for the bytecode rewriter. `DeoptimizationPoint::bci`
-    // is what the VM RESUMES AT, and it is recorded from the emitter's own pc
-    // deep inside the emitter. `plan_bytecode_loop_xform` refuses every
-    // construct that records one (`DeoptRealEnabled`, `PreciseExceptionFrames`,
-    // `InvokedynamicPresent`), so this vector is provably empty here — but if a
-    // future emit path records one anyway, discard the method rather than
-    // publish an output PC as an interpreter resume point.
-    if loop_xform.is_some() && !compiler.deopt_points.is_empty() {
-        tracing::warn!(
-            method = method_key,
-            deopt_points = compiler.deopt_points.len(),
-            "JIT compile bailed: bytecode loop rewrite recorded a deopt point whose \
-             bci is an output PC; method stays interpreted"
-        );
-        return None;
+    // The bytecode rewriter's coordinate change, CHECKED rather than assumed.
+    //
+    // `DeoptimizationPoint::bci` is what the VM resumes at, and it is recorded
+    // deep inside the emitter from the emitter's own pc.
+    // `build_and_record_deopt_point` publishes it through `Compiler::orig_bci`;
+    // this re-derives that answer from the emitter pc each point kept
+    // (`deopt_point_pcs`) and discards the METHOD if the translation did not
+    // hold, if a point landed on the versioning guard's synthetic bytes, or if
+    // two copies of one bytecode published disagreeing frames under one bci.
+    // See the helper for why each of those is fatal.
+    //
+    // This replaces the "any deopt point at all discards the method" backstop
+    // that stood here while `deopt_real`, precise exception frames and
+    // `invokedynamic` were refused outright — a vector that was provably empty
+    // then, and is the normal case now.
+    if let Some(x) = &loop_xform {
+        if let Err(why) = rewritten_deopt_points_are_publishable(
+            x,
+            &compiler.deopt_points,
+            &compiler.deopt_point_pcs,
+            orig_code_len,
+        ) {
+            crate::metrics::record_loop_xform_event("loop_xform_deopt_bci_unpublishable");
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+                eprintln!("[JIT_GEN] bytecode loop rewrite DISCARDED: {why}");
+            }
+            tracing::warn!(
+                method = method_key,
+                deopt_points = compiler.deopt_points.len(),
+                reason = why.as_str(),
+                "JIT compile bailed: bytecode loop rewrite could not publish its deopt \
+                 points in interpreter-bci space; method stays interpreted"
+            );
+            return None;
+        }
     }
 
     // Build the CompiledMethod with OSR metadata.
@@ -1972,17 +2000,22 @@ pub fn compile_with_param_slots(
     // (the emit site is gated), so production artifacts are unchanged. Step 8
     // consults `can_osr_exit` + `osr_exit_points` (under `CRATONVM_DEOPT_REAL`)
     // to route a mid-loop bail through the deopt trampoline.
-    // Bcis, consumed by the VM's OSR-exit route. Provably empty under a
-    // bytecode rewrite (`emit_osr_exit_map_at` fires only when
-    // `deopt_real_enabled()`, and the indy site is refused), so the
-    // translation arm is a backstop rather than a live path. `filter_map`
-    // drops a pc with no provenance instead of publishing it raw.
+    // Bcis, consumed by the VM's OSR-exit route, so interpreter-bci space —
+    // `filter_map` drops a pc with no provenance instead of publishing it raw.
+    // A LIVE path since the bci translation retired the `deopt_real` and
+    // `invokedynamic` refusals: every copy of a loop-boundary bytecode records
+    // its own exit map, and all of them collapse onto the one original bci, so
+    // deduplicate rather than publish the same bci `copies + 1` times.
     cm.osr_exit_points = match &loop_xform {
-        Some(x) => compiler
-            .osr_exit_points
-            .iter()
-            .filter_map(|&pc| x.bci_at(pc))
-            .collect(),
+        Some(x) => {
+            let mut seen = FxHashSet::default();
+            compiler
+                .osr_exit_points
+                .iter()
+                .filter_map(|&pc| x.bci_at(pc))
+                .filter(|bci| seen.insert(*bci))
+                .collect()
+        }
         None => compiler.osr_exit_points,
     };
     // FIX: mirror `can_deopt_resume`'s elided-monitor exclusion above — an

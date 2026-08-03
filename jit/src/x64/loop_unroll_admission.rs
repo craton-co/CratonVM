@@ -521,10 +521,16 @@ fn compile_accum_fixture() -> Option<CompiledMethod> {
 
 /// [`compile_accum_fixture`] over arbitrary bytecode in the same frame
 /// shape (one `int` parameter, three locals), so a REWRITTEN method can be
-/// compiled as itself. That is the only way to put a transformed artifact
-/// in front of the emitter today: the wired path refuses every compile
-/// while `deopt_real` is on — see
-/// `the_wired_compile_path_is_refused_before_any_loop_is_looked_at`.
+/// compiled as itself.
+///
+/// This used to be the ONLY way to put a transformed artifact in front of
+/// the emitter, because the wired path refused every compile while
+/// `deopt_real` was on. It no longer is — see
+/// `the_wired_compile_path_reaches_a_loop_under_the_default_configuration`
+/// and `a_transformed_methods_published_deopt_bcis_are_interpreter_bcis`,
+/// which drive the real wired path. Compiling planner output *as* a method
+/// is still the sharper instrument for a pure-provenance question: it
+/// isolates the emitter from the planner.
 fn compile_bytes(code: &[u8], code_len: usize) -> Option<CompiledMethod> {
     compile(
         code,
@@ -631,14 +637,14 @@ fn planning_refuses_unless_armed() {
 /// `return Err(...)` it sits above, or counting the refusal instead of the
 /// condition.
 #[test]
-fn the_refusal_tally_counts_all_four_conditions_not_just_the_first() {
-    // Serialised against the other tally test: these are process-wide
-    // counters and the module's tests run concurrently.
-    let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    crate::metrics::reset_loop_xform_counts_for_test();
+fn the_tally_counts_all_four_conditions_not_just_the_one_that_refuses() {
+    // Counted PER THREAD: the globals are bumped by every compile in this
+    // crate's test binary. See `metrics::LoopXformCapture`.
+    let tally = crate::metrics::LoopXformCapture::start();
     let code = shape_int_accum_loop();
-    // Every condition true at once. The planner refuses on the first, and the
-    // tally must still see all four.
+    // Every condition true at once. Only the last of them refuses, and the
+    // tally must still see all four — that independence is what measured the
+    // other three out of the way in the first place.
     let all = LoopRewriteShape {
         deopt_real: true,
         precise_exception_frames: true,
@@ -646,22 +652,16 @@ fn the_refusal_tally_counts_all_four_conditions_not_just_the_first() {
         has_inline_sites: true,
     };
     {
-        // Armed, so the four are what refuses rather than the arming check —
-        // which sits above them and would otherwise be the only row that moved.
+        // Armed, so a refusal here is one of the four rather than the arming
+        // check, which sits above them.
         let _armed = Armed::new();
         assert_eq!(
             plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), all).unwrap_err(),
-            LoopRewriteRefusal::DeoptRealEnabled,
-            "the first refusal is still the one returned"
+            LoopRewriteRefusal::InlineSitesPresent,
+            "inline sites are the only whole-compile refusal left"
         );
     }
-    let counts = |name: &str| -> u64 {
-        crate::metrics::loop_xform_counts()
-            .into_iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, c)| c)
-            .unwrap_or_else(|| panic!("no such counter: {name}"))
-    };
+    let counts = |name: &str| tally.count(name);
     assert_eq!(counts("loop_xform_compiles"), 1);
     for name in [
         "loop_xform_deopt_real",
@@ -671,16 +671,20 @@ fn the_refusal_tally_counts_all_four_conditions_not_just_the_first() {
     ] {
         assert_eq!(counts(name), 1, "{name} was not counted");
     }
-    assert_eq!(counts("loop_xform_eligible"), 0);
+    assert_eq!(
+        counts("loop_xform_eligible"),
+        0,
+        "`eligible` is `no whole-compile refusal held`, and inline sites held"
+    );
     assert_eq!(
         counts("loop_xform_not_armed"),
         0,
-        "a compile refused by the four never reaches the arming check"
+        "a refused compile never reaches the arming check"
     );
 
     // …and a compile with none of the four set is `eligible`, whether or not
     // anything is armed. That is what makes the row a property of the METHOD.
-    crate::metrics::reset_loop_xform_counts_for_test();
+    tally.reset();
     assert_eq!(
         plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
         LoopRewriteRefusal::NotArmed
@@ -696,25 +700,17 @@ fn the_refusal_tally_counts_all_four_conditions_not_just_the_first() {
     ] {
         assert_eq!(counts(name), 0, "{name}");
     }
-    crate::metrics::reset_loop_xform_counts_for_test();
 }
 
 /// The loop-level rows, which need the rewriter armed.
 #[test]
 fn the_tally_separates_no_candidate_loop_from_a_structural_refusal() {
-    let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let counts = |name: &str| -> u64 {
-        crate::metrics::loop_xform_counts()
-            .into_iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, c)| c)
-            .unwrap_or_else(|| panic!("no such counter: {name}"))
-    };
+    let tally = crate::metrics::LoopXformCapture::start();
+    let counts = |name: &str| tally.count(name);
     let _armed = Armed::new();
 
     // A method with no loop the planner will take: counted as
     // `no_candidate_loop`, not as a planner refusal.
-    crate::metrics::reset_loop_xform_counts_for_test();
     let none = vec![0x03u8, 0xac]; // iconst_0; ireturn
     assert_eq!(
         plan_bytecode_loop_xform(&none, 2, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
@@ -727,7 +723,7 @@ fn the_tally_separates_no_candidate_loop_from_a_structural_refusal() {
     // …and a method the planner selects a loop in but the rewriter refuses:
     // the irreducible fixture, which is either skipped as a candidate or
     // refused structurally. Whichever it is, exactly one of the two rows moves.
-    crate::metrics::reset_loop_xform_counts_for_test();
+    tally.reset();
     let irr = shape_irreducible();
     assert!(plan_bytecode_loop_xform(&irr, 21, &[], &HashMap::new(), accum_shape_ok()).is_err());
     assert_eq!(
@@ -736,58 +732,68 @@ fn the_tally_separates_no_candidate_loop_from_a_structural_refusal() {
         "exactly one outcome row per refused compile"
     );
     assert_eq!(counts("loop_xform_applied"), 0);
-    crate::metrics::reset_loop_xform_counts_for_test();
 }
 
-/// Serialises the two tally tests. `LOOP_XFORM_COUNTERS` is process-wide and
-/// this module's tests run concurrently, so without this each would see the
-/// other's increments — the flakiness would look like a counting bug.
-static TALLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Every whole-compile refusal names a construct that publishes an emitter
-/// pc to the VM as a resume bci through a path this wiring does not
-/// translate. Each must refuse on its own, not merely in combination.
+/// Three of the four conditions no longer refuse, and the fourth still does.
+///
+/// `deopt_real`, precise exception frames and `invokedynamic` named ONE
+/// problem — a path that hands the VM an emitter pc as a resume bci — and
+/// `build_and_record_deopt_point`'s translation answers it for all three at
+/// once. Inline sites are not that problem: an inlined callee's bcis are in
+/// the CALLEE's space and there is nothing in this method to translate them
+/// to, so that one is still a refusal.
+///
+/// The edit this catches is a re-tightening: putting any of the three back
+/// would return `eligible` to zero on real code, which is the state the
+/// measurement in `loop-02` exists to have gotten out of.
 #[test]
-fn planning_refuses_every_untranslated_construct() {
+fn planning_admits_the_three_translated_constructs_and_still_refuses_inlining() {
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
-    for (shape, want) in [
+    for (label, shape) in [
         (
+            "deopt_real",
             LoopRewriteShape {
                 deopt_real: true,
                 ..accum_shape_ok()
             },
-            LoopRewriteRefusal::DeoptRealEnabled,
         ),
         (
+            "precise exception frames",
             LoopRewriteShape {
                 precise_exception_frames: true,
                 ..accum_shape_ok()
             },
-            LoopRewriteRefusal::PreciseExceptionFrames,
         ),
         (
+            "invokedynamic",
             LoopRewriteShape {
                 has_indy: true,
                 ..accum_shape_ok()
             },
-            LoopRewriteRefusal::InvokedynamicPresent,
         ),
-        (
+    ] {
+        assert!(
+            plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), shape).is_ok(),
+            "{label} is translated, not refused"
+        );
+    }
+    assert_eq!(
+        plan_bytecode_loop_xform(
+            &code,
+            21,
+            &[],
+            &HashMap::new(),
             LoopRewriteShape {
                 has_inline_sites: true,
                 ..accum_shape_ok()
             },
-            LoopRewriteRefusal::InlineSitesPresent,
-        ),
-    ] {
-        assert_eq!(
-            plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), shape).unwrap_err(),
-            want
-        );
-    }
+        )
+        .unwrap_err(),
+        LoopRewriteRefusal::InlineSitesPresent,
+    );
     // Positive control: with none of them set, the same fixture IS admitted,
-    // so the four refusals above are not vacuous.
+    // so the refusal above is not vacuous.
     assert!(plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok()).is_ok());
 }
 
@@ -1011,17 +1017,20 @@ fn the_planner_peels_a_bypassable_header_instead_of_skipping_it() {
     }
 }
 
-/// Why the wired compile path does not produce a transformed artifact,
-/// stated as a fact rather than left in a comment.
+/// Arming the rewriter is now sufficient, under whatever `deopt_real` this
+/// process actually has.
 ///
-/// `deopt_real` is ON by default and is the FIRST of the four whole-compile
-/// refusals, so arming the rewriter is not sufficient: `CRATONVM_DEOPT_REAL`
-/// must also be off, and no unit test can arrange that (the flag snapshot is
+/// This test is the inverse of the one it replaces. `deopt_real` was the
+/// FIRST of four whole-compile refusals and is default-ON and process-wide,
+/// so an armed compile could not reach a loop unless `CRATONVM_DEOPT_REAL`
+/// was explicitly off — which no unit test can arrange (the flag snapshot is
 /// latched process-wide and this one is additionally cached in a
-/// `OnceLock`). Narrowing those four refusals is `loop-02`'s lane. Three
-/// tests in this module depend on this and none of them said so.
+/// `OnceLock`). Reading `crate::deopt_real_enabled()` rather than hard-coding
+/// `false` is what makes this an assertion about the REAL configuration
+/// instead of a hypothetical one, and it is why the assertion is
+/// unconditional now: the answer must not depend on that flag any more.
 #[test]
-fn the_wired_compile_path_is_refused_before_any_loop_is_looked_at() {
+fn the_wired_compile_path_reaches_a_loop_under_the_default_configuration() {
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     let real_shape = LoopRewriteShape {
@@ -1030,18 +1039,321 @@ fn the_wired_compile_path_is_refused_before_any_loop_is_looked_at() {
         has_indy: false,
         has_inline_sites: false,
     };
-    let planned = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), real_shape);
-    if crate::deopt_real_enabled() {
+    assert!(
+        plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), real_shape).is_ok(),
+        "an armed compile must reach a loop whatever `deopt_real` is set to; \
+         `deopt_real={}`",
+        crate::deopt_real_enabled(),
+    );
+}
+
+/// `for (i = 0; i < n; i++) s += i;` followed by an `invokedynamic` whose
+/// bootstrap is not `StringConcatFactory`, so its lowering is the
+/// unconditional uncommon trap.
+///
+/// The trap is the one snapshot path in this backend that is NOT gated on
+/// `deopt_real_enabled()`, which is exactly why it is the fixture: it records
+/// a `DeoptimizationPoint` in a plain unit-test compile, where the flag
+/// cannot be turned on. Header 4, body 12 → the static heuristic's 4x arm,
+/// and the indy sits in the SUFFIX, so its output pc is shifted by every
+/// duplicated body (and by the versioning guard) and cannot coincide with its
+/// bci by accident.
+fn shape_accum_loop_then_indy() -> Vec<u8> {
+    vec![
+        0x03, // 0:  iconst_0
+        0x3c, // 1:  istore_1
+        0x03, // 2:  iconst_0
+        0x3d, // 3:  istore_2
+        0x1c, // 4:  iload_2             <- header
+        0x1a, // 5:  iload_0
+        0xa2, 0x00, 0x0d, // 6:  if_icmpge 19
+        0x1b, // 9:  iload_1
+        0x1c, // 10: iload_2
+        0x60, // 11: iadd
+        0x3c, // 12: istore_1
+        0x84, 0x02, 0x01, // 13: iinc 2, 1
+        0xa7, 0xff, 0xf4, // 16: goto 4              <- back edge
+        0xba, 0x00, 0x01, 0x00, 0x00, // 19: invokedynamic ()I
+        0xac, // 24: ireturn
+    ]
+}
+
+/// LOOP-02's acceptance criterion: a transformed method's recorded bcis are
+/// all in INTERPRETER space.
+///
+/// This is the whole of what retired the `DeoptRealEnabled`,
+/// `PreciseExceptionFrames` and `InvokedynamicPresent` refusals. Each named a
+/// path that records `DeoptimizationPoint::bci` from the emitter's own pc,
+/// and the VM RESUMES at that field — so while it was an output pc the only
+/// safe thing to do was refuse the whole compile.
+///
+/// Non-vacuous by construction, three ways: `loop_xform_applied` proves the
+/// transform actually fired (the trap in measuring this is that arming also
+/// turns the native unroller off, so "the code got longer" proves nothing);
+/// the published bci is compared against the ORIGINAL indy pc, which the
+/// rewrite shifts by 41 bytes; and the unarmed control compiles the same
+/// bytes and must publish the same bci, which is what says the assertion is
+/// about the translation rather than about this fixture's numbers.
+#[test]
+fn a_transformed_methods_published_deopt_bcis_are_interpreter_bcis() {
+    // Counted per thread; see `metrics::LoopXformCapture`.
+    let tally = crate::metrics::LoopXformCapture::start();
+    let code = shape_accum_loop_then_indy();
+    const INDY_BCI: u32 = 19;
+
+    // Every instruction boundary of the fixture. Under `deopt_real` (the
+    // default) a snapshot is recorded at every OSR-eligible pc as well as at
+    // the indy trap, so the assertion below is about the whole published set,
+    // not just the trap's.
+    let boundaries: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 16, 19, 24];
+
+    // Control: unarmed, nothing is rewritten and every bci is its own pc.
+    let plain = compile_indy_fixture(&code).expect("the unarmed fixture compiles");
+    assert!(
+        plain.deopt_points.iter().any(|p| p.bci == INDY_BCI),
+        "unarmed, the indy trap records its own pc as its bci",
+    );
+    for p in &plain.deopt_points {
+        assert!(boundaries.contains(&p.bci), "unarmed: bci {} is not an instruction", p.bci);
+    }
+
+    tally.reset();
+    let applied = {
+        let _armed = Armed::new();
+        let cm = compile_indy_fixture(&code).expect("the armed fixture compiles");
+        let counts = |name: &str| tally.count(name);
         assert_eq!(
-            planned.unwrap_err(),
-            LoopRewriteRefusal::DeoptRealEnabled,
-            "while `deopt_real` is on, no armed compile can reach a loop"
+            counts("loop_xform_applied"),
+            1,
+            "the transform must actually have fired, or every assertion below \
+             is about an untransformed method",
         );
-    } else {
+        assert_eq!(
+            counts("loop_xform_deopt_bci_unpublishable"),
+            0,
+            "the artifact must be published, not discarded by the backstop",
+        );
+        cm
+    };
+
+    assert!(
+        applied.deopt_points.iter().any(|p| p.bci == INDY_BCI),
+        "the indy trap records a snapshot whether or not `deopt_real` is on",
+    );
+    // THE assertion. The rewrite moves this method's instructions by up to 41
+    // bytes; every one of these bcis would be an output pc without the
+    // translation, and most of them are not even instruction boundaries of the
+    // original method.
+    for p in &applied.deopt_points {
         assert!(
-            planned.is_ok(),
-            "with `deopt_real` off the same compile IS admitted"
+            boundaries.contains(&p.bci),
+            "a transformed method published bci {}, which is not an instruction \
+             boundary of the ORIGINAL method — it is an output pc",
+            p.bci,
         );
+        assert_eq!(
+            p.frame_state.bci, p.bci,
+            "the frame state's bci is the one the resume sinks read; it must \
+             agree with the point's",
+        );
+    }
+    assert!(
+        applied.osr_exit_points.contains(&(INDY_BCI as usize)),
+        "the published OSR-exit bci set is in the same space",
+    );
+    for &bci in &applied.osr_exit_points {
+        // Cast: bci fits u32
+        assert!(boundaries.contains(&(bci as u32)), "osr exit bci {bci} is an output pc");
+    }
+    {
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            applied.osr_exit_points.iter().all(|b| seen.insert(*b)),
+            "the copies collapse onto one bci each; publishing duplicates would \
+             make the set `copies + 1` times too long",
+        );
+    }
+}
+
+/// [`compile_bytes`] with one resolved `invokedynamic` at pc 19: zero
+/// argument slots, an `int` result and no `StringConcatFactory` bridge, so
+/// the lowering takes the uncommon trap. The legacy `compile()` wrapper
+/// takes no `indy_info`, so this goes to `compile_with_param_slots`.
+fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
+    compile_with_param_slots(
+        code,
+        code.len(),
+        1,     // num_params: (int n)
+        3,     // max_locals: n, s, i
+        false, // needs_heap
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &JitRuntimeHelpers::default(),
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        HashMap::new(),
+        None,
+        &[0],
+        1,
+        0,
+        Vec::new(),
+        "T.f:(I)I",
+        // (pc, arg_slots, ret_type, arg_type_tags, concat_site)
+        vec![(19, 0, b'I', Vec::new(), 0)],
+    )
+}
+
+/// The publishability check refuses what the translation cannot describe.
+///
+/// Three cases, each fatal to the METHOD rather than to the transform (which
+/// is already emitted by the time it runs): a point on the versioning guard's
+/// synthetic bytes, a point whose published bci is not what the provenance
+/// map says, and two copies of one bci that describe different frames.
+/// Refusing costs a compilation; publishing an output pc as a resume bci
+/// resumes arbitrary bytecode.
+#[test]
+fn the_publishability_check_refuses_a_point_the_translation_cannot_describe() {
+    let _armed = Armed::new();
+    let code = shape_int_accum_loop();
+    let x = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())
+        .expect("the fixture is admitted");
+    let (guard_from, guard_to) = x.guard_span().expect("the fixture versions");
+
+    // A well-formed point: inside the region, published bci = provenance.
+    let body_pc = x.fast_base() + 1;
+    let body_bci = x.bci_at(body_pc).expect("provenance is total");
+    // Cast: original bci fits u32
+    let point = |bci: usize| test_deopt_point(bci as u32);
+    let ok = point(body_bci);
+    assert!(
+        rewritten_deopt_points_are_publishable(&x, &[ok], &[body_pc], 21).is_ok(),
+        "a point whose published bci is its provenance is publishable",
+    );
+
+    // The guard's bytes carry the header's bci so provenance stays total, but
+    // they are an image of no instruction: resuming there would re-enter the
+    // interpreter at the header with the guard's own operands live.
+    assert!(guard_to > guard_from);
+    let on_guard = point(x.bci_at(guard_from).expect("total"));
+    let err = rewritten_deopt_points_are_publishable(&x, &[on_guard], &[guard_from], 21)
+        .expect_err("a point on the guard is not publishable");
+    assert!(err.contains("versioning guard"), "{err}");
+
+    // A raw output pc published as a bci — what a future emit path that skips
+    // `orig_bci` would produce.
+    // Cast: output pc fits u32 in this fixture
+    let raw = test_deopt_point(body_pc as u32);
+    let err = rewritten_deopt_points_are_publishable(&x, &[raw], &[body_pc], 21)
+        .expect_err("an untranslated pc is not publishable");
+    assert!(err.contains("provenance says"), "{err}");
+
+    // Two copies of one bytecode that disagree about a field a bci-keyed
+    // consumer takes ON TRUST. `reason` is the grouping key, so the field that
+    // can actually differ under one key is one of the others.
+    let other_pc = body_pc + x.body_len;
+    assert_eq!(x.bci_at(other_pc), Some(body_bci), "same bytecode, next copy");
+    let mut conflicts = test_deopt_point(body_bci as u32);
+    conflicts.speculation_id = 7;
+    assert_eq!(conflicts.reason, point(body_bci).reason, "same group");
+    let err = rewritten_deopt_points_are_publishable(
+        &x,
+        &[point(body_bci), conflicts],
+        &[body_pc, other_pc],
+        21,
+    )
+    .expect_err("conflicting copies are not publishable");
+    assert!(err.contains("disagreeing"), "{err}");
+
+    // A machine-LOCATION difference is not a disagreement at all. Two copies
+    // differ in their operand spill offsets by construction — the walk hands
+    // them out as it emits — and both are right for their own copy.
+    let mut relocated = test_deopt_point(body_bci as u32);
+    relocated.frame_state.stack = vec![crate::deopt::FrameValue::StackSlot(-64)];
+    let mut elsewhere = test_deopt_point(body_bci as u32);
+    elsewhere.frame_state.stack = vec![crate::deopt::FrameValue::StackSlot(-72)];
+    assert!(
+        rewritten_deopt_points_are_publishable(
+            &x,
+            &[relocated, elsewhere],
+            &[body_pc, other_pc],
+            21,
+        )
+        .is_ok(),
+        "one `int` operand in two different spill slots is the SAME contract",
+    );
+
+    // A slot-KIND difference is reported, not refused: the only bci-keyed
+    // reader of it is the OSR entry contract, which re-verifies every slot
+    // against the live interpreter frame. `IndyDeoptProbe.concatLoop` is the
+    // real case — its two unrolled copies disagree about local 3 at the
+    // `invokedynamic`, because the forward oop dataflow reaches copy 1 through
+    // copy 0's `astore_3`. Refusing it discarded the method for nothing.
+    let mut retyped = test_deopt_point(body_bci as u32);
+    retyped.frame_state.locals = vec![crate::deopt::FrameValue::RegisterRef(12)];
+    let mut untyped = test_deopt_point(body_bci as u32);
+    untyped.frame_state.locals = vec![crate::deopt::FrameValue::Register(12)];
+    assert!(
+        rewritten_deopt_points_are_publishable(
+            &x,
+            &[retyped, untyped],
+            &[body_pc, other_pc],
+            21,
+        )
+        .is_ok(),
+        "a slot-kind divergence is counted, not refused",
+    );
+
+    // …and identical copies are fine, which is the normal case.
+    assert!(rewritten_deopt_points_are_publishable(
+        &x,
+        &[point(body_bci), point(body_bci)],
+        &[body_pc, other_pc],
+        21,
+    )
+    .is_ok());
+
+    // A misaligned bookkeeping pair is fatal on its own.
+    let err = rewritten_deopt_points_are_publishable(&x, &[point(body_bci)], &[], 21)
+        .expect_err("a missing emitter pc is fatal");
+    assert!(err.contains("emitter pcs"), "{err}");
+}
+
+/// A minimal `DeoptimizationPoint` at `bci`, with the frame state the checker
+/// compares. `native_offset` is deliberately constant: it is the one field
+/// two copies of a bytecode are SUPPOSED to differ in.
+fn test_deopt_point(bci: u32) -> crate::deopt::DeoptimizationPoint {
+    let reason = crate::deopt::DeoptReason::UnreachedCode;
+    crate::deopt::DeoptimizationPoint {
+        native_offset: 0,
+        bci,
+        reason,
+        action: crate::deopt::DeoptAction::Reinterpret,
+        semantics: crate::deopt::ResumeSemantics::for_reason(reason),
+        speculation_id: 0,
+        frame_state: crate::deopt::FrameState {
+            method_key: "T.f:(I)I".to_string(),
+            bci,
+            locals: Vec::new(),
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        },
     }
 }
 
@@ -1162,31 +1474,42 @@ fn the_osr_gap_is_refused_and_the_compile_path_does_not_yet_reach_it() {
         "the suffix keeps its entries, shifted past the copies"
     );
 
-    // Part 2 — and the compile path does not reach part 1 yet.
+    // Part 2 — the compile path now REACHES part 1's territory, and the
+    // answer there is different because the artifact it produces is
+    // VERSIONED.
     //
-    // This half exists because the original version of this test asserted
-    // part 1's constants against `compile()`'s artifact and FAILED, and the
-    // failure looked like a wrong-code bug. It was not one: the planner
-    // refuses this compile outright — `plan_bytecode_loop_xform` has four
-    // whole-compile refusals ahead of any loop selection — so `loop_xform`
-    // is `None` and the artifact is simply an ordinary un-rewritten one.
+    // This half used to assert that the planner refused the compile outright
+    // (four whole-compile refusals ahead of any loop selection, `deopt_real`
+    // first), so `loop_xform` was `None` and the artifact was an ordinary
+    // un-rewritten one. Three of those refusals are gone, and this fixture is
+    // now rewritten by the wired path.
     //
-    // What made that hard to see is the trap below: arming the rewriter
-    // ALSO disables the native byte-copy unroller, because the two are
-    // exact complements. So an armed compile produces different machine
-    // code whether or not a bytecode transform happened, and "the code
-    // length changed" does NOT prove the artifact was rewritten. That was
-    // the flawed premise check.
+    // The gap is still refused *for an unversioned unroll* — that is part 1,
+    // and it is the invariant. It is not visible here because
+    // `plan_versioned` proves `trip >= 4` for this loop and emits the
+    // transform behind a pre-header guard, whose failing edge is an UNTOUCHED
+    // image of the region, back edge included. `steady_state_base` is that
+    // fallback copy, so every bci in the region — the back edge's included —
+    // has a steady-state image and keeps its entry. That is the versioning
+    // arm's whole point: an OSR-entered method runs the untouched loop.
     //
-    // If this assertion ever fires, the compile path has started producing
-    // rewritten artifacts and part 1's constants should be asserted against
-    // `compile()` again.
+    // The trap this test has always been about still applies: arming ALSO
+    // disables the native byte-copy unroller, so "the code length changed"
+    // does not prove a bytecode transform happened. `loop_xform_applied` is
+    // what proves it.
     let baseline = compile_accum_fixture()
         .expect("the helper-free fixture must compile on the default path");
+    let tally = crate::metrics::LoopXformCapture::start();
     let armed = {
         let _armed = Armed::new();
         compile_accum_fixture().expect("the armed fixture must still compile")
     };
+    let applied = tally.count("loop_xform_applied");
+    drop(tally);
+    assert_eq!(
+        applied, 1,
+        "the wired path must now produce a rewritten artifact for this fixture",
+    );
     let base_osr = baseline
         .osr_pc_to_native
         .as_ref()
@@ -1196,12 +1519,25 @@ fn the_osr_gap_is_refused_and_the_compile_path_does_not_yet_reach_it() {
         .as_ref()
         .expect("the armed artifact publishes OSR entries");
     assert_eq!(base_osr.len(), 22, "baseline: one slot per bci, plus the end");
-    assert_eq!(armed_osr.len(), 22, "armed: same length — same bci space");
+    assert_eq!(
+        armed_osr.len(),
+        22,
+        "armed: same length — the rewrite is 57 bytes longer, and the published \
+         table is rebuilt in INTERPRETER-bci space, so its length must not move",
+    );
+    let x = {
+        let _armed = Armed::new();
+        plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())
+            .expect("the fixture is admitted")
+    };
+    assert!(
+        x.versioning.is_some(),
+        "this fixture versions; the assertion below is about the fallback copy",
+    );
     assert!(
         armed_osr[16] >= 0,
-        "the compile path is not producing rewritten artifacts yet, so the \
-         back-edge bci is still an ordinary OSR entry. If this fires, the \
-         planner has started admitting this fixture and part 1's constants \
-         belong here."
+        "under versioning the steady state is the untouched fallback copy, so \
+         the back-edge bci keeps an entry. An UNVERSIONED unroll refuses it — \
+         that is part 1.",
     );
 }

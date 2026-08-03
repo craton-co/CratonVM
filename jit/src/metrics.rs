@@ -1419,17 +1419,26 @@ pub fn record_osr_event(event: &str) {
 /// Bytecode loop-rewriter admission, counted per compile that reaches
 /// `x64::loop_rewrite::plan_bytecode_loop_xform`.
 ///
-/// ## Why the four refusal conditions are counted INDEPENDENTLY
+/// ## Why the four conditions are counted INDEPENDENTLY
 ///
-/// The planner evaluates them in a fixed order and returns on the first, so a
-/// "which refusal fired" tally answers a question nobody asked: `deopt_real` is
-/// default-ON and process-wide, so it would account for **100%** of refusals
-/// and hide the other three permanently. Each condition is therefore recorded
-/// on every compile that reaches the planner, whether or not an earlier one has
-/// already refused. The four counts **overlap by construction** — a method with
-/// an `invokedynamic` compiled under `deopt_real` bumps both — and must not be
-/// summed. `loop_xform_eligible` is the count of compiles where none of them
-/// held.
+/// They were once four whole-compile REFUSALS evaluated in a fixed order,
+/// returning on the first — so a "which refusal fired" tally answered a
+/// question nobody asked: `deopt_real` is default-ON and process-wide, so it
+/// would have accounted for **100%** of refusals and hidden the other three
+/// permanently. Counting them independently is what retired three of them:
+/// `DeoptimizationPoint::bci` is now published through the rewrite's own
+/// provenance map (`Compiler::orig_bci`), which removed `deopt_real`, precise
+/// exception frames and `invokedynamic` as refusals in one move. Only
+/// `inline_sites` still refuses.
+///
+/// The four rows stay, still recorded on every compile that reaches the
+/// planner whether or not something else refuses, because they now answer a
+/// different question: how much of the compile population each construct
+/// covers — i.e. how much the translation bought. They **overlap by
+/// construction** — a method with an `invokedynamic` compiled under
+/// `deopt_real` bumps both — and must not be summed. `loop_xform_eligible` is
+/// the count of compiles no whole-compile refusal held for, which today is
+/// exactly `loop_xform_compiles - loop_xform_inline_sites`.
 ///
 /// ## They are properties of the METHOD, not of the rewriter
 ///
@@ -1440,17 +1449,16 @@ pub fn record_osr_event(event: &str) {
 /// which is the honest answer rather than a gap.
 ///
 /// See `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
-pub const LOOP_XFORM_EVENTS: [&str; 10] = [
+pub const LOOP_XFORM_EVENTS: [&str; 12] = [
     // Denominator: compiles that reached the planner at all.
     "loop_xform_compiles",
-    // The four whole-compile refusal conditions, each counted on every compile
-    // it holds for. Overlapping; do not sum.
+    // The four conditions, each counted on every compile it holds for.
+    // Overlapping; do not sum. Only the last of them still REFUSES.
     "loop_xform_deopt_real",
     "loop_xform_precise_exception_frames",
     "loop_xform_invokedynamic",
     "loop_xform_inline_sites",
-    // None of the four held. This is the population a narrowing effort would
-    // be trying to grow.
+    // No whole-compile refusal held. `compiles - inline_sites` today.
     "loop_xform_eligible",
     // …and of those, the ones that got no further because nothing armed the
     // rewriter. On a default run this equals `loop_xform_compiles`.
@@ -1463,10 +1471,24 @@ pub const LOOP_XFORM_EVENTS: [&str; 10] = [
     "loop_xform_planner_refused",
     // A transform was produced and the emitter compiled rewritten bytecode.
     "loop_xform_applied",
+    // …and was then DISCARDED, because its recorded deopt points could not be
+    // published as interpreter resume points. Fail-closed: the method stays
+    // interpreted. Any non-zero value here is a defect in the coordinate
+    // change, not a tuning signal — see
+    // `x64::loop_rewrite::rewritten_deopt_points_are_publishable`.
+    "loop_xform_deopt_bci_unpublishable",
+    // Two images of one bytecode published deopt points whose frame SHAPES
+    // differ (a slot's kind, the operand-stack depth, a monitor). Reported, not
+    // refused: the only bci-keyed reader of those fields is the OSR entry
+    // contract, which re-verifies every one of them against the live
+    // interpreter frame. Non-zero is normal — see `PointDifference`.
+    "loop_xform_deopt_frames_diverge",
 ];
 
 /// One relaxed counter per [`LOOP_XFORM_EVENTS`] entry.
 static LOOP_XFORM_COUNTERS: [AtomicU64; LOOP_XFORM_EVENTS.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -1488,6 +1510,72 @@ static LOOP_XFORM_COUNTERS: [AtomicU64; LOOP_XFORM_EVENTS.len()] = [
 pub fn record_loop_xform_event(event: &str) {
     if let Some(idx) = LOOP_XFORM_EVENTS.iter().position(|e| *e == event) {
         LOOP_XFORM_COUNTERS[idx].fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        LOOP_XFORM_CAPTURE.with(|c| {
+            if let Some(v) = c.borrow_mut().as_mut() {
+                v[idx] += 1;
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Installed by [`LoopXformCapture`]; `None` on every thread that has not
+    /// asked to count.
+    static LOOP_XFORM_CAPTURE: std::cell::RefCell<Option<Vec<u64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A per-thread view of [`record_loop_xform_event`], for tests that assert
+/// counts.
+///
+/// [`LOOP_XFORM_COUNTERS`] is process-wide, and in this crate's test binary
+/// EVERY compile bumps it — `x64::tests` alone puts thousands of methods
+/// through `compile_with_param_slots`, concurrently. So a test asserting
+/// `loop_xform_compiles == 1` against the globals is asserting against every
+/// other test's work, and serialising the asserting module does not help
+/// because the producers are in other modules. It fails rarely, which is worse
+/// than failing often: the symptom is one unrelated count off by one.
+///
+/// The planner runs on its caller's thread, so counting there is exact and
+/// needs no lock. Nothing outside `#[cfg(test)]` is compiled.
+#[cfg(test)]
+pub(crate) struct LoopXformCapture(());
+
+#[cfg(test)]
+impl LoopXformCapture {
+    /// Start counting THIS thread's events from zero. Dropping the guard stops
+    /// counting; the global counters are untouched throughout.
+    pub(crate) fn start() -> Self {
+        LOOP_XFORM_CAPTURE.with(|c| *c.borrow_mut() = Some(vec![0; LOOP_XFORM_EVENTS.len()]));
+        LoopXformCapture(())
+    }
+
+    /// This thread's count for `event`. Panics on an unknown name rather than
+    /// answering zero, which is how a renamed row would otherwise pass.
+    pub(crate) fn count(&self, event: &str) -> u64 {
+        let idx = LOOP_XFORM_EVENTS
+            .iter()
+            .position(|e| *e == event)
+            .unwrap_or_else(|| panic!("no such counter: {event}"));
+        LOOP_XFORM_CAPTURE.with(|c| c.borrow().as_ref().map_or(0, |v| v[idx]))
+    }
+
+    /// Forget everything counted so far and keep counting.
+    pub(crate) fn reset(&self) {
+        LOOP_XFORM_CAPTURE.with(|c| {
+            if let Some(v) = c.borrow_mut().as_mut() {
+                v.iter_mut().for_each(|x| *x = 0);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for LoopXformCapture {
+    fn drop(&mut self) {
+        LOOP_XFORM_CAPTURE.with(|c| *c.borrow_mut() = None);
     }
 }
 
@@ -1502,14 +1590,9 @@ pub fn loop_xform_counts() -> Vec<(&'static str, u64)> {
         .collect()
 }
 
-/// Drop every loop-rewriter count. Test-only, for the same reason
-/// [`reset_scheduling_counts_for_test`] is.
-#[cfg(test)]
-pub(crate) fn reset_loop_xform_counts_for_test() {
-    for counter in LOOP_XFORM_COUNTERS.iter() {
-        counter.store(0, Ordering::Relaxed);
-    }
-}
+// There is deliberately no `reset_loop_xform_counts_for_test`. Zeroing a
+// process-wide counter that every concurrent test is incrementing does not make
+// a count assertable — see [`LoopXformCapture`], which is what to use instead.
 
 /// Read every OSR event's count, including zero-valued ones, in
 /// [`OSR_EVENTS`] order. Relaxed loads: a sample, not an atomic snapshot.
