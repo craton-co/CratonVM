@@ -69,6 +69,20 @@ $Httpd  = Join-Path $InstallRoot 'bin\httpd.exe'
 function Write-Info($m) { Write-Host "[httpd-setup] $m" -ForegroundColor Cyan }
 function Die($m) { Write-Host "[httpd-setup] ERROR: $m" -ForegroundColor Red; exit 1 }
 
+# Windows PowerShell 5.1 wraps a native command's stderr in an ErrorRecord, so
+# under ErrorActionPreference=Stop any exe that writes to stderr - httpd -t
+# prints "Syntax OK" there, git apply --check prints its complaint there -
+# terminates the script no matter what it exited with. Run natives inside a
+# Continue window and judge them by $LASTEXITCODE.
+function Invoke-Native([scriptblock]$sb) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $global:LASTEXITCODE = 0
+        & $sb 2>&1 | Out-String
+    } finally { $ErrorActionPreference = $prev }
+}
+
 # ---------------------------------------------------------------------------
 # 1. httpd binary
 # ---------------------------------------------------------------------------
@@ -81,8 +95,8 @@ if (Test-Path $Httpd) {
   Write-Info "downloading $Url"
   # curl.exe rather than Invoke-WebRequest: apachelounge.com rejects some
   # default PowerShell user agents.
-  & curl.exe -sS -L -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -o $tmp $Url
-  if ($LASTEXITCODE -ne 0) { Die "download failed (curl rc=$LASTEXITCODE)" }
+  $dl = Invoke-Native { & curl.exe -sS -L -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -o $tmp $Url }
+  if ($LASTEXITCODE -ne 0) { Die "download failed (curl rc=${LASTEXITCODE}): $dl" }
 
   $got = (Get-FileHash $tmp -Algorithm SHA256).Hash
   if ($got -ne $Sha256) { Die "SHA-256 mismatch for ${Zip}: got $got, expected $Sha256" }
@@ -111,9 +125,9 @@ ErrorLog "|C:/Windows/System32/more.com"
 LogLevel warn
 ServerName localhost:54999
 '@ | Set-Content -Path $probe -Encoding ascii
-$out = & $Httpd -t -f $probe 2>&1
+$out = Invoke-Native { & $Httpd -t -f $probe }
 Remove-Item $probe -Force -ErrorAction SilentlyContinue
-if ($out -notmatch 'Syntax OK') { Die "httpd cannot load the required modules:`n$out" }
+if ($LASTEXITCODE -ne 0 -or $out -notmatch 'Syntax OK') { Die "httpd cannot load the required modules (rc=${LASTEXITCODE}):`n$out" }
 Write-Info "module smoke test: Syntax OK"
 
 # ---------------------------------------------------------------------------
@@ -126,14 +140,14 @@ if ($SkipPatch) {
   Push-Location $RepoRoot
   try {
     # --reverse --check succeeds only when the patch is ALREADY applied.
-    & git apply --check --reverse $Patch 2>$null
+    $null = Invoke-Native { & git apply --check --reverse $Patch }
     if ($LASTEXITCODE -eq 0) {
       Write-Info "TesterHttpd readiness patch already applied"
     } else {
-      & git apply --check $Patch 2>&1 | Out-Null
-      if ($LASTEXITCODE -ne 0) { Die "fixtures/httpd-ready-timeout.patch does not apply - apps/tomcat's TesterHttpd.java has diverged; re-derive it" }
-      & git apply $Patch
-      if ($LASTEXITCODE -ne 0) { Die "git apply failed" }
+      $chk = Invoke-Native { & git apply --check $Patch }
+      if ($LASTEXITCODE -ne 0) { Die "fixtures/httpd-ready-timeout.patch does not apply - apps/tomcat's TesterHttpd.java has diverged; re-derive it.`n$chk" }
+      $ap = Invoke-Native { & git apply $Patch }
+      if ($LASTEXITCODE -ne 0) { Die "git apply failed: $ap" }
       Write-Info "applied TesterHttpd readiness patch"
 
       $tc = Join-Path $RepoRoot 'apps\tomcat'
@@ -143,8 +157,8 @@ if ($SkipPatch) {
         $javac = 'C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot\bin\javac.exe'
         Push-Location $tc
         try {
-          & $javac -nowarn -cp $cp -d "$tc\output\testclasses" 'test\org\apache\tomcat\integration\httpd\TesterHttpd.java'
-          if ($LASTEXITCODE -ne 0) { Die "javac failed on the patched TesterHttpd.java" }
+          $jc = Invoke-Native { & $javac -nowarn -cp $cp -d "$tc\output\testclasses" 'test\org\apache\tomcat\integration\httpd\TesterHttpd.java' }
+          if ($LASTEXITCODE -ne 0) { Die "javac failed on the patched TesterHttpd.java:`n$jc" }
           Write-Info "recompiled TesterHttpd into output\testclasses"
         } finally { Pop-Location }
       } else {
