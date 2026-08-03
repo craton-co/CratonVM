@@ -16078,6 +16078,88 @@ mod tests {
         assert_eq!(mgr.class_store.get(c).unwrap().first_field_index, 2);
     }
 
+    /// Scaling measurement for the descendant walk, kept reproducible rather
+    /// than quoted from a session that no longer exists.
+    ///
+    /// `#[ignore]` — it is a measurement, not an assertion about the machine
+    /// it runs on. Run it with:
+    ///
+    /// ```text
+    /// cargo test --release -p cratonvm-classloading --lib -- --ignored --nocapture descendant_walk_scaling
+    /// ```
+    ///
+    /// The shape it reproduces is the real one: a JDK stub being upgraded has
+    /// a handful of descendants among tens of thousands of loaded classes, so
+    /// the old "probe every class with `is_subclass_of`" scan paid the whole
+    /// class count on every upgrade while the answer was a five-element list.
+    #[test]
+    #[ignore]
+    fn descendant_walk_scaling() {
+        const CLASSES: usize = 20_000;
+        const SUBTREE: usize = 5;
+        const UPGRADES: usize = 2_000;
+
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+        let root = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(root, "Root", None, 1, 0, 1));
+        for i in 0..SUBTREE {
+            let id = mgr.class_store.next_id();
+            mgr.class_store.add(layout_fixture_class(
+                id,
+                &format!("Sub{i}"),
+                Some(root),
+                1,
+                1,
+                2,
+            ));
+        }
+        // The rest are unrelated top-level classes, as most loaded classes are
+        // with respect to any one stub.
+        for i in 0..CLASSES {
+            let id = mgr.class_store.next_id();
+            mgr.class_store
+                .add(layout_fixture_class(id, &format!("Other{i}"), None, 1, 0, 1));
+        }
+
+        let indexed = std::time::Instant::now();
+        let mut visited = 0usize;
+        for _ in 0..UPGRADES {
+            visited += mgr.class_store.descendants_of(root).len();
+        }
+        let indexed = indexed.elapsed();
+
+        // The scan the index replaced, reproduced here so both numbers come
+        // off the same machine in the same run.
+        let scanned = std::time::Instant::now();
+        let mut probes = 0usize;
+        for _ in 0..UPGRADES {
+            for idx in 0..mgr.class_store.slot_count() {
+                let cid = ClassId::new(idx as u32);
+                if cid == root {
+                    continue;
+                }
+                probes += 1;
+                let Some(sup) = mgr.class_store.get(cid).and_then(|c| c.superclass) else {
+                    continue;
+                };
+                let _ = mgr
+                    .class_store
+                    .get(sup)
+                    .is_some_and(|sc| sc.is_subclass_of(root, &mgr.class_store));
+            }
+        }
+        let scanned = scanned.elapsed();
+
+        println!(
+            "descendant walk over {CLASSES} classes x {UPGRADES} upgrades\n  \
+             index : {indexed:?} ({visited} descendants visited)\n  \
+             scan  : {scanned:?} ({probes} classes probed)\n  \
+             ratio : {:.1}x",
+            scanned.as_secs_f64() / indexed.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+    }
+
     /// `descendants_of` must agree with the brute-force "scan every slot and
     /// walk its superclass chain" answer the index replaced, and must return
     /// parents before children so a consumer can recompute in one pass.
