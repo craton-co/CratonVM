@@ -50,6 +50,7 @@ fn backend_sources() -> String {
         include_str!("deopt_stubs.rs"),
         include_str!("osr.rs"),
         include_str!("arith.rs"),
+        include_str!("simd.rs"),
         include_str!("tests.rs"),
         include_str!("flag_and_header_contracts.rs"),
         include_str!("loop_unroll_admission.rs"),
