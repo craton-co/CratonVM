@@ -1362,11 +1362,24 @@ unsafe fn try_call_compiled_entry_reentrant(
     // back to its live CompiledMethod and register the precise frame for the
     // full duration of the nested call.
     let mut needs_ctx = needs_ctx;
-    let jit_root_guard = cratonvm_jit::lookup_jit_code_range(entry).map(|cm_ptr| {
-        // SAFETY: the JIT code-range registry owns this CompiledMethod while
-        // its entry remains callable; the guard is dropped before this helper
-        // returns to the caller that holds the corresponding code cache entry.
-        let compiled = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+    // Pin, don't peek. This is the ONE path into compiled code that used to hold
+    // no owning reference to the body it entered: it resolved a bare `cm_ptr`
+    // out of the code-range registry and dereferenced it, on the argument that
+    // "the registry owns this CompiledMethod while its entry remains callable".
+    // The registry stores a raw address, not an `Arc`, so it owns nothing — and
+    // the caller's keep-alive here is a *thread-local dispatch cache entry*
+    // (`try_mic_rust_cached_entry` reads `entry`/`needs_context` out of the map
+    // and calls the raw pointer). A nested dispatch from the callee re-enters
+    // `flush_raw_entry_dispatch_caches`, whose `clear()` drops exactly that
+    // entry — measured releasing a published body at `active_jit_executions`
+    // = 1 on `BasicErrorControllerIntegrationTests`.
+    //
+    // Holding the pin across the call is what makes the process-wide invariant
+    // true: **a thread inside a compiled body always holds an owning reference
+    // to it**, so a reference count reaching zero is itself a proof that no
+    // thread is inside. One atomic increment (the registry carries a `Weak`).
+    let pinned = cratonvm_jit::pin_jit_code_range_owner(entry);
+    let jit_root_guard = pinned.as_deref().map(|compiled| {
         // cceres2 (WildFly SIGSEGV cores SF2/SF3/SM): the caller-supplied ABI
         // flag can come from a cache whose (entry, needs_context) pair was
         // read non-atomically across a concurrent inline-cache retarget or
@@ -1399,6 +1412,9 @@ unsafe fn try_call_compiled_entry_reentrant(
     #[cfg(debug_assertions)]
     restore_jit_borrow(borrow);
     drop(jit_root_guard);
+    // AFTER the guard: the pin is what keeps the body mapped for the whole
+    // call, so it must outlive both the call and the chain entry naming it.
+    drop(pinned);
     result
 }
 
@@ -1955,7 +1971,7 @@ fn publish_mic_rust_cached_entry(
             DispatchCache {
                 entry: entry_ptr,
                 needs_context: needs_ctx,
-                _owner: Some(owner),
+                _owner: Some(owner.into()),
             },
         );
     });
@@ -5592,6 +5608,87 @@ mod system_class_memo {
 // that id and never on the real `java/lang/System`. Do not reintroduce it
 // without a `vm_identity` in the key.
 
+/// Record a CONFIRMED class initialization in the lock-free memo.
+///
+/// Called from `finalize_class_init` (the single authoritative end of a
+/// successful `<clinit>`), so the memo answers for every initialized class
+/// rather than only for those a compiled `getstatic` has already missed on.
+/// Idempotent, lock-free, and a no-op for a VM that does not own the table.
+pub fn note_class_initialized(vm: &SharedVm, class_id: ClassId) {
+    class_init_memo::mark_initialized(vm.vm_identity, class_id.as_u32());
+}
+
+/// Compile-time resolver: where does this static field's storage live?
+///
+/// Returns the address of the `AtomicPtr` cell holding the declaring class's
+/// statics base (see `StaticsIndex::base_cell_addr`), or `0` for "not
+/// inlineable — keep the helper". The JIT bakes the returned address as an
+/// immediate and emits two dependent loads instead of a `CALL jit_getstatic`.
+///
+/// # Why every rejection below is required
+///
+/// * **`java/lang/System`** — its `out`/`err`/`in` statics are serviced by the
+///   bootstrap intercept inside [`jit_getstatic`], which returns a synthetic
+///   stream rather than the stored value. A direct load would read the raw
+///   slot and `println` would silently no-op on a null stream.
+/// * **Not yet initialized** — an inline load runs no `<clinit>` (JVMS §5.5).
+///   The helper's init check is the only thing standing between a compiled
+///   first-touch `getstatic` and the zero-initialized placeholder; a site is
+///   therefore only inlined when the class is ALREADY initialized at compile
+///   time, which is also exactly when HotSpot omits its init barrier.
+/// * **Nothing published / index off** — no address to bake.
+///
+/// # Lock discipline
+///
+/// This runs on whichever thread is compiling, including the background
+/// compiler, and takes **no VM lock at all**: three relaxed/acquire atomic
+/// loads. That is deliberate. The compiler is called from inside the
+/// interpreter's tier-up path and from a background thread, and a resolver that
+/// reached for `class_manager.read()` would be one queued writer away from
+/// deadlocking a compile against a class load.
+///
+/// # Safety
+///
+/// `vm_ptr` must be the `SharedVm` pointer the JIT registered alongside this
+/// function (see `set_static_base_resolver`), or 0.
+pub unsafe extern "C" fn jit_resolve_static_base(
+    vm_ptr: i64,
+    class_id_raw: i64,
+    field_index: i64,
+) -> i64 {
+    if vm_ptr == 0 || class_id_raw < 0 || field_index < 0 {
+        return 0;
+    }
+    // SAFETY: `vm_ptr` is the `&SharedVm` the VM registered with the JIT; the
+    // `SharedVm` lives inside an `Arc` for the life of the process.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let raw = class_id_raw as u32;
+    if vm
+        .classes
+        .system_class_id
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == raw
+    {
+        return 0;
+    }
+    if !class_init_memo::is_initialized(vm.vm_identity, raw) {
+        return 0;
+    }
+    if crate::vm::statics_index_disabled() {
+        return 0;
+    }
+    match vm
+        .classes
+        .statics_index
+        .base_cell_addr(ClassId::new(raw), field_index as usize)
+    {
+        // Cast: a user-space address always fits the positive i64 range; `0` is
+        // the sentinel and `base_cell_addr` never returns a null cell address.
+        Some(addr) => addr as i64,
+        None => 0,
+    }
+}
+
 pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
     gs_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _gs_total = gs_prof::CycGuard::new(&gs_prof::CYC_TOTAL);
@@ -7354,7 +7451,20 @@ struct DispatchCache {
     entry: usize,
     needs_context: bool,
     /// Owns JIT code while this thread-local raw entry remains published.
-    _owner: Option<std::sync::Arc<cratonvm_jit::CompiledMethod>>,
+    ///
+    /// [`cratonvm_jit::RetainedCode`], not a bare `Arc`, because this map is
+    /// evicted by the very thread that dispatches through it: a generation
+    /// flush (`flush_raw_entry_dispatch_caches`), a class-identity flush, a
+    /// replacement `insert`, or thread exit. Any of those can run while this
+    /// thread is *inside* the body it names — `try_mic_rust_cached_entry` reads
+    /// only `entry`/`needs_context` out of the map and calls the raw pointer, so
+    /// the map entry is the sole owner across the call, and a nested dispatch
+    /// from the callee re-enters the flush. Dropping a bare `Arc` there unmaps
+    /// the code under this thread's own return address; measured on
+    /// `BasicErrorControllerIntegrationTests` at
+    /// `active_jit_executions` = 1. The wrapper releases through
+    /// `defer_jit_owner`, which retains until no thread is in compiled code.
+    _owner: Option<cratonvm_jit::RetainedCode>,
 }
 
 #[derive(Clone, Copy)]
@@ -8139,7 +8249,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                                         DispatchCache {
                                             entry,
                                             needs_context,
-                                            _owner: Some(owner),
+                                            _owner: Some(owner.into()),
                                         },
                                     );
                                 });
@@ -8250,7 +8360,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     DispatchCache {
                         entry,
                         needs_context: needs_ctx,
-                        _owner: Some(compiled.clone()),
+                        _owner: Some(compiled.clone().into()),
                     },
                 );
             });
@@ -8312,7 +8422,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         DispatchCache {
                             entry,
                             needs_context: needs_ctx,
-                            _owner: Some(owner),
+                            _owner: Some(owner.into()),
                         },
                     );
                 });
@@ -13300,6 +13410,21 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     cratonvm_jit::x64::set_arm_savebase_watch_fn(jit_arm_savebase_watch as *const () as usize);
     cratonvm_jit::x64::set_disarm_savebase_watch_fn(
         jit_disarm_savebase_watch as *const () as usize,
+    );
+
+    // Compile-time static-slot resolver. Registered through a process-global
+    // setter rather than a `JitRuntimeHelpers` field because it is never called
+    // from generated code — only by the compiler, while emitting — so it needs
+    // no ABI slot, no golden offset and no revision bump. The `SharedVm`
+    // pointer travels with it: the answer is per-VM (`ClassId`s are), and the
+    // setter latches the first VM and permanently disables inlining if a second
+    // one registers, rather than silently resolving VM A's ids against VM B's
+    // statics. A VM-less `build_helpers()` passes 0 and registers nothing.
+    cratonvm_jit::x64::set_static_base_resolver(
+        jit_resolve_static_base as *const () as usize,
+        vm_for_helpers
+            .map(|shared| shared as *const crate::vm::SharedVm as usize)
+            .unwrap_or(0),
     );
 
     // §7/§10 — publish this VM's execution policy to the JIT BEFORE anything

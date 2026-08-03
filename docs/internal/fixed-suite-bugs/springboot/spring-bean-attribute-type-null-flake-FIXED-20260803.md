@@ -1,5 +1,111 @@
 # Rare: `@Bean` attribute resolution fails because a primitive return type is unmappable
 
+**Status: FIXED 2026-08-03.** Retired from `docs/known-issues/`. Everything
+from "What happened" down is the original report, kept verbatim; the closure
+is immediately below.
+
+---
+
+## Closure (2026-08-03)
+
+This bug was never caught live — the map-miss audit and instrumented
+`ClassUtils` the original report built were never running at the moment it
+fired, and it still hasn't fired again since (0/1030+ hunt attempts across
+this and the prior session, both before and after the fixes below). So this
+is closed on the strength of two real defects found and fixed, both matching
+the original report's own analysis, plus an unusually large amount of
+negative evidence — not on having watched the mechanism fire and confirmed
+the fix stops it. Re-open if it resurfaces.
+
+### Fix 1 — exactly the report's own "where to look next" candidate #1
+
+`native_class_is_primitive` (`native-builtins/src/lang_class.rs`) read a
+**hard-coded instance slot 7** for `java/lang/Class`'s `primitive` flag, on
+the unchecked assumption that slot 7 is wherever
+`get_or_create_primitive_mirror`'s **name-based** field resolution
+(`resolve_class_mirror_slots` in `vm/src/vm/vm_object.rs`) happens to land it
+for this JDK build. The report named this precisely: "Those agreeing is an
+assumption, not a check." It is now resolved by field name, the same way the
+writer resolves it, cached once found — so reader and writer agree by
+construction instead of by coincidence, and a mirror that hasn't loaded
+`java/lang/Class` in its final form yet gets rechecked instead of the
+resolution being cached as permanently absent.
+
+For `boolean.class` on the JDK build this was tested against, slot 7 already
+happened to be correct — this closes a hazard for a build where it isn't,
+not a confirmed hit on this exact failure. But it removes the "assumption,
+not a check" the report flagged as unaudited.
+
+### Fix 2 — a defect the report didn't name: `IdentityHashMap` wasn't using identity
+
+The failing map, `ClassUtils.primitiveTypeToWrapperMap`, is a real
+`java.util.IdentityHashMap<Class<?>, Class<?>>`. CratonVM materializes it as
+a synthetic bucket map (same 3-field layout as `HashMap`), and its
+`get`/`put`/`remove`/`containsKey` were registered directly onto the
+**generic** bucket-map natives — the same ones `HashMap` uses. Those compute
+the bucket hash and collision equality via the key's **virtual**
+`hashCode()`/`equals()` — content semantics, not the reference identity
+`IdentityHashMap`'s contract requires.
+
+This happened to be invisible for `java.lang.Class` keys specifically,
+because `Class` doesn't override either method (both fall back to
+`Object`'s, which are identity-based anyway) — which is exactly why nothing
+caught it before. But every `hashCode()`/`equals()` dispatch it triggered was
+a real, unnecessary moving-GC window that a pure identity computation never
+needs — and this codebase has fixed the same *shape* of bug (a stale
+`ObjectRef` surviving a GC triggered mid-dispatch inside this exact bucket-map
+code) multiple times before in unrelated contexts (see the `S111r27`,
+`HIB-MAPPUT-PINORDER.1`, and WildFly-parallel-boot-stale-objectref comments
+already in `native-collections/src/lib.rs`). A receiver classification
+(`CF_IDENTITY_MAP`) now routes `IdentityHashMap` (and subclasses) straight to
+`ctx.identity_hash_code()` + pointer equality, matching real
+`IdentityHashMap` semantics and removing that dispatch surface for this map
+family entirely — for `get`, `put`, `remove`, and `containsKey`, including
+the string/int fast-path overlays that would otherwise collapse
+equal-content-but-not-identical keys.
+
+This is the stronger fix of the two: it's a genuine spec violation (provable
+without ever seeing this bug fire — `new IdentityHashMap<>()` given two
+`.equals()`-but-not-`==` keys behaved like a content map before this), and it
+eliminates an entire class of GC-timing risk from every `IdentityHashMap`
+operation in the VM, not just this one call site.
+
+### Validation
+
+* Full `native-collections` and `native-builtins` test suites (3240+ tests)
+  pass clean, before and after merging in ~90 unrelated commits that landed
+  on `dev` during this session.
+* `hunt-beanflake2.sh` (chunk 9, both detectors — `CRATONVM_DBG_MAP_MISS_AUDIT`
+  and the instrumented `ClassUtils`) run **900 times** against the fixed
+  binary across three rounds, 6-wide: **0 reproductions, 0 detector hits**.
+  Combined with the ~130 runs from the original investigation, that's
+  **~1030 total attempts**, none of which caught the failure either before or
+  after the fix.
+* The "What was fixed on the way" defect below (redefine-collection-layout)
+  was independently confirmed already merged into `dev` (`4a647c9071`,
+  ancestor-checked) — soak time has passed with no recurrence.
+
+### A separate, unrelated, more severe finding made along the way
+
+While validating the fix against the latest `dev` (merged in ~90 commits
+since this investigation started), `hunt-beanflake2.sh` against chunk 9
+started failing **100% of the time** — not with this bug, but with a javac
+**internal compiler `AssertionError`** (`Check$SuperThisChecker.check`,
+`checkSuperInitCalls`) while CratonVM self-hosts javac 25.0.3 to compile
+Spring's AOT-generated sources, immediately after CratonVM's JIT logs bailout
+warnings on javac's own `ClassReader` methods. A vanilla `origin/dev` build
+(no fixes from this doc applied) reproduces the identical failure, so this is
+confirmed **pre-existing on `dev`, unrelated to either fix above** — not a
+regression from this work. It blocks the Spring AOT test cluster entirely
+and needs its own investigation; flagged separately rather than folded into
+this closure.
+
+---
+
+# Rare: `@Bean` attribute resolution fails because a primitive return type is unmappable
+
+*(original report, verbatim)*
+
 | | |
 |---|---|
 | **Status** | **OPEN — observed once, still not reproduced** in ~130 instrumented runs. A large adjacent defect was found and fixed on the way (see "What was fixed"), and it may or may not be the cause. Two tools now exist that did not before: a VM-side miss audit and an instrumented `ClassUtils`. |

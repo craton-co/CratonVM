@@ -60,6 +60,24 @@ fn maybe_dump_shutdown_reports() {
 
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
+        // The bytecode loop rewriter's admission tally, on the same switch and
+        // for the same reason: it is what the compiler did, read at exit. The
+        // counters themselves are always collected (they do not consult
+        // `metrics::enabled()`), so this prints real numbers from a default
+        // run — which is the measurement
+        // `docs/known-issues/c2/loop-02-planner-admission-gates.md` asks for
+        // before any of the four gates is narrowed.
+        //
+        // The four condition rows OVERLAP: a method with an `invokedynamic`
+        // compiled under `deopt_real` is in both. Read each against
+        // `loop_xform_compiles`; never sum them.
+        let tally = cratonvm_jit::metrics::loop_xform_counts();
+        let row = tally
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("[cratonvm] loop-xform admission: {row}");
     }
 
     // Phase accounting. Delegate the compile-phase breakdown rather than

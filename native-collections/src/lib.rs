@@ -123,6 +123,21 @@ const CF_BUCKET_MAP_NAME: u16 = 1 << 8;
 /// stale bit is unreachable: `receiver_facts` is only ever asked about the
 /// runtime class of an object that exists.
 const CF_HAS_NAME: u16 = 1 << 9;
+/// `IdentityHashMap` ancestry (exact class or a user subclass).
+///
+/// `IdentityHashMap.get`/`put` are registered straight onto the generic
+/// bucket-map natives (`native_map_get_pub`/`native_map_put_pub` — see
+/// `register_identity_hashmap_natives`), which by default compute the bucket
+/// hash and collision equality via the key's *virtual* `hashCode()`/`equals()`
+/// — content semantics. That happens to coincide with reference semantics for
+/// a key class like `java.lang.Class` that doesn't override either method,
+/// which is why this went unnoticed, but it is not what `IdentityHashMap`'s
+/// contract requires, and every `hashCode()`/`equals()` dispatch it triggers
+/// is a moving-GC window a pure identity computation would not need at all.
+/// `map_hash_key`/`map_keys_equal` consult this flag to skip virtual dispatch
+/// entirely for an identity-map receiver — see `map_hash_key_identity`
+/// and `map_keys_equal_identity`.
+const CF_IDENTITY_MAP: u16 = 1 << 10;
 
 /// Cached classification of one `ClassId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -256,6 +271,23 @@ fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
     // class necessarily has a name, so the common case skips the call.
     if exact.is_some() || ctx.class_name_of_id(cid).is_some() {
         flags |= CF_HAS_NAME;
+    }
+    // `IdentityHashMap` is not a `WellKnownClass` variant (it participates in
+    // no other family decision here), so a direct name walk is simpler than
+    // adding a 16th variant for this one flag. Paid once per `ClassId`, then
+    // cached forever by `receiver_facts` like every other bit above.
+    {
+        let mut cur = cid;
+        for _ in 0..FACTS_WALK_LIMIT {
+            if ctx.class_name_of_id(cur).as_deref() == Some("java/util/IdentityHashMap") {
+                flags |= CF_IDENTITY_MAP;
+                break;
+            }
+            match ctx.superclass_of(cur) {
+                Some(parent) if parent != cur => cur = parent,
+                _ => break,
+            }
+        }
     }
     ClassFacts(flags)
 }
@@ -5721,6 +5753,26 @@ fn enum_set_contains_member(
     }
 }
 
+/// Pure reference-identity hash, matching `IdentityHashMap`'s documented
+/// contract (`System.identityHashCode`), with the same bit-spread every other
+/// bucket hash in this file applies. Unlike `map_hash_key`, this never
+/// dispatches into Java (`ctx.identity_hash_code` reads the object header),
+/// so it cannot trigger a moving GC — an identity-map lookup/insert needs no
+/// pin around this call.
+#[inline]
+fn map_hash_key_identity(ctx: &dyn NativeContext, key: ObjectRef) -> i32 {
+    let h = ctx.identity_hash_code(key);
+    h ^ ((h as u32) >> 16) as i32
+}
+
+/// Pure reference-identity equality, matching `IdentityHashMap`'s documented
+/// contract (`==`, not `Object.equals`). Never dispatches into Java, so —
+/// unlike `map_keys_equal` — it cannot trigger a moving GC either.
+#[inline]
+fn map_keys_equal_identity(a: ObjectRef, b: ObjectRef) -> bool {
+    std::ptr::eq(a.as_ptr(), b.as_ptr())
+}
+
 /// Compute hash for a key.
 ///
 /// MED fix: when the user-supplied `hashCode()` throws (i.e. `invoke_virtual`
@@ -7408,6 +7460,18 @@ fn is_lhm_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     receiver_facts(ctx, this).has(CF_LHM)
 }
 
+/// True when `this`'s runtime class is `java/util/IdentityHashMap` or a
+/// subclass. `native_hashmap_get_exact`/`native_map_put_evict_pinned` consult
+/// this to compute the bucket hash/equality via reference identity
+/// (`ctx.identity_hash_code` + pointer equality) instead of the receiver
+/// key's virtual `hashCode()`/`equals()` — see `CF_IDENTITY_MAP`.
+///
+/// PERF: memoized per `ClassId` — see `CF_IDENTITY_MAP`.
+#[inline]
+fn is_identity_map_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    receiver_facts(ctx, this).has(CF_IDENTITY_MAP)
+}
+
 fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -7726,12 +7790,25 @@ fn native_map_put_evict_pinned(
     key_pin: usize,
     value_pin: usize,
 ) -> MethodCallResult {
+    // `IdentityHashMap` receiver: use reference-identity hash/equality
+    // (`CF_IDENTITY_MAP`) instead of virtual `hashCode()`/`equals()` — see
+    // `map_hash_key_identity`. `this` is fresh here (just pinned by the
+    // caller, no GC-triggering call has run yet), so this read is safe.
+    let identity_mode = is_identity_map_receiver(ctx, this);
+
     // Handle null key: hash=0, bucket=0, key field stores null
     // hashCode() can collect before this helper reaches its first field access;
     // refresh the caller's already-pinned key before dispatching it.
     let key_for_hash = read_pinned_elem(ctx, key_pin, key_val);
     let (hash, is_null_key) = match key_for_hash {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => return Ok(Some(Value::Object(None))), // non-object keys not supported
     };
@@ -7852,7 +7929,13 @@ fn native_map_put_evict_pinned(
             // stored key: `key.equals(k)`, not `k.equals(key)`. The direction
             // is observable for asymmetric equality implementations and was
             // load-bearing for ANTLR DFA-state canonicalization.
-            let eq = map_keys_equal(ctx, key_for_eq, node_key)?;
+            //
+            // `IdentityHashMap` receiver: reference identity, not `equals()`.
+            let eq = if identity_mode {
+                map_keys_equal_identity(key_for_eq, node_key)
+            } else {
+                map_keys_equal(ctx, key_for_eq, node_key)?
+            };
             node = ctx.read_native_pin(node_pin, node);
             ctx.unpin_native_roots(node_key_pin);
             ctx.unpin_native_roots(node_pin);
@@ -8059,13 +8142,20 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Object(None))),
     };
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Value::Object(Some(key)) = key_val {
-        if let Some(result) = native_hashmap_get_string_fast(ctx, this, key) {
+    // `IdentityHashMap` receiver: the string/int fast paths below key by
+    // content (all equal-content Strings collapse to one entry, ignoring
+    // `==`), which is wrong for an identity map. Skip straight to the
+    // general path, which honours `CF_IDENTITY_MAP` below.
+    let identity_mode = is_identity_map_receiver(ctx, this);
+    if !identity_mode {
+        if let Value::Object(Some(key)) = key_val {
+            if let Some(result) = native_hashmap_get_string_fast(ctx, this, key) {
+                return result;
+            }
+        }
+        if let Some(result) = try_hm_int_fast_get(ctx, this, key_val) {
             return result;
         }
-    }
-    if let Some(result) = try_hm_int_fast_get(ctx, this, key_val) {
-        return result;
     }
     let this = materialize_hm_int_fast(ctx, this)?;
 
@@ -8088,7 +8178,14 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let key_pin = pin_value(ctx, key_val);
     let key_for_hash = read_pinned_elem(ctx, key_pin, key_val);
     let (hash, is_null_key) = match key_for_hash {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => {
             ctx.unpin_native_roots(this_pin);
@@ -8165,7 +8262,12 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 Value::Object(Some(k)) => k,
                 _ => key_ref.unwrap(),
             };
-            let eq = map_keys_equal(ctx, key_cur, node_key)?;
+            // `IdentityHashMap` receiver: reference identity, not `equals()`.
+            let eq = if identity_mode {
+                map_keys_equal_identity(key_cur, node_key)
+            } else {
+                map_keys_equal(ctx, key_cur, node_key)?
+            };
             node = ctx.read_native_pin(node_pin, node);
             ctx.unpin_native_roots(node_key_pin);
             ctx.unpin_native_roots(node_pin);
@@ -8376,8 +8478,19 @@ fn native_map_remove_pinned(
     remove_pin_base: usize,
     key_pin: usize,
 ) -> MethodCallResult {
+    // `IdentityHashMap` receiver: reference identity, not virtual
+    // `hashCode()`/`equals()` — see `CF_IDENTITY_MAP`. `this` is fresh here
+    // (just re-read from its pin by the caller).
+    let identity_mode = is_identity_map_receiver(ctx, this);
     let (hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -8415,6 +8528,7 @@ fn native_map_remove_pinned(
         search_hash: i32,
         key_pin: usize,
         key_fallback: Value,
+        identity_mode: bool,
     ) -> Result<bool, MethodCallFailed> {
         // The node and requested key can both be relocated while this native
         // call is running on a Tomcat worker. Reload the node *before* reading
@@ -8434,6 +8548,11 @@ fn native_map_remove_pinned(
         let Value::Object(Some(k)) = read_pinned_elem(ctx, key_pin, key_fallback) else {
             return Ok(false);
         };
+        // `IdentityHashMap` receiver: reference identity, not `equals()` — and
+        // no Java dispatch means no GC risk, so skip the pin dance below.
+        if identity_mode {
+            return Ok(map_keys_equal_identity(k, nk));
+        }
         // The freshly loaded node key has no caller-owned pin. Retain it
         // together with the already-rooted requested key for every
         // fast-wrapper probe and the eventual Java equals dispatch.
@@ -8457,7 +8576,7 @@ fn native_map_remove_pinned(
         // dohead-post-fix-sporadic-residuals.md's header-count residual).
         let head_pin = ctx.pin_native_root(head);
         let head_matches =
-            node_matches_inner(ctx, head_pin, head, is_null_key, hash, key_pin, key_val)?;
+            node_matches_inner(ctx, head_pin, head, is_null_key, hash, key_pin, key_val, identity_mode)?;
         let head = ctx.read_native_pin(head_pin, head);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
         // GC SAFETY (2026-07-20, DoHead sporadic transport-flake
@@ -8514,7 +8633,7 @@ fn native_map_remove_pinned(
             let prev_pin = ctx.pin_native_root(prev);
             let curr_pin = ctx.pin_native_root(curr);
             let curr_matches =
-                node_matches_inner(ctx, curr_pin, curr, is_null_key, hash, key_pin, key_val)?;
+                node_matches_inner(ctx, curr_pin, curr, is_null_key, hash, key_pin, key_val, identity_mode)?;
             prev = ctx.read_native_pin(prev_pin, prev);
             let curr = ctx.read_native_pin(curr_pin, curr);
             // GC SAFETY: same `this`-goes-stale hazard as the head check
@@ -8589,6 +8708,9 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // `map_keys_equal` dispatch arbitrary Java code (hashCode()/equals()),
     // which can trigger a moving GC. Pin `this` and the search key up front
     // and re-read them (plus the bucket-chain `node`) after every such call.
+    // `IdentityHashMap` receiver: reference identity, not virtual
+    // `hashCode()`/`equals()` — see `CF_IDENTITY_MAP`.
+    let identity_mode = is_identity_map_receiver(ctx, this);
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key_val);
     this = materialize_hm_int_fast(ctx, this)?;
@@ -8597,7 +8719,14 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
     let key_for_hash = key_val;
     let (hash, is_null_key) = match key_for_hash {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(Some(k)) => (
+            if identity_mode {
+                map_hash_key_identity(ctx, k)
+            } else {
+                map_hash_key(ctx, k)?
+            },
+            false,
+        ),
         Value::Object(None) => (0, true),
         _ => {
             ctx.unpin_native_roots(this_pin);
@@ -8665,7 +8794,11 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 Value::Object(Some(k)) => k,
                 _ => key_ref.unwrap(),
             };
-            let eq = map_keys_equal(ctx, key_cur, node_key)?;
+            let eq = if identity_mode {
+                map_keys_equal_identity(key_cur, node_key)
+            } else {
+                map_keys_equal(ctx, key_cur, node_key)?
+            };
             node = ctx.read_native_pin(node_pin, node);
             ctx.unpin_native_roots(node_key_pin);
             ctx.unpin_native_roots(node_pin);
