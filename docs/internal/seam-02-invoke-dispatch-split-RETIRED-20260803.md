@@ -93,6 +93,39 @@ my desk. The test failed on its first run and named the discrepancy. All six
 needles are unchanged from the pre-split tree, which is the machine-checked
 statement that eleven commits moved code and nothing else.
 
+### The app-suite half
+
+The doc asks for "a real app suite — these files are the interpreter's hot path
+and a subtle behaviour change will show up in Spring or Tomcat long before it
+shows up in a unit test." Run on the finished tree: **40 Spring Boot classes
+from `core/spring-boot`**, drawn from the classes `verify-01`'s checked-in
+`apps/spring-boot-suite-runner/baseline.tsv` records as PASS, driven through
+`/data/sbrun.sh` against a release binary built from this branch.
+
+**39 PASS, 1 FAIL.** The one failure is
+`SpringApplicationAotProcessorTests` (2 of 8 methods), and it is not a clean
+signal in either direction: re-run three times on the *same* binary it went
+FAIL / FAIL / PASS. A flaky class cannot be evidence of a regression, and the
+Spring AOT cluster has its own open lane and its own history in
+`docs/internal/fixed-suite-bugs/springboot/`.
+
+What that run does establish is the thing worth establishing: 39 classes of real
+Spring Boot — bean factories, environment binding, banner rendering, bootstrap
+contexts, availability events — execute through the split dispatch tiers with no
+behaviour change at all.
+
+Two notes on running it at all, both costs of a shared host:
+
+* The first release build was **OOM-killed**. 31 GB total, 25 in use by other
+  sessions, no swap, and `-C lto=fat -C codegen-units=1` did not fit.
+  `dmesg` names it plainly ("Out of memory: Killed process ... (rustc)"), but
+  cargo reports it as "could not compile", which reads like a code error.
+  `CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` built
+  in 3m25s. A thinner LTO is a different binary from the shipped one, which is
+  fine for a behavioural check and would not be for a timing one.
+* `-p cratonvm-vm-cli` does not exist; the package is `cratonvm-cli` and the
+  binary is `cratonvm`.
+
 ## The trap that only shows in the test build
 
 Moves out of `interpreter.rs` rewrite `super::` to `crate::runtime::`, because
