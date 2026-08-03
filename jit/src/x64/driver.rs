@@ -401,6 +401,7 @@ pub fn compile_with_param_slots(
         },
     ) {
         Ok(x) => {
+            crate::metrics::record_loop_xform_event("loop_xform_applied");
             if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
                 eprintln!(
                     "[JIT_GEN] bytecode loop rewrite: kind={:?} versioned={} header={} \
