@@ -1,10 +1,11 @@
 # The lowering contract
 
-**What this is.** The settled answer to `docs/known-issues/c2/hir-01`, which
-asked how many IR levels this compiler should have, who owns the oop-map
-obligation, what migration path keeps the tree green, and what the first
-increment buys. It is prose and a migration plan. It deliberately contains no
-crate skeleton, no trait hierarchy and no `mir/` directory.
+**What this is.** The settled answer to the `hir-01` lane
+(`docs/internal/hir-01-lowering-contract-RETIRED-20260803.md`), which asked how
+many IR levels this compiler should have, who owns the oop-map obligation, what
+migration path keeps the tree green, and what the first increment buys. It is
+prose and a migration plan. It deliberately contains no crate skeleton, no
+trait hierarchy and no `mir/` directory.
 
 **Every claim below was checked against the tree at `a9241eed` and the file and
 line are given.** Where the tree contradicted the brief, the delta is recorded
