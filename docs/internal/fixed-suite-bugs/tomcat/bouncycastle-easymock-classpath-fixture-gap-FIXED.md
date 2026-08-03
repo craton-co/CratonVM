@@ -159,8 +159,12 @@ future "CratonVM-only PASS" diff on them is expected, not suspicious.
 
 ## Out of scope (separate, already-filed issues)
 
-* `TestSSLValveWithProxy01/02` — need a real `httpd` binary, see
-  `docs/known-issues/tomcat/httpd-proxy-integration-windows-connection-refused.md`.
+* `TestSSLValveWithProxy01/02` — needed a real `httpd` binary; ✅ FIXED
+  2026-08-03, see
+  [httpd-proxy-integration-windows-FIXED-20260803.md](httpd-proxy-integration-windows-FIXED-20260803.md).
+  Standing that fixture up also exposed a real CratonVM defect underneath it
+  (the synthetic `Process` aliasing `java.lang.Process`'s own six field slots),
+  which had been failing all 9 classes in that family.
 * `TestOcspEnabled`, `TestSsl` — pre-existing flake noted in
   `serversocket-bind-socketaddress-noop-localport-zero-FIXED.md`, not this gap.
 * `objenesis` resolves to 3.3 from the Gradle cache where
