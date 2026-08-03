@@ -136,7 +136,7 @@ Class library and compatibility policy:
                                 Cargo feature, which is NOT in the default set;
                                 without it the launcher exits with an error
                                 instead of starting a VM with no class library.
-                                `--version --verbose` reports whether this build
+                                `-Xinternalversion` reports whether this build
                                 has it (jdk.mode.synthetic_compiled_in).
   --jdk-only                    Real JDK, and real class bytes are authoritative:
                                 no fabricated compatibility class and no

@@ -328,12 +328,12 @@ fixed constants, `LAUNCHER_DEFAULT_JDK_MODE = Real` and
 `EMBEDDED_DEFAULT_JDK_MODE = Synthetic`, neither derived from a Cargo feature
 or from host probing, and the only way to change either is an explicit flag or
 `VmConfig::with_jdk_mode`. The second launcher entry point (`libcratonvm`)
-calls `require_synthetic_jdk` too, and `--version --verbose` reports
+calls `require_synthetic_jdk` too, and `-Xinternalversion` reports
 `jdk.mode.synthetic_compiled_in` so the question is answerable before a run.
 
 Added here: `--help` now states the build requirement and points at that
-`--version` key (the rejection message alone is not documentation — it only
-appears after the run has already failed), plus
+`-Xinternalversion` key (the rejection message alone is not documentation — it
+only appears after the run has already failed), plus
 `the_usage_text_states_the_synthetic_jdk_build_requirement` and
 `real_jdk_flag_selects_real_mode_regardless_of_the_synthetic_feature`.
 
