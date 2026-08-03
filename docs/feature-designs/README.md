@@ -19,6 +19,7 @@ build and in what order*, including the cross-feature dependencies below.
 | [`real-cdi-bean-container.md`](../internal/fixed-suite-bugs/real-cdi-bean-container.md) | Retire the per-framework shim cluster (ArC/Spring/WildFly/MSC/Infinispan/Agroal) with real bytecode. | XL | general `<clinit>`/classloading fixes |
 | [`jep358-helpful-npe.md`](jep358-helpful-npe.md) | Helpful NPE messages via bci-context analysis + `getExtendedNPEMessage`. | M | JIT-NPE parity ← deopt |
 | [`proxy-real-classfile.md`](../internal/fixed-suite-bugs/proxy-real-classfile.md) | Generate a real `$ProxyN` class file (vs. name-lookup synthetic shim). | M | runtime defineClass (WP2.3) |
+| [`jit-machine-level-and-instruction-selection.md`](jit-machine-level-and-instruction-selection.md) | **Increment 0 landed; 1–4 on hold, and the hold is the result.** Four compiler levels, not three; the missing one is a machine list. Shadow selection measured **15.7–19.0%** tiler coverage on real compiles with `Rule::Lea`/`AluImm` firing zero times, so the next step is six 32-bit pattern rows — not a machine level. | S (then L, gated) | — |
 | [`embedding-api.md`](embedding-api.md) | `libcratonvm` C-ABI + JNI Invocation-API parity (`JNI_CreateJavaVM`). | L | — |
 | [`keystore-mldsa-mlkem.md`](keystore-mldsa-mlkem.md) | `KeyStore.getInstance` PKCS12/JKS + route ML-DSA/ML-KEM to a real provider. | M | — |
 

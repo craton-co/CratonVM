@@ -416,3 +416,36 @@ every promotion/load pattern that reaches this map — worth comparing what
 each failing class's boot sequence does differently (Jersey servlet
 init order, security filter chain construction, WebFlux vs. servlet dispatch)
 against the passing class rather than assuming a fourth independent cause.
+
+## Closure (2026-08-03)
+
+Re-verified from the same worktree/session that retired the companion
+`basicerrorcontroller-class-cluster-20260728.md` (same GC-family CCE
+signature, cross-referenced by both docs), since that doc's
+"Regression note (2026-08-01, again)" also named this doc's
+`DefaultSeparator` CCE as still open. It is not.
+
+**2 of 2 clean runs, zero occurrences of the `DefaultSeparator` CCE**, all
+3 classes named in the regression note above
+(`IntegrationGraphEndpointWebIntegrationTests`,
+`JerseyEndpointRequestIntegrationTests`,
+`ManagementWebSecurityAutoConfigurationTests`), one process per class, JIT
+on, default flags, real JDK 25
+(`/data/jdk25-real-20260717/jdk-25.0.3+9`), `-Parallel 1`, worktree
+`/data/data/wt-becit2-20260803` forked from `origin/dev` @ `a9241eedf3`,
+binary `cratonvm-becit2`:
+
+| run | IntegrationGraphEndpoint | JerseyEndpointRequest | ManagementWebSecurity |
+|---|---|---|---|
+| `pathcontainer-verify-20260803a` | PASS 76.6s | PASS 219.1s | PASS 100.6s |
+| `pathcontainer-verify-20260803b` | PASS 66.8s | PASS 112.1s | PASS 83.8s |
+
+No code change was needed or made — see the companion doc's closure section
+for why (no unmerged fix candidate explains it; the likeliest explanation
+is the same one given there: enough independent GC/JIT fixes have landed
+on `dev` since the 08-01 regression binary to shift the timing this
+reclaimed-object race depended on, with no single attributable commit).
+
+**Retiring this doc alongside its companion.** If the `DefaultSeparator`
+CCE reappears, treat it as a new report — this closure has no fix commit
+to point a regression at.

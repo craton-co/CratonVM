@@ -13,14 +13,17 @@ here — which lanes have a **first increment** rather than a finished lane.
 
 | Lane | Docs | Why it is untouched |
 |---|---|---|
-| HIR/LIR/MIR | ~~`hir-01`~~ **settled**, `hir-02` | The contract question is answered: `docs/jit/lowering-contract.md`. `hir-01` retired to `docs/internal/hir-01-lowering-contract-RETIRED-20260803.md` on 2026-08-03. `hir-02` is unblocked but should follow the contract's increment order, which starts with a step that emits nothing. |
-| Profile-guided inlining | `pgo-01`, `pgo-02` | The *policy* exists and is tested. The *evidence* it needs is not recorded, and the speculation it would enable has no guard/deopt pairing. |
+| HIR/LIR/MIR | ~~`hir-01`~~ ~~`hir-02`~~ **both closed 2026-08-03** | Consolidated into `docs/feature-designs/jit-machine-level-and-instruction-selection.md`. Four levels, not three; the report's "HIR" is the bytecode. Increment 0 (shadow selection, emits nothing) landed and measured **15.7–19.0%** coverage on real compiles with `Rule::Lea`/`AluImm` firing **zero** times — so the next step is six 32-bit pattern rows, not a machine level. |
+| Profile-guided inlining | ~~`pgo-01`~~, `pgo-02` | `pgo-01`'s first increment shipped 2026-08-03 — see `docs/internal/pgo-01-call-site-evidence-gap-RETIRED-20260803.md`. The *policy* still is not fed: `pgo-02`'s speculation has no guard/deopt pairing yet. |
 | OSR | `osr-01`, `osr-02` | OSR entry works. Its metadata contract and its exit/recompile story are the gaps. |
 | Loop transforms | `loop-01`, `loop-02` | One transform (bytecode unroll) is wired behind an opt-in. Everything else is unbuilt, and the planner refuses most compiles for reasons nobody has revisited. |
 | `x64.rs` / `invoke.rs` seams | `seam-01`, `seam-02` | 40k and 24k lines. The split is mechanical but every lane in the wave collided on these two files. |
 
 Plus `verify-01`, which is not a lane — it is the harness every lane above
-needs in order to prove it did not regress anything.
+needs in order to prove it did not regress anything. Its first increment
+shipped 2026-08-03 (`scripts/verify/compare.py` + fixture checks in the H2
+and Tomcat runners + real checked-in baselines for H2/Tomcat/Spring Boot) —
+see `docs/internal/verify-01-differential-harness-RETIRED-20260803.md`.
 
 ## Rules that made the last two waves work
 
@@ -51,17 +54,23 @@ shipped or narrowly avoided.
 
 ## Sequencing
 
-`hir-01` and `verify-01` are the only two with a hard ordering claim: nothing
+`hir-01` and `verify-01` were the only two with a hard ordering claim: nothing
 in the HIR lane should start before `hir-01` settles the contract, and every
 other lane is easier to land once `verify-01` exists. The rest are
 independent of each other by construction — that is what the ownership tables
-are for.
+are for. (The HIR ordering claim is discharged; `verify-01` still stands.)
 
-**`hir-01` closed 2026-08-03.** Its answer is `docs/jit/lowering-contract.md`.
-The one thing to carry into the other lanes: the contract's three-defect test
-scored **one of three**, so the HIR/MIR migration is *not* justified as a
-correctness investment, and its first increment emits no bytes and exists to
-produce the measurement that decides whether to continue. Answering rule 1
-("verify the premise") turned up three stale claims in neighbouring docs, two
-of which asserted that finished work was unfinished — the failure mode this
-directory's rule 1 was written for, in the direction nobody checks.
+**The HIR lane closed 2026-08-03**, both docs, into
+`docs/feature-designs/jit-machine-level-and-instruction-selection.md`. Three
+things to carry into the other lanes:
+
+1. The three-defect test scored **one of three**, so that migration was never
+   justified as a correctness investment — only by a measurement.
+2. The measurement then said **stop**: 15.7–19.0% coverage on real compiles,
+   with the two rules the migration was *for* firing zero times. A ten-shape
+   synthetic corpus had said 38.2% and named the wrong rules. **Do not size a
+   lane from a fixture's node mix.**
+3. Rule 1 ("verify the premise") turned up *five* stale claims, four of which
+   asserted that finished work was unfinished — the failure mode this
+   directory's rule 1 was written for, in the direction nobody checks. One was a
+   red test on `dev` that predated the lane entirely.
