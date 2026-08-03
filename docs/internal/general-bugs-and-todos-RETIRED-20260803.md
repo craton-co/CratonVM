@@ -116,9 +116,9 @@ the pre-upgrade parent, so its own fields overlap the parent's and
 "out-of-bounds field read ... undersized object layout" this function exists
 to prevent.
 
-Proven, not inferred. `a_subclass_above_the_live_class_count_still_gets_its_
-layout_recomputed` was run against a copy of the tree with the old loop
-restored:
+Proven, not inferred —
+`a_subclass_above_the_live_class_count_still_gets_its_layout_recomputed` was
+run against a copy of the tree with the old loop restored:
 
 ```
 test class_manager::tests::a_subclass_above_the_live_class_count_still_gets_its_layout_recomputed ... FAILED
@@ -148,11 +148,21 @@ ascending-id scan provided. Cost drops to `O(descendants)`.
 `upgrade_synthetic_class` re-parents through `set_superclass` rather than
 writing `class.superclass` through `get_mut`: a stub minted under one
 superclass whose real bytecode names another has to *move* its edge, and a raw
-field write would leave the propagation blind to it. `re_parenting_a_class_
-moves_its_edge_in_the_subclass_index` pins that, and
+field write would leave the propagation blind to it.
+`re_parenting_a_class_moves_its_edge_in_the_subclass_index` pins that, and
 `the_subclass_index_agrees_with_a_full_hierarchy_scan` pins the index against
 the brute-force answer it replaced (including topological order, and with a
 tombstone in the store).
+
+Three bootstrap sites in `vm_init` were doing exactly that raw write
+(`Enumeration$Impl`, `Comparator$Native`, the unmodifiable-view wrappers) and
+are routed through the new `ClassManager::set_superclass`. Inert in practice —
+the new parent is `java/lang/Object`, whose layout never grows — but they were
+written that way for no reason other than that it is the obvious way to write
+the line, which is why the fix is paired with a gate:
+`superclass_is_only_ever_written_through_set_superclass` walks the workspace
+and fails on any raw write outside `class.rs`. There is no failure at the point
+of the mistake, so a comment would not have held.
 
 ### 2c. `unregister_class_layout` swept the whole version map
 
