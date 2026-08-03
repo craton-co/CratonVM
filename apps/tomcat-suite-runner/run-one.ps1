@@ -53,7 +53,16 @@ if ($Vm -eq 'hotspot') {
   if (-not $Exe) { throw '-Exe is required for -Vm craton' }
   $exePath = $Exe
 }
-$argv = @("-Xmx$MaxHeap", '-cp', $cp)
+# org.apache.tomcat.integration.httpd.* starts a real Apache httpd reverse
+# proxy per test; TesterHttpd looks for a literal "httpd" on PATH unless this
+# property points at one, and Windows has no httpd on PATH. See
+# setup-httpd-windows.ps1, which unpacks the tree this default points at.
+# Inert for every other class (nothing else reads the property), so it is set
+# unconditionally rather than behind a switch.
+$Httpd = 'C:\craton\tools\Apache24\bin\httpd.exe'
+$argv = @("-Xmx$MaxHeap")
+if (Test-Path $Httpd) { $argv += "-Dtomcat.test.httpd.path=$Httpd" }
+$argv += @('-cp', $cp)
 if ($Class) { $argv += @('org.junit.runner.JUnitCore', $Class) }
 else        { $argv += @($Main) + $Args2 }
 
