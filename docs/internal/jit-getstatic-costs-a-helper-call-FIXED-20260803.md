@@ -133,6 +133,56 @@ The helper arm routes `RAX == i64::MIN` through
 that. The inline form makes no call, so it has no sentinel and no ambiguity. The
 helper path is still reachable (see the refusals above) and still has it.
 
+## A tear round 2 shipped, found while validating round 3
+
+`probes/StaticRaceProbe.java` (new) points four reader threads at statics that a
+fifth thread flips between two known values, and asserts every value read is one
+of the two. It found this, in seconds:
+
+```
+static long  flipped between 0x0123456789ABCDEF and 0x7EDCBA9876543210
+                       read back as 0x7EDCBA9889ABCDEF
+```
+
+— the high half of one value with the low half of the other. Round 2's
+`StaticsIndex::get` copied the whole 16-byte `Value` cell in one go, and a
+16-byte access is **not** single-copy atomic on x86-64. For a plain
+`long`/`double` static JLS §17.7 permits a non-atomic read; the same probe tore
+a **`static volatile long`** too, which it does not permit, and it tore under
+`--nojit` as well — `get_static_shared` is the interpreter's path into the same
+function.
+
+Fixed here: `get` now reads the cell as two aligned 8-byte `read_volatile`s and
+transmutes the pair back. The discriminant word and any 4-byte payload share the
+low word; an 8-byte payload *is* the high word; so no payload spans a load. No
+knowledge of the enum's discriminant encoding is needed — only its size — and
+every bit pattern assemblable from two writes is still a valid `Value` (the
+`Object` variant's niche makes a zero pointer word `None`, never an invalid
+`NonNull`).
+
+| mode | before | after |
+|---|---|---|
+| CratonVM, inline `getstatic` (round 3) | PASS | PASS |
+| CratonVM, helper `getstatic` | **FAIL** (torn volatile long) | PASS |
+| CratonVM, `--nojit` (interpreter) | **FAIL** (torn volatile long) | PASS |
+| HotSpot | PASS | PASS |
+
+Two things worth keeping:
+
+* **Round 3's inline load was already immune**, for free: one aligned 8-byte
+  load of the payload word cannot tear. Narrowing the read is what fixed the
+  other two paths.
+* **The store side needed no change, and that is a measurement rather than an
+  assumption**: with the read narrowed, 15 s x 4 readers x 3 modes saw no tear,
+  which is only possible if the payload qword is already stored atomically.
+
+The Rust-level test (`get_never_returns_a_torn_long`) pins the invariant in CI
+but does **not** reproduce the historical tear on its own — whether rustc emits
+one wide copy or two narrow loads depends on the inlining context, and in that
+test's context it already chose the narrow form (checked by reverting the fix:
+the Java probe still tore, the Rust test still passed). A future rewrite of
+`get` has to be re-checked against the probe.
+
 ## The measurement trap: this probe was measuring the interpreter
 
 Worth more than the fix. Run as its old reproduction line said, every rung read
