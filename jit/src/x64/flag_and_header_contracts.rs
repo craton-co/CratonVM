@@ -54,6 +54,7 @@ fn backend_sources() -> String {
         include_str!("arrays.rs"),
         include_str!("objects.rs"),
         include_str!("inlining.rs"),
+        include_str!("loop_rewrite.rs"),
         include_str!("tests.rs"),
         include_str!("flag_and_header_contracts.rs"),
         include_str!("loop_unroll_admission.rs"),
