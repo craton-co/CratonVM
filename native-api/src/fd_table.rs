@@ -955,7 +955,49 @@ impl FileDescriptorTable {
         }
     }
 
-    /// Sequential read from a FileReadWrite file (advances the cursor).
+    /// Run `f` against the `Seek` view of **any** file-backed entry.
+    ///
+    /// All three file variants are seekable, but two of them are wrapped in a
+    /// buffer, so we hand `f` the *wrapper* rather than the inner `fs::File`:
+    /// `BufReader`'s `Seek` impl reconciles/discards its read-ahead buffer and
+    /// its `stream_position` subtracts the unconsumed remainder, while
+    /// `BufWriter`'s flushes pending bytes at their original offset *before*
+    /// moving the cursor and its `stream_position` adds the pending length.
+    /// Seeking the file behind either wrapper's back would strand the buffer —
+    /// a reader would keep serving pre-seek bytes, a writer would flush its
+    /// pending bytes at the new offset. (`pread_at`/`pwrite_at` already work
+    /// this way; see their comments.)
+    ///
+    /// Accepting only `FileReadWrite` here is what produced
+    /// `IOException: seek0: bad fd for rw_seek` for every `FileChannel`
+    /// obtained from a `FileInputStream`/`FileOutputStream` — those register as
+    /// `FileRead`/`FileWrite`, and on Windows `FileChannelImpl.transferToDirect`
+    /// brackets each transfer with `position()`/`position(pos)`
+    /// (`transferToDirectlyNeedsPositionLock()` is `true` there), so
+    /// `ExpandWar.copy`'s `ic.transferTo(pos, size, oc)` threw on its first
+    /// call. Keep every seek/position/size accessor below routed through this
+    /// helper so the variant list cannot drift apart again.
+    fn with_seekable<R>(
+        &self,
+        fd: FdId,
+        what: &'static str,
+        f: impl FnOnce(&mut dyn io::Seek) -> Result<R, io::Error>,
+    ) -> Result<R, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad fd for {what}")))?;
+        match &*entry {
+            FileEntry::FileReadWrite(file) => f(&mut *file.lock()),
+            FileEntry::FileRead(reader) => f(&mut *reader.lock()),
+            FileEntry::FileWrite(writer) => f(&mut *writer.lock()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("bad fd for {what}"),
+            )),
+        }
+    }
+
+    /// Sequential read from a readable file entry (advances the cursor).
     pub fn rw_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
         let entry = self
             .get_entry(fd)
@@ -965,6 +1007,10 @@ impl FileDescriptorTable {
                 let mut f = file.lock();
                 f.read(buf)
             }
+            // A `FileInputStream`-backed channel. Read *through* the
+            // `BufReader` (as `read_bytes` does) so a preceding `rw_seek`,
+            // which moved the wrapper and not the inner file, is honoured.
+            FileEntry::FileRead(reader) => reader.lock().read(buf),
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for rw_read",
@@ -972,7 +1018,7 @@ impl FileDescriptorTable {
         }
     }
 
-    /// Sequential write to a FileReadWrite file (advances the cursor).
+    /// Sequential write to a writable file entry (advances the cursor).
     pub fn rw_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
         use io::Write;
         let entry = self
@@ -983,6 +1029,16 @@ impl FileDescriptorTable {
                 let mut f = file.lock();
                 f.write(data)
             }
+            // A `FileOutputStream`-backed channel. Write through the
+            // `BufWriter` and flush, matching `write_bytes`'s
+            // immediate-visibility contract (Java's `FileOutputStream.write`
+            // is unbuffered) and keeping the wrapper's cursor authoritative.
+            FileEntry::FileWrite(writer) => {
+                let mut w = writer.lock();
+                let n = w.write(data)?;
+                w.flush()?;
+                Ok(n)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for rw_write",
@@ -990,40 +1046,16 @@ impl FileDescriptorTable {
         }
     }
 
-    /// Seek in a FileReadWrite file. Returns new position.
+    /// Seek in a file-backed entry. Returns the new position.
     pub fn rw_seek(&self, fd: FdId, pos: io::SeekFrom) -> Result<u64, io::Error> {
         use io::Seek;
-        let entry = self
-            .get_entry(fd)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_seek"))?;
-        match &*entry {
-            FileEntry::FileReadWrite(file) => {
-                let mut f = file.lock();
-                f.seek(pos)
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "bad fd for rw_seek",
-            )),
-        }
+        self.with_seekable(fd, "rw_seek", |s| s.seek(pos))
     }
 
-    /// Get the current position in a FileReadWrite file.
+    /// Get the current position in a file-backed entry.
     pub fn rw_position(&self, fd: FdId) -> Result<u64, io::Error> {
         use io::Seek;
-        let entry = self
-            .get_entry(fd)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_position"))?;
-        match &*entry {
-            FileEntry::FileReadWrite(file) => {
-                let mut f = file.lock();
-                f.stream_position()
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "bad fd for rw_position",
-            )),
-        }
+        self.with_seekable(fd, "rw_position", |s| s.stream_position())
     }
 
     /// Clone the underlying `std::fs::File` for any file-backed entry.
@@ -1051,8 +1083,9 @@ impl FileDescriptorTable {
         }
     }
 
-    /// Set the length of a FileReadWrite file (truncate or extend).
+    /// Set the length of a writable file entry (truncate or extend).
     pub fn rw_set_length(&self, fd: FdId, len: u64) -> Result<(), io::Error> {
+        use io::Write;
         let entry = self
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_set_length"))?;
@@ -1061,6 +1094,16 @@ impl FileDescriptorTable {
                 let f = file.lock();
                 f.set_len(len)
             }
+            // `FileChannel.truncate()` on a `FileOutputStream`-backed channel.
+            // Flush first: buffered bytes belong to the pre-truncation file, so
+            // letting them land afterwards would re-extend it behind the
+            // caller's back. The JDK adjusts the channel position itself after
+            // a truncate, so we only resize here.
+            FileEntry::FileWrite(writer) => {
+                let mut w = writer.lock();
+                w.flush()?;
+                w.get_ref().set_len(len)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for rw_set_length",
@@ -1068,12 +1111,14 @@ impl FileDescriptorTable {
         }
     }
 
-    /// Flush a FileReadWrite file's contents to stable storage. Used by
+    /// Flush a file entry's contents to stable storage. Used by
     /// `RandomAccessFile` modes `"rws"` (`data_only == false` → `sync_all`,
     /// data + metadata) and `"rwd"` (`data_only == true` → `sync_data`, data
     /// only) which require every write to reach durable storage before the
-    /// call returns.
+    /// call returns, and by `FileDescriptor.sync()` — which Java allows on the
+    /// descriptor of a plain `FileOutputStream`, hence the `FileWrite` arm.
     pub fn rw_sync(&self, fd: FdId, data_only: bool) -> Result<(), io::Error> {
+        use io::Write;
         let entry = self
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for rw_sync"))?;
@@ -1086,6 +1131,22 @@ impl FileDescriptorTable {
                     f.sync_all()
                 }
             }
+            FileEntry::FileWrite(writer) => {
+                // Buffered bytes are not "written" as far as the kernel is
+                // concerned, so they must reach it before we ask for the sync.
+                let mut w = writer.lock();
+                w.flush()?;
+                if data_only {
+                    w.get_ref().sync_data()
+                } else {
+                    w.get_ref().sync_all()
+                }
+            }
+            // No `FileRead` arm on purpose: a read-only handle has nothing to
+            // flush, and `FlushFileBuffers` on one fails with
+            // ERROR_ACCESS_DENIED on Windows (it needs GENERIC_WRITE), so
+            // "succeeding" here would mean lying on one platform and erroring
+            // on the other.
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for rw_sync",
@@ -1110,6 +1171,22 @@ impl FileDescriptorTable {
             FileEntry::FileRead(reader) => {
                 let mut r = reader.lock();
                 let inner = r.get_mut();
+                let saved = inner.stream_position()?;
+                let size = inner.seek(SeekFrom::End(0))?;
+                inner.seek(SeekFrom::Start(saved))?;
+                Ok(size)
+            }
+            // `FileChannel.size()` on a `FileOutputStream`-backed channel —
+            // also the `position()` path for an *append*-mode channel, which
+            // the JDK answers with `nd.size(fd)` rather than a seek. Flush
+            // first so buffered-but-unwritten bytes count toward the size, then
+            // measure the inner file and restore its cursor (the `BufWriter`'s
+            // own position is derived from it).
+            FileEntry::FileWrite(writer) => {
+                use io::Write;
+                let mut w = writer.lock();
+                w.flush()?;
+                let inner = w.get_mut();
                 let saved = inner.stream_position()?;
                 let size = inner.seek(SeekFrom::End(0))?;
                 inner.seek(SeekFrom::Start(saved))?;
@@ -3464,5 +3541,127 @@ mod tests {
         let as_io: io::Error = err.into();
         assert_eq!(as_io.kind(), io::ErrorKind::PermissionDenied);
         assert!(as_io.to_string().contains("file-read"), "{as_io}");
+    }
+
+    // -----------------------------------------------------------------------
+    // seek/position/size/truncate on `FileRead` + `FileWrite` entries.
+    //
+    // `FileChannel`s obtained from a `FileInputStream`/`FileOutputStream` are
+    // backed by these two variants, and on Windows the JDK's
+    // `FileChannelImpl.transferToDirect` calls `position()` (=> `rw_seek`) on
+    // the source before every transfer. Accepting only `FileReadWrite` here
+    // made `ExpandWar.copy` — and so all of `TestManagerWebapp` — fail with
+    // `IOException: seek0: bad fd for rw_seek`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rw_seek_and_position_work_on_a_read_fd() {
+        let path = temp_file_with("0123456789");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_read(&path).unwrap();
+
+        assert_eq!(table.rw_position(fd).unwrap(), 0);
+        assert_eq!(table.rw_seek(fd, io::SeekFrom::Start(4)).unwrap(), 4);
+        assert_eq!(table.rw_position(fd).unwrap(), 4);
+
+        // The seek must be honoured by the following sequential read — i.e.
+        // the BufReader's own buffer was reconciled, not left stale.
+        let mut buf = [0u8; 3];
+        assert_eq!(table.rw_read(fd, &mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"456");
+        assert_eq!(table.rw_position(fd).unwrap(), 7);
+        // ...and by `read_bytes`, which the `read0` native uses.
+        let mut buf2 = [0u8; 3];
+        assert_eq!(table.read_bytes(fd, &mut buf2).unwrap(), 3);
+        assert_eq!(&buf2, b"789");
+
+        assert_eq!(table.rw_seek(fd, io::SeekFrom::End(-2)).unwrap(), 8);
+        assert_eq!(table.file_size(fd).unwrap(), 10);
+        table.close(fd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rw_seek_position_and_size_work_on_a_write_fd() {
+        let path = temp_path("seek_write_fd");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_write(&path, false).unwrap();
+
+        assert_eq!(table.rw_position(fd).unwrap(), 0);
+        table.write_bytes(fd, b"abcdef").unwrap();
+        assert_eq!(table.rw_position(fd).unwrap(), 6);
+        assert_eq!(table.file_size(fd).unwrap(), 6);
+
+        // Re-seek and overwrite in place; the bytes must land at offset 2.
+        assert_eq!(table.rw_seek(fd, io::SeekFrom::Start(2)).unwrap(), 2);
+        assert_eq!(table.rw_write(fd, b"XY").unwrap(), 2);
+        assert_eq!(table.rw_position(fd).unwrap(), 4);
+        table.close(fd).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"abXYef");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rw_set_length_truncates_a_write_fd() {
+        let path = temp_path("truncate_write_fd");
+        let table = FileDescriptorTable::new();
+        let fd = table.open_write(&path, false).unwrap();
+        table.write_bytes(fd, b"abcdefgh").unwrap();
+        table.rw_set_length(fd, 3).unwrap();
+        assert_eq!(table.file_size(fd).unwrap(), 3);
+        table.close(fd).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rw_sync_accepts_a_write_fd() {
+        let path = temp_path("sync_fds");
+        let table = FileDescriptorTable::new();
+        let wfd = table.open_write(&path, false).unwrap();
+        table.write_bytes(wfd, b"durable").unwrap();
+        table.rw_sync(wfd, true).unwrap();
+        table.rw_sync(wfd, false).unwrap();
+        table.close(wfd).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"durable");
+
+        // A read-only handle stays rejected — see the comment on `rw_sync`.
+        let rfd = table.open_read(&path).unwrap();
+        assert!(table.rw_sync(rfd, false).is_err());
+        table.close(rfd).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn seek_family_still_rejects_non_file_fds() {
+        let table = FileDescriptorTable::new();
+        // stdout is not seekable — the error text callers match on must stay.
+        let err = table.rw_seek(1, io::SeekFrom::Start(0)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("bad fd for rw_seek"), "{err}");
+        assert!(table.rw_position(1).is_err());
+        assert!(table.file_size(1).is_err());
+        assert!(table.rw_set_length(1, 0).is_err());
+        // ...and an fd that was never opened.
+        let err = table.rw_seek(4242, io::SeekFrom::Start(0)).unwrap_err();
+        assert!(err.to_string().contains("bad fd for rw_seek"), "{err}");
+    }
+
+    #[test]
+    fn rw_read_and_rw_write_keep_their_direction() {
+        let rpath = temp_file_with("data");
+        let wpath = temp_path("direction_write");
+        let table = FileDescriptorTable::new();
+        let rfd = table.open_read(&rpath).unwrap();
+        let wfd = table.open_write(&wpath, false).unwrap();
+
+        assert!(table.rw_write(rfd, b"X").is_err());
+        let mut buf = [0u8; 1];
+        assert!(table.rw_read(wfd, &mut buf).is_err());
+
+        table.close(rfd).unwrap();
+        table.close(wfd).unwrap();
+        let _ = fs::remove_file(&rpath);
+        let _ = fs::remove_file(&wpath);
     }
 }
