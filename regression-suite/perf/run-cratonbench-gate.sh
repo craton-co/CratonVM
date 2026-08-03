@@ -230,7 +230,7 @@ REACH_ADM_TOTAL=0
 REACH_BOD_TOTAL=0
 REACH_MEASURED=0
 REACH_BROKEN=0
-record_reach() {  # record_reach <phase> <requests> <admitted> <bodies> <compiles_c1> <compiles_c2>
+record_reach() {  # record_reach <phase> <requests> <admitted> <bodies> <c1> <c2> <osr>
     case "$2$3$4" in
         *-*)
             printf 'ir_reach_%s\tNOT RECORDED (phase produced no usable run)\n' "$1" >> "$MANIFEST"
@@ -246,33 +246,42 @@ record_reach() {  # record_reach <phase> <requests> <admitted> <bodies> <compile
     # 1. Monotonicity. Every body came from an admitted method and every
     #    admitted method came from a request, so requests >= admitted >=
     #    bodies is a property of the pipeline, not of this run.
-    # 2. A non-OSR compile that never appeared at the admission chain.
-    #    `compiles_c1`/`compiles_c2` come from a DIFFERENT line, emitted by a
-    #    different module (the tier manager's shutdown summary), and neither
-    #    a C1 nor a C2 compile can happen without passing the chain — the C1
-    #    ones report `optimize=false` there and are counted in `requests`.
-    #    So `c1+c2 > 0` with `requests == 0` is not a workload fact; it is
-    #    this scrape being broken.
+    # 2. More non-OSR compiles than requests. `compiles_c1`/`compiles_c2`/
+    #    `compiles_osr` come from a DIFFERENT line, emitted by a different
+    #    module (the tier manager's shutdown summary), and a non-OSR compile
+    #    cannot happen without passing the chain — the C1 ones report
+    #    `optimize=false` there and are counted in `requests` too. So
+    #    `c1 + c2 - osr > requests` is not a workload fact; it is this scrape
+    #    reading a log that no longer says what it expects.
     #
-    #    OSR is deliberately not in that sum. An OSR compile goes through
-    #    `compile_osr_artifact`, which calls the backend directly — a second
-    #    compile door that does not pass this chain — so `osr > 0` alongside
-    #    `requests == 0` is exactly what a phase that is one long loop inside
-    #    one method looks like, which is most of CratonBench.
-    _c1=${5:--}; _c2=${6:--}
+    #    OSR is subtracted, and that correction is measured rather than
+    #    assumed. An OSR compile goes through `compile_osr_artifact`, which
+    #    calls the backend directly — a second compile door that does not
+    #    pass this chain — but the tier manager still counts it under the
+    #    TIER it was requested at, so a C2-tier OSR compile lands in `c2=`.
+    #    On the Azure bench host 2026-08-03 the `arithmetic` phase reports
+    #    `c1=0 c2=1 osr=1` with zero admission lines: that single C2 compile
+    #    IS the OSR one. Without the subtraction this check called that
+    #    phase's genuine reach of zero a broken scrape — which is what a
+    #    phase that is one long loop inside one method looks like, and that
+    #    is most of CratonBench.
+    _c1=${5:--}; _c2=${6:--}; _osr=${7:--}
     [ "$_c1" = "-" ] && _c1=0
     [ "$_c2" = "-" ] && _c2=0
+    [ "$_osr" = "-" ] && _osr=0
+    _nonosr=$(( _c1 + _c2 - _osr ))
+    [ "$_nonosr" -lt 0 ] && _nonosr=0
     _suffix=""
     if [ "$2" -lt "$3" ] || [ "$3" -lt "$4" ]; then
         echo "  $1: REACH SCRAPE BROKEN — requests=$2 admitted=$3 bodies=$4 is not monotone." >&2
         _suffix=" SCRAPE-BROKEN (not monotone)"
         REACH_BROKEN=$((REACH_BROKEN + 1))
-    elif [ "$2" -eq 0 ] && [ $(( _c1 + _c2 )) -gt 0 ]; then
-        echo "  $1: REACH SCRAPE BROKEN — the tier manager reports c1=$_c1 c2=$_c2 but no" >&2
-        echo "      compile request reached the admission chain. The '[ir] admission' line" >&2
-        echo "      in jit/src/lib.rs has moved or been reworded; this run's reach is not a" >&2
-        echo "      measured zero and must not be read as one." >&2
-        _suffix=" SCRAPE-BROKEN (c1=$_c1 c2=$_c2 compiled but no request seen; NOT a measured zero)"
+    elif [ "$_nonosr" -gt "$2" ]; then
+        echo "  $1: REACH SCRAPE BROKEN — the tier manager reports c1=$_c1 c2=$_c2 osr=$_osr" >&2
+        echo "      ($_nonosr non-OSR compiles) but only $2 request(s) reached the admission" >&2
+        echo "      chain. The '[ir] admission' line in jit/src/lib.rs has moved or been" >&2
+        echo "      reworded; this run's reach must not be read as measured." >&2
+        _suffix=" SCRAPE-BROKEN ($_nonosr non-OSR compiles vs $2 requests; NOT measured)"
         REACH_BROKEN=$((REACH_BROKEN + 1))
     fi
 
@@ -692,9 +701,9 @@ EOD
     # so adding one column in the middle of the sample row would have
     # silently re-pointed every maximum at its neighbour, with no error and
     # no obviously wrong number.
-    read -r a_rss a_c1 a_c2 a_gcn a_gcp50 a_gcp99 a_gcmax a_irreq a_iradm a_irbod <<EOD
+    read -r a_rss a_c1 a_c2 a_osr a_gcn a_gcp50 a_gcp99 a_gcmax a_irreq a_iradm a_irbod <<EOD
 $(awk -F'\t' -v p="$phase" \
-    -v want="peak_rss_kb compiles_c1 compiles_c2 gc_young_count gc_young_p50_us gc_young_p99_us gc_young_max_us ir_requests ir_admitted ir_bodies" '
+    -v want="peak_rss_kb compiles_c1 compiles_c2 compiles_osr gc_young_count gc_young_p50_us gc_young_p99_us gc_young_max_us ir_requests ir_admitted ir_bodies" '
     BEGIN { nw = split(want, wname, " ") }
     /^#/ && NR == 1 {
         for (i = 1; i <= NF; i++) { h = $i; sub(/^#/, "", h); idx[h] = i }
@@ -724,7 +733,7 @@ EOD
             "$want_sum" "$base_ms" "$status" "-" "calibrate" \
             "$a_rss" "$a_c1" "$a_c2" "$a_gcn" "$a_gcp50" "$a_gcp99" "$a_gcmax" \
             "$a_irreq" "$a_iradm" "$a_irbod" >> "$SUMMARY"
-        record_reach "$phase" "$a_irreq" "$a_iradm" "$a_irbod" "$a_c1" "$a_c2"
+        record_reach "$phase" "$a_irreq" "$a_iradm" "$a_irbod" "$a_c1" "$a_c2" "$a_osr"
         continue
     fi
 
@@ -747,7 +756,7 @@ EOD
         "$want_sum" "$base_ms" "$status" "$budget" "$verdict" \
         "$a_rss" "$a_c1" "$a_c2" "$a_gcn" "$a_gcp50" "$a_gcp99" "$a_gcmax" \
         "$a_irreq" "$a_iradm" "$a_irbod" >> "$SUMMARY"
-    record_reach "$phase" "$a_irreq" "$a_iradm" "$a_irbod" "$a_c1" "$a_c2"
+    record_reach "$phase" "$a_irreq" "$a_iradm" "$a_irbod" "$a_c1" "$a_c2" "$a_osr"
 done <<EOF
 $BASELINE_BODY
 EOF

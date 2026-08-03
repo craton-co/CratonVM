@@ -44,10 +44,17 @@
 # that summary reports compiles and this scrape saw no admission line, the
 # scrape is broken and the run is refused rather than reported as zero.
 #
-# (OSR is deliberately excluded from that check. An OSR compile goes through
-# `compile_osr_artifact`, which calls the backend directly — a second compile
-# door that does not pass this chain — so `osr=N` with zero requests is
-# normal, and is what a phase that is one long loop in one method looks like.)
+# OSR is subtracted before that comparison, and the reason is measured, not
+# assumed. An OSR compile goes through `compile_osr_artifact`, which calls the
+# backend directly — a second compile door that does not pass the admission
+# chain — but it is still counted by the tier manager under the TIER it was
+# requested at, so a C2-tier OSR compile lands in `c2=`. Measured on the Azure
+# bench host 2026-08-03: CratonBench's `arithmetic` phase reports
+# `c1=0 c2=1 osr=1` with zero admission lines. That one C2 compile is the OSR
+# one. A check that did not subtract `osr` called this phase's genuine reach
+# of zero a broken scrape — which is why the comparison is
+# `c1 + c2 - osr > requests`, and why `osr>0` with `requests=0` is normal for
+# a phase that is one long loop inside one method.
 #
 # Exit codes: 0 = measured (whatever the workload's own exit code), 2 = usage
 # or setup error, 3 = refused — the witness disagrees with the scrape, or the
@@ -113,11 +120,13 @@ if [ "$REQ" -lt "$ADM" ] || [ "$ADM" -lt "$BOD" ]; then
     echo "  request, so this is the scrape misreading the log, not the VM." >&2
     exit 3
 fi
-if [ "$REQ" -eq 0 ] && [ $(( WC1 + WC2 )) -gt 0 ]; then
-    echo "REFUSED: the tier manager reports c1=$WC1 c2=$WC2 but no compile request" >&2
-    echo "  reached the admission chain. A non-OSR compile cannot do that, so the" >&2
-    echo "  '[ir] admission' line in jit/src/lib.rs has moved or been reworded." >&2
-    echo "  This is NOT a measured reach of zero. Raw stderr: $ERR" >&2
+NONOSR=$(( WC1 + WC2 - WOSR )); [ "$NONOSR" -lt 0 ] && NONOSR=0
+if [ "$NONOSR" -gt "$REQ" ]; then
+    echo "REFUSED: the tier manager reports c1=$WC1 c2=$WC2 osr=$WOSR — $NONOSR non-OSR" >&2
+    echo "  compile(s) — but only $REQ compile request(s) reached the admission chain." >&2
+    echo "  A non-OSR compile cannot do that, so the '[ir] admission' line in" >&2
+    echo "  jit/src/lib.rs has moved or been reworded and this scrape is reading a log" >&2
+    echo "  that no longer says what it expects. Raw stderr: $ERR" >&2
     exit 3
 fi
 
