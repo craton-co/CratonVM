@@ -4763,20 +4763,29 @@ pub struct InlineBackendCaps {
 }
 
 impl InlineBackendCaps {
-    /// What `x64::compile` can do TODAY, verified against the source:
+    /// What `x64::compile` can do, verified against the source (updated
+    /// 2026-08-03, PGO-02):
     ///
-    ///  * `invokestatic` consults `inline_sites` (x64.rs:17274) and
-    ///    `invokespecial` does too (x64.rs:19463, whose own comment reads
-    ///    "invokespecial only — virtual/interface not eligible"), so
-    ///    statically bound splicing is real;
-    ///  * the `0xb6 | 0xb7 | 0xb9` arm never consults `inline_sites` for
-    ///    `0xb6`/`0xb9`, and its plain direct-call path (x64.rs:20716) emits an
-    ///    unconditional `CALL` with no receiver test — the `guard_class_id`
-    ///    compare exists only inside the String and CRC32 intrinsic ladders.
+    ///  * `invokestatic` consults `inline_sites` and `invokespecial` does
+    ///    too (statically bound DirectBind splicing, pre-existing);
+    ///  * the `0xb6 | 0xb7 | 0xb9` arm's `op == 0xb6 || op == 0xb9` case NOW
+    ///    ALSO consults `inline_sites` plus a companion
+    ///    `inline_guard_class_ids` map, when both carry an entry for the
+    ///    pc — populated together, only for an admitted `Monomorphic`
+    ///    verdict. See `docs/feature-designs/profile-guided-inlining.md` §5
+    ///    for the exact guard-then-splice lowering and why a miss falls
+    ///    through to the SAME unguarded direct-call path below rather than a
+    ///    deopt (the `guard_class_id` compare inside the String/CRC32
+    ///    intrinsic ladders is a separate, pre-existing mechanism this does
+    ///    not touch).
     ///
-    /// So a speculative plan has nowhere to be emitted and is refused. See
-    /// `docs/jit/profile-guided-inlining.md` for the exact backend edit that
-    /// would flip the second flag.
+    /// `guarded_inline_body_at_virtual_sites` below is still hard-coded
+    /// `false`: the flip to `true` happens at the `plan_inline` call site in
+    /// `try_compile_inner`, derived from whether a `class_id_name_resolver`
+    /// was threaded in — which the VM only does when
+    /// `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is set (default-off, unsoaked).
+    /// Every caller that doesn't opt in gets this const fn's `false`,
+    /// byte-for-byte the pre-PGO-02 behavior.
     pub const fn single_pass_x64() -> InlineBackendCaps {
         InlineBackendCaps {
             inline_body_at_static_sites: true,

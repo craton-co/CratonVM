@@ -19748,6 +19748,128 @@ impl Compiler {
                         }
                     }
 
+                    // PGO-02 (docs/feature-designs/profile-guided-inlining.md):
+                    // guarded MONOMORPHIC virtual/interface inline. `inline_sites`
+                    // + `inline_guard_class_ids` are populated TOGETHER, only for
+                    // an admitted `InlineVerdict::Monomorphic` plan, only when
+                    // `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is on (see
+                    // `InlineBackendCaps` in jit/src/lib.rs) — with the flag off
+                    // `inline_guard_class_ids` is always empty and this whole
+                    // block costs one HashMap probe. Splices the callee body via
+                    // the SAME `try_emit_inline` the invokespecial check above
+                    // already uses, behind a receiver class-id guard; the miss
+                    // edge falls through UNCHANGED to the normal dispatch code
+                    // below (MIC/PIC/`jit_invoke_dispatch`) — never a deopt (see
+                    // the design doc's §3 deopt-safety argument: no caller
+                    // scopes are populated, so this relies on — and does not
+                    // change — the existing guarantee that nothing inside an
+                    // inlined body publishes a deopt point).
+                    let mut guarded_virtual_done_patch: Option<usize> = None;
+                    if op != 0xb7 {
+                        if let (Some(guard_class_id), Some(site)) = (
+                            self.inline_guard_class_ids.get(&pc).copied(),
+                            self.inline_sites.get(&pc).cloned(),
+                        ) {
+                            let recv_depth = site.callee_num_args;
+                            if recv_depth >= 1 && self.stack.len() >= recv_depth {
+                                let recv_slot = self.stack[self.stack.len() - recv_depth];
+
+                                // Full state snapshot from BEFORE any guard byte
+                                // is emitted — mirrors try_emit_inline's own
+                                // checkpoint set exactly (see its comment on the
+                                // groovyjarjarasm-asm-handler-getexceptiontablesize
+                                // fix for why every one of these fields matters),
+                                // so a rewind on either failure path below is
+                                // indistinguishable from never having attempted
+                                // this guard at all.
+                                let buf_checkpoint = self.buf.pos();
+                                let stack_checkpoint = self.stack.clone();
+                                let oop_marks_checkpoint = self.stack_oop_marks.clone();
+                                let spill_checkpoint = self.next_spill_offset;
+                                let exception_check_stubs_checkpoint =
+                                    self.exception_check_stubs.len();
+                                let deopt_stubs_checkpoint = self.deopt_stubs.len();
+                                let forward_patches_checkpoint = self.forward_patches.len();
+                                let jump_table_patches_checkpoint =
+                                    self.jump_table_patches.len();
+                                let self_call_patches_checkpoint = self.self_call_patches.len();
+                                let bounds_check_stubs_checkpoint =
+                                    self.bounds_check_stubs.len();
+                                let null_check_store_stubs_checkpoint =
+                                    self.null_check_store_stubs.len();
+
+                                // Guard: null receiver -> miss. Class mismatch ->
+                                // miss. Peeked, not popped — try_emit_inline does
+                                // its own popping on the hit path below, and the
+                                // miss path needs the receiver+args untouched for
+                                // the normal-dispatch code that runs next.
+                                self.load_slot_to_reg(RAX, recv_slot);
+                                self.emit_test_r64_r64(RAX);
+                                let mut miss_patches: Vec<usize> = Vec::with_capacity(2);
+                                miss_patches.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // CMP DWORD [RAX+0], guard_class_id — identical
+                                // encoding to the String/CRC32 intrinsic guard
+                                // above (81 /7 id, ModRM 0x78 = mod00 /7 rm=RAX).
+                                self.buf.emit(&[0x81, 0x78, 0x00]);
+                                self.buf.emit(&guard_class_id.to_le_bytes());
+                                miss_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                if self.try_emit_inline(pc) {
+                                    // Hit: skip the about-to-be-emitted
+                                    // normal-dispatch bytes entirely.
+                                    guarded_virtual_done_patch =
+                                        Some(self.emit_jmp_rel32_patch());
+                                    // Land every guard-miss branch right here —
+                                    // the start of the UNCHANGED normal-dispatch
+                                    // code that is about to run next.
+                                    for p in miss_patches {
+                                        self.patch_rel32_to_here(p);
+                                    }
+                                    // The inline body already consumed the
+                                    // receiver+args and pushed its result via the
+                                    // same push_from_rax / push_from_rax_as_xmm0
+                                    // convention the normal-dispatch code below
+                                    // also uses. Restore the compiler's SYMBOLIC
+                                    // state (not the already-emitted bytes) to
+                                    // exactly what it was before the guard, so
+                                    // that code — the only Rust-level
+                                    // continuation from here, run unconditionally
+                                    // — pops the SAME receiver+args positions and
+                                    // pushes the canonical result shape for every
+                                    // bytecode that follows, regardless of which
+                                    // machine-code path a given execution
+                                    // actually takes at runtime.
+                                    self.stack = stack_checkpoint;
+                                    self.stack_oop_marks = oop_marks_checkpoint;
+                                    self.next_spill_offset = spill_checkpoint;
+                                } else {
+                                    // try_emit_inline already rolled back its OWN
+                                    // side effects (see its doc comment); rewind
+                                    // the guard bytes and their checkpointed
+                                    // state too, so the fall-through below is
+                                    // byte-identical to never having attempted
+                                    // this guard.
+                                    self.buf.rewind_to(buf_checkpoint);
+                                    self.stack = stack_checkpoint;
+                                    self.stack_oop_marks = oop_marks_checkpoint;
+                                    self.next_spill_offset = spill_checkpoint;
+                                    self.exception_check_stubs
+                                        .truncate(exception_check_stubs_checkpoint);
+                                    self.deopt_stubs.truncate(deopt_stubs_checkpoint);
+                                    self.forward_patches.truncate(forward_patches_checkpoint);
+                                    self.jump_table_patches
+                                        .truncate(jump_table_patches_checkpoint);
+                                    self.self_call_patches
+                                        .truncate(self_call_patches_checkpoint);
+                                    self.bounds_check_stubs
+                                        .truncate(bounds_check_stubs_checkpoint);
+                                    self.null_check_store_stubs
+                                        .truncate(null_check_store_stubs_checkpoint);
+                                }
+                            }
+                        }
+                    }
+
                     // The direct exceptional-return service needs the same
                     // invoke metadata as the normal dispatch fallback.
                     let info_ptr = self
@@ -22200,6 +22322,9 @@ impl Compiler {
                                 }
                             }
                         }
+                    }
+                    if let Some(done) = guarded_virtual_done_patch {
+                        self.patch_rel32_to_here(done);
                     }
                     if op == 0xb9 {
                         pc += 5;
@@ -26485,6 +26610,7 @@ mod tests {
             &helpers,
             std::collections::HashSet::new(),
             HashMap::new(),
+            HashMap::new(), // inline_guard_class_ids (PGO-02)
             None,
             &[0],
             1,
@@ -30345,6 +30471,7 @@ mod tests {
                 helpers,
                 std::collections::HashSet::new(),
                 HashMap::new(),
+                HashMap::new(), // inline_guard_class_ids (PGO-02)
                 None, // string_layout
                 &[],
                 0,
