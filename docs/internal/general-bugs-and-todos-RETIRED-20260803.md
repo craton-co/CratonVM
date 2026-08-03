@@ -273,7 +273,20 @@ returning. The failure it guards is not a hang but a silent one: the timed
 branch once ignored the condvar's verdict and always slept out the full
 timeout, so `Thread.join(millis)` and `awaitTermination` "worked" while
 burning the whole duration after the event they waited for.
-`an_untimed_waiter_is_released_by_an_interrupt_wake` covers the untimed half.
+`an_untimed_waiter_is_released_by_an_interrupt_wake` covers the untimed half:
+it asserts the wake is actually delivered (the monitor is inflated, so
+`wake_waiters_for_interrupt` must return `true`) and that the waiter leaves
+reporting the interrupt. It deliberately does **not** assert a latency bound —
+the 5 ms poll would satisfy one on its own, so a timing assertion here would
+pass with the fix reverted and be worse than none.
+
+**What was deliberately not changed.** The 5 ms poll stays. `thread_interrupt`
+is today the only production writer of the interrupt flag (every other
+`set_interrupted` call in the tree is a test), so raising the interval would
+be safe *today* — but the poll is the safety net for any future path that sets
+the flag without going through the wake, and shortening the gap between "flag
+set" and "waiter notices" was never the poll's cost. The wake is the fix; the
+poll is the backstop.
 
 ---
 
