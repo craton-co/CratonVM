@@ -56,12 +56,14 @@
 #                    The GC and JIT summaries are shutdown-only. The reach
 #                    (`ir-compiles`) is NOT: it prints one line per compile
 #                    REQUEST, on the compile path. That path is entered a
-#                    single-digit number of times per phase — the whole point
-#                    of MEAS-02 — and an A/B of the seven phases with and
-#                    without it found no effect outside noise (see
-#                    docs/internal/meas-02-*). Keep the flag for strict
-#                    parity with an older result set, and re-take the A/B if
-#                    a phase ever starts issuing compile requests in bulk.
+#                    single-digit number of times per phase — which is the
+#                    whole point of MEAS-02 — and the whole extra output was
+#                    counted at 0-4 lines / 0-419 bytes per phase, against a
+#                    shortest phase of 165 ms. See
+#                    docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md
+#                    §6. Keep the flag for strict parity with an older result
+#                    set, and re-count if a phase ever starts issuing compile
+#                    requests in bulk.
 #   --skip-reliability  Measure without the reliability gate. The manifest
 #                    records reliability_gate=skipped and compare.py REFUSES
 #                    to render a verdict from such a run. Debugging only.
