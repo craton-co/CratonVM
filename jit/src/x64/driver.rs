@@ -403,9 +403,16 @@ pub fn compile_with_param_slots(
         Ok(x) => {
             if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
                 eprintln!(
-                    "[JIT_GEN] bytecode loop rewrite: header={} body_len={} copies={} \
-                     code_len {}->{} poll_free={}",
-                    x.header, x.body_len, x.copies, code_len, x.code_len, x.poll_free_bytes
+                    "[JIT_GEN] bytecode loop rewrite: kind={:?} versioned={} header={} \
+                     body_len={} copies={} code_len {}->{} poll_free={}",
+                    x.kind,
+                    x.versioning.is_some(),
+                    x.header,
+                    x.body_len,
+                    x.copies,
+                    code_len,
+                    x.code_len,
+                    x.poll_free_bytes
                 );
             }
             Some(x)

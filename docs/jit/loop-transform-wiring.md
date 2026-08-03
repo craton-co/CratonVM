@@ -1,9 +1,17 @@
 # Wiring the bytecode loop transform into `compile_with_param_slots`
 
+> **SUPERSEDED — historical.** Everything this file lists as "not wired" has
+> been wired since, and its census of what would need translating is wrong in
+> one place (`OopMapEntry::bytecode_pc` must *not* be translated). Read
+> [`loop-rewriter-wiring.md`](loop-rewriter-wiring.md) instead; it records the
+> state of the wiring as built, including guarded versioning. This file is kept
+> because it is where the acceptance criterion was set out, and because two
+> other docs cite it.
+
 Companion to [`loop-transforms.md`](loop-transforms.md), which describes the
-transform itself. This file records what is wired **today**, and what a future
-change must do before the transform is allowed to rewrite the bytecode the
-emitter compiles.
+transform itself. This file records what was wired **at the time it was
+written**, and what a future change had to do before the transform was allowed
+to rewrite the bytecode the emitter compiles.
 
 Status as of this change:
 

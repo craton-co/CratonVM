@@ -19,7 +19,7 @@ reasons it was refused. Nothing emits a vector instruction, nothing is wired
 into `compile`, and no existing behaviour changes. The emitter's remaining debt
 is itemised in [What an emitter still needs](#what-an-emitter-still-needs).
 
-The gate admits **11 of the 27 loops** in its test corpus. That number is low on
+The gate admits **12 of the 29 loops** in its test corpus. That number is low on
 purpose and is discussed in [The honest number](#the-honest-number).
 
 ## The transform being reasoned about
@@ -222,7 +222,7 @@ lesson about how far a loop is from admissible.
 | `VariableStride` | a runtime step has no compile-time dependence distance |
 | `NonUnitStep` | `scale * stride != 1`; a contiguous load does not cover one iteration block |
 | `UnknownTripCount` | `scev::trip_count` could not bound the iteration count |
-| `TripCountTooSmall` | the loop may run fewer times than one vector pass covers |
+| `TripCountTooSmall` | the loop may run fewer times than one vector pass covers **and no runtime check settles it** |
 | `SafepointInBody` | a body safepoint must describe a frame a vectorized iteration no longer holds |
 | `DeoptPointInBody` | the deopt metadata describes a scalar frame at one bytecode index; there is no encoding for "lane 3 was iteration 11" |
 | `OpaqueMemoryEffect` | an unanalyzable call reads/writes `AliasClass::Any` |
@@ -264,20 +264,46 @@ different: the runtime may rebuild an interpreter frame there, and the frame it
 would rebuild describes one scalar iteration whose locals a widened body no
 longer holds in that shape.
 
+## Minimum trip count: a guard, not a refusal
+
+`admit_vectorization` asks `CountedLoop::prove_trip_count_at_least(lanes, env)`
+whenever the compile-time interval's minimum is below the lane count, and takes
+the resulting `PreheaderGuard::TripCountAtLeast` as an obligation. It carries it
+in `plan.guards` with `array == NO_NODE` — the guard is not about an array, and
+that keeps it in its own de-duplication bucket so it can never discharge, or be
+discharged by, an array's length guard. `vec_emit::emit_guard` already handled
+this variant (`VecGuardValues::Term`); only the gate was missing.
+
+This matters because the interval for `for (i = 0; i < n; i++)` with a runtime
+`n` is `[0, i32::MAX]`, so refusing on `trip.min` refused almost every real
+loop. `TripCountTooSmall` now means what is left when the proof itself refuses:
+a *constant* trip count below the lane count (nothing to discover at run time —
+the answer is already known and it is "no"), a decreasing or non-unit-stride
+loop, a post-tested loop, or an unbounded entry value.
+
+The tail is unaffected. A minimum is not a multiple, so
+`TailStrategy::ScalarRemainder` still applies; only an exact trip count divisible
+by the lane count gives `TailStrategy::None`.
+
 ## The honest number
 
-11 of 27 corpus loops are admitted. Two caveats on reading that figure:
+12 of 29 corpus loops are admitted. Three caveats on reading that figure:
 
 * The corpus is built as **must-refuse / must-admit pairs**, one pair per
   refusal class, so the ratio is partly a property of the corpus design rather
   than of real Java. It is a coverage statement, not a coverage prediction.
-* Applied to real bytecode the rate would be *lower*, not higher, and the two
-  reasons are known:
-  * **Every array access costs a guard.** At IR level there is no JVM local slot
-    to pass to `prove_index_in_bounds_of`, so the `length >= a.length` tautology
-    shortcut is unavailable and every access yields a `LengthAtLeast` obligation
-    an emitter must discharge.
-  * **An unknown trip count is refused outright.** See the next section.
+* It moved from 11-of-27 to 12-of-29 by *adding* the pair `TripCountTooSmall`
+  never had, not by relaxing anything: a runtime-bounded loop (now admitted
+  behind one compare) and a loop whose constant trip count is below the lane
+  count (still refused). Asking for the trip-count witness changed no other
+  corpus verdict, which is worth stating because the reason this extension was
+  once deferred — "it moves the 11-of-27 number" — turned out not to be true of
+  the corpus as it stood.
+* Applied to real bytecode the rate would still be *lower* than the corpus
+  suggests, because **every array access costs a guard**: at IR level there is no
+  JVM local slot to pass to `prove_index_in_bounds_of`, so the
+  `length >= a.length` tautology shortcut is unavailable and every access yields
+  a `LengthAtLeast` obligation an emitter must discharge.
 
 ## What an emitter still needs
 
@@ -286,13 +312,11 @@ Nothing below is in scope for this pass; each is a real prerequisite.
 1. **Guard emission.** All of `plan.guards`, per array, in the pre-header, with
    a deopt/fallback edge to the untouched scalar loop. A plan whose guards are
    partially emitted proves nothing and must be treated as refused.
-2. **A `TripCountAtLeast` guard shape.** `scev::PreheaderGuard` has no variant
-   expressing a runtime `trip >= lanes` check, so the gate refuses
-   `TripCountTooSmall` rather than returning an obligation nobody can discharge.
-   This is the single largest source of refusals on real loops (`for (i = 0; i <
-   n; i++)` with unknown `n` has `trip.min == 0`). Adding the variant is a
-   `scev.rs` change and is **out of scope for this file** — see
-   [Out of scope](#out-of-scope).
+   `vec_emit::emit_vector_loop` does this and returns the `rel32` sites the
+   caller must patch; what is still missing is the caller.
+2. ~~**A `TripCountAtLeast` guard shape.**~~ Done: the variant exists
+   (`docs/jit/trip-count-guards.md`), `vec_emit` discharges it, and the gate asks
+   for it — see [Minimum trip count](#minimum-trip-count-a-guard-not-a-refusal).
 3. **Vector register allocation.** `regalloc.rs` has no XMM/YMM class for
    general values; the existing SIMD paths in `x64.rs` hand-pick registers
    inside a single pattern emitter.
@@ -316,11 +340,8 @@ Nothing below is in scope for this pass; each is a real prerequisite.
 
 Reported rather than changed, because other work owns those files:
 
-* `jit/src/scev.rs` — `PreheaderGuard` needs a `TripCountAtLeast { term,
-  minimum }` variant (or equivalent) before a loop with an unknown-but-positive
-  trip count can be admitted. Today `admit_vectorization` refuses with
-  `TripCountTooSmall { min_trips: 0, .. }`. Adding it is additive; nothing
-  existing changes meaning.
+* ~~`jit/src/scev.rs` — `PreheaderGuard` needs a `TripCountAtLeast` variant~~ —
+  landed, and consumed here.
 * `jit/src/scev.rs` — `prove_index_in_bounds_of` takes `array_local:
   Option<usize>` (a JVM slot). An IR-level caller has a `NodeId`, not a slot, so
   it must pass `None` and forfeits the tautology shortcut. An overload keyed on
