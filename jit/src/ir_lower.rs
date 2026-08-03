@@ -4631,8 +4631,17 @@ fn reloc_emit_enabled() -> bool {
                     self.buf.emit(&[0x48, 0x8B, 0x44, 0xC8, d]);
                 }
             }
+            // Structurally unreachable — the caller routes FP to the XMM path.
+            // A `debug_assert!` here would be a FAIL-OPEN: it vanishes in
+            // release, this function would emit nothing, and the caller's
+            // `store_rax(slot)` would still run and spill whatever RAX happens
+            // to hold (the array pointer) as the element's value. Latch the
+            // bailout so release refuses the compile instead.
             MemKind::Float | MemKind::Double => {
-                debug_assert!(false, "FP element loads take the XMM path");
+                self.latch_bailout(Bailout::with_context(
+                    BailoutReason::Internal("ir_lower: FP element load reached the GPR emitter"),
+                    format!("{kind:?}"),
+                ));
             }
         }
     }
@@ -4656,8 +4665,15 @@ fn reloc_emit_enabled() -> bool {
             MemKind::Byte => self.buf.emit(&[0x88, 0x54, 0x08, d]),
             // MOV WORD [RAX + RCX*2 + HEADER_SIZE], DX  (0x66 = 16-bit operand)
             MemKind::Char | MemKind::Short => self.buf.emit(&[0x66, 0x89, 0x54, 0x48, d]),
+            // Structurally unreachable — see the load emitter's note. Same
+            // fail-open, worse consequence: a silently dropped array store.
             MemKind::Ref | MemKind::Float | MemKind::Double => {
-                debug_assert!(false, "ArrayStore({kind:?}) never reaches the GPR path");
+                self.latch_bailout(Bailout::with_context(
+                    BailoutReason::Internal(
+                        "ir_lower: a non-integral element store reached the GPR emitter",
+                    ),
+                    format!("{kind:?}"),
+                ));
             }
         }
     }
