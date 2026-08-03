@@ -261,6 +261,64 @@ pub enum Op {
     /// Float / double constant stored as raw bits (no inputs).
     ConstF(u64),
 
+    // ── Constant-pool constants that are NOT immediates (cov-01) ─────
+    //
+    // These three are constants in the bytecode's sense and runtime calls in
+    // the machine's. Each names a constant-pool SITE and materialises its value
+    // on every execution through the same helper the single-pass backend uses,
+    // and each therefore carries `[ctrl, mem]` and the `MemAccess::Opaque`
+    // memory shape `Op::Call` has: a safepoint, an allocation, and a barrier
+    // nothing reorders across.
+    //
+    // Re-materialising rather than baking is not a missed optimisation — it is
+    // the correctness requirement. An `ObjectRef` baked at compile time is
+    // stale the moment a relocating collector moves it, and `<clinit>` is a
+    // side effect the constant owes on first touch. See each variant.
+    /// `ldc <String>` — the interned literal at (`bytes`, `len`). Inputs
+    /// `[ctrl, mem]`, result `Ref`.
+    ///
+    /// Lowered as a call to `helpers.ldc_string`, which consults the VM string
+    /// pool. The bytes live in the compiling artifact (`_jit_strings`), so the
+    /// baked address outlives the code; the *object* is fetched fresh every
+    /// execution, because the pool is rewritten after a moving collection.
+    ConstString {
+        bytes: usize,
+        len: usize,
+    },
+
+    /// `ldc <Class>` — the mirror of the class named at `cp_idx` in
+    /// `holder_class_id`'s constant pool. Inputs `[ctrl, mem]`, result `Ref`.
+    ///
+    /// Lowered as a call to `helpers.ldc_class_cp`. CP-indexed rather than
+    /// class-id-indexed for the two reasons `JitLdcConstant::ClassMirror`
+    /// records: the target may not be loaded yet, and loading it is a user
+    /// `ClassLoader.loadClass` that must not run inside the compiler. A `0`
+    /// return is a published pending exception, not a value.
+    ConstClass {
+        holder_class_id: u32,
+        cp_idx: u16,
+    },
+
+    /// `getstatic` — read the static field at `field_index` of `class_id`.
+    /// Inputs `[ctrl, mem]`; result typed from `type_tag`.
+    ///
+    /// Two lowerings, chosen exactly as the single-pass backend's `0xb2` arm
+    /// chooses: a direct load through the class's baked base-POINTER cell when
+    /// `x64::resolve_static_base` accepts the site (which it does only for a
+    /// class already initialised at compile time), and `helpers.getstatic`
+    /// otherwise — that helper runs `<clinit>` on first touch and reports a
+    /// failure as the `i64::MIN` deopt sentinel with a pending Java exception.
+    ///
+    /// `putstatic` has no counterpart here on purpose: a static reference WRITE
+    /// owes an SATB pre-barrier that no collector `set_field` barrier covers,
+    /// which is why the single-pass backend keeps writes on their helpers.
+    LoadStatic {
+        class_id: u32,
+        field_index: u32,
+        type_tag: u8,
+        is_volatile: bool,
+    },
+
     // ── Parameters ───────────────────────────────────────────────────
     /// Method parameter at index `i` (no inputs — defined at Start).
     Param(u16),
@@ -2755,6 +2813,14 @@ impl Op {
             Op::New { .. } => (2, MemAccess::Allocate), // [ctrl, mem]
             Op::NewArray { .. } => (3, MemAccess::Allocate), // [ctrl, mem, length]
             Op::Call { .. } => (2, MemAccess::Opaque), // [ctrl, mem, args…]
+            // cov-01. Each is a call to a runtime helper that can intern, load
+            // a class, or run `<clinit>` — i.e. arbitrary Java. `Opaque` is the
+            // top of the effect lattice (reads Any, writes Any, safepoint,
+            // allocates), which is the same classification `Op::Call` gets and
+            // the only defensible one for a node whose callee is a class
+            // initialiser.
+            Op::ConstString { .. } | Op::ConstClass { .. } => (2, MemAccess::Opaque), // [ctrl, mem]
+            Op::LoadStatic { .. } => (2, MemAccess::Opaque), // [ctrl, mem]
             Op::LambdaIntToDouble => (4, MemAccess::Opaque), // [ctrl, mem, lambda, index]
             Op::MonitorEnter => (3, MemAccess::MonitorEnter), // [ctrl, mem, obj]
             Op::MonitorExit => (3, MemAccess::MonitorExit), // [ctrl, mem, obj]
@@ -3536,6 +3602,23 @@ pub struct IrBuilder {
     /// constant `Op::ConstF`/`Float` (`fconst`). The caller only inserts a
     /// float entry when the FP tier is on.
     ldc_info: HashMap<usize, (i64, bool)>,
+    /// cov-01 increment 2: resolved `ldc <String>` sites (`pc → (bytes, len)`),
+    /// the ADDRESS and length of the literal's UTF-8, not a reference. Set by
+    /// [`Self::set_ldc_string_info`]. The caller owns the bytes for the
+    /// artifact's lifetime; see [`Op::ConstString`] for why the object itself
+    /// is re-fetched on every execution instead.
+    ldc_string_info: HashMap<usize, (usize, usize)>,
+    /// cov-01 increment 3: resolved `ldc <Class>` sites
+    /// (`pc → (holder_class_id, cp_idx)`). Set by
+    /// [`Self::set_ldc_class_info`]; a site whose helper is unwired is simply
+    /// absent, so the arm bails. See [`Op::ConstClass`].
+    ldc_class_info: HashMap<usize, (u32, u16)>,
+    /// cov-01 increment 4: resolved `getstatic` (0xb2) sites
+    /// (`pc → (class_id, field_index, type_tag, is_volatile)`) — the same tuple
+    /// the single-pass backend's `static_field_info` carries. Set by
+    /// [`Self::set_static_field_info`]; an unresolvable site is absent and the
+    /// arm bails the method. See [`Op::LoadStatic`].
+    static_field_info: HashMap<usize, (u32, usize, u8, bool)>,
 }
 
 impl IrBuilder {
@@ -3585,6 +3668,9 @@ impl IrBuilder {
             tdigest_scalar_kernel: false,
             ldc2w_info: HashMap::new(),
             ldc_info: HashMap::new(),
+            ldc_string_info: HashMap::new(),
+            ldc_class_info: HashMap::new(),
+            static_field_info: HashMap::new(),
         }
     }
 
@@ -3599,6 +3685,28 @@ impl IrBuilder {
     /// not present makes that `ldc` bail the method to single-pass.
     pub fn set_ldc_info(&mut self, info: HashMap<usize, (i64, bool)>) {
         self.ldc_info = info;
+    }
+
+    /// cov-01 increment 2: supply resolved `ldc <String>` sites
+    /// (`pc → (bytes, len)`). The caller must keep the bytes alive for the
+    /// artifact's lifetime — the lowered body bakes their address.
+    pub fn set_ldc_string_info(&mut self, info: HashMap<usize, (usize, usize)>) {
+        self.ldc_string_info = info;
+    }
+
+    /// cov-01 increment 3: supply resolved `ldc <Class>` sites
+    /// (`pc → (holder_class_id, cp_idx)`). Only sites whose
+    /// `helpers.ldc_class_cp` is wired may be supplied.
+    pub fn set_ldc_class_info(&mut self, info: HashMap<usize, (u32, u16)>) {
+        self.ldc_class_info = info;
+    }
+
+    /// cov-01 increment 4: supply resolved `getstatic` sites
+    /// (`pc → (class_id, field_index, type_tag, is_volatile)`). Must be called
+    /// before [`Self::build`]; an absent pc bails that `getstatic` to
+    /// single-pass.
+    pub fn set_static_field_info(&mut self, info: HashMap<usize, (u32, usize, u8, bool)>) {
+        self.static_field_info = info;
     }
 
     /// The data type for a merge / loop-carried `Op::Phi`, derived from its
@@ -5645,26 +5753,119 @@ impl IrBuilder {
                 // int clause, so the builder cannot infer the width from
                 // admission either. See `JitLdcConstant::Immediate`.
                 //
-                // Every non-immediate site — String, Class, `MethodHandle`,
-                // `MethodType`, condy — is simply absent from `ldc_info` and
-                // bails the method to single-pass, which DOES compile all of
-                // them. That is the fail-closed half of this arm and it is the
-                // point: a constant materialised without its resolution side
-                // effects (interning, class loading, `<clinit>`) is a
-                // wrong-code bug, not a missing optimisation.
+                // Increments 2 and 3 add the two REFERENCE constants — a String
+                // literal and a Class mirror. Neither is an immediate: each
+                // names a constant-pool site whose value is materialised on
+                // every execution by the same runtime helper the single-pass
+                // backend calls, because an `ObjectRef` baked at compile time is
+                // stale the moment a relocating collector moves it. Both are
+                // therefore `[ctrl, mem]` safepoint nodes, not constants — see
+                // `Op::ConstString` / `Op::ConstClass`.
+                //
+                // Everything still absent from all three tables — `MethodHandle`,
+                // `MethodType`, condy, a site whose helper is unwired, a float
+                // with the FP gate off — bails the method to single-pass, which
+                // DOES compile all of them. That is the fail-closed half of this
+                // arm and it is the point: a constant materialised without its
+                // resolution side effects (interning, class loading, `<clinit>`)
+                // is a wrong-code bug, not a missing optimisation.
                 0x12 | 0x13 => {
                     let width = if op == 0x12 { 2 } else { 3 };
-                    let (bits, is_float) = match self.ldc_info.get(&pc) {
-                        Some(&v) => v,
-                        None => return ir_build_bail(line!(), pc),
-                    };
-                    let c = if is_float {
-                        self.fconst(f32::from_bits(bits as u32))
+                    if let Some(&(bits, is_float)) = self.ldc_info.get(&pc) {
+                        let c = if is_float {
+                            self.fconst(f32::from_bits(bits as u32))
+                        } else {
+                            self.iconst(bits)
+                        };
+                        self.push(c);
+                        pc += width;
+                    } else if let Some(&(bytes, len)) = self.ldc_string_info.get(&pc) {
+                        let s = self.graph.add(
+                            Op::ConstString { bytes, len },
+                            IrType::Ref,
+                            vec![self.ctrl, self.mem],
+                            Some(pc),
+                        );
+                        // The node IS the new memory token, exactly as
+                        // `Op::Call` is: interning can allocate, and a
+                        // collection may run inside the helper, so nothing may
+                        // be reordered across it.
+                        self.mem = s;
+                        self.push(s);
+                        pc += width;
+                    } else if let Some(&(holder_class_id, cp_idx)) = self.ldc_class_info.get(&pc) {
+                        let c = self.graph.add(
+                            Op::ConstClass {
+                                holder_class_id,
+                                cp_idx,
+                            },
+                            IrType::Ref,
+                            vec![self.ctrl, self.mem],
+                            Some(pc),
+                        );
+                        self.mem = c;
+                        self.push(c);
+                        pc += width;
                     } else {
-                        self.iconst(bits)
+                        return ir_build_bail(line!(), pc);
+                    }
+                }
+                // getstatic — cov-01 increment 4, and the single largest opcode
+                // in the survey (92 of 273 events).
+                //
+                // A load from a statics base plus the ref/non-ref split, exactly
+                // as the lane brief frames it. `static_field_info` names the
+                // offset and the type tag; this arm's job is to match the
+                // single-pass `0xb2` arm's behaviour, not to invent one, so the
+                // class-initialisation question is answered where that arm
+                // answers it — in the lowering, which picks between the direct
+                // load (only for a class the resolver reports already
+                // initialised) and `helpers.getstatic` (which runs `<clinit>`
+                // and can throw).
+                //
+                // Three type tags are refused here rather than in the lowering,
+                // because the refusal is about the VALUE tier and not about the
+                // load: `J`/`D` are category-2 and `F` is FP, and admitting one
+                // would put a `Long`/`Double`/`Float` node in a graph whose
+                // admission clause may have been the int one. The gates the
+                // caller already threads (`ir_emit_long`, `ir_emit_fp`) decide
+                // that for `ldc2_w`; a static field has no equivalent signal at
+                // this point, so the conservative answer is the one that keeps
+                // the method compiling on the other backend.
+                0xb2 => {
+                    let (class_id, field_index, type_tag, is_volatile) =
+                        match self.static_field_info.get(&pc) {
+                            Some(&si) => si,
+                            None => return ir_build_bail(line!(), pc),
+                        };
+                    let ty = match type_tag {
+                        b'I' | b'Z' | b'B' | b'C' | b'S' => IrType::Int,
+                        b'L' | b'[' => IrType::Ref,
+                        _ => return ir_build_bail(line!(), pc),
                     };
-                    self.push(c);
-                    pc += width;
+                    // A `field_index` past `u32` cannot be encoded in the baked
+                    // displacement; refuse rather than truncate.
+                    let Ok(field_index) = u32::try_from(field_index) else {
+                        return ir_build_bail(line!(), pc);
+                    };
+                    let load = self.graph.add(
+                        Op::LoadStatic {
+                            class_id,
+                            field_index,
+                            type_tag,
+                            is_volatile,
+                        },
+                        ty,
+                        vec![self.ctrl, self.mem],
+                        Some(pc),
+                    );
+                    // Both lowerings can reach the runtime (the helper one runs
+                    // `<clinit>`), and a volatile read is a JMM acquire, so the
+                    // node advances the memory token like every other
+                    // `MemAccess::Opaque` node.
+                    self.mem = load;
+                    self.push(load);
+                    pc += 3;
                 }
 
                 // tableswitch / lookupswitch — lower as a CMP-equality chain
@@ -8351,6 +8552,27 @@ mod tests {
             ),
             (Op::NewArray { element_type: 10 }, 3, MemAccess::Allocate),
             (Op::Call { info_ptr: 0 }, 2, MemAccess::Opaque),
+            // cov-01 — the same classification `Op::Call` has, for the same
+            // reason: the helper each lowers to can run arbitrary Java.
+            (Op::ConstString { bytes: 0, len: 0 }, 2, MemAccess::Opaque),
+            (
+                Op::ConstClass {
+                    holder_class_id: 0,
+                    cp_idx: 0,
+                },
+                2,
+                MemAccess::Opaque,
+            ),
+            (
+                Op::LoadStatic {
+                    class_id: 0,
+                    field_index: 0,
+                    type_tag: b'I',
+                    is_volatile: false,
+                },
+                2,
+                MemAccess::Opaque,
+            ),
             (Op::LambdaIntToDouble, 4, MemAccess::Opaque),
             (Op::MonitorEnter, 3, MemAccess::MonitorEnter),
             (Op::MonitorExit, 3, MemAccess::MonitorExit),

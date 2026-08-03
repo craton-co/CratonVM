@@ -10289,6 +10289,19 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
             element_type: *element_type,
         },
         ir::Op::Call { .. } => EaOp::Call,
+        // cov-01. `EaOp::Call` is the conservative mapping and the honest one:
+        // all three lower to a runtime helper that can run arbitrary Java, and
+        // their memory shape in `ir::Op::memory_shape` is already
+        // `MemAccess::Opaque` for that reason — the two classifications must
+        // not disagree. None of the three has a reference INPUT, so the
+        // arg-escape half of the `Call` rule is a no-op; what matters is that
+        // the reference each PRODUCES is treated like a call result rather than
+        // like a fresh allocation, because none of them is one. An interned
+        // literal, a class mirror and a static field's referent are all
+        // pre-existing objects that other threads can already see.
+        ir::Op::ConstString { .. } | ir::Op::ConstClass { .. } | ir::Op::LoadStatic { .. } => {
+            EaOp::Call
+        }
         ir::Op::ArrayLength => EaOp::ArrayLength,
         // Array element access escapes its array reference (conservative): map to
         // `EaOp::Call`, whose handling marks every reference input `ArgEscape`.
@@ -10361,6 +10374,9 @@ fn ea_control_preds(node: &ir::Node) -> &[ir::NodeId] {
         | ir::Op::New { .. }
         | ir::Op::NewArray { .. }
         | ir::Op::Call { .. }
+        | ir::Op::ConstString { .. }
+        | ir::Op::ConstClass { .. }
+        | ir::Op::LoadStatic { .. }
         | ir::Op::LambdaIntToDouble => &node.inputs[..node.inputs.len().min(1)],
         // Start, and every floating pure node (Const, Add, Cmp, Phi, …). A node
         // with no control input has no fixed position, so it is never cold.
@@ -13420,32 +13436,105 @@ fn try_compile_inner(
         // optimizing builder had no arm for
         // (`docs/known-issues/c2/ir-coverage-survey-20260803.md`).
         //
-        // Increment 1 is the IMMEDIATE case only — the `int` and `float`
-        // constants `ldc_info` already carries as an `i64`. That is a constant
-        // node and nothing else: no memory edge, no safepoint, no GC
-        // interaction, no new refusal. An `int` constant is admitted
-        // unconditionally (a pure `Op::Const`/`Int`); a `float` constant only
-        // under `ir_emit_fp`, mirroring the `ldc2_w` gate directly above — the
-        // builder would otherwise emit an `Op::ConstF`/`Float` into a graph the
-        // FP tier is switched off for.
+        // Three site kinds, three tables, all fed from the SAME resolver the
+        // single-pass backend uses — this lane consumes a table the caller
+        // already computes, it does not resolve a constant pool:
         //
-        // A pc that is absent (no resolver, a String/Class/condy entry, or a
-        // float with the FP gate off) makes the builder's 0x12/0x13 arm bail
-        // that method to single-pass — the pre-existing behaviour, only
-        // narrower.
+        //   * `Immediate` → `(bits, is_float)`. A constant node and nothing
+        //     else: no memory edge, no safepoint, no GC interaction. An `int`
+        //     constant is admitted unconditionally; a `float` constant only
+        //     under `ir_emit_fp`, mirroring the `ldc2_w` gate directly above —
+        //     the builder would otherwise emit an `Op::ConstF`/`Float` into a
+        //     graph the FP tier is switched off for.
+        //   * `String` → the interned-literal SITE (`bytes`, `len`), not a
+        //     reference: the value is materialised by `helpers.ldc_string` on
+        //     every execution, because an `ObjectRef` baked at compile time can
+        //     relocate between two runs of the body.
+        //   * `ClassMirror` → the CP-indexed site, served by
+        //     `helpers.ldc_class_cp` for the same reason plus one more:
+        //     resolution can load a class, which runs arbitrary Java.
+        //
+        // A pc absent from all three (no resolver, a `MethodHandle` /
+        // `MethodType` / condy entry, an unwired class helper, or a float with
+        // the FP gate off) makes the builder's 0x12/0x13 arm bail that method
+        // to single-pass — the pre-existing behaviour, only narrower.
+        //
+        // Keep-alive for the string-literal bytes whose ADDRESS the lowered
+        // body bakes as an imm64. Moved onto the finished `CompiledMethod`
+        // below, next to the `Op::Call` info boxes, so the pointer cannot
+        // outlive its pointee.
+        let mut ir_ldc_strings: Vec<Box<str>> = Vec::new();
         if !scan.ldc_ops.is_empty() {
             if let Some(resolver) = cp_ldc_resolver {
                 let mut imm: std::collections::HashMap<usize, (i64, bool)> =
                     std::collections::HashMap::new();
+                let mut strs: std::collections::HashMap<usize, (usize, usize)> =
+                    std::collections::HashMap::new();
+                let mut classes: std::collections::HashMap<usize, (u32, u16)> =
+                    std::collections::HashMap::new();
                 for &(pc, cp_idx) in &scan.ldc_ops {
-                    if let Some(JitLdcConstant::Immediate { bits, is_float }) = resolver(cp_idx) {
-                        if !is_float || ir_emit_fp {
-                            imm.insert(pc, (bits, is_float));
+                    match resolver(cp_idx) {
+                        Some(JitLdcConstant::Immediate { bits, is_float }) => {
+                            if !is_float || ir_emit_fp {
+                                imm.insert(pc, (bits, is_float));
+                            }
                         }
+                        Some(JitLdcConstant::String(text)) => {
+                            let boxed: Box<str> = text.into_boxed_str();
+                            strs.insert(pc, (boxed.as_ptr() as usize, boxed.len()));
+                            ir_ldc_strings.push(boxed);
+                        }
+                        Some(JitLdcConstant::ClassMirror {
+                            holder_class_id,
+                            cp_idx,
+                        }) => {
+                            // `ldc_class_cp` is an OptionalPtr — a hand-built
+                            // test helper table leaves it 0. Omit the site
+                            // rather than plan a CALL to address 0; the builder
+                            // then bails the method, exactly as the single-pass
+                            // arm does for the same condition.
+                            if helpers.ldc_class_cp != 0 {
+                                classes.insert(pc, (holder_class_id, cp_idx));
+                            }
+                        }
+                        None => {}
                     }
                 }
                 builder.set_ldc_info(imm);
+                builder.set_ldc_string_info(strs);
+                builder.set_ldc_class_info(classes);
             }
+        }
+        // cov-01 increment 4: resolve `getstatic` (0xb2) sites for the IR
+        // builder — the largest single opcode in the survey (92 events). Same
+        // resolver and same `(class_id, field_index, type_tag, is_volatile)`
+        // tuple the single-pass backend's 0xb2 arm consumes; an unresolvable
+        // site is omitted and the builder bails that method.
+        //
+        // `putstatic` (0xb3) is deliberately NOT fed. The single-pass backend
+        // keeps it on `jit_putstatic_*` because a static reference WRITE owes
+        // an SATB pre-barrier that no collector `set_field` barrier covers —
+        // statics live in a Rust-side table, not the heap — and a missed one is
+        // a hidden-pointer SATB hole. This lane owns the read arm only.
+        //
+        // The class ids this collects are ALSO recorded on the finished
+        // artifact (`static_init_classes`, below), because compiled code reads
+        // static storage directly and the interpreter's compiled-entry path is
+        // what ensure-initializes the declaring classes once per artifact.
+        let mut ir_static_init_classes: Vec<u32> = Vec::new();
+        if !scan.static_field_ops.is_empty() {
+            if let Some(resolver) = cp_static_field_resolver {
+                let mut sm = std::collections::HashMap::with_capacity(scan.static_field_ops.len());
+                for &(pc, cp_idx) in &scan.static_field_ops {
+                    if let Some((class_id, field_index, type_tag, is_volatile)) = resolver(cp_idx) {
+                        sm.insert(pc, (class_id, field_index, type_tag, is_volatile));
+                        ir_static_init_classes.push(class_id);
+                    }
+                }
+                builder.set_static_field_info(sm);
+            }
+            ir_static_init_classes.sort_unstable();
+            ir_static_init_classes.dedup();
         }
         // Thread the resolved instance-field layout (pc → (field_index,
         // type_tag)) into the builder so it can lower an int-category
@@ -14221,6 +14310,42 @@ fn try_compile_inner(
                         if !ir_call_infos.is_empty() {
                             compiled._jit_invoke_infos = ir_call_infos;
                             compiled._jit_strings = ir_call_strings;
+                            compiled.has_dispatch = true;
+                        }
+                        // cov-01: the same keep-alive obligation for an
+                        // `ldc <String>` site, whose UTF-8 bytes' ADDRESS is
+                        // baked into the body as an imm64 argument to
+                        // `helpers.ldc_string`. `append`, never assign — the
+                        // call strings may already be installed above, and
+                        // dropping either list frees memory the emitted code
+                        // still names.
+                        compiled._jit_strings.append(&mut ir_ldc_strings);
+                        // cov-01 / RBC.5: compiled code reads static storage
+                        // directly, bypassing the interpreter's
+                        // `ensure_class_initialized_shared`, so the declaring
+                        // class of every static site must be initialized before
+                        // this body first runs. `x64::compile` records exactly
+                        // this list for the single-pass artifact; an IR
+                        // artifact that lowers `getstatic` owes it too, and
+                        // without it the direct (helper-free) load reads a
+                        // block whose `<clinit>` has not run.
+                        //
+                        // `append` + re-dedup for the same reason as the
+                        // callee-entry list below: assigning would discard
+                        // anything already recorded on the artifact.
+                        if !ir_static_init_classes.is_empty() {
+                            compiled
+                                .static_init_classes
+                                .append(&mut ir_static_init_classes);
+                            compiled.static_init_classes.sort_unstable();
+                            compiled.static_init_classes.dedup();
+                            // `jit_getstatic` resolves `&mut JvmThread` through
+                            // `jit_thread_mut()` to run `<clinit>`, and the
+                            // `!has_dispatch` fast entry never sets that TLS —
+                            // the `jit-clinit-gap-has-dispatch` defect, whose
+                            // single-pass fix is the
+                            // `!compiler.static_field_info.is_empty()` clause in
+                            // `x64/driver.rs`. Same helper, same requirement.
                             compiled.has_dispatch = true;
                         }
                         // IR direct-call lowering: record every raw JIT-to-JIT
@@ -23380,7 +23505,17 @@ mod layout_constant_inventory {
         // address (`HEADER_SIZE + packed_body_offset`) — a disp32 site, so it
         // does not share the disp8 backwards-addressing hazard, but it does
         // bake the header size into machine code.
-        ("ir_lower.rs", [8, 3, 4, 0, 0, 0, 3, 0]),
+        //
+        // cov-01 added one site, `emit_inline_getstatic`, which accounts for
+        // the fifth `SLOT_SIZE`, the fourth `FIELD_CELL_PAYLOAD32_OFFSET` and
+        // both `FIELD_CELL_PAYLOAD64_OFFSET`s (the `use` list and the site).
+        // It addresses a STATICS block, which has no object header — hence no
+        // new `HEADER_SIZE` — and reaches the cell as
+        // `field_index * SLOT_SIZE + payload_offset` from the block base, the
+        // same 16-byte `Value` cell shape `field_cell_layout_matches_value_enum`
+        // pins. It is a disp32 site (`48 8B 80 disp32` / `48 63 80 disp32`), so
+        // it does not share the disp8 backwards-addressing hazard.
+        ("ir_lower.rs", [8, 3, 5, 0, 0, 0, 4, 2]),
     ];
 
     fn source(file: &str) -> &'static str {
