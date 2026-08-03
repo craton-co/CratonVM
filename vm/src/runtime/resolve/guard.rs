@@ -251,10 +251,20 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter/invoke.rs",
         "find_method_recursive(",
-        19,
+        16,
         "migration step 3a: invoke dispatch. Was 27 before the SEAM-02 split \
-         moved the JIT bridge out; the other 8 are the `jit_bridge.rs` row \
-         below. Nothing was migrated — 19 + 8 = 27.",
+         moved this cluster into three files; the other 11 are the \
+         `jit_bridge.rs` (8) and `native_override.rs` (3) rows below. Nothing \
+         was migrated — 16 + 8 + 3 = 27.",
+    ),
+    (
+        "vm/src/runtime/interpreter/native_override.rs",
+        "find_method_recursive(",
+        3,
+        "migration step 3a: the override policy's share of the invoke-dispatch \
+         cluster — the superclass walk that gives an abstract-class native its \
+         reach has to find the method it is overriding. Relocated by the \
+         SEAM-02 split, not added.",
     ),
     (
         "vm/src/runtime/interpreter/invoke.rs",

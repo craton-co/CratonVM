@@ -20786,6 +20786,8 @@ pub use field_access::*;
 // delegates to. Only `resolve_method_metadata` was widened.
 pub(crate) mod invoke;
 pub use invoke::*;
+mod native_override;
+pub use native_override::*;
 mod jit_bridge;
 pub use jit_bridge::*;
 
