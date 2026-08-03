@@ -130,6 +130,30 @@ pub static BLOCKS_MERGED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub static COMPACT_ESCAPE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// GCAUD-9 (2026-08-03): how many old-gen compactions were ABANDONED because
+/// `walk_objects` covered fewer bytes than `used_bytes` says are allocated —
+/// i.e. some region's `scan_region` broke early on an implausible header and
+/// left real (possibly live, possibly overlay-only-referenced) memory outside
+/// the walked set. See the check at the top of [`OldGen::compact`]. Distinct
+/// from `COMPACT_ESCAPE_HITS`: that counter fires when a walked, MARKED
+/// object's ordinary field points outside the walk; this one fires when the
+/// walk itself is incomplete, which `COMPACT_ESCAPE_HITS`'s ordinary-field
+/// closure cannot detect for an object reachable only through a Rust-side
+/// overlay side table.
+pub static COMPACT_WALK_GAP_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// GCAUD-9 follow-up (2026-08-03): how many times `scan_region` broke a
+/// region's walk early on an implausible header. Distinct from
+/// `COMPACT_WALK_GAP_HITS` (which counts abandoned *compactions*, one per
+/// GC cycle): this counts every individual break, including ones a later
+/// `compact()` call re-discovers at the exact same offset because nothing
+/// upstream has fixed the underlying header. Gates the raw-byte dump in
+/// [`scan_region`]'s break arm to the first few hits so a persistent,
+/// unmoving break point doesn't spam every subsequent GC cycle.
+pub static SCAN_REGION_BREAK_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Non-moving free-list allocator for the old generation.
 ///
 /// Objects are allocated from a size-segregated free list (round-5 #14
@@ -799,6 +823,32 @@ impl OldGen {
             let total_size = raw_size.checked_add(7).map(|size| size & !7).unwrap_or(0);
             // Sanity check: if total_size is 0 or too large, stop scanning
             if total_size < HEADER_SIZE || offset + total_size > end_offset {
+                let n = SCAN_REGION_BREAK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 8 {
+                    // Raw header bytes, not the typed struct: the whole point
+                    // is that this header may not be trustworthy to decode as
+                    // one, and a `Debug` format on an out-of-range `kind`
+                    // walked exactly this wild-pointer bug once already (see
+                    // docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md).
+                    // SAFETY: `ptr` is inside the allocated region between
+                    // `start_offset` and `end_offset`, both within `self.data`;
+                    // HEADER_SIZE bytes at `ptr` are therefore in-bounds.
+                    let raw_bytes: [u8; HEADER_SIZE] =
+                        unsafe { std::ptr::read(ptr as *const [u8; HEADER_SIZE]) };
+                    tracing::warn!(
+                        offset,
+                        end_offset,
+                        total_size,
+                        raw_size,
+                        kind = header.kind as u8,
+                        element_type = header.element_type as u8,
+                        array_length = header.array_length(),
+                        num_slots = header.num_slots(),
+                        bytes = ?raw_bytes,
+                        "old-gen scan_region: BREAK on implausible header — dumping raw bytes \
+                         so the corruption can finally be seen instead of inferred",
+                    );
+                }
                 break;
             }
             objects.push((ptr, total_size));
@@ -833,10 +883,65 @@ impl OldGen {
     pub fn compact(&mut self) -> HashMap<usize, usize> {
         let base = self.data.as_mut_ptr();
         let objects = self.walk_objects();
-        // GCAUD-4: bumped up front, so it covers the abandoned path too — that
-        // path clears mark bits, which is itself a change no address-keyed
-        // snapshot taken earlier may assume away.
+        // GCAUD-4: bumped up front, so it covers both abandoned paths below
+        // (this one and Phase 0's) — each clears mark bits, which is itself a
+        // change no address-keyed snapshot taken earlier may assume away.
         self.reclaim_epoch = self.reclaim_epoch.wrapping_add(1);
+
+        // GCAUD-9 (2026-08-03): `walk_objects`/`scan_region` deliberately
+        // `break`s a region's scan early on an implausible header ("Sanity
+        // check: if total_size is 0 or too large, stop scanning") rather than
+        // re-syncing — a safe recovery for a diagnostic READ, but `compact`
+        // does not just read `objects`: Phase 3 below PHYSICALLY OVERWRITES
+        // memory outside it by sliding survivors into the freed space. Any
+        // object `scan_region` silently dropped from a region it broke out of
+        // early — including a correctly-marked, live one, if the ONLY thing
+        // still pointing at it is a Rust-side overlay side table
+        // (`lhm_overlay`/`ll_overlay`/etc., which Phase 0's escape check below
+        // cannot see — it only walks ordinary header ref-slots) — never
+        // enters `live_objects`, gets no `pointer_map` entry, and has its
+        // memory handed to whatever survivor Phase 3 slides on top of it.
+        // Every live reference to it (an overlay entry, in particular) then
+        // points at that survivor's data instead — exactly the "unrelated
+        // object's bytes read back through a stale-but-not-obviously-wrong
+        // pointer" shape the residual corruption in
+        // docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md
+        // keeps presenting as (Follow-up 4).
+        //
+        // `used_bytes` is independently maintained by `alloc`/`free` — it is
+        // the ground truth for "how many bytes are currently allocated
+        // (live or dead-but-unfreed)" and does not depend on re-parsing
+        // headers. A complete, un-broken walk must account for exactly that
+        // many bytes (every allocated byte belongs to exactly one walked
+        // object; free bytes are excluded by construction — `scan_region` is
+        // only ever called on the gaps BETWEEN free blocks). If it does not,
+        // some region's scan broke early and there is live-or-dead-but-real
+        // allocated memory this compaction cannot see — abandon it and
+        // over-retain for one more cycle, the same fail-safe direction Phase
+        // 0's escape check already takes below, rather than risk physically
+        // overwriting memory whose occupant is unknown.
+        let walked_bytes: usize = objects.iter().map(|&(_, sz)| sz).sum();
+        if walked_bytes != self.used_bytes {
+            let n = COMPACT_WALK_GAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                tracing::warn!(
+                    walked_bytes,
+                    used_bytes = self.used_bytes,
+                    walked_objects = objects.len(),
+                    "old-gen compaction ABANDONED: walk_objects covered fewer bytes than are \
+                     allocated -- a region's scan broke early on an implausible header and left \
+                     live-or-dead memory outside the walked set. Sliding survivors into it would \
+                     overwrite an object nothing in this walk can prove is dead. Retaining the \
+                     whole generation for this cycle instead.",
+                );
+            }
+            for &(obj_ptr, _size) in &objects {
+                // SAFETY: `walk_objects` yielded this as a valid object start.
+                let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
+                header.gc_flags &= !GC_FLAG_MARKED;
+            }
+            return HashMap::new();
+        }
 
         // Phase 0 (dangling-ref guard): close the live set under "referenced
         // by a live old-gen object".
