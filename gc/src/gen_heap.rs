@@ -16438,7 +16438,23 @@ mod tests {
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _ = GenerationalHeap::major_gc(&mut major_roots, &young_from, &mut old_gen, &[]);
+            // `old_gen_gc(compact = true)` rather than `major_gc`, deliberately.
+            // `major_gc` asks `oldgen_compact_enabled()`, which since 2026-08-03
+            // is default-OFF process-wide (pending root-cause attribution of the
+            // corruption compaction was found to cause — see its doc comment).
+            // Routing through it would make this test pass for the wrong reason:
+            // the object would sit still because nothing compacts at all, and
+            // the downgrade this test exists to prove would never be exercised.
+            // It is also a `OnceLock` env gate, so a test cannot turn it on
+            // without racing every other test in the process. Ask the compacting
+            // arm directly instead.
+            let _ = GenerationalHeap::old_gen_gc(
+                &mut major_roots,
+                &young_from,
+                &mut old_gen,
+                true,
+                &[],
+            );
         }
 
         // SAFETY: the collector either left the object alone or slid/zeroed the

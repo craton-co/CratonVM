@@ -84,6 +84,25 @@ the other. It is the strongest evidence this page has ever had, and it is still
 (7 worker-hour) soak, and this A/B is one worker-hour per arm. Run it longer
 before drawing the line.
 
+### Old-gen compaction became default-OFF on 2026-08-03 — read the A/B accordingly
+
+`major_gc` now asks `oldgen_compact_enabled()` (`CRATONVM_OLDGEN_COMPACT`),
+which is **off by default** pending root-cause attribution of a separate
+corruption compaction was found to cause. That lands after the A/B above was
+run, and it changes which arms of this page are reachable in production:
+
+* the control-arm verdict quoted above names `freed_by="old-gen mark-compact"`
+  — a path a default-configured build **no longer runs**;
+* the FIX-arm residual quoted in *Status* names `freed_by="in-place old-gen
+  sweep"` — which is still the live path, and is therefore where the remaining
+  gap has to be looked for.
+
+The interior-root fix's compacting half is not thereby moot: it is the
+correctness precondition for turning compaction back on, and its regression
+test now drives `old_gen_gc(compact = true)` directly rather than through
+`major_gc`, so it keeps testing the downgrade rather than silently passing
+because nothing compacts.
+
 ## Severity
 **HIGH** — silent. Before this session no guard fired: zero
 `gen_heap::set_field`/`get_field` out-of-bounds hits, zero
