@@ -106,7 +106,7 @@ restores the nine original briefs.
 | `pgo-02` | bimorphic splicing, a deopt-capable guard, `StableType` invalidation, the metrics harvest | `docs/feature-designs/profile-guided-inlining.md` §8 | nobody |
 | `osr-01` | the second compile door — `compile_osr_artifact` calls `x64::compile` directly | `docs/feature-designs/jit-osr-entry-metadata.md` | nobody |
 | `osr-02` | the exit-state differential (its forcing lever, `CRATONVM_OSR_EXIT_AFTER=N`, already exists) | `docs/feature-designs/jit-osr-exit-and-recompile.md` | nobody |
-| `loop-01` | unswitching, interchange, fusion — but the binding constraint is now the loop band and structural admission (`no_candidate_loop` is 94%+ of eligible compiles), not the gates `loop-02` retired | `loop-01-peeling-and-versioning.md` | nobody |
+| `loop-01` | unswitching, interchange, fusion — but the binding constraint is now the loop band and structural admission (`no_candidate_loop` is 94%+ of eligible compiles), not the gates `loop-02` retired | `archive/loop-01-peeling-and-versioning.md` | nobody |
 | `verify-01` | still stands as the harness every lane above wants | `docs/internal/verify-01-differential-harness-RETIRED-20260803.md` | nobody |
 
 
