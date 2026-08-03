@@ -24427,27 +24427,85 @@ mod tests {
             (format!("{manifest}/src/runtime/interpreter.rs"), 0),
             (format!("{manifest}/src/vm/vm_exec.rs"), 1),
             // x64.rs lives in the `jit` sibling crate; path is resolved
-            // relative to this crate's manifest.
-            (format!("{manifest}/../jit/src/x64.rs"), 16),
+            // relative to this crate's manifest. Its ratchet is **zero**: the
+            // sixteen pre-existing sites it used to carry all moved into
+            // submodules in the 2026-08-03 split and are pinned there
+            // individually, below. Nothing may come back.
+            (format!("{manifest}/../jit/src/x64.rs"), 0),
         ];
+        // A submodule whose `mod` declaration in the parent is `#[cfg(test)]`
+        // -gated is test code in its entirety, and must be skipped.
+        //
+        // The attribute lives on the *declaration*, not inside the file, so
+        // `scan_production_section` finds no boundary in the file itself and
+        // would scan every assertion in it as production code. That is not
+        // hypothetical: when `x64.rs`'s three inline test modules became files
+        // on 2026-08-03, this gate failed with 18 "production panic sites" in
+        // `x64/loop_unroll_admission.rs`, every one of them an `assert!` that
+        // had been skipped the day before as part of `#[cfg(test)] mod
+        // loop_unroll_admission { ... }`.
+        //
+        // The rule this restores: **splitting a file must not change what the
+        // gate covers.** Test code was exempt inline and stays exempt in a
+        // file, and production code stays covered either way.
+        //
+        // Derived from the parent's declaration rather than from file names or
+        // contents: the parent is the thing that decides, so renaming a file or
+        // removing its `#[cfg(test)]` changes the answer here with no edit.
+        fn declared_cfg_test(parent_src: &str, stem: &str) -> bool {
+            let mut prev_was_cfg_test = false;
+            for line in parent_src.lines() {
+                let t = line.trim_start();
+                if t.is_empty() || t.starts_with("//") || t.starts_with('*') {
+                    continue;
+                }
+                let decl = t
+                    .trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub(super) ")
+                    .trim_start_matches("pub ");
+                if decl == format!("mod {stem};") {
+                    return prev_was_cfg_test;
+                }
+                prev_was_cfg_test = t.starts_with("#[cfg(test)]");
+            }
+            false
+        }
+
         for (dir, max_allowed) in [
             (format!("{manifest}/src/runtime/interpreter"), 0usize),
             (format!("{manifest}/../jit/src/x64"), 0usize),
         ] {
+            let parent = std::fs::read_to_string(format!("{dir}.rs"))
+                .unwrap_or_else(|e| panic!("cannot read module parent {dir}.rs: {e}"));
             let entries = std::fs::read_dir(&dir)
                 .unwrap_or_else(|e| panic!("cannot enumerate split module dir {dir}: {e}"));
-            let mut found = 0usize;
+            let mut production = 0usize;
+            let mut test_only: Vec<String> = Vec::new();
             for entry in entries {
                 let path = entry.expect("readable dir entry").path();
-                if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    found += 1;
-                    targets.push((path.to_string_lossy().into_owned(), max_allowed));
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
                 }
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                if declared_cfg_test(&parent, &stem) {
+                    test_only.push(stem);
+                    continue;
+                }
+                production += 1;
+                targets.push((path.to_string_lossy().into_owned(), max_allowed));
             }
+            // Non-vacuity: the exemption above is the only way this gate can
+            // quietly stop covering a directory, so require that something in
+            // each one is still being scanned as production.
             assert!(
-                found > 0,
-                "no submodules found under {dir} — the split-module half of \
-                 this gate silently stopped covering anything",
+                production > 0,
+                "every .rs under {dir} was classified as a `#[cfg(test)]` \
+                 module ({test_only:?}) — the split-module half of this gate \
+                 silently stopped covering anything",
             );
         }
 
@@ -24466,11 +24524,55 @@ mod tests {
         // blanket "const fn panics are fine" rule: a `const fn` called at run
         // time panics like any other function, which is why the scanner is not
         // taught to skip them wholesale.
+        //
+        // The other four entries are the 2026-08-03 split's bookkeeping, not
+        // new debt. Before the split those sixteen sites were pooled in one
+        // ratcheted allowance on `x64.rs`; the split moved them, unchanged,
+        // into the files that now own the code. Pinning them per file is
+        // strictly stronger than the pool was — a site can no longer move
+        // between files unnoticed — and the assertion below keeps the pool's
+        // guarantee as a single number.
+        //
+        // These are all codegen-invariant `unreachable!()`s, `.unwrap()`s on
+        // an `Option` a preceding branch already proved `Some`, and two
+        // `.expect()`s inside the cycle-breaking loop of the stack shuffler.
+        // They are owned by the JIT lane, not by this gate. Lower them as they
+        // are cleaned up; never raise one.
+        let per_file: [(&str, usize); 5] = [
+            ("jit/src/x64/disp.rs", 1),
+            ("jit/src/x64/arith.rs", 1),
+            ("jit/src/x64/bytecode_walk.rs", 10),
+            ("jit/src/x64/inlining.rs", 2),
+            ("jit/src/x64/operand_stack.rs", 3),
+        ];
         for (path, max_allowed) in targets.iter_mut() {
-            if path.replace('\\', "/").ends_with("jit/src/x64/disp.rs") {
-                *max_allowed = 1;
+            let norm = path.replace('\\', "/");
+            for (suffix, allowed) in per_file {
+                if norm.ends_with(suffix) {
+                    *max_allowed = allowed;
+                }
             }
         }
+
+        // The ratchet, as one number. `disp.rs`'s const-evaluation `panic!` is
+        // the documented exception above; the remaining 16 are exactly the
+        // budget `x64.rs` carried before it was split. A new submodule with a
+        // fresh allowance, or a raised one, fails here — which is the hazard
+        // the pooled form was protecting against and the per-file form would
+        // otherwise reopen.
+        let x64_budget: usize = targets
+            .iter()
+            .filter(|(p, _)| p.replace('\\', "/").contains("/jit/src/x64"))
+            .map(|(_, allowed)| *allowed)
+            .sum();
+        assert!(
+            x64_budget <= 17,
+            "the x64 backend's total production-panic allowance is {x64_budget}, \
+             above the 17 it was ratcheted at before the file was split (16 \
+             pooled on x64.rs + disp.rs's documented const-eval panic!). The \
+             per-file table exists to pin those sites to a file, not to raise \
+             the total.",
+        );
 
         for (path, max_allowed) in &targets {
             let (hits, scanned) = scan_production_section(path, &needles);
