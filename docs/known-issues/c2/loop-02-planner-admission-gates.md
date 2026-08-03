@@ -159,10 +159,14 @@ measurably not.
 
 * All three Spring Boot classes above pass **armed**
   (`CRATONVM_JIT=rootsnap-cache,bytecode-loop-xform`), 18/5/38 tests, 0 failed,
-  with 10, 15 and 58 methods actually rewritten and
+  **three runs each**, with 10, 15–16 and 58 methods rewritten per run and
   `loop_xform_deopt_bci_unpublishable = loop_xform_deopt_frames_diverge = 0`
-  across all of it. `loop-rewriter-wiring.md` listed "no application suite has
-  run with the rewriter armed" as a gap; that gap is closed for Spring Boot.
+  in all nine. `loop-rewriter-wiring.md` listed "no application suite has run
+  with the rewriter armed" as a gap; that gap is closed for Spring Boot.
+
+  Three runs rather than one because this is the arm where a wrong resume bci
+  would show up, and a single green run of a suite that is green anyway says
+  very little. The counters are stable to ±1 compile across the three.
 * `probes/LoopXformProbe.java`, `probes/LoopVersionOsrProbe.java`,
   `probes/IndyDeoptProbe.java`, `bench/StringRegexOnly.java` and
   `bench/HashMapOnly.java` match HotSpot exactly in all three configurations —

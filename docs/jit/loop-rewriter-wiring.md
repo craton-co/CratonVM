@@ -334,8 +334,9 @@ This is the case for the flag existing. Every unit test passed throughout.
   `bytecode-loop-xform`, and `bytecode-loop-xform,deopt-real=0`.
 * An application suite, armed and under the DEFAULT `deopt_real`:
   `core/spring-boot-autoconfigure`'s `AutoConfigurationSorterTests`,
-  `ConditionalOnClassTests` and `ConditionalOnPropertyTests`, 61 tests, 0
-  failures, 83 methods rewritten between them, and zero discards
+  `ConditionalOnClassTests` and `ConditionalOnPropertyTests` — 61 tests, 0
+  failures, ~83 methods rewritten between them, three runs each, and zero
+  discards in all nine
   (`loop_xform_deopt_bci_unpublishable = loop_xform_deopt_frames_diverge = 0`).
 * `cargo test -p cratonvm-jit --test '*'` with the rewriter armed and
   `deopt_real` off: 196 tests, all passing, with the transform firing during the
