@@ -1248,7 +1248,8 @@ impl ThreadRegistry {
     /// loop re-checks and re-parks.
     pub fn peek_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
         let threads = self.threads.read();
-        *threads.get(&thread_id)?.jmx_waiting_monitor.lock()
+        let monitor = *threads.get(&thread_id)?.jmx_waiting_monitor.lock();
+        monitor
     }
 
     pub fn take_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
