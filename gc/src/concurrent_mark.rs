@@ -881,25 +881,41 @@ impl ConcurrentMarker {
                 }
             }
             // Primitive arrays have no references to scan.
-        } else if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
-            // Compact object: 8-byte reference slots at the per-class oop-map
-            // offsets. An aligned single-word 8-byte pointer load cannot tear,
-            // so (like the reference-array branch above) no stripe lock is
-            // needed even though this runs concurrently with mutators.
-            for &off in &layout.ref_offsets {
-                let off = off as usize;
-                if off + ref_field_size() > body {
-                    break;
-                }
-                // SAFETY: `off` is within the object's body (capped above).
-                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + off) };
-                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
-                if raw != 0 {
-                    let ref_ptr = raw as usize as *mut u8;
-                    if markable_old_object(ref_ptr, object_starts)
-                        && self.bitmap.try_mark(ref_ptr as usize)
-                    {
-                        self.queue.push(ref_ptr);
+        } else if crate::is_compact_object(header) {
+            // HIB-DCAST-LATEPHASE.1: `compact_oop_scan` returns `None` both
+            // for "this is a legacy object" (its documented contract) and,
+            // via its internal `class_layout_for_fields(..)?`, for "this IS
+            // a compact object (`GC_FLAG_COMPACT` set) but its class's
+            // layout is not registered right now". Gating on
+            // `is_compact_object(header)` (the header bit, independent of
+            // the registry) rather than `compact_oop_scan(..).is_some()`
+            // keeps the second case out of the legacy arm below, which would
+            // misread this object's packed compact body under the legacy
+            // `num_slots * SLOT_SIZE` formula — an UNBOUNDED stride (this
+            // loop has no `body_bytes` cap, unlike `scan_dirty_cards`'s
+            // twin) past the object's real extent. A compact object whose
+            // layout cannot be resolved has no provably-safe reference slots
+            // to visit; skip it.
+            if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
+                // Compact object: 8-byte reference slots at the per-class oop-map
+                // offsets. An aligned single-word 8-byte pointer load cannot tear,
+                // so (like the reference-array branch above) no stripe lock is
+                // needed even though this runs concurrently with mutators.
+                for &off in &layout.ref_offsets {
+                    let off = off as usize;
+                    if off + ref_field_size() > body {
+                        break;
+                    }
+                    // SAFETY: `off` is within the object's body (capped above).
+                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + off) };
+                    let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
+                    if raw != 0 {
+                        let ref_ptr = raw as usize as *mut u8;
+                        if markable_old_object(ref_ptr, object_starts)
+                            && self.bitmap.try_mark(ref_ptr as usize)
+                        {
+                            self.queue.push(ref_ptr);
+                        }
                     }
                 }
             }

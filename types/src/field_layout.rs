@@ -917,6 +917,20 @@ pub fn is_compact_object(header: &ObjectHeader) -> bool {
     header.gc_flags & GC_FLAG_COMPACT != 0
 }
 
+/// A legacy-object body size this function returns in place of `num_slots *
+/// SLOT_SIZE` when `num_slots` exceeds [`MAX_PLAUSIBLE_LEGACY_SLOTS`].
+///
+/// `HIB-DCAST-LATEPHASE.1`: chosen so `HEADER_SIZE + object_body_size(..)`
+/// cannot overflow `usize` and so no real old-gen/region/semispace arena can
+/// ever contain an object this large — every caller's own "does this extent
+/// fit in the arena" bounds check therefore rejects it, the same way a `0`
+/// body size makes [`gen_object_total_size`] callers re-sync on a corrupt
+/// header. (`0` doesn't work here: `HEADER_SIZE + 0 == HEADER_SIZE` passes a
+/// `total < HEADER_SIZE` check, which is exactly the "sized as a plausible
+/// stride" hazard `gen_object_total_size`'s own GCAUD-3 note describes for a
+/// different sentinel.)
+const IMPLAUSIBLE_LEGACY_BODY_SIZE: usize = 1 << 40; // 1 TiB
+
 /// Total instance-field body size in bytes (excludes `HEADER_SIZE`), honouring
 /// this object's layout. Object total size = `HEADER_SIZE + object_body_size`.
 ///
@@ -937,15 +951,83 @@ pub fn object_body_size(header: &ObjectHeader) -> usize {
         })
         .unwrap_or(0)
     } else {
-        header.num_slots() as usize * SLOT_SIZE
+        // HIB-DCAST-LATEPHASE.1: defensive cap, mirroring the `num_slots >
+        // (1 << 24)` screen `gen_object_total_size` (gc/src/gen_heap.rs) has
+        // long applied — "no real class has 1<<24 fields" — which this
+        // sibling function never carried. Without it, a walker deriving an
+        // object's extent from this value (`OldGen::scan_region` and its
+        // twins in every other collector) can validate an implausibly large
+        // "object" that merely happens to fit inside a big enough arena: a
+        // desynced walk landing on payload bytes decodes them as a legacy
+        // header with a huge `num_slots`, `num_slots * SLOT_SIZE` is still
+        // small enough to fit before the arena's end (especially near a
+        // large free tail), and the object is accepted as valid. A later
+        // reference-slot scan then strides through tens of millions of
+        // `Value` cells — past the object's real extent, and eventually past
+        // the arena itself — into unmapped memory: a `SIGSEGV` reached this
+        // way against the real `DefaultCatalogAndSchemaTest` workload.
+        let num_slots = header.num_slots() as usize;
+        if num_slots > MAX_PLAUSIBLE_LEGACY_SLOTS {
+            return IMPLAUSIBLE_LEGACY_BODY_SIZE;
+        }
+        num_slots * SLOT_SIZE
     }
 }
+
+/// Shared with [`object_body_size`]'s cap; matches the `1 << 24` bound
+/// `gen_object_total_size` and `old_gen_mark_candidate_plausible` (both in
+/// `gc/src/gen_heap.rs`) already use for the same reason.
+const MAX_PLAUSIBLE_LEGACY_SLOTS: usize = 1 << 24;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::class_id::ClassId;
+    use crate::heap_types::{ArrayElementType, ObjectKind, HEADER_SIZE};
+
     static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `HIB-DCAST-LATEPHASE.1`: a legacy (non-compact) object whose `shape`
+    /// field holds an implausible `num_slots` (e.g. from a GC walk that
+    /// desynced onto payload bytes and decoded them as a header) must not be
+    /// sized as `num_slots * SLOT_SIZE` — for tens of millions of "slots"
+    /// that is still small enough to fit inside a large arena, so a walker
+    /// deriving the object's extent from this value accepts it as valid, and
+    /// a later reference-slot scan strides through all of them into unmapped
+    /// memory. Asserts the cap fires and that adding `HEADER_SIZE` to the
+    /// result cannot overflow (every caller does exactly that).
+    #[test]
+    fn object_body_size_caps_an_implausible_legacy_num_slots() {
+        let header = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            0,
+            33_000_000, // far past the 1<<24 (~16.7M) cap
+        );
+        assert_eq!(object_body_size(&header), IMPLAUSIBLE_LEGACY_BODY_SIZE);
+        assert!(
+            HEADER_SIZE.checked_add(object_body_size(&header)).is_some(),
+            "HEADER_SIZE + object_body_size(..) must not overflow"
+        );
+    }
+
+    /// A plausible legacy `num_slots` must still size exactly as before —
+    /// the cap must not touch real objects.
+    #[test]
+    fn object_body_size_is_unaffected_below_the_cap() {
+        let header = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            0,
+            4,
+        );
+        assert_eq!(object_body_size(&header), 4 * SLOT_SIZE);
+    }
 
     #[test]
     fn layout_offsets_and_oopmap() {

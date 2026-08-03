@@ -10513,17 +10513,37 @@ impl GenerationalHeap {
         walked_bases: &[usize],
         worklist: &mut Vec<*mut u8>,
     ) {
-        // A worklist entry whose `kind` byte is not a valid discriminant was
-        // never an object base: some push site handed us a dangling or interior
-        // address. Counted (not rejected) here — rejecting is the FIX, which is
-        // deliberately not part of this diagnostic commit. See
-        // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+        // A worklist entry whose `kind`/`element_type` byte is not a valid
+        // discriminant was never an object base: some push site handed us a
+        // dangling or interior address. This was long COUNTED but not
+        // rejected here — see
+        // `docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`,
+        // which explicitly deferred the reject as follow-up work. Deferring it
+        // left the door open for the exact hazard that doc's Half 2 fix was
+        // written to close: `gen_object_total_size(header)` below reads
+        // `header.kind`/`header.element_type` as TYPED `#[repr(u8)]` enums,
+        // which is instant UB for an out-of-range discriminant — optimized
+        // code is free to lower that into a hardware trap rather than doing
+        // anything resembling "the wrong thing but not crashing"
+        // (`HIB-DCAST-LATEPHASE.1`: reached this way as a SIGSEGV reading
+        // through a garbage `array_length` treated as a slot/byte count).
+        // Reject now, mirroring `OldGen::scan_region`'s equivalent fix in
+        // `docs/internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`:
+        // validate the raw tag bytes through
+        // `object_kind_from_tag`/`array_element_type_from_tag` before ever
+        // forming a `&ObjectHeader` reference.
         // SAFETY: every push site range-checked `obj_ptr` against old gen, so
-        // offset 4 is mapped.
-        if unsafe { *obj_ptr.add(OBJECT_KIND_OFFSET) } > 2 {
+        // offsets 4/5 are mapped; reading a raw `u8` has no validity
+        // requirement beyond in-bounds-and-readable.
+        let kind_tag = unsafe { *obj_ptr.add(OBJECT_KIND_OFFSET) };
+        let elem_tag = unsafe { *obj_ptr.add(ARRAY_ELEMENT_TYPE_OFFSET) };
+        if object_kind_from_tag(kind_tag).is_none() || array_element_type_from_tag(elem_tag).is_none()
+        {
             OLDMARK_BAD_KIND_HITS.fetch_add(1, Ordering::Relaxed);
+            return;
         }
-        // SAFETY: `obj_ptr` is a live old-gen object from the mark worklist; its header is valid.
+        // SAFETY: `obj_ptr` is a live old-gen object from the mark worklist,
+        // and the kind/element_type tag bytes were just validated above.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
         // DoHead comb-7 fix (2026-07-03): validate the claimed extent before
         // scanning — the young-mark twin of this check caught a corrupt
@@ -11155,6 +11175,46 @@ impl GenerationalHeap {
             // conservative roots before forwarding writes through them.
             return old_ptr;
         }
+        // HIB-DCAST-LATEPHASE.1: `young_object_starts.contains(old_ptr)` above
+        // is exact pre-GC membership, but this function's own next comment
+        // block already documented the residual risk — "A corrupted header
+        // (e.g., slot tag mis-identified a non-pointer bit-pattern as an
+        // ObjectRef) would cause forward_object to walk into arbitrary
+        // memory" — for `old_ptr` values that reach here as a false
+        // conservative root rather than a genuine object start. That guard
+        // ran too late: it read `kind`/`element_type` as TYPED `#[repr(u8)]`
+        // enums via `ptr::read` below FIRST, and only checked plausibility
+        // afterward. Loading an out-of-range discriminant is immediate UB the
+        // moment the typed `.read()` happens, before any check can reject it
+        // — optimized code is free to lower that into a hardware trap rather
+        // than doing anything resembling "the wrong thing but not crashing"
+        // (this reached a `SIGILL` inside heavily-inlined GC code against the
+        // real `DefaultCatalogAndSchemaTest` workload). Validate the raw tag
+        // bytes through `object_kind_from_tag`/`array_element_type_from_tag`
+        // — the same fix already applied to `OldGen::scan_region` and
+        // `scan_object_for_old_refs` (see
+        // `docs/internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`)
+        // — before ever reading either field as a typed enum.
+        // SAFETY: `old_ptr` is confirmed inside young from-space via
+        // `young_object_starts.contains` above, so the two single-byte tag
+        // reads at the fixed header offsets are in-bounds; reading a raw `u8`
+        // has no validity requirement beyond in-bounds-and-readable.
+        let kind_tag = unsafe { *old_ptr.add(OBJECT_KIND_OFFSET) };
+        let elem_tag = unsafe { *old_ptr.add(ARRAY_ELEMENT_TYPE_OFFSET) };
+        if object_kind_from_tag(kind_tag).is_none() || array_element_type_from_tag(elem_tag).is_none()
+        {
+            tracing::debug!(
+                target: "cratonvm::gc::guard",
+                old_ptr = ?old_ptr,
+                kind_tag,
+                elem_tag,
+                backtrace = ?std::backtrace::Backtrace::capture(),
+                "gen_heap::forward_object: invalid kind/element_type tag — false root or \
+                 corrupted header, not decoded as ObjectHeader",
+            );
+            return old_ptr;
+        }
+
         // SAFETY: `old_ptr` points to a live young-gen object; its header is
         // valid. Build an owned *copy* of the header rather than holding a
         // shared `&ObjectHeader`: later in this function we install the
@@ -11170,7 +11230,9 @@ impl GenerationalHeap {
         // an owned header from those values.
         // SAFETY: `old_ptr` points at a live young-gen object, so each field of its
         // `ObjectHeader` is initialized and individually readable via addr_of! reads;
-        // no aliasing `&` is held while we later install the forwarding pointer.
+        // no aliasing `&` is held while we later install the forwarding pointer. The
+        // kind/element_type tag bytes were just validated above, so reading them as
+        // typed enums here is sound.
         let header: ObjectHeader = unsafe {
             let h = old_ptr as *const ObjectHeader;
             let mut owned = ObjectHeader::new(
@@ -12674,14 +12736,37 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
     if !old_gen.contains(neighbor) {
         return false;
     }
+    // HIB-DCAST-LATEPHASE.1: `neighbor` is a deliberately UNPROVEN,
+    // speculative address — this function's whole job is to guess whether it
+    // looks like a real header — so its kind/element_type tag bytes are
+    // exactly as likely to be garbage as any other candidate this file
+    // screens. The removed code below constructed `nheader` and then read
+    // `nheader.kind`/`nheader.kind as u8` unconditionally: loading an
+    // out-of-range discriminant into a typed `#[repr(u8)]` enum is instant
+    // UB the moment that load happens, regardless of what the code does with
+    // the value afterward — `as u8` does not avoid it, because the enum is
+    // still read *as an enum* first. Validate both raw tag bytes through
+    // `object_kind_from_tag`/`array_element_type_from_tag` before ever
+    // constructing a typed `&ObjectHeader`, mirroring every other fix in
+    // `docs/internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`.
+    // SAFETY: bounds-checked by `old_gen.contains(neighbor)` above.
+    let kind_tag = unsafe { *neighbor.add(OBJECT_KIND_OFFSET) };
+    let elem_tag = unsafe { *neighbor.add(ARRAY_ELEMENT_TYPE_OFFSET) };
+    let (Some(kind), Some(_)) = (
+        object_kind_from_tag(kind_tag),
+        array_element_type_from_tag(elem_tag),
+    ) else {
+        return false;
+    };
     // SAFETY: bounds-checked above.
-    let nheader = unsafe { &*(neighbor as *const ObjectHeader) };
     let nword0 = unsafe { *(neighbor as *const u64) };
-    let kind_byte = nheader.kind as u8;
-    let is_array = nheader.kind == ObjectKind::Array;
-    let plausible = nword0 != 0
-        && kind_byte <= 1
-        && (is_array || nheader.num_slots() <= (1 << 24))
+    if nword0 == 0 {
+        return false;
+    }
+    // SAFETY: the kind/element_type tag bytes were just validated above.
+    let nheader = unsafe { &*(neighbor as *const ObjectHeader) };
+    let is_array = kind == ObjectKind::Array;
+    let plausible = (is_array || nheader.num_slots() <= (1 << 24))
         && (!is_array || nheader.array_length() <= i32::MAX as u32)
         && header_reserved_fields_plausible(nheader);
     if !plausible {
@@ -13474,16 +13559,38 @@ pub(crate) unsafe fn for_each_ref_slot(
                 }
             }
         }
-    } else if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
-        for &off in &layout.ref_offsets {
-            let off = off as usize;
-            if off + ref_field_size() > body {
-                break;
-            }
-            let s = obj_ptr.add(HEADER_SIZE + off);
-            let raw: u64 = read_ref_slot(s);
-            if raw != 0 {
-                f(raw as usize as *mut u8, off);
+    } else if is_compact_object(header) {
+        // HIB-DCAST-LATEPHASE.1: `compact_oop_scan` returns `None` for TWO
+        // different reasons — "this is a legacy object" (its own documented
+        // contract) and, via its `class_layout_for_fields(..)?` early return,
+        // "this IS a compact object but its class's layout is not registered
+        // for this (class_id, field_count) right now" (e.g. a redefinition
+        // raced the registry). Testing `is_compact_object(header)` directly
+        // — the per-object `GC_FLAG_COMPACT` header bit set at allocation,
+        // independent of the registry — distinguishes the two. Treating the
+        // second case as "fall back to legacy 16-byte-cell scanning" (the old
+        // behaviour) reads this object's *compact*, packed, possibly much
+        // smaller body under the *legacy* `num_slots * SLOT_SIZE` formula —
+        // `num_slots()` returns the compact field count here, not a legacy
+        // slot count, so the loop below strides past the object's real
+        // extent (validated only for the layout-less HEADER_SIZE-only size
+        // `object_body_size` reports) into unmapped memory: a `SIGSEGV`
+        // reached this way against the real `DefaultCatalogAndSchemaTest`
+        // workload. A compact object whose layout cannot be resolved has no
+        // provably-safe reference slots to visit; skip it exactly as an
+        // implausible/corrupt object is skipped elsewhere, rather than
+        // guessing.
+        if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
+            for &off in &layout.ref_offsets {
+                let off = off as usize;
+                if off + ref_field_size() > body {
+                    break;
+                }
+                let s = obj_ptr.add(HEADER_SIZE + off);
+                let raw: u64 = read_ref_slot(s);
+                if raw != 0 {
+                    f(raw as usize as *mut u8, off);
+                }
             }
         }
     } else {
@@ -13536,24 +13643,32 @@ pub(crate) unsafe fn forward_ref_slots(
                 }
             }
         }
-    } else if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
-        for &off in &layout.ref_offsets {
-            let off = off as usize;
-            if off + ref_field_size() > body {
-                break;
-            }
-            let s = obj_ptr.add(HEADER_SIZE + off);
-            let raw: u64 = read_ref_slot(s);
-            if raw != 0 {
-                if let Some(n) = forward(raw as usize as *mut u8) {
-                    // gcstress face-1 hunt (no-op unless gated).
-                    crate::heap::cell_watch_check(
-                        s as usize,
-                        8,
-                        "forward_ref_slots-compact",
-                        &(n as usize),
-                    );
-                    write_ref_slot(s, n as u64);
+    } else if is_compact_object(header) {
+        // See the matching note in `for_each_ref_slot`: `compact_oop_scan`
+        // returning `None` here means the layout for this genuinely-compact
+        // object (`GC_FLAG_COMPACT` set) is not currently registered, NOT
+        // that this is a legacy object. Falling through to the legacy arm
+        // would forward/rewrite this object's packed compact body under the
+        // wrong 16-byte-cell formula, striding past its real extent.
+        if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
+            for &off in &layout.ref_offsets {
+                let off = off as usize;
+                if off + ref_field_size() > body {
+                    break;
+                }
+                let s = obj_ptr.add(HEADER_SIZE + off);
+                let raw: u64 = read_ref_slot(s);
+                if raw != 0 {
+                    if let Some(n) = forward(raw as usize as *mut u8) {
+                        // gcstress face-1 hunt (no-op unless gated).
+                        crate::heap::cell_watch_check(
+                            s as usize,
+                            8,
+                            "forward_ref_slots-compact",
+                            &(n as usize),
+                        );
+                        write_ref_slot(s, n as u64);
+                    }
                 }
             }
         }
@@ -14054,6 +14169,80 @@ mod tests {
         // `total_size < HEADER_SIZE` corruption test accepts).
         compact_filler.shape = 3;
         assert_eq!(gen_object_total_size(&compact_filler), 0);
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`: a compact object (`GC_FLAG_COMPACT` set)
+    /// whose class layout is not currently registered must not be scanned
+    /// as a legacy object. `compact_oop_scan` returns `None` for exactly
+    /// this case too (its internal `class_layout_for_fields(..)?` early
+    /// return), and before this fix `for_each_ref_slot`/`forward_ref_slots`
+    /// read that `None` as "this must be a legacy object" — which walks
+    /// this object's (possibly much smaller, differently laid out) compact
+    /// body under the legacy `num_slots * SLOT_SIZE` formula. That reached a
+    /// `SIGSEGV` against the real `DefaultCatalogAndSchemaTest` workload,
+    /// whose Hibernate/ByteBuddy proxy classes churn redefinitions.
+    #[test]
+    fn for_each_ref_slot_skips_a_compact_object_with_no_registered_layout() {
+        let heap = small_gen_heap();
+        let obj = heap.alloc_object(ClassId::new(999_999), 4);
+        heap.set_field(obj, 0, Value::Int(1));
+
+        // No layout is registered for ClassId(999_999), so `compact_oop_scan`
+        // returns `None` for it despite the bit being set -- the exact state
+        // under test.
+        // SAFETY: flips the per-object compact bit on a live, fully
+        // initialized allocation.
+        unsafe {
+            let header = &mut *(obj.as_ptr() as *mut ObjectHeader);
+            header.gc_flags |= GC_FLAG_COMPACT;
+        }
+
+        let mut visited = Vec::new();
+        // SAFETY: `obj.as_ptr()` points at a valid, fully-initialized header
+        // whose body is in-bounds (a real allocation from `small_gen_heap`).
+        unsafe {
+            let header = &*(obj.as_ptr() as *const ObjectHeader);
+            for_each_ref_slot(obj.as_ptr(), header, |ptr, idx| visited.push((ptr, idx)));
+        }
+        assert!(
+            visited.is_empty(),
+            "an unresolvable compact object must be skipped, not walked as legacy"
+        );
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`: `victim8_neighbor_explains_zero_prefix` reads
+    /// a deliberately UNPROVEN, speculative address's `kind`/`element_type`
+    /// bytes as typed enums before validating them. Constructs a real
+    /// zero-word0 candidate immediately followed (at `candidate + 8`) by an
+    /// allocation whose `kind` tag byte is corrupted to a value outside
+    /// `ObjectKind`'s declared discriminants, and asserts the probe rejects
+    /// it (returns `false`) instead of trapping.
+    #[test]
+    fn victim8_neighbor_explains_zero_prefix_rejects_an_invalid_kind_tag() {
+        let mut og = OldGen::new(4096);
+        // One block, big enough to hold an 8-byte zero prefix plus a full
+        // header at the +8 offset `victim8_neighbor_explains_zero_prefix`
+        // probes — `alloc` zeroes the whole block, so the leading 8 bytes
+        // are already the "zero prefix" this probe exists to explain away.
+        let candidate = og.alloc(8 + HEADER_SIZE, 8).unwrap();
+        let neighbor = unsafe { candidate.add(8) };
+
+        // 0xFF is not a declared ObjectKind discriminant (0=Object, 1=Array,
+        // 2=HumongousFiller).
+        // SAFETY: `neighbor` is a live allocation from `og`; writing raw
+        // bytes does not require the resulting values to be valid typed
+        // fields.
+        unsafe {
+            // A non-zero word0 so only the kind tag is under test. Written
+            // FIRST: word0 spans bytes 0..8, which includes the kind byte at
+            // `OBJECT_KIND_OFFSET` (4) — writing it after would clobber the
+            // corrupted tag below.
+            std::ptr::write(neighbor as *mut u64, 1u64);
+            std::ptr::write(neighbor.add(OBJECT_KIND_OFFSET), 0xFFu8);
+        }
+
+        // Must not crash.
+        assert!(!victim8_neighbor_explains_zero_prefix(candidate, &og));
     }
 
     // -----------------------------------------------------------------
@@ -14952,6 +15141,42 @@ mod tests {
 
         // Age should be incremented
         assert_eq!(heap.get_header(new_obj).gc_age, 1);
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`: `forward_object_impl` used to read
+    /// `kind`/`element_type` as TYPED `#[repr(u8)]` enums via `ptr::read`
+    /// *before* its own later plausibility guard could reject them —
+    /// instant UB for an invalid discriminant, which optimized code lowered
+    /// into a hardware trap (a `SIGILL` deep inside heavily-inlined GC code
+    /// against the real `DefaultCatalogAndSchemaTest` workload). Corrupts
+    /// only the raw `kind` tag byte of an otherwise legitimately-allocated,
+    /// tracked young-gen object and asserts a minor GC survives it —
+    /// treating the object as an unmoved suspected false root instead of
+    /// decoding the corrupt bytes.
+    #[test]
+    fn minor_gc_survives_a_root_with_an_invalid_kind_tag() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj = heap.alloc_object(ClassId::new(1), 2);
+        heap.set_field(obj, 0, Value::Int(42));
+
+        // 0xFF is not a declared ObjectKind discriminant (0=Object, 1=Array,
+        // 2=HumongousFiller).
+        // SAFETY: `obj.as_ptr() + OBJECT_KIND_OFFSET` is the `kind` byte of a
+        // live allocation; writing a raw `u8` there does not require the
+        // resulting value to be a valid `ObjectKind`.
+        unsafe {
+            std::ptr::write(obj.as_ptr().add(OBJECT_KIND_OFFSET), 0xFFu8);
+        }
+
+        let mut roots = vec![obj];
+        // Must not crash: the invalid tag is rejected before it is ever read
+        // as a typed enum.
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+        // The corrupted object is treated as a suspected false root and left
+        // unmoved, not decoded/copied.
+        assert_eq!(result.stats.objects_copied, 0);
     }
 
     #[test]
@@ -16572,6 +16797,53 @@ mod tests {
             after, before,
             "the old-gen mark decoded an INTERIOR address as an ObjectHeader \
              instead of rejecting it (bad-kind hits {before} -> {after})",
+        );
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`: `scan_object_for_old_refs` used to COUNT a
+    /// worklist entry with an invalid `kind`/`element_type` tag via
+    /// `OLDMARK_BAD_KIND_HITS` but go on to decode the corrupt bytes as a
+    /// typed `ObjectHeader` anyway — the reject was documented as
+    /// deliberately deferred follow-up work. Loading an out-of-range
+    /// discriminant into a `#[repr(u8)]` enum is instant UB the moment it is
+    /// read, and optimized code is free to lower that into a hardware trap:
+    /// this reached `gen_object_total_size`'s read of `header.array_length()`
+    /// as a slot/byte count and crashed with `SIGSEGV` against the real
+    /// `DefaultCatalogAndSchemaTest` workload. Asserts the entry is rejected
+    /// (no referents scanned) instead of decoded.
+    #[test]
+    fn scan_object_for_old_refs_rejects_a_worklist_entry_with_an_invalid_kind_tag() {
+        let mut og = OldGen::new(4096);
+        let obj_size = HEADER_SIZE + 2 * SLOT_SIZE;
+        let ptr = og.alloc(obj_size, 8).unwrap();
+        // SAFETY: `ptr` is a fresh allocation from this OldGen; `set_num_slots`
+        // writes a valid header field.
+        unsafe {
+            let header = &mut *(ptr as *mut ObjectHeader);
+            header.set_num_slots(2);
+        }
+        // 0xFF is not a declared ObjectKind discriminant (0=Object, 1=Array,
+        // 2=HumongousFiller) -- simulating a dangling/corrupt worklist entry.
+        // SAFETY: `ptr + OBJECT_KIND_OFFSET` is the `kind` byte of a live
+        // allocation from `og`; writing a raw `u8` there does not require the
+        // resulting value to be a valid `ObjectKind`.
+        unsafe {
+            std::ptr::write(ptr.add(OBJECT_KIND_OFFSET), 0xFFu8);
+        }
+
+        let before = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
+        let mut worklist: Vec<*mut u8> = Vec::new();
+        GenerationalHeap::scan_object_for_old_refs(ptr, &og, &[], &mut worklist);
+        let after = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
+
+        assert!(
+            worklist.is_empty(),
+            "a corrupt header must not be scanned for referents"
+        );
+        assert!(
+            after > before,
+            "expected the bad-kind guard to fire and bump OLDMARK_BAD_KIND_HITS \
+             ({before} -> {after})"
         );
     }
 
