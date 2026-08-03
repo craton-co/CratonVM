@@ -846,7 +846,28 @@ fn http11_request_impl(
     }
 
     let addr = format!("{}:{}", host, port);
-    let tcp_stream = TcpStream::connect(&addr).map_err(|e| format!("connect: {e}"))?;
+    // Resolve first so IPv4-mapped destinations (`::ffff:a.b.c.d`) can be
+    // folded to plain IPv4 before dialling: on Windows an AF_INET6 socket
+    // cannot reach one (`IPV6_V6ONLY` defaults to 1 → WSAEADDRNOTAVAIL), and a
+    // URL host arrives here as text, never through `InetAddress`. Same fold
+    // the h1 client does in `http_client::open_connection`.
+    let mut last_err: Option<String> = None;
+    let mut connected: Option<TcpStream> = None;
+    for sa in std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+        .map_err(|e| format!("resolve {addr}: {e}"))?
+        .map(cratonvm_native_io::outbound_policy::normalize_connect_addr)
+    {
+        match TcpStream::connect(sa) {
+            Ok(s) => {
+                connected = Some(s);
+                break;
+            }
+            Err(e) => last_err = Some(format!("connect {sa}: {e}")),
+        }
+    }
+    let tcp_stream = connected.ok_or_else(|| {
+        last_err.unwrap_or_else(|| format!("connect: no address resolved for {addr}"))
+    })?;
     tcp_stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .ok();
