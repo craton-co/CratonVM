@@ -89,19 +89,26 @@ elsewhere). Until that closes, no amount of AQS-specific work can help: the
 JDK's concurrency classes are written as many small methods precisely because
 every other JVM inlines them away.
 
-In descending order of expected value:
+Every candidate below reduces to that same floor — which is the finding, not an
+evasion. In descending order of expected value:
 
 1. **Inlining.** Nothing in the ruled-out list actually splices a callee body
    into its caller. `docs/feature-designs/profile-guided-inlining.md` §8 still
    has bimorphic splicing and a deopt-capable guard open. Sixteen calls going
    to zero is the whole gap.
-2. **`AtomicInteger` is fully natively overridden.** The schema-2 census lists
-   `get`, `set`, `compareAndSet`, `incrementAndGet` and 13 more as `bridge`
-   natives, so `AtomicInteger.get()` costs **969 ns** — *more than an empty
-   bytecode call* — where the real body is `return value;` on a volatile int,
-   and being a native it can never be compiled or inlined. Dropping those in
-   real-JDK mode is a contained experiment with a clear hypothesis; it needs
-   `Unsafe.compareAndSetInt` to be sound first.
+2. **The trivial atomic accessors are now a pessimization.** The schema-2
+   census shows the *whole* `java.util.concurrent.atomic` package implemented
+   natively — `AtomicInteger` 17 entries, `AtomicLong` 17, `AtomicIntegerArray`
+   26, every `*FieldUpdater`, `LongAdder`, `DoubleAdder` — on top of 241
+   `jdk/internal/misc/Unsafe` natives. That is deliberate and the CAS/arithmetic
+   members plausibly must stay that way. But `AtomicInteger.get()` costs
+   **969 ns**, *more than an empty bytecode call (431 ns)*, for a body that is
+   `return value;` on a volatile int: for the plain `get`/`set` accessors the
+   native is now strictly worse than the bytecode it replaces, and being native
+   it can never be compiled or inlined. Narrow and testable — but note it does
+   not escape item 1: 969 ns *is* the native-call floor, so this trims a
+   constant rather than removing the wall. It also needs the real `value` field
+   to be live on these synthetic-layout objects, which is unverified.
 3. The `java/util/` tier-up exclusion is miscalibrated even though it is not
    the bottleneck here: its comment ties it to a Spring *collections* graph,
    and `java.util.concurrent.*` is caught by the prefix as collateral. Worth
