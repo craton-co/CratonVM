@@ -16018,7 +16018,7 @@ mod tests {
             .class_store
             .descendants_of(root)
             .iter()
-            .map(ClassId::as_u32)
+            .map(|c| c.as_u32())
             .collect();
         let bfs_order = via_index.clone();
         via_index.sort_unstable();
