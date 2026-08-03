@@ -75,7 +75,7 @@ use crate::vm::{
     invoke_shared, read_java_string, set_static_shared, SharedVm,
 };
 
-type CachedInvokeTarget = GenericCachedInvokeTarget<Arc<crate::jit::CompiledMethod>>;
+type CachedInvokeTarget = GenericCachedInvokeTarget<cratonvm_jit::RetainedCode>;
 
 // ---------------------------------------------------------------------------
 // GC trigger helper
@@ -7939,7 +7939,12 @@ pub fn execute(
                     note_jit_skip_seal("early-backend-bail", &skip_key);
                     shared.jit.jit_skip_set.write().insert(skip_key.clone());
                 }
-                if let Some(compiled) = compiled {
+                // `RetainedCode`: this handle is regularly the LAST owner of
+                // a body that has since been superseded, and it is released on
+                // the mutator, so a bare `Arc` drop here unmaps executable
+                // memory with no quiescence proof behind it. See
+                // `cratonvm_jit::RetainedCode`.
+                if let Some(compiled) = compiled.map(cratonvm_jit::RetainedCode::new) {
                     if crate::runtime::env_cache::jit_entry_dbg() {
                         eprintln!(
                             "[JIT_ENTRY] {}.{}{}",
