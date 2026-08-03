@@ -135,6 +135,9 @@ pub fn compile(
         helpers,
         non_escaping_new,
         inline_sites,
+        // PGO-02: legacy/test wrapper never plans a guarded virtual inline
+        // (it has no profile-driven admission path at all).
+        HashMap::new(),
         string_layout,
         &[],
         0,
@@ -288,6 +291,14 @@ pub fn compile_with_param_slots(
     helpers: &JitRuntimeHelpers,
     non_escaping_new: std::collections::HashSet<usize>,
     inline_sites: HashMap<usize, crate::InlineSite>,
+    // PGO-02: guard_class_id for every Monomorphic-admitted virtual/interface
+    // inline site, keyed by the same pc as `inline_sites`. See
+    // `docs/feature-designs/profile-guided-inlining.md`. Deliberately NOT
+    // threaded through the loop-unroll pc-replication tuple a few lines below
+    // (unlike `inline_sites` itself) — a replicated pc without an entry here
+    // just falls back to normal dispatch for that unrolled copy, which is
+    // always correct, only not optimized.
+    inline_guard_class_ids: HashMap<usize, u32>,
     // Compile-time resolved `java/lang/String` field layout for the String
     // call-site intrinsics (length/charAt/hashCode/…). `None` means "String
     // layout unavailable" — String-intrinsic codegen (added by a later
@@ -1549,6 +1560,7 @@ pub fn compile_with_param_slots(
     compiler.scalar_field_ops = sr_plan.field_ops;
     compiler.scalar_init_skips = sr_plan.init_skips;
     compiler.inline_sites = inline_sites.into_iter().collect();
+    compiler.inline_guard_class_ids = inline_guard_class_ids.into_iter().collect();
     // String call-site intrinsics: hand the resolved String field layout to
     // the compiler so intrinsic codegen can emit inline field loads.
     compiler.string_layout = string_layout;
@@ -1620,6 +1632,10 @@ pub fn compile_with_param_slots(
     // Emit prologue
     compiler.emit_prologue();
     if compiler.failed {
+        let (site, pc, op) = compiler
+            .failed_site
+            .unwrap_or(("singlepass-prologue", 0, 0));
+        crate::note_jit_bail_site_at(site, pc, op);
         return None;
     }
     let entry_offset = 0; // prologue starts at offset 0
@@ -1632,16 +1648,19 @@ pub fn compile_with_param_slots(
         // `compile-bail` line names the method but not the opcode. Neither is
         // a diagnosis on its own, and they are not even both printed on the
         // same run for an OSR/callee compile.
-        crate::note_jit_bail_site_at(
+        //
+        // A refusal raised through the `failed` FLAG names its own site and the
+        // pc/op live when it was raised; the flag is only checked after the
+        // whole dispatch loop, so `dbg_last_pc`/`dbg_last_op` would name
+        // whatever instruction happened to be last instead.
+        let (site, pc, op) = compiler.failed_site.unwrap_or((
             "singlepass-codegen",
             compiler.dbg_last_pc,
             compiler.dbg_last_op,
-        );
+        ));
+        crate::note_jit_bail_site_at(site, pc, op);
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
-            eprintln!(
-                "[cratonvm-jitc] codegen-bail pc={} op=0x{:02x}",
-                compiler.dbg_last_pc, compiler.dbg_last_op
-            );
+            eprintln!("[cratonvm-jitc] codegen-bail site={site} pc={pc} op=0x{op:02x}");
         }
         return None;
     }

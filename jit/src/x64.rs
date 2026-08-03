@@ -698,7 +698,24 @@ struct Compiler {
     branch_target_stack_oop_marks: FxHashMap<usize, Vec<bool>>,
     /// Set to true when an internal error (e.g. stack underflow) is detected
     /// during compilation.  `compile_bytecode` checks this and bails out.
+    ///
+    /// Raise it through [`Compiler::fail`], never by assignment — the flag on
+    /// its own says nothing about WHAT refused (see `failed_site`).
     failed: bool,
+    /// The FIRST site that raised `failed`, with the bytecode pc/opcode current
+    /// at that moment.
+    ///
+    /// `failed` is a flag consulted only after the whole dispatch loop has run,
+    /// so a refusal through it used to be attributed to
+    /// `dbg_last_pc`/`dbg_last_op` — the last bytecode the emitter touched,
+    /// which for a method that walks on to its `ireturn` is just the last
+    /// instruction and names nothing. `Rbc6FieldProbe.getfieldRefHandlerLocal`
+    /// reported `singlepass-codegen(pc=36,op=0xac)`, an arm that has no
+    /// `return false` of its own, for an operand-stack underflow one
+    /// instruction earlier. Every raising site now names itself and that name
+    /// reaches the `compile-bail` line, the way `note_jit_bail_site` works
+    /// everywhere else.
+    failed_site: Option<(&'static str, usize, u8)>,
     /// Bitmask of scratch XMM registers (2-7) currently in use on the simulated stack.
     /// Bit N corresponds to SCRATCH_XMMS[N]. Used to allocate scratch XMMs for
     /// FP intermediate persistence across bytecodes.
@@ -746,6 +763,9 @@ struct Compiler {
     sr_monitor_scalar_ops: std::collections::HashSet<usize>,
     /// Inline sites: bytecode PC → resolved InlineSite for inlining callee bytecode.
     inline_sites: FxHashMap<usize, crate::InlineSite>,
+    // PGO-02: see the `inline_guard_class_ids` parameter doc on
+    // `compile_with_param_slots`.
+    inline_guard_class_ids: FxHashMap<usize, u32>,
     /// Compile-time resolved `java/lang/String` field layout, for the String
     /// call-site intrinsics. `None` ⇒ String layout unavailable (intrinsic
     /// codegen bails to normal dispatch). See `crate::StringFieldLayout`.
@@ -2044,6 +2064,7 @@ impl Compiler {
             branch_target_stack_depth: FxHashMap::default(),
             branch_target_stack_oop_marks: FxHashMap::default(),
             failed: false,
+            failed_site: None,
             helpers,
             scratch_xmm_in_use: 0,
             fp_hoist_info: Vec::new(),
@@ -2059,6 +2080,7 @@ impl Compiler {
             sr_monitor_at: FxHashMap::default(),
             sr_monitor_scalar_ops: std::collections::HashSet::new(),
             inline_sites: FxHashMap::default(),
+            inline_guard_class_ids: FxHashMap::default(),
             string_layout: None,
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
@@ -2262,6 +2284,20 @@ impl Compiler {
     /// inline null-check stubs at array store/load sites.
     pub(crate) fn is_local_nonnull(&self, pc: usize, local: usize) -> bool {
         self.null_check_info.is_nonnull(pc, local)
+    }
+
+    /// Raise the compile-wide failure flag, naming the site that raised it.
+    ///
+    /// Only the FIRST call records a site: the dispatch loop deliberately keeps
+    /// walking after a failure (several handlers push placeholders so
+    /// downstream opcodes keep a plausible stack height), so anything raised
+    /// afterwards is a consequence, not the cause.
+    #[cold]
+    fn fail(&mut self, site: &'static str) {
+        if self.failed_site.is_none() {
+            self.failed_site = Some((site, self.dbg_last_pc, self.dbg_last_op));
+        }
+        self.failed = true;
     }
 
     /// Offset for local variable `idx`: [rbp - (idx+1)*8]

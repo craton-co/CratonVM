@@ -169,6 +169,32 @@ impl Compiler {
         // (getstatic cache removed — every getstatic calls the helper at
         // runtime for JMM thread-safety.)
 
+        // The map above answers "does SOME instruction branch here", which is
+        // not the same question as "can control reach here". The walk below
+        // revives dead code at every branch target, so a target whose only
+        // predecessors are themselves dead came back to life with no recorded
+        // state — `expected_depth` fell back to 0 and the operand stack was
+        // rebuilt empty.
+        //
+        // The population that hits it is EXCEPTION HANDLER BODIES. The backend
+        // has no in-method handler dispatch, so a handler body is dead code in
+        // the emitted image; but a branch INSIDE one (a ternary, an `if`, a
+        // loop) still marks its own targets, and the walk cannot tell those
+        // apart from a live join. `Rbc6FieldProbe.getfieldRefHandlerLocal` —
+        // `catch (NPE e) { return scratch + (seen == null ? 0 : 1); }` —
+        // revived at the ternary's merge with an empty stack, so the `iadd`
+        // there underflowed and refused the whole method. The revived block was
+        // also published as an OSR entry point, described by a stack model that
+        // never applied to it.
+        //
+        // Compute real reachability and revive only there. Nothing live is
+        // lost: the first PC of every reachable run is either PC 0 or a branch
+        // target, which is exactly where a revival happens, and a fall-through
+        // successor of a reachable instruction is reachable by construction. A
+        // `None` result means opaque control flow (`jsr`/`ret`, malformed
+        // encodings) — keep the historical behaviour there rather than guess.
+        let reachable = compute_reachable_pcs(code, code_len);
+
         let mut dead = false; // true after unconditional control transfer
 
         let mut pc = 0;
@@ -186,19 +212,32 @@ impl Compiler {
             if branch_targets[pc] {
                 self.slot_mirror = None;
             }
-            // DCE: if we're in dead code and this PC isn't a branch target, skip it
+            // DCE: if we're in dead code and this PC isn't reachable, skip it
             if dead {
-                if branch_targets[pc] {
-                    dead = false; // reachable via branch
-                                  // At merge points after unconditional branches, reconstruct
-                                  // the simulated stack using canonical frame offsets. The
-                                  // predecessor path called canonicalize_stack() before the
-                                  // goto, so values live at base_spill + i*8.
-                    let expected_depth = self
-                        .branch_target_stack_depth
-                        .get(&pc)
-                        .copied()
-                        .unwrap_or(0);
+                let revive = match &reachable {
+                    Some(r) => r[pc],
+                    None => branch_targets[pc],
+                };
+                if revive {
+                    // Reachable via a branch. At merge points after
+                    // unconditional branches, reconstruct the simulated stack
+                    // using canonical frame offsets: the predecessor path
+                    // called `canonicalize_stack` before the goto, so values
+                    // live at `base_spill + i*8`.
+                    dead = false;
+                    // A revived PC is reachable, so an emitted branch named
+                    // it — and every branch-emitting arm records the operand
+                    // stack live at its target through
+                    // `record_branch_target_depth`. The one shape that could
+                    // still land here unrecorded is a PC reached ONLY by a
+                    // LATER (backward) branch, which has not been emitted yet;
+                    // the historical `unwrap_or(0)` rebuilt an empty stack for
+                    // it and compiled on, which is a silent wrong-code path,
+                    // not a conservative one. Refuse instead — and say so.
+                    let Some(&expected_depth) = self.branch_target_stack_depth.get(&pc) else {
+                        self.fail("singlepass-codegen/revived-merge-depth-unrecorded");
+                        return false;
+                    };
                     if !self.set_spill_depth(expected_depth) {
                         return false;
                     }
@@ -1929,7 +1968,7 @@ impl Compiler {
                 0x5a => {
                     if dupx_codegen_disabled() || dup_x1_codegen_disabled() || self.stack.len() < 2
                     {
-                        self.failed = true;
+                        self.fail("singlepass-codegen/dup_x1-unsupported-shape");
                         let _ = self.push_stack();
                     } else {
                         let a_slot = self.peek_stack();
@@ -1972,7 +2011,7 @@ impl Compiler {
                         // Unprovable form (or malformed height) — stay
                         // interpreted; placeholder keeps the model height
                         // plausible until the post-loop `failed` check.
-                        self.failed = true;
+                        self.fail("singlepass-codegen/dup_x2-unprovable-form");
                         let _ = self.push_stack();
                     } else {
                         let a_slot = self.peek_stack();
@@ -2050,7 +2089,7 @@ impl Compiler {
                             // placeholders so downstream opcode handlers keep a
                             // plausible stack height until the post-loop `failed`
                             // check discards this compilation.
-                            self.failed = true;
+                            self.fail("singlepass-codegen/dup2-unprovable-top-width");
                             let _ = self.push_stack();
                             let _ = self.push_stack();
                         }
@@ -3336,6 +3375,20 @@ impl Compiler {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
+                    // Every arm of a switch is a branch target, and needs the
+                    // operand stack live at it recorded exactly the way the
+                    // `if`/`goto` arms record theirs — the dead-code merge
+                    // reconstruction reads both the depth and the oop marks
+                    // from this map. Nothing recorded them before: an arm
+                    // revived from dead code fell back to depth 0 with
+                    // all-`false` marks, which is a guess in the depth and the
+                    // very unsoundness `branch_target_stack_oop_marks`
+                    // documents in the marks. The key is already popped here,
+                    // so `self.stack` is exactly what every arm sees.
+                    self.record_branch_target_depth(def_target);
+                    for &target in &targets {
+                        self.record_branch_target_depth(target);
+                    }
 
                     if count <= 4 {
                         // Small table: CMP chain (compact code, few comparisons)
@@ -3476,6 +3529,20 @@ impl Compiler {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
+                    // Every arm of a switch is a branch target, and needs the
+                    // operand stack live at it recorded exactly the way the
+                    // `if`/`goto` arms record theirs — the dead-code merge
+                    // reconstruction reads both the depth and the oop marks
+                    // from this map. Nothing recorded them before: an arm
+                    // revived from dead code fell back to depth 0 with
+                    // all-`false` marks, which is a guess in the depth and the
+                    // very unsoundness `branch_target_stack_oop_marks`
+                    // documents in the marks. The key is already popped here,
+                    // so `self.stack` is exactly what every arm sees.
+                    self.record_branch_target_depth(def_target);
+                    for &(_, target) in &pairs {
+                        self.record_branch_target_depth(target);
+                    }
 
                     if npairs <= 6 {
                         // Small: linear CMP chain (fast for few entries)
@@ -4537,7 +4604,7 @@ impl Compiler {
                                 // its simulated stack no longer matches. Bail
                                 // out of JIT compilation; the interpreter can
                                 // execute the ordinary invoke path safely.
-                                self.failed = true;
+                                self.fail("singlepass-codegen/lambda-int-to-double-stack-shape");
                                 return false;
                             };
                             let lambda_slot = self.stack[self.stack.len() - 2];
@@ -5662,7 +5729,7 @@ impl Compiler {
                                     // Spill region exhausted — bail the whole
                                     // compile (always safe: the method falls
                                     // back to the interpreter).
-                                    self.failed = true;
+                                    self.fail("singlepass-codegen/arraycopy-args-spill-exhausted");
                                     return false;
                                 }
                                 None => {
@@ -6765,6 +6832,128 @@ impl Compiler {
                         if self.try_emit_inline(pc) {
                             pc += 3;
                             continue;
+                        }
+                    }
+
+                    // PGO-02 (docs/feature-designs/profile-guided-inlining.md):
+                    // guarded MONOMORPHIC virtual/interface inline. `inline_sites`
+                    // + `inline_guard_class_ids` are populated TOGETHER, only for
+                    // an admitted `InlineVerdict::Monomorphic` plan, only when
+                    // `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is on (see
+                    // `InlineBackendCaps` in jit/src/lib.rs) — with the flag off
+                    // `inline_guard_class_ids` is always empty and this whole
+                    // block costs one HashMap probe. Splices the callee body via
+                    // the SAME `try_emit_inline` the invokespecial check above
+                    // already uses, behind a receiver class-id guard; the miss
+                    // edge falls through UNCHANGED to the normal dispatch code
+                    // below (MIC/PIC/`jit_invoke_dispatch`) — never a deopt (see
+                    // the design doc's §3 deopt-safety argument: no caller
+                    // scopes are populated, so this relies on — and does not
+                    // change — the existing guarantee that nothing inside an
+                    // inlined body publishes a deopt point).
+                    let mut guarded_virtual_done_patch: Option<usize> = None;
+                    if op != 0xb7 {
+                        if let (Some(guard_class_id), Some(site)) = (
+                            self.inline_guard_class_ids.get(&pc).copied(),
+                            self.inline_sites.get(&pc).cloned(),
+                        ) {
+                            let recv_depth = site.callee_num_args;
+                            if recv_depth >= 1 && self.stack.len() >= recv_depth {
+                                let recv_slot = self.stack[self.stack.len() - recv_depth];
+
+                                // Full state snapshot from BEFORE any guard byte
+                                // is emitted — mirrors try_emit_inline's own
+                                // checkpoint set exactly (see its comment on the
+                                // groovyjarjarasm-asm-handler-getexceptiontablesize
+                                // fix for why every one of these fields matters),
+                                // so a rewind on either failure path below is
+                                // indistinguishable from never having attempted
+                                // this guard at all.
+                                let buf_checkpoint = self.buf.pos();
+                                let stack_checkpoint = self.stack.clone();
+                                let oop_marks_checkpoint = self.stack_oop_marks.clone();
+                                let spill_checkpoint = self.next_spill_offset;
+                                let exception_check_stubs_checkpoint =
+                                    self.exception_check_stubs.len();
+                                let deopt_stubs_checkpoint = self.deopt_stubs.len();
+                                let forward_patches_checkpoint = self.forward_patches.len();
+                                let jump_table_patches_checkpoint =
+                                    self.jump_table_patches.len();
+                                let self_call_patches_checkpoint = self.self_call_patches.len();
+                                let bounds_check_stubs_checkpoint =
+                                    self.bounds_check_stubs.len();
+                                let null_check_store_stubs_checkpoint =
+                                    self.null_check_store_stubs.len();
+
+                                // Guard: null receiver -> miss. Class mismatch ->
+                                // miss. Peeked, not popped — try_emit_inline does
+                                // its own popping on the hit path below, and the
+                                // miss path needs the receiver+args untouched for
+                                // the normal-dispatch code that runs next.
+                                self.load_slot_to_reg(RAX, recv_slot);
+                                self.emit_test_r64_r64(RAX);
+                                let mut miss_patches: Vec<usize> = Vec::with_capacity(2);
+                                miss_patches.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // CMP DWORD [RAX+0], guard_class_id — identical
+                                // encoding to the String/CRC32 intrinsic guard
+                                // above (81 /7 id, ModRM 0x78 = mod00 /7 rm=RAX).
+                                self.buf.emit(&[0x81, 0x78, 0x00]);
+                                self.buf.emit(&guard_class_id.to_le_bytes());
+                                miss_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                if self.try_emit_inline(pc) {
+                                    // Hit: skip the about-to-be-emitted
+                                    // normal-dispatch bytes entirely.
+                                    guarded_virtual_done_patch =
+                                        Some(self.emit_jmp_rel32_patch());
+                                    // Land every guard-miss branch right here —
+                                    // the start of the UNCHANGED normal-dispatch
+                                    // code that is about to run next.
+                                    for p in miss_patches {
+                                        self.patch_rel32_to_here(p);
+                                    }
+                                    // The inline body already consumed the
+                                    // receiver+args and pushed its result via the
+                                    // same push_from_rax / push_from_rax_as_xmm0
+                                    // convention the normal-dispatch code below
+                                    // also uses. Restore the compiler's SYMBOLIC
+                                    // state (not the already-emitted bytes) to
+                                    // exactly what it was before the guard, so
+                                    // that code — the only Rust-level
+                                    // continuation from here, run unconditionally
+                                    // — pops the SAME receiver+args positions and
+                                    // pushes the canonical result shape for every
+                                    // bytecode that follows, regardless of which
+                                    // machine-code path a given execution
+                                    // actually takes at runtime.
+                                    self.stack = stack_checkpoint;
+                                    self.stack_oop_marks = oop_marks_checkpoint;
+                                    self.next_spill_offset = spill_checkpoint;
+                                } else {
+                                    // try_emit_inline already rolled back its OWN
+                                    // side effects (see its doc comment); rewind
+                                    // the guard bytes and their checkpointed
+                                    // state too, so the fall-through below is
+                                    // byte-identical to never having attempted
+                                    // this guard.
+                                    self.buf.rewind_to(buf_checkpoint);
+                                    self.stack = stack_checkpoint;
+                                    self.stack_oop_marks = oop_marks_checkpoint;
+                                    self.next_spill_offset = spill_checkpoint;
+                                    self.exception_check_stubs
+                                        .truncate(exception_check_stubs_checkpoint);
+                                    self.deopt_stubs.truncate(deopt_stubs_checkpoint);
+                                    self.forward_patches.truncate(forward_patches_checkpoint);
+                                    self.jump_table_patches
+                                        .truncate(jump_table_patches_checkpoint);
+                                    self.self_call_patches
+                                        .truncate(self_call_patches_checkpoint);
+                                    self.bounds_check_stubs
+                                        .truncate(bounds_check_stubs_checkpoint);
+                                    self.null_check_store_stubs
+                                        .truncate(null_check_store_stubs_checkpoint);
+                                }
+                            }
                         }
                     }
 
@@ -9220,6 +9409,9 @@ impl Compiler {
                                 }
                             }
                         }
+                    }
+                    if let Some(done) = guarded_virtual_done_patch {
+                        self.patch_rel32_to_here(done);
                     }
                     if op == 0xb9 {
                         pc += 5;

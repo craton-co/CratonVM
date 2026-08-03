@@ -62,6 +62,14 @@ if ($Vm -eq 'hotspot') {
   if (-not $Exe) { throw '-Exe is required for -Vm craton' }
   $exePath = $Exe
 }
+# org.apache.tomcat.integration.httpd.* starts a real Apache httpd reverse
+# proxy per test; TesterHttpd looks for a literal "httpd" on PATH unless this
+# property points at one, and Windows has no httpd on PATH. See
+# setup-httpd-windows.ps1, which unpacks the tree this default points at.
+# Inert for every other class (nothing else reads the property), so it is
+# appended unconditionally rather than behind a switch.
+$Httpd = 'C:\craton\tools\Apache24\bin\httpd.exe'
+
 # Keep this list byte-for-byte in step with $jvmArgs in run-tomcat-suite.ps1's
 # Invoke-Mode - it is the whole point of this script.
 $argv = @(
@@ -75,6 +83,7 @@ $argv = @(
   '--add-opens','java.base/java.util=ALL-UNNAMED',
   '--add-opens','java.base/java.util.concurrent=ALL-UNNAMED'
 )
+if (Test-Path $Httpd) { $argv += "-Dtomcat.test.httpd.path=$Httpd" }
 if ($Vm -eq 'craton') {
   if ($NoJit) { $argv += '--nojit' }
 } elseif ($NoJit) {

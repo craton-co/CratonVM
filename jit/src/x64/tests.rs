@@ -548,6 +548,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         &helpers,
         std::collections::HashSet::new(),
         HashMap::new(),
+        HashMap::new(), // inline_guard_class_ids (PGO-02)
         None,
         &[0],
         1,
@@ -4408,6 +4409,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             helpers,
             std::collections::HashSet::new(),
             HashMap::new(),
+            HashMap::new(), // inline_guard_class_ids (PGO-02)
             None, // string_layout
             &[],
             0,
@@ -10753,6 +10755,117 @@ fn build_lookupswitch_bytecode(pairs: &[(i32, i32)], default_val: i32) -> (Vec<u
     code.push(0);
     code.push(0);
     (code, code_len)
+}
+
+/// `compile_switch_method`'s shape with the locals a handler-body fixture
+/// needs. The bytecode under test never runs; only the compiler's decision
+/// about it is asserted.
+fn compile_probe_method(
+    code: &[u8],
+    num_params: usize,
+    max_locals: usize,
+) -> Option<CompiledMethod> {
+    compile(
+        code,
+        code.len(),
+        num_params,
+        max_locals,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+}
+
+/// A dead region containing a branch of its own must not refuse the method.
+///
+/// The backend has no in-method exception-handler dispatch, so a handler
+/// body is dead code in the emitted image — but a branch INSIDE one still
+/// marks its own targets, and the DCE walk revived at every branch target
+/// regardless of whether anything reachable could get there. It came back
+/// with no recorded operand-stack depth, rebuilt an empty stack, and then
+/// underflowed on the merge's `iadd`, refusing the whole method.
+///
+/// Shape transcribed from `Rbc6FieldProbe.getfieldRefHandlerLocal`'s
+/// handler — `catch (NPE e) { return scratch + (seen == null ? 0 : 1); }`
+/// — whose ternary is the branch in question. See
+/// `docs/internal/singlepass-codegen-refuses-handler-body-merge-FIXED-20260803.md`.
+#[test]
+fn a_dead_region_with_an_internal_branch_does_not_refuse_the_method() {
+    //  0: iload_0
+    //  1: ireturn           <- everything below is unreachable
+    //  2: iload_0
+    //  3: aload_1
+    //  4: ifnonnull 11
+    //  7: iconst_0
+    //  8: goto 12
+    // 11: iconst_1
+    // 12: iadd              <- the merge that underflowed
+    // 13: ireturn
+    let code = [
+        0x1a, 0xac, 0x1a, 0x2b, 0xc7, 0x00, 0x07, 0x03, 0xa7, 0x00, 0x04, 0x04, 0x60, 0xac,
+    ];
+    assert!(
+        compile_probe_method(&code, 2, 2).is_some(),
+        "a branch inside an unreachable region must not refuse the method"
+    );
+
+    // The live prefix alone compiles, so the refusal really did come from
+    // the dead tail and not from `iload_0; ireturn`.
+    assert!(compile_probe_method(&code[..2], 2, 2).is_some());
+}
+
+/// The same shape reached through a `goto` over the dead region, which is
+/// how a `try`/`catch` actually lays out: the live path jumps past the
+/// handler, so the handler body sits between two live PCs.
+#[test]
+fn a_dead_region_between_two_live_ones_is_skipped_whole() {
+    //  0: goto 14           (over the "handler")
+    //  3: iload_0           <- unreachable from here ...
+    //  4: aload_1
+    //  5: ifnonnull 12
+    //  8: iconst_0
+    //  9: goto 13
+    // 12: iconst_1
+    // 13: iadd              <- ... to here
+    // 14: iconst_2          <- live again
+    // 15: ireturn
+    let code = [
+        0xa7, 0x00, 0x0e, 0x1a, 0x2b, 0xc7, 0x00, 0x07, 0x03, 0xa7, 0x00, 0x04, 0x04, 0x60,
+        0x05, 0xac,
+    ];
+    assert!(compile_probe_method(&code, 2, 2).is_some());
+}
+
+/// A refusal raised through the `failed` FLAG names the site that raised
+/// it, not whatever opcode the walk happened to reach afterwards.
+///
+/// `dup2` at PC 0 has no preceding instruction, so its top-of-stack width
+/// is unprovable and the arm raises the flag. The walk then runs on to the
+/// `ireturn`, which is exactly the misattribution this records: the old
+/// reason string was `singlepass-codegen(pc=1,op=0xac)`.
+#[test]
+fn a_flag_refusal_names_the_site_that_raised_it() {
+    let code = [0x5c, 0xac]; // dup2; ireturn
+    let _ = crate::take_jit_bail_site(); // clear anything a prior test left
+    assert!(compile_probe_method(&code, 0, 1).is_none());
+    let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
+    assert_eq!(site, "singlepass-codegen/dup2-unprovable-top-width");
 }
 
 fn compile_switch_method(code: &[u8], code_len: usize) -> Option<CompiledMethod> {

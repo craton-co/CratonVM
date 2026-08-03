@@ -21,15 +21,15 @@ impl Compiler {
     pub(super) fn checked_spill_range_end(&mut self, start: i32, slots: usize) -> Option<i32> {
         let bytes = slots.checked_mul(8).and_then(|n| i32::try_from(n).ok());
         let Some(bytes) = bytes else {
-            self.failed = true;
+            self.fail("singlepass-codegen/spill-range-byte-count-overflow");
             return None;
         };
         let Some(end) = start.checked_add(bytes) else {
-            self.failed = true;
+            self.fail("singlepass-codegen/spill-range-end-overflow");
             return None;
         };
         if start < self.base_spill_offset || end > self.spill_limit_offset {
-            self.failed = true;
+            self.fail("singlepass-codegen/spill-range-exhausted");
             return None;
         }
         Some(end)
@@ -129,7 +129,7 @@ impl Compiler {
         let slot = match self.stack.pop() {
             Some(s) => s,
             None => {
-                self.failed = true;
+                self.fail("singlepass-codegen/operand-stack-underflow-pop");
                 return StackSlot::Frame(0);
             }
         };
@@ -318,7 +318,7 @@ impl Compiler {
         match self.stack.last().copied() {
             Some(s) => s,
             None => {
-                self.failed = true;
+                self.fail("singlepass-codegen/operand-stack-underflow-peek");
                 StackSlot::Frame(0)
             }
         }
@@ -353,7 +353,7 @@ impl Compiler {
             }
         }
         if next > self.spill_limit_offset {
-            self.failed = true;
+            self.fail("singlepass-codegen/spill-cursor-past-limit");
             return;
         }
         self.next_spill_offset = next;
@@ -438,7 +438,7 @@ impl Compiler {
                     // bail defensively rather than corrupt if that invariant
                     // is ever broken.)
                     if parked {
-                        self.failed = true;
+                        self.fail("singlepass-codegen/parallel-move-second-park");
                         return;
                     }
                     let mut walk = pending[0].0;
@@ -456,7 +456,7 @@ impl Compiler {
                             None => {
                                 // No blocker found for an all-blocked move —
                                 // inconsistent state; bail safely.
-                                self.failed = true;
+                                self.fail("singlepass-codegen/parallel-move-no-blocker");
                                 return;
                             }
                         }

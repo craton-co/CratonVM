@@ -219,7 +219,7 @@ impl Compiler {
             return;
         }
         let Some(disps) = stack_bang_frame_probe_disps(frame_size) else {
-            self.failed = true;
+            self.fail("singlepass-codegen/stack-bang-probe-unrepresentable");
             return;
         };
         for disp in disps {

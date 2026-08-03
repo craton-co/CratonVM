@@ -179,7 +179,7 @@ impl Compiler {
                 // This should be unreachable because the caller uses the same
                 // predicate. Fail compilation closed if future call-site
                 // refactoring breaks that pairing.
-                self.failed = true;
+                self.fail("singlepass-codegen/self-call-moving-proof-unpublishable");
                 return;
             }
             // Match the metadata state normally established by

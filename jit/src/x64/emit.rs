@@ -898,7 +898,7 @@ impl Compiler {
             (16, true) => 0xBF,  // MOVSX r64, r/m16
             (16, false) => 0xB7, // MOVZX r64, r/m16
             _ => {
-                self.failed = true;
+                self.fail("singlepass-codegen/movsx-source-width-unsupported");
                 return;
             }
         };

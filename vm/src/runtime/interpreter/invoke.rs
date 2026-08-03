@@ -15466,6 +15466,7 @@ pub(super) fn compile_osr_artifact(
                 &helpers,
                 scan.non_escaping_new.clone(), // escape analysis results
                 std::collections::HashMap::new(), // inline_sites
+                std::collections::HashMap::new(), // inline_guard_class_ids (PGO-02, no guarded plan from this scan-based fast path)
                 None, // string_layout — String intrinsics land in a later wave
                 &param_jvm_slots,
                 param_slot_span,
@@ -15531,6 +15532,7 @@ pub(super) fn compile_osr_artifact(
     // back-edge does not re-run the whole pipeline to the same conclusion; the
     // artifact stays cached and other PCs are unaffected.
     if !osr_reused && !compiled.can_osr_enter(entry_pc) {
+        cratonvm_jit::metrics::record_osr_event("osr_refused_entry");
         crate::jit::mark_osr_entry_rejected(
             &class_name,
             &method_name,
@@ -15724,6 +15726,7 @@ pub(super) fn try_osr(
             // again. A state-dependent refusal (a slot's type, the local count,
             // live operands) must NOT be memoed — the next trip over the back-edge
             // carries different locals and may well be admissible.
+            cratonvm_jit::metrics::record_osr_event("osr_refused_entry");
             let permanent = cratonvm_jit::osr_refusal_is_permanent(&b);
             if permanent {
                 crate::jit::mark_osr_entry_rejected(
@@ -15792,6 +15795,12 @@ pub(super) fn try_osr(
     };
 
     crate::jit::helpers::restore_jit_thread(saved_jit_thread);
+
+    // An entry was taken. Counted here rather than before the call so a panic
+    // inside compiled code is not reported as a successful entry, and counted
+    // unconditionally because the whole point of `osr_entered` is to be the
+    // denominator `osr_exited` is read against.
+    cratonvm_jit::metrics::record_osr_event("osr_entered");
 
     // FIX (OSR uncommon-trap fallthrough, HHH-15895 `InPredicateTest`):
     // `jit_uncommon_trap` (used by, among others, the invokedynamic 0xba arm's
@@ -16042,6 +16051,13 @@ pub(super) fn try_osr(
     //     it was — correct only when the bail precedes any committed loop iteration
     //     (the unconditional-at-header trigger). The validated Step-8 default.
     if result_i64 == i64::MIN {
+        // The entered frame is leaving compiled code without a value. This is
+        // the event the doc leads with: an OSR bail that resumes at the wrong
+        // interpreter state re-runs loop iterations, which is a wrong-answer
+        // bug that no termination test can see. Counting it does not fix that
+        // — it makes "entered and immediately left, every time" visible in a
+        // default run, which is the shape of the livelock.
+        cratonvm_jit::metrics::record_osr_event("osr_exited");
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
             dbg_deopt_sink("osr-exit", &rframe, "");
             // Identity gate (jit-invokedynamic-groovy-regression): the stash
@@ -17043,6 +17059,18 @@ pub(super) fn try_jit_upgrade_with_gate(
         let cm = shared.classes.class_manager.read();
         resolve_jit_new_site(&cm, class_id, cp_idx)
     };
+    // PGO-02: receiver class-id -> class-name resolver for a guarded
+    // speculative virtual/interface inline plan's SpeculatedReceiver
+    // invalidation dependency (plan_inline's fail-closed rule — see
+    // docs/feature-designs/profile-guided-inlining.md). `None` (id not
+    // loaded, or unloaded between profiling and compiling) refuses
+    // that one speculation rather than recording an unmatchable
+    // name-less dependency.
+    let class_id_namer = |cid: u32| -> Option<String> {
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(cratonvm_types::ClassId::new(cid))
+            .map(|c| c.name.to_string())
+    };
     // activate-ir-optimizer: elidable-`<init>` resolver for `new` scalar
     // replacement. Now default-ON (soaked: bt10/14/16/18 == HotSpot, POJO probes
     // == HotSpot, 802 jit + 20 differential tests green). `CRATONVM_JIT_SCALAR_NEW=0`
@@ -17478,6 +17506,18 @@ pub(super) fn try_jit_upgrade_with_gate(
                 let cm = shared.classes.class_manager.read();
                 resolve_jit_new_site(&cm, callee_cid, cp_idx)
             };
+            // PGO-02: receiver class-id -> class-name resolver for a guarded
+                // speculative virtual/interface inline plan's SpeculatedReceiver
+                // invalidation dependency (plan_inline's fail-closed rule — see
+                // docs/feature-designs/profile-guided-inlining.md). `None` (id not
+                // loaded, or unloaded between profiling and compiling) refuses
+                // that one speculation rather than recording an unmatchable
+                // name-less dependency.
+            let c_class_id_namer = |cid: u32| -> Option<String> {
+                let cm = shared.classes.class_manager.read();
+                cm.get_class(cratonvm_types::ClassId::new(cid))
+                    .map(|c| c.name.to_string())
+            };
             // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
             // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
             let c_scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
@@ -17619,6 +17659,11 @@ pub(super) fn try_jit_upgrade_with_gate(
                 // invokedynamic-uncommon-trap fix: resolves an invokedynamic
                 // CP index to its target descriptor for the callee's pool.
                 Some(&c_indy_descriptor_resolver),
+                if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+                    Some(&c_class_id_namer)
+                } else {
+                    None
+                },
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -17767,6 +17812,11 @@ pub(super) fn try_jit_upgrade_with_gate(
         // to an unconditional uncommon-trap deopt instead of bailing the
         // whole method.
         Some(&indy_descriptor_resolver),
+        if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+            Some(&class_id_namer)
+        } else {
+            None
+        },
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -18502,6 +18552,18 @@ pub(super) fn try_jit_compile_callee_slow(
         let cm = shared.classes.class_manager.read();
         resolve_jit_new_site(&cm, cid, cp_idx)
     };
+    // PGO-02: receiver class-id -> class-name resolver for a guarded
+    // speculative virtual/interface inline plan's SpeculatedReceiver
+    // invalidation dependency (plan_inline's fail-closed rule — see
+    // docs/feature-designs/profile-guided-inlining.md). `None` (id not
+    // loaded, or unloaded between profiling and compiling) refuses
+    // that one speculation rather than recording an unmatchable
+    // name-less dependency.
+    let class_id_namer = |namer_cid: u32| -> Option<String> {
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(cratonvm_types::ClassId::new(namer_cid))
+            .map(|c| c.name.to_string())
+    };
     // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
     // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
     let scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
@@ -18782,6 +18844,11 @@ pub(super) fn try_jit_compile_callee_slow(
         // to an unconditional uncommon-trap deopt instead of bailing the
         // whole method.
         Some(&indy_descriptor_resolver),
+        if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+            Some(&class_id_namer)
+        } else {
+            None
+        },
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
