@@ -360,3 +360,88 @@ cause. `BasicErrorControllerIntegrationTests` passing while its 3 siblings
 fail suggests the fix is real but incomplete, not fake — worth comparing what
 GC pressure/promotion pattern each sibling class's boot sequence produces
 against the one class that now reliably passes.
+
+## Closure (2026-08-03)
+
+Re-verified from scratch in a fresh worktree
+(`/data/data/wt-becit2-20260803`, branch
+`fix/basicerrorcontroller-cluster-residual-20260803`, forked from
+`origin/dev` @ `a9241eedf3`, binary `cratonvm-becit2`), specifically to
+check whether the "Regression note (2026-08-01, again)" above still holds.
+It does not.
+
+**4 of 4 clean full-class runs, one excluded host artifact, zero
+occurrences of the `ConditionAndOutcomes` CCE or the
+`CaseInsensitiveComparator`/checkcast abort** — same 5 classes as the
+regression note (`BasicErrorControllerIntegrationTests`,
+`BasicErrorControllerDirectMockMvcTests`,
+`OAuth2ResourceServerAutoConfigurationTests`,
+`CloudFoundryActuatorAutoConfigurationTests`,
+`JettyServletWebServerFactoryTests`), one process per class, JIT on,
+default flags, real JDK 25 (`/data/jdk25-real-20260717/jdk-25.0.3+9`),
+`-Parallel 1`:
+
+| run | Basic­ErrorController­IntegrationTests | DirectMockMvcTests | OAuth2ResourceServer | CloudFoundryActuator | Jetty |
+|---|---|---|---|---|---|
+| `becit-verify-20260803a` | PASS 145.0s | PASS 46.9s | PASS 130.8s | PASS 95.9s | PASS 259.3s |
+| `becit-verify-20260803b` | PASS 151.2s | PASS 32.7s | PASS 112.4s | PASS 81.2s | PASS 226.6s |
+| `becit-verify-20260803c` | **excluded** | **excluded** | not run | not run | not run |
+| `becit-verify-20260803d` | PASS 218.1s | PASS 28.3s | PASS 120.9s | PASS 156.4s | PASS 302.2s |
+| `becit-verify-20260803e` | PASS 239.6s | PASS 46.3s | PASS 274.5s | PASS 219.1s | PASS 365.6s |
+
+Run `c` is excluded, not counted as a failure either way: both classes it
+reached died with `java.io.IOException: No space left on device (os error
+28)` from Spring Boot's embedded-Tomcat temp dir, because the shared host's
+root filesystem (`/`, NOT `/data/data`) was at 100% full (0 bytes avail)
+from other concurrent sessions' `/tmp` usage at that moment — the same
+recurring host artifact [[reference_azure_build_host]] already documents
+repeatedly. Confirmed by the log: no exception, no checkcast, no
+comparator — just the temp-dir `IOException`. Runs `d` and `e` redirect
+`-Djava.io.tmpdir=/data/data/tmp-becit20260803` (off the full root fs) and
+both came back clean, along with `a`/`b` which happened to run before the
+root fs filled. This is exactly the "read the run counts, not any single
+run" methodology this doc already established for
+`BasicErrorControllerIntegrationTests`'s original validation — applied
+here to a run that failed on disk, not on the VM.
+
+The rising per-class wall times across `a`→`e` (Jetty 259s→226s→302s→365s)
+track this shared host's `uptime` load average rising from ~0-2 to ~12-14
+over the session, not a regression — consistent with
+[[reference_shared_host_multitenant_confound]].
+
+**No code change was needed or made.** Investigated whether an identified,
+unmerged fix could explain the improvement:
+`fix(gc): validate the marker's owner->overlay edge against class identity`
+(`67439f6f6b`, on `origin/fix/hib-reclaimed-live-roots-20260801`) attacks
+the exact "reclaimed object" root-cause family this doc's own reference
+material ([[reference_object_cannot_be_cast_is_a_reclaimed_object]]) names
+for the `ConditionAndOutcomes` CCE shape. It is NOT the explanation: its
+own next commit on that branch, `b546dbddcf` ("disable the owner class
+filter by default — measured harmful"), found by one-binary alternating
+A/B on `DefaultCatalogAndSchemaTest` that enforcing it reclaims thousands
+of live objects (`stale receivers`: 0 off / 3641 on), and correctly left
+it OFF by default. Neither commit is an ancestor of `origin/dev`; nothing
+else in `1b24cca1fe..origin/dev` (87 commits, 30 touching
+`gc/`+`jit/`+`vm/`+`native-collections/`) carries a matching message
+either. The most likely explanation is that the fast pace of concurrent,
+independently-landed GC/JIT fixes on `dev` since the 08-01 binary shifted
+timing/allocation patterns enough that whatever race window the CCE needed
+no longer opens on the current tip — not a single attributable commit.
+This is consistent with the doc's own earlier admission that the CCE was
+"NOT re-observed" via live repro even in the original investigating
+session; it was always attributed by signature match, never root-caused
+directly.
+
+The two items filed under "What this does NOT close" are both independently
+resolved: the IR code-buffer flood is
+`docs/internal/fixed-suite-bugs/jit-ir-tier-code-buffer-estimate-20260801-FIXED.md`
+(FIXED 2026-08-01), and the `DeferredLogFactory.getLog(Class)` receiver
+mix-up has not been observed since `7f1b1f263` and both its known causes
+(`run_jit_callee_handler`'s handler-frame rebuild, the IR backend dropping
+args past the entry-ABI registers) are fixed and merged.
+
+**Retiring this doc.** If the `ConditionAndOutcomes` CCE or the
+`CaseInsensitiveComparator`/checkcast abort reappears, treat it as a new
+report rather than reopening this one — this closure has no single fix
+commit to point a regression at, and the next occurrence deserves its own
+live repro and root cause rather than another signature-match guess.
