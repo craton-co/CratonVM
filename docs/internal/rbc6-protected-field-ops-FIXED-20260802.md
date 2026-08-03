@@ -144,15 +144,19 @@ for a real reason:
 * **array loads/stores, `ldc`/`ldc_w`, integer divide, allocation, `checkcast`,
   `invokedynamic`** — see `precise_frame_publishing_opcode`'s doc comment.
 
-## Follow-up this exposed
+## Follow-up this exposed — FIXED 2026-08-03
 
-`Rbc6FieldProbe.getfieldRefHandlerLocal` now gets PAST RBC.6 and is refused by
-the single-pass backend instead:
+`Rbc6FieldProbe.getfieldRefHandlerLocal` got PAST RBC.6 and was refused by the
+single-pass backend instead:
 `compile-bail … backend_attempted=true reason=singlepass-codegen(pc=36,op=0xac)`.
-That is a pre-existing hole in handler-body codegen that RBC.6 was hiding, not
-something this change caused, and its effect is benign (the method stays
-interpreted). Tracked in
-[known-issues/jit/singlepass-codegen-refuses-handler-body-merge-20260802.md](../known-issues/jit/singlepass-codegen-refuses-handler-body-merge-20260802.md).
+That was a pre-existing hole in handler-body codegen that RBC.6 had been
+hiding, not something this change caused. The DCE walk revived dead code at
+every branch target, so the ternary inside the handler body came back to life
+with no recorded operand stack and underflowed at its own merge. Fixed by
+reviving on real reachability instead — see
+[singlepass-codegen-refuses-handler-body-merge-FIXED-20260803.md](singlepass-codegen-refuses-handler-body-merge-FIXED-20260803.md),
+which also names every `failed`-flag refusal site and makes the switch arms
+record their branch-target state.
 
 ## Corrections to other docs
 

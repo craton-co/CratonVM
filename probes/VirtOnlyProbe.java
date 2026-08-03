@@ -66,8 +66,15 @@ public final class VirtOnlyProbe {
     public static void main(String[] args) {
         int n = args.length > 0 ? Integer.parseInt(args[0]) : 5_000_000;
 
-        // Warm both ways: a long OSR loop and many short invocation-compiled ones.
-        for (int r = 0; r < 200; r++) {
+        // 1200, not 200: a rung must be INVOKED past the tier-up threshold
+        // (c1_threshold=500) to run compiled from entry. At 200 the only route
+        // into compiled code is OSR, and OSR entry into these loops is refused
+        // today (osr-entry-unresumable-exit -- see
+        // docs/known-issues/jit/osr-entry-unresumable-exit-refuses-hot-counted-loops-20260803.md),
+        // so every rung measured the INTERPRETER and read ~90 ns/op flat,
+        // identically under --nojit. Sanity check before trusting a number
+        // here: the control rung must land near HotSpot's ~1 ns/op, not ~90.
+        for (int r = 0; r < 1200; r++) {
             sink += arith(2_000); sink += staticCall(2_000);
             sink += virtualCall(2_000); sink += ifaceCall(2_000);
         }

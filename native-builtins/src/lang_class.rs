@@ -3149,17 +3149,34 @@ pub(crate) fn native_class_is_primitive(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    // WP4.2: real-JDK Class layout stores `primitive:boolean` at instance
-    // slot 7 вЂ” `get_or_create_primitive_mirror` writes Int(1) there for
-    // primitive mirrors. Prefer that over the name-based check, because
-    // the name slot can be observed as a stale Int after early-boot
-    // descriptor-aware coercion runs (the legacy Int(-1) sentinel that
-    // `prim_mirror_create` writes into slot 0 leaks into slot 1 read-back
-    // under some boot orderings, leaving `mirror_class_name` returning
-    // None and primitive `Class.getName()` returning null).
-    if let Value::Int(flag) = ctx.get_field(this, 7) {
-        if flag != 0 {
-            return Ok(Some(Value::Int(1)));
+    // WP4.2, hardened: real-JDK Class layout stores `primitive:boolean` at
+    // some fixed instance slot that `get_or_create_primitive_mirror` writes
+    // Int(1) into for primitive mirrors — prefer that flag over the
+    // name-based check below, because the name slot can be observed as a
+    // stale Int after early-boot descriptor-aware coercion runs (the legacy
+    // Int(-1) sentinel that `prim_mirror_create` writes into slot 0 leaks
+    // into slot 1 read-back under some boot orderings, leaving
+    // `mirror_class_name` returning None and primitive `Class.getName()`
+    // returning null).
+    //
+    // The slot used to be hard-coded as `7`, on the unchecked assumption
+    // that that's where THIS JDK build's compiled `java/lang/Class` happens
+    // to place the `primitive` field — the exact "answering true for a
+    // class that is not primitive" hazard flagged in
+    // docs/known-issues/springboot/spring-bean-attribute-type-null-flake.md.
+    // Resolve it the same way the writer does (`resolve_class_mirror_slots`
+    // in `vm/src/vm/vm_object.rs`, i.e. by field name against the loaded
+    // `java/lang/Class`), so reader and writer agree by construction instead
+    // of by coincidence. `java/lang/Class`'s layout is fixed for the process
+    // once loaded, so the resolved index is cached — but never a permanent
+    // `None`, so a call landing before `java/lang/Class` has resolved to its
+    // real (non-stub) form still gets rechecked, rather than falling back to
+    // the name-based check for the rest of the run.
+    if let Some(idx) = primitive_field_slot(ctx) {
+        if let Value::Int(flag) = ctx.get_field(this, idx) {
+            if flag != 0 {
+                return Ok(Some(Value::Int(1)));
+            }
         }
     }
     // Fallback: the legacy synthetic-mode layout where the only signal
@@ -3170,6 +3187,26 @@ pub(crate) fn native_class_is_primitive(
         "int" | "long" | "float" | "double" | "boolean" | "char" | "byte" | "short" | "void"
     );
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
+}
+
+/// Instance-field index of `java/lang/Class.primitive` (a `boolean`),
+/// resolved by name against the loaded class — mirrors
+/// `resolve_class_mirror_slots`'s writer-side resolution in
+/// `vm/src/vm/vm_object.rs` so `native_class_is_primitive` reads the exact
+/// slot `get_or_create_primitive_mirror` wrote, regardless of this JDK
+/// build's actual field order. Cached once resolved (the layout is fixed for
+/// the process lifetime); a `None` (e.g. `java/lang/Class` not yet loaded as
+/// its real, non-stub form) is not cached, so a later call gets a fresh
+/// chance to resolve it.
+fn primitive_field_slot(ctx: &dyn NativeContext) -> Option<usize> {
+    static CACHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let cached = CACHED.load(std::sync::atomic::Ordering::Relaxed);
+    if cached != usize::MAX {
+        return Some(cached);
+    }
+    let idx = ctx.resolve_field_index("java/lang/Class", "primitive")?;
+    CACHED.store(idx, std::sync::atomic::Ordering::Relaxed);
+    Some(idx)
 }
 
 pub(crate) fn native_class_get_superclass(
@@ -8157,10 +8194,25 @@ fn link_isolated_method_signatures(
             _ => return Err(isolated_loader_class_not_found(ctx, name)),
         };
         let mirror_pin = ctx.pin_native_root(mirror);
-        let link_ok = ctx
-            .class_id_from_mirror(mirror)
-            .map(|class_id| ctx.initialize_class(class_id).is_ok())
-            .unwrap_or(true);
+        // Netty CompositeByteBuf clinit bug (20260731): forcing full
+        // initialization here is only safe when this thread is not already
+        // mid-<clinit>. `loadClass` above already proved the type is present
+        // and loadable in this isolated loader's view -- that's all JVMS
+        // §5.5 requires for exposing it as a reflective method's
+        // return/parameter type. Actually running its <clinit> as well is an
+        // extra (originally intended to turn a missing transitive type into
+        // an eager NoClassDefFoundError for OnBeanCondition), but doing so
+        // while this thread is already inside another class's still-running
+        // <clinit> lets the forced class observe THAT class's statics at
+        // their pre-assignment default instead of failing to resolve --
+        // see docs/known-issues/springboot/netty-compositebytebuf-clinit-reads-unpooled-empty-buffer-null-20260731.md.
+        let link_ok = if ctx.in_clinit() {
+            true
+        } else {
+            ctx.class_id_from_mirror(mirror)
+                .map(|class_id| ctx.initialize_class(class_id).is_ok())
+                .unwrap_or(true)
+        };
         ctx.unpin_native_roots(mirror_pin);
         if !link_ok {
             return Err(isolated_loader_class_not_found(ctx, name));

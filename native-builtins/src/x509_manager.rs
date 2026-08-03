@@ -2555,7 +2555,12 @@ fn ocsp_http_post(
     };
 
     let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    // The host comes from an OCSP responder URL, i.e. text that never passed
+    // through `InetAddress` — fold an IPv4-mapped destination to plain IPv4 so
+    // Windows can dial it (an AF_INET6 socket cannot reach one). See
+    // `outbound_policy::normalize_connect_addr`.
+    let mut stream = cratonvm_native_io::outbound_policy::connect_str_normalized(&addr)
+        .map_err(|e| format!("connect {addr}: {e}"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| format!("set_read_timeout: {e}"))?;

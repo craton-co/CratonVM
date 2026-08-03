@@ -6553,6 +6553,10 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         crate::vm::vm_util::ensure_class_initialized_shared(&self.shared, self.thread, class_id)
     }
 
+    fn in_clinit(&self) -> bool {
+        crate::vm::vm_util::in_clinit_shared()
+    }
+
     fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
         self.shared
             .classes
@@ -13235,13 +13239,21 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
-        #[cfg(windows)]
-        // Conscrypt's extracted OpenJDK JNI DLL uses the same unsafe
-        // RegisterNatives-on-load pattern as tcnative on CratonVM.
+        // Conscrypt's extracted OpenJDK JNI library uses the same unsafe
+        // RegisterNatives-on-load pattern as tcnative on CratonVM, on every
+        // platform -- not just Windows. Its JNI_OnLoad calls FindClass on a
+        // handful of bootstrap classes before doing anything else, and our
+        // FindClass (and the RegisterNatives it feeds) aren't ABI-complete
+        // enough to satisfy it; conscrypt's own init aborts the process the
+        // moment one of those lookups fails (SIGABRT from inside
+        // libconscrypt_openjdk_jni's `jniutil::init`, not a Rust panic).
+        // Jetty only needs a provider that can advertise its ALPN processor
+        // while it builds a connector; the actual TLS engine remains
+        // CratonVM's own TLS surface (`t27_tls.rs`), and the Java entry
+        // points conscrypt's Java-side classes call into are satisfied by
+        // `register_conscrypt_native_bridges` in native-builtins/src/tls.rs.
         let skip_jni_onload_tcnative =
             basename_lc.contains("tcnative") || basename_lc.contains("conscrypt_openjdk_jni");
-        #[cfg(not(windows))]
-        let skip_jni_onload_tcnative = false;
 
         unsafe {
             type JniOnLoad = extern "C" fn(

@@ -22,11 +22,14 @@ use std::sync::{Arc, OnceLock, Weak};
 
 /// One class's static-field storage, at a **stable, never-freed address**.
 ///
-/// Static reads are the most expensive field access in compiled code (~35 ns
+/// Static reads were the most expensive field access in compiled code (~35 ns
 /// against HotSpot's ~1 — see
-/// `docs/known-issues/jit-getstatic-costs-a-helper-call-20260731.md`). What is
-/// left after trimming the helper is the `RwLock` + hash probe that reaching a
-/// `Vec<Value>` inside an `FxHashMap` requires.
+/// `docs/internal/jit-getstatic-costs-a-helper-call-FIXED-20260803.md`). What
+/// was left after trimming the helper is the `RwLock` + hash probe that reaching
+/// a `Vec<Value>` inside an `FxHashMap` requires — and, once this block had a
+/// stable address, the prerequisite for deleting the helper CALL outright:
+/// compiled `getstatic` now bakes [`StaticsIndex::base_cell_addr`] and loads
+/// from the block directly.
 ///
 /// A `Vec` cannot be read without that lock, because a `resize` would move the
 /// buffer out from under a concurrent reader. This block therefore **leaks**
@@ -197,12 +200,83 @@ impl StaticsIndex {
         if base.is_null() || field_index >= slot.len.load(Ordering::Relaxed) {
             return None;
         }
+        // Read the cell as two independent 8-byte words instead of copying
+        // the 16-byte `Value` in one go.
+        //
+        // `*base.add(i)` on a 16-byte type is lowered as a wide (SSE) copy, and
+        // a 16-byte access is NOT single-copy atomic on x86-64. Against a
+        // concurrent `putstatic` this reader observed **halves of two different
+        // writes**: `probes/StaticRaceProbe.java` reproduces it in seconds, a
+        // `static long` flipped between `0x0123456789ABCDEF` and
+        // `0x7EDCBA9876543210` reading back as `0x7EDCBA9889ABCDEF`. For a
+        // plain `long`/`double` static JLS §17.7 permits that; for a
+        // **`volatile`** one it does not, and the same probe tore a
+        // `static volatile long` too — on the interpreter path (`--nojit`) as
+        // well, since `get_static_shared` routes through here.
+        //
+        // Two aligned 8-byte volatile loads fix it: the discriminant word and a
+        // 4-byte payload share the low word, an 8-byte payload IS the high
+        // word, so no payload ever spans a load. `read_volatile` is what stops
+        // the optimizer from merging them back into one wide move.
+        //
+        // The STORE side needs no matching change, and that is a measurement,
+        // not an assumption: with the read narrowed, 15 s x 4 reader threads x
+        // {inline JIT, helper JIT, interpreter} observed no tear at all, which
+        // is only possible if the payload qword is already stored atomically.
+        // (Which is what x86-64 gives: whatever a 16-byte struct store lowers
+        // to, it never splits an 8-byte-aligned qword.)
+        //
+        // Transmuting the pair back into a `Value` needs no knowledge of the
+        // enum's discriminant encoding, only its size — and every bit pattern
+        // that can be assembled here is a valid `Value`, including a tag from
+        // one write paired with a payload from another: the `Object` variant is
+        // `Option<ObjectRef>`, whose niche makes a zero pointer word `None`
+        // rather than an invalid `NonNull`.
+        const _: () = assert!(std::mem::size_of::<Value>() == 16);
         // SAFETY: `base` points into a leaked, never-freed `StaticsBlock`, and
         // `field_index` was bounds-checked against the length published for
-        // that same block. The read is unsynchronized against a concurrent
-        // `putstatic`, exactly as the JIT's inline `getfield` already is for
-        // instance-field cells.
-        Some(unsafe { *base.add(field_index) })
+        // that same block. `base` is 8-aligned (it is a `Value` pointer), so
+        // both words are aligned. The read stays unsynchronized against a
+        // concurrent `putstatic` — as the JIT's inline `getfield` is for
+        // instance-field cells — it is only no longer TORN.
+        let cell = unsafe { base.add(field_index) } as *const u64;
+        let lo = unsafe { cell.read_volatile() };
+        let hi = unsafe { cell.add(1).read_volatile() };
+        // SAFETY: `Value` is 16 bytes (asserted above) and these are its own
+        // bytes, read from a live cell.
+        Some(unsafe { std::mem::transmute::<[u64; 2], Value>([lo, hi]) })
+    }
+
+    /// Address of the `AtomicPtr` **cell** that names a class's statics base —
+    /// what compiled `getstatic` code bakes as an immediate.
+    ///
+    /// Deliberately NOT the block address. A `StaticsBlock` is stable for the
+    /// life of the VM in the normal case, but two paths can still publish a
+    /// different one for the same class: `StaticsBlock::grow_to` (a write past
+    /// the published length) and a re-`prepare_class_shared`. Baking the block
+    /// address would leave compiled code reading the abandoned copy — writes
+    /// would land in the new block and never be observed. Baking the address of
+    /// the pointer cell costs one extra dependent load and makes every
+    /// republication visible to already-compiled code with no patching, no
+    /// invalidation protocol and no new invariant to maintain: the slot array
+    /// is allocated once (`OnceLock`) and never freed, so this address is valid
+    /// forever.
+    ///
+    /// `None` = not indexable, nothing published yet, or `field_index` past the
+    /// published length — the caller keeps the `jit_getstatic` helper path.
+    pub fn base_cell_addr(&self, class_id: ClassId, field_index: usize) -> Option<usize> {
+        let idx = class_id.as_u32() as usize;
+        if idx >= Self::CAPACITY {
+            return None;
+        }
+        let slots = self.slots.get()?;
+        let slot = &slots[idx];
+        if slot.base.load(Ordering::Acquire).is_null()
+            || field_index >= slot.len.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        Some(&slot.base as *const std::sync::atomic::AtomicPtr<Value> as usize)
     }
 }
 
@@ -243,6 +317,20 @@ pub struct ClassRealm {
     /// step by `set_static_shared` / the class-init path, which publish every
     /// block they create or grow.
     pub statics_index: StaticsIndex,
+
+    /// `java/lang/System`'s `ClassId` in THIS VM, or `u32::MAX` while unknown.
+    ///
+    /// Recorded by `prepare_class_shared`, which already has the class name in
+    /// hand. Compiled `getstatic` uses it as a lock-free "does this read need
+    /// the `System.out`/`err`/`in` bootstrap intercept?" test before deciding
+    /// to emit a direct load: the intercept lives in `jit_getstatic`, so a
+    /// static of this one class must never bypass the helper. Answering by
+    /// name would need a `class_manager` acquisition on the compiler thread,
+    /// which is the one thing the resolver must not do.
+    ///
+    /// Per-`ClassRealm`, so unlike the deleted process-global `system_class_id`
+    /// atomic it cannot leak one VM's id into another's decisions.
+    pub system_class_id: AtomicU32,
 
     /// Cache of resolved symbolic references (fields and methods).
     pub resolution_cache: RwLock<ResolutionCache>,
@@ -472,5 +560,135 @@ impl Drop for ClassManagerWriteGuard<'_> {
         // `class_manager_write()`/`.read()` itself: the lock this guard held
         // is already gone by this point.
         cratonvm_classloading::drain_pending_class_hooks();
+    }
+}
+
+#[cfg(test)]
+mod statics_index_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    /// A lock-free static read must never observe halves of two different
+    /// writes.
+    ///
+    /// [`StaticsIndex::get`] used to copy the whole 16-byte `Value` cell in one
+    /// go, and a 16-byte access is not single-copy atomic on x86-64: a reader
+    /// racing a `putstatic` of a `long` saw the high half of one value with the
+    /// low half of another. `probes/StaticRaceProbe.java` reproduces it from
+    /// Java in seconds — on the interpreter too, since `get_static_shared`
+    /// routes through here — and for a `volatile` long that is a JLS §17.7
+    /// violation, not merely the permitted non-atomic plain-long read.
+    ///
+    /// This is the same race in miniature: one writer flipping a slot between
+    /// two patterns, four readers asserting they only ever see those two.
+    ///
+    /// **It does not, on its own, reproduce the historical tear.** Whether
+    /// rustc emits one wide copy or two 8-byte loads depends on the inlining
+    /// context, and in this test's context it already chose the narrow form:
+    /// verified by reverting the fix, at which point the Java probe still tore
+    /// within seconds and this test still passed. So read it as a cheap CI pin
+    /// on the invariant, not as the reproduction — that is
+    /// `probes/StaticRaceProbe.java`, and a future rewrite of `get` has to be
+    /// re-checked against the probe, not against this.
+    #[test]
+    fn get_never_returns_a_torn_long() {
+        const A: i64 = 0x0123_4567_89AB_CDEF;
+        const B: i64 = 0x7EDC_BA98_7654_3210;
+
+        let block = StaticsBlock::new(4);
+        let index = Arc::new(StaticsIndex::new());
+        index.publish(ClassId::new(3), &block);
+        // The block is leaked by construction, so a raw base pointer outlives
+        // both threads; `usize` to carry it across the spawn boundary.
+        let base = block.base_ptr() as usize;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_stop = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            let slot = base as *mut Value;
+            let mut flip = false;
+            while !writer_stop.load(AtomicOrdering::Relaxed) {
+                flip = !flip;
+                // Exactly what `set_static_shared` does to the cell, minus the
+                // lock the lock-free reader does not take either.
+                // SAFETY: `slot` is the leaked block's first cell.
+                unsafe { *slot = Value::Long(if flip { B } else { A }) };
+            }
+        });
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let index = Arc::clone(&index);
+                std::thread::spawn(move || {
+                    for _ in 0..200_000 {
+                        match index.get(ClassId::new(3), 0) {
+                            Some(Value::Long(v)) => assert!(
+                                v == A || v == B,
+                                "torn long static read: {v:#x} is neither {A:#x} nor {B:#x}"
+                            ),
+                            // The writer only ever stores `Value::Long`; the
+                            // initial `Value::Int(0)` is legitimate until its
+                            // first store lands.
+                            Some(Value::Int(0)) => {}
+                            other => panic!("unexpected static cell: {other:?}"),
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for r in readers {
+            r.join().expect("reader thread");
+        }
+        stop.store(true, AtomicOrdering::Relaxed);
+        writer.join().expect("writer thread");
+    }
+
+    /// The address handed to compiled code is the POINTER CELL, so a
+    /// republication (a grown or re-prepared block) is followed with no
+    /// patching — that is the whole reason the backend pays an extra load.
+    #[test]
+    fn base_cell_addr_is_stable_across_republication() {
+        let index = StaticsIndex::new();
+        let first = StaticsBlock::new(2);
+        index.publish(ClassId::new(9), &first);
+        let cell = index
+            .base_cell_addr(ClassId::new(9), 1)
+            .expect("published block must resolve");
+
+        let second = StaticsBlock::new(8);
+        assert_ne!(
+            first.base_ptr(),
+            second.base_ptr(),
+            "the two blocks must be distinct allocations for this test to mean anything"
+        );
+        index.publish(ClassId::new(9), &second);
+
+        assert_eq!(
+            index.base_cell_addr(ClassId::new(9), 1),
+            Some(cell),
+            "the pointer cell address must not move when the block does"
+        );
+        // And what compiled code loads through it is the NEW block.
+        // SAFETY: `cell` is the address of this index's `AtomicPtr` slot.
+        let observed =
+            unsafe { (*(cell as *const std::sync::atomic::AtomicPtr<Value>)).load(Ordering::Acquire) };
+        assert_eq!(observed, second.base_ptr());
+    }
+
+    /// Out of range in either direction means "keep the helper", never a baked
+    /// address that would read past the block.
+    #[test]
+    fn base_cell_addr_refuses_unpublished_and_out_of_bounds() {
+        let index = StaticsIndex::new();
+        assert_eq!(index.base_cell_addr(ClassId::new(4), 0), None);
+        let block = StaticsBlock::new(2);
+        index.publish(ClassId::new(4), &block);
+        assert!(index.base_cell_addr(ClassId::new(4), 1).is_some());
+        assert_eq!(index.base_cell_addr(ClassId::new(4), 2), None);
+        assert_eq!(
+            index.base_cell_addr(ClassId::new(StaticsIndex::CAPACITY as u32), 0),
+            None
+        );
     }
 }

@@ -233,10 +233,19 @@ from rows with no addressing subtlety to rows whose length is load-bearing.
 | 7 | `jmp_rel32`, `jcc_rel32` | The call sites want the patch offset, not just the bytes; migrate them to `Encoded::imm_offset` in one change so no site computes the offset by hand. |
 | — | `cmov_r64_r64`, `movq_xmm_r64`, `movq_r64_xmm`, `movsd/movss_xmm_xmm`, `pxor_xmm_self`, `sqrtsd_xmm_xmm`, `mov_r64_imm64_full`, `mov_r64_r64_store_form` | Migrate opportunistically with whatever wave touches their call sites. |
 
-Two things to do *before* wave 1, neither of which is a code change to
-`x64.rs`'s emitters:
+**Not the same migration as
+`docs/feature-designs/jit-machine-level-and-instruction-selection.md`.** That one
+builds a machine level *above* this table, so `ir_lower` stops selecting and
+encoding in one breath. This one retires `x64.rs`'s hand-written emitters
+*onto* the table without changing who calls them. They are independent and can
+land in either order; each makes the other cheaper.
 
-1. Declare the module. `x64.rs` needs `pub mod isel;` — see below.
+One thing to do *before* wave 1, and it is not a code change to `x64.rs`'s
+emitters:
+
+1. ~~Declare the module.~~ **Done 2026-08-01** — `pub mod isel;` is at
+   `x64.rs:136`, in the shape given under [Wiring](#wiring) below. Its 68 tests
+   run and pass.
 2. Decide whether `select` or `encode_named` is the call-site API. The
    emitters have void signatures and bail through
    `ExecutableBuffer::mark_overflowed`; `Pattern::encode` returns a `Result`.
@@ -245,9 +254,10 @@ Two things to do *before* wave 1, neither of which is a code change to
 
 ## Wiring
 
-`jit/src/x64.rs` needs one line. Insert it immediately after the existing
-`disp` re-export (currently line 122), before the
-`// SIMD loop analysis and vectorization` banner:
+**Landed 2026-08-01.** `jit/src/x64.rs:136` carries the line below, immediately
+after the `disp` re-export and before the `// SIMD loop analysis and
+vectorization` banner. Kept here because the rationale under it is still the
+reason the module is `pub mod` and not `mod` + glob:
 
 ```rust
 pub use disp::{base_requires_displacement, base_requires_sib, disp8_const, Disp, DispOutOfRange};
