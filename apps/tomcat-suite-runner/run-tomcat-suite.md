@@ -1,7 +1,7 @@
 # Tomcat suite runner for CratonVM (Linux) - `run-tomcat-suite.sh`
 
-Linux counterpart to the Windows `run-tomcat-suite.ps1` harness (local to the
-Windows box, not git-tracked). Runs the Apache Tomcat JUnit test suite
+Linux counterpart to the Windows `run-tomcat-suite.ps1` harness (now tracked
+alongside it — see §6 for its classpath contract). Runs the Apache Tomcat JUnit test suite
 one-process-per-class against CratonVM or a real-JDK (HotSpot) baseline,
 sharded N ways, with a resumable per-shard `results.csv`.
 
@@ -98,3 +98,41 @@ initial non-PASS classes; the other 172 failed on HotSpot too).
 - `nohup`'d background shard launches on a shared host get killed at SSH
   logout unless linger is enabled first: `sudo -n loginctl enable-linger
   $(whoami)`.
+
+## 6. Windows harness: the classpath must be COMPLETE, and it now says so
+
+`run-tomcat-suite.ps1 -Setup` builds `apps\tomcat\.suite\cp.txt` from
+`Build-Classpath`. Two things about it are load-bearing:
+
+- **Each jar is looked up by several names.** Tomcat's `ant download-compile`
+  renames what it downloads (`bouncycastle-provider-1.84.jar`), while the
+  Gradle/Maven caches hold the upstream artifact name
+  (`bcprov-jdk18on-1.84.jar`). Matching only the renamed name is what silently
+  dropped BouncyCastle and EasyMock off this box's classpath for weeks —
+  eleven classes reported `NoClassDefFoundError` and were filed as two
+  separate "CratonVM" known-issues docs. Roots searched, in order:
+  `C:\Users\Victor\tomcat-build-libs`, the Gradle module cache,
+  `~\.m2\repository`, and `apps\tomcat\.suite\lib`.
+- **A miss is now fatal.** Unresolvable jars are printed in red, written to
+  `.suite\cp-missing.txt`, and abort the run unless `-AllowMissingLibs` is
+  passed. Drop the jar into `apps\tomcat\.suite\lib` (any layout) and re-run
+  `-RefreshClasspath`, which rebuilds `cp.txt` + `all-tests.txt` in seconds
+  without the ~20 min `ant deploy && ant test-compile`.
+
+`run-one.ps1` reads the same `cp.txt` and mirrors `Invoke-Mode`'s `$jvmArgs`
+verbatim (4 × `--add-opens`, the `tomcat.test.*` system properties,
+`--nojit`/`-Xint`). Keep the two lists in step: a single-class repro that omits
+`--add-opens=java.base/java.lang` fails every EasyMock-based class for reasons
+that have nothing to do with the VM.
+
+**EasyMock on JDK 25 fails on HotSpot, by design of neither.** EasyMock 5.6.0
+class-mocking needs byte-buddy's `ClassInjector.UsingUnsafe`, which is
+unavailable on JDK 25 under any flag combination; it falls back to a
+`MethodHandles.lookup()` rooted in its own package and dies with "must be
+defined in the same package as `org.easymock.internal.ClassProxyFactory`".
+Eight classes (`TestSSLValve`, `TestJNDIRealm`, `TestPersistentManager`,
+`TestWebappServiceLoader`, `TestCrawlerSessionManagerValve`,
+`TestLoadBalancerDrainingValve`, `TestRequest`, `TestTldScanner`) are therefore
+permanently red in a HotSpot control run and green under CratonVM — expected,
+not a regression. Details:
+`docs/internal/fixed-suite-bugs/tomcat/bouncycastle-easymock-classpath-fixture-gap-FIXED.md`.

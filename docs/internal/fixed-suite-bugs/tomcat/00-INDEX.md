@@ -148,3 +148,18 @@ both binaries, written up individually: groups 21-28. Everything else
 contention-suspected findings, 1 Windows-only fixture gap) is in
 [29](29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md), not treated as new
 bugs.
+
+## Windows classpath fixture gap closed, 2026-08-03
+
+`apps\tomcat\.suite\cp.txt` was short by four jars (BouncyCastle
+provider/pkix/util 1.84 + EasyMock 5.6.0) because `Build-Classpath` matched
+only Tomcat's renamed jar names and `$LIB` no longer exists on this box. Eleven
+classes reported `NoClassDefFoundError` and had been filed as two separate
+known-issues docs; both are now retired into
+[bouncycastle-easymock-classpath-fixture-gap-FIXED](bouncycastle-easymock-classpath-fixture-gap-FIXED.md).
+With the classpath repaired **CratonVM passes 13/13** of the affected classes
+(JIT and `--nojit`) and **HotSpot passes 5/13** — EasyMock 5.6.0 cannot mock
+classes on JDK 25 at all, so those 8 classes are permanently red in a HotSpot
+control run and must not be scored as CratonVM regressions. The same doc
+records two `run-one.ps1` defects found on the way (it passed none of the
+suite's `--add-opens`/`tomcat.test.*` JVM args, and its exit code was always 0).
