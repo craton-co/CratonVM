@@ -1,5 +1,20 @@
 # The original lane briefs, recovered
 
+**2026-08-03 — `cov-02-array-element-access.md` joined them, on the opposite
+terms.** It was not deleted by the commit that landed it; it was *moved here*,
+whole, because that lane is **finished** rather than first-incremented. Its
+closeout — what landed, three premise deltas, the before/after measurement, and
+the gaps that appeared behind the ones it closed — is
+[`docs/internal/cov-02-array-element-access-RETIRED-20260803.md`](../../../internal/cov-02-array-element-access-RETIRED-20260803.md).
+Read the closeout; this copy of the brief is here so its reasoning stays
+readable, not because anything in it is still open.
+
+| file | retired by | what is genuinely finished | what is not |
+|---|---|---|---|
+| `cov-02-array-element-access.md` | 2026-08-03 | all seven owned opcodes, plus `laload`/`saload`/`lastore`/`castore`/`sastore` for symmetry. Measured refusals for the seven 79 → **0**; optimizing-backend bodies 591 → **652** across the survey's three Spring Boot workloads | `aastore` (0x53), declined on purpose — it needs the SATB + card write barriers, and the refusal is written into the builder. Two measured events. `dup2` (0x5c), one event, no owner |
+
+## The other nine
+
 These nine files are the lane docs this directory shipped with. Each was
 **deleted by the commit that implemented its first increment**, so the brief
 went away at the moment the work stopped being hypothetical — and with it the
