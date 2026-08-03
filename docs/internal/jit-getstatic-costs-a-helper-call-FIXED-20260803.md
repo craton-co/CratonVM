@@ -214,9 +214,21 @@ dispatch cost only ~2.7 ns more than a direct static call — 1.5x, not 6x. That
 particular trap is now defused (the read is free), but the habit is not: hoist
 first, then measure.
 
-Also still true: **a bare direct call costs ~5 ns on this VM**
-(`probes/VirtOnlyProbe.java`, `invokestatic` marginal). No amount of trimming
-inside a helper can beat that — which is why the fix had to delete the call.
+Also still true, and **re-verified on 2026-08-03** after giving
+`probes/VirtOnlyProbe.java` the same warm-up fix (it was measuring the
+interpreter too), 2M iterations, control 2.81 ns/op:
+
+| rung | marginal | 07-31 | HotSpot |
+|---|---|---|---|
+| `invokestatic` | +5.52 | +5.34 | −0.01 |
+| `invokevirtual` | +9.13 | +8.02 | +0.00 |
+| `invokeinterface` | +8.96 | — | −0.01 |
+
+**A bare direct call costs ~5.5 ns on this VM.** No amount of trimming inside a
+helper can beat that — which is why the fix had to delete the call, not shrink
+it. And virtual dispatch is still ~1.65x a direct static call, not 6x, so
+devirtualizing provably-monomorphic virtuals remains the wrong place to look for
+the remaining call cost. (Checksums match HotSpot on all four rungs.)
 
 ## Reproduction
 
