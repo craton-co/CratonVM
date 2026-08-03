@@ -251,9 +251,10 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter/invoke.rs",
         "find_method_recursive(",
-        27,
-        "migration step 3a: invoke dispatch. The single largest bypass \
-         cluster in the tree.",
+        19,
+        "migration step 3a: invoke dispatch. Was 27 before the SEAM-02 split \
+         moved the JIT bridge out; the other 8 are the `jit_bridge.rs` row \
+         below. Nothing was migrated — 19 + 8 = 27.",
     ),
     (
         "vm/src/runtime/interpreter/invoke.rs",
@@ -265,10 +266,12 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter/invoke.rs",
         "resolve_field_ref(",
-        11,
+        1,
         "migration step 3a: these become `MemberResolver::field_ref`. Each is \
          a one-line change but each also changes the error type at the call \
-         site, so they move as one commit with a full suite behind it.",
+         site, so they move as one commit with a full suite behind it. Was 11; \
+         the SEAM-02 split moved 10 of them into `jit_bridge.rs` (row below), \
+         so 1 + 10 = 11.",
     ),
     (
         "vm/src/runtime/interpreter/invoke.rs",
@@ -285,11 +288,34 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "migration step 3a: direct cache probes on the invoke fast paths. \
          `MemberResolver::probe_method_ref` is the replacement.",
     ),
+    // The `new`-path `check_class_access` moved to `jit_bridge.rs` with
+    // `resolve_jit_new_site` in the SEAM-02 split; its row moved with it (see
+    // below). No row remains here, because a row with no site is permission
+    // nobody is using — which is exactly what `the_allowlist_has_no_dead_rows`
+    // refuses to let sit in this table.
     (
-        "vm/src/runtime/interpreter/invoke.rs",
+        "vm/src/runtime/interpreter/jit_bridge.rs",
+        "find_method_recursive(",
+        8,
+        "migration step 3a: the JIT bridge's share of the invoke-dispatch cluster — \
+         callee resolution for a compile request, the OSR artifact's own \
+         lookup, and the native-shadow probes. Relocated by the split, not \
+         added: see the arithmetic on the `invoke.rs` row above.",
+    ),
+    (
+        "vm/src/runtime/interpreter/jit_bridge.rs",
+        "resolve_field_ref(",
+        10,
+        "migration step 3a: field peeks the compiler needs before it can bake an offset \
+         — the getter/setter inline sites and the elidable-construction \
+         analysis. Relocated by the split, not added.",
+    ),
+    (
+        "vm/src/runtime/interpreter/jit_bridge.rs",
         "access_control::check_",
         1,
-        "migration step 3a: `check_class_access` on the `new` path.",
+        "migration step 3a: `check_class_access` on the `new` path, which is inside \
+         `resolve_jit_new_site`. Relocated by the split, not added.",
     ),
     (
         "vm/src/runtime/interpreter.rs",

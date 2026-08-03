@@ -20786,6 +20786,8 @@ pub use field_access::*;
 // delegates to. Only `resolve_method_metadata` was widened.
 pub(crate) mod invoke;
 pub use invoke::*;
+mod jit_bridge;
+pub use jit_bridge::*;
 
 // ---------------------------------------------------------------------------
 // Helper: loader-faithful ARRAY class resolution (JVMS §5.3.3)
