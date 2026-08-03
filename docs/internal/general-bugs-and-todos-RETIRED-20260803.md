@@ -405,16 +405,56 @@ comparison is not attributable and is not reported. The control below is
 `origin/dev` HEAD built from the same tree, so the only difference is this
 branch.
 
-<!-- CONTROL -->
+**bintrees, control vs branch, 6 rounds x 2 orders x 2 moving-young arms**
+(48 samples). Checksums identical throughout.
+
+| arm | median | mean | min |
+|---|---:|---:|---:|
+| control, moving-young off | 3707 | 4193 | 2522 |
+| branch, moving-young off | 4095 | 4042 | 2272 |
+| control, moving-young on | 4383 | 4539 | 2511 |
+| branch, moving-young on | 4971 | 4739 | 3416 |
+
+**Inconclusive, and reported as such.** The branch is nominally slower by
+median in both arms and nominally *faster* by mean and by min in the OFF arm —
+the signs disagree between statistics and between arms. The control's own
+spread is 2511–8089 ms, a 3.2x range on one binary in one arm, which is larger
+than every difference in the table. Nothing here is resolvable at this host's
+noise level, and the ON/OFF ratio is not resolvable in this run either (it
+reads ~1.15x here against the ~2.1x the quieter earlier run and
+`moving-young-throughput.md` both give) — which is the clearest single
+statement of how noisy the run was.
+
+**So the question was asked somewhere it can actually be answered.** `bintrees`
+loads about thirty classes, unloads none and interrupts no thread, so nothing
+this branch changes is even reachable in its hot loop. What the branch *does*
+touch on a per-class basis is VM boot: one adjacency insert per
+`ClassStore::add`, one reverse-index insert per first
+`register_class_layout` of a `(class, field-count)` pair. A boot-dominated
+workload (`Hello.main`, wall clock, one warm-up per binary, 15 iterations x 2
+orders = 30 samples each, interleaved):
+
+| | median | min |
+|---|---:|---:|
+| control | 785 ms | 351 ms |
+| branch | 765 ms | 399 ms |
+
+Indistinguishable — 2.5% apart by median, in the branch's favour, and the
+opposite sign by min. That is the expected result: ~400 boot classes x one
+hash insert is microseconds against a ~780 ms boot.
+
 
 ### Caveat on the timings
 
-`bintrees` with moving-young on ranged 2368–6388 ms across samples of the
-*same* binary and arm — a 2.7x spread, on a host running other people's cargo
-builds at load 10–27. The ON/OFF ratio survives that because it is large,
-consistent in sign across every round and both orders, and independently
-documented at the same value. Any difference of a similar size to the spread
-itself should be treated as unmeasured on this host, not as measured-and-small.
+`bintrees` ranged 2368–8089 ms across samples of the *same* binary in the
+*same* arm, on a host running other people's cargo builds at load 10–27. The
+ON/OFF ratio is reported because it is large, consistent in sign across every
+round and both orders of the quieter run, and independently documented at the
+same 2.1x by `moving-young-throughput.md` — three things the control-vs-branch
+comparison has none of. Any difference of a size comparable to the spread
+itself is **unmeasured** on this host, not measured-and-small; that is why the
+branch's cost was re-asked on the boot path, where the change is actually
+reachable, instead of being declared absent from a bintrees table.
 
 ---
 
