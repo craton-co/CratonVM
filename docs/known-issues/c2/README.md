@@ -39,6 +39,14 @@ five methods it admits. The binding constraint is **opcode coverage in
 `IrBuilder::build` and four whole-method conjuncts in `ir_compatible`**, not
 gating and not tiering. Three findings shape the `cov-*` lanes:
 
+> **The opcode half of that sentence is no longer true.** `cov-01` and `cov-02`
+> both closed 2026-08-03. On `ConditionalOnPropertyTests` the opcode gap went
+> from 196 events to **10** and bodies from 410 to **538 (+31%)**; what is left
+> is `cov-04` (82), `cov-03` (43) and the `ir_compatible` conjuncts. Read the
+> combined re-measurement in
+> [`ir-coverage-survey-20260803.md`](ir-coverage-survey-20260803.md) before
+> sizing anything from the table below.
+
 * ~~**`getstatic` + `ldc`/`ldc_w` is 69% of every opcode gap** (189 of 273).~~
   **Fixed 2026-08-03** (`cov-01`). All three are at zero; `+116` bodies
   (`+20%`) across the three Spring workloads. See the re-measurement in

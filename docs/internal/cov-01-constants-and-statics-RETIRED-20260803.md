@@ -51,6 +51,24 @@ That total is the survey's own headline figure for all ten workloads (592
 bodies): the bench phases contribute two and these three classes contribute the
 rest. So **+20% on the whole measured population**, not on a chosen slice.
 
+### On top of `cov-02`, which landed the same day
+
+`cov-02` (array element access) landed independently and in parallel, so the
+table above was measured against a base that does not contain it. Re-measured
+on the merged tree against a `cov-02`-only baseline, same protocol:
+
+| `ConditionalOnPropertyTests` | `cov-02` only | both lanes |
+|---|---:|---:|
+| **bodies** | **442–443** | **537–538** |
+| `build returned None` | 247 | **136** |
+
+`cov-01` is worth **+95 bodies on top of `cov-02`** — measured directly rather
+than inferred by adding two independent deltas. Together the two lanes are
+**410 → 538, +31%**, and the opcode gap on this workload is down from 196
+events to **10**: `newarray` 4 (`cov-06`), `aastore` 4 (`cov-02`'s one
+deliberate exception), `putstatic` 1, `dup2` 1. Everything else the builder
+refuses is now structural, and 82 of the 136 are `cov-04`'s.
+
 ## Where the 180 remaining refusals are, and who owns them
 
 The whole opcode gap is now `cov-02`'s. Re-derived from the same runs:

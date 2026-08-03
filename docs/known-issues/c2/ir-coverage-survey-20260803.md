@@ -265,6 +265,49 @@ The 590–592 figure is the same 592 the headline table reports for all ten
 workloads, because the bench phases contribute two bodies and the three Spring
 classes contribute the rest. Every arm passes its tests and none crashed.
 
+### `cov-01` **and** `cov-02` together — the number to size the next lane from
+
+The two lanes landed the same day, independently, so neither table above
+includes the other's work. Measured on the merged tree, same protocol, against
+a `cov-02`-only baseline:
+
+| `ConditionalOnPropertyTests` | `cov-02` only | both lanes |
+|---|---:|---:|
+| admitted | 696–697 | 695 |
+| **bodies** | **442–443** | **537–538** |
+| `build returned None` | 247 | **136** |
+
+`cov-01` is worth **+95 bodies on top of `cov-02`** — measured, not inferred
+from the two independent deltas. Against the original survey's 410, the two
+lanes together are **+128, +31%**.
+
+**The opcode gap is now essentially closed.** Ten events remain on this
+workload, down from 196:
+
+| opcode | mnemonic | events | lane |
+|---|---|---:|---|
+| `0xbc` | `newarray` | 4 | `cov-06` |
+| `0x53` | `aastore` | 4 | `cov-02`'s one deliberate exception |
+| `0xb3` | `putstatic` | 1 | nobody (the SATB pre-barrier) |
+| `0x5c` | `dup2` | 1 | nobody |
+
+Everything else the builder still refuses is **structural**, and two thirds of
+it is one lane's:
+
+| site | what it is | events | lane |
+|---|---|---:|---|
+| `ir.rs:5456` | `invokespecial` that is neither resolvable nor a trivial `<init>` | **72** | `cov-04` |
+| `ir.rs:5337` | `putfield` whose type tag is not `I/Z/B/C/S` | 38 | `cov-03` |
+| `ir.rs:5516` | an invoke with no `invoke_info` at that pc | 9 | `cov-04` |
+| `ir.rs:5293` | `getfield` of a `long`/`float`/`double` | 5 | `cov-03` |
+| `ir.rs:5471` | `invokespecial <init>` whose receiver is not a fresh `new` | 1 | `cov-04` |
+| `ir.rs:5381` | a `new` with no entry in `new_info` | 1 | nobody |
+
+So the binding constraint the README opens with has **changed**: it is no
+longer "opcode coverage in `IrBuilder::build`". It is `cov-04` (82 events),
+`cov-03` (43), and the four `ir_compatible` conjuncts, which no opcode lane
+touches.
+
 | opcode | mnemonic | before | after | lane |
 |---|---|---:|---:|---|
 | `0xb2` | `getstatic` | 72 | **0** | ~~`cov-01`~~ |
