@@ -19,6 +19,18 @@
  * express the bug. `System.gc()` is what makes the old sweep run below the 75%
  * occupancy threshold.
  *
+ * `mp` adds the `hm_int_fast` overlay shape — a `Map.of(Character, ...)`, the
+ * exact construction `org.springframework.http.server.DefaultPathContainer`
+ * uses for its `SEPARATORS` table
+ * (docs/known-issues/springboot/webflux-defaultpathcontainer-defaultseparator-classcast.md).
+ * `Character` unboxes to `Value::Int`, which routes the backing map through
+ * `hm_int_fast` instead of the LHM/TM side tables the other fields exercise —
+ * a distinct overlay implementation, so it is not proven by the same code path
+ * as `tm`/`ts`/`lhm`. Both `explicitGc` and allocation-pressure modes (see
+ * below) cover it; the allocation-pressure mode is the one that matches real
+ * Spring Boot suite runs, which never call `System.gc()` themselves and hit
+ * this shape purely through natural promotion.
+ *
  * Deterministic output; the runner diffs it against HotSpot.
  *
  *   cratonvm --java-home <jdk> -cp build ROverlaySystemGcStress
@@ -47,6 +59,19 @@ public class ROverlaySystemGcStress {
         if (!c) throw new AssertionError(m);
     }
 
+    /** Reference type held only in the `hm_int_fast` overlay for `mp`, below —
+     * mirrors DefaultPathContainer's `DefaultSeparator`: a small object whose
+     * only path to the heap is the Character-keyed Map.of entry. */
+    static final class MpVal {
+        final char c;
+        final String tag;
+
+        MpVal(char c, String tag) {
+            this.c = c;
+            this.tag = tag;
+        }
+    }
+
     /** One generation's worth of overlay-backed collections, all cross-checked. */
     static final class Bundle {
         final int id;
@@ -55,6 +80,9 @@ public class ROverlaySystemGcStress {
         final LinkedList<String> ll = new LinkedList<>();
         final TreeMap<String, String> tm = new TreeMap<>();
         final TreeSet<String> ts = new TreeSet<>();
+        // `hm_int_fast` overlay shape (Character key -> Value::Int unboxing),
+        // same construction as DefaultPathContainer.SEPARATORS.
+        final Map<Character, MpVal> mp;
 
         Bundle(int id, int width) {
             this.id = id;
@@ -66,6 +94,9 @@ public class ROverlaySystemGcStress {
                 tm.put(k, "v" + id + "." + i);
                 ts.add(k);
             }
+            mp = Map.of(
+                    '/', new MpVal('/', "%2F" + id),
+                    '.', new MpVal('.', "%2E" + id));
         }
 
         void verify(int width) {
@@ -82,6 +113,13 @@ public class ROverlaySystemGcStress {
                 check(v.equals(tm.get(k)), "tm lost " + k + " -> " + tm.get(k));
                 check(ts.contains(k), "ts lost " + k);
             }
+            check(mp.size() == 2, "mp size " + mp.size() + " != 2 (bundle " + id + ")");
+            MpVal slash = mp.get('/');
+            MpVal dot = mp.get('.');
+            check(slash != null && slash.c == '/' && ("%2F" + id).equals(slash.tag),
+                    "mp lost or corrupted '/' (bundle " + id + "): " + (slash == null ? "null" : slash.tag));
+            check(dot != null && dot.c == '.' && ("%2E" + id).equals(dot.tag),
+                    "mp lost or corrupted '.' (bundle " + id + "): " + (dot == null ? "null" : dot.tag));
             // Insertion order is the whole point of the overlay for LHM/LHS/LL.
             int i = 0;
             for (Map.Entry<String, String> e : lhm.entrySet()) {
