@@ -110,6 +110,13 @@ another, both deliberately:
   `ir_lower.rs` for which "the shrink went the wrong way" is not representable.
   `docs/internal/arch-2026-07-26/{layout-constant-hazards,header-shrink}.md` were
   updated in the same change, as their tripwires demand.
+* **`debug_assert!(false, …)` on an unreachable arm is a fail-open**, and both
+  emitters shipped one before review caught it. It vanishes in release: the GPR
+  load would then emit nothing, and the caller's `store_rax(slot)` would still
+  run and spill whatever RAX happens to hold — the array pointer — as the
+  element's value; the store would be silently dropped. Both arms are
+  structurally unreachable today, which is exactly the claim this directory's
+  rule 3 says to *enforce* rather than assert. They latch a bailout now.
 
 ## The measurement
 
@@ -199,7 +206,15 @@ category-2 shape that would have to be handled, not refused).
   backend (`produced a body for IrArrayAccessProbe.{iaload,baload,caload,saload,
   laload,aaload,arraylength,iastore,bastore,castore,sastore,elemPlusLen,
   dupX1Shape}`). A run that prints PASS while that grep is empty proves nothing
-  about this lane, which is why the probe's header says so.
+  about this lane, which is why the probe's header says so. It also passes with
+  `CRATONVM_COMPRESSED_OOPS=1` — the only thing that exercises `aaload`'s narrow
+  4-byte element decode, which is otherwise dead code — and under `--nojit`,
+  which is the interpreter agreeing with both compiled backends.
+* Sixteen further `spring-boot-autoconfigure` test classes, run A/B **interleaved**
+  (base binary, then new binary, per class) so a load excursion on the shared
+  host hits both arms rather than manufacturing a one-sided red. 16/16 PASS on
+  both. With the three survey workloads that is 19 Spring Boot classes green on
+  the new binary.
 * Three source-scanning gates fired during the change and were all real:
   `the_op_representatives_cover_every_declared_variant`,
   `layout_constant_emission_sites_are_inventoried`, and
@@ -208,7 +223,18 @@ category-2 shape that would have to be handled, not refused).
   defeats a scan that splits on `"\n}\n"`, and it then silently scans the rest
   of the file — worth knowing, because the failure looks like a code defect);
   the other two were the inventory doing its job.
-* `cargo test -p cratonvm-jit --release`: 1,868 lib + 213 integration, 0 failed.
+* `cargo test -p cratonvm-jit --release`: 1,868 lib + 213 integration, 0 failed,
+  on the tree merged forward to `dev`.
+
+  The rest of the workspace was **not** a usable gate on 2026-08-03 and the
+  reason is worth writing down rather than rediscovering:
+  `native-collections/tests/gc_relocation_harness.rs` does not compile on `dev`
+  (`gc_overlay_roots_for_collection` gained a second parameter and one call site
+  did not follow), and the Azure host was carrying three other sessions' builds,
+  so `rustc` was OOM-killed on the LTO'd `cratonvm-vm` integration test binaries
+  — which reads as "could not compile", not as "out of memory". Neither is
+  related to this change; both are load-bearing context for anyone reading a red
+  workspace run from that day.
 
 ## What is left
 
