@@ -78,7 +78,27 @@ pub fn set_bytecode_loop_rewriter_armed(on: bool) -> bool {
 /// more times behind one back edge, giving `(k+1)^2` bodies per poll — a
 /// time-to-safepoint neither unroller's budget check ever saw.
 pub(super) fn bytecode_loop_xform_rewrites_bytecode() -> bool {
-    BYTECODE_LOOP_REWRITER_ARMED.with(|c| c.get())
+    BYTECODE_LOOP_REWRITER_ARMED.with(|c| c.get()) || bytecode_loop_xform_flag()
+}
+
+/// `CRATONVM_JIT=bytecode-loop-xform` — the process-wide form of the opt-in.
+///
+/// Read **once**. `runtime_var_os` on a declared flag consults a latched
+/// snapshot anyway, so a per-compile read would buy nothing and cost a lookup;
+/// the `OnceLock` makes that explicit and leaves one relaxed load on the path.
+///
+/// This is the switch that lets the transforms be executed by something larger
+/// than a unit test. It is deliberately not sufficient on its own: with
+/// `deopt_real` on — the default — `plan_bytecode_loop_xform` still refuses
+/// every compile before it looks at a loop, so a run that means to exercise a
+/// transformed method needs `CRATONVM_JIT='bytecode-loop-xform,-deopt-real'`.
+/// A run that sets only the first is not mis-configured, it just gets the
+/// unarmed compile with the native unroller off.
+pub(super) fn bytecode_loop_xform_flag() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BYTECODE_LOOP_XFORM").is_some()
+    })
 }
 
 /// Is the native byte-copy unroller (the `0xa7` arm of `compile_bytecode`)
@@ -233,14 +253,151 @@ pub(crate) struct LoopRewriteShape {
     pub(crate) has_inline_sites: bool,
 }
 
-/// Choose ONE loop to unroll at the bytecode level and rewrite the method.
+/// Number of iterations the peel arm takes off a loop.
 ///
-/// The profitability band is deliberately character-for-character the native
+/// One. Peeling's payoff here is not the peeled iteration itself — it is that
+/// after peel(k) the steady-state copy is reachable only by fall-through from
+/// the copy above it and by its own back edge, so a header an external branch
+/// could enter is no longer *bypassable* and the transforms that filter on
+/// `find_bypassable_loop_headers` (the aaload and arith LICM hoists, the FP
+/// hoists, the speculative-BCE guards, matrix-dot, the bulk-byte loops) can
+/// keep the pre-header they had to drop. One copy is enough for that; every
+/// further copy is code growth with no additional claim behind it.
+pub(super) const LOOP_PEEL_COPIES: usize = 1;
+/// Largest body the peel arm will duplicate. The same ceiling the unroll band
+/// applies to its 2x arm — peeling one copy costs exactly what unrolling one
+/// extra copy costs, so it is bounded by the same number rather than a new one.
+const LOOP_PEEL_MAX_BODY_BYTES: usize = 50;
+
+/// The `trip >= minimum` pre-header check for this loop, when one can be proved
+/// and there is anything left to check.
+///
+/// `None` — meaning "do not version" — in three different situations, and the
+/// caller treats all three the same way (emit the plain transform):
+///
+///  * the loop is not counted in a shape `scev` recognises;
+///  * its exit test is not the first thing the header does, so the
+///    `LoopForm::PreTested` claim `prove_trip_count_at_least` needs would be a
+///    guess. `PostTested` is the conservative spelling and that proof refuses it
+///    outright, so this returns `None` rather than assert a form it cannot
+///    justify — see `loop_analysis::analyze_counted_loop_at`;
+///  * the minimum is already a compile-time fact (`TripCountProof::Static`), in
+///    which case a runtime compare would test something already known.
+///
+/// The guard is a PROFITABILITY filter, not a legality one: peel and unroll are
+/// correct at every trip count, because every copy keeps the body's own exit
+/// branches. What versioning buys is that the duplicated copies are only
+/// reached when the loop actually runs often enough to use them — the common
+/// `for (i = 0; i < n; i++)` has a compile-time `trip.min` of zero, so without
+/// this the planner duplicates a body that may never execute — and that a loop
+/// which runs fewer times takes an *untouched* copy of itself instead of
+/// entering a 4x-unrolled body. It costs one body of code (the fallback).
+fn trip_count_guard(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+    minimum: usize,
+) -> Option<crate::scev::PreheaderGuard> {
+    // There is no constant pool here, so a `Math.min`/`Math.max` limit is
+    // simply not recognised. That costs a guard, never soundness.
+    let (counted, test_pc) = crate::loop_analysis::analyze_counted_loop_at(
+        code,
+        code_len,
+        header,
+        back_edge,
+        crate::scev::LoopForm::PreTested,
+        &|_| None,
+    )?;
+    if test_pc != header {
+        return None;
+    }
+    // Widening: usize minimum to u64.
+    match counted.prove_trip_count_at_least(minimum as u64, &crate::scev::RangeEnv::new()) {
+        // Exactly one guard, or none: `plan_loop_version` emits ONE pre-header
+        // check, and a partially-discharged obligation proves nothing (the rule
+        // `docs/jit/trip-count-guards.md` states for every consumer).
+        crate::scev::TripCountProof::Guarded(gs) => match gs.as_slice() {
+            [g] => Some(g.clone()),
+            _ => None,
+        },
+        crate::scev::TripCountProof::Static | crate::scev::TripCountProof::Refused(_) => None,
+    }
+}
+
+/// Duplicate `extra` extra bodies with `kind`'s transform, versioned against a
+/// trip-count guard when [`trip_count_guard`] can produce one.
+///
+/// A versioning refusal is not this method's refusal: the guard is not what
+/// makes peel or unroll legal, so an unencodable or compile-time-decided guard
+/// falls back to the plain transform, which is exactly what the planner emitted
+/// before versioning existed.
+fn plan_versioned(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+    extra: usize,
+    exception_ranges: &[(usize, usize, usize)],
+    kind: LoopXformKind,
+) -> Result<LoopXform, LoopXformRefusal> {
+    if let Some(guard) = trip_count_guard(code, code_len, header, back_edge, extra + 1) {
+        match plan_loop_version(
+            code,
+            code_len,
+            header,
+            back_edge,
+            extra,
+            exception_ranges,
+            kind,
+            &guard,
+        ) {
+            Ok(x) => return Ok(x),
+            Err(refusal) => {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+                    eprintln!(
+                        "[JIT_GEN] loop versioning refused: header={header} \
+                         back_edge={back_edge} copies={extra} reason={refusal:?} \
+                         — falling back to the unguarded transform"
+                    );
+                }
+            }
+        }
+    }
+    match kind {
+        LoopXformKind::Peel => {
+            plan_loop_peel(code, code_len, header, back_edge, extra, exception_ranges)
+        }
+        LoopXformKind::Unroll => {
+            plan_loop_unroll(code, code_len, header, back_edge, extra, exception_ranges)
+        }
+    }
+}
+
+/// Choose ONE loop to transform at the bytecode level and rewrite the method.
+///
+/// Three arms, in the order they are tried:
+///
+///  * **Peel**, for a loop whose header is *bypassable* — one an external
+///    branch can enter. Every speculating transform in this backend drops its
+///    pre-header when it sees one, and the planner used to skip such a loop
+///    outright. Peeling moves the steady-state loop past that edge (the
+///    external branch still lands on copy 0, which flows into the copy below
+///    it), so the loop the emitter finds in the rewritten bytecode has a single
+///    entry and keeps its hoists. See [`LOOP_PEEL_COPIES`].
+///  * **Unroll, PGO factor**, when a profiled trip count is available.
+///  * **Unroll, static heuristic**, the band below.
+///
+/// The unroll band is deliberately character-for-character the native
 /// unroller's (see the `unroll_loops` construction in
 /// `compile_with_param_slots`), so arming the rewriter changes *which
-/// machinery* unrolls a loop, not *which loops* are considered. The
-/// legality question is `plan_loop_unroll`'s, exactly as it already is for
-/// the native unroller via `plan_native_unroll`.
+/// machinery* unrolls a loop, not *which loops* are considered. The legality
+/// question is `plan_loop_unroll`'s, exactly as it already is for the native
+/// unroller via `plan_native_unroll`.
+///
+/// Every arm goes through [`plan_versioned`], so a duplicating transform is
+/// emitted behind a `trip >= copies + 1` pre-header check whenever one can be
+/// proved and encoded, with an untouched copy of the loop on the failing edge.
 ///
 /// Exactly one loop, because a `LoopXform` describes one rewrite: composing
 /// two would mean composing their provenance maps, which the primitives in
@@ -257,7 +414,42 @@ pub(super) fn plan_bytecode_loop_xform(
 ) -> Result<LoopXform, LoopRewriteRefusal> {
     use LoopRewriteRefusal as R;
 
+    // ── Tally, before anything can short-circuit ──────────────────────
+    //
+    // Every one of the four conditions is recorded on every compile it holds
+    // for, INDEPENDENTLY of whether an earlier one already refuses. Counting
+    // "which refusal fired" instead would report `deopt_real` for 100% of
+    // compiles — it is default-ON and process-wide — and would hide the other
+    // three permanently, which is the state this lane exists to get out of.
+    // The four counts therefore overlap and must not be summed;
+    // `metrics::LOOP_XFORM_EVENTS` says so where a reader will find it.
+    //
+    // Cost on the default path: one relaxed increment per condition that
+    // holds, per compile. Compiles are thousands per run, not millions.
+    use crate::metrics::record_loop_xform_event as tally;
+    tally("loop_xform_compiles");
+    if shape.deopt_real {
+        tally("loop_xform_deopt_real");
+    }
+    if shape.precise_exception_frames {
+        tally("loop_xform_precise_exception_frames");
+    }
+    if shape.has_indy {
+        tally("loop_xform_invokedynamic");
+    }
+    if shape.has_inline_sites {
+        tally("loop_xform_inline_sites");
+    }
+    let eligible = !(shape.deopt_real
+        || shape.precise_exception_frames
+        || shape.has_indy
+        || shape.has_inline_sites);
+    if eligible {
+        tally("loop_xform_eligible");
+    }
+
     if !bytecode_loop_xform_rewrites_bytecode() {
+        tally("loop_xform_not_armed");
         return Err(R::NotArmed);
     }
     // Whole-compile refusals, cheapest first. Each names a construct that
@@ -283,27 +475,50 @@ pub(super) fn plan_bytecode_loop_xform(
         if back_edge >= code_len || code[back_edge] != 0xa7 {
             continue;
         }
-        // Same pre-header placement contract the native unroller, the LICM
-        // hoists, matrix-dot and the bulk-byte loops all apply.
-        if bypassable.contains(&header) {
-            continue;
-        }
         let body_size = back_edge - header;
         if body_size < 5 {
             continue;
+        }
+        // The peel arm. A bypassable header is the pre-header placement
+        // problem every other speculating transform in this backend answers by
+        // giving up; peeling answers it by moving the steady-state loop out of
+        // the external edge's reach. The rewriter admits the shape — an edge
+        // that targets the HEADER is not `ExternalEntry`, only one that lands
+        // below it is — so this is a planner arm, not a new transform.
+        if bypassable.contains(&header) {
+            if body_size > LOOP_PEEL_MAX_BODY_BYTES {
+                continue;
+            }
+            match plan_versioned(
+                code,
+                code_len,
+                header,
+                back_edge,
+                LOOP_PEEL_COPIES,
+                exception_ranges,
+                LoopXformKind::Peel,
+            ) {
+                Ok(x) if !x.provenance_is_total() => return Err(R::ProvenanceNotTotal),
+                Ok(x) => return Ok(x),
+                Err(e) => {
+                    last_refusal = Some(e);
+                    continue;
+                }
+            }
         }
         // PGO path: a profiled trip count extends eligibility to larger
         // bodies. A refusal here does NOT fall through to the static
         // heuristic — same as the native unroller's `return`.
         if let Some(&pgo_factor) = loop_unroll_hints.get(&back_edge) {
             if body_size <= 50 || (body_size <= 100 && pgo_factor <= 2) {
-                return match plan_loop_unroll(
+                return match plan_versioned(
                     code,
                     code_len,
                     header,
                     back_edge,
                     pgo_factor.saturating_sub(1),
                     exception_ranges,
+                    LoopXformKind::Unroll,
                 ) {
                     Ok(x) if !x.provenance_is_total() => Err(R::ProvenanceNotTotal),
                     Ok(x) => Ok(x),
@@ -318,19 +533,24 @@ pub(super) fn plan_bytecode_loop_xform(
         } else {
             continue;
         };
-        match plan_loop_unroll(
+        match plan_versioned(
             code,
             code_len,
             header,
             back_edge,
             extra_copies,
             exception_ranges,
+            LoopXformKind::Unroll,
         ) {
             Ok(x) if !x.provenance_is_total() => return Err(R::ProvenanceNotTotal),
             Ok(x) => return Ok(x),
             Err(e) => last_refusal = Some(e),
         }
     }
+    tally(match last_refusal {
+        Some(_) => "loop_xform_planner_refused",
+        None => "loop_xform_no_candidate_loop",
+    });
     Err(last_refusal.map(R::Planner).unwrap_or(R::NoCandidateLoop))
 }
 

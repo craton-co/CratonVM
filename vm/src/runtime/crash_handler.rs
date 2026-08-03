@@ -2101,7 +2101,7 @@ fn install_signal_handlers() {
             let n = hex_into_buf(&mut rbuf, cratonvm_jit::code_frees_total() as u64);
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
-            if let Some((base, len, active)) =
+            if let Some((base, len, active, flags)) =
                 cratonvm_jit::recent_code_free_covering(fault_pc as usize)
             {
                 async_signal_safe::write_all(
@@ -2120,6 +2120,30 @@ fn install_signal_handlers() {
                 let n = hex_into_buf(&mut rbuf, active as u64);
                 async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
                 async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+                // The count above is NOT self-interpreting, and reading it as
+                // if it were has already cost one investigation a session: it
+                // is sampled at the `munmap`, not at the instant the release
+                // was decided, and it is recorded for every executable buffer
+                // including compile attempts that nothing ever pointed into.
+                // These three arms are what make it readable.
+                let published = flags & cratonvm_jit::CODE_FREE_PUBLISHED != 0;
+                let authorised = flags & cratonvm_jit::CODE_FREE_AUTHORISED != 0;
+                if !published {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#    NEVER PUBLISHED: a discarded compile attempt. No cache entry, baked call or trampoline could name it, so the count above is not evidence of anything.\n",
+                    );
+                } else if authorised {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#    published, released BY THE RETIREMENT QUEUE with a quiescence proof. A non-zero count above only means some OTHER thread entered compiled code between the proof and the unmap.\n",
+                    );
+                } else {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#    *** published body released OUTSIDE the retirement queue. This IS a use-after-free of executable memory. Re-run with CRATONVM_DBG_JIT_CODE_FREE=1 to name the release site. ***\n",
+                    );
+                }
             } else {
                 async_signal_safe::write_all(
                     async_signal_safe::STDERR_FD,

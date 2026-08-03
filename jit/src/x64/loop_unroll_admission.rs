@@ -12,14 +12,21 @@
 //! * the NATIVE byte-copy unroller in the `0xa7` arm of `compile_bytecode`,
 //! admitted by `plan_native_unroll`;
 //! * the BYTECODE rewriter in `x64::licm` (`plan_loop_peel` /
-//! `plan_loop_unroll`), which today is consulted only as the native one's
-//! admission oracle and never rewrites the code the emitter compiles.
+//! `plan_loop_unroll` / `plan_loop_version`), planned by
+//! `x64::loop_rewrite::plan_bytecode_loop_xform`. It IS wired — it rewrites
+//! the bytes the emitter compiles — behind an opt-in that is off by default,
+//! and it is also the native unroller's admission oracle.
 //!
 //! These tests pin the admission test (what the old `code[back_edge] == 0xa7`
-//! + body-size heuristic was missing), the mutual exclusion, and the two
-//! provenance contracts a future rewrite wiring must honour: deopt/oop-map
-//! bcis stay INTERPRETER bcis, and an OSR entry lands on the steady-state copy
-//! rather than a peeled prefix.
+//! + body-size heuristic was missing), the mutual exclusion, the planner's
+//! three arms (peel for a bypassable header, PGO unroll, static unroll, each
+//! versioned against a trip-count guard when one can be proved), and the two
+//! provenance contracts the rewrite wiring honours: deopt/oop-map bcis stay
+//! INTERPRETER bcis, and an OSR entry lands on the steady-state copy — the
+//! fallback under versioning — rather than a peeled prefix or a guard.
+//!
+//! `docs/known-issues/c2/loop-01-peeling-and-versioning.md` is the lane, and
+//! `docs/jit/loop-rewriter-wiring.md` the wiring's status of record.
 
 use super::*;
 
@@ -509,9 +516,19 @@ fn accum_shape_ok() -> LoopRewriteShape {
 /// metadata and an all-zero helper table (the method calls none).
 fn compile_accum_fixture() -> Option<CompiledMethod> {
     let code = shape_int_accum_loop();
+    compile_bytes(&code, 21)
+}
+
+/// [`compile_accum_fixture`] over arbitrary bytecode in the same frame
+/// shape (one `int` parameter, three locals), so a REWRITTEN method can be
+/// compiled as itself. That is the only way to put a transformed artifact
+/// in front of the emitter today: the wired path refuses every compile
+/// while `deopt_real` is on — see
+/// `the_wired_compile_path_is_refused_before_any_loop_is_looked_at`.
+fn compile_bytes(code: &[u8], code_len: usize) -> Option<CompiledMethod> {
     compile(
-        &code,
-        21,
+        code,
+        code_len,
         1,     // num_params: (int n)
         3,     // max_locals: n, s, i
         false, // needs_heap
@@ -579,8 +596,153 @@ fn planning_refuses_unless_armed() {
     let x = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())
         .expect("armed, the fixture is admitted");
     assert_eq!((x.header, x.body_len, x.copies), (4, 12, 3));
-    assert_eq!(x.code_len, 57);
+    // 4x unroll, VERSIONED. The fixture's limit is a runtime `n`, so its
+    // compile-time trip count is `[0, i32::MAX]` and the planner will not
+    // duplicate four bodies without a runtime check that they are reached;
+    // the failing edge runs an untouched copy of the loop.
+    let v = x.versioning.as_ref().expect("the accum fixture is versioned");
+    assert_eq!(
+        v.guard,
+        crate::scev::PreheaderGuard::TripCountAtLeast {
+            term: crate::scev::SymBound {
+                base: crate::scev::BoundTerm::Bound(crate::scev::BoundSource::Local(0)),
+                addend: 0,
+            },
+            minimum: 4,
+        },
+        "the guard must be `n >= 4`: one compare on the loop's own limit"
+    );
+    assert_eq!(v.guard_pc, 4);
+    assert_eq!(v.guard_len, 5, "iload_0; iconst_4; if_icmplt");
+    assert_eq!(v.fallback_base, 4 + 5 + 4 * 12 + 3);
+    // prefix + guard + 4 copies + the untouched fallback + suffix.
+    assert_eq!(x.code_len, 21 + 5 + 3 * 12 + 15);
 }
+
+/// The refusal tally must count the four conditions INDEPENDENTLY.
+///
+/// This is the whole point of `loop-02`'s first increment. The planner returns
+/// on the first refusal that holds, so a tally keyed on "which one fired" would
+/// record `deopt_real` — default-ON and process-wide — for 100% of compiles and
+/// say nothing about the other three, which is exactly the measurement gap the
+/// lane exists to close.
+///
+/// The edit that would trip this: moving any `tally(...)` call below the
+/// `return Err(...)` it sits above, or counting the refusal instead of the
+/// condition.
+#[test]
+fn the_refusal_tally_counts_all_four_conditions_not_just_the_first() {
+    // Serialised against the other tally test: these are process-wide
+    // counters and the module's tests run concurrently.
+    let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::metrics::reset_loop_xform_counts_for_test();
+    let code = shape_int_accum_loop();
+    // Every condition true at once. The planner refuses on the first, and the
+    // tally must still see all four.
+    let all = LoopRewriteShape {
+        deopt_real: true,
+        precise_exception_frames: true,
+        has_indy: true,
+        has_inline_sites: true,
+    };
+    {
+        // Armed, so the four are what refuses rather than the arming check —
+        // which sits above them and would otherwise be the only row that moved.
+        let _armed = Armed::new();
+        assert_eq!(
+            plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), all).unwrap_err(),
+            LoopRewriteRefusal::DeoptRealEnabled,
+            "the first refusal is still the one returned"
+        );
+    }
+    let counts = |name: &str| -> u64 {
+        crate::metrics::loop_xform_counts()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| panic!("no such counter: {name}"))
+    };
+    assert_eq!(counts("loop_xform_compiles"), 1);
+    for name in [
+        "loop_xform_deopt_real",
+        "loop_xform_precise_exception_frames",
+        "loop_xform_invokedynamic",
+        "loop_xform_inline_sites",
+    ] {
+        assert_eq!(counts(name), 1, "{name} was not counted");
+    }
+    assert_eq!(counts("loop_xform_eligible"), 0);
+    assert_eq!(
+        counts("loop_xform_not_armed"),
+        0,
+        "a compile refused by the four never reaches the arming check"
+    );
+
+    // …and a compile with none of the four set is `eligible`, whether or not
+    // anything is armed. That is what makes the row a property of the METHOD.
+    crate::metrics::reset_loop_xform_counts_for_test();
+    assert_eq!(
+        plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
+        LoopRewriteRefusal::NotArmed
+    );
+    assert_eq!(counts("loop_xform_compiles"), 1);
+    assert_eq!(counts("loop_xform_eligible"), 1);
+    assert_eq!(counts("loop_xform_not_armed"), 1);
+    for name in [
+        "loop_xform_deopt_real",
+        "loop_xform_precise_exception_frames",
+        "loop_xform_invokedynamic",
+        "loop_xform_inline_sites",
+    ] {
+        assert_eq!(counts(name), 0, "{name}");
+    }
+    crate::metrics::reset_loop_xform_counts_for_test();
+}
+
+/// The loop-level rows, which need the rewriter armed.
+#[test]
+fn the_tally_separates_no_candidate_loop_from_a_structural_refusal() {
+    let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let counts = |name: &str| -> u64 {
+        crate::metrics::loop_xform_counts()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| panic!("no such counter: {name}"))
+    };
+    let _armed = Armed::new();
+
+    // A method with no loop the planner will take: counted as
+    // `no_candidate_loop`, not as a planner refusal.
+    crate::metrics::reset_loop_xform_counts_for_test();
+    let none = vec![0x03u8, 0xac]; // iconst_0; ireturn
+    assert_eq!(
+        plan_bytecode_loop_xform(&none, 2, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
+        LoopRewriteRefusal::NoCandidateLoop
+    );
+    assert_eq!(counts("loop_xform_eligible"), 1);
+    assert_eq!(counts("loop_xform_no_candidate_loop"), 1);
+    assert_eq!(counts("loop_xform_planner_refused"), 0);
+
+    // …and a method the planner selects a loop in but the rewriter refuses:
+    // the irreducible fixture, which is either skipped as a candidate or
+    // refused structurally. Whichever it is, exactly one of the two rows moves.
+    crate::metrics::reset_loop_xform_counts_for_test();
+    let irr = shape_irreducible();
+    assert!(plan_bytecode_loop_xform(&irr, 21, &[], &HashMap::new(), accum_shape_ok()).is_err());
+    assert_eq!(
+        counts("loop_xform_no_candidate_loop") + counts("loop_xform_planner_refused"),
+        1,
+        "exactly one outcome row per refused compile"
+    );
+    assert_eq!(counts("loop_xform_applied"), 0);
+    crate::metrics::reset_loop_xform_counts_for_test();
+}
+
+/// Serialises the two tally tests. `LOOP_XFORM_COUNTERS` is process-wide and
+/// this module's tests run concurrently, so without this each would see the
+/// other's increments — the flakiness would look like a counting bug.
+static TALLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Every whole-compile refusal names a construct that publishes an emitter
 /// pc to the VM as a resume bci through a path this wiring does not
@@ -652,15 +814,15 @@ fn planning_reports_the_structural_refusal() {
         ),
         "unexpected refusal for an irreducible loop: {err:?}"
     );
-    // Pre-header bypass: the region itself is impeccable, so only the
-    // `bypassable_headers` filter can refuse it — and it does so by
-    // skipping the candidate, leaving no candidate at all.
+    // Pre-header bypass: the region itself is impeccable, and the planner
+    // used to skip the candidate outright, leaving no candidate at all. It
+    // now PEELS it — see
+    // `the_planner_peels_a_bypassable_header_instead_of_skipping_it`.
     let byp = shape_bypassable_header();
     assert!(plan_loop_unroll(&byp, 30, 11, 25, 3, &[]).is_ok());
-    assert_eq!(
-        plan_bytecode_loop_xform(&byp, 30, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
-        LoopRewriteRefusal::NoCandidateLoop
-    );
+    let x = plan_bytecode_loop_xform(&byp, 30, &[], &HashMap::new(), accum_shape_ok())
+        .expect("a bypassable header is peeled rather than skipped");
+    assert_eq!(x.kind, LoopXformKind::Peel);
 }
 
 /// The profitability band is the native unroller's, PGO arm included.
@@ -673,7 +835,20 @@ fn the_pgo_hint_sets_the_factor_exactly_as_the_native_unroller_does() {
     let x = plan_bytecode_loop_xform(&code, 21, &[], &hints, accum_shape_ok())
         .expect("PGO factor 2 is admitted");
     assert_eq!(x.copies, 1);
-    assert_eq!(x.code_len, 21 + 12);
+    // Versioned like the static arm, at the factor the hint asked for: the
+    // guard's minimum tracks the number of copies, so it is `n >= 2` here
+    // and `n >= 4` for the 4x static heuristic.
+    assert_eq!(
+        x.versioning.as_ref().map(|v| v.guard.clone()),
+        Some(crate::scev::PreheaderGuard::TripCountAtLeast {
+            term: crate::scev::SymBound {
+                base: crate::scev::BoundTerm::Bound(crate::scev::BoundSource::Local(0)),
+                addend: 0,
+            },
+            minimum: 2,
+        })
+    );
+    assert_eq!(x.code_len, 21 + 5 + 12 + 15, "guard + 2 copies + the fallback");
     // A degenerate factor is refused, not underflowed — and, matching the
     // native unroller, does NOT fall back to the static heuristic.
     for factor in [0usize, 1] {
@@ -788,6 +963,162 @@ fn the_fixture_loop_is_what_the_planner_is_offered() {
     let x = plan_loop_unroll(&code, 21, 4, 16, 3, &[]).expect("admitted");
     assert_eq!(x.code_len, 21 + 3 * 12);
     assert!(x.provenance_is_total());
+}
+
+/// The peel arm. A loop whose header an external branch can enter used to
+/// be skipped outright, because every speculating transform in this backend
+/// drops its pre-header when it sees one. Peeling moves the steady-state
+/// loop out of that edge's reach, so the hoists can be kept.
+#[test]
+fn the_planner_peels_a_bypassable_header_instead_of_skipping_it() {
+    let _armed = Armed::new();
+    let code = shape_bypassable_header();
+    let (len, header, back_edge) = (30usize, 11usize, 25usize);
+    let loops = detect_loops(&code, len);
+    assert_eq!(loops, vec![(header, back_edge)]);
+    assert!(
+        find_bypassable_loop_headers(&code, len, &loops, &[]).contains(&header),
+        "the fixture must really be bypassable, or this test proves nothing"
+    );
+
+    let x = plan_bytecode_loop_xform(&code, len, &[], &HashMap::new(), accum_shape_ok())
+        .expect("a bypassable header is peeled");
+    assert_eq!(x.kind, LoopXformKind::Peel);
+    assert_eq!(x.copies, LOOP_PEEL_COPIES);
+    assert_eq!(x.header, header);
+    assert!(x.provenance_is_total());
+
+    // The point of the arm: the loop that runs when the guard holds is
+    // entered only by fall-through and its own back edge, so the pre-header
+    // the hoists need is reachable on every entry to it.
+    let out_loops = detect_loops(&x.code, x.code_len);
+    let bypass =
+        find_bypassable_loop_headers(&x.code, x.code_len, &out_loops, &x.exception_ranges);
+    let fast_steady = x.fast_base() + x.copies * x.body_len;
+    assert!(
+        out_loops.contains(&(fast_steady, x.fast_back_edge_pc())),
+        "the peeled steady-state loop must be a loop in the output"
+    );
+    assert!(
+        !bypass.contains(&fast_steady),
+        "the peeled steady-state loop must not be bypassable"
+    );
+    // Its fallback twin IS bypassable — the guard branches into it — and
+    // that is fine: it is the cold copy, and it is the copy OSR enters.
+    if let Some(v) = &x.versioning {
+        assert!(bypass.contains(&v.fallback_base));
+        assert_eq!(x.steady_state_base(), v.fallback_base);
+    }
+}
+
+/// Why the wired compile path does not produce a transformed artifact,
+/// stated as a fact rather than left in a comment.
+///
+/// `deopt_real` is ON by default and is the FIRST of the four whole-compile
+/// refusals, so arming the rewriter is not sufficient: `CRATONVM_DEOPT_REAL`
+/// must also be off, and no unit test can arrange that (the flag snapshot is
+/// latched process-wide and this one is additionally cached in a
+/// `OnceLock`). Narrowing those four refusals is `loop-02`'s lane. Three
+/// tests in this module depend on this and none of them said so.
+#[test]
+fn the_wired_compile_path_is_refused_before_any_loop_is_looked_at() {
+    let _armed = Armed::new();
+    let code = shape_int_accum_loop();
+    let real_shape = LoopRewriteShape {
+        deopt_real: crate::deopt_real_enabled(),
+        precise_exception_frames: false,
+        has_indy: false,
+        has_inline_sites: false,
+    };
+    let planned = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), real_shape);
+    if crate::deopt_real_enabled() {
+        assert_eq!(
+            planned.unwrap_err(),
+            LoopRewriteRefusal::DeoptRealEnabled,
+            "while `deopt_real` is on, no armed compile can reach a loop"
+        );
+    } else {
+        assert!(
+            planned.is_ok(),
+            "with `deopt_real` off the same compile IS admitted"
+        );
+    }
+}
+
+/// LOOP-01's acceptance rule: prove the transform fired by something only a
+/// transformed artifact has.
+///
+/// `compile()` cannot be that vehicle on the wired path (see the test
+/// above), so this compiles the bytes the planner produced *as* the method
+/// and asserts a property of the resulting machine code that no
+/// untransformed artifact can have: mapped back into interpreter-bci space,
+/// EVERY OSR entry in the region — the header's included — lands inside the
+/// FALLBACK copy, which sits after the guard and all four guarded bodies.
+/// `pc_to_native` is non-decreasing in pc, so comparing native offsets
+/// compares positions.
+///
+/// The edit that would trip it: dropping the `versioning` arm of
+/// `osr_entry_pc`, which would answer with a guarded copy and make
+/// `mid < fallback_off`. Pointing the header at the guard instead — which
+/// is what it did until the transform was executed on real code — trips it
+/// at `rebuilt[4]`.
+#[test]
+fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
+    let _armed = Armed::new();
+    let code = shape_int_accum_loop();
+    let x = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())
+        .expect("versioned unroll");
+    let v = x.versioning.as_ref().expect("versioned");
+    let art = compile_bytes(&x.code, x.code_len)
+        .expect("the rewritten bytes must compile as an ordinary method");
+    let out_osr = art
+        .osr_pc_to_native
+        .as_ref()
+        .expect("the artifact publishes OSR entries");
+    assert_eq!(
+        out_osr.len(),
+        x.code_len + 1,
+        "compiled as the REWRITTEN method, so the vector is in output-PC space"
+    );
+
+    let rebuilt = x.rebuild_pc_to_native(out_osr, 21);
+    assert_eq!(rebuilt.len(), 22, "one slot per interpreter bci, plus the end");
+    // Versioning has no back-edge gap: the fallback is a full image of the
+    // region, so every INSTRUCTION in it keeps an entry — including the
+    // back edge itself, where a plain 4x unroll answers `-1` because its
+    // steady state is copy 0, which ends just before it.
+    let mut bci = 4usize;
+    while bci <= 16 {
+        assert!(
+            rebuilt[bci] >= 0,
+            "bci {bci}: versioning must not refuse OSR inside the region"
+        );
+        bci += bytecode_len_at(&code, bci);
+    }
+    assert_eq!(bci, 19, "the walk must land past the back edge");
+    assert!(
+        rebuilt[16] >= 0,
+        "the back-edge bci stays enterable under versioning"
+    );
+
+    let fallback_off = out_osr[v.fallback_base];
+    assert!(fallback_off >= 0, "the fallback copy was emitted");
+    assert_eq!(
+        rebuilt[4], fallback_off,
+        "the header's OSR entry is the fallback copy's first byte — NOT the \
+         guard, which is not a loop header and so is not a pc the OSR \
+         trampoline can reconstruct a compiled state for"
+    );
+    for bci in [9usize, 10, 11, 12, 13, 16] {
+        assert!(
+            rebuilt[bci] >= fallback_off,
+            "bci {bci}: a mid-body OSR entry must land in the fallback copy, \
+             not in a guarded one"
+        );
+    }
+    // …and the fast copies really are ahead of it, so the comparison above
+    // is not trivially true of every artifact.
+    assert!(out_osr[x.fast_base()] >= 0 && out_osr[x.fast_base()] < fallback_off);
 }
 
 /// End to end: with the rewriter armed the emitter really compiles the
