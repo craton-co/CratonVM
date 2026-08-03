@@ -167,6 +167,25 @@ the known **renegotiation** residual — rustls does not renegotiate:
 as group 21's one by-design residual). Not touched by this change; tracked
 separately.
 
+### Re-verified on merged `dev`
+
+`dev` moved during verification (JIT single-pass handler merge, OSR contract,
+PGO call-site evidence — `bdd405d3a`), so the branch was merged and rebuilt
+(`cratonvm-wsjsse-merged-20260803.exe`) and the same 16 classes re-run: **every
+status identical**, both WebSocket classes still `OK (6 tests)` / `OK (3 tests)`,
+`bc=0` throughout.
+
+One extra row appeared on that run — `TestSsl.testPost[JSSE]`, `expected:<0>
+but was:<5>`, five of its concurrent POST threads taking `os error 10053`
+(WSAECONNABORTED). It is a **flake, not a regression**: re-running `TestSsl`
+three more times on that same binary gave `testPost` FAIL / PASS / PASS, while
+`testClientInitiatedRenegotiation` failed 3/3. That matches the standing note
+that `TestSsl` flips between pass and fail on both HotSpot and CratonVM. It is
+also structurally impossible for this fix to cause it: the change only ever
+makes `wrap` consume *less*, and a starved application write would stall rather
+than abort — and `handshake_status_of` cannot return `NOT_HANDSHAKING` until
+the same flag is set, so the post-handshake path is provably reachable.
+
 ## Note on the retired doc's repro block
 
 It used the per-flag env spelling, which is legacy — the VM answers with:
