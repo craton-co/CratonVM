@@ -11721,6 +11721,31 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                 .threads
                 .thread_registry
                 .set_interrupted(tid, true);
+            // Wake a target parked in `Object.wait()`, for the same reason the
+            // `LockSupport.park` unpark below exists: `interrupt()` only sets a
+            // flag, and `Monitor::wait` can observe it no sooner than its next
+            // 5 ms poll slice. `Object.wait()` was the one blocking primitive
+            // left without a prompt wake — a thread interrupted while waiting
+            // sat in the condvar for up to a full slice before throwing
+            // `InterruptedException`, and an untimed wait had nothing but that
+            // poll to end it.
+            //
+            // The registry already records which monitor a thread is parked on
+            // (written for JMX right before the park, taken right after), so the
+            // target is identified without a new side table. The wake consumes
+            // no pending notification, and a `Some` that has already gone stale
+            // costs one spurious wakeup, which `Object.wait()` permits.
+            if let Some(monitor_obj) = self
+                .shared
+                .threads
+                .thread_registry
+                .peek_jmx_waiting_monitor(tid)
+            {
+                self.shared
+                    .threads
+                    .monitors
+                    .wake_waiters_for_interrupt(monitor_obj);
+            }
         }
         // Match HotSpot `Thread.interrupt0`: wake the target if it is parked in
         // `LockSupport.park` (e.g. AQS `ConditionObject.await`). Without this the

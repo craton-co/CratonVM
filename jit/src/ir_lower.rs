@@ -26,7 +26,10 @@ use crate::deopt::{
     VirtualObjectState,
 };
 use crate::regalloc::{resolve_parallel_copy, CopyOp, ValueLoc};
-use cratonvm_types::{ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
+use cratonvm_types::narrow_oop::narrow_base;
+use cratonvm_types::{
+    narrow_oops_enabled, ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE,
+};
 
 // ── Header-offset emission sites (arch-2026-07-26 `layout-constant-hazards`) ──
 //
@@ -3639,8 +3642,21 @@ fn reloc_emit_enabled() -> bool {
             // the memory-token edge still serialises them with neighbours.
             Op::ArrayLoad(kind) => {
                 let slot = self.alloc_slot(id);
-                let is_d = matches!(kind, MemKind::Double);
                 let bci = node.bytecode_pc.unwrap_or(0);
+                // COV-02: everything that is not `float`/`double` lands the
+                // element in a GPR and spills it exactly as the single-pass
+                // backend does. The guards, the SIB base/index registers and
+                // the header displacement are identical for every width — the
+                // only thing that varies is one instruction.
+                if !matches!(kind, MemKind::Float | MemKind::Double) {
+                    self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
+                    self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
+                    self.emit_array_null_bounds_guards(bci);
+                    self.emit_gpr_array_elem_load(*kind);
+                    self.store_rax(slot);
+                    return;
+                }
+                let is_d = matches!(kind, MemKind::Double);
                 self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
                 self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
                 self.emit_array_null_bounds_guards(bci);
@@ -3661,8 +3677,34 @@ fn reloc_emit_enabled() -> bool {
             // result slot is read), but a slot is allocated for layout uniformity.
             Op::ArrayStore(kind) => {
                 let _slot = self.alloc_slot(id);
-                let is_d = matches!(kind, MemKind::Double);
                 let bci = node.bytecode_pc.unwrap_or(0);
+                // COV-02: the integral widths take the value in RDX, which
+                // `emit_array_null_bounds_guards` does not touch (it uses
+                // RAX/RCX and R10), so it can be loaded before the guards for
+                // the same reason XMM0 is on the FP path.
+                //
+                // `MemKind::Ref` cannot reach here: `IrBuilder::build` has no
+                // `aastore` (0x53) arm, deliberately — see the refusal note at
+                // that arm's neighbours in `ir.rs`. Fail closed rather than
+                // emit a barrier-less reference store.
+                if !matches!(kind, MemKind::Float | MemKind::Double) {
+                    if matches!(kind, MemKind::Ref) {
+                        self.latch_bailout(Bailout::with_context(
+                            BailoutReason::UnsupportedShape(
+                                "ir_lower: ArrayStore(Ref) needs the SATB + card write barriers",
+                            ),
+                            format!("n{id} is an aastore; the IR tier emits no store barrier"),
+                        ));
+                        return;
+                    }
+                    self.load_reg_from_frame(RDX, self.slot_of(node.inputs[4])); // value → RDX
+                    self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
+                    self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
+                    self.emit_array_null_bounds_guards(bci);
+                    self.emit_gpr_array_elem_store(*kind);
+                    return;
+                }
+                let is_d = matches!(kind, MemKind::Double);
                 self.fp_load_value(XMM0, node.inputs[4], is_d); // value → XMM0
                 self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
                 self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
@@ -3672,6 +3714,36 @@ fn reloc_emit_enabled() -> bool {
                 let sib = if is_d { 0xC8 } else { 0x88 };
                 self.buf
                     .emit(&[prefix, 0x0F, 0x11, 0x44, sib, HEADER_SIZE as u8]);
+            }
+            // arraylength (COV-02). inputs = [ctrl, mem, array]. One 32-bit
+            // load at a fixed header offset behind the JVMS null check. No
+            // element type, no bounds check, no barrier — the cheapest node in
+            // this lane and 43 of its 77 measured events.
+            //
+            // `MOV EAX, [RAX + ARRAY_LENGTH_OFFSET]` zero-extends into RAX,
+            // which is also the correct sign extension: an array length is a
+            // non-negative `u32` bounded by `i32::MAX`. Byte-identical to the
+            // single-pass `emit_arraylength_regs`.
+            //
+            // The null path DEOPTS rather than jumping over the load: control
+            // leaves for the shared stub, the interpreter re-executes this
+            // `arraylength` and throws the real NullPointerException with the
+            // method's own handler semantics. Emitting the load without the
+            // check would be a SIGSEGV in generated code.
+            Op::ArrayLength => {
+                let slot = self.alloc_slot(id);
+                let bci = node.bytecode_pc.unwrap_or(0);
+                self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+                self.buf.emit(&[
+                    0x8B,
+                    0x40,
+                    // Compile-time checked: a layout constant past 127 would
+                    // encode a NEGATIVE disp8 and read before the object.
+                    crate::x64::disp::disp8_const(ARRAY_LENGTH_OFFSET as i64) as u8,
+                ]); // MOV EAX, [RAX + ARRAY_LENGTH_OFFSET]
+                self.store_rax(slot);
             }
             // invokestatic — dispatch via the `jit_invoke_dispatch` helper
             // (Gap B). inputs = [ctrl, mem, arg0, arg1, …]. The IR builder emits
@@ -3950,14 +4022,16 @@ fn reloc_emit_enabled() -> bool {
             // that op and not another was the one that could vanish.
             //
             // Costs nothing when the claim it replaces is true. Verified
-            // 2026-08-03: the five `ir::Op` variants with no arm here —
-            // `ArrayLength`, `I2B`, `I2C`, `I2S`, `NewArray` — are unreachable
-            // from a real compile. `I2B`/`I2C`/`I2S` are constructed NOWHERE in
-            // the crate (`IrBuilder` decomposes 0x91/0x92/0x93 into
-            // `Shl`/`Shr`/`And` instead — see the arms at `ir.rs`'s 0x91);
-            // `ArrayLength` and `NewArray` are constructed only in `#[cfg(test)]`
-            // code, and the builder has no `arraylength`/`newarray`/`anewarray`
-            // opcode arm to produce them from.
+            // 2026-08-03: the four `ir::Op` variants with no arm here —
+            // `I2B`, `I2C`, `I2S`, `NewArray` — are unreachable from a real
+            // compile. `I2B`/`I2C`/`I2S` are constructed NOWHERE in the crate
+            // (`IrBuilder` decomposes 0x91/0x92/0x93 into `Shl`/`Shr`/`And`
+            // instead — see the arms at `ir.rs`'s 0x91); `NewArray` is
+            // constructed only in `#[cfg(test)]` code, and the builder has no
+            // `newarray`/`anewarray` opcode arm to produce it from.
+            //
+            // `ArrayLength` was the fifth until COV-02 gave it both an
+            // `arraylength` builder arm and a lowering arm above.
             //
             // Latched rather than returned because this function is infallible
             // by signature and every emitting arm below assumes it stays that
@@ -4490,6 +4564,118 @@ fn reloc_emit_enabled() -> bool {
             ]); // MOV R10D,[RAX+12]
         self.buf.emit(&[0x44, 0x39, 0xD1]); // CMP ECX, R10D
         self.emit_deopt_unless(0x82, bci, DeoptReason::BoundsCheck); // JB continue
+    }
+
+    /// COV-02 — the integral / reference element **load**, with the array
+    /// pointer in RAX and the index in RCX (the layout
+    /// [`Self::emit_array_null_bounds_guards`] leaves behind) and the result in
+    /// RAX, extended to 64 bits by the width's own JVMS rule.
+    ///
+    /// Byte-for-byte the single-pass backend's `emit_{int,long,byte,char,
+    /// short,ref}_aload_regs` (`jit/src/x64/arrays.rs`). That is not an
+    /// aesthetic preference: `jit/tests/ir_vs_singlepass.rs` compares the two
+    /// backends' answers on the same bytecode, so any divergence in the
+    /// extension rule (`baload` sign-extends, `caload` zero-extends) is a
+    /// wrong-code bug the harness is built to catch — and the cheapest way not
+    /// to have one is to emit the same instruction.
+    ///
+    /// `MemKind::Float` / `MemKind::Double` never reach here; the caller routes
+    /// them to the XMM path.
+    ///
+    /// **One header-offset emission site, not seven.** Every arm below is the
+    /// same `[RAX + RCX*scale + HEADER_SIZE]` address with a different opcode,
+    /// so the displacement is materialised once as `d` and shared. The object-
+    /// header shrink has to visit every place this crate bakes `HEADER_SIZE`
+    /// into an instruction (`layout_constant_inventory`), and one shared local
+    /// is one place to visit instead of seven. `disp8_const` also makes the
+    /// backwards-addressing hazard a COMPILE error rather than a silent read
+    /// before the object, which a raw narrowing cast to `u8` does not.
+    fn emit_gpr_array_elem_load(&mut self, kind: MemKind) {
+        let d = crate::x64::disp::disp8_const(HEADER_SIZE as i64) as u8;
+        match kind {
+            // MOVSXD RAX, DWORD [RAX + RCX*4 + HEADER_SIZE]
+            MemKind::Int => self.buf.emit(&[0x48, 0x63, 0x44, 0x88, d]),
+            // MOV RAX, QWORD [RAX + RCX*8 + HEADER_SIZE]
+            MemKind::Long => self.buf.emit(&[0x48, 0x8B, 0x44, 0xC8, d]),
+            // MOVSX EAX, BYTE [RAX + RCX*1 + HEADER_SIZE] ; MOVSXD RAX, EAX
+            MemKind::Byte => {
+                self.buf.emit(&[0x0F, 0xBE, 0x44, 0x08, d]);
+                self.buf.emit(&[0x48, 0x63, 0xC0]);
+            }
+            // MOVZX EAX, WORD [RAX + RCX*2 + HEADER_SIZE] (already zero-extends
+            // through the full RAX — a `char` is unsigned, so no MOVSXD).
+            MemKind::Char => self.buf.emit(&[0x0F, 0xB7, 0x44, 0x48, d]),
+            // MOVSX EAX, WORD [RAX + RCX*2 + HEADER_SIZE] ; MOVSXD RAX, EAX
+            MemKind::Short => {
+                self.buf.emit(&[0x0F, 0xBF, 0x44, 0x48, d]);
+                self.buf.emit(&[0x48, 0x63, 0xC0]);
+            }
+            // `aaload`. The result is a REFERENCE: the node is `IrType::Ref`,
+            // so `emit_safepoint_map` publishes this slot as a rewritable root
+            // at every later safepoint, which is what makes the element
+            // survive a relocating young collection.
+            MemKind::Ref => {
+                if narrow_oops_enabled() {
+                    // 4-byte `(addr - base) >> 3`, 0 == null. Decode to a full
+                    // pointer so every consumer downstream is unchanged, and
+                    // keep null at 0 rather than rebasing it to `base` — `SHL`
+                    // sets ZF from its result, so the null test is free.
+                    self.buf.emit(&[0x8B, 0x44, 0x88, d]); // MOV EAX,[RAX+RCX*4+H]
+                    self.buf.emit(&[0x48, 0xC1, 0xE0, 0x03]); // SHL RAX, 3
+                    self.buf.emit(&[0x74, 0x0D]); // JZ +13 (null stays 0)
+                    self.buf.emit(&[0x49, 0xBB]); // MOV R11, imm64
+                    self.buf.emit(&narrow_base().to_le_bytes());
+                    self.buf.emit(&[0x4C, 0x01, 0xD8]); // ADD RAX, R11
+                } else {
+                    // MOV RAX, QWORD [RAX + RCX*8 + HEADER_SIZE]
+                    self.buf.emit(&[0x48, 0x8B, 0x44, 0xC8, d]);
+                }
+            }
+            // Structurally unreachable — the caller routes FP to the XMM path.
+            // A `debug_assert!` here would be a FAIL-OPEN: it vanishes in
+            // release, this function would emit nothing, and the caller's
+            // `store_rax(slot)` would still run and spill whatever RAX happens
+            // to hold (the array pointer) as the element's value. Latch the
+            // bailout so release refuses the compile instead.
+            MemKind::Float | MemKind::Double => {
+                self.latch_bailout(Bailout::with_context(
+                    BailoutReason::Internal("ir_lower: FP element load reached the GPR emitter"),
+                    format!("{kind:?}"),
+                ));
+            }
+        }
+    }
+
+    /// COV-02 — the integral element **store**: array in RAX, index in RCX,
+    /// value in RDX. The single-pass twins are `emit_{int,long,byte,short}_
+    /// astore_regs`; `castore` and `sastore` share one 16-bit store, exactly as
+    /// they do there.
+    ///
+    /// `MemKind::Ref` is refused by the caller (no store barrier in this tier)
+    /// and the FP kinds take the XMM path. One shared header displacement, for
+    /// the reason given on [`Self::emit_gpr_array_elem_load`].
+    fn emit_gpr_array_elem_store(&mut self, kind: MemKind) {
+        let d = crate::x64::disp::disp8_const(HEADER_SIZE as i64) as u8;
+        match kind {
+            // MOV DWORD [RAX + RCX*4 + HEADER_SIZE], EDX
+            MemKind::Int => self.buf.emit(&[0x89, 0x54, 0x88, d]),
+            // MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
+            MemKind::Long => self.buf.emit(&[0x48, 0x89, 0x54, 0xC8, d]),
+            // MOV BYTE [RAX + RCX*1 + HEADER_SIZE], DL
+            MemKind::Byte => self.buf.emit(&[0x88, 0x54, 0x08, d]),
+            // MOV WORD [RAX + RCX*2 + HEADER_SIZE], DX  (0x66 = 16-bit operand)
+            MemKind::Char | MemKind::Short => self.buf.emit(&[0x66, 0x89, 0x54, 0x48, d]),
+            // Structurally unreachable — see the load emitter's note. Same
+            // fail-open, worse consequence: a silently dropped array store.
+            MemKind::Ref | MemKind::Float | MemKind::Double => {
+                self.latch_bailout(Bailout::with_context(
+                    BailoutReason::Internal(
+                        "ir_lower: a non-integral element store reached the GPR emitter",
+                    ),
+                    format!("{kind:?}"),
+                ));
+            }
+        }
     }
 
     /// Emit the single shared deopt stub (if any guard jumps to it) and patch
@@ -5223,6 +5409,7 @@ fn op_defines_result_slot(op: &Op) -> bool {
             | Op::Load(_)
             | Op::ArrayLoad(_)
             | Op::ArrayStore(_)
+            | Op::ArrayLength
             | Op::New { .. }
             | Op::Call { .. }
             | Op::LambdaIntToDouble
@@ -11065,7 +11252,7 @@ mod tests {
     /// comment for the evidence per op). This is a statement about the tree,
     /// not a permission: a variant added here is a variant the optimizing tier
     /// silently declines to compile, and the edit should be visible in review.
-    const UNLOWERABLE: [&str; 5] = ["ArrayLength", "I2B", "I2C", "I2S", "NewArray"];
+    const UNLOWERABLE: [&str; 4] = ["I2B", "I2C", "I2S", "NewArray"];
 
     /// **Exhaustive on purpose — do not add a wildcard arm.**
     ///
@@ -11115,13 +11302,14 @@ mod tests {
             | Op::Load(_)
             | Op::ArrayLoad(_)
             | Op::ArrayStore(_)
+            | Op::ArrayLength
             | Op::New { .. }
             | Op::Call { .. }
             | Op::LambdaIntToDouble => LoweredValue,
             // Effects with an arm but no result slot.
             Op::Store(_) | Op::MonitorEnter | Op::MonitorExit | Op::Guard { .. } => LoweredEffect,
             // No arm. Keep in step with `UNLOWERABLE`; the tests check it.
-            Op::ArrayLength | Op::I2B | Op::I2C | Op::I2S | Op::NewArray { .. } => Unlowerable,
+            Op::I2B | Op::I2C | Op::I2S | Op::NewArray { .. } => Unlowerable,
         }
     }
 
@@ -11401,9 +11589,11 @@ mod tests {
     /// reads its value. `ir::Op::MonitorEnter` was exactly that shape and this
     /// is the general form of the guard it got.
     ///
-    /// `Op::ArrayLength` is used because it is on `UNLOWERABLE` and produces a
+    /// `Op::NewArray` is used because it is on `UNLOWERABLE` and produces a
     /// value; the graph is hand-built so no optimizer pass can DCE it away
-    /// before the lowerer sees it.
+    /// before the lowerer sees it. (It was `Op::ArrayLength` until COV-02 gave
+    /// that op a lowering arm — the witness has to be an op with NO arm, which
+    /// is exactly what the precondition assertion below enforces.)
     ///
     /// **Anti-vacuity, executed rather than argued (2026-08-03).** A test that
     /// asserts `is_none()` passes for any refusal, including one that has
@@ -11425,17 +11615,22 @@ mod tests {
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
         let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
-        let arr = graph.add(Op::Param(0), IrType::Ref, vec![start], None);
+        let len_arg = graph.add(Op::Param(0), IrType::Int, vec![start], None);
         // Scheduled, lowered, and read by nobody — the monitor's shape.
-        let _len = graph.add(Op::ArrayLength, IrType::Int, vec![ctrl, mem, arr], None);
+        let _len = graph.add(
+            Op::NewArray { element_type: 10 },
+            IrType::Ref,
+            vec![ctrl, mem, len_arg],
+            None,
+        );
         let zero = graph.add(Op::Const(0), IrType::Int, vec![], None);
         let ret = graph.add(Op::Return, IrType::Void, vec![ctrl, zero], None);
         graph.exit = ret;
 
         assert_eq!(
-            declared_lowering(&Op::ArrayLength),
+            declared_lowering(&Op::NewArray { element_type: 10 }),
             OpLowering::Unlowerable,
-            "precondition: this test is only meaningful while `ArrayLength` has \
+            "precondition: this test is only meaningful while `NewArray` has \
              no arm — if one was added, pick another `UNLOWERABLE` op"
         );
 
