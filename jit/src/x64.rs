@@ -700,6 +700,12 @@ struct Compiler {
     /// reaches the `compile-bail` line, the way `note_jit_bail_site` works
     /// everywhere else.
     failed_site: Option<(&'static str, usize, u8)>,
+    /// Set by `patch_branches` when it rejects the method: the branch target
+    /// PC that had no native offset, and the nearest emitted PC at or below it.
+    /// The refusal named neither before, and its message asserted a cause
+    /// ("malformed bytecode a verifier would reject") that is demonstrably
+    /// wrong for real javac output.
+    unresolved_branch_target: Option<(usize, i64)>,
     /// Bitmask of scratch XMM registers (2-7) currently in use on the simulated stack.
     /// Bit N corresponds to SCRATCH_XMMS[N]. Used to allocate scratch XMMs for
     /// FP intermediate persistence across bytecodes.
@@ -2049,6 +2055,7 @@ impl Compiler {
             branch_target_stack_oop_marks: FxHashMap::default(),
             failed: false,
             failed_site: None,
+            unresolved_branch_target: None,
             helpers,
             scratch_xmm_in_use: 0,
             fp_hoist_info: Vec::new(),
@@ -19276,7 +19283,27 @@ impl Compiler {
                             //      are NOT targeted (already branched
                             //      above), so the callee is a normal
                             //      JIT-compiled method.
+                            //   4. `pc + 3` is NOT a branch target. The
+                            //      tail form CONSUMES the `xreturn` — it emits
+                            //      no code for that PC and leaves
+                            //      `pc_to_native[pc + 3]` unset — so any other
+                            //      edge into it becomes unresolvable and
+                            //      `patch_branches` rejects the whole method
+                            //      with `branch-target-not-an-instruction-
+                            //      boundary`, a reason whose message blames
+                            //      malformed bytecode. It is the ordinary
+                            //      shape `return (x != null ? x : missing())`:
+                            //      the `else` arm's call sits immediately
+                            //      before the shared `areturn`, and the `then`
+                            //      arm's `goto` lands on it. Fusing would also
+                            //      be wrong on its own terms — the other edge
+                            //      arrives with its own value on the operand
+                            //      stack and expects a plain return, not "load
+                            //      args and JMP to the callee". This is the
+                            //      same precondition the const-arith peepholes
+                            //      state: never fuse across a merge point.
                             let tail_op_matches = pc + 3 < code_len
+                                && !branch_targets[pc + 3]
                                 && match (ret_type, code[pc + 3]) {
                                     (b'I' | b'Z' | b'B' | b'S' | b'C', 0xAC) => true,
                                     (b'J', 0xAD) => true,
@@ -19522,8 +19549,14 @@ impl Compiler {
                         // frame down, so a throw from the self-recursive callee
                         // would bypass the handler covering this pc
                         // (see `pc_is_protected`).
+                        // Never when the `xreturn` is a branch target: the
+                        // tail form consumes that PC without emitting it, so
+                        // another edge into it has no native offset to be
+                        // patched to (see the sibling-tail arm above for the
+                        // full argument).
                         let is_tail_call = pc + 3 < code_len
                             && matches!(code[pc + 3], 0xac..=0xb0) // ireturn..areturn
+                            && !branch_targets[pc + 3]
                             && !self.pc_is_protected(pc);
 
                         // jit-invokedynamic-groovy-regression fix: a method
@@ -23347,16 +23380,48 @@ impl Compiler {
         true
     }
 
+    /// Record which target `patch_branches` could not resolve, plus the
+    /// highest PC at or below it that the emitter actually placed. The pair
+    /// distinguishes the two ways this happens: a `nearest` strictly below the
+    /// target means the walk stepped OVER it (something consumed the target's
+    /// PC without emitting it), and `-1` means nothing below it was emitted at
+    /// all (the target sits in a region the walk never entered).
+    #[cold]
+    fn note_unresolved_branch_target(&mut self, target_pc: usize) {
+        if self.unresolved_branch_target.is_some() {
+            return;
+        }
+        let nearest = (0..=target_pc.min(self.pc_to_native.len().saturating_sub(1)))
+            .rev()
+            .find(|&p| self.pc_to_native[p] >= 0)
+            .map_or(-1i64, |p| p as i64);
+        self.unresolved_branch_target = Some((target_pc, nearest));
+    }
+
     /// Patch all forward branches and jump-table entries.
     ///
     /// Returns `false` when any recorded branch/table target has no native
-    /// offset (`pc_to_native[target_pc] < 0` or out of range). Every target
-    /// the scan pass collects is revived and emitted by the dead-code walk,
-    /// so an unresolved target means the bytecode branches to a PC that is
-    /// not an instruction boundary (e.g. into the middle of a `goto`'s
-    /// operand bytes) — malformed bytecode that a classfile verifier would
-    /// reject, but which CratonVM can still meet via unverified/synthetic
-    /// code. Previously such patches were silently SKIPPED, leaving the
+    /// offset (`pc_to_native[target_pc] < 0` or out of range).
+    ///
+    /// **Do not read that as "malformed bytecode".** This comment used to say
+    /// an unresolved target meant the method branched into the middle of an
+    /// instruction — something a classfile verifier would reject, reachable
+    /// only through unverified/synthetic code. That claim was wrong, and it
+    /// cost real compiles: every FUSING lowering in the emitter consumes a PC
+    /// without emitting it, and if that PC is a branch target the edge onto it
+    /// is unresolvable here. The tail-call forms swallowed the `xreturn` at
+    /// `pc + 3` and refused five ordinary Spring/bytebuddy methods this way
+    /// (`ResolvableType.isAssignableFrom`, `TypeMappedAnnotations.get`, …),
+    /// blaming their bytecode. See
+    /// `docs/internal/jit-tailcall-swallows-shared-return-FIXED-20260803.md`.
+    ///
+    /// So when this fires, suspect a fusion before you suspect the classfile:
+    /// `note_unresolved_branch_target` records the target and the nearest PC
+    /// the emitter actually placed, and `CRATONVM_DBG_JITC=1` prints both.
+    /// A `nearest` a few bytes below the target names the instruction whose
+    /// arm over-advanced `pc`.
+    ///
+    /// Previously such patches were silently SKIPPED, leaving the
     /// emitted rel32 placeholder `0`: the branch fell through (or, when the
     /// branch was the last emitted instruction, execution ran off the body
     /// into the out-of-line stubs — observed as a STATUS_ACCESS_VIOLATION
@@ -23372,6 +23437,7 @@ impl Compiler {
                 -1
             };
             if target_native < 0 {
+                self.note_unresolved_branch_target(target_pc);
                 return false; // unresolved target — reject the method
             }
             // rel32 = target - (patch_offset + 4)
@@ -23392,6 +23458,7 @@ impl Compiler {
                 -1
             };
             if target_native < 0 {
+                self.note_unresolved_branch_target(target_pc);
                 return false; // unresolved table target — reject the method
             }
             let rel = target_native - table_base as i32; // Cast: x86-64 rel32 displacement
@@ -25413,7 +25480,23 @@ pub fn compile_with_param_slots(
     // instruction boundary (malformed/unverified bytecode) — reject the
     // method rather than leave an unpatched jump in executable code.
     if !compiler.patch_branches() {
-        crate::note_jit_bail_site("branch-target-not-an-instruction-boundary");
+        // Name the target. `pc` here is the branch target with no native
+        // offset and `op` the byte at it — enough to check against a `javap -c`
+        // listing whether the target really is off-boundary (it usually is
+        // not: see `docs/known-issues/jit/`).
+        let (target, nearest) = compiler.unresolved_branch_target.unwrap_or((0, -1));
+        let target_op = code.get(target).copied().unwrap_or(0);
+        crate::note_jit_bail_site_at(
+            "branch-target-not-an-instruction-boundary",
+            target,
+            target_op,
+        );
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!(
+                "[cratonvm-jitc] branch-target-unresolved target={target} op=0x{target_op:02x} \
+                 nearest_emitted_at_or_below={nearest} code_len={code_len}"
+            );
+        }
         return None;
     }
 
@@ -37072,6 +37155,108 @@ mod tests {
         assert!(compile_probe_method(&code, 0, 1).is_none());
         let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
         assert_eq!(site, "singlepass-codegen/dup2-unprovable-top-width");
+    }
+
+    /// `return cond ? x : helper()` — the `else` arm's call sits immediately
+    /// before the shared `xreturn`, and the `then` arm's `goto` lands on it.
+    ///
+    /// Both tail-call forms USED to swallow that `xreturn`: they emit no code
+    /// for its PC, so `pc_to_native` stayed -1 there, and `patch_branches`
+    /// then rejected the whole method with
+    /// `branch-target-not-an-instruction-boundary` — a reason that blames
+    /// malformed bytecode for what is ordinary javac output.
+    ///
+    ///     0: iload_0
+    ///     1: ifeq 8
+    ///     4: iconst_1
+    ///     5: goto 12          <- the edge onto the return
+    ///     8: iload_0
+    ///     9: invokestatic
+    ///    12: ireturn          <- swallowed by the tail form
+    const TAILCALL_OVER_SHARED_RETURN: [u8; 13] = [
+        0x1a, 0x99, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x07, 0x1a, 0xb8, 0x00, 0x01, 0xac,
+    ];
+
+    /// The self-recursive tail form (`invokestatic` with no `invoke_info` and
+    /// no `direct_call` is a self-call here, as every other test in this file
+    /// relies on).
+    #[test]
+    fn a_self_tail_call_may_not_swallow_a_branch_targeted_return() {
+        assert!(
+            compile_probe_method(&TAILCALL_OVER_SHARED_RETURN, 1, 1).is_some(),
+            "the `goto`'s target is the `ireturn` the tail form consumes"
+        );
+    }
+
+    /// The sibling tail form — reached only when the callee is ALREADY
+    /// compiled, which is why this never reproduced from a cold standalone
+    /// probe and only showed up inside a warm Spring context.
+    #[test]
+    fn a_sibling_tail_call_may_not_swallow_a_branch_targeted_return() {
+        let callee = super::super::JitDirectCall {
+            // Never executed — only the emitted JMP/CALL target.
+            entry: 0x1000,
+            needs_context: false,
+            num_params: 1,
+            return_type: b'I',
+            guard_class_id: 0,
+        };
+        assert!(
+            compile_with_direct_call(&TAILCALL_OVER_SHARED_RETURN, 1, 1, 9, callee).is_some(),
+            "a direct-callable callee must not let the tail form eat the shared return"
+        );
+    }
+
+    /// Without the branch onto it, the same call/return pair is still the
+    /// fusible shape and must keep compiling — the guard is about the merge,
+    /// not about tail calls.
+    #[test]
+    fn a_tail_call_over_an_unshared_return_still_compiles() {
+        let code = [0x1a, 0xb8, 0x00, 0x01, 0xac]; // iload_0; invokestatic; ireturn
+        assert!(compile_probe_method(&code, 1, 1).is_some());
+        let callee = super::super::JitDirectCall {
+            entry: 0x1000,
+            needs_context: false,
+            num_params: 1,
+            return_type: b'I',
+            guard_class_id: 0,
+        };
+        assert!(compile_with_direct_call(&code, 1, 1, 1, callee).is_some());
+    }
+
+    /// `compile_probe_method` with one direct-callable callee wired at `at_pc`.
+    fn compile_with_direct_call(
+        code: &[u8],
+        num_params: usize,
+        max_locals: usize,
+        at_pc: usize,
+        callee: super::super::JitDirectCall,
+    ) -> Option<CompiledMethod> {
+        compile(
+            code,
+            code.len(),
+            num_params,
+            max_locals,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![(at_pc, callee)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
     }
 
     fn compile_switch_method(code: &[u8], code_len: usize) -> Option<CompiledMethod> {
