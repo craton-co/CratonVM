@@ -188,10 +188,15 @@ rather than guesses when program order is not dominance. The in-module applier
 `apply_scalar_replacement` was rewritten to consume `load_values` (it had the
 same last-write-wins bug) and to be all-or-nothing.
 
-**Not yet end-to-end.** The production applier `apply_ea_to_ir` still reads
-`field_values` and still refuses via its own id-comparison heuristic — see §6
-for the edit that switches it over. Until then the pipeline is *correct but
-pessimistic*: EA can answer the load, the applier declines to use the answer.
+**Yes, end-to-end too, since 2026-08-02.** §6.1's edit landed: the production
+applier's planner `plan_scalar_replacement` consumes `info.load_value` per load
+and refuses on `Unknown` (`jit/src/lib.rs:10353`), and the id-comparison
+heuristic is gone. The end-to-end witness is
+`ea_load_before_a_later_store_forwards_the_pre_store_value`
+(`jit/src/lib.rs:17228`), which asserts the pre-store value is forwarded *and*
+pins the precondition that `field_values[0]` — the source the applier used to
+read — still holds the wrong (later) value, so the test cannot pass by
+accident.
 
 ---
 
@@ -266,10 +271,16 @@ compilation knows to revisit `program_order_proves_dominance`.
 All in `jit/src/lib.rs`, which is another agent's file. Cited by symbol, not
 line, because that file is being edited concurrently.
 
-### 6.1 Use the per-load answer (priority 1 — turns a refusal into an optimization)
+### 6.1 Use the per-load answer — **DONE 2026-08-02**
 
-`plan_scalar_replacement`, the `LAST-WRITE-WINS HAZARD` block and the
-`load_plans` loop below it. Today:
+Landed as written below. `plan_scalar_replacement` now builds `load_plans` from
+`info.load_value(ea_load)` and returns `None` on `LoadResolution::Unknown`
+(`jit/src/lib.rs:10353`); the `LAST-WRITE-WINS HAZARD` block and its `s > l`
+refusal are gone; `field_index` stayed, as predicted. Witness:
+`ea_load_before_a_later_store_forwards_the_pre_store_value` (`lib.rs:17228`).
+The prescription is kept below for the record.
+
+The shape it replaced:
 
 ```rust
 // refuse the object if any store to the loaded field is later
