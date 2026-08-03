@@ -20,7 +20,9 @@ Everything here lives in `jit/src/x64.rs` and `jit/src/x64/licm.rs`.
 | Translating baked-in bcis via `bci_at` | **wired**, 4 sites |
 | `osr_pc_to_native` rebuilt in original-bci space | **wired** (`rebuild_pc_to_native`) |
 | `osr_dead_mask` rebuilt in original-bci space | **wired** |
-| Validated by anything larger than a unit test | **no** |
+| Translating `DeoptimizationPoint::bci` / `FrameState::bci` | **wired** (`build_and_record_deopt_point`) |
+| That translation checked before the artifact is published | **wired** (`rewritten_deopt_points_are_publishable`) |
+| Validated by anything larger than a unit test | **yes** — probes, benches, and three Spring Boot classes armed |
 
 ## How it is enabled
 
@@ -90,17 +92,23 @@ plain transform, which is byte-for-byte what this emitted before versioning
 existed — the guard is a profitability filter, not what makes peel or unroll
 legal.
 
-### Reachability: this is dead code today, twice over
+### Reachability
 
-The opt-in is a thread-local nothing in the VM sets. **And** even when armed,
-the first whole-compile refusal — `DeoptRealEnabled` — fires on every compile,
-because `crate::deopt_real_enabled()` defaults to on. So an armed process still
-produces no transformed artifact unless `CRATONVM_DEOPT_REAL` is explicitly
-off, and no unit test can arrange that (the flag snapshot is latched
-process-wide and this one is additionally cached in a `OnceLock`).
+Off by default: the opt-in is a thread-local nothing in the VM sets, plus the
+process-wide `CRATONVM_JIT=bytecode-loop-xform`.
 
-`the_wired_compile_path_is_refused_before_any_loop_is_looked_at` pins it.
-Narrowing those four refusals is `loop-02`'s lane.
+It used to be dead code *twice* over — arming was not enough, because the first
+whole-compile refusal (`DeoptRealEnabled`) fired on every compile,
+`crate::deopt_real_enabled()` being default-ON. `loop-02` retired that refusal
+along with `PreciseExceptionFrames` and `InvokedynamicPresent`, so arming is now
+sufficient and `CRATONVM_JIT=bytecode-loop-xform` alone reaches loops under the
+default configuration. On `core/spring-boot-autoconfigure` that is 95–98% of
+compiles eligible (it was 0%) and 10–58 methods per test class actually
+rewritten — see `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
+
+`the_wired_compile_path_reaches_a_loop_under_the_default_configuration` pins it,
+by reading `crate::deopt_real_enabled()` rather than hard-coding it: the answer
+must not depend on that flag any more.
 
 `compile_with_param_slots` then
 
@@ -240,10 +248,18 @@ Both are still routed through `replicate_pc_keyed` so the census has no
 
 * `exception_ranges` (from `PENDING_EXCEPTION_RANGES`) — replaced wholesale by
   `xform.exception_ranges`, which the rewriter produced.
-* `protected_ranges` (from `PROTECTED_RANGES_REQUEST`) — **not** rewritten,
-  and it does not need to be: its only consumer, `Compiler::pc_is_protected`,
-  is read exclusively on the `precise_exception_frames` paths, which the
-  transform refuses.
+* `protected_ranges` (from `PROTECTED_RANGES_REQUEST`) — **not** rewritten.
+  `Compiler::pc_is_protected` translates its argument through
+  `Compiler::orig_bci` instead, which is the right shape for a table of SPANS
+  rather than of pc-keyed entries: every copy of a bytecode inside a `try` maps
+  back to the one bci the range covers.
+
+  This entry used to say the ranges did not need translating because their only
+  consumer is on the `precise_exception_frames` paths, which the transform
+  refused. That was wrong twice: there are three consumers, and the two in the
+  sibling-tail-call admission (`bytecode_walk.rs`) are not gated on
+  `precise_exception_frames` at all — so the census was already describing a
+  latent wrong answer, before `loop-02` made those paths reachable.
 
 ## Whole-compile refusals
 
@@ -255,19 +271,25 @@ bailing would abandon a method the backend can compile perfectly well.
 | Refusal | Why |
 |---|---|
 | `NotArmed` | the default |
-| `DeoptRealEnabled` | `CRATONVM_DEOPT_REAL`: precise snapshots record a resume bci from the emitter pc |
-| `PreciseExceptionFrames` | same, via `emit_post_invoke_exception_check` / `emit_precise_null_check_field_store` |
-| `InvokedynamicPresent` | see above; the one such path that is live in production |
 | `InlineSitesPresent` | inlined-callee bci space |
 | `NoCandidateLoop` | nothing passed the band + `bypassable_headers` |
 | `Planner(_)` | one of `plan_loop_unroll`'s 17 structural refusals |
 | `ProvenanceNotTotal` | unreachable; re-checked because `orig_bci` rests on it |
 
-There is one more, later and louder: if a transform is in effect and the
-compile nevertheless recorded a `deopt_points` entry, `compile_with_param_slots`
-**discards the method** (returns `None`) rather than publish an output PC as an
-interpreter resume point. The three refusals above make that vector provably
-empty; the check exists so a future emit path cannot silently break it.
+`DeoptRealEnabled`, `PreciseExceptionFrames` and `InvokedynamicPresent` were
+here too. All three named one thing — a path that hands the VM an emitter pc as
+a resume bci — and all three went when
+`build_and_record_deopt_point` started publishing `DeoptimizationPoint::bci`
+through `Compiler::orig_bci`.
+
+There is one more refusal, later and louder: if a transform is in effect,
+`compile_with_param_slots` puts every recorded deopt point through
+`rewritten_deopt_points_are_publishable` and **discards the method** (returns
+`None`) if the translation did not hold, if a point landed on the versioning
+guard's synthetic bytes, or if two copies of one bytecode disagree about a field
+a bci-keyed consumer takes on trust. This used to be "any deopt point at all
+discards the method", which was cheap while the vector was provably empty and is
+not an option now that it is the normal case.
 
 ## What executing it found
 
@@ -307,7 +329,14 @@ This is the case for the flag existing. Every unit test passed throughout.
 * Both compile doors, on real Java: the invocation-count door and the OSR door,
   each producing a versioned artifact whose answers match HotSpot's exactly
   (`probes/LoopXformProbe.java`, `probes/LoopVersionOsrProbe.java`,
-  `bench/StringRegexOnly.java`, `bench/HashMapOnly.java`).
+  `probes/IndyDeoptProbe.java`, `bench/StringRegexOnly.java`,
+  `bench/HashMapOnly.java`) — in all three configurations: default,
+  `bytecode-loop-xform`, and `bytecode-loop-xform,deopt-real=0`.
+* An application suite, armed and under the DEFAULT `deopt_real`:
+  `core/spring-boot-autoconfigure`'s `AutoConfigurationSorterTests`,
+  `ConditionalOnClassTests` and `ConditionalOnPropertyTests`, 61 tests, 0
+  failures, 83 methods rewritten between them, and zero discards
+  (`loop_xform_deopt_bci_unpublishable = loop_xform_deopt_frames_diverge = 0`).
 * `cargo test -p cratonvm-jit --test '*'` with the rewriter armed and
   `deopt_real` off: 196 tests, all passing, with the transform firing during the
   run (confirmed with `CRATONVM_DBG=jit-gen`, not assumed — a vacuous pass here
@@ -317,9 +346,9 @@ This is the case for the flag existing. Every unit test passed throughout.
 
 ## What is NOT validated
 
-* No application suite (Tomcat, H2, Spring Boot) has run with the rewriter
-  armed, and no sanitizer or GC-stress configuration has. The workloads above
-  are single-threaded and allocate little.
+* No sanitizer or GC-stress configuration has run with the rewriter armed, and
+  neither has Tomcat or H2. The Spring Boot classes above are the only
+  multi-threaded, allocating workload it has seen.
 * No benchmark A/B. Wall-clock on the shared Azure host spreads far too wide to
   read a transform this size, and the only honest meter there is callgrind.
 * Nothing has exercised a rewritten method through a real GC pause or a real
@@ -340,10 +369,12 @@ This is the case for the flag existing. Every unit test passed throughout.
 
 1. `#[derive(Clone)]` on `JitDirectCall` in `jit/src/lib.rs`, which would
    delete the packed-tuple detour.
-2. Translating `DeoptimizationPoint::bci` at `build_and_record_deopt_point`,
-   which would retire `DeoptRealEnabled`, `PreciseExceptionFrames` and
-   `InvokedynamicPresent` in one move. That is the largest remaining piece, and
-   until it lands nothing here executes — see "Reachability" above and
+2. ~~Translating `DeoptimizationPoint::bci` at `build_and_record_deopt_point`~~
+   — done, and it retired `DeoptRealEnabled`, `PreciseExceptionFrames` and
+   `InvokedynamicPresent` together, as predicted. What it did NOT predict:
+   `pc_is_protected` was already asking its question in the wrong space, the
+   versioning guard's bytes had to stop being OSR-eligible, and the copies of
+   one bytecode legitimately disagree about a slot's oop-ness. See
    `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
 3. ~~`loop-transform-wiring.md` still describes the pre-wiring state~~ — it now
    carries a superseded banner pointing here.
