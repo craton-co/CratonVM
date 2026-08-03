@@ -90,6 +90,9 @@ pub fn lookup(class: &str, name: &str, desc: &str) -> Option<InterpIntrinsic> {
         ("java/lang/Long", "longValue", "()J") => LongLongValue,
         ("java/lang/Long", "parseLong", "(Ljava/lang/String;)J") => LongParseLong,
 
+        // java/lang/Thread — static, empty body, pure CPU hint
+        ("java/lang/Thread", "onSpinWait", "()V") => ThreadOnSpinWait,
+
         // java/lang/Math — static, pure arithmetic
         ("java/lang/Math", "abs", "(I)I") => MathAbsInt,
         ("java/lang/Math", "abs", "(J)J") => MathAbsLong,
@@ -157,6 +160,7 @@ pub fn is_static(kind: InterpIntrinsic) -> bool {
     matches!(
         kind,
         SystemArraycopy
+            | ThreadOnSpinWait
             | IntegerValueOf
             | IntegerParseInt
             | LongValueOf
@@ -192,6 +196,15 @@ pub fn dispatch(
         StringIsEmpty => string::intrinsic_string_is_empty(ctx, args),
         // System
         SystemArraycopy => system::intrinsic_system_arraycopy(ctx, args),
+        // Thread
+        ThreadOnSpinWait => {
+            // Same body as the registry native: a CPU pause hint, nothing
+            // observable. The interpreter's invokestatic fast path answers
+            // this without reaching here at all; this arm covers any caller
+            // that still routes through the generic dispatch.
+            std::hint::spin_loop();
+            Ok(None)
+        }
         // StringBuilder
         StringBuilderAppendString => stringbuilder::intrinsic_sb_append_string(ctx, args),
         StringBuilderAppendInt => stringbuilder::intrinsic_sb_append_int(ctx, args),
@@ -251,6 +264,7 @@ pub fn callback_for(kind: InterpIntrinsic) -> cratonvm_native_api::NativeCallbac
         StringCharAt => tramp!(StringCharAt),
         StringIsEmpty => tramp!(StringIsEmpty),
         SystemArraycopy => tramp!(SystemArraycopy),
+        ThreadOnSpinWait => tramp!(ThreadOnSpinWait),
         StringBuilderAppendString => tramp!(StringBuilderAppendString),
         StringBuilderAppendInt => tramp!(StringBuilderAppendInt),
         StringBuilderAppendChar => tramp!(StringBuilderAppendChar),

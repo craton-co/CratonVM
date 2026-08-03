@@ -12497,7 +12497,6 @@ pub(super) fn execute_invokestatic(
             || isolated_url_definition
             || has_user_defining_loader
         {
-            loader_specific_dispatch = true;
             // Preserve the initiating loader even when the global classpath
             // already has a same-named class. This is required for nested
             // implementation jars whose owner is only visible to the caller
@@ -12511,9 +12510,49 @@ pub(super) fn execute_invokestatic(
             } else {
                 lookup_loader_initiated(shared, current_class_id, &method_class_name)
             };
-            known.or_else(|| {
+            let selected = known.or_else(|| {
                 drive_defining_loader_load(shared, thread, current_class_id, &method_class_name)
-            })
+            });
+            // Set on SELECTION, not on attempt.
+            //
+            // This flag's only job is to suppress invoke-cache promotion, and
+            // the comment above it already states the rule: "Only a genuinely
+            // loader-specific owner selection ... may suppress promotion."
+            // Setting it before the lookup broke that rule the moment
+            // `loader_aware_resolution()` became default-on (2026-07-04):
+            // `should_use_loader_initiated_resolution` then returns `true`
+            // unconditionally, so EVERY invokestatic whose constant-pool owner
+            // is not the caller class entered this arm, set the flag, resolved
+            // `None`, dispatched through the ordinary flat path anyway — and
+            // was never promoted. The invokestatic inline cache was, in
+            // effect, globally off.
+            //
+            // The cost is not subtle. An uncached invokestatic re-runs the
+            // whole slow path on EVERY call: constant-pool resolve, three
+            // string-keyed native-registry probes, a superclass walk under the
+            // class-manager `RwLock`. `Thread.onSpinWait()` — an empty JDK
+            // method — measured **2.9 us per call** against 0.35 us for a
+            // byte-identical empty static in a user class (which IS cached,
+            // via `self_class_id`) and 44 ns on HotSpot. Because
+            // `AbstractQueuedSynchronizer.acquire` spins up to 255
+            // `onSpinWait` rounds before parking, that lands directly on every
+            // lock and condition handoff in the VM: `Condition.signal ->
+            // await` 228 us vs HotSpot's 2.8 us, `LinkedBlockingQueue.put ->
+            // take` 208 us vs 3.5 us, `ThreadPoolExecutor.execute -> task
+            // entered` 558 us vs 22 us.
+            //
+            // Promoting a site that selected nothing is sound:
+            // `populate_invoke_cache` performs its OWN loader-aware owner
+            // resolution (`loader_owner_override`) before building the entry,
+            // which is exactly why `invokevirtual`/`invokespecial` sites have
+            // always been promoted through it. Suppression stays in place for
+            // the case it was written for — a loader-specific owner actually
+            // chosen here — because that owner is a `ClassId` the cache key
+            // cannot yet carry.
+            if selected.is_some() {
+                loader_specific_dispatch = true;
+            }
+            selected
         } else {
             None
         }
@@ -13032,6 +13071,66 @@ pub(super) fn populate_invoke_cache(
         class_name
     };
 
+    // `Thread.onSpinWait()` — install the intrinsic entry WITHOUT requiring a
+    // registered native, unlike the ordinary intrinsic probe further down.
+    //
+    // In real-JDK mode there IS no `Thread.onSpinWait` native (the schema-2
+    // census lists none), so that probe — which only runs for a method that
+    // has one — never sees this site. Nothing else caches it either, so every
+    // single call takes the `execute_invokestatic` slow path: a constant-pool
+    // resolve, three string-keyed native-registry probes, and a superclass
+    // walk under the class-manager read lock. Measured **2.3 us per call**,
+    // against 0.4 us for a byte-identical empty static in a user class and
+    // 44 ns on HotSpot.
+    //
+    // That is not a micro-benchmark curiosity.
+    // `AbstractQueuedSynchronizer.acquire` spins up to 255 `onSpinWait`
+    // rounds before it parks, so ONE lock or condition handoff burns up to
+    // 580 us of pure dispatch. Measured against HotSpot on the same host:
+    // `Condition.signal -> await` 228 us vs 2.8 us, `LinkedBlockingQueue.put
+    // -> take` 208 us vs 3.5 us, `ThreadPoolExecutor.execute -> task entered`
+    // 558 us vs 22 us. That last one is the dispatch Tomcat's WebSocket
+    // completion path runs for every message
+    // (`WsRemoteEndpointImplServer.clearHandler` hands the `SendHandler` to
+    // the container executor), and it alone exceeds
+    // `TestAsyncMessagesPerformance`'s 500 us SEQ2 budget.
+    //
+    // Answering it inline is behaviour-identical to running it: the JDK body
+    // is empty (`@IntrinsicCandidate public static void onSpinWait() {}`) and
+    // HotSpot lowers it to a single PAUSE. See the matching arm in
+    // `execute_invokestatic_cached`, which skips `safe_native_call` entirely.
+    if !is_special
+        && !crate::runtime::env_cache::intrinsics_disabled()
+        && matches!(
+            cratonvm_native_builtins::intrinsics::lookup(&class_name, &method_name, &descriptor),
+            Some(cratonvm_native_api::InterpIntrinsic::ThreadOnSpinWait)
+        )
+    {
+        let cm = shared.classes.class_manager.read();
+        let gate = match cm.get_loaded_class_id(&class_name) {
+            Some(cid) => RedefineGate::snapshot(cm.class_redefine_generation_handle(cid)),
+            None => RedefineGate::never_stale(),
+        };
+        drop(cm);
+        let kind = cratonvm_native_api::InterpIntrinsic::ThreadOnSpinWait;
+        let param_descs: Arc<[Arc<str>]> = Arc::from(Vec::new());
+        thread.invoke_cache.put(
+            caller_class_id,
+            cp_index,
+            is_special,
+            CachedInvokeTarget::Intrinsic {
+                kind,
+                callback: cratonvm_native_builtins::intrinsics::callback_for(kind),
+                num_params: 0,
+                param_descs,
+                return_type: b'V',
+                receiver_class_id: None,
+                gate,
+            },
+        );
+        return;
+    }
+
     // A ConstantPool Methodref is not a call-site identity: the same
     // `Object.equals(Object)` entry can be used by several bytecode offsets
     // in one method with unrelated receiver shapes.  Keep this highly
@@ -13520,10 +13619,40 @@ pub(super) fn execute_invokestatic_cached(
             num_params,
             param_descs,
             return_type,
-            kind: _,
+            kind,
             receiver_class_id: _,
             gate: _,
         } => {
+            // `Thread.onSpinWait()` is answered WITHOUT a call.
+            //
+            // Its JDK body is empty (`@IntrinsicCandidate public static void
+            // onSpinWait() {}`) and HotSpot lowers it to one PAUSE
+            // instruction — 44 ns measured. Routing it through the ordinary
+            // intrinsic path costs `safe_native_call` (arg pinning, panic
+            // catch, JNI exception drain), which measured **1.9 us per call**
+            // here, and that is not a micro-benchmark curiosity:
+            // `AbstractQueuedSynchronizer.acquire` spins up to 255 rounds
+            // before it parks, so ONE lock or condition handoff burned up to
+            // 480 us of pure call overhead. That is what made
+            // `Condition.signal -> await` 207 us against HotSpot's 2.8 us,
+            // `ThreadPoolExecutor.execute -> task entered` 568 us against 22
+            // us, and Tomcat's `TestAsyncMessagesPerformance` SEQ2 — a 500 us
+            // budget spent almost entirely on one executor dispatch — breach
+            // on ~80% of its 500 message boundaries.
+            //
+            // There is nothing to pop (no params, no receiver) and nothing to
+            // push (`()V`), so the entire call is the hint below plus the pc
+            // advance that returning `Handled` performs.
+            if kind == cratonvm_native_api::InterpIntrinsic::ThreadOnSpinWait {
+                // Counted like any other intrinsic dispatch so
+                // `CRATONVM_INTRINSIC_STATS=1` can PROVE the fast path fires
+                // — the first cut of this change was inert (the entry was
+                // never installed) and the timings alone could not tell that
+                // apart from "installed but no faster".
+                INTRINSIC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::hint::spin_loop();
+                return Ok(CachedCallResult::Handled);
+            }
             let mut arg_buf = [Value::Uninitialized; MAX_INTRINSIC_ARGS];
             let args = pop_coerced_invoke_args_intrinsic(
                 shared,
