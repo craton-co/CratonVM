@@ -40,13 +40,26 @@ five methods it admits. The binding constraint is **opcode coverage in
 gating and not tiering. Three findings shape the `cov-*` lanes:
 
 * **`getstatic` + `ldc`/`ldc_w` is 69% of every opcode gap** (189 of 273).
-* **A `float[]` element can be lowered and an `int[]` element cannot.**
-  `IrBuilder::build` has arms for `faload`/`daload`/`fastore`/`dastore` and for
+* ~~**A `float[]` element can be lowered and an `int[]` element cannot.**~~
+  ~~`IrBuilder::build` has arms for `faload`/`daload`/`fastore`/`dastore` and for
   no integral or reference array access at all. Those four are what an FP
-  kernel needs; the arms that exist are the arms the fixtures demanded.
+  kernel needs; the arms that exist are the arms the fixtures demanded.~~
+  **Fixed 2026-08-03** (`cov-02`). Every integral and reference array access has
+  an arm; `aastore` is the one deliberate exception and says so in the builder.
 * **`checkcast`/`instanceof` refuses 306 methods** — more than all 273
   opcode-gap events combined — and they never reach the builder, so they are
   invisible in the opcode histogram.
+
+A second run with `CRATONVM_JIT_FORCE_C2=1` — every request routed to the
+optimizing tier — settles the question the `cov-*` lanes rest on, in two parts.
+**Correctness: clean.** 886 IR bodies, 61/61 Spring Boot tests, 7/7 CratonBench
+checksums against HotSpot, zero panics or new warnings. **Coverage: forcing C2
+buys none.** 886 bodies against 595, over *the same 495 distinct methods* — the
+two method sets are identical. Forcing C2 changes when the tier is used, never
+which methods it can serve, so the `cov-*` lanes are the only lever there is.
+Whether an IR body is *faster* than the C1 body it replaces remains unmeasured;
+nothing showed the 1.85x regression this project has on record, which is enough
+to say the programme is not self-defeating and not enough to say it pays.
 
 And one finding about the measurement itself: **CratonBench issues seven
 compile requests to the optimizing tier across all seven phases and gets two
@@ -63,7 +76,7 @@ read each lane's "first increment".
 | Lane | Owns | Events | Notes |
 |---|---|---:|---|
 | [`cov-01`](cov-01-constants-and-statics.md) | `ir.rs` arms `0x12`/`0x13`/`0xb2` | 189 | largest opcode bucket; the caller already supplies every table it needs |
-| [`cov-02`](cov-02-array-element-access.md) | `ir.rs` arms `0x2e`/`0x32`/`0x33`/`0x34`/`0x54`/`0x5a`/`0xbe` | 77 | `arraylength` alone is 43 and is the cheapest thing in this directory |
+| ~~`cov-02`~~ | ~~`ir.rs` arms `0x2e`/`0x32`/`0x33`/`0x34`/`0x54`/`0x5a`/`0xbe`~~ | ~~77~~ | **CLOSED 2026-08-03** — all seven at zero. [Closeout](../../internal/cov-02-array-element-access-RETIRED-20260803.md) · [brief](archive/cov-02-array-element-access.md) |
 | [`cov-03`](cov-03-field-stores-and-wide-fields.md) | `ir.rs` arms `0xb4`/`0xb5` | 43 | `getfield` learned about references; `putfield` twenty lines below did not |
 | ~~`cov-04`~~ **CLOSED 2026-08-03** | `ir.rs` invoke arms + `<init>` elision | 68 | see below |
 | [`cov-05`](cov-05-checkcast-and-instanceof.md) | one `ir_compatible` conjunct | 306 | biggest refusal anywhere; `instanceof` first, `checkcast` needs `cov-07`'s answer |
@@ -117,6 +130,14 @@ on whatever opcode gap they meet next — so the `cov-01`/`cov-02` rankings will
 move, and the shortfall between "admitted rose by N" and "bodies rose by less
 than N" is the result, not a regression.
 
+**`cov-02` already moved them, and the same rule applies to an opcode arm.**
+Closing its seven took the three Spring Boot workloads from 591 bodies to 652,
+and the methods that used to die at an array opcode now die at the next one:
+`newarray` 1 → 5 (`cov-06`), `getstatic` 91 → 92 and `ldc` 90 → 92 (`cov-01`),
+plus two `aastore` and one `dup2` that belong to nobody. **Size `cov-01` and
+`cov-06` from a fresh survey, not from the table above** — the numbers in it
+were measured before 61 more methods started reaching the backend.
+
 ## The residuals the closed lanes left
 
 Named here because a residual inside a "closed" row does not read like work.
@@ -129,7 +150,7 @@ restores the nine original briefs.
 | `pgo-02` | bimorphic splicing, a deopt-capable guard, `StableType` invalidation, the metrics harvest | `docs/feature-designs/profile-guided-inlining.md` §8 | nobody |
 | `osr-01` | the second compile door — `compile_osr_artifact` calls `x64::compile` directly | `docs/feature-designs/jit-osr-entry-metadata.md` | nobody |
 | `osr-02` | the exit-state differential (its forcing lever, `CRATONVM_OSR_EXIT_AFTER=N`, already exists) | `docs/feature-designs/jit-osr-exit-and-recompile.md` | nobody |
-| `loop-01` | unswitching, interchange, fusion — but the binding constraint is now the loop band and structural admission (`no_candidate_loop` is 94%+ of eligible compiles), not the gates `loop-02` retired | `loop-01-peeling-and-versioning.md` | nobody |
+| `loop-01` | unswitching, interchange, fusion — but the binding constraint is now the loop band and structural admission (`no_candidate_loop` is 94%+ of eligible compiles), not the gates `loop-02` retired | `archive/loop-01-peeling-and-versioning.md` | nobody |
 | `verify-01` | still stands as the harness every lane above wants | `docs/internal/verify-01-differential-harness-RETIRED-20260803.md` | nobody |
 
 

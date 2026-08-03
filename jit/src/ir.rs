@@ -5029,6 +5029,131 @@ impl IrBuilder {
                     self.mem = store;
                     pc += 1;
                 }
+
+                // ── COV-02: the integral and reference array element access ──
+                //
+                // `faload`/`daload`/`fastore`/`dastore` above are the arms an FP
+                // benchmark kernel needed. Nobody decided that a `float[]`
+                // element should be lowerable and an `int[]` element should
+                // not; the survey in `docs/known-issues/c2/` measured 77 events
+                // on the missing arms, second-largest opcode bucket, and the
+                // *shape* is the argument rather than the number. These arms
+                // are the same node with a different [`MemKind`]: one element
+                // width, one sign/zero-extension rule, the same JVMS null +
+                // bounds guards, the same memory token.
+                //
+                // iaload / laload / aaload / baload / caload / saload.
+                // (`baload` covers `boolean[]` too — one byte either way.)
+                //
+                // `aaload` is a REFERENCE load: the node is typed
+                // `IrType::Ref`, so `ir_lower::emit_safepoint_map`'s scan
+                // publishes its spill slot as a rewritable root at every later
+                // safepoint. Typing it `Int` would compile — and lose the
+                // element across the first relocating collection.
+                //
+                // `aastore` is deliberately NOT here (see the store arm below).
+                0x2e | 0x2f | 0x32 | 0x33 | 0x34 | 0x35 => {
+                    let (kind, ty) = match op {
+                        0x2e => (MemKind::Int, IrType::Int),
+                        0x2f => (MemKind::Long, IrType::Long),
+                        0x32 => (MemKind::Ref, IrType::Ref),
+                        0x33 => (MemKind::Byte, IrType::Int),
+                        0x34 => (MemKind::Char, IrType::Int),
+                        // 0x35 saload
+                        _ => (MemKind::Short, IrType::Int),
+                    };
+                    let index = self.pop();
+                    let array = self.pop();
+                    let load = self.graph.add(
+                        Op::ArrayLoad(kind),
+                        ty,
+                        vec![self.ctrl, self.mem, array, index],
+                        Some(pc),
+                    );
+                    self.mem = load;
+                    self.push(load);
+                    pc += 1;
+                }
+                // iastore / lastore / bastore / castore / sastore.
+                //
+                // `aastore` (0x53) is OUT OF SCOPE and stays out, stated here
+                // rather than left for the next reader to infer from an absence:
+                // a reference element store needs the SATB pre-write barrier and
+                // the card-mark write barrier the single-pass backend emits
+                // around `emit_ref_astore_regs`, and a missing barrier is
+                // invisible until a concurrent collection drops the only path to
+                // an overwritten-but-live target. Refusing the method is the
+                // cheap answer; emitting the store without the barriers is a
+                // use-after-free that surfaces somewhere else entirely.
+                0x4f | 0x50 | 0x54 | 0x55 | 0x56 => {
+                    let kind = match op {
+                        0x4f => MemKind::Int,
+                        0x50 => MemKind::Long,
+                        0x54 => MemKind::Byte,
+                        0x55 => MemKind::Char,
+                        // 0x56 sastore
+                        _ => MemKind::Short,
+                    };
+                    let value = self.pop();
+                    let index = self.pop();
+                    let array = self.pop();
+                    let store = self.graph.add(
+                        Op::ArrayStore(kind),
+                        IrType::Memory,
+                        vec![self.ctrl, self.mem, array, index, value],
+                        Some(pc),
+                    );
+                    self.mem = store;
+                    pc += 1;
+                }
+                // arraylength — the array's immutable length word.
+                //
+                // The cheapest thing in this lane: one 32-bit load at a fixed
+                // header offset behind a null check. No element type, no bounds
+                // check, no barrier.
+                //
+                // It does NOT advance the memory token. Nothing in the JVM
+                // writes an array's length, so `AliasClass::ArrayLength` can
+                // never conflict with a write (`Graph::may_alias`), and putting
+                // a pure read in the token chain would serialise every store
+                // around it for nothing. The token is still an *input*, which is
+                // what pins the node behind the writes that produced the array.
+                0xbe => {
+                    let array = self.pop();
+                    let len = self.graph.add(
+                        Op::ArrayLength,
+                        IrType::Int,
+                        vec![self.ctrl, self.mem, array],
+                        Some(pc),
+                    );
+                    self.push(len);
+                    pc += 1;
+                }
+                // dup_x1 — insert a copy of the top value below the second.
+                //
+                // A stack shuffle rather than an access; it is in this lane only
+                // because it appears in the same method bodies (six events).
+                // The abstract stack holds one entry per VALUE, so the shuffle
+                // is three pushes — but only if BOTH operands are category 1,
+                // which is what JVMS §dup_x1 requires. A category-2 operand
+                // would mean this builder's one-entry-per-value stack and the
+                // verifier's two-slot stack disagree about what "the value
+                // below" names, so refuse rather than shuffle the wrong entry.
+                0x5a => {
+                    let (Some(v1), Some(v2)) = (self.pop_opt(), self.pop_opt()) else {
+                        return ir_build_bail(line!(), pc);
+                    };
+                    let is_cat2 = |ty: IrType| matches!(ty, IrType::Long | IrType::Double);
+                    if is_cat2(self.graph.nodes[v1 as usize].ty)
+                        || is_cat2(self.graph.nodes[v2 as usize].ty)
+                    {
+                        return ir_build_bail(line!(), pc);
+                    }
+                    self.push(v1);
+                    self.push(v2);
+                    self.push(v1);
+                    pc += 1;
+                }
                 // getfield — read an instance field as an `Op::Load`.
                 //
                 // Slice 1 (read-only) of the field/call IR frontier: only
