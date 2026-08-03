@@ -5325,12 +5325,16 @@ mod tests {
     /// documentation — it only appears after the run has already failed.
     #[test]
     fn the_usage_text_states_the_synthetic_jdk_build_requirement() {
+        // `LONG_ABOUT` is hand-wrapped to the help column, so a phrase can be
+        // split across lines with the next line's indent in between. Collapse
+        // whitespace before matching rather than pinning today's line breaks.
+        let flat = LONG_ABOUT.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            LONG_ABOUT.contains("synthetic-jdk` Cargo feature"),
+            flat.contains("synthetic-jdk` Cargo feature"),
             "--help must name the Cargo feature --synthetic-jdk needs"
         );
         assert!(
-            LONG_ABOUT.contains("jdk.mode.synthetic_compiled_in"),
+            flat.contains("jdk.mode.synthetic_compiled_in"),
             "--help must point at the way to check whether THIS build has it"
         );
     }
