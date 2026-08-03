@@ -129,6 +129,17 @@ Same base (`a64f3a5b4d`), same class, one binary apart:
 No other bail reason moved: the rest of both histograms is unchanged apart from
 tiering nondeterminism.
 
+Re-verified after merging dev's SEAM-01 backend split (the change had to be
+ported onto the new modules): 1836 jit tests pass, regression-suite 22/22,
+both Spring classes still show zero unresolved targets.
+
+`OAuth2ResourceServerAutoConfigurationTests` has ONE flaky test —
+`autoConfigurationShouldConfigureResourceServerUsingOAuthIssuerUri`, a read
+timeout against its own localhost mock server. An interleaved A/B (arms
+alternating inside one window, so both see the same host load) fails it on the
+UNFIXED control too. See
+`docs/known-issues/springboot/oauth2-issuer-uri-mock-server-read-timeout-flake-20260803.md`.
+
 The three fixtures are real guards — on the unfixed tree
 `a_self_tail_call_may_not_swallow_a_branch_targeted_return` and
 `a_sibling_tail_call_may_not_swallow_a_branch_targeted_return` both FAIL while
