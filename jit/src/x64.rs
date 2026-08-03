@@ -402,6 +402,19 @@ struct Compiler {
     /// live in output-PC space and translating one of them would make
     /// `find_oop_map_for_safepoint_id`'s `.find()` ambiguous across copies.
     bci_provenance: Option<Vec<u32>>,
+    /// `[start, end)` of the versioning pre-header guard's SYNTHETIC bytes in
+    /// the pc space being emitted, when a versioned bytecode loop rewrite is in
+    /// effect. `None` on every ordinary compile and on an unversioned rewrite.
+    ///
+    /// Provenance is total, so these bytes answer [`Compiler::orig_bci`] with
+    /// the loop header's bci — but they are an image of no original
+    /// instruction: `encode_preheader_guard` synthesised them, and part-way
+    /// through them the abstract operand stack is not the header's. Anything
+    /// that would publish a pc to the VM *as* a bci must therefore refuse here
+    /// rather than translate. Today that is exactly the OSR-entry table and the
+    /// OSR-exit snapshot keyed off it; `rewritten_deopt_points_are_publishable`
+    /// is the fail-closed backstop that catches a future one.
+    synthetic_guard_span: Option<(usize, usize)>,
     /// An allocation OOM bail (`emit_post_alloc_oom_check`) was emitted in this
     /// method — by `newarray` (0xbc), `anewarray` (0xbd), or `new` (0xbb).
     /// Forces `has_dispatch` for the SAME thread-availability reason as
@@ -1127,6 +1140,17 @@ struct Compiler {
     /// deopt-osr Step 1: stable boxed copies of `deopt_points`, for the
     /// imm64-baked deopt stub to load by pointer (mirrors `_deopt_point_boxes`).
     deopt_boxes: Vec<Box<crate::deopt::DeoptimizationPoint>>,
+    /// The EMITTER pc each `deopt_points` entry was recorded at, one per entry
+    /// and in the same order.
+    ///
+    /// `DeoptimizationPoint::bci` is published in interpreter-bci space (see
+    /// [`Compiler::orig_bci`]), so on a rewritten method it is no longer the
+    /// coordinate the point was recorded at and the translation cannot be
+    /// re-derived from the published artifact alone. This keeps the input, so
+    /// `compile_with_param_slots` can CHECK the coordinate change instead of
+    /// trusting it — see `x64::loop_rewrite::rewritten_deopt_points_are_publishable`.
+    /// Identical to each point's own `bci` on every ordinary compile.
+    deopt_point_pcs: Vec<usize>,
     /// deopt-osr Step 9 follow-up (a): raw pointer to a single, process-lifetime
     /// **leaked** `DeoptEpochGuard` for this artifact, baked as the 4th arg into
     /// every frame-deopt stub so `x64_deopt_entry` can short-circuit a superseded
@@ -2082,6 +2106,7 @@ impl Compiler {
             // Installed after construction by `compile_with_param_slots`, and
             // only when it decided to compile rewritten bytecode.
             bci_provenance: None,
+            synthetic_guard_span: None,
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
             forward_patches: Vec::new(),
@@ -2225,6 +2250,7 @@ impl Compiler {
             param_slot_span: 0,
             deopt_points: Vec::new(),
             deopt_boxes: Vec::new(),
+            deopt_point_pcs: Vec::new(),
             deopt_epoch_guard: std::ptr::null(),
             method_key: String::new(),
             gc_inert_selfrec,

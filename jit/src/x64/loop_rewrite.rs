@@ -88,12 +88,12 @@ pub(super) fn bytecode_loop_xform_rewrites_bytecode() -> bool {
 /// the `OnceLock` makes that explicit and leaves one relaxed load on the path.
 ///
 /// This is the switch that lets the transforms be executed by something larger
-/// than a unit test. It is deliberately not sufficient on its own: with
-/// `deopt_real` on — the default — `plan_bytecode_loop_xform` still refuses
-/// every compile before it looks at a loop, so a run that means to exercise a
-/// transformed method needs `CRATONVM_JIT='bytecode-loop-xform,-deopt-real'`.
-/// A run that sets only the first is not mis-configured, it just gets the
-/// unarmed compile with the native unroller off.
+/// than a unit test, and since the bci translation landed it is sufficient on
+/// its own: `CRATONVM_JIT=bytecode-loop-xform` alone now reaches loops under
+/// the DEFAULT `deopt_real` configuration. It used to additionally need
+/// `-deopt-real`, because `plan_bytecode_loop_xform` refused every compile
+/// before it looked at a loop; that refusal is gone, and pairing the two flags
+/// now measures the deopt-real-off configuration rather than the transform.
 pub(super) fn bytecode_loop_xform_flag() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| {
@@ -214,23 +214,18 @@ pub(crate) enum LoopRewriteRefusal {
     /// The default. This thread never called
     /// [`set_bytecode_loop_rewriter_armed`].
     NotArmed,
-    /// `CRATONVM_DEOPT_REAL`. The precise-deopt snapshots record
-    /// `DeoptimizationPoint::bci`, which the VM *resumes at*, and they are
-    /// built deep inside the emitter from the emitter's own pc. Translating
-    /// them is a separate piece of work; until it lands, refuse.
-    DeoptRealEnabled,
-    /// Precise exceptional frames. Same reason: `emit_post_invoke_exception_check`
-    /// and `emit_precise_null_check_field_store` record a resume-bearing
-    /// snapshot keyed on the emitter pc.
-    PreciseExceptionFrames,
-    /// The method has an `invokedynamic`. Its lowering is an unconditional
-    /// trap that records an `UnreachedCode` snapshot through
-    /// `emit_osr_exit_map_at_reason` — and unlike the two above, that path is
-    /// NOT gated on `deopt_real_enabled()`, so it would fire in production.
-    InvokedynamicPresent,
     /// The method has inline sites. An inlined callee contributes its own bci
     /// space (`docs/jit/deopt-inline-scopes.md`) that this wiring's
     /// caller-only provenance map does not describe.
+    ///
+    /// The last of the four whole-compile refusals this lane started with, and
+    /// the only one a bci translation cannot answer. `DeoptRealEnabled`,
+    /// `PreciseExceptionFrames` and `InvokedynamicPresent` all named the same
+    /// thing — a path that publishes an emitter pc to the VM as a resume bci —
+    /// and all three were retired together when `build_and_record_deopt_point`
+    /// started publishing `DeoptimizationPoint::bci` through
+    /// [`super::Compiler::orig_bci`]. An inlined callee is different in kind:
+    /// there is no bci in THIS method's space to translate to.
     InlineSitesPresent,
     /// No loop in the method passed the profitability band and the structural
     /// admission test.
@@ -244,12 +239,22 @@ pub(crate) enum LoopRewriteRefusal {
     Planner(LoopXformRefusal),
 }
 
-/// The properties of a pending compile that decide whether the bytecode loop
-/// rewriter may run at all, independent of any particular loop.
+/// The properties of a pending compile the planner records, and — for the last
+/// field — refuses on.
+///
+/// The first three were refusals until the bci translation landed. They are
+/// still carried and still counted, because the tally they feed is what says
+/// how much that translation bought and would say immediately if a future
+/// change put one of them back in the way. Deleting a field here deletes a row
+/// from `metrics::LOOP_XFORM_EVENTS`, not just a parameter.
 pub(crate) struct LoopRewriteShape {
+    /// `CRATONVM_DEOPT_REAL`, process-wide and default-ON. Counted only.
     pub(crate) deopt_real: bool,
+    /// This method's handlers need precise exceptional frames. Counted only.
     pub(crate) precise_exception_frames: bool,
+    /// This method contains an `invokedynamic`. Counted only.
     pub(crate) has_indy: bool,
+    /// This method has inlined callees — the one condition still refused.
     pub(crate) has_inline_sites: bool,
 }
 
@@ -417,12 +422,18 @@ pub(super) fn plan_bytecode_loop_xform(
     // ── Tally, before anything can short-circuit ──────────────────────
     //
     // Every one of the four conditions is recorded on every compile it holds
-    // for, INDEPENDENTLY of whether an earlier one already refuses. Counting
-    // "which refusal fired" instead would report `deopt_real` for 100% of
-    // compiles — it is default-ON and process-wide — and would hide the other
-    // three permanently, which is the state this lane exists to get out of.
-    // The four counts therefore overlap and must not be summed;
-    // `metrics::LOOP_XFORM_EVENTS` says so where a reader will find it.
+    // for, INDEPENDENTLY of whether one of them refuses. That independence is
+    // what retired three of them: counting "which refusal fired" would have
+    // reported `deopt_real` for 100% of compiles — it is default-ON and
+    // process-wide — and would have hidden the other three permanently. The
+    // four counts overlap and must not be summed; `metrics::LOOP_XFORM_EVENTS`
+    // says so where a reader will find it.
+    //
+    // Three of them no longer refuse. They are still counted because they are
+    // the measurement that says so, and because a future emit path that
+    // reintroduces an untranslated resume bci would show up as
+    // `loop_xform_deopt_bci_unpublishable` against these denominators rather
+    // than as a mystery.
     //
     // Cost on the default path: one relaxed increment per condition that
     // holds, per compile. Compiles are thousands per run, not millions.
@@ -440,10 +451,10 @@ pub(super) fn plan_bytecode_loop_xform(
     if shape.has_inline_sites {
         tally("loop_xform_inline_sites");
     }
-    let eligible = !(shape.deopt_real
-        || shape.precise_exception_frames
-        || shape.has_indy
-        || shape.has_inline_sites);
+    // "No whole-compile refusal holds", which is the population a narrowing
+    // effort is trying to grow — not "none of the four conditions holds", which
+    // stopped being the same question when three of them stopped refusing.
+    let eligible = !shape.has_inline_sites;
     if eligible {
         tally("loop_xform_eligible");
     }
@@ -452,18 +463,22 @@ pub(super) fn plan_bytecode_loop_xform(
         tally("loop_xform_not_armed");
         return Err(R::NotArmed);
     }
-    // Whole-compile refusals, cheapest first. Each names a construct that
-    // publishes an emitter pc to the VM as a resume bci through a path this
-    // wiring does not translate; see the variant docs.
-    if shape.deopt_real {
-        return Err(R::DeoptRealEnabled);
-    }
-    if shape.precise_exception_frames {
-        return Err(R::PreciseExceptionFrames);
-    }
-    if shape.has_indy {
-        return Err(R::InvokedynamicPresent);
-    }
+    // The one whole-compile refusal left.
+    //
+    // `deopt_real`, precise exception frames and `invokedynamic` used to refuse
+    // here, and all three named one thing: a path that hands the VM an emitter
+    // pc as a resume bci. `build_and_record_deopt_point` now publishes
+    // `DeoptimizationPoint::bci` and `FrameState::bci` through
+    // `Compiler::orig_bci`, `pc_is_protected` asks its question in interpreter
+    // space, and `compile_with_param_slots` re-derives and CHECKS the whole
+    // translation before publishing the artifact — so all three are answered
+    // rather than avoided.
+    //
+    // Inlining is not answered by that. An inlined callee's snapshot bcis live
+    // in the CALLEE's bci space, and this provenance map describes the caller's
+    // rewritten bytes only: there is nothing in this method to translate them
+    // to. Retiring it means describing inline scopes
+    // (`docs/jit/deopt-inline-scopes.md`), not relaxing a check.
     if shape.has_inline_sites {
         return Err(R::InlineSitesPresent);
     }
@@ -568,6 +583,154 @@ pub(super) fn replicate_pc3<A: Clone, B: Clone>(x: &LoopXform, t: Vec<(usize, A,
         .into_iter()
         .map(|(pc, (a, b))| (pc, a, b))
         .collect()
+}
+
+/// Do two deopt points describe the same program point?
+///
+/// Everything a bci-keyed consumer could read, compared field by field.
+/// `native_offset` is deliberately excluded — two copies of one bytecode are
+/// at different native offsets and that is the whole point. `FrameState` and
+/// `MonitorInfo` carry no `PartialEq` (four other files construct them), so the
+/// comparison is spelled out here rather than derived.
+///
+/// A recorded `caller` chain counts as disagreement on both sides, not just
+/// when the chains differ: inline sites are still refused, so a caller chain
+/// under a rewrite means something changed that this argument did not consider.
+fn deopt_points_agree(
+    a: &crate::deopt::DeoptimizationPoint,
+    b: &crate::deopt::DeoptimizationPoint,
+) -> bool {
+    a.reason == b.reason
+        && a.action == b.action
+        && a.semantics == b.semantics
+        && a.speculation_id == b.speculation_id
+        && a.frame_state.caller.is_none()
+        && b.frame_state.caller.is_none()
+        && a.frame_state.bci == b.frame_state.bci
+        && a.frame_state.method_key == b.frame_state.method_key
+        && a.frame_state.locals == b.frame_state.locals
+        && a.frame_state.stack == b.frame_state.stack
+        && a.frame_state.monitors.len() == b.frame_state.monitors.len()
+        && a.frame_state
+            .monitors
+            .iter()
+            .zip(b.frame_state.monitors.iter())
+            .all(|(m, n)| m.lock_depth == n.lock_depth && m.object == n.object)
+}
+
+/// May this transformed compile's deopt points be published as interpreter
+/// resume points?
+///
+/// `build_and_record_deopt_point` publishes `DeoptimizationPoint::bci` through
+/// `Compiler::orig_bci`. This re-derives that translation from the emitter pc
+/// each point was recorded at (`Compiler::deopt_point_pcs`) and refuses the
+/// METHOD — not the transform, which is already emitted by the time this runs —
+/// if any of four things does not hold. Refusing costs the method its
+/// compilation; publishing an output PC as a resume bci resumes arbitrary
+/// bytecode, so this is fail-closed by construction and its counter
+/// (`loop_xform_deopt_bci_unpublishable`) should read zero forever.
+///
+///  1. **Every point still has its emitter pc.** A `deopt_points` push that
+///     forgets `deopt_point_pcs` would silently misalign every check below, so
+///     the lengths are compared first and the mismatch is fatal.
+///  2. **The published bci is what the provenance map says**, and is inside the
+///     ORIGINAL method. This is the actual translation, checked rather than
+///     trusted: an emit path that bakes a raw pc into a point it constructs
+///     itself fails here instead of reaching the VM.
+///  3. **No point sits on the versioning guard.** The guard's bytes carry the
+///     loop header's bci so provenance stays total, but they are an image of no
+///     instruction — `encode_preheader_guard` synthesises them — and the
+///     abstract operand stack part-way through them is not the header's. A
+///     resume there would re-enter the interpreter at the header with the
+///     guard's operands live.
+///  4. **Copies of one bytecode describe the same frame.** The bci-keyed
+///     consumers in `jit/src/lib.rs` (`osr_entry_frame_state`,
+///     `transfer_osr_exit_into_live_frame`, the de-speculation reason lookup)
+///     take the FIRST point with a matching bci, so if the copies disagree the
+///     pick is arbitrary. Agreement makes it arbitrary-but-correct. It is
+///     expected to hold — the copies are identical bytecode over a method-wide
+///     register allocation — but "expected" is not the standard for something
+///     the VM resumes at.
+///
+///     Grouped by `(bci, reason)` and compared only across DISTINCT emitter
+///     pcs, because neither of the other two shapes is the rewrite's doing. One
+///     pc can carry two points with different reasons — an `invokedynamic`
+///     inside an OSR-eligible pc records both an `OsrExit` map and the trap's
+///     `UnreachedCode` map — and an ordinary compile publishes that same pair
+///     under one bci. Refusing it here would refuse a shape that has nothing to
+///     do with the coordinate change.
+pub(super) fn rewritten_deopt_points_are_publishable(
+    x: &LoopXform,
+    points: &[crate::deopt::DeoptimizationPoint],
+    emitter_pcs: &[usize],
+    orig_code_len: usize,
+) -> Result<(), String> {
+    if points.len() != emitter_pcs.len() {
+        return Err(format!(
+            "{} deopt points but {} recorded emitter pcs: a `deopt_points` push \
+             skipped `deopt_point_pcs`",
+            points.len(),
+            emitter_pcs.len()
+        ));
+    }
+    let guard = x.guard_span();
+    let mut first_at: FxHashMap<(u32, crate::deopt::DeoptReason), usize> = FxHashMap::default();
+    for (i, p) in points.iter().enumerate() {
+        let pc = emitter_pcs[i];
+        if let Some((from, to)) = guard {
+            if pc >= from && pc < to {
+                return Err(format!(
+                    "deopt point at output pc {pc} lies inside the versioning guard \
+                     [{from}, {to}), whose bytes are synthetic and are an image of \
+                     no original instruction"
+                ));
+            }
+        }
+        match x.bci_at(pc) {
+            // Widening: u32 -> usize
+            Some(bci) if bci == p.bci as usize => {}
+            other => {
+                return Err(format!(
+                    "deopt point at output pc {pc} published bci {} but the \
+                     rewrite's provenance says {other:?}",
+                    p.bci
+                ));
+            }
+        }
+        // Widening: u32 -> usize
+        if p.bci as usize >= orig_code_len {
+            return Err(format!(
+                "deopt point at output pc {pc} published bci {}, past the original \
+                 method's {orig_code_len} bytes",
+                p.bci
+            ));
+        }
+        if p.frame_state.bci != p.bci {
+            return Err(format!(
+                "deopt point at output pc {pc} published bci {} but its frame \
+                 state says {}",
+                p.bci, p.frame_state.bci
+            ));
+        }
+        // Keyed on `(bci, reason)` and compared only across DISTINCT emitter
+        // pcs — see point 4 of the doc comment for why the other two shapes are
+        // an ordinary compile's and not this rewrite's.
+        match first_at.get(&(p.bci, p.reason)) {
+            Some(&j) if emitter_pcs[j] != pc && !deopt_points_agree(&points[j], p) => {
+                return Err(format!(
+                    "two copies of bci {} published disagreeing {:?} frames \
+                     (output pcs {} and {pc}); a bci-keyed consumer would pick \
+                     one arbitrarily",
+                    p.bci, p.reason, emitter_pcs[j]
+                ));
+            }
+            Some(_) => {}
+            None => {
+                first_at.insert((p.bci, p.reason), i);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`replicate_pc3`] for a 5-tuple `(pc, a, b, c, d)`.
