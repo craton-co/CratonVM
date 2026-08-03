@@ -593,6 +593,9 @@ fn the_rewriter_is_off_by_default_and_armed_per_thread() {
 
 #[test]
 fn planning_refuses_unless_armed() {
+    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
+    // this module's tests run concurrently. See `TALLY_LOCK`.
+    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let code = shape_int_accum_loop();
     assert_eq!(
         plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
@@ -750,9 +753,14 @@ fn the_tally_separates_no_candidate_loop_from_a_structural_refusal() {
     crate::metrics::reset_loop_xform_counts_for_test();
 }
 
-/// Serialises the two tally tests. `LOOP_XFORM_COUNTERS` is process-wide and
-/// this module's tests run concurrently, so without this each would see the
-/// other's increments — the flakiness would look like a counting bug.
+/// Serialises every test in this module that reaches
+/// `plan_bytecode_loop_xform`, directly or through a compile helper.
+///
+/// `LOOP_XFORM_COUNTERS` is process-wide and Rust runs a module's tests
+/// concurrently, so a test asserting a count sees every other test's increments
+/// — and the flakiness looks like a counting bug, not like a missing lock. It
+/// is not enough for the two tests that ASSERT counts to hold this: the
+/// PRODUCERS have to as well, which is every test below that plans or compiles.
 static TALLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Three of the four conditions no longer refuse, and the fourth still does.
@@ -769,6 +777,9 @@ static TALLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// measurement in `loop-02` exists to have gotten out of.
 #[test]
 fn planning_admits_the_three_translated_constructs_and_still_refuses_inlining() {
+    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
+    // this module's tests run concurrently. See `TALLY_LOCK`.
+    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     for (label, shape) in [
@@ -822,6 +833,9 @@ fn planning_admits_the_three_translated_constructs_and_still_refuses_inlining() 
 /// half-rewritten, and reports the rewriter's own reason.
 #[test]
 fn planning_reports_the_structural_refusal() {
+    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
+    // this module's tests run concurrently. See `TALLY_LOCK`.
+    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     // Irreducible: the cycle is entered at both of its blocks. Header 7,
     // back edge 17, body 10 — inside the profitability band, so the band
@@ -855,6 +869,9 @@ fn planning_reports_the_structural_refusal() {
 /// The profitability band is the native unroller's, PGO arm included.
 #[test]
 fn the_pgo_hint_sets_the_factor_exactly_as_the_native_unroller_does() {
+    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
+    // this module's tests run concurrently. See `TALLY_LOCK`.
+    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     // Factor 2 ⇒ 1 extra copy, overriding the static heuristic's 3.
@@ -978,6 +995,9 @@ fn a_pointer_payload_is_shared_across_the_copies() {
 /// describing a different method.
 #[test]
 fn the_fixture_loop_is_what_the_planner_is_offered() {
+    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
+    // this module's tests run concurrently. See `TALLY_LOCK`.
+    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let code = shape_int_accum_loop();
     assert_eq!(code.len(), 21);
     assert_eq!(detect_loops(&code, 21), vec![(4usize, 16usize)]);
@@ -998,6 +1018,9 @@ fn the_fixture_loop_is_what_the_planner_is_offered() {
 /// loop out of that edge's reach, so the hoists can be kept.
 #[test]
 fn the_planner_peels_a_bypassable_header_instead_of_skipping_it() {
+    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
+    // this module's tests run concurrently. See `TALLY_LOCK`.
+    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_bypassable_header();
     let (len, header, back_edge) = (30usize, 11usize, 25usize);
@@ -1052,6 +1075,9 @@ fn the_planner_peels_a_bypassable_header_instead_of_skipping_it() {
 /// unconditional now: the answer must not depend on that flag any more.
 #[test]
 fn the_wired_compile_path_reaches_a_loop_under_the_default_configuration() {
+    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
+    // this module's tests run concurrently. See `TALLY_LOCK`.
+    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     let real_shape = LoopRewriteShape {
@@ -1258,6 +1284,9 @@ fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
 /// resumes arbitrary bytecode.
 #[test]
 fn the_publishability_check_refuses_a_point_the_translation_cannot_describe() {
+    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
+    // this module's tests run concurrently. See `TALLY_LOCK`.
+    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     let x = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())
@@ -1292,28 +1321,63 @@ fn the_publishability_check_refuses_a_point_the_translation_cannot_describe() {
         .expect_err("an untranslated pc is not publishable");
     assert!(err.contains("provenance says"), "{err}");
 
-    // Two copies of one bytecode with different frames. The bci-keyed
-    // consumers in `jit/src/lib.rs` take the first match, so disagreement
-    // means an arbitrary pick.
+    // Two copies of one bytecode that disagree about a field a bci-keyed
+    // consumer takes ON TRUST. `reason` is the grouping key, so the field that
+    // can actually differ under one key is one of the others.
     let other_pc = body_pc + x.body_len;
     assert_eq!(x.bci_at(other_pc), Some(body_bci), "same bytecode, next copy");
-    let mut disagrees = test_deopt_point(body_bci as u32);
-    disagrees.frame_state.locals = vec![crate::deopt::FrameValue::Int(7)];
-    // Same reason, different output pc: exactly the shape only a rewrite can
-    // produce. Two points at ONE pc with different reasons are an ordinary
-    // compile's shape and are deliberately not refused.
-    assert_eq!(disagrees.reason, point(body_bci).reason);
+    let mut conflicts = test_deopt_point(body_bci as u32);
+    conflicts.speculation_id = 7;
+    assert_eq!(conflicts.reason, point(body_bci).reason, "same group");
     let err = rewritten_deopt_points_are_publishable(
         &x,
-        &[point(body_bci), disagrees],
+        &[point(body_bci), conflicts],
         &[body_pc, other_pc],
         21,
     )
-    .expect_err("disagreeing copies are not publishable");
+    .expect_err("conflicting copies are not publishable");
     assert!(err.contains("disagreeing"), "{err}");
 
-    // …and agreeing copies are fine, which is the normal case: the copies are
-    // identical bytecode over a method-wide register allocation.
+    // A machine-LOCATION difference is not a disagreement at all. Two copies
+    // differ in their operand spill offsets by construction — the walk hands
+    // them out as it emits — and both are right for their own copy.
+    let mut relocated = test_deopt_point(body_bci as u32);
+    relocated.frame_state.stack = vec![crate::deopt::FrameValue::StackSlot(-64)];
+    let mut elsewhere = test_deopt_point(body_bci as u32);
+    elsewhere.frame_state.stack = vec![crate::deopt::FrameValue::StackSlot(-72)];
+    assert!(
+        rewritten_deopt_points_are_publishable(
+            &x,
+            &[relocated, elsewhere],
+            &[body_pc, other_pc],
+            21,
+        )
+        .is_ok(),
+        "one `int` operand in two different spill slots is the SAME contract",
+    );
+
+    // A slot-KIND difference is reported, not refused: the only bci-keyed
+    // reader of it is the OSR entry contract, which re-verifies every slot
+    // against the live interpreter frame. `IndyDeoptProbe.concatLoop` is the
+    // real case — its two unrolled copies disagree about local 3 at the
+    // `invokedynamic`, because the forward oop dataflow reaches copy 1 through
+    // copy 0's `astore_3`. Refusing it discarded the method for nothing.
+    let mut retyped = test_deopt_point(body_bci as u32);
+    retyped.frame_state.locals = vec![crate::deopt::FrameValue::RegisterRef(12)];
+    let mut untyped = test_deopt_point(body_bci as u32);
+    untyped.frame_state.locals = vec![crate::deopt::FrameValue::Register(12)];
+    assert!(
+        rewritten_deopt_points_are_publishable(
+            &x,
+            &[retyped, untyped],
+            &[body_pc, other_pc],
+            21,
+        )
+        .is_ok(),
+        "a slot-kind divergence is counted, not refused",
+    );
+
+    // …and identical copies are fine, which is the normal case.
     assert!(rewritten_deopt_points_are_publishable(
         &x,
         &[point(body_bci), point(body_bci)],
@@ -1370,6 +1434,9 @@ fn test_deopt_point(bci: u32) -> crate::deopt::DeoptimizationPoint {
 /// at `rebuilt[4]`.
 #[test]
 fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
+    // Every `plan_bytecode_loop_xform` bumps the process-wide tally, and
+    // this module's tests run concurrently. See `TALLY_LOCK`.
+    let _tally = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _armed = Armed::new();
     let code = shape_int_accum_loop();
     let x = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())

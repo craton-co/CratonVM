@@ -1449,7 +1449,7 @@ pub fn record_osr_event(event: &str) {
 /// which is the honest answer rather than a gap.
 ///
 /// See `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
-pub const LOOP_XFORM_EVENTS: [&str; 11] = [
+pub const LOOP_XFORM_EVENTS: [&str; 12] = [
     // Denominator: compiles that reached the planner at all.
     "loop_xform_compiles",
     // The four conditions, each counted on every compile it holds for.
@@ -1477,10 +1477,17 @@ pub const LOOP_XFORM_EVENTS: [&str; 11] = [
     // change, not a tuning signal — see
     // `x64::loop_rewrite::rewritten_deopt_points_are_publishable`.
     "loop_xform_deopt_bci_unpublishable",
+    // Two images of one bytecode published deopt points whose frame SHAPES
+    // differ (a slot's kind, the operand-stack depth, a monitor). Reported, not
+    // refused: the only bci-keyed reader of those fields is the OSR entry
+    // contract, which re-verifies every one of them against the live
+    // interpreter frame. Non-zero is normal — see `PointDifference`.
+    "loop_xform_deopt_frames_diverge",
 ];
 
 /// One relaxed counter per [`LOOP_XFORM_EVENTS`] entry.
 static LOOP_XFORM_COUNTERS: [AtomicU64; LOOP_XFORM_EVENTS.len()] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

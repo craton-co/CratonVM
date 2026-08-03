@@ -585,37 +585,143 @@ pub(super) fn replicate_pc3<A: Clone, B: Clone>(x: &LoopXform, t: Vec<(usize, A,
         .collect()
 }
 
-/// Do two deopt points describe the same program point?
+/// Where do two copies of one bytecode's deopt points differ?
 ///
-/// Everything a bci-keyed consumer could read, compared field by field.
-/// `native_offset` is deliberately excluded — two copies of one bytecode are
-/// at different native offsets and that is the whole point. `FrameState` and
-/// `MonitorInfo` carry no `PartialEq` (four other files construct them), so the
-/// comparison is spelled out here rather than derived.
+/// Split in two, because the bci-keyed consumers in `jit/src/lib.rs` take one
+/// half on trust and re-validate the other half against the live interpreter
+/// frame before using it. `Fatal` is the first half; `Divergent` is the second
+/// and is reported rather than refused.
+enum PointDifference {
+    /// A field a bci-keyed consumer uses WITHOUT checking it: picking the wrong
+    /// copy silently applies the wrong one.
+    ///
+    /// `transfer_osr_exit_into_live_frame` reads the point's `semantics` and
+    /// `real_frame_deopt_resume_and_despeculate`'s de-speculation step reads its
+    /// `reason` (which is the grouping key here, so it never reaches this).
+    /// Neither is checked against anything.
+    Fatal(String),
+    /// A field the OSR ENTRY contract re-derives and then VERIFIES.
+    ///
+    /// `osr_entry_frame_state` reads each slot through
+    /// `OsrSlotType::from_frame_value` — deliberately coarser than `FrameValue`,
+    /// which also encodes *where* the value lives — and `try_osr_entry` compares
+    /// every one of those expectations against the live interpreter frame's own
+    /// tags, refusing the entry on a mismatch. So picking the wrong copy here
+    /// can only make an OSR entry be refused (or accepted) that the other copy
+    /// would have decided the other way. Both outcomes are safe: the seeding is
+    /// by machine home, which is method-wide in this backend, and every path
+    /// that RECONSTRUCTS a frame finds its point by native offset
+    /// (`CompiledMethod::find_deopt_point`) or through the box pointer the
+    /// copy's own deopt stub bakes — never by bci.
+    ///
+    /// It is a real thing, not a hypothetical: `IndyDeoptProbe.concatLoop`'s
+    /// two unrolled copies disagree about local 3 (`Register` vs `RegisterRef`)
+    /// at the `invokedynamic`, because the forward oop dataflow reaches copy 1
+    /// through copy 0's `astore_3` and reaches copy 0 through the loop entry,
+    /// where the local is not yet a reference. Refusing that discarded the
+    /// method for no soundness gain.
+    Divergent(String),
+}
+
+/// The first difference between two deopt points recorded at two images of one
+/// bytecode, or `None` if they describe the same program point.
 ///
-/// A recorded `caller` chain counts as disagreement on both sides, not just
-/// when the chains differ: inline sites are still refused, so a caller chain
-/// under a rewrite means something changed that this argument did not consider.
-fn deopt_points_agree(
+/// `native_offset` and every `FrameValue`'s machine location are excluded by
+/// construction: two copies are SUPPOSED to differ there. Operand spill offsets
+/// in particular are handed out as the walk emits, so copy 1's operand lives in
+/// a different frame slot from copy 0's, and both are right for their own copy.
+fn deopt_point_difference(
     a: &crate::deopt::DeoptimizationPoint,
     b: &crate::deopt::DeoptimizationPoint,
-) -> bool {
-    a.reason == b.reason
-        && a.action == b.action
-        && a.semantics == b.semantics
-        && a.speculation_id == b.speculation_id
-        && a.frame_state.caller.is_none()
-        && b.frame_state.caller.is_none()
-        && a.frame_state.bci == b.frame_state.bci
-        && a.frame_state.method_key == b.frame_state.method_key
-        && a.frame_state.locals == b.frame_state.locals
-        && a.frame_state.stack == b.frame_state.stack
-        && a.frame_state.monitors.len() == b.frame_state.monitors.len()
-        && a.frame_state
-            .monitors
-            .iter()
-            .zip(b.frame_state.monitors.iter())
-            .all(|(m, n)| m.lock_depth == n.lock_depth && m.object == n.object)
+) -> Option<PointDifference> {
+    use PointDifference::{Divergent, Fatal};
+    fn kind(v: &crate::deopt::FrameValue) -> &'static str {
+        match crate::OsrSlotType::from_frame_value(v) {
+            Some(t) => t.name(),
+            None => "undescribable",
+        }
+    }
+    fn slots(
+        what: &str,
+        a: &[crate::deopt::FrameValue],
+        b: &[crate::deopt::FrameValue],
+    ) -> Option<String> {
+        if a.len() != b.len() {
+            return Some(format!("{what} count {} vs {}", a.len(), b.len()));
+        }
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            if crate::OsrSlotType::from_frame_value(x) != crate::OsrSlotType::from_frame_value(y) {
+                return Some(format!(
+                    "{what} {i} is {} ({x:?}) vs {} ({y:?})",
+                    kind(x),
+                    kind(y)
+                ));
+            }
+        }
+        None
+    }
+    if a.semantics != b.semantics {
+        return Some(Fatal(format!(
+            "semantics {:?} vs {:?}",
+            a.semantics, b.semantics
+        )));
+    }
+    if a.action != b.action {
+        return Some(Fatal(format!("action {:?} vs {:?}", a.action, b.action)));
+    }
+    if a.speculation_id != b.speculation_id {
+        return Some(Fatal(format!(
+            "speculation id {} vs {}",
+            a.speculation_id, b.speculation_id
+        )));
+    }
+    if a.frame_state.bci != b.frame_state.bci {
+        return Some(Fatal(format!(
+            "frame bci {} vs {}",
+            a.frame_state.bci, b.frame_state.bci
+        )));
+    }
+    if a.frame_state.method_key != b.frame_state.method_key {
+        return Some(Fatal(format!(
+            "method key {:?} vs {:?}",
+            a.frame_state.method_key, b.frame_state.method_key
+        )));
+    }
+    // Inline sites are still refused, so a caller chain under a rewrite means
+    // something changed that none of this argument considered.
+    if a.frame_state.caller.is_some() || b.frame_state.caller.is_some() {
+        return Some(Fatal(
+            "an inlined caller scope, which inline sites are still refused for".to_string(),
+        ));
+    }
+    if let Some(d) = slots("local", &a.frame_state.locals, &b.frame_state.locals) {
+        return Some(Divergent(d));
+    }
+    if let Some(d) = slots("stack slot", &a.frame_state.stack, &b.frame_state.stack) {
+        return Some(Divergent(d));
+    }
+    if a.frame_state.monitors.len() != b.frame_state.monitors.len() {
+        return Some(Divergent(format!(
+            "monitor count {} vs {}",
+            a.frame_state.monitors.len(),
+            b.frame_state.monitors.len()
+        )));
+    }
+    for (i, (m, n)) in a
+        .frame_state
+        .monitors
+        .iter()
+        .zip(b.frame_state.monitors.iter())
+        .enumerate()
+    {
+        if m.lock_depth != n.lock_depth
+            || crate::OsrSlotType::from_frame_value(&m.object)
+                != crate::OsrSlotType::from_frame_value(&n.object)
+        {
+            return Some(Divergent(format!("monitor {i} differs")));
+        }
+    }
+    None
 }
 
 /// May this transformed compile's deopt points be published as interpreter
@@ -647,10 +753,11 @@ fn deopt_points_agree(
 ///     consumers in `jit/src/lib.rs` (`osr_entry_frame_state`,
 ///     `transfer_osr_exit_into_live_frame`, the de-speculation reason lookup)
 ///     take the FIRST point with a matching bci, so if the copies disagree the
-///     pick is arbitrary. Agreement makes it arbitrary-but-correct. It is
-///     expected to hold — the copies are identical bytecode over a method-wide
-///     register allocation — but "expected" is not the standard for something
-///     the VM resumes at.
+///     pick is arbitrary. Only the fields those consumers take ON TRUST are
+///     refused; the OSR entry contract's slot types are re-verified against the
+///     live interpreter frame, so a divergence there is counted
+///     (`loop_xform_deopt_frames_diverge`) and logged instead. See
+///     [`PointDifference`], which is where that split is argued.
 ///
 ///     Grouped by `(bci, reason)` and compared only across DISTINCT emitter
 ///     pcs, because neither of the other two shapes is the rewrite's doing. One
@@ -716,13 +823,30 @@ pub(super) fn rewritten_deopt_points_are_publishable(
         // pcs — see point 4 of the doc comment for why the other two shapes are
         // an ordinary compile's and not this rewrite's.
         match first_at.get(&(p.bci, p.reason)) {
-            Some(&j) if emitter_pcs[j] != pc && !deopt_points_agree(&points[j], p) => {
-                return Err(format!(
-                    "two copies of bci {} published disagreeing {:?} frames \
-                     (output pcs {} and {pc}); a bci-keyed consumer would pick \
-                     one arbitrarily",
-                    p.bci, p.reason, emitter_pcs[j]
-                ));
+            Some(&j) if emitter_pcs[j] != pc => {
+                match deopt_point_difference(&points[j], p) {
+                    Some(PointDifference::Fatal(how)) => {
+                        return Err(format!(
+                            "two copies of bci {} published disagreeing {:?} points \
+                             (output pcs {} and {pc}): {how}; a bci-keyed consumer \
+                             takes that field on trust and would pick one arbitrarily",
+                            p.bci, p.reason, emitter_pcs[j]
+                        ));
+                    }
+                    Some(PointDifference::Divergent(how)) => {
+                        crate::metrics::record_loop_xform_event("loop_xform_deopt_frames_diverge");
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+                            eprintln!(
+                                "[JIT_GEN] loop-rewrite copies of bci {} diverge at \
+                                 output pcs {} and {pc}: {how} — the OSR entry \
+                                 contract re-validates this, so it is reported, not \
+                                 refused",
+                                p.bci, emitter_pcs[j]
+                            );
+                        }
+                    }
+                    None => {}
+                }
             }
             Some(_) => {}
             None => {
