@@ -242,6 +242,96 @@ impl Compiler {
 
 
 
+    /// Emit a compiled `getstatic` as a direct load, with no helper `CALL`.
+    ///
+    /// Returns `false` when the site cannot be inlined, in which case the
+    /// caller must keep the `jit_getstatic` path; `true` means the value has
+    /// been pushed (and the oop mark / volatile fence emitted) already.
+    ///
+    /// # Shape
+    ///
+    /// ```text
+    ///   MOV RAX, imm64          ; &statics_index[class].base  (the POINTER cell)
+    ///   MOV RAX, [RAX]          ; the class's statics block base
+    ///   MOV/MOVSXD RAX, [RAX + field_index*16 + payload_off]
+    /// ```
+    ///
+    /// The first two are what replaces a helper round trip; the third is the
+    /// same load the inline `getfield` arms emit, against the same 16-byte
+    /// `Value` cell layout (`FIELD_CELL_PAYLOAD*_OFFSET`, pinned by
+    /// `field_cell_layout_matches_value_enum`). Result conventions match
+    /// `jit_getstatic` exactly: `MOVSXD` for the int category (`Value::Int(i)
+    /// => i as i64`), a 32-bit zero-extending `MOV` for float (`f.to_bits() as
+    /// i64`), a 64-bit `MOV` of the payload word for long/double/reference
+    /// (`Object(None)` leaves that word zero, i.e. JVM null).
+    ///
+    /// # What is NOT emitted, and why that is safe
+    ///
+    /// * **No class-init check.** The resolver only answers for a class that is
+    ///   already initialized, and initialization is monotonic.
+    /// * **No exception check.** With no call there is no `i64::MIN` deopt
+    ///   sentinel to disambiguate — which also removes a latent bug the helper
+    ///   path still has, where a `static long` legitimately holding
+    ///   `Long.MIN_VALUE` is indistinguishable from a thrown `<clinit>`.
+    /// * **No `flush_scratch_registers`.** Nothing here clobbers a register the
+    ///   operand-stack cache can hold: `SCRATCH_REGS` is `[R8, R9]` and this
+    ///   sequence touches only RAX, which the helper path clobbers anyway.
+    /// * **No plausibility check on a reference payload.** Same contract as the
+    ///   inline `getfield` arms, which also raw-load the payload word.
+    pub(super) fn try_emit_inline_getstatic(
+        &mut self,
+        class_id_raw: u32,
+        field_index: usize,
+        type_tag: u8,
+        is_volatile: bool,
+    ) -> bool {
+        if !inline_getstatic_enabled() {
+            return false;
+        }
+        let Some(base_cell) = resolve_static_base(class_id_raw, field_index) else {
+            return false;
+        };
+        // Cast: cell byte offset within the class's statics block -> disp32.
+        let Ok(cell_off) = i32::try_from(field_index.saturating_mul(SLOT_SIZE)) else {
+            return false;
+        };
+        // Cast: the baked address of the never-freed base-pointer cell.
+        self.emit_mov_imm64(RAX, base_cell as i64);
+        self.emit_mov_r64_mem_disp32(RAX, RAX, 0);
+        match type_tag {
+            b'J' | b'D' | b'L' | b'[' => self.emit_mov_r64_mem_disp32(
+                RAX,
+                RAX,
+                // Cast: fixed layout offset to i32 instruction displacement
+                cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+            ),
+            b'F' => self.emit_mov_r32_mem_disp32(
+                RAX,
+                RAX,
+                // Cast: fixed layout offset to i32 instruction displacement
+                cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+            ),
+            _ => self.emit_movsxd_r64_mem_disp32(
+                RAX,
+                RAX,
+                // Cast: fixed layout offset to i32 instruction displacement
+                cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+            ),
+        }
+        // Volatile static: MFENCE after the read, exactly as the helper arm does
+        // (x86-64 already gives acquire ordering for the load itself).
+        if is_volatile {
+            self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
+        }
+        self.push_from_rax();
+        // A reference-typed static's loaded value is a live oop — same
+        // obligation as the helper arm (T1.1.a).
+        if type_tag == b'L' || type_tag == b'[' {
+            self.mark_top_as_oop();
+        }
+        true
+    }
+
     pub(super) fn emit_guarded_getfield_receiver_check(&mut self, bounds_addr: usize) -> Vec<usize> {
         let mut slow: Vec<usize> = Vec::new();
         // 1. null → slow (helper throws the NPE).

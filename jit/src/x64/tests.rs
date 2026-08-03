@@ -4046,6 +4046,110 @@ fn test_getfield_guarded_inline_fast_and_fallback() {
     assert_eq!(result, 424242, "null receiver must route to the helper");
 }
 
+/// Inline (helper-free) `getstatic`: with a resolver wired, the default `0xb2`
+/// arm emits the two-load direct form and leaves NO call to `jit_getstatic`
+/// behind; a site the resolver declines keeps the helper.
+///
+/// Both directions are asserted from ONE registration on purpose:
+/// `set_static_base_resolver` deliberately latches its context for the life of
+/// the process (a second VM must never re-point it at its own statics), so the
+/// test resolver instead answers for exactly one `(class, field)` pair and
+/// declines everything else — which also keeps it inert for any other test in
+/// this binary that compiles a `getstatic`.
+#[test]
+fn test_getstatic_inline_direct_load_and_fallback() {
+    use std::sync::atomic::AtomicPtr;
+
+    /// Marker helper: returns a constant no direct load of the block below
+    /// could produce, so routing is observable.
+    unsafe extern "C" fn marker_getstatic(_vm: i64, _cid: i64, _idx: i64) -> i64 {
+        424_242
+    }
+
+    /// Stands in for `jit_resolve_static_base`. `ctx` IS the address of the
+    /// base-pointer cell here, so the test needs no VM.
+    unsafe extern "C" fn test_resolver(ctx: i64, class_id: i64, field_index: i64) -> i64 {
+        if class_id == 0x5EED && field_index == 1 {
+            ctx
+        } else {
+            0
+        }
+    }
+
+    // A leaked statics block plus the `AtomicPtr` cell that names it — the same
+    // two-level shape `StaticsIndex` publishes.
+    static CELL_ADDR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cell_addr = *CELL_ADDR.get_or_init(|| {
+        let block: &'static mut [Value] =
+            Box::leak(vec![Value::Int(1), Value::Int(-7), Value::Int(2)].into_boxed_slice());
+        let cell: &'static AtomicPtr<Value> =
+            Box::leak(Box::new(AtomicPtr::new(block.as_mut_ptr())));
+        // Cast: the address the backend bakes as an immediate.
+        cell as *const AtomicPtr<Value> as usize
+    });
+    set_static_base_resolver(test_resolver as *const () as usize, cell_addr);
+
+    // getstatic #1 ; ireturn
+    let code: Vec<u8> = vec![0xb2, 0x00, 0x01, 0xac, 0, 0];
+    let code_len = 4;
+    let mut helpers = test_helpers();
+    helpers.getstatic = marker_getstatic as *const () as usize;
+
+    let build = |field_index: usize| {
+        compile(
+            &code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(), // multianewarray_info
+            Vec::new(), // field_info
+            Vec::new(), // typecheck_info
+            // static_field_info: (pc, class_id, field_index, type_tag, volatile)
+            vec![(0usize, 0x5EEDu32, field_index, b'I', false)],
+            Vec::new(), // new_info
+            Vec::new(), // anewarray_info
+            Vec::new(), // invoke_info
+            Vec::new(), // direct_calls
+            Vec::new(), // mic_slots
+            Vec::new(), // pic_slots
+            Vec::new(), // ldc_info
+            Vec::new(), // ldc2w_info
+            HashMap::new(),
+            HashMap::new(),
+            &helpers,
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .expect("test JIT compile")
+    };
+
+    // 1. Resolved site → direct load of slot 1, sign-extended.
+    let inlined = build(1);
+    // SAFETY: JIT-compiled machine code from valid bytecode in an executable
+    // mmap region, as in every other codegen test here.
+    let v = unsafe { inlined.try_call(&[0]).expect("test JIT call") };
+    assert_eq!(
+        v, -7,
+        "a resolved getstatic must read the block directly (MOVSXD of the Int payload)"
+    );
+    assert_eq!(
+        calls_to(&inlined, helpers.getstatic),
+        0,
+        "an inlined getstatic must leave no CALL to jit_getstatic"
+    );
+
+    // 2. Declined site (field 0) → the helper still owns it.
+    let fallback = build(0);
+    // SAFETY: as above.
+    let v = unsafe { fallback.try_call(&[0]).expect("test JIT call") };
+    assert_eq!(
+        v, 424_242,
+        "a site the resolver declines must keep the jit_getstatic path"
+    );
+}
+
 // -----------------------------------------------------------------------
 // G1-2 — the inline reference-store fast paths must not elide the
 // collector's post-write barrier on a backend that publishes no region
