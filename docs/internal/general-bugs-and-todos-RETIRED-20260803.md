@@ -1,0 +1,371 @@
+# "General Bugs & TODOs" — retired
+
+**Status: ✅ RETIRED 2026-08-03.** All five items are closed. Three were
+already fixed in the tree and are re-verified here with the evidence the item
+asked for; two carried live residuals, which are fixed on
+`fix/general-bugs-todo-20260803`.
+
+The original list is preserved verbatim under "The original list" below,
+because three of its five items describe the code as it was *before* a fix
+that had already landed — and one of those descriptions points at the wrong
+file. Keeping the text makes the drift readable instead of confusing.
+
+## Verdicts
+
+| # | item | verdict |
+|---|---|---|
+| 1 | GC: incorrect "moving young" logic | **already fixed** (arch-2026-07-26); the flag and its term are deleted, a regression test pins the inverse, benchmarks re-run below |
+| 2 | Perf: layout registry lookup hotspot | **two live defects found and fixed** — one a silent correctness bug, one the quadratic scan the item describes |
+| 3 | Concurrency: unsafe `ObjectRef` sharing | **already audited**; the one gap the audit itself flagged as unenforced is now enforced |
+| 4 | Logic: monitor notify bug | **the described mechanism was already correct; a real residual found and fixed** — `Object.wait()` had no prompt interrupt wake |
+| 5 | Interop: incorrect synthetic-JDK handling | **already fixed**; usage text and two tests added |
+
+---
+
+## Item 1 — GC "moving young" logic
+
+**Claim.** `Heap::collect_young_if_threshold()` in `gc/src/heap.rs` guards
+moving GC with `self.is_active() && !self.allow_moving_young`, made
+unconditional by mistake; removing the `!allow_moving_young` clause restores
+the semispace copy collector.
+
+**Verdict: already fixed, and the diagnosis was right.** The term existed and
+was exactly as harmful as described. It was deleted — along with the
+`CRATONVM_ALLOW_MOVING_YOUNG` flag that fed it — by the arch-2026-07-26
+`moving-young-precise-roots` work.
+
+Two corrections to the report, both worth recording because they cost time to
+re-derive:
+
+* The code is in `gc/src/gen_heap.rs::collect_garbage_inner`, not
+  `gc/src/heap.rs::collect_young_if_threshold`. `gen_heap.rs` keeps a
+  commented-out copy of the exact expression (`let fail_closed_non_moving =
+  is_active() && !gc_flags().allow_moving_young;`) as the historical record,
+  which is what makes a text search still find it.
+* The fix was **not** "remove or alter the `!allow_moving_young` clause" so
+  that the flag permits moving. Both the term *and the flag* were deleted. The
+  reasoning is in the source and is the right one: a flag whose only job is to
+  permit correct behaviour is not a safety mechanism, and the old shape meant
+  `CRATONVM_MOVING_YOUNG=1` alone could never run a moving cycle under a live
+  JIT frame — which is the only case the feature exists for.
+
+Two diversions survive, and both are real: conservative (unrewritable) JIT
+roots when moving-young is not in effect, and the promotion-OOM fallback when
+both generations are ~90% full.
+
+**Regression guard.** `gen_heap.rs`'s
+`moving_young_copies_with_live_jit_frame_and_proven_coverage` asserts the
+inverse directly: with a live JIT frame, healthy generations and a proven
+coverage map, `objects_copied` must be non-zero and the root must be rewritten.
+Its own doc comment records that the test was *unreachable at any single env
+setting* under the old code. Nothing further was needed here.
+
+**Benchmarks.** See "Measurements" below.
+
+**Not this item's defect, still open.** `JIT_PUBLISHES_RELOCATION_CONTRACT`
+is `false`, so a runtime veto still forces the non-moving sweep once compiled
+code exists. That is a deliberate, separately documented project state with
+its own flip checklist (`types/src/flags.rs`, and
+`docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`),
+not a residual of the guard bug.
+
+---
+
+## Item 2 — layout registry lookup hotspot
+
+**Claim.** Object layouts are resolved by a linear search of the class
+hierarchy on every lookup; cache `ClassId -> layout` in a map.
+
+**Verdict: the specific cache already exists — and looking for the *rest* of
+the described shape found two live defects.**
+
+The `ClassId -> layout` lookup itself is already O(1) and heavily optimised:
+`types/src/field_layout.rs` keeps a dense `Vec` indexed by `ClassId`, a
+version registry behind `parking_lot::RwLock<FxHashMap<_>>`, and two
+generation-validated thread-local working sets. Its own comments record the
+`perf record` that drove that work (`BinTreesClassic d=18`: 37.8% of samples
+in `class_layout_for_fields`, 4.8% more in SipHash underneath it). Nothing to
+do there.
+
+What was *not* fixed is the place that genuinely still scanned the hierarchy.
+
+### 2a. `recompute_subclass_layouts` skipped subclasses after any class unload
+
+`ClassManager::recompute_subclass_layouts(changed_id)` propagates a layout
+change to every transitive subclass. It answered "which classes are
+descendants?" with:
+
+```rust
+let class_count = self.class_store.len();
+for idx in 0..class_count { /* ... is_subclass_of(changed_id) ... */ }
+```
+
+`ClassStore::len()` is the **live** class count. The ClassId upper bound is
+`slot_count()`, and its own doc says so — ids are never reused, so an unloaded
+class leaves a tombstone and `len() < slot_count()` forever after.
+
+One unloaded class was therefore enough to make the loop stop a slot short and
+silently skip the highest-id subclasses. Those are the most recently loaded
+ones — i.e. exactly the application classes that extend the JDK stub being
+upgraded. A skipped descendant keeps a `first_field_index` computed against
+the pre-upgrade parent, so its own fields overlap the parent's and
+`getfield`/`putfield` resolve past the object's slot count: the
+"out-of-bounds field read ... undersized object layout" this function exists
+to prevent.
+
+Proven, not inferred. `a_subclass_above_the_live_class_count_still_gets_its_
+layout_recomputed` was run against a copy of the tree with the old loop
+restored:
+
+```
+test class_manager::tests::a_subclass_above_the_live_class_count_still_gets_its_layout_recomputed ... FAILED
+assertion `left == right` failed: Child's own field must start after Parent's two fields
+  left: 1
+ right: 2
+```
+
+Two more sites made the same `len()`-as-id-bound mistake and are fixed the
+same way: `validate_native_coverage` (`vm/src/vm/vm_object.rs`, under-reported
+the native census after an unload) and the vtable catch-up pass in
+`vm_init.rs`.
+
+### 2b. …and it was quadratic
+
+The same loop probed **every** class with `is_subclass_of`, which walks a
+superclass chain: `O(classes x depth)` per call, once per synthetic-stub
+upgrade whose layout shifted. On a framework-scale run that is thousands of
+upgrades against tens of thousands of classes.
+
+`ClassStore` now carries a direct-subclass adjacency index, maintained by
+`add`, the new `set_superclass`, and `remove`. `descendants_of` walks it
+breadth-first and yields exactly the transitive subclasses, parents before
+children — the topological order the recompute needs, and the one the old
+ascending-id scan provided. Cost drops to `O(descendants)`.
+
+`upgrade_synthetic_class` re-parents through `set_superclass` rather than
+writing `class.superclass` through `get_mut`: a stub minted under one
+superclass whose real bytecode names another has to *move* its edge, and a raw
+field write would leave the propagation blind to it. `re_parenting_a_class_
+moves_its_edge_in_the_subclass_index` pins that, and
+`the_subclass_index_agrees_with_a_full_hierarchy_scan` pins the index against
+the brute-force answer it replaced (including topological order, and with a
+tombstone in the store).
+
+### 2c. `unregister_class_layout` swept the whole version map
+
+Dropping one class's entries used `retain` over the entire
+`(class_id, field_count) -> layout` map — `O(all registered versions)` per
+unloaded class, so tearing down a class loader was quadratic in the number of
+loaded classes. That is the same "linear scan where an index belongs" shape
+the registry above was rewritten to remove. A reverse index
+(`class_id -> its field counts`) makes it `O(that class's versions)`.
+
+---
+
+## Item 3 — unsafe `ObjectRef` sharing
+
+**Claim.** `ObjectRef` is `unsafe impl Send/Sync` on an outdated
+single-threaded-mutator assumption. Audit cross-thread uses; if safe sharing
+is not guaranteed, remove the impls; at minimum document why they are sound.
+
+**Verdict: already done, and done more thoroughly than the item asks.** The
+audit is `docs/threading/objectref-concurrency-contract.md` (401 lines: the
+real threading model, what mutates the pointee and under what lock, whether
+the pointee can move under a live copy on another thread, a per-operation
+contract table, and the soundness derivation). The `unsafe impl`s stay, and
+the SAFETY note above them was rewritten to be *narrower* than the argument it
+replaced — it asserts only that the 16-byte value is `Copy` with no interior
+mutability and no ownership semantics, and explicitly stops asserting anything
+about the pointee.
+
+The item's premise that the impls rested on a single-threaded mutator was
+correct about the *old* note, which is exactly why it was replaced: that
+coupling tied two auto-trait impls to the whole GC design, so they read as
+unsound the moment the scheduler changed. They were not. The contract doc's §8
+also records two claims in the old note that were simply false (plain field
+access takes no lock; the JIT's `jit_putfield_*` helpers do write slots
+outside the GC).
+
+**What was left.** §7 of that doc lists nine invariants resting on convention
+rather than types. One of them is a gap this item's "audit all uses" reading
+covers directly, §7.3: `Hash`/`Eq` are address-based, so every
+`HashMap<ObjectRef, _>` needs a GC disposition — and *"Nothing enumerates the
+tables that need it."*
+
+That is now enumerated and enforced. `vm/src/memory/addr_keyed.rs` carries a
+census of every address-keyed table in the workspace with the disposition its
+own source states, and a test walks the tree and fails when a declaration
+appears that is not listed, or when an audited file's declaration count
+changes.
+
+The audit behind the list — all nine are accounted for, and none was found
+broken:
+
+| table | disposition |
+|---|---|
+| `gpu_pinned_refs` | pinned; membership is what forbids relocation |
+| `class_mirrors_reverse` | rebuilt inside the collection by `vm/src/memory/gc.rs` |
+| `offload::input_cache` | remapped + swept via `addr_keyed::remap_and_sweep` |
+| `inet_addr_side_table`, `ds_side_table` | scanned + remapped (`gc_scan_inet_addr_roots` / `gc_update_inet_addr_refs`, and the re10 pair) |
+| `synthetic_locale_data`, `locale_data` | scanned + remapped (`gc_scan_locale_roots`) |
+| `class_data_store` | tolerated under a stated condition: effectively write-only; the source names the re-key-by-identity-hash migration required before a reader is added |
+| `EQE_PENDING` | tolerated under a stated condition: values are identity-hash-rooted, and a stale key only splits one EQE's tasks across two buckets that are both drained unconditionally |
+
+No live defect. The gap was that nothing would have noticed the tenth.
+
+The census walks **directories**, not a list of file names: a gate keyed on
+file names goes quietly fail-open exactly when the code it guards is
+reorganised. It also fails loudly when it cannot find the workspace root, when
+the walk turns up implausibly few files, or when the pattern matches nothing,
+so it cannot pass vacuously.
+
+---
+
+## Item 4 — monitor notify
+
+**Claim.** `wait()` may hang if a thread is interrupted right before `notify`;
+`notify()` should use `Condvar::notify_one()` under the same lock `wait()`
+holds, `wait()` should re-check its condition in a loop, and a test should
+cover "A waits with a timeout, B notifies".
+
+**Verdict: every mechanism the item names was already in place — and looking
+for the *symptom* found a real residual.**
+
+Already correct in `vm/src/threading/monitor.rs`:
+
+* `notify` / `notify_all` take the monitor state lock and signal
+  `wait_condvar` while holding it, which is the pairing the item asks for.
+* `wait` loops on a predicate and returns on a signal, so a caller re-checks.
+* The lost-wakeup case the item's title points at is handled explicitly: a
+  thread that is both notified and interrupted in the same slice forwards the
+  notification to another waiter before breaking out, so the single
+  notification is not consumed by the `InterruptedException` throw.
+* JLS §17.2.1 entry-time check and clear-on-throw are both in
+  `vm_exec.rs::monitor_wait`.
+
+**The residual.** `Thread.interrupt()` only sets a flag. `Monitor::wait`
+therefore observes an interrupt no sooner than its next 5 ms poll slice, and
+an *untimed* wait had nothing but that poll to end it. `Thread.interrupt0`
+already unparks a target blocked in `LockSupport.park` for exactly this
+reason — the comment there even says "without this the target only notices at
+the next 5 ms interrupt poll". `Object.wait()` was the one blocking primitive
+left without a prompt wake.
+
+Fixed by using the monitor the registry already records for JMX
+(`set_jmx_waiting_monitor`, written just before the park and taken just after)
+to identify what to wake. No new side table. The wake:
+
+* is a `notify_all`, because the interrupted thread is not identifiable from
+  the interrupter, and a `notify_one` reaching the wrong waiter would leave
+  the interrupt unserviced for another slice *and* consume a slot;
+* consumes no pending notification — condvars bank no permits — so it cannot
+  swallow a `notify()`. `an_interrupt_wake_does_not_swallow_a_later_notify`
+  pins this;
+* never inflates: `wait()` inflates, so an object with no monitor has no
+  waiters, and inflating on an interrupt would put a heavyweight monitor on
+  every object an interrupted thread happened to hold.
+  `an_interrupt_wake_never_inflates_an_untouched_object` pins this.
+
+**The test the item asks for** is
+`a_timed_waiter_returns_as_soon_as_it_is_notified` — A waits with a 5 s
+timeout, B notifies after 30 ms, and the assertion is on elapsed time, not on
+returning. The failure it guards is not a hang but a silent one: the timed
+branch once ignored the condvar's verdict and always slept out the full
+timeout, so `Thread.join(millis)` and `awaitTermination` "worked" while
+burning the whole duration after the event they waited for.
+`an_untimed_waiter_is_released_by_an_interrupt_wake` covers the untimed half.
+
+---
+
+## Item 5 — synthetic-JDK handling
+
+**Claim.** `--synthetic-jdk` on a binary built without the `synthetic-jdk`
+feature silently fails to find classes; the launcher's check "may be
+incomplete". Ensure a clear error, update the usage docs, and ensure
+`--real-jdk` correctly overrides synthetic mode.
+
+**Verdict: already fixed on both halves; the usage-doc half was the only thing
+missing.**
+
+`resolve_jdk_mode` in `vm-cli/src/main.rs` is the single authority. It rejects
+the flag pair explicitly (not just via clap's `conflicts_with`, so an argv
+preprocessing change cannot quietly make one win), then validates the selected
+mode: `require_synthetic_jdk()` for synthetic, `require_real_jdk()` for real.
+Neither falls back to the other library — a run whose standard library was
+chosen by the host is neither reproducible nor reportable. The error text
+names the feature, what the state would be if the launch proceeded, and both
+fixes.
+
+`--real-jdk` overriding is structural rather than a preference: there are two
+fixed constants, `LAUNCHER_DEFAULT_JDK_MODE = Real` and
+`EMBEDDED_DEFAULT_JDK_MODE = Synthetic`, neither derived from a Cargo feature
+or from host probing, and the only way to change either is an explicit flag or
+`VmConfig::with_jdk_mode`. The second launcher entry point (`libcratonvm`)
+calls `require_synthetic_jdk` too, and `--version --verbose` reports
+`jdk.mode.synthetic_compiled_in` so the question is answerable before a run.
+
+Added here: `--help` now states the build requirement and points at that
+`--version` key (the rejection message alone is not documentation — it only
+appears after the run has already failed), plus
+`the_usage_text_states_the_synthetic_jdk_build_requirement` and
+`real_jdk_flag_selects_real_mode_regardless_of_the_synthetic_feature`.
+
+---
+
+## Measurements
+
+<!-- MEASUREMENTS -->
+
+---
+
+## The original list
+
+> **[GC] Incorrect "moving young" logic:** Symptom: Certain GC benchmarks fall
+> back to a slow non-moving young-gen collection even when moving GC is
+> enabled. Root cause: In `gc/src/heap.rs`, the guard for using moving GC was
+> inadvertently made unconditional. Fix: Change the guard logic so that if
+> `CRATONVM_MOVING_YOUNG=1`, the semispace copy collector is used for young
+> gen. For example, in `Heap::collect_young_if_threshold()`, replace the logic
+> `if self.is_active() && !self.allow_moving_young { ... }` with a check that
+> allows moving when permitted (remove or alter the `!self.allow_moving_young`
+> clause). Retest `BinaryTrees` and `Sieve` benchmarks to ensure the fix
+> eliminates the regression. (TODO in gc/src/heap.rs at lines around where
+> `fail_closed_non_moving` is set.)
+>
+> **[Performance] Layout registry lookup hotspot:** Symptom: Profile shows a
+> large fraction of runtime spent resolving object layouts by scanning class
+> hierarchy. Root cause: The code does a linear search each time a class layout
+> is needed. Fix: Modify `classloading::LayoutRegistry` (or similar) to cache
+> mappings from `ClassId` to layout index. For example, add a
+> `HashMap<ClassId, LayoutId>` updated whenever a new layout is registered. In
+> the lookup function, first check the map. This eliminates repetitive linear
+> scans. Measure impact to confirm ~50% cut in layout lookup time.
+>
+> **[Concurrency] Unsafe ObjectRef sharing:** Symptom: `ObjectRef` is marked
+> `unsafe impl Send/Sync` despite potential multithreaded mutation. Root cause:
+> Historical assumption of single-threaded mutator is outdated. Fix: Audit all
+> uses of `ObjectRef` across threads. If indeed Java object references are
+> passed between threads, ensure correctness by adding necessary memory fences
+> or marking fields `volatile` in JNI terms. If safe sharing is not guaranteed,
+> remove the unsafe impl and use explicit `Arc<Mutex<Object>>` when needed. At
+> minimum, add comments documenting why `Send/Sync` is (or is not) safe under
+> the one-thread-per-Java-thread model. (Edit `types/src/value.rs` around the
+> `unsafe impl` of `ObjectRef`.)
+>
+> **[Logic] Monitor notify bug:** Symptom: `wait()` may hang if a thread is
+> interrupted right before `notify`. Root cause: The `monitor` code may miss a
+> notification or double-wait. Fix: In `vm/src/threading/monitor.rs`, ensure
+> `notify()` uses `Condvar::notify_one()` under the same lock that `wait()` is
+> doing `wait()`. Check that `wait()` rechecks the condition in a loop. If
+> necessary, restructure to use Rust's `Condvar` correctly (lock guard + loop
+> on predicate). Add tests where thread A waits with a timeout and thread B
+> notifies to verify no deadlock.
+>
+> **[Interop] Incorrect synthetic JDK handling:** Symptom: Running with
+> `--synthetic-jdk` on a binary built without `synthetic-jdk` feature silently
+> fails to find classes. Root cause: The launcher in `vm-cli` rejects synthetic
+> mode only by fatal error, but the check may be incomplete. Fix: In
+> `vm-cli/main.rs`, make sure that if `--synthetic-jdk` is passed without the
+> `synthetic-jdk` feature, the program exits with a clear error. Update the
+> usage docs accordingly. Conversely, ensure `--real-jdk` correctly overrides
+> synthetic mode. (Check `VmConfig::for_launcher()` in `vm/src/config.rs`.)

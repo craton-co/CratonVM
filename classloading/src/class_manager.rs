@@ -6013,6 +6013,17 @@ impl ClassManager {
         self.class_store.get_mut(id)
     }
 
+    /// Re-parent a loaded class.
+    ///
+    /// Use this instead of writing `class.superclass` through
+    /// [`Self::get_class_mut`]: the store keeps a direct-subclass adjacency
+    /// index (see [`ClassStore::descendants_of`]) that a raw field write
+    /// desynchronises, which would make `recompute_subclass_layouts` blind to
+    /// the class on the next superclass layout change.
+    pub fn set_superclass(&mut self, id: ClassId, superclass: Option<ClassId>) {
+        self.class_store.set_superclass(id, superclass);
+    }
+
     /// Atomically detach every class defined by `loader_id` from the live
     /// metadata graph.
     ///
@@ -15819,6 +15830,107 @@ mod tests {
         let child = mgr.class_store.get(child_id).unwrap();
         assert_eq!(child.first_field_index, 2);
         assert_eq!(child.num_total_fields, 3);
+    }
+
+    /// `Class::superclass` may only be written by `ClassStore::set_superclass`.
+    ///
+    /// The store keeps a direct-subclass adjacency index that
+    /// `recompute_subclass_layouts` walks. A raw `class.superclass = ...`
+    /// through `get_mut` compiles, runs, and looks right — and silently
+    /// removes the class from that walk, so the next time its superclass grows
+    /// a field the class keeps a stale `first_field_index` and its own fields
+    /// overlap the parent's. There is no failure at the point of the mistake,
+    /// which is exactly why this is a gate and not a comment.
+    ///
+    /// Scans DIRECTORIES rather than named files: a module split renames
+    /// files, and a gate keyed on file names goes quietly fail-open at the
+    /// moment the code it guards is reorganised. Fails loudly rather than
+    /// vacuously when the workspace root or the sources cannot be found.
+    #[test]
+    fn superclass_is_only_ever_written_through_set_superclass() {
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    collect_rs(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the classloading crate directory must have a parent")
+            .to_path_buf();
+        assert!(
+            workspace.join("Cargo.toml").is_file(),
+            "workspace root not found at {} — failing rather than scanning nothing",
+            workspace.display()
+        );
+
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&workspace).expect("workspace root is readable") {
+            let src = entry.expect("readable directory entry").path().join("src");
+            if src.is_dir() {
+                collect_rs(&src, &mut files);
+            }
+        }
+        assert!(
+            files.len() > 100,
+            "only {} source files found under {} — the directory walk is broken",
+            files.len(),
+            workspace.display()
+        );
+
+        // Assembled rather than written as one literal so this file's own
+        // scanner does not match itself.
+        let needle = format!(".{} = ", "superclass");
+        let exempt = [
+            // Owns the field and the index together; `set_superclass` is the
+            // one legitimate writer.
+            "classloading/src/class.rs",
+            // Different type entirely: a CDS archive record whose `superclass`
+            // is the superclass NAME (a `String`), with no index behind it.
+            "native-builtins/src/cds.rs",
+        ];
+
+        let mut offenders: Vec<String> = Vec::new();
+        for file in &files {
+            let rel = file
+                .strip_prefix(&workspace)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if exempt.iter().any(|e| rel.ends_with(e)) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            for (n, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains(&needle) {
+                    offenders.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "`Class::superclass` written directly, bypassing \
+             `ClassStore::set_superclass` and desynchronising the \
+             direct-subclass index that `recompute_subclass_layouts` walks. \
+             Call `ClassManager::set_superclass` / \
+             `ClassStore::set_superclass` instead:\n  {}",
+            offenders.join("\n  ")
+        );
     }
 
     /// Build a minimal loaded class for the layout-propagation tests below.
