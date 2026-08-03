@@ -23333,7 +23333,18 @@ mod layout_constant_inventory {
         // address (`HEADER_SIZE + packed_body_offset`) — a disp32 site, so it
         // does not share the disp8 backwards-addressing hazard, but it does
         // bake the header size into machine code.
-        ("ir_lower.rs", [8, 3, 4, 0, 0, 0, 3, 0]),
+        //
+        // COV-02 added two more of each of the first two. `HEADER_SIZE`
+        // 8 -> 10: `emit_gpr_array_elem_load` and `emit_gpr_array_elem_store`,
+        // one shared displacement apiece covering every integral/reference
+        // element width (int, long, byte, char, short, ref — wide and narrow).
+        // That is deliberately ONE site per emitter rather than one per width;
+        // the header shrink has fewer places to visit, and both go through
+        // `disp::disp8_const`, so an oversized header is a build failure rather
+        // than a read before the object. `ARRAY_LENGTH_OFFSET` 3 -> 4: the
+        // `arraylength` lowering's own length load, alongside the bounds
+        // check's.
+        ("ir_lower.rs", [10, 4, 4, 0, 0, 0, 3, 0]),
     ];
 
     fn source(file: &str) -> &'static str {

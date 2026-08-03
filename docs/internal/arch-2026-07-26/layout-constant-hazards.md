@@ -122,7 +122,23 @@ pre-session numbers from `header-shrink.md` §6.6 are in parentheses):
 | `jit/src/lib.rs:3236` (3186) | `(HEADER_SIZE + body_off) as i32` — compact string field **payload** address | disp32 |
 | `jit/src/lib.rs:3210` (3226) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32` — legacy string field cell | disp32 |
 
-**All eight already read the shared constants, not literals** — no site needed
+**2026-08-03, COV-02** (`docs/known-issues/c2/cov-02-array-element-access.md`)
+added three more `ir_lower.rs` sites, all **disp8**, all checked by
+`disp::disp8_const` rather than narrowed with a raw cast:
+
+| Site | What it emits | Form |
+| --- | --- | --- |
+| `emit_gpr_array_elem_load` | `[RAX+RCX*{1,2,4,8}+HEADER_SIZE]` for `iaload`/`laload`/`baload`/`caload`/`saload`/`aaload` | **disp8**, checked |
+| `emit_gpr_array_elem_store` | the same address for `iastore`/`lastore`/`bastore`/`castore`/`sastore` | **disp8**, checked |
+| `Op::ArrayLength`'s lowering arm | `MOV EAX,[RAX+ARRAY_LENGTH_OFFSET]` for `arraylength` | **disp8**, checked |
+
+Each emitter materialises the header displacement **once** and shares it across
+every element width, which is why eleven new instruction encodings cost two new
+sites rather than eleven. Preserve that when the shrink lands: a per-width copy
+of the constant would be eleven places to revisit, and this file would be the
+only thing that noticed.
+
+**All eight originals already read the shared constants, not literals** — no site needed
 converting. The hazards are the ones the inventory was supposed to surface and
 did not:
 
@@ -142,7 +158,10 @@ are exact: `HEADER_SIZE as u8` 31, `HEADER_SIZE as i32` 11,
 `ARRAY_LENGTH_OFFSET as u8` 16, `ARRAY_LENGTH_OFFSET as i32` 5. The sibling
 `ir_lower_header_offset_sites_are_inventoried_too` is likewise exact at 2 / 2 / 1,
 and this session's edits deliberately avoid that needle's spelling so both
-totals still hold.
+totals still hold. (COV-02 gave that sibling a fifth row and moved two of its
+counts: `HEADER_SIZE as u8` stays 2 — the FP arms — a new `HEADER_SIZE as i64`
+row is 2 for the two checked GPR emitters, and `ARRAY_LENGTH_OFFSET as i64`
+went 1 → 2 for `arraylength`'s own length load.)
 
 **But the mechanism is structurally blind to a case that matters.** The needle
 requires the constant to be *immediately* followed by a cast. Both `lib.rs` sites
@@ -170,7 +189,13 @@ layout constants this crate could plausibly emit:
 | | `HEADER_SIZE` | `ARRAY_LENGTH_OFFSET` | `SLOT_SIZE` | `REF_ELEMENT_SIZE` | `MARK_WORD_OFFSET` | `IDENTITY_HASH_CODE_OFFSET` | `FIELD_CELL_PAYLOAD32_OFFSET` | `FIELD_CELL_PAYLOAD64_OFFSET` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `jit/src/lib.rs` | 3 | 1 | 2 | 1 | 0 | 0 | 1 | 1 |
-| `jit/src/ir_lower.rs` | 7 | 3 | 4 | 0 | 0 | 0 | 3 | 0 |
+| `jit/src/ir_lower.rs` | 10 | 4 | 4 | 0 | 0 | 0 | 3 | 0 |
+
+(The `ir_lower.rs` row read `7 | 3 | …` when this section was written, went to
+`8` with the 2026-07-31 guarded inline compact `getfield`, and to `10 | 4` with
+COV-02's two GPR array emitters and `arraylength`'s length load. The authority
+is `INVENTORY` in `jit/src/lib.rs`, which is executed; this table is a copy and
+had already drifted by one before COV-02 re-derived it.)
 
 The zero entries are as load-bearing as the rest: a constant that starts being
 used in a file where it never appeared before also trips the assertion and forces

@@ -559,9 +559,19 @@ fn header_offset_emission_site_inventory_matches_the_doc() {
 #[test]
 fn ir_lower_header_offset_sites_are_inventoried_too() {
     let src = include_str!("../ir_lower.rs");
-    let cases: [(&str, &str, usize); 4] = [
+    let cases: [(&str, &str, usize); 5] = [
+        // The two raw narrowings are the FP element access (`faload`/`daload`/
+        // `fastore`/`dastore`) emitted before COV-02. Everything COV-02 added
+        // goes through the checked `disp8_const` form counted below, so this
+        // number must not grow.
         ("HEADER_SIZE", " as u8", 2),
         ("HEADER_SIZE", " as i32", 2),
+        // COV-02: the two GPR array element emitters
+        // (`emit_gpr_array_elem_load` / `emit_gpr_array_elem_store`), each of
+        // which materialises the header displacement ONCE and shares it across
+        // every element width. Deleting either would silently restore an
+        // unchecked site.
+        ("HEADER_SIZE", " as i64", 2),
         // 0, deliberately: this site moved to
         // `disp::disp8_const(ARRAY_LENGTH_OFFSET as i64)`, which is a
         // `const fn` that fails the BUILD if the constant ever exceeds 127.
@@ -571,8 +581,9 @@ fn ir_lower_header_offset_sites_are_inventoried_too() {
         // silent negative-disp8 hazard and trips this back to 1.
         ("ARRAY_LENGTH_OFFSET", " as u8", 0),
         // The checked form must stay present; deleting it would silently
-        // restore an unchecked site elsewhere.
-        ("ARRAY_LENGTH_OFFSET", " as i64", 1),
+        // restore an unchecked site elsewhere. Two of them since COV-02: the
+        // bounds check's length load, and `arraylength`'s own.
+        ("ARRAY_LENGTH_OFFSET", " as i64", 2),
     ];
     for (base, suffix, expected) in cases {
         let needle = format!("{base}{suffix}");
