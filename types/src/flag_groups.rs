@@ -618,6 +618,10 @@ pub const INVENTORY: &[E] = &[
     // Default-ON: `x64::licm::gc_inert_selfrec_enabled` reads `0`/`false`/`off`.
     E { group: Group::JIT, token: "gc-inert-selfrec", on_key: Some("CRATONVM_JIT_GC_INERT_SELFREC"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "getfield-helper", on_key: Some("CRATONVM_JIT_GETFIELD_HELPER"), off_key: None, off_word: None },
+    // Presence-parsed kill switch for the inline (helper-free) compiled
+    // `getstatic` load, exactly like `getfield-helper` above: setting it
+    // routes every static read back through `jit_getstatic`.
+    E { group: Group::JIT, token: "getstatic-helper", on_key: Some("CRATONVM_JIT_GETSTATIC_HELPER"), off_key: None, off_word: None },
     // PGO-02: guarded monomorphic-virtual-call inlining (splice the callee
     // body behind a receiver class-id guard, miss falls to normal dispatch,
     // never a deopt). Default-OFF until soaked — see

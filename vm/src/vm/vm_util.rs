@@ -852,6 +852,18 @@ fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassSta
     }
     if matches!(new_state, ClassState::Initialized) {
         super::vm_object::pre_init_wrapper_type_field_for_class(shared, class_id);
+        // Authoritative, monotonic "this class is initialized" event. The JIT's
+        // lock-free init memo used to be written ONLY by `jit_getstatic`, i.e.
+        // only after a compiled static read had already taken the slow path
+        // once. That is too late for the compiler, which must decide whether a
+        // `getstatic` may become a direct load (no helper, so no init check)
+        // BEFORE the method's first compiled execution. Marking it here makes
+        // the memo a general lock-free predicate with no extra bookkeeping:
+        // this is exactly the point at which `<clinit>` has completed
+        // successfully, which is the only condition the memo is allowed to
+        // record (a failed `<clinit>` finalizes as `InitializationError` and is
+        // deliberately not marked).
+        crate::jit::helpers::note_class_initialized(shared, class_id);
     }
     // Remove waiter and notify all blocked threads.
     let removed = shared.classes.class_init_waiters.lock().remove(&class_id);
@@ -2189,6 +2201,19 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
         }
         (class.name.to_string(), info)
     };
+
+    // Compiled `getstatic` needs a lock-free answer to "is this the class whose
+    // statics the `System.out`/`err`/`in` bootstrap intercept services?" before
+    // it may emit a direct load. Preparation is the earliest point the name is
+    // known, and it always precedes initialization — which the inline path also
+    // requires — so the id is always recorded before any inline decision about
+    // this class can be taken. See `ClassRealm::system_class_id`.
+    if class_name == "java/lang/System" {
+        shared
+            .classes
+            .system_class_id
+            .store(class_id.as_u32(), std::sync::atomic::Ordering::Relaxed);
+    }
 
     // Allocate static field slots with default values, then overlay any
     // resolved ConstantValue. String constants are allocated through the

@@ -1161,18 +1161,14 @@ impl Compiler {
 
                 // getstatic (0xb2) — use callee's static_field_info
                 //
-                // MED-2 bail (round-2 JIT review): same gap as the top-level
-                // 0xb2 handler at line ~9620 — see the long comment there
-                // for the full unblocking plan. Briefly: `SharedVm.classes.statics`
-                // slot addresses aren't stable (Vec resize, lazy entry),
-                // so we can't bake them as `imm64` and emit `MOV reg,
-                // [imm64]`. Stay on the helper-call path.
+                // Same direct-load-or-helper split as the top-level 0xb2 arm;
+                // the long note there explains what is baked and which sites
+                // still take `jit_getstatic`.
                 0xb2 => {
                     if cpc + 2 >= callee_len {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
-                    self.flush_scratch_registers();
                     // `static_field_info` is keyed by callee bytecode PC,
                     // not CP index — match on `cpc` (see the `getfield`
                     // note above).
@@ -1182,28 +1178,43 @@ impl Compiler {
                         .find(|(p, _, _, _, _)| *p == cpc)
                         .copied()
                     {
-                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
-                        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
-                        self.emit_call_absolute(self.helpers.getstatic);
-                        // jit-linewrapper-flushtype-npe fix (2026-07-17):
-                        // see the matching fix + comment at the top-level
-                        // 0xb2 arm -- same helper, same missing
-                        // post-invoke exception check for a `<clinit>`
-                        // failure surfaced via the deopt sentinel.
-                        self.emit_post_invoke_exception_check(type_tag);
-                        // Volatile static: emit MFENCE after read (SeqCst acquire)
-                        if is_volatile {
-                            self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
-                        }
-                        self.push_from_rax();
-                        // T1.1.a (fix, 2026-07-07) — see the matching fix at
-                        // the top-level 0xb2 arm: a reference-typed static
-                        // field must not keep push_from_rax's default
-                        // non-oop mark, or it decodes wrong in a precise
-                        // GC/deopt oop map while live.
-                        if type_tag == b'L' || type_tag == b'[' {
-                            self.mark_top_as_oop();
+                        // Direct load, no helper CALL — see the top-level 0xb2
+                        // arm. `flush_scratch_registers` deliberately moved
+                        // INSIDE the helper branch: the inline form clobbers
+                        // only RAX, so spilling the operand-stack cache for it
+                        // would give back part of what it saves. The `else`
+                        // arm below abandons the whole inline attempt, so it
+                        // needs no flush either.
+                        if !self.try_emit_inline_getstatic(
+                            class_id_raw,
+                            field_index,
+                            type_tag,
+                            is_volatile,
+                        ) {
+                            self.flush_scratch_registers();
+                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                            self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
+                            self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                            self.emit_call_absolute(self.helpers.getstatic);
+                            // jit-linewrapper-flushtype-npe fix (2026-07-17):
+                            // see the matching fix + comment at the top-level
+                            // 0xb2 arm -- same helper, same missing
+                            // post-invoke exception check for a `<clinit>`
+                            // failure surfaced via the deopt sentinel.
+                            self.emit_post_invoke_exception_check(type_tag);
+                            // Volatile static: emit MFENCE after read (SeqCst acquire)
+                            if is_volatile {
+                                self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
+                            }
+                            self.push_from_rax();
+                            // T1.1.a (fix, 2026-07-07) — see the matching fix at
+                            // the top-level 0xb2 arm: a reference-typed static
+                            // field must not keep push_from_rax's default
+                            // non-oop mark, or it decodes wrong in a precise
+                            // GC/deopt oop map while live.
+                            if type_tag == b'L' || type_tag == b'[' {
+                                self.mark_top_as_oop();
+                            }
                         }
                     } else {
                         self.next_spill_offset = callee_local_base;
@@ -1214,10 +1225,10 @@ impl Compiler {
 
                 // putstatic (0xb3) — use callee's static_field_info
                 //
-                // MED-2 bail (round-2 JIT review): same gap as the top-level
-                // 0xb3 handler — slot pointer not stable, no VM-crate access
-                // from `jit`. See the comment on the top-level 0xb2 handler
-                // for the full unblocking plan.
+                // Helper-only, like the top-level 0xb3 arm: the address
+                // machinery exists now, but the SATB pre-barrier and the
+                // first-touch block creation live in `set_static_shared`. See
+                // the note on the top-level 0xb3 arm.
                 0xb3 => {
                     if cpc + 2 >= callee_len {
                         self.next_spill_offset = callee_local_base;

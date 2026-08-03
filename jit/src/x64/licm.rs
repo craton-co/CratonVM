@@ -1165,6 +1165,103 @@ pub fn set_disarm_savebase_watch_fn(addr: usize) {
     DISARM_SAVEBASE_WATCH_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-global pointer to the VM-side `jit_resolve_static_base` resolver
+/// (`extern "C" fn(vm_ptr, class_id, field_index) -> i64`), registered at VM
+/// init. Called by the backend **while compiling**, never from generated code,
+/// so — like the savebase pair above — it avoids a `JitRuntimeHelpers` ABI
+/// change entirely.
+pub static STATIC_BASE_RESOLVER_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The `SharedVm` pointer passed back to [`STATIC_BASE_RESOLVER_FN`]. Latched
+/// to the FIRST VM that registers.
+pub static STATIC_BASE_RESOLVER_CTX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set once a SECOND VM registers a different context, and never cleared.
+///
+/// `ClassId`s are per-VM, so resolving VM A's `(class_id, field_index)` against
+/// VM B's statics would bake the address of an unrelated class's slot into VM
+/// A's code — the same cross-VM aliasing that made the process-global
+/// `system_class_id` atomic and the unqualified `class_init_memo` wrong (see
+/// `docs/vm-jit-cache-keying.md`). There is no correct answer to give once two
+/// VMs share the process, so the mechanism turns itself off for BOTH and every
+/// static read goes back to the helper: slower, never wrong.
+static STATIC_BASE_RESOLVER_POISONED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Register the compile-time static-slot resolver (called once per VM).
+pub fn set_static_base_resolver(addr: usize, vm_ctx: usize) {
+    use std::sync::atomic::Ordering;
+    if addr == 0 || vm_ctx == 0 {
+        return;
+    }
+    // Store the function BEFORE claiming the context: a reader that observes a
+    // non-zero context must never then read a zero function pointer.
+    STATIC_BASE_RESOLVER_FN.store(addr, Ordering::Release);
+    if let Err(prev) =
+        STATIC_BASE_RESOLVER_CTX.compare_exchange(0, vm_ctx, Ordering::AcqRel, Ordering::Acquire)
+    {
+        if prev != vm_ctx {
+            STATIC_BASE_RESOLVER_POISONED.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Ask the VM where a static field's storage base pointer lives.
+///
+/// `None` = "not inlineable, keep the helper": no VM registered, two VMs
+/// registered, or the VM itself declined (class not initialized, the class is
+/// `java/lang/System`, nothing published, index switched off).
+pub fn resolve_static_base(class_id_raw: u32, field_index: usize) -> Option<usize> {
+    use std::sync::atomic::Ordering;
+    if STATIC_BASE_RESOLVER_POISONED.load(Ordering::Acquire) {
+        return None;
+    }
+    let ctx = STATIC_BASE_RESOLVER_CTX.load(Ordering::Acquire);
+    if ctx == 0 {
+        return None;
+    }
+    let raw = STATIC_BASE_RESOLVER_FN.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: the only writer of these two words is `set_static_base_resolver`,
+    // which the VM calls with `jit_resolve_static_base` and its own `SharedVm`
+    // pointer; the function is `extern "C" fn(i64, i64, i64) -> i64` and the
+    // `SharedVm` outlives every compilation.
+    let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = unsafe { std::mem::transmute(raw) };
+    // Cast: `usize`/`u32` inputs to the C ABI's i64 parameters.
+    let addr = unsafe { f(ctx as i64, class_id_raw as i64, field_index as i64) };
+    if addr == 0 {
+        None
+    } else {
+        // Cast: back to an address; `0` is the sentinel, everything else is a
+        // real (positive, user-space) pointer.
+        Some(addr as u64 as usize)
+    }
+}
+
+/// Default-ON inline (helper-free) compiled `getstatic`.
+///
+/// Every `getstatic` in compiled code used to `CALL jit_getstatic` — ~35 ns
+/// against HotSpot's ~1, where HotSpot emits a plain load
+/// (`docs/internal/jit-getstatic-costs-a-helper-call-FIXED-20260803.md`).
+/// With the declaring class already initialized at compile time, the helper has
+/// nothing left to decide, so the backend bakes the address of the class's
+/// statics base-pointer cell and emits two dependent loads instead of a call.
+///
+/// `CRATONVM_JIT_GETSTATIC_HELPER=1` (or `CRATONVM_JIT=getstatic-helper`)
+/// restores the helper-only path, mirroring `CRATONVM_JIT_GETFIELD_HELPER`.
+pub fn inline_getstatic_enabled() -> bool {
+    // NOT OnceLock-cached, for the same reason as
+    // `guarded_inline_getfield_enabled`: this is a compile-time gate read once
+    // per call SITE during compilation, never on the runtime hot path, and
+    // caching it would make the off-switch racy against whichever thread
+    // triggers the first compilation in the process.
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_GETSTATIC_HELPER").is_none()
+}
+
 /// spring-bug-10 diagnostic (`CRATONVM_SHADOW_RAW_RELOAD`) — bypass the reload's
 /// savebase bounds-guard (movable path) so a corrupt savebase faults on deref
 /// (surfacing the bad value in the crash dump) instead of healing to pop-only.
