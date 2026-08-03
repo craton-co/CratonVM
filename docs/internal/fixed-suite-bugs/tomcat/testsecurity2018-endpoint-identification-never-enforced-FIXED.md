@@ -220,6 +220,12 @@ the two classes the classpath doc measured alongside `TestSecurity2018` —
 
 32 classes measured in total; the only verdict that moved is the target's.
 
+**Re-verified after merging `origin/dev` `63446c7f8`** (dev moved ~17 commits
+during this work): the 17-class batch re-run against the merged binary
+reproduces the same table row for row — `TestSecurity2018` PASS, the same two
+pre-existing failures with the same failing test names, everything else
+identical.
+
 `--nojit`, `TestSecurity2018`, both arms interleaved twice: base FAIL, FAIL;
 fix PASS, PASS.
 
