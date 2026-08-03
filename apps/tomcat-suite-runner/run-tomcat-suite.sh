@@ -134,6 +134,20 @@ run_one() {
       else
         heap="10g"
       fi
+    elif [ "$cls" = "org.apache.tomcat.integration.httpd.TestChunkedTransferEncodingWithProxy" ]; then
+      # Same shape without the naming convention: PAYLOAD_SIZE is literally
+      # 10 * 1024 * 1024 * 100 = 1 GiB and TomcatBaseTest.postUrl needs a second
+      # buffer of the same size. HotSpot fits that in the 2g default (26.6 s
+      # measured); the fixed Xmx/2 old-gen cap above means CratonVM cannot, and
+      # the class OOMs at exactly "native primitive array of length 1048576000".
+      # 4g clears it (110 s measured). `--Xmx 2g -XX:+UseG1GC` also passes but
+      # takes 275 s, close enough to the 300 s default timeout to score as a
+      # HANG, so prefer the heap bump.
+      if [[ "$MAX_HEAP" =~ ^([0-9]+)[gG]$ ]] && [ "${BASH_REMATCH[1]}" -ge 4 ]; then
+        heap="$MAX_HEAP"
+      else
+        heap="4g"
+      fi
     fi
     timeout "${TIMEOUT_SEC}s" "$CRATONVM_EXE" \
       --java-home "$JAVA_HOME25" --Xmx "$heap" $gc_flag \

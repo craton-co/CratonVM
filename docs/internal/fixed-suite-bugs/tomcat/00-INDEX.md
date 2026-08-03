@@ -163,3 +163,23 @@ classes on JDK 25 at all, so those 8 classes are permanently red in a HotSpot
 control run and must not be scored as CratonVM regressions. The same doc
 records two `run-one.ps1` defects found on the way (it passed none of the
 suite's `--add-opens`/`tomcat.test.*` JVM args, and its exit code was always 0).
+
+## Windows httpd reverse-proxy fixture closed — and a real defect under it, 2026-08-03
+
+[httpd-proxy-integration-windows-FIXED-20260803](httpd-proxy-integration-windows-FIXED-20260803.md).
+The 9 `org.apache.tomcat.integration.httpd.*` classes had been filed as a pure
+fixture gap because HotSpot failed identically — but with no httpd installed
+*both VMs fail before any VM-specific code runs*, so that shared red proved
+nothing. Standing the fixture up (`setup-httpd-windows.ps1`: SHA-256-verified
+Apache Lounge build into a local dir, plus a patch raising `TesterHttpd`'s
+1000 ms listener deadline, which MPM WinNT startup misses every time at a
+measured 1.0-1.5 s) produced **9 HotSpot PASS vs 9 CratonVM FAIL**, all on one
+defect: the synthetic `Process` kept its own state at slots 0..5, which is
+where real `java.lang.Process` bytecode resolves its own six
+`inputReader`/`inputCharset`/… cache fields, so `p.inputReader()` read a pipe
+fd as a `BufferedReader`. Now **9/9 on both VMs**. Regression witness:
+`apps/tomcat-suite-runner/probes/ProcessReaderProbe.java`.
+
+**The lesson to carry:** "HotSpot fails identically" only closes a family when
+the shared failure is the *last* one. Until the fixture is actually up, it is
+an untested hypothesis, not a verdict.
