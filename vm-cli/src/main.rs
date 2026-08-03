@@ -132,6 +132,12 @@ Class library and compatibility policy:
                                 shims). This is the default.
   --synthetic-jdk               Standalone synthetic class library (~5,200 Rust
                                 stubs). Conflicts with --real-jdk and --jdk-only.
+                                Needs a binary built with the `synthetic-jdk`
+                                Cargo feature, which is NOT in the default set;
+                                without it the launcher exits with an error
+                                instead of starting a VM with no class library.
+                                `--version --verbose` reports whether this build
+                                has it (jdk.mode.synthetic_compiled_in).
   --jdk-only                    Real JDK, and real class bytes are authoritative:
                                 no fabricated compatibility class and no
                                 synthetic-stub native. Implies --real-jdk.
@@ -5310,6 +5316,45 @@ mod tests {
         if let Err(e) = result {
             let msg = format!("{e:#}");
             assert!(msg.contains("synthetic-jdk"), "{msg}");
+        }
+    }
+
+    /// The general-bugs TODO's "update the usage docs accordingly": the
+    /// `synthetic-jdk` build requirement is a property a user hits at launch,
+    /// so `--help` has to state it. The rejection message alone is not
+    /// documentation — it only appears after the run has already failed.
+    #[test]
+    fn the_usage_text_states_the_synthetic_jdk_build_requirement() {
+        assert!(
+            LONG_ABOUT.contains("synthetic-jdk` Cargo feature"),
+            "--help must name the Cargo feature --synthetic-jdk needs"
+        );
+        assert!(
+            LONG_ABOUT.contains("jdk.mode.synthetic_compiled_in"),
+            "--help must point at the way to check whether THIS build has it"
+        );
+    }
+
+    /// `--real-jdk` must select the real library outright, including in a
+    /// build that does have the synthetic one compiled in. The two flags are
+    /// symmetric selections, not a preference the build configuration can
+    /// override.
+    #[test]
+    fn real_jdk_flag_selects_real_mode_regardless_of_the_synthetic_feature() {
+        // Point at a nonexistent JAVA_HOME so the mode is decided without
+        // depending on whether this machine has a JDK: an `Err` naming the
+        // real-JDK search proves real mode was chosen, and an `Ok` carries the
+        // mode directly.
+        match resolve_jdk_mode(false, true, Some("/definitely/not/a/jdk/anywhere")) {
+            Ok((mode, _)) => assert_eq!(mode, cratonvm_vm::config::JdkMode::Real),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("no usable JDK was found"),
+                    "--real-jdk must fail through the REAL-JDK path, not fall \
+                     back to synthetic: {msg}"
+                );
+            }
         }
     }
 

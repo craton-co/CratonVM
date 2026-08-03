@@ -1678,8 +1678,13 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
     let mut missing = Vec::new();
 
     let cm = shared.classes.class_manager.read();
-    // Iterate over all loaded classes in the ClassStore
-    for class_id_u32 in 0..cm.class_store.len() as u32 {
+    // Iterate over all loaded classes in the ClassStore.
+    //
+    // `slot_count()`, not `len()`: `len()` is the LIVE class count, so after
+    // any class unload the tombstone makes it smaller than the id upper bound
+    // and this census silently stopped short of the highest-id classes — the
+    // most recently loaded ones. `get` already skips tombstones below.
+    for class_id_u32 in 0..cm.class_store.slot_count() as u32 {
         let class_id = ClassId::new(class_id_u32);
         let class = match cm.class_store.get(class_id) {
             Some(c) => c,

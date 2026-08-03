@@ -8919,13 +8919,20 @@ impl ClassManager {
             },
         };
 
-        // Update the class in-place
+        // Update the class in-place.
+        //
+        // The superclass goes through `ClassStore::set_superclass` rather than
+        // the `get_mut` block below: the store keeps a direct-subclass
+        // adjacency index (see `ClassStore::descendants_of`), and a stub minted
+        // under one superclass whose real bytecode names another must move its
+        // edge, not just its field. A raw `class.superclass = ...` here would
+        // leave `recompute_subclass_layouts` blind to this class.
+        self.class_store.set_superclass(id, superclass_id);
         if let Some(class) = self.class_store.get_mut(id) {
             class.source_file = source_file;
             class.version = class_file.version;
             class.constant_pool = class_file.constant_pool;
             class.access_flags = class_file.access_flags;
-            class.superclass = superclass_id;
             class.interfaces = interface_ids;
             class.fields = class_file.fields;
             class.methods = class_file.methods;
@@ -9181,34 +9188,34 @@ impl ClassManager {
     /// grown (`max(old, new)`): objects already allocated against the
     /// previous layout must not be left with too few slots.
     fn recompute_subclass_layouts(&mut self, changed_id: ClassId) {
-        let class_count = self.class_store.len();
         // Descendants whose `first_field_index` actually shifts: their
         // previously-resolved `(referring-class, cp-index) -> ResolvedField`
         // cache entries are baked against the stale offset and must be evicted
         // (see the post-loop invalidation below).
         let mut changed_descendants: Vec<u32> = Vec::new();
-        for idx in 0..class_count {
-            let cid = ClassId::new(idx as u32);
-            // The changed class itself is already up to date.
-            if cid == changed_id {
-                continue;
-            }
-            let superclass_id = match self.class_store.get(cid) {
-                Some(c) => c.superclass,
-                None => continue,
-            };
-            // Only recompute classes that actually inherit (transitively)
-            // from the changed class. `is_subclass_of` includes the
-            // `superclass == changed_id` case via its own `id == other`
-            // check, so this single probe covers any chain depth.
-            let is_descendant = superclass_id
-                .and_then(|sid| self.class_store.get(sid))
-                .map(|sc| sc.is_subclass_of(changed_id, &self.class_store))
-                .unwrap_or(false);
-            if !is_descendant {
-                continue;
-            }
-            let Some(super_id) = superclass_id else {
+        // `descendants_of` walks the store's direct-subclass adjacency index
+        // breadth-first, so it yields exactly the transitive subclasses of
+        // `changed_id`, parents before children — the topological order the
+        // recompute below needs, since each entry reads its parent's
+        // already-updated `num_total_fields`.
+        //
+        // This replaces a scan of `0..class_store.len()` that probed every
+        // class with `is_subclass_of`. That scan was wrong twice over:
+        //
+        //   * `len()` is the LIVE class count, not the id upper bound —
+        //     `slot_count()` is (see its doc). After any class unload the
+        //     tombstone makes `len() < slot_count()`, so the loop stopped
+        //     short and silently skipped the highest-id subclasses. Those are
+        //     the most recently loaded ones, i.e. precisely the application
+        //     classes that extend a JDK stub. A missed descendant keeps a
+        //     `first_field_index` baked against the pre-upgrade parent and its
+        //     own fields then overlap the parent's — the "out-of-bounds field
+        //     read ... undersized object layout" this function exists to
+        //     prevent.
+        //   * it cost `O(classes x hierarchy depth)` per upgrade, and runs
+        //     once per synthetic-stub upgrade whose layout shifted.
+        for cid in self.class_store.descendants_of(changed_id) {
+            let Some(super_id) = self.class_store.get(cid).and_then(|c| c.superclass) else {
                 continue;
             };
             let parent_total = self
@@ -15812,6 +15819,214 @@ mod tests {
         let child = mgr.class_store.get(child_id).unwrap();
         assert_eq!(child.first_field_index, 2);
         assert_eq!(child.num_total_fields, 3);
+    }
+
+    /// Build a minimal loaded class for the layout-propagation tests below.
+    fn layout_fixture_class(
+        id: ClassId,
+        name: &str,
+        superclass: Option<ClassId>,
+        own_fields: usize,
+        first_field_index: usize,
+        num_total_fields: usize,
+    ) -> Class {
+        Class {
+            id,
+            loader_id: ClassLoaderId::Application,
+            name: cratonvm_types::intern_arc(name),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Loaded,
+            initializing_thread: None,
+            constant_pool: empty_constant_pool(),
+            access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+            superclass,
+            interfaces: vec![],
+            fields: (0..own_fields)
+                .map(|i| make_field(&format!("f{i}"), false))
+                .collect(),
+            methods: vec![],
+            first_field_index,
+            num_total_fields,
+            bootstrap_methods: vec![],
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: None,
+            origin: ClassOrigin::default(),
+            is_synthetic_stub: false,
+            signature: None,
+            has_finalizer: false,
+            code_source: None,
+            array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    /// A subclass whose `ClassId` sits above the store's LIVE class count —
+    /// which is what any prior class unload produces, since ids are never
+    /// reused — must still have its layout recomputed when its superclass
+    /// grows.
+    ///
+    /// `recompute_subclass_layouts` used to iterate `0..class_store.len()`,
+    /// and `len()` is the live count, not the id upper bound (`slot_count()`
+    /// is). One tombstone was therefore enough to make the loop stop one slot
+    /// short and skip the highest-id subclass — the most recently loaded one,
+    /// i.e. exactly the application class that extends the JDK stub being
+    /// upgraded. The skipped class keeps a `first_field_index` computed
+    /// against the pre-upgrade parent, so its own fields overlap the parent's
+    /// and `getfield` reads past the object's slot count.
+    #[test]
+    fn a_subclass_above_the_live_class_count_still_gets_its_layout_recomputed() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        // Slot 0: loaded, then unloaded — the tombstone that makes
+        // `len() < slot_count()` for the rest of this test.
+        let doomed = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(doomed, "Doomed", None, 0, 0, 0));
+
+        let parent_id = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(parent_id, "Parent", None, 1, 0, 1));
+
+        let child_id = mgr.class_store.next_id();
+        mgr.class_store.add(layout_fixture_class(
+            child_id,
+            "Child",
+            Some(parent_id),
+            1,
+            1,
+            2,
+        ));
+
+        mgr.class_store.remove(doomed);
+        assert!(
+            child_id.as_u32() as usize >= mgr.class_store.len(),
+            "fixture must place Child at or above the live count, else the \
+             old `0..len()` loop would have reached it anyway (live={}, \
+             child={})",
+            mgr.class_store.len(),
+            child_id.as_u32(),
+        );
+
+        // Parent's real bytecode arrives and grows it from 1 field to 2.
+        if let Some(parent) = mgr.class_store.get_mut(parent_id) {
+            parent.fields = vec![make_field("p1", false), make_field("p2", false)];
+            parent.num_total_fields = 2;
+        }
+        mgr.recompute_subclass_layouts(parent_id);
+
+        let child = mgr.class_store.get(child_id).unwrap();
+        assert_eq!(
+            child.first_field_index, 2,
+            "Child's own field must start after Parent's two fields"
+        );
+        assert_eq!(child.num_total_fields, 3);
+    }
+
+    /// The direct-subclass index must survive a stub being re-parented by its
+    /// real bytecode: `upgrade_synthetic_class` moves the superclass edge via
+    /// `ClassStore::set_superclass`, and the descendant walk has to follow it.
+    #[test]
+    fn re_parenting_a_class_moves_its_edge_in_the_subclass_index() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        let a = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(a, "A", None, 1, 0, 1));
+        let b = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(b, "B", None, 1, 0, 1));
+        // Minted under A, as a synthetic stub would be.
+        let c = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(c, "C", Some(a), 1, 1, 2));
+
+        assert_eq!(mgr.class_store.descendants_of(a), vec![c]);
+        assert!(mgr.class_store.descendants_of(b).is_empty());
+
+        // Real bytecode says C actually extends B.
+        mgr.class_store.set_superclass(c, Some(b));
+        assert!(mgr.class_store.descendants_of(a).is_empty());
+        assert_eq!(mgr.class_store.descendants_of(b), vec![c]);
+
+        // And the layout propagation follows the new parent, not the old one.
+        if let Some(bc) = mgr.class_store.get_mut(b) {
+            bc.fields = vec![make_field("b1", false), make_field("b2", false)];
+            bc.num_total_fields = 2;
+        }
+        mgr.recompute_subclass_layouts(b);
+        assert_eq!(mgr.class_store.get(c).unwrap().first_field_index, 2);
+    }
+
+    /// `descendants_of` must agree with the brute-force "scan every slot and
+    /// walk its superclass chain" answer the index replaced, and must return
+    /// parents before children so a consumer can recompute in one pass.
+    #[test]
+    fn the_subclass_index_agrees_with_a_full_hierarchy_scan() {
+        let mut mgr = ClassManager::new(&[], &[], &[]);
+
+        // root -> {mid_a, mid_b}; mid_a -> {leaf}; plus an unrelated class
+        // and one tombstone.
+        let root = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(root, "Root", None, 0, 0, 0));
+        let unrelated = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(unrelated, "Unrelated", None, 0, 0, 0));
+        let mid_a = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(mid_a, "MidA", Some(root), 0, 0, 0));
+        let mid_b = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(mid_b, "MidB", Some(root), 0, 0, 0));
+        let leaf = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(leaf, "Leaf", Some(mid_a), 0, 0, 0));
+        let doomed = mgr.class_store.next_id();
+        mgr.class_store
+            .add(layout_fixture_class(doomed, "Doomed", Some(mid_b), 0, 0, 0));
+        mgr.class_store.remove(doomed);
+
+        let mut brute: Vec<u32> = Vec::new();
+        for idx in 0..mgr.class_store.slot_count() {
+            let cid = ClassId::new(idx as u32);
+            if cid == root {
+                continue;
+            }
+            let Some(sup) = mgr.class_store.get(cid).and_then(|c| c.superclass) else {
+                continue;
+            };
+            if mgr
+                .class_store
+                .get(sup)
+                .is_some_and(|sc| sc.is_subclass_of(root, &mgr.class_store))
+            {
+                brute.push(cid.as_u32());
+            }
+        }
+        brute.sort_unstable();
+
+        let mut via_index: Vec<u32> = mgr
+            .class_store
+            .descendants_of(root)
+            .iter()
+            .map(ClassId::as_u32)
+            .collect();
+        let bfs_order = via_index.clone();
+        via_index.sort_unstable();
+        assert_eq!(via_index, brute, "index and full scan disagree");
+
+        // Parents before children: `Leaf` must not precede `MidA`.
+        let pos = |c: ClassId| bfs_order.iter().position(|&x| x == c.as_u32()).unwrap();
+        assert!(pos(mid_a) < pos(leaf), "order {bfs_order:?} is not topological");
     }
 
     #[test]

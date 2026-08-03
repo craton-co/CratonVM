@@ -3380,7 +3380,11 @@ impl SharedVm {
         // in the VM's VtableManager too.
         {
             let cm = vm.classes.class_manager.read();
-            let store_len = cm.class_store.len() as u32;
+            // `slot_count()`, not `len()` — the latter is the live count and
+            // under-runs the id space as soon as anything has been unloaded
+            // (see `ClassStore::slot_count`). `vtable_descriptors_of` returns
+            // `None` for tombstoned ids, so the extra slots cost nothing.
+            let store_len = cm.class_store.slot_count() as u32;
             for cid in 0..store_len {
                 let cid = crate::classloading::ClassId::new(cid);
                 if let Some(entries) = cm.vtable_descriptors_of(cid) {
