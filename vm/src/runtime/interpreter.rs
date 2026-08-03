@@ -11713,7 +11713,7 @@ fn execute_frame_from_index(
                             FastPathInvokeError::Fatal(e) => return Err(e),
                         },
                     }
-                    match execute_invoke(shared, thread, frame_idx, cp_index, false) {
+                    match execute_invoke(shared, thread, frame_idx, cp_index, false, saved_pc) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -11763,7 +11763,7 @@ fn execute_frame_from_index(
                             FastPathInvokeError::Fatal(e) => return Err(e),
                         },
                     }
-                    match execute_invoke(shared, thread, frame_idx, cp_index, true) {
+                    match execute_invoke(shared, thread, frame_idx, cp_index, true, saved_pc) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -11821,7 +11821,7 @@ fn execute_frame_from_index(
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
                     let cached_result =
-                        execute_invokestatic_cached(shared, thread, frame_idx, cp_index);
+                        execute_invokestatic_cached(shared, thread, frame_idx, cp_index, saved_pc);
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -11843,7 +11843,7 @@ fn execute_frame_from_index(
                             FastPathInvokeError::Fatal(e) => return Err(e),
                         },
                     }
-                    match execute_invokestatic(shared, thread, frame_idx, cp_index) {
+                    match execute_invokestatic(shared, thread, frame_idx, cp_index, saved_pc) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -11924,7 +11924,7 @@ fn execute_frame_from_index(
                     }
                     // invokeinterface: thread is_interface=true so γ's stash
                     // arms the default-method rescue.
-                    match execute_invoke_kind(shared, thread, frame_idx, cp_index, false, true) {
+                    match execute_invoke_kind(shared, thread, frame_idx, cp_index, false, true, saved_pc) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -19129,7 +19129,7 @@ fn execute_instruction(
                 }
                 CachedCallResult::Handled => {}
                 CachedCallResult::CacheMiss => {
-                    match execute_invoke(shared, thread, frame_idx, *index, is_special_invoke)? {
+                    match execute_invoke(shared, thread, frame_idx, *index, is_special_invoke, saved_pc)? {
                         CachedCallResult::FramePushed => {
                             return Ok(InstructionResult::FramePushed);
                         }
@@ -19156,13 +19156,13 @@ fn execute_instruction(
             // already enjoyed. A miss/edge-case (JVMTI redefine, synthetic
             // stub upgrade) falls through to the exact same slow path used
             // before this fix.
-            match execute_invokestatic_cached(shared, thread, frame_idx, *index)? {
+            match execute_invokestatic_cached(shared, thread, frame_idx, *index, saved_pc)? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
                 }
                 CachedCallResult::Handled => {}
                 CachedCallResult::CacheMiss => {
-                    match execute_invokestatic(shared, thread, frame_idx, *index)? {
+                    match execute_invokestatic(shared, thread, frame_idx, *index, saved_pc)? {
                         CachedCallResult::FramePushed => {
                             return Ok(InstructionResult::FramePushed);
                         }
@@ -19237,7 +19237,7 @@ fn execute_instruction(
                 }
                 CachedCallResult::Handled => {}
                 CachedCallResult::CacheMiss => {
-                    match execute_invoke_kind(shared, thread, frame_idx, *index, false, true)? {
+                    match execute_invoke_kind(shared, thread, frame_idx, *index, false, true, saved_pc)? {
                         CachedCallResult::FramePushed => {
                             return Ok(InstructionResult::FramePushed);
                         }

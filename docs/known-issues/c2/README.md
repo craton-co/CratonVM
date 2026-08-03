@@ -14,7 +14,7 @@ here — which lanes have a **first increment** rather than a finished lane.
 | Lane | Docs | Why it is untouched |
 |---|---|---|
 | HIR/LIR/MIR | ~~`hir-01`~~ **settled**, `hir-02` | The contract question is answered: `docs/jit/lowering-contract.md`. `hir-01` retired to `docs/internal/hir-01-lowering-contract-RETIRED-20260803.md` on 2026-08-03. `hir-02` is unblocked but should follow the contract's increment order, which starts with a step that emits nothing. |
-| Profile-guided inlining | `pgo-01`, `pgo-02` | The *policy* exists and is tested. The *evidence* it needs is not recorded, and the speculation it would enable has no guard/deopt pairing. |
+| Profile-guided inlining | ~~`pgo-01`~~, `pgo-02` | `pgo-01`'s first increment shipped 2026-08-03 — see `docs/internal/pgo-01-call-site-evidence-gap-RETIRED-20260803.md`. The *policy* still is not fed: `pgo-02`'s speculation has no guard/deopt pairing yet. |
 | OSR | `osr-01`, `osr-02` | OSR entry works. Its metadata contract and its exit/recompile story are the gaps. |
 | Loop transforms | `loop-01`, `loop-02` | One transform (bytecode unroll) is wired behind an opt-in. Everything else is unbuilt, and the planner refuses most compiles for reasons nobody has revisited. |
 | `x64.rs` / `invoke.rs` seams | `seam-01`, `seam-02` | 40k and 24k lines. The split is mechanical but every lane in the wave collided on these two files. |
