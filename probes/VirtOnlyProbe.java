@@ -66,14 +66,18 @@ public final class VirtOnlyProbe {
     public static void main(String[] args) {
         int n = args.length > 0 ? Integer.parseInt(args[0]) : 5_000_000;
 
-        // 1200, not 200: a rung must be INVOKED past the tier-up threshold
-        // (c1_threshold=500) to run compiled from entry. At 200 the only route
-        // into compiled code is OSR, and OSR entry into these loops is refused
-        // today (osr-entry-unresumable-exit -- see
-        // docs/known-issues/jit/osr-entry-unresumable-exit-refuses-hot-counted-loops-20260803.md),
-        // so every rung measured the INTERPRETER and read ~90 ns/op flat,
-        // identically under --nojit. Sanity check before trusting a number
-        // here: the control rung must land near HotSpot's ~1 ns/op, not ~90.
+        // 1200 invocations, not 200: past the tier-up threshold
+        // (c1_threshold=500) each rung runs compiled from entry, which is the
+        // tier this probe means to measure. Lowering it to 200 is the way to
+        // isolate OSR instead — below the threshold, an OSR entry at the loop
+        // header is the only route into compiled code.
+        //
+        // Both routes were dead until 2026-08-03: every OSR entry was refused
+        // `osr-entry-unresumable-exit`, so at 200 every rung silently measured
+        // the INTERPRETER at ~90 ns/op, identically under `--nojit`. See
+        // docs/internal/osr-entry-unresumable-exit-FIXED-20260803.md. The cheap
+        // check, either way: the control rung must land near HotSpot's ~1
+        // ns/op, not near 90.
         for (int r = 0; r < 1200; r++) {
             sink += arith(2_000); sink += staticCall(2_000);
             sink += virtualCall(2_000); sink += ifaceCall(2_000);
