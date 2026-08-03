@@ -22,7 +22,7 @@ Pinned with `-encoding UTF-8`.
 
 **Every run now records the optimizing tier's per-phase reach.** Across all
 seven CratonBench phases the C2/IR tier is asked 8 times, admits 3 and produces
-**2** bodies — so the gate measures the single-pass backend, and a CratonBench
+**3** bodies — so the gate measures the single-pass backend, and a CratonBench
 delta is not evidence about C2 in either direction. That fact now travels with
 the numbers instead of having to be rediscovered.
 
@@ -35,7 +35,7 @@ the numbers instead of having to be rediscovered.
   with two consistency checks that refuse rather than report a zero when the
   scrape is reading a log that no longer says what it expects.
 - `bench/CratonBenchC2.java` — a candidate workload with a framework-shaped
-  node mix, reaching the tier 38/19/12 across three phases. Deliberately **not**
+  node mix, reaching the tier 36/17/11 across three phases. Deliberately **not**
   a gate phase and with no baseline; see
   `docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md`.
 

@@ -40,18 +40,18 @@ to hand-grepping: the failure mode of this measurement is a confident zero.
 | `AutoConfigurationSorterTests` | 352 | 182 | 98 | 72 | 123 |
 | `ConditionalOnClassTests` | 223 | 103 | 84 | 36 | 58 |
 | **CratonBench, all seven phases** | **7** | **3** | **3** | **1** | **2** |
-| `CratonBenchC2`, all three phases | 38 | 19 | 16 | 3 | 12 |
+| `CratonBenchC2`, all three phases | 36 | 17 | 16 | 3 | 11 |
 
-The CratonBench row is left at the original survey's numbers. A re-take at
-`7c08e9abe` measured **8** requests, not 7 — `stringregex` issues one now — with
-`admitted` and `bodies` unchanged. The row is not edited because the three
-Spring rows above it were not re-taken, and a table with one re-measured row
-and three stale ones is worse than a table with a note. See the next section
-for the re-take.
+The CratonBench row is left at the original survey's numbers. A re-take after
+`cov-02` landed measured **8** requests and **3** bodies, not 7 and 2:
+`stringregex` issues a request it did not before, and `sieve` now produces a
+body it could not. The row is not edited because the three Spring rows above
+it were not re-taken, and a table with one re-measured row and three stale
+ones is worse than a table with a note. See the next section for the re-take.
 
 That CratonBench row is `meas-02`. The CPU benchmark suite — the thing the perf
-gate measures and the README table publishes — issues **seven** compile requests
-to the optimizing tier across all seven phases and gets **two** bodies. Every
+gate measures and the README table publishes — issues **eight** compile requests
+to the optimizing tier across all seven phases and gets **three** bodies. Every
 conclusion this project has drawn about C2 from a CratonBench number was drawn
 from a workload that does not reach it.
 
@@ -60,40 +60,52 @@ characterised below. It is **not** a gate phase and has no baseline.
 
 ## The C2-reach column (`meas-02` increment 1)
 
-Re-measured 2026-08-03 on the Azure bench host at `7c08e9abe`, one run per
-phase, default configuration, with `regression-suite/perf/c2-reach.sh` — which
-is the "one env var" that answers *does this workload reach the optimizing
-tier* before anything about it is anchored. Counts, so the host's load
-(1-min 13–50 throughout) does not affect them.
+Measured 2026-08-03 on the Azure bench host at `50218df9b` — **after `cov-02`
+landed** — one run per phase, default configuration, with
+`regression-suite/perf/c2-reach.sh`, which is the "one env var" that answers
+*does this workload reach the optimizing tier* before anything about it is
+anchored. Counts, so the host's load (1-min 12–50 throughout) does not affect
+them.
 
 | phase | requests | admitted | bodies | of the requests, `optimize=false` | tier mgr `c1`/`c2`/`osr` |
 |---|---:|---:|---:|---:|---|
 | `cb:arithmetic` | 0 | 0 | 0 | 0 | 0 / 1 / 1 |
 | `cb:fib` | 1 | 1 | **1** | 0 | 1 / 0 / 0 |
-| `cb:sieve` | 2 | 1 | 0 | 1 | 1 / 3 / 2 |
+| `cb:sieve` | 2 | 1 | **1** | 1 | 1 / 3 / 2 |
 | `cb:matrix` | 1 | 0 | 0 | 0 | 0 / 1 / 1 |
 | `cb:hashmap` | 0 | 0 | 0 | 0 | 0 / 1 / 1 |
 | `cb:stringregex` | 1 | 0 | 0 | 0 | 0 / 1 / 1 |
 | `cb:bintrees` | 3 | 1 | **1** | 2 | 2 / 2 / 1 |
-| **CratonBench total** | **8** | **3** | **2** | **3** | |
-| `c2c:dispatch` | 17 | 9 | **6** | 6 | 6 / 6 / 1 |
-| `c2c:bind` | 9 | 5 | **2** | 4 | 4 / 3 / 1 |
+| **CratonBench total** | **8** | **3** | **3** | **3** | |
+| `c2c:dispatch` | 15 | 7 | **5** | 6 | 6 / 6 / 1 |
+| `c2c:bind` | 9–10 | 5–6 | **2–3** | 4 | 4 / 3 / 1 |
 | `c2c:pipeline` | 12 | 5 | **4** | 6 | 6 / 5 / 1 |
-| **CratonBenchC2 total** | **38** | **19** | **12** | **16** | |
+| **CratonBenchC2 total** | **36–37** | **17–18** | **11–12** | **16** | |
 
-The three `c2c` rows were identical on two consecutive runs, cell for cell.
+### `cov-02` moved this table, and the record caught it
 
-One delta against the table `meas-02` was written from, small and worth
-recording rather than smoothing over: `stringregex` issues **one** request
-now, where the original survey recorded zero — so the CratonBench total is 8,
-not 7. `admitted` and `bodies` are unchanged, so nothing downstream of it
-moves.
+The same ten phases on a **pre-`cov-02`** binary (`7c08e9abe`) gave
+`cb:sieve` **2/1/0** and a CratonBench total of 8/3/**2**. Closing the array
+opcodes gave `sieve` its body: it was dying on `0x54 bastore`, which is now
+lowered. So the perf gate's headline reach is **three** bodies across seven
+phases, not two — still small enough that the conclusion is unchanged, and
+exactly the kind of movement the per-phase record exists to make visible
+without anyone re-deriving it.
 
-An earlier draft of the candidate, sized differently, measured `bind` at 9/5/2
-and then 10/6/2 on two consecutive runs. Tier promotion is invocation-count
-driven against a background compiler, so a workload sized close to a threshold
-has run-to-run play in its request count. The sizes above are an order of
-magnitude past `c2_threshold` and do not.
+The candidate moved the other way on the same change, `dispatch` 17/9/6 →
+15/7/5, which is a smaller admitted set producing a comparable number of
+bodies.
+
+Two more things worth recording rather than smoothing over:
+
+* `stringregex` issues **one** request, where the original survey recorded
+  zero — so the CratonBench total is 8, not 7. It admits nothing either way.
+* `bind` measured 9/5/2 and 10/6/3 on two consecutive runs of the *same*
+  binary. Tier promotion is invocation-count driven against a background
+  compiler on a contended host, so a request can land on either side of a
+  process's shutdown. Everything else here reproduced exactly. Treat
+  single-digit differences as noise and re-run before drawing a conclusion
+  from one.
 
 **`compiles_c2` is not this measurement.** The tier manager counts a compile
 under the TIER it was requested at, whichever backend produced the body — and
@@ -112,19 +124,23 @@ in the same *places* real code does. The two suites' refusals, same runs:
 |---|---|---:|---:|
 | `!scan.typecheck_ops.is_empty()` (`checkcast`/`instanceof`) | `cov-05` | 0 | 5 |
 | `!scan.anewarray_ops.is_empty()` | `cov-06` | 0 | 4 |
-| `ir.rs:5204` — `invokespecial` | `cov-04` | 0 | 4 |
-| `ir.rs:5085` — reference `putfield` | `cov-03` | 0 | 1 |
+| `ir.rs:5329` — non-elidable `<init>` on `invokespecial` | `cov-04` | 0 | 4 |
+| `ir.rs:5210` — `putfield` whose tag is not `I/Z/B/C/S`, i.e. every reference field store | `cov-03` | 0 | 1 |
 | `0x12 ldc` | `cov-01` | 0 | 1 |
-| `0xbe arraylength` | `cov-02` | 0 | 1 |
 | `scan.has_athrow` | `cov-07` | 2 | 0 |
 | `!scan.multianewarray_ops.is_empty()` | `cov-06` | 2 | 0 |
-| `0x54 bastore` | `cov-02` | 1 | 0 |
 
 The candidate's top three refusals are the survey's top three (306, 138 and 53
 events on Spring). CratonBench's are `athrow` and `multianewarray`, which rank
 third and last, and it never once touches `checkcast`, `anewarray`,
 `invokespecial` or a reference field store. The suites do not merely differ in
 how far they get; they disagree about what the optimizing tier's problems are.
+
+Both suites' array-opcode rows are gone from this table since `cov-02`:
+pre-`cov-02` the candidate refused once on `0xbe arraylength` and CratonBench
+once on `0x54 bastore`. The two `ir.rs` line numbers moved with the same
+change (5204 → 5329, 5085 → 5210); they are the same two sites, re-derived,
+not new ones.
 
 ## Where the 390 die: opcodes `IrBuilder::build` has no arm for
 
@@ -171,6 +187,13 @@ fixture's node mix"* — showing up in the code rather than in a plan.
 | `ir.rs:5041` | `getfield` of a `long`/`float`/`double` | 6 | `cov-03` |
 | `ir.rs:5314` | — | 2 | `cov-04` |
 | `ir.rs:5219` | — | 1 | `cov-04` |
+
+**These line numbers are pre-`cov-02`.** Adding the array arms pushed the whole
+match statement down; re-derived after it landed, `5204` is now **5329** and
+`5085` is now **5210** — the same two sites, and they are the two that `cov-04`
+and `cov-03` own. Re-derive the other four before quoting them; a stale line
+number in a lane brief sends its first reader to the wrong arm, and this table
+is what `cov-03` and `cov-04` are sized from.
 
 `ir.rs:5085` is the second asymmetry. The `getfield` arm was taught to handle
 reference fields, and its own comment records why: *"This was the single largest

@@ -12,35 +12,44 @@ change that.
 
 ## 1. The premise, re-taken
 
-The brief's table was re-measured on the Azure bench host at `7c08e9abe`, one
-run per phase, default configuration. Counts, not timings, so the host's load
-(1-min 13–50 throughout) does not touch them.
+The brief's table was re-measured on the Azure bench host, twice: once at
+`7c08e9abe` (this branch, whose merge base predates `cov-02`) and again at
+`50218df9b`, after `cov-02` landed on `dev`. Counts, not timings, so the host's
+load (1-min 12–50 throughout) does not touch them.
 
-| phase | requests | admitted | bodies | brief said |
-|---|---:|---:|---:|---|
-| arithmetic | 0 | 0 | 0 | 0 / 0 / 0 ✓ |
-| fib | 1 | 1 | 1 | 1 / 1 / 1 ✓ |
-| sieve | 2 | 1 | 0 | 2 / 1 / 0 ✓ |
-| matrix | 1 | 0 | 0 | 1 / 0 / 0 ✓ |
-| hashmap | 0 | 0 | 0 | 0 / 0 / 0 ✓ |
-| stringregex | **1** | 0 | 0 | **0** / 0 / 0 ✗ |
-| bintrees | 3 | 1 | 1 | 3 / 1 / 1 ✓ |
-| **total** | **8** | **3** | **2** | 7 / 3 / 2 |
+| phase | pre-`cov-02` | post-`cov-02` | brief said |
+|---|---|---|---|
+| arithmetic | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 ✓ |
+| fib | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 ✓ |
+| sieve | 2 / 1 / 0 | 2 / 1 / **1** | 2 / 1 / 0 |
+| matrix | 1 / 0 / 0 | 1 / 0 / 0 | 1 / 0 / 0 ✓ |
+| hashmap | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 ✓ |
+| stringregex | **1** / 0 / 0 | **1** / 0 / 0 | **0** / 0 / 0 |
+| bintrees | 3 / 1 / 1 | 3 / 1 / 1 | 3 / 1 / 1 ✓ |
+| **total** | **8 / 3 / 2** | **8 / 3 / 3** | 7 / 3 / 2 |
 
-**The premise holds.** One extra request on `stringregex` moves the total from
-seven to eight and moves nothing else: `admitted` is 3 and `bodies` is 2, as
-the brief measured. The brief's verification clause — "it reads 0–3 for the
+**The premise holds.** The brief's verification clause — "it reads 0–3 for the
 current seven phases; if it reads anything else, this lane's premise has
-changed" — is satisfied.
+changed" — is satisfied in both columns, and the conclusion is untouched: seven
+phases, three bodies.
 
-Reproducibility, for whoever re-takes this: the seven CratonBench phases were
-measured twice and were identical both times, cell for cell. So were the
-candidate's three, at their final sizes. An earlier draft of the candidate,
-sized closer to `c2_threshold`, was *not* — `bind` measured 9/5/2 then 10/6/2
-— which is what §4 sizes against. Tier promotion is invocation-count driven
-against a background compiler, so a workload sized near the threshold has
-run-to-run play in its request count; one sized an order of magnitude past it
-does not.
+Two deltas, and the second is the record doing its job on its first day:
+
+* `stringregex` issues one compile request where the survey recorded zero. It
+  admits nothing either way, so nothing downstream moves.
+* **`cov-02` gave `sieve` a body.** It was dying on `0x54 bastore`, which that
+  lane lowered. A `cov-*` lane moving the bench suite's own reach is exactly
+  the movement the per-phase record exists to surface without anybody
+  re-deriving it — and it is the first thing this record found.
+
+Reproducibility, for whoever re-takes this: every CratonBench phase was
+measured twice per binary and was identical each time. The candidate's
+`dispatch` and `pipeline` likewise. `bind` measured 9/5/2 then 10/6/3 on
+consecutive runs of the same binary — tier promotion is invocation-count
+driven against a background compiler on a contended host, so a request can
+land on either side of shutdown. Treat a single-digit difference as noise and
+re-run; do not treat a `bodies` difference of the `sieve` kind that way, which
+is why they are recorded separately.
 
 ## 2. What a results directory now records
 
@@ -153,11 +162,12 @@ dispatch loop has and a single enormous kernel loop does not.
 
 | | requests | admitted | bodies |
 |---|---:|---:|---:|
-| CratonBench, seven phases | 8 | 3 | 2 |
-| CratonBenchC2, three phases | 38 | 19 | 12 |
+| CratonBench, seven phases | 8 | 3 | 3 |
+| CratonBenchC2, three phases | 36–37 | 17–18 | 11–12 |
 
-Per phase, identical on two consecutive runs: `dispatch` 17/9/6, `bind` 9/5/2,
-`pipeline` 12/5/4.
+Per phase, post-`cov-02`: `dispatch` 15/7/5 (twice), `bind` 9/5/2 then 10/6/3,
+`pipeline` 12/5/4 (twice). Pre-`cov-02` the same file measured 17/9/6, 9/5/2,
+12/5/4.
 
 Reaching the tier is the cheap part. The part that matters is *where* it
 fails, because a candidate that reaches C2 and then fails in places real code
@@ -168,18 +178,21 @@ lane from:
 |---|---|---:|---:|---|
 | `checkcast` / `instanceof` | `cov-05` | 0 | 5 | 1st (306) |
 | `anewarray` | `cov-06` | 0 | 4 | 2nd (138) |
-| `invokespecial` (`ir.rs:5204`) | `cov-04` | 0 | 4 | 53 |
-| reference `putfield` (`ir.rs:5085`) | `cov-03` | 0 | 1 | 37 |
+| non-elidable `<init>` on `invokespecial` (`ir.rs:5329`) | `cov-04` | 0 | 4 | 53 |
+| reference `putfield` (`ir.rs:5210`) | `cov-03` | 0 | 1 | 37 |
 | `ldc` | `cov-01` | 0 | 1 | joint 1st opcode gap (90) |
-| `arraylength` | `cov-02` | 0 | 1 | 43 |
 | `athrow` | `cov-07` | 2 | 0 | 89 |
 | `multianewarray` | `cov-06` | 2 | 0 | 2 |
-| `bastore` | `cov-02` | 1 | 0 | 2 |
 
 The candidate's top three refusals are the survey's top three. CratonBench
 never once touches `checkcast`, `anewarray`, `invokespecial` or a reference
 field store. The two suites do not merely differ in how far they get — they
 disagree about what the optimizing tier's problems are.
+
+Both suites had an array-opcode row before `cov-02` — the candidate one
+`arraylength`, CratonBench one `bastore` — and both are gone. The two `ir.rs`
+line numbers moved with the same change (5204 → 5329, 5085 → 5210): same two
+sites, re-derived, not new ones.
 
 ### Sizes, and what sizing them taught
 
@@ -198,10 +211,10 @@ by accident:
   *count* is what makes the per-batch frame hot; batch *size* only makes each
   call do more.
 
-An earlier draft, sized closer to the threshold, measured `bind` at 9/5/2 then
-10/6/2 on consecutive runs. At the sizes above, all three phases reproduced
-cell for cell across two runs. The checksums also agree exactly between
-CratonVM and HotSpot, on all three phases.
+`dispatch` and `pipeline` reproduce cell for cell at these sizes; `bind`'s
+request count still moves by one between runs (§1). The checksums agree
+exactly between CratonVM and HotSpot, on all three phases, which is a
+correctness signal the gate's own phases also carry.
 
 ## 5. What was deliberately NOT done
 

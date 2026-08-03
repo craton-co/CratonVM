@@ -191,7 +191,7 @@ baseline file is per-host). For a new bench host, generate
 per-phase reach — `ir_requests` / `ir_admitted` / `ir_bodies` in
 `samples.tsv`, one `ir_reach_<phase>` line in `manifest.tsv`, and a summary
 line on the console. Across all seven phases the optimizing (C2/IR) tier
-produces **two** bodies, so the gate measures the **single-pass** backend, and
+produces **three** bodies, so the gate measures the **single-pass** backend, and
 a CratonBench delta is not evidence about C2 in either direction — including
 "the C2 change did no harm". Note `compiles_c2` is a *different* column and is
 not a substitute: it counts compiles whose requested tier was C2, including

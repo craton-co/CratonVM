@@ -62,7 +62,7 @@ nothing showed the 1.85x regression this project has on record, which is enough
 to say the programme is not self-defeating and not enough to say it pays.
 
 And one finding about the measurement itself: **CratonBench issues eight
-compile requests to the optimizing tier across all seven phases and gets two
+compile requests to the optimizing tier across all seven phases and gets three
 bodies.** The perf gate measures the single-pass backend. That is `meas-02`,
 and it is why the array-arm asymmetry survived — the suite that would have
 shown it does not reach the tier.
@@ -72,8 +72,12 @@ reach, so that fact travels with the numbers instead of having to be
 rediscovered, and `compare.py` names the phases whose delta is not evidence
 about the tier. Details, and the two defects the lane turned up on the way,
 in [`docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md`](../../internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md).
-(Eight requests, not the seven the original survey recorded: `stringregex`
-issues one now. `admitted` and `bodies` are unchanged.)
+
+Eight and three, not the seven and two the original survey recorded, and the
+record is what caught both: `stringregex` issues a request it did not before,
+and **`cov-02` gave `sieve` a body** by lowering the `0x54 bastore` it used to
+die on. A `cov-*` lane moving the bench suite's own reach is exactly the
+movement the per-phase record exists to make visible.
 
 ## The coverage lanes
 

@@ -164,7 +164,7 @@ produced. It is in `samples.tsv`/`summary.tsv` as `ir_requests` /
 line per phase.
 
 Read it before quoting a delta as evidence about the JIT. On the seven
-CratonBench phases the tier produces **two** bodies in total, so almost every
+CratonBench phases the tier produces **three** bodies in total, so almost every
 phase's number is a measurement of the single-pass backend and says nothing
 about C2 in either direction — including "the C2 change did no harm". That is
 `docs/known-issues/c2/`'s MEAS-02, and the reach record exists so the fact
