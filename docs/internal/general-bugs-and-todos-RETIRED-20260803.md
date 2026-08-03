@@ -250,9 +250,10 @@ Already correct in `vm/src/threading/monitor.rs`:
 therefore observes an interrupt no sooner than its next 5 ms poll slice, and
 an *untimed* wait had nothing but that poll to end it. `Thread.interrupt0`
 already unparks a target blocked in `LockSupport.park` for exactly this
-reason — the comment there even says "without this the target only notices at
-the next 5 ms interrupt poll". `Object.wait()` was the one blocking primitive
-left without a prompt wake.
+reason, and its comment says so in as many words: *"Without this the target
+only notices at the next 5 ms interrupt poll; an explicit unpark makes the
+wakeup prompt and matches the JVM contract."* `Object.wait()` was the one
+blocking primitive left without that.
 
 Fixed by using the monitor the registry already records for JMX
 (`set_jmx_waiting_monitor`, written just before the park and taken just after)
