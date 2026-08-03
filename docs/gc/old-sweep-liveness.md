@@ -22,6 +22,7 @@ Read §5.1 of the audit first. This is the follow-up, not a restatement.
 | **GCAUD-8a** | The in-place old-gen sweep runs the live-set closure before its free loop. An unmarked block that a **marked** old-gen object still references is promoted to live and retained, transitively, instead of being handed back to the free list. This is the same fixpoint `OldGen::compact`'s Phase 0 has run since it was written; the sweep never had it. | `gc/src/old_gen.rs:1216` (`close_live_set`), `gc/src/gen_heap.rs:9320` |
 | **GCAUD-8b** | A **precise** mark push site no longer lets the byte-plausibility screen have the last word. When `old_gen_mark_candidate_plausible` rejects an address that `OldGen::walk_objects()` yielded as an object **base**, the walk wins and the object is marked. | `gc/src/gen_heap.rs:11581` (`rescue_mark_candidate_by_walk`), `:11643`, `:9051` |
 | **GCAUD-7** | `HashCodeTable::update_after_gc` remaps **and sweeps**, and takes an explicit survival predicate so a future consumer cannot wire it up without answering "which of these addresses are still alive?". | `gc/src/compact_header.rs:523` |
+| **H2-CID0** | The root seed resolves an **interior** conservative root to the object that contains it, instead of asking two exact-base questions and dropping it. The in-place arm then marks it; the COMPACTING arm cannot (a slid object leaves the root dangling) and is downgraded to the in-place sweep for that cycle. A conservative root is routinely a field address or a register spilled mid-object, and both existing screens are exact-base tests, so such a root marked nothing and this sweep freed a live block under it. Root cause of the H2 `MVStore` `ClassId(0)` family; see section 7. | `gc/src/gen_heap.rs` (`old_gen_interior_root_base`, and `old_gen_gc`'s root seed) |
 | **GCAUD-5** | Decided, not fixed. The audit's fail-safe argument holds for the case it analysed and has a hole it did not (§4). | — |
 
 New counters, all in `gen_heap.rs`: `OLDMARK_RESCUED_BY_WALK`,
@@ -40,7 +41,9 @@ push site into its worklist, and what each one can miss.
 
 | # | Push site | Line | Input trusted? | Can it drop a live edge? |
 |---|---|---|---|---|
-| 1 | Root seed, `roots` slice | `:9051` | address only | **Yes** — the seed applies the `conservative = true` screen to the *whole* slice, and that slice mixes precise roots (statics, JNI globals, `pinned`, monitors: `vm/src/memory/roots.rs:527`) with register/stack guesses. Nothing here can tell them apart, so a precise root gets `victim8_neighbor_explains_zero_prefix` applied to it — a heuristic about a zero first header word. **Closed by 8b.** |
+| 1 | Root seed, `roots` slice | `:9051` | address only | **Yes** — the seed applies the `conservative = true` screen to the *whole* slice, and that slice mixes precise roots (statics, JNI globals, `pinned`, monitors: `vm/src/memory/roots.rs:527`) with register/stack guesses. Nothing here can tell them apart, so a precise root gets `victim8_neighbor_explains_zero_prefix` applied to it — a heuristic about a zero first header word. **Closed by 8b.** And a second, independent miss that 8b does not touch: the
+slice's *conservative* half is frequently INTERIOR to a live object, and both
+screens are exact-base tests. **Closed by H2-CID0, section 7.** |
 | 2 | `mark_young_to_old_refs`, precise slot scan | `:9578` | reference slot | **Yes** — via the screen. **Closed by 8b.** |
 | 3 | `mark_young_to_old_refs`, conservative word scan of an unparseable stretch | `:9551` | walk-base membership | No, over-marks. This site has *always* used walk membership rather than the screen — it is the precedent 8b generalises. |
 | 4 | `external_roots_for_matching_owners` (young owner) | `:9099` | overlay side table | **Yes** — via the screen. **Closed by 8b.** |
@@ -103,10 +106,17 @@ untouched. So when the two disagree about an address the walk produced, the walk
 wins — `rescue_mark_candidate_by_walk` (`gen_heap.rs:11581`).
 
 The override is exactly as wide as the proof. It is membership in the base list,
-not "inside old gen": an interior address is still rejected, because marking one
-writes a mark bit into a live object's payload — the corruption the screen was
-added to stop. That is asserted as a negative control in
+not "inside old gen": an interior address is still rejected *as a base*, because
+marking one writes a mark bit into a live object's payload — the corruption the
+screen was added to stop. That is asserted as a negative control in
 `mark_and_push_rescues_a_walked_base_the_plausibility_screen_rejects`.
+
+That is the right answer for the eight **precise** push sites, and it is the
+wrong answer for the one **conservative** one. A register or stack word is
+routinely an interior address of a live object, and rejecting it leaves that
+object unmarked — which on this arm means freed. Section 7 is that case, and it
+does not weaken this one: it resolves the interior address to its containing
+base through the same grid and marks the **base**, never the interior word.
 
 The grid is derived **once**, at the top of `old_gen_gc` (`:8996`), under the
 old-gen lock that the mark and the sweep both run under. It must not outlive
@@ -354,3 +364,150 @@ a sweep, not a root provider. `pinned` (`pinned.rs:71`) is the contrast: a pin
 is a real keep-alive obligation, so remap-never-sweep is right there. An
 identity hash is a cache entry, and a cached dead key at a recycled address is a
 stranger's identity.
+
+---
+
+## 7. H2-CID0 — the root seed's INTERIOR conservative roots
+
+*Added 2026-08-02. This is the root cause of the H2 `MVStore`
+`ClassId(0)` / `java.lang.Object` family — the retired
+`bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep` write-up — and the
+old-generation twin of `b5fc69a6fc`, which fixed the same defect in the young
+sweep's selective promotion.*
+
+### 7.1 The rule
+
+Sites 1 (the root seed) and 3 (the young→old conservative word scan) are the
+only mark sources that take a **guess**. Everything in sections 1 and 2 above is
+about a guess being wrong in the direction of *not being an object at all*. This
+is the other direction: the guess is a perfectly good pointer, just not to an
+object's first byte.
+
+A conservative root is frequently an interior word — a field address, an array
+element, a derived pointer, a callee-saved register spilled mid-object. Both of
+the seed's tests are exact-base tests:
+
+* `old_gen_mark_candidate_plausible` decodes the bytes *at* the address as an
+  `ObjectHeader` and asks whether they look like one;
+* `rescue_mark_candidate_by_walk` binary-searches the address in the list of
+  object starts the grid walk produced.
+
+Neither can say anything about an address that lies *inside* an object. The
+young collector has an entire exact-base **oracle** for exactly this
+(`gen_heap.rs`, "Exact-base oracle for CONSERVATIVE candidates"): `mark_young`
+resolves an interior word to the object that contains it and keeps that object
+alive. Old gen had no resolution at all, so an old-gen object whose only
+surviving reference was an interior word in a register got **no mark bit**, and
+this sweep frees from `GC_FLAG_MARKED` and nothing else.
+
+There is a sharper half. When the interior address's bytes happen to decode as a
+plausible header — and a zeroed object body decodes as an entirely ordinary
+`num_slots = 0` header — the screen returned `true`, so the seed wrote
+`GC_FLAG_MARKED` **into the containing object's payload** and then handed those
+payload bytes to the BFS as an `ObjectHeader`. The same root could both fail to
+retain the object and corrupt it.
+
+### 7.2 The change
+
+`old_gen_gc`'s root seed now runs in two passes.
+
+**Pass 1 — resolve.** `old_gen_interior_root_base` maps every root that is
+strictly inside a walked `(base, size)` extent to that base. Containment is
+asked *before* the two exact-base screens, for the same reason the walk outranks
+the screen in section 1.1: it is a derivation off the object grid, not a reading
+of one header's bytes, and an address strictly inside a walked object is not an
+object base *whatever* its bytes look like. Asking it first also removes the
+payload-corruption half of section 7.1.
+
+**Pass 2 — decide, then mark.** What the resolved set means depends on the arm:
+
+* on the **in-place** arm, marking the containing base is sufficient and is what
+  happens. Pure over-retention: the object does not move, and a false positive —
+  a garbage word that happens to land inside a live object — retains one block
+  for one cycle, which is what conservative marking does anyway;
+* on the **compacting** arm, marking is *not* sufficient. The compactor would
+  slide the object, and the interior word — a register, a stack slot — cannot be
+  rewritten. So that cycle **does not compact at all**: it reclaims in place
+  instead, which is exactly the collector for an un-rewritable root set. It
+  still frees dead blocks and still coalesces the free list afterwards, so the
+  fragmentation the compactor exists to fix stays bounded, and compaction
+  resumes on the next cycle whose roots are all object bases.
+
+### 7.3 The compacting arm was assumed safe, and was not
+
+The first version of this change left the compacting arm alone, on this
+argument: `major_gc` has exactly one production caller — the **moving** young
+cycle — and the moving Cheney collector rewrites every root it is handed, so it
+runs only when the root set is precise; a conservative interior word cannot
+reach it.
+
+`COMPACT_DROPPED_INTERIOR_ROOT` was added to assert that, and refuted it on the
+first `TestMVStoreCacheLoop` run:
+
+```text
+ERROR cratonvm::gc::guard: old-gen mark-compact is dropping 1 block(s) an
+  INTERIOR conservative root points into.
+```
+
+Under `CRATONVM_NO_MOVING_YOUNG=1`, `moving_young` is false, so
+`divert_non_moving`'s first term — `has_conservative_roots && !moving_young` —
+turns on the in-place path only for the cycles that predicate calls
+conservative. Every *other* cycle falls through to `collect_garbage_inner`'s
+main path and can run `major_gc`, and `has_conservative_roots` is not "some root
+is an interior word": measured on the same runs, 91–441 roots per run resolve to
+an interior address, and the observed offsets (`interior_off=48`, `=56` on
+96-byte objects, i.e. `HEADER_SIZE + 8·n`) are ordinary `&obj.fieldN` derived
+pointers, not garbage.
+
+The victim that cost is in the old-gen reclamation ring, on two independent
+reproductions:
+
+```text
+original_class=java/nio/ByteBuffer  target_class=java.nio.ByteBuffer
+freed_by="old-gen mark-compact"     free_seq=1471173 / 2057878
+```
+
+— the `ByteBuffer` H2's `FilePathCache` had cached, dropped by the compaction,
+read back through the stale reference as `java.lang.Object`. Note both
+`free_seq` values: at the ring's previous size of 16 K entries the record had
+wrapped about a hundred times before the failing `checkcast` asked, which is why
+four sessions of this investigation never saw it.
+
+### 7.4 Counters and the negative control
+
+| counter | meaning |
+| --- | --- |
+| `OLDMARK_INTERIOR_ROOT_PINS` | conservative roots resolved to a containing base. Non-zero means the workload actually produces interior old-gen roots. The first eight are named in the log (`old-gen mark: conservative root … is an INTERIOR word of the live object at …`), so a run that never reaches the shutdown summary still answers. Measured 91–441 per `TestMVStoreCacheLoop` run. |
+| `OLD_SWEEP_FREED_INTERIOR_PINNED` | blocks the in-place sweep freed anyway. **Zero by construction** on an ordinary run; non-zero would mean the pin has regressed. |
+| `COMPACT_DROPPED_INTERIOR_ROOT` | blocks the COMPACTION dropped that an interior root pointed into. This is the counter that refuted section 7.3's original argument. Zero by construction once the downgrade is in. |
+| `COMPACT_DOWNGRADED_INTERIOR_ROOT` | major collections that asked to compact and reclaimed in place instead. The cost side of the fix — read it against `[GC] generational: major=N`. |
+| `COMPACT_DROPPED_WATCHED` | blocks the compaction dropped that were `java.lang.ref.Reference` referents. Not a defect on its own (weak reachability is not reachability); it is the number to read beside a `checkcast` verdict, because a stale non-null `Reference.get()` over a dropped block would mean the post-GC CLEAR did not happen. |
+| `OLD_FREE_LIST_OVERLAPS` | old-gen free-list blocks that overlap a neighbour, i.e. a span freed twice. The coalescer already sorts the list, so this is one comparison per block. The young sweep has had `DOUBLE_FREE_SPANS` since 2026-08-01; old gen had nothing. |
+
+`CRATONVM_GC_NO_OLD_INTERIOR_PINS=1` keeps the accounting and disables the pin.
+That is the negative control: with it set, `OLD_SWEEP_FREED_INTERIOR_PINNED`
+counts exactly the blocks this sweep hands back to the free list under a live
+root it cannot rewrite. All three counters are printed by
+`VmHeap::print_gc_summary` (`--verbose:gc` / `CRATONVM_GC_STATS=1`) when any is
+non-zero.
+
+### 7.5 Tests
+
+One per arm, each with a positive control in the same run so that a collector
+which simply declined to reclaim anything cannot pass:
+
+* `gen_heap::tests::interior_conservative_root_retains_the_old_gen_object_it_points_into`
+  — the in-place arm. Two objects aged into old gen, the only root an interior
+  word of one of them, one `sweep_old_gen_non_moving`.
+* `gen_heap::tests::an_interior_conservative_root_forbids_old_gen_compaction`
+  — the compacting arm, and the one that matches the H2 reproduction. A garbage
+  object in FRONT of the live one gives the compaction real work, so a cycle
+  that compacted would slide the live object over it.
+
+Both are differentials: with `CRATONVM_GC_NO_OLD_INTERIOR_PINS=1` the first
+fails with *"the sweep freed the old-gen object an INTERIOR conservative root
+points into"* and the second with the family's own face —
+
+```text
+address 0x77bb64000dd0 now reads class_id=0
+```

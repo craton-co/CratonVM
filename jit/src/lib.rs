@@ -14931,7 +14931,46 @@ fn try_compile_inner(
                             continue;
                         }
                     }
-                    if direct_jit_callee_calls_enabled {
+                    // STATICALLY BOUND ONLY (`invokespecial` / `invokestatic`).
+                    //
+                    // `callee_compiler` is asked about the constant-pool
+                    // RESOLVED (class, method, descriptor). For an
+                    // `invokevirtual` / `invokeinterface` that names the STATIC
+                    // receiver type, not the runtime one — so binding its
+                    // compiled entry here, with `guard_class_id: 0` and no
+                    // receiver check at all, calls THAT body for every
+                    // receiver, including one whose class overrides the method.
+                    //
+                    // The CRC32 note further down this ladder already states
+                    // the assumption ("this invokestatic/invokespecial path
+                    // never resolves a CRC32 intrinsic (those are
+                    // `invokevirtual` only), so `guard_class_id` is 0") — it
+                    // was simply never enforced, and the enclosing
+                    // `matches!(invoke_kind, 0..=3)` lets 0 and 2 in.
+                    //
+                    // Virtual and interface sites are NOT unhandled: they have
+                    // their own block below (`invoke_kind == 0 || == 2`), where
+                    // every direct bind is either a `final` class, a helper
+                    // that re-checks the receiver's exact class itself, or a
+                    // `guard_class_id` the codegen compares at runtime — and
+                    // failing all of those they fall through to the MIC/PIC
+                    // inline cache, which is class-id guarded by construction.
+                    //
+                    // Measured: H2's `org.h2.value.VersionedValue.
+                    // getCurrentValue()` returns `(T) this` (H2's "a raw value
+                    // is its own VersionedValue" trick) and
+                    // `VersionedValueCommitted` overrides it with
+                    // `return value`. Once the BASE was compiled, every
+                    // `v.getCurrentValue()` in `VersionedValueType.write` —
+                    // static type `VersionedValue` — reached the base body and
+                    // returned the WRAPPER, which the caller casts to the
+                    // payload type: `ClassCastException:
+                    // VersionedValueUncommitted cannot be cast to
+                    // org.h2.value.Value`, deterministically, single-threaded,
+                    // inside 1000 rows of a plain JDBC `MERGE` loop. The
+                    // callee filters (no natives, no non-empty exception table)
+                    // are why this only bites a small overridable method.
+                    if direct_jit_callee_calls_enabled && matches!(invoke_kind, 1 | 3) {
                         if let Some(compiler) = callee_compiler.as_ref() {
                             if let Some((entry, callee_needs_ctx)) =
                                 compiler(&class_name, &method_name, &descriptor)
@@ -15029,7 +15068,13 @@ fn try_compile_inner(
                         ));
                         continue;
                     }
-                } else if direct_jit_callee_calls_enabled {
+                } else if direct_jit_callee_calls_enabled
+                    // Same static-binding restriction as the bind above:
+                    // a bailed-inline virtual site must fall through to
+                    // the class-id-guarded MIC/PIC, not to an unguarded
+                    // raw CALL into the statically resolved body.
+                    && matches!(invoke_kind, 1 | 3)
+                {
                     // INLINE-BAIL FALLBACK (tomcat doc 04, 2026-07-27).
                     //
                     // A site planned for inlining used to get NO direct call,
@@ -16546,6 +16591,42 @@ mod tests {
             if cond() {
                 return true;
             }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// [`eventually`], for a condition that waits on the **deferred retirement
+    /// queue** — "this published body was released", "this artifact's last
+    /// owner went away".
+    ///
+    /// The difference is that this one also CAUSES the event it is waiting
+    /// for. `defer_jit_owner` queues an artifact rather than freeing it while
+    /// `ACTIVE_JIT_EXECUTIONS != 0`, and the queue is drained only by
+    /// `jit_execution_leave` observing the counter reach zero. That counter is
+    /// process-global, so in a test binary the drain is somebody else's job:
+    /// whichever sibling test happens to leave JIT execution last. Polling
+    /// alone therefore waits on an event that may simply not happen — if this
+    /// test is the last one running, nothing is left to trigger it, and the
+    /// assertion fails for a reason that has nothing to do with what it is
+    /// checking. That is what
+    /// `test_inline_cache_reclamation_waits_for_jit_quiescence` was failing on,
+    /// about 1 run in 12 at `--test-threads=32`.
+    ///
+    /// An `enter`/`leave` pair on a thread holding no compiled frame is inert
+    /// except that its `leave` re-runs the quiescence check, so pumping it
+    /// between probes turns "wait for someone else" into "make it happen once
+    /// the process is actually quiescent".
+    ///
+    /// It does NOT paper over a wrong answer: a body that is genuinely still
+    /// owned stays owned for the whole window, exactly as with [`eventually`].
+    fn eventually_drained(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            jit_execution_enter();
+            jit_execution_leave();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         cond()
@@ -20130,14 +20211,26 @@ mod tests {
         // cannot be perturbed by a concurrently-running test's registrations.
         let base = 0x5EED_0000_0000usize;
         register_jit_method_name(base, 0x100, "Probe.absent()V".to_string());
-        assert!(matches!(
-            lookup_jit_method_name_detailed(base + 0x10),
-            JitNameLookup::Found(ref n) if n == "Probe.absent()V"
-        ));
-        assert!(matches!(
-            lookup_jit_method_name_detailed(base + 0x100),
-            JitNameLookup::NotFound
-        ));
+        // …but it CAN be perturbed by a concurrent test holding the registry
+        // lock, because this accessor is a `try_lock` and `Locked` is a third
+        // legitimate answer — which is the whole point of the type this test is
+        // about. Retry past it rather than reading it as a wrong answer. The
+        // address argument above is about registrations; this is about the
+        // lock, and only the sibling test below had noticed the difference.
+        assert!(
+            eventually(|| matches!(
+                lookup_jit_method_name_detailed(base + 0x10),
+                JitNameLookup::Found(ref n) if n == "Probe.absent()V"
+            )),
+            "a registered range must resolve to its name"
+        );
+        assert!(
+            eventually(|| matches!(
+                lookup_jit_method_name_detailed(base + 0x100),
+                JitNameLookup::NotFound
+            )),
+            "one past the end of the only registered range is an absence"
+        );
 
         let _held = jit_name_ranges().lock().expect("registry lock");
         assert!(matches!(
@@ -20750,7 +20843,7 @@ mod tests {
         );
         drop(old);
         assert!(
-            eventually(|| lookup_jit_code_range(old_entry).is_none()),
+            eventually_drained(|| lookup_jit_code_range(old_entry).is_none()),
             "the replaced artifact must unregister after its last Arc is released"
         );
         if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
@@ -20808,22 +20901,8 @@ mod tests {
         );
         jit_execution_leave();
 
-        // `ACTIVE_JIT_EXECUTIONS` is process-global and this suite runs tests in
-        // parallel, so a sibling test's execution epoch can hold the drain off
-        // for a moment. Poll (each probe re-runs the quiescence check) instead
-        // of asserting on the first observation.
-        let mut released = false;
-        for _ in 0..500 {
-            if lookup_jit_code_range(old_entry).is_none() {
-                released = true;
-                break;
-            }
-            jit_execution_enter();
-            jit_execution_leave();
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
         assert!(
-            released,
+            eventually_drained(|| lookup_jit_code_range(old_entry).is_none()),
             "the retired body must be released once JIT execution is quiescent"
         );
         if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
@@ -20860,18 +20939,11 @@ mod tests {
         let entry = cm.entry_ptr() as usize;
         register_jit_code_range(entry, cm.code_len(), Arc::as_ptr(&cm) as usize);
         cache.remove(class, method, desc, cid);
-        for _ in 0..500 {
-            if Arc::strong_count(&cm) == 1 {
-                break;
-            }
-            jit_execution_enter();
-            jit_execution_leave();
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert_eq!(
+        assert!(
+            eventually_drained(|| Arc::strong_count(&cm) == 1),
+            "the retirement queue should have released the cache's reference \
+             (strong count is {})",
             Arc::strong_count(&cm),
-            1,
-            "the retirement queue should have released the cache's reference"
         );
         (cm, entry)
     }
@@ -20908,7 +20980,7 @@ mod tests {
         jit_execution_leave();
 
         assert!(
-            eventually(|| lookup_jit_code_range(entry).is_none()),
+            eventually_drained(|| lookup_jit_code_range(entry).is_none()),
             "and must release it once JIT execution is quiescent"
         );
     }
@@ -20931,6 +21003,7 @@ mod tests {
         let (published_before, unqueued_before) = published_code_free_audit();
         // A bare `Arc`, dropped by hand: exactly the shape the two thread-local
         // dispatch caches used to have.
+        let own = Arc::as_ptr(&cm) as usize;
         drop(cm);
         let (published_after, unqueued_after) = published_code_free_audit();
 
@@ -20942,8 +21015,16 @@ mod tests {
             unqueued_after > unqueued_before,
             "and a release that never reached the retirement queue must be counted as one"
         );
-        assert!(
-            lookup_jit_code_range(entry).is_none(),
+        // `is_none()` would be wrong, and flaked about 1 run in 20 at
+        // `--test-threads=32`: `mmap` regularly hands the page this body just
+        // released straight to a concurrently-running test, which registers its
+        // own range at the same address. What this test owns is that the range
+        // no longer binds `entry` to OUR artifact — a `Some(other)` is somebody
+        // else's business, and is exactly the reading
+        // `clear_all_unregisters_every_code_range` already spells out.
+        assert_ne!(
+            lookup_jit_code_range(entry),
+            Some(own),
             "the unqueued release really did unmap it — which is why it is counted"
         );
     }
@@ -20976,7 +21057,7 @@ mod tests {
 
         assert!(cache.get(&class, &method, &desc, cid).is_none());
         assert!(
-            eventually(|| lookup_jit_code_range(entry).is_none()),
+            eventually_drained(|| lookup_jit_code_range(entry).is_none()),
             "removed code must unregister when no caller or reader owns it"
         );
     }
@@ -21033,7 +21114,7 @@ mod tests {
 
         cache.remove(&caller_class, &caller_method, &desc, cid);
         assert!(
-            eventually(|| lookup_jit_code_range(old_entry).is_none()),
+            eventually_drained(|| lookup_jit_code_range(old_entry).is_none()),
             "dropping the final direct caller must reclaim the old body"
         );
     }
@@ -21168,7 +21249,7 @@ mod tests {
 
         slot.clear_compiled_entry();
         assert!(
-            eventually(|| artifact.strong_count() == 0),
+            eventually_drained(|| artifact.strong_count() == 0),
             "clearing the last holder must release the artifact"
         );
     }
@@ -21257,9 +21338,15 @@ mod tests {
             "a raw cache reader may still be between load and call"
         );
         jit_execution_leave();
+        // `eventually_drained`, not a bare assertion: `ACTIVE_JIT_EXECUTIONS`
+        // is process-global, so this thread's `leave` is the final transition
+        // only if no sibling test is inside its own execution epoch. What is
+        // being checked is that the deferred owner is released once JIT
+        // execution IS quiescent — and the pump is what makes that observable
+        // here rather than whenever some unrelated test happens to leave.
         assert!(
-            lookup_jit_code_range(entry).is_none(),
-            "the final quiescent transition must drain deferred code owners"
+            eventually_drained(|| lookup_jit_code_range(entry).is_none()),
+            "the quiescent transition must drain deferred code owners"
         );
     }
 
@@ -21634,11 +21721,11 @@ mod tests {
         // `CompiledMethod::drop` — which unmaps the code and unregisters the
         // range — for both bodies.
         assert!(
-            eventually(|| weak_a.strong_count() == 0),
+            eventually_drained(|| weak_a.strong_count() == 0),
             "clear_all must release the last owner of body A"
         );
         assert!(
-            eventually(|| weak_b.strong_count() == 0),
+            eventually_drained(|| weak_b.strong_count() == 0),
             "clear_all must release the last owner of body B"
         );
         // And no code range still binds our entry addresses to OUR bodies. A
@@ -21717,7 +21804,7 @@ mod tests {
         // eight — unmapping the code and returning `committed_by_test` bytes.
         for (i, weak) in bodies.iter().enumerate() {
             assert!(
-                eventually(|| weak.strong_count() == 0),
+                eventually_drained(|| weak.strong_count() == 0),
                 "clear_all must return body m{i}'s executable mapping"
             );
         }
