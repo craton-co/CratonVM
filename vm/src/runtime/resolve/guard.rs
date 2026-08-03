@@ -251,7 +251,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter/invoke.rs",
         "find_method_recursive(",
-        11,
+        3,
         "migration step 3a: invoke dispatch. The SEAM-02 split distributed \
          this cluster across several interpreter files; the per-needle totals \
          are pinned by `the_split_did_not_change_the_interpreter_budget` \
@@ -277,9 +277,26 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter/invoke.rs",
         ".resolution_cache",
-        4,
+        2,
         "migration step 3a: direct cache probes on the invoke fast paths. \
          `MemberResolver::probe_method_ref` is the replacement.",
+    ),
+    (
+        "vm/src/runtime/interpreter/dispatch_virtual.rs",
+        "find_method_recursive(",
+        8,
+        "migration step 3a: virtual and interface dispatch — the vtable \
+         fast path, the general cached path, and the native-shadow consult \
+         each resolve the target they are about to call. Relocated by the \
+         SEAM-02 split, not added.",
+    ),
+    (
+        "vm/src/runtime/interpreter/dispatch_virtual.rs",
+        ".resolution_cache",
+        2,
+        "migration step 3a: direct cache probes on the virtual fast paths. \
+         MemberResolver::probe_method_ref is the replacement. Relocated by \
+         the SEAM-02 split, not added.",
     ),
     (
         "vm/src/runtime/interpreter/dispatch_static.rs",
