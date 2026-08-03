@@ -1603,6 +1603,165 @@ pub static PATTERNS: &[Pattern] = &[
         flags: FlagEffect::W,
         ..Pattern::BASE
     },
+    // ── 32-bit ALU immediates ────────────────────────────────────────
+    //
+    // `Rule::AluImm` fired ZERO times on 850 real Spring Boot compiles before
+    // these rows existed — every attempt came back `Unencodable`, because the
+    // table had only 64-bit immediate forms and Java arithmetic is 32-bit.
+    // That measurement (`docs/feature-designs/jit-machine-level-and-instruction-selection.md`)
+    // is what reordered the lane to put these first.
+    //
+    // Each row reproduces a byte literal `x64.rs`'s constant-folding fast path
+    // ALREADY emits, so the table's one trustworthy property — every row
+    // anchored to hand-written code it matches byte-for-byte — is preserved.
+    // `ir_lower` does not emit these: it materialises the constant into ECX and
+    // uses the register form, which is exactly the round trip these rows drop.
+    //
+    // No REX. The anchors all target EAX (`rex_w: false`, `RexMode::IfNeeded`
+    // leaves the prefix off for registers 0-7), which is what makes them
+    // byte-identical to the literals below rather than merely equivalent.
+    Pattern {
+        name: "add_r32_imm8",
+        emitter: "x64.rs iadd-const fast path `[0x83, 0xC0, imm8]`",
+        op: Op::Add,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(0),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "add_r32_imm32",
+        emitter: "x64.rs iadd-const fast path `[0x81, 0xC0] + imm32`",
+        op: Op::Add,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x81),
+            reg: RegF::Ext(0),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm32,
+        flags: FlagEffect::W,
+        cost: Cost::new(6, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "sub_r32_imm8",
+        emitter: "x64.rs isub-const fast path `[0x83, 0xE8, imm8]`",
+        op: Op::Sub,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(5),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "sub_r32_imm32",
+        emitter: "x64.rs isub-const fast path `[0x81, 0xE8] + imm32`",
+        op: Op::Sub,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x81),
+            reg: RegF::Ext(5),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm32,
+        flags: FlagEffect::W,
+        cost: Cost::new(6, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "and_r32_imm8",
+        emitter: "x64.rs iand-const fast path `[0x83, 0xE0, imm8]`",
+        op: Op::And,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(4),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "or_r32_imm8",
+        emitter: "x64.rs ior-const fast path `[0x83, 0xC8, imm8]`",
+        op: Op::Or,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(1),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "xor_r32_imm8",
+        emitter: "x64.rs ixor-const fast path `[0x83, 0xF0, imm8]`",
+        op: Op::Xor,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(6),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
+    Pattern {
+        name: "cmp_r32_imm8",
+        emitter: "x64.rs if_icmp-const fast path `[0x83, 0xF8, imm8]`",
+        op: Op::Cmp,
+        ty: Ty::I32,
+        src: OpKind::Imm,
+        enc: Enc {
+            opcode: Opcode::One(0x83),
+            reg: RegF::Ext(7),
+            rm: RmF::RegDst,
+            ..Enc::BASE
+        },
+        imm: ImmForm::Imm8,
+        constraints: &[Constraint::ImmFitsI8],
+        flags: FlagEffect::W,
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
     Pattern {
         name: "add_r32_r32",
         emitter: "ir_lower.rs inline `[0x01, 0xC8]` (Op::Add, Int)",
@@ -3474,11 +3633,30 @@ impl MInst {
                 (Op::Or, ImmForm::Imm8) => Some("or_r64_imm8"),
                 _ => None,
             },
+            // 32-bit, the forms real Java arithmetic actually asks for. `AluImm`
+            // fired zero times on 850 Spring Boot compiles until these existed:
+            // the rows were missing AND this mapping was, and either alone is
+            // enough to make `require_encodable` discard the tile.
+            MInst::AluRI { op, ty: Ty::I32, form, .. } => match (op, form) {
+                (Op::Add, ImmForm::Imm8) => Some("add_r32_imm8"),
+                (Op::Add, ImmForm::Imm32) => Some("add_r32_imm32"),
+                (Op::Sub, ImmForm::Imm8) => Some("sub_r32_imm8"),
+                (Op::Sub, ImmForm::Imm32) => Some("sub_r32_imm32"),
+                (Op::And, ImmForm::Imm8) => Some("and_r32_imm8"),
+                (Op::Or, ImmForm::Imm8) => Some("or_r32_imm8"),
+                (Op::Xor, ImmForm::Imm8) => Some("xor_r32_imm8"),
+                _ => None,
+            },
             MInst::AluRI { .. } => None,
             MInst::AluRM { .. } => None,
             MInst::CmpRR { ty: Ty::I64, .. } => Some("cmp_r64_r64"),
             MInst::CmpRR { ty: Ty::I32, .. } => Some("cmp_r32_r32"),
             MInst::CmpRR { .. } => None,
+            MInst::CmpRI {
+                ty: Ty::I32,
+                form: ImmForm::Imm8,
+                ..
+            } => Some("cmp_r32_imm8"),
             MInst::CmpRI { .. } => None,
             MInst::TestRR { ty: Ty::I64, .. } => Some("test_r64_r64"),
             MInst::TestRR { ty: Ty::I32, .. } => Some("test_r32_r32"),
@@ -7070,6 +7248,73 @@ mod tests {
         let a = select_block(&graph, &block, None, &SelectOptions::default());
         let b = select_block(&graph, &block, None, &SelectOptions::default());
         assert_eq!(a, b);
+    }
+
+    /// Every 32-bit immediate row reproduces the `x64.rs` byte literal it
+    /// names, exactly.
+    ///
+    /// The table's one trustworthy property is that a row is anchored to
+    /// hand-written code it matches byte-for-byte; eight rows added on the
+    /// strength of a coverage measurement are eight chances to weaken it. Each
+    /// literal below is copied from the constant-folding fast path in `x64.rs`
+    /// (the `iadd`/`isub`/`iand`/`ior`/`ixor`/`if_icmp` const arms), with EAX
+    /// as the destination — which is what those arms use, and why no REX
+    /// prefix appears.
+    ///
+    /// The exact edit that trips it: change any `RegF::Ext(n)` above. The
+    /// `/n` digit is the opcode extension that distinguishes `ADD` from `SUB`
+    /// from `AND` in the shared `0x83` group, and getting it wrong produces a
+    /// valid instruction that computes something else entirely.
+    #[test]
+    fn the_32bit_immediate_rows_reproduce_the_x64_byte_literals() {
+        // `x64.rs` constant-folding fast path, EAX destination — which is why
+        // no REX prefix appears in any of these.
+        assert_eq!(sel(&gpr_imm(Op::Add, Ty::I32, RAX, 7)), vec![0x83, 0xC0, 0x07]);
+        assert_eq!(
+            sel(&gpr_imm(Op::Add, Ty::I32, RAX, 100_000)),
+            vec![0x81, 0xC0, 0xA0, 0x86, 0x01, 0x00]
+        );
+        assert_eq!(sel(&gpr_imm(Op::Sub, Ty::I32, RAX, 7)), vec![0x83, 0xE8, 0x07]);
+        assert_eq!(
+            sel(&gpr_imm(Op::Sub, Ty::I32, RAX, 100_000)),
+            vec![0x81, 0xE8, 0xA0, 0x86, 0x01, 0x00]
+        );
+        assert_eq!(sel(&gpr_imm(Op::And, Ty::I32, RAX, 7)), vec![0x83, 0xE0, 0x07]);
+        assert_eq!(sel(&gpr_imm(Op::Or, Ty::I32, RAX, 7)), vec![0x83, 0xC8, 0x07]);
+        assert_eq!(sel(&gpr_imm(Op::Xor, Ty::I32, RAX, 7)), vec![0x83, 0xF0, 0x07]);
+        assert_eq!(sel(&gpr_imm(Op::Cmp, Ty::I32, RAX, 7)), vec![0x83, 0xF8, 0x07]);
+    }
+
+    /// The new rows are reachable through `MInst::probe`, not merely present.
+    ///
+    /// A row the table has but `pattern_name` cannot name is a row
+    /// `SelectOptions::require_encodable` still discards — which is the state
+    /// the whole 850-method measurement was taken in. Both halves or neither.
+    #[test]
+    fn a_32bit_immediate_tile_is_encodable() {
+        for (op, form, imm) in [
+            (Op::Add, ImmForm::Imm8, 7i64),
+            (Op::Add, ImmForm::Imm32, 100_000),
+            (Op::Sub, ImmForm::Imm8, 7),
+            (Op::And, ImmForm::Imm8, 7),
+            (Op::Or, ImmForm::Imm8, 7),
+            (Op::Xor, ImmForm::Imm8, 7),
+        ] {
+            let inst = MInst::AluRI {
+                op,
+                ty: Ty::I32,
+                dst: 0,
+                lhs: 1,
+                imm,
+                form,
+            };
+            assert!(
+                inst.pattern_name().is_some(),
+                "{op:?}/{form:?} at I32 has a row but no `pattern_name` mapping"
+            );
+            inst.probe()
+                .unwrap_or_else(|e| panic!("{op:?}/{form:?} at I32: {e:?}"));
+        }
     }
 
     /// The instructions the table cannot encode yet, pinned so the gap is a
