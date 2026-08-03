@@ -1119,6 +1119,21 @@ pub fn jit_ir_call_virtual() -> bool {
     })
 }
 
+/// PGO-02: guarded monomorphic-virtual-call inlining. Default-OFF (absent or
+/// `"0"`/`"false"` => disabled) - a new speculative JIT lowering soaks behind
+/// an opt-in flag per the c2 remediation wave's own rule, not the inverted
+/// default some `ir-*` levers above use. `=1` (or any other non-`"0"`/
+/// `"false"` value) opts in. See
+/// `docs/feature-designs/profile-guided-inlining.md`.
+#[inline]
+pub fn jit_guarded_virtual_inline() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_GUARDED_VIRTUAL_INLINE")
+            .is_ok_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+    })
+}
+
 #[inline]
 pub fn jit_ir_fp() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();

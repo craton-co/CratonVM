@@ -8,6 +8,7 @@
 //! its no-panic `deny` gate, where it has one) are inherited here.
 
 use super::*;
+use crate::scev::{BoundSource, BoundTerm, PreheaderGuard};
 
 
 /// A loop-invariant `aload X; iload Y; aaload` sequence that can be hoisted
@@ -2891,7 +2892,11 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
 // unchanged. Peeling in fact *removes* bypassability of the steady-state
 // loop: after peel(k) the only edge into copy `k` is the fall-through from
 // copy `k-1` and the back edge, both internal, so a hoist the guard had to
-// drop before can be kept. `peeled_loop_is_not_bypassable` pins that.
+// drop before can be kept. `peeling_removes_the_preheader_bypass_from_the_
+// steady_state_loop` pins that, and `x64.rs`'s
+// `the_planner_peels_a_bypassable_header_instead_of_skipping_it` is the planner
+// arm that acts on it. (This paragraph used to cite a
+// `peeled_loop_is_not_bypassable` that was never written.)
 
 /// Largest loop body (in bytecodes) either transform will duplicate.
 #[allow(dead_code)]
@@ -2922,7 +2927,6 @@ pub(super) fn poll_bearing_opcode(op: u8) -> bool {
 
 /// `true` when an opcode's fall-through successor exists (i.e. control can
 /// reach the next instruction in linear order).
-#[allow(dead_code)]
 pub(super) fn opcode_falls_through(op: u8) -> bool {
     !matches!(op, 0xa7 | 0xa9 | 0xaa | 0xab | 0xac..=0xb1 | 0xbf | 0xc8)
 }
@@ -2934,7 +2938,6 @@ pub(super) fn opcode_falls_through(op: u8) -> bool {
 /// statically known (`jsr`/`jsr_w`/`ret`) or the encoding is malformed or
 /// points outside `[0, code_len)`. Callers must treat `false` as opaque, not
 /// as "no targets": guessing here is how a transform loses an edge.
-#[allow(dead_code)]
 pub(super) fn branch_targets_at(
     code: &[u8],
     pc: usize,
@@ -3047,6 +3050,68 @@ pub(super) fn branch_targets_at(
         }
         _ => true,
     }
+}
+
+/// Bytecode PCs reachable from the method entry along ORDINARY control flow —
+/// fall-through plus explicit branch/switch edges.
+///
+/// Exception-table handler entries are deliberately NOT roots. The x86-64
+/// backend has no in-method handler dispatch: an implicit exception leaves
+/// through the `i64::MIN` sentinel and `athrow` lowers to the same, so a
+/// compiled body is only ever resumed at one of its own handlers by the
+/// interpreter (`route_jit_signal_exception` / `run_jit_callee_handler` both
+/// rebuild an interpreter frame for it). Every handler body is therefore dead
+/// code in the emitted image, and this map says so.
+///
+/// The optimizing tier settled the same question first and for the same
+/// reason: `ir::IrBuilder::build` skips every PC outside
+/// `ir::normally_reachable_pcs`, which is this walk over the verifier's CFG.
+/// Walking handler bodies there produced orphan nodes; walking them here
+/// produced a revived merge with no operand stack. Two tiers, one contract.
+///
+/// Returns `None` — "refuse, do not guess" — when any instruction's successor
+/// set is not statically known (`jsr` / `ret` / `jsr_w`) or an encoding is
+/// malformed. Callers must then keep whatever conservative behaviour they had.
+///
+/// Sized `code_len + 1` to match the emitter's own `branch_targets` map, so the
+/// two are indexed by the same `pc`.
+pub(super) fn compute_reachable_pcs(code: &[u8], code_len: usize) -> Option<Vec<bool>> {
+    if code_len > code.len() {
+        return None;
+    }
+    let mut reachable = vec![false; code_len + 1];
+    if code_len == 0 {
+        return Some(reachable);
+    }
+    reachable[0] = true;
+    let mut work = vec![0usize];
+    let mut targets: Vec<usize> = Vec::new();
+    while let Some(pc) = work.pop() {
+        // A branch INTO the middle of an instruction decodes garbage from here
+        // on. That cannot corrupt what the emitter reads (it only ever indexes
+        // this map at real instruction boundaries) and the walk stays bounded
+        // by `code_len`; such a method is rejected afterwards by
+        // `patch_branches`, which finds the target has no native offset.
+        let len = bytecode_len_at(code, pc).max(1);
+        targets.clear();
+        if !branch_targets_at(code, pc, code_len, &mut targets) {
+            return None;
+        }
+        for &t in &targets {
+            if !reachable[t] {
+                reachable[t] = true;
+                work.push(t);
+            }
+        }
+        if opcode_falls_through(code[pc]) {
+            let next = pc + len;
+            if next < code_len && !reachable[next] {
+                reachable[next] = true;
+                work.push(next);
+            }
+        }
+    }
+    Some(reachable)
 }
 
 /// `true` when the emitter will emit a cooperative safepoint poll at `pc`.
@@ -3407,6 +3472,91 @@ pub(crate) enum LoopXformRefusal {
     /// The transform would leave a poll-free span longer than
     /// [`LOOP_XFORM_MAX_POLL_FREE_BYTES`] bytecodes.
     TimeToSafepointBudget,
+    /// A versioning guard this rewriter cannot emit as straight-line bytecode:
+    /// a term that is not an `int` local or a constant, a term whose evaluation
+    /// could throw (`arraylength`, a field read), a local index that would need
+    /// `wide`, a threshold too large for `sipush` (there is no constant pool to
+    /// mint an `ldc` in), or a guard that is two comparisons rather than one.
+    /// See [`encode_preheader_guard`].
+    GuardNotEncodable,
+    /// The versioning guard is decided at compile time. Both verdicts are
+    /// refusals: an always-true guard means the caller wants the plain
+    /// transform (a runtime compare would test a known fact), and an
+    /// always-false one means the guarded version is dead code.
+    GuardIsConstant,
+}
+
+/// The extra structure a GUARDED VERSIONING rewrite adds to a [`LoopXform`].
+///
+/// Versioning emits a pre-header check and lays down TWO images of the loop:
+/// the transformed one on the guarded path and an untouched copy of the
+/// original on the fallback path.
+///
+/// ```text
+///     original            version(guard, unroll(k))
+///     ────────            ─────────────────────────
+///     H: body             G: <guard>   ──(fails)──┐
+///        goto H           F: body      (copy 0)   │
+///                            …                    │
+///                            body     (copy k)    │
+///                            goto F               │
+///                         B: body     ◀───────────┘
+///                            goto B
+/// ```
+///
+/// The guard is straight-line bytecode ending in ONE conditional branch to
+/// `fallback_base`, taken exactly when the guard FAILS. Nothing falls into `B`
+/// from above: the region always ends in an unconditional `goto` (the back
+/// edge, checked before anything is emitted), so the fallback copy is reachable
+/// only through the guard's branch and its own back edge.
+///
+/// Four properties make this sound rather than merely plausible, and each is
+/// pinned by a test:
+///
+/// * **The guard cannot throw, allocate, call, poll or write.** Only `iload`,
+///   an integer constant push and one `if_icmp*` are ever emitted —
+///   [`encode_preheader_guard`] refuses every other shape — so none of the four
+///   sites that bake a bci into machine code (`Compiler::orig_bci`'s callers)
+///   can fire at a guard PC, no safepoint map is recorded there, and the
+///   sequence is stack-balanced, so the frame at the guard's first byte is the
+///   frame the interpreter has at the header.
+/// * **The guard's bytes carry the header's bci but are not an IMAGE of it.**
+///   Provenance must stay total, so they map to the header; but
+///   [`LoopXform::outputs_for_bci`] skips them, so replicating a pc-keyed side
+///   table never lands a field resolution or an inline cache on synthetic
+///   bytecode.
+/// * **OSR enters the fallback, and never anything else.** Not the transformed
+///   copies — entering one skips the guard, which is the whole point of having
+///   one — and not the guard either, even at the header, where re-evaluating it
+///   would be correct at the bytecode level. An OSR entry is only valid at a pc
+///   whose compiled state the entry trampoline can reconstruct from the
+///   interpreter frame, and the emitter publishes that state at loop headers;
+///   the guard sits in the prologue's straight-line code. See
+///   [`LoopXform::osr_entry_pc`], which carries the failure that taught this.
+/// * **Both loops still poll.** The fast path's back edge and the fallback's are
+///   each checked with [`emits_safepoint_poll_at`] on the emitted bytes.
+///
+/// The guard's *meaning* is the caller's business. For peel and unroll it is a
+/// profitability filter only — both transforms are legal at every trip count
+/// (each copy keeps the body's own exit branches), so a guard that is
+/// pessimistic or optimistic costs speed and nothing else. A future transform
+/// that is legal only above a minimum must supply a guard that is sound for
+/// that claim; this rewriter emits what it is given and proves only that the
+/// fast path is unreachable when the guard fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) struct LoopVersioning {
+    /// The obligation the emitted pre-header discharges.
+    pub(super) guard: PreheaderGuard,
+    /// Output PC of the guard's first byte. Equal to the original header PC —
+    /// the guard is inserted exactly where the loop used to start, so every
+    /// edge that reached the loop now reaches the guard.
+    pub(super) guard_pc: usize,
+    /// Length of the emitted guard, in bytecodes.
+    pub(super) guard_len: usize,
+    /// Output PC of the fallback copy: an untouched image of the original
+    /// region, back edge included.
+    pub(super) fallback_base: usize,
 }
 
 /// A transformed method: rewritten bytecode plus everything a consumer needs
@@ -3442,21 +3592,62 @@ pub(super) struct LoopXform {
     orig_code_len: usize,
     /// Original PC just past the back-edge instruction.
     orig_back_edge_end: usize,
+    /// Present exactly when this is a guarded VERSIONING rewrite. `None` for a
+    /// plain peel or unroll, and every accessor below then behaves exactly as
+    /// it did before versioning existed.
+    pub(super) versioning: Option<LoopVersioning>,
+    /// What an original PC at or past `orig_back_edge_end` shifts by:
+    /// `guard_len + copies * body_len + fallback_len`. Equal to
+    /// `copies * body_len` without versioning.
+    suffix_shift: usize,
 }
 
 #[allow(dead_code)]
 impl LoopXform {
-    /// Output PC of the (single) back-edge instruction.
+    /// Output PC of the STEADY-STATE loop's back-edge instruction — the one
+    /// an OSR entry's loop will execute.
+    ///
+    /// Under versioning the steady state is the fallback copy, so this is the
+    /// fallback's back edge; [`Self::fast_back_edge_pc`] is the transformed
+    /// path's. Without versioning the two are the same instruction.
     pub(super) fn back_edge_pc(&self) -> usize {
-        self.header + (self.copies + 1) * self.body_len
+        if let Some(v) = &self.versioning {
+            return v.fallback_base + self.body_len;
+        }
+        self.fast_back_edge_pc()
+    }
+
+    /// Output PC of the TRANSFORMED loop's back-edge instruction.
+    pub(super) fn fast_back_edge_pc(&self) -> usize {
+        self.fast_base() + (self.copies + 1) * self.body_len
+    }
+
+    /// Output PC of the transformed region's first copy: the header, past the
+    /// guard when there is one.
+    pub(super) fn fast_base(&self) -> usize {
+        self.header + self.versioning.as_ref().map_or(0, |v| v.guard_len)
+    }
+
+    /// `[start, end)` of the emitted pre-header guard, or `None` when this is
+    /// not a versioning rewrite.
+    pub(super) fn guard_span(&self) -> Option<(usize, usize)> {
+        self.versioning
+            .as_ref()
+            .map(|v| (v.guard_pc, v.guard_pc + v.guard_len))
     }
 
     /// Output PC where the steady-state copy of the body begins — the copy
-    /// the back edge re-enters.
+    /// the back edge re-enters, and the only copy an OSR entry may land in.
+    ///
+    /// Under versioning that is the FALLBACK copy: it is the one image of the
+    /// region that is valid to enter without the guard having run.
     pub(super) fn steady_state_base(&self) -> usize {
+        if let Some(v) = &self.versioning {
+            return v.fallback_base;
+        }
         match self.kind {
-            LoopXformKind::Peel => self.header + self.copies * self.body_len,
-            LoopXformKind::Unroll => self.header,
+            LoopXformKind::Peel => self.fast_base() + self.copies * self.body_len,
+            LoopXformKind::Unroll => self.fast_base(),
         }
     }
 
@@ -3493,9 +3684,19 @@ impl LoopXform {
     ///
     /// Empty for a `bci` with no image — impossible for a PC inside the
     /// rewritten region, possible for one past the end.
+    /// A versioning guard's bytes are deliberately NOT images: they carry the
+    /// header's bci so provenance stays total, but no original instruction was
+    /// copied there, and an entry replicated onto them would key a field
+    /// resolution or an inline cache to a synthetic `iload`.
     pub(super) fn outputs_for_bci(&self, bci: usize) -> Vec<usize> {
+        let guard = self.guard_span();
         let mut out = Vec::new();
         for (pc, &b) in self.bci_of.iter().enumerate() {
+            if let Some((from, to)) = guard {
+                if pc >= from && pc < to {
+                    continue;
+                }
+            }
             if b as usize == bci {
                 out.push(pc);
             }
@@ -3603,8 +3804,30 @@ impl LoopXform {
             return Some(bci);
         }
         if bci >= self.orig_back_edge_end {
-            // Suffix: shifted past every copy.
-            return Some(bci + self.copies * self.body_len);
+            // Suffix: shifted past the guard, every copy and the fallback.
+            return Some(bci + self.suffix_shift);
+        }
+        if let Some(v) = &self.versioning {
+            // EVERY bci in the region, the header included, enters the FALLBACK
+            // copy. It is a full image of the region — back edge included — so
+            // every bci round-trips, with none of unroll's back-edge gap.
+            //
+            // The header does NOT enter the guard, and that is not a missed
+            // optimisation but the fix for a wrong-code bug this returned
+            // before it was executed on real code. Re-evaluating the guard on
+            // entry looks like exactly what a fall-through entry does, and at
+            // the bytecode level it is. At the MACHINE level it is not: an OSR
+            // entry is only valid at a pc whose compiled state the entry
+            // trampoline can reconstruct from the interpreter frame, and the
+            // emitter publishes that state at loop headers, not at arbitrary
+            // straight-line pcs. The guard sits in the method's prologue, where
+            // a local can legitimately live in a register the trampoline does
+            // not seed — entering there ran the loop with a null `this` for the
+            // receiver stored just above it.
+            //
+            // Cost: an OSR-entered method runs the untouched loop rather than
+            // the transformed one. Only entering costs that, not calling.
+            return Some(v.fallback_base + (bci - self.header));
         }
         match self.kind {
             // Peel's steady state is the last copy, which is a full image of
@@ -3652,6 +3875,7 @@ pub(super) fn plan_loop_peel(
         iterations,
         exception_ranges,
         LoopXformKind::Peel,
+        None,
     )
 }
 
@@ -3684,7 +3908,167 @@ pub(super) fn plan_loop_unroll(
         extra_copies,
         exception_ranges,
         LoopXformKind::Unroll,
+        None,
     )
+}
+
+/// Version a natural loop against a pre-header guard: `kind`'s transform of the
+/// loop on the guarded path, an untouched copy of the original on the fallback
+/// path.
+///
+/// This is the shape every later loop transform needs — the one that lets a
+/// transform with a precondition exist at all — and it is the same shape
+/// `x64::vec_emit` is written against (a guard, a fallback edge, and the
+/// transformed body only on the passing side). See [`LoopVersioning`] for the
+/// layout, the soundness argument and what the guard does and does not mean.
+///
+/// Refusals are [`plan_loop_peel`]'s, plus [`LoopXformRefusal::GuardNotEncodable`]
+/// and [`LoopXformRefusal::GuardIsConstant`] from the guard encoder. A caller
+/// that cannot version can always fall back to the unguarded transform: the
+/// guard is not what makes peel or unroll legal.
+#[allow(dead_code)]
+pub(super) fn plan_loop_version(
+    code: &[u8],
+    code_len: usize,
+    header: usize,
+    back_edge: usize,
+    extra: usize,
+    exception_ranges: &[(usize, usize, usize)],
+    kind: LoopXformKind,
+    guard: &PreheaderGuard,
+) -> Result<LoopXform, LoopXformRefusal> {
+    rewrite_loop_copies(
+        code,
+        code_len,
+        header,
+        back_edge,
+        extra,
+        exception_ranges,
+        kind,
+        Some(guard),
+    )
+}
+
+/// Encode one [`PreheaderGuard`] as straight-line bytecode ending in a
+/// conditional branch taken exactly when the guard FAILS.
+///
+/// The branch's 2-byte offset field is left zero; [`rewrite_loop_copies`]
+/// patches it once the fallback copy's PC is known. The emitted sequence is
+/// always `<push term> <push threshold> if_icmp<fail> 00 00`.
+///
+/// ## What it will emit, and why the list is this short
+///
+/// Only `iload` / `iload_<n>`, an integer constant push and one `if_icmp*`.
+/// Every other shape is [`LoopXformRefusal::GuardNotEncodable`]. The
+/// restriction is not timidity — it is what makes the guard's provenance sound:
+///
+/// * **Nothing that can throw.** [`BoundSource::ArrayLength`] would need
+///   `aload; arraylength`, which throws `NullPointerException` at a PC whose
+///   provenance is the loop header — a throw the original method does not have
+///   at that bci, reported through `Compiler::orig_bci` as if it did.
+///   [`BoundSource::Field`] adds resolution and class initialisation on top of
+///   that. Both are refused.
+/// * **Nothing that needs a constant pool.** `ldc` / `ldc2_w` name a pool entry
+///   and this rewriter cannot mint one: it rewrites bytes, it does not own the
+///   class. So the threshold has to fit `sipush`.
+/// * **Nothing with two comparisons.** [`PreheaderGuard::StrideInRange`] is two
+///   checks and would need two fallback edges. A caller that needs it can ask
+///   for the two guards separately once versioning takes a guard *set*.
+///
+/// ## 64-bit evaluation without 64-bit bytecode
+///
+/// `scev` specifies these checks in 64 bits precisely so that `base + addend`
+/// is not materialised as a wrapping `int` add. This encoding never
+/// materialises it: the addend is folded into the compile-time threshold
+/// (`T = limit - addend`, computed in `i64`), leaving a single `int` compare
+/// against a value proved to be in `i32` range. A threshold outside that range
+/// is not an encoding failure but a compile-time verdict —
+/// [`LoopXformRefusal::GuardIsConstant`] — because no `int` could satisfy it or
+/// fail it.
+fn encode_preheader_guard(guard: &PreheaderGuard) -> Result<Vec<u8>, LoopXformRefusal> {
+    use LoopXformRefusal as R;
+    // `at_least`: the guarded path requires `term >= threshold`. Otherwise it
+    // requires `term <= threshold`.
+    let (term, threshold, at_least) = match guard {
+        PreheaderGuard::NonNegative(t) => (t, 0i64, true),
+        // Widening: i32 limit to i64.
+        PreheaderGuard::AtLeast { term, limit } => (term, *limit as i64, true),
+        PreheaderGuard::AtMost { term, limit } => (term, *limit as i64, false),
+        PreheaderGuard::TripCountAtLeast { term, minimum } => {
+            // `prove_trip_count_at_least` refuses a minimum above `u32::MAX`,
+            // so this is a defensive bound, not a live case.
+            if *minimum > u32::MAX as u64 {
+                return Err(R::GuardNotEncodable);
+            }
+            // Widening: u32-bounded minimum to i64.
+            (term, *minimum as i64, true)
+        }
+        PreheaderGuard::LengthAtLeast(_) | PreheaderGuard::StrideInRange { .. } => {
+            return Err(R::GuardNotEncodable);
+        }
+    };
+    // Widening: i32 addend to i64. Folding it here is what keeps the check
+    // 64-bit-exact without a 64-bit bytecode.
+    let t = threshold - term.addend as i64;
+    let local = match &term.base {
+        // A compile-time term settles the guard without emitting anything.
+        BoundTerm::Const(_) | BoundTerm::Bound(BoundSource::Const(_)) => {
+            return Err(R::GuardIsConstant);
+        }
+        BoundTerm::Bound(BoundSource::Local(l)) => *l,
+        // The IV's value on entry to the loop, read from its local in the
+        // pre-header — which is exactly where this guard sits.
+        BoundTerm::IvEntry(l) => *l,
+        _ => return Err(R::GuardNotEncodable),
+    };
+    // A threshold no `int` can be on the wrong side of is a compile-time
+    // verdict, not a guard. Widening: i32 bounds to i64.
+    let decided = if at_least {
+        t <= i32::MIN as i64 || t > i32::MAX as i64
+    } else {
+        t >= i32::MAX as i64 || t < i32::MIN as i64
+    };
+    if decided {
+        return Err(R::GuardIsConstant);
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(8);
+    match local {
+        // iload_0 .. iload_3
+        0..=3 => out.push(0x1a + local as u8), // Cast: 0..=3 fits u8
+        // iload <index>
+        4..=255 => {
+            out.push(0x15);
+            out.push(local as u8); // Cast: checked <= 255
+        }
+        // `wide iload` would make the guard a 4-byte instruction the emitter
+        // walks differently; refuse rather than special-case it.
+        _ => return Err(R::GuardNotEncodable),
+    }
+    // Cast: proved to be in `i32` range just above.
+    let t = t as i32;
+    match t {
+        // iconst_m1 .. iconst_5
+        -1..=5 => out.push((t + 3) as u8), // Cast: -1..=5 shifted into 0x02..=0x08
+        // bipush
+        -128..=127 => {
+            out.push(0x10);
+            out.push(t as i8 as u8); // Cast: checked to fit i8
+        }
+        // sipush
+        -32768..=32767 => {
+            out.push(0x11);
+            // Cast: checked to fit i16
+            out.extend_from_slice(&(t as i16).to_be_bytes());
+        }
+        // Anything wider needs `ldc`, hence a constant-pool entry.
+        _ => return Err(R::GuardNotEncodable),
+    }
+    // The branch fires on the FAILING condition, so the fallback edge is taken
+    // exactly when the guard does not hold.
+    out.push(if at_least { 0xa1 } else { 0xa3 }); // if_icmplt / if_icmpgt
+    out.push(0);
+    out.push(0);
+    Ok(out)
 }
 
 /// Number of alignment pad bytes a `tableswitch`/`lookupswitch` at `pc`
@@ -3710,6 +4094,7 @@ pub(super) fn switch_pad(pc: usize) -> usize {
 }
 
 /// The shared peel/unroll rewriter. See the section header.
+#[allow(clippy::too_many_arguments)]
 fn rewrite_loop_copies(
     code: &[u8],
     code_len: usize,
@@ -3718,6 +4103,7 @@ fn rewrite_loop_copies(
     extra: usize,
     exception_ranges: &[(usize, usize, usize)],
     kind: LoopXformKind,
+    version: Option<&PreheaderGuard>,
 ) -> Result<LoopXform, LoopXformRefusal> {
     use LoopXformRefusal as R;
 
@@ -3746,7 +4132,18 @@ fn rewrite_loop_copies(
         return Err(R::NotABackEdge);
     }
     let back_edge_end = back_edge + 3;
-    let delta = extra * body_len;
+    let region_len = back_edge_end - header;
+    // Encoded before any structural work: it is the cheapest refusal and it
+    // fixes the output's length, which every PC computed below depends on.
+    let guard_bytes: Vec<u8> = match version {
+        None => Vec::new(),
+        Some(g) => encode_preheader_guard(g)?,
+    };
+    let guard_len = guard_bytes.len();
+    // Versioning lays down a second, UNTOUCHED image of the region on the
+    // fallback path; peel and unroll lay down none.
+    let fallback_len = if version.is_some() { region_len } else { 0 };
+    let delta = guard_len + extra * body_len + fallback_len;
 
     // Where an ORIGINAL pc outside the region ends up in the output. The
     // prefix `[0, header)` and the region itself keep their PCs — the region's
@@ -3908,31 +4305,64 @@ fn rewrite_loop_copies(
         }
     };
     push_span(0, header, &mut out, &mut bci_of);
+    // The guard's bytes carry the HEADER's bci. They are not an image of it —
+    // `outputs_for_bci` skips them — but every output byte must resolve to a
+    // real bci or `Compiler::orig_bci` is unsound, and the header is the bci
+    // whose frame the guard runs with: the sequence is stack-balanced, writes
+    // no local, and cannot throw, so no deopt or exception site can name a
+    // guard PC in the first place.
+    out.extend_from_slice(&guard_bytes);
+    for _ in 0..guard_len {
+        // Cast: bounded by `code_len`, checked against u32::MAX above
+        bci_of.push(header as u32);
+    }
     for _ in 0..extra {
         push_span(header, back_edge, &mut out, &mut bci_of);
     }
     push_span(header, back_edge_end, &mut out, &mut bci_of);
+    if version.is_some() {
+        push_span(header, back_edge_end, &mut out, &mut bci_of);
+    }
     push_span(back_edge_end, code_len, &mut out, &mut bci_of);
     if out.len() != out_len || bci_of.len() != out_len {
         return Err(R::BadShape);
     }
 
+    let fast_base = header + guard_len;
+    let fallback_base = fast_base + extra * body_len + region_len;
     let loop_entry = match kind {
-        LoopXformKind::Peel => header + extra * body_len,
-        LoopXformKind::Unroll => header,
+        LoopXformKind::Peel => fast_base + extra * body_len,
+        LoopXformKind::Unroll => fast_base,
     };
 
-    // Spans of the output, as (out_base, orig_from, orig_to, copy_index).
-    // `out_pc = out_base + (orig_pc - orig_from)` inside each.
-    let mut spans: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(extra + 3);
-    spans.push((0, 0, header, 0));
+    // Spans of the output, as (out_base, orig_from, orig_to, region), where
+    // `region` is `Some((base, next_iteration))` for a copy of the loop region:
+    // `base` is where that copy's image of the header sits, and
+    // `next_iteration` is where a branch to the header from INSIDE that copy
+    // goes. `out_pc = out_base + (orig_pc - orig_from)` inside each span.
+    let mut spans: Vec<(usize, usize, usize, Option<(usize, usize)>)> =
+        Vec::with_capacity(extra + 4);
+    spans.push((0, 0, header, None));
     for ci in 0..extra {
-        spans.push((header + ci * body_len, header, back_edge, ci));
+        let base = fast_base + ci * body_len;
+        spans.push((base, header, back_edge, Some((base, base + body_len))));
     }
-    spans.push((header + extra * body_len, header, back_edge_end, extra));
-    spans.push((back_edge_end + delta, back_edge_end, code_len, 0));
+    let last = fast_base + extra * body_len;
+    spans.push((last, header, back_edge_end, Some((last, loop_entry))));
+    if version.is_some() {
+        // The fallback is a self-contained image of the original loop: its back
+        // edge targets its own first byte, so it is a loop in its own right and
+        // never re-enters the transformed copies.
+        spans.push((
+            fallback_base,
+            header,
+            back_edge_end,
+            Some((fallback_base, fallback_base)),
+        ));
+    }
+    spans.push((back_edge_end + delta, back_edge_end, code_len, None));
 
-    for &(out_base, from, to, ci) in &spans {
+    for &(out_base, from, to, region) in &spans {
         let mut pc = from;
         while pc < to {
             let len = bytecode_len_at(code, pc);
@@ -3952,31 +4382,41 @@ fn rewrite_loop_copies(
                 }
                 // Cast: non-negative index to usize
                 let t = t as usize;
-                let internal = pc >= header && pc < back_edge_end;
-                let new_t = if internal && t == header {
-                    // A branch to the header from inside is "next iteration":
-                    // the next copy, and from the last copy the loop entry
-                    // (peel: the last copy itself; unroll: the first). The
-                    // back-edge `goto` is exactly this case with `ci == extra`.
-                    if ci < extra {
-                        header + (ci + 1) * body_len
-                    } else {
-                        loop_entry
+                let new_t = match region {
+                    Some((region_base, next_iter)) => {
+                        if t == header {
+                            // A branch to the header from inside is "next
+                            // iteration": the next copy, the loop entry from
+                            // the last one (peel: the last copy itself; unroll:
+                            // the first), and its own first byte from the
+                            // fallback. The back-edge `goto` is exactly this
+                            // case in the span that carries it.
+                            next_iter
+                        } else if t < header {
+                            t
+                        } else if t < back_edge_end {
+                            // Into the region from inside it: relocate into
+                            // this copy.
+                            region_base + (t - header)
+                        } else {
+                            t + delta
+                        }
                     }
-                } else if t < header {
-                    t
-                } else if t < back_edge_end {
-                    // Into the region: an internal edge relocates into its own
-                    // copy; an external one can only be targeting the header
-                    // (every other case was refused as `ExternalEntry`), which
-                    // is copy 0's first byte and has not moved.
-                    if internal {
-                        t + ci * body_len
-                    } else {
-                        t
+                    // Prefix or suffix. An edge into the region from outside it
+                    // can only target the header — every other case was refused
+                    // as `ExternalEntry` — and the header's image for an
+                    // OUTSIDE edge is the guard, so an entry from anywhere is
+                    // guarded. Without versioning the guard is empty and this
+                    // is the header itself, unmoved.
+                    None => {
+                        if t >= header && t < back_edge_end {
+                            header
+                        } else if t < header {
+                            t
+                        } else {
+                            t + delta
+                        }
                     }
-                } else {
-                    t + delta
                 };
                 let out_pc = out_base + (pc - from);
                 // Cast: PCs to isize for the signed offset
@@ -3997,6 +4437,29 @@ fn rewrite_loop_copies(
         }
     }
 
+    // ── The guard's fallback edge ─────────────────────────────────────
+    //
+    // `encode_preheader_guard` always ends in a 3-byte conditional branch with
+    // a zero offset field; this is where it learns what to jump to. Patched
+    // after the copies so `fallback_base` is a settled PC, and re-proved by the
+    // CFG build below like every other branch in the output.
+    if guard_len != 0 {
+        let at = fast_base - 3;
+        // Cast: PCs to isize for the signed offset
+        let off = fallback_base as isize - at as isize;
+        // Widening: i16 bounds to isize
+        if off < i16::MIN as isize || off > i16::MAX as isize {
+            return Err(R::OffsetOverflow);
+        }
+        // Cast: checked above to fit the 2-byte signed branch field
+        let enc = (off as i16).to_be_bytes();
+        if at + 2 >= out.len() {
+            return Err(R::BadShape);
+        }
+        out[at + 1] = enc[0];
+        out[at + 2] = enc[1];
+    }
+
     // ── Prove it on the emitted bytes, do not argue it ────────────────
     //
     // The output must walk exactly, keep every branch target on an
@@ -4009,12 +4472,20 @@ fn rewrite_loop_copies(
     if !all_backward_edges_are_polled(&out, out_len) {
         return Err(R::UnpolledBackEdge);
     }
-    // …and the loop's own back edge is one of them.
-    let out_back_edge = header + (extra + 1) * body_len;
+    // …and EVERY loop this rewrite produced has its own back-edge poll: the
+    // transformed one, and the fallback when there is one. A versioned method
+    // has two loops, and checking only the first would leave the fallback — the
+    // copy OSR enters — unproven.
+    let out_back_edge = fast_base + (extra + 1) * body_len;
     if !emits_safepoint_poll_at(&out, out_back_edge, out_len) {
         return Err(R::UnpolledBackEdge);
     }
-    let poll_free_bytes = body_len.saturating_mul(extra + 1);
+    if version.is_some() && !emits_safepoint_poll_at(&out, fallback_base + body_len, out_len) {
+        return Err(R::UnpolledBackEdge);
+    }
+    // The guard sits between the previous poll and the first copy, so it
+    // lengthens the poll-free span by its own (tiny, bounded) size.
+    let poll_free_bytes = guard_len.saturating_add(body_len.saturating_mul(extra + 1));
     if poll_free_bytes > LOOP_XFORM_MAX_POLL_FREE_BYTES {
         return Err(R::TimeToSafepointBudget);
     }
@@ -4032,6 +4503,13 @@ fn rewrite_loop_copies(
         poll_free_bytes,
         orig_code_len: code_len,
         orig_back_edge_end: back_edge_end,
+        versioning: version.map(|g| LoopVersioning {
+            guard: g.clone(),
+            guard_pc: header,
+            guard_len,
+            fallback_base,
+        }),
+        suffix_shift: delta,
     })
 }
 
@@ -4073,8 +4551,103 @@ mod loop_xform_tests {
     struct Trace {
         /// `(original bci, locals)` before every executed instruction.
         steps: Vec<(usize, Vec<i32>)>,
+        /// Execution PC of each step, in the same order. Only a VERSIONED run
+        /// needs it: a guard's bytes carry the header's bci, so `steps` alone
+        /// cannot tell a guard from the header, and filtering the guard out by
+        /// bci would delete the header's own steps too.
+        step_pcs: Vec<usize>,
         outcome: Outcome,
         heap: Vec<i32>,
+    }
+
+    /// An exception-handler body is not reachable along ordinary control flow,
+    /// so nothing inside it is — including the merge point of a branch the
+    /// handler body makes to itself. This is the whole content of the
+    /// handler-body-merge refusal: the emitter's branch-target map said `true`
+    /// for that merge, and "some instruction branches here" is not
+    /// "control can reach here".
+    #[test]
+    fn a_handler_bodys_own_branch_targets_are_not_reachable() {
+        //  0: iload_0
+        //  1: ireturn
+        //  2: iload_0           <- handler body (exception-table target)
+        //  3: aload_1
+        //  4: ifnonnull 11
+        //  7: iconst_0
+        //  8: goto 12
+        // 11: iconst_1
+        // 12: iadd
+        // 13: ireturn
+        let code = [
+            0x1a, 0xac, 0x1a, 0x2b, 0xc7, 0x00, 0x07, 0x03, 0xa7, 0x00, 0x04, 0x04, 0x60, 0xac,
+        ];
+        let r = compute_reachable_pcs(&code, code.len()).expect("statically known control flow");
+        assert_eq!(&r[..2], &[true, true], "the live prefix is reachable");
+        assert!(
+            r[2..code.len()].iter().all(|&b| !b),
+            "nothing after the `ireturn` is reachable: {r:?}"
+        );
+
+        // The emitter's own question answers differently for the two merges,
+        // which is exactly why it could not be used for this.
+        let targets = compute_branch_targets(&code, code.len());
+        assert!(targets[11] && targets[12]);
+    }
+
+    /// Both edges of a conditional, and the fall-through of everything that
+    /// has one, are reachable; a `goto` has no fall-through.
+    #[test]
+    fn reachability_follows_both_edges_and_stops_at_a_goto() {
+        //  0: iload_0
+        //  1: ifeq 7
+        //  4: goto 8
+        //  7: iconst_1          (reached only by the `ifeq`)
+        //  8: ireturn
+        let code = [0x1a, 0x99, 0x00, 0x06, 0xa7, 0x00, 0x04, 0x04, 0xac];
+        let r = compute_reachable_pcs(&code, code.len()).expect("statically known control flow");
+        assert_eq!(
+            &r[..code.len()],
+            &[true, true, false, false, true, false, false, true, true],
+            "only instruction boundaries on a real path are marked"
+        );
+    }
+
+    /// Every arm of a switch is an edge, and the switch itself has no
+    /// fall-through.
+    #[test]
+    fn reachability_follows_every_switch_arm() {
+        //  0: iconst_0
+        //  1: nop; nop          (align the tableswitch operands to 4)
+        //  3: tableswitch { 0: +21 (24), 1: +23 (26), default: +25 (28) }
+        // 24: iconst_1; ireturn
+        // 26: iconst_2; ireturn
+        // 28: iconst_3; ireturn
+        let mut code: Vec<u8> = vec![0x03, 0x00, 0x00, 0xaa];
+        code.extend_from_slice(&25i32.to_be_bytes()); // default -> 28
+        code.extend_from_slice(&0i32.to_be_bytes()); // low
+        code.extend_from_slice(&1i32.to_be_bytes()); // high
+        code.extend_from_slice(&21i32.to_be_bytes()); // case 0 -> 24
+        code.extend_from_slice(&23i32.to_be_bytes()); // case 1 -> 26
+        code.extend_from_slice(&[0x04, 0xac, 0x05, 0xac, 0x06, 0xac]);
+        assert_eq!(code.len(), 30);
+        let r = compute_reachable_pcs(&code, code.len()).expect("statically known control flow");
+        for pc in [0usize, 1, 2, 3, 24, 25, 26, 27, 28, 29] {
+            assert!(r[pc], "pc {pc} is on a real path");
+        }
+        for pc in 4..24usize {
+            assert!(!r[pc], "pc {pc} is switch payload, not an instruction");
+        }
+    }
+
+    /// `jsr`/`ret` have no statically known successor set. The analysis refuses
+    /// rather than under-approximating reachability, because an
+    /// under-approximation here deletes live code.
+    #[test]
+    fn opaque_control_flow_refuses_rather_than_guessing() {
+        let jsr = [0xa8, 0x00, 0x03, 0xac]; // jsr +3; ireturn
+        assert!(compute_reachable_pcs(&jsr, jsr.len()).is_none());
+        let ret = [0xa9, 0x01]; // ret 1
+        assert!(compute_reachable_pcs(&ret, ret.len()).is_none());
     }
 
     /// Target PC of the 2-byte-offset branch at `pc`, or its fall-through.
@@ -4104,12 +4677,14 @@ mod loop_xform_tests {
         let mut heap = heap_in.to_vec();
         let mut stack: Vec<i32> = Vec::new();
         let mut steps: Vec<(usize, Vec<i32>)> = Vec::new();
+        let mut step_pcs: Vec<usize> = Vec::new();
         let mut pc = 0usize;
         let mut budget = 200_000usize;
         loop {
             if budget == 0 {
                 return Trace {
                     steps,
+                    step_pcs,
                     outcome: Outcome::StepLimit,
                     heap,
                 };
@@ -4121,6 +4696,7 @@ mod loop_xform_tests {
                 None => pc,
             };
             steps.push((bci, locals.clone()));
+            step_pcs.push(pc);
             let op = code[pc];
             match op {
                 // nop
@@ -4162,6 +4738,7 @@ mod loop_xform_tests {
                     if idx < 0 || idx as usize >= heap.len() {
                         return Trace {
                             steps,
+                            step_pcs,
                             outcome: Outcome::Throw("ArrayIndexOutOfBounds", bci),
                             heap,
                         };
@@ -4189,6 +4766,7 @@ mod loop_xform_tests {
                     if idx < 0 || idx as usize >= heap.len() {
                         return Trace {
                             steps,
+                            step_pcs,
                             outcome: Outcome::Throw("ArrayIndexOutOfBounds", bci),
                             heap,
                         };
@@ -4214,6 +4792,7 @@ mod loop_xform_tests {
                     if b == 0 {
                         return Trace {
                             steps,
+                            step_pcs,
                             outcome: Outcome::Throw("ArithmeticException", bci),
                             heap,
                         };
@@ -4261,6 +4840,7 @@ mod loop_xform_tests {
                     let v = stack.pop().expect("ireturn value");
                     return Trace {
                         steps,
+                        step_pcs,
                         outcome: Outcome::Return(v),
                         heap,
                     };
@@ -4269,6 +4849,7 @@ mod loop_xform_tests {
                 0xb1 => {
                     return Trace {
                         steps,
+                        step_pcs,
                         outcome: Outcome::Void,
                         heap,
                     }
@@ -4281,10 +4862,29 @@ mod loop_xform_tests {
     /// The step sequence with the back-edge `goto` removed (see the section
     /// comment: it has no data effect and cannot throw).
     fn steps_without_back_edge(t: &Trace, back_edge: usize) -> Vec<(usize, Vec<i32>)> {
+        steps_without_back_edge_or_guard(t, back_edge, None)
+    }
+
+    /// …and with a versioning guard's synthetic bytes removed as well.
+    ///
+    /// The guard is filtered by output PC, not by bci: it carries the header's
+    /// bci so that provenance stays total, so filtering by bci would delete the
+    /// header's own steps. Removing it is sound for the same reason removing
+    /// the back edge is — it writes no local, cannot throw, and its only
+    /// observable effect is which version runs, which the caller asserts
+    /// separately.
+    fn steps_without_back_edge_or_guard(
+        t: &Trace,
+        back_edge: usize,
+        guard: Option<(usize, usize)>,
+    ) -> Vec<(usize, Vec<i32>)> {
         t.steps
             .iter()
-            .filter(|(b, _)| *b != back_edge)
-            .cloned()
+            .zip(t.step_pcs.iter())
+            .filter(|(s, pc)| {
+                s.0 != back_edge && !matches!(guard, Some((from, to)) if **pc >= from && **pc < to)
+            })
+            .map(|(s, _)| s.clone())
             .collect()
     }
 
@@ -4774,11 +5374,18 @@ mod loop_xform_tests {
 
         // Peeling moves the external entry onto the PEELED copy, so the
         // steady-state loop has no entry but its own back edge and the
-        // fall-through: a hoist the guard had to drop is legal again.
-        let peel = plan_loop_peel(&code, len, 11, 25, 1, &[]).expect("peel");
-        let ploops = detect_loops(&peel.code, peel.code_len);
-        assert_eq!(ploops, vec![(peel.steady_state_base(), peel.back_edge_pc())]);
-        assert!(find_bypassable_loop_headers(&peel.code, peel.code_len, &ploops, &[]).is_empty());
+        // fall-through: a hoist the guard had to drop is legal again. At every
+        // factor the planner can ask for, not just one.
+        for k in 1..=3usize {
+            let peel = plan_loop_peel(&code, len, 11, 25, k, &[]).expect("peel");
+            let ploops = detect_loops(&peel.code, peel.code_len);
+            assert_eq!(ploops, vec![(peel.steady_state_base(), peel.back_edge_pc())], "k={k}");
+            assert_eq!(peel.steady_state_base(), 11 + k * 14, "k={k}");
+            assert!(
+                find_bypassable_loop_headers(&peel.code, peel.code_len, &ploops, &[]).is_empty(),
+                "k={k}"
+            );
+        }
 
         // Unrolling does NOT: its first copy IS the header, so the external
         // edge still lands on the loop. Stated so nobody assumes otherwise.
@@ -5506,4 +6113,452 @@ mod loop_xform_tests {
             assert!(all_backward_edges_are_polled(&x.code, x.code_len), "k={k}");
         }
     }
+
+    // ── Guarded versioning ───────────────────────────────────────────────
+    //
+    // The transform is described in `LoopVersioning`. These tests carry its
+    // four load-bearing claims: the two versions compute the same thing, the
+    // guard decides which one runs and nothing else, the guard is inert enough
+    // for its provenance to be the header's, and both loops still poll.
+
+    use crate::scev::SymBound;
+
+    /// `trip >= minimum` on [`shape_a`]'s runtime limit (`n`, local 0) — the
+    /// exact shape `CountedLoop::prove_trip_count_at_least` mints for
+    /// `for (i = 0; i < n; i++)`, which is the commonest loop in Java and the
+    /// one whose compile-time `trip.min` is zero.
+    fn trip_guard(minimum: u64) -> PreheaderGuard {
+        PreheaderGuard::TripCountAtLeast {
+            term: SymBound {
+                base: BoundTerm::Bound(BoundSource::Local(0)),
+                addend: 0,
+            },
+            minimum,
+        }
+    }
+
+    #[test]
+    fn a_versioned_loop_runs_the_same_steps_whichever_version_it_takes() {
+        let code = shape_a();
+        let (len, header, back_edge, body_len) = (23usize, 4usize, 18usize, 14usize);
+        for k in 1..=3usize {
+            for kind in [LoopXformKind::Peel, LoopXformKind::Unroll] {
+                // The minimum the planner asks for: enough trips to reach every
+                // copy the transform makes.
+                let guard = trip_guard(k as u64 + 1);
+                let x = plan_loop_version(&code, len, header, back_edge, k, &[], kind, &guard)
+                    .expect("versioning is admitted");
+                let v = x.versioning.as_ref().expect("versioned");
+                // Layout: prefix, guard, k + 1 copies, the untouched fallback,
+                // suffix.
+                assert_eq!(v.guard_pc, header);
+                assert_eq!(v.guard_len, 5, "iload_0; iconst_<k+1>; if_icmplt");
+                assert_eq!(x.fast_base(), header + 5);
+                assert_eq!(v.fallback_base, header + 5 + (k + 1) * body_len + 3);
+                assert_eq!(x.code_len, len + 5 + k * body_len + body_len + 3);
+                assert!(x.provenance_is_total());
+
+                // Trip counts either side of the guard's minimum, so both
+                // versions are exercised by this comparison.
+                for n in 0..=8i32 {
+                    let locals = [n, 0, 0];
+                    let base = interp(&code, len, None, &locals, &[]);
+                    assert_eq!(base.outcome, Outcome::Return(n * (n - 1)), "fixture, n={n}");
+                    let t = interp(&x.code, x.code_len, Some(&x.bci_of), &locals, &[]);
+                    assert_eq!(t.outcome, base.outcome, "{kind:?} k={k} n={n}");
+                    assert_eq!(
+                        steps_without_back_edge_or_guard(&t, back_edge, x.guard_span()),
+                        steps_without_back_edge(&base, back_edge),
+                        "{kind:?} k={k} n={n}: executed sequence diverged"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_guard_takes_the_fast_version_exactly_when_it_holds() {
+        let code = shape_a();
+        let (len, header, back_edge) = (23usize, 4usize, 18usize);
+        let k = 3usize;
+        let x = plan_loop_version(
+            &code,
+            len,
+            header,
+            back_edge,
+            k,
+            &[],
+            LoopXformKind::Unroll,
+            &trip_guard(4),
+        )
+        .expect("versioning is admitted");
+        let fallback = x.versioning.as_ref().expect("versioned").fallback_base;
+        let fallback_end = fallback + x.body_len + 3;
+        for n in 0..=8i32 {
+            let t = interp(&x.code, x.code_len, Some(&x.bci_of), &[n, 0, 0], &[]);
+            let ran_fast = t
+                .step_pcs
+                .iter()
+                .any(|&pc| pc >= x.fast_base() && pc < fallback);
+            let ran_fallback = t
+                .step_pcs
+                .iter()
+                .any(|&pc| pc >= fallback && pc < fallback_end);
+            // `n >= 4` IS the guard, and it is the only thing that decides
+            // which body runs. Without this the test above would pass just as
+            // happily if the guard were never emitted at all.
+            assert_eq!(ran_fast, n >= 4, "n={n}: wrong version for the guard");
+            assert_eq!(ran_fallback, n < 4, "n={n}: wrong version for the guard");
+            assert!(ran_fast != ran_fallback, "n={n}: both versions ran");
+        }
+    }
+
+    #[test]
+    fn a_versioning_guard_writes_nothing_and_balances_the_stack() {
+        // This is the property that makes the guard's provenance — the header's
+        // bci — sound. Nothing it emits can throw, allocate, call, poll or
+        // write a local, so no deopt point, exception-check stub, bounds-check
+        // stub or `athrow` can name a guard PC, and the operand stack at the
+        // guard's first byte is the stack the interpreter has at the header.
+        for guard in [
+            trip_guard(4),
+            PreheaderGuard::NonNegative(SymBound {
+                base: BoundTerm::IvEntry(1),
+                addend: 0,
+            }),
+            PreheaderGuard::AtMost {
+                term: SymBound {
+                    base: BoundTerm::Bound(BoundSource::Local(2)),
+                    addend: -1,
+                },
+                limit: 1000,
+            },
+            PreheaderGuard::AtLeast {
+                term: SymBound {
+                    base: BoundTerm::Bound(BoundSource::Local(9)),
+                    addend: 7,
+                },
+                limit: -50,
+            },
+        ] {
+            let bytes = encode_preheader_guard(&guard).expect("encodable");
+            // Ends in exactly one conditional branch, with the placeholder
+            // offset `rewrite_loop_copies` patches.
+            assert_eq!(&bytes[bytes.len() - 2..], &[0, 0], "{guard:?}");
+            let branch = bytes[bytes.len() - 3];
+            assert!(
+                matches!(branch, 0xa1 | 0xa3),
+                "{guard:?}: branch opcode {branch:#04x}"
+            );
+            let mut pc = 0usize;
+            let mut depth = 0i32;
+            let mut branches = 0usize;
+            while pc < bytes.len() {
+                let op = bytes[pc];
+                assert!(
+                    matches!(op, 0x02..=0x08 | 0x10 | 0x11 | 0x15 | 0x1a..=0x1d | 0xa1 | 0xa3),
+                    "{guard:?}: emitted {op:#04x}, which is not in the inert set"
+                );
+                depth += match op {
+                    0xa1 | 0xa3 => {
+                        branches += 1;
+                        -2
+                    }
+                    _ => 1,
+                };
+                pc += bytecode_len_at(&bytes, pc);
+            }
+            assert_eq!(pc, bytes.len(), "{guard:?}: the guard does not walk exactly");
+            assert_eq!(depth, 0, "{guard:?}: the guard is not stack-balanced");
+            assert_eq!(branches, 1, "{guard:?}: one fallback edge, no more");
+            // No backward branch, so no poll is owed and none is dropped.
+            assert!(all_backward_edges_are_polled(&bytes[..bytes.len() - 3], pc - 3));
+        }
+    }
+
+    #[test]
+    fn the_guard_encoder_refuses_everything_it_cannot_prove_inert() {
+        use LoopXformRefusal as R;
+        let local = |l: usize| SymBound {
+            base: BoundTerm::Bound(BoundSource::Local(l)),
+            addend: 0,
+        };
+        let code = shape_a();
+        for (guard, want, why) in [
+            // Would need `aload; arraylength` — a NullPointerException at a PC
+            // whose provenance is the loop header, i.e. a throw the original
+            // method does not have at that bci.
+            (
+                PreheaderGuard::LengthAtLeast(local(0)),
+                R::GuardNotEncodable,
+                "length guard",
+            ),
+            (
+                PreheaderGuard::NonNegative(SymBound {
+                    base: BoundTerm::Bound(BoundSource::ArrayLength(0)),
+                    addend: 0,
+                }),
+                R::GuardNotEncodable,
+                "arraylength term",
+            ),
+            // A field read adds resolution and class initialisation too.
+            (
+                PreheaderGuard::NonNegative(SymBound {
+                    base: BoundTerm::Bound(BoundSource::Field {
+                        cp_index: 3,
+                        receiver_local: None,
+                    }),
+                    addend: 0,
+                }),
+                R::GuardNotEncodable,
+                "field term",
+            ),
+            // Two comparisons would need two fallback edges.
+            (
+                PreheaderGuard::StrideInRange {
+                    local: 1,
+                    headroom: local(0),
+                },
+                R::GuardNotEncodable,
+                "stride range",
+            ),
+            // `wide iload`.
+            (
+                PreheaderGuard::NonNegative(local(256)),
+                R::GuardNotEncodable,
+                "wide local index",
+            ),
+            // Needs `ldc`, hence a constant-pool entry this rewriter cannot
+            // mint: it rewrites bytes, it does not own the class.
+            (
+                PreheaderGuard::AtLeast {
+                    term: local(0),
+                    limit: 100_000,
+                },
+                R::GuardNotEncodable,
+                "threshold past sipush",
+            ),
+            // Compile-time verdicts, in both directions.
+            (
+                PreheaderGuard::NonNegative(SymBound {
+                    base: BoundTerm::Const(7),
+                    addend: 0,
+                }),
+                R::GuardIsConstant,
+                "constant term",
+            ),
+            (
+                PreheaderGuard::AtLeast {
+                    term: local(0),
+                    limit: i32::MIN,
+                },
+                R::GuardIsConstant,
+                "no int can fail it",
+            ),
+            (
+                PreheaderGuard::TripCountAtLeast {
+                    term: local(0),
+                    minimum: u32::MAX as u64,
+                },
+                R::GuardIsConstant,
+                "no int can pass it",
+            ),
+        ] {
+            assert_eq!(encode_preheader_guard(&guard), Err(want), "{why}");
+            // …and the transform refuses with the same reason rather than
+            // emitting a fast path nothing guards.
+            assert_eq!(
+                plan_loop_version(&code, 23, 4, 18, 1, &[], LoopXformKind::Unroll, &guard),
+                Err(want),
+                "{why}"
+            );
+        }
+        // Positive control: the same call site IS admitted with a guard the
+        // encoder can emit, so none of the refusals above is vacuous.
+        assert!(plan_loop_version(
+            &code,
+            23,
+            4,
+            18,
+            1,
+            &[],
+            LoopXformKind::Unroll,
+            &trip_guard(2)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_side_table_entry_is_never_replicated_onto_the_guard() {
+        let code = shape_a();
+        let x = plan_loop_version(
+            &code,
+            23,
+            4,
+            18,
+            1,
+            &[],
+            LoopXformKind::Unroll,
+            &trip_guard(2),
+        )
+        .expect("versioned");
+        let (gfrom, gto) = x.guard_span().expect("versioned");
+        let fallback = x.versioning.as_ref().expect("versioned").fallback_base;
+        // The header's images are the two fast copies and the fallback — three
+        // real instructions — and NOT the five synthetic guard bytes.
+        let images = x.outputs_for_bci(4);
+        assert_eq!(images, vec![x.fast_base(), x.fast_base() + 14, fallback]);
+        assert!(images.iter().all(|&pc| pc < gfrom || pc >= gto));
+        assert!(
+            images.iter().all(|&pc| x.code[pc] == code[4]),
+            "every image must really be the header's opcode"
+        );
+        // The guard's bytes still resolve to a bci — `Compiler::orig_bci` has
+        // to be able to answer for every output PC — they are simply not
+        // images.
+        for pc in gfrom..gto {
+            assert_eq!(x.bci_at(pc), Some(4));
+        }
+        assert!(x.provenance_is_total());
+        // A pc-keyed table therefore lands one entry per real copy: two fast,
+        // one fallback, plus the untouched suffix site.
+        let lifted = x.replicate_pc_keyed(&[(4usize, 0xAAu8), (22, 0xBBu8)]);
+        assert_eq!(lifted.len(), 4);
+        assert!(lifted[..3].iter().all(|&(_, p)| p == 0xAA));
+        assert_eq!(lifted[3], (22 + x.suffix_shift, 0xBB));
+    }
+
+    #[test]
+    fn osr_into_a_versioned_loop_lands_in_the_fallback_and_never_the_guard() {
+        let code = shape_a();
+        let (len, header, back_edge) = (23usize, 4usize, 18usize);
+        for kind in [LoopXformKind::Peel, LoopXformKind::Unroll] {
+            for k in 1..=3usize {
+                let x = plan_loop_version(
+                    &code,
+                    len,
+                    header,
+                    back_edge,
+                    k,
+                    &[],
+                    kind,
+                    &trip_guard(k as u64 + 1),
+                )
+                .expect("versioned");
+                let v = x.versioning.clone().expect("versioned");
+                // The header enters the FALLBACK, not the guard. Entering the
+                // guard is correct bytecode and wrong machine code: the guard
+                // is not a loop header, so it is not a pc the OSR trampoline
+                // can reconstruct a compiled state for. This assertion is the
+                // regression test for the null receiver that produced.
+                assert_eq!(x.osr_entry_pc(header), Some(v.fallback_base));
+                assert_ne!(x.osr_entry_pc(header), Some(v.guard_pc));
+                // …and so does every other bci in the region: entering a
+                // transformed copy would skip the guard, which is the whole
+                // point of having one.
+                let mut pc = header + bytecode_len_at(&code, header);
+                while pc < back_edge + 3 {
+                    let entry = x.osr_entry_pc(pc).expect("bci is in range");
+                    assert_eq!(entry, v.fallback_base + (pc - header), "{kind:?} k={k} bci={pc}");
+                    assert_eq!(x.bci_at(entry), Some(pc));
+                    assert!(entry >= x.steady_state_base() && entry <= x.back_edge_pc());
+                    assert!(
+                        entry >= v.fallback_base,
+                        "{kind:?} k={k} bci={pc}: OSR entered a guarded copy"
+                    );
+                    pc += bytecode_len_at(&code, pc);
+                }
+                // No OSR entry anywhere in the method resolves into the guard.
+                let (gfrom, gto) = x.guard_span().expect("versioned");
+                for bci in 0..len {
+                    if let Some(entry) = x.osr_entry_pc(bci) {
+                        assert!(
+                            entry < gfrom || entry >= gto,
+                            "{kind:?} k={k} bci={bci}: OSR entry {entry} is inside the guard"
+                        );
+                    }
+                }
+                // Versioning has no back-edge gap whatever the fast side is:
+                // the fallback is a full image of the region, back edge
+                // included. Unroll on its own answers `None` here.
+                assert_eq!(x.osr_entry_pc(back_edge), Some(x.back_edge_pc()));
+                // Outside the region, unchanged apart from the shift.
+                assert_eq!(x.osr_entry_pc(0), Some(0));
+                assert_eq!(x.osr_entry_pc(22), Some(22 + x.suffix_shift));
+                assert_eq!(x.osr_entry_pc(len), None);
+                // The published vector is one slot per interpreter bci, with no
+                // refusal anywhere in the region.
+                let synthetic: Vec<i32> = (0..=x.code_len as i32).collect();
+                let rebuilt = x.rebuild_pc_to_native(&synthetic, len);
+                assert_eq!(rebuilt.len(), len + 1);
+                assert!(
+                    rebuilt[header..=back_edge].iter().all(|&n| n >= 0),
+                    "{kind:?} k={k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_versions_keep_a_back_edge_poll() {
+        let code = shape_a();
+        let (len, body_len) = (23usize, 14usize);
+        for k in 1..=3usize {
+            for kind in [LoopXformKind::Peel, LoopXformKind::Unroll] {
+                let x =
+                    plan_loop_version(&code, len, 4, 18, k, &[], kind, &trip_guard(k as u64 + 1))
+                        .expect("versioned");
+                let v = x.versioning.as_ref().expect("versioned");
+                assert!(all_backward_edges_are_polled(&x.code, x.code_len));
+                // There are TWO loops now, and both are polled: the guarded one
+                // and the fallback the failing edge reaches. Checking only the
+                // first would leave the copy OSR enters unproven.
+                assert_eq!(
+                    backward_branch_pcs(&x.code, x.code_len),
+                    vec![x.fast_back_edge_pc(), x.back_edge_pc()],
+                    "{kind:?} k={k}"
+                );
+                assert!(emits_safepoint_poll_at(&x.code, x.fast_back_edge_pc(), x.code_len));
+                assert!(emits_safepoint_poll_at(&x.code, x.back_edge_pc(), x.code_len));
+                assert_eq!(x.back_edge_pc(), v.fallback_base + body_len);
+                assert!(x.poll_free_bytes <= LOOP_XFORM_MAX_POLL_FREE_BYTES);
+                // Below the guard's minimum the fallback runs, and it polls
+                // once per trip exactly like the original loop.
+                for n in 0..=(k as i32) {
+                    let t = interp(&x.code, x.code_len, Some(&x.bci_of), &[n, 0, 0], &[]);
+                    // Widening: a non-negative trip count to usize
+                    assert_eq!(poll_count(&t, 18), n as usize, "{kind:?} k={k} n={n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_enclosing_handler_range_covers_both_versions() {
+        let code = shape_a();
+        // A `try` that lexically encloses the loop, with its handler after it.
+        let ranges = [(2usize, 21usize, 21usize)];
+        let x = plan_loop_version(
+            &code,
+            23,
+            4,
+            18,
+            1,
+            &ranges,
+            LoopXformKind::Unroll,
+            &trip_guard(2),
+        )
+        .expect("versioned");
+        let v = x.versioning.as_ref().expect("versioned");
+        assert_eq!(x.exception_ranges.len(), 1);
+        let (s, e, h) = x.exception_ranges[0];
+        assert_eq!(s, 2, "the range still starts where it did");
+        assert_eq!(e, 21 + x.suffix_shift);
+        assert_eq!(h, 21 + x.suffix_shift);
+        assert!(
+            s <= v.guard_pc && e >= v.fallback_base + x.body_len + 3,
+            "the widened range must cover the guard, every copy and the fallback"
+        );
+    }
+
 }

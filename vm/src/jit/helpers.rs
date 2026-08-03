@@ -1362,11 +1362,24 @@ unsafe fn try_call_compiled_entry_reentrant(
     // back to its live CompiledMethod and register the precise frame for the
     // full duration of the nested call.
     let mut needs_ctx = needs_ctx;
-    let jit_root_guard = cratonvm_jit::lookup_jit_code_range(entry).map(|cm_ptr| {
-        // SAFETY: the JIT code-range registry owns this CompiledMethod while
-        // its entry remains callable; the guard is dropped before this helper
-        // returns to the caller that holds the corresponding code cache entry.
-        let compiled = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+    // Pin, don't peek. This is the ONE path into compiled code that used to hold
+    // no owning reference to the body it entered: it resolved a bare `cm_ptr`
+    // out of the code-range registry and dereferenced it, on the argument that
+    // "the registry owns this CompiledMethod while its entry remains callable".
+    // The registry stores a raw address, not an `Arc`, so it owns nothing — and
+    // the caller's keep-alive here is a *thread-local dispatch cache entry*
+    // (`try_mic_rust_cached_entry` reads `entry`/`needs_context` out of the map
+    // and calls the raw pointer). A nested dispatch from the callee re-enters
+    // `flush_raw_entry_dispatch_caches`, whose `clear()` drops exactly that
+    // entry — measured releasing a published body at `active_jit_executions`
+    // = 1 on `BasicErrorControllerIntegrationTests`.
+    //
+    // Holding the pin across the call is what makes the process-wide invariant
+    // true: **a thread inside a compiled body always holds an owning reference
+    // to it**, so a reference count reaching zero is itself a proof that no
+    // thread is inside. One atomic increment (the registry carries a `Weak`).
+    let pinned = cratonvm_jit::pin_jit_code_range_owner(entry);
+    let jit_root_guard = pinned.as_deref().map(|compiled| {
         // cceres2 (WildFly SIGSEGV cores SF2/SF3/SM): the caller-supplied ABI
         // flag can come from a cache whose (entry, needs_context) pair was
         // read non-atomically across a concurrent inline-cache retarget or
@@ -1399,6 +1412,9 @@ unsafe fn try_call_compiled_entry_reentrant(
     #[cfg(debug_assertions)]
     restore_jit_borrow(borrow);
     drop(jit_root_guard);
+    // AFTER the guard: the pin is what keeps the body mapped for the whole
+    // call, so it must outlive both the call and the chain entry naming it.
+    drop(pinned);
     result
 }
 
@@ -1955,7 +1971,7 @@ fn publish_mic_rust_cached_entry(
             DispatchCache {
                 entry: entry_ptr,
                 needs_context: needs_ctx,
-                _owner: Some(owner),
+                _owner: Some(owner.into()),
             },
         );
     });
@@ -7435,7 +7451,20 @@ struct DispatchCache {
     entry: usize,
     needs_context: bool,
     /// Owns JIT code while this thread-local raw entry remains published.
-    _owner: Option<std::sync::Arc<cratonvm_jit::CompiledMethod>>,
+    ///
+    /// [`cratonvm_jit::RetainedCode`], not a bare `Arc`, because this map is
+    /// evicted by the very thread that dispatches through it: a generation
+    /// flush (`flush_raw_entry_dispatch_caches`), a class-identity flush, a
+    /// replacement `insert`, or thread exit. Any of those can run while this
+    /// thread is *inside* the body it names — `try_mic_rust_cached_entry` reads
+    /// only `entry`/`needs_context` out of the map and calls the raw pointer, so
+    /// the map entry is the sole owner across the call, and a nested dispatch
+    /// from the callee re-enters the flush. Dropping a bare `Arc` there unmaps
+    /// the code under this thread's own return address; measured on
+    /// `BasicErrorControllerIntegrationTests` at
+    /// `active_jit_executions` = 1. The wrapper releases through
+    /// `defer_jit_owner`, which retains until no thread is in compiled code.
+    _owner: Option<cratonvm_jit::RetainedCode>,
 }
 
 #[derive(Clone, Copy)]
@@ -8220,7 +8249,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                                         DispatchCache {
                                             entry,
                                             needs_context,
-                                            _owner: Some(owner),
+                                            _owner: Some(owner.into()),
                                         },
                                     );
                                 });
@@ -8331,7 +8360,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     DispatchCache {
                         entry,
                         needs_context: needs_ctx,
-                        _owner: Some(compiled.clone()),
+                        _owner: Some(compiled.clone().into()),
                     },
                 );
             });
@@ -8393,7 +8422,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         DispatchCache {
                             entry,
                             needs_context: needs_ctx,
-                            _owner: Some(owner),
+                            _owner: Some(owner.into()),
                         },
                     );
                 });

@@ -949,7 +949,7 @@ pub mod vector_gate {
     use crate::ir::{AliasClass, Graph, MemEffect, MemKind, NodeId, NO_NODE};
     use crate::scev::{
         BoundsProof, CountedLoop, IndexExpr, IntRange, OverflowModel, PreheaderGuard, RangeEnv,
-        RefusalReason, TripCount,
+        RefusalReason, TripCount, TripCountProof,
     };
     use cratonvm_types::{element_byte_size, ArrayElementType, HEADER_SIZE};
 
@@ -1530,7 +1530,12 @@ pub mod vector_gate {
     /// redundant, never wrong.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct ArrayGuard {
-        /// The array reference node whose access produced this obligation.
+        /// The array reference node whose access produced this obligation, or
+        /// [`NO_NODE`] when the obligation is not about an array at all — which
+        /// today means the loop's `trip >= lanes` check. The field exists so
+        /// that two identical-looking `LengthAtLeast` guards over two different
+        /// arrays are never deduplicated into one; a guard with no array is in
+        /// a bucket of its own and dedupes only against itself.
         pub array: NodeId,
         /// The obligation itself.
         pub guard: PreheaderGuard,
@@ -1559,7 +1564,8 @@ pub mod vector_gate {
         /// *soundness*, not just for bounds elision.
         pub overflow: OverflowModel,
         /// Pre-header obligations. **All** of them must be emitted, or the
-        /// plan is void.
+        /// plan is void. An entry whose `array` is [`NO_NODE`] is not about an
+        /// array — today, the loop's `trip >= lanes` check.
         pub guards: Vec<ArrayGuard>,
         /// Every dependence the body carries, including the harmless ones.
         pub dependences: Vec<Dependence>,
@@ -1590,17 +1596,22 @@ pub mod vector_gate {
         },
         /// [`CountedLoop::trip_count`] could not bound the iteration count.
         UnknownTripCount,
-        /// The loop may execute fewer times than one vector pass covers.
+        /// The loop may execute fewer times than one vector pass covers, and
+        /// no runtime check can settle it.
         ///
-        /// This is a refusal rather than a guard because the gate does not ask
-        /// [`CountedLoop::prove_trip_count_at_least`] for a witness. The guard
-        /// shape itself *does* exist —
-        /// [`PreheaderGuard::TripCountAtLeast`] was added for exactly this
-        /// family and names vectorization in its own doc — so admitting these
-        /// loops behind a runtime `trip >= lanes` check is a live extension,
-        /// not an impossible one. It is deliberately not taken here: it
-        /// broadens admission, and the emitter that would consume it
-        /// (`super::vec_emit`) has never executed a byte.
+        /// The gate asks [`CountedLoop::prove_trip_count_at_least`] for a
+        /// witness first, and takes the resulting
+        /// [`PreheaderGuard::TripCountAtLeast`] — the shape added for exactly
+        /// this family, and the one `super::vec_emit` already discharges with
+        /// `VecGuardValues::Term`. This variant is what is left when that proof
+        /// refuses: a *constant* trip count below the lane count (nothing to
+        /// check at runtime — the answer is already known and it is "no"), a
+        /// decreasing or non-unit-stride loop (the witness would not be
+        /// trip-count-valued), a post-tested loop, or an unbounded entry value.
+        ///
+        /// Before the witness was asked for, this fired on
+        /// `for (i = 0; i < n; i++)` with a runtime `n`, whose compile-time
+        /// interval is `[0, i32::MAX]` — i.e. on almost every real loop.
         TripCountTooSmall {
             /// The fewest iterations the loop may run.
             min_trips: u64,
@@ -2000,16 +2011,48 @@ pub mod vector_gate {
                 TailStrategy::ScalarRemainder { max_iterations: 0 }
             }
             Some(t) => {
+                // Widening: lane count to u64.
                 if lanes >= 2 && t.min < lanes as u64 {
-                    // A runtime `trip >= lanes` check would rescue this, and
-                    // `PreheaderGuard::TripCountAtLeast` is the shape that
-                    // expresses it. The gate does not ask for that witness
-                    // today — see `VecRefusal::TripCountTooSmall` for why the
-                    // extension is deliberately not taken yet.
-                    refusals.push(VecRefusal::TripCountTooSmall {
-                        min_trips: t.min,
-                        lanes,
-                    });
+                    // The compile-time interval is `[0, i32::MAX]` for
+                    // `for (i = 0; i < n; i++)` with a runtime `n`, so refusing
+                    // on `t.min` alone refuses almost every real loop —
+                    // `docs/jit/trip-count-guards.md` names this as the single
+                    // largest source of refusals here. Ask for the runtime
+                    // witness instead: one pre-header compare, in the shape
+                    // `vec_emit` already discharges.
+                    match cand
+                        .counted
+                        .prove_trip_count_at_least(lanes as u64, cand.env)
+                    {
+                        // Unreachable in practice — the proof's own early-out
+                        // is this same interval — and handled rather than
+                        // asserted, because "already proved" means there is
+                        // nothing to emit either way.
+                        TripCountProof::Static => {}
+                        TripCountProof::Guarded(gs) => {
+                            for guard in gs {
+                                // Not an array obligation: `NO_NODE` keeps it
+                                // in its own dedup bucket, so it can never
+                                // discharge (or be discharged by) an array's
+                                // length guard.
+                                let entry = ArrayGuard {
+                                    array: NO_NODE,
+                                    guard,
+                                };
+                                if !guards.contains(&entry) {
+                                    guards.push(entry);
+                                }
+                            }
+                        }
+                        // No runtime check settles it. See the variant's doc
+                        // for the four shapes that land here.
+                        TripCountProof::Refused(_) => {
+                            refusals.push(VecRefusal::TripCountTooSmall {
+                                min_trips: t.min,
+                                lanes,
+                            });
+                        }
+                    }
                 }
                 match t.exact() {
                     Some(exact) if lanes >= 2 && exact % lanes as u64 == 0 => TailStrategy::None,
@@ -2506,6 +2549,16 @@ pub mod vector_gate {
             (g, case)
         }
 
+        /// `for (i = 0; i < 2; i++) b[i] = a[i];` — a trip count KNOWN to be
+        /// below the lane count. The runtime witness cannot rescue this one:
+        /// there is nothing to discover at run time, the answer is already
+        /// known and it is "no".
+        fn small_trip_loop() -> (Graph, Case) {
+            let (g, mut case) = distinct_allocation_loop();
+            case.counted = counted_loop(0, 2);
+            (g, case)
+        }
+
         /// `for (i = 0; i < 1023; i++) b[i] = a[i];` — a trip count the lane
         /// count does not divide.
         fn remainder_tail_loop() -> (Graph, Case) {
@@ -2578,6 +2631,14 @@ pub mod vector_gate {
                 ("guarded overflow", guarded_overflow_loop, true),
                 ("non-unit stride", non_unit_stride_loop, false),
                 ("remainder tail", remainder_tail_loop, true),
+                // The `TripCountTooSmall` pair. It was missing: the corpus is
+                // built as must-refuse / must-admit pairs, one per refusal
+                // class, and this class had only the fixture below it and no
+                // corpus entry at all — which is why asking
+                // `prove_trip_count_at_least` for a witness left the old
+                // 11-of-27 number untouched instead of moving it.
+                ("unknown trip, guarded", unknown_trip_loop, true),
+                ("trip below the lane count", small_trip_loop, false),
                 ("field access", field_access_loop, false),
             ];
             entries
@@ -3075,16 +3136,58 @@ pub mod vector_gate {
             assert!(case.run(&g).is_admitted());
         }
 
+        /// The must-admit / must-refuse pair for the trip-count floor.
+        ///
+        /// A runtime limit is the commonest loop in Java and its compile-time
+        /// interval is `[0, i32::MAX]`; it is admitted behind ONE pre-header
+        /// compare, carried in the plan as an obligation with no array. A
+        /// *constant* limit below the lane count is still refused, because
+        /// there is nothing a runtime check could discover — the answer is
+        /// already known and it is "no".
         #[test]
-        fn an_unbounded_trip_count_is_refused() {
+        fn an_unbounded_trip_count_is_guarded_and_a_known_small_one_is_refused() {
             let (g, case) = unknown_trip_loop();
+            let verdict = case.run(&g);
+            let plan = match &verdict {
+                VecVerdict::Admitted(p) => p,
+                VecVerdict::Refused(r) => panic!("a runtime trip count must be guarded: {r:?}"),
+            };
+            let trip_guards: Vec<&ArrayGuard> = plan
+                .guards
+                .iter()
+                .filter(|e| matches!(e.guard, PreheaderGuard::TripCountAtLeast { .. }))
+                .collect();
+            assert_eq!(trip_guards.len(), 1, "one compare, not one per access");
+            assert_eq!(
+                trip_guards[0].array, NO_NODE,
+                "a trip-count obligation is not about an array"
+            );
+            match trip_guards[0].guard {
+                PreheaderGuard::TripCountAtLeast { minimum, .. } => {
+                    assert_eq!(minimum, plan.lanes as u64, "the minimum is the lane count")
+                }
+                _ => unreachable!("filtered above"),
+            }
+            // The tail is unchanged: a guard proves a MINIMUM, not a multiple,
+            // so the scalar remainder is still needed.
+            assert_eq!(
+                plan.tail,
+                TailStrategy::ScalarRemainder {
+                    max_iterations: plan.lanes - 1
+                }
+            );
+
+            // …and the refusal is not dead: a limit no runtime check can
+            // rescue still names it.
+            let (g, mut case) = distinct_allocation_loop();
+            case.counted = counted_loop(0, 2);
             let verdict = case.run(&g);
             assert!(
                 verdict.refusals().iter().any(|r| matches!(
                     r,
-                    VecRefusal::TripCountTooSmall { min_trips: 0, .. }
+                    VecRefusal::TripCountTooSmall { min_trips: 2, .. }
                 )),
-                "a loop that may run zero times cannot enter a vector body: {:?}",
+                "a loop known to run twice cannot enter a four-lane body: {:?}",
                 verdict.refusals()
             );
         }
@@ -3192,10 +3295,10 @@ pub mod vector_gate {
                     admitted += 1;
                 }
             }
-            assert_eq!(total, 27);
+            assert_eq!(total, 29);
             assert_eq!(
-                admitted, 11,
-                "11 of 27 corpus loops admitted; the rest name a refusal class"
+                admitted, 12,
+                "12 of 29 corpus loops admitted; the rest name a refusal class"
             );
         }
     }
