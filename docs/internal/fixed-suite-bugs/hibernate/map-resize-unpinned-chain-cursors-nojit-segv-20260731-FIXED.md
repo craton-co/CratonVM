@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🟢 **RESOLVED 2026-08-03.** `DefaultCatalogAndSchemaTest` now completes cleanly at exact parity with HotSpot — `found=132 started=132 ok=132 failed=0` — reproduced on **three independent full runs**, including the plain production default with no special flags. See Follow-up 4 for the full mechanism, the bisection that found it, and the fix (`OldGen::compact` — the old-gen sliding compactor — is now **disabled by default**; it was corrupting live object headers, and the exact line responsible inside its Phase 1-3 was not identified by code review, only by empirically bisecting it out). `compact()` itself is not deleted and can be re-enabled with `CRATONVM_OLDGEN_COMPACT=1` for whoever eventually finds and fixes the real bug. `cratonvm-gc`'s full test suite (952 tests) and the fast regression suite (22/22, including every prior GC-stress reproducer named in this doc) are green against the fix. Broader `hib-suite-runner` validation in progress before merge to `dev`. |
+| **Status** | 🟢 **RESOLVED 2026-08-03 for this doc's own `--nojit` scope; the underlying corruption is broader and stays open under a sibling doc.** `DefaultCatalogAndSchemaTest` under `--nojit` (this doc's repro, below) now completes cleanly at exact parity with HotSpot — `found=132 started=132 ok=132 failed=0` — on **three independent full runs**, including the plain production default with no special flags. `OldGen::compact` (the old-gen sliding compactor) is now **disabled by default**, which is what fixed it. **Important correction, same day:** `compact()` is NOT the corruption's writer — a JIT-on run of the same class, with `compact()` still disabled, crashed with the identical `num_slots=33554433` signature inside the mark-phase BFS (`old_gen_gc`'s `scan_object_for_old_refs`, which runs before the compact-vs-sweep branch is even reached). The corruption predates and is shared by both old-gen reclamation strategies; disabling `compact()` only stopped this specific `--nojit` reproducer from walking into it, for a reason not established. See Follow-up 4 / Resolution for the full history, including the retraction. The JIT-on crash is [`defaultcatalogandschema-late-phase-instability-20260801.md`](../../../known-issues/hibernate/defaultcatalogandschema-late-phase-instability-20260801.md)'s problem, not this doc's, and remains OPEN there with this session's findings folded in. `compact()` itself is not deleted and can be re-enabled with `CRATONVM_OLDGEN_COMPACT=1` at no established cost. `cratonvm-gc`'s full test suite (952 tests), the fast regression suite (22/22), and 400 real Hibernate classes across both JIT modes are green against the fix. |
 | **ID** | `HIB-MAPRESIZE-STALE.1` |
 | **Found** | 2026-07-31, validating the `DefaultCatalogAndSchemaTest` runner accommodation ([`../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md)). |
 | **Fixed** | 2026-08-03, branch `fix/hib-mapresize-chain-cursor-retire-20260803`. Commits `1ec76ae41` (stale-objref canary hardening), `83f640e62` (compact walk-coverage guard), `86bcb96ed` (raw-byte corruption dump), `96b2bc4a7` (**the fix**: compaction disabled by default). |
@@ -954,7 +954,7 @@ continues this:
    audited this session the way `sweep_old_gen_non_moving` was for defect 4.
    Start there before `coalesce_free_blocks` again.
 
-### Resolution — 2026-08-03: `OldGen::compact()` is the writer; disabled by default
+### Resolution — 2026-08-03: `--nojit` lane fixed; `OldGen::compact()` is NOT the writer (retracted below)
 
 Two more fixes closed the walk-coverage gap the corruption exposed
 (`83f640e62`: `compact()` now verifies `walk_objects`'s total covers
@@ -1021,18 +1021,35 @@ passed, 0 failed. Fast regression suite: 22/22, including `RMapGcStress`,
 `RMapResizeGc`, `ROverlaySystemGcStress` — every GC-stress reproducer this
 doc's history produced.
 
-**What this is not.** The exact statement inside `compact()`'s Phase 1-3
-responsible for writing `shape=0x02000001` was not identified — only that
-avoiding the function entirely removes the symptom, repeatedly and
-deterministically. This is a validated, evidence-backed default flip, not a
-root-cause patch. `compact()` is disabled, not deleted, specifically so a
-future session can re-enable it (`CRATONVM_OLDGEN_COMPACT=1`) once the real
-bug is found — the two literal-ASCII-text findings above (`kind=0x3a`,
-`"TestTask"`) remain the strongest unchased lead for that session, alongside
-the two now-audited-but-still-suspect phases (Phase 1-3 itself, and whatever
-in the moving-young promotion path could hand `compact()` a live object whose
-header already reads wrong before compaction ever touches it — not yet ruled
-out, since code review of `compact()` alone came up empty).
+**RETRACTED same day: `compact()` is not the writer.** A same-class run under
+JIT-ON, with compaction disabled by the fix below (`CRATONVM_OLDGEN_COMPACT`
+unset — its default), still crashed: `EXCEPTION_ACCESS_VIOLATION` at
+`old_gen_gc+0xFA3` (`gen_heap.rs:10060`, `Self::scan_object_for_old_refs`
+inside the mark-phase BFS — code that runs identically whether `compact` ends
+up `true` or `false`, and runs *before* that branch is even reached), with
+the identical `num_slots=33554433` signature logged eleven lines earlier.
+`gc young-gen actual: 2 moving cycle(s), 30 cycle(s) diverted to the
+NON-MOVING sweep` — under JIT-on this workload spends nearly all its old-gen
+time in the in-place sweep anyway, which `compact()` being disabled does not
+touch. **So the corruption is not produced by `compact()` at all** — it
+predates old_gen_gc's mark phase, is shared by both reclamation strategies,
+and disabling `compact()` merely stopped this specific `--nojit` reproducer
+from *walking into* it, for a reason not established (workload/timing
+difference between the two lanes, not a difference in whether the bug can
+fire). The exact statement responsible for writing `shape=0x02000001` was
+**not** identified by code review of `compact()` — correctly, as it turns
+out, since `compact()` was never the culprit. This JIT-on crash is the same
+symptom [`defaultcatalogandschema-late-phase-instability-20260801.md`](../../../known-issues/hibernate/defaultcatalogandschema-late-phase-instability-20260801.md)
+already tracks; that doc has been updated with this session's findings
+(compact() ruled out there too, the mark-phase-BFS location, and the
+shared-mechanism argument) and remains OPEN. `compact()` is disabled, not
+deleted, specifically so a future session investigating *that* doc can
+re-enable it (`CRATONVM_OLDGEN_COMPACT=1`) without cost — it was never shown
+to be part of the problem, only empirically NOT necessary for this doc's own
+`--nojit` reproducer to pass. The two literal-ASCII-text findings above
+(`kind=0x3a`, `"TestTask"`) remain the strongest unchased lead for whoever
+picks up the real investigation, now correctly filed against the sibling
+doc instead of this one.
 
 **Fragmentation tradeoff, acknowledged not resolved.** `compact()` exists to
 defragment old gen; the in-place sweep's own `coalesce_free_blocks` fallback
