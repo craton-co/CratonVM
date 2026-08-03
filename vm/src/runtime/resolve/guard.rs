@@ -383,9 +383,17 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/interpreter.rs",
         "access_control::check_",
-        2,
+        1,
         "migration step 3b: `check_class_access` for `new` (the one member of \
          the access-control surface that IS wired) plus one probe.",
+    ),
+    (
+        "vm/src/runtime/interpreter/opcodes.rs",
+        "access_control::check_",
+        1,
+        "migration step 3b: check_class_access on the new opcode arm, which \
+         moved to opcodes.rs with execute_instruction. Relocated by the \
+         SEAM-02 split, not added.",
     ),
     (
         "vm/src/runtime/interpreter/field_access.rs",

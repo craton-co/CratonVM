@@ -24,6 +24,29 @@ fn read_ws(rel: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
+/// Read a module: the `foo.rs` file plus every `foo/*.rs` submodule.
+///
+/// A check that names a single file silently stops covering the code when that
+/// file is split — and `vm/src/runtime/interpreter.rs` has been split twice now.
+/// `t11_safety_conformance` already reads this module the same way; this is the
+/// same fix applied to the one T14 check that did not.
+fn read_module(rel: &str) -> String {
+    let mut src = read_ws(rel);
+    let dir = workspace_root().join(rel.trim_end_matches(".rs"));
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut paths: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
+            .collect();
+        paths.sort();
+        for p in paths {
+            src.push('\n');
+            src.push_str(&std::fs::read_to_string(&p).unwrap_or_default());
+        }
+    }
+    src
+}
+
 /// Whitespace-stripped copy of a source file. `registry.register(...)` calls
 /// are frequently wrapped across several lines by rustfmt, so a per-line text
 /// scan misses them (and conflicts with `cargo fmt`). Matching against the
@@ -637,7 +660,11 @@ fn t14_system_properties_populated() {
 
 #[test]
 fn t14_system_stream_intercept_exists() {
-    let interp = read_ws("vm/src/runtime/interpreter.rs");
+    // The whole interpreter module: `ensure_system_streams` moved into
+    // `interpreter/opcodes.rs` with `execute_instruction` in the SEAM-02 split,
+    // and a check that reads only `interpreter.rs` would report the intercept
+    // missing when it had merely moved one file over.
+    let interp = read_module("vm/src/runtime/interpreter.rs");
 
     assert!(
         interp.contains("System.out") || interp.contains("java/lang/System"),
