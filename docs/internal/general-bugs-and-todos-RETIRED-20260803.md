@@ -187,9 +187,9 @@ real threading model, what mutates the pointee and under what lock, whether
 the pointee can move under a live copy on another thread, a per-operation
 contract table, and the soundness derivation). The `unsafe impl`s stay, and
 the SAFETY note above them was rewritten to be *narrower* than the argument it
-replaced — it asserts only that the 16-byte value is `Copy` with no interior
-mutability and no ownership semantics, and explicitly stops asserting anything
-about the pointee.
+replaced — it asserts only that the value (a single `NonNull<u8>`) is `Copy`
+with no `Drop`, no interior mutability and no ownership semantics, and
+explicitly stops asserting anything about the pointee.
 
 The item's premise that the impls rested on a single-threaded mutator was
 correct about the *old* note, which is exactly why it was replaced: that
