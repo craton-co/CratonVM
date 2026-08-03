@@ -619,6 +619,131 @@ fn planning_refuses_unless_armed() {
     assert_eq!(x.code_len, 21 + 5 + 3 * 12 + 15);
 }
 
+/// The refusal tally must count the four conditions INDEPENDENTLY.
+///
+/// This is the whole point of `loop-02`'s first increment. The planner returns
+/// on the first refusal that holds, so a tally keyed on "which one fired" would
+/// record `deopt_real` — default-ON and process-wide — for 100% of compiles and
+/// say nothing about the other three, which is exactly the measurement gap the
+/// lane exists to close.
+///
+/// The edit that would trip this: moving any `tally(...)` call below the
+/// `return Err(...)` it sits above, or counting the refusal instead of the
+/// condition.
+#[test]
+fn the_refusal_tally_counts_all_four_conditions_not_just_the_first() {
+    // Serialised against the other tally test: these are process-wide
+    // counters and the module's tests run concurrently.
+    let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::metrics::reset_loop_xform_counts_for_test();
+    let code = shape_int_accum_loop();
+    // Every condition true at once. The planner refuses on the first, and the
+    // tally must still see all four.
+    let all = LoopRewriteShape {
+        deopt_real: true,
+        precise_exception_frames: true,
+        has_indy: true,
+        has_inline_sites: true,
+    };
+    {
+        // Armed, so the four are what refuses rather than the arming check —
+        // which sits above them and would otherwise be the only row that moved.
+        let _armed = Armed::new();
+        assert_eq!(
+            plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), all).unwrap_err(),
+            LoopRewriteRefusal::DeoptRealEnabled,
+            "the first refusal is still the one returned"
+        );
+    }
+    let counts = |name: &str| -> u64 {
+        crate::metrics::loop_xform_counts()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| panic!("no such counter: {name}"))
+    };
+    assert_eq!(counts("loop_xform_compiles"), 1);
+    for name in [
+        "loop_xform_deopt_real",
+        "loop_xform_precise_exception_frames",
+        "loop_xform_invokedynamic",
+        "loop_xform_inline_sites",
+    ] {
+        assert_eq!(counts(name), 1, "{name} was not counted");
+    }
+    assert_eq!(counts("loop_xform_eligible"), 0);
+    assert_eq!(
+        counts("loop_xform_not_armed"),
+        0,
+        "a compile refused by the four never reaches the arming check"
+    );
+
+    // …and a compile with none of the four set is `eligible`, whether or not
+    // anything is armed. That is what makes the row a property of the METHOD.
+    crate::metrics::reset_loop_xform_counts_for_test();
+    assert_eq!(
+        plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
+        LoopRewriteRefusal::NotArmed
+    );
+    assert_eq!(counts("loop_xform_compiles"), 1);
+    assert_eq!(counts("loop_xform_eligible"), 1);
+    assert_eq!(counts("loop_xform_not_armed"), 1);
+    for name in [
+        "loop_xform_deopt_real",
+        "loop_xform_precise_exception_frames",
+        "loop_xform_invokedynamic",
+        "loop_xform_inline_sites",
+    ] {
+        assert_eq!(counts(name), 0, "{name}");
+    }
+    crate::metrics::reset_loop_xform_counts_for_test();
+}
+
+/// The loop-level rows, which need the rewriter armed.
+#[test]
+fn the_tally_separates_no_candidate_loop_from_a_structural_refusal() {
+    let _guard = TALLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let counts = |name: &str| -> u64 {
+        crate::metrics::loop_xform_counts()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| panic!("no such counter: {name}"))
+    };
+    let _armed = Armed::new();
+
+    // A method with no loop the planner will take: counted as
+    // `no_candidate_loop`, not as a planner refusal.
+    crate::metrics::reset_loop_xform_counts_for_test();
+    let none = vec![0x03u8, 0xac]; // iconst_0; ireturn
+    assert_eq!(
+        plan_bytecode_loop_xform(&none, 2, &[], &HashMap::new(), accum_shape_ok()).unwrap_err(),
+        LoopRewriteRefusal::NoCandidateLoop
+    );
+    assert_eq!(counts("loop_xform_eligible"), 1);
+    assert_eq!(counts("loop_xform_no_candidate_loop"), 1);
+    assert_eq!(counts("loop_xform_planner_refused"), 0);
+
+    // …and a method the planner selects a loop in but the rewriter refuses:
+    // the irreducible fixture, which is either skipped as a candidate or
+    // refused structurally. Whichever it is, exactly one of the two rows moves.
+    crate::metrics::reset_loop_xform_counts_for_test();
+    let irr = shape_irreducible();
+    assert!(plan_bytecode_loop_xform(&irr, 21, &[], &HashMap::new(), accum_shape_ok()).is_err());
+    assert_eq!(
+        counts("loop_xform_no_candidate_loop") + counts("loop_xform_planner_refused"),
+        1,
+        "exactly one outcome row per refused compile"
+    );
+    assert_eq!(counts("loop_xform_applied"), 0);
+    crate::metrics::reset_loop_xform_counts_for_test();
+}
+
+/// Serialises the two tally tests. `LOOP_XFORM_COUNTERS` is process-wide and
+/// this module's tests run concurrently, so without this each would see the
+/// other's increments — the flakiness would look like a counting bug.
+static TALLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Every whole-compile refusal names a construct that publishes an emitter
 /// pc to the VM as a resume bci through a path this wiring does not
 /// translate. Each must refuse on its own, not merely in combination.

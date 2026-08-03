@@ -1416,6 +1416,101 @@ pub fn record_osr_event(event: &str) {
     }
 }
 
+/// Bytecode loop-rewriter admission, counted per compile that reaches
+/// `x64::loop_rewrite::plan_bytecode_loop_xform`.
+///
+/// ## Why the four refusal conditions are counted INDEPENDENTLY
+///
+/// The planner evaluates them in a fixed order and returns on the first, so a
+/// "which refusal fired" tally answers a question nobody asked: `deopt_real` is
+/// default-ON and process-wide, so it would account for **100%** of refusals
+/// and hide the other three permanently. Each condition is therefore recorded
+/// on every compile that reaches the planner, whether or not an earlier one has
+/// already refused. The four counts **overlap by construction** — a method with
+/// an `invokedynamic` compiled under `deopt_real` bumps both — and must not be
+/// summed. `loop_xform_eligible` is the count of compiles where none of them
+/// held.
+///
+/// ## They are properties of the METHOD, not of the rewriter
+///
+/// which is why they are meaningful on a default (unarmed) run: "how often does
+/// an `invokedynamic` cost this transform a method" needs nothing armed. The
+/// four loop-level rows below do need it — on an unarmed run
+/// `loop_xform_not_armed` equals `loop_xform_compiles` and the rest are zero,
+/// which is the honest answer rather than a gap.
+///
+/// See `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
+pub const LOOP_XFORM_EVENTS: [&str; 10] = [
+    // Denominator: compiles that reached the planner at all.
+    "loop_xform_compiles",
+    // The four whole-compile refusal conditions, each counted on every compile
+    // it holds for. Overlapping; do not sum.
+    "loop_xform_deopt_real",
+    "loop_xform_precise_exception_frames",
+    "loop_xform_invokedynamic",
+    "loop_xform_inline_sites",
+    // None of the four held. This is the population a narrowing effort would
+    // be trying to grow.
+    "loop_xform_eligible",
+    // …and of those, the ones that got no further because nothing armed the
+    // rewriter. On a default run this equals `loop_xform_compiles`.
+    "loop_xform_not_armed",
+    // Armed and eligible, but no loop passed the profitability band and the
+    // structural admission test.
+    "loop_xform_no_candidate_loop",
+    // Armed and eligible, a loop was selected, and the rewriter refused it for
+    // a structural reason (`LoopXformRefusal`).
+    "loop_xform_planner_refused",
+    // A transform was produced and the emitter compiled rewritten bytecode.
+    "loop_xform_applied",
+];
+
+/// One relaxed counter per [`LOOP_XFORM_EVENTS`] entry.
+static LOOP_XFORM_COUNTERS: [AtomicU64; LOOP_XFORM_EVENTS.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Count one occurrence of `event`.
+///
+/// Infallible, non-blocking and independent of [`enabled`], like
+/// [`record_osr_event`]: the point of this tally is to be readable from a
+/// default run, and a counter that only works when the metrics ring is on
+/// would answer for a configuration nobody runs. An unknown name is ignored.
+pub fn record_loop_xform_event(event: &str) {
+    if let Some(idx) = LOOP_XFORM_EVENTS.iter().position(|e| *e == event) {
+        LOOP_XFORM_COUNTERS[idx].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Read every loop-rewriter event's count, including zero-valued ones, in
+/// [`LOOP_XFORM_EVENTS`] order. Relaxed loads: a sample, not an atomic
+/// snapshot.
+pub fn loop_xform_counts() -> Vec<(&'static str, u64)> {
+    LOOP_XFORM_EVENTS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (*name, LOOP_XFORM_COUNTERS[i].load(Ordering::Relaxed)))
+        .collect()
+}
+
+/// Drop every loop-rewriter count. Test-only, for the same reason
+/// [`reset_scheduling_counts_for_test`] is.
+#[cfg(test)]
+pub(crate) fn reset_loop_xform_counts_for_test() {
+    for counter in LOOP_XFORM_COUNTERS.iter() {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Read every OSR event's count, including zero-valued ones, in
 /// [`OSR_EVENTS`] order. Relaxed loads: a sample, not an atomic snapshot.
 pub fn osr_counts() -> Vec<(&'static str, u64)> {
@@ -1597,6 +1692,13 @@ pub struct MetricsSummary {
     /// hot loop means the requests are being refused or declined, and the
     /// other two rows say which.
     pub osr: Vec<(&'static str, u64)>,
+    /// [`loop_xform_counts`] verbatim: bytecode loop-rewriter admission,
+    /// process-wide and metrics-flag-independent like the three above.
+    ///
+    /// The four refusal-condition rows **overlap** — read each against
+    /// `loop_xform_compiles`, never as a partition, and never by summing them.
+    /// See [`LOOP_XFORM_EVENTS`].
+    pub loop_xform: Vec<(&'static str, u64)>,
 }
 
 /// Aggregate the retained reports.
@@ -1657,6 +1759,7 @@ pub fn summary() -> MetricsSummary {
         bailout_categories: crate::bailout::bailout_counts(),
         scheduling: scheduling_counts(),
         osr: osr_counts(),
+        loop_xform: loop_xform_counts(),
     }
 }
 
@@ -1698,6 +1801,7 @@ impl MetricsSummary {
         );
         let _ = write!(s, ",\"scheduling\":{}", pairs(&self.scheduling));
         let _ = write!(s, ",\"osr\":{}", pairs(&self.osr));
+        let _ = write!(s, ",\"loop_xform\":{}", pairs(&self.loop_xform));
         s.push('}');
         s
     }

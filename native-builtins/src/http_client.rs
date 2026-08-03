@@ -316,8 +316,18 @@ fn open_connection(
     // accepts a single SocketAddr, so we resolve manually and try each.
     let mut last_err: Option<String> = None;
     let mut tcp: Option<TcpStream> = None;
+    // `normalize_connect_addr` folds an IPv4-mapped destination
+    // (`::ffff:a.b.c.d`) to plain IPv4. A URL carries its host as TEXT, so this
+    // path never passes through `InetAddress` — which is where real JDK, and
+    // CratonVM's own mirror of it, collapses that literal to an
+    // `Inet4Address`. Without the fold we build an AF_INET6 socket, and on
+    // Windows `IPV6_V6ONLY` defaults to 1, so `connect` cannot reach a mapped
+    // destination: `TestStartupIPv6Connectors.testIPv6MappedIPv4` reported
+    // exactly "connect [::ffff:127.0.0.1]:<port>: ... (os error 10049)" from
+    // the `last_err` line below.
     for sa in std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
         .map_err(|e| format!("resolve {addr}: {e}"))?
+        .map(cratonvm_native_io::outbound_policy::normalize_connect_addr)
     {
         match TcpStream::connect_timeout(&sa, connect_timeout) {
             Ok(s) => {
