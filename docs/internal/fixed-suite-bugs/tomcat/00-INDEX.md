@@ -42,6 +42,8 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [testssl-client-initiated-renegotiation](testssl-client-initiated-renegotiation-FIXED.md) | The last `TestSsl` failure left after the hostname-verification fix. The bare `assertTrue` is the `HandshakeCompletedListener` never firing — and probing it turned up **three** client-side JSSE defects unrelated to renegotiation: listeners accepted but never invoked (they had been registered as an inert no-op to silence an `AbstractMethodError`), `getSession()` returning **null** where JSSE guarantees non-null, and a version-pinned `SSLContext.getInstance("TLSv1.2")` ignored so the socket negotiated TLS 1.3. The protocol pin had to be fixed in `net_phase_e`'s `createSocket`, which re-registers the same triple later and **wins** — fixing only the `phases_late` copy changed nothing | TestSsl | FAIL | ✅ **FIXED** (2026-08-02) — one **by-design** residual: client-initiated TLS 1.2 renegotiation, which rustls omits as its CVE-2009-3555/3SHAKE mitigation, so `testClientInitiatedRenegotiation[JSSE]` stays red |
 | [32](32-doc04-residual-perf-assertions-CLOSED.md) | The four per-test performance assertions carved out of 04. One real defect found and FIXED: the bulk `ByteBuffer` natives copied **one byte per accessor call** — 293 µs per 8 KiB where the same VM's `System.arraycopy` did it in 2.7 µs — which was the whole of the WebSocket SEQ1 gap and had been misattributed to "upcall and frame-decode cost". 32.2 is not a defect (now confirmed on a **loaded** host, 5.8 % margin). 32.1, 32.4 and 32.3's SEQ2 residual are consumers of VM-wide throughput problems and moved to the documents that own them | TestMapperPerformance, TestELParserPerformance, TestAsyncMessagesPerformance, TestOneLineFormatterPerformance | perf | ✅ **CLOSED** (2026-07-31) — **two of the four tests still FAIL**; they are tracked in [30](30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md) and [the retired moving-young gate doc](../../jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md), not here |
 | [tls-stw](testsslhostconfigcompat-testhostec-read-timeout-FIXED.md) | `testHostEC[JSSE-KEYSTORE]` wedged for exactly 300 s in ~1 run in 4 — the https branch of `http_url_connection::perform` parked the calling thread in `recv()` with **no GC blocking region**, so a stop-the-world cross-thread JIT takeover deadlocked against it while every Tomcat thread that owed it bytes sat at the same barrier. Not an EC/no-SAN/endpoint-identification problem at all (the open doc's lead); `testHostEC` is simply test 12 of 78, where the run's Nth young GC lands | TestSSLHostConfigCompat | FAIL (flake) | ✅ **FIXED** (2026-08-01) |
+| [locale-script](testacceptlanguage-locale-script-variant-dropped-FIXED.md) | `Locale.forLanguageTag` was a hand-rolled Rust BCP-47 split whose side table had no slot for a **script**, so `zh-hant-CN` came back as bare `zh_CN` ("expected:`<zh_CN_#Hant>` but was:`<zh_CN>`"). Four more defects in the same family: an extension singleton filed as the *variant* (`en-US-u-ca-japanese` → variant `"u"`), `und` treated as a language, `toString()` omitting the extension suffix, and `stripExtensions()` an identity stub. Fixed by delegating to the JDK's own `forLanguageTag` body — `Locale.Builder.setLanguageTag`, which shares that chain, was already byte-identical to HotSpot, so re-implementing BCP-47 in Rust was never needed. The Rust split survives for synthetic-JDK mode only, now with 8 unit tests | TestAcceptLanguage | FAIL | ✅ **FIXED** (2026-08-03) |
+| [ws-async-seq2](websocket-async-send-interframe-latency-CLOSED-20260803.md) | The gap between two async WebSocket messages, opened as "root cause not found". It is not in the WebSocket code: `clearHandler` hands the `SendHandler` to the container `ThreadPoolExecutor`, so SEQ2's 500 us budget contains **two** AQS handoffs — and every AQS-mediated handoff in the VM is 13-26x HotSpot (`Condition.signal`→`await` 96.9 us vs 7.4; `execute`→task 167 us vs 7.9), while `park`/`unpark` and monitor `wait`/`notify` are within 3-4x. The doc's own probes measured Semaphore/LockSupport/Object.wait — none of which is the primitive on the path. One real defect fell out and is FIXED: **the invokestatic inline cache had been globally suppressed since the 2026-07-04 `loader_aware_resolution` default flip** (`loader_specific_dispatch` set on *attempting* loader-aware resolution, not on selecting an owner), so `Thread.onSpinWait()` — which AQS calls up to 255 times per handoff — cost 807 ns instead of 109 ns | TestAsyncMessagesPerformance | perf | ✅ **CLOSED** (2026-08-03) — **the test still FAILS**; the residue is the per-call floor and is carried by [aqs-thread-handoff-latency](../../../known-issues/vm/aqs-thread-handoff-latency-20260803.md), not here |
 
 14 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14/21/22/25/27/28); the open set is
 dominated by the throughput wall (04) and the not-yet-individually-diagnosed
@@ -148,3 +150,76 @@ both binaries, written up individually: groups 21-28. Everything else
 contention-suspected findings, 1 Windows-only fixture gap) is in
 [29](29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md), not treated as new
 bugs.
+
+## Windows classpath fixture gap closed, 2026-08-03
+
+`apps\tomcat\.suite\cp.txt` was short by four jars (BouncyCastle
+provider/pkix/util 1.84 + EasyMock 5.6.0) because `Build-Classpath` matched
+only Tomcat's renamed jar names and `$LIB` no longer exists on this box. Eleven
+classes reported `NoClassDefFoundError` and had been filed as two separate
+known-issues docs; both are now retired into
+[bouncycastle-easymock-classpath-fixture-gap-FIXED](bouncycastle-easymock-classpath-fixture-gap-FIXED.md).
+With the classpath repaired **CratonVM passes 13/13** of the affected classes
+(JIT and `--nojit`) and **HotSpot passes 5/13** — EasyMock 5.6.0 cannot mock
+classes on JDK 25 at all, so those 8 classes are permanently red in a HotSpot
+control run and must not be scored as CratonVM regressions. The same doc
+records two `run-one.ps1` defects found on the way (it passed none of the
+suite's `--add-opens`/`tomcat.test.*` JVM args, and its exit code was always 0).
+
+## Windows httpd reverse-proxy fixture closed — and a real defect under it, 2026-08-03
+
+[httpd-proxy-integration-windows-FIXED-20260803](httpd-proxy-integration-windows-FIXED-20260803.md).
+The 9 `org.apache.tomcat.integration.httpd.*` classes had been filed as a pure
+fixture gap because HotSpot failed identically — but with no httpd installed
+*both VMs fail before any VM-specific code runs*, so that shared red proved
+nothing. Standing the fixture up (`setup-httpd-windows.ps1`: SHA-256-verified
+Apache Lounge build into a local dir, plus a patch raising `TesterHttpd`'s
+1000 ms listener deadline, which MPM WinNT startup misses every time at a
+measured 1.0-1.5 s) produced **9 HotSpot PASS vs 9 CratonVM FAIL**, all on one
+defect: the synthetic `Process` kept its own state at slots 0..5, which is
+where real `java.lang.Process` bytecode resolves its own six
+`inputReader`/`inputCharset`/… cache fields, so `p.inputReader()` read a pipe
+fd as a `BufferedReader`. Now **9/9 on both VMs**. Regression witness:
+`apps/tomcat-suite-runner/probes/ProcessReaderProbe.java`.
+
+**The lesson to carry:** "HotSpot fails identically" only closes a family when
+the shared failure is the *last* one. Until the fixture is actually up, it is
+an untested hypothesis, not a verdict.
+
+
+## IPv4-mapped IPv6 destinations unreachable on Windows, 2026-08-03
+
+[teststartupipv6connectors-ipv6-mapped-ipv4-FIXED-20260803](teststartupipv6connectors-ipv6-mapped-ipv4-FIXED-20260803.md).
+`TcpStream::connect*` takes its socket family from the `SocketAddr`, so a
+`SocketAddr::V6` gets AF_INET6 — and Windows defaults `IPV6_V6ONLY` to 1, so it
+cannot reach `::ffff:127.0.0.1` at all (WSAEADDRNOTAVAIL / os error 10049).
+Linux defaults it off, hence Windows-only. Real JDK never builds that socket:
+`InetAddress.getByName` returns an `Inet4Address`, and CratonVM's `InetAddress`
+layer already mirrored the fold — **but every connect path that re-parses the
+destination from a STRING in Rust bypasses it** (a URL's host text, or an
+`InetSocketAddress` that kept its hostname). Folded at all six such sites via
+`outbound_policy::normalize_connect_addr`. `TestStartupIPv6Connectors` 3/4 →
+**4/4**, A/B over 16 network classes with **zero** regressions.
+
+Two things generalise. **A one-line report can be a six-site defect:** the doc
+named only `HttpURLConnection`; a probe over four connect surfaces found
+`SocketChannel.connect` broken too. **And the dead-copy trap bit again** — the
+first fix went into `http_client::open_connection`, which `HttpURLConnection`
+does not use; `http_url_connection.rs` has its own connect loop, twice.
+
+## WebSocket-over-TLS `[JSSE]` client connect fixed, 2026-08-03
+
+`SSLEngine.wrap()` treated the caller's source buffer as application data for
+one flight of the handshake: `do_wrap` gated on `!conn.is_handshaking()`, but
+`handshake_status_of` keeps answering NEED_WRAP past that point (group 21's
+TLS-1.2 server-flight fix), so a caller obeying NEED_WRAP had its buffer
+drained — and the bytes ENCRYPTED onto the wire. Tomcat's WebSocket client
+passes a static 16921-byte `DUMMY`, so `wrap` reported `bytesConsumed=16384`,
+tripping `AsyncChannelWrapperSecure`'s "Bytes were consumed from the input
+during a write", and the never-rewound `DUMMY` carried the damage into later
+connections. Gated on `handshake_finished_reported` instead. Both `[JSSE]`
+classes go FAIL → PASS and are the ONLY rows that move across a 16-class TLS
+set run on two binaries; the residual `TestSsl` / `TestClientCert` failures are
+the pre-existing renegotiation ones, identical on both arms. Write-up:
+[websocket-jsse-wrap-consumed-app-data-during-handshake-FIXED](websocket-jsse-wrap-consumed-app-data-during-handshake-FIXED.md).
+

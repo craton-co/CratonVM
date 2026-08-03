@@ -326,6 +326,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "ir-compiles", on_key: Some("CRATONVM_DBG_IR_COMPILES"), off_key: None, off_word: None },
     // The trace half of `jit/ir-linear-scan`; same token name in the group that
     // owns tracing, exactly like `ir-long` and `xt-jit-root-scan` below.
+    E { group: Group::DBG, token: "ir-isel", on_key: Some("CRATONVM_DBG_IR_ISEL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-linear-scan", on_key: Some("CRATONVM_DBG_IR_LINEAR_SCAN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-long", on_key: Some("CRATONVM_DBG_IR_LONG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ir-reloc", on_key: Some("CRATONVM_DBG_IR_RELOC"), off_key: None, off_word: None },
@@ -582,6 +583,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "arith-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_ARITH_LICM"), off_word: None },
     E { group: Group::JIT, token: "bce", on_key: None, off_key: Some("CRATONVM_JIT_NO_BCE"), off_word: None },
     E { group: Group::JIT, token: "bg-compile", on_key: Some("CRATONVM_BG_COMPILE"), off_key: None, off_word: None },
+    // The bytecode loop rewriter (`x64::plan_bytecode_loop_xform`: peel,
+    // unroll, guarded versioning). Default-**OFF**, and arming it also turns
+    // the native byte-copy unroller off — the two are exact complements, and
+    // both firing on one loop would put `(k+1)^2` bodies behind one back-edge
+    // poll. Sufficient on its own since `loop-02` retired the `deopt-real`
+    // whole-compile refusal: this token alone now reaches loops under the
+    // default configuration, and pairing it with `-deopt-real` measures the
+    // deopt-real-off configuration rather than the transform. See
+    // `docs/jit/loop-rewriter-wiring.md`.
+    E { group: Group::JIT, token: "bytecode-loop-xform", on_key: Some("CRATONVM_JIT_BYTECODE_LOOP_XFORM"), off_key: None, off_word: None },
     // Default-ON: `x64::escape_analysis::bulk_byte_loops_enabled` reads
     // `0`/`false`/`off` (trimmed, case-insensitive) as the kill switch.
     E { group: Group::JIT, token: "bulk-byte-loops", on_key: Some("CRATONVM_JIT_BULK_BYTE_LOOPS"), off_key: None, off_word: Some("0") },
@@ -608,6 +619,15 @@ pub const INVENTORY: &[E] = &[
     // Default-ON: `x64::licm::gc_inert_selfrec_enabled` reads `0`/`false`/`off`.
     E { group: Group::JIT, token: "gc-inert-selfrec", on_key: Some("CRATONVM_JIT_GC_INERT_SELFREC"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "getfield-helper", on_key: Some("CRATONVM_JIT_GETFIELD_HELPER"), off_key: None, off_word: None },
+    // Presence-parsed kill switch for the inline (helper-free) compiled
+    // `getstatic` load, exactly like `getfield-helper` above: setting it
+    // routes every static read back through `jit_getstatic`.
+    E { group: Group::JIT, token: "getstatic-helper", on_key: Some("CRATONVM_JIT_GETSTATIC_HELPER"), off_key: None, off_word: None },
+    // PGO-02: guarded monomorphic-virtual-call inlining (splice the callee
+    // body behind a receiver class-id guard, miss falls to normal dispatch,
+    // never a deopt). Default-OFF until soaked — see
+    // docs/feature-designs/profile-guided-inlining.md.
+    E { group: Group::JIT, token: "guarded-virtual-inline", on_key: Some("CRATONVM_JIT_GUARDED_VIRTUAL_INLINE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "helpful-npe-opcodes", on_key: Some("CRATONVM_HELPFUL_NPE_OPCODES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inclusive-bce", on_key: Some("CRATONVM_JIT_INCLUSIVE_BCE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-allow-static", on_key: Some("CRATONVM_INLINE_ALLOW_STATIC"), off_key: None, off_word: None },
@@ -634,6 +654,8 @@ pub const INVENTORY: &[E] = &[
     // already the off state and `off_word` stays `None`; writing `"0"` here
     // would work too but would mislabel the row as a default-ON knob, which is
     // the one thing this table is supposed to state unambiguously.
+    E { group: Group::JIT, token: "ir-isel-shadow", on_key: Some("CRATONVM_JIT_IR_ISEL_SHADOW"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "precise-field-ops", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_FIELD_OPS"), off_word: None },
     E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.

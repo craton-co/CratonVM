@@ -1217,16 +1217,33 @@ fn native_quarkus_logging_handle_failed_start(
 // ---------------------------------------------------------------------------
 // ProcessBuilder / Process — actual process execution via std::process
 // ProcessBuilder = 4-field synthetic (command=0, directory=1, env=2, redirect=3)
-// Process = 4-field synthetic (exit_code=0, stdout=1, stderr=2, pid=3)
+// Process = 4-field synthetic (exit_code, stdout, stderr, pid) laid out AFTER
+// the six slots java.lang.Process declares for itself — see
+// JAVA_PROCESS_FIELD_COUNT below.
 // ---------------------------------------------------------------------------
 const PB_FIELD_COMMAND: usize = 0;
 const PB_FIELD_DIRECTORY: usize = 1;
 const PB_FIELD_ENVIRONMENT: usize = 2;
 
-const PROC_FIELD_EXIT: usize = 0;
-const PROC_FIELD_STDOUT: usize = 1;
-const PROC_FIELD_STDERR: usize = 2;
-const PROC_FIELD_PID: usize = 3;
+/// Leading slots reserved for `java.lang.Process`'s own six instance fields
+/// (`outputWriter`, `outputCharset`, `inputReader`, `inputCharset`,
+/// `errorReader`, `errorCharset`). Real `java.lang.Process` bytecode — the
+/// final concrete `inputReader()`/`errorReader()`/`outputWriter()` — resolves
+/// those to absolute slots 0..=5 on whatever receiver it is handed, so a
+/// synthetic Process that puts its own state there makes that bytecode read
+/// an int fd as a `BufferedReader`. Must stay identical to `native-io`'s
+/// `process::JAVA_PROCESS_FIELD_COUNT`: `native-io`'s `legacy_captured_stream`
+/// reads THIS layout's stdout/stderr string slots through its own
+/// `PROC_FIELD_STDIN_FD`/`PROC_FIELD_STDOUT_FD` constants, an alias that only
+/// holds while both layouts start at the same offset.
+const JAVA_PROCESS_FIELD_COUNT: usize = 6;
+
+const PROC_FIELD_EXIT: usize = JAVA_PROCESS_FIELD_COUNT;
+const PROC_FIELD_STDOUT: usize = JAVA_PROCESS_FIELD_COUNT + 1;
+const PROC_FIELD_STDERR: usize = JAVA_PROCESS_FIELD_COUNT + 2;
+const PROC_FIELD_PID: usize = JAVA_PROCESS_FIELD_COUNT + 3;
+/// Total slots on this (legacy) synthetic Process.
+const PROC_FIELD_COUNT: usize = JAVA_PROCESS_FIELD_COUNT + 4;
 
 /// Walk a `java.util.Map`'s entries via its own `entrySet()`/`iterator()`/
 /// `Map.Entry` protocol (virtual dispatch on the receiver's real class, not a
@@ -1518,7 +1535,8 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                 let child_pid = child.id();
                 match child.wait_with_output() {
                     Ok(output) => {
-                        let process = alloc_concurrent_synthetic(ctx, "java/lang/Process", 4);
+                        let process =
+                            alloc_concurrent_synthetic(ctx, "java/lang/Process", PROC_FIELD_COUNT);
                         // Pin across the create_strings below — a moving young GC there
                         // would relocate the fresh Process (native stale-local family).
                         let process_pin = ctx.pin_native_root(process);

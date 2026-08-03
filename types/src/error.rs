@@ -168,6 +168,10 @@ const UNKNOWN: &str = "<unknown>";
 /// What an absolute path is replaced with when `verbose` is false.
 const REDACTED: &str = "<redacted>";
 
+/// Offered only on a report that actually redacted something.
+const REMEDIATION_EXPLAIN: &str =
+    "re-run with --explain-jdk-only to print absolute paths unredacted";
+
 /// The penultimate line of every [`JdkOnlyViolation::render`]. Pinned: §1.7
 /// requires every strict-mode failure to name the fallback, and an operator
 /// scrolled to the bottom of a wall of diagnostics must find it in the same
@@ -445,9 +449,30 @@ impl JdkOnlyViolation {
     /// `native-builtins/src/lib.rs:1234` — pass through untouched, because
     /// those are the ones a reader actually needs and they leak nothing about
     /// the machine the run happened on.
+    /// The loader that initiated the request, for the variants that record one.
+    ///
+    /// Only `CompatibilityClassRequested` carries it: it is the only refusal
+    /// where "who asked" is a loader rather than a call site.
+    pub fn initiating_loader(&self) -> Option<&str> {
+        match self {
+            Self::CompatibilityClassRequested {
+                initiating_loader, ..
+            } => initiating_loader.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn render(&self, jdk_feature: Option<u32>, verbose: bool) -> String {
         let mut out = String::new();
-        out.push_str(&format!("JDK-only policy violation [{}]\n", self.kind()));
+        // The headline names the mode that refused, not just the rule. A report
+        // pasted into a tracker has to say "this VM was run with --jdk-only"
+        // before anything else, or the first reply is always "run it normally
+        // then" — which is exactly the fallback the last line already offers.
+        // `docs/jdk-only-migration.md` shows the same shape.
+        out.push_str(&format!(
+            "CratonVM --jdk-only: policy violation [{}]\n",
+            self.kind()
+        ));
         out.push_str(&format!(
             "  requested class:   {}\n",
             redact_paths(self.class(), verbose)
@@ -462,6 +487,18 @@ impl JdkOnlyViolation {
                 None => UNKNOWN.to_string(),
             }
         ));
+        // The initiating loader is half the answer to "why did this class not
+        // resolve": the same name resolves differently through the app loader
+        // and through a module layer, and a fabrication refusal is nearly
+        // always a story about which one asked. `to_json` has always carried
+        // it; the long form dropped it, which is the wrong way round — the
+        // long form is the one a human reads.
+        if let Some(loader) = self.initiating_loader() {
+            out.push_str(&format!(
+                "  initiating loader: {}\n",
+                redact_paths(loader, verbose)
+            ));
+        }
         out.push_str(&format!(
             "  reason:            {}\n",
             redact_paths(&self.reason(), verbose)
@@ -488,6 +525,12 @@ impl JdkOnlyViolation {
         out.push_str("  Remediation:\n");
         for line in self.remediation() {
             out.push_str(&format!("    {line}\n"));
+        }
+        // Only when something was actually redacted: a reader who can see the
+        // paths does not need to be told how to see them, and an unconditional
+        // line trains people to ignore it.
+        if !verbose && out.contains(REDACTED) {
+            out.push_str(&format!("    {REMEDIATION_EXPLAIN}\n"));
         }
         out.push_str(&format!("    {REMEDIATION_FALLBACK}\n"));
         out.push_str(&format!("    {REMEDIATION_CAPTURE}\n"));

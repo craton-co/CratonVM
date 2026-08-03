@@ -445,6 +445,73 @@ pub fn check_outbound(target: &str) -> Result<(), String> {
 // Helpers: connect with the configured timeout, honouring the policy.
 // ---------------------------------------------------------------------------
 
+/// Collapse an IPv4-mapped IPv6 destination (`::ffff:a.b.c.d`) to the plain
+/// IPv4 address before dialling it. Every other address passes through.
+///
+/// **Why this is not cosmetic.** `TcpStream::connect*` picks the socket family
+/// from the `SocketAddr`, so a `SocketAddr::V6` gets an AF_INET6 socket — and
+/// on Windows `IPV6_V6ONLY` defaults to **1**, so that socket cannot reach a
+/// v4-mapped destination at all: `connect` fails with WSAEADDRNOTAVAIL
+/// (`os error 10049`, "the requested address is not valid in its context").
+/// Linux defaults the option off (`net.ipv6.bindv6only=0`), which is why the
+/// same code path works there and this is a Windows-only failure.
+///
+/// Real JDK never hands the OS this destination in the first place:
+/// `InetAddress.getByName("::ffff:127.0.0.1")` returns an **`Inet4Address`**,
+/// so the JDK builds an AF_INET socket to `127.0.0.1`. CratonVM's own
+/// `InetAddress` layer already mirrors that fold (`net_phase_e`'s
+/// `hotspot_ip_string`) — but any connect path that re-parses the destination
+/// from a *string* in Rust (a URL's host, or an `InetSocketAddress` that kept
+/// its original hostname text) bypasses it and inherits the platform
+/// behaviour. That is how `TestStartupIPv6Connectors.testIPv6MappedIPv4`
+/// failed, via `HttpURLConnection`, and `SocketChannel.connect` with it.
+///
+/// Same spirit as `socket_channel::connect_target_host`'s wildcard→loopback
+/// rewrite: normalise a destination the OS was never meant to receive, rather
+/// than handing it over and reporting the OS's complaint.
+///
+/// Only the *mapped* form (`::ffff:a.b.c.d`) is folded, matching
+/// `hotspot_ip_string` exactly. `Ipv6Addr::to_ipv4` is deliberately NOT used:
+/// it also matches the deprecated IPv4-compatible form and `::1`, so `::1`
+/// would silently become `0.0.0.1`.
+pub fn normalize_connect_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::from((v4, v6.port())),
+            None => addr,
+        },
+        _ => addr,
+    }
+}
+
+/// `TcpStream::connect(target)` with [`normalize_connect_addr`] applied to
+/// every resolved candidate.
+///
+/// Drop-in replacement for `TcpStream::connect(&host_port_string)` at sites
+/// that dial a host taken from a URL or config. `TcpStream::connect(&str)`
+/// resolves and iterates internally, so there is no way to fold the addresses
+/// without taking the resolution over — hence this helper rather than a
+/// one-line `.map()` like the sites that already resolve for themselves.
+///
+/// No policy check: this exists purely for the address fold, and the callers
+/// are paths that historically did not consult the outbound policy. Use
+/// [`policy_connect`] when the policy should apply.
+pub fn connect_str_normalized(target: &str) -> std::io::Result<std::net::TcpStream> {
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in target.to_socket_addrs()?.map(normalize_connect_addr) {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("no addresses resolved for {target}"),
+        )
+    }))
+}
+
 /// Connect to `target` (a `host:port` string) with the policy + timeout
 /// applied. On policy reject the caller gets `Err` with an
 /// "outbound policy" message; on connect error / DNS failure / timeout
@@ -462,9 +529,12 @@ pub fn policy_connect(target: &str) -> Result<std::net::TcpStream, PolicyConnect
     // Resolution: do it ourselves so we have a `SocketAddr` to feed to
     // `connect_timeout`. If the input is already a literal `IP:port`,
     // `to_socket_addrs` short-circuits without DNS lookup.
+    // Normalise BEFORE the per-address policy re-check below, so the address
+    // that gets vetted is the one that actually gets dialled.
     let addrs: Vec<SocketAddr> = target
         .to_socket_addrs()
         .map_err(PolicyConnectError::Io)?
+        .map(normalize_connect_addr)
         .collect();
 
     if addrs.is_empty() {
@@ -913,6 +983,48 @@ mod tests {
         }
         for on in ["1", "true", "yes", "on", "anything"] {
             assert!(is_on(on), "expected enabled for {on:?}");
+        }
+    }
+
+    /// An IPv4-mapped destination must be dialled as plain IPv4, because on
+    /// Windows an AF_INET6 socket cannot reach one (`IPV6_V6ONLY` defaults to
+    /// 1 → WSAEADDRNOTAVAIL). The port must survive the fold.
+    #[test]
+    fn normalize_connect_addr_folds_v4_mapped() {
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:8080".parse().unwrap();
+        let got = normalize_connect_addr(mapped);
+        assert!(matches!(got, SocketAddr::V4(_)), "expected V4, got {got}");
+        assert_eq!(got.ip().to_string(), "127.0.0.1");
+        assert_eq!(got.port(), 8080);
+
+        // A non-loopback mapped address folds the same way.
+        let mapped: SocketAddr = "[::ffff:10.1.2.3]:1".parse().unwrap();
+        assert_eq!(normalize_connect_addr(mapped).ip().to_string(), "10.1.2.3");
+    }
+
+    /// Everything that is NOT `::ffff:a.b.c.d` must pass through untouched.
+    /// `::1` is the one that matters: `Ipv6Addr::to_ipv4` (which this must not
+    /// use) also matches the loopback and the deprecated IPv4-compatible form,
+    /// so it would silently rewrite `::1` to `0.0.0.1` and dial a stranger.
+    #[test]
+    fn normalize_connect_addr_leaves_everything_else_alone() {
+        for literal in [
+            "[::1]:80",
+            "[fe80::1]:80",
+            "[2001:db8::1]:80",
+            "[::]:80",
+            // Deprecated IPv4-COMPATIBLE form (`::a.b.c.d`), not the mapped
+            // one — `hotspot_ip_string` does not fold it either, so neither
+            // does this, and the two stay consistent.
+            "[::127.0.0.1]:80",
+            "127.0.0.1:80",
+        ] {
+            let addr: SocketAddr = literal.parse().unwrap();
+            assert_eq!(
+                normalize_connect_addr(addr),
+                addr,
+                "{literal} must pass through unchanged"
+            );
         }
     }
 }

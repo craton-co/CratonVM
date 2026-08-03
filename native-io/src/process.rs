@@ -123,20 +123,54 @@ struct PipeFds {
     stderr_fd: i32,
 }
 
-/// Field layout on the synthetic `java/lang/Process` object.
-/// Must match the initialization done by the bytecode / native below.
-const PROC_FIELD_EXIT: usize = 0;
-const PROC_FIELD_STDIN_FD: usize = 1;
-const PROC_FIELD_STDOUT_FD: usize = 2;
-const PROC_FIELD_STDERR_FD: usize = 3;
-const PROC_FIELD_PID: usize = 4;
-const PROC_FIELD_HANDLE: usize = 5;
+/// Number of instance fields `java.lang.Process` itself declares, reserved as
+/// the LEADING slots of the synthetic Process so that real `java.lang.Process`
+/// bytecode reaching one of these receivers reads the field it means to.
+///
+/// `java.lang.Process` is not field-less. Since JDK 17 it declares, in this
+/// order, `outputWriter`, `outputCharset`, `inputReader`, `inputCharset`,
+/// `errorReader`, `errorCharset` — the caches behind the final concrete
+/// `inputReader()` / `errorReader()` / `outputWriter()` methods. An instance
+/// field resolves to an ABSOLUTE slot (superclass field count + declaration
+/// index) and `java.lang.Process` extends `Object`, so those six are slots
+/// 0..=5 of whatever receiver that bytecode runs against.
+///
+/// The synthetic Process used to keep its own state at 0..=5, so
+/// `p.inputReader()` read the stdout pipe fd as `inputReader` — a non-null
+/// int — took the "reader already created" branch, and then NPE'd on the
+/// still-null `inputCharset`:
+///
+/// ```text
+/// java.lang.NullPointerException: Cannot invoke "java.nio.charset.Charset.equals(Object)"
+///         because "this.inputCharset" is null
+///         at java.lang.Process.inputReader(Process.java:338)
+/// ```
+///
+/// That aliasing is why `java/lang/Process` is recorded as a *supertype* of
+/// `cratonvm/synthetic/Process` in `class_manager::jdk_interfaces` rather than
+/// as its superclass. Reserving the slots here removes the aliasing instead,
+/// so the three final reader/writer methods run their real bytecode (which
+/// then calls the native `getInputStream`/`getErrorStream`/`getOutputStream`)
+/// rather than corrupting it. Cost: six reference slots per Process object.
+///
+/// Reserved slots stay null — only the JDK's own bytecode writes them.
+const JAVA_PROCESS_FIELD_COUNT: usize = 6;
 
-/// Sentinel "not yet exited" value stored in field 0.
+/// Field layout on the synthetic `java/lang/Process` object, offset past the
+/// reserved slots above.
+/// Must match the initialization done by the bytecode / native below.
+const PROC_FIELD_EXIT: usize = JAVA_PROCESS_FIELD_COUNT;
+const PROC_FIELD_STDIN_FD: usize = JAVA_PROCESS_FIELD_COUNT + 1;
+const PROC_FIELD_STDOUT_FD: usize = JAVA_PROCESS_FIELD_COUNT + 2;
+const PROC_FIELD_STDERR_FD: usize = JAVA_PROCESS_FIELD_COUNT + 3;
+const PROC_FIELD_PID: usize = JAVA_PROCESS_FIELD_COUNT + 4;
+const PROC_FIELD_HANDLE: usize = JAVA_PROCESS_FIELD_COUNT + 5;
+
+/// Sentinel "not yet exited" value stored in the exit-code field.
 const EXIT_NOT_YET: i32 = i32::MIN;
 
 /// Total number of fields on the synthetic Process.
-const PROC_FIELD_COUNT: usize = 6;
+const PROC_FIELD_COUNT: usize = JAVA_PROCESS_FIELD_COUNT + 6;
 
 /// Class name the synthetic Process is allocated under.
 ///
@@ -617,7 +651,9 @@ fn spawn_and_wrap_with_redirects(
     );
 
     // Allocate the synthetic Process under its own named class (see
-    // SYNTHETIC_PROCESS_CLASS) and populate its 6 fields.
+    // SYNTHETIC_PROCESS_CLASS) and populate its 6 own fields. The 6 slots
+    // ahead of them belong to java.lang.Process's own reader/writer caches and
+    // are deliberately left null — see JAVA_PROCESS_FIELD_COUNT.
     let proc_class = ctx.ensure_synthetic_class(SYNTHETIC_PROCESS_CLASS, PROC_FIELD_COUNT);
     let proc_ref = ctx.alloc_object(proc_class, PROC_FIELD_COUNT);
     ctx.set_field(proc_ref, PROC_FIELD_EXIT, Value::Int(EXIT_NOT_YET));

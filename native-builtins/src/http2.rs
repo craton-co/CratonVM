@@ -846,7 +846,12 @@ fn http11_request_impl(
     }
 
     let addr = format!("{}:{}", host, port);
-    let tcp_stream = TcpStream::connect(&addr).map_err(|e| format!("connect: {e}"))?;
+    // Fold IPv4-mapped destinations (`::ffff:a.b.c.d`) to plain IPv4 before
+    // dialling: on Windows an AF_INET6 socket cannot reach one (`IPV6_V6ONLY`
+    // defaults to 1 → WSAEADDRNOTAVAIL), and a URL host arrives here as text,
+    // never through `InetAddress`. Same fold the h1 client applies.
+    let tcp_stream = cratonvm_native_io::outbound_policy::connect_str_normalized(&addr)
+        .map_err(|e| format!("connect: {e}"))?;
     tcp_stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .ok();

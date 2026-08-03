@@ -3924,8 +3924,56 @@ fn reloc_emit_enabled() -> bool {
             }
             // Control and meta nodes — skip
             Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {}
-            // Unhandled — skip (bail in ir_compatible prevents reaching here)
-            _ => {}
+            // No lowering arm. REFUSE the compile; do NOT fall through.
+            //
+            // This arm used to be `_ => {}` with the comment "bail in
+            // `ir_compatible` prevents reaching here". That claim was asserted,
+            // never checked, and it cannot be checked where it was written:
+            // `ir::ir_compatible` decides admission in the BYTECODE's
+            // vocabulary (`scan.anewarray_ops`, `scan.typecheck_ops`,
+            // `scan.has_athrow`), and this match is over `ir::Op`. Two
+            // enumerations of different things, kept in agreement by a comment.
+            //
+            // What silence costs is not an optimization, it is the node's
+            // semantics. `ir::Op::MonitorEnter` is the worked example: when the
+            // monitor ops were added to the IR for escape analysis, this
+            // catch-all would have compiled a `monitorenter` to *nothing* — the
+            // lock silently gone, an unbalanced `monitorexit` left behind. That
+            // one op got a hand-written guard at the top of
+            // `lower_inner_with_scopes`; this arm is the general form of it.
+            //
+            // `verify_data_locations` is NOT that general form, though it looks
+            // like it: it refuses when a value-typed input's op is absent from
+            // `op_defines_result_slot`, so it only ever fires for an unlowered
+            // op whose result someone READS. A monitor produces no value.
+            // Nothing reads it, so nothing checked it — which is exactly why
+            // that op and not another was the one that could vanish.
+            //
+            // Costs nothing when the claim it replaces is true. Verified
+            // 2026-08-03: the five `ir::Op` variants with no arm here —
+            // `ArrayLength`, `I2B`, `I2C`, `I2S`, `NewArray` — are unreachable
+            // from a real compile. `I2B`/`I2C`/`I2S` are constructed NOWHERE in
+            // the crate (`IrBuilder` decomposes 0x91/0x92/0x93 into
+            // `Shl`/`Shr`/`And` instead — see the arms at `ir.rs`'s 0x91);
+            // `ArrayLength` and `NewArray` are constructed only in `#[cfg(test)]`
+            // code, and the builder has no `arraylength`/`newarray`/`anewarray`
+            // opcode arm to produce them from.
+            //
+            // Latched rather than returned because this function is infallible
+            // by signature and every emitting arm below assumes it stays that
+            // way. `lower_inner_with_scopes` takes the latch after the last
+            // block and discards the artifact — the same channel `alloc_slot`
+            // and `slot_of` already use, and the reason `poison_slot` exists.
+            other => {
+                self.latch_bailout(Bailout::with_context(
+                    BailoutReason::UnsupportedShape("ir_lower: op has no lowering arm"),
+                    format!(
+                        "n{id} ({other:?}, {:?}) reached lower_data_node's catch-all; \
+                         emitting nothing would drop its semantics",
+                        node.ty
+                    ),
+                ));
+            }
         }
     }
 
@@ -5128,8 +5176,16 @@ fn is_value_ty(ty: IrType) -> bool {
 /// Must stay in step with `lower_data_node`'s match arms: every arm that calls
 /// `alloc_slot` is listed here, plus `Op::Phi` (reserved up front by
 /// `prealloc_phi_slots`). Ops that reach `lower_data_node`'s catch-all — they
-/// emit nothing — are deliberately absent, because a value read from one of
-/// them has no location either.
+/// refuse the compile — are deliberately absent, because a value read from one
+/// of them has no location either.
+///
+/// "Must stay in step" used to be enforced by this sentence alone. It is now
+/// enforced by `every_ir_op_is_lowered_or_declared_unlowerable` and the two
+/// tests beside it, which read this function's body, `lower_data_node`'s arms
+/// and `ir::Op`'s own declaration out of the source and compare all three. See
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`
+/// ("The cheap alternative") for why three enumerations of one set is
+/// the shape that produced the monitor defect.
 fn op_defines_result_slot(op: &Op) -> bool {
     matches!(
         op,
@@ -6113,15 +6169,38 @@ fn verify_slot_colouring(
 /// prologue, and it is the first thing to revisit — see the doc.
 const IR_LOWER_LS_XMMS: [u8; 4] = [2, 3, 4, 5];
 
+/// `CRATONVM_JIT_IR_ISEL_SHADOW` — run the instruction selector over this
+/// compile's blocks, count what it would have produced, and **discard it**.
+///
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+/// increment 0. Default **off**. Turning it
+/// on changes no emitted byte — `shadow_selection_changes_no_emitted_byte`
+/// pins that — and costs one tiling pass per compile. It exists to replace the
+/// contract's ten-shape synthetic coverage figure with one taken over real
+/// compiles, because that number is what decides whether the rest of the
+/// HIR/MIR migration is worth its cost.
+///
+/// Report the result with `CRATONVM_DBG=ir-isel`.
+fn isel_shadow_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ISEL_SHADOW") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// `CRATONVM_DBG=ir-isel` — print one shadow-selection line per compile.
+fn isel_shadow_reporting() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_ISEL").is_some()
+}
+
 /// `CRATONVM_JIT_IR_LINEAR_SCAN=1` — run the linear-scan allocator and use its
 /// result as a register read cache. Default OFF.
 ///
-/// Declared-flag note: the name must also be listed in
-/// `types/src/flag_groups.rs` for `-XX:` options and `with_thread_overrides` to
-/// reach it. Until it is, `runtime_var` falls through to a live `std::env`
-/// read, which still honours the environment but is invisible to the flag
-/// snapshot. Tests do not depend on either — they drive [`LsForce`] — so a
-/// declaration change cannot silently make them vacuous.
+/// Declared in `types/src/flag_groups.rs` as `jit/ir-linear-scan`, so `-XX:`
+/// options and `flags::with_thread_overrides` reach it. (This comment used to
+/// say the declaration was still missing; it landed, and the tests never
+/// depended on either spelling — they drive [`LsForce`] — so nothing here went
+/// vacuous in the meantime.)
 fn linear_scan_enabled() -> bool {
     #[cfg(test)]
     {
@@ -6842,20 +6921,30 @@ pub(crate) fn lower_inner_with_scopes(
     // caller scopes above it. Empty ⇒ flat, caller-less deopt frames.
     inline_scopes: &InlineScopeTable,
 ) -> Option<CompiledMethod> {
-    // A monitor in the graph must REFUSE the compile, not fall through.
+    // A monitor whose helper is absent must REFUSE the compile.
     //
-    // `ir::Op::MonitorEnter`/`MonitorExit` exist (escape analysis needs them to
-    // reason about lock elision), but there is no lowering arm for them here
-    // and no monitor helper in `JitRuntimeHelpers` to call. `lower_data_node`'s
-    // catch-all is `_ => {}`, so an unguarded monitor would compile to *nothing*
-    // — the lock silently disappears, which is a data race and an unbalanced
-    // `monitorexit`, not a missed optimization.
+    // History, because the shape of it is the reason `lower_data_node`'s final
+    // arm now refuses too. `ir::Op::MonitorEnter`/`MonitorExit` were added for
+    // escape analysis (lock elision) BEFORE either a lowering arm or a
+    // `JitRuntimeHelpers` monitor entry existed. `lower_data_node`'s catch-all
+    // was `_ => {}` at the time, so an unguarded monitor compiled to *nothing*
+    // — the lock silently gone, an unbalanced `monitorexit` left behind, a data
+    // race rather than a missed optimization. This guard was written to keep
+    // that unreachable.
     //
-    // Unreachable today (`IrBuilder` has no `monitorenter` arm, so a
-    // synchronized method bails earlier), which is exactly why this guard has
-    // to exist before that arm is ever added: the failure it prevents is
-    // silent. Adding the helper is not a small change — the helper table's byte
-    // offsets are baked into emitted machine code.
+    // Both halves have since landed: `lower_data_node` has a real
+    // `Op::MonitorEnter | Op::MonitorExit` arm that calls the helper, and
+    // `a_synchronized_region_lowers_through_the_monitor_helper` drives it. So
+    // what remains here is narrower than the comment this replaces claimed: a
+    // graph with monitor ops and a helper table that has no monitor entry (in
+    // practice a synthetic unit-test table). Refuse rather than call through a
+    // zero pointer.
+    //
+    // The general form of the original hazard — an `ir::Op` variant with no arm
+    // at all — is now handled where it arises, by that final arm, instead of
+    // needing a new hand-written guard here per op. See
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+    // "The cheap alternative".
     if (helpers.monitor_enter == 0 || helpers.monitor_exit == 0)
         && graph
             .nodes
@@ -7061,6 +7150,23 @@ pub(crate) fn lower_inner_with_scopes(
             }
             Ok(None) => {}
             Err(bailout) => return refuse(bailout),
+        }
+    }
+
+    // ── Shadow instruction selection (default OFF, emits nothing) ────
+    //
+    // Placed here, after every refusal above, so the population it measures is
+    // exactly the population that gets a compiled body — measuring methods the
+    // lowerer then refuses would inflate the figure with code nobody runs.
+    //
+    // Deliberately NOT fail-closed, which is the one place in this file that is
+    // true. See `isel::shadow_select_method`: a flag whose documented effect is
+    // a count must not decide what compiles, or the count describes a different
+    // program. A `covers()` violation is counted and printed, not raised.
+    if isel_shadow_enabled() {
+        let stats = crate::x64::isel::shadow_select_method(graph, schedule);
+        if isel_shadow_reporting() {
+            eprintln!("[ir-isel] {}", stats.summary_line());
         }
     }
 
@@ -10760,6 +10866,596 @@ mod tests {
     /// A value live across a helper call must not keep a caller-saved register.
     ///
     /// FP `Op::Rem` is the sharp case: it lowers to `CALL jit_drem`, and
+    // ── Shadow instruction selection ─────────────────────────────────
+    //
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+    // increment 0.
+    //
+    // Increment 0's whole claim is "turning this on changes no emitted byte".
+    // These are what hold it up. Note they drive the flag through
+    // `flags::with_thread_overrides` and NOT `std::env::set_var`: the flag is
+    // declared (`types/src/flag_groups.rs`, `jit/ir-isel-shadow`), so the
+    // override mechanism reaches it, and a process-wide env write would race
+    // every other test in this binary.
+
+    /// Compile the same method with the shadow pass off and on, and compare
+    /// **the emitted bytes**.
+    ///
+    /// Not "compare the result", not "both compiled" — the bytes. A shadow pass
+    /// that perturbed slot numbering, buffer sizing or safepoint ids would still
+    /// produce a working method and would still have broken the one property
+    /// that makes increment 0 free.
+    ///
+    /// The exact edit that trips it: make the shadow block do anything to
+    /// `lowerer` (allocate a slot, bump `next_sp_id`, touch the buffer).
+    #[test]
+    fn shadow_selection_changes_no_emitted_byte() {
+        // Enabling the flag mutates the process-global shadow counters, so this
+        // test owes the same lock as the two that read them.
+        let _guard = crate::x64::isel::SHADOW_TEST_LOCK.lock();
+        // int f(int a, int b) { return (a + b) * a; } — arithmetic, one block,
+        // the shape `isel`'s ALU and LEA rules actually fire on, so the shadow
+        // pass has real work to do rather than trivially selecting nothing.
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0xac, 0, 0];
+
+        let bytes = |on: bool| -> Vec<u8> {
+            let value = if on { Some("1") } else { None };
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_JIT_IR_ISEL_SHADOW", value)],
+                || {
+                    let cm = compile_via_ir(&code, 4, 2, 2).expect("compiles either way");
+                    // SAFETY: the artifact is alive for the duration of this
+                    // borrow, and `code_len` is what the emitter wrote.
+                    unsafe {
+                        std::slice::from_raw_parts(cm.entry_ptr() as *const u8, cm.code_len())
+                            .to_vec()
+                    }
+                },
+            )
+        };
+
+        let off = bytes(false);
+        let on = bytes(true);
+        assert!(!off.is_empty(), "precondition: the method compiled to bytes");
+        assert_eq!(
+            off.len(),
+            on.len(),
+            "shadow selection changed the emitted length"
+        );
+        assert_eq!(off, on, "shadow selection changed the emitted bytes");
+    }
+
+    /// With the flag on, the pass actually ran — and covered every node.
+    ///
+    /// Without this the byte-identity test above passes vacuously: a shadow
+    /// pass that never executes also changes no byte. So this asserts the
+    /// counters moved, that `covers()` held on every block, and that the
+    /// coverage figure is a real fraction rather than the "no nodes" zero.
+    #[test]
+    fn shadow_selection_runs_and_covers_every_scheduled_node() {
+        let _guard = crate::x64::isel::SHADOW_TEST_LOCK.lock();
+        crate::x64::isel::reset_shadow_totals();
+
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0xac, 0, 0];
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_IR_ISEL_SHADOW", Some("1"))],
+            || {
+                compile_via_ir(&code, 4, 2, 2).expect("compiles");
+            },
+        );
+
+        let (methods, stats) = crate::x64::isel::shadow_totals();
+        assert_eq!(methods, 1, "exactly one method should have been shadowed");
+        assert!(stats.blocks > 0, "no blocks were selected");
+        assert!(stats.nodes > 0, "no data nodes were offered to the selector");
+        assert!(stats.tiles >= stats.blocks, "every block yields >= 1 tile");
+        assert_eq!(
+            stats.coverage_failures, 0,
+            "`BlockSelection::covers` failed on {} block(s) — that is an `isel` \
+             bug, not a measurement",
+            stats.coverage_failures
+        );
+        assert!(
+            stats.matched_tiles > 0,
+            "no rule fired on `(a + b) * a`; the corpus this test uses was \
+             chosen because the ALU rules match it, so zero means the selector \
+             regressed, not that the method is unusual"
+        );
+        let pct = stats.coverage_pct();
+        assert!(
+            pct > 0.0 && pct <= 100.0,
+            "coverage {pct} is not a fraction"
+        );
+    }
+
+    /// With the flag OFF — the default, and every compile today — the pass does
+    /// not run at all.
+    ///
+    /// The counter, not the bytes: "changed no byte" and "did not execute" are
+    /// different claims and increment 0 makes both.
+    #[test]
+    fn shadow_selection_is_off_by_default() {
+        let _guard = crate::x64::isel::SHADOW_TEST_LOCK.lock();
+        crate::x64::isel::reset_shadow_totals();
+
+        let code = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0xac, 0, 0];
+        compile_via_ir(&code, 4, 2, 2).expect("compiles");
+
+        let (methods, stats) = crate::x64::isel::shadow_totals();
+        assert_eq!(methods, 0, "the shadow pass ran without being asked");
+        assert_eq!(stats, crate::x64::isel::ShadowStats::default());
+    }
+
+    /// The flag is DECLARED, so `-XX:` and the test override mechanism reach it.
+    ///
+    /// Rule 4 of `docs/known-issues/c2/README.md`: an undeclared flag is
+    /// invisible to both, and the declaration sweep has already had to be re-run
+    /// once because a flag was added 21 minutes after it closed at zero. The
+    /// two tests above would still pass with an undeclared flag — `runtime_var`
+    /// falls through to a live `std::env` read — so this checks the property
+    /// they cannot.
+    #[test]
+    fn the_shadow_flag_is_declared() {
+        let declared: Vec<&str> = cratonvm_types::flag_groups::INVENTORY
+            .iter()
+            .filter_map(|e| e.on_key)
+            .collect();
+        assert!(
+            declared.contains(&"CRATONVM_JIT_IR_ISEL_SHADOW"),
+            "`CRATONVM_JIT_IR_ISEL_SHADOW` is not in `types/src/flag_groups.rs`"
+        );
+        assert!(
+            declared.contains(&"CRATONVM_DBG_IR_ISEL"),
+            "`CRATONVM_DBG_IR_ISEL` is not in `types/src/flag_groups.rs`"
+        );
+    }
+
+    // ── The three `ir::Op` enumerations, checked against each other ──
+    //
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+    // "The cheap alternative". One set of operations is enumerated
+    // in three places, in two different vocabularies:
+    //
+    //   1. `lower_data_node`'s match arms          — 48 of 53 `ir::Op` variants
+    //   2. `op_defines_result_slot`                — 37
+    //   3. `ir::ir_compatible`                     — in the BYTECODE's
+    //      vocabulary (`scan.anewarray_ops`, …), not `Op`'s
+    //
+    // (1) and (2) are checked here. (3) cannot be: it answers a different
+    // question about a different type, which is precisely why the catch-all's
+    // old claim — "bail in `ir_compatible` prevents reaching here" — was not
+    // checkable where it was written, and why `lower_data_node`'s final arm now
+    // refuses instead of asserting.
+    //
+    // WHAT TRIPS THESE (rule 5 of `docs/known-issues/c2/README.md`: write down
+    // the exact edit, or the test is decoration):
+    //
+    //   * Add a variant to `ir::Op`. `declared_lowering` is an exhaustive match
+    //     with NO wildcard arm, so the crate stops compiling until the author
+    //     classifies it. That is the primary forcing function and it fires at
+    //     build time, not test time.
+    //   * Classify it `Lowered*` but forget the `lower_data_node` arm.
+    //     `every_ir_op_is_lowered_or_declared_unlowerable` fails: the source
+    //     scan finds no arm naming it.
+    //   * Add the arm but forget `op_defines_result_slot`.
+    //     `op_defines_result_slot_matches_the_arms_that_allocate` fails.
+    //   * Remove a variant from `ir::Op` and leave it here.
+    //     `the_op_representatives_cover_every_declared_variant` fails.
+    //
+    // All three scans read the source with `include_str!`, the same idiom as
+    // `the_register_read_path_is_gated_on_publication` above.
+
+    /// What `lower_data_node` does with one `ir::Op`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum OpLowering {
+        /// Has an arm, and that arm allocates a result slot. Must therefore
+        /// also be named by `op_defines_result_slot`.
+        LoweredValue,
+        /// Has an arm, but produces no value anyone can read: a control node, a
+        /// memory-only effect, or a terminator handled by `lower_terminator`.
+        LoweredEffect,
+        /// No arm. Reaching `lower_data_node` with one refuses the compile.
+        Unlowerable,
+    }
+
+    /// The five variants with no lowering arm — the explicit list the catch-all
+    /// used to leave implicit.
+    ///
+    /// Each is unreachable from a real compile today (see the catch-all's own
+    /// comment for the evidence per op). This is a statement about the tree,
+    /// not a permission: a variant added here is a variant the optimizing tier
+    /// silently declines to compile, and the edit should be visible in review.
+    const UNLOWERABLE: [&str; 5] = ["ArrayLength", "I2B", "I2C", "I2S", "NewArray"];
+
+    /// **Exhaustive on purpose — do not add a wildcard arm.**
+    ///
+    /// This match is the forcing function. A new `ir::Op` variant makes the
+    /// crate fail to compile here, which is the only mechanism that catches the
+    /// author *before* the tests run.
+    fn declared_lowering(op: &Op) -> OpLowering {
+        use OpLowering::{LoweredEffect, LoweredValue, Unlowerable};
+        match op {
+            // Control and terminator nodes: an arm exists and does nothing,
+            // because `lower_terminator` owns them.
+            Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {
+                LoweredEffect
+            }
+            // Values.
+            Op::Const(_)
+            | Op::ConstF(_)
+            | Op::Param(_)
+            | Op::Phi
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::Cmp(_)
+            | Op::LCmp
+            | Op::FCmp { .. }
+            | Op::I2L
+            | Op::L2I
+            | Op::I2F
+            | Op::I2D
+            | Op::L2F
+            | Op::L2D
+            | Op::F2I
+            | Op::F2L
+            | Op::F2D
+            | Op::D2I
+            | Op::D2L
+            | Op::D2F
+            | Op::Load(_)
+            | Op::ArrayLoad(_)
+            | Op::ArrayStore(_)
+            | Op::New { .. }
+            | Op::Call { .. }
+            | Op::LambdaIntToDouble => LoweredValue,
+            // Effects with an arm but no result slot.
+            Op::Store(_) | Op::MonitorEnter | Op::MonitorExit | Op::Guard { .. } => LoweredEffect,
+            // No arm. Keep in step with `UNLOWERABLE`; the tests check it.
+            Op::ArrayLength | Op::I2B | Op::I2C | Op::I2S | Op::NewArray { .. } => Unlowerable,
+        }
+    }
+
+    /// One representative value per `ir::Op` variant, with the variant's name.
+    ///
+    /// The names are what the source scans compare against;
+    /// `the_op_representatives_cover_every_declared_variant` proves the list is
+    /// complete against `ir.rs` itself, so it cannot quietly fall behind.
+    fn op_representatives() -> Vec<(&'static str, Op)> {
+        use crate::ir::CmpOp;
+        vec![
+            ("Start", Op::Start),
+            ("Return", Op::Return),
+            ("If", Op::If),
+            ("Merge", Op::Merge),
+            ("Region", Op::Region),
+            ("Proj", Op::Proj(0)),
+            ("Const", Op::Const(0)),
+            ("ConstF", Op::ConstF(0)),
+            ("Param", Op::Param(0)),
+            ("Phi", Op::Phi),
+            ("Add", Op::Add),
+            ("Sub", Op::Sub),
+            ("Mul", Op::Mul),
+            ("Div", Op::Div),
+            ("Rem", Op::Rem),
+            ("Neg", Op::Neg),
+            ("And", Op::And),
+            ("Or", Op::Or),
+            ("Xor", Op::Xor),
+            ("Shl", Op::Shl),
+            ("Shr", Op::Shr),
+            ("UShr", Op::UShr),
+            ("Cmp", Op::Cmp(CmpOp::Eq)),
+            ("LCmp", Op::LCmp),
+            (
+                "FCmp",
+                Op::FCmp {
+                    double: false,
+                    nan_greater: false,
+                },
+            ),
+            ("I2L", Op::I2L),
+            ("L2I", Op::L2I),
+            ("I2F", Op::I2F),
+            ("I2D", Op::I2D),
+            ("L2F", Op::L2F),
+            ("L2D", Op::L2D),
+            ("F2I", Op::F2I),
+            ("F2L", Op::F2L),
+            ("F2D", Op::F2D),
+            ("D2I", Op::D2I),
+            ("D2L", Op::D2L),
+            ("D2F", Op::D2F),
+            ("I2B", Op::I2B),
+            ("I2C", Op::I2C),
+            ("I2S", Op::I2S),
+            ("Load", Op::Load(MemKind::Int)),
+            ("Store", Op::Store(MemKind::Int)),
+            ("ArrayLength", Op::ArrayLength),
+            ("ArrayLoad", Op::ArrayLoad(MemKind::Int)),
+            ("ArrayStore", Op::ArrayStore(MemKind::Int)),
+            (
+                "New",
+                Op::New {
+                    class_id: 0,
+                    num_fields: 0,
+                },
+            ),
+            ("NewArray", Op::NewArray { element_type: 10 }),
+            ("Call", Op::Call { info_ptr: 0 }),
+            ("LambdaIntToDouble", Op::LambdaIntToDouble),
+            ("MonitorEnter", Op::MonitorEnter),
+            ("MonitorExit", Op::MonitorExit),
+            ("Guard", Op::Guard { bci: 0 }),
+            ("Dead", Op::Dead),
+        ]
+    }
+
+    /// Every `Op::X` named at match-arm depth inside `lower_data_node`.
+    ///
+    /// Twelve-space indentation is the arm depth in that function; anything
+    /// deeper is inside an arm *body* (`matches!(node.op, Op::MonitorEnter)` at
+    /// the monitor arm, for one), and counting those would report an arm that
+    /// does not exist.
+    fn ops_with_a_lowering_arm() -> std::collections::BTreeSet<String> {
+        let src = include_str!("ir_lower.rs");
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        let mut out = std::collections::BTreeSet::new();
+        for line in body.lines() {
+            if line.starts_with("            Op::") || line.starts_with("            | Op::") {
+                collect_op_names(line, &mut out);
+            }
+        }
+        assert!(
+            !out.is_empty(),
+            "the arm scan found nothing — `lower_data_node`'s shape changed and \
+             this test would now pass vacuously"
+        );
+        out
+    }
+
+    /// Every `Op::X` named in `op_defines_result_slot`'s body.
+    fn ops_that_define_a_result_slot() -> std::collections::BTreeSet<String> {
+        let src = include_str!("ir_lower.rs");
+        let body = src
+            .split("fn op_defines_result_slot(op: &Op) -> bool {")
+            .nth(1)
+            .expect("op_defines_result_slot is in this file")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut out = std::collections::BTreeSet::new();
+        collect_op_names(body, &mut out);
+        assert!(!out.is_empty(), "the slot scan found nothing");
+        out
+    }
+
+    /// Every variant declared in `ir::Op` itself — the ground truth.
+    fn declared_op_variants() -> std::collections::BTreeSet<String> {
+        let src = include_str!("ir.rs");
+        let block = src
+            .split("\npub enum Op {")
+            .nth(1)
+            .expect("ir.rs declares `pub enum Op`")
+            .split("\n}\n")
+            .next()
+            .expect("the enum ends");
+        let mut out = std::collections::BTreeSet::new();
+        for line in block.lines() {
+            // Variants sit at exactly four spaces; struct-variant FIELDS sit at
+            // eight and are lower-case, doc comments start with `/`.
+            let rest = match line.strip_prefix("    ") {
+                Some(r) => r,
+                None => continue,
+            };
+            if !rest.starts_with(|c: char| c.is_ascii_uppercase()) {
+                continue;
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            if !name.is_empty() {
+                out.insert(name);
+            }
+        }
+        assert!(!out.is_empty(), "the `ir::Op` scan found nothing");
+        out
+    }
+
+    fn collect_op_names(text: &str, out: &mut std::collections::BTreeSet<String>) {
+        let mut rest = text;
+        while let Some(i) = rest.find("Op::") {
+            let after = &rest[i + 4..];
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            if !name.is_empty() && name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                out.insert(name);
+            }
+            rest = after;
+        }
+    }
+
+    /// The representative list is complete against `ir::Op`'s own declaration.
+    ///
+    /// Trips when a variant is REMOVED from `ir::Op` and left here — the case
+    /// `declared_lowering`'s exhaustiveness cannot catch, because deleting a
+    /// variant makes an arm unreachable, not missing.
+    #[test]
+    fn the_op_representatives_cover_every_declared_variant() {
+        let declared = declared_op_variants();
+        let listed: std::collections::BTreeSet<String> = op_representatives()
+            .into_iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
+        assert_eq!(
+            declared, listed,
+            "`op_representatives` and `ir::Op` disagree — left is what ir.rs \
+             declares, right is what this test enumerates"
+        );
+    }
+
+    /// Every `ir::Op` variant either has a lowering arm or is on `UNLOWERABLE`.
+    ///
+    /// This is the check the catch-all's old comment stood in for.
+    #[test]
+    fn every_ir_op_is_lowered_or_declared_unlowerable() {
+        let armed = ops_with_a_lowering_arm();
+        let mut missing_arm = Vec::new();
+        let mut unexpected_arm = Vec::new();
+        for (name, op) in op_representatives() {
+            let has_arm = armed.contains(name);
+            match declared_lowering(&op) {
+                OpLowering::Unlowerable if has_arm => unexpected_arm.push(name),
+                OpLowering::Unlowerable => {}
+                _ if !has_arm => missing_arm.push(name),
+                _ => {}
+            }
+        }
+        assert!(
+            missing_arm.is_empty(),
+            "declared lowerable but `lower_data_node` has no arm: {missing_arm:?} — \
+             either write the arm or move it to `UNLOWERABLE` deliberately"
+        );
+        assert!(
+            unexpected_arm.is_empty(),
+            "on `UNLOWERABLE` but `lower_data_node` now has an arm: {unexpected_arm:?} — \
+             promote it to `LoweredValue`/`LoweredEffect`"
+        );
+
+        // And the explicit list agrees with the classification, so a reader can
+        // trust `UNLOWERABLE` without re-deriving it.
+        let classified: std::collections::BTreeSet<String> = op_representatives()
+            .into_iter()
+            .filter(|(_, op)| declared_lowering(op) == OpLowering::Unlowerable)
+            .map(|(n, _)| n.to_string())
+            .collect();
+        let listed: std::collections::BTreeSet<String> =
+            UNLOWERABLE.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classified, listed,
+            "`UNLOWERABLE` and `declared_lowering` disagree"
+        );
+    }
+
+    /// `op_defines_result_slot` names exactly the arms that allocate a slot.
+    ///
+    /// The direction that matters is *over*-claiming: an op listed here whose
+    /// arm never calls `alloc_slot` makes `slot_of` hand back a zero offset,
+    /// which is `[rbp - 0]` — the saved caller frame pointer — read as a value.
+    /// That is the defect `verify_data_locations` was written for, arriving
+    /// through the other door.
+    #[test]
+    fn op_defines_result_slot_matches_the_arms_that_allocate() {
+        let named_in_fn = ops_that_define_a_result_slot();
+        let mut wrong = Vec::new();
+        for (name, op) in op_representatives() {
+            let declared = declared_lowering(&op) == OpLowering::LoweredValue;
+            if op_defines_result_slot(&op) != declared || named_in_fn.contains(name) != declared {
+                wrong.push((
+                    name,
+                    declared,
+                    op_defines_result_slot(&op),
+                    named_in_fn.contains(name),
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "(op, classified as value, `op_defines_result_slot` says, source names it): {wrong:?}"
+        );
+        // Guards the "in step" claim from the other side: nothing may define a
+        // result slot without having an arm at all.
+        let armed = ops_with_a_lowering_arm();
+        let orphans: Vec<&String> = named_in_fn.difference(&armed).collect();
+        assert!(
+            orphans.is_empty(),
+            "`op_defines_result_slot` claims a slot for ops with no lowering arm: {orphans:?}"
+        );
+    }
+
+    /// An op with no lowering arm REFUSES the compile — it does not emit
+    /// nothing.
+    ///
+    /// The witness has to be an op whose result **nobody reads**, because that
+    /// is the only case the pre-emission nets do not already cover:
+    /// `verify_data_locations` refuses an unlowered op only when some node
+    /// reads its value. `ir::Op::MonitorEnter` was exactly that shape and this
+    /// is the general form of the guard it got.
+    ///
+    /// `Op::ArrayLength` is used because it is on `UNLOWERABLE` and produces a
+    /// value; the graph is hand-built so no optimizer pass can DCE it away
+    /// before the lowerer sees it.
+    ///
+    /// **Anti-vacuity, executed rather than argued (2026-08-03).** A test that
+    /// asserts `is_none()` passes for any refusal, including one that has
+    /// nothing to do with the catch-all. So the mutation was run: with the
+    /// final arm of `lower_data_node` reverted to `_ => {}`, this graph
+    /// compiles to a body and this assertion fails. That is the edit to repeat
+    /// if the test is ever suspected of measuring something else.
+    #[test]
+    fn an_op_with_no_lowering_arm_refuses_instead_of_emitting_nothing() {
+        use crate::ir::{Graph, IrType, Op, NO_NODE};
+
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let arr = graph.add(Op::Param(0), IrType::Ref, vec![start], None);
+        // Scheduled, lowered, and read by nobody — the monitor's shape.
+        let _len = graph.add(Op::ArrayLength, IrType::Int, vec![ctrl, mem, arr], None);
+        let zero = graph.add(Op::Const(0), IrType::Int, vec![], None);
+        let ret = graph.add(Op::Return, IrType::Void, vec![ctrl, zero], None);
+        graph.exit = ret;
+
+        assert_eq!(
+            declared_lowering(&Op::ArrayLength),
+            OpLowering::Unlowerable,
+            "precondition: this test is only meaningful while `ArrayLength` has \
+             no arm — if one was added, pick another `UNLOWERABLE` op"
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        assert!(
+            schedule
+                .blocks
+                .iter()
+                .any(|b| b.nodes.contains(&_len)),
+            "precondition: the unlowerable node must actually be scheduled, or \
+             this test passes without exercising the catch-all"
+        );
+
+        assert!(
+            lower(&graph, &schedule, 1, 1, &no_helpers()).is_none(),
+            "a graph containing an op with no lowering arm must not produce a \
+             compiled body"
+        );
+    }
+
     /// `regalloc::ir_op_is_call` did not count it until this wiring landed.
     #[test]
     fn a_value_live_across_a_helper_call_keeps_no_register() {

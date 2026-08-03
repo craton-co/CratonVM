@@ -581,6 +581,43 @@ fn promo_seed_dbg() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PROMO_SEED").is_some())
 }
 
+/// 2026-08-03 (`HIB-MAPRESIZE-STALE.1`, see
+/// docs/known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md
+/// Follow-up 4): whether `OldGen::compact` (the sliding mark-compact
+/// collector) is permitted to run at all. Default **disabled** —
+/// `major_gc` now runs the in-place, non-compacting arm of `old_gen_gc`
+/// unconditionally instead.
+///
+/// This was found by bisection, not by reading: `walk_objects` covering
+/// hundreds of MB fewer bytes than `used_bytes` (fixed defensively in
+/// `OldGen::compact`'s new walk-coverage guard, see `COMPACT_WALK_GAP_HITS`)
+/// proved real corruption was already present the FIRST time compaction ran
+/// in a session — but forcing every old-gen major GC through the
+/// non-compacting arm instead (`CRATONVM_DBG_FORCE_OLDGEN_NO_COMPACT=1`, the
+/// flag this replaced) made `DefaultCatalogAndSchemaTest` complete cleanly,
+/// twice, at exact parity with HotSpot (`found=132`) — where every prior
+/// compact-enabled run of the same class crashed or came up short. That
+/// implicates something in `compact`'s own Phase 1-3 (forwarding-pointer
+/// assignment / reference-slot rewrite / slide), not just the walk-coverage
+/// gap, but the exact mechanism was not found by code review (Phase 1-3 and
+/// the overlay `pointer_map` remap in
+/// `native_collections::gc_update_collection_overlay_refs` were both
+/// audited; both look correct in isolation).
+///
+/// `compact` still exists, still self-tests, and is not deleted: a future
+/// session that finds the real bug can flip this back with
+/// `CRATONVM_OLDGEN_COMPACT=1` to re-enable it (or remove this gate once
+/// fixed). Until then, over-retaining memory the in-place sweep's own
+/// `coalesce_free_blocks` fallback cannot fully defragment is judged the
+/// safer failure mode than the memory corruption this replaces — the same
+/// "over-retention over corruption" direction every other fail-safe check
+/// added during this investigation already takes.
+fn oldgen_compact_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_OLDGEN_COMPACT").is_some())
+}
+
 /// DBG: optional young-GC stress threshold (bytes). Read from
 /// `CRATONVM_DBG_GC_STRESS`, or `CRATONVM_GC_STRESS` as an accepted alias
 /// (the latter is what several handoff/repro docs use; without the alias the
@@ -2172,17 +2209,38 @@ impl GenerationalHeap {
             // this point. Not a functional change: only executed on the
             // already-panicking path, gated behind the same debug flag.
             let fwd_ptr = header.forwarding_address();
+            // 2026-08-03: `is_forwarded()` is a bare `!fwd_ptr.is_null()` check
+            // with no validation of what it points at — the same trust this
+            // diagnostic itself used to extend to `fwd_ptr` before dereferencing
+            // it below. When the header under suspicion is not a genuine
+            // forwarding marker but a corrupted one (garbage bytes that happen
+            // to leave `forwarding_ptr` non-null — the same corruption class
+            // `old_gen_mark_candidate_plausible` screens for elsewhere), that
+            // deref reads unmapped memory and SIGSEGVs the diagnostic itself
+            // instead of reporting the corruption it exists to catch. Route
+            // through `is_object_address` (lock-free, bounds+alignment+tag
+            // validated) exactly like every other "is this byte pattern a real
+            // object base" check in this file, and report an implausible target
+            // as data rather than crashing on it.
             let (fwd_class_id, fwd_kind) = if !fwd_ptr.is_null() {
-                // SAFETY: `fwd_ptr` is a non-null forwarding address (checked above) installed by evacuation,
-                // pointing at the object's live relocated header; read-only, diagnostic-only (stale-objref debug) path.
-                let fwd_header = unsafe { &*(fwd_ptr as *const ObjectHeader) };
-                // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`.
-                // `fwd_ptr` came out of a header this very diagnostic suspects,
-                // so its target is not trustworthy enough to decode as an enum.
-                (
-                    fwd_header.class_id.as_u32(),
-                    format!("0x{:02x}", fwd_header.kind as u8),
-                )
+                match self.is_object_address(fwd_ptr as usize) {
+                    Some(fwd_obj) => {
+                        // SAFETY: `is_object_address` validated `fwd_ptr` as a
+                        // plausible object base inside a managed region before
+                        // returning it; read-only, diagnostic-only (stale-objref
+                        // debug) path.
+                        let fwd_header = unsafe { &*(fwd_obj.as_ptr() as *const ObjectHeader) };
+                        // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`.
+                        (
+                            fwd_header.class_id.as_u32(),
+                            format!("0x{:02x}", fwd_header.kind as u8),
+                        )
+                    }
+                    None => (
+                        u32::MAX,
+                        format!("<implausible-forward 0x{:x}>", fwd_ptr as usize),
+                    ),
+                }
             } else {
                 (u32::MAX, "<null-forward>".to_string())
             };
@@ -2200,11 +2258,34 @@ impl GenerationalHeap {
                 use std::fmt::Write as _;
                 if let Some(old) = self.old_gen.try_lock() {
                     let card_base = self.card_table.base_addr();
-                    'oldscan: for (optr, _sz) in old.walk_objects() {
+                    'oldscan: for (optr, sz) in old.walk_objects() {
                         // SAFETY: walk_objects yields valid object starts.
                         let oh = unsafe { &*(optr as *const ObjectHeader) };
+                        // Re-derive this object's total size from the header
+                        // `for_each_ref_slot` is about to trust (`num_slots`/
+                        // `array_length`) and compare it against `sz`, the size
+                        // `walk_objects` already validated fits this object's
+                        // slot in the region a moment ago. This is the same
+                        // "the caller must not trust a header `for_each_ref_slot`
+                        // hasn't screened" gap `get_header_diagnostics`'s
+                        // `fwd_ptr` deref had — a header this diagnostic reads a
+                        // second time, on a heap the panic path does not hold a
+                        // GC-exclusive lock over, can read differently than the
+                        // walk that produced `sz`. Trusting it blindly here made
+                        // `for_each_ref_slot` stride `num_slots`/`array_length`
+                        // slots past a plausible-looking `optr` and SIGSEGV the
+                        // diagnostic itself, exactly like the `fwd_ptr` case
+                        // above. Skip (report nothing for this object) rather
+                        // than crash — the same "over-retain / under-report, but
+                        // never dereference blind" tradeoff as everywhere else in
+                        // this holder scan.
+                        if gen_object_total_size(oh) != sz {
+                            continue 'oldscan;
+                        }
                         let mut hits: Vec<usize> = Vec::new();
-                        // SAFETY: header/object pair valid for the walk.
+                        // SAFETY: header/object pair valid for the walk; `sz`
+                        // re-check above confirms the header is self-consistent
+                        // with what `walk_objects` measured for this slot.
                         unsafe {
                             for_each_ref_slot(optr, oh, |raw, idx| {
                                 if raw as usize == stale_usize {
@@ -9804,7 +9885,17 @@ impl GenerationalHeap {
         old_gen: &mut OldGen,
         young_skips: &[(usize, usize)],
     ) -> HashMap<usize, usize> {
-        Self::old_gen_gc(roots, young_from, old_gen, true, young_skips)
+        // See `oldgen_compact_enabled`: compaction is disabled by default as
+        // of 2026-08-03 pending root-cause attribution of the corruption it
+        // was found to cause (docs/known-issues/hibernate/
+        // map-resize-unpinned-chain-cursors-nojit-segv-20260731.md).
+        Self::old_gen_gc(
+            roots,
+            young_from,
+            old_gen,
+            oldgen_compact_enabled(),
+            young_skips,
+        )
     }
 
     /// Mark old space from the complete root set and either compact it (when
@@ -9971,8 +10062,14 @@ impl GenerationalHeap {
             // above. Major GC also uses stable pre-compaction addresses, so it
             // can reclaim an unreachable old collection and its side-table
             // graph together instead of treating every entry as a global root.
+            // Owner identity: the index is keyed by ADDRESS, so a recycled
+            // block hands this BFS the previous tenant's overlay refs. The
+            // header here is already validated (this object is marked), so
+            // pass its class id and let the provider reject a stale entry.
+            // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
+            let owner_class = Some(unsafe { &*(obj_ptr as *const ObjectHeader) }.class_id.as_u32());
             for overlay_ref in
-                crate::external_roots::external_roots_for_owner(obj_ptr as usize)
+                crate::external_roots::external_roots_for_owner(obj_ptr as usize, owner_class)
             {
                 mark_and_push_old_gen(
                     overlay_ref.as_ptr(),
@@ -12946,7 +13043,12 @@ fn scan_young_object(
         .as_ref()
         .is_some_and(|owners| owners.contains(&obj_addr))
     {
-        for overlay_ref in crate::external_roots::external_roots_for_owner(obj_addr) {
+        // Same owner-identity check as the old-gen BFS: reject an overlay
+        // entry left behind by a previous tenant of this address.
+        for overlay_ref in crate::external_roots::external_roots_for_owner(
+            obj_addr,
+            Some(header.class_id.as_u32()),
+        ) {
             mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist);
         }
     }
@@ -17071,7 +17173,7 @@ mod tests {
             }
         }
 
-        fn roots_for_owner(owner_addr: usize) -> Vec<ObjectRef> {
+        fn roots_for_owner(owner_addr: usize, _class_id: Option<u32>) -> Vec<ObjectRef> {
             let owner = OWNER.load(Ordering::Relaxed);
             if owner != 0 && owner == owner_addr {
                 held()
@@ -17686,7 +17788,15 @@ mod tests {
             let mut old_gen = heap.old_gen.lock();
             let free_blocks_before = old_gen.free_block_count();
 
-            let compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
+            // `major_gc` now defaults to the non-compacting arm (`compact()`
+            // is disabled by default as of 2026-08-03 pending root-cause
+            // attribution — see `oldgen_compact_enabled`'s doc comment).
+            // This test specifically exercises `compact()`'s own
+            // defragmentation behavior, so call `old_gen_gc` directly with
+            // `compact=true` rather than going through the production
+            // default.
+            let compact_map =
+                GenerationalHeap::old_gen_gc(&mut roots, &young_from, &mut old_gen, true, &[]);
 
             // After compaction: exactly one free block (defragmented)
             assert_eq!(
@@ -17814,11 +17924,15 @@ mod tests {
             .map(|(_, o)| o)
             .collect();
 
-        // Run mark-compact via major GC
+        // Run mark-compact via major GC. `major_gc` now defaults to the
+        // non-compacting arm (see `oldgen_compact_enabled`'s doc comment);
+        // this test specifically exercises `compact()`'s own
+        // defragmentation, so call `old_gen_gc` directly with `compact=true`.
         {
             let young_from = heap.young_from.lock();
             let mut old_gen = heap.old_gen.lock();
-            let _compact_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
+            let _compact_map =
+                GenerationalHeap::old_gen_gc(&mut roots, &young_from, &mut old_gen, true, &[]);
 
             // Used space should have decreased (half the objects freed)
             assert!(

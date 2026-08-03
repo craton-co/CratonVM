@@ -25,7 +25,22 @@ pub struct ExternalRootProvider {
     pub name: &'static str,
     pub scan: fn(&mut Vec<ObjectRef>),
     pub owner_addrs: fn() -> Option<HashSet<usize>>,
-    pub roots_for_owner: fn(usize) -> Vec<ObjectRef>,
+    /// Roots owned by the object at `owner_addr`, whose CURRENT class id the
+    /// caller supplies so the provider can reject a STALE owner entry.
+    ///
+    /// The owner index is keyed by address, and an address is recycled the
+    /// moment its previous tenant is reclaimed. Without an identity check the
+    /// marker is handed the DEAD owner's references on behalf of whatever
+    /// unrelated object now occupies that address — observed as
+    /// `rejecting external-overlay(BFS owner) candidate … not a plausible
+    /// object base` on non-headers (ASCII string payload, raw heap pointers,
+    /// interior addresses). A class id is GC-invariant (it travels with the
+    /// header), which is exactly the discriminator `native-collections`'
+    /// mutator-side `widened_obj_key` already applies for recycled identity
+    /// hashes; this carries it to the marker, which had no check at all.
+    ///
+    /// `None` means "class unknown at this call site" and skips the check.
+    pub roots_for_owner: fn(usize, Option<u32>) -> Vec<ObjectRef>,
     pub roots_for_matching_owners: fn(&OwnerPredicate<'_>) -> Vec<ObjectRef>,
     pub remap: fn(&HashMap<usize, usize>),
     pub prune: fn(&OwnerPredicate<'_>),
@@ -83,10 +98,16 @@ pub fn external_owner_addrs() -> Option<HashSet<usize>> {
     (!result.is_empty()).then_some(result)
 }
 
-pub fn external_roots_for_owner(owner_addr: usize) -> Vec<ObjectRef> {
+/// Roots owned by the object at `owner_addr`.
+///
+/// `owner_class_id` is that object's CURRENT class id, used to reject an owner
+/// entry left behind by a previous tenant of the same address — see
+/// [`ExternalRootProvider::roots_for_owner`]. Pass `None` only where the class
+/// genuinely is not available; the check is skipped then.
+pub fn external_roots_for_owner(owner_addr: usize, owner_class_id: Option<u32>) -> Vec<ObjectRef> {
     let mut roots = Vec::new();
     for provider in snapshot() {
-        roots.extend((provider.roots_for_owner)(owner_addr));
+        roots.extend((provider.roots_for_owner)(owner_addr, owner_class_id));
     }
     roots
 }
@@ -131,7 +152,7 @@ mod tests {
     fn owners() -> Option<HashSet<usize>> {
         Some(HashSet::from([OWNER]))
     }
-    fn roots_for_owner(owner: usize) -> Vec<ObjectRef> {
+    fn roots_for_owner(owner: usize, _class_id: Option<u32>) -> Vec<ObjectRef> {
         (owner == OWNER).then(|| object(ROOT)).into_iter().collect()
     }
     fn matching(predicate: &OwnerPredicate<'_>) -> Vec<ObjectRef> {
@@ -169,7 +190,7 @@ mod tests {
         assert_eq!(REMAPS.load(Ordering::SeqCst), 1);
         assert!(roots.contains(&object(ROOT)));
         assert!(external_owner_addrs().unwrap().contains(&OWNER));
-        assert_eq!(external_roots_for_owner(OWNER), vec![object(ROOT)]);
+        assert_eq!(external_roots_for_owner(OWNER, None), vec![object(ROOT)]);
         assert_eq!(
             external_roots_for_matching_owners(&|owner| owner == OWNER),
             vec![object(ROOT)]
