@@ -40,7 +40,7 @@ to hand-grepping: the failure mode of this measurement is a confident zero.
 | `AutoConfigurationSorterTests` | 352 | 182 | 98 | 72 | 123 |
 | `ConditionalOnClassTests` | 223 | 103 | 84 | 36 | 58 |
 | **CratonBench, all seven phases** | **7** | **3** | **3** | **1** | **2** |
-| `CratonBenchC2`, all three phases | 37 | 18 | 16 | 3 | 10 |
+| `CratonBenchC2`, all three phases | 38 | 19 | 16 | 3 | 12 |
 
 The CratonBench row is left at the original survey's numbers. A re-take at
 `7c08e9abe` measured **8** requests, not 7 — `stringregex` issues one now — with
@@ -76,22 +76,24 @@ tier* before anything about it is anchored. Counts, so the host's load
 | `cb:stringregex` | 1 | 0 | 0 | 0 | 0 / 1 / 1 |
 | `cb:bintrees` | 3 | 1 | **1** | 2 | 2 / 2 / 1 |
 | **CratonBench total** | **8** | **3** | **2** | **3** | |
-| `c2c:dispatch` | 15 | 7 | **4** | 6 | 6 / 6 / 1 |
-| `c2c:bind` | 10 | 6 | **2** | 4 | 4 / 3 / 1 |
+| `c2c:dispatch` | 17 | 9 | **6** | 6 | 6 / 6 / 1 |
+| `c2c:bind` | 9 | 5 | **2** | 4 | 4 / 3 / 1 |
 | `c2c:pipeline` | 12 | 5 | **4** | 6 | 6 / 5 / 1 |
-| **CratonBenchC2 total** | **37** | **18** | **10** | **16** | |
+| **CratonBenchC2 total** | **38** | **19** | **12** | **16** | |
 
-Two deltas against the table `meas-02` was written from, both small and both
-worth recording rather than smoothing over:
+The three `c2c` rows were identical on two consecutive runs, cell for cell.
 
-* `stringregex` issues **one** request now, where the original survey recorded
-  zero — so the CratonBench total is 8, not 7. `admitted` and `bodies` are
-  unchanged, so nothing downstream of it moves.
-* `bind` measured 9/5/2 and then 10/6/2 on two consecutive runs of the same
-  binary. Tier promotion is invocation-count driven against a background
-  compiler, so the request count has a little run-to-run play in it. Treat
-  single-digit differences in `requests` as noise; `bodies` was stable across
-  both runs of all ten phases.
+One delta against the table `meas-02` was written from, small and worth
+recording rather than smoothing over: `stringregex` issues **one** request
+now, where the original survey recorded zero — so the CratonBench total is 8,
+not 7. `admitted` and `bodies` are unchanged, so nothing downstream of it
+moves.
+
+An earlier draft of the candidate, sized differently, measured `bind` at 9/5/2
+and then 10/6/2 on two consecutive runs. Tier promotion is invocation-count
+driven against a background compiler, so a workload sized close to a threshold
+has run-to-run play in its request count. The sizes above are an order of
+magnitude past `c2_threshold` and do not.
 
 **`compiles_c2` is not this measurement.** The tier manager counts a compile
 under the TIER it was requested at, whichever backend produced the body — and

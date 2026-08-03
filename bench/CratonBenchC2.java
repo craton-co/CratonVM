@@ -35,6 +35,22 @@ import java.util.Map;
  *   CratonBenchC2 <phase>    run ONE phase (isolated-process methodology)
  *                            phase = dispatch | bind | pipeline
  *
+ * KNOWN, and the reason this is not anchored: on the Azure bench host the
+ * `dispatch` phase is BIMODAL run to run — the same binary on the same
+ * classes measured 0.42 s and 0.65 s, then 8.8 s, then 2.1 s, then 19 s and
+ * 30 s, with IDENTICAL compile counts (c1=6 c2=6 osr=1) in the fast and slow
+ * modes. It is not driven by the iteration count: 2,000,000 reps measured
+ * 2.1 s and 19 s on different runs. Pinning to two CPUs instead of one made
+ * some runs fast and left others slow, so the single-core contention between
+ * the mutator and the background compiler is at most part of it. The host was
+ * at a 1-min load of 13-20 throughout, which is a confound that could not be
+ * removed, so this is recorded rather than explained.
+ *
+ * The REACH and NODE-MIX numbers in the survey are counts and are unaffected
+ * by any of that; they reproduced exactly across runs. The timing is what is
+ * uncharacterised. See
+ * docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md.
+ *
  * Output shape is CratonBench's, exactly: "<n>. <name> : <ms> ms  [<sum>]",
  * so `run-cratonbench-gate.sh` can run this file unchanged if it is ever
  * anchored. It is NOT anchored: see docs/known-issues/c2/ for the policy on
@@ -70,6 +86,29 @@ public class CratonBenchC2 {
     static final String KEY_ABSENT = "id-absent";
     static final int MIX = 31;
     static final long PRIME = 1_000_003L;
+
+    // Phase sizes. Two constraints, and the second is the one that is easy to
+    // break by accident:
+    //
+    //   1. Seconds, not minutes — the gate's own requirement. Measured on the
+    //      Azure bench host: 0.4-0.7 s, 3.3-3.5 s, 2.0-2.6 s. (CratonVM is
+    //      70-300x HotSpot on this workload, so the HotSpot times are tens of
+    //      milliseconds; size against the slow one.)
+    //   2. Every method whose compilation is the POINT of this file must stay
+    //      an order of magnitude past `c2_threshold` = 20,000 INVOCATIONS.
+    //      That is what makes a workload reach the optimizing tier at all —
+    //      not its opcodes — and it is why CratonBench, which is seven
+    //      enormous loops inside seven methods, does not.
+    //
+    // `pipeline` is 40,000 x 16 rather than the more natural 1,000 x 256 for
+    // constraint 2 alone: the same 640,000 handler calls either way, but at
+    // 1,000 batches `runBatch` itself is invoked a thousand times and never
+    // becomes a C2 candidate. Batch COUNT is what makes the per-batch frame
+    // hot; batch SIZE only makes each call do more.
+    static final int DISPATCH_REQS = 400_000;
+    static final int BIND_REQS = 2_000_000;
+    static final int PIPELINE_BATCHES = 40_000;
+    static final int PIPELINE_BATCH_SIZE = 16;
 
     /** Dispatch target. Several impls, so the call site is polymorphic. */
     interface Handler {
@@ -344,20 +383,20 @@ public class CratonBenchC2 {
 
         if (wants(filter, "dispatch")) {
             long t0 = System.currentTimeMillis();
-            long r = benchDispatch(3_000_000);
-            total += report("1. dispatch    (3M reqs)  ", t0, r);
+            long r = benchDispatch(DISPATCH_REQS);
+            total += report("1. dispatch    (400K reqs)", t0, r);
             if (all) System.gc();
         }
         if (wants(filter, "bind")) {
             long t0 = System.currentTimeMillis();
-            long r = benchBind(6_000_000);
-            total += report("2. bind        (6M reqs)  ", t0, r);
+            long r = benchBind(BIND_REQS);
+            total += report("2. bind        (2M reqs)  ", t0, r);
             if (all) System.gc();
         }
         if (wants(filter, "pipeline")) {
             long t0 = System.currentTimeMillis();
-            long r = benchPipeline(20_000, 256);
-            total += report("3. pipeline    (20Kx256)  ", t0, r);
+            long r = benchPipeline(PIPELINE_BATCHES, PIPELINE_BATCH_SIZE);
+            total += report("3. pipeline    (40Kx16)   ", t0, r);
             if (all) System.gc();
         }
         if (all) {

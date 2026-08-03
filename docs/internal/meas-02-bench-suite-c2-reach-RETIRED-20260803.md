@@ -127,7 +127,10 @@ dispatch loop has and a single enormous kernel loop does not.
 | | requests | admitted | bodies |
 |---|---:|---:|---:|
 | CratonBench, seven phases | 8 | 3 | 2 |
-| CratonBenchC2, three phases | 37 | 18 | 10 |
+| CratonBenchC2, three phases | 38 | 19 | 12 |
+
+Per phase, identical on two consecutive runs: `dispatch` 17/9/6, `bind` 9/5/2,
+`pipeline` 12/5/4.
 
 Reaching the tier is the cheap part. The part that matters is *where* it
 fails, because a candidate that reaches C2 and then fails in places real code
@@ -151,27 +154,68 @@ never once touches `checkcast`, `anewarray`, `invokespecial` or a reference
 field store. The two suites do not merely differ in how far they get — they
 disagree about what the optimizing tier's problems are.
 
+### Sizes, and what sizing them taught
+
+`DISPATCH_REQS` = 400,000, `BIND_REQS` = 2,000,000, `PIPELINE_BATCHES` =
+40,000 x 16. Two constraints, and the second is the one that is easy to break
+by accident:
+
+* **Seconds, not minutes** — the gate's requirement. Measured: 2.9–5.3 s,
+  3.2–3.3 s, 4.1–6.4 s on CratonVM; 37 ms, 72 ms, 32 ms on HotSpot, which is
+  a 45–200x gap and a separate subject.
+* **Every method whose compilation is the point must stay an order of
+  magnitude past `c2_threshold` = 20,000 INVOCATIONS.** `pipeline` is
+  40,000 x 16 rather than the more natural 1,000 x 256 for this reason alone:
+  the same 640,000 handler calls either way, but at 1,000 batches `runBatch`
+  itself is invoked a thousand times and never becomes a C2 candidate. Batch
+  *count* is what makes the per-batch frame hot; batch *size* only makes each
+  call do more.
+
+An earlier draft, sized closer to the threshold, measured `bind` at 9/5/2 then
+10/6/2 on consecutive runs. At the sizes above, all three phases reproduced
+cell for cell across two runs. The checksums also agree exactly between
+CratonVM and HotSpot, on all three phases.
+
 ## 5. What was deliberately NOT done
 
-**The candidate is not a gate phase and has no baseline.** The brief's own
-instruction ("do not add a phase to the gate yet") is one reason. The other is
-that this host has not been quiet: the 1-min load ran 13–50 for the whole
-session, and the gate refuses to measure above 2.0 for good reasons. A
-baseline anchored under that load would be a number nobody could reproduce,
-which is the failure mode `BENCHMARK.md`'s retracted HashMap row already cost
-this project once.
+**The candidate is not a gate phase and has no baseline.** There are now three
+reasons, and only the first was in the brief.
+
+1. The brief's own instruction: "do not add a phase to the gate yet".
+2. **The host has not been quiet.** The 1-min load ran 13–50 for the whole
+   session and the gate refuses to measure above 2.0, for good reasons. A
+   baseline anchored under that load would be a number nobody could reproduce
+   — the failure mode `BENCHMARK.md`'s retracted HashMap row already cost this
+   project once.
+3. **`dispatch` is bimodal, and that is not a load artefact alone.** The same
+   binary on the same classes measured 0.42 s and 0.65 s, then 8.8 s, then
+   2.1 s, then 19 s, then 30 s — with **identical** compile counts
+   (`c1=6 c2=6 osr=1`) in the fast and slow modes. It is not driven by the
+   iteration count: 2,000,000 reps measured 2.1 s and 19 s on different runs.
+   Pinning to two CPUs instead of one made some runs fast (3.7 s, 4.7 s) and
+   left others slow (22 s, 30 s), so contention between the mutator and the
+   background compiler on a single pinned core is at most part of it. Cause
+   not isolated; the host load is a confound that could not be removed.
+
+Reason 3 is the interesting one and it is not only about anchoring: a 17x
+swing on identical work with identical compile counts is a lead, not just a
+nuisance. Note it is invisible to the current gate, whose phases compile
+almost nothing — which is the same blind spot MEAS-02 is about, showing up in
+timing rather than in coverage.
 
 What anchoring needs, in order:
 
 1. A quiet host (1-min load < 2.0) — the gate enforces this itself.
-2. `--calibrate` on that host, and a per-phase CV inside the gate's 5% ceiling.
-   §6 has the run-to-run spread measured under load, which is a *ceiling* on
-   the quiet-host figure, not an estimate of it.
-3. An evidence document, as the re-anchoring policy in `regression-suite/README.md`
-   requires — and it should quote the phase's C2 reach, which is now recorded
-   for it automatically.
+2. An explanation for reason 3, or a demonstration that it does not occur on a
+   quiet host. A 5% budget against a phase that swings 17x is not a gate.
+3. `--calibrate` on that host, with a per-phase CV inside the gate's 5%
+   ceiling.
+4. An evidence document, as the re-anchoring policy in
+   `regression-suite/README.md` requires — and it should quote the phase's C2
+   reach, which is now recorded for it automatically.
 
-Until then the candidate is a characterised workload that anyone can run, and
+Until then the candidate is a workload whose *reach* and *node mix* are
+characterised and reproducible, and whose *timing* is not; and
 `regression-suite/perf/c2-reach.sh` is how the next candidate gets the same
 treatment before anybody proposes anchoring it.
 
@@ -222,7 +266,14 @@ answer ever needs to be tighter than that.
 
 ## 7. Residuals
 
-* **Anchoring the candidate**, per §5. Owner: nobody.
+Every one of these is unowned.
+
+* **`dispatch`'s 17x bimodality** (§5 reason 3): identical work, identical
+  compile counts, 0.42 s to 30 s. The most interesting thing this lane found
+  and the one it did not explain. Repro: `bench/CratonBenchC2.java`, phase
+  `dispatch`, run it ten times.
+* **Anchoring the candidate**, per §5 — blocked on the two above it, not on a
+  decision.
 * **The A/B in §6 was taken on a loaded host.** Interleaving bounds the effect
   rather than eliminating the confound; re-take it on a quiet host if the
   answer ever needs to be tighter than "inside the noise floor".
