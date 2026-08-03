@@ -53,6 +53,17 @@ gating and not tiering. Three findings shape the `cov-*` lanes:
   opcode-gap events combined — and they never reach the builder, so they are
   invisible in the opcode histogram.
 
+A second run with `CRATONVM_JIT_FORCE_C2=1` — every request routed to the
+optimizing tier — settles the question the `cov-*` lanes rest on, in two parts.
+**Correctness: clean.** 886 IR bodies, 61/61 Spring Boot tests, 7/7 CratonBench
+checksums against HotSpot, zero panics or new warnings. **Coverage: forcing C2
+buys none.** 886 bodies against 595, over *the same 495 distinct methods* — the
+two method sets are identical. Forcing C2 changes when the tier is used, never
+which methods it can serve, so the `cov-*` lanes are the only lever there is.
+Whether an IR body is *faster* than the C1 body it replaces remains unmeasured;
+nothing showed the 1.85x regression this project has on record, which is enough
+to say the programme is not self-defeating and not enough to say it pays.
+
 And one finding about the measurement itself: **CratonBench issues seven
 compile requests to the optimizing tier across all seven phases and gets two
 bodies.** The perf gate measures the single-pass backend. That is `meas-02`,
