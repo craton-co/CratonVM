@@ -956,7 +956,11 @@ impl ConcurrentMarker {
             // `ObjectRef` only as a stripe-lock key (its address is hashed),
             // never to mutate the object.
             let obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(obj_ptr) };
-            for slot_idx in 0..header.num_slots() as usize {
+            // HIB-DCAST-LATEPHASE.1: cap by the same `1 << 24` plausibility
+            // bound used throughout gc/src/gen_heap.rs for a header's
+            // `num_slots` — see `for_each_ref_slot`'s matching fix.
+            let num_slots = (header.num_slots() as usize).min(1 << 24);
+            for slot_idx in 0..num_slots {
                 // Serialize the 16-byte read against striped mutator writes so
                 // we never observe a torn (tag, payload) pair. Held only for
                 // the duration of this single slot read.

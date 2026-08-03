@@ -293,7 +293,12 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
                     },
                 );
             } else {
-                let num_slots = header.num_slots() as usize;
+                // HIB-DCAST-LATEPHASE.1: cap by the same `1 << 24`
+                // plausibility bound `old_gen_mark_candidate_plausible`/
+                // `gen_object_total_size` apply to a header's `num_slots` —
+                // "no real object has this many fields" — so a corrupted
+                // value cannot stride this loop into unmapped memory.
+                let num_slots = (header.num_slots() as usize).min(1 << 24);
                 for slot_idx in 0..num_slots {
                 // SAFETY: slot_idx < num_slots, so the offset is within the object.
                 let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
@@ -755,7 +760,8 @@ pub fn collect_with_finalizers(
                     },
                 );
             } else {
-                let num_slots = header.num_slots() as usize;
+                // HIB-DCAST-LATEPHASE.1: see the matching cap above.
+                let num_slots = (header.num_slots() as usize).min(1 << 24);
                 for slot_idx in 0..num_slots {
                 let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                 let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
@@ -918,7 +924,8 @@ pub fn collect_with_finalizers(
                         },
                     );
                 } else {
-                    let num_slots = header.num_slots() as usize;
+                    // HIB-DCAST-LATEPHASE.1: see the matching cap above.
+                    let num_slots = (header.num_slots() as usize).min(1 << 24);
                     for slot_idx in 0..num_slots {
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                     let value = unsafe { std::ptr::read(slot_ptr as *const Value) };

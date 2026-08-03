@@ -13653,7 +13653,21 @@ pub(crate) unsafe fn for_each_ref_slot(
 ) {
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
-            for i in 0..header.array_length() as usize {
+            // HIB-DCAST-LATEPHASE.1: cap by the same `1 << 24` plausibility
+            // bound `old_gen_mark_candidate_plausible`/`gen_object_total_size`
+            // already apply to a header's own `array_length`/`num_slots` —
+            // "no real array/object has this many elements/fields." This
+            // function has ~25 call sites across gen_heap.rs/old_gen.rs/
+            // vm_heap.rs, several without a walked size handy to cap against
+            // precisely (see `OldGen::for_each_old_gen_ref`'s doc comment for
+            // that more precise fix, applied where a caller has one); this
+            // coarser cap is the one every caller gets for free without
+            // threading one through. It does not guarantee correctness for a
+            // header whose `array_length` is wrong but still under the cap —
+            // only that this function cannot itself stride tens of millions
+            // of slots into unmapped memory.
+            let elems = (header.array_length() as usize).min(1 << 24);
+            for i in 0..elems {
                 let s = obj_ptr.add(HEADER_SIZE + i * ref_element_size());
                 let raw: u64 = read_ref_slot(s);
                 if raw != 0 {
@@ -13696,7 +13710,9 @@ pub(crate) unsafe fn for_each_ref_slot(
             }
         }
     } else {
-        for slot_idx in 0..header.num_slots() as usize {
+        // HIB-DCAST-LATEPHASE.1: same cap as the array arm above.
+        let slots = (header.num_slots() as usize).min(1 << 24);
+        for slot_idx in 0..slots {
             let s = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
             if let Value::Object(Some(r)) = std::ptr::read(s as *const Value) {
                 f(r.as_ptr(), slot_idx);
@@ -13725,7 +13741,9 @@ pub(crate) unsafe fn forward_ref_slots(
 ) {
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
-            for i in 0..header.array_length() as usize {
+            // HIB-DCAST-LATEPHASE.1: see the matching cap in `for_each_ref_slot`.
+            let elems = (header.array_length() as usize).min(1 << 24);
+            for i in 0..elems {
                 let s = obj_ptr.add(HEADER_SIZE + i * ref_element_size());
                 let raw: u64 = read_ref_slot(s);
                 if raw != 0 {
@@ -13775,7 +13793,9 @@ pub(crate) unsafe fn forward_ref_slots(
             }
         }
     } else {
-        for slot_idx in 0..header.num_slots() as usize {
+        // HIB-DCAST-LATEPHASE.1: see the matching cap in `for_each_ref_slot`.
+        let slots = (header.num_slots() as usize).min(1 << 24);
+        for slot_idx in 0..slots {
             let s = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
             if let Value::Object(Some(r)) = std::ptr::read(s as *const Value) {
                 if let Some(n) = forward(r.as_ptr()) {

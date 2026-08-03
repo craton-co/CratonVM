@@ -1194,6 +1194,26 @@ impl OldGen {
     /// are filtered out, matching the bounds gate Phase 2 uses, so a caller
     /// only ever sees old-gen referents.
     ///
+    /// `total_size` MUST be the size `walk_objects` computed for this exact
+    /// object (`HEADER_SIZE + object_body_size(..)` at walk time) and is used
+    /// to cap every arm's iteration count — the same pattern
+    /// `mark_young_to_old_refs` already uses (`max_slots = body_bytes /
+    /// SLOT_SIZE`). `HIB-DCAST-LATEPHASE.1`: this function used to re-read
+    /// `header.array_length()`/`header.num_slots()` fresh at call time and
+    /// trust them completely, with no cap at all. A caller may run this on an
+    /// object well after `walk_objects` validated it — `close_live_set_over_old_gen`'s
+    /// Phase 0 fixpoint, for one, calls this from a `for &(obj_ptr, _size) in
+    /// objects` loop with `_size` unused — and a header field that reads
+    /// differently on that later pass than it did during the walk (this file
+    /// and its siblings document several distinct causes of exactly that) hits
+    /// an UNBOUNDED `for slot_idx in 0..num_slots` stride into unmapped
+    /// memory: the deterministic `SIGSEGV` inside this function's inlined
+    /// legacy-object arm, reached via `close_live_set_over_old_gen`, against
+    /// the real `DefaultCatalogAndSchemaTest` workload. Capping by the
+    /// WALKED size — ground truth this function does not need to re-derive
+    /// or guess at — closes that regardless of why the live re-read
+    /// disagrees.
+    ///
     /// The header is *not* borrowed across the `f` callback: the four scalar
     /// fields needed to drive the walk are copied out up front via
     /// `read_unaligned` on raw field pointers. This matters because a caller
@@ -1202,9 +1222,15 @@ impl OldGen {
     /// header — holding a live `&ObjectHeader` across that write would alias a
     /// `&mut` to the same bytes. Reading scalars up front keeps the borrow
     /// short and the walk sound under a self-loop.
-    fn for_each_old_gen_ref(obj_ptr: *mut u8, data: &[u8], mut f: impl FnMut(usize)) {
+    fn for_each_old_gen_ref(
+        obj_ptr: *mut u8,
+        total_size: usize,
+        data: &[u8],
+        mut f: impl FnMut(usize),
+    ) {
         let data_start = data.as_ptr() as usize;
         let data_end = data_start + data.len();
+        let body_bytes = total_size.saturating_sub(HEADER_SIZE);
 
         // Snapshot the layout-driving fields (incl. the compact oop-map Arc),
         // then drop the reference before any callback runs (see the aliasing
@@ -1223,7 +1249,11 @@ impl OldGen {
 
         if kind == ObjectKind::Array {
             if element_type == ArrayElementType::Reference {
-                for i in 0..array_length as usize {
+                // Cap by the WALKED size, not the freshly-read `array_length`
+                // — see this function's doc comment.
+                let max_elems = body_bytes / ref_element_size();
+                let elems = (array_length as usize).min(max_elems);
+                for i in 0..elems {
                     let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
                     let raw: u64 = unsafe { read_ref_slot(slot) };
                     if raw != 0 {
@@ -1266,7 +1296,11 @@ impl OldGen {
                 }
             }
         } else {
-            for slot_idx in 0..num_slots as usize {
+            // Cap by the WALKED size, not the freshly-read `num_slots` — see
+            // this function's doc comment.
+            let max_slots = body_bytes / SLOT_SIZE;
+            let slots = (num_slots as usize).min(max_slots);
+            for slot_idx in 0..slots {
                 let slot = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                 let value = unsafe { std::ptr::read(slot as *const Value) };
                 if let Value::Object(Some(ref_obj)) = value {
@@ -1356,7 +1390,7 @@ impl OldGen {
         // from 0→1, so this terminates in at most `objects.len()` passes.
         loop {
             let mut promoted_any = false;
-            for &(obj_ptr, _size) in objects {
+            for &(obj_ptr, size) in objects {
                 // Snapshot the marked bit; don't hold a header borrow while the
                 // closure below may write the same header (self-loop case).
                 let is_marked =
@@ -1364,7 +1398,7 @@ impl OldGen {
                 if !is_marked {
                     continue; // only trace *live* referrers
                 }
-                Self::for_each_old_gen_ref(obj_ptr, data, |ref_ptr| {
+                Self::for_each_old_gen_ref(obj_ptr, size, data, |ref_ptr| {
                     // GCAUD-2: `for_each_old_gen_ref` filters only on the
                     // backing store's [start, end) range — no alignment, no
                     // object-start validation. Writing a mark bit through an
