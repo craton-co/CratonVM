@@ -1259,6 +1259,11 @@ pub fn compile_with_param_slots(
         reserve_stack_floor,
         gc_inert_selfrec && reserve_stack_floor,
         precise_exception_frames,
+        // The `0xba` lowering emits a frame-deopt stub that spills 32 registers
+        // into the `SavedRegisters` region, and it does so whether or not
+        // `deopt_real_enabled()`. The frame therefore has to reserve that region
+        // on the same condition — see `deopt_regs_size` in `x64.rs`.
+        !indy_info.is_empty(),
         protected_ranges,
     );
     KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));

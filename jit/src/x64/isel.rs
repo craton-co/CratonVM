@@ -4868,6 +4868,9 @@ mod tests {
                 false,
                 false,
                 false,
+                // No `invokedynamic` in this fixture — see the sibling call
+                // site in `x64/tests.rs`.
+                false,
                 Vec::new(),
             );
             Reference { compiler }

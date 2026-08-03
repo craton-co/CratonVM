@@ -1629,6 +1629,40 @@ mod deopt_snapshot_tests {
     }
 }
 
+/// Does this method's frame need the 256-byte `SavedRegisters` region that the
+/// frame-deopt stub spills 16 GPRs and 16 XMMs into?
+///
+/// **This must cover every stub `emit_deopt_stubs` takes the spilling path
+/// for.** That path is selected by
+///
+/// ```text
+/// deopt_real_enabled() || matches!(reason, 8 | 9 | 10)
+/// ```
+///
+/// Reasons 9 and 10 are the precise-exception-frame stubs, which
+/// `precise_exception_frames` covers. Reason 8 is the unconditional
+/// `invokedynamic` trap, which is emitted whether or not `deopt_real` is on —
+/// and it was covered by neither, which is not a missed optimisation but a
+/// stack-corrupting bug: with the region unreserved `deopt_regs_base` is 0, so
+/// the stub's `[rbp - (base - r*8)]` stores become `[rbp]`, `[rbp+8]`, … and
+/// walk UP over the saved `rbp` and the return address. The epilogue's `ret`
+/// then jumps to whatever register landed on the return slot.
+///
+/// Kept as a free function so the contract can be tested with `deopt_real`
+/// OFF — the only configuration the divergence was visible in, and one no
+/// in-process test can reach, because `deopt_real_enabled()` latches a
+/// process-wide `OnceLock`.
+///
+/// See `probes/IndyDeoptProbe.java` and
+/// `docs/known-issues/jit/deopt-real-off-null-entry-sigsegv-20260803.md`.
+pub(crate) fn deopt_spill_region_reserved(
+    deopt_real: bool,
+    precise_exception_frames: bool,
+    has_indy_sites: bool,
+) -> bool {
+    deopt_real || precise_exception_frames || has_indy_sites
+}
+
 impl Compiler {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1652,6 +1686,12 @@ impl Compiler {
         reserve_stack_floor: bool,
         gc_inert_selfrec: bool,
         precise_exception_frames: bool,
+        // Does this method contain an `invokedynamic`? The `0xba` lowering
+        // emits a frame-deopt stub (reason 8) that spills 32 registers into the
+        // `SavedRegisters` region, and it does so whether or not
+        // `deopt_real_enabled()` — so the frame has to reserve that region on
+        // the same condition. See `deopt_regs_size` below.
+        has_indy_sites: bool,
         protected_ranges: Vec<(u32, u32)>,
     ) -> Self {
         // Compact arrays: byte[] uses 1-byte elements, int[] uses 4-byte, ref[] uses 8-byte.
@@ -1923,7 +1963,33 @@ impl Compiler {
         // [rbp - (deopt_regs_base - r*8)] (ascending with r from
         // &gpr[0] = [rbp - deopt_regs_base]); the XMM half follows the GPR half in
         // `#[repr(C)]` order, so xmm[n] at [rbp - (deopt_regs_base - 128 - n*8)].
-        let deopt_regs_size = if crate::deopt_real_enabled() || precise_exception_frames {
+        // The condition MUST cover every stub that spills into this region.
+        // `emit_deopt_stubs` takes the spilling path when
+        //
+        //     deopt_real_enabled() || matches!(reason, 8 | 9 | 10)
+        //
+        // and reasons 9/10 are the precise-exception-frame stubs, which
+        // `precise_exception_frames` already covers. Reason 8 — the
+        // unconditional `invokedynamic` trap — was covered by neither, and that
+        // is a stack-corrupting bug rather than a missing optimisation: with the
+        // region unreserved `deopt_regs_base` is 0, so the stub's
+        // `[rbp - (base - r*8)]` stores become `[rbp]`, `[rbp+8]`, … — walking
+        // UP into the caller's frame, over the saved `rbp` and the return
+        // address. The epilogue's `ret` then jumps to whatever register landed
+        // on the return slot (`rcx`), which is how
+        // `CRATONVM_JIT='deopt-real=0'` turned a hot lambda into a SIGSEGV at a
+        // constant, unmapped address. Reproducer:
+        // `probes/IndyDeoptProbe.java`;
+        // `docs/known-issues/jit/deopt-real-off-null-entry-sigsegv-20260803.md`.
+        //
+        // Byte-identical whenever `deopt_real_enabled()` (the default) or when
+        // the method has no `invokedynamic`: the region was already reserved in
+        // the first case and is not needed in the second.
+        let deopt_regs_size = if deopt_spill_region_reserved(
+            crate::deopt_real_enabled(),
+            precise_exception_frames,
+            has_indy_sites,
+        ) {
             32 * 8
         } else {
             0

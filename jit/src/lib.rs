@@ -2387,49 +2387,58 @@ impl CompiledMethod {
     /// The compiled code must match the expected signature.
     #[inline]
     pub unsafe fn try_call(&self, args: &[i64]) -> Result<i64, CompileError> {
-        validate_code_ptr(self.entry).map_err(CompileError::InvalidCodePtr)?;
+        // Read the entry ONCE and both validate and call THAT value.
+        //
+        // `validate_code_ptr(self.entry)` followed by `transmute(self.entry)`
+        // is a time-of-check/time-of-use hole: the two are separate loads, the
+        // optimiser is free to reload, and the pointer is written through raw
+        // pointers by paths this `&self` does not synchronise with. Whatever
+        // produces a null there, the one guarantee worth having is that the
+        // pointer we jump to is the pointer we checked.
+        let entry = self.entry;
+        validate_code_ptr(entry).map_err(CompileError::InvalidCodePtr)?;
         match args.len() {
             0 => {
-                let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(entry);
                 Ok(f())
             }
             1 => {
-                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(args[0]))
             }
             2 => {
-                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(args[0], args[1]))
             }
             3 => {
-                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2]))
             }
             4 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2], args[3]))
             }
             5 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2], args[3], args[4]))
             }
             6 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2], args[3], args[4], args[5]))
             }
             7 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     args[0], args[1], args[2], args[3], args[4], args[5], args[6],
                 ))
             }
             8 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
                 ))
@@ -2464,45 +2473,48 @@ impl CompiledMethod {
         vm_ptr: i64,
         args: &[i64],
     ) -> Result<i64, CompileError> {
-        validate_code_ptr(self.entry).map_err(CompileError::InvalidCodePtr)?;
+        // Read the entry ONCE — see [`CompiledMethod::try_call`] for why
+        // validating one load and calling another is not the same check.
+        let entry = self.entry;
+        validate_code_ptr(entry).map_err(CompileError::InvalidCodePtr)?;
         match args.len() {
             0 => {
-                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(vm_ptr))
             }
             1 => {
-                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0]))
             }
             2 => {
-                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1]))
             }
             3 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1], args[2]))
             }
             4 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1], args[2], args[3]))
             }
             5 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1], args[2], args[3], args[4]))
             }
             6 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5],
                 ))
             }
             7 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
                 ))

@@ -142,6 +142,9 @@ fn push_stack_refuses_to_cross_spill_limit() {
         false,
         false,
         false,
+        // No `invokedynamic` in this fixture, so no register-spilling
+        // frame-deopt stub and nothing to reserve a spill region for.
+        false,
         Vec::new(),
     );
 
