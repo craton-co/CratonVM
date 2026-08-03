@@ -102,7 +102,7 @@ the exit code).
 |---|---|---|---|
 | `tomcat.util.net.TestPQC` | PASS `OK (39)` | PASS `OK (39)` | PASS `OK (39)` |
 | `tomcat.util.net.TestLargeClientHello` | PASS `OK (1)` | PASS `OK (1)` | PASS `OK (1)` |
-| `tomcat.security.TestSecurity2018` | PASS `OK (1)` | PASS `OK (1)` | PASS `OK (1)` |
+| `tomcat.security.TestSecurity2018` | PASS `OK (1)` | PASS `OK (1)` ‡ | PASS `OK (1)` ‡ |
 | `catalina.core.TestAsyncContextImpl` | PASS `OK (70)` | PASS `OK (70)` | PASS `OK (70)` |
 | `catalina.filters.TestRestCsrfPreventionFilter` | PASS `OK (23)` | PASS `OK (23)` | PASS `OK (23)` |
 | `catalina.realm.TestJNDIRealm` | FAIL ×3 † | PASS `OK (4)` | PASS `OK (4)` |
@@ -116,6 +116,24 @@ the exit code).
 
 The three classes the BouncyCastle doc named go green everywhere, with
 identical test counts on both VMs. Nothing was hiding under the classpath gap.
+
+## ‡ Correction (2026-08-03): the `TestSecurity2018` CratonVM cells were VACUOUS passes
+
+That class is `@Test(expected = DeploymentException.class)`, so it scores PASS
+for *any* `DeploymentException` — including one raised because the wss://
+connection never completed. On this binary it never completed:
+`SSLException: Bytes were consumed from the input during a write`, the defect
+later fixed by `fedb11592`. Endpoint identification — the mechanism the class
+exists to test — did not run at all, and had never been implemented on the
+`SSLEngine` lane. Its wall clock on CratonVM here (~68 s against HotSpot's
+2.4 s) was the visible tell.
+
+The two CratonVM cells above are therefore **not evidence that hostname
+verification worked**, and reading them that way sent a later triage down a
+170-commit bisect for a regression that never happened. Full account, evidence
+and fix:
+[`testsecurity2018-endpoint-identification-never-enforced-FIXED.md`](testsecurity2018-endpoint-identification-never-enforced-FIXED.md).
+The HotSpot cell is genuine.
 
 ## † The residual is HotSpot's, not CratonVM's: EasyMock 5.6.0 cannot mock classes on JDK 25
 

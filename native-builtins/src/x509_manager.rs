@@ -2851,11 +2851,21 @@ pub(crate) fn check_revocation_for_verifier(
 // So `do_check_trusted` *cannot* perform the host check itself without the
 // intended host, and silently inventing one would be worse than omitting it.
 // Instead this module exposes `verify_hostname` / `check_endpoint_identity`
-// as the public entry point for the SSL-engine layer (tls.rs) to call at the
-// point where the peer host and the negotiated identification algorithm are
-// actually available. Until that wiring lands, endpoint identity is enforced
-// by whatever caller threads the host in; the chain-trust path is unchanged
-// and never *weakened* by this addition.
+// as the public entry point for the layer that DOES know the peer host and the
+// negotiated identification algorithm; the chain-trust path is unchanged and
+// never *weakened* by this addition.
+//
+// Two callers thread the host in today:
+//
+//   * `http_url_connection::huc_verify_hostname` — the native
+//     `HttpURLConnection` client path.
+//   * `t27_tls::engine_check_endpoint_identity` — the `SSLEngine` lane, after
+//     the handshake and after the application's `TrustManager[]` has had its
+//     say (JSSE's order). This wiring was MISSING until 2026-08-03, which is
+//     the whole of CVE-2018-8034's shape: a `localhost`-only certificate was
+//     accepted for a connection to `127.0.0.1`. If you add a third TLS client
+//     lane, it needs its own call here — an unwired lane performs no host
+//     check at all, and nothing in this module can detect that.
 
 /// Why an endpoint-identity (hostname) check failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
