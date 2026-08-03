@@ -23466,7 +23466,27 @@ pub fn set_bytecode_loop_rewriter_armed(on: bool) -> bool {
 /// more times behind one back edge, giving `(k+1)^2` bodies per poll — a
 /// time-to-safepoint neither unroller's budget check ever saw.
 fn bytecode_loop_xform_rewrites_bytecode() -> bool {
-    BYTECODE_LOOP_REWRITER_ARMED.with(|c| c.get())
+    BYTECODE_LOOP_REWRITER_ARMED.with(|c| c.get()) || bytecode_loop_xform_flag()
+}
+
+/// `CRATONVM_JIT=bytecode-loop-xform` — the process-wide form of the opt-in.
+///
+/// Read **once**. `runtime_var_os` on a declared flag consults a latched
+/// snapshot anyway, so a per-compile read would buy nothing and cost a lookup;
+/// the `OnceLock` makes that explicit and leaves one relaxed load on the path.
+///
+/// This is the switch that lets the transforms be executed by something larger
+/// than a unit test. It is deliberately not sufficient on its own: with
+/// `deopt_real` on — the default — `plan_bytecode_loop_xform` still refuses
+/// every compile before it looks at a loop, so a run that means to exercise a
+/// transformed method needs `CRATONVM_JIT='bytecode-loop-xform,-deopt-real'`.
+/// A run that sets only the first is not mis-configured, it just gets the
+/// unarmed compile with the native unroller off.
+fn bytecode_loop_xform_flag() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BYTECODE_LOOP_XFORM").is_some()
+    })
 }
 
 /// Is the native byte-copy unroller (the `0xa7` arm of `compile_bytecode`)

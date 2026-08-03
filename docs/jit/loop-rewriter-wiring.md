@@ -175,9 +175,12 @@ Plain data. `direct_calls` goes through the same primitive via a packed tuple
 because `JitDirectCall` (in `jit/src/lib.rs`) has no `Clone`; deriving it there
 would let this call `replicate_pc_keyed` directly.
 
-`loop_unroll_hints` is keyed by back-edge pc, and under `Unroll` an original
-back-edge bci has exactly one image (only the last copy carries the back edge),
-so the rebuilt map stays single-valued.
+`loop_unroll_hints` is keyed by back-edge pc. Under `Unroll` an original
+back-edge bci has exactly one image (only the last copy carries the back edge);
+under versioning it has two — the guarded loop's back edge and the fallback's —
+and the map stays well formed because those are two different keys. Its only
+consumer is the native byte-copy unroller, which is off whenever any of this
+runs.
 
 ### Replicated, payload is a READ-ONLY pointer — sound (3)
 
