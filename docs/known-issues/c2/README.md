@@ -20,7 +20,10 @@ here — which lanes have a **first increment** rather than a finished lane.
 | `x64.rs` / `invoke.rs` seams | `seam-01`, `seam-02` | 40k and 24k lines. The split is mechanical but every lane in the wave collided on these two files. |
 
 Plus `verify-01`, which is not a lane — it is the harness every lane above
-needs in order to prove it did not regress anything.
+needs in order to prove it did not regress anything. Its first increment
+shipped 2026-08-03 (`scripts/verify/compare.py` + fixture checks in the H2
+and Tomcat runners + real checked-in baselines for H2/Tomcat/Spring Boot) —
+see `docs/internal/verify-01-differential-harness-RETIRED-20260803.md`.
 
 ## Rules that made the last two waves work
 
