@@ -165,10 +165,12 @@ skipped when `is_client` is false.
 
 ## Verification
 
-Linux, Azure host, `/data/data/apps/tomcat`, JDK 25.0.3, one process per class,
-JIT on, status from the JUnit banner. `base` = `dev` `c685f1e65` unmodified;
-`fix` = same tree + this change. Arms **interleaved per class, alternating
-order**, never one block each.
+### Linux
+
+Azure host, `/data/data/apps/tomcat`, JDK 25.0.3, one process per class, JIT
+on, status from the JUnit banner. `base` = `dev` `c685f1e65` unmodified; `fix`
+= same tree + this change. Arms **interleaved per class, alternating order**,
+never one block each.
 
 | Class | base | fix |
 |---|---|---|
@@ -196,6 +198,28 @@ pre-existing, and permanently so: rustls categorically rejects renegotiation
 ‡ `testCVE_2019_0232`, identical failure in BOTH arms — pre-existing, a
 separate defect with nothing to do with TLS.
 
+A second batch, same protocol, covering the paths that share
+`createSSLEngine` (server-side TLS, HTTP/2, the non-TLS WebSocket family) and
+the two classes the classpath doc measured alongside `TestSecurity2018` —
+**15 of 15 identical in both arms**, with real counts:
+`coyote.http2.TestHttp2Section_3_5` `OK (2)`,
+`coyote.http2.TestHttp2InitialConnection` `OK (6)`,
+`coyote.http11.TestHttp11Processor` `OK (66)`,
+`util.net.TestSSLHostConfigCipher` `OK (12)`,
+`util.net.TestSSLHostConfig` `OK (11)`,
+`catalina.manager.TestManagerWebappSsl` `OK (3)`,
+`catalina.valves.rewrite.TestResolverSSL` `OK (3)`,
+`websocket.TestWsPingPongMessages` `OK (1)`,
+`websocket.TestWsRemoteEndpoint` `OK (8)`,
+`websocket.TestWsSubprotocols` `OK (1)`,
+`websocket.server.TestWsServerContainer` `OK (37)`,
+`util.net.TestClientCertTls13` `OK (6)`,
+`catalina.core.TestAsyncContextImpl` `OK (70)`,
+`util.net.TestPQC` `OK (26)`,
+`util.net.TestLargeClientHello` `OK (1)`.
+
+32 classes measured in total; the only verdict that moved is the target's.
+
 `--nojit`, `TestSecurity2018`, both arms interleaved twice: base FAIL, FAIL;
 fix PASS, PASS.
 
@@ -207,6 +231,21 @@ Probe, same fixture:
 | CratonVM base | `ACCEPTED` — the connection succeeded, hostname verification did not run |
 | CratonVM fix | `REJECTED-BY-HOSTNAME-VERIFICATION` — `SSLHandshakeException: endpoint identification (HTTPS) failed for host "127.0.0.1": certificate identity does not match host "127.0.0.1"` |
 | CratonVM at `bdd405d3a` (Windows, pre-`fedb11592`) | `REJECTED-FOR-ANOTHER-REASON` — `SSLException: Bytes were consumed from the input during a write` ← **the vacuous pass, named** |
+
+### Windows — the platform the bug was filed on
+
+`apps/tomcat` fixture, `cratonvm-tlsepid-fix-20260803.exe` vs
+`cratonvm-wsjsse-merged-20260803.exe` (dev of the same day), interleaved:
+
+| Class | base | fix |
+|---|---|---|
+| `tomcat.security.TestSecurity2018` | **FAIL, FAIL** | **PASS `OK (1)`, PASS `OK (1)`** |
+| `websocket.TestWsWebSocketContainerSSL` | PASS `OK (3)` | PASS `OK (3)` |
+| `websocket.TestWebSocketFrameClientSSL` | PASS `OK (6)` | PASS `OK (6)` |
+| `util.net.TestSSLHostConfigCompat` | PASS `OK (78)` | PASS `OK (78)` |
+| `util.net.TestCustomSslTrustManager` | PASS `OK (9)` | PASS `OK (9)` |
+
+Probe on Windows: base `ACCEPTED`, fix `REJECTED-BY-HOSTNAME-VERIFICATION`.
 
 `CRATONVM_DBG=tls-auth` on the fixed binary shows the two gates firing in JSSE's
 order, which is the point of the fix:
