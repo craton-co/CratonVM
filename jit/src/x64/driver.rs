@@ -569,7 +569,13 @@ pub fn compile_with_param_slots(
                 .into_iter()
                 .collect::<HashMap<usize, crate::InlineSite>>(),
             replicate_pc3(x, compact_field_info),
-            // Always empty here — `InvokedynamicPresent` refuses the transform.
+            // NOT empty any more. `InvokedynamicPresent` used to refuse the
+            // transform outright; since the deopt bci translation landed, a
+            // method with an `invokedynamic` is rewritten like any other and
+            // every copy of a `0xba` site needs its own entry here — the site
+            // lowers to an unconditional trap that records a resume snapshot,
+            // and a copy without an entry would bail the whole compile
+            // (`indy_info_idx` miss ⇒ `return false`).
             replicate_pc5(x, indy_info),
         ),
     };
