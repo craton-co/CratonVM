@@ -268,6 +268,52 @@ pub fn ensure_system_stdin_object(
 // Free functions: class initialization
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Nesting depth of `<clinit>` frames currently executing on this
+    /// (OS) thread, including nested/re-entrant `<clinit>` calls one
+    /// static initializer transitively triggers. See `in_clinit_shared`.
+    static CLINIT_NESTING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// True while this thread is executing inside some class's `<clinit>`.
+///
+/// Reflective code paths (e.g. building `java.lang.reflect.Method`
+/// mirrors) must consult this before forcing an UNRELATED class's full
+/// initialization as a side effect of merely exposing its return/parameter
+/// type. JVMS §5.5 triggers initialization only via `new`/`getstatic`/
+/// `putstatic`/`invokestatic` on that exact class, never as a side effect
+/// of reflection over a *different*, currently-initializing class. Forcing
+/// it anyway lets the newly-initialized class observe the in-progress
+/// class's static fields at their pre-assignment default (usually `null`)
+/// instead of failing to resolve at all -- see
+/// `docs/known-issues/springboot/netty-compositebytebuf-clinit-reads-unpooled-empty-buffer-null-20260731.md`
+/// for the concrete repro (Netty's `Unpooled.<clinit>` -> `UnpooledByteBufAllocator`
+/// superclass init -> `ResourceLeakDetector.addExclusions` ->
+/// `Class.getDeclaredMethods()` on `AbstractByteBufAllocator`, whose declared
+/// `compositeBuffer()` return type `CompositeByteBuf` was being force-initialized
+/// mid-way through `Unpooled.<clinit>`, before `EMPTY_BUFFER` was assigned).
+pub fn in_clinit_shared() -> bool {
+    CLINIT_NESTING_DEPTH.with(|d| d.get() > 0)
+}
+
+/// RAII depth counter paired with `in_clinit_shared`. Increment on
+/// `<clinit>` entry, decrement on every exit (including panics unwinding
+/// through the guarded scope).
+struct ClinitDepthGuard;
+
+impl ClinitDepthGuard {
+    fn enter() -> Self {
+        CLINIT_NESTING_DEPTH.with(|d| d.set(d.get() + 1));
+        ClinitDepthGuard
+    }
+}
+
+impl Drop for ClinitDepthGuard {
+    fn drop(&mut self) {
+        CLINIT_NESTING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Ensure a class is fully initialized (JVM spec В§5.5).
 ///
 /// Handles three cases:
@@ -1158,6 +1204,7 @@ fn initialize_class_shared(
     }
     if has_clinit {
         tracing::debug!(class = %class_name_for_jfr, "running <clinit>");
+        let _clinit_depth_guard = ClinitDepthGuard::enter();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             super::invoke_on_class_shared(shared, thread, class_id, "<clinit>", "()V", &[])
         }));
