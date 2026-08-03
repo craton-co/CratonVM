@@ -166,9 +166,11 @@ pub(crate) fn report_reclaimed_receiver(
             );
         }
     }
-    // The young-sweep ring only records under `CRATONVM_DBG_SWEEP_ZERO`, which
-    // also switches the young collector to the sequential walk — so a hit here
-    // means the run was instrumented, and a miss says nothing either way.
+    // The per-object young-sweep ring only records under
+    // `CRATONVM_DBG_SWEEP_ZERO`, which also switches the young collector to the
+    // sequential walk — so a hit here means the run was instrumented, and a
+    // miss says nothing either way. It is still worth asking, because it names
+    // the victim's original CLASS, which the span ring above cannot.
     if zero_header {
         if let Some((cid, kind, cycle, reason, initiator, blocked)) =
             cratonvm_gc::gen_heap::sweep_zero_lookup(addr)

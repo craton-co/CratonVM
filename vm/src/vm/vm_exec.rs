@@ -3486,6 +3486,119 @@ impl<'a> NativeContextImpl<'a> {
         trace
     }
 
+    /// H2-CID0-BLOCKED — catch the blocked-frame face of the `ClassId(0)`
+    /// family at the moment it becomes observable, instead of minutes later
+    /// on whatever call site happens to dereference it first.
+    ///
+    /// A thread parked in a native publishes its frames exactly once
+    /// (`deposit_root_snapshot`) and is then invisible to every collector
+    /// except through that snapshot. If the snapshot omits a live frame slot,
+    /// the young sweep reclaims and ZEROES the object under it and the owner
+    /// resumes reading an all-zero header. What that looks like from Java
+    /// depends only on which bytecode touches it first:
+    ///
+    /// * `NoSuchMethodError java/lang/Object.hasNext()Z` — the `for (Future
+    ///   job : jobs)` iterator in `TestMultiThread.testConcurrentUpdate`;
+    /// * `CloneNotSupportedException` — `java.lang.Object` is not `Cloneable`,
+    ///   so a zeroed header turns `super.clone()` into a plausible-looking
+    ///   application error with no GC smell at all;
+    /// * `java.lang.Object cannot be cast to X`, or a bare SIGSEGV.
+    ///
+    /// Only the first had a reporter, and it fired 1 run in 16. This audit
+    /// asks the same question of every frame slot at every wake, so the event
+    /// rate is bounded by the DEFECT rather than by which bytecode ran next.
+    ///
+    /// Cost: one header load per object slot (`ClassId(0)` slots are rare on a
+    /// healthy run — only a genuine `new Object()` reads that way), and the
+    /// free-list verdict, which takes the young and old heap locks, is reached
+    /// only for those. A process-wide probe budget bounds a workload that
+    /// really does park with `Object` locals.
+    ///
+    /// See `docs/known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md`.
+    fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
+        static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        const PROBE_BUDGET: u64 = 200_000;
+        let heap = &self.shared.mem.heap;
+        let probe = |addr: usize, ctx: &dyn Fn() -> String| {
+            if PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= PROBE_BUDGET {
+                return;
+            }
+            // Free-list membership FIRST, and only then the full report. A
+            // zeroed header is ambiguous on its own — `java.lang.Object` is
+            // `ClassId(0)` and so is a genuine `new Object()` — and the young
+            // span ring cannot settle it either, because the allocator
+            // re-serves young spans. Asking the heap whether the address is
+            // inside a hole right now is the one question with no false
+            // positives: a live object is never in a free block, never past
+            // the allocation frontier, and never in the inactive semispace.
+            if heap.reclaimed_hole_at(addr).is_none() {
+                return;
+            }
+            crate::memory::reclaim_guard::report_reclaimed_receiver(
+                self.shared,
+                addr,
+                site,
+                &ctx(),
+                0,
+            );
+        };
+        for (fi, fr) in self.thread.frames.iter().enumerate() {
+            let check = |o: cratonvm_types::ObjectRef, what: &str, idx: usize| {
+                let a = o.as_ptr() as usize;
+                // Region membership first: a lost-tag slot can hold a
+                // non-address, and the header read below is a raw
+                // dereference.
+                if heap.is_heap_addr(a).is_none() {
+                    return;
+                }
+                // `ClassId(0)` alone is not the face. A PRIMITIVE ARRAY also
+                // reads back class id 0 — array headers carry the COMPONENT
+                // class id (JVMS §4.4.1; see `virtual_dispatch_target_cached`)
+                // and `long[]`/`int[]` have none — so gating on the class id
+                // alone flags every `long[] toc` local in
+                // `FileStore.dropUnusedChunks` on every wake. Requiring
+                // `kind == Object` costs one more byte load and drops that
+                // whole population; the all-zero header the collector leaves
+                // behind reads `kind == Object` because that is discriminant
+                // zero.
+                if heap.class_id_of(o).as_u32() != 0
+                    || heap.kind_of(o) != cratonvm_types::ObjectKind::Object
+                {
+                    return;
+                }
+                probe(a, &|| {
+                    format!(
+                        "tid={} frame#{fi} {}.{} pc={} {what}[{idx}]",
+                        self.thread.thread_id.0,
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.pc,
+                    )
+                });
+            };
+            // Only locals the collector itself would have rooted. A local
+            // the liveness analysis calls dead is SUPPOSED to be reclaimable:
+            // `H2ConcurrentUpdateLoop.main` slot 8 holds the seed loop's
+            // `PreparedStatement` for the rest of the method and read back as
+            // a free block on every wake. Counting those separately keeps the
+            // signal — a LIVE local the collector took anyway — visible.
+            let live_mask = fr.live_locals_mask_here();
+            for li in 0..fr.locals_len() {
+                if li < 64 && live_mask & (1u64 << li) == 0 {
+                    continue;
+                }
+                if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                    check(o, "local", li);
+                }
+            }
+            for si in 0..fr.stack.len() {
+                if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                    check(o, "stack", si);
+                }
+            }
+        }
+    }
+
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
     ///
@@ -3885,6 +3998,12 @@ impl<'a> NativeContextImpl<'a> {
                 }
             }
         }
+        // H2-CID0-BLOCKED: a slot that is ALREADY zeroed here was reclaimed
+        // before this block, so the blocked window is not where it was lost —
+        // the distinction the wake-side audit cannot make on its own.
+        if raise_blocked_flag {
+            self.audit_frames_for_reclaimed_slots("blocked frame slot (block entry)");
+        }
         // Mark the blocked region AFTER the snapshot is complete: from this
         // point on, every GC initiator maintains this thread's roots via
         // `fold_pointer_map_into_blocked` (snapshot remap + frame-fixup
@@ -4160,6 +4279,12 @@ impl<'a> NativeContextImpl<'a> {
                 }
             }
         }
+        // H2-CID0-BLOCKED: every relocation this thread slept through has now
+        // been applied, so any frame slot still reading `ClassId(0)` is either
+        // a genuine `new Object()` or an object that was RECLAIMED while this
+        // thread was parked and could not defend it. `report_reclaimed_receiver`
+        // separates the two by free-list membership.
+        self.audit_frames_for_reclaimed_slots("blocked frame slot (wake)");
         // Refresh (don't clear) the snapshot: we are runnable again but may
         // not reach a safepoint before the next GC scans roots; an empty
         // snapshot would hide every object reachable only from our frames.
