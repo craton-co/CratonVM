@@ -730,6 +730,9 @@ struct Compiler {
     sr_monitor_scalar_ops: std::collections::HashSet<usize>,
     /// Inline sites: bytecode PC → resolved InlineSite for inlining callee bytecode.
     inline_sites: FxHashMap<usize, crate::InlineSite>,
+    // PGO-02: see the `inline_guard_class_ids` parameter doc on
+    // `compile_with_param_slots`.
+    inline_guard_class_ids: FxHashMap<usize, u32>,
     /// Compile-time resolved `java/lang/String` field layout, for the String
     /// call-site intrinsics. `None` ⇒ String layout unavailable (intrinsic
     /// codegen bails to normal dispatch). See `crate::StringFieldLayout`.
@@ -2043,6 +2046,7 @@ impl Compiler {
             sr_monitor_at: FxHashMap::default(),
             sr_monitor_scalar_ops: std::collections::HashSet::new(),
             inline_sites: FxHashMap::default(),
+            inline_guard_class_ids: FxHashMap::default(),
             string_layout: None,
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
@@ -23304,6 +23308,9 @@ pub fn compile(
         helpers,
         non_escaping_new,
         inline_sites,
+        // PGO-02: legacy/test wrapper never plans a guarded virtual inline
+        // (it has no profile-driven admission path at all).
+        HashMap::new(),
         string_layout,
         &[],
         0,
@@ -23803,6 +23810,14 @@ pub fn compile_with_param_slots(
     helpers: &JitRuntimeHelpers,
     non_escaping_new: std::collections::HashSet<usize>,
     inline_sites: HashMap<usize, crate::InlineSite>,
+    // PGO-02: guard_class_id for every Monomorphic-admitted virtual/interface
+    // inline site, keyed by the same pc as `inline_sites`. See
+    // `docs/feature-designs/profile-guided-inlining.md`. Deliberately NOT
+    // threaded through the loop-unroll pc-replication tuple a few lines below
+    // (unlike `inline_sites` itself) — a replicated pc without an entry here
+    // just falls back to normal dispatch for that unrolled copy, which is
+    // always correct, only not optimized.
+    inline_guard_class_ids: HashMap<usize, u32>,
     // Compile-time resolved `java/lang/String` field layout for the String
     // call-site intrinsics (length/charAt/hashCode/…). `None` means "String
     // layout unavailable" — String-intrinsic codegen (added by a later
@@ -25064,6 +25079,7 @@ pub fn compile_with_param_slots(
     compiler.scalar_field_ops = sr_plan.field_ops;
     compiler.scalar_init_skips = sr_plan.init_skips;
     compiler.inline_sites = inline_sites.into_iter().collect();
+    compiler.inline_guard_class_ids = inline_guard_class_ids.into_iter().collect();
     // String call-site intrinsics: hand the resolved String field layout to
     // the compiler so intrinsic codegen can emit inline field loads.
     compiler.string_layout = string_layout;
