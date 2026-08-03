@@ -14678,13 +14678,38 @@ fn try_compile_inner(
             // roots.  Route through the checked re-entrant bridge instead;
             // it installs a distinct JitEntryGuard for the actual callee.
             let direct_jit_callee_calls_enabled = direct_jit_callee_calls_enabled();
-            // PGO-02: virtual/interface sites (0 | 2) now go through the SAME
-            // plan_inline call as static/special (3 | 1) below — the metrics-
-            // only pre-tally that used to stand in for a real admission attempt
-            // here (measuring "how much GuardNotEmittable is costing") is gone;
-            // `inline_tally.record(&plan)` below now records every invoke kind's
-            // real verdict, admitted or refused, uniformly.
-            if !is_recursive_call && matches!(invoke_kind, 0..=3) {
+            // PGO-02: virtual/interface sites (0 | 2) go through the SAME
+            // plan_inline call as static/special (3 | 1) below, but ONLY when
+            // `class_id_name_resolver` is `Some` — i.e. only when
+            // CRATONVM_JIT_GUARDED_VIRTUAL_INLINE is actually on. This flag is
+            // documented (jit/src/lib.rs's `InlineBackendCaps` doc comment,
+            // vm/src/runtime/env_cache.rs's `jit_guarded_virtual_inline`) as
+            // "default-off, unsoaked" and behavior-preserving when off, but
+            // admitting 0|2 unconditionally broke that: `plan_inline` calls
+            // `classify_receiver_shape` (previously reached for these sites
+            // only under the removed `metrics::enabled()`-gated pre-tally)
+            // before it ever consults `caps.guarded_inline_body_at_virtual_sites`,
+            // so flag-off callers paid for and ran that admission machinery on
+            // every virtual/interface call site in every compiled method for
+            // the first time — confirmed via bisect
+            // (f697d618ea, this same plumbing commit with zero codegen behind
+            // it) to be the cause of a javac-self-hosting internal
+            // AssertionError (`Check$SuperThisChecker`, 100% reproducible on
+            // Spring AOT chunk 9) that has nothing to do with the feature this
+            // flag gates. Gating virtual/interface admission on the resolver
+            // being present restores the exact pre-PGO-02 code path (this
+            // whole `if` skipped for 0|2) when the flag is off, matching
+            // static/special's own unconditional admission, which this bug
+            // never touched. The metrics-only pre-tally this replaced is not
+            // restored — losing that one measurement when the feature is off
+            // is an acceptable trade for not running unaudited machinery on
+            // every unrelated JIT compile.
+            let virtual_interface_inline_admitted = class_id_name_resolver.is_some();
+            if !is_recursive_call
+                && (invoke_kind == 3
+                    || invoke_kind == 1
+                    || (virtual_interface_inline_admitted && matches!(invoke_kind, 0 | 2)))
+            {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
                     if let Some(resolver_fn) = inline_resolver.as_ref() {
