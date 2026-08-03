@@ -3519,6 +3519,31 @@ impl<'a> NativeContextImpl<'a> {
         static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         const PROBE_BUDGET: u64 = 200_000;
         let heap = &self.shared.mem.heap;
+        // Nothing this thread holds can have been reclaimed since the last
+        // time this walk proved it clean unless a COLLECTION ran in between,
+        // so that is the audit's real precondition — and it is what bounds the
+        // cost. Both call sites sit on the blocked-region entry/exit path,
+        // which a workload doing file or socket I/O crosses thousands of times
+        // between two collections; without this gate the audit would walk
+        // every frame's locals and stack on each of those crossings, doubling
+        // a `deposit_root_snapshot` that already walks exactly the same slots.
+        // With it the audit costs at most one frame walk per collection per
+        // thread, which is the rate at which it can possibly have anything new
+        // to say.
+        //
+        // Thread-local because both sites run ON the owning thread, and it is
+        // seeded to `u64::MAX` so the first audit on a thread always runs.
+        // Updated on every audit rather than only at block entry, so a wake
+        // with no matching entry (or a nested blocked region) still compares
+        // against the last time THIS thread looked.
+        thread_local! {
+            static LAST_AUDITED_GC_COUNT: std::cell::Cell<u64> =
+                const { std::cell::Cell::new(u64::MAX) };
+        }
+        let gc_count = heap.collection_count();
+        if LAST_AUDITED_GC_COUNT.with(|c| c.replace(gc_count)) == gc_count {
+            return;
+        }
         let probe = |addr: usize, ctx: &dyn Fn() -> String| {
             if PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= PROBE_BUDGET {
                 return;
