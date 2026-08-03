@@ -6260,7 +6260,27 @@ impl Compiler {
                             //      are NOT targeted (already branched
                             //      above), so the callee is a normal
                             //      JIT-compiled method.
+                            //   4. `pc + 3` is NOT a branch target. The
+                            //      tail form CONSUMES the `xreturn` — it emits
+                            //      no code for that PC and leaves
+                            //      `pc_to_native[pc + 3]` unset — so any other
+                            //      edge into it becomes unresolvable and
+                            //      `patch_branches` rejects the whole method
+                            //      with `branch-target-not-an-instruction-
+                            //      boundary`, a reason whose message blames
+                            //      malformed bytecode. It is the ordinary
+                            //      shape `return (x != null ? x : missing())`:
+                            //      the `else` arm's call sits immediately
+                            //      before the shared `areturn`, and the `then`
+                            //      arm's `goto` lands on it. Fusing would also
+                            //      be wrong on its own terms — the other edge
+                            //      arrives with its own value on the operand
+                            //      stack and expects a plain return, not "load
+                            //      args and JMP to the callee". This is the
+                            //      same precondition the const-arith peepholes
+                            //      state: never fuse across a merge point.
                             let tail_op_matches = pc + 3 < code_len
+                                && !branch_targets[pc + 3]
                                 && match (ret_type, code[pc + 3]) {
                                     (b'I' | b'Z' | b'B' | b'S' | b'C', 0xAC) => true,
                                     (b'J', 0xAD) => true,
@@ -6506,8 +6526,14 @@ impl Compiler {
                         // frame down, so a throw from the self-recursive callee
                         // would bypass the handler covering this pc
                         // (see `pc_is_protected`).
+                        // Never when the `xreturn` is a branch target: the
+                        // tail form consumes that PC without emitting it, so
+                        // another edge into it has no native offset to be
+                        // patched to (see the sibling-tail arm above for the
+                        // full argument).
                         let is_tail_call = pc + 3 < code_len
                             && matches!(code[pc + 3], 0xac..=0xb0) // ireturn..areturn
+                            && !branch_targets[pc + 3]
                             && !self.pc_is_protected(pc);
 
                         // jit-invokedynamic-groovy-regression fix: a method

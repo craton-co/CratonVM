@@ -716,6 +716,12 @@ struct Compiler {
     /// reaches the `compile-bail` line, the way `note_jit_bail_site` works
     /// everywhere else.
     failed_site: Option<(&'static str, usize, u8)>,
+    /// Set by `patch_branches` when it rejects the method: the branch target
+    /// PC that had no native offset, and the nearest emitted PC at or below it.
+    /// The refusal named neither before, and its message asserted a cause
+    /// ("malformed bytecode a verifier would reject") that is demonstrably
+    /// wrong for real javac output.
+    pub(crate) unresolved_branch_target: Option<(usize, i64)>,
     /// Bitmask of scratch XMM registers (2-7) currently in use on the simulated stack.
     /// Bit N corresponds to SCRATCH_XMMS[N]. Used to allocate scratch XMMs for
     /// FP intermediate persistence across bytecodes.
@@ -2065,6 +2071,7 @@ impl Compiler {
             branch_target_stack_oop_marks: FxHashMap::default(),
             failed: false,
             failed_site: None,
+            unresolved_branch_target: None,
             helpers,
             scratch_xmm_in_use: 0,
             fp_hoist_info: Vec::new(),
@@ -2407,16 +2414,48 @@ impl Compiler {
     // this module, so that is not reachable from outside the backend.
 
 
+    /// Record which target `patch_branches` could not resolve, plus the
+    /// highest PC at or below it that the emitter actually placed. The pair
+    /// distinguishes the two ways this happens: a `nearest` strictly below the
+    /// target means the walk stepped OVER it (something consumed the target's
+    /// PC without emitting it), and `-1` means nothing below it was emitted at
+    /// all (the target sits in a region the walk never entered).
+    #[cold]
+    fn note_unresolved_branch_target(&mut self, target_pc: usize) {
+        if self.unresolved_branch_target.is_some() {
+            return;
+        }
+        let nearest = (0..=target_pc.min(self.pc_to_native.len().saturating_sub(1)))
+            .rev()
+            .find(|&p| self.pc_to_native[p] >= 0)
+            .map_or(-1i64, |p| p as i64);
+        self.unresolved_branch_target = Some((target_pc, nearest));
+    }
+
     /// Patch all forward branches and jump-table entries.
     ///
     /// Returns `false` when any recorded branch/table target has no native
-    /// offset (`pc_to_native[target_pc] < 0` or out of range). Every target
-    /// the scan pass collects is revived and emitted by the dead-code walk,
-    /// so an unresolved target means the bytecode branches to a PC that is
-    /// not an instruction boundary (e.g. into the middle of a `goto`'s
-    /// operand bytes) — malformed bytecode that a classfile verifier would
-    /// reject, but which CratonVM can still meet via unverified/synthetic
-    /// code. Previously such patches were silently SKIPPED, leaving the
+    /// offset (`pc_to_native[target_pc] < 0` or out of range).
+    ///
+    /// **Do not read that as "malformed bytecode".** This comment used to say
+    /// an unresolved target meant the method branched into the middle of an
+    /// instruction — something a classfile verifier would reject, reachable
+    /// only through unverified/synthetic code. That claim was wrong, and it
+    /// cost real compiles: every FUSING lowering in the emitter consumes a PC
+    /// without emitting it, and if that PC is a branch target the edge onto it
+    /// is unresolvable here. The tail-call forms swallowed the `xreturn` at
+    /// `pc + 3` and refused five ordinary Spring/bytebuddy methods this way
+    /// (`ResolvableType.isAssignableFrom`, `TypeMappedAnnotations.get`, …),
+    /// blaming their bytecode. See
+    /// `docs/internal/jit-tailcall-swallows-shared-return-FIXED-20260803.md`.
+    ///
+    /// So when this fires, suspect a fusion before you suspect the classfile:
+    /// `note_unresolved_branch_target` records the target and the nearest PC
+    /// the emitter actually placed, and `CRATONVM_DBG_JITC=1` prints both.
+    /// A `nearest` a few bytes below the target names the instruction whose
+    /// arm over-advanced `pc`.
+    ///
+    /// Previously such patches were silently SKIPPED, leaving the
     /// emitted rel32 placeholder `0`: the branch fell through (or, when the
     /// branch was the last emitted instruction, execution ran off the body
     /// into the out-of-line stubs — observed as a STATUS_ACCESS_VIOLATION
@@ -2432,6 +2471,7 @@ impl Compiler {
                 -1
             };
             if target_native < 0 {
+                self.note_unresolved_branch_target(target_pc);
                 return false; // unresolved target — reject the method
             }
             // rel32 = target - (patch_offset + 4)
@@ -2452,6 +2492,7 @@ impl Compiler {
                 -1
             };
             if target_native < 0 {
+                self.note_unresolved_branch_target(target_pc);
                 return false; // unresolved table target — reject the method
             }
             let rel = target_native - table_base as i32; // Cast: x86-64 rel32 displacement
