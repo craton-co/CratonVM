@@ -8157,10 +8157,25 @@ fn link_isolated_method_signatures(
             _ => return Err(isolated_loader_class_not_found(ctx, name)),
         };
         let mirror_pin = ctx.pin_native_root(mirror);
-        let link_ok = ctx
-            .class_id_from_mirror(mirror)
-            .map(|class_id| ctx.initialize_class(class_id).is_ok())
-            .unwrap_or(true);
+        // Netty CompositeByteBuf clinit bug (20260731): forcing full
+        // initialization here is only safe when this thread is not already
+        // mid-<clinit>. `loadClass` above already proved the type is present
+        // and loadable in this isolated loader's view -- that's all JVMS
+        // §5.5 requires for exposing it as a reflective method's
+        // return/parameter type. Actually running its <clinit> as well is an
+        // extra (originally intended to turn a missing transitive type into
+        // an eager NoClassDefFoundError for OnBeanCondition), but doing so
+        // while this thread is already inside another class's still-running
+        // <clinit> lets the forced class observe THAT class's statics at
+        // their pre-assignment default instead of failing to resolve --
+        // see docs/known-issues/springboot/netty-compositebytebuf-clinit-reads-unpooled-empty-buffer-null-20260731.md.
+        let link_ok = if ctx.in_clinit() {
+            true
+        } else {
+            ctx.class_id_from_mirror(mirror)
+                .map(|class_id| ctx.initialize_class(class_id).is_ok())
+                .unwrap_or(true)
+        };
         ctx.unpin_native_roots(mirror_pin);
         if !link_ok {
             return Err(isolated_loader_class_not_found(ctx, name));

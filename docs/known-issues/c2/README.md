@@ -13,7 +13,7 @@ here — which lanes have a **first increment** rather than a finished lane.
 
 | Lane | Docs | Why it is untouched |
 |---|---|---|
-| HIR/LIR/MIR | `hir-01`, `hir-02` | The IR is single-level. Splitting it is a contract question before it is a code question. |
+| HIR/LIR/MIR | ~~`hir-01`~~ **settled**, `hir-02` | The contract question is answered: `docs/jit/lowering-contract.md`. `hir-01` retired to `docs/internal/hir-01-lowering-contract-RETIRED-20260803.md` on 2026-08-03. `hir-02` is unblocked but should follow the contract's increment order, which starts with a step that emits nothing. |
 | Profile-guided inlining | `pgo-01`, `pgo-02` | The *policy* exists and is tested. The *evidence* it needs is not recorded, and the speculation it would enable has no guard/deopt pairing. |
 | OSR | `osr-01`, `osr-02` | OSR entry works. Its metadata contract and its exit/recompile story are the gaps. |
 | Loop transforms | `loop-01`, `loop-02` | One transform (bytecode unroll) is wired behind an opt-in. Everything else is unbuilt, and the planner refuses most compiles for reasons nobody has revisited. |
@@ -56,3 +56,12 @@ in the HIR lane should start before `hir-01` settles the contract, and every
 other lane is easier to land once `verify-01` exists. The rest are
 independent of each other by construction — that is what the ownership tables
 are for.
+
+**`hir-01` closed 2026-08-03.** Its answer is `docs/jit/lowering-contract.md`.
+The one thing to carry into the other lanes: the contract's three-defect test
+scored **one of three**, so the HIR/MIR migration is *not* justified as a
+correctness investment, and its first increment emits no bytes and exists to
+produce the measurement that decides whether to continue. Answering rule 1
+("verify the premise") turned up three stale claims in neighbouring docs, two
+of which asserted that finished work was unfinished — the failure mode this
+directory's rule 1 was written for, in the direction nobody checks.

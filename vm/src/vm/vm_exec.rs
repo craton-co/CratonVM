@@ -6553,6 +6553,10 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         crate::vm::vm_util::ensure_class_initialized_shared(&self.shared, self.thread, class_id)
     }
 
+    fn in_clinit(&self) -> bool {
+        crate::vm::vm_util::in_clinit_shared()
+    }
+
     fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
         self.shared
             .classes
