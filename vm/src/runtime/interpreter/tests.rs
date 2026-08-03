@@ -2463,24 +2463,6 @@ fn hot_files_have_no_production_panics() {
     // Derived from the parent's declaration rather than from file names or
     // contents: the parent is the thing that decides, so renaming a file or
     // removing its `#[cfg(test)]` changes the answer here with no edit.
-    fn declared_cfg_test(parent_src: &str, stem: &str) -> bool {
-        let mut prev_was_cfg_test = false;
-        for line in parent_src.lines() {
-            let t = line.trim_start();
-            if t.is_empty() || t.starts_with("//") || t.starts_with('*') {
-                continue;
-            }
-            let decl = t
-                .trim_start_matches("pub(crate) ")
-                .trim_start_matches("pub(super) ")
-                .trim_start_matches("pub ");
-            if decl == format!("mod {stem};") {
-                return prev_was_cfg_test;
-            }
-            prev_was_cfg_test = t.starts_with("#[cfg(test)]");
-        }
-        false
-    }
 
     for (dir, max_allowed) in [
         (format!("{manifest}/src/runtime/interpreter"), 0usize),
@@ -4738,6 +4720,31 @@ fn ldc_converter_passes_through_unrelated_errors() {
 // not just the ~33-line file header.
 // -----------------------------------------------------------------------
 
+/// Is `<stem>.rs` under a module directory declared `#[cfg(test)]` by its
+/// parent?
+///
+/// Used by both source-scanning gates below: a test-only submodule must not
+/// be scanned as production code, and must not be counted towards the
+/// production surface B3 requires.
+fn declared_cfg_test(parent_src: &str, stem: &str) -> bool {
+    let mut prev_was_cfg_test = false;
+    for line in parent_src.lines() {
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with("//") || t.starts_with('*') {
+            continue;
+        }
+        let decl = t
+            .trim_start_matches("pub(crate) ")
+            .trim_start_matches("pub(super) ")
+            .trim_start_matches("pub ");
+        if decl == format!("mod {stem};") {
+            return prev_was_cfg_test;
+        }
+        prev_was_cfg_test = t.starts_with("#[cfg(test)]");
+    }
+    false
+}
+
 /// Meta-test for B3: prove `scan_production_section` covers the real
 /// production dispatch surface of interpreter.rs (thousands of lines),
 /// not just the doc-comment header — and that the body is panic-free.
@@ -4747,7 +4754,6 @@ fn ldc_converter_passes_through_unrelated_errors() {
 #[test]
 fn b3_gate_scans_full_production_body_of_interpreter() {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let path = format!("{manifest}/src/runtime/interpreter.rs");
     let needles = [
         ".unwrap()",
         ".expect(",
@@ -4756,11 +4762,42 @@ fn b3_gate_scans_full_production_body_of_interpreter() {
         "todo!(",
         "unreachable!(",
     ];
-    let (hits, scanned) = scan_production_section(&path, &needles);
+
+    // The interpreter MODULE, not the file. This gate's property is "the scan
+    // reaches the real dispatch surface, not just the ~33-line header", and
+    // that surface is the module. Asserting it against `interpreter.rs` alone
+    // was true at 26,000 lines and false the moment the SEAM-02 split moved
+    // most of it one directory down — a gate reporting a broken scanner when
+    // the scanner was fine.
+    let dir = format!("{manifest}/src/runtime/interpreter");
+    let parent = std::fs::read_to_string(format!("{dir}.rs")).expect("read interpreter.rs");
+    let mut paths = vec![format!("{dir}.rs")];
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("enumerate interpreter/")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
+        .collect();
+    entries.sort();
+    for p in entries {
+        let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or_default();
+        if !declared_cfg_test(&parent, stem) {
+            paths.push(p.to_string_lossy().into_owned());
+        }
+    }
+
+    let mut hits = 0usize;
+    let mut scanned = 0usize;
+    for p in &paths {
+        let (h, sc) = scan_production_section(p, &needles);
+        hits += h;
+        scanned += sc;
+    }
     assert!(
         scanned > 10_000,
-        "B3: scan covered only {scanned} lines — the production body \
-         of interpreter.rs was not scanned (boundary detection broke).",
+        "B3: the scan covered only {scanned} production lines across {} files \
+         of the interpreter module — the dispatch surface was not scanned \
+         (boundary detection broke).",
+        paths.len(),
     );
     assert_eq!(
         hits, 0,
