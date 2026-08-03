@@ -9725,6 +9725,96 @@ impl Compiler {
         }
     }
 
+    /// Emit a compiled `getstatic` as a direct load, with no helper `CALL`.
+    ///
+    /// Returns `false` when the site cannot be inlined, in which case the
+    /// caller must keep the `jit_getstatic` path; `true` means the value has
+    /// been pushed (and the oop mark / volatile fence emitted) already.
+    ///
+    /// # Shape
+    ///
+    /// ```text
+    ///   MOV RAX, imm64          ; &statics_index[class].base  (the POINTER cell)
+    ///   MOV RAX, [RAX]          ; the class's statics block base
+    ///   MOV/MOVSXD RAX, [RAX + field_index*16 + payload_off]
+    /// ```
+    ///
+    /// The first two are what replaces a helper round trip; the third is the
+    /// same load the inline `getfield` arms emit, against the same 16-byte
+    /// `Value` cell layout (`FIELD_CELL_PAYLOAD*_OFFSET`, pinned by
+    /// `field_cell_layout_matches_value_enum`). Result conventions match
+    /// `jit_getstatic` exactly: `MOVSXD` for the int category (`Value::Int(i)
+    /// => i as i64`), a 32-bit zero-extending `MOV` for float (`f.to_bits() as
+    /// i64`), a 64-bit `MOV` of the payload word for long/double/reference
+    /// (`Object(None)` leaves that word zero, i.e. JVM null).
+    ///
+    /// # What is NOT emitted, and why that is safe
+    ///
+    /// * **No class-init check.** The resolver only answers for a class that is
+    ///   already initialized, and initialization is monotonic.
+    /// * **No exception check.** With no call there is no `i64::MIN` deopt
+    ///   sentinel to disambiguate — which also removes a latent bug the helper
+    ///   path still has, where a `static long` legitimately holding
+    ///   `Long.MIN_VALUE` is indistinguishable from a thrown `<clinit>`.
+    /// * **No `flush_scratch_registers`.** Nothing here clobbers a register the
+    ///   operand-stack cache can hold: `SCRATCH_REGS` is `[R8, R9]` and this
+    ///   sequence touches only RAX, which the helper path clobbers anyway.
+    /// * **No plausibility check on a reference payload.** Same contract as the
+    ///   inline `getfield` arms, which also raw-load the payload word.
+    fn try_emit_inline_getstatic(
+        &mut self,
+        class_id_raw: u32,
+        field_index: usize,
+        type_tag: u8,
+        is_volatile: bool,
+    ) -> bool {
+        if !inline_getstatic_enabled() {
+            return false;
+        }
+        let Some(base_cell) = resolve_static_base(class_id_raw, field_index) else {
+            return false;
+        };
+        // Cast: cell byte offset within the class's statics block → disp32.
+        let Ok(cell_off) = i32::try_from(field_index.saturating_mul(SLOT_SIZE)) else {
+            return false;
+        };
+        // Cast: the baked address of the never-freed base-pointer cell.
+        self.emit_mov_imm64(RAX, base_cell as i64);
+        self.emit_mov_r64_mem_disp32(RAX, RAX, 0);
+        match type_tag {
+            b'J' | b'D' | b'L' | b'[' => self.emit_mov_r64_mem_disp32(
+                RAX,
+                RAX,
+                // Cast: fixed layout offset to i32 instruction displacement
+                cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+            ),
+            b'F' => self.emit_mov_r32_mem_disp32(
+                RAX,
+                RAX,
+                // Cast: fixed layout offset to i32 instruction displacement
+                cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+            ),
+            _ => self.emit_movsxd_r64_mem_disp32(
+                RAX,
+                RAX,
+                // Cast: fixed layout offset to i32 instruction displacement
+                cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+            ),
+        }
+        // Volatile static: MFENCE after the read, exactly as the helper arm does
+        // (x86-64 already gives acquire ordering for the load itself).
+        if is_volatile {
+            self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
+        }
+        self.push_from_rax();
+        // A reference-typed static's loaded value is a live oop — same
+        // obligation as the helper arm (T1.1.a).
+        if type_tag == b'L' || type_tag == b'[' {
+            self.mark_top_as_oop();
+        }
+        true
+    }
+
     /// Push RAX as XMM0 for FP intermediates (array loads, conversions, etc.).
     /// Avoids the RAX→frame→XMM0 round-trip when the value is consumed by a
     /// subsequent FP binop.
@@ -10951,18 +11041,14 @@ impl Compiler {
 
                 // getstatic (0xb2) — use callee's static_field_info
                 //
-                // MED-2 bail (round-2 JIT review): same gap as the top-level
-                // 0xb2 handler at line ~9620 — see the long comment there
-                // for the full unblocking plan. Briefly: `SharedVm.classes.statics`
-                // slot addresses aren't stable (Vec resize, lazy entry),
-                // so we can't bake them as `imm64` and emit `MOV reg,
-                // [imm64]`. Stay on the helper-call path.
+                // Same direct-load-or-helper split as the top-level 0xb2 arm;
+                // the long note there explains what is baked and which sites
+                // still take `jit_getstatic`.
                 0xb2 => {
                     if cpc + 2 >= callee_len {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
-                    self.flush_scratch_registers();
                     // `static_field_info` is keyed by callee bytecode PC,
                     // not CP index — match on `cpc` (see the `getfield`
                     // note above).
@@ -10972,28 +11058,43 @@ impl Compiler {
                         .find(|(p, _, _, _, _)| *p == cpc)
                         .copied()
                     {
-                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
-                        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
-                        self.emit_call_absolute(self.helpers.getstatic);
-                        // jit-linewrapper-flushtype-npe fix (2026-07-17):
-                        // see the matching fix + comment at the top-level
-                        // 0xb2 arm -- same helper, same missing
-                        // post-invoke exception check for a `<clinit>`
-                        // failure surfaced via the deopt sentinel.
-                        self.emit_post_invoke_exception_check(type_tag);
-                        // Volatile static: emit MFENCE after read (SeqCst acquire)
-                        if is_volatile {
-                            self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
-                        }
-                        self.push_from_rax();
-                        // T1.1.a (fix, 2026-07-07) — see the matching fix at
-                        // the top-level 0xb2 arm: a reference-typed static
-                        // field must not keep push_from_rax's default
-                        // non-oop mark, or it decodes wrong in a precise
-                        // GC/deopt oop map while live.
-                        if type_tag == b'L' || type_tag == b'[' {
-                            self.mark_top_as_oop();
+                        // Direct load, no helper CALL — see the top-level 0xb2
+                        // arm. `flush_scratch_registers` deliberately moved
+                        // INSIDE the helper branch: the inline form clobbers
+                        // only RAX, so spilling the operand-stack cache for it
+                        // would give back part of what it saves. The `else`
+                        // arm below abandons the whole inline attempt, so it
+                        // needs no flush either.
+                        if !self.try_emit_inline_getstatic(
+                            class_id_raw,
+                            field_index,
+                            type_tag,
+                            is_volatile,
+                        ) {
+                            self.flush_scratch_registers();
+                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                            self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
+                            self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                            self.emit_call_absolute(self.helpers.getstatic);
+                            // jit-linewrapper-flushtype-npe fix (2026-07-17):
+                            // see the matching fix + comment at the top-level
+                            // 0xb2 arm -- same helper, same missing
+                            // post-invoke exception check for a `<clinit>`
+                            // failure surfaced via the deopt sentinel.
+                            self.emit_post_invoke_exception_check(type_tag);
+                            // Volatile static: emit MFENCE after read (SeqCst acquire)
+                            if is_volatile {
+                                self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
+                            }
+                            self.push_from_rax();
+                            // T1.1.a (fix, 2026-07-07) — see the matching fix at
+                            // the top-level 0xb2 arm: a reference-typed static
+                            // field must not keep push_from_rax's default
+                            // non-oop mark, or it decodes wrong in a precise
+                            // GC/deopt oop map while live.
+                            if type_tag == b'L' || type_tag == b'[' {
+                                self.mark_top_as_oop();
+                            }
                         }
                     } else {
                         self.next_spill_offset = callee_local_base;
@@ -11004,10 +11105,10 @@ impl Compiler {
 
                 // putstatic (0xb3) — use callee's static_field_info
                 //
-                // MED-2 bail (round-2 JIT review): same gap as the top-level
-                // 0xb3 handler — slot pointer not stable, no VM-crate access
-                // from `jit`. See the comment on the top-level 0xb2 handler
-                // for the full unblocking plan.
+                // Helper-only, like the top-level 0xb3 arm: the address
+                // machinery exists now, but the SATB pre-barrier and the
+                // first-touch block creation live in `set_static_shared`. See
+                // the note on the top-level 0xb3 arm.
                 0xb3 => {
                     if cpc + 2 >= callee_len {
                         self.next_spill_offset = callee_local_base;
@@ -16560,77 +16661,53 @@ impl Compiler {
                     pc += 1;
                 }
 
-                // getstatic (0xb2) — always call helper for thread safety
+                // getstatic (0xb2) — a direct load, or the helper
                 //
-                // MED-2 (round-2 JIT review) — HotSpot inlines non-volatile
-                // getstatic as a single `MOV reg, [imm64]` against the class's
-                // static-area slot, because both the class_id and the slot
-                // address are known at JIT compile time. CratonVM cannot
-                // currently emit that form. Bail rationale (see round-1 TLAB
-                // bail at 10783-10807 for the same pattern):
+                // HotSpot emits a plain load for a `getstatic`, because both
+                // the class and the slot address are known at compile time.
+                // CratonVM called `jit_getstatic` for every static read
+                // instead, and that CALL — not the read — was the whole cost:
+                // ~35 ns against HotSpot's ~1. See
+                // `docs/internal/jit-getstatic-costs-a-helper-call-FIXED-20260803.md`.
                 //
-                //   1. Slot storage is `SharedVm.classes.statics:
-                //      RwLock<HashMap<ClassId, Vec<Value>>>` (see
-                //      `vm/src/vm/vm_object.rs::get_static_shared` at line
-                //      472). The slot address is NOT stable:
-                //        * the `Vec<Value>` is grown by `resize` in
-                //          `set_static_shared` (vm_object.rs:498) — any prior
-                //          `&v[idx]` pointer dangles after the grow,
-                //        * the HashMap entry is created lazily on first
-                //          write (line 485), so a getstatic at warmup time
-                //          may see no entry at all,
-                //        * concurrent writers hold the RwLock write guard;
-                //          a JIT inline `MOV [imm64]` would race the
-                //          interpreter's `set_static_shared`.
-                //      The slot pointer would therefore have to be embedded
-                //      as an immediate yet remain valid across the program's
-                //      lifetime — neither holds today.
+                // MED-2 (round-2 JIT review) named three blockers for emitting
+                // the load. All three are gone:
                 //
-                //   2. Even if the storage were a stably-addressed array,
-                //      the `Value` enum is a tagged union (Int/Long/Float/
-                //      Double/Object), not a raw machine word. The JIT would
-                //      have to read both the tag and the payload to know
-                //      how to push to its operand stack — multi-step,
-                //      atomicity-fragile, and dependent on the enum layout.
+                //   1. "Slot storage is a `Vec<Value>` inside an `RwLock`ed
+                //      `HashMap`, so the address is not stable." It is now a
+                //      `StaticsBlock` — one leaked, never-freed allocation per
+                //      class — mirrored by the lock-free `StaticsIndex`.
+                //   2. "The `Value` enum is a tagged union, not a machine
+                //      word." Its layout is pinned by
+                //      `types::heap_types::field_cell_layout_matches_value_enum`,
+                //      and the inline `getfield` arms below have been reading
+                //      field cells through `FIELD_CELL_PAYLOAD*_OFFSET` since
+                //      July. A static cell is the same 16 bytes.
+                //   3. "The `jit` crate has no `vm` dependency, so it cannot
+                //      resolve a slot address at compile time." It does not
+                //      need one. The VM registers a resolver function pointer
+                //      plus its own `SharedVm` pointer through a process-global
+                //      setter (`set_static_base_resolver`), exactly as it
+                //      registers the savebase watch helpers — no
+                //      `JitRuntimeHelpers` field, no golden offset, no ABI
+                //      revision bump, because generated code never calls it.
+                //      Only this backend does, while emitting.
                 //
-                //   3. The `jit` crate has no dependency on the `vm` crate
-                //      (see `jit/Cargo.toml` — only types, reader, jit-api).
-                //      So even doing the resolution at JIT compile time
-                //      would require either (a) a new field on
-                //      `JitRuntimeHelpers` that exposes a fn-pointer
-                //      `resolve_static_slot(class_id, field_index) ->
-                //      *const Value`, or (b) plumbing the resolved slot
-                //      addresses into the per-bci `static_field_info` from
-                //      the caller in vm/src/jit/. Both require edits beyond
-                //      this file; this task is constrained to `jit/src/x64.rs`
-                //      only.
+                // What is baked is the address of the class's base-POINTER
+                // cell, not of the block: see `try_emit_inline_getstatic` for
+                // the emitted shape and `StaticsIndex::base_cell_addr` for why
+                // that one extra dependent load buys immunity to every
+                // republication path.
                 //
-                // To wire inlining later, the prerequisites are:
-                //   * Change `SharedVm.classes.statics` to use a stable allocation
-                //     for each class's static area (e.g. `Box<[AtomicU64]>`
-                //     allocated once per `<clinit>` and pinned for the
-                //     class's life). Volatile fields then use
-                //     `MOV [imm64]` + MFENCE; non-volatile use plain
-                //     `MOV [imm64]` (x86 already gives acquire ordering
-                //     for aligned 8-byte loads).
-                //   * Add a `JitRuntimeHelpers` field exposing the slot
-                //     resolver, or pre-resolve at JIT compile time and
-                //     extend `static_field_info` to carry the slot ptr.
-                //   * Match the static slot type to the field's JVM type
-                //     (use type_tag) so the inline MOV writes the right
-                //     width (32 for int/float, 64 for long/double/ref).
+                // The helper below still owns every site the resolver declines
+                // — a class not yet initialized at compile time (an inline load
+                // runs no `<clinit>`), `java/lang/System` (the `out`/`err`/`in`
+                // bootstrap intercept), anything not yet published, a second VM
+                // in this process, and everything when
+                // `CRATONVM_JIT=getstatic-helper` is set.
                 //
-                // Expected speedup once wired: a JIT-compiled hot loop with
-                // a getstatic+putstatic pair drops from ~2 CALLs + arg
-                // marshalling (~12-18 cycles round trip) to two MOVs
-                // (~3-4 cycles). HotSpot publishes this as the dominant
-                // static-field-access optimization; we expect a 4-6x
-                // speedup on static-field-heavy microbenchmarks
-                // (Counter.increment(), shared lazy-init flags, etc.).
-                //
-                // Until then, every static access stays on the helper
-                // path below. This is correct (the helper takes the
-                // RwLock and reads `Value` properly) but slow.
+                // `putstatic` (0xb3) deliberately stays on its helpers; see the
+                // note there.
                 0xb2 => {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
                     let (_, class_id_raw, field_index, type_tag, is_volatile) = self
@@ -16638,6 +16715,20 @@ impl Compiler {
                         .get(&pc)
                         .map(|&i| self.static_field_info[i])
                         .unwrap_or((pc, 0, 0, b'I', false));
+
+                    // Direct load, no helper CALL — the structural fix this
+                    // opcode's long bail comment above describes. It emits the
+                    // value push, the oop mark and the volatile fence itself,
+                    // so the whole helper sequence below is skipped.
+                    if self.try_emit_inline_getstatic(
+                        class_id_raw,
+                        field_index,
+                        type_tag,
+                        is_volatile,
+                    ) {
+                        pc += 3;
+                        continue;
+                    }
 
                     self.flush_scratch_registers();
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
@@ -16683,15 +16774,21 @@ impl Compiler {
 
                 // putstatic (0xb3) — write static field via type-specific helper
                 //
-                // MED-2 (round-2 JIT review): same bail as 0xb2 above. The
-                // symmetric inline form would be `MOV [imm64], reg`, but
-                // (a) `SharedVm.classes.statics` slot addresses aren't stable
-                // (the Vec resizes; the HashMap entry is created lazily),
-                // (b) writes need to go through `set_static_shared` so the
-                // GC and finalizer paths see the new object reference, and
-                // (c) the `jit` crate has no `vm` dependency to resolve the
-                // slot pointer at JIT compile time. See the long bail comment
-                // on the 0xb2 handler above for the full unblocking plan.
+                // The three MED-2 blockers listed on the 0xb2 arm above are
+                // gone, and the same baked base-pointer cell would address a
+                // write just as well. The write side is NOT symmetric, though,
+                // and deliberately stays on the helper: `set_static_shared`
+                // fires the SATB pre-barrier for an overwritten reference —
+                // statics live in this Rust-side table, not the heap, so no
+                // collector `set_field` barrier covers them and a missed one is
+                // a hidden-pointer SATB hole (final remark misses the old
+                // referent, cleanup frees a live region) — and it is also what
+                // creates or grows a class's block on first touch. Inlining
+                // reads costs that machinery nothing; inlining writes would
+                // have to reproduce all of it. Reads were the measured problem
+                // (see the 0xb2 arm's doc); a primitive-only inline `putstatic`
+                // is the tractable next step if static WRITES ever show up on a
+                // hot path.
                 0xb3 => {
                     self.flush_scratch_registers();
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
@@ -29964,6 +30061,110 @@ mod tests {
         // SAFETY: as above.
         let result = unsafe { compiled.try_call(&[0]).expect("jit call") };
         assert_eq!(result, 424242, "null receiver must route to the helper");
+    }
+
+    /// Inline (helper-free) `getstatic`: with a resolver wired, the default
+    /// `0xb2` arm emits the two-load direct form and leaves NO call to
+    /// `jit_getstatic` behind; a site the resolver declines keeps the helper.
+    ///
+    /// Both directions are asserted from ONE registration on purpose:
+    /// `set_static_base_resolver` deliberately latches its context for the life
+    /// of the process (a second VM must never re-point it at its own statics),
+    /// so the test resolver instead answers for exactly one `(class, field)`
+    /// pair and declines everything else — which also keeps it inert for any
+    /// other test in this binary that compiles a `getstatic`.
+    #[test]
+    fn test_getstatic_inline_direct_load_and_fallback() {
+        use std::sync::atomic::AtomicPtr;
+
+        /// Marker helper: returns a constant no direct load of the block below
+        /// could produce, so routing is observable.
+        unsafe extern "C" fn marker_getstatic(_vm: i64, _cid: i64, _idx: i64) -> i64 {
+            424_242
+        }
+
+        /// Stands in for `jit_resolve_static_base`. `ctx` IS the address of the
+        /// base-pointer cell here, so the test needs no VM.
+        unsafe extern "C" fn test_resolver(ctx: i64, class_id: i64, field_index: i64) -> i64 {
+            if class_id == 0x5EED && field_index == 1 {
+                ctx
+            } else {
+                0
+            }
+        }
+
+        // A leaked statics block plus the `AtomicPtr` cell that names it —
+        // the same two-level shape `StaticsIndex` publishes.
+        static CELL_ADDR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let cell_addr = *CELL_ADDR.get_or_init(|| {
+            let block: &'static mut [Value] =
+                Box::leak(vec![Value::Int(1), Value::Int(-7), Value::Int(2)].into_boxed_slice());
+            let cell: &'static AtomicPtr<Value> =
+                Box::leak(Box::new(AtomicPtr::new(block.as_mut_ptr())));
+            // Cast: the address the backend bakes as an immediate.
+            cell as *const AtomicPtr<Value> as usize
+        });
+        set_static_base_resolver(test_resolver as *const () as usize, cell_addr);
+
+        // getstatic #1 ; ireturn
+        let code: Vec<u8> = vec![0xb2, 0x00, 0x01, 0xac, 0, 0];
+        let code_len = 4;
+        let mut helpers = test_helpers();
+        helpers.getstatic = marker_getstatic as *const () as usize;
+
+        let build = |field_index: usize| {
+            compile(
+                &code,
+                code_len,
+                1,
+                1,
+                false,
+                Vec::new(), // multianewarray_info
+                Vec::new(), // field_info
+                Vec::new(), // typecheck_info
+                // static_field_info: (pc, class_id, field_index, type_tag, volatile)
+                vec![(0usize, 0x5EEDu32, field_index, b'I', false)],
+                Vec::new(), // new_info
+                Vec::new(), // anewarray_info
+                Vec::new(), // invoke_info
+                Vec::new(), // direct_calls
+                Vec::new(), // mic_slots
+                Vec::new(), // pic_slots
+                Vec::new(), // ldc_info
+                Vec::new(), // ldc2w_info
+                HashMap::new(),
+                HashMap::new(),
+                &helpers,
+                std::collections::HashSet::new(),
+                HashMap::new(),
+                None, // string_layout
+            )
+            .expect("test JIT compile")
+        };
+
+        // 1. Resolved site → direct load of slot 1, sign-extended.
+        let inlined = build(1);
+        // SAFETY: JIT-compiled machine code from valid bytecode in an
+        // executable mmap region, as in every other codegen test here.
+        let v = unsafe { inlined.try_call(&[0]).expect("test JIT call") };
+        assert_eq!(
+            v, -7,
+            "a resolved getstatic must read the block directly (MOVSXD of the Int payload)"
+        );
+        assert_eq!(
+            calls_to(&inlined, helpers.getstatic),
+            0,
+            "an inlined getstatic must leave no CALL to jit_getstatic"
+        );
+
+        // 2. Declined site (field 0) → the helper still owns it.
+        let fallback = build(0);
+        // SAFETY: as above.
+        let v = unsafe { fallback.try_call(&[0]).expect("test JIT call") };
+        assert_eq!(
+            v, 424_242,
+            "a site the resolver declines must keep the jit_getstatic path"
+        );
     }
 
     // -----------------------------------------------------------------------

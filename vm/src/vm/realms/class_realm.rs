@@ -22,11 +22,14 @@ use std::sync::{Arc, OnceLock, Weak};
 
 /// One class's static-field storage, at a **stable, never-freed address**.
 ///
-/// Static reads are the most expensive field access in compiled code (~35 ns
+/// Static reads were the most expensive field access in compiled code (~35 ns
 /// against HotSpot's ~1 — see
-/// `docs/known-issues/jit-getstatic-costs-a-helper-call-20260731.md`). What is
-/// left after trimming the helper is the `RwLock` + hash probe that reaching a
-/// `Vec<Value>` inside an `FxHashMap` requires.
+/// `docs/internal/jit-getstatic-costs-a-helper-call-FIXED-20260803.md`). What
+/// was left after trimming the helper is the `RwLock` + hash probe that reaching
+/// a `Vec<Value>` inside an `FxHashMap` requires — and, once this block had a
+/// stable address, the prerequisite for deleting the helper CALL outright:
+/// compiled `getstatic` now bakes [`StaticsIndex::base_cell_addr`] and loads
+/// from the block directly.
 ///
 /// A `Vec` cannot be read without that lock, because a `resize` would move the
 /// buffer out from under a concurrent reader. This block therefore **leaks**
@@ -204,6 +207,38 @@ impl StaticsIndex {
         // instance-field cells.
         Some(unsafe { *base.add(field_index) })
     }
+
+    /// Address of the `AtomicPtr` **cell** that names a class's statics base —
+    /// what compiled `getstatic` code bakes as an immediate.
+    ///
+    /// Deliberately NOT the block address. A `StaticsBlock` is stable for the
+    /// life of the VM in the normal case, but two paths can still publish a
+    /// different one for the same class: `StaticsBlock::grow_to` (a write past
+    /// the published length) and a re-`prepare_class_shared`. Baking the block
+    /// address would leave compiled code reading the abandoned copy — writes
+    /// would land in the new block and never be observed. Baking the address of
+    /// the pointer cell costs one extra dependent load and makes every
+    /// republication visible to already-compiled code with no patching, no
+    /// invalidation protocol and no new invariant to maintain: the slot array
+    /// is allocated once (`OnceLock`) and never freed, so this address is valid
+    /// forever.
+    ///
+    /// `None` = not indexable, nothing published yet, or `field_index` past the
+    /// published length — the caller keeps the `jit_getstatic` helper path.
+    pub fn base_cell_addr(&self, class_id: ClassId, field_index: usize) -> Option<usize> {
+        let idx = class_id.as_u32() as usize;
+        if idx >= Self::CAPACITY {
+            return None;
+        }
+        let slots = self.slots.get()?;
+        let slot = &slots[idx];
+        if slot.base.load(Ordering::Acquire).is_null()
+            || field_index >= slot.len.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        Some(&slot.base as *const std::sync::atomic::AtomicPtr<Value> as usize)
+    }
 }
 
 /// Class loading, linking, resolution and per-class caches. Owns the L10 lock.
@@ -243,6 +278,20 @@ pub struct ClassRealm {
     /// step by `set_static_shared` / the class-init path, which publish every
     /// block they create or grow.
     pub statics_index: StaticsIndex,
+
+    /// `java/lang/System`'s `ClassId` in THIS VM, or `u32::MAX` while unknown.
+    ///
+    /// Recorded by `prepare_class_shared`, which already has the class name in
+    /// hand. Compiled `getstatic` uses it as a lock-free "does this read need
+    /// the `System.out`/`err`/`in` bootstrap intercept?" test before deciding
+    /// to emit a direct load: the intercept lives in `jit_getstatic`, so a
+    /// static of this one class must never bypass the helper. Answering by
+    /// name would need a `class_manager` acquisition on the compiler thread,
+    /// which is the one thing the resolver must not do.
+    ///
+    /// Per-`ClassRealm`, so unlike the deleted process-global `system_class_id`
+    /// atomic it cannot leak one VM's id into another's decisions.
+    pub system_class_id: AtomicU32,
 
     /// Cache of resolved symbolic references (fields and methods).
     pub resolution_cache: RwLock<ResolutionCache>,
