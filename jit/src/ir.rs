@@ -3524,7 +3524,7 @@ pub struct IrBuilder {
     /// and read **only** by [`Self::bail_invoke`]. Never consulted by lowering,
     /// so an absent or stale entry cannot change a compile.
     ///
-    /// It exists because the four invoke bails below report a line number and a
+    /// It exists because the invoke bails below report a line number and a
     /// pc, and the question every one of them raises — *which callee* — was
     /// otherwise a `javap` away for each event. `cov-04`'s whole first
     /// increment was "group the 53 by callee"; this is what makes that a grep.
@@ -3739,7 +3739,7 @@ impl IrBuilder {
     }
 
     /// Diagnostic-only: supply `pc → "0xNN cn.mn desc"` for the invoke sites, so
-    /// the four invoke bails can name the callee they refused. Never read by
+    /// the three invoke bails can name the callee they refused. Never read by
     /// lowering; `lib.rs` only calls this when `CRATONVM_DBG=ir-compiles` (or
     /// `jitc`) is on, so the default path never builds the strings.
     pub fn set_invoke_labels(&mut self, labels: HashMap<usize, Box<str>>, method: Box<str>) {
