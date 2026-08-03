@@ -143,6 +143,17 @@ pub static COMPACT_ESCAPE_HITS: std::sync::atomic::AtomicU64 =
 pub static COMPACT_WALK_GAP_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// GCAUD-9 follow-up (2026-08-03): how many times `scan_region` broke a
+/// region's walk early on an implausible header. Distinct from
+/// `COMPACT_WALK_GAP_HITS` (which counts abandoned *compactions*, one per
+/// GC cycle): this counts every individual break, including ones a later
+/// `compact()` call re-discovers at the exact same offset because nothing
+/// upstream has fixed the underlying header. Gates the raw-byte dump in
+/// [`scan_region`]'s break arm to the first few hits so a persistent,
+/// unmoving break point doesn't spam every subsequent GC cycle.
+pub static SCAN_REGION_BREAK_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Non-moving free-list allocator for the old generation.
 ///
 /// Objects are allocated from a size-segregated free list (round-5 #14
@@ -812,6 +823,32 @@ impl OldGen {
             let total_size = raw_size.checked_add(7).map(|size| size & !7).unwrap_or(0);
             // Sanity check: if total_size is 0 or too large, stop scanning
             if total_size < HEADER_SIZE || offset + total_size > end_offset {
+                let n = SCAN_REGION_BREAK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 8 {
+                    // Raw header bytes, not the typed struct: the whole point
+                    // is that this header may not be trustworthy to decode as
+                    // one, and a `Debug` format on an out-of-range `kind`
+                    // walked exactly this wild-pointer bug once already (see
+                    // docs/internal/fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md).
+                    // SAFETY: `ptr` is inside the allocated region between
+                    // `start_offset` and `end_offset`, both within `self.data`;
+                    // HEADER_SIZE bytes at `ptr` are therefore in-bounds.
+                    let raw_bytes: [u8; HEADER_SIZE] =
+                        unsafe { std::ptr::read(ptr as *const [u8; HEADER_SIZE]) };
+                    tracing::warn!(
+                        offset,
+                        end_offset,
+                        total_size,
+                        raw_size,
+                        kind = header.kind as u8,
+                        element_type = header.element_type as u8,
+                        array_length = header.array_length(),
+                        num_slots = header.num_slots(),
+                        bytes = ?raw_bytes,
+                        "old-gen scan_region: BREAK on implausible header — dumping raw bytes \
+                         so the corruption can finally be seen instead of inferred",
+                    );
+                }
                 break;
             }
             objects.push((ptr, total_size));
