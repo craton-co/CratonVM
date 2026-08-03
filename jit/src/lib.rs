@@ -89,6 +89,11 @@ pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
 pub mod ir_schedule;
+// The OSR entry-metadata contract, as executable checks — see
+// `docs/feature-designs/jit-osr-entry-metadata.md`. Kept out of this file
+// deliberately: it must be testable against synthetic vectors, and a check
+// that can only be handed a real `CompiledMethod` cannot be.
+pub mod osr_contract;
 pub mod ir_verify;
 pub mod loop_analysis;
 pub mod metrics;
