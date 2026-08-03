@@ -273,8 +273,12 @@ Three line kinds carry everything above:
 
 * `[ir] invoke-plan <method>: sites=N new_ops=N anewarray_ops=N gates(...) call_eligible=B`
   — one per invoke-bearing compile, before the builder runs.
-* `[ir] invoke-plan <method>: NO invoke_info — <reason>` — which of the six
-  conditions discarded the map, and at which pc.
+* `[ir] invoke-plan <method>: NO invoke_info — <reason>` — which condition
+  discarded the map, and at which pc. Five remain after this lane:
+  `call_eligible=false`, a gate being off, `cp_invoke_resolver` declining the CP
+  index, `static_call_shape` refusing the descriptor, and a self-recursive wide
+  return. All five measured zero except `call_eligible`, which measures zero too
+  now that only `anewarray` is left in it.
 * `[ir] IrBuilder::build refused at ir.rs:NNNN (bytecode pc N) in <caller> callee <0xNN cn.mn desc>`
   — the bail, now naming both ends. The caller is what makes the join to the
   reason line exact rather than an assumption about log interleaving.
