@@ -4330,7 +4330,8 @@ fn admit(t: Tile, opts: &SelectOptions, notes: &mut Vec<Note>) -> Option<Tile> {
 
 
 // ---------------------------------------------------------------------------
-// Shadow selection — `docs/jit/lowering-contract.md` §5, increment 0
+// Shadow selection — increment 0 of
+// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`
 // ---------------------------------------------------------------------------
 //
 // Run the tiler over a real compile's blocks, check its own invariant, count

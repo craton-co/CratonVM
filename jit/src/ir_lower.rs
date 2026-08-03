@@ -5183,7 +5183,8 @@ fn is_value_ty(ty: IrType) -> bool {
 /// enforced by `every_ir_op_is_lowered_or_declared_unlowerable` and the two
 /// tests beside it, which read this function's body, `lower_data_node`'s arms
 /// and `ir::Op`'s own declaration out of the source and compare all three. See
-/// `docs/jit/lowering-contract.md` §7 for why three enumerations of one set is
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`
+/// ("The cheap alternative") for why three enumerations of one set is
 /// the shape that produced the monitor defect.
 fn op_defines_result_slot(op: &Op) -> bool {
     matches!(
@@ -6171,7 +6172,8 @@ const IR_LOWER_LS_XMMS: [u8; 4] = [2, 3, 4, 5];
 /// `CRATONVM_JIT_IR_ISEL_SHADOW` — run the instruction selector over this
 /// compile's blocks, count what it would have produced, and **discard it**.
 ///
-/// `docs/jit/lowering-contract.md` §5, increment 0. Default **off**. Turning it
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+/// increment 0. Default **off**. Turning it
 /// on changes no emitted byte — `shadow_selection_changes_no_emitted_byte`
 /// pins that — and costs one tiling pass per compile. It exists to replace the
 /// contract's ten-shape synthetic coverage figure with one taken over real
@@ -6941,7 +6943,8 @@ pub(crate) fn lower_inner_with_scopes(
     // The general form of the original hazard — an `ir::Op` variant with no arm
     // at all — is now handled where it arises, by that final arm, instead of
     // needing a new hand-written guard here per op. See
-    // `docs/jit/lowering-contract.md` §7.
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+    // "The cheap alternative".
     if (helpers.monitor_enter == 0 || helpers.monitor_exit == 0)
         && graph
             .nodes
@@ -10863,7 +10866,10 @@ mod tests {
     /// A value live across a helper call must not keep a caller-saved register.
     ///
     /// FP `Op::Rem` is the sharp case: it lowers to `CALL jit_drem`, and
-    // ── Shadow instruction selection (`docs/jit/lowering-contract.md` §5) ──
+    // ── Shadow instruction selection ─────────────────────────────────
+    //
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+    // increment 0.
     //
     // Increment 0's whole claim is "turning this on changes no emitted byte".
     // These are what hold it up. Note they drive the flag through
@@ -11006,7 +11012,8 @@ mod tests {
 
     // ── The three `ir::Op` enumerations, checked against each other ──
     //
-    // `docs/jit/lowering-contract.md` §7. One set of operations is enumerated
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`,
+    // "The cheap alternative". One set of operations is enumerated
     // in three places, in two different vocabularies:
     //
     //   1. `lower_data_node`'s match arms          — 48 of 53 `ir::Op` variants
