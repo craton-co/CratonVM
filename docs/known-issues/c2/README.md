@@ -108,8 +108,39 @@ say lowering these opcodes makes anything faster."* Every lane in the table
 below widens the set of methods this can happen to, and nothing today compares
 an IR body against the C1 body it replaces before keeping it.
 
-[`perf-01`](perf-01-sieve-ir-body-6x-slower-than-c1.md) — open, unowned,
-and it raises a policy question bigger than the defect.
+~~`perf-01`~~ **FIXED 2026-08-04**, same day it was found — the optimizing
+tier's admission chain now asks the single-pass backend's own detectors whether
+they would vectorise a loop in this method, and declines it if so.
+[Closeout](../../internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md)
+· [brief](archive/perf-01-sieve-ir-body-6x-slower-than-c1.md).
+
+**The general form was taken on the same day.** What the single-pass backend
+can do and the IR tier cannot is now enumerated in
+`jit/src/x64/single_pass_only.rs` — seven classes, each consumed by a
+single-pass emitter at a loop header, each without a counterpart in
+`ir_optimize`/`ir_lower` — and the admission chain consults the enumeration
+rather than a one-off predicate. **The IR tier has no vectoriser at all**, so
+`cov-02` hitting one of these was not bad luck: four more of the same shape
+were waiting. Widening the veto from three classes to seven still costs
+exactly one IR body across both benchmark suites.
+
+Two things that audit turned up, for whoever extends the list:
+
+* **Loop unswitching is detected but not performed** — its emitter's own
+  contract says the sequence is additive and "removing the emission yields
+  identical final state". It was in the first draft on the strength of its
+  name. Do not add a class because a detector and an emitter exist; read what
+  the emitter emits.
+* **`ir_optimize`'s unroll and LICM are default-ON**, not off as the comments
+  beside them claimed until 2026-08-04. That is why the single-pass unroller
+  and hoists are not on the list.
+
+**What is still open**: the enumeration catches an advantage somebody wrote
+down, not one nobody did. The mechanism that would close that is a
+backend-parity harness — compile a corpus both ways and flag any method whose
+single-pass body has VEX or `REP`-string bytes its IR body lacks, which is
+capability-agnostic. It needs the two backends driven independently over one
+method, which `try_compile_inner` does not currently allow. Unowned.
 
 ## The coverage lanes
 
