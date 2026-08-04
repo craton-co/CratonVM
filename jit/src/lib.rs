@@ -957,6 +957,78 @@ static PUBLISHED_CODE_FREES: std::sync::atomic::AtomicUsize =
 static UNQUEUED_PUBLISHED_CODE_FREES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Process-wide, append-only intern table for the class names that
+/// `checkcast` / `instanceof` sites hand to `jit_checkcast` / `jit_instanceof`
+/// as a raw `(ptr, len)` pair.
+///
+/// # Why these names cannot live on the compiled method
+///
+/// The type-check helpers in `vm/src/jit/helpers.rs` memoize on that pair:
+///
+/// * `JIT_TYPECHECK_TARGET_CACHE` — `(vm, ptr, len) -> resolved target ClassId`
+/// * `JIT_TYPECHECK_ANSWER_CACHE` — `(vm, ptr, len, receiver ClassId, lenient)
+///   -> the check passed`
+///
+/// Both are *thread-locals*, so they outlive any one compiled method. The
+/// names used to be `Box<str>`s owned by `CompiledMethod::_jit_strings`, freed
+/// when that method is dropped — tier-up, invalidation, code-cache eviction.
+/// The allocator then hands the same block to the next compilation, so a
+/// `(ptr, len)` key silently starts naming a DIFFERENT class of the same
+/// length, and both caches answer for the old one.
+///
+/// That is not theoretical: modelling this allocation pattern under `mimalloc`
+/// (this VM's allocator) over 8000 name allocations produced 3568 keys that
+/// later meant a different class name.
+///
+/// The reachable failure is a `String` passing `instanceof java/lang/Number`.
+/// `java/lang/String` and `java/lang/Number` are both 16 bytes; a warm
+/// `x instanceof String` site leaves `(vm, P, 16, String, lenient=false) ->
+/// true` behind, and once `P` is recycled for a `java/lang/Number` site the
+/// strict `instanceof` answers `true` while the paired `checkcast` — a
+/// different site pointer, and `lenient = true`, so a different key — resolves
+/// honestly and throws. In `scala.runtime.BoxesRunTime.equals2` those two
+/// bytecodes are seven apart:
+///
+/// ```text
+///   1: instanceof java/lang/Number
+///   4: ifeq   16
+///   8: checkcast java/lang/Number
+/// ```
+///
+/// which is the whole of
+/// `ClassCastException: class java.lang.String cannot be cast to class
+/// java.lang.Number` inside `Seq.distinct`, seen in Kafka's
+/// `CoreUtils.listenerListToEndPoints`.
+///
+/// Interning by CONTENT makes the pair a permanent, unique identity for one
+/// class name, which is what both caches always assumed. It also makes them
+/// strictly more effective: two `checkcast`s to the same class — in one method
+/// or in two — now share a cache entry instead of evicting each other.
+///
+/// Entries are never freed. The table is bounded by the number of DISTINCT
+/// class names that appear at a type-check site in the program, not by the
+/// number of compilations.
+static TYPECHECK_NAME_INTERN: std::sync::OnceLock<
+    parking_lot::Mutex<rustc_hash::FxHashSet<&'static str>>,
+> = std::sync::OnceLock::new();
+
+/// Intern `name` and return the stable `(ptr, len)` pair for it. Repeated calls
+/// with equal contents return the identical pointer, for the life of the
+/// process.
+pub fn intern_typecheck_class_name(name: &str) -> (*const u8, usize) {
+    let table = TYPECHECK_NAME_INTERN.get_or_init(|| parking_lot::Mutex::new(Default::default()));
+    let mut table = table.lock();
+    let interned: &'static str = match table.get(name) {
+        Some(existing) => existing,
+        None => {
+            let leaked: &'static str = Box::leak(String::from(name).into_boxed_str());
+            table.insert(leaked);
+            leaked
+        }
+    };
+    (interned.as_ptr(), interned.len())
+}
+
 /// Published bodies unmapped, and how many of those bypassed the retirement
 /// queue.
 pub fn published_code_free_audit() -> (usize, usize) {
@@ -10382,7 +10454,7 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
             class_id: *class_id,
             num_fields: *num_fields,
         },
-        ir::Op::NewArray { element_type } => EaOp::NewArray {
+        ir::Op::NewArray { element_type, .. } => EaOp::NewArray {
             element_type: *element_type,
         },
         ir::Op::Call { .. } => EaOp::Call,
@@ -11882,22 +11954,20 @@ pub fn force_c2_enabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FORCE_C2").is_some()
 }
 
-/// PERF-01: would the single-pass backend vectorise a byte-array loop in this
-/// method?
+/// PERF-01: which single-pass-only lowering, if any, applies to this method?
 ///
 /// A thin adapter — it exists to convert this crate's exception table into the
-/// `(start, end, handler)` triples `find_bypassable_loop_headers` wants, which
-/// is the same conversion `set_pending_exception_ranges` does at backend
-/// entry. The decision itself lives in `x64::single_pass_has_bulk_byte_lowering`,
-/// next to the detectors, and is shared with the code that emits the
-/// pre-headers so the two cannot disagree.
+/// `(start, end, handler)` triples `find_bypassable_loop_headers` wants, the
+/// same conversion `set_pending_exception_ranges` does at backend entry. The
+/// decision, and the enumeration behind it, live in `x64::single_pass_only`.
 ///
-/// Called once per compile request, on the compile path only.
-fn single_pass_vectorises_a_loop(
+/// Called once per compile request, on the compile path only, and rejected on
+/// a raw-byte scan before it does any analysis.
+fn single_pass_only_lowering_for(
     code: &[u8],
     code_len: usize,
     cached: &CachedBytecodeMethod,
-) -> bool {
+) -> Option<x64::SinglePassOnly> {
     let ranges: Vec<(usize, usize, usize)> = cached
         .exception_table
         .iter()
@@ -11909,7 +11979,7 @@ fn single_pass_vectorises_a_loop(
             )
         })
         .collect();
-    x64::single_pass_has_bulk_byte_lowering(code, code_len, &ranges)
+    x64::single_pass_only_lowering(code, code_len, &ranges)
 }
 
 /// Is per-stage reporting of the optimizing tier's refusals switched on?
@@ -13428,10 +13498,11 @@ fn try_compile_inner(
         } else if precise_exception_frames {
             "precise exception frames required (RBC.6: a handler reads a non-parameter local)"
                 .to_string()
-        } else if single_pass_vectorises_a_loop(code, code_len, cached) {
-            "the single-pass backend vectorises a byte-array loop in this method and the \
-             IR tier would emit a scalar one"
-                .to_string()
+        } else if let Some(k) = single_pass_only_lowering_for(code, code_len, cached) {
+            format!(
+                "the single-pass backend has {} here and the IR tier has no equivalent",
+                k.label()
+            )
         } else {
             let cat2 = method_uses_category2(code, code_len, &cached.method_descriptor);
             let fp = method_uses_fp(code, code_len, &cached.method_descriptor);
@@ -13497,7 +13568,7 @@ fn try_compile_inner(
         // widens the set of methods that happens to — is written up in
         // `docs/known-issues/c2/archive/perf-01-sieve-ir-body-6x-slower-than-c1.md`
         // and is not solved here.
-        && !single_pass_vectorises_a_loop(code, code_len, cached)
+        && single_pass_only_lowering_for(code, code_len, cached).is_none()
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
         // tier used to refuse EVERY method with a `try`/`catch`, which is an
         // enormous population of ordinary Java and cost ~7x on each of them
@@ -13676,14 +13747,15 @@ fn try_compile_inner(
         // below, next to the `Op::Call` info boxes, so the pointer cannot
         // outlive its pointee.
         let mut ir_ldc_strings: Vec<Box<str>> = Vec::new();
-        // cov-05: keep-alive for `instanceof`/`checkcast` target class-name
-        // bytes, same obligation as `ir_ldc_strings` immediately above (the
-        // lowered body bakes the ADDRESS as an imm64 argument to
-        // `helpers.instanceof_check`/`helpers.checkcast`). Populated below,
-        // near the `new_info` / `anewarray_info` construction they share a
-        // resolver with.
-        let mut ir_instanceof_strings: Vec<Box<str>> = Vec::new();
-        let mut ir_checkcast_strings: Vec<Box<str>> = Vec::new();
+        // cov-05: `instanceof`/`checkcast` target class-name bytes, whose
+        // ADDRESS the lowered body bakes as an imm64 argument to
+        // `helpers.instanceof_check`/`helpers.checkcast`. Unlike
+        // `ir_ldc_strings` immediately above, these are NOT kept alive on the
+        // `CompiledMethod`: they are interned process-wide by
+        // `intern_typecheck_class_name`, because the type-check helpers
+        // memoize on the `(ptr, len)` pair in thread-locals that outlive any
+        // one compiled method. Populated below, near the `new_info` /
+        // `anewarray_info` construction they share a resolver with.
         // cov-05: `jit_checkcast`'s definitive-refusal path constructs a
         // `ClassCastException` through `jit_thread_mut()` (the JIT_THREAD
         // TLS), same requirement `jit_getstatic`'s `<clinit>` has — the
@@ -13855,6 +13927,26 @@ fn try_compile_inner(
                 builder.set_new_info(new_info_map, trivial_init_pcs);
             }
         }
+        // cov-06: resolved `anewarray` (0xbd) sites for the IR builder — the
+        // same `cp_new_resolver` the `new` block above uses (an `anewarray`
+        // CP entry is a class reference, exactly like `new`'s). Independent
+        // of the elidable-init resolver: `anewarray` has no `<init>` to
+        // elide. Only a `Resolved` site enters the map; a `Deferred` site
+        // (component class not loaded yet) is omitted, so the builder's
+        // 0xbd arm bails that method to single-pass — the same model `new`
+        // already uses for its own deferred case.
+        if !scan.anewarray_ops.is_empty() {
+            if let Some(new_resolver) = cp_new_resolver {
+                let mut anewarray_info_map =
+                    std::collections::HashMap::with_capacity(scan.anewarray_ops.len());
+                for &(pc, cp_idx) in &scan.anewarray_ops {
+                    if let Some(JitNewSite::Resolved { class_id, .. }) = new_resolver(cp_idx) {
+                        anewarray_info_map.insert(pc, class_id);
+                    }
+                }
+                builder.set_anewarray_info(anewarray_info_map);
+            }
+        }
         // cov-05: resolve `checkcast` (0xc0) / `instanceof` (0xc1) sites for
         // the IR builder — 306 events, the largest single whole-method
         // refusal in the survey, more than every opcode gap combined:
@@ -13895,14 +13987,14 @@ fn try_compile_inner(
                 for &(pc, cp_idx) in &scan.typecheck_ops {
                     if matches!(new_resolver(cp_idx), Some(JitNewSite::Resolved { .. })) {
                         if let Some(name) = name_resolver(cp_idx) {
-                            let boxed: Box<str> = name.into_boxed_str();
-                            let entry = (boxed.as_ptr() as usize, boxed.len());
+                            // Interned process-wide, NOT owned by this
+                            // compilation — see `intern_typecheck_class_name`.
+                            let (ptr, len) = intern_typecheck_class_name(&name);
+                            let entry = (ptr as usize, len);
                             if checkcast_pcs.contains(&pc) {
                                 cc_im.insert(pc, entry);
-                                ir_checkcast_strings.push(boxed);
                             } else {
                                 io_im.insert(pc, entry);
-                                ir_instanceof_strings.push(boxed);
                             }
                         }
                     }
@@ -14676,20 +14768,14 @@ fn try_compile_inner(
                     );
                 }
 
-                // Arrays still use the baseline tier's specialized allocation
-                // lowering. Escaping object allocations are supported directly
-                // by the optimizing tier through the shared allocation stub;
-                // scalar-replaced objects are already `Op::Dead`.
-                let has_live_new_array = graph
-                    .nodes
-                    .iter()
-                    .any(|n| matches!(n.op, ir::Op::NewArray { .. }));
-                if has_live_new_array && ir_stage_reporting() {
-                    eprintln!(
-                        "[ir] optimizing tier declined {}.{} — a live Op::NewArray survived",
-                        cached.class_name, cached.method_name
-                    );
-                }
+                // cov-06: array allocations are now supported directly by the
+                // optimizing tier through the shared `emit_new_array_stub`,
+                // the same way escaping object allocations already are —
+                // a live `Op::NewArray` no longer forces a fall-through to
+                // the single-pass backend. (Scalar-replaced `Op::New` nodes
+                // are already `Op::Dead`; `Op::NewArray` is never scalar
+                // -replaced at all — see `escape_analysis.rs`.)
+                //
                 // Unconditional pre-lowering verification. This is the gate the
                 // review's exit criterion names: "invalid IR or ABI state
                 // causes a deterministic compilation bailout, never silent
@@ -14699,8 +14785,7 @@ fn try_compile_inner(
                 // and would itself panic on the dangling edge the verifier is
                 // there to catch. `CRATONVM_JIT_VERIFY_IR=0` is the kill switch
                 // — see `ir_verify::pre_lower_verify_disabled`.
-                if !has_live_new_array && !ir_verify_bail && !ir_verify::pre_lower_verify_disabled()
-                {
+                if !ir_verify_bail && !ir_verify::pre_lower_verify_disabled() {
                     ir_verify_bail |= ir_verify_reject(
                         &graph,
                         "pre-lower",
@@ -14709,7 +14794,7 @@ fn try_compile_inner(
                         &cached.method_descriptor,
                     );
                 }
-                if !has_live_new_array && !ir_verify_bail {
+                if !ir_verify_bail {
                     // The graph the lowerer will actually see. `live_nodes` is
                     // the non-`Op::Dead` count: the gap against `nodes` is dead
                     // arena the optimizer left behind. That gap no longer costs
@@ -14755,6 +14840,43 @@ fn try_compile_inner(
                     );
                     drop(metrics_lower);
                     if let Some(mut compiled) = lowered {
+                        // cov-06 residual: a surviving `Op::New` or
+                        // `Op::NewArray` allocation call can fail (OOM, or a
+                        // negative length for an array) and stash a pending
+                        // exception through the SAME `JIT_PENDING_EXCEPTION`
+                        // channel `getstatic`/an invoke uses — see the
+                        // `ir_static_init_classes` `has_dispatch` arm below
+                        // ("the `jit-clinit-gap-has-dispatch` defect") for the
+                        // identical shape. Without `has_dispatch`, the VM's
+                        // fast call entry never drains that pending exception,
+                        // so the allocation helper's `i64::MIN` failure
+                        // sentinel is NOT recognised as a deopt/exception —
+                        // `execute_jit_call`'s `b'[' | b'L'` return arm only
+                        // checks `result == 0`, so `i64::MIN` (`!= 0`) is
+                        // pushed as `Value::Object(Some(ObjectRef::from_raw(
+                        // 0x8000000000000000)))`, an address no live heap
+                        // region contains. Reading it back later degrades
+                        // through the NaN-box plausibility gate to
+                        // `Value::Long` (see `CompactValue::to_value`), and a
+                        // subsequent array/field access on it then reads as
+                        // silently null instead of throwing the real
+                        // OutOfMemoryError/NegativeArraySizeException.
+                        //
+                        // Reached in practice: a hot method that `newarray`s
+                        // in a tight loop under GC/heap pressure eventually
+                        // hits this path (`vm/tests/jit_cov06_array_allocation.rs`
+                        // reproduced it deterministically once the surrounding
+                        // program's memory footprint was large enough to
+                        // trigger it before `--Xmx 32m` was exhausted).
+                        // `Op::New` has the identical gap for plain object
+                        // allocation — same fix, same reasoning.
+                        if graph
+                            .nodes
+                            .iter()
+                            .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }))
+                        {
+                            compiled.has_dispatch = true;
+                        }
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
                         // for the code's lifetime, and mark the method as using
@@ -14775,13 +14897,12 @@ fn try_compile_inner(
                         // dropping either list frees memory the emitted code
                         // still names.
                         compiled._jit_strings.append(&mut ir_ldc_strings);
-                        // cov-05: the same keep-alive obligation for an
-                        // `instanceof`/`checkcast` target class-name site,
-                        // whose UTF-8 bytes' ADDRESS is baked into the body as
-                        // an imm64 argument to `helpers.instanceof_check` /
-                        // `helpers.checkcast`.
-                        compiled._jit_strings.append(&mut ir_instanceof_strings);
-                        compiled._jit_strings.append(&mut ir_checkcast_strings);
+                        // cov-05: `instanceof`/`checkcast` target class names
+                        // deliberately do NOT appear here — they are interned
+                        // for the life of the process instead, so the
+                        // `(ptr, len)` pair the type-check helpers memoize on
+                        // cannot be recycled for another class. See
+                        // `intern_typecheck_class_name`.
                         // cov-05: see `ir_needs_dispatch_for_checkcast`'s
                         // declaration above for why.
                         if ir_needs_dispatch_for_checkcast {
@@ -14920,8 +15041,8 @@ fn try_compile_inner(
 
     // Control reaches here either because the optimizing pipeline was never
     // admitted, or because it was entered and declined (an unbuildable graph,
-    // a verifier rejection, a surviving `NewArray`, a lowerer bail). The
-    // recorder already knows which — `enter_single_pass` flags the second case
+    // a verifier rejection, a lowerer bail). The recorder already knows which
+    // — `enter_single_pass` flags the second case
     // as a fall-through, which is what makes "the C2 tier produced no bodies"
     // separable from "the C2 tier was never asked".
     metrics.enter_single_pass();
@@ -14997,10 +15118,10 @@ fn try_compile_inner(
             let Some(class_name) = resolver(cp_idx) else {
                 jitc_bail!("typecheck_class")
             };
-            let boxed: Box<str> = class_name.into_boxed_str();
-            let ptr = boxed.as_ptr();
-            let len = boxed.len();
-            owned_strings.push(boxed);
+            // Interned process-wide, NOT owned by this compilation — the
+            // type-check helpers memoize on `(ptr, len)` from thread-locals
+            // that outlive us. See `intern_typecheck_class_name`.
+            let (ptr, len) = intern_typecheck_class_name(&class_name);
             typecheck_info.push((pc, ptr, len));
         }
     }
@@ -22468,6 +22589,62 @@ mod tests {
         assert_eq!(len, 5);
         let s = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) };
         assert_eq!(s, "hello");
+    }
+
+    /// A type-check site's `(ptr, len)` pair is the KEY of two thread-local
+    /// memos that outlive any one compiled method
+    /// (`JIT_TYPECHECK_TARGET_CACHE`, `JIT_TYPECHECK_ANSWER_CACHE` in
+    /// `vm/src/jit/helpers.rs`). It must therefore be a permanent, unique
+    /// identity for one class name.
+    ///
+    /// Regression: these names used to be `Box<str>`s owned by
+    /// `CompiledMethod::_jit_strings`, freed on tier-up / invalidation /
+    /// eviction, so the allocator recycled the block for the next
+    /// compilation's name of the same length and both memos then answered for
+    /// the class that used to live there. `java/lang/String` and
+    /// `java/lang/Number` are both 16 bytes, which is how a `String` came to
+    /// pass `instanceof java/lang/Number` and blow up
+    /// `scala.runtime.BoxesRunTime.equals2`'s very next `checkcast`.
+    #[test]
+    fn typecheck_class_names_are_interned_by_content_not_owned_by_a_compilation() {
+        let (p_string, l_string) = intern_typecheck_class_name("java/lang/String");
+        assert_eq!(l_string, 16);
+
+        // Churn the allocator the way a run of compile-then-drop cycles does.
+        // Nothing here may be handed the interned block back.
+        let mut churn: Vec<Box<str>> = Vec::new();
+        for _ in 0..512 {
+            churn.push(String::from("java/lang/Number").into_boxed_str());
+            churn.push(String::from("java/lang/Object").into_boxed_str());
+            if churn.len() > 8 {
+                churn.drain(..4);
+            }
+        }
+        drop(churn);
+
+        let (p_number, l_number) = intern_typecheck_class_name("java/lang/Number");
+        assert_eq!(l_number, l_string, "the two names are the same length");
+        assert_ne!(
+            p_string, p_number,
+            "two different class names must never share a (ptr, len) key"
+        );
+
+        // Same content -> same pointer, so two sites checking the same class
+        // share one memo entry instead of evicting each other.
+        assert_eq!(
+            intern_typecheck_class_name("java/lang/String"),
+            (p_string, l_string)
+        );
+
+        // And the bytes still read back as themselves after all that churn.
+        for (ptr, len, expect) in [
+            (p_string, l_string, "java/lang/String"),
+            (p_number, l_number, "java/lang/Number"),
+        ] {
+            // SAFETY: interned entries are leaked and never freed.
+            let s = unsafe { std::str::from_utf8(std::slice::from_raw_parts(ptr, len)) }.unwrap();
+            assert_eq!(s, expect);
+        }
     }
 
     /// T10.3 — Verify the FxHashMap swap preserves insert/lookup semantics for

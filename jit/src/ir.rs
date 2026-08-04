@@ -489,8 +489,21 @@ pub enum Op {
     },
 
     /// Array allocation.  Inputs: `[ctrl, mem, length]`.
+    ///
+    /// Two shapes, distinguished by `element_type`:
+    ///   * `newarray` (0xbc) — a PRIMITIVE array. `element_type` is the JVM
+    ///     atype tag (4-11: `T_BOOLEAN`..`T_LONG`); `component_class_id` is
+    ///     unused (`0`). No class resolution, no deferred path — the atype
+    ///     names the element kind directly.
+    ///   * `anewarray` (0xbd) — a REFERENCE array of an already-loaded
+    ///     component class. `element_type` is `0` (not a valid atype — JVM
+    ///     atypes start at 4), and `component_class_id` names the loaded
+    ///     class. A component class not yet loaded at compile time (the
+    ///     deferred case) is refused by the builder, exactly like an
+    ///     unresolved `new`.
     NewArray {
         element_type: u8,
+        component_class_id: u32,
     },
 
     // ── Method calls ─────────────────────────────────────────────────
@@ -3658,6 +3671,13 @@ pub struct IrBuilder {
     /// initialisers, no finalizer) are present. A `new` whose pc is absent
     /// makes `build` bail (`None` → single-pass).
     new_info: HashMap<usize, (u32, usize)>,
+    /// cov-06: resolved allocation layout for `anewarray`, keyed by bytecode
+    /// pc: `pc → component_class_id`. Set by [`Self::set_anewarray_info`];
+    /// only an already-loaded component class is present — a `Deferred` site
+    /// (target class not loaded yet) is omitted, exactly like an unresolved
+    /// `new`. An `anewarray` whose pc is absent makes `build` bail (`None` →
+    /// single-pass).
+    anewarray_info: HashMap<usize, u32>,
     /// Bytecode pcs of `invokespecial` calls to a trivial no-arg void
     /// constructor (`<init>()V`) that may be **elided** (the receiver is a
     /// fresh, non-escaping object whose fields are zero-initialised and set by
@@ -3797,6 +3817,7 @@ impl IrBuilder {
             loop_phis: HashMap::new(),
             field_info: HashMap::new(),
             new_info: HashMap::new(),
+            anewarray_info: HashMap::new(),
             trivial_init_pcs: HashSet::new(),
             invoke_info: HashMap::new(),
             invoke_labels: HashMap::new(),
@@ -4022,6 +4043,14 @@ impl IrBuilder {
     ) {
         self.new_info = new_info;
         self.trivial_init_pcs = trivial_init_pcs;
+    }
+
+    /// cov-06: supply the resolved allocation layout (`pc → component_class_id`)
+    /// for `anewarray` sites the builder lowers into `Op::NewArray`. Must be
+    /// called before [`Self::build`]; an absent `anewarray` pc bails to
+    /// single-pass — see [`Self::anewarray_info`].
+    pub fn set_anewarray_info(&mut self, info: HashMap<usize, u32>) {
+        self.anewarray_info = info;
     }
 
     /// Gap B: supply the resolved `invokestatic` call sites (`pc → (info_ptr,
@@ -5725,6 +5754,61 @@ impl IrBuilder {
                     self.push(newobj);
                     pc += 3;
                 }
+                // newarray — allocate a PRIMITIVE array (cov-06, first
+                // increment). No class resolution, no deferred path: the
+                // atype immediate names the element kind directly, so this
+                // proves the `Op::NewArray` shape with nothing else attached.
+                // Escape analysis already refuses to scalar-replace it (only
+                // `Op::New` is eligible — see `escape_analysis.rs`), so a
+                // `newarray` always survives to `ir_lower`'s shared
+                // allocation stub, which calls the same `jit_newarray` helper
+                // the single-pass backend's 0xbc arm does.
+                0xbc => {
+                    let atype = code[pc + 1];
+                    let len = self.pop();
+                    let arr = self.graph.add(
+                        Op::NewArray {
+                            element_type: atype,
+                            component_class_id: 0,
+                        },
+                        IrType::Ref,
+                        vec![self.ctrl, self.mem, len],
+                        Some(pc),
+                    );
+                    self.push(arr);
+                    pc += 2;
+                }
+                // anewarray — allocate a REFERENCE array of an
+                // already-loaded component class (cov-06, second increment).
+                // `element_type: 0` is not a valid JVM atype (they start at
+                // 4), so it doubles as the "this is a reference array"
+                // discriminant `ir_lower` and `jit_anewarray_object` share.
+                //
+                // A `Deferred` site (component class not loaded at compile
+                // time) has no entry in `anewarray_info` — `lib.rs` never
+                // inserts one — so it bails this method to single-pass here,
+                // exactly like an unresolved `new`. `ir_compatible` no longer
+                // refuses every `anewarray`-bearing method outright; only the
+                // per-site resolution gates it, the same model `new` already
+                // uses.
+                0xbd => {
+                    let component_class_id = match self.anewarray_info.get(&pc) {
+                        Some(&id) => id,
+                        None => return ir_build_bail(line!(), pc),
+                    };
+                    let len = self.pop();
+                    let arr = self.graph.add(
+                        Op::NewArray {
+                            element_type: 0,
+                            component_class_id,
+                        },
+                        IrType::Ref,
+                        vec![self.ctrl, self.mem, len],
+                        Some(pc),
+                    );
+                    self.push(arr);
+                    pc += 3;
+                }
                 // invokespecial — two lowerings, tried in this order:
                 //
                 //  1. ELISION of a trivial `<init>()V` on a fresh object: pop
@@ -6928,6 +7012,19 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     if scan.new_ops.len() > IR_MAX_ALLOCATIONS {
         return ir_reject("scan.new_ops.len() > IR_MAX_ALLOCATIONS");
     }
+    // cov-06: `anewarray` sites. Same budget shape and same reasoning as the
+    // `new` cap above — it bounds how many reference-array allocations are
+    // admitted, each one lowered through the shared `emit_new_array_stub`
+    // (never scalar-replaced: `escape_analysis.rs` refuses to scalar-replace
+    // any `Op::NewArray`, primitive or reference — an element write is not a
+    // field write, and no pass here models one). `newarray` (0xbc) has no
+    // analogous cap: it carries no constant-pool site to resolve, so there is
+    // nothing here to bound admission on — an unbounded number of primitive
+    // array allocations costs the builder nothing `IR_MAX_GRAPH_NODES`
+    // doesn't already bound.
+    if scan.anewarray_ops.len() > IR_MAX_ARRAY_ALLOCATIONS {
+        return ir_reject("scan.anewarray_ops.len() > IR_MAX_ARRAY_ALLOCATIONS");
+    }
 
     // ── Surviving exclusions — real missing lowerings, not budgets ───
     //  * ARRAY allocation of every arity. `newarray` (0xbc) and `anewarray`
@@ -6944,6 +7041,17 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     //    reported "open" (jit-ir-relocation-map-contract.md). A
     //    method the builder will refuse must be refused HERE, cheaply and with
     //    a reason, not after a full graph build.
+    //  * `multianewarray` (0xc5) — no arm in `IrBuilder::build`'s opcode
+    //    match and `Op::NewArray` cannot represent a multi-dimensional
+    //    allocation. Unlike `newarray`/`anewarray` (cov-06's first two
+    //    increments — see `Op::NewArray`, the builder's 0xbc/0xbd arms and
+    //    `ir_lower`'s lowering arm), this one is a genuinely different
+    //    lowering shape: the single-pass backend's 0xc5 arm is a helper call
+    //    sequence (`jit_multianewarray_2d`) the IR pipeline has no equivalent
+    //    op for, and the survey found only 2 events against `anewarray`'s
+    //    138 — not worth a new `Op` variant and a second resolver-fed info
+    //    map for. Left refused deliberately; a method containing one still
+    //    compiles fine on the single-pass backend.
     //  * `checkcast` / `instanceof` / `athrow` — NONE of the three is refused
     //    here (as of cov-05 for the first two, cov-07 for the third).
     //    `instanceof` produces an `int`, cannot throw, and has no
@@ -6968,9 +7076,6 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     //    `jit_typecheck_resolve` can run a user classloader's
     //    `loadClass`/`findClass`, arbitrary Java this tier does not host
     //    inside a helper call.
-    if !scan.anewarray_ops.is_empty() {
-        return ir_reject("!scan.anewarray_ops.is_empty() (no IR lowering for 0xbd)");
-    }
     if !scan.multianewarray_ops.is_empty() {
         return ir_reject("!scan.multianewarray_ops.is_empty()");
     }
@@ -6995,6 +7100,12 @@ pub const IR_MAX_STATIC_FIELD_OPS: usize = 64;
 /// shared `emit_new_object_stub` (which costs the baseline tier's inline TLAB
 /// bump). It never applied to arrays, which are refused outright.
 pub const IR_MAX_ALLOCATIONS: usize = 16;
+
+/// cov-06: maximum `anewarray` sites. Same budget posture as
+/// [`IR_MAX_ALLOCATIONS`] — every admitted site is always lowered through the
+/// shared `emit_new_array_stub` (never scalar-replaced), so this bounds the
+/// stub-call cost, not an optimization headroom.
+pub const IR_MAX_ARRAY_ALLOCATIONS: usize = 16;
 
 /// Maximum bytecode length for the IR pipeline.
 ///
@@ -7147,6 +7258,72 @@ mod tests {
         );
         assert_eq!(graph.nodes[load.inputs[2] as usize].op, Op::Param(0));
         assert_eq!(graph.nodes[load.inputs[3] as usize].op, Op::Const(0));
+    }
+
+    /// cov-06, first increment: `newarray` (0xbc) needs no resolver
+    /// plumbing at all — `iconst_1; newarray int; areturn` must build
+    /// straight away, with the atype immediate carried verbatim and the
+    /// runtime length wired as the third input.
+    #[test]
+    fn test_ir_newarray_emits_new_array_node() {
+        let code = [0x04, 0xbc, 0x0a, 0xb0, 0, 0]; // iconst_1; newarray T_INT; areturn
+        let builder = IrBuilder::new(0, 0);
+        let graph = builder.build(&code, 4).expect("IR build failed");
+        let arr = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::NewArray { .. }))
+            .expect("newarray should emit an Op::NewArray node");
+        assert_eq!(
+            arr.op,
+            Op::NewArray {
+                element_type: 10,
+                component_class_id: 0,
+            }
+        );
+        assert_eq!(arr.inputs.len(), 3, "NewArray inputs = [ctrl, mem, length]");
+        assert_eq!(graph.nodes[arr.inputs[2] as usize].op, Op::Const(1));
+    }
+
+    /// cov-06, second increment: `anewarray` (0xbd) against an
+    /// already-loaded component class lowers the same way, keyed by pc
+    /// through `set_anewarray_info` exactly like `set_new_info` resolves
+    /// `new`.
+    #[test]
+    fn test_ir_anewarray_resolved_emits_new_array_node() {
+        let code = [0x04, 0xbd, 0x00, 0x01, 0xb0, 0, 0]; // iconst_1; anewarray #1; areturn
+        let mut builder = IrBuilder::new(0, 0);
+        let mut info = HashMap::new();
+        info.insert(1usize, 42u32); // anewarray opcode is at pc 1
+        builder.set_anewarray_info(info);
+        let graph = builder.build(&code, 5).expect("IR build failed");
+        let arr = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::NewArray { .. }))
+            .expect("anewarray should emit an Op::NewArray node");
+        assert_eq!(
+            arr.op,
+            Op::NewArray {
+                element_type: 0,
+                component_class_id: 42,
+            }
+        );
+    }
+
+    /// cov-06: an `anewarray` whose component class is NOT in
+    /// `anewarray_info` (the deferred / not-yet-loaded case) must bail the
+    /// build, not guess a class id — `ir_compatible` no longer refuses
+    /// every `anewarray`-bearing method outright, so this per-site gate is
+    /// the only thing standing between a deferred site and wrong codegen.
+    #[test]
+    fn test_ir_anewarray_unresolved_bails() {
+        let code = [0x04, 0xbd, 0x00, 0x01, 0xb0, 0, 0];
+        let builder = IrBuilder::new(0, 0);
+        assert!(
+            builder.build(&code, 5).is_none(),
+            "an anewarray pc absent from anewarray_info must bail to single-pass"
+        );
     }
 
     /// `static int f(int flag, int n, int d) { if (flag != 0) return 0; return n / d; }`
@@ -7718,14 +7895,25 @@ mod tests {
         scan.new_ops = (0..IR_MAX_ALLOCATIONS + 1).map(|i| (i, i as u16)).collect();
         assert!(!ir_compatible(&scan));
         scan.new_ops.clear();
-        // ARRAY allocation is not a budget at all — `IrBuilder::build` has no
-        // arm for 0xbd, so ONE site must be refused here rather than admitted
-        // into a pipeline that bails on it after a full graph build.
-        scan.anewarray_ops = vec![(0, 1)];
+        // cov-06: `anewarray` is a budget now, same shape as `new_ops` above
+        // — `IrBuilder::build` has a real 0xbd arm, so admission tracks
+        // `IR_MAX_ARRAY_ALLOCATIONS` rather than refusing outright.
+        scan.anewarray_ops = (0..IR_MAX_ARRAY_ALLOCATIONS)
+            .map(|i| (i, i as u16))
+            .collect();
+        assert!(ir_compatible(&scan));
+        scan.anewarray_ops = (0..IR_MAX_ARRAY_ALLOCATIONS + 1)
+            .map(|i| (i, i as u16))
+            .collect();
         assert!(!ir_compatible(&scan));
         scan.anewarray_ops.clear();
 
         // ── Surviving exclusions (NOT budgets) ──────────────────────
+        // multianewarray still rejected outright — see the comment at its
+        // `ir_compatible` check: cov-06 deliberately left it refused.
+        scan.multianewarray_ops = vec![(0, 1, 2)];
+        assert!(!ir_compatible(&scan));
+        scan.multianewarray_ops.clear();
         // cov-05: neither `instanceof` (0xc1) nor `checkcast` (0xc0) refuses
         // the whole method here any more — both are admitted structurally,
         // with the loaded-target-only gate applied per-site by
@@ -9244,7 +9432,14 @@ mod tests {
                 2,
                 MemAccess::Allocate,
             ),
-            (Op::NewArray { element_type: 10 }, 3, MemAccess::Allocate),
+            (
+                Op::NewArray {
+                    element_type: 10,
+                    component_class_id: 0,
+                },
+                3,
+                MemAccess::Allocate,
+            ),
             (Op::Call { info_ptr: 0 }, 2, MemAccess::Opaque),
             // cov-01 — the same classification `Op::Call` has, for the same
             // reason: the helper each lowers to can run arbitrary Java.
