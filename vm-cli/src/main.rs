@@ -73,9 +73,16 @@ fn maybe_dump_shutdown_reports() {
         }
         let (mir_methods, tiles, mismatches) = cratonvm_jit::ir_lower::mir_totals::read();
         if mir_methods != 0 {
+            // `shadow_tiles` / `arm_bytes` / `enc_bytes` are verify mode's
+            // sizing of the increment byte equality cannot cover: what the
+            // encoder would have written for the tiles it is not allowed to
+            // emit, against what the per-opcode arms did write.
+            let (shadow, arm_bytes, enc_bytes) =
+                cratonvm_jit::ir_lower::mir_totals::read_shadow();
             eprintln!(
                 "[ir-isel] MIR TOTALS methods={mir_methods} tiles={tiles} \
-                 mismatches={mismatches}"
+                 mismatches={mismatches} shadow_tiles={shadow} \
+                 arm_bytes={arm_bytes} enc_bytes={enc_bytes}"
             );
         }
     }
