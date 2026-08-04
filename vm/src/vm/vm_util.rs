@@ -2418,6 +2418,30 @@ impl<'a> crate::classloading::vtype::ClassHierarchy for ClassStoreHierarchy<'a> 
 // Post-clinit fixup for swallowed <clinit> exceptions
 // ---------------------------------------------------------------------------
 
+/// Widen a fixup value to the variant its field's descriptor declares.
+///
+/// The fixups below are written as `Value::Int(n)` because that is how the
+/// numbers read; the field may be declared `J`, `F` or `D`. A cell whose
+/// variant disagrees with the descriptor is a *latent* defect, not an
+/// immediate one: the interpreter's static read coerces, so the wrong variant
+/// is invisible until something reads the cell by descriptor instead — which
+/// the JIT's inline `getstatic` does, by loading the payload word the variant
+/// determines. See the call site for the ZIP-timestamp failure that exposed it.
+///
+/// `Value::Object` and matching variants pass through untouched, so this is a
+/// no-op for every fixup that was already right.
+fn coerce_static_to_descriptor(value: Value, descriptor: &str) -> Value {
+    match (descriptor.as_bytes().first(), &value) {
+        (Some(b'J'), Value::Int(i)) => Value::Long(i64::from(*i)),
+        // Widening: an integer literal into the float/double cell the field
+        // declares. Same intent as the `J` arm; no fixup writes one today, and
+        // the arm exists so adding one cannot reintroduce the defect.
+        (Some(b'F'), Value::Int(i)) => Value::Float(*i as f32),
+        (Some(b'D'), Value::Int(i)) => Value::Double(f64::from(*i)),
+        _ => value,
+    }
+}
+
 /// After swallowing a `<clinit>` failure, populate critical static fields
 /// that downstream code unconditionally dereferences. Without this, swallowed
 /// `<clinit>` failures leave static fields as null/0, causing NPEs in code
@@ -2437,6 +2461,28 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     // were read back as default-zero by the interpreter, surfacing as the
     // "0 0 OK" output and the cascade NPE on signum during BigDecimal
     // <clinit>.
+    // The stored `Value` variant must match the field's DECLARED descriptor,
+    // not merely carry the right number — SB-LOADER-ZIPCONTENT (2026-08-04).
+    //
+    // `jdk/internal/misc/Unsafe.ARRAY_*_BASE_OFFSET` is declared `J` on JDK 21+
+    // (`getstatic ... ARRAY_BYTE_BASE_OFFSET:J` in `ZipUtils.get16`'s
+    // bytecode), and the fixup below wrote `Value::Int(16)` into it. The
+    // interpreter reads that leniently and sees 16, so nothing looked wrong for
+    // a month — but the JIT's inline `getstatic` (`try_emit_inline_getstatic`,
+    // the direct-load path added 2026-08-03) dispatches on the descriptor: for
+    // `J` it loads the cell's 64-bit payload word, which an `Int` cell never
+    // wrote. Compiled code therefore read **8** where the interpreter read 16.
+    //
+    // `ZipUtils.get16` is `getShortUnaligned(b, off + ARRAY_BYTE_BASE_OFFSET)`,
+    // so every compiled ZIP central-directory parse read from 8 bytes before
+    // the array data and the extra-field walk silently found nothing:
+    // `ZipContentTests.entryWithEpochTimeOfZeroShouldNotFail` saw the DOS
+    // fallback 1980-01-01 instead of the extended timestamp's 1970-01-01. It
+    // passes cold and fails once the method is hot, which is the tell.
+    //
+    // Coercing here rather than at each call site keeps every fixup in this
+    // function right by construction: the same mismatch anywhere else would be
+    // just as invisible from the interpreter.
     let set_static_by_name = |field_name: &str, value: Value| {
         let cm = shared.classes.class_manager.read();
         if let Some(cls) = cm.get_class(class_id) {
@@ -2444,7 +2490,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             for f in &cls.fields {
                 if f.is_static() {
                     if &*f.name == field_name {
+                        let descriptor = f.descriptor.clone();
                         drop(cm);
+                        let value = coerce_static_to_descriptor(value, &descriptor);
                         super::vm_object::set_static_shared(shared, class_id, static_idx, value);
                         return true;
                     }
@@ -3932,6 +3980,69 @@ mod tests {
 
     fn test_shared() -> Arc<SharedVm> {
         Arc::new(SharedVm::new(VmConfig::default()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-clinit fixup value/descriptor agreement
+    // (SB-LOADER-ZIPCONTENT, 2026-08-04)
+    //
+    // `jdk/internal/misc/Unsafe.ARRAY_BYTE_BASE_OFFSET` is declared `J`; the
+    // fixup wrote `Value::Int(16)`. The interpreter coerces on read, so this
+    // was invisible for as long as only the interpreter read it. The JIT's
+    // inline `getstatic` dispatches on the DESCRIPTOR — `J` loads the cell's
+    // 64-bit payload word, which an `Int` cell never wrote — so compiled code
+    // read 8 and every compiled ZIP header parse addressed 8 bytes before the
+    // array data.
+    //
+    // Asserted as a value/descriptor DECISION rather than end to end: the
+    // observable symptom was a wrong ZIP timestamp four libraries away, which
+    // no test would attribute back to here.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_int_fixup_widens_into_a_long_field() {
+        assert_eq!(
+            coerce_static_to_descriptor(Value::Int(16), "J"),
+            Value::Long(16),
+            "ARRAY_BYTE_BASE_OFFSET is declared J; an Int cell there reads as 8 \
+             from the JIT's descriptor-dispatched inline getstatic",
+        );
+    }
+
+    #[test]
+    fn a_matching_int_fixup_is_left_alone() {
+        assert_eq!(
+            coerce_static_to_descriptor(Value::Int(1), "I"),
+            Value::Int(1)
+        );
+        assert_eq!(
+            coerce_static_to_descriptor(Value::Int(0), "Z"),
+            Value::Int(0),
+            "booleans ride in Value::Int by convention and must not be widened",
+        );
+        assert_eq!(
+            coerce_static_to_descriptor(Value::Long(7), "J"),
+            Value::Long(7),
+            "an already-correct Long is untouched",
+        );
+    }
+
+    #[test]
+    fn reference_and_fp_descriptors_are_handled() {
+        assert_eq!(
+            coerce_static_to_descriptor(Value::Object(None), "Ljava/lang/Object;"),
+            Value::Object(None),
+            "a reference fixup must pass through — widening it would be a \
+             type-confused cell, the very defect this function exists for",
+        );
+        assert_eq!(
+            coerce_static_to_descriptor(Value::Int(2), "D"),
+            Value::Double(2.0)
+        );
+        assert_eq!(
+            coerce_static_to_descriptor(Value::Int(2), "F"),
+            Value::Float(2.0)
+        );
     }
 
     // -----------------------------------------------------------------------
