@@ -4002,8 +4002,9 @@ impl SharedVm {
     ///
     /// ```json
     /// {
-    ///   "schema_version": 2,
+    ///   "schema_version": 3,
     ///   "mode": "compatible",
+    ///   "image_adjudication": true,
     ///   "counts": { "intrinsic": 2, "bridge": 1, "synthetic-stub": 1, "total": 4 },
     ///   "natives": [
     ///     { "class": "java/lang/System", "name": "arraycopy",
@@ -4012,11 +4013,36 @@ impl SharedVm {
     ///       "registered_by": "native-builtins/src/lib.rs:1234",
     ///       "overwrote": "synthetic-stub",
     ///       "invocations": 10,
+    ///       "kind_stated": true,
     ///       "real_declaring_method": { "loaded": true, "declared": true,
-    ///                                  "acc_native": true, "has_code": false } }
+    ///                                  "acc_native": true, "has_code": false },
+    ///       "image_declaring_method": { "image_has_class": true, "declared": true,
+    ///                                   "acc_native": true, "has_code": false } }
     ///   ]
     /// }
     /// ```
+    ///
+    /// ## Schema 3 — `image_declaring_method`
+    ///
+    /// Schema 2's `real_declaring_method` answers from the **loaded** class
+    /// store, so it is a measurement of the run: `loaded: false` means "this
+    /// workload never touched the class". That is the right answer to the
+    /// question it asks and the wrong instrument for adjudicating the registry,
+    /// because the registrations most in need of a verdict are the ones no
+    /// single workload exercises. `docs/known-issues/jdk-only/`'s sixteen
+    /// `JDK-ONLY-CLASSIFY: unknown — needs census` verdicts are all blocked on
+    /// exactly that.
+    ///
+    /// `image_declaring_method` asks the same four questions of the **bytes on
+    /// the class path**, parsed and thrown away — see
+    /// [`ClassManager::adjudicate_natives_against_image`], which explains at
+    /// length why it must not simply load the classes. It is populated only
+    /// when `verbose`, because it costs one class-file parse per distinct
+    /// registered class; `image_adjudication` at the top level says whether the
+    /// pass ran, so a `null` column is never ambiguous.
+    ///
+    /// Reading the two together is the point: `real` says whether this run
+    /// exercised the slot, `image` says whether the JDK declares it at all.
     ///
     /// Notes on the fields that are easy to misread:
     ///
@@ -4124,8 +4150,30 @@ impl SharedVm {
             }
         }
 
-        let mut out = String::with_capacity(256 + 192 * rows.len());
-        out.push_str("{\n  \"schema_version\": 2,\n");
+        // The per-row image adjudication (`image_declaring_method`). Costs one
+        // class-file parse per DISTINCT registered class — roughly a thousand —
+        // so it rides `verbose` (`--explain-jdk-only`) rather than firing on
+        // every difftest child. The key is emitted either way, `null` when the
+        // pass did not run, so a reader never has to infer from the shape which
+        // kind of census this is; `image_adjudication` says it outright.
+        let image_verdicts: Option<Vec<cratonvm_classloading::ImageMethodVerdict>> =
+            match (verbose, cm) {
+                (true, Some(cm)) => {
+                    let triples: Vec<(String, String, String)> = rows
+                        .iter()
+                        .map(|r| (r.class.clone(), r.name.clone(), r.descriptor.clone()))
+                        .collect();
+                    Some(cm.adjudicate_natives_against_image(&triples))
+                }
+                _ => None,
+            };
+
+        let mut out = String::with_capacity(256 + 256 * rows.len());
+        out.push_str("{\n  \"schema_version\": 3,\n");
+        out.push_str(&format!(
+            "  \"image_adjudication\": {},\n",
+            image_verdicts.is_some()
+        ));
         out.push_str(&format!(
             "  \"mode\": {},\n",
             json_escape(self.compatibility_mode().as_str())
@@ -4226,12 +4274,20 @@ impl SharedVm {
                         method.is_some_and(|m| m.is_native()),
                         method.is_some_and(|m| !m.is_native() && !m.is_abstract()),
                     ));
-                    out.push_str("}\n");
+                    out.push_str("},\n");
                 }
                 // Not `{"loaded": false, …}`: that is a *measurement* saying the
                 // run never touched the class, and it would be a lie here. See
                 // this function's `partial` note.
-                None => out.push_str("      \"real_declaring_method\": null\n"),
+                None => out.push_str("      \"real_declaring_method\": null,\n"),
+            }
+            match image_verdicts.as_ref().map(|v| v[i]) {
+                Some(v) => out.push_str(&format!(
+                    "      \"image_declaring_method\": {{\"image_has_class\": {}, \
+                     \"declared\": {}, \"acc_native\": {}, \"has_code\": {}}}\n",
+                    v.image_has_class, v.declared, v.acc_native, v.has_code
+                )),
+                None => out.push_str("      \"image_declaring_method\": null\n"),
             }
             out.push_str("    }");
         }

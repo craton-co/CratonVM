@@ -413,18 +413,22 @@ struct Args {
 
     /// Synthetic-stub census: dump every registered native with its
     /// classification (intrinsic / bridge / synthetic-stub) to the given
-    /// JSON file on VM shutdown. Schema (`schema_version` 2):
-    /// `{ "mode", "counts": {...}, "invocations": {...},
+    /// JSON file on VM shutdown. Schema (`schema_version` 3):
+    /// `{ "mode", "image_adjudication", "counts": {...}, "invocations": {...},
     /// "natives": [{class, name, descriptor, kind, registered_by, overwrote,
-    /// invocations, real_declaring_method}...] }`, sorted by
+    /// invocations, kind_stated, real_declaring_method,
+    /// image_declaring_method}...] }`, sorted by
     /// `(class, name, descriptor)` with a stable sort, so duplicate triples
     /// stay in registration order — the overwrite chronology — and the file is
     /// byte-stable across machines. `counts` counts *registrations* (schema 1's
     /// block, unchanged, so the stub ratchet still reads it); `invocations` is
     /// the separate per-kind dispatch total. Use this to verify the default
     /// build is synthetic-stub-free, and (via `invocations`) that no synthetic
-    /// stub was dispatched. Absolute registration-site paths are redacted
-    /// unless `--explain-jdk-only` is also passed. See
+    /// stub was dispatched. Absolute registration-site paths are redacted, and
+    /// `image_declaring_method` — the per-registration adjudication against the
+    /// bytes on the class path, which is what tells a real `ACC_NATIVE` bridge
+    /// from a registration nobody adjudicated — is `null`, unless
+    /// `--explain-jdk-only` is also passed. See
     /// docs/synthetic-vs-real-explained.md and
     /// docs/feature-designs/jdk-only-mode.md §9.
     #[arg(long = "dump-native-registry", value_name = "FILE")]

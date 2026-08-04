@@ -65,6 +65,10 @@ pub use class::{
 // the crate root because the consumers (`vm`, `vm-cli`, `difftest`) already
 // import `Class` from here.
 pub use class_origin::{ClassOrigin, ClassOriginEntry};
+// The per-registration adjudication of a native against the bytes on the class
+// path (`--dump-native-registry` schema 3's `image_declaring_method`). Named at
+// the crate root for the same reason as `ClassOrigin`: `vm` is the consumer.
+pub use class_manager::ImageMethodVerdict;
 pub use class_manager::is_bootstrap_appended_class;
 pub use class_manager::synthetic_stub_instance_field_count;
 pub use class_manager::{

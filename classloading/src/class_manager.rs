@@ -1798,6 +1798,36 @@ pub struct RedefineOptions {
     pub preserve_original_bytes: bool,
 }
 
+/// What the real class-path image says about one native registration's target
+/// method, decided **without loading or defining anything**.
+///
+/// This is the discriminator contract §1.5 turns on: a `Bridge` is what an
+/// `ACC_NATIVE` method binds to, so `acc_native == false` on a `Bridge` row is a
+/// registration nobody adjudicated, and `has_code == true` on one is a native
+/// shadowing concrete bytecode.
+///
+/// Distinct from the native census's `real_declaring_method`, which asks the
+/// *loaded* class store the same question and therefore answers only for classes
+/// the run happened to touch. See
+/// [`ClassManager::adjudicate_natives_against_image`] for why both exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageMethodVerdict {
+    /// The class path (CDS, then bootstrap, extension, application) yields bytes
+    /// for this name. `false` means the image has no such class — which for a
+    /// JDK name is exactly the case where `load_class` would have *fabricated* a
+    /// synthetic stub.
+    pub image_has_class: bool,
+    /// Those bytes declare a method with this exact name and descriptor.
+    pub declared: bool,
+    /// …and it is `ACC_NATIVE`.
+    pub acc_native: bool,
+    /// …and it is neither `native` nor `abstract`, so JVMS §4.6 says it carries
+    /// a `Code` attribute. Read from the access flags rather than from a decoded
+    /// attribute, so a lazy-attribute decode state cannot masquerade as a fact
+    /// about the class.
+    pub has_code: bool,
+}
+
 /// Manages class loading for the VM.
 ///
 /// Maintains the `ClassStore` (all loaded classes), three built-in class finders
@@ -4611,6 +4641,96 @@ impl ClassManager {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Adjudicate a whole registry's worth of `(class, name, descriptor)`
+    /// triples against the bytes on the class path.
+    ///
+    /// ## Why this exists next to the census's `real_declaring_method`
+    ///
+    /// That column answers from the **loaded** class store, so it is a
+    /// measurement of the run: `loaded: false` means "this workload never
+    /// touched the class". That is the honest answer to the question it asks,
+    /// and it is the wrong instrument for adjudicating ~8,000 registrations,
+    /// because the ones most in need of a verdict are precisely the ones no
+    /// single workload exercises. `docs/known-issues/jdk-only/`'s sixteen
+    /// `JDK-ONLY-CLASSIFY: unknown — needs census` verdicts are all blocked on
+    /// this distinction.
+    ///
+    /// ## Why it does not just load the classes
+    ///
+    /// Force-loading every registered name through [`Self::load_class`] would
+    /// **fabricate a synthetic stub for every name the image lacks** (see
+    /// `would_fabricate_synthetic_stub`), which is both a large perturbation of
+    /// the thing being measured and, under `JdkOnly`, several hundred recorded
+    /// violations manufactured by the measurement itself. This reads bytes and
+    /// parses them; nothing is defined, no `ClassId` is allocated, no
+    /// `<clinit>` runs, and `&self` makes that structural rather than a promise.
+    ///
+    /// Parses each distinct class **once**, not once per registration — the
+    /// registry has thousands of rows over roughly a thousand classes. A class
+    /// whose bytes are present but unparseable is reported as
+    /// `image_has_class: true` with everything else `false`, which is
+    /// deliberately indistinguishable from "declares no such method": both mean
+    /// "the image does not give this registration an `ACC_NATIVE` target", and
+    /// that is the only question this answers.
+    pub fn adjudicate_natives_against_image(
+        &self,
+        triples: &[(String, String, String)],
+    ) -> Vec<ImageMethodVerdict> {
+        use std::collections::hash_map::Entry;
+
+        // class name -> (present, methods it declares). `None` for the map
+        // means "bytes absent"; parsing failure yields an empty method set.
+        let mut parsed: FxHashMap<String, Option<FxHashMap<(Arc<str>, Arc<str>), (bool, bool)>>> =
+            FxHashMap::default();
+
+        triples
+            .iter()
+            .map(|(class, name, descriptor)| {
+                let entry = match parsed.entry(class.clone()) {
+                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Vacant(v) => {
+                        let decoded = self.find_class_bytes_delegated(class).ok().map(|(bytes, _)| {
+                            match cratonvm_reader::class_reader::read_class(&bytes) {
+                                Ok(cf) => cf
+                                    .methods
+                                    .iter()
+                                    .map(|m| {
+                                        (
+                                            (m.name.clone(), m.descriptor.clone()),
+                                            (m.is_native(), !m.is_native() && !m.is_abstract()),
+                                        )
+                                    })
+                                    .collect(),
+                                Err(_) => FxHashMap::default(),
+                            }
+                        });
+                        v.insert(decoded)
+                    }
+                };
+                match entry {
+                    None => ImageMethodVerdict {
+                        image_has_class: false,
+                        declared: false,
+                        acc_native: false,
+                        has_code: false,
+                    },
+                    Some(methods) => {
+                        let found = methods
+                            .iter()
+                            .find(|((n, d), _)| &***n == name.as_str() && &***d == descriptor.as_str())
+                            .map(|(_, flags)| *flags);
+                        ImageMethodVerdict {
+                            image_has_class: true,
+                            declared: found.is_some(),
+                            acc_native: found.is_some_and(|(is_native, _)| is_native),
+                            has_code: found.is_some_and(|(_, has_code)| has_code),
+                        }
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Find class bytes using parent delegation.
