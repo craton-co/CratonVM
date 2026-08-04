@@ -1,7 +1,70 @@
 # JDK-only mode — open wave-2 work list
 
-**Status:** OPEN. Filed 2026-07-31 from wave-1 implementation findings;
-re-verified against the re-landed tree the same day.
+**Status:** OPEN, reduced 2026-08-04. Filed 2026-07-31 from wave-1
+implementation findings; re-verified against the re-landed tree the same day.
+
+---
+
+## 2026-08-04 pass — what closed, what moved, what did not
+
+Two records left this directory, one item was retracted, and every remaining
+record carries a **What changed on 2026-08-04** section stating what was done
+and what it did *not* do. Read that section before working an item; the body
+below it is the original filing.
+
+**Closed and moved to `docs/internal/`:**
+
+| Was | Now |
+|---|---|
+| 9 — the observability surface | [`jdk-only-observability-surface-FIXED-20260804.md`](../../internal/jdk-only-observability-surface-FIXED-20260804.md) |
+| 10 — `System.exit` bypasses the census | [`jdk-only-system-exit-census-FIXED-20260804.md`](../../internal/jdk-only-system-exit-census-FIXED-20260804.md) |
+
+**The finding that came out of closing item 9, and that changes how the rest of
+this list should be worked.** `requested_by` now names the *Rust* call site that
+asked for each fabrication, not only the Java frame — because on a strict boot
+essentially every compatibility class comes from a native asking for an
+allocation shape, and has no Java frame at all. Item 4 scopes its migration at
+"52 live call sites in 27 files". **Three of them fire on a strict boot.** Take
+the census from the workload you care about before sizing any of this from a
+grep.
+
+**Substantially reduced, still open:**
+
+* **3** — the statically-unreachable h2-bnf block is alive (a landed, measured
+  fix that had never once executed); both halves of the policy are named
+  functions side by side; a 29-shape table pins the `(cold, warm)` verdict pair.
+  Deletion still needs RKC16N.6 fixed.
+* **8** — one list plus one *stated* exception, with the divergence asserted by
+  a test instead of described in two comments. Reconciliation still needs the
+  `StringJoiner` heap-integrity defect fixed.
+* **7** — the marker undercount that made this tier-1 is gone: a census constant
+  names all eight sites plus the ninth, the probe has one implementation instead
+  of three, and a gate fails on a partial sweep. No site is deleted; that still
+  needs real `ThreadPoolExecutor` field initialisation first.
+* **5** — `AnonymousObject$N` migrated to `VmInternal` and verified
+  (`compatibility-stub` 14 → 13, `vm-internal` 0 → 1, total unchanged).
+  `Proxy$Instance`'s origin question is answered — `VmInternal`, not
+  `GeneratedProxy`, and the in-code marker is corrected — but flipping it is not
+  attempted.
+* **1** — `register_with_kind` exists and the census carries `kind_stated`, so
+  "chosen" and "inherited" are finally distinguishable per row. Nothing is
+  reclassified; contract §8 makes that its own wave.
+* **2** — the two `unknown` overlay verdicts drop from ranked-HIGH on evidence
+  (two of three checks run, both clean); the third is instrumented. The
+  cross-crate sweep is untouched and is the bulk of the item.
+* **11 §5** — **retracted**: its premise (the memo needs policy-qualifying) does
+  not hold. Checking it found a larger defect in its place — seven force-native
+  dispatch sites bypassing `resolve_dispatch` and the census entirely — which is
+  fixed. **11 §13** — closed, at 14 occurrences rather than the 5 filed.
+
+**Unchanged and open:** 4 (the migration itself), 11 §1, §2, §4, §6, §8, §9,
+§10, §11, and §3's residual.
+
+Four new guards landed, each **verified by injecting a violation and watching it
+fail**, then reverted: the site census, the no-hand-inlined-probe scan, the
+allow-list divergence test, and the String-policy verdict table.
+
+---
 
 Normative contract: [`docs/feature-designs/jdk-only-mode.md`](../../feature-designs/jdk-only-mode.md)
 (owned by the orchestrator; do not edit). Wave 1 is **measurement, not
@@ -79,12 +142,22 @@ was fixed on 2026-08-01. The interpreter invoke cache now carries the id and
 kind, re-applies central policy, and counts both static and virtual warm hits.
 The JIT MIC/PIC-slot half remains independently tracked by item 11 §1.
 
+**Every row in the tier-1 table above predates the 2026-08-04 pass.** The "why
+it is dangerous" column still describes the defect each record was filed for
+accurately; what changed is how much of each is left, and in one case (item 8's
+"two copies") the shape. See the summary at the top of this file, and the
+*What changed on 2026-08-04* section in each record.
+
 ### Tier 2 — the instruments the tier-1 items must be measured with
 
-| # | Record | Why it matters |
-|---|---|---|
-| 9 | [The observability surface has two remaining holes](observability-surface-has-three-unfilled-holes.md) | Of the three originally filed, one closed during the re-land: `real_declaring_method` is now populated from a non-initiating lookup, and the two divergent schema-2 writers were unified into one. Still open: (a) `ClassOriginEntry::requested_by` is `null` — the requester is known to the interpreter, not `ClassManager`; (b) `--trace-jdk-only` polls two append-only logs, so mid-run class-origin violations surface at shutdown. |
-| 10 | [`System.exit(N)` bypasses the JDK-only census entirely](system-exit-bypasses-the-jdk-only-census.md) | The launcher writes the census at four failure sites, but `std::process::exit` never unwinds and none of the four is reached. The runs most likely to need the census — a strict boot that gives up and exits — are exactly the runs that produce none. The one existing hook cannot safely take the class-manager lock from an arbitrary Java thread. |
+**Both closed 2026-08-04**, and moved to `docs/internal/`:
+[the observability surface](../../internal/jdk-only-observability-surface-FIXED-20260804.md)
+and [the `System.exit` census](../../internal/jdk-only-system-exit-census-FIXED-20260804.md).
+
+Their outputs are what the tier-1 items should now be worked from. In
+particular: `requested_by` names the Rust call site of every fabrication, the
+schema-2 census carries `kind_stated`, `--trace-jdk-only` reports class-origin
+violations live, and a run that ends in `System.exit` leaves a census behind.
 
 ### Cross-cutting
 
@@ -96,31 +169,50 @@ The JIT MIC/PIC-slot half remains independently tracked by item 11 §1.
 
 ## Dependency order for wave 2
 
-The items are not independent. The order that avoids doing work twice:
+The items are not independent. Steps 1 and 2 of the original order — finish the
+instruments, make the census survive `System.exit` — are **done**; what follows
+is the order for what remains.
 
-1. **Item 9** — finish the instruments. The `real_declaring_method` column now
-   exists, which unblocks item 1's reclassification; `requested_by` and a live
-   trace are what remain, and item 4's migration needs the first of those to be
-   a work list rather than a list of names.
-2. **Item 10** — make the census survive `System.exit`. Every item below is
-   evidence-driven, and the evidence is currently lost for a whole class of
-   runs.
-3. **Item 1** — make every native's kind an explicit, per-registration fact.
-   `registered_by` provenance is already captured (`#[track_caller]` landed), so
-   "chosen" and "inherited" can now be told apart in the census. Nothing else in
-   tier 1 can be done safely before this: items 3, 7, 8 and item 11 §4/§11
-   all end with "let `resolve_dispatch` decide from `NativeKind` +
-   `Method::code()`", which requires the kinds to be true.
-4. **Item 11 §1** — item 6 is retired: the interpreter's invoke cache now
-   stores the kind and `NativeMethodId`. The JIT's MIC/PIC slots remain open
-   and currently pay for the gap with a blanket refusal that costs `JdkOnly`
-   runs every inline-cached native call.
-5. **Items 3, 7, 8, and item 11 §4/§8/§9/§11** — delete the hard-coded lists,
-   each with its own regression corpus.
-6. **Items 4 and 5** — migrate the `ensure_synthetic_class` callers to the
-   fallible/generated entry points that already exist, correct the VM-internal
-   origins, then delete `is_synthetic_stub`.
-7. **Item 2** — finish the layout sweep across `native-builtins`,
+The single most useful thing to do before starting any of it: **take the
+schema-2 census and the class-origin census from a real-JDK run of the workload
+you actually care about.** Every item below is evidence-driven, the instruments
+now produce that evidence (`requested_by` naming Rust call sites, `kind_stated`
+separating chosen from inherited kinds, a live violation trace), and the one
+concrete result so far — 52 grep-visible `ensure_synthetic_class` call sites, 3
+of which fire on a strict boot — suggests the grep-derived sizes in these
+records are systematically wrong in the same direction.
+
+1. **Item 1** — make every native's kind an explicit, per-registration fact.
+   `register_with_kind` and the `kind_stated` census column exist now; the
+   migration and the reclassification do not, and contract §8 scopes them as
+   their own subsystem-per-PR wave. Nothing else in tier 1 can be done safely
+   before this: items 3, 7, 8 and item 11 §4/§11 all end with "let
+   `resolve_dispatch` decide from `NativeKind` + `Method::code()`", which
+   requires the kinds to be true.
+2. **Item 11 §1** — the JIT's MIC/PIC slots still store a raw entry pointer with
+   no kind beside it, and pay for the gap with a blanket refusal that costs
+   `JdkOnly` runs every inline-cached native call. Independent of item 1 in
+   principle, but the fix is the same shape and worth doing next to it.
+3. **The three blockers, each of which is real engineering rather than
+   cleanup.** They gate items 3, 8 and 7 respectively, and none of them is a
+   JDK-only change:
+   * **RKC16N.6** — real-JDK `java/lang/String` bytecode resolution during JDK
+     `<clinit>`s. Until this is fixed, both `String` lists have to stay.
+   * **The `StringJoiner` heap-reference-integrity defect** (HIB-CV-32 family).
+     Until this is fixed, the two real-protected-stub paths have to disagree.
+     Worth re-checking whether it still reproduces before assuming it does —
+     `sj_real_layout` and an old-gen corruption fix have both landed since it
+     was diagnosed.
+   * **Real `ThreadPoolExecutor` field initialisation** so
+     `Executors.new*ThreadPool()` returns objects built by the real `<init>`.
+     Until this is fixed, reclassifying `native_es_execute` drops it under
+     `--jdk-only` and strict mode loses thread pools.
+4. **Items 3, 7, 8, and item 11 §4/§8/§9/§11** — delete the hard-coded lists,
+   each with its own regression corpus. Gated on 1 and 3.
+5. **Items 4 and 5** — migrate the remaining `ensure_synthetic_class` callers,
+   settle `Proxy$Instance`, then delete `is_synthetic_stub`. Drive the migration
+   from the `requested_by` census, not from a grep.
+6. **Item 2** — finish the layout sweep across `native-builtins`,
    `native-collections`, `native-io` and `vm/src/native/`. Independent of the
    rest and can run in parallel, but it is the item most likely to surface new
    blockers.

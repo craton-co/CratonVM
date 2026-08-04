@@ -2475,7 +2475,7 @@ struct JdkOnlyExitDumpPaths {
 /// runs. Without this a `--jdk-only --jdk-only-report r.json` run of a program
 /// whose error handler exits produced no report at all — and those are the runs
 /// the report exists for. See
-/// `docs/known-issues/jdk-only/system-exit-bypasses-the-jdk-only-census.md`.
+/// `docs/internal/jdk-only-system-exit-census-FIXED-20260804.md`.
 ///
 /// Shares `write_jdk_only_dumps`' `WRITTEN` latch, so a `System.exit` racing a
 /// normal shutdown cannot produce two interleaved writes to the same path;

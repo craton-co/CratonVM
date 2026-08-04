@@ -5,6 +5,56 @@ against the re-landed tree the same day. **DANGEROUS: causes silent
 misclassification, not a clean failure, and it misclassifies in both
 directions.**
 
+## What changed on 2026-08-04 — step 2 exists, and the blocking evidence gap is closed
+
+*What specifically must change* lists three steps. Step 1 (provenance) was
+already met. Step 2 is now available and step 3's prerequisite is met.
+
+**`NativeMethodRegistry::register_with_kind(class, method, desc, cb, kind)`
+exists.** It states the kind at the registration site instead of inheriting it
+from whatever `set_category` an ancestor frame last ran. It sets and restores
+`current_category` around the inner `register` rather than passing the kind
+down, deliberately: `register`'s body reads that field in a dozen places (the
+two drop arms and the `keep_real_*` heuristics), and threading a parameter
+through some of them would leave the ambient field authoritative for the rest —
+exactly the split the entry point exists to remove. `#[track_caller]` on both,
+so provenance still points at the registrar.
+
+**The census can now tell "chosen" from "inherited".** *Evidence needed that we
+do not have* said the blocking question was which of the 157 baseline entries
+are deliberate stubs and which merely inherited the default. `registered_by`
+answers *where* a registration was written; it does not answer whether anybody
+decided what it is. The schema-2 census carries a **`kind_stated`** boolean per
+row, true only for a registration made through `register_with_kind`.
+
+Read it with the direction of the mistake in mind. `kind_stated: false` on a
+`SyntheticStub` row means only "no `set_category` covered this call site", since
+`SyntheticStub` is the default — very different from a deliberate stub, and the
+two were previously indistinguishable. **`kind_stated: false` on a `Bridge` row
+is the dangerous one**: `Bridge` is never the default, so it can only have been
+inherited from a `set_category` line covering more registrations than its author
+was thinking about. That is the shape of the 1,195-registration
+`native-collections` verdict below, and the census will now say so per row
+instead of per crate.
+
+## What is still open — which is the bulk of it
+
+Nothing has been reclassified, and nothing here changes a single native's kind.
+That is deliberate and matches the constraint the record itself sets: contract
+§8 says *"Do not edit `native-builtins/src/lib.rs`; the 157-stub
+reclassification is a separate wave with its own subsystem-per-PR discipline."*
+
+Step 2's migration (registrar by registrar, starting with the
+`JDK-ONLY-CLASSIFY`-marked ones) and step 3 (reclassify, then flip the default
+last) are that wave. The tooling for it exists now; the wave does not.
+
+The one thing to do before it starts is the run this record asks for: **take the
+schema-2 census from a real-JDK boot of a workload that actually exercises the
+classes being adjudicated**, and read `kind_stated` alongside `kind` and
+`registered_by`. Do not guess a per-entry disposition before that run exists —
+and note that a row of all-`false` in `real_declaring_method` means "this run
+did not exercise the class", not "the JDK does not declare this method".
+
 ## What is wrong
 
 A native's `NativeKind` is never stated at its registration site. It is
@@ -238,7 +288,7 @@ proof that a one-line "fix" here is a one-line thousand-registration change.
 Which of the 157 baseline entries are *deliberate* stubs and which merely
 inherited the default is now **answerable** — `registered_by` and
 `real_declaring_method` are both populated in the schema-2 census (see
-[the observability record](observability-surface-has-three-unfilled-holes.md)).
+[the observability record](../../internal/jdk-only-observability-surface-FIXED-20260804.md)).
 What does not exist yet is the census *taken from a real-JDK boot* and the
 per-entry adjudication built on it. Do not guess a per-entry disposition before
 that run exists.

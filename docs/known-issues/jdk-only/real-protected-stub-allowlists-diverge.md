@@ -14,6 +14,57 @@ divergence itself is untouched, so the item stays in tier 1 — it still produce
 different dispatch verdicts for the same class on two paths — but it is no
 longer a trap for an unwarned reader.
 
+## What changed on 2026-08-04
+
+**There is one list now.** The title above describes the tree as it was: an
+inline `matches!` in `vm_exec::invoke_or_native` and a separate
+`real_protected_stub_class` in the interpreter, maintained by hand, which is
+how they came to differ. Both predicates now read one
+`real_protected_stub_class_common` (the ten classes both paths agree on) plus
+one **stated** exception —
+
+* `real_protected_stub_class(name)` — the warm paths;
+* `real_protected_stub_class_cold(name)` — `= real_protected_stub_class(name) ||
+  name == "java/util/StringJoiner"`, called by `invoke_or_native`.
+
+Adding a class to the common list protects it on both paths; a class that
+belongs on only one has to say which, in code. That is the property two copies
+could not offer.
+
+**The divergence itself is untouched, and is now asserted rather than
+described.** `real_protected_stub_paths_diverge_on_exactly_stringjoiner` fails
+if the two predicates disagree about anything other than `StringJoiner` — in
+either direction. This is the *divergence test* the record asks for first under
+*How to verify a fix*, with one deliberate difference from its wording: it does
+not "fail today on `java/util/StringJoiner`" and get frozen as an expected
+failure, it asserts the disagreement is exactly that one class and passes. A
+merge in either direction fails it; so does adding a twelfth class to one path
+only. Verified by injecting the naive "make them match" edit and watching it
+fail.
+
+A second test, `every_corpus_class_is_protected_on_some_path`, keeps the test
+corpus honest: without it, deleting a class from the shared list and forgetting
+the corpus would leave the divergence test passing while silently checking a
+name neither path mentions.
+
+## What is still open — and it is the whole of it
+
+**Reconciling the divergence**, which means fixing the `StringJoiner`
+heap-reference-integrity defect (HIB-CV-32 family: `gen_heap::read_slot`
+"corrupt Value cell" firing on the second `add()`), not merging the lists.
+Nothing above touches that. Both naive directions still reintroduce a known
+defect, for the reasons in *Blast radius* below, and the test now enforces that
+neither is taken by accident.
+
+One thing worth re-checking before assuming the defect is still live: it was
+diagnosed 2026-07-10, `native-collections` has since grown `sj_real_layout`
+(which resolves the real class's field indices by name), and a large old-gen
+corruption family was closed 2026-08-04. Whether the guard still trips is a
+question for a run, not a reading — and the run is cheap: add
+`java/util/StringJoiner` to `real_protected_stub_class_common`, delete the
+`_cold` exception, and exercise a `StringJoiner` whose second and subsequent
+`add()` calls must be observable in `toString()`.
+
 ## What is wrong
 
 "Which `NativeKind::SyntheticStub` natives must yield to loaded real bytecode"

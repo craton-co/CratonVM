@@ -1,9 +1,69 @@
 # The forced-native `java/lang/String` policy exists in three places, in disagreeing forms, and one block is statically unreachable
 
-**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31, re-verified
-against the re-landed tree the same day. **DANGEROUS: the disagreement is
-silent, and it has already made a landed, measured performance fix into dead
-code.**
+**Status:** OPEN, materially reduced 2026-08-04. Filed 2026-07-31, re-verified
+against the re-landed tree the same day.
+
+## What changed on 2026-08-04
+
+**The dead block is alive.** `substring(I)`, `charAt`, `length`, `isEmpty` and
+`startsWith` are on the warm path's whitelist now, so the block that names them
+is reachable. It never had been: a landed, root-caused, measured fix that had
+not once executed. That is a *reduction* in divergence rather than a new
+behaviour — `check_override` has forced these same names on the cold path since
+RKC16N.6, so before this the first call at a site ran the native and every call
+after it ran real bytecode.
+
+The scope is exactly the one the h2-bnf comment argued for and no wider: plain
+UTF-16 indexing and content comparison, trivially equivalent to the real
+bytecode for every input. `trim` / `toLowerCase` / `toUpperCase` / `compareTo*`
+/ `split` are still excluded, because forcing those is a *correctness* change
+wearing a performance change's clothes and needs its own Unicode/locale review.
+
+**The two halves are named functions, side by side, with the disagreement
+asserted.** `cold_forced_native_string_name` (the 21-name, descriptor-blind
+list, extracted from `check_override`'s inline `matches!`) and
+`warm_forced_native_string_candidate` now sit together in
+`vm/src/runtime/interpreter/native_override.rs`, and
+`forced_native_string_policy_divergence_is_exactly_the_unicode_sensitive_names`
+pins the `(cold, warm)` verdict pair for all 29 shapes either path mentions.
+
+It is deliberately **not** an equality assertion — the two are not equal, on
+purpose — it freezes *which* shapes disagree, so changing one half without the
+other fails a test instead of silently making a `String` method's behaviour
+depend on how many times its call site has executed. Both guards are verified by
+injection: dropping `charAt` from the warm whitelist reproduces the 2026-07-23
+defect and fails both, one naming the changed verdict, one naming the block that
+went dead.
+
+`the_h2_bnf_string_entries_are_reachable` is the regression test this record
+asked for under *How to verify a fix*: it calls
+`force_native_over_real_jdk_bytecode("java/lang/String", "charAt", "(I)C")` and
+requires `true`.
+
+## What is still open
+
+1. **Fix RKC16N.6** — the real-JDK `java/lang/String` bytecode-resolution
+   failure during JDK `<clinit>`s. Both lists are workarounds for it, and it is
+   the only thing that lets them be deleted. Boot-critical
+   (`java/nio/charset/StandardCharsets.<clinit>` is on the path) and out of
+   scope for a wave-2 cleanup.
+2. Deleting both interpreter arms and the two JIT ladders together, which (1)
+   gates.
+3. Separating the *performance* entries (the `CRATONVM_NATIVE_STRING_REGEX`
+   family) from the *correctness workaround* entries by registering the former
+   as reviewed `NativeKind::Intrinsic`. Gated on
+   [item 1](native-kind-is-ambient-and-defaults-to-syntheticstub.md), not on
+   RKC16N.6.
+
+**The "they are already `Intrinsic`" premise is still UNVERIFIED**, and it is
+now cheaper to check: the schema-2 census carries a `kind_stated` column, so one
+real-JDK run answers both whether `String`'s natives are `Intrinsic` and whether
+anybody decided that.
+
+---
+
+*The original filing follows. Its diagnosis of the dead block is correct and is
+what the 2026-08-04 fix acted on.*
 
 ## What is wrong
 

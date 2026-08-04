@@ -11,6 +11,59 @@ silent wrong-field read or write, never an exception.**
 > names **six** drift families, not five, and the marker table's per-file
 > verdict split was slightly off.
 
+## What changed on 2026-08-04 — step 2 of four
+
+*What specifically must change* lists four steps. Step 2 — **adjudicate the two
+`unknown` verdicts in `vm/src/vm/vm_object.rs`** — is now partly answered, with
+evidence rather than an argument.
+
+Both are **overlays**, not mis-numbered slots: a VM-internal `Int` deliberately
+written on top of `java.lang.Class`'s instance field 0, which JDK 25 declares as
+`Constructor<T> cachedConstructor` — a *reference* slot. The question was never
+"is this the right slot" but "does writing an `Int` where the image declares a
+reference corrupt anything". The marker listed three checks. Two are run,
+against a real JDK 21 image, and both are clean:
+
+1. Three rounds of `getDeclaredConstructor()` on a nested class, interleaved
+   with `String.class.getConstructor(String.class)` — so the second and third
+   take the real bytecode's `cachedConstructor != null` fast path — all returned
+   the right `Constructor`. Nothing raised, and no `expected object reference,
+   got int(N)`.
+2. The same run under `CRATONVM_DBG=overlay`, whose hunter
+   (`overlay_write_is_destructive`) exists precisely to report a primitive
+   written to a reference slot, reported nothing.
+
+So the verdict stays `unknown` but **drops from ranked-HIGH**: the two checks
+that would have shown live harm did not.
+
+The third check — does anything still *depend* on the overlay — is the one whose
+answer removes code rather than reassuring about it, and nothing in the tree
+could answer it. `mirror_class_id` (`native-builtins/src/lang_class.rs`) is the
+overlay's only reader outside the VM, a fallback behind the reverse map, and it
+now reports its first hit under the same flag. **One broad real-JDK run makes
+the verdict decidable.** A ten-class probe does not: silence over a small
+workload is not silence over Spring Boot, and the marker says so rather than
+inviting a deletion on thin evidence.
+
+The primitive-mirror sibling (`Int(-1)` over the same slot) rides on that
+finding: it is the easier of the two to retire if check 3 comes back zero,
+because a primitive mirror has no legitimate `cachedConstructor` reader at all.
+
+## What is still open — steps 1, 3 and 4, which are the bulk
+
+* **Step 1, the sweep.** `native-builtins`, `native-collections`, `native-io`
+  and `vm/src/native/` are still unswept, and until they are the 10 markers
+  understate the problem by an unknown factor. This is the largest remaining
+  piece of the item and nothing above touches it.
+* **Step 3**, replacing the two `breaks-under-strict` sites in `vm_util.rs`.
+  Note the `ValueLayout` one cannot be converted at all — the marker is explicit
+  that there are no real fields to name, so it is a
+  `CompatibilityClassRequested` violation, not a slot-numbering bug, and fixing
+  it means letting the real `ValueLayout.<clinit>` run.
+* **Step 4**, making `safe` verdicts checkable rather than asserted. They are
+  claims about JDK 25 that nothing in the build re-checks; a JDK upgrade should
+  fail a test, not corrupt an object.
+
 ## What is wrong
 
 A large amount of CratonVM native and VM-internal code reaches into Java objects

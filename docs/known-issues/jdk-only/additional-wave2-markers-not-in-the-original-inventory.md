@@ -16,6 +16,26 @@ now publishes the policy), §12 (all three documentation gaps are closed) and
 §13 (three of five stale doc paths remain, and the count is per-occurrence not
 per-path).
 
+## 2026-08-04 status
+
+* **§5 — RETRACTED.** Its premise does not hold: the memo is mode-independent.
+  Checking it turned up a real defect one level down — seven force-native
+  dispatch sites that bypassed `resolve_dispatch` and the census entirely —
+  which is **FIXED**. Read §5 before acting on any of it.
+* **§13 — CLOSED.** All three moved doc paths repointed. The re-verification
+  found **fourteen** occurrences, not the five this record counted: the
+  interpreter file split multiplied them, and the wrapped-comment form
+  (`docs/known-issues/` at end of line, basename on the next comment line) hides
+  from a grep for the full path. This record already said to search for the
+  basename rather than the path, and it was *still* an undercount.
+  *Separately:* the same scan found **403** dead `docs/…md` citations across
+  162 files tree-wide, all of them files that merely moved. That is a
+  pre-existing tree-wide condition, not a JDK-only one, and is filed on its own.
+* **§1, §2, §4, §6, §8, §9, §10, §11 — unchanged and open.** §3's residual
+  (`matcher_native_callback_uncached`, plus the unaudited arms of
+  `jit_invoke_dispatch` / `jit_invoke_virtual_mic`) is also unchanged.
+* **§12 — still closed.**
+
 ---
 
 ## 1. The JIT has the same missing-`NativeKind` hole as the interpreter's invoke cache — twice — but wave 1 bought time with a blanket refusal
@@ -216,7 +236,62 @@ would put a policy read on the hottest boxing/collection paths in the VM to
 defend against a state that cannot occur. If either gate above is ever removed,
 this comment is the reason these bodies look unguarded."*
 
-## 5. `jit-api`'s `force_native_cache` memoizes a hard-coded dispatcher, and the memo is not policy-qualified
+## 5. `jit-api`'s `force_native_cache` memo — RETRACTED, and replaced by a larger defect one level down
+
+**The premise is wrong.** The marker says the memoized `bool` must become
+policy-qualified because *"a `true` memoized under `Compatible` is not a valid
+answer under `JdkOnly` and this cell cannot tell the two apart"*. Checked
+2026-08-04: `force_native_over_real_jdk_bytecode(class_name, method_name,
+method_descriptor)` takes those three arguments and nothing else. It never reads
+the compatibility mode. The memo is mode-independent and sound, and the
+`OnceLock<(bool, u8)>` reshape it asks for would buy nothing. **Do not do it.**
+
+Policy is applied *downstream* of the memo, at dispatch — which is where the
+actual defect was.
+
+### The defect: seven dispatch sites bypassed `resolve_dispatch` entirely — FIXED 2026-08-04
+
+`intercept_force_registered_native` and
+`intercept_force_registered_native_cached` are reached from **seven** call sites
+across `dispatch_static`, `dispatch_virtual` and `invoke`, and both ended in a
+bare `safe_native_call` on a callback from `NativeMethodRegistry::find`. No
+`dispatch_policy`, no `resolve_native_dispatch_wave1`, no `record_invocation`.
+
+Their entire purpose is to make a registered native beat *concrete real-JDK
+bytecode* — precisely the inversion §1.4 forbids under `JdkOnly` — so under
+`--jdk-only` these were seven unguarded holes in contract §11's *"every
+strict-mode native dispatch"*, and in `Compatible` they were seven dispatches
+missing from the §4 census. Every sibling route (`invoke_or_native`,
+`try_stackless_invoke` steps 1 and 6, `invoke_on_class_shared_inner`) was routed
+in wave 1; these two were missed, and §5's framing is part of why nobody looked
+— it pointed at the memo, which is fine, and away from the dispatch, which was
+not.
+
+Both now go through `admit_forced_native`, which resolves the id, applies §7
+with `compat_native_wins: true` (the site's pre-existing unconditional verdict)
+and `bytecode_available: true` — concrete bytecode existing is the *premise* of
+reaching these sites, unlike `resolve_step1_native`, which runs before
+resolution and honestly passes `false` — then counts the dispatch. It has three
+answers, and the third matters: a `SyntheticStub` under `JdkOnly` **raises**
+`VmError::JdkOnly` rather than declining, matching
+`invoke_on_class_shared_inner`, because swallowing it would run the real
+bytecode quietly and leave a strict run reporting zero synthetic-stub
+invocations for a call that was one.
+
+`Compatible` is bit-for-bit unchanged: `resolve_native_dispatch_wave1` is a pure
+function of `compat_native_wins` there. The cached path keeps its
+generation-keyed `NativeCallSite` memo — added because the `find` it replaced
+measured as the #2 hottest symbol (~7% of samples) on
+`TestResponsePerformance` — by handing the resolved id to
+`admit_forced_native_id`, so the warm cost is two array indexes, the policy call
+and one relaxed `fetch_add`.
+
+Measured on a `--jdk-only` boot of a trivial program:
+`interpreter_bytecode_preferred` went 0 → **4**, and two
+`native-shadows-bytecode` violations appeared. Those four refusals were
+happening before and were invisible.
+
+### The original §5 text, kept for the correction it also carries
 
 `jit-api/src/lib.rs` 204:
 
