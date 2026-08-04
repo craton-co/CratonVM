@@ -61,18 +61,30 @@ impl Compiler {
         // overlapping in both directions), so this is NOT the `type.temporal`
         // residual it was added to bisect.
         //
-        // TRIED AND REVERTED 2026-07-31: dropping the `moving_young_enabled()`
-        // term, so the flush also runs in the non-moving lane where nothing
-        // else spills a caller-saved scratch oop. It is a plausible root-
-        // visibility fix and it made things WORSE — the
-        // `CRATONVM_NO_MOVING_YOUNG=1 CRATONVM_SHADOW_STACK=1` lane turned a
-        // clean run into a deterministic SIGILL (2/2), where the same lane on
-        // the same tree without this change runs clean (2/2). Calling it here
-        // reserves spill slots and rewrites `self.stack` at a point the
-        // non-precise frame layout did not budget for. Whoever revisits the
-        // non-moving lane's root visibility should start from the shadow
-        // publication instead — see
-        // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+        // TRIED AND REVERTED 2026-07-31 — and the RECORDED REASON WAS WRONG.
+        // Corrected 2026-08-03. Dropping the `moving_young_enabled()` term (so
+        // the flush also runs in the non-moving lane) was reverted because that
+        // lane then SIGILL'd 2/2, and the revert note blamed THIS call site:
+        // "calling it here reserves spill slots and rewrites `self.stack` at a
+        // point the non-precise frame layout did not budget for". It does not.
+        // The SIGILL was the inline-PIC cascade's inter-slot `JNE` truncating
+        // to `rel8` and branching backwards into the blind spill run emitted a
+        // few lines below (fixed in `7f1b1f263`); ANY change that pushed a PIC
+        // slot body past 127 bytes reproduced it, and this one did. Re-tested
+        // 2026-08-03 with the truncation fixed — term removed,
+        // `CRATONVM_GC=-moving-young`, Hibernate `ZonedDateTimeTest`, run
+        // INTERLEAVED with a pre-fix build as a positive control: control
+        // SIGILL 2/2 (1st and 5th), this variant clean 3/3.
+        //
+        // The term nevertheless STAYS, now for a reason about this mechanism
+        // rather than about a crash: in the non-moving lane the full-GPR blind
+        // spill below (`safepoint_reg_spill_all`, default-on since the same
+        // day) already copies every caller-saved register into a frame slot the
+        // conservative scan reads, so the flush buys no root visibility there —
+        // only per-safepoint code size. Under moving-young it is NOT redundant:
+        // it also rewrites `self.stack`, so the PRECISE map names those slots,
+        // and a moving cycle has no conservative backstop to fall back on.
+        // See `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
         if moving_young_enabled() && scratch_flush_at_safepoint_enabled() {
             self.flush_scratch_registers();
         }

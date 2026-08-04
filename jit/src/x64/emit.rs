@@ -1206,14 +1206,14 @@ impl Compiler {
     ///
     /// `mark_overflowed` makes the driver drop the half-emitted method and fall
     /// back, which is always better than emitting the wrong branch.
+    ///
+    /// The body now lives on [`ExecutableBuffer::patch_rel8_or_bail`] so the
+    /// *other* backend can reach it too: `ir_lower` carried eight raw
+    /// `(a - b - 1) as u8` patches of its own, i.e. the identical defect one
+    /// module over. This stays as the single-pass backend's spelling because
+    /// ~60 call sites already use it.
     pub(super) fn patch_rel8_or_bail(buf: &mut ExecutableBuffer, patch: usize, rel: i64) {
-        match i8::try_from(rel) {
-            // Cast: rel8 displacement, range-checked immediately above.
-            Ok(v) => {
-                buf.try_patch_byte(patch, v as u8).ok();
-            }
-            Err(_) => buf.mark_overflowed(),
-        }
+        buf.patch_rel8_or_bail(patch, rel);
     }
 
     /// Patch a previously-emitted `rel32` displacement so it targets the
