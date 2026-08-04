@@ -59,55 +59,98 @@ both JIT and no-JIT modes. The crash needs the real `parseMem` stage — i.e.
 Tomcat's BCEL parser actually running — before it. Whatever is wrong is set up
 by that workload, not by the faulting loop's own shape.
 
-## The isolation tools do not work on it, and that is a second bug
+## The bisect levers had a real hole — in OSR, not where I first said
 
-Every documented narrowing lever reads "no effect", and **none of them is
-inert** — the plumbing was validated before drawing that conclusion
-(`CRATONVM_JIT=definitely-not-a-token` is rejected with `unknown configuration
-token`, and `CRATONVM_DISABLE_JIT=1` does change the outcome):
+> **Correction (2026-08-04).** The first revision of this section claimed the
+> levers were bypassed by *the eager single-pass first-call path*, on the
+> strength of a run where `bisect-only=zzzNoSuchPrefix` still left 11 methods
+> compiled. **That was wrong, and it was wrong for the dumbest possible
+> reason: I spelled the flag as `CRATONVM_JIT=bisect-only=…`, and
+> `bisect-only` is a `CRATONVM_DBG` token (`jit-bisect-only`), not a
+> `CRATONVM_JIT` one.** The VM rejected it with `unknown configuration token`
+> on stderr, which my output filter dropped. Every "no effect" row was an
+> inert lever — the exact trap `reference_inert_lever_is_not_an_elimination`
+> exists to prevent, walked into while holding the note that warns about it.
+> Validating *one* token (`definitely-not-a-token`) and then assuming the rest
+> parsed is not validation. **Check that the lever changed the compiled census,
+> not merely that some token somewhere is rejected.**
 
-| lever | result |
+With the correct spelling the levers work, and there was still a genuine hole
+underneath the mistake. `CRATONVM_DBG=jit-bisect-only=zzzNoSuchPrefix` allows
+nothing to compile:
+
+| binary | OSR entries under `jit-bisect-only=zzz` | `JitCache::put` census | result |
+|---|---:|---:|---|
+| unmodified `dev` | **21** | 0 | **SIGSEGV** |
+| with the gate below | **0** | 0 | **clean** |
+
+`compile_osr_artifact` reaches `x64::compile_with_param_slots` directly — its
+own comment says so ("This path calls the backend directly instead of going
+through `try_compile`") — and the levers were applied only inside
+`try_compile`. So **OSR bodies were force-interpretable by neither lever**, and
+because OSR publishes through `put_osr` rather than the counted `put`, the
+`jit-compiled` census showed **zero** while 21 OSR bodies were compiling and
+one of them was crashing. A bisect against that reads as a clean exoneration.
+
+**Fixed here**: the two levers are now one shared predicate,
+`cratonvm_jit::jit_force_interpret`, applied at `try_compile`, at
+`compile_osr_artifact`, and at `execute`'s eager first-call compile.
+
+## With the levers working, the bisect converges
+
+All on the fixed binary. Control first — it must still crash, or the "fix" is
+just "OSR disabled":
+
+| arm | result |
 |---|---|
-| `CRATONVM_JIT=deny=ParseSplit2Probe` / `java/io` / `org/apache/tomcat` / `java/util` | SIGSEGV |
-| `CRATONVM_JIT=bisect-only=<the probe>` | SIGSEGV |
-| `CRATONVM_JIT=bisect-only=zzzNoSuchPrefix` | SIGSEGV |
-| `CRATONVM_JIT=-osr`, `-osr-dead-locals`, `osr-dead-mask-blanket` | SIGSEGV |
+| **control, no flags** | **SIGSEGV** |
+| `jit-bisect-only=AnnotationScanSplitProbe` | **SIGSEGV** |
+| `jit-bisect-only=org/apache/tomcat` | clean |
+| `jit-bisect-only=java/` | clean |
+| `jit-bisect-only=org/apache/tomcat,java/` | clean |
+| `CRATONVM_JIT=deny=AnnotationScanSplitProbe` (whole class) | clean |
+| `deny=…​.main` / `.readBytes` / `.arrayRead` / `.parseMem` / `.readRaw` / `.allocOnly` | **SIGSEGV** (each) |
 
-The last `bisect-only` row is the tell. `zzzNoSuchPrefix` matches nothing, so
-it should leave essentially nothing compiled — and yet
-`CRATONVM_DBG=jit-compiled` under that exact setting still reports **11
-compiled methods**, all `org/apache/tomcat/util/bcel/*`:
+So the miscompiled code is **in the probe class itself**, and **no single
+method accounts for it** — denying any one is not enough, denying all of them
+is. That points at an interaction between two or more compiled bodies of that
+class rather than one bad body, which is the next thing to pin down (pairwise
+deny is ~15 runs and was not done here).
+
+The one OSR entry the class takes is worth recording as the leading suspect:
 
 ```
-Constant.readConstant(Ljava/io/DataInput;)…
-ConstantUtf8.getInstance(Ljava/io/DataInput;)…
-Utility.skipFully(Ljava/io/DataInput;I)V
-ConstantUtf8.<init>(Ljava/lang/String;)V
-ConstantPool.getConstant(I)… / (IB)… / (ILjava/lang/Class;)…
-…
+[cratonvm-osr] enter AnnotationScanSplitProbe.readBytes()J entry_pc=59
+  num_locals=8 locals=[475842200, 0, 115580, 0, …] tags=[1, 1, 1, 1, 4, 4, 4, 0]
 ```
 
-So `CRATONVM_JIT=deny=` / `bisect-only=` are applied in `jit::try_compile` and
-**do not gate whatever compiled those** — the eager single-pass first-call path
-reaches codegen without passing the filter. That makes the project's primary
-"which method is miscompiled" tool silently ineffective for an entire class of
-compilation, which is worth fixing on its own merits: a lever that filters only
-some of the compilers reads exactly like an exoneration.
-
-Those 11 methods are the current candidate set.
+`readBytes` holds a `long` accumulator (a category-2 local) alongside three
+reference locals, which is the shape of the known slot-reuse / OSR-trampoline
+family (`probes/SlotReuseCategoryProbe.java`, `probes/HighHalfReuseProbe.java`).
+Denying `readBytes` alone does **not** stop the crash, so it is not the whole
+story.
 
 ## Suggested next steps
 
-1. **Make the filter total.** Apply the `deny` / `bisect-only` predicate at
-   every codegen entry point, not just `jit::try_compile`, then re-run the
-   bisect above — it should then converge in a few runs.
-2. Failing that, `CRATONVM_SYMBOLIZE` the faulting `pc` against the same
-   binary (with the `.pdb` beside the exe — see
-   [[reference_symbolize_cratonvm_crash_needs_pdb_beside_exe]]) and
-   cross-check with `llvm-objdump`, since ICF can name the wrong function
+1. **Pairwise deny inside the probe class** (~15 runs) to find the interacting
+   pair. Single-method denies are all negative and the whole-class deny is
+   positive, so the answer is a combination.
+2. `CRATONVM_DBG=osr,osr-meta` on the failing run, focusing on
+   `readBytes()J entry_pc=59` — the category-2 accumulator beside three
+   reference locals is the shape of the slot-reuse family, and
+   `probes/OsrDeadLocalProbe.java` / `probes/SlotReuseCategoryProbe.java` are
+   the existing differentials for it.
+3. `CRATONVM_SYMBOLIZE` the faulting `pc` against the same binary (with the
+   `.pdb` beside the exe — see
+   [[reference_symbolize_cratonvm_crash_needs_pdb_beside_exe]]) and cross-check
+   with `llvm-objdump`, since ICF can name the wrong function
    ([[reference_profsym_profile_and_icf_confused_symbolize]]).
-3. The crash needs `parseMem` to run first, so bisect the *preceding* stages
+4. The crash needs `parseMem` to run first, so bisect the *preceding* stages
    too — dropping `parseMem` may well make it vanish and name the setup.
+
+**Whatever you do, verify each lever changed the compiled census** (`OSR
+enters` and `JIT_COMPILED: put` counts) before reading anything into a "no
+effect" row. That is what this investigation got wrong the first time.
 
 ## Relationship to the throughput work
 
