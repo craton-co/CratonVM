@@ -10382,7 +10382,7 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
             class_id: *class_id,
             num_fields: *num_fields,
         },
-        ir::Op::NewArray { element_type } => EaOp::NewArray {
+        ir::Op::NewArray { element_type, .. } => EaOp::NewArray {
             element_type: *element_type,
         },
         ir::Op::Call { .. } => EaOp::Call,
@@ -13854,6 +13854,26 @@ fn try_compile_inner(
                 builder.set_new_info(new_info_map, trivial_init_pcs);
             }
         }
+        // cov-06: resolved `anewarray` (0xbd) sites for the IR builder — the
+        // same `cp_new_resolver` the `new` block above uses (an `anewarray`
+        // CP entry is a class reference, exactly like `new`'s). Independent
+        // of the elidable-init resolver: `anewarray` has no `<init>` to
+        // elide. Only a `Resolved` site enters the map; a `Deferred` site
+        // (component class not loaded yet) is omitted, so the builder's
+        // 0xbd arm bails that method to single-pass — the same model `new`
+        // already uses for its own deferred case.
+        if !scan.anewarray_ops.is_empty() {
+            if let Some(new_resolver) = cp_new_resolver {
+                let mut anewarray_info_map =
+                    std::collections::HashMap::with_capacity(scan.anewarray_ops.len());
+                for &(pc, cp_idx) in &scan.anewarray_ops {
+                    if let Some(JitNewSite::Resolved { class_id, .. }) = new_resolver(cp_idx) {
+                        anewarray_info_map.insert(pc, class_id);
+                    }
+                }
+                builder.set_anewarray_info(anewarray_info_map);
+            }
+        }
         // cov-05: resolve `checkcast` (0xc0) / `instanceof` (0xc1) sites for
         // the IR builder — 306 events, the largest single whole-method
         // refusal in the survey, more than every opcode gap combined:
@@ -14675,20 +14695,14 @@ fn try_compile_inner(
                     );
                 }
 
-                // Arrays still use the baseline tier's specialized allocation
-                // lowering. Escaping object allocations are supported directly
-                // by the optimizing tier through the shared allocation stub;
-                // scalar-replaced objects are already `Op::Dead`.
-                let has_live_new_array = graph
-                    .nodes
-                    .iter()
-                    .any(|n| matches!(n.op, ir::Op::NewArray { .. }));
-                if has_live_new_array && ir_stage_reporting() {
-                    eprintln!(
-                        "[ir] optimizing tier declined {}.{} — a live Op::NewArray survived",
-                        cached.class_name, cached.method_name
-                    );
-                }
+                // cov-06: array allocations are now supported directly by the
+                // optimizing tier through the shared `emit_new_array_stub`,
+                // the same way escaping object allocations already are —
+                // a live `Op::NewArray` no longer forces a fall-through to
+                // the single-pass backend. (Scalar-replaced `Op::New` nodes
+                // are already `Op::Dead`; `Op::NewArray` is never scalar
+                // -replaced at all — see `escape_analysis.rs`.)
+                //
                 // Unconditional pre-lowering verification. This is the gate the
                 // review's exit criterion names: "invalid IR or ABI state
                 // causes a deterministic compilation bailout, never silent
@@ -14698,8 +14712,7 @@ fn try_compile_inner(
                 // and would itself panic on the dangling edge the verifier is
                 // there to catch. `CRATONVM_JIT_VERIFY_IR=0` is the kill switch
                 // — see `ir_verify::pre_lower_verify_disabled`.
-                if !has_live_new_array && !ir_verify_bail && !ir_verify::pre_lower_verify_disabled()
-                {
+                if !ir_verify_bail && !ir_verify::pre_lower_verify_disabled() {
                     ir_verify_bail |= ir_verify_reject(
                         &graph,
                         "pre-lower",
@@ -14708,7 +14721,7 @@ fn try_compile_inner(
                         &cached.method_descriptor,
                     );
                 }
-                if !has_live_new_array && !ir_verify_bail {
+                if !ir_verify_bail {
                     // The graph the lowerer will actually see. `live_nodes` is
                     // the non-`Op::Dead` count: the gap against `nodes` is dead
                     // arena the optimizer left behind. That gap no longer costs
@@ -14754,6 +14767,43 @@ fn try_compile_inner(
                     );
                     drop(metrics_lower);
                     if let Some(mut compiled) = lowered {
+                        // cov-06 residual: a surviving `Op::New` or
+                        // `Op::NewArray` allocation call can fail (OOM, or a
+                        // negative length for an array) and stash a pending
+                        // exception through the SAME `JIT_PENDING_EXCEPTION`
+                        // channel `getstatic`/an invoke uses — see the
+                        // `ir_static_init_classes` `has_dispatch` arm below
+                        // ("the `jit-clinit-gap-has-dispatch` defect") for the
+                        // identical shape. Without `has_dispatch`, the VM's
+                        // fast call entry never drains that pending exception,
+                        // so the allocation helper's `i64::MIN` failure
+                        // sentinel is NOT recognised as a deopt/exception —
+                        // `execute_jit_call`'s `b'[' | b'L'` return arm only
+                        // checks `result == 0`, so `i64::MIN` (`!= 0`) is
+                        // pushed as `Value::Object(Some(ObjectRef::from_raw(
+                        // 0x8000000000000000)))`, an address no live heap
+                        // region contains. Reading it back later degrades
+                        // through the NaN-box plausibility gate to
+                        // `Value::Long` (see `CompactValue::to_value`), and a
+                        // subsequent array/field access on it then reads as
+                        // silently null instead of throwing the real
+                        // OutOfMemoryError/NegativeArraySizeException.
+                        //
+                        // Reached in practice: a hot method that `newarray`s
+                        // in a tight loop under GC/heap pressure eventually
+                        // hits this path (`vm/tests/jit_cov06_array_allocation.rs`
+                        // reproduced it deterministically once the surrounding
+                        // program's memory footprint was large enough to
+                        // trigger it before `--Xmx 32m` was exhausted).
+                        // `Op::New` has the identical gap for plain object
+                        // allocation — same fix, same reasoning.
+                        if graph
+                            .nodes
+                            .iter()
+                            .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }))
+                        {
+                            compiled.has_dispatch = true;
+                        }
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
                         // for the code's lifetime, and mark the method as using
@@ -14919,8 +14969,8 @@ fn try_compile_inner(
 
     // Control reaches here either because the optimizing pipeline was never
     // admitted, or because it was entered and declined (an unbuildable graph,
-    // a verifier rejection, a surviving `NewArray`, a lowerer bail). The
-    // recorder already knows which — `enter_single_pass` flags the second case
+    // a verifier rejection, a lowerer bail). The recorder already knows which
+    // — `enter_single_pass` flags the second case
     // as a fall-through, which is what makes "the C2 tier produced no bodies"
     // separable from "the C2 tier was never asked".
     metrics.enter_single_pass();
