@@ -1,11 +1,11 @@
-# Architecture review A1–A9 — findings, fixes, and two corrections
+# Architecture review A1–A9 — findings, fixes, and three corrections
 
 **Slug:** `architecture-review-a1-a9`
 **Date:** 2026-08-04
 **Status:** LANDED for A1, A3, A4a, A6, A7, A8. **A5 WITHDRAWN** and **A2
-DOWNGRADED** — both rested on claims that measurement did not support (§A5,
-§A2). **A4b NOT DONE** — scoped below, deliberately not half-landed. **A9
-advisory.**
+CLOSED** — both rested on claims that measurement did not support, and A2's
+surviving residual was then measured and found negligible (§A5, §A2). **A4b
+NOT DONE** — scoped below, deliberately not half-landed. **A9 advisory.**
 
 Three of the nine findings were wrong in whole or in part, and all three errors
 share a shape: a conclusion drawn from the *storage* or from a grep, without
@@ -40,7 +40,7 @@ Files changed:
 | | Finding | Status |
 |---|---|---|
 | A1 | JIT bakes a `repr(Rust)` enum layout; the comment justifying it is false | **LANDED** |
-| A2 | "Statics cost a runtime tag load" | **DOWNGRADED — half wrong**; footprint-only residual, unmeasured |
+| A2 | "Statics cost a runtime tag load" | **CLOSED — half wrong, rest measured at 2-3 KiB** |
 | A3 | 13 diagnostic gates inline on the native-call funnel | **LANDED** |
 | A4a | Two byte-identical exception-unwind copies in the dispatch loop | **LANDED** |
 | A4b | 122 opcodes with two implementations; per-bytecode safepoint poll | **NOT DONE** — §A4b |
@@ -132,7 +132,7 @@ leaving `Int` at 0 while moving `Object` would still miscompile.
 
 ---
 
-# A2 — DOWNGRADED: the tag-load justification was wrong; only footprint remains
+# A2 — CLOSED: the tag-load justification was wrong; the footprint residual is 2-3 KiB
 
 ## What the review claimed
 
@@ -155,15 +155,35 @@ descriptor selecting the load width and sign-extension; it emits no runtime tag
 check. Compiled `getstatic` has never read the discriminant word. The claim was
 made from the *storage* type without reading the emitter.
 
-## What is actually left
+## What is actually left, and it was measured
 
 Footprint, and only footprint: `SLOT_SIZE` is 16, so a statics block is
 `n_fields * 16` bytes where a packed layout would be the sum of 1/2/4/8-byte
-cells. One block per loaded class, sized by that class's static count.
+cells.
 
-**This was not measured**, and it should be before anyone spends the change on
-it. The population is statics only — far smaller than instance fields or arrays,
-which already carry the compact layout.
+Measured with a temporary census in `impl Drop for SharedVm` (walk
+`classes.statics`, sum `slot_len()`, and sum the packed width of each class's
+static field descriptors from `class_manager`). The probe was reverted after
+measuring; it is not in the tree.
+
+| Workload | classes w/ statics | slots | current | packed | saving |
+|---|---:|---:|---:|---:|---:|
+| `HelloWorld` | 26 | 252 | 4,032 B | 1,041 B | 2 KiB |
+| `MapEqRepro` | 60 | 289 | 4,624 B | 1,255 B | 3 KiB |
+| `DistinctEquals` | 44 | 261 | 4,176 B | 1,102 B | 3 KiB |
+| `StringNativeAllocationChurn` | 26 | 252 | 4,032 B | 1,041 B | 2 KiB |
+| `LicmHoistBench` | 26 | 252 | 4,032 B | 1,041 B | 2 KiB |
+| `SdJwtDisclosureDigestProbe` | 25 | 252 | 4,032 B | 1,041 B | 2 KiB |
+
+The ratio is a stable **3.9×**, but the absolute number is **2–3 KiB**. Note
+`ClassRealm::statics` holds a block only for a class that has been *initialized*
+and *has* statics, which is why the population stays in the dozens even though
+the VM loads far more classes.
+
+Extrapolating generously — a large application at 15,000 initialized
+statics-bearing classes with the same ~9.7 slots each — gives ~2.3 MB current
+against ~0.6 MB packed, i.e. **a saving on the order of 1.7 MB**, well under 1%
+of a normal heap. (Extrapolated, not measured: no Spring/Tomcat run was taken.)
 
 ## Why it is now assessed as not worth doing as stated
 
@@ -182,13 +202,22 @@ change:
   one dependent deref, one payload load, whatever the cell width is.
 
 So this buys memory, not speed, at the price of a new miscompile risk class in
-the backend. That may still be worth it if the footprint turns out to be large —
-but the review presented it as a speed fix, and it is not one.
+the backend. The review presented it as a speed fix, and it is not one.
 
-**Recommendation:** measure the aggregate statics-block bytes on a real workload
-first. If the number is small, close this. `A1` is landed either way and was the
-genuine prerequisite: the cell layout the emitters read is now a language
-guarantee rather than an observation.
+## Verdict: CLOSED, not worth doing
+
+2–3 KiB measured on every available workload, ~1.7 MB on a generous
+extrapolation to a large application. That does not justify adding a per-class
+per-field offset path through the compile-time resolver and both inline
+`getstatic` emitters, whose failure mode is a silent wrong value.
+
+Reopen only if a real Spring/Tomcat measurement contradicts the extrapolation by
+an order of magnitude, or if a future change makes the read path sensitive to
+cell width (it currently is not — the emitted sequence is one baked immediate,
+one dependent deref, one payload load, at any width).
+
+`A1` is landed either way and was the genuine prerequisite: the cell layout the
+emitters read is now a language guarantee rather than an observation.
 
 ---
 
