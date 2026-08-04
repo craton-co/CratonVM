@@ -3486,6 +3486,144 @@ impl<'a> NativeContextImpl<'a> {
         trace
     }
 
+    /// H2-CID0-BLOCKED — catch the blocked-frame face of the `ClassId(0)`
+    /// family at the moment it becomes observable, instead of minutes later
+    /// on whatever call site happens to dereference it first.
+    ///
+    /// A thread parked in a native publishes its frames exactly once
+    /// (`deposit_root_snapshot`) and is then invisible to every collector
+    /// except through that snapshot. If the snapshot omits a live frame slot,
+    /// the young sweep reclaims and ZEROES the object under it and the owner
+    /// resumes reading an all-zero header. What that looks like from Java
+    /// depends only on which bytecode touches it first:
+    ///
+    /// * `NoSuchMethodError java/lang/Object.hasNext()Z` — the `for (Future
+    ///   job : jobs)` iterator in `TestMultiThread.testConcurrentUpdate`;
+    /// * `CloneNotSupportedException` — `java.lang.Object` is not `Cloneable`,
+    ///   so a zeroed header turns `super.clone()` into a plausible-looking
+    ///   application error with no GC smell at all;
+    /// * `java.lang.Object cannot be cast to X`, or a bare SIGSEGV.
+    ///
+    /// Only the first had a reporter, and it fired 1 run in 16. This audit
+    /// asks the same question of every frame slot at every wake, so the event
+    /// rate is bounded by the DEFECT rather than by which bytecode ran next.
+    ///
+    /// Cost: one header load per object slot (`ClassId(0)` slots are rare on a
+    /// healthy run — only a genuine `new Object()` reads that way), and the
+    /// free-list verdict, which takes the young and old heap locks, is reached
+    /// only for those. A process-wide probe budget bounds a workload that
+    /// really does park with `Object` locals.
+    ///
+    /// See `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
+    fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
+        static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        const PROBE_BUDGET: u64 = 200_000;
+        let heap = &self.shared.mem.heap;
+        // Nothing this thread holds can have been reclaimed since the last
+        // time this walk proved it clean unless a COLLECTION ran in between,
+        // so that is the audit's real precondition — and it is what bounds the
+        // cost. Both call sites sit on the blocked-region entry/exit path,
+        // which a workload doing file or socket I/O crosses thousands of times
+        // between two collections; without this gate the audit would walk
+        // every frame's locals and stack on each of those crossings, doubling
+        // a `deposit_root_snapshot` that already walks exactly the same slots.
+        // With it the audit costs at most one frame walk per collection per
+        // thread, which is the rate at which it can possibly have anything new
+        // to say.
+        //
+        // Thread-local because both sites run ON the owning thread, and it is
+        // seeded to `u64::MAX` so the first audit on a thread always runs.
+        // Updated on every audit rather than only at block entry, so a wake
+        // with no matching entry (or a nested blocked region) still compares
+        // against the last time THIS thread looked.
+        thread_local! {
+            static LAST_AUDITED_GC_COUNT: std::cell::Cell<u64> =
+                const { std::cell::Cell::new(u64::MAX) };
+        }
+        let gc_count = heap.collection_count();
+        if LAST_AUDITED_GC_COUNT.with(|c| c.replace(gc_count)) == gc_count {
+            return;
+        }
+        let probe = |addr: usize, ctx: &dyn Fn() -> String| {
+            if PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= PROBE_BUDGET {
+                return;
+            }
+            // Free-list membership FIRST, and only then the full report. A
+            // zeroed header is ambiguous on its own — `java.lang.Object` is
+            // `ClassId(0)` and so is a genuine `new Object()` — and the young
+            // span ring cannot settle it either, because the allocator
+            // re-serves young spans. Asking the heap whether the address is
+            // inside a hole right now is the one question with no false
+            // positives: a live object is never in a free block, never past
+            // the allocation frontier, and never in the inactive semispace.
+            if heap.reclaimed_hole_at(addr).is_none() {
+                return;
+            }
+            crate::memory::reclaim_guard::report_reclaimed_receiver(
+                self.shared,
+                addr,
+                site,
+                &ctx(),
+                0,
+            );
+        };
+        for (fi, fr) in self.thread.frames.iter().enumerate() {
+            let check = |o: cratonvm_types::ObjectRef, what: &str, idx: usize| {
+                let a = o.as_ptr() as usize;
+                // Region membership first: a lost-tag slot can hold a
+                // non-address, and the header read below is a raw
+                // dereference.
+                if heap.is_heap_addr(a).is_none() {
+                    return;
+                }
+                // `ClassId(0)` alone is not the face. A PRIMITIVE ARRAY also
+                // reads back class id 0 — array headers carry the COMPONENT
+                // class id (JVMS §4.4.1; see `virtual_dispatch_target_cached`)
+                // and `long[]`/`int[]` have none — so gating on the class id
+                // alone flags every `long[] toc` local in
+                // `FileStore.dropUnusedChunks` on every wake. Requiring
+                // `kind == Object` costs one more byte load and drops that
+                // whole population; the all-zero header the collector leaves
+                // behind reads `kind == Object` because that is discriminant
+                // zero.
+                if heap.class_id_of(o).as_u32() != 0
+                    || heap.kind_of(o) != cratonvm_types::ObjectKind::Object
+                {
+                    return;
+                }
+                probe(a, &|| {
+                    format!(
+                        "tid={} frame#{fi} {}.{} pc={} {what}[{idx}]",
+                        self.thread.thread_id.0,
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.pc,
+                    )
+                });
+            };
+            // Only locals the collector itself would have rooted. A local
+            // the liveness analysis calls dead is SUPPOSED to be reclaimable:
+            // `H2ConcurrentUpdateLoop.main` slot 8 holds the seed loop's
+            // `PreparedStatement` for the rest of the method and read back as
+            // a free block on every wake. Counting those separately keeps the
+            // signal — a LIVE local the collector took anyway — visible.
+            let live_mask = fr.live_locals_mask_here();
+            for li in 0..fr.locals_len() {
+                if li < 64 && live_mask & (1u64 << li) == 0 {
+                    continue;
+                }
+                if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                    check(o, "local", li);
+                }
+            }
+            for si in 0..fr.stack.len() {
+                if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                    check(o, "stack", si);
+                }
+            }
+        }
+    }
+
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
     ///
@@ -3885,6 +4023,12 @@ impl<'a> NativeContextImpl<'a> {
                 }
             }
         }
+        // H2-CID0-BLOCKED: a slot that is ALREADY zeroed here was reclaimed
+        // before this block, so the blocked window is not where it was lost —
+        // the distinction the wake-side audit cannot make on its own.
+        if raise_blocked_flag {
+            self.audit_frames_for_reclaimed_slots("blocked frame slot (block entry)");
+        }
         // Mark the blocked region AFTER the snapshot is complete: from this
         // point on, every GC initiator maintains this thread's roots via
         // `fold_pointer_map_into_blocked` (snapshot remap + frame-fixup
@@ -4160,6 +4304,12 @@ impl<'a> NativeContextImpl<'a> {
                 }
             }
         }
+        // H2-CID0-BLOCKED: every relocation this thread slept through has now
+        // been applied, so any frame slot still reading `ClassId(0)` is either
+        // a genuine `new Object()` or an object that was RECLAIMED while this
+        // thread was parked and could not defend it. `report_reclaimed_receiver`
+        // separates the two by free-list membership.
+        self.audit_frames_for_reclaimed_slots("blocked frame slot (wake)");
         // Refresh (don't clear) the snapshot: we are runnable again but may
         // not reach a safepoint before the next GC scans roots; an empty
         // snapshot would hide every object reachable only from our frames.
@@ -6551,6 +6701,10 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         // `VmError::Internal`, aborting the whole VM instead of letting
         // Java code catch them.
         crate::vm::vm_util::ensure_class_initialized_shared(&self.shared, self.thread, class_id)
+    }
+
+    fn in_clinit(&self) -> bool {
+        crate::vm::vm_util::in_clinit_shared()
     }
 
     fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
@@ -8986,6 +9140,37 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     #[track_caller]
     fn array_length(&self, obj: ObjectRef) -> usize {
+        // KINDOF-SENTINEL: `obj` reaches this native accessor from callers
+        // (e.g. `native-collections`' `map_state`, which validates a bucket
+        // array via `heap_kind_of` and then calls this several lines later)
+        // that treat an earlier validation as still good at the point of
+        // use. Observed once with `obj` as the all-ones sentinel
+        // `0xFFFFFFFFFFFFFFFF` — not a stale-but-plausible address, and not
+        // reachable through any conservative-root-scan path (those all
+        // filter through `is_object_address`, which this call chain does
+        // not). `load_and_forward`'s very first read (`header.is_forwarded()`)
+        // dereferences the raw pointer unconditionally, so an invalid `obj`
+        // here is a hard crash rather than a wrong answer. Validate before
+        // touching memory at all, and fall back to the same "not an array"
+        // diagnostic path already used below for a live-but-wrong-kind object.
+        if self
+            .shared
+            .mem
+            .heap
+            .is_object_address(obj.as_ptr() as usize)
+            .is_none()
+        {
+            if crate::runtime::env_cache::dbg_arrlen() {
+                let loc = std::panic::Location::caller();
+                eprintln!(
+                    "[ARRAY-LEN-GUARD] obj is not a valid heap address rust-caller={}:{} obj={:?}",
+                    loc.file(),
+                    loc.line(),
+                    obj
+                );
+            }
+            return 0;
+        }
         let obj = self.shared.mem.heap.load_and_forward(obj);
         let kind = self.shared.mem.heap.kind_of(obj);
         if kind != ObjectKind::Array {
@@ -11567,6 +11752,31 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                 .threads
                 .thread_registry
                 .set_interrupted(tid, true);
+            // Wake a target parked in `Object.wait()`, for the same reason the
+            // `LockSupport.park` unpark below exists: `interrupt()` only sets a
+            // flag, and `Monitor::wait` can observe it no sooner than its next
+            // 5 ms poll slice. `Object.wait()` was the one blocking primitive
+            // left without a prompt wake — a thread interrupted while waiting
+            // sat in the condvar for up to a full slice before throwing
+            // `InterruptedException`, and an untimed wait had nothing but that
+            // poll to end it.
+            //
+            // The registry already records which monitor a thread is parked on
+            // (written for JMX right before the park, taken right after), so the
+            // target is identified without a new side table. The wake consumes
+            // no pending notification, and a `Some` that has already gone stale
+            // costs one spurious wakeup, which `Object.wait()` permits.
+            if let Some(monitor_obj) = self
+                .shared
+                .threads
+                .thread_registry
+                .peek_jmx_waiting_monitor(tid)
+            {
+                self.shared
+                    .threads
+                    .monitors
+                    .wake_waiters_for_interrupt(monitor_obj);
+            }
         }
         // Match HotSpot `Thread.interrupt0`: wake the target if it is parked in
         // `LockSupport.park` (e.g. AQS `ConditionObject.await`). Without this the
@@ -13235,13 +13445,21 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
-        #[cfg(windows)]
-        // Conscrypt's extracted OpenJDK JNI DLL uses the same unsafe
-        // RegisterNatives-on-load pattern as tcnative on CratonVM.
+        // Conscrypt's extracted OpenJDK JNI library uses the same unsafe
+        // RegisterNatives-on-load pattern as tcnative on CratonVM, on every
+        // platform -- not just Windows. Its JNI_OnLoad calls FindClass on a
+        // handful of bootstrap classes before doing anything else, and our
+        // FindClass (and the RegisterNatives it feeds) aren't ABI-complete
+        // enough to satisfy it; conscrypt's own init aborts the process the
+        // moment one of those lookups fails (SIGABRT from inside
+        // libconscrypt_openjdk_jni's `jniutil::init`, not a Rust panic).
+        // Jetty only needs a provider that can advertise its ALPN processor
+        // while it builds a connector; the actual TLS engine remains
+        // CratonVM's own TLS surface (`t27_tls.rs`), and the Java entry
+        // points conscrypt's Java-side classes call into are satisfied by
+        // `register_conscrypt_native_bridges` in native-builtins/src/tls.rs.
         let skip_jni_onload_tcnative =
             basename_lc.contains("tcnative") || basename_lc.contains("conscrypt_openjdk_jni");
-        #[cfg(not(windows))]
-        let skip_jni_onload_tcnative = false;
 
         unsafe {
             type JniOnLoad = extern "C" fn(
@@ -22088,7 +22306,7 @@ fn invoke_on_class_shared_inner(
                 // `TestMultiThread.testConcurrentUpdate @pc=252` — the
                 // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
                 // docs/known-issues/h2/
-                // bug-h2-blocked-frame-classid0-dispatch-miss.md.
+                // bug-h2-classid0-stale-address-family.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
                     crate::memory::reclaim_guard::report_reclaimed_receiver(
                         shared,
@@ -23212,6 +23430,43 @@ mod tests {
             new,
             "monitor_on_exit must be forwarded, or the implicit monitorexit \
              releases a vacated address"
+        );
+    }
+
+    /// KINDOF-SENTINEL (2026-08-03): `NativeHeapAccess::array_length` used to
+    /// dereference `obj` unconditionally via `load_and_forward` before ever
+    /// checking it pointed at real heap memory. Observed once in the wild as
+    /// a `native-collections::map_state` bucket-array reference that had
+    /// gone from a validated `ObjectKind::Array` to the all-ones sentinel
+    /// `0xFFFFFFFFFFFFFFFF` by the time this accessor read it — an
+    /// `EXCEPTION_ACCESS_VIOLATION` reading exactly that address. Whatever
+    /// corrupted the value upstream, `array_length` itself must not crash on
+    /// an invalid pointer: it has an established "not an array" fallback
+    /// (returns 0) for a *live* non-array object, and an invalid address
+    /// must take that same safe path rather than a hard fault.
+    #[test]
+    fn array_length_rejects_an_invalid_object_pointer_instead_of_faulting() {
+        let shared = test_shared();
+        let tid = ThreadId(0x7603);
+        let mut thread = JvmThread::new(tid, "kindof-sentinel-test");
+
+        let ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        // SAFETY: deliberately constructing an invalid ObjectRef to prove
+        // `array_length` validates before dereferencing — never dereferenced
+        // as a real pointer if the fix holds. 8-byte aligned (unlike the
+        // observed all-ones sentinel) only to clear `ObjectRef::from_raw`'s
+        // `debug_assert_aligned`, which is compiled out in the release build
+        // where the real crash was observed; `is_object_address` rejects
+        // this for being outside every heap region, the same rejection path
+        // an unaligned address takes.
+        let sentinel = unsafe { ObjectRef::from_raw(0xFFFF_FFFF_FFFF_FFF8u64 as *mut u8) };
+        assert_eq!(
+            ctx.array_length(sentinel),
+            0,
+            "an invalid pointer must fall back to 0, not fault"
         );
     }
 

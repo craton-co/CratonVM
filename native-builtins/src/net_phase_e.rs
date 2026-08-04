@@ -11492,21 +11492,30 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
     ] {
         r.register(ctx_cls, "createSSLEngine", desc, |ctx, args| {
-            let eng = alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4);
+            let eng0 = alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4);
+            // Everything below this point allocates (a ReentrantLock, and the
+            // peer-host String further down), so `eng` must be pinned and
+            // re-read rather than held raw across those calls.
+            let eng_pin = ctx.pin_native_root(eng0);
             let lock = match ctx.new_object_initialized(
                 "java/util/concurrent/locks/ReentrantLock",
                 "()V",
                 &[],
             )? {
                 Some(Value::Object(Some(lock))) => lock,
-                _ => return Err(npe("ReentrantLock <init> failed")),
+                _ => {
+                    ctx.unpin_native_roots(eng_pin);
+                    return Err(npe("ReentrantLock <init> failed"));
+                }
             };
+            let eng = ctx.read_native_pin(eng_pin, eng0);
             ctx.set_field_by_name(eng, "engineLock", Value::Object(Some(lock)));
             // Copy this SSLContext's per-context identity (its keystore cert+key)
             // onto the engine, so the rustls handshake presents THIS context's
             // cert (server cert, or client cert for mTLS) instead of the global.
             if let Ok(sslctx) = obj_arg(args, 0) {
                 let identity = crate::t27_tls::ctx_identity(ctx, sslctx);
+                let eng = ctx.read_native_pin(eng_pin, eng0);
                 // A client context commonly has only trust material. Capture
                 // its roots before the next context creation can replace the
                 // thread-local selection used by the rustls engine.
@@ -11519,6 +11528,26 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 // (independent of whether a KMF identity was also present).
                 crate::t27_tls::set_engine_trust_ctx_key(ctx, eng, sslctx);
             }
+            // `createSSLEngine(String host, int port)` — record the host the
+            // caller intends to reach. Dropping it silently made this engine
+            // announce `localhost` as its SNI whatever host was dialled, and
+            // left RFC 2818 endpoint identification with nothing to verify
+            // against (see `t27_tls::set_engine_peer_host`). The no-arg
+            // overload shares this closure, hence the arity test rather than a
+            // per-descriptor body.
+            if args.len() >= 3 {
+                let host = match args.get(1) {
+                    Some(Value::Object(Some(h))) => ctx.read_string(*h),
+                    _ => None,
+                };
+                let port = args.get(2).and_then(|v| v.as_int()).unwrap_or(-1);
+                if let Some(host) = host.filter(|h| !h.is_empty()) {
+                    let eng = ctx.read_native_pin(eng_pin, eng0);
+                    crate::t27_tls::set_engine_peer_host(ctx, eng, host, port);
+                }
+            }
+            let eng = ctx.read_native_pin(eng_pin, eng0);
+            ctx.unpin_native_roots(eng_pin);
             Ok(Some(Value::Object(Some(eng))))
         });
     }

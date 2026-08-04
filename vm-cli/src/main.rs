@@ -60,6 +60,25 @@ fn maybe_dump_shutdown_reports() {
 
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
+        // The bytecode loop rewriter's admission tally, on the same switch and
+        // for the same reason: it is what the compiler did, read at exit. The
+        // counters themselves are always collected (they do not consult
+        // `metrics::enabled()`), so this prints real numbers from a default
+        // run — which is the measurement that retired three of the four gates
+        // (`docs/known-issues/c2/loop-02-planner-admission-gates.md`) and is
+        // what would say immediately if one of them got back in the way.
+        //
+        // The four condition rows OVERLAP: a method with an `invokedynamic`
+        // compiled under `deopt_real` is in both. Read each against
+        // `loop_xform_compiles`; never sum them. Only `loop_xform_inline_sites`
+        // still refuses; the other three are counted and admitted.
+        let tally = cratonvm_jit::metrics::loop_xform_counts();
+        let row = tally
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("[cratonvm] loop-xform admission: {row}");
     }
 
     // Phase accounting. Delegate the compile-phase breakdown rather than
@@ -113,6 +132,12 @@ Class library and compatibility policy:
                                 shims). This is the default.
   --synthetic-jdk               Standalone synthetic class library (~5,200 Rust
                                 stubs). Conflicts with --real-jdk and --jdk-only.
+                                Needs a binary built with the `synthetic-jdk`
+                                Cargo feature, which is NOT in the default set;
+                                without it the launcher exits with an error
+                                instead of starting a VM with no class library.
+                                `-Xinternalversion` reports whether this build
+                                has it (jdk.mode.synthetic_compiled_in).
   --jdk-only                    Real JDK, and real class bytes are authoritative:
                                 no fabricated compatibility class and no
                                 synthetic-stub native. Implies --real-jdk.
@@ -3935,8 +3960,7 @@ fn run() -> Result<()> {
             // Cross-thread STW peer-scan coverage. A non-zero count means the
             // collector swept while a peer it could not classify was still
             // running JIT code, i.e. that cycle marked from an INCOMPLETE root
-            // set. See docs/known-issues/h2/
-            // bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md.
+            // set. See docs/gc/old-sweep-liveness.md.
             use std::sync::atomic::Ordering as O;
             let peers = cratonvm_vm::jit::xt_root_scan::XT_PEERS_UNCLASSIFIED.load(O::Relaxed);
             let cycles =
@@ -5292,6 +5316,49 @@ mod tests {
         if let Err(e) = result {
             let msg = format!("{e:#}");
             assert!(msg.contains("synthetic-jdk"), "{msg}");
+        }
+    }
+
+    /// The general-bugs TODO's "update the usage docs accordingly": the
+    /// `synthetic-jdk` build requirement is a property a user hits at launch,
+    /// so `--help` has to state it. The rejection message alone is not
+    /// documentation — it only appears after the run has already failed.
+    #[test]
+    fn the_usage_text_states_the_synthetic_jdk_build_requirement() {
+        // `LONG_ABOUT` is hand-wrapped to the help column, so a phrase can be
+        // split across lines with the next line's indent in between. Collapse
+        // whitespace before matching rather than pinning today's line breaks.
+        let flat = LONG_ABOUT.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("synthetic-jdk` Cargo feature"),
+            "--help must name the Cargo feature --synthetic-jdk needs"
+        );
+        assert!(
+            flat.contains("jdk.mode.synthetic_compiled_in"),
+            "--help must point at the way to check whether THIS build has it"
+        );
+    }
+
+    /// `--real-jdk` must select the real library outright, including in a
+    /// build that does have the synthetic one compiled in. The two flags are
+    /// symmetric selections, not a preference the build configuration can
+    /// override.
+    #[test]
+    fn real_jdk_flag_selects_real_mode_regardless_of_the_synthetic_feature() {
+        // Point at a nonexistent JAVA_HOME so the mode is decided without
+        // depending on whether this machine has a JDK: an `Err` naming the
+        // real-JDK search proves real mode was chosen, and an `Ok` carries the
+        // mode directly.
+        match resolve_jdk_mode(false, true, Some("/definitely/not/a/jdk/anywhere")) {
+            Ok((mode, _)) => assert_eq!(mode, cratonvm_vm::config::JdkMode::Real),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("no usable JDK was found"),
+                    "--real-jdk must fail through the REAL-JDK path, not fall \
+                     back to synthetic: {msg}"
+                );
+            }
         }
     }
 

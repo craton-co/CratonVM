@@ -89,6 +89,11 @@ pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
 pub mod ir_schedule;
+// The OSR entry-metadata contract, as executable checks — see
+// `docs/feature-designs/jit-osr-entry-metadata.md`. Kept out of this file
+// deliberately: it must be testable against synthetic vectors, and a check
+// that can only be handed a real `CompiledMethod` cannot be.
+pub mod osr_contract;
 pub mod ir_verify;
 pub mod loop_analysis;
 pub mod metrics;
@@ -352,6 +357,12 @@ pub struct ExecutableBuffer {
     /// bail is indistinguishable from a method the JIT declined for any other
     /// reason. See [`wanted`](Self::wanted).
     wanted: usize,
+    /// AUDIT: set once the owning `CompiledMethod` has been published into a
+    /// dispatch surface, i.e. once a raw pointer into this buffer can be held
+    /// by generated code. A free of a buffer with this bit clear is harmless
+    /// whatever `ACTIVE_JIT_EXECUTIONS` reads; a free of one with it set is
+    /// only safe if the retirement queue authorised it.
+    published: bool,
     /// Which sizing heuristic allocated this buffer, for the overflow warning.
     ///
     /// Four independent estimates allocate executable buffers, and the warning
@@ -388,8 +399,15 @@ impl ExecutableBuffer {
             capacity,
             overflowed: false,
             wanted: 0,
+            published: false,
             tag: "untagged",
         })
+    }
+
+    /// AUDIT: mark this buffer as reachable by generated code.
+    #[inline]
+    pub fn mark_published(&mut self) {
+        self.published = true;
     }
 
     /// Name the sizing heuristic that allocated this buffer. Shown by the
@@ -593,6 +611,36 @@ impl ExecutableBuffer {
         Ok(())
     }
 
+    /// Patch a `rel8` branch displacement, or discard the compile.
+    ///
+    /// The one rule this enforces is that a displacement which does not fit in
+    /// an `i8` must NEVER be written truncated. `rel as u8` is not a near-miss:
+    /// it turns an out-of-range forward branch into a backward one, and on x86
+    /// the landing site is normally the middle of an earlier instruction. The
+    /// inline-PIC cascade shipped exactly that — `JNE -128` into the body of
+    /// the pre-call spill/shadow-push run, which then ran as an unguarded
+    /// infinite push loop (`docs/internal/jit-raw-jit-to-jit-shadow-stack-
+    /// overflow-FIXED-20260731.md`), and the same wrap reappeared as a
+    /// deterministic SIGILL in the `CRATONVM_NO_MOVING_YOUNG=1` lane, whose
+    /// larger slot bodies pushed the same branch past 127 bytes.
+    ///
+    /// Marking the buffer overflowed makes the driver's
+    /// `if buf.overflowed() { return None; }` discard the half-emitted method
+    /// and fall back to the interpreter, which is always valid. Every emitter
+    /// that patches a short branch goes through here — `jit`'s only remaining
+    /// `try_patch_byte(.., .. as u8)` is the one inside this function, which
+    /// `rel8_displacement_patches_all_go_through_the_range_checked_helper`
+    /// pins.
+    pub fn patch_rel8_or_bail(&mut self, patch: usize, rel: i64) {
+        match i8::try_from(rel) {
+            // Cast: rel8 displacement, range-checked immediately above.
+            Ok(v) => {
+                self.try_patch_byte(patch, v as u8).ok();
+            }
+            Err(_) => self.mark_overflowed(),
+        }
+    }
+
     // task #44: the deprecated panicking `patch_i32` / `patch_byte` shims
     // have been removed. Every internal codegen site was migrated to the
     // `try_patch_*` variants in task #20 (commit acd57f2). A workspace grep
@@ -777,10 +825,39 @@ impl Drop for ExecutableBuffer {
         // thread was inside compiled code — which is precisely the bug the
         // `defer_jit_owner` retirement queue above exists to prevent, so a
         // non-zero value here means some release path is still bypassing it.
+        let authorised = reclaim_is_authorised();
+        let mut flags = 0usize;
+        if self.published {
+            flags |= CODE_FREE_PUBLISHED;
+            PUBLISHED_CODE_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !authorised {
+                // THE invariant this module exists to keep. A published body's
+                // mapping may only be returned from inside a reclamation the
+                // retirement queue proved safe; every other path releases it
+                // without having asked whether a thread is executing it, which
+                // is a use-after-free of executable memory.
+                let n = UNQUEUED_PUBLISHED_CODE_FREES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 32 && dbg_jit_code_free_enabled() {
+                    eprintln!(
+                        "[jit-unqueued-free] PUBLISHED body base={:#x} len={:#x} \
+released OUTSIDE the retirement queue; active_jit_executions={}\n{}",
+                        self.ptr as usize,
+                        self.capacity,
+                        ACTIVE_JIT_EXECUTIONS.get(),
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
+        if authorised {
+            flags |= CODE_FREE_AUTHORISED;
+        }
         record_code_free(
             self.ptr as usize,
             self.capacity,
             ACTIVE_JIT_EXECUTIONS.get(),
+            flags,
         );
         if never_free_code_enabled() {
             return;
@@ -820,17 +897,95 @@ static RECENT_FREE_LEN: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
 static RECENT_FREE_ACTIVE: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
+/// Bit 0: the buffer belonged to a *published* body, i.e. one a dispatch
+/// surface could hand a raw pointer to. Bit 1: the release was authorised by
+/// the retirement queue's quiescence proof.
+///
+/// Both are needed to read `RECENT_FREE_ACTIVE` correctly, and neither used to
+/// be recorded. `active_jit_executions` alone cannot distinguish a genuine
+/// bypass from (a) a discarded compile attempt, which nothing can point into,
+/// or (b) a perfectly legal reclamation whose `munmap` merely happened after
+/// some *other* thread entered compiled code — the count is sampled at the
+/// unmap, not at the decision. A crash report that names only the count
+/// therefore reads as damning when it is not; see
+/// `docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
+static RECENT_FREE_FLAGS: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
+
+/// `RECENT_FREE_FLAGS` bit: the buffer belonged to a published body.
+pub const CODE_FREE_PUBLISHED: usize = 1;
+/// `RECENT_FREE_FLAGS` bit: the retirement queue authorised the release.
+pub const CODE_FREE_AUTHORISED: usize = 2;
 static RECENT_FREE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn record_code_free(base: usize, len: usize, active_executions: usize) {
+thread_local! {
+    /// AUDIT: non-zero while this thread is inside a reclamation the retirement
+    /// queue authorised (`defer_jit_owner`'s quiescent fast path, or the drain).
+    /// Nested drops inherit it, which is correct: a `CompiledMethod` reclaimed
+    /// under the queue also reclaims the callee roots and inline-cache owners it
+    /// held.
+    static AUTHORISED_RECLAIM_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct AuthorisedReclaim;
+
+impl AuthorisedReclaim {
+    fn enter() -> Self {
+        AUTHORISED_RECLAIM_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        AuthorisedReclaim
+    }
+}
+
+impl Drop for AuthorisedReclaim {
+    fn drop(&mut self) {
+        AUTHORISED_RECLAIM_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+fn reclaim_is_authorised() -> bool {
+    AUTHORISED_RECLAIM_DEPTH
+        .try_with(|d| d.get() != 0)
+        .unwrap_or(false)
+}
+
+/// AUDIT: published bodies whose mapping was released.
+static PUBLISHED_CODE_FREES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// AUDIT: published bodies released by a path the retirement queue never saw.
+/// **Every one of these is a potential use-after-free of executable memory**:
+/// nothing on that path asked whether a thread was inside the body.
+static UNQUEUED_PUBLISHED_CODE_FREES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Published bodies unmapped, and how many of those bypassed the retirement
+/// queue.
+pub fn published_code_free_audit() -> (usize, usize) {
+    (
+        PUBLISHED_CODE_FREES.load(std::sync::atomic::Ordering::Relaxed),
+        UNQUEUED_PUBLISHED_CODE_FREES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `CRATONVM_DBG_JIT_CODE_FREE=1` — name the release site of every executable
+/// buffer, and of every published body released outside the retirement queue.
+fn dbg_jit_code_free_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_CODE_FREE").is_some())
+}
+
+fn record_code_free(base: usize, len: usize, active_executions: usize, flags: usize) {
     use std::sync::atomic::Ordering;
     // DIAG (`CRATONVM_DBG_JIT_CODE_FREE=1`): name the release site. Executable
     // buffers are unmapped a handful of times per process, so capturing a
     // backtrace here is free in practice and it is the only way to tell WHICH
     // owner dropped last — the crash it explains reports only an address.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_CODE_FREE").is_some() {
+    if dbg_jit_code_free_enabled() {
         eprintln!(
-            "[jit-code-free] base={base:#x} len={len:#x} active_jit_executions={active_executions}\n{}",
+            "[jit-code-free] base={base:#x} len={len:#x} active_jit_executions={active_executions} \
+published={} authorised={}\n{}",
+            flags & CODE_FREE_PUBLISHED != 0,
+            flags & CODE_FREE_AUTHORISED != 0,
             std::backtrace::Backtrace::force_capture()
         );
     }
@@ -841,6 +996,7 @@ fn record_code_free(base: usize, len: usize, active_executions: usize) {
     RECENT_FREE_BASE[i].store(0, Ordering::Relaxed);
     RECENT_FREE_LEN[i].store(len, Ordering::Relaxed);
     RECENT_FREE_ACTIVE[i].store(active_executions, Ordering::Relaxed);
+    RECENT_FREE_FLAGS[i].store(flags, Ordering::Relaxed);
     RECENT_FREE_BASE[i].store(base, Ordering::Release);
 }
 
@@ -850,10 +1006,17 @@ pub fn code_frees_total() -> usize {
 }
 
 /// Was `addr` inside one of the last [`RECENT_CODE_FREES`] executable buffers
-/// this process unmapped? Returns `(base, len, active_jit_executions_at_free)`.
+/// this process unmapped? Returns
+/// `(base, len, active_jit_executions_at_free, flags)`, where `flags` carries
+/// [`CODE_FREE_PUBLISHED`] and [`CODE_FREE_AUTHORISED`].
+///
+/// Read the flags before the count. An unpublished buffer is one nothing could
+/// point into, and an authorised release already carries a quiescence proof —
+/// in both cases a non-zero `active_jit_executions_at_free` says nothing,
+/// because the count is sampled at the `munmap` rather than at the decision.
 ///
 /// Async-signal-safe: atomic loads only.
-pub fn recent_code_free_covering(addr: usize) -> Option<(usize, usize, usize)> {
+pub fn recent_code_free_covering(addr: usize) -> Option<(usize, usize, usize, usize)> {
     use std::sync::atomic::Ordering;
     for i in 0..RECENT_CODE_FREES {
         let base = RECENT_FREE_BASE[i].load(Ordering::Acquire);
@@ -862,7 +1025,12 @@ pub fn recent_code_free_covering(addr: usize) -> Option<(usize, usize, usize)> {
         }
         let len = RECENT_FREE_LEN[i].load(Ordering::Relaxed);
         if addr >= base && addr < base.saturating_add(len) {
-            return Some((base, len, RECENT_FREE_ACTIVE[i].load(Ordering::Relaxed)));
+            return Some((
+                base,
+                len,
+                RECENT_FREE_ACTIVE[i].load(Ordering::Relaxed),
+                RECENT_FREE_FLAGS[i].load(Ordering::Relaxed),
+            ));
         }
     }
     None
@@ -963,7 +1131,14 @@ impl OopMapEntry {
 // `CompiledMethod` stays alive through cache, direct-call, inline-cache, and
 // active-reader ownership. Its final Drop unregisters the range before unmap.
 
-type JitCodeRange = (usize, usize, usize);
+/// `(start, end, cm_ptr, owner)`.
+///
+/// `owner` is what makes [`pin_jit_code_range_owner`] lock-free, and it exists
+/// because a *pin* — not a bare `cm_ptr` — is what the JIT-dispatch helper needs
+/// before it calls a raw entry. `cm_ptr` is retained beside it for the root
+/// walkers, which run under their own quiescence rules and want no refcount
+/// traffic per stack word.
+type JitCodeRange = (usize, usize, usize, std::sync::Weak<CompiledMethod>);
 
 /// Copy-on-write code-range registry.
 ///
@@ -1025,14 +1200,38 @@ pub fn jit_code_ranges_generation() -> u64 {
 /// Register `[entry, entry+len)` → `cm_ptr` (the `Arc<CompiledMethod>` inner
 /// address). No-op for empty/zero ranges. Stage 5.
 pub fn register_jit_code_range(entry: usize, len: usize, cm_ptr: usize) {
+    register_jit_code_range_inner(entry, len, cm_ptr, std::sync::Weak::new())
+}
+
+/// Register a range together with a weak handle on its owner, so
+/// [`pin_jit_code_range_owner`] can retain the body without taking a lock.
+///
+/// This is the form the two publication sites use. The bare
+/// [`register_jit_code_range`] remains for synthetic ranges (tests) that have no
+/// `Arc` to downgrade; pinning one of those falls back to the locking path.
+pub fn register_jit_code_range_owned(entry: usize, len: usize, owner: &Arc<CompiledMethod>) {
+    register_jit_code_range_inner(
+        entry,
+        len,
+        Arc::as_ptr(owner) as usize,
+        Arc::downgrade(owner),
+    )
+}
+
+fn register_jit_code_range_inner(
+    entry: usize,
+    len: usize,
+    cm_ptr: usize,
+    owner: std::sync::Weak<CompiledMethod>,
+) {
     if entry == 0 || len == 0 || cm_ptr == 0 {
         return;
     }
     let registry = jit_code_ranges();
     if let Ok(_writer) = registry.writer.lock() {
         let mut next = (**registry.snapshot.load()).clone();
-        next.push((entry, entry.saturating_add(len), cm_ptr));
-        next.sort_unstable_by_key(|&(start, _, _)| start);
+        next.push((entry, entry.saturating_add(len), cm_ptr, owner));
+        next.sort_unstable_by_key(|&(start, _, _, _)| start);
         registry.snapshot.store(std::sync::Arc::new(next));
         // Release: any cached snapshot taken with Acquire after this point must
         // see the push above (ordinary Mutex unlock already provides this, but
@@ -1051,7 +1250,7 @@ pub fn unregister_jit_code_range(entry: usize) {
     let registry = jit_code_ranges();
     if let Ok(_writer) = registry.writer.lock() {
         let mut next = (**registry.snapshot.load()).clone();
-        next.retain(|&(e, _, _)| e != entry);
+        next.retain(|(e, _, _, _)| *e != entry);
         registry.snapshot.store(std::sync::Arc::new(next));
         JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -1103,7 +1302,7 @@ pub fn jit_code_ranges_snapshot() -> Vec<(usize, usize)> {
         .snapshot
         .load()
         .iter()
-        .map(|&(e, end, _)| (e, end))
+        .map(|(e, end, _, _)| (*e, *end))
         .collect()
 }
 
@@ -1112,9 +1311,9 @@ pub fn jit_code_ranges_snapshot() -> Vec<(usize, usize)> {
 /// a lock-free binary search. Stage 5.
 pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
     let ranges = jit_code_ranges().snapshot.load();
-    let candidate = ranges.partition_point(|&(entry, _, _)| entry <= addr);
-    let &(entry, end, cm) = ranges.get(candidate.checked_sub(1)?)?;
-    (addr >= entry && addr < end).then_some(cm)
+    let candidate = ranges.partition_point(|(entry, _, _, _)| *entry <= addr);
+    let (entry, end, cm, _) = ranges.get(candidate.checked_sub(1)?)?;
+    (addr >= *entry && addr < *end).then_some(*cm)
 }
 
 /// Resolve `addr` to a *retained* owner of the compiled body containing it.
@@ -1132,20 +1331,29 @@ pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
 /// makes the metadata and the code buffer valid for as long as it is held.
 /// `None` means "no live body covers this address", which is the safe answer.
 ///
-/// Costs one mutex acquisition on `jit_entry_owners` over the lock-free range
-/// search, so it belongs on the per-frame paths (a root scan naming one frame),
-/// not on the per-stack-word conservative sweep — that one wants
-/// [`snapshot_code_ranges_into`], which hands out no owner pointer at all.
+/// Costs one `Weak::upgrade` — an atomic increment — over the lock-free range
+/// search, so it is affordable on the per-dispatch path that calls a raw entry,
+/// not just on the per-frame ones. It is NOT for the per-stack-word
+/// conservative sweep; that one wants [`snapshot_code_ranges_into`], which
+/// hands out no owner at all.
 pub fn pin_jit_code_range_owner(addr: usize) -> Option<Arc<CompiledMethod>> {
     let entry = {
         let ranges = jit_code_ranges().snapshot.load();
-        let candidate = ranges.partition_point(|&(entry, _, _)| entry <= addr);
-        let &(entry, end, _) = ranges.get(candidate.checked_sub(1)?)?;
-        if addr < entry || addr >= end {
+        let candidate = ranges.partition_point(|(entry, _, _, _)| *entry <= addr);
+        let (entry, end, _, owner) = ranges.get(candidate.checked_sub(1)?)?;
+        if addr < *entry || addr >= *end {
             return None;
         }
-        entry
+        // Fast path: the range was registered by `put`/`put_osr`, which carry
+        // the owner. A live body upgrades with one atomic increment.
+        if let Some(pinned) = owner.upgrade() {
+            return Some(pinned);
+        }
+        *entry
     };
+    // Either the body is gone (the honest `None`), or this range was registered
+    // without an owner — the synthetic ranges unit tests install. Both are rare
+    // enough to pay `jit_entry_owners`'s lock.
     resolve_jit_entry_owner(entry)
 }
 
@@ -1163,7 +1371,7 @@ pub fn pin_jit_code_range_owner(addr: usize) -> Option<Arc<CompiledMethod>> {
 pub fn snapshot_code_ranges_into(buf: &mut Vec<(usize, usize)>) {
     buf.clear();
     let ranges = jit_code_ranges().snapshot.load();
-    buf.extend(ranges.iter().map(|&(e, end, _)| (e, end)));
+    buf.extend(ranges.iter().map(|(e, end, _, _)| (*e, *end)));
 }
 
 /// DBG (spring-bug-11): code-range → method-name table for naming a JIT frame in
@@ -2209,49 +2417,58 @@ impl CompiledMethod {
     /// The compiled code must match the expected signature.
     #[inline]
     pub unsafe fn try_call(&self, args: &[i64]) -> Result<i64, CompileError> {
-        validate_code_ptr(self.entry).map_err(CompileError::InvalidCodePtr)?;
+        // Read the entry ONCE and both validate and call THAT value.
+        //
+        // `validate_code_ptr(self.entry)` followed by `transmute(self.entry)`
+        // is a time-of-check/time-of-use hole: the two are separate loads, the
+        // optimiser is free to reload, and the pointer is written through raw
+        // pointers by paths this `&self` does not synchronise with. Whatever
+        // produces a null there, the one guarantee worth having is that the
+        // pointer we jump to is the pointer we checked.
+        let entry = self.entry;
+        validate_code_ptr(entry).map_err(CompileError::InvalidCodePtr)?;
         match args.len() {
             0 => {
-                let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(entry);
                 Ok(f())
             }
             1 => {
-                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(args[0]))
             }
             2 => {
-                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(args[0], args[1]))
             }
             3 => {
-                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2]))
             }
             4 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2], args[3]))
             }
             5 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2], args[3], args[4]))
             }
             6 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(args[0], args[1], args[2], args[3], args[4], args[5]))
             }
             7 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     args[0], args[1], args[2], args[3], args[4], args[5], args[6],
                 ))
             }
             8 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
                 ))
@@ -2286,45 +2503,48 @@ impl CompiledMethod {
         vm_ptr: i64,
         args: &[i64],
     ) -> Result<i64, CompileError> {
-        validate_code_ptr(self.entry).map_err(CompileError::InvalidCodePtr)?;
+        // Read the entry ONCE — see [`CompiledMethod::try_call`] for why
+        // validating one load and calling another is not the same check.
+        let entry = self.entry;
+        validate_code_ptr(entry).map_err(CompileError::InvalidCodePtr)?;
         match args.len() {
             0 => {
-                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(vm_ptr))
             }
             1 => {
-                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0]))
             }
             2 => {
-                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(self.entry);
+                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1]))
             }
             3 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1], args[2]))
             }
             4 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1], args[2], args[3]))
             }
             5 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(vm_ptr, args[0], args[1], args[2], args[3], args[4]))
             }
             6 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5],
                 ))
             }
             7 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
-                    std::mem::transmute(self.entry);
+                    std::mem::transmute(entry);
                 Ok(f(
                     vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
                 ))
@@ -3013,6 +3233,48 @@ impl OsrEntryPlan {
 }
 
 impl CompiledMethod {
+    /// Stamp `key` (`"<class>.<method>:<descriptor>"`) into every deopt
+    /// snapshot this artifact publishes that does not already carry one.
+    ///
+    /// The optimizing IR lowerer cannot name the method it is compiling —
+    /// `ir_lower::resolve_frame_state` records `method_key: String::new()` and
+    /// its doc comment says the VM caller fills it in. Nothing ever did, and an
+    /// identity-less snapshot is not merely untidy: `try_resume_trapped_callee`
+    /// refuses it outright (*"no usable stash identity"*), so the `i64::MIN`
+    /// deopt sentinel keeps travelling up through the compiled callers until
+    /// some **unrelated** outer method's first-call tier-up sink consumes the
+    /// foreign frame, fails its own `deopt_frame_matches_method` check and
+    /// raises `precise deoptimization unavailable … refusing side-effecting
+    /// replay` — naming a bci that does not exist in the method it blames. That
+    /// is the `org/h2/mvstore/MVMap.evaluateMemoryForKey … at bci 123` failure
+    /// (bci 123 is the `ldiv` in `org.h2.util.MemoryEstimator.estimateMemory`,
+    /// which is 31 bytes long in `evaluateMemoryForKey`).
+    ///
+    /// Only empty keys are filled, so a backend that already stamps its own
+    /// (the single-pass x64 emitter) and the per-scope keys an inlined
+    /// `caller` chain carries are both left exactly as they were.
+    ///
+    /// Mutating the `String` inside a `Box<DeoptimizationPoint>` does not move
+    /// the box, so the `imm64` payload addresses already baked into the emitted
+    /// deopt stubs stay valid. Both lists are stamped: the boxes are what the
+    /// stubs hand to `ir_deopt_entry`, and the by-value `deopt_points` are what
+    /// the VM's resume sinks search for the trap's reason.
+    pub fn stamp_deopt_method_key(&mut self, key: &str) {
+        if key.is_empty() {
+            return;
+        }
+        for p in &mut self.deopt_points {
+            if p.frame_state.method_key.is_empty() {
+                p.frame_state.method_key.push_str(key);
+            }
+        }
+        for p in &mut self._deopt_point_boxes {
+            if p.frame_state.method_key.is_empty() {
+                p.frame_state.method_key.push_str(key);
+            }
+        }
+    }
+
     /// The precise entry contract at `entry_pc`, if this artifact has one.
     ///
     /// Prefers the `OsrExit`-tagged point (that IS the loop-boundary snapshot
@@ -3064,11 +3326,11 @@ impl CompiledMethod {
                     format!("deopt point at bci {} holds monitors", p.bci),
                 ));
             }
-            if !deopt::frame_state_is_resumable(fs) {
+            if let Some(slot) = deopt::first_unresumable_slot(fs) {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
                     format!(
-                        "deopt point at bci {} ({:?}) reconstructs an unresumable frame",
+                        "deopt point at bci {} ({:?}) reconstructs an unresumable frame: {slot}",
                         p.bci, p.reason
                     ),
                 ));
@@ -4721,20 +4983,29 @@ pub struct InlineBackendCaps {
 }
 
 impl InlineBackendCaps {
-    /// What `x64::compile` can do TODAY, verified against the source:
+    /// What `x64::compile` can do, verified against the source (updated
+    /// 2026-08-03, PGO-02):
     ///
-    ///  * `invokestatic` consults `inline_sites` (x64.rs:17274) and
-    ///    `invokespecial` does too (x64.rs:19463, whose own comment reads
-    ///    "invokespecial only — virtual/interface not eligible"), so
-    ///    statically bound splicing is real;
-    ///  * the `0xb6 | 0xb7 | 0xb9` arm never consults `inline_sites` for
-    ///    `0xb6`/`0xb9`, and its plain direct-call path (x64.rs:20716) emits an
-    ///    unconditional `CALL` with no receiver test — the `guard_class_id`
-    ///    compare exists only inside the String and CRC32 intrinsic ladders.
+    ///  * `invokestatic` consults `inline_sites` and `invokespecial` does
+    ///    too (statically bound DirectBind splicing, pre-existing);
+    ///  * the `0xb6 | 0xb7 | 0xb9` arm's `op == 0xb6 || op == 0xb9` case NOW
+    ///    ALSO consults `inline_sites` plus a companion
+    ///    `inline_guard_class_ids` map, when both carry an entry for the
+    ///    pc — populated together, only for an admitted `Monomorphic`
+    ///    verdict. See `docs/feature-designs/profile-guided-inlining.md` §5
+    ///    for the exact guard-then-splice lowering and why a miss falls
+    ///    through to the SAME unguarded direct-call path below rather than a
+    ///    deopt (the `guard_class_id` compare inside the String/CRC32
+    ///    intrinsic ladders is a separate, pre-existing mechanism this does
+    ///    not touch).
     ///
-    /// So a speculative plan has nowhere to be emitted and is refused. See
-    /// `docs/jit/profile-guided-inlining.md` for the exact backend edit that
-    /// would flip the second flag.
+    /// `guarded_inline_body_at_virtual_sites` below is still hard-coded
+    /// `false`: the flip to `true` happens at the `plan_inline` call site in
+    /// `try_compile_inner`, derived from whether a `class_id_name_resolver`
+    /// was threaded in — which the VM only does when
+    /// `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is set (default-off, unsoaked).
+    /// Every caller that doesn't opt in gets this const fn's `false`,
+    /// byte-for-byte the pre-PGO-02 behavior.
     pub const fn single_pass_x64() -> InlineBackendCaps {
         InlineBackendCaps {
             inline_body_at_static_sites: true,
@@ -5967,8 +6238,31 @@ mod inline_selection_tests {
 /// `ObjectRef`: the latter can relocate between compiled invocations.
 #[derive(Clone, Debug)]
 pub enum JitLdcConstant {
-    Immediate(i64),
+    /// A `CONSTANT_Integer` or `CONSTANT_Float` entry, already reduced to the
+    /// machine word both backends push.
+    ///
+    /// `is_float` (cov-01) records which of the two it was. The single-pass
+    /// backend does not read it — it pushes `bits` with `MOV imm64` and lets
+    /// the CONSUMING opcode pick the width, exactly as it does for `ldc2_w`.
+    /// The IR builder has no consuming opcode to ask: it must type the node it
+    /// creates, and an `Op::Const`/`Int` holding a float bit pattern is a
+    /// mistyped φ and a mistyped deopt slot. So this flag is the same shape
+    /// `cp_ldc2w_resolver`'s `(bits, is_double)` already has, for the same
+    /// reason.
+    Immediate { bits: i64, is_float: bool },
     String(String),
+    /// A `CONSTANT_Class` entry: `ldc <Class>` pushes that class's mirror.
+    ///
+    /// Carries the *referencing* class id and the CP index rather than a
+    /// resolved class id, for the same two reasons [`JitNewSite::Deferred`]
+    /// does — the target may not be loaded yet, and loading it is a user
+    /// `ClassLoader.loadClass` that must not run inside the compiler. The
+    /// mirror is fetched at run time by `helpers.ldc_class_cp`, which is also
+    /// what keeps it correct under a relocating collector.
+    ClassMirror {
+        holder_class_id: u32,
+        cp_idx: u16,
+    },
 }
 
 /// Compile-time resolution of a `new` (0xbb) / `anewarray` (0xbd)
@@ -8727,6 +9021,7 @@ fn drain_deferred_jit_owners_if_quiescent() {
     }
     let retired = std::mem::take(&mut *queue);
     drop(queue);
+    let _authorised = AuthorisedReclaim::enter();
     drop(retired);
 }
 
@@ -8739,6 +9034,7 @@ fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
         return;
     }
     if ACTIVE_JIT_EXECUTIONS.is_zero() {
+        let _authorised = AuthorisedReclaim::enter();
         drop(owner);
         return;
     }
@@ -8761,6 +9057,106 @@ pub fn jit_execution_leave() {
     // common "some other thread is still in JIT" case costs one load.
     if ACTIVE_JIT_EXECUTIONS.is_zero() {
         drain_deferred_jit_owners_if_quiescent();
+    }
+}
+
+/// Hand a compiled artifact to the retirement queue.
+///
+/// The public face of `defer_jit_owner`. **Every** long-lived holder of an
+/// `Arc<CompiledMethod>` that backs a raw entry pointer must release it through
+/// here rather than by dropping the `Arc`: a plain drop that happens to be the
+/// last one unmaps the body without asking whether a thread is inside it, which
+/// is exactly the use-after-free the queue exists to prevent. Prefer
+/// [`RetainedCode`], which cannot forget.
+pub fn retire_jit_owner(owner: Option<Arc<CompiledMethod>>) {
+    defer_jit_owner(owner);
+}
+
+/// An `Arc<CompiledMethod>` held as the keep-alive for a raw entry pointer,
+/// whose release goes through the retirement queue **by construction**.
+///
+/// The distinction matters only on the last reference, and only for a body a
+/// thread can be executing — but that is precisely the case a per-call-site or
+/// per-thread dispatch cache produces. Such a cache is evicted by the very
+/// thread dispatching through it (a generation flush, a staleness eviction, a
+/// replacement), so the eviction can run while that thread is *inside* the body
+/// whose only remaining owner the cache entry is. Dropping the `Arc` there
+/// unmaps the code under the thread's own return address.
+///
+/// Wrapping the field makes the routing structural: `clear`, `remove`,
+/// map-replacement, `Vec` truncation and thread-exit teardown all release
+/// through [`retire_jit_owner`] without any of those call sites knowing they
+/// had an obligation.
+pub struct RetainedCode(Option<Arc<CompiledMethod>>);
+
+impl RetainedCode {
+    /// Take ownership of a compiled artifact as a raw-entry keep-alive.
+    pub fn new(owner: Arc<CompiledMethod>) -> Self {
+        Self(Some(owner))
+    }
+
+    /// The underlying artifact.
+    pub fn arc(&self) -> &Arc<CompiledMethod> {
+        self.0.as_ref().expect("RetainedCode is only empty while dropping")
+    }
+}
+
+impl Clone for RetainedCode {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl std::ops::Deref for RetainedCode {
+    type Target = CompiledMethod;
+    fn deref(&self) -> &CompiledMethod {
+        self.arc()
+    }
+}
+
+impl std::fmt::Debug for RetainedCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RetainedCode(entry={:#x})", self.entry_ptr() as usize)
+    }
+}
+
+impl From<Arc<CompiledMethod>> for RetainedCode {
+    fn from(owner: Arc<CompiledMethod>) -> Self {
+        Self::new(owner)
+    }
+}
+
+impl Drop for RetainedCode {
+    fn drop(&mut self) {
+        let Some(owner) = self.0.take() else {
+            return;
+        };
+        // The per-call-site invoke cache is *cloned* on every cached dispatch,
+        // so this drop is a hot path. A drop that is provably not the last
+        // reference cannot unmap anything, and the retirement queue has nothing
+        // to say about it — one relaxed load instead of a striped-counter walk.
+        //
+        // Two concurrent last-two drops can both read `> 1` and neither route.
+        // That is not a hole here, because the safety of a plain last drop does
+        // not rest on this test: `pin_jit_code_range_owner` makes every thread
+        // inside a compiled body hold an owning reference to it, so a reference
+        // count that reaches zero already proves no thread is inside. The queue
+        // remains the backstop, and `published_code_free_audit` counts any
+        // release that skipped it.
+        //
+        // The one caveat, stated because it is invisible at this call site: the
+        // JIT->JIT dispatch pin resolves through the code-range registry, which
+        // `put`/`put_osr` populate only when precise JIT maps OR the
+        // cross-thread root scan are on. Both default ON, and opting out of
+        // BOTH (`CRATONVM_NO_PRECISE_JIT_MAPS=1` with
+        // `CRATONVM_XT_JIT_ROOT_SCAN=0`) leaves that one entry path unpinned —
+        // as it was before this existed, so no regression, but the ownership
+        // argument above is then weaker than the queue alone.
+        if Arc::strong_count(&owner) > 1 {
+            drop(owner);
+            return;
+        }
+        defer_jit_owner(Some(owner));
     }
 }
 
@@ -9207,6 +9603,7 @@ flushed at epoch {barrier}",
         // `JitEntryGuard` reads to keep this class's defining loader alive
         // while one of these frames is on a stack.
         compiled.owner_class_id = declaring_class_id.as_u32();
+        compiled._buffer.mark_published();
         let arc = Arc::new(compiled);
         // Stage 5 — register this method's code range for the GC RBP-chain
         // walker. Enabled when the precise gate is on (the registry is consulted
@@ -9216,11 +9613,7 @@ flushed at epoch {barrier}",
         // would make every peer look "not in JIT" and the scan a no-op). The
         // default path keeps zero bookkeeping overhead.
         if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
-            register_jit_code_range(
-                arc.entry_ptr() as usize,
-                arc.code_len(),
-                Arc::as_ptr(&arc) as usize,
-            );
+            register_jit_code_range_owned(arc.entry_ptr() as usize, arc.code_len(), &arc);
         }
         // DBG (spring-bug-11): record entry→name so a crash report can name the
         // faulting JIT method. Gated; no overhead unless CRATONVM_DBG_JIT_NAMES.
@@ -9300,13 +9693,10 @@ flushed at epoch {barrier}",
         }
         // See the matching note in `put`.
         compiled.owner_class_id = declaring_class_id.as_u32();
+        compiled._buffer.mark_published();
         let arc = Arc::new(compiled);
         if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
-            register_jit_code_range(
-                arc.entry_ptr() as usize,
-                arc.code_len(),
-                Arc::as_ptr(&arc) as usize,
-            );
+            register_jit_code_range_owned(arc.entry_ptr() as usize, arc.code_len(), &arc);
         }
         if jit_names_enabled() {
             register_jit_method_name(
@@ -9888,13 +10278,20 @@ fn ir_call_is_identity_hash(node: &ir::Node, info_ptr: usize) -> bool {
 // gate, both of which need monitors to exist before they can decide anything.
 // Wire them in the same change as the variants, not before.
 //
-// `athrow` ⇒ `EaOp::Throw` cannot be wired at all: `ir::Op` has no throw and
-// `ir::IrBuilder` rejects the whole method when `scan.has_athrow` (there is no
-// athrow lowering — see the `ir_reject("scan.has_athrow")` gate). So no IR
-// graph reaching this bridge contains a throw, and `EaOp::Throw` stays
-// producerless until handler bodies are compiled. Note for whoever does that:
-// `escape_analysis::program_order_proves_dominance` explicitly assumes the
-// absence of exception control flow and must gain a `may_throw` term then.
+// `athrow` ⇒ `EaOp::Throw` — WIRED, cov-07. `ir::Op::Throw` now exists
+// (`IrBuilder::build`'s `0xbf` arm) and maps below with NO operand
+// re-packing: its `[ctrl, mem, exc]` layout is forwarded verbatim by the
+// second pass's default arm, exactly like `Op::Return`'s `[ctrl, val]` — the
+// escape rule at `escape_analysis::Op::Return | Op::Throw` iterates every
+// input and filters by `is_ref_producer`, so the extra non-ref `ctrl`/`mem`
+// inputs are harmless.
+//
+// `escape_analysis::program_order_proves_dominance` was NOT given a
+// `may_throw` term, and does not need one: `Op::Throw` always LEAVES the
+// frame (the compiled body never branches to an in-method handler — see
+// `Op::Throw`'s own doc comment in `ir.rs`), so it cannot create a control
+// edge back to a lower-id load, which is the only thing that predicate
+// guards against. See `docs/internal/cov-07-athrow-RETIRED-*.md`.
 
 /// Map a single `ir::Op` variant to its `escape_analysis::Op` counterpart.
 fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
@@ -9918,6 +10315,8 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         // attribute the monitor to the memory token.
         ir::Op::MonitorEnter => EaOp::MonitorEnter,
         ir::Op::MonitorExit => EaOp::MonitorExit,
+        // cov-07. No re-packing needed — see the section comment above.
+        ir::Op::Throw => EaOp::Throw,
         ir::Op::New {
             class_id,
             num_fields,
@@ -9929,6 +10328,19 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
             element_type: *element_type,
         },
         ir::Op::Call { .. } => EaOp::Call,
+        // cov-01. `EaOp::Call` is the conservative mapping and the honest one:
+        // all three lower to a runtime helper that can run arbitrary Java, and
+        // their memory shape in `ir::Op::memory_shape` is already
+        // `MemAccess::Opaque` for that reason — the two classifications must
+        // not disagree. None of the three has a reference INPUT, so the
+        // arg-escape half of the `Call` rule is a no-op; what matters is that
+        // the reference each PRODUCES is treated like a call result rather than
+        // like a fresh allocation, because none of them is one. An interned
+        // literal, a class mirror and a static field's referent are all
+        // pre-existing objects that other threads can already see.
+        ir::Op::ConstString { .. } | ir::Op::ConstClass { .. } | ir::Op::LoadStatic { .. } => {
+            EaOp::Call
+        }
         ir::Op::ArrayLength => EaOp::ArrayLength,
         // Array element access escapes its array reference (conservative): map to
         // `EaOp::Call`, whose handling marks every reference input `ArgEscape`.
@@ -9991,6 +10403,7 @@ fn ea_control_preds(node: &ir::Node) -> &[ir::NodeId] {
         ir::Op::Merge | ir::Op::Region => node.inputs.as_slice(),
         // Everything else pins control at input 0 (when it has one at all).
         ir::Op::Return
+        | ir::Op::Throw
         | ir::Op::If
         | ir::Op::Proj(_)
         | ir::Op::Guard { .. }
@@ -10001,6 +10414,9 @@ fn ea_control_preds(node: &ir::Node) -> &[ir::NodeId] {
         | ir::Op::New { .. }
         | ir::Op::NewArray { .. }
         | ir::Op::Call { .. }
+        | ir::Op::ConstString { .. }
+        | ir::Op::ConstClass { .. }
+        | ir::Op::LoadStatic { .. }
         | ir::Op::LambdaIntToDouble => &node.inputs[..node.inputs.len().min(1)],
         // Start, and every floating pure node (Const, Add, Cmp, Phi, …). A node
         // with no control input has no fixed position, so it is never cold.
@@ -10897,6 +11313,111 @@ pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
 }
 
+/// Last recorded refusal site per method, keyed exactly like [`jit_bail_list`].
+///
+/// The thread-local [`JIT_BAIL_SITE`] answers "why did the compile that just
+/// ran bail?", which only helps somebody already watching `CRATONVM_DBG_JITC`
+/// at the moment it happened. The place a permanently-uncompilable hot method
+/// is actually *noticed* is the end-of-run
+/// `CRATONVM_DBG=jit-method-stats` table, which runs long after every compile
+/// worker has moved on — so the reason has to outlive the compile. Same
+/// key/collision argument as the bail-list above: a collision at worst
+/// mislabels one diagnostic line.
+static JIT_BAIL_REASONS: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<u64, (&'static str, u32, u32)>>,
+> = std::sync::OnceLock::new();
+
+fn jit_bail_reasons(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, (&'static str, u32, u32)>> {
+    JIT_BAIL_REASONS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+fn record_jit_bail_reason(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    site: (&'static str, u32, u32),
+) {
+    let h = compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
+    jit_bail_reasons().write().insert(h, site);
+}
+
+/// The refusal site last recorded for this method, rendered for a report
+/// line, or `None` if no compile of it ever bailed.
+pub fn jit_bail_reason_for(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<String> {
+    let h = compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
+    let site = *jit_bail_reasons().read().get(&h)?;
+    Some(format_jit_bail_site(Some(site)))
+}
+
+thread_local! {
+    /// Why the compile currently running on this thread refused the method.
+    ///
+    /// `(site, bytecode_pc, opcode)`; the pc/opcode pair is `(0, 0)` for the
+    /// sites that are not a single bytecode's fault.
+    ///
+    /// # Why this exists
+    ///
+    /// `try_compile` reported a failed compile as
+    /// `compile-bail <method> backend_attempted=<bool>` and nothing else.
+    /// `backend_attempted` reads like "the backend ran and gave up", but it is
+    /// really a *permanence* flag: three constant-pool resolver misses set it
+    /// too, precisely so the method lands on the bail-list instead of being
+    /// retried forever. So the one bit that looked like a classification
+    /// conflated "codegen has a hole" with "this CP entry is a shape the
+    /// compiler never accepts", and a permanently-interpreted hot JDK method
+    /// was indistinguishable from a transient resolver miss — which is exactly
+    /// how `java/text/DateFormatSymbols.getProviderInstance` (a plain
+    /// `ldc <Class>`) sat unexplained. See
+    /// `docs/known-issues/jit-bans/dateformatsymbols-getproviderinstance-compile-bail-20260731.md`.
+    ///
+    /// One-shot per compile: `try_compile` clears it on entry so a bail can
+    /// only ever report its own cause, never a previous method's.
+    static JIT_BAIL_SITE: std::cell::Cell<Option<(&'static str, u32, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Record why this compile is about to bail. Cheap enough (one `Cell` store)
+/// to run unconditionally, so the reason is available whether or not
+/// `CRATONVM_DBG_JITC` was set when the compile started.
+pub fn note_jit_bail_site(site: &'static str) {
+    JIT_BAIL_SITE.with(|c| c.set(Some((site, 0, 0))));
+}
+
+/// [`note_jit_bail_site`] for a refusal attributable to one bytecode — the
+/// single-pass backend's per-opcode `return false` arms.
+pub fn note_jit_bail_site_at(site: &'static str, pc: usize, opcode: u8) {
+    JIT_BAIL_SITE.with(|c| c.set(Some((site, pc as u32, u32::from(opcode)))));
+}
+
+/// Take (and clear) the recorded bail site.
+pub fn take_jit_bail_site() -> Option<(&'static str, u32, u32)> {
+    JIT_BAIL_SITE.with(|c| c.take())
+}
+
+/// Render a taken bail site for a diagnostic line.
+fn format_jit_bail_site(site: Option<(&'static str, u32, u32)>) -> String {
+    match site {
+        Some((s, 0, 0)) => s.to_string(),
+        Some((s, pc, op)) => format!("{s}(pc={pc},op=0x{op:02x})"),
+        None => "unrecorded".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OSR entry-point reject memo
 // ---------------------------------------------------------------------------
@@ -11021,6 +11542,59 @@ fn jit_bisect_only_filter() -> Option<&'static Vec<String>> {
             Some(prefixes)
         })
         .as_ref()
+}
+
+/// Do the bisect levers force `class_name`.`method_name` to stay interpreted?
+///
+/// **Call this at EVERY codegen entry point, not just [`try_compile`].** Both
+/// levers used to be checked only inside `try_compile`, and two paths reach the
+/// backend without going through it — `execute`'s eager first-call single-pass
+/// compile, and `compile_osr_artifact`, which says so in its own comment
+/// ("This path calls the backend directly instead of going through
+/// `try_compile`"). An entire class of compiled body was therefore invisible to
+/// both levers.
+///
+/// That is worse than a missing feature, because it makes the levers *lie*.
+/// Isolating a miscompile with them is a proof by elimination, and "deny this
+/// package and the crash goes away" only means something if the deny actually
+/// stopped a compile. Measured 2026-08-04 against
+/// `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`:
+/// `CRATONVM_JIT=bisect-only=zzzNoSuchPrefix` — a prefix matching nothing, so
+/// nothing should compile at all — still left **11 methods compiled** and the
+/// crash still reproduced. Every bisect step read "no effect", which reads as
+/// an exoneration and was really a silent no-op.
+///
+/// The levers are otherwise unchanged: `CRATONVM_JIT_DENY` is a
+/// comma-separated list of substrings matched against `Class.method`, and
+/// `CRATONVM_JIT_BISECT_ONLY` is the inverse allowlist of class-name prefixes.
+/// Both are no-ops unless set, and the `format!` is reached only when the deny
+/// lever is actually configured.
+pub fn jit_force_interpret(class_name: &str, method_name: &str) -> bool {
+    force_interpret_matches(
+        jit_deny_filter().map(|v| v.as_slice()),
+        jit_bisect_only_filter().map(|v| v.as_slice()),
+        class_name,
+        method_name,
+    )
+}
+
+/// The matching rule behind [`jit_force_interpret`], with the two parsed
+/// filters passed in rather than read from the process-wide `OnceLock`s — so
+/// it is unit-testable without racing every other test in this binary for the
+/// one-shot env read.
+fn force_interpret_matches(
+    deny: Option<&[String]>,
+    bisect_only: Option<&[String]>,
+    class_name: &str,
+    method_name: &str,
+) -> bool {
+    if let Some(filter) = deny {
+        let sig = format!("{class_name}.{method_name}");
+        if filter.iter().any(|f| sig.contains(f.as_str())) {
+            return true;
+        }
+    }
+    bisect_only.is_some_and(|prefixes| !prefixes.iter().any(|p| class_name.starts_with(p.as_str())))
 }
 
 /// Diagnostic: number of `try_compile` calls short-circuited because
@@ -11593,6 +12167,7 @@ pub fn try_compile(
         ir_emit_virtual_calls,
         ir_emit_fp,
         cp_invokedynamic_descriptor_resolver,
+        None,
     )
 }
 
@@ -11717,6 +12292,16 @@ pub fn try_compile_with_invokespecial_resolver(
     // whatever bytecode follows. `None` (resolver absent, or it returns `None`
     // for a given site) bails the whole compile — see `try_compile_inner`.
     cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    // PGO-02: maps a receiver CLASS ID (not a CP index - the runtime
+    // identity a guarded speculative inline's receiver class-id check
+    // resolved against) to its class name, so a Monomorphic/Bimorphic
+    // InlinePlan can record a SpeculatedReceiver invalidation dependency
+    // (plan_inline refuses via NoInvalidationDependency without one - the
+    // fail-closed rule in docs/feature-designs/profile-guided-inlining.md).
+    // `None` (resolver absent, or it returns `None` for a given id) refuses
+    // every speculative virtual/interface inline at that site; static/
+    // special DirectBind sites are unaffected (no receiver dependency).
+    class_id_name_resolver: Option<&dyn Fn(u32) -> Option<String>>,
 ) -> Option<CompiledMethod> {
     // Open the compilation scope FIRST, before any constant-pool resolver runs.
     // Every `CompiledMethod` built under it — including one built by a nested
@@ -11780,18 +12365,13 @@ pub fn try_compile_with_invokespecial_resolver(
     // JIT-compiled) so a single suspect compiled method can be isolated
     // from the rest of a workload's JIT-compiled code, without disabling
     // JIT wholesale. No-op unless the env var is set.
-    if jit_deny_filter().is_some_and(|filter| {
-        let sig = format!("{}.{}", cached.class_name, cached.method_name);
-        filter.iter().any(|f| sig.contains(f.as_str()))
-    }) {
-        return None;
-    }
-
-    // `CRATONVM_JIT_BISECT_ONLY` — the inverse: only the listed class-name
-    // prefixes stay JIT-eligible. No-op unless set.
-    if jit_bisect_only_filter()
-        .is_some_and(|prefixes| !prefixes.iter().any(|p| cached.class_name.starts_with(p.as_str())))
-    {
+    //
+    // `CRATONVM_JIT_BISECT_ONLY` is the inverse: only the listed class-name
+    // prefixes stay JIT-eligible. Both now live in `jit_force_interpret`, so
+    // the eager first-call and OSR codegen paths — which do NOT come through
+    // this function — can apply the identical predicate. See that function for
+    // why sharing it matters.
+    if jit_force_interpret(&cached.class_name, &cached.method_name) {
         return None;
     }
 
@@ -11805,6 +12385,10 @@ pub fn try_compile_with_invokespecial_resolver(
     // Consume the per-compile self-call identity proof FIRST — even an
     // early bail below must not leak a stale `true` into a later compile.
     let self_call_identity_stable = SELF_CALL_IDENTITY_STABLE.with(|c| c.replace(false));
+    // Same one-shot discipline for the bail-site record: clear whatever the
+    // previous compile on this worker thread left behind, so a bail below can
+    // only ever report its own cause.
+    let _ = take_jit_bail_site();
     let _compile_stack_guard = JitCompileStackGuard::enter(cached);
 
     // Inner pipeline: returns None on either a transient resolver miss
@@ -11837,6 +12421,7 @@ pub fn try_compile_with_invokespecial_resolver(
         ir_emit_virtual_calls,
         ir_emit_fp,
         cp_invokedynamic_descriptor_resolver,
+        class_id_name_resolver,
         &mut backend_attempted,
         self_call_identity_stable,
     );
@@ -11851,11 +12436,34 @@ pub fn try_compile_with_invokespecial_resolver(
             &cached.method_descriptor,
         );
     }
-    if result.is_none() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
-        eprintln!(
-            "[cratonvm-jitc] compile-bail {}.{}{} backend_attempted={}",
-            cached.class_name, cached.method_name, cached.method_descriptor, backend_attempted
-        );
+    if result.is_none() {
+        // Take once and use for both sinks: the trace line below (only when
+        // `CRATONVM_DBG_JITC` is on) and the per-method store the end-of-run
+        // stats table reads (always, so the reason survives the compile).
+        let site = take_jit_bail_site();
+        if let Some(site) = site {
+            record_jit_bail_reason(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+                site,
+            );
+        }
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            // `reason=` is the point of this line. `backend_attempted` alone
+            // says only whether the bail is permanent (see `JIT_BAIL_SITE`),
+            // which is not a diagnosis — a resolver that cannot represent an
+            // `ldc <Class>` and a backend that ran out of code buffer both
+            // print `true`.
+            eprintln!(
+                "[cratonvm-jitc] compile-bail {}.{}{} backend_attempted={} reason={}",
+                cached.class_name,
+                cached.method_name,
+                cached.method_descriptor,
+                backend_attempted,
+                format_jit_bail_site(site),
+            );
+        }
     }
     // DBG (env-gated): dump the emitted machine code for a specific method so
     // its prologue/epilogue + body can be disassembled offline. Set
@@ -12159,16 +12767,39 @@ fn exc_table_c2_disabled() -> bool {
 /// MIC/`jit_invoke_dispatch` paths both end in
 /// `emit_post_invoke_exception_check`.
 ///
-/// `getfield`/`putfield` (0xb4/0xb5) are NOT here. They were added 2026-07-28
-/// in `5bf306bb0` alongside a precise null check, but that check has a single
-/// call site on the INLINED-CALLEE `putfield` path; the top-level arms keep an
-/// inline fast path that neither null-checks nor publishes a frame. Measured
-/// with `probes/Rbc6FieldProbe.java`: a `getfield` NPE inside a protected range
-/// let the handler read a non-parameter local as 0 instead of 38, and a
-/// `putfield` on a null receiver did not throw at all. Both are silent wrong
-/// answers, which is what RBC.6 exists to prevent. Re-admit them only together
-/// with a precise frame at the top-level field arms — see
-/// `docs/internal/fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md`.
+/// `getfield`/`putfield` (0xb4/0xb5) are here as of 2026-08-02, and the
+/// condition their old exclusion asked for — "a precise frame at the top-level
+/// field arms" — is what now holds. The exclusion was written when the only
+/// precise null check (`5bf306bb0`, 2026-07-28) had a single call site, on the
+/// INLINED-CALLEE `putfield` path. Both top-level arms grew one afterwards and
+/// nobody revisited this list:
+///
+/// * `putfield` — `cd451facc` ("a compiled putfield on a null receiver must
+///   throw NPE") put `emit_precise_null_check_field_store` at the top of the
+///   top-level `0xb5` arm, ahead of every inline/compact/helper sub-path, so a
+///   null receiver inside a protected range records a reason-10 frame at the
+///   trapping bci. The one arm it deliberately skips is the scalar-replaced
+///   store, whose "objectref" is a dummy with no receiver behind it and
+///   therefore cannot NPE.
+/// * `getfield` — a null receiver reaches `helpers.getfield` on EVERY
+///   sub-path (compact-inline, uniform-inline, resolved-helper and
+///   unresolved-helper), because both receiver checks that guard the inline
+///   loads — `emit_trusted_oop_receiver_check` and
+///   `emit_guarded_getfield_receiver_check` — begin with a null test that
+///   branches to the helper. Each of those calls is followed by
+///   `emit_post_invoke_exception_check`, which is precisely where the reason-9
+///   frame is built.
+///
+/// The single exception is the opt-in RAW inline `getfield`
+/// (`CRATONVM_JIT_INLINE_GETFIELD`), which keeps historical null-reads-as-0
+/// semantics: it neither throws nor publishes. `precise_field_ops_enabled`
+/// therefore withdraws this admission whenever that flag is on, so the two can
+/// never be combined.
+///
+/// `probes/Rbc6FieldProbe.java` is the acceptance test the old exclusion cited
+/// against these opcodes — five methods whose handler reads a non-parameter
+/// local written inside the `try`, differentially checked against HotSpot and
+/// `--nojit`.
 ///
 /// `invokedynamic` (0xba) is deliberately absent too: it lowers to an
 /// unconditional deopt trap, not to a call site that publishes a frame.
@@ -12176,7 +12807,32 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
     if matches!(op, 0xb6 | 0xb9) {
         return precise_virtual_invokes_enabled();
     }
+    if matches!(op, 0xb4 | 0xb5) {
+        return precise_field_ops_enabled();
+    }
     matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
+}
+
+/// Whether a protected `getfield`/`putfield` may be treated as publishing a
+/// precise exceptional frame — see the list above for why it does.
+///
+/// Two ways to say no:
+///
+/// * `CRATONVM_JIT_NO_PRECISE_FIELD_OPS=1`, so one binary can be A/B'd against
+///   its own pre-change behaviour. Comparing against a separately built branch
+///   would confound this with everything else that landed.
+/// * `CRATONVM_JIT_INLINE_GETFIELD=1` (the opt-in RAW inline `getfield`), whose
+///   null path leaves `RAX = 0` and returns the field as zero rather than
+///   throwing. It publishes no frame because it raises no exception at all, so
+///   admitting `getfield` while it is on would hand a handler a frame that is
+///   never built. Not cached here: `inline_getfield_enabled` does its own
+///   `OnceLock`, and this runs per protected opcode at COMPILE time, never on
+///   any hot path.
+fn precise_field_ops_enabled() -> bool {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_FIELD_OPS").is_some() {
+        return false;
+    }
+    !x64::inline_getfield_enabled()
 }
 
 /// Opt-out for admitting `invokevirtual`/`invokeinterface` above, so one
@@ -12199,10 +12855,29 @@ fn precise_exception_frame_sites_supported(
             .iter()
             .any(|entry| pc >= entry.start_pc as usize && pc < entry.end_pc as usize)
     };
+    // `ldc`/`ldc_w` (0x12/0x13) stay: a String constant allocates through
+    // `helpers.ldc_string` and a Class constant resolves through
+    // `helpers.ldc_class_cp` (which can run a user `ClassLoader.loadClass` and
+    // then throw), and neither publishes a precise frame — the class site's
+    // `0`-return guard branches to the SHARED sentinel stub.
+    //
+    // `ldc2_w` (0x14) is NOT in that family, despite having been lumped in with
+    // it. It can only push a `long` or a `double`. The one form that could run
+    // Java is a `CONSTANT_Dynamic` with a long/double descriptor — and
+    // `cp_ldc2w_resolver` accepts only `Long`/`Double` pool entries, answering
+    // `None` for everything else, which is a PERMANENT compile bail
+    // (`ldc2w-constant-unsupported`). So an `ldc2_w` that survives to codegen is
+    // a bare constant push: it cannot throw, allocate or GC, and admitting it
+    // here cannot produce a compiled body containing a throwing one, because
+    // that compile has already bailed. Keeping it excluded cost every
+    // `long`-arithmetic-inside-`try` method its compile — `probes/
+    // Rbc6FieldProbe.java`'s `getfieldLongHandlerLocal` is the witness: one
+    // `long 1000003L` literal in the protected range was the whole reason it
+    // stayed interpreted while its `int` twin compiled.
     let may_throw_without_precise_frame = |op: u8| {
         matches!(
             op,
-            0x12..=0x14 // ldc family (String/class resolution can allocate)
+            0x12 | 0x13 // ldc / ldc_w — String and Class constants
                 | 0x2e..=0x35 // array loads
                 | 0x4f..=0x56 // array stores
                 | 0x6c | 0x6d | 0x70 | 0x71 // integer divide/remainder
@@ -12278,7 +12953,17 @@ fn try_compile_inner(
     ir_emit_fp: bool,
     // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
     // its target descriptor. See `try_compile`.
+    // PGO-02: maps a receiver CLASS ID (not a CP index - the runtime
+    // identity a guarded speculative inline's receiver class-id check
+    // resolved against) to its class name, so a Monomorphic/Bimorphic
+    // InlinePlan can record a SpeculatedReceiver invalidation dependency
+    // (plan_inline refuses via NoInvalidationDependency without one - the
+    // fail-closed rule in docs/feature-designs/profile-guided-inlining.md).
+    // `None` (resolver absent, or it returns `None` for a given id) refuses
+    // every speculative virtual/interface inline at that site; static/
+    // special DirectBind sites are unaffected (no receiver dependency).
     cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    class_id_name_resolver: Option<&dyn Fn(u32) -> Option<String>>,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -12407,9 +13092,33 @@ fn try_compile_inner(
     macro_rules! jitc_bail {
         ($site:expr) => {
             return {
+                crate::note_jit_bail_site($site);
                 if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
                     eprintln!(
                         "[cratonvm-jitc] resolver-bail site={} {}.{}{}",
+                        $site, cached.class_name, cached.method_name, cached.method_descriptor
+                    );
+                }
+                None
+            }
+        };
+    }
+
+    /// A bail the compiler will never take back: the offending property is
+    /// fixed by the class file, so retrying cannot change the answer. Sets
+    /// `backend_attempted`, which is what routes the method onto the permanent
+    /// bail-list — the flag's real meaning, despite its name.
+    ///
+    /// Named exactly like [`jitc_bail`] so the two read the same in a trace;
+    /// the `permanent-bail` prefix is what tells them apart.
+    macro_rules! jitc_permanent_bail {
+        ($site:expr) => {
+            return {
+                *backend_attempted = true;
+                crate::note_jit_bail_site($site);
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                    eprintln!(
+                        "[cratonvm-jitc] permanent-bail site={} {}.{}{}",
                         $site, cached.class_name, cached.method_name, cached.method_descriptor
                     );
                 }
@@ -12440,8 +13149,7 @@ fn try_compile_inner(
             // attempts on `DefiniteLengthInputStream.readAllIntoByteArray`
             // in ONE asn1 RegressionTest run. Route through the existing
             // permanent bail-list machinery.
-            *backend_attempted = true;
-            return None;
+            jitc_permanent_bail!("jit-scan-reject")
         }
     };
     drop(metrics_scan);
@@ -12790,6 +13498,16 @@ fn try_compile_inner(
         // unconditionally rather than only under the long gate.
         let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
         builder.set_param_types(&ptypes);
+        // COV-03: admit `J` / `F`+`D` INSTANCE FIELD accesses from the same two
+        // flags this admission chain evaluates. A wide field is the one way a
+        // category-2 or FP value can enter the graph with no category-2/FP
+        // OPCODE in the body (`getfield J; invokestatic (J)V` has neither), so
+        // `method_uses_category2` / `method_uses_fp` would admit such a method
+        // with the long/FP tier off and the builder would then produce
+        // `IrType::Long`/`Double` nodes it does not support. Telling the builder
+        // directly keeps the premise those gates rest on true rather than
+        // assuming it.
+        builder.set_wide_field_gates(ir_emit_long, ir_emit_fp);
         if ir_emit_long || ir_emit_fp {
             // inc 26 (long) / inc 35 (double): resolve `ldc2_w` constants to
             // `(pc → (bits, is_double))` so the builder lowers a `long` to
@@ -12809,6 +13527,154 @@ fn try_compile_inner(
                     builder.set_ldc2w_info(lm);
                 }
             }
+        }
+        // cov-01 increment 1: resolve `ldc`/`ldc_w` (0x12/0x13) constants for
+        // the IR builder. `getstatic` + `ldc`/`ldc_w` was 189 of the 273
+        // opcode-gap events measured on 2026-08-03 — 69% of every opcode the
+        // optimizing builder had no arm for
+        // (`docs/known-issues/c2/ir-coverage-survey-20260803.md`).
+        //
+        // Three site kinds, three tables, all fed from the SAME resolver the
+        // single-pass backend uses — this lane consumes a table the caller
+        // already computes, it does not resolve a constant pool:
+        //
+        //   * `Immediate` → `(bits, is_float)`. A constant node and nothing
+        //     else: no memory edge, no safepoint, no GC interaction. An `int`
+        //     constant is admitted unconditionally; a `float` constant only
+        //     under `ir_emit_fp`, mirroring the `ldc2_w` gate directly above —
+        //     the builder would otherwise emit an `Op::ConstF`/`Float` into a
+        //     graph the FP tier is switched off for.
+        //   * `String` → the interned-literal SITE (`bytes`, `len`), not a
+        //     reference: the value is materialised by `helpers.ldc_string` on
+        //     every execution, because an `ObjectRef` baked at compile time can
+        //     relocate between two runs of the body.
+        //   * `ClassMirror` → the CP-indexed site, served by
+        //     `helpers.ldc_class_cp` for the same reason plus one more:
+        //     resolution can load a class, which runs arbitrary Java.
+        //
+        // A pc absent from all three (no resolver, a `MethodHandle` /
+        // `MethodType` / condy entry, an unwired class helper, or a float with
+        // the FP gate off) makes the builder's 0x12/0x13 arm bail that method
+        // to single-pass — the pre-existing behaviour, only narrower.
+        //
+        // Keep-alive for the string-literal bytes whose ADDRESS the lowered
+        // body bakes as an imm64. Moved onto the finished `CompiledMethod`
+        // below, next to the `Op::Call` info boxes, so the pointer cannot
+        // outlive its pointee.
+        let mut ir_ldc_strings: Vec<Box<str>> = Vec::new();
+        // cov-05: keep-alive for `instanceof`/`checkcast` target class-name
+        // bytes, same obligation as `ir_ldc_strings` immediately above (the
+        // lowered body bakes the ADDRESS as an imm64 argument to
+        // `helpers.instanceof_check`/`helpers.checkcast`). Populated below,
+        // near the `new_info` / `anewarray_info` construction they share a
+        // resolver with.
+        let mut ir_instanceof_strings: Vec<Box<str>> = Vec::new();
+        let mut ir_checkcast_strings: Vec<Box<str>> = Vec::new();
+        // cov-05: `jit_checkcast`'s definitive-refusal path constructs a
+        // `ClassCastException` through `jit_thread_mut()` (the JIT_THREAD
+        // TLS), same requirement `jit_getstatic`'s `<clinit>` has — the
+        // `!has_dispatch` fast entry never sets that TLS. Set below, near
+        // where the `getstatic` lane sets the same flag for the same reason.
+        let mut ir_needs_dispatch_for_checkcast = false;
+        if !scan.ldc_ops.is_empty() {
+            if let Some(resolver) = cp_ldc_resolver {
+                let mut imm: std::collections::HashMap<usize, (i64, bool)> =
+                    std::collections::HashMap::new();
+                let mut strs: std::collections::HashMap<usize, (usize, usize)> =
+                    std::collections::HashMap::new();
+                let mut classes: std::collections::HashMap<usize, (u32, u16)> =
+                    std::collections::HashMap::new();
+                for &(pc, cp_idx) in &scan.ldc_ops {
+                    match resolver(cp_idx) {
+                        Some(JitLdcConstant::Immediate { bits, is_float }) => {
+                            if !is_float || ir_emit_fp {
+                                imm.insert(pc, (bits, is_float));
+                            }
+                        }
+                        Some(JitLdcConstant::String(text)) => {
+                            let boxed: Box<str> = text.into_boxed_str();
+                            strs.insert(pc, (boxed.as_ptr() as usize, boxed.len()));
+                            ir_ldc_strings.push(boxed);
+                        }
+                        Some(JitLdcConstant::ClassMirror {
+                            holder_class_id,
+                            cp_idx,
+                        }) => {
+                            // `ldc_class_cp` is an OptionalPtr — a hand-built
+                            // test helper table leaves it 0. Omit the site
+                            // rather than plan a CALL to address 0; the builder
+                            // then bails the method, exactly as the single-pass
+                            // arm does for the same condition.
+                            if helpers.ldc_class_cp != 0 {
+                                classes.insert(pc, (holder_class_id, cp_idx));
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                builder.set_ldc_info(imm);
+                builder.set_ldc_string_info(strs);
+                builder.set_ldc_class_info(classes);
+            }
+        }
+        // cov-01 increment 4: resolve `getstatic` (0xb2) sites for the IR
+        // builder — the largest single opcode in the survey (92 events). Same
+        // resolver and same `(class_id, field_index, type_tag, is_volatile)`
+        // tuple the single-pass backend's 0xb2 arm consumes; an unresolvable
+        // site is omitted and the builder bails that method.
+        //
+        // `putstatic` (0xb3) is deliberately NOT fed. The single-pass backend
+        // keeps it on `jit_putstatic_*` because a static reference WRITE owes
+        // an SATB pre-barrier that no collector `set_field` barrier covers —
+        // statics live in a Rust-side table, not the heap — and a missed one is
+        // a hidden-pointer SATB hole. This lane owns the read arm only.
+        //
+        // The class ids this collects are ALSO recorded on the finished
+        // artifact (`static_init_classes`, below), because compiled code reads
+        // static storage directly and the interpreter's compiled-entry path is
+        // what ensure-initializes the declaring classes once per artifact.
+        //
+        // The VALUE TIER is gated here and not in the builder, because this is
+        // the only place that knows the width. `getstatic` is polymorphic: it
+        // is listed by neither `is_category2_opcode` nor `is_float_opcode`, so
+        // a method whose only wide or floating-point content is a static read
+        // has `method_uses_category2() == false` and `fp_in_body() == false`,
+        // and is admitted to the optimizing pipeline through the INT clause.
+        // Feeding it a `J` site with `ir_emit_long` off would then put a `Long`
+        // node in a graph the long tier is switched off for, and a `D`/`F` site
+        // an FP node with the FP tier off.
+        //
+        // Same shape as the float half of the `ldc` feed above, and as the
+        // `ldc2_w` feed's `if ir_emit_long || ir_emit_fp`: the party that
+        // resolved the width is the party that decides. A gated-off site is
+        // simply absent, so the builder's 0xb2 arm bails that method to
+        // single-pass, which compiles every width.
+        let mut ir_static_init_classes: Vec<u32> = Vec::new();
+        if !scan.static_field_ops.is_empty() {
+            if let Some(resolver) = cp_static_field_resolver {
+                let mut sm = std::collections::HashMap::with_capacity(scan.static_field_ops.len());
+                for &(pc, cp_idx) in &scan.static_field_ops {
+                    if let Some((class_id, field_index, type_tag, is_volatile)) = resolver(cp_idx) {
+                        let admitted_by_value_tier = match type_tag {
+                            b'J' => ir_emit_long,
+                            b'D' | b'F' => ir_emit_fp,
+                            _ => true,
+                        };
+                        if admitted_by_value_tier {
+                            sm.insert(pc, (class_id, field_index, type_tag, is_volatile));
+                        }
+                        // Recorded regardless of the value tier: this list is
+                        // the ensure-init obligation, which the declaring class
+                        // owes whether or not the IR lowers the read. It also
+                        // matches the single-pass artifact, which records every
+                        // static site including every `putstatic`.
+                        ir_static_init_classes.push(class_id);
+                    }
+                }
+                builder.set_static_field_info(sm);
+            }
+            ir_static_init_classes.sort_unstable();
+            ir_static_init_classes.dedup();
         }
         // Thread the resolved instance-field layout (pc → (field_index,
         // type_tag)) into the builder so it can lower an int-category
@@ -12875,6 +13741,65 @@ fn try_compile_inner(
                 builder.set_new_info(new_info_map, trivial_init_pcs);
             }
         }
+        // cov-05: resolve `checkcast` (0xc0) / `instanceof` (0xc1) sites for
+        // the IR builder — 306 events, the largest single whole-method
+        // refusal in the survey, more than every opcode gap combined:
+        // `docs/known-issues/c2/cov-05-checkcast-and-instanceof.md`.
+        //
+        // Admits a site ONLY when its target class is already resolved and
+        // loaded at compile time. `cp_new_resolver` already answers exactly
+        // that question for `new`/`anewarray` — `Resolved` means the
+        // CONSTANT_Class entry's target is loaded, `Deferred`/`None` means it
+        // is not (or the entry is malformed) — and a checkcast/instanceof CP
+        // entry is the identical CONSTANT_Class shape, so this reuses that
+        // resolver rather than adding a new one. `num_fields`/the two init
+        // flags `Resolved` also carries are irrelevant here and discarded;
+        // only "loaded or not" is read.
+        //
+        // A site that resolves `Deferred` (or has no resolver at all) is
+        // simply omitted from `checkcast_info`/`instanceof_info`, so the
+        // builder's 0xc0/0xc1 arm bails THAT site — and so the method — to
+        // single-pass, which resolves lazily via `jit_typecheck_resolve`'s
+        // not-yet-loaded slow path. That path can run a user classloader's
+        // `loadClass`/`findClass`, arbitrary Java this tier does not host
+        // inside a helper call — see the admission comment in `ir.rs`.
+        //
+        // `scan.typecheck_ops` is `checkcast_ops ∪ instanceof_ops`; a pc is
+        // routed to `checkcast_info` iff it is also in `scan.checkcast_ops`,
+        // else to `instanceof_info` — the two are no longer mutually
+        // exclusive at the whole-method level as of cov-05 (a method may
+        // contain both), unlike the pre-cov-05 shape where `checkcast_ops`
+        // non-empty refused the whole method upstream.
+        if !scan.typecheck_ops.is_empty() {
+            if let (Some(new_resolver), Some(name_resolver)) =
+                (cp_new_resolver, cp_class_name_resolver)
+            {
+                let checkcast_pcs: std::collections::HashSet<usize> =
+                    scan.checkcast_ops.iter().map(|&(pc, _)| pc).collect();
+                let mut cc_im = std::collections::HashMap::new();
+                let mut io_im = std::collections::HashMap::new();
+                for &(pc, cp_idx) in &scan.typecheck_ops {
+                    if matches!(new_resolver(cp_idx), Some(JitNewSite::Resolved { .. })) {
+                        if let Some(name) = name_resolver(cp_idx) {
+                            let boxed: Box<str> = name.into_boxed_str();
+                            let entry = (boxed.as_ptr() as usize, boxed.len());
+                            if checkcast_pcs.contains(&pc) {
+                                cc_im.insert(pc, entry);
+                                ir_checkcast_strings.push(boxed);
+                            } else {
+                                io_im.insert(pc, entry);
+                                ir_instanceof_strings.push(boxed);
+                            }
+                        }
+                    }
+                }
+                if !cc_im.is_empty() {
+                    ir_needs_dispatch_for_checkcast = true;
+                }
+                builder.set_checkcast_info(cc_im);
+                builder.set_instanceof_info(io_im);
+            }
+        }
         // Gap B / inc 22: invokestatic → `Op::Call`. Only when the IR-call gate
         // is on AND the method has no `new`/array allocation (a surviving `New`
         // would need the allocation path the lowerer lacks; array ops bail the
@@ -12916,14 +13841,93 @@ fn try_compile_inner(
         // ON; it can no longer force it off. See the design doc for the matching
         // `vm/src/runtime/env_cache.rs` cleanup.
         let ir_emit_virtual_calls = ir_virtual_calls_enabled(ir_emit_virtual_calls);
+        // cov-04 census. The invoke bails in `IrBuilder::build` report a line
+        // number and a bytecode pc; neither says *which callee*, and the whole
+        // first increment of
+        // `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`
+        // was "group them by callee before writing code". Under
+        // `CRATONVM_DBG=ir-compiles` (or `jitc`) hand the builder a
+        // diagnostic-only `pc → "0xNN cn.mn desc"` map so each bail names its
+        // callee, and print the method-level facts that decide whether
+        // `invoke_info` is populated at all. Costs nothing when the flag is off:
+        // the resolver is not called and no string is built.
+        if ir_stage_reporting() && !scan.invoke_ops.is_empty() {
+            if let Some(resolver) = cp_invoke_resolver {
+                let mut labels: std::collections::HashMap<usize, Box<str>> =
+                    std::collections::HashMap::with_capacity(scan.invoke_ops.len());
+                for &(pc, cp_idx, opcode) in &scan.invoke_ops {
+                    if let Some((cn, mn, desc)) = resolver(cp_idx) {
+                        labels.insert(
+                            pc,
+                            format!("{opcode:#04x} {cn}.{mn}{desc}").into_boxed_str(),
+                        );
+                    }
+                }
+                builder.set_invoke_labels(
+                    labels,
+                    format!(
+                        "{}.{}{}",
+                        cached.class_name, cached.method_name, cached.method_descriptor
+                    )
+                    .into_boxed_str(),
+                );
+            }
+            eprintln!(
+                "[ir] invoke-plan {}.{}{}: sites={} new_ops={} anewarray_ops={} \
+                 gates(static={ir_emit_calls} special={ir_emit_special_calls} \
+                 virtual={ir_emit_virtual_calls}) call_eligible={}",
+                cached.class_name,
+                cached.method_name,
+                cached.method_descriptor,
+                scan.invoke_ops.len(),
+                scan.new_ops.len(),
+                // `new_ops` is reported but is NOT part of `call_eligible` any
+                // more (cov-04 increment 2). It stays in the line because it is
+                // what the pre-fix measurement keyed on, so the two runs remain
+                // comparable — but this field must keep matching the predicate
+                // below, or the census reports a gate that is not the gate.
+                scan.anewarray_ops.len(),
+                scan.anewarray_ops.is_empty(),
+            );
+        }
         if (ir_emit_calls || ir_emit_special_calls || ir_emit_virtual_calls)
             && !scan.invoke_ops.is_empty()
         {
             if let Some(resolver) = cp_invoke_resolver {
-                let call_eligible = scan.new_ops.is_empty() && scan.anewarray_ops.is_empty();
+                // cov-04. This used to also require `scan.new_ops.is_empty()`,
+                // on the premise that "a surviving `New` would need the
+                // allocation path the lowerer lacks". `ir_lower` grew that path
+                // — its `Op::New` arm goes through the shared
+                // compact-layout/TLAB-aware `jit_new_object` stub, the same
+                // helper the single-pass backend's `0xbb` uses, and it already
+                // refuses (`helpers.new_object == 0`) rather than emitting a
+                // call through address zero. So the term outlived its reason,
+                // and it was the single largest cause of an invoke refusal
+                // measured: 79 compiles lost `invoke_info` to it, producing 39
+                // of the 68 invoke bails — including all 13 at the `0xb6`/`0xb8`
+                // arm and both at `0xb9`, whose callees are ordinary
+                // perfectly-resolvable methods that were never the problem.
+                //
+                // `anewarray` stays: `IrBuilder::build` has no `0xbd` arm at
+                // all, and `ir_compatible` refuses such methods one stage
+                // earlier anyway (that conjunct is `cov-06`'s, not this lane's).
+                //
+                // An allocation that reaches an `Op::Call` as an argument is
+                // arg-escaped by the escape analysis, so it is really allocated
+                // rather than scalar-replaced — see `build_connection_graph`'s
+                // `Op::Call` arm.
+                let call_eligible = scan.anewarray_ops.is_empty();
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     let mut all_emittable = true;
+                    // cov-04 census: which site, and which of the five
+                    // conditions below, turned `all_emittable` off. Only built
+                    // under the debug flag; `all_emittable` is the real state.
+                    // The distinction matters because a single non-emittable
+                    // site discards `invoke_info` for the WHOLE method, so the
+                    // builder then bails on whichever invoke comes FIRST — which
+                    // is rarely the site that caused it.
+                    let mut nonemittable: Option<String> = None;
                     // Follow-up to the fib44 fix: when
                     // `CRATONVM_JIT_IR_SELFREC_DIRECT` is on, an eligible
                     // self-recursive static call is emitted as a DIRECT self-call
@@ -12953,29 +13957,67 @@ fn try_compile_inner(
                             || ((is_virtual || is_interface) && ir_emit_virtual_calls))
                         {
                             all_emittable = false;
+                            if ir_stage_reporting() {
+                                nonemittable =
+                                    Some(format!("pc={pc}: gate off for opcode {opcode:#04x}"));
+                            }
                             break;
                         }
                         let (cn, mn, desc) = match resolver(cp_idx) {
                             Some(t) => t,
                             None => {
                                 all_emittable = false;
+                                if ir_stage_reporting() {
+                                    nonemittable = Some(format!(
+                                        "pc={pc}: cp_invoke_resolver declined cp_idx={cp_idx}"
+                                    ));
+                                }
                                 break;
                             }
                         };
-                        // A `<init>` `invokespecial` is never a real `Op::Call`
-                        // here: a constructor is only ever handled by the
-                        // scalar-new elision path (`trivial_init_pcs`), and
-                        // eliding vs. calling a ctor are different transforms.
-                        // (Belt-and-braces — a `<init>`-bearing method also has
-                        // a `new`, so `call_eligible` is already false.)
-                        if is_special && mn == "<init>" {
-                            all_emittable = false;
-                            break;
-                        }
+                        // cov-04. This used to read
+                        //
+                        //     if is_special && mn == "<init>" { all_emittable = false; break; }
+                        //
+                        // on the premise that "a constructor is only ever
+                        // handled by the scalar-new elision path, and a
+                        // `<init>`-bearing method also has a `new`, so
+                        // `call_eligible` is already false". The second half of
+                        // that is simply not true, and the measurement says so:
+                        // 35 of the compiles this term disabled had **no `new`
+                        // at all** — they were compiled CONSTRUCTORS, whose
+                        // `super(...)` / `this(...)` chain call is an
+                        // `invokespecial` to `<init>` on `this`. Eliding one is
+                        // never an option (the receiver is a parameter, not a
+                        // fresh `Op::New`), so this term was not choosing
+                        // between two transforms; it was refusing the only one.
+                        //
+                        // A `<init>` now takes the ordinary statically-bound
+                        // `invoke_kind == 1` route, which is exactly what the
+                        // single-pass backend already emits for every
+                        // non-elidable constructor call (see the
+                        // `cp_elidable_init_resolver` rewrite below, whose
+                        // `else` arm is this same dispatch). The builder still
+                        // prefers ELISION whenever the pc is elidable and the
+                        // receiver is a fresh `Op::New`, so scalar replacement
+                        // is unaffected — see `IrBuilder::build`'s `0xb7` arm.
+                        //
+                        // What a `<init>` may NOT do is take the direct-call
+                        // path below: `direct_target` bakes an entry this
+                        // compile resolved by running `callee_compiler`, and
+                        // making every constructor site compile its callee is a
+                        // compile-time and recursion-cycle change this lane did
+                        // not measure. Constructors keep helper dispatch.
+                        let is_ctor = is_special && mn == "<init>";
                         let (desc_args, ret) = match static_call_shape(&desc) {
                             Some(t) => t,
                             None => {
                                 all_emittable = false;
+                                if ir_stage_reporting() {
+                                    nonemittable = Some(format!(
+                                        "pc={pc}: static_call_shape refused {cn}.{mn}{desc}"
+                                    ));
+                                }
                                 break;
                             }
                         };
@@ -13011,6 +14053,11 @@ fn try_compile_inner(
                             // it on the IR path with a direct self-call instead
                             // (invoke_kind 4 below).
                             all_emittable = false;
+                            if ir_stage_reporting() {
+                                nonemittable = Some(format!(
+                                    "pc={pc}: self-recursive wide return {cn}.{mn}{desc}"
+                                ));
+                            }
                             break;
                         }
                         // Every kind except `invokestatic` marshals the receiver
@@ -13063,7 +14110,7 @@ fn try_compile_inner(
                         //    `callee_compiler` call). Without this a super call
                         //    could be bound to the wrong method body.
                         let mut direct_target: Option<(usize, bool)> = None;
-                        if ir_direct && (is_static || is_special) && !is_self_recursive {
+                        if ir_direct && (is_static || is_special) && !is_ctor && !is_self_recursive {
                             let special_owner: Option<String> = if is_special {
                                 cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx))
                             } else {
@@ -13216,7 +14263,27 @@ fn try_compile_inner(
                         ir_ic_slots.clear();
                         ir_mic_boxes.clear();
                         ir_pic_boxes.clear();
+                        if ir_stage_reporting() {
+                            eprintln!(
+                                "[ir] invoke-plan {}.{}{}: NO invoke_info — {}",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                nonemittable
+                                    .as_deref()
+                                    .unwrap_or("no emittable invoke site found"),
+                            );
+                        }
                     }
+                } else if ir_stage_reporting() {
+                    eprintln!(
+                        "[ir] invoke-plan {}.{}{}: NO invoke_info — call_eligible=false \
+                         (anewarray_ops={})",
+                        cached.class_name,
+                        cached.method_name,
+                        cached.method_descriptor,
+                        scan.anewarray_ops.len(),
+                    );
                 }
             }
         }
@@ -13586,6 +14653,54 @@ fn try_compile_inner(
                             compiled._jit_strings = ir_call_strings;
                             compiled.has_dispatch = true;
                         }
+                        // cov-01: the same keep-alive obligation for an
+                        // `ldc <String>` site, whose UTF-8 bytes' ADDRESS is
+                        // baked into the body as an imm64 argument to
+                        // `helpers.ldc_string`. `append`, never assign — the
+                        // call strings may already be installed above, and
+                        // dropping either list frees memory the emitted code
+                        // still names.
+                        compiled._jit_strings.append(&mut ir_ldc_strings);
+                        // cov-05: the same keep-alive obligation for an
+                        // `instanceof`/`checkcast` target class-name site,
+                        // whose UTF-8 bytes' ADDRESS is baked into the body as
+                        // an imm64 argument to `helpers.instanceof_check` /
+                        // `helpers.checkcast`.
+                        compiled._jit_strings.append(&mut ir_instanceof_strings);
+                        compiled._jit_strings.append(&mut ir_checkcast_strings);
+                        // cov-05: see `ir_needs_dispatch_for_checkcast`'s
+                        // declaration above for why.
+                        if ir_needs_dispatch_for_checkcast {
+                            compiled.has_dispatch = true;
+                        }
+                        // cov-01 / RBC.5: compiled code reads static storage
+                        // directly, bypassing the interpreter's
+                        // `ensure_class_initialized_shared`, so the declaring
+                        // class of every static site must be initialized before
+                        // this body first runs. `x64::compile` records exactly
+                        // this list for the single-pass artifact; an IR
+                        // artifact that lowers `getstatic` owes it too, and
+                        // without it the direct (helper-free) load reads a
+                        // block whose `<clinit>` has not run.
+                        //
+                        // `append` + re-dedup for the same reason as the
+                        // callee-entry list below: assigning would discard
+                        // anything already recorded on the artifact.
+                        if !ir_static_init_classes.is_empty() {
+                            compiled
+                                .static_init_classes
+                                .append(&mut ir_static_init_classes);
+                            compiled.static_init_classes.sort_unstable();
+                            compiled.static_init_classes.dedup();
+                            // `jit_getstatic` resolves `&mut JvmThread` through
+                            // `jit_thread_mut()` to run `<clinit>`, and the
+                            // `!has_dispatch` fast entry never sets that TLS —
+                            // the `jit-clinit-gap-has-dispatch` defect, whose
+                            // single-pass fix is the
+                            // `!compiler.static_field_info.is_empty()` clause in
+                            // `x64/driver.rs`. Same helper, same requirement.
+                            compiled.has_dispatch = true;
+                        }
                         // IR direct-call lowering: record every raw JIT-to-JIT
                         // callee entry baked into this body. `_direct_callee_roots`
                         // (computed at publication) keeps the callee's executable
@@ -13622,6 +14737,17 @@ fn try_compile_inner(
                             compiled._direct_callee_entries.sort_unstable();
                             compiled._direct_callee_entries.dedup();
                         }
+                        // The lowerer leaves every frame state identity-less
+                        // and documents that the caller fills it in; this is
+                        // that caller. Without the stamp an optimizing-tier
+                        // deopt cannot be resumed by the call site that
+                        // triggered it and instead surfaces as a hard
+                        // `InternalError` against an unrelated outer method —
+                        // see `CompiledMethod::stamp_deopt_method_key`.
+                        compiled.stamp_deopt_method_key(&format!(
+                            "{}.{}:{}",
+                            cached.class_name, cached.method_name, cached.method_descriptor
+                        ));
                         // Backend-routing introspection (tests only): this body was
                         // produced by the optimizing IR pipeline. A method that
                         // bailed out of IR to single-pass never reaches here, so it
@@ -13865,11 +14991,27 @@ fn try_compile_inner(
     // codegen arm bails per-site instead.
     let mut ldc_info: Vec<(usize, i64)> = Vec::new();
     let mut ldc_string_info: Vec<(usize, *const u8, usize)> = Vec::new();
+    let mut ldc_class_info: Vec<(usize, u32, u16)> = Vec::new();
     if !scan.ldc_ops.is_empty() {
         if let Some(resolver) = cp_ldc_resolver {
             for &(pc, cp_idx) in &scan.ldc_ops {
                 match resolver(cp_idx) {
-                    Some(JitLdcConstant::Immediate(v)) => ldc_info.push((pc, v)),
+                    // The single-pass backend ignores `is_float`: it pushes the
+                    // bits and the consuming opcode picks the width. See the
+                    // variant's doc for why the IR builder cannot.
+                    Some(JitLdcConstant::Immediate { bits, .. }) => ldc_info.push((pc, bits)),
+                    Some(JitLdcConstant::ClassMirror {
+                        holder_class_id,
+                        cp_idx,
+                    }) => {
+                        // The helper is `OptionalPtr`: a hand-built test table
+                        // leaves it 0, and then this site keeps the historical
+                        // whole-compile bail rather than emitting a CALL to 0.
+                        if helpers.ldc_class_cp == 0 {
+                            jitc_bail!("ldc_class_helper_unwired")
+                        }
+                        ldc_class_info.push((pc, holder_class_id, cp_idx));
+                    }
                     Some(JitLdcConstant::String(text)) => {
                         let boxed: Box<str> = text.into_boxed_str();
                         let ptr = boxed.as_ptr();
@@ -13892,8 +15034,7 @@ fn try_compile_inner(
                         // diagnostic-free hang: TestResponsePerformance's
                         // trivial `getRequestURI() { return "..."; }` bailed
                         // on every one of ~1M hot-loop calls).
-                        *backend_attempted = true;
-                        return None;
+                        jitc_permanent_bail!("ldc-constant-unsupported")
                     }
                 }
             }
@@ -13915,8 +15056,7 @@ fn try_compile_inner(
                     // RBC.7 twin: a non-Long/Double constant at this ldc2_w
                     // index is likewise fixed by the bytecode — permanent
                     // bail, not a transient miss. See the ldc arm above.
-                    *backend_attempted = true;
-                    return None;
+                    jitc_permanent_bail!("ldc2w-constant-unsupported")
                 }
             };
             ldc2w_info.push((pc, val));
@@ -13951,6 +15091,19 @@ fn try_compile_inner(
     let mut pic_slots: Vec<(usize, *const JitPICSlot)> = Vec::new();
     let mut owned_pic_slots: Vec<Box<JitPICSlot>> = Vec::new();
     let mut inline_sites: HashMap<usize, InlineSite> = HashMap::new();
+    // PGO-02: guard_class_id for every admitted Monomorphic virtual/
+    // interface inline plan, keyed by the same pc as inline_sites. Kept as
+    // a separate map rather than a new InlineSite field because
+    // vm/src/runtime/interpreter/invoke.rs constructs InlineSite with an
+    // exhaustive struct literal (adding a field there would break the vm
+    // crate). NOT threaded through the loop-unroll pc replication below
+    // (unlike inline_sites itself) - a loop-unrolled copy of a guarded
+    // virtual call site simply won't find an entry here and falls back to
+    // normal dispatch, which is always correct, just not optimized. Bimorphic
+    // is deliberately not carried here yet either: this increment is scoped
+    // to plan_inline's Monomorphic verdict only ("the narrowest speculation
+    // that is worth anything" - see the retired pgo-02 doc).
+    let mut inline_guard_class_ids: HashMap<usize, u32> = HashMap::new();
     // jit-inlining-and-ir-calls: HotSpot-shaped inlining budget. `hot_loops` is
     // derived once from the profile plus the bytecode; a caller that executes
     // any hot loop gets the larger whole-method budget, and each site inside
@@ -14050,44 +15203,38 @@ fn try_compile_inner(
             // roots.  Route through the checked re-entrant bridge instead;
             // it installs a distinct JitEntryGuard for the actual callee.
             let direct_jit_callee_calls_enabled = direct_jit_callee_calls_enabled();
-            // C2-review P1 — virtual/interface sites are NOT admitted for
-            // inlining (the single-pass backend has no guarded inline lowering
-            // for them; see `InlineBackendCaps::single_pass_x64`), but their
-            // receiver shape is readable from the profile alone and is the
-            // evidence that decides whether that backend work is worth doing.
-            // Classify and tally, without paying for a callee resolution.
-            //
-            // Gated on `metrics::enabled()` because `classify_receiver_shape`
-            // ranks the receiver map, which allocates: this is a measurement,
-            // and a measurement must not tax the compile path it measures. Off
-            // (the process default) it is one relaxed atomic load per virtual
-            // site.
-            if matches!(invoke_kind, 0 | 2) && metrics::enabled() {
-                let refusal = match classify_receiver_shape(
-                    profile.and_then(|p| p.receivers.get(&pc)),
-                ) {
-                    ReceiverShape::Unprofiled => InlineRefusal::NoProfileEvidence,
-                    ReceiverShape::Cold { observations, .. } => {
-                        InlineRefusal::ColdSite { observations }
-                    }
-                    ReceiverShape::Megamorphic { types, .. } => {
-                        if types > INLINE_MEGAMORPHIC_TYPE_CEILING {
-                            InlineRefusal::Megamorphic { types }
-                        } else {
-                            InlineRefusal::ReceiverNotDominant { types }
-                        }
-                    }
-                    // A shape this policy WOULD speculate on, refused only
-                    // because the backend cannot emit the guard. This counter
-                    // is the whole point of the arm: it measures the size of
-                    // the opportunity currently being left on the table.
-                    ReceiverShape::Monomorphic { .. } | ReceiverShape::Bimorphic { .. } => {
-                        InlineRefusal::GuardNotEmittable
-                    }
-                };
-                inline_tally.record_refusal(&refusal);
-            }
-            if !is_recursive_call && (invoke_kind == 3 || invoke_kind == 1) {
+            // PGO-02: virtual/interface sites (0 | 2) go through the SAME
+            // plan_inline call as static/special (3 | 1) below, but ONLY when
+            // `class_id_name_resolver` is `Some` — i.e. only when
+            // CRATONVM_JIT_GUARDED_VIRTUAL_INLINE is actually on. This flag is
+            // documented (jit/src/lib.rs's `InlineBackendCaps` doc comment,
+            // vm/src/runtime/env_cache.rs's `jit_guarded_virtual_inline`) as
+            // "default-off, unsoaked" and behavior-preserving when off, but
+            // admitting 0|2 unconditionally broke that: `plan_inline` calls
+            // `classify_receiver_shape` (previously reached for these sites
+            // only under the removed `metrics::enabled()`-gated pre-tally)
+            // before it ever consults `caps.guarded_inline_body_at_virtual_sites`,
+            // so flag-off callers paid for and ran that admission machinery on
+            // every virtual/interface call site in every compiled method for
+            // the first time — confirmed via bisect
+            // (f697d618ea, this same plumbing commit with zero codegen behind
+            // it) to be the cause of a javac-self-hosting internal
+            // AssertionError (`Check$SuperThisChecker`, 100% reproducible on
+            // Spring AOT chunk 9) that has nothing to do with the feature this
+            // flag gates. Gating virtual/interface admission on the resolver
+            // being present restores the exact pre-PGO-02 code path (this
+            // whole `if` skipped for 0|2) when the flag is off, matching
+            // static/special's own unconditional admission, which this bug
+            // never touched. The metrics-only pre-tally this replaced is not
+            // restored — losing that one measurement when the feature is off
+            // is an acceptable trade for not running unaudited machinery on
+            // every unrelated JIT compile.
+            let virtual_interface_inline_admitted = class_id_name_resolver.is_some();
+            if !is_recursive_call
+                && (invoke_kind == 3
+                    || invoke_kind == 1
+                    || (virtual_interface_inline_admitted && matches!(invoke_kind, 0 | 2)))
+            {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
                     if let Some(resolver_fn) = inline_resolver.as_ref() {
@@ -14112,13 +15259,18 @@ fn try_compile_inner(
                             // `plan_inline`, together with the depth,
                             // recursion, exception-range and dependency rules
                             // this site had none of. For a statically bound
-                            // callee — the only kind that reaches here, see the
-                            // enclosing `invoke_kind` test — the admission
+                            // callee (`invoke_kind` 3 | 1) the admission
                             // decision is the SAME size/expansion/budget
                             // arithmetic as before, so an unprofiled compile
                             // inlines exactly as it did; what is new is that a
                             // refusal now says why, and that the dependencies
-                            // are taken from the plan rather than assumed.
+                            // are taken from the plan rather than assumed. For
+                            // a virtual/interface callee (0 | 2, PGO-02) the
+                            // policy additionally requires a dominant receiver
+                            // shape and a resolvable invalidation dependency —
+                            // see `classify_receiver_shape` / `receiver_class_namer`
+                            // below — before it will even consider the guard the
+                            // backend caps must also allow.
                             let site_hot = call_site_is_hot(pc, &inline_hot_loops, profile);
                             let callee_triple = (
                                 site.class_name.clone(),
@@ -14156,16 +15308,41 @@ fn try_compile_inner(
                                     pc,
                                 ),
                                 precise_exception_frames,
-                                caps: InlineBackendCaps::single_pass_x64(),
-                                // No class-id → name resolver is threaded into
-                                // this function, so a speculative plan could
-                                // not record its receiver dependency anyway.
-                                // Moot today: the caps above already refuse
-                                // every speculative site.
-                                receiver_class_namer: None,
+                                // PGO-02: `class_id_name_resolver` doubles as the
+                                // feature's on/off gate — the VM call sites pass
+                                // `None` unless CRATONVM_JIT_GUARDED_VIRTUAL_INLINE
+                                // is set (default-off), so an absent resolver both
+                                // disables guarded virtual/interface speculation
+                                // AND is the reason plan_inline would refuse one
+                                // anyway (no invalidation dependency could be
+                                // recorded). Static/special DirectBind sites are
+                                // unaffected either way — they never consult this.
+                                caps: InlineBackendCaps {
+                                    guarded_inline_body_at_virtual_sites:
+                                        class_id_name_resolver.is_some(),
+                                    ..InlineBackendCaps::single_pass_x64()
+                                },
+                                receiver_class_namer: class_id_name_resolver,
                             });
                             inline_tally.record(&plan);
-                            if plan.is_admitted() {
+                            // PGO-02: the backend only has codegen for
+                            // Monomorphic guarded splicing this increment
+                            // (InlineBackendCaps has ONE flag covering both
+                            // Monomorphic and Bimorphic, but there is no
+                            // Bimorphic emitter yet — see
+                            // docs/feature-designs/profile-guided-inlining.md).
+                            // A Bimorphic admission is plan_inline's own true
+                            // verdict (tallied above as such), but recording
+                            // inline_sites/a dependency for a splice the
+                            // backend will never actually emit would be a
+                            // permanent, pointless invalidation liability —
+                            // treat it as not-actionable here instead.
+                            let backend_can_emit = plan.is_admitted()
+                                && !matches!(plan.verdict, InlineVerdict::Bimorphic { .. });
+                            if backend_can_emit {
+                                if let InlineVerdict::Monomorphic { guard_class_id } = plan.verdict {
+                                    inline_guard_class_ids.insert(pc, guard_class_id);
+                                }
                                 inline_budget_remaining =
                                     inline_budget_remaining.saturating_sub(plan.expansion_cost);
                                 if site.needs_heap {
@@ -14279,7 +15456,46 @@ fn try_compile_inner(
                             continue;
                         }
                     }
-                    if direct_jit_callee_calls_enabled {
+                    // STATICALLY BOUND ONLY (`invokespecial` / `invokestatic`).
+                    //
+                    // `callee_compiler` is asked about the constant-pool
+                    // RESOLVED (class, method, descriptor). For an
+                    // `invokevirtual` / `invokeinterface` that names the STATIC
+                    // receiver type, not the runtime one — so binding its
+                    // compiled entry here, with `guard_class_id: 0` and no
+                    // receiver check at all, calls THAT body for every
+                    // receiver, including one whose class overrides the method.
+                    //
+                    // The CRC32 note further down this ladder already states
+                    // the assumption ("this invokestatic/invokespecial path
+                    // never resolves a CRC32 intrinsic (those are
+                    // `invokevirtual` only), so `guard_class_id` is 0") — it
+                    // was simply never enforced, and the enclosing
+                    // `matches!(invoke_kind, 0..=3)` lets 0 and 2 in.
+                    //
+                    // Virtual and interface sites are NOT unhandled: they have
+                    // their own block below (`invoke_kind == 0 || == 2`), where
+                    // every direct bind is either a `final` class, a helper
+                    // that re-checks the receiver's exact class itself, or a
+                    // `guard_class_id` the codegen compares at runtime — and
+                    // failing all of those they fall through to the MIC/PIC
+                    // inline cache, which is class-id guarded by construction.
+                    //
+                    // Measured: H2's `org.h2.value.VersionedValue.
+                    // getCurrentValue()` returns `(T) this` (H2's "a raw value
+                    // is its own VersionedValue" trick) and
+                    // `VersionedValueCommitted` overrides it with
+                    // `return value`. Once the BASE was compiled, every
+                    // `v.getCurrentValue()` in `VersionedValueType.write` —
+                    // static type `VersionedValue` — reached the base body and
+                    // returned the WRAPPER, which the caller casts to the
+                    // payload type: `ClassCastException:
+                    // VersionedValueUncommitted cannot be cast to
+                    // org.h2.value.Value`, deterministically, single-threaded,
+                    // inside 1000 rows of a plain JDBC `MERGE` loop. The
+                    // callee filters (no natives, no non-empty exception table)
+                    // are why this only bites a small overridable method.
+                    if direct_jit_callee_calls_enabled && matches!(invoke_kind, 1 | 3) {
                         if let Some(compiler) = callee_compiler.as_ref() {
                             if let Some((entry, callee_needs_ctx)) =
                                 compiler(&class_name, &method_name, &descriptor)
@@ -14377,7 +15593,13 @@ fn try_compile_inner(
                         ));
                         continue;
                     }
-                } else if direct_jit_callee_calls_enabled {
+                } else if direct_jit_callee_calls_enabled
+                    // Same static-binding restriction as the bind above:
+                    // a bailed-inline virtual site must fall through to
+                    // the class-id-guarded MIC/PIC, not to an unguarded
+                    // raw CALL into the statically resolved body.
+                    && matches!(invoke_kind, 1 | 3)
+                {
                     // INLINE-BAIL FALLBACK (tomcat doc 04, 2026-07-27).
                     //
                     // A site planned for inlining used to get NO direct call,
@@ -14998,12 +16220,14 @@ fn try_compile_inner(
         pic_slots,
         ldc_info,
         ldc_string_info,
+        ldc_class_info,
         ldc2w_info,
         branch_hints,
         loop_unroll_hints,
         helpers,
         std::collections::HashSet::new(), // non_escaping_new — escape analysis done inside x64 too
         inline_sites,
+        inline_guard_class_ids,
         string_layout,
         &param_jvm_slots,
         param_slot_span,
@@ -15892,6 +17116,42 @@ mod tests {
             if cond() {
                 return true;
             }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// [`eventually`], for a condition that waits on the **deferred retirement
+    /// queue** — "this published body was released", "this artifact's last
+    /// owner went away".
+    ///
+    /// The difference is that this one also CAUSES the event it is waiting
+    /// for. `defer_jit_owner` queues an artifact rather than freeing it while
+    /// `ACTIVE_JIT_EXECUTIONS != 0`, and the queue is drained only by
+    /// `jit_execution_leave` observing the counter reach zero. That counter is
+    /// process-global, so in a test binary the drain is somebody else's job:
+    /// whichever sibling test happens to leave JIT execution last. Polling
+    /// alone therefore waits on an event that may simply not happen — if this
+    /// test is the last one running, nothing is left to trigger it, and the
+    /// assertion fails for a reason that has nothing to do with what it is
+    /// checking. That is what
+    /// `test_inline_cache_reclamation_waits_for_jit_quiescence` was failing on,
+    /// about 1 run in 12 at `--test-threads=32`.
+    ///
+    /// An `enter`/`leave` pair on a thread holding no compiled frame is inert
+    /// except that its `leave` re-runs the quiescence check, so pumping it
+    /// between probes turns "wait for someone else" into "make it happen once
+    /// the process is actually quiescent".
+    ///
+    /// It does NOT paper over a wrong answer: a body that is genuinely still
+    /// owned stays owned for the whole window, exactly as with [`eventually`].
+    fn eventually_drained(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            jit_execution_enter();
+            jit_execution_leave();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         cond()
@@ -19476,14 +20736,26 @@ mod tests {
         // cannot be perturbed by a concurrently-running test's registrations.
         let base = 0x5EED_0000_0000usize;
         register_jit_method_name(base, 0x100, "Probe.absent()V".to_string());
-        assert!(matches!(
-            lookup_jit_method_name_detailed(base + 0x10),
-            JitNameLookup::Found(ref n) if n == "Probe.absent()V"
-        ));
-        assert!(matches!(
-            lookup_jit_method_name_detailed(base + 0x100),
-            JitNameLookup::NotFound
-        ));
+        // …but it CAN be perturbed by a concurrent test holding the registry
+        // lock, because this accessor is a `try_lock` and `Locked` is a third
+        // legitimate answer — which is the whole point of the type this test is
+        // about. Retry past it rather than reading it as a wrong answer. The
+        // address argument above is about registrations; this is about the
+        // lock, and only the sibling test below had noticed the difference.
+        assert!(
+            eventually(|| matches!(
+                lookup_jit_method_name_detailed(base + 0x10),
+                JitNameLookup::Found(ref n) if n == "Probe.absent()V"
+            )),
+            "a registered range must resolve to its name"
+        );
+        assert!(
+            eventually(|| matches!(
+                lookup_jit_method_name_detailed(base + 0x100),
+                JitNameLookup::NotFound
+            )),
+            "one past the end of the only registered range is an absence"
+        );
 
         let _held = jit_name_ranges().lock().expect("registry lock");
         assert!(matches!(
@@ -20096,7 +21368,7 @@ mod tests {
         );
         drop(old);
         assert!(
-            eventually(|| lookup_jit_code_range(old_entry).is_none()),
+            eventually_drained(|| lookup_jit_code_range(old_entry).is_none()),
             "the replaced artifact must unregister after its last Arc is released"
         );
         if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
@@ -20154,27 +21426,132 @@ mod tests {
         );
         jit_execution_leave();
 
-        // `ACTIVE_JIT_EXECUTIONS` is process-global and this suite runs tests in
-        // parallel, so a sibling test's execution epoch can hold the drain off
-        // for a moment. Poll (each probe re-runs the quiescence check) instead
-        // of asserting on the first observation.
-        let mut released = false;
-        for _ in 0..500 {
-            if lookup_jit_code_range(old_entry).is_none() {
-                released = true;
-                break;
-            }
-            jit_execution_enter();
-            jit_execution_leave();
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
         assert!(
-            released,
+            eventually_drained(|| lookup_jit_code_range(old_entry).is_none()),
             "the retired body must be released once JIT execution is quiescent"
         );
         if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
             unregister_jit_code_range(new_cm.entry_ptr() as usize);
         }
+    }
+
+    /// Drive a published body down to a single owner and hand that owner to
+    /// the caller, together with its entry address.
+    ///
+    /// `ACTIVE_JIT_EXECUTIONS` is process-global and this suite runs in
+    /// parallel, so "the cache released its reference" is not observable on the
+    /// first try — a sibling test's execution epoch can hold the drain off.
+    /// Pump the quiescence check until the count settles.
+    fn sole_owner_of_a_published_body(
+        cache: &JitCache,
+        class: &Arc<str>,
+        method: &Arc<str>,
+        desc: &Arc<str>,
+        cid: cratonvm_types::ClassId,
+    ) -> (Arc<CompiledMethod>, usize) {
+        let mut buf = ExecutableBuffer::new(64).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            CompiledMethod::new(buf),
+        );
+        let cm = cache
+            .get(class, method, desc, cid)
+            .expect("published body");
+        let entry = cm.entry_ptr() as usize;
+        register_jit_code_range(entry, cm.code_len(), Arc::as_ptr(&cm) as usize);
+        cache.remove(class, method, desc, cid);
+        assert!(
+            eventually_drained(|| Arc::strong_count(&cm) == 1),
+            "the retirement queue should have released the cache's reference \
+             (strong count is {})",
+            Arc::strong_count(&cm),
+        );
+        (cm, entry)
+    }
+
+    /// The last owner of a published body is regularly a **per-thread dispatch
+    /// cache entry**, and such a cache is evicted by the very thread that
+    /// dispatches through it — a generation flush, a staleness eviction, a
+    /// replacement. So the eviction can run while a frame of that body is on
+    /// that thread's own stack, and a bare `Arc` drop there unmaps executable
+    /// memory with no quiescence proof behind it.
+    ///
+    /// [`RetainedCode`] is what makes the release structural instead of a rule
+    /// every container has to remember. Measured on
+    /// `BasicErrorControllerIntegrationTests` before it existed: 50 published
+    /// bodies per run released outside the queue, seven of them with
+    /// `active_jit_executions` at 1, 2 or 3 — the crash signature of
+    /// `docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
+    #[test]
+    fn retained_code_releases_a_published_body_through_the_queue() {
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("RetainedCodeQueueClass");
+        let method: Arc<str> = Arc::from("m");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(1);
+        let (cm, entry) = sole_owner_of_a_published_body(&cache, &class, &method, &desc, cid);
+
+        let held = RetainedCode::new(cm);
+        jit_execution_enter();
+        drop(held);
+        assert!(
+            lookup_jit_code_range(entry).is_some(),
+            "the last owner must not unmap a published body while a thread is inside compiled code"
+        );
+        jit_execution_leave();
+
+        assert!(
+            eventually_drained(|| lookup_jit_code_range(entry).is_none()),
+            "and must release it once JIT execution is quiescent"
+        );
+    }
+
+    /// The counter behind [`published_code_free_audit`] is the *enforcement* of
+    /// the rule above, and it has to be able to fail: a plain `Arc` drop that
+    /// happens to be the last reference to a published body must be recorded.
+    ///
+    /// Both counters are process-global and monotone, so a sibling test can only
+    /// push them higher — never hide the increment this test causes itself.
+    #[test]
+    fn the_free_audit_records_a_release_that_skipped_the_queue() {
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("UnqueuedReleaseAuditClass");
+        let method: Arc<str> = Arc::from("m");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(1);
+        let (cm, entry) = sole_owner_of_a_published_body(&cache, &class, &method, &desc, cid);
+
+        let (published_before, unqueued_before) = published_code_free_audit();
+        // A bare `Arc`, dropped by hand: exactly the shape the two thread-local
+        // dispatch caches used to have.
+        let own = Arc::as_ptr(&cm) as usize;
+        drop(cm);
+        let (published_after, unqueued_after) = published_code_free_audit();
+
+        assert!(
+            published_after > published_before,
+            "the release of a published body must be counted"
+        );
+        assert!(
+            unqueued_after > unqueued_before,
+            "and a release that never reached the retirement queue must be counted as one"
+        );
+        // `is_none()` would be wrong, and flaked about 1 run in 20 at
+        // `--test-threads=32`: `mmap` regularly hands the page this body just
+        // released straight to a concurrently-running test, which registers its
+        // own range at the same address. What this test owns is that the range
+        // no longer binds `entry` to OUR artifact — a `Some(other)` is somebody
+        // else's business, and is exactly the reading
+        // `clear_all_unregisters_every_code_range` already spells out.
+        assert_ne!(
+            lookup_jit_code_range(entry),
+            Some(own),
+            "the unqueued release really did unmap it — which is why it is counted"
+        );
     }
 
     #[test]
@@ -20205,7 +21582,7 @@ mod tests {
 
         assert!(cache.get(&class, &method, &desc, cid).is_none());
         assert!(
-            eventually(|| lookup_jit_code_range(entry).is_none()),
+            eventually_drained(|| lookup_jit_code_range(entry).is_none()),
             "removed code must unregister when no caller or reader owns it"
         );
     }
@@ -20262,7 +21639,7 @@ mod tests {
 
         cache.remove(&caller_class, &caller_method, &desc, cid);
         assert!(
-            eventually(|| lookup_jit_code_range(old_entry).is_none()),
+            eventually_drained(|| lookup_jit_code_range(old_entry).is_none()),
             "dropping the final direct caller must reclaim the old body"
         );
     }
@@ -20397,7 +21774,7 @@ mod tests {
 
         slot.clear_compiled_entry();
         assert!(
-            eventually(|| artifact.strong_count() == 0),
+            eventually_drained(|| artifact.strong_count() == 0),
             "clearing the last holder must release the artifact"
         );
     }
@@ -20486,9 +21863,15 @@ mod tests {
             "a raw cache reader may still be between load and call"
         );
         jit_execution_leave();
+        // `eventually_drained`, not a bare assertion: `ACTIVE_JIT_EXECUTIONS`
+        // is process-global, so this thread's `leave` is the final transition
+        // only if no sibling test is inside its own execution epoch. What is
+        // being checked is that the deferred owner is released once JIT
+        // execution IS quiescent — and the pump is what makes that observable
+        // here rather than whenever some unrelated test happens to leave.
         assert!(
-            lookup_jit_code_range(entry).is_none(),
-            "the final quiescent transition must drain deferred code owners"
+            eventually_drained(|| lookup_jit_code_range(entry).is_none()),
+            "the quiescent transition must drain deferred code owners"
         );
     }
 
@@ -20863,11 +22246,11 @@ mod tests {
         // `CompiledMethod::drop` — which unmaps the code and unregisters the
         // range — for both bodies.
         assert!(
-            eventually(|| weak_a.strong_count() == 0),
+            eventually_drained(|| weak_a.strong_count() == 0),
             "clear_all must release the last owner of body A"
         );
         assert!(
-            eventually(|| weak_b.strong_count() == 0),
+            eventually_drained(|| weak_b.strong_count() == 0),
             "clear_all must release the last owner of body B"
         );
         // And no code range still binds our entry addresses to OUR bodies. A
@@ -20946,7 +22329,7 @@ mod tests {
         // eight — unmapping the code and returning `committed_by_test` bytes.
         for (i, weak) in bodies.iter().enumerate() {
             assert!(
-                eventually(|| weak.strong_count() == 0),
+                eventually_drained(|| weak.strong_count() == 0),
                 "clear_all must return body m{i}'s executable mapping"
             );
         }
@@ -22153,46 +23536,60 @@ mod tests {
             &table,
         ));
 
-        // `getfield`/`putfield` remain excluded — the top-level field arms
-        // still keep an inline fast path that neither null-checks nor
-        // publishes a frame. One `getfield` inside the same protected range is
-        // enough to withhold coverage.
-        let mut with_field = code.clone();
-        with_field.splice(1..1, [0xb4, 0x00, 0x03]);
-        let field_table = vec![ExceptionTableEntry {
+        // One un-admitted throwing opcode anywhere in the same protected
+        // range is still enough to withhold coverage for the whole method —
+        // this list is a conjunction, not a majority vote. `aaload` (0x32) is
+        // the witness: its inline bounds/null check bails to the shared
+        // sentinel stub, which records no frame.
+        let mut with_aaload = code.clone();
+        with_aaload.splice(1..1, [0x32]);
+        let aaload_table = vec![ExceptionTableEntry {
             start_pc: 0,
-            end_pc: 16,
-            handler_pc: 16,
+            end_pc: 14,
+            handler_pc: 14,
             catch_type: 0,
         }];
         assert!(!precise_exception_frame_sites_supported(
-            &with_field,
-            with_field.len(),
-            &field_table,
+            &with_aaload,
+            with_aaload.len(),
+            &aaload_table,
         ));
     }
 
+    /// `getfield`/`putfield` inside a protected range no longer withhold
+    /// coverage (2026-08-02). The exclusion outlived its cause: both top-level
+    /// field arms grew a precise null trap after it was written — see
+    /// `precise_frame_publishing_opcode`'s own doc for which commit did which.
+    ///
+    /// This is a static-admission test. The behavioural acceptance tests are
+    /// `probes/Rbc6FieldProbe.java` (a handler reading a non-parameter local
+    /// after a field NPE) and `probes/SyncBlockFieldProbe.java` (javac's
+    /// `synchronized` cleanup handler releasing the monitor on the way out) —
+    /// re-run THOSE, not this, before touching the list again.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn protected_field_access_keeps_unsafe_handler_interpreted() {
+    fn protected_field_access_is_precise_exception_covered() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
 
         let code = vec![
             0x2a, // 0: aload_0
             0xb4, 0x00, 0x01, // 1: getfield #1
             0x57, // 4: pop
-            0xb1, // 5: return
-            0x4c, // 6: astore_1
-            0x2b, // 7: aload_1
-            0xbf, // 8: athrow
+            0x2a, // 5: aload_0
+            0x03, // 6: iconst_0
+            0xb5, 0x00, 0x02, // 7: putfield #2
+            0xb1, // 10: return
+            0x4c, // 11: astore_1
+            0x2b, // 12: aload_1
+            0xbf, // 13: athrow
         ];
         let table = vec![ExceptionTableEntry {
             start_pc: 0,
-            end_pc: 5,
-            handler_pc: 6,
+            end_pc: 11,
+            handler_pc: 11,
             catch_type: 0,
         }];
-        assert!(!precise_exception_frame_sites_supported(
+        assert!(precise_exception_frame_sites_supported(
             &code,
             code.len(),
             &table,
@@ -22461,7 +23858,29 @@ mod layout_constant_inventory {
         // address (`HEADER_SIZE + packed_body_offset`) — a disp32 site, so it
         // does not share the disp8 backwards-addressing hazard, but it does
         // bake the header size into machine code.
-        ("ir_lower.rs", [8, 3, 4, 0, 0, 0, 3, 0]),
+        //
+        // COV-02 added two more of each of the first two. `HEADER_SIZE`
+        // 8 -> 10: `emit_gpr_array_elem_load` and `emit_gpr_array_elem_store`,
+        // one shared displacement apiece covering every integral/reference
+        // element width (int, long, byte, char, short, ref — wide and narrow).
+        // That is deliberately ONE site per emitter rather than one per width;
+        // the header shrink has fewer places to visit, and both go through
+        // `disp::disp8_const`, so an oversized header is a build failure rather
+        // than a read before the object. `ARRAY_LENGTH_OFFSET` 3 -> 4: the
+        // `arraylength` lowering's own length load, alongside the bounds
+        // check's.
+        //
+        // cov-01 added one site on top of that, `emit_inline_getstatic`, which
+        // accounts for the fifth `SLOT_SIZE`, the fourth
+        // `FIELD_CELL_PAYLOAD32_OFFSET` and both `FIELD_CELL_PAYLOAD64_OFFSET`s
+        // (the `use` list and the site). It addresses a STATICS block, which
+        // has no object header — hence no new `HEADER_SIZE` — and reaches the
+        // cell as `field_index * SLOT_SIZE + payload_offset` from the block
+        // base, the same 16-byte `Value` cell shape
+        // `field_cell_layout_matches_value_enum` pins. It is a disp32 site
+        // (`48 8B 80 disp32` / `48 63 80 disp32`), so it does not share the
+        // disp8 backwards-addressing hazard the three array sites have.
+        ("ir_lower.rs", [10, 4, 5, 0, 0, 0, 4, 2]),
     ];
 
     fn source(file: &str) -> &'static str {
@@ -22968,5 +24387,73 @@ mod code_cache_lifetime_tests {
     fn pinning_an_unmapped_address_yields_none() {
         assert!(pin_jit_code_range_owner(0).is_none());
         assert!(pin_jit_code_range_owner(0x10).is_none());
+    }
+
+    /// The bisect levers' matching rule. Pinned as a pure function because the
+    /// live predicate reads two `OnceLock`s seeded from the environment once
+    /// per process, which no test can set reproducibly.
+    ///
+    /// The load-bearing case is the last one. `CRATONVM_DBG=jit-bisect-only`
+    /// with a prefix matching NOTHING must force EVERY method interpreted —
+    /// that is what makes "allow only X, does the crash survive?" a valid
+    /// bisect step. See `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`:
+    /// the OSR path did not consult this predicate at all, so 21 OSR bodies
+    /// compiled under exactly that setting and every bisect row read a
+    /// meaningless "no effect".
+    #[test]
+    fn bisect_levers_match_deny_by_substring_and_allow_only_by_prefix() {
+        let deny = vec!["org/h2/mvstore/MVStore.commit".to_string()];
+        assert!(force_interpret_matches(
+            Some(&deny),
+            None,
+            "org/h2/mvstore/MVStore",
+            "commit"
+        ));
+        assert!(!force_interpret_matches(
+            Some(&deny),
+            None,
+            "org/h2/mvstore/MVStore",
+            "rollback"
+        ));
+
+        // A bare package entry pins everything under it.
+        let pkg = vec!["org/keycloak/".to_string()];
+        assert!(force_interpret_matches(
+            Some(&pkg),
+            None,
+            "org/keycloak/Foo",
+            "bar"
+        ));
+
+        // Allowlist: listed prefix stays eligible, everything else does not.
+        let only = vec!["org/apache/tomcat".to_string()];
+        assert!(!force_interpret_matches(
+            None,
+            Some(&only),
+            "org/apache/tomcat/util/bcel/classfile/ConstantPool",
+            "getConstant"
+        ));
+        assert!(force_interpret_matches(
+            None,
+            Some(&only),
+            "java/io/BufferedInputStream",
+            "read"
+        ));
+
+        // Neither lever set: nothing is forced interpreted.
+        assert!(!force_interpret_matches(None, None, "any/Class", "any"));
+
+        // A prefix that matches nothing forces EVERY method interpreted.
+        let nothing = vec!["zzzNoSuchPrefix".to_string()];
+        for (c, m) in [
+            ("java/io/BufferedInputStream", "read"),
+            ("org/apache/tomcat/util/bcel/classfile/ConstantPool", "getConstant"),
+            ("AnnotationScanSplitProbe", "readBytes"),
+        ] {
+            assert!(
+                force_interpret_matches(None, Some(&nothing), c, m),
+                "bisect-only with an unmatched prefix must force {c}.{m} interpreted"
+            );
+        }
     }
 }

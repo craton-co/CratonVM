@@ -51,6 +51,33 @@ pub enum InterpIntrinsic {
     LongValueOf,
     LongLongValue,
     LongParseLong,
+    // java/lang/Thread
+    //
+    // `onSpinWait` is unlike every other entry here: it is not *dispatched* at
+    // all. The JDK declares it `@IntrinsicCandidate public static void
+    // onSpinWait() {}` — an EMPTY body that HotSpot lowers to a single x86
+    // PAUSE — so the interpreter answers the call site inline (a `spin_loop()`
+    // hint and a pc advance) instead of paying `safe_native_call`. The tag
+    // exists so the inline cache can recognise the site once and take that
+    // path; `dispatch`/`callback_for` still handle it for any caller that goes
+    // through the generic route.
+    ThreadOnSpinWait,
+    /// `Thread.currentThread()` — the same shape: answered inline, not
+    /// dispatched.
+    ///
+    /// Once a thread's `java_thread_obj` mirror exists it is a single field
+    /// read, it is already a GC root, and returning it cannot allocate,
+    /// collect or throw — so entering `safe_native_call` buys nothing and
+    /// costs ~400 ns (measured: `probes/NativeShapeProbe.java`). Worth
+    /// singling out because the JDK calls it constantly: **twice per
+    /// uncontended `ReentrantLock.lock()`/`unlock()` pair** (censused with
+    /// `--dump-native-registry`, `probes/LockNativeCensusProbe.java`), plus
+    /// every AQS ownership check and thread-local lookup.
+    ///
+    /// The interpreter falls through to the ordinary path when the mirror has
+    /// not been created yet — that first call must run the allocating slow
+    /// path in `current_thread_object`.
+    ThreadCurrentThread,
     // java/lang/Math
     MathAbsInt,
     MathAbsLong,

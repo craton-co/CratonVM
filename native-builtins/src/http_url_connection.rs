@@ -2313,9 +2313,22 @@ fn perform(
     let addr = format!("{}:{}", parsed.host, parsed.port);
     let mut last_err: Option<String> = None;
     let mut tcp: Option<TcpStream> = None;
+    // `normalize_connect_addr` folds an IPv4-mapped destination
+    // (`::ffff:a.b.c.d`) to plain IPv4. A URL carries its host as TEXT, so this
+    // path never passes through `InetAddress` — which is where real JDK, and
+    // CratonVM's own mirror of it, collapses that literal to an
+    // `Inet4Address`. Without the fold we build an AF_INET6 socket, and on
+    // Windows `IPV6_V6ONLY` defaults to 1, so `connect` cannot reach a mapped
+    // destination: `TestStartupIPv6Connectors.testIPv6MappedIPv4` reported
+    // exactly "connect [::ffff:127.0.0.1]:<port>: ... (os error 10049)" from
+    // the `last_err` line below. The fold also makes the IPv4-first sort do
+    // what it says: a mapped address is a v4 destination wearing a v6
+    // sockaddr, so it used to sort LAST despite being the loopback we want
+    // tried first.
     let mut addrs: Vec<std::net::SocketAddr> =
         std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
             .map_err(|e| format!("resolve {addr}: {e}"))?
+            .map(cratonvm_native_io::outbound_policy::normalize_connect_addr)
             .collect();
     // preferIPv4Stack semantics: try IPv4 candidates before IPv6. On Windows a
     // "localhost" lookup returns `[::1, 127.0.0.1]` (IPv6 first), but an
@@ -2883,8 +2896,12 @@ fn is_poolable(resp_headers: &[(String, String)], req_headers: &[(String, String
 /// ~15-line loop).
 fn connect_plain(parsed: &Url1, connect_timeout: Duration) -> Result<TcpStream, String> {
     let addr = format!("{}:{}", parsed.host, parsed.port);
+    // Same IPv4-mapped fold as `perform`'s loop above — see the comment there.
+    // This function is a deliberate duplicate of that loop, so a fix to one is
+    // only half a fix.
     let mut addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
         .map_err(|e| format!("resolve {addr}: {e}"))?
+        .map(cratonvm_native_io::outbound_policy::normalize_connect_addr)
         .collect();
     addrs.sort_by_key(|sa| u8::from(sa.is_ipv6()));
     let mut last_err: Option<String> = None;

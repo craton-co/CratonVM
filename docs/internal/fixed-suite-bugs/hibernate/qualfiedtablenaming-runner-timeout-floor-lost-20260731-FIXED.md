@@ -137,10 +137,12 @@ Measured on the same class, same flags, baseline vs fixed binary:
 The fix is real and eliminates this writer completely, but the `--nojit` arm
 still dies — via a **second, independent** corrupt writer in
 `native-collections`' map resize. Root-caused and filed separately as
-[`HIB-MAPRESIZE-STALE.1`](../../../known-issues/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731.md);
+[`HIB-MAPRESIZE-STALE.1`](map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md);
 not fixed here, deliberately (~50 lines of pin plumbing in a hot native, with a
 trap found while prototyping, and a ~50-minute validation cycle — it deserves
-its own change, not a fold-in to a harness fix).
+its own change, not a fold-in to a harness fix). **Resolved 2026-08-03** — see
+that doc's own Follow-up 4/Resolution: the actual writer turned out to be
+`OldGen::compact`, not the map-resize natives this section suspected.
 
 ## Blocker 2 (real VM defect): JIT-on OOMs on a half-empty heap
 

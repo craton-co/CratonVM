@@ -253,7 +253,7 @@ contract.
 | Stage | User contract | Gate to enter |
 |---|---|---|
 | **1 — Internal diagnostic** *(current)* | `--jdk-only` may fail. The census and the errors are the product, not successful execution. | Flag exists; violations are structured; no synthetic-stub *invocation* goes unrecorded. Failures are expected. |
-| **2 — Experimental** | The core Java corpus and selected frameworks pass. The fallback is documented and works. | Linux + JDK 21 strict job **blocking**. Zero `CompatibilityStub` classes on the core corpus. Startup/memory budgets published (see [`benchmarks/jdk-only.md`](benchmarks/jdk-only.md)). |
+| **2 — Experimental** | The core Java corpus and selected frameworks pass. The fallback is documented and works. | Linux + JDK 21 strict job **blocking**. Zero `CompatibilityStub` classes on the core corpus. Startup/memory budgets published (see [`benchmarks/jdk-only.md`](benchmarking/jdk-only.md)). |
 | **3 — Preview** | JDK 21 and 25, Linux and Windows, broad runtime-service coverage. | Differential and regression gates blocking in strict mode. No new unapproved HotSpot divergence. Windows filesystem/process/networking vectors stable. |
 | **4 — Stable** | A declared JDK/platform matrix, published performance budgets, a support policy. | No known P0/P1 compatibility substitution remains open in [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md). Zero final `SyntheticStub` registrations. Zero synthetic-stub invocations across interpreter, JIT, JNI, reflection and method-handle paths. |
 

@@ -1486,6 +1486,24 @@ pub trait NativeClassAccess {
         Ok(())
     }
 
+    /// True while the current thread is executing inside some class's
+    /// `<clinit>` (including nested/re-entrant `<clinit>` calls it
+    /// transitively triggers).
+    ///
+    /// Callers that would otherwise force a *different*, unrelated class's
+    /// full initialization as a side effect of reflection (e.g. resolving
+    /// the return type of a `java.lang.reflect.Method` mirror) must check
+    /// this first and skip the eager `initialize_class` call when true --
+    /// JVMS §5.5 never requires initializing a class merely because its
+    /// name shows up in another class's method signature, and doing so
+    /// anyway while genuinely mid-`<clinit>` lets the forced class observe
+    /// the in-progress class's statics before they are assigned. Defaults
+    /// to `false` (preserves prior behavior) for implementors that do not
+    /// track this.
+    fn in_clinit(&self) -> bool {
+        false
+    }
+
     /// Return all JPMS `provides` implementation class names for a given service
     /// interface (binary class name, e.g. `"com/example/MyService"`).
     /// Walks all registered module descriptors' `provides` entries.

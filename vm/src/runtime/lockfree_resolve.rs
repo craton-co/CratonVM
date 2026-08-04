@@ -187,7 +187,7 @@ use crate::classloading::resolution::CachedInvokeTarget as GenericCachedInvokeTa
 use crate::classloading::ClassId;
 use std::hash::{Hash, Hasher};
 
-type CachedInvokeTarget = GenericCachedInvokeTarget<Arc<crate::jit::CompiledMethod>>;
+type CachedInvokeTarget = GenericCachedInvokeTarget<cratonvm_jit::RetainedCode>;
 
 // ---------------------------------------------------------------------------
 // ResolutionKey

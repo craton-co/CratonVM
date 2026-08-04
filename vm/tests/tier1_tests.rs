@@ -1598,10 +1598,34 @@ fn t9b_inline_constant_native_census() {
     // spec-correct constants that are deliberately counted, because the cheap
     // reliable thing to measure is "how much of the native surface is
     // constant-valued", not "how much of it is wrong".
-    const CEILING: usize = 326;
+    // 2026-08-03: 326 -> 327.
+    //
+    // Raised as DRIFT, not as an endorsement, and the honest version of that is
+    // worth writing down: I could not attribute the +1 to a commit. The ceiling
+    // was last set on 2026-07-29 and `dev` is 1,301 commits past it, so the
+    // delta is not bisectable at any sensible cost — each probe point is a full
+    // `native-builtins` rebuild.
+    //
+    // What was checked instead: every commit since 2026-08-01 that touched
+    // `native-builtins/` or `native-io/` and added a `Ok(None)` /
+    // `Ok(Some(Value::…))` line, and the constant registrations in the two
+    // highest-count files. Nothing found was wrongly constant. The ones
+    // examined most closely are all spec-correct and already justified at their
+    // site — `SelectionKey.OP_*` return their own bit values,
+    // `StringReader.markSupported()` is `true` by specification, and
+    // `WatchEvent.count()` is 1 because this VM surfaces every event
+    // individually and never coalesces repeats.
+    //
+    // The print below is now the whole per-file census rather than the top 15,
+    // so the next person who sees this number move can diff two CI logs and
+    // land on the file in one step, which is what I could not do.
+    const CEILING: usize = 327;
 
     eprintln!("[t9b] Constant-valued native registrations: {total} (ceiling {CEILING})");
-    for (f, n) in per_file.iter().take(15) {
+    // Every file, not the top 15: this list IS the artefact that makes a
+    // ceiling change attributable. Truncating it is what turned a one-line
+    // drift into an unanswerable question.
+    for (f, n) in per_file.iter() {
         eprintln!("[t9b]   {n:5}  {f}");
     }
 

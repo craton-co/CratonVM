@@ -1,3 +1,12 @@
+// The corpus invokes this as `cratonvm/PgoTest` and the file lives in the
+// `cratonvm/` directory — but it declared no package, so javac staged it in
+// the DEFAULT package (`$OUT_DIR/test-classes/PgoTest.class`) and all 10 of
+// its tests failed with `ClassNotFound: cratonvm/PgoTest`. The committed
+// .class beside this file hid that: its `this_class` says `PgoTest` while its
+// path says `cratonvm/PgoTest` — a contradiction HotSpot rejects outright and
+// only CratonVM's loader tolerated.
+package cratonvm;
+
 public class PgoTest {
 
     // --- Branch profiling: biased branches ---

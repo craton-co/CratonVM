@@ -386,7 +386,7 @@ pub fn shadow_stack_enabled() -> bool {
     // lane faulted on a zeroed heap slot within seconds of real work.
     // Restoring publication with `CRATONVM_SHADOW_STACK=1` and changing
     // nothing else made the same runs clean. See
-    // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+    // `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
     *ENABLED.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some()
             || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MY_SHADOW_EMISSION") {

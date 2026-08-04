@@ -20142,8 +20142,18 @@ mod io_tests {
         );
 
         assert!(result.is_ok(), "handler path returned error: {result:?}");
-        let calls = ctx.recorded_calls();
-        assert_eq!(calls.len(), 1, "unexpected calls: {calls:?}");
+        // Exactly one HANDLER callback. Counting every recorded invoke instead
+        // would also count the `IOException.<init>` that `afc_io_exception`
+        // makes whenever the context can allocate — which is the branch
+        // production takes, and which this mock only began exercising once its
+        // `new_object` stopped reporting allocation failure.
+        let calls: Vec<_> = ctx
+            .recorded_calls()
+            .iter()
+            .filter(|c| c.method_name == "failed" || c.method_name == "completed")
+            .cloned()
+            .collect();
+        assert_eq!(calls.len(), 1, "unexpected handler callbacks: {calls:?}");
         let call = &calls[0];
         assert_eq!(call.method_name, "failed");
         assert_eq!(

@@ -3919,6 +3919,60 @@ fn notify_generated_class_handler(
 /// already taken. Names cglib itself reserved are already skipped by its own
 /// predicate, so this loop is a no-op unless a native generator got there
 /// first.
+/// The loader namespace real CGLIB is about to define the class it is naming
+/// into, or `None` when that cannot be established.
+///
+/// `AbstractClassGenerator.generate` publishes itself on the static `CURRENT`
+/// ThreadLocal *before* it calls `generateClassName`, so
+/// `getCurrent().getClassLoader()` is exactly the `ClassLoader` its
+/// `ReflectUtils.defineClass` a few lines later will target — the same object
+/// `create()` used to pick the `ClassLoaderData` whose reserved-name predicate
+/// produced the candidate.
+///
+/// `AbstractClassGenerator` is resolved from the naming policy's OWN class
+/// rather than by name: under `@CompileWithForkedClassLoader` every non-JDK
+/// name is defined twice, and the global by-name lookup then answers `None`
+/// (deliberately — see `ClassManager::get_loaded_class_id`) or the wrong copy.
+/// Both classes live in `org.springframework.cglib.core`, so whichever copy of
+/// cglib is running, the referencing lookup lands on its own.
+fn current_generator_loader_namespace(
+    ctx: &mut dyn NativeContext,
+    naming_policy: ObjectRef,
+) -> Option<u32> {
+    const ACG: &str = "org/springframework/cglib/core/AbstractClassGenerator";
+    let policy_cid = ctx.class_id_of_object(naming_policy);
+    let acg_cid = ctx
+        .class_id_by_name_via_referencing_class(policy_cid, ACG)
+        .ok()?;
+    let current = ctx
+        .invoke_by_class_id(
+            acg_cid,
+            ACG,
+            "getCurrent",
+            "()Lorg/springframework/cglib/core/AbstractClassGenerator;",
+            &[],
+        )
+        .ok()??;
+    let Value::Object(Some(generator)) = current else {
+        return None;
+    };
+    // `getClassLoader()` runs bytecode (`Enhancer` answers it from its
+    // superclass), so the generator has to survive a GC across the call.
+    let pin = ctx.pin_native_root(generator);
+    let generator = ctx.read_native_pin(pin, generator);
+    let namespace = match ctx.invoke_virtual(
+        generator,
+        "getClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(cl))) => Some(loader_namespace_for_object(ctx, cl)),
+        _ => None,
+    };
+    ctx.unpin_native_roots(pin);
+    namespace
+}
+
 fn native_spring_naming_policy_get_class_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3948,10 +4002,43 @@ fn native_spring_naming_policy_get_class_name(
     let Ok(mut counter) = num.parse::<u64>() else {
         return Ok(candidate);
     };
+    // Only advance past a name the loader CGLIB is about to define into has
+    // already defined ITSELF. This used to ask `class_id_by_name`, i.e. "is
+    // this name taken ANYWHERE in the VM", and the honest answer to that is
+    // `true` for names that are perfectly free in the target loader.
+    //
+    // Spring AOT is the case that breaks: `CglibAopProxy` builds a proxy class
+    // in the forked test loader at build time, then builds the same proxy again
+    // in the compiled artifacts' child `DynamicClassLoader` at run time. On
+    // HotSpot the second generation keeps `$$0` — nothing in the CHILD holds
+    // that name — and `AbstractClassGenerator`'s `attemptLoad` then resolves it
+    // through delegation to the build-time class, so the proxy is reused and no
+    // second definition happens at all. Bumping it to `$$1` makes that load
+    // miss, and the fresh proxy lands in the child loader, a different runtime
+    // package from its superclass — where a package-private override is not an
+    // override (JVMS 5.4.5) and `invokevirtual` keeps reaching the original
+    // body. That was the whole of
+    // `AotIntegrationTests.endToEndTestsForBeanOverrides`'s divergence:
+    // `MockitoSpyBeanAndSpringAopProxyIntegrationTests$DateService.getDate` is
+    // package-private, so the spy's stub was silently bypassed.
+    //
+    // The collision this shim exists for is unaffected: `cce_enhance` defines
+    // its `$$SpringCGLIB$$<n>` into a namespace, and a name it minted is
+    // therefore defined BY that namespace's loader, which is exactly what
+    // `class_id_defined_by_loader_exact` reports.
+    let Some(target_loader) = current_generator_loader_namespace(ctx, this) else {
+        // No generator on the stack (`SpringNamingPolicyTests` calls
+        // `getClassName` directly) — there is no target loader to test against,
+        // so leave cglib's own answer alone, as HotSpot does.
+        return Ok(candidate);
+    };
     let mut chosen = name.clone();
     // Bounded: a runaway here would be worse than a collision.
     for _ in 0..1024 {
-        if ctx.class_id_by_name(&chosen.replace('.', "/")).is_none() {
+        if ctx
+            .class_id_defined_by_loader_exact(&chosen.replace('.', "/"), target_loader)
+            .is_none()
+        {
             break;
         }
         counter += 1;

@@ -3874,7 +3874,14 @@ fn ir_op_defines_value(op: &Op) -> bool {
             | Op::ArrayStore(_)
             | Op::New { .. }
             | Op::Call { .. }
+            // cov-01 — mirrors `ir_lower::op_defines_result_slot`.
+            | Op::ConstString { .. }
+            | Op::ConstClass { .. }
+            | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble
+            // cov-05 — mirrors `ir_lower::op_defines_result_slot`.
+            | Op::InstanceOf { .. }
+            | Op::CheckCast { .. }
     )
 }
 
@@ -3890,8 +3897,19 @@ fn ir_op_is_safepoint(op: &Op) -> bool {
         Op::Call { .. }
             | Op::New { .. }
             | Op::NewArray { .. }
+            // cov-01: the two `ldc` constants always call a helper; `getstatic`
+            // does whenever the class is not already initialized at compile
+            // time. Over-approximating a site that took the direct load costs a
+            // promotion, never correctness — see this function's doc.
+            | Op::ConstString { .. }
+            | Op::ConstClass { .. }
+            | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble
             | Op::Guard { .. }
+            // cov-05: `jit_instanceof`/`jit_checkcast` can allocate a Class
+            // mirror on first touch, same as the three above.
+            | Op::InstanceOf { .. }
+            | Op::CheckCast { .. }
     )
 }
 
@@ -3928,10 +3946,24 @@ fn ir_op_is_call(op: &Op) -> bool {
         Op::Call { .. }
             | Op::New { .. }
             | Op::NewArray { .. }
+            // cov-01 — same superset reasoning as `Op::Load`/`Op::Store` above:
+            // these lower to `MOV RAX,helper ; CALL RAX` and return into the
+            // body, so a caller-saved register live across one must not be
+            // assumed to survive. `Op::LoadStatic`'s direct route emits no call
+            // at all, and being listed here merely denies it a register it did
+            // not need.
+            | Op::ConstString { .. }
+            | Op::ConstClass { .. }
+            | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble
             | Op::Rem
             | Op::Load(_)
             | Op::Store(_)
+            // cov-05: `MOV RAX,jit_instanceof|jit_checkcast ; CALL RAX`,
+            // returns into the body — same superset reasoning as the other
+            // helper calls above.
+            | Op::InstanceOf { .. }
+            | Op::CheckCast { .. }
     )
 }
 
