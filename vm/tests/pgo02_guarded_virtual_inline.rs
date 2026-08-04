@@ -114,6 +114,11 @@ fn test_pgo02_guarded_virtual_inline() {
             // builder has no `invoke_info` for those sites and bails the whole
             // method, which is exactly the routing this file needs.
             ("CRATONVM_JIT_IR_CALL_VIRTUAL", Some("0")),
+            // So `check_metrics_harvest` has something to read. The design doc
+            // recorded the inline tally as unharvested; it is harvested, and
+            // this is the run that proves it end to end rather than by reading
+            // `metrics.rs`.
+            ("CRATONVM_JIT_METRICS", Some("1")),
         ],
         run_all_checks,
     );
@@ -147,6 +152,40 @@ fn run_all_checks() -> Result<(), String> {
     check_uncaught_from_inlined_frame(&mut vm)?;
     check_thrower(&mut vm)?;
     check_polymorphic(&mut vm)?;
+    check_metrics_harvest()?;
+    Ok(())
+}
+
+/// The inlining tally reaches the metrics surface.
+///
+/// `docs/feature-designs/profile-guided-inlining.md` recorded this as an open
+/// gap ("Nothing in `jit/src/metrics.rs` harvests it yet"). It does —
+/// `CompileRecorder::installed` copies the whole tally off the artifact — but
+/// the claim was only ever checked by reading the source, and a harvest that
+/// runs on no real compile is indistinguishable from one that does not exist.
+/// This asserts it against the reports the compiles above actually published.
+fn check_metrics_harvest() -> Result<(), String> {
+    let reports = cratonvm_jit::metrics::compilation_reports();
+    if reports.is_empty() {
+        return Err(
+            "check_metrics_harvest: no compilation reports at all — CRATONVM_JIT_METRICS did              not take, so nothing below would have been measured"
+                .to_string(),
+        );
+    }
+    let speculative = reports
+        .iter()
+        .filter(|r| matches!(r.speculative_inlined_sites, cratonvm_jit::metrics::Measured::Value(n) if n > 0))
+        .count();
+    if speculative == 0 {
+        let measured = reports
+            .iter()
+            .filter(|r| !matches!(r.inline_candidates, cratonvm_jit::metrics::Measured::NotMeasured))
+            .count();
+        return Err(format!(
+            "check_metrics_harvest: {} reports, {measured} carrying an inline tally, but none              reporting a speculative site — the guarded inlines the checks above proved              happened did not reach the metrics surface",
+            reports.len()
+        ));
+    }
     Ok(())
 }
 

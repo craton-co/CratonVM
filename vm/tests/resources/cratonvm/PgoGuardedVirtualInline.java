@@ -8,35 +8,42 @@ package cratonvm;
 // compile mid-call, a different, untouched code path.
 public class PgoGuardedVirtualInline {
     static class A {
-        int tag(int x) {
+        // PUBLIC on purpose. The guarded inliner refuses a package-private
+        // method selected from a class other than the constant-pool class,
+        // because whether it OVERRIDES the resolved method depends on runtime
+        // packages it does not resolve — see
+        // `receiver_resolution_is_dispatch_faithful`. Every override below is
+        // therefore public, which is also the ordinary shape of a virtual call
+        // in real Java.
+        public int tag(int x) {
             return x + 1;
         }
     }
 
     static class B extends A {
         @Override
-        int tag(int x) {
+        public int tag(int x) {
             return x + 1000;
         }
     }
 
     static class C extends A {
         @Override
-        int tag(int x) {
+        public int tag(int x) {
             return x + 2000;
         }
     }
 
     static class D extends A {
         @Override
-        int tag(int x) {
+        public int tag(int x) {
             return x + 3000;
         }
     }
 
     static class Thrower extends A {
         @Override
-        int tag(int x) {
+        public int tag(int x) {
             if (x == 7) {
                 throw new IllegalStateException("boom-" + x);
             }
@@ -53,7 +60,7 @@ public class PgoGuardedVirtualInline {
         int divisor = 1;
 
         @Override
-        int tag(int x) {
+        public int tag(int x) {
             return x / divisor;
         }
     }

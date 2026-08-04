@@ -5387,7 +5387,6 @@ fn resolve_inline_site_from(
             declaring_id,
             method,
             callee_method,
-            callee_desc,
         ) {
             return None;
         }
@@ -5784,7 +5783,6 @@ fn receiver_resolution_is_dispatch_faithful(
     declaring_id: ClassId,
     method: &cratonvm_reader::method::ClassFileMethod,
     callee_method: &str,
-    callee_desc: &str,
 ) -> bool {
     // A virtual/interface site never dispatches to a static method, and a
     // private method is never inherited — a walk that reached one from a
@@ -5807,47 +5805,35 @@ fn receiver_resolution_is_dispatch_faithful(
     if !class_is_assignable_to(store, receiver_id, cp_class_id) {
         return false;
     }
-    // Where the constant-pool reference itself resolves. If selection landed on
-    // the SAME method, there is no override question to answer.
-    let resolved = crate::classloading::find_method_recursive(
-        cp_class_id,
-        callee_method,
-        callee_desc,
-        store,
-    );
-    let Some((_, resolved_declaring_id)) = resolved else {
-        // The declared site does not resolve at all. That is a shape this
-        // resolver has no model for; refuse rather than guess.
-        return false;
-    };
-    if resolved_declaring_id == declaring_id {
-        return true;
-    }
-    // A genuine override: public or protected overrides across any package.
+    // Is the selected method genuinely an OVERRIDE of what the constant-pool
+    // reference resolves to? Two sufficient conditions, both answerable from
+    // what is already in hand — deliberately NOT by resolving the CP reference
+    // as well. `vm/src/runtime/resolve/guard.rs` ratchets the interpreter's
+    // metadata-table bypass budget downward and nothing raises it; a second
+    // `find_method_recursive` here would, and the cheaper rules below cost
+    // only reach, never correctness.
+    //
+    //  1. `public`/`protected` overrides anything with the same name and
+    //     descriptor it inherits, in any package (JVMS §5.4.5).
+    //  2. Otherwise, the method must be declared on the CONSTANT-POOL CLASS
+    //     itself — in which case CP resolution stops there and the selected
+    //     method IS the resolved method, so there is no override question to
+    //     answer.
+    //
+    // What this refuses is the remaining shape: a PACKAGE-PRIVATE method found
+    // by walking up from the receiver, declared somewhere other than the CP
+    // class. It may or may not override — a package-private method in a
+    // different runtime package does NOT (dispatch runs the resolved method,
+    // while the walk found the impostor) — and telling those apart needs the
+    // CP-side resolution this deliberately does without. Refusing costs a
+    // package-private virtual site its inline; guessing costs a wrong body.
     if method
         .access_flags
         .intersects(MethodAccessFlags::PUBLIC | MethodAccessFlags::PROTECTED)
     {
         return true;
     }
-    // Package-private: an override only within the same runtime package —
-    // same package NAME and same defining loader.
-    let (Some(selected), Some(resolved_owner)) =
-        (store.get(declaring_id), store.get(resolved_declaring_id))
-    else {
-        return false;
-    };
-    selected.loader_id == resolved_owner.loader_id
-        && runtime_package_of(&selected.name) == runtime_package_of(&resolved_owner.name)
-}
-
-/// The package part of an internal class name (`a/b/C` -> `a/b`), empty for the
-/// unnamed package.
-fn runtime_package_of(internal_name: &str) -> &str {
-    match internal_name.rfind('/') {
-        Some(i) => &internal_name[..i],
-        None => "",
-    }
+    declaring_id == cp_class_id
 }
 
 /// Whether `sub` is `sup` or inherits/implements it.
