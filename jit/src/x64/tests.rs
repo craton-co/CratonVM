@@ -5972,6 +5972,62 @@ fn detects_and_executes_canonical_byte_sieve_loop_nest() {
     assert_eq!(empty, 0);
 }
 
+/// PERF-01. The optimizing tier's admission chain asks
+/// `single_pass_has_bulk_byte_lowering` whether THIS backend would vectorise a
+/// loop, and declines the method when it would. If that predicate stops firing
+/// on `CratonBench.sieve`, the IR tier takes the method back and the phase
+/// goes from 2,462 ms to 15,823 ms with no test failing and no checksum
+/// changing — which is exactly how the regression it guards against shipped.
+///
+/// The edits that trip this test: any of the three detectors ceasing to match,
+/// or the veto drifting away from the emission path's own
+/// `detect_bulk_byte_loops`.
+#[test]
+fn single_pass_bulk_byte_veto_fires_on_the_cratonbench_sieve() {
+    // The same exact javac shape as
+    // `detects_and_executes_canonical_byte_sieve_loop_nest` above.
+    let sieve = [
+        0x03, 0x3d, // 0: int i/count = 0
+        0x1c, 0x1b, 0xa3, 0x00, 0x0d, // 2: clear-loop header -> 17
+        0x2a, 0x1c, 0x03, 0x54, // 7: a[i] = 0
+        0x84, 0x02, 0x01, 0xa7, 0xff, 0xf4, // 11: i++; goto 2
+        0x03, 0x3d, 0x05, 0x3e, // 17: count=0; outer i=2
+        0x1d, 0x1b, 0xa3, 0x00, 0x2b, // 21: outer header -> 66
+        0x2a, 0x1d, 0x33, 0x9a, 0x00, 0x1f, // 26: if (a[i]) -> 60
+        0x84, 0x02, 0x01, // 32: count++
+        0x1d, 0x1d, 0x60, 0x36, 0x04, // 35: j=i+i
+        0x15, 0x04, 0x1b, 0xa3, 0x00, 0x11, // 40: inner header -> 60
+        0x2a, 0x15, 0x04, 0x04, 0x54, // 46: a[j] = 1
+        0x15, 0x04, 0x1d, 0x60, 0x36, 0x04, // 51: j += i
+        0xa7, 0xff, 0xef, // 57: goto 40
+        0x84, 0x03, 0x01, 0xa7, 0xff, 0xd6, // 60: i++; goto 21
+        0x1c, 0xac, // 66: return count
+        0x00, 0x00,
+    ];
+    assert!(
+        single_pass_has_bulk_byte_lowering(&sieve, 68, &[]),
+        "the veto must fire on CratonBench.sieve — without it the IR tier \
+         takes this method and emits a scalar loop 6.4x slower than the \
+         vectorised one this backend already emits"
+    );
+
+    // And it must agree with what the emission path actually found: vetoing a
+    // method this backend would NOT vectorise costs an IR body for nothing.
+    let loops = detect_loops(&sieve, 68);
+    let found =
+        detect_bulk_byte_loops(&sieve, 68, &loops, &rustc_hash::FxHashSet::default());
+    assert!(
+        !found.is_empty(),
+        "the veto said yes but the emission path found nothing to emit"
+    );
+
+    // A method with no loop at all is not vetoed: `iconst_0; ireturn`.
+    assert!(
+        !single_pass_has_bulk_byte_lowering(&[0x03, 0xac], 2, &[]),
+        "a loopless method must stay eligible for the optimizing tier"
+    );
+}
+
 #[test]
 fn test_find_modified_locals() {
     // Loop body: iinc 1,1; istore_2; aload_0; iload_3; aaload

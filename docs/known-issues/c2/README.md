@@ -108,8 +108,18 @@ say lowering these opcodes makes anything faster."* Every lane in the table
 below widens the set of methods this can happen to, and nothing today compares
 an IR body against the C1 body it replaces before keeping it.
 
-[`perf-01`](perf-01-sieve-ir-body-6x-slower-than-c1.md) — open, unowned,
-and it raises a policy question bigger than the defect.
+~~`perf-01`~~ **FIXED 2026-08-04**, same day it was found — the optimizing
+tier's admission chain now asks the single-pass backend's own detectors whether
+they would vectorise a loop in this method, and declines it if so.
+[Closeout](../../internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md)
+· [brief](archive/perf-01-sieve-ir-body-6x-slower-than-c1.md).
+
+**The policy question underneath it is still open and unowned.** The veto is a
+special case: it works because the single-pass backend happens to have a
+detector to ask. The next lane may widen the IR tier onto a method where that
+backend has some other advantage nobody has enumerated, and there will be
+nothing to ask. A general answer — compare the two bodies once, keep the faster
+— does not exist.
 
 ## The coverage lanes
 

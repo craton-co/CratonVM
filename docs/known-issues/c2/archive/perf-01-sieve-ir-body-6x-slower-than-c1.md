@@ -1,6 +1,13 @@
 # PERF-01 — the optimizing tier's `sieve` body is 6.4x slower than the C1 body it replaced
 
-**Status:** open, unowned. **Found 2026-08-04. Landed 2026-08-03.**
+**Status: FIXED 2026-08-04**, same day it was found. Closeout, with the
+verification and the limitation the fix leaves behind:
+[`docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`](../../../internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md).
+The brief is kept because its reasoning — and the policy question in its "first
+increment", which is **still open** — is what a reader needs, not because
+anything in the measurement below is still current.
+
+**Found 2026-08-04. Landed 2026-08-03.**
 **Owns:** whatever lowers `baload`/`bastore` in `IrBuilder::build`, and the
 decision of whether an IR body may replace a C1 body without evidence.
 Not `regression-suite/perf/`.

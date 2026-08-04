@@ -291,8 +291,39 @@ pub(super) fn publish_entry_metadata(
     // once the sort loop OSR-entered.
     let mut osr_xmm_assignments = xmm_assignments.to_vec();
     {
+        // …but ONLY for a slot that is NOTHING BUT a high half.
+        //
+        // `wide_local_high_halves` is a whole-method scan: it marks `N+1` for
+        // every `lstore N`/`dstore N` anywhere in the method. Under legal JVM
+        // slot reuse the same index is frequently a live cat-1 local in a
+        // DISJOINT range — `java.util.DualPivotQuicksort.mixedInsertionSort`
+        // has slot 7 as `long ai`'s high half in its first region and as the
+        // `int i` loop counter in the other two. Nulling that slot's OSR
+        // register assignment made the trampoline seed only its FRAME slot
+        // while the compiled body kept reading its REGISTER, so an OSR entry
+        // into the second region ran with a garbage `i`: the insertion loop
+        // `while (ai < a[--i])` walked off the front of the array and threw
+        // `ArrayIndexOutOfBoundsException` with an index in the hundreds of
+        // millions. `Arrays.sort(long[])` of >= 1000 elements failed on the
+        // FIRST sort, every run — see
+        // `docs/known-issues/jit/arrays-sort-long-osr-miscompile-20260803.md`.
+        //
+        // `classify_local_kinds` already draws exactly this distinction: a high
+        // half that is independently accessed is `Ambiguous`, an untouched one
+        // is `HighHalf`. Only the latter is safe to strip.
+        //
+        // The hazard the stripping exists for — a dead slot sharing a register
+        // with a live local, whose seed would clobber the live owner — is still
+        // covered for `Ambiguous` slots, and more precisely, by the per-entry-PC
+        // dead mask built right below: at a PC where such a slot really is the
+        // dead high half it is not live-in, so it lands in the blanket set and
+        // is masked if (and only if) its register is genuinely shared.
+        let kinds = classify_local_kinds(code, code_len, num_locals);
         let high_halves = wide_local_high_halves(code, code_len);
         for &hh in &high_halves {
+            if !matches!(kinds.get(hh), Some(LocalKind::HighHalf)) {
+                continue;
+            }
             if hh < osr_local_assignments.len() {
                 osr_local_assignments[hh] = None;
             }
