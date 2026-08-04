@@ -251,14 +251,60 @@ stock scan reports `osr=0`: not one OSR body in the entire run.
 `CRATONVM_JIT=loop-work-tierup` (default-off) fixes that — `ConstantPool.<init>`
 compiles, tracked methods 9 → 10 — and buys **2–3%, inside the noise**.
 
+**Not a field-resolution-cache miss either.** `resolve_field_ref_loader_aware`
+does full symbolic work on every access *including a cache hit* — two `String`
+allocations, two extra `class_manager.read()`s and a whole
+`resolve_class_loader_aware` — purely to revalidate the entry it already holds.
+Short-circuiting that for non-loader-sensitive callers
+(`CRATONVM_JIT=field-cache-fastpath`, default-off) is worth **nothing**
+measurable: off 1894–2047, on 1919–2019 µs/class over four interleaved passes.
+(The waste is real and worth removing on its own merits; it is ~3% of a 250x
+gap. NB I did not independently confirm the fast path fires — the available
+counters do not distinguish it — so read this as "no measurable effect", not as
+"the fast path was exercised and did not help".)
+
 **So it is not a gate at all — it is interpreter throughput.** The decisive
 measurement: on a quiet host `--nojit` is *faster* than the default
 (1911/1868 vs 1978/1952 µs/class). Compiled code contributes nothing to this
 workload; compilation overhead slightly outweighs it. The `perf` profile is
-correspondingly flat — `execute_frame_from_index` 11%, then a long tail at
-1–4% each (`is_object_address`, `execute_instruction`, `memcmp`,
-`execute_invokevirtual_cached`, `resolve_field_ref_loader_aware`,
-`slot_for_exact`, `load_class_concurrent`) — with no hotspot to remove.
+correspondingly flat — `execute_frame_from_index` 11.6%, then a long tail at
+1–4% each (`is_object_address` 4.2, `execute_instruction` 3.6, `memcmp` 3.5,
+`resolve_field_ref_loader_aware` 3.3, `invoke_on_class_shared_inner` 3.1,
+`execute_invokevirtual_cached` 2.8, `load_class_concurrent` 2.2,
+`slot_for_exact` 1.6, `complete_jmx_monitor_enter` 1.5) — no hotspot to remove.
+
+### The number that actually sizes this: interpreter vs interpreter
+
+`CallFloorProbe` under `HotSpot -Xint` against `CratonVM --nojit` removes the
+JIT from both sides and prices the interpreters directly (ns/op):
+
+| body | HotSpot `-Xint` | CratonVM `--nojit` | ratio |
+|---|---|---|---|
+| arith (no call) | 17.2 | 176.1 | 10x |
+| + invokestatic leaf | 21.1 | 435.7 | **21x** |
+| + invokevirtual leaf | 17.2 | 666.0 | **39x** |
+| + invokeinterface leaf | 17.0 | 679.7 | **40x** |
+| + `String.length()` | 26.6 | 1105.1 | **42x** |
+
+Read the *increments*, not the absolutes: adding one call costs HotSpot's
+interpreter ~4 ns and CratonVM's **~260 ns (static) to ~490 ns (virtual)** —
+**65–120x**. Pure arithmetic is only 10x. So this VM's interpreter is
+respectable at straight-line bytecode and catastrophic at **invoke**, and the
+BCEL parse is invoke-dense (one object per constant-pool entry, getters
+throughout). That, not any one symbol, is the 226x.
+
+Scale, from `CRATONVM_DBG=hotpath-counts` over the same scan: ~2.0M bytecodes
+executed, ~1.2M instance-field accesses, 201k method-ref resolutions — about
+5,300 bytecodes per class at ~385 ns each.
+
+**What would actually move this** is the interpreted invoke path itself:
+`try_stackless_invoke` alone runs ~34 string comparisons per call (several of
+them `class_name.contains(...)` *substring searches* — that is the
+`is_contained_in` in the profile), plus a native-registry probe, a
+class-manager read lock, `Arc` clone/drop traffic for code+name+descriptor, and
+frame push/pop. Fixing that is an interpreter-dispatch project — inline caches,
+a resolved constant pool, per-call-site precomputed flags — not a point fix,
+and it is the only thing that gets 240x anywhere near the ~5x exit criterion.
 
 **Consequence for the exit criteria below: they are not reachable by tiering
 work.** ~240x against an interpreter that the JIT cannot help is a
