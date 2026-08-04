@@ -6225,6 +6225,31 @@ fn map_alloc_node(
     node
 }
 
+/// The value a `Set` stores in its backing map to mean "this element is
+/// present".
+///
+/// It has to survive the round trip as NON-NULL, because `native_hs_add` /
+/// `native_hs_remove` report membership from whether the previous value was
+/// null — that is the whole encoding. A raw `Value::Int(1)` does not survive on
+/// a node bound to a real JDK class: the value slot is `V value` ->
+/// `Ljava/lang/Object;`, and `coerce_field_value_by_descriptor`'s `b'L'` arm
+/// turns a primitive there into null, so `remove(x)` deletes the element and
+/// still answers `false`. That is the defect `7bf427af1` fixed on the
+/// LinkedHashMap side after it broke Jersey's `Resource.Builder`.
+///
+/// The element is its own marker: a reference, no allocation, no Java
+/// dispatch, and exactly what a real `HashSet.PRESENT` stands in for.
+///
+/// A NULL element has no reference to use and keeps the legacy `Int(1)`, so
+/// membership for that one element must not be read from the value —
+/// `native_hs_add`/`native_hs_remove` settle it with `containsKey` instead.
+fn present_marker(elem: Value) -> Value {
+    match elem {
+        Value::Object(Some(_)) => elem,
+        _ => Value::Int(1),
+    }
+}
+
 /// S111r26: Layout-aware node key reader.
 ///
 /// The legacy synthetic layout stores: key=0, value=1, hash=2, next=3.
@@ -10346,7 +10371,7 @@ fn make_view_set_of(
     for (i, elem) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
         let elem = read_pinned_elem(ctx, elem_handles[i], *elem);
-        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), elem, sentinel]) {
+        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), elem, present_marker(elem)]) {
             ctx.unpin_native_roots(first_pin);
             return Err(e);
         }
@@ -10515,7 +10540,7 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
         for (k, key_pin) in keys.into_iter().zip(key_pins) {
             let backing = ctx.read_native_pin(roots_base, backing);
             let k = read_pinned_elem(ctx, key_pin, k);
-            let _ = native_map_put(ctx, &[Value::Object(Some(backing)), k, sentinel]);
+            let _ = native_map_put(ctx, &[Value::Object(Some(backing)), k, present_marker(k)]);
         }
     }
     ctx.unpin_native_roots(roots_base);
@@ -11072,7 +11097,7 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         // Best-effort populate; ignore errors so callers see a non-empty
         // set even if a single put failed (e.g. unhashable wrapper).
-        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, sentinel]);
+        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present_marker(elem)]);
     }
     let set = ctx.read_native_pin(set_pin, set);
     ctx.unpin_native_roots(set_pin);
@@ -11564,27 +11589,30 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
-    // put(key, PRESENT) — returns null if key was new. This is the whole of
-    // how a Set encodes membership, so the marker MUST survive the round trip
-    // as non-null: `remove` below reports "was it there" from the same slot.
+    // put(element, PRESENT) — the previous value being null is how this
+    // reports "the element was not already in the set". See `present_marker`
+    // for why the marker must be a reference.
     //
-    // A raw `Value::Int(1)` only survives because the backing map's nodes are
-    // untyped (`ClassId::new(0)` in `native_map_put_evict_pinned` — see the
-    // load-bearing note there). On a node bound to a real JDK class the value
-    // slot is `Ljava/lang/Object;` and a primitive is coerced to null, which
-    // makes `remove` delete the element and still answer `false`. Prefer the
-    // element itself as its own marker: it is a reference, it needs no
-    // allocation and no Java dispatch, and it is what a real
-    // `HashSet.PRESENT` stands in for. A null element has no such marker and
-    // keeps the legacy `Int(1)` — it is only reachable through the untyped
-    // node, and `LinkedHashMapNodeProbe` covers it.
-    let sentinel = match elem {
-        Value::Object(Some(_)) => elem,
-        _ => Value::Int(1),
+    // A NULL element has no reference to mark itself with, so its membership
+    // cannot be read out of the value slot at all. Settle that one case with
+    // `containsKey`, which distinguishes "absent" from "present" without
+    // consulting the value.
+    let elem_is_null = matches!(elem, Value::Object(None));
+    let had_null = if elem_is_null {
+        matches!(
+            native_map_contains_key(ctx, &[Value::Object(Some(backing)), elem])?,
+            Some(Value::Int(1))
+        )
+    } else {
+        false
     };
-    let put_args = [Value::Object(Some(backing)), elem, sentinel];
+    let put_args = [Value::Object(Some(backing)), elem, present_marker(elem)];
     let old = native_map_put(ctx, &put_args)?;
-    let was_new = matches!(old, Some(Value::Object(None)));
+    let was_new = if elem_is_null {
+        !had_null
+    } else {
+        matches!(old, Some(Value::Object(None)))
+    };
     Ok(Some(Value::Int(if was_new { 1 } else { 0 })))
 }
 
@@ -11747,12 +11775,29 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let elem_pin = pin_value(ctx, elem);
     let backing = ctx.read_native_pin(backing_pin, backing);
     let elem = read_pinned_elem(ctx, elem_pin, elem);
+    // A null element carries no PRESENT marker of its own (see
+    // `present_marker`), so the removed value cannot say whether it was there.
+    // Ask `containsKey` first — it does not consult the value. `containsKey`
+    // dispatches Java and can move things, so re-read through the pins after.
+    let had_null = if matches!(elem, Value::Object(None)) {
+        match native_map_contains_key(ctx, &[Value::Object(Some(backing)), elem]) {
+            Ok(v) => Some(matches!(v, Some(Value::Int(1)))),
+            Err(e) => {
+                ctx.unpin_native_roots(backing_pin);
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+    let backing = ctx.read_native_pin(backing_pin, backing);
+    let elem = read_pinned_elem(ctx, elem_pin, elem);
     let remove_args = [Value::Object(Some(backing)), elem];
     let old = native_map_remove(ctx, &remove_args);
     ctx.unpin_native_roots(backing_pin);
     let old = old?;
     Ok(Some(Value::Int(
-        if !matches!(old, Some(Value::Object(None))) {
+        if had_null.unwrap_or(!matches!(old, Some(Value::Object(None)))) {
             1
         } else {
             0
@@ -15483,7 +15528,7 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
     for (index, elem) in elems.iter().enumerate() {
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         let elem = read_pinned_elem(ctx, elem_handles[index], *elem);
-        if let Err(err) = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, sentinel]) {
+        if let Err(err) = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present_marker(elem)]) {
             ctx.unpin_native_roots(if elem_base == usize::MAX {
                 set_pin
             } else {
@@ -26138,7 +26183,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     for (i, val) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
-        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel]) {
+        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, present_marker(val)]) {
             ctx.unpin_native_roots(source_pin);
             return Err(e);
         }
