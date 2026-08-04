@@ -152,6 +152,17 @@ pub(crate) fn resolve_field_ref(
 /// global store. Behaviour is unchanged whenever the referencing class is
 /// NOT user-loader-owned (gate off, or a built-in defining loader) — that
 /// case still resolves via the same global `load_class_concurrent` path.
+/// `CRATONVM_JIT=field-cache-fastpath` — let a resolution-cache hit short-circuit
+/// the loader-aware revalidation when the caller is not loader-sensitive. Read
+/// once and cached; this sits on the interpreter's field path. Default-OFF →
+/// behaviour byte-for-byte unchanged.
+fn field_cache_fastpath_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FIELD_CACHE_FASTPATH").is_some()
+    })
+}
+
 pub(super) fn resolve_field_ref_loader_aware(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -170,6 +181,37 @@ pub(super) fn resolve_field_ref_loader_aware(
         .read()
         .get_field(current_class_id, cp_index)
         .cloned();
+
+    // FAST PATH: a cache hit for a caller that is NOT loader-sensitive is
+    // already the answer, and the validation below is a tautology for it.
+    //
+    // What that validation costs on EVERY field access, cache hit included:
+    // two `String` allocations (`class_name.to_string()` and
+    // `field_name.to_string()`), two further `class_manager.read()`
+    // acquisitions, and a full `resolve_class_loader_aware` — which is where
+    // this workload's `load_class_concurrent` samples come from. It is the most
+    // expensive thing on the interpreter's field path, and Tomcat's annotation
+    // scan executes ~1.2M instance field accesses against ~2.0M bytecodes in
+    // total (`CRATONVM_DBG=hotpath-counts`).
+    //
+    // The header comment above states the concern precisely: an entry may have
+    // been populated by a loader-blind helper, so it must not be trusted
+    // blindly **for a user-loader caller**.
+    // `should_use_loader_initiated_resolution` is exactly that question, takes
+    // only the class id, and needs none of the strings — so ask it first. When
+    // it is false, loader-blind and loader-aware resolution agree by
+    // construction, so re-deriving the owner can only reproduce
+    // `cached.declaring_class_id` and the `cache_matches_owner` test below is
+    // guaranteed to pass.
+    //
+    // Default-OFF pending the A/B: `CRATONVM_JIT=field-cache-fastpath`.
+    if field_cache_fastpath_enabled() {
+        if let Some(hit) = &cached {
+            if !should_use_loader_initiated_resolution(shared, current_class_id) {
+                return Ok(hit.clone());
+            }
+        }
+    }
 
     let (field_class_name, field_name) = {
         let cm = shared.classes.class_manager.read();
