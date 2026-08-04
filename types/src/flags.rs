@@ -691,6 +691,12 @@ pub struct GcFlags {
     /// `CRATONVM_SP_NO_COALESCE` — opt **out** of selective-promotion region
     /// coalescing.
     pub sp_no_coalesce: bool,
+    /// `CRATONVM_NO_DEFRAG_PROMOTE` — opt **out** of the non-moving young
+    /// sweep's defragmentation escalation (promote every unpinned survivor,
+    /// ignoring `PROMOTION_AGE`, once the young arena's free list can no longer
+    /// serve a modest contiguous request). On by default; consumers want
+    /// `!no_defrag_promote`.
+    pub no_defrag_promote: bool,
     /// `CRATONVM_CARD_TABLE_ONLY` — restrict old→young discovery to the card
     /// table.
     pub card_table_only: bool,
@@ -867,6 +873,7 @@ impl GcFlags {
             promotion_oom_guard_broad: present(src, "CRATONVM_PROMOTION_OOM_GUARD_BROAD"),
             no_selective_promote: present(src, "CRATONVM_NO_SELECTIVE_PROMOTE"),
             sp_no_coalesce: present(src, "CRATONVM_SP_NO_COALESCE"),
+            no_defrag_promote: present(src, "CRATONVM_NO_DEFRAG_PROMOTE"),
             card_table_only: present(src, "CRATONVM_CARD_TABLE_ONLY"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: one_or_true(src, "CRATONVM_G1_PARALLEL_EVAC"),

@@ -85,6 +85,57 @@ const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 /// turning every near-capacity refill into an allocation-failure collection.
 const NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT: usize = 90;
 
+/// Largest free block below which the non-moving young sweep declares its
+/// arena defragmentable — see [`young_arena_needs_defragmentation`].
+///
+/// 64 KiB, chosen to sit well above what a single allocation asks for and well
+/// below anything a healthy arena has: the request that exposed this was an
+/// 8 KiB `byte[]`, and a young generation that cannot find eight times that
+/// contiguously has stopped being an allocation arena. Deliberately absolute
+/// rather than a fraction of capacity — the harm is "this specific request no
+/// longer fits", which does not scale with heap size.
+const DEFRAG_LARGEST_FREE_FLOOR: usize = 64 * 1024;
+
+/// Fraction of capacity the bump cursor must have consumed before the sweep
+/// will consider defragmenting: `used >= capacity - capacity/64`, i.e. 98.4 %.
+/// Below that there is still bump room, so a small largest-free-block says
+/// nothing — the arena has simply not been carved up yet.
+const DEFRAG_BUMP_EXHAUSTED_RECIPROCAL: usize = 64;
+
+/// Has the young from-space degenerated into a free list nobody can allocate a
+/// modest contiguous object out of?
+///
+/// Both halves are required, and each rules out a different false positive:
+///
+/// * **bump-exhausted** — while the cursor still has room, `largest_free_block`
+///   is small simply because nothing has been freed yet. Escalating there would
+///   promote a young nursery's entire contents on its first collection.
+/// * **largest hole below the floor** — a big `free_list_bytes` with a big
+///   largest block is a perfectly healthy swept arena. The fragmentation face is
+///   specifically *many bytes free, none of them together*.
+///
+/// Pure, and split out from the sweep, because the sweep is 3,000 lines long
+/// and this predicate decides whether hundreds of megabytes get tenured.
+fn young_arena_needs_defragmentation(used: usize, capacity: usize, largest_free: usize) -> bool {
+    if capacity == 0 {
+        return false;
+    }
+    let bump_exhausted = used >= capacity.saturating_sub(capacity / DEFRAG_BUMP_EXHAUSTED_RECIPROCAL);
+    // A tiny arena (the unit tests') can have a capacity below the floor; there
+    // "no 64 KiB block" is not a defect, so require the floor to be meaningful.
+    bump_exhausted && capacity > DEFRAG_LARGEST_FREE_FLOOR && largest_free < DEFRAG_LARGEST_FREE_FLOOR
+}
+
+/// Count of non-moving young sweeps that took the defragmentation escalation.
+/// Diagnostic only; read by the GC summary.
+static DEFRAG_PROMOTE_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+/// How many non-moving young sweeps have escalated to defragmentation
+/// (see [`young_arena_needs_defragmentation`]).
+pub fn defrag_promote_cycles() -> u64 {
+    DEFRAG_PROMOTE_CYCLES.load(Ordering::Relaxed)
+}
+
 /// Byte spacing at which the parallel sweep SUBSAMPLES the object grid the
 /// allocator records (`arena.rs`). Small enough that a multi-hundred-megabyte
 /// young gen yields far more chunks than workers (so a chunk that stops early
@@ -7623,6 +7674,66 @@ impl GenerationalHeap {
             let sweep_free_blocks = merge_skips(young_from.free_blocks_sorted());
             let sweep_used = young_from.used();
 
+            // ----- Defragmentation escalation (SB-LOADER-ZIPCONTENT, 2026-08-04)
+            //
+            // The age gate below is right for a nursery that gets compacted:
+            // short-lived survivors stay in young, die there, and the *next*
+            // moving cycle slides everything back together. This sweep never
+            // slides anything. So on a process that stays on the non-moving
+            // path — which is every process with a live JIT frame the coverage
+            // proof cannot clear — young degenerates monotonically:
+            //
+            //   * the bump cursor reaches the top once and never resets (a
+            //     survivor anywhere in the arena forbids a reset), so every
+            //     later allocation is a free-list carve;
+            //   * each cycle's survivors are a DIFFERENT few MB scattered over
+            //     the whole arena, and almost none of them live to
+            //     `PROMOTION_AGE`, so `promoted` stays at 0 forever;
+            //   * the coalescer merges only ADJACENT holes, and a survivor
+            //     between two holes is a wall it cannot cross.
+            //
+            // Measured on `ZipContentTests` (`CRATONVM_DBG=gc-overhead`): after
+            // ~700 cycles the young from-space read `used=536,866,904`
+            // (= capacity), `free_list=529,026,112` — **98.5 % of the arena
+            // free** — and `largest_free=9,608`. Not a full heap; a heap whose
+            // largest contiguous hole had fallen below the 8 KB array that
+            // assertj allocates once per ZIP entry. Every such allocation then
+            // forced a GC that freed ~10 KB, and the run either crawled or
+            // (before the `try_alloc_array_full` fix in `jit/helpers.rs`) died
+            // with `OutOfMemoryError` next to a gigabyte of old-gen headroom.
+            //
+            // The escalation: once the arena is bump-exhausted AND its largest
+            // hole can no longer serve a modest contiguous request, tenure
+            // every unpinned survivor regardless of age. That is the drain
+            // selective promotion already implements and already argues safe —
+            // pinning is BY RAW SLOT VALUE, so a conservative false positive
+            // pins some object rather than mis-relocating one, and the age
+            // gate was never part of that safety argument. With the survivors
+            // gone the coalescer's walls come down and the free list collapses
+            // back to a few huge spans.
+            //
+            // Self-limiting by construction: after one escalated cycle
+            // `largest_free_block` is enormous, so the predicate is false again
+            // — it cannot degenerate into promote-everything-always, which
+            // would flood old gen with objects that die immediately.
+            let defrag_escalate = !gc_flags().no_defrag_promote
+                && young_arena_needs_defragmentation(
+                    sweep_used,
+                    young_from.capacity(),
+                    young_from.largest_free_block(),
+                );
+            if defrag_escalate {
+                DEFRAG_PROMOTE_CYCLES.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    "young non-moving sweep: defragmentation escalation — used={} \
+                     capacity={} largest_free={}; tenuring every unpinned survivor \
+                     regardless of age",
+                    sweep_used,
+                    young_from.capacity(),
+                    young_from.largest_free_block(),
+                );
+            }
+
             // (1) Pin set: every root / finalizer value that lands in young.
             //
             // Stage B (precise oop maps, B-K relocation track): EXCLUDE addresses
@@ -7893,7 +8004,7 @@ impl GenerationalHeap {
                     // young then wedged the heap into the old-gen-spill →
                     // abort path that the native-alloc boundary GC exists to
                     // relieve).
-                    let aged = header.gc_age + 1 >= PROMOTION_AGE;
+                    let aged = defrag_escalate || header.gc_age + 1 >= PROMOTION_AGE;
                     let header_marked = header.gc_flags & GC_FLAG_MARKED != 0;
                     let marked = header_marked || side_bits.contains(addr);
                     if marked && !aged && !header_marked {
@@ -16092,6 +16203,83 @@ mod tests {
         assert_eq!(header.kind, ObjectKind::Object);
         assert_eq!(header.array_length(), 0);
         assert_eq!(header.num_slots(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Defragmentation escalation predicate (SB-LOADER-ZIPCONTENT, 2026-08-04)
+    //
+    // `young_arena_needs_defragmentation` decides whether a non-moving young
+    // sweep tenures EVERY unpinned survivor instead of only the aged ones. Both
+    // a false positive (old gen floods with objects that die immediately) and a
+    // false negative (the arena that produced this bug stays wedged) are
+    // expensive, so both directions are pinned here rather than left to the
+    // end-to-end run that motivated it.
+    // -----------------------------------------------------------------------
+
+    /// The measured degenerate state, verbatim from `ZipContentTests` under
+    /// `CRATONVM_DBG=gc-overhead`: a 512 MiB young from-space, bump cursor at
+    /// the top, 98.5 % of it free, and a largest hole of 9,608 bytes — smaller
+    /// than the 8 KiB array whose allocation failure started this.
+    #[test]
+    fn the_measured_zipcontent_arena_is_defragmentable() {
+        assert!(young_arena_needs_defragmentation(
+            536_866_904,
+            536_870_912,
+            9_608
+        ));
+    }
+
+    /// A healthy swept arena: bump-exhausted and mostly free, but its holes are
+    /// merged into multi-megabyte spans. Escalating here would tenure a whole
+    /// nursery for no reason.
+    #[test]
+    fn a_coalesced_arena_is_not_defragmentable() {
+        assert!(
+            !young_arena_needs_defragmentation(536_866_904, 536_870_912, 400 * 1024 * 1024),
+            "many bytes free AND a large largest block is what a working \
+             non-moving sweep looks like",
+        );
+        // And the state one escalated cycle produces, which is what makes the
+        // escalation self-limiting rather than a promote-everything-always.
+        assert!(!young_arena_needs_defragmentation(
+            536_866_904,
+            536_870_912,
+            DEFRAG_LARGEST_FREE_FLOOR
+        ));
+    }
+
+    /// A young generation that has NOT been carved up yet: the cursor still has
+    /// room, so a small largest-free-block only means nothing has been freed.
+    /// Without this half the predicate would fire on the first collection of
+    /// every process.
+    #[test]
+    fn an_arena_with_bump_room_left_is_not_defragmentable() {
+        assert!(
+            !young_arena_needs_defragmentation(1024, 536_870_912, 0),
+            "a fresh arena has no free blocks at all and must not escalate",
+        );
+        // Just below the bump-exhaustion line (98.4 %).
+        let cap = 536_870_912usize;
+        assert!(!young_arena_needs_defragmentation(
+            cap - cap / 64 - 1,
+            cap,
+            8
+        ));
+    }
+
+    /// Degenerate inputs: a zero-capacity arena, and one whose whole capacity
+    /// is below the floor (the unit-test heaps in this very file), must not
+    /// report "defragmentable" — in the second case there is no 64 KiB block
+    /// because there is no 64 KiB.
+    #[test]
+    fn tiny_and_empty_arenas_never_escalate() {
+        assert!(!young_arena_needs_defragmentation(0, 0, 0));
+        assert!(!young_arena_needs_defragmentation(4096, 4096, 0));
+        assert!(!young_arena_needs_defragmentation(
+            DEFRAG_LARGEST_FREE_FLOOR,
+            DEFRAG_LARGEST_FREE_FLOOR,
+            0
+        ));
     }
 
     #[test]

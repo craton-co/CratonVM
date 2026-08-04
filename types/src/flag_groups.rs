@@ -827,6 +827,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "default-heap-ergonomics", on_key: Some("CRATONVM_DEFAULT_HEAP_ERGONOMICS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "default-heap-max-mb", on_key: Some("CRATONVM_DEFAULT_HEAP_MAX_MB"), off_key: None, off_word: None },
+    // Default-ON kill switch, hence `off_key` only: `CRATONVM_GC=-defrag-promote`
+    // restores the pre-2026-08-04 non-moving young sweep, which promoted only
+    // objects that had reached `PROMOTION_AGE` and therefore had no way out of
+    // a free list fragmented below any usable block size.
+    E { group: Group::GC, token: "defrag-promote", on_key: None, off_key: Some("CRATONVM_NO_DEFRAG_PROMOTE"), off_word: None },
     // Bisection escape hatches for two GC fixes, both opt-out-only. Enabling
     // either *reinstates a known defect* (stale-address writes in post-GC
     // reference processing; monotonic old-gen fragmentation) — they exist for
