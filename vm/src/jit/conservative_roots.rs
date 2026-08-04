@@ -1210,7 +1210,7 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> Option<(usize, usize)> {
                 // is always after the method entry instruction.
                 let cm = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
                 let entry = cm.entry_ptr() as usize;
-                if w != entry && is_plausible_return_pc(w, entry) {
+                if w != entry && is_plausible_return_pc(w) {
                     return Some((addr, w));
                 }
             }
@@ -1272,7 +1272,7 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> Option<(usize, usize)> {
                 if idx > 0
                     && w > ranges[idx - 1].0
                     && w < ranges[idx - 1].1
-                    && is_plausible_return_pc(w, ranges[idx - 1].0)
+                    && is_plausible_return_pc(w)
                 {
                     return Some((addr, w));
                 }
@@ -1313,65 +1313,82 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> Option<(usize, usize)> {
 /// that costs moving cycles, never correctness — the opposite of a filter that
 /// waves a real unregistered frame through.
 ///
-/// `range_lo` is the start of the registered code range `w` was found in, and
-/// is the read's lower bound: `w` is strictly inside a mapped, executable JIT
-/// code range, but one byte past its start is all the caller guarantees, so the
-/// look-back window is clamped to `w - range_lo` bytes and never touches the
-/// page before the range.
+/// Reading the bytes needs a keep-alive, not just an address. The caller's
+/// range snapshot is a lock-free copy that can name a body whose last `Arc` has
+/// since been dropped — every other user of that snapshot only *compares*
+/// addresses, so a stale entry was harmless until this function wanted to
+/// dereference one. [`cratonvm_jit::pin_jit_code_range_owner`] upgrades the
+/// range's `Weak` and keeps the executable buffer alive for the read; `None`
+/// (the body really is gone) is a rejection, and a correct one — no live frame
+/// can be returning into reclaimed code.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
-fn is_plausible_return_pc(w: usize, range_lo: usize) -> bool {
+fn is_plausible_return_pc(w: usize) -> bool {
     if !return_pc_validation_enabled() {
         return true;
     }
-    // How many bytes before `w` are still inside this code range, capped at the
-    // longest encoding we recognise (REX + FF + ModRM + SIB + disp32 = 8, of
-    // which 7 precede the return address at most).
-    let avail = w.saturating_sub(range_lo).min(7);
+    let Some(owner) = cratonvm_jit::pin_jit_code_range_owner(w) else {
+        return false;
+    };
+    // Lower bound for the look-back: the body's own entry point, which is the
+    // start of its registered range. `w` is strictly inside `[entry, end)`, so
+    // the window never reaches the page before the code buffer.
+    let entry = owner.entry_ptr() as usize;
+    // Bytes available behind `w`, capped at the longest encoding tail we
+    // recognise (REX + FF + ModRM + SIB + disp32, of which 7 precede the
+    // return address at most).
+    let avail = w.saturating_sub(entry).min(CALL_TAIL_MAX);
+    let mut window = [0u8; CALL_TAIL_MAX];
+    for i in 0..avail {
+        // SAFETY: `w - avail + i` is in `[entry, w)`, inside the executable
+        // buffer `owner` is holding alive for the duration of this call.
+        window[i] = unsafe { ((w - avail + i) as *const u8).read() };
+    }
+    call_encoding_precedes(&window[..avail])
+}
+
+/// Longest instruction tail [`call_encoding_precedes`] inspects.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+const CALL_TAIL_MAX: usize = 7;
+
+/// Does `window` — the bytes immediately preceding a candidate return address,
+/// in address order, at most [`CALL_TAIL_MAX`] of them — end with a near-call
+/// encoding?
+///
+/// Split out from [`is_plausible_return_pc`] so the decode is testable without
+/// a live JIT code range: this half is pure, the other half is the pin-and-read.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn call_encoding_precedes(window: &[u8]) -> bool {
+    let n = window.len();
     // A near call is at least two bytes (`FF /2` with a register operand), so
-    // there is nothing decodable below that.
-    if avail < 2 {
+    // nothing shorter can decode.
+    if n < 2 {
         return false;
     }
-    let mut prev = [0u8; 7];
-    for i in 0..avail {
-        // prev[7 - avail + i] holds the byte at w - avail + i, so the window is
-        // right-aligned at `w - 1` exactly as the fixed-length decoder expects.
-        // SAFETY: `w - avail + i` is in `[range_lo, w)`, inside the same
-        // registered, mapped, executable JIT code range as `w`. That range
-        // stays mapped for the life of the process — `JIT_CODE_RANGES` only
-        // ever grows (see `jit/src/lib.rs`), which is also what lets the
-        // caller's thread-local range snapshot be reused across calls.
-        prev[7 - avail + i] = unsafe { ((w - avail + i) as *const u8).read() };
-    }
+    // Right-align into a fixed array so an encoding of length `len` always has
+    // its opcode at index `CALL_TAIL_MAX - len`.
+    let mut prev = [0u8; CALL_TAIL_MAX];
+    prev[CALL_TAIL_MAX - n..].copy_from_slice(window);
     // `E8 rel32`: the direct near call, 5 bytes, so its opcode sits 5 back.
-    if avail >= 5 && prev[2] == 0xE8 {
+    if n >= 5 && prev[CALL_TAIL_MAX - 5] == 0xE8 {
         return true;
     }
     // `FF /2` indirect near call: 2..=7 bytes. Walk every length the encoding
     // can take and accept if the byte at that distance is `FF` and the ModRM
     // that follows selects reg field 2 (`/2`, bits 5..3 == 0b010).
-    for len in 2..=avail {
-        let op_idx = 7 - len;
-        if prev[op_idx] != 0xFF {
-            continue;
-        }
-        let modrm = prev[op_idx + 1];
-        if (modrm >> 3) & 0b111 == 0b010 {
+    for len in 2..=n {
+        let op = CALL_TAIL_MAX - len;
+        if prev[op] == 0xFF && (prev[op + 1] >> 3) & 0b111 == 0b010 {
             return true;
         }
     }
     // Same, one byte earlier, to allow a single REX prefix (0x40..=0x4F) in
     // front of the `FF`.
-    for len in 3..=avail {
-        let rex_idx = 7 - len;
-        if prev[rex_idx] & 0xF0 != 0x40 {
-            continue;
-        }
-        if prev[rex_idx + 1] != 0xFF {
-            continue;
-        }
-        let modrm = prev[rex_idx + 2];
-        if (modrm >> 3) & 0b111 == 0b010 {
+    for len in 3..=n {
+        let rex = CALL_TAIL_MAX - len;
+        if prev[rex] & 0xF0 == 0x40
+            && prev[rex + 1] == 0xFF
+            && (prev[rex + 2] >> 3) & 0b111 == 0b010
+        {
             return true;
         }
     }
@@ -2250,10 +2267,32 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
         };
         if let Some((slot, word)) = hit {
             if dbg {
+                // Name the actual evidence: which slot, which word, how far
+                // into which compiled body, and the bytes the return-address
+                // filter accepted. "Some word somewhere looked like compiled
+                // code" is not something the next reader can act on, and this
+                // probe's whole cost is that it can be wrong.
+                let (body, off, tail) =
+                    match cratonvm_jit::pin_jit_code_range_owner(word) {
+                        Some(cm) => {
+                            let entry = cm.entry_ptr() as usize;
+                            let back = word.saturating_sub(entry).min(8);
+                            let mut bytes = String::new();
+                            for i in 0..back {
+                                // SAFETY: inside the buffer `cm` holds alive.
+                                let b = unsafe { ((word - back + i) as *const u8).read() };
+                                bytes.push_str(&format!("{b:02x} "));
+                            }
+                            (entry, word - entry, bytes)
+                        }
+                        None => (0, 0, "<body reclaimed>".to_string()),
+                    };
                 eprintln!(
                     "[moving-young-coverage] incomplete: unregistered JIT frame on native stack \
-                     (stack slot 0x{slot:x} holds 0x{word:x}, search band \
-                     [0x{search_lo:x}, 0x{high:x}))"
+                     (stack slot 0x{slot:x} holds 0x{word:x} = body 0x{body:x}+0x{off:x}, \
+                     preceding bytes [{tail}], search band [0x{search_lo:x}, 0x{high:x}), \
+                     slot is 0x{depth:x} above search_lo)",
+                    depth = slot.saturating_sub(search_lo),
                 );
             }
             cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
@@ -4605,26 +4644,13 @@ mod tests {
     // compacted, and fragmented its young generation until an 8 KB array could
     // not be allocated.
     //
-    // The tests below are byte-level: they lay out real x86-64 encodings in a
-    // buffer and ask whether the address *after* them reads as a return PC.
-    // Both directions are asserted — a filter that only ever says "no" would
-    // pass an accept-nothing implementation, and one that only says "yes"
-    // would pass the pre-fix accept-everything behaviour this replaces.
+    // The tests below are byte-level: they hand `call_encoding_precedes` the
+    // bytes that would sit in front of a candidate return address and ask
+    // whether it decodes as a call tail. Both directions are asserted — a
+    // filter that only ever says "no" would pass an accept-nothing
+    // implementation, and one that only says "yes" would pass the pre-fix
+    // accept-everything behaviour this replaces.
     // -----------------------------------------------------------------------
-
-    /// `code[..]` laid out in a heap buffer; returns `(w, range_lo)` where `w`
-    /// is the address one past the last byte — i.e. the return address a
-    /// `call` at the end of `code` would push.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    fn ret_pc_for(code: &[u8]) -> (Vec<u8>, usize, usize) {
-        // 16 bytes of trailing slack so `w` is a readable address inside the
-        // same allocation (the real caller's `w` is inside the code range).
-        let mut buf = code.to_vec();
-        buf.extend_from_slice(&[0u8; 16]);
-        let lo = buf.as_ptr() as usize;
-        let w = lo + code.len();
-        (buf, w, lo)
-    }
 
     /// `E8 rel32` — the direct near call the JIT emits for a static/known
     /// target. Its return address MUST be accepted, or the probe stops
@@ -4632,99 +4658,83 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn direct_near_call_return_address_is_accepted() {
-        let (_buf, w, lo) = ret_pc_for(&[0x90, 0x90, 0xE8, 0x11, 0x22, 0x33, 0x44]);
         assert!(
-            is_plausible_return_pc(w, lo),
+            call_encoding_precedes(&[0x90, 0x90, 0xE8, 0x11, 0x22, 0x33, 0x44]),
             "the address after `E8 rel32` is a return address",
         );
     }
 
-    /// `FF /2` indirect near call, register form (`callq *%rax` = `FF D0`),
-    /// and with a REX prefix (`callq *%r11` = `41 FF D3`) — the inline-cache
-    /// and megamorphic-stub shapes.
+    /// `FF /2` indirect near call: register form (`callq *%rax` = `FF D0`),
+    /// with a REX prefix (`callq *%r11` = `41 FF D3`), and the memory form
+    /// (`callq *0x10(%rbx)` = `FF 53 10`) — the inline-cache, megamorphic-stub
+    /// and vtable shapes.
     #[test]
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn indirect_near_call_return_addresses_are_accepted() {
-        let (_b1, w1, lo1) = ret_pc_for(&[0x90, 0x90, 0xFF, 0xD0]);
-        assert!(is_plausible_return_pc(w1, lo1), "`callq *%rax`");
-
-        let (_b2, w2, lo2) = ret_pc_for(&[0x90, 0x41, 0xFF, 0xD3]);
-        assert!(is_plausible_return_pc(w2, lo2), "`callq *%r11` (REX.B)");
-
-        // Memory form with disp8: `callq *0x10(%rbx)` = `FF 53 10`.
-        let (_b3, w3, lo3) = ret_pc_for(&[0x90, 0xFF, 0x53, 0x10]);
-        assert!(is_plausible_return_pc(w3, lo3), "`callq *0x10(%rbx)`");
+        assert!(call_encoding_precedes(&[0x90, 0x90, 0xFF, 0xD0]), "callq *%rax");
+        assert!(
+            call_encoding_precedes(&[0x90, 0x41, 0xFF, 0xD3]),
+            "callq *%r11 (REX.B)",
+        );
+        assert!(
+            call_encoding_precedes(&[0x90, 0xFF, 0x53, 0x10]),
+            "callq *0x10(%rbx)",
+        );
     }
 
     /// The whole point: a word that merely points INTO compiled code, with
-    /// ordinary non-call instructions in front of it, is rejected. `48 89 45 F8`
-    /// (`mov %rax,-0x8(%rbp)`) is about as common as generated code gets, and
-    /// `FF` appears here only as part of a displacement, never as an opcode
-    /// whose ModRM selects `/2`.
+    /// ordinary non-call instructions in front of it, is rejected.
     #[test]
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn a_stored_code_pointer_is_not_a_return_address() {
-        let (_b1, w1, lo1) = ret_pc_for(&[0x48, 0x89, 0x45, 0xF8]);
+        // `mov %rax,-0x8(%rbp)` — about as common as generated code gets.
         assert!(
-            !is_plausible_return_pc(w1, lo1),
+            !call_encoding_precedes(&[0x48, 0x89, 0x45, 0xF8]),
             "`mov %rax,-0x8(%rbp)` does not end a call — before this filter \
              every such word fabricated an unregistered JIT frame",
         );
-
-        // `FF` present, but as a displacement byte of `mov -0x1(%rcx),%eax`
+        // `FF` present, but as the displacement byte of `mov -0x1(%rcx),%eax`
         // (`8B 41 FF`), not as a call opcode.
-        let (_b2, w2, lo2) = ret_pc_for(&[0x90, 0x90, 0x8B, 0x41, 0xFF]);
         assert!(
-            !is_plausible_return_pc(w2, lo2),
+            !call_encoding_precedes(&[0x90, 0x90, 0x8B, 0x41, 0xFF]),
             "an `FF` byte is not a call unless it is the opcode AND its ModRM \
              reg field is /2",
         );
-
-        // `FF` as an opcode, but `/1` (`decl`), not `/2` (`call`).
-        let (_b3, w3, lo3) = ret_pc_for(&[0x90, 0x90, 0xFF, 0xC8]);
+        // `FF` as an opcode, but `/1` (`dec`), not `/2` (`call`).
         assert!(
-            !is_plausible_return_pc(w3, lo3),
+            !call_encoding_precedes(&[0x90, 0x90, 0xFF, 0xC8]),
             "`FF /1` is `dec`, not `call`",
         );
     }
 
-    /// Clamping: a candidate one byte past the start of its code range has no
-    /// decodable window behind it, so it is rejected rather than read out of
-    /// the range. Asserted because getting this wrong is a read of the page
-    /// before a JIT arena, not a wrong answer.
+    /// Clamping: a candidate so close to the start of its code range that no
+    /// call encoding could fit behind it is rejected, rather than the decoder
+    /// reading further back than the caller proved is inside the buffer.
+    /// Asserted because getting this wrong is a read off the front of a JIT
+    /// arena, not merely a wrong answer.
     #[test]
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    fn a_candidate_at_the_range_start_is_rejected_without_reading_below_it() {
-        let buf = vec![0xE8u8; 32];
-        let lo = buf.as_ptr() as usize;
+    fn a_window_shorter_than_any_call_encoding_is_rejected() {
+        assert!(!call_encoding_precedes(&[]), "no window at all");
         assert!(
-            !is_plausible_return_pc(lo + 1, lo),
-            "one byte of window cannot hold any call encoding",
+            !call_encoding_precedes(&[0xE8]),
+            "one byte cannot hold any call encoding — not even the `FF /2` \
+             register form, which needs two",
         );
     }
 
-    /// The kill switch restores accept-everything. Asserted as a DECISION:
-    /// `CRATONVM_JIT=-retpc-validate` is the documented one-flag bisect for
-    /// this filter, and a bisect lever that silently does nothing is worse
-    /// than no lever (see `reference_inert_lever_is_not_an_elimination`).
+    /// The filter is ON by default. Asserted as a DECISION rather than left
+    /// implicit: `CRATONVM_JIT=-retpc-validate` is the documented one-flag
+    /// bisect, and a future default flip must fail HERE rather than silently
+    /// voiding every test above (see
+    /// `reference_presence_predicate_lies_after_default_flip`).
     #[test]
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    fn the_kill_switch_accepts_every_in_range_word() {
-        // `return_pc_validation_enabled` latches in a `OnceLock`, so this
-        // asserts the gate's own contract rather than racing that latch: with
-        // validation off the function must not even look at the bytes.
-        if !return_pc_validation_enabled() {
-            let (_b, w, lo) = ret_pc_for(&[0x48, 0x89, 0x45, 0xF8]);
-            assert!(is_plausible_return_pc(w, lo));
-        } else {
-            // Default build: the filter is ON, which is what every other test
-            // here depends on. Assert that, so a future default flip fails
-            // HERE instead of silently voiding the four tests above.
-            let (_b, w, lo) = ret_pc_for(&[0x48, 0x89, 0x45, 0xF8]);
-            assert!(
-                !is_plausible_return_pc(w, lo),
-                "retpc validation must be ON by default",
-            );
-        }
+    fn return_pc_validation_is_on_by_default() {
+        assert!(
+            return_pc_validation_enabled(),
+            "the A5 scan must validate return addresses unless \
+             CRATONVM_JIT_NO_RETPC_VALIDATE is set",
+        );
     }
 }
