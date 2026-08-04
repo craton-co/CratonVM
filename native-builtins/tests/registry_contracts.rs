@@ -383,7 +383,7 @@ fn watch_service_surface_has_a_single_owner_in_native_io() {
 ///   the pre-fix `field 0 = None` shape. Every Spring Boot test going
 ///   through `ModifiedClassPathClassLoader` (Aether resolving
 ///   `@ClassPathOverrides` coordinates over HTTPS) failed on it. See
-///   `docs/internal/fixed-suite-bugs/springboot/`
+///   `fixed-suite-bugs/springboot/`
 ///   `sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 ///
 /// So this pins the *surviving owner site*, not merely the count: a duplicate
@@ -443,8 +443,21 @@ fn ssl_entry_points_keep_their_documented_owning_registration() {
         // so the LAST row is the one that owns the slot (`register` is
         // last-write-wins on the exact triple).
         let owner = rows[rows.len() - 1];
+        // `registered_by` comes from `Location::caller()`, whose `file()` uses
+        // the HOST path separator — so on Windows every row reads
+        // `native-builtins\src\...` and no comparison against a `/`-spelled
+        // expectation can ever match. This guard was therefore red on Windows
+        // for reasons having nothing to do with what it guards: it reported
+        // "owned by ...ssl_security.rs:1521, not by ...ssl_security.rs" —
+        // the same file, spelled two ways — while the invariant it exists to
+        // protect (registered exactly once, by that file) was intact.
+        //
+        // Normalize both sides. A guard that cannot pass on a platform is not
+        // a guard there; it is a permanently-red test that trains people to
+        // ignore this suite, which is exactly what it was written to prevent.
+        let norm = |s: &str| s.replace('\\', "/");
         assert!(
-            owner.starts_with(owner_file),
+            norm(owner).starts_with(&norm(owner_file)),
             "{class}.{method}{descriptor} is owned by {owner}, not by {owner_file}. \
              It is registered {n} time(s), by {rows:?}. Registration order alone \
              decides the winner, so a new or moved registration silently replaced \

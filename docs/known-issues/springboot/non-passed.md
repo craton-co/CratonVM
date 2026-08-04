@@ -12,10 +12,13 @@
 > `fixed-suite-bugs/springboot/jarmode-tools-crlf-fixture-phantom-failures-FIXED.md`.
 >
 > That doc also covers the runner gap that let HotSpot-shared failures be filed
-> as CratonVM defects, now fixed (`BOTH-FAIL`). **A HotSpot control over the
-> whole 32-class residual list found 5 such rows** — the four above plus
-> `ChangelogWriterTests`, which is still red here and still fails on HotSpot
-> too, i.e. it is a fixture failure, not a VM one.
+> as CratonVM defects, now fixed (`BOTH-FAIL`).
+>
+> **`ChangelogWriterTests` (above) is also stale** — the fixture tree was
+> normalized to LF in full on 2026-08-04 and it now PASSES on HotSpot and on
+> CratonVM. A full-suite HotSpot run before/after showed that whole-tree change
+> moved exactly that one class and broke nothing: 1,975 rows compared, one
+> `FAIL -> PASS`, zero regressions.
 
 1 CRASH
 Module	Class	Seconds

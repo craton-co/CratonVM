@@ -707,7 +707,7 @@ fn huc_real_perform(
             }
         };
         let tls_restrictions = if parsed.scheme == "https" {
-            match huc_client_tls_restrictions(ctx, &parsed.host, parsed.port) {
+            match huc_client_tls_restrictions(ctx, Some(this), &parsed.host, parsed.port) {
                 Ok(r) => r,
                 Err(e) => {
                     ctx.unpin_native_roots(this_pin);
@@ -1591,20 +1591,44 @@ pub(crate) type ClientTlsRestrictions = (Vec<String>, Vec<String>);
 /// no restriction at all.
 fn huc_client_tls_restrictions(
     ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
     host: &str,
     port: u16,
 ) -> Result<Option<ClientTlsRestrictions>, MethodCallFailed> {
     let dbg = crate::nbflags().dbg_tls_auth_ok;
-    // Read the factory from the GC-rooted native slot, NOT from the real JDK
-    // static field: writing that field does not stick on this VM (measured —
-    // see `t27_tls::huc_default_factory_slot`), which silently disabled this
-    // whole mechanism.
-    let Some(factory) = crate::t27_tls::huc_default_ssl_socket_factory() else {
+    // FIX (huc-per-connection-ssf-readback): prefer THIS connection's own
+    // factory, installed by `HttpsURLConnection.setSSLSocketFactory`, over the
+    // process default — the JDK's precedence. Until that setter started
+    // storing the factory (see `t27_tls`'s registration) an instance-scoped
+    // factory's cipher/protocol restrictions were unreachable here, so an
+    // instance `setSSLSocketFactory` silently connected unrestricted while an
+    // otherwise identical `setDefaultSSLSocketFactory` was honoured.
+    //
+    // Read before anything below allocates or runs bytecode: `connection` is
+    // the caller's already-pin-refreshed reference, and a moving collection
+    // during the probe up-call would strand it.
+    let instance_factory = connection.and_then(|c| {
+        match ctx.get_field_by_name(c, "sslSocketFactory") {
+            Value::Object(Some(f)) => Some(f),
+            _ => None,
+        }
+    });
+    // The process default lives in a GC-rooted native slot, NOT in the real
+    // JDK static field: writing that field does not stick on this VM
+    // (measured — see `t27_tls::huc_default_factory_slot`), which silently
+    // disabled this whole mechanism.
+    let Some(factory) = instance_factory.or_else(crate::t27_tls::huc_default_ssl_socket_factory)
+    else {
         if dbg {
             eprintln!("[dbg-tls-auth] huc_client_tls_restrictions: no default factory installed");
         }
         return Ok(None);
     };
+    if dbg && instance_factory.is_some() {
+        eprintln!(
+            "[dbg-tls-auth] huc_client_tls_restrictions: using this connection's own factory"
+        );
+    }
     // Our own placeholder carrier has no overriding Java bytecode to run, so
     // probing it can only ever come back empty. Compare by `ClassId` rather
     // than by name: `alloc_concurrent_synthetic` documents that
@@ -3119,7 +3143,7 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
     // FIX (client-cipher-restriction): resolve any real caller-installed
     // SSLSocketFactory BEFORE calling perform — the probe up-call needs `ctx`.
     let tls_restrictions = if parsed.scheme == "https" {
-        huc_client_tls_restrictions(ctx, &parsed.host, parsed.port)?
+        huc_client_tls_restrictions(ctx, Some(this), &parsed.host, parsed.port)?
     } else {
         None
     };
