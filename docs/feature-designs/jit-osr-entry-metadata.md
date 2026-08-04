@@ -314,7 +314,12 @@ the contract check so one bug is not counted in both places.
    prints both, alongside the per-door admission counts, the ungated-backend
    count, the bail-list short-circuits, the cap refusals and the stale-epoch
    refusals. Before that, every one of those accessors had no caller anywhere
-   in the tree.
+   in the tree. The same hook now prints the **OSR lifecycle** row
+   (`osr_entered` / `osr_exited` / `osr_refused_entry` / `osr_compile_declined`),
+   which the `osr-02` lane ungated for the same reason and which nothing
+   printed either. That row is the only place an *entry-time* over-refusal is
+   visible at all: it shows up as `osr_entered` collapsing while
+   `osr_refused_entry` rises, and nowhere else.
 4. **The eager first-call door is dormant under the default configuration.**
    `bg-compile` is default-ON and reroutes a first-call compile to the
    background worker, so its gate is inert unless `CRATONVM_JIT=bg-compile=0`.
@@ -352,6 +357,30 @@ checksums identical to HotSpot, in both the default arm and the
 
 The first row is why the third exists: no single configuration exercises all
 three doors, so a one-arm measurement would have left two of them unproven.
+
+**Over-refusal: none.** The new entry-time refusal is the one change here that
+could silently cost a workload its OSR, so it was A/B'd against a `dev`-base
+binary (`51bbf9211`), arms interleaved base/fix/base/fix:
+
+| | base | fix |
+|---|---:|---:|
+| `OsrDeadLocalProbe` OSR entries | 22, 22 | 22, 22 |
+| `CratonBench` compiles (c1 / c2 / osr) | 4 / 9 / 7 | 4 / 9 / 7 |
+| `CratonBench` `OSR-refuse` lines (`CRATONVM_DBG=jitc`) | 0 | 0 |
+| `CratonBench` `osr_refused_entry` | — | **0** |
+
+`validate_osr_entry` refused **nothing** on either arm, so the contract-
+disagreement tag never fired on real code — which is what "expected to stay
+zero" has to mean before it is worth having.
+
+One thing this measurement corrected on its own: `CratonBench` OSR *entries*
+first read 509 (base) against 508 (fix), reproducibly, across both interleaved
+rounds. It is not a delta. Repeating it on the **same** binary gives 510 and 508,
+and the workload's own `total invocations` swings 4,240–6,224 run to run — the
+interpreter/compiled split moves with timing, so a back-edge counter can miss
+its threshold. The compile counts, which do not depend on timing, are identical
+on every run. A two-round interleave was not enough to see that; the same-binary
+repeat was.
 
 **Each check shown capable of firing** (inject, build, run, revert):
 
