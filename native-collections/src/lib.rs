@@ -8213,21 +8213,25 @@ fn native_map_put_evict_pinned(
     // primitive written to the value slot, declared `Ljava/lang/Object;`, is
     // coerced to NULL.
     //
-    // `native_hs_add` writes a raw `Value::Int(1)` PRESENT marker through this
-    // path, and `native_hs_add`/`native_hs_remove` decide membership purely
-    // from whether the previous value was null. So making this node "properly"
-    // typed, on its own, silently turns every `HashSet.remove(x)` into "delete
-    // it and report false" and every duplicate `add` into "reported new".
-    //
-    // That is not hypothetical: it is exactly what happened on the
+    // That is not hypothetical. It is exactly what happened on the
     // LinkedHashMap side when its node was switched to the real
     // `java/util/LinkedHashMap$Entry` (`7bf427af1`, and Defect 3 of
-    // `fixed-suite-bugs/springboot/kafka-embedded-kraft-boundport-listeners-distinct-classcastexception-20260804-FIXED.md`),
-    // where it broke Jersey's `Resource.Builder.onBuildMethod`.
+    // `fixed-suite-bugs/springboot/kafka-embedded-kraft-boundport-listeners-distinct-classcastexception-20260804-FIXED.md`):
+    // the Set PRESENT marker went to null and broke Jersey's
+    // `Resource.Builder.onBuildMethod`.
     //
-    // If you change this class, box the marker first — and
-    // `probes/LinkedHashMapNodeProbe.java`'s set-membership section is what
-    // tells you whether you got it right.
+    // The marker is no longer the obstacle — every one now goes through
+    // `present_marker` and is a reference. But that was MEASURED to be
+    // necessary and NOT sufficient: building this line as
+    // `alloc_synthetic(ctx, "java/util/HashMap$Node", NODE_NUM_FIELDS)` on top
+    // of the marker fix still fails `probes/LinkedHashMapNodeProbe.java` and
+    // `SetSurface`, including `Map$Entry.getKey()` coming back null and
+    // `keySet().remove` leaving the map unshrunk. Whatever else this node's
+    // real descriptors change has not been chased down.
+    //
+    // So: switching this class is its own validated project, not a tidy-up.
+    // `LinkedHashMapNodeProbe`'s set-membership and map-view sections are the
+    // guard — they go loudly red (9 failures) the moment this line changes.
     let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
     // Keep the node and both object values rooted through population and
     // refresh every reference immediately before its store. The later
