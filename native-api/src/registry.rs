@@ -2584,8 +2584,10 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     fn read_string(&self, obj: ObjectRef) -> Option<String>;
 
     /// Return the raw Java `String.hashCode()` for a confirmed String object.
-    /// `None` means that `obj` is not a String. Implementations may override
-    /// this to inspect compact storage without allocating a host String.
+    /// `None` means "no hash was computed": `obj` is not a String, or an
+    /// overriding implementation could not read its character storage.
+    /// Implementations may override this to inspect compact storage without
+    /// allocating a host String.
     fn java_string_hash_code(&self, obj: ObjectRef) -> Option<i32> {
         self.read_string(obj).map(|text| {
             text.encode_utf16().fold(0i32, |hash, unit| {
@@ -2595,7 +2597,15 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     }
 
     /// Compare two confirmed Java Strings without routing through Java
-    /// dispatch. `None` means at least one operand is not a String.
+    /// dispatch.
+    ///
+    /// `Some(_)` is an answer. `None` means **the comparison was not made** —
+    /// an operand is not a String, or an overriding implementation could not
+    /// read one operand's character storage — and the caller must fall back to
+    /// dispatching `String.equals`. An implementation must never report `false`
+    /// for a pair it did not actually read: doing so silently turned every
+    /// `ConcurrentHashMap.get` on a String key into a miss (see
+    /// `docs/known-issues/vm/chm-get-misses-stored-key-in-process-20260803.md`).
     fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
         Some(self.read_string(a)? == self.read_string(b)?)
     }

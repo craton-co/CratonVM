@@ -5389,97 +5389,196 @@ fn is_real_java_string(shared: &SharedVm, object: ObjectRef) -> bool {
         .is_some_and(|class| class.name.as_ref() == "java/lang/String")
 }
 
-/// Return the raw Java String hash directly from compact storage.
+/// How a `java.lang.String` instance stores its characters.
+///
+/// The first two match the JDK's own `String.LATIN1` / `String.UTF16` coder
+/// constants and describe a `byte[]` payload. [`STRING_STORAGE_CHARS`] is the
+/// pre-JDK-9 `char[]` payload, which CratonVM's own fabricated
+/// `java/lang/String` still uses — see [`java_string_storage`].
+const STRING_STORAGE_LATIN1: u8 = 0;
+const STRING_STORAGE_UTF16: u8 = 1;
+const STRING_STORAGE_CHARS: u8 = 2;
+
+/// Locate a String's character array and how that array is encoded.
+///
+/// Returning `None` means *"this object's characters could not be located"* —
+/// never *"the string is empty"* and never anything about a comparison. Every
+/// caller must treat `None` as "fall back to running `String.hashCode()` /
+/// `String.equals()`".
+///
+/// # Why this is not just slots 0 and 1
+///
+/// The JDK-9+ compact layout (`value:[B` at slot 0, `coder:B` at slot 1) is
+/// probed first and answered without touching class metadata: it is the layout
+/// of every String in a real-JDK run and these readers sit under the hottest
+/// comparison in the map natives.
+///
+/// But it is not the only layout this VM runs. CratonVM's fabricated
+/// `java/lang/String` (booted whenever no real JDK image is in play — every
+/// in-process `VmConfig::new()` test) declares `value` + `hash` and has **no
+/// `coder` field at all**, so its slot 1 holds the *cached hash*. Reading that
+/// as a coder is what made `compact_java_strings_equal` answer "not equal" for
+/// two identical Strings, which in turn made `ConcurrentHashMap.get` miss
+/// every String key the same map had just stored
+/// (`docs/known-issues/vm/chm-get-misses-stored-key-in-process-20260803.md`).
+/// So when the positional probe does not describe a String, resolve `value`
+/// and `coder` by NAME off the receiver's own class before giving up.
+fn java_string_storage(shared: &SharedVm, object: ObjectRef) -> Option<(ObjectRef, u8)> {
+    let heap = &shared.mem.heap;
+    if let Value::Object(Some(value)) = heap.get_field(object, 0) {
+        match heap.array_element_type(value) {
+            Some(ArrayElementType::Char) => return Some((value, STRING_STORAGE_CHARS)),
+            Some(ArrayElementType::Byte) => match heap.get_field(object, 1) {
+                Value::Int(0) => return Some((value, STRING_STORAGE_LATIN1)),
+                Value::Int(1) => return Some((value, STRING_STORAGE_UTF16)),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    java_string_storage_by_name(shared, object)
+}
+
+/// Metadata-driven half of [`java_string_storage`], for any `java/lang/String`
+/// whose layout is not the JDK-9+ positional one. A missing `coder` field means
+/// a `byte[]` payload is LATIN1 — the same default `NativeContextImpl
+/// ::read_string` applies when it takes this route.
+fn java_string_storage_by_name(shared: &SharedVm, object: ObjectRef) -> Option<(ObjectRef, u8)> {
+    let class_id = shared.mem.heap.class_id_of(object);
+    let (value_index, coder_index) = {
+        let cm = shared.classes.class_manager.read();
+        (
+            resolve_field_index_in_hierarchy(class_id, "value", &cm.class_store)?,
+            resolve_field_index_in_hierarchy(class_id, "coder", &cm.class_store),
+        )
+    };
+    let Value::Object(Some(value)) = shared.mem.heap.get_field(object, value_index) else {
+        return None;
+    };
+    match shared.mem.heap.array_element_type(value) {
+        Some(ArrayElementType::Char) => Some((value, STRING_STORAGE_CHARS)),
+        Some(ArrayElementType::Byte) => {
+            match coder_index.map(|index| shared.mem.heap.get_field(object, index)) {
+                None | Some(Value::Int(0)) => Some((value, STRING_STORAGE_LATIN1)),
+                Some(Value::Int(1)) => Some((value, STRING_STORAGE_UTF16)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Number of UTF-16 code units in a character array of `element_count`
+/// elements under `storage`. `None` for a UTF16 `byte[]` of odd length, which
+/// is not a decodable String payload.
+fn string_unit_count(element_count: usize, storage: u8) -> Option<usize> {
+    match storage {
+        STRING_STORAGE_LATIN1 => Some(element_count),
+        STRING_STORAGE_UTF16 => (element_count % 2 == 0).then(|| element_count / 2),
+        _ => Some(element_count),
+    }
+}
+
+/// Read one UTF-16 code unit out of a String's character array.
+///
+/// # Safety
+/// `data` must point at `storage`'s payload and `index` must be less than the
+/// [`string_unit_count`] computed for that same payload.
+unsafe fn string_unit_at(data: *const u8, storage: u8, index: usize) -> u16 {
+    if storage == STRING_STORAGE_LATIN1 {
+        return unsafe { *data.add(index) } as u16;
+    }
+    // Both the UTF16 `byte[]` payload and a `char[]` payload are pairs of
+    // little-endian bytes (`StringUTF16.isBigEndian() == false`, and `char[]`
+    // elements are stored as native-endian `u16` on the little-endian targets
+    // this VM builds for).
+    unsafe {
+        u16::from_le_bytes([*data.add(index * 2), *data.add(index * 2 + 1)])
+    }
+}
+
+/// Return the raw Java String hash directly from the receiver's character
+/// storage, without materialising a host `String`.
+///
+/// `None` means the storage could not be read, not that the hash is 0.
 fn compact_java_string_hash(shared: &SharedVm, object: ObjectRef) -> Option<i32> {
     if !is_real_java_string(shared, object) {
         return None;
     }
-    let (Value::Object(Some(bytes)), Value::Int(coder)) = (
-        shared.mem.heap.get_field(object, 0),
-        shared.mem.heap.get_field(object, 1),
-    ) else {
-        return None;
-    };
-    if !matches!(coder, 0 | 1)
-        || shared.mem.heap.array_element_type(bytes) != Some(ArrayElementType::Byte)
-    {
-        return None;
-    }
-    let ptr = shared.mem.heap.array_data_ptr(bytes)?;
-    let raw = unsafe {
-        std::slice::from_raw_parts(ptr as *const u8, shared.mem.heap.array_length(bytes))
-    };
+    let (value, storage) = java_string_storage(shared, object)?;
+    let data = shared.mem.heap.array_data_ptr(value)?;
+    let units = string_unit_count(shared.mem.heap.array_length(value), storage)?;
     let mut hash = 0i32;
-    if coder == 0 {
-        for &byte in raw {
-            hash = hash.wrapping_mul(31).wrapping_add(byte as i32);
-        }
-    } else {
-        if raw.len() & 1 != 0 {
-            return None;
-        }
-        for unit in raw.chunks_exact(2) {
-            hash = hash
-                .wrapping_mul(31)
-                .wrapping_add(u16::from_le_bytes([unit[0], unit[1]]) as i32);
-        }
+    for index in 0..units {
+        // SAFETY: `data` is `value`'s payload and `index < units`, the unit
+        // count computed for that payload.
+        let unit = unsafe { string_unit_at(data, storage, index) };
+        hash = hash.wrapping_mul(31).wrapping_add(unit as i32);
     }
     Some(hash)
 }
 
-/// Compare final compact `java.lang.String` instances without creating a
-/// host `String`. Cache entries originate only from confirmed String keys; the
-/// class-id equality guard therefore also rejects unrelated objects that happen
-/// to expose a similar field layout.
-fn compact_java_strings_equal(shared: &SharedVm, left: ObjectRef, right: ObjectRef) -> bool {
+/// Compare two `java.lang.String` instances without creating a host `String`.
+///
+/// `Some(_)` is an ANSWER; `None` means "this comparison was not made" — the
+/// caller must fall back to dispatching `String.equals`. Returning `false` for
+/// a String whose storage this function does not understand is what made
+/// `ConcurrentHashMap.get` miss keys the map held (see [`java_string_storage`]
+/// and the known-issue file it names): a "not equal" verdict is only ever
+/// correct once BOTH operands have actually been read.
+fn compact_java_strings_equal(
+    shared: &SharedVm,
+    left: ObjectRef,
+    right: ObjectRef,
+) -> Option<bool> {
     if left == right {
-        return true;
+        return Some(true);
     }
     if shared.mem.heap.class_id_of(left) != shared.mem.heap.class_id_of(right) {
-        return false;
+        return Some(false);
     }
-    let (Value::Object(Some(left_bytes)), Value::Int(left_coder)) = (
-        shared.mem.heap.get_field(left, 0),
-        shared.mem.heap.get_field(left, 1),
+    let (left_value, left_storage) = java_string_storage(shared, left)?;
+    let (right_value, right_storage) = java_string_storage(shared, right)?;
+    let (Some(left_data), Some(right_data)) = (
+        shared.mem.heap.array_data_ptr(left_value),
+        shared.mem.heap.array_data_ptr(right_value),
     ) else {
-        return false;
+        return None;
     };
-    let (Value::Object(Some(right_bytes)), Value::Int(right_coder)) = (
-        shared.mem.heap.get_field(right, 0),
-        shared.mem.heap.get_field(right, 1),
-    ) else {
-        return false;
-    };
-    if !matches!(left_coder, 0 | 1)
-        || !matches!(right_coder, 0 | 1)
-        || shared.mem.heap.array_element_type(left_bytes) != Some(ArrayElementType::Byte)
-        || shared.mem.heap.array_element_type(right_bytes) != Some(ArrayElementType::Byte)
-    {
-        return false;
+    let left_elements = shared.mem.heap.array_length(left_value);
+    let right_elements = shared.mem.heap.array_length(right_value);
+    if left_storage == right_storage {
+        // Same representation: one raw payload compare, no decoding at all.
+        let stride = if left_storage == STRING_STORAGE_LATIN1 {
+            1
+        } else {
+            2
+        };
+        let left_raw =
+            unsafe { std::slice::from_raw_parts(left_data, left_elements * stride) };
+        let right_raw =
+            unsafe { std::slice::from_raw_parts(right_data, right_elements * stride) };
+        return Some(left_raw == right_raw);
     }
-    let (Some(left_ptr), Some(right_ptr)) = (
-        shared.mem.heap.array_data_ptr(left_bytes),
-        shared.mem.heap.array_data_ptr(right_bytes),
-    ) else {
-        return false;
-    };
-    let left_len = shared.mem.heap.array_length(left_bytes);
-    let right_len = shared.mem.heap.array_length(right_bytes);
-    let left_raw = unsafe { std::slice::from_raw_parts(left_ptr as *const u8, left_len) };
-    let right_raw = unsafe { std::slice::from_raw_parts(right_ptr as *const u8, right_len) };
-    if left_coder == right_coder {
-        return left_raw == right_raw;
+    let left_units = string_unit_count(left_elements, left_storage)?;
+    let right_units = string_unit_count(right_elements, right_storage)?;
+    if left_units != right_units {
+        return Some(false);
     }
-    let (latin, utf16) = if left_coder == 0 {
-        (left_raw, right_raw)
-    } else {
-        (right_raw, left_raw)
-    };
-    utf16.len() == latin.len().saturating_mul(2)
-        && latin
-            .iter()
-            .zip(utf16.chunks_exact(2))
-            .all(|(&byte, unit)| byte == unit[0] && unit[1] == 0)
+    for index in 0..left_units {
+        // SAFETY: each pointer is its own value array's payload and `index` is
+        // below that array's unit count.
+        let (l, r) = unsafe {
+            (
+                string_unit_at(left_data, left_storage, index),
+                string_unit_at(right_data, right_storage, index),
+            )
+        };
+        if l != r {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 impl<'a> NativeContextImpl<'a> {
@@ -9863,7 +9962,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         if !is_real_java_string(self.shared, a) || !is_real_java_string(self.shared, b) {
             return None;
         }
-        Some(compact_java_strings_equal(self.shared, a, b))
+        compact_java_strings_equal(self.shared, a, b)
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {

@@ -34,6 +34,25 @@ fn chm_diag() {
         let result = vm.invoke("cratonvm/ChmDiagProbe", m, "()I", &[]);
         println!("== {m} => {result:?}");
     }
+    let cm = vm.shared.classes.class_manager.read();
+    for name in ["java/lang/String", "java/util/HashMap"] {
+        match cm.get_loaded_class_id(name) {
+            Some(id) => {
+                let cls = cm.get_class(id).unwrap();
+                println!(
+                    "class {name} id={id:?} synthetic_stub={} total_fields={} fields={:?}",
+                    cls.is_synthetic_stub,
+                    cls.num_total_fields,
+                    cls.fields
+                        .iter()
+                        .filter(|f| !f.is_static())
+                        .map(|f| (f.name.to_string(), f.descriptor.to_string()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            None => println!("class {name} NOT LOADED"),
+        }
+    }
 }
 
 #[test]
