@@ -814,8 +814,21 @@ pub(crate) fn resolve_class_loader_aware(
     //     through Quarkus's `RunnerClassLoader`.
     //     Strictly additive: it only pre-resolves a component whose global
     //     answer was going to be fabricated anyway.
+    //
+    //     Gated on THIS referencing class having a defining loader, not on the
+    //     process-wide "some loader exists" latch. The whole pre-pass exists to
+    //     feed `drive_defining_loader_load`, which bails immediately without a
+    //     `defining_loader_for(referencing_class_id)` — so for an app- or
+    //     bootstrap-defined referencing class the `would_fabricate_synthetic_stub`
+    //     probe (a class-manager read lock plus a name lookup) could only ever
+    //     lead to a no-op. Same predicate, evaluated per class instead of per
+    //     process; see `class_may_have_defining_loader` for why the difference
+    //     is worth 1.8x on a class-parsing workload.
     if let Some(component) = array_component_class_name(name) {
-        if cratonvm_native_builtins::classloader::any_defining_loader_registered()
+        if cratonvm_native_builtins::classloader::defining_loader_for(
+            referencing_class_id.as_u32(),
+        )
+        .is_some()
             && shared
                 .classes
                 .class_manager
@@ -1077,7 +1090,16 @@ pub(crate) fn resolve_class_loader_aware(
     // generated Arc bytecode resolved to a stub, which then could not be cast
     // to `io.quarkus.arc.InjectableBean`. Strictly additive -- it only
     // pre-empts an answer that was going to be fake.
-    if cratonvm_native_builtins::classloader::any_defining_loader_registered()
+    //
+    // Reuses `has_registered_defining_loader` (computed once above) rather than
+    // the process-wide "any loader exists" latch, for the same reason as the
+    // (0) pre-pass: the body is a `drive_defining_loader_load`, which needs a
+    // defining loader for THIS referencing class and returns `None` without
+    // one. Every `new`/`checkcast`/`instanceof` of an app-loader class reaches
+    // this line -- resolution is not cached per call site -- so the probe ran
+    // on the hot path of every allocation once any custom loader had ever
+    // defined a class.
+    if has_registered_defining_loader
         && shared
             .classes
             .class_manager
