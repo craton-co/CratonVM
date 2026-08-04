@@ -146,6 +146,95 @@ public class PgoGuardedVirtualInline {
         return DIVIDER.tag(x);
     }
 
+    // How many frames naming `tag` appear in the stack trace of an exception
+    // raised inside `callDivider`'s call to `Divider.tag`?
+    //
+    // The brief's verification list asks that a guard which always fires
+    // produce "the same observable results as the un-inlined path — same
+    // exceptions, same STACK TRACES, same `finally` execution". A spliced body
+    // has no frame of its own, so this is the measurement that says whether
+    // the trace still names the callee. The `try` is HERE, not in
+    // `callDivider`, so `callDivider`'s site stays outside any protected range
+    // and remains eligible for the guard.
+    public static int dividerTagFrames(int x) {
+        try {
+            return callDivider(x);
+        } catch (Throwable e) {
+            int n = 0;
+            for (StackTraceElement el : e.getStackTrace()) {
+                if ("tag".equals(el.getMethodName())) {
+                    n++;
+                }
+            }
+            return -n;
+        }
+    }
+
+    // A callee holding a `finally`, called from a guard-eligible site. The
+    // inline resolver refuses any callee with a non-empty exception table, so
+    // this must never be spliced — and the `finally` must run either way.
+    static class FinallyTagger extends A {
+        static int sideEffects = 0;
+
+        @Override
+        public int tag(int x) {
+            try {
+                if (x == 13) {
+                    return -13;
+                }
+                return x + 1;
+            } finally {
+                sideEffects++;
+            }
+        }
+    }
+
+    private static final A FINALLY_TAGGER = new FinallyTagger();
+
+    public static int callFinally(int x) {
+        return FINALLY_TAGGER.tag(x);
+    }
+
+    public static int finallySideEffects() {
+        return FinallyTagger.sideEffects;
+    }
+
+    // A `synchronized` callee at a guard-eligible site. Every `FrameState` the
+    // lowerer builds hard-codes an empty monitor list, so an inlined body can
+    // carry no monitor state — the brief's second blocker. This must never be
+    // spliced.
+    static class SyncTagger extends A {
+        @Override
+        public synchronized int tag(int x) {
+            return x + 42;
+        }
+    }
+
+    private static final A SYNC_TAGGER = new SyncTagger();
+
+    public static int callSynchronized(int x) {
+        return SYNC_TAGGER.tag(x);
+    }
+
+    // A callee whose body takes a monitor (`monitorenter`/`monitorexit`) at a
+    // guard-eligible site. Same refusal, different bytecode shape.
+    static class MonitorTagger extends A {
+        private final Object lock = new Object();
+
+        @Override
+        public int tag(int x) {
+            synchronized (lock) {
+                return x + 99;
+            }
+        }
+    }
+
+    private static final A MONITOR_TAGGER = new MonitorTagger();
+
+    public static int callMonitor(int x) {
+        return MONITOR_TAGGER.tag(x);
+    }
+
     // Interface reach: `invokeinterface Tagger.itag`, one implementation.
     // Resolving from the constant-pool class finds only the ABSTRACT method
     // (no Code attribute), so this site can never inline unless resolution
