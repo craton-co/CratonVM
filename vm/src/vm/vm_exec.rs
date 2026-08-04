@@ -5399,6 +5399,16 @@ const STRING_STORAGE_LATIN1: u8 = 0;
 const STRING_STORAGE_UTF16: u8 = 1;
 const STRING_STORAGE_CHARS: u8 = 2;
 
+/// The element type of `object`, or `None` when `object` is not an array at
+/// all. `VmHeap::array_element_type` reads a header word that is only
+/// meaningful on an array, so every layout probe below goes through here.
+fn array_element_type_of(shared: &SharedVm, object: ObjectRef) -> Option<ArrayElementType> {
+    if shared.mem.heap.kind_of(object) != ObjectKind::Array {
+        return None;
+    }
+    shared.mem.heap.array_element_type(object)
+}
+
 /// Locate a String's character array and how that array is encoded.
 ///
 /// Returning `None` means *"this object's characters could not be located"* —
@@ -5426,7 +5436,10 @@ const STRING_STORAGE_CHARS: u8 = 2;
 fn java_string_storage(shared: &SharedVm, object: ObjectRef) -> Option<(ObjectRef, u8)> {
     let heap = &shared.mem.heap;
     if let Value::Object(Some(value)) = heap.get_field(object, 0) {
-        match heap.array_element_type(value) {
+        // `array_element_type` / `array_length` read header words that only
+        // mean anything on an array, so the kind check comes first — same
+        // order, and for the same reason, as `read_java_string`'s.
+        match array_element_type_of(shared, value) {
             Some(ArrayElementType::Char) => return Some((value, STRING_STORAGE_CHARS)),
             Some(ArrayElementType::Byte) => match heap.get_field(object, 1) {
                 Value::Int(0) => return Some((value, STRING_STORAGE_LATIN1)),
@@ -5455,7 +5468,7 @@ fn java_string_storage_by_name(shared: &SharedVm, object: ObjectRef) -> Option<(
     let Value::Object(Some(value)) = shared.mem.heap.get_field(object, value_index) else {
         return None;
     };
-    match shared.mem.heap.array_element_type(value) {
+    match array_element_type_of(shared, value) {
         Some(ArrayElementType::Char) => Some((value, STRING_STORAGE_CHARS)),
         Some(ArrayElementType::Byte) => {
             match coder_index.map(|index| shared.mem.heap.get_field(object, index)) {
