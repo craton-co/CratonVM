@@ -3424,10 +3424,34 @@ fn reloc_emit_enabled() -> bool {
             // interpreter's `NegativeArraySizeException`/`OutOfMemoryError`
             // machinery), converted to the JIT-wide `i64::MIN` sentinel
             // exactly like `Op::New`'s failure path.
+            //
+            // `jit_newarray`/`jit_anewarray_object` can trigger a real
+            // collection (TLAB exhaustion), so — unlike `Op::New`'s arm,
+            // which has no operand of its own to protect — this allocation
+            // needs a fresh safepoint map published BEFORE it, exactly as
+            // `Op::MonitorEnter`/`Op::Call` do: without one, `sp_id_slot_off`
+            // keeps naming whichever EARLIER safepoint last wrote it (or none
+            // at all), so a collection during THIS call matches a map
+            // describing a different program point and relocates against it
+            // — `emit_safepoint_map`'s own doc names this exact hazard.
+            // Reached in practice: a hot method that `newarray`s in a tight
+            // loop and returns the array to an interpreter caller corrupted
+            // the returned reference under GC pressure before this map was
+            // added (`vm/tests/jit_cov06_array_allocation.rs`, `gcRootsOK`/
+            // the plain allocate-loop warm-up both reproduced it).
+            //
+            // Published BEFORE `alloc_slot(id)` too — `alloc_slot` marks this
+            // node's OWN result slot `defined_nodes[id] = true` immediately,
+            // and the result is not written until the call returns, so a map
+            // taken after `alloc_slot` would hand the collector an
+            // uninitialised word to treat as a live reference (the same
+            // ordering `emit_safepoint_map`'s doc requires).
             Op::NewArray {
                 element_type,
                 component_class_id,
             } => {
+                let sp_live_hi = self.spill_high_water;
+                self.emit_safepoint_map(sp_live_hi);
                 let slot = self.alloc_slot(id);
                 let length_slot = self.slot_of(node.inputs[2]);
                 let (target, immediate) = if *element_type != 0 {
