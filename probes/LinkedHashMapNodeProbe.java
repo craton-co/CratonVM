@@ -136,6 +136,49 @@ public class LinkedHashMapNodeProbe {
         check("iteration order", "[k4=v4, k5=v5, k6=v6]", entryListOf(m).toString());
     }
 
+    /**
+     * Hibernate's {@code BoundedConcurrentHashMap.LRU} shape: the override
+     * removes the eldest ITSELF (its eviction listener calls back into
+     * {@code this.remove}) and then reports true, so the caller's own removal
+     * has to be an idempotent no-op. This is the path the eldest-key pin in
+     * {@code native_lhm_put_evict} exists for — the key is read before the
+     * dispatch precisely because the node may be unlinked by the time it
+     * returns.
+     */
+    static final class ReentrantEvictor extends LinkedHashMap<String, String> {
+        private static final long serialVersionUID = 1L;
+        boolean andReportTrue;
+        int evicted;
+
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+            if (size() <= 3) {
+                return false;
+            }
+            remove(eldest.getKey()); // reentrant removal, exactly like Hibernate's LRU
+            evicted++;
+            return andReportTrue;
+        }
+    }
+
+    private static void reentrantEvictionIsIdempotent() {
+        System.out.println("== override removes the eldest reentrantly");
+        for (int variant = 0; variant < 2; variant++) {
+            boolean reportTrue = variant == 0;
+            ReentrantEvictor m = new ReentrantEvictor();
+            m.andReportTrue = reportTrue;
+            for (int i = 1; i <= 6; i++) {
+                m.put("k" + i, "v" + i);
+            }
+            String tag = " (reports " + reportTrue + ")";
+            check("size" + tag, Integer.valueOf(3), Integer.valueOf(m.size()));
+            check("evictions" + tag, Integer.valueOf(3), Integer.valueOf(m.evicted));
+            check("oldest gone" + tag, null, m.get("k1"));
+            check("newest kept" + tag, "v6", m.get("k6"));
+            check("order" + tag, "[k4=v4, k5=v5, k6=v6]", entryListOf(m).toString());
+        }
+    }
+
     // ------------------------------------------------------------------
     // 2. The node still behaves as a LinkedHashMap node everywhere else
     // ------------------------------------------------------------------
@@ -263,6 +306,7 @@ public class LinkedHashMapNodeProbe {
         eldestIsTheRealNode();
         eldestSetValueWritesThroughToTheMap();
         eldestEvictionStillWorks();
+        reentrantEvictionIsIdempotent();
         insertionOrderAndBasicOps();
         entrySetSetValueWritesThrough();
         accessOrderIsLru();
