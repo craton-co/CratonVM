@@ -4206,6 +4206,10 @@ impl SharedVm {
                 None => out.push_str("      \"overwrote\": null,\n"),
             }
             out.push_str(&format!("      \"invocations\": {},\n", row.invocations));
+            // "Did anyone adjudicate this kind, or did it inherit an ambient
+            // `set_category`?" — the discriminator the 157-entry
+            // reclassification needs. See `NativeCensusEntry::kind_stated`.
+            out.push_str(&format!("      \"kind_stated\": {},\n", row.kind_stated));
 
             match cm {
                 Some(cm) => {

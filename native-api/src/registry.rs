@@ -4347,6 +4347,22 @@ pub struct NativeCensusEntry {
     /// Times this slot was dispatched through any path this run. `0` on a
     /// superseded row: the count belongs to whoever currently owns the slot.
     pub invocations: u64,
+    /// Whether [`Self::kind`] was **stated at this registration site**
+    /// (`register_with_kind`) or inherited from an ambient `set_category` in
+    /// some enclosing registrar (`register`).
+    ///
+    /// This is the column the 157-entry reclassification was blocked on.
+    /// `registered_by` says *where* a registration was written; only this says
+    /// whether anybody decided what it is. A `false` here on a `SyntheticStub`
+    /// row means nothing more than "no `set_category` covered this call site",
+    /// since `SyntheticStub` is the default — which is very different from a
+    /// deliberate stub, and the two were previously indistinguishable.
+    ///
+    /// Read it with the direction of the mistake in mind: `false` on a
+    /// `Bridge` row is the *dangerous* one, because `Bridge` is never the
+    /// default and can only have been inherited from a `set_category` line that
+    /// covered more registrations than its author was thinking about.
+    pub kind_stated: bool,
 }
 
 /// Registry of native method implementations.
@@ -4504,6 +4520,22 @@ pub struct NativeMethodRegistry {
     /// The category applied to subsequent `register()` calls. Scoped via
     /// `with_category`. Defaults to `SyntheticStub` (conservative).
     current_category: NativeKind,
+    /// Whether `current_category` was **stated at the registration site**
+    /// ([`NativeMethodRegistry::register_with_kind`]) rather than inherited
+    /// from an ambient `set_category` / `with_category` in an ancestor frame.
+    ///
+    /// Index-parallel copy lands in `kind_stated`. Only ever `true` for the
+    /// duration of one `register_with_kind` call, which sets and restores it
+    /// around the inner `register`.
+    ///
+    /// This is the discriminator the 157-entry reclassification needs: today
+    /// the census can say a registration is a `SyntheticStub` and where it was
+    /// written, but not whether anyone *decided* that. See
+    /// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`.
+    next_kind_stated: bool,
+    /// Per-registration copy of [`Self::next_kind_stated`], index-parallel with
+    /// `registrations` and `categories`.
+    kind_stated: Vec<bool>,
     /// Strict "no synthetic stubs" mode. When true, `register()` DROPS any
     /// registration whose `current_category` is `SyntheticStub` — it is never
     /// inserted, so a call to that method falls through to real JDK bytecode
@@ -4667,6 +4699,8 @@ impl NativeMethodRegistry {
             ),
             categories: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             current_category: NativeKind::SyntheticStub,
+            next_kind_stated: false,
+            kind_stated: Vec::new(),
             // Read once at construction. `CRATONVM_NO_STUBS` (any non-empty
             // value) enables strict mode: synthetic-stub registrations are
             // dropped so calls hit real bytecode or a clear error.
@@ -4830,6 +4864,56 @@ impl NativeMethodRegistry {
         self.current_category = prev;
     }
 
+    /// [`Self::register`], with the kind stated **at the registration site**
+    /// instead of inherited from whatever `set_category` the enclosing
+    /// registrar last ran.
+    ///
+    /// This is the migration target for
+    /// `docs/known-issues/jdk-only/native-kind-is-ambient-and-defaults-to-syntheticstub.md`.
+    /// `register` takes four arguments, none of them a kind; the kind comes
+    /// from a mutable field on the registry that some *ancestor* frame set. The
+    /// consequence runs in both directions and is silent at the point of the
+    /// mistake:
+    ///
+    /// * one `set_category(Bridge)` line at the head of
+    ///   `register_collections_natives` tags **1,195 registrations**, not one
+    ///   of which targets an `ACC_NATIVE` method;
+    /// * and a permanent bridge that inherits `SyntheticStub` is *dropped* by
+    ///   the arms below under `CRATONVM_NO_STUBS` / `JdkOnly`, which is the
+    ///   2026-07-14 `java.util.Properties` regression that surfaced minutes
+    ///   later as `InternalError: null property: java.home`.
+    ///
+    /// A registration made through this entry point records
+    /// [`NativeCensusEntry::kind_stated`], so the census can finally separate
+    /// *"someone adjudicated this"* from *"this inherited the default"* —
+    /// which is the evidence the 157-entry reclassification was blocked on.
+    ///
+    /// `#[track_caller]` on both this and `register` so provenance still points
+    /// at the registrar, not at this line.
+    #[track_caller]
+    pub fn register_with_kind(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        callback: NativeCallback,
+        kind: NativeKind,
+    ) {
+        // Set/restore rather than passing `kind` down: `register`'s body reads
+        // `current_category` in a dozen places (the two drop arms and the
+        // `keep_real_*` heuristics), and threading a parameter through all of
+        // them would leave the ambient field authoritative for some of the
+        // decisions and the argument for others — exactly the split this entry
+        // point exists to remove.
+        let prev = self.current_category;
+        let prev_stated = self.next_kind_stated;
+        self.current_category = kind;
+        self.next_kind_stated = true;
+        self.register(class_name, method_name, descriptor, callback);
+        self.current_category = prev;
+        self.next_kind_stated = prev_stated;
+    }
+
     /// The category a native was registered under, or `None` if no native is
     /// registered for this exact triple. O(1).
     #[inline]
@@ -4908,6 +4992,10 @@ impl NativeMethodRegistry {
                     registered_by: prov.map(|p| format!("{}:{}", p.site.file(), p.site.line())),
                     overwrote: prov.and_then(|p| p.overwrote),
                     invocations,
+                    // Same index-parallel discipline (and same conservative
+                    // fallback direction) as `kind` above: a hypothetical
+                    // desync reports "inherited", never a false "adjudicated".
+                    kind_stated: self.kind_stated.get(reg_index).copied().unwrap_or(false),
                 }
             })
             .collect()
@@ -5528,6 +5616,10 @@ impl NativeMethodRegistry {
         // `Intrinsic` — takes effect, matching the previous `insert`-not-
         // -`or_insert` semantics of the removed `category_by_key` map.
         self.categories.push(self.current_category);
+        // Index-parallel with `categories`: was that kind stated here, or
+        // inherited? Only `register_with_kind` sets the flag, and only for the
+        // duration of its own inner call.
+        self.kind_stated.push(self.next_kind_stated);
         // Provenance, index-parallel with the two pushes above. `overwrote` is
         // read HERE — before the `match prior_slot` arm below rewrites
         // `slot.kind` in place — because that is the last moment the displaced

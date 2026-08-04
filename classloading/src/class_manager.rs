@@ -2666,24 +2666,27 @@ impl ClassManager {
                 name: c.name.to_string(),
                 origin: c.origin.as_str().to_string(),
                 reason: c.origin.reason().map(|r| r.to_string()),
-                // The requesting `owner/Class.method(Desc)` is known to the
-                // *interpreter* — it is the frame that ran the `new` /
-                // `checkcast` / `Class.forName` — and is not reachable from
-                // `ClassManager`, which is called with a bare name. Rather
-                // than thread the frame through every load path, the VM's
-                // class-load choke point calls
-                // [`Self::attach_origin_requester`] with the frame it was
-                // resolving for, and that fills this map.
+                // Two provenances, in one string, in the order they become
+                // known:
                 //
-                // `None` here therefore means one of three things, and they
-                // are worth telling apart before drawing a conclusion:
-                // the class produced no violation (the common case — nothing
-                // to attribute); or it was fabricated during VM bootstrap,
-                // before any Java frame existed; or it was requested by a
-                // native through the direct `ensure_synthetic_class` API,
-                // which has a Rust caller and no Java frame. Only the last is
-                // a gap, and `registered_by`-style provenance is the right
-                // instrument for it, not this field.
+                // * the **Rust call site**, from `#[track_caller]` on the
+                //   `ensure_*` → `fabricate_class` →
+                //   `admit_compatibility_class` chain. Always available, and
+                //   for a `--jdk-only` boot it is the answer for nearly the
+                //   whole population: compatibility classes come overwhelmingly
+                //   from natives asking for an allocation shape, not from
+                //   constant-pool resolution.
+                // * the **Java frame** — the method that ran the `new` /
+                //   `checkcast` / `Class.forName` — which `ClassManager` cannot
+                //   see (it is called with a bare name) and which the VM's
+                //   class-load choke point supplies afterwards through
+                //   [`Self::attach_origin_requester`]. Rendered as
+                //   `"owner/Class.method(Desc) via <rust site>"`.
+                //
+                // `None` here means the class produced no violation at all —
+                // i.e. nothing to attribute — which is the common case and the
+                // whole point of a census: 400-odd honest rows and a handful
+                // that name who is responsible.
                 requested_by: self.origin_requesters.get(&*c.name).cloned(),
                 real_bytes_found: c.origin.has_real_bytes(),
                 loader_id: c.loader_id.to_native_id(),
@@ -2736,18 +2739,28 @@ impl ClassManager {
         if from >= self.origin_violations.len() {
             return;
         }
-        let requester = format!("{owner}.{method}{descriptor}");
         for violation in &mut self.origin_violations[from..] {
             if let JdkOnlyViolation::CompatibilityClassRequested {
-                class, requester: slot, ..
+                class,
+                requester: slot,
+                ..
             } = violation
             {
-                if slot.is_none() {
-                    *slot = Some(requester.clone());
-                    self.origin_requesters
-                        .entry(class.clone())
-                        .or_insert_with(|| requester.clone());
-                }
+                // Layered on top of the Rust call site
+                // `admit_compatibility_class` already recorded, giving
+                // `"org/foo/Bar.baz(Desc) via classloading/…:7289"`. Both
+                // halves answer different questions and both are worth
+                // keeping: the Java frame says which application code depends
+                // on the fabrication, the Rust site says which VM code
+                // performed it — and the latter is the work list the
+                // `ensure_synthetic_class` migration needs.
+                let combined = match slot.as_deref() {
+                    Some(site) => format!("{owner}.{method}{descriptor} via {site}"),
+                    None => format!("{owner}.{method}{descriptor}"),
+                };
+                self.origin_requesters
+                    .insert(class.clone(), combined.clone());
+                *slot = Some(combined);
             }
         }
     }
@@ -2794,12 +2807,32 @@ impl ClassManager {
     /// `NoClassDefFoundError` unchanged. The structured
     /// [`JdkOnlyViolation`] carries the detail an operator needs; the thrown
     /// exception carries what the *program* needs.
+    ///
+    /// # Provenance
+    ///
+    /// `#[track_caller]`, threaded through `fabricate_class` and the three
+    /// `ensure_*` entry points, so the recorded `requester` names the **Rust
+    /// call site** that asked for the fabrication.
+    ///
+    /// That is not a consolation prize for the missing Java frame — it is the
+    /// answer for most of the population. A `--jdk-only` boot's compatibility
+    /// classes come overwhelmingly from natives calling `ensure_synthetic_class`
+    /// directly for an allocation shape, not from constant-pool resolution, and
+    /// those have a Rust caller and no Java frame at all. The Java frame, when
+    /// one exists, is added on top by [`Self::attach_origin_requester`].
+    ///
+    /// Costs one `format!` per *distinct class name*, inside the dedupe branch —
+    /// not per request, which is thousands of times more often.
+    #[track_caller]
     fn admit_compatibility_class(&mut self, name: &str, reason: &str) -> Result<(), VmError> {
         // Deduped by class name: a single missing class is requested over and
         // over (constant-pool resolution, `Class.forName` probes, every
         // allocation of a stub-backed container), and an undeduped list would
         // be thousands of rows of a handful of names.
         if self.origin_violations_seen.insert(name.to_string()) {
+            let site = core::panic::Location::caller();
+            self.origin_requesters
+                .insert(name.to_string(), format!("{}:{}", site.file(), site.line()));
             self.origin_violations
                 .push(JdkOnlyViolation::CompatibilityClassRequested {
                     class: name.to_string(),
@@ -2808,11 +2841,10 @@ impl ClassManager {
                     // debug-asserts it), so the initiating loader is not in
                     // question here.
                     initiating_loader: Some("bootstrap".to_string()),
-                    // Filled in by `attach_origin_requester` once the load
-                    // returns to the VM choke point that knows the frame; see
-                    // `dump_class_origins`. It is deliberately still `None`
-                    // *here*, because this crate is called with a bare name.
-                    requester: None,
+                    // The Rust call site. A Java frame, when there is one, is
+                    // added on top by `attach_origin_requester` once the load
+                    // unwinds to the VM choke point that can see it.
+                    requester: Some(format!("{}:{}", site.file(), site.line())),
                     reason: reason.to_string(),
                 });
             // Live trace (contract §9). Dispatched inside the dedupe branch so
@@ -3275,6 +3307,7 @@ impl ClassManager {
     /// refusal wearing an infallible signature; a caller that can do better
     /// should use [`Self::try_ensure_synthetic_class`], which says so in a
     /// `Result`.
+    #[track_caller]
     pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         let fabricated = self.fabricate_class(
             name,
@@ -3324,6 +3357,7 @@ impl ClassManager {
     /// The two are deliberately different error shapes: a caller retrying with
     /// an initiating loader (the right response to 2) must not confuse it with
     /// a policy refusal it cannot retry out of.
+    #[track_caller]
     pub fn try_ensure_synthetic_class(
         &mut self,
         name: &str,
@@ -3362,6 +3396,7 @@ impl ClassManager {
     /// pass a stub origin would reach the ambiguity gate and get an `Err`;
     /// `.expect`ing it would abort the VM for what is a recoverable naming
     /// conflict. The stand-in keeps the failure local to the one allocation.
+    #[track_caller]
     pub fn ensure_generated_class(
         &mut self,
         name: &str,
@@ -3471,6 +3506,7 @@ impl ClassManager {
     // [`Self::ensure_generated_class`] with `VmInternal` / `GeneratedProxy`
     // respectively, in the same wave that re-audits the `is_synthetic_stub`
     // readers.
+    #[track_caller]
     fn fabricate_class(
         &mut self,
         name: &str,
