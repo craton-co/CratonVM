@@ -2834,6 +2834,20 @@ pub(super) fn try_jit_upgrade_with_gate(
         cm.get_class(cratonvm_types::ClassId::new(cid))
             .map(|c| c.name.to_string())
     };
+    // PGO-02 R0: the BODY a receiver of exactly `cid` dispatches to at a site
+    // declared `(cp_class, name, desc)` — what a guard admitting that class may
+    // splice. See `resolve_receiver_inline_site` for why the constant-pool
+    // callee is the wrong body here.
+    let receiver_inline_resolver = |cid: u32, cp_class: &str, name: &str, desc: &str| {
+        resolve_receiver_inline_site(
+            shared,
+            cached.declaring_class_id,
+            cid,
+            cp_class,
+            name,
+            desc,
+        )
+    };
     // activate-ir-optimizer: elidable-`<init>` resolver for `new` scalar
     // replacement. Now default-ON (soaked: bt10/14/16/18 == HotSpot, POJO probes
     // == HotSpot, 802 jit + 20 differential tests green). `CRATONVM_JIT_SCALAR_NEW=0`
@@ -3287,6 +3301,14 @@ pub(super) fn try_jit_upgrade_with_gate(
                 cm.get_class(cratonvm_types::ClassId::new(cid))
                     .map(|c| c.name.to_string())
             };
+            // PGO-02 R0: the BODY a receiver of exactly `cid` dispatches to at a
+            // site declared `(cp_class, name, desc)`. The guard admits a runtime
+            // class, so this — not the constant-pool callee — is what may be
+            // spliced behind it. See `resolve_receiver_inline_site`.
+            let c_receiver_inline_resolver =
+                |cid: u32, cp_class: &str, name: &str, desc: &str| {
+                    resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc)
+                };
             // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
             // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
             let c_scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
@@ -3436,6 +3458,11 @@ pub(super) fn try_jit_upgrade_with_gate(
                 Some(&c_indy_descriptor_resolver),
                 if crate::runtime::env_cache::jit_guarded_virtual_inline() {
                     Some(&c_class_id_namer)
+                } else {
+                    None
+                },
+                if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+                    Some(&c_receiver_inline_resolver)
                 } else {
                     None
                 },
@@ -3589,6 +3616,11 @@ pub(super) fn try_jit_upgrade_with_gate(
         Some(&indy_descriptor_resolver),
         if crate::runtime::env_cache::jit_guarded_virtual_inline() {
             Some(&class_id_namer)
+        } else {
+            None
+        },
+        if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+            Some(&receiver_inline_resolver)
         } else {
             None
         },
@@ -4339,6 +4371,19 @@ pub(super) fn try_jit_compile_callee_slow(
         cm.get_class(cratonvm_types::ClassId::new(namer_cid))
             .map(|c| c.name.to_string())
     };
+    // PGO-02 R0: see the sibling resolver in `try_jit_compile` — the body a
+    // receiver of exactly this class id dispatches to, which is the only body a
+    // guard admitting that class may splice.
+    let receiver_inline_resolver = |rcv_cid: u32, cp_class: &str, name: &str, desc: &str| {
+        resolve_receiver_inline_site(
+            shared,
+            cached.declaring_class_id,
+            rcv_cid,
+            cp_class,
+            name,
+            desc,
+        )
+    };
     // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
     // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
     let scalar_new_on = crate::runtime::env_cache::jit_scalar_new();
@@ -4627,6 +4672,11 @@ pub(super) fn try_jit_compile_callee_slow(
         Some(&indy_descriptor_resolver),
         if crate::runtime::env_cache::jit_guarded_virtual_inline() {
             Some(&class_id_namer)
+        } else {
+            None
+        },
+        if crate::runtime::env_cache::jit_guarded_virtual_inline() {
+            Some(&receiver_inline_resolver)
         } else {
             None
         },
@@ -5194,9 +5244,80 @@ pub fn jit_panic_to_exception(
 /// - Bytecode length <= MAX_INLINE_BYTECODE_SIZE (35)
 /// - No exception handlers, not synchronized
 /// - No unsupported bytecodes (new, checkcast, instanceof, invoke*, etc.)
+///
+/// Resolution starts at the CONSTANT-POOL class, which is the right answer for
+/// `invokestatic`/`invokespecial` and the wrong one for a guarded virtual or
+/// interface site — see [`resolve_receiver_inline_site`].
 pub(super) fn resolve_inline_site(
     shared: &SharedVm,
     requesting_class_id: ClassId,
+    callee_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+) -> Option<cratonvm_jit::InlineSite> {
+    resolve_inline_site_from(
+        shared,
+        requesting_class_id,
+        None,
+        callee_class,
+        callee_method,
+        callee_desc,
+    )
+}
+
+/// Resolve the body a receiver of EXACTLY `receiver_class_id` dispatches to at
+/// a call site declared `(cp_class, callee_method, callee_desc)` — PGO-02's
+/// guarded-inline resolver.
+///
+/// A guarded inline compares the receiver's class id against a class taken
+/// from the receiver-type profile, then runs a spliced body. Those two only
+/// agree if the body is the one that class actually dispatches to. Resolving
+/// from `cp_class` instead — the receiver expression's STATIC type — splices
+/// the superclass's method behind a guard that just certified the subclass,
+/// which is silent wrong code at every overriding site. Starting the JVMS
+/// selection walk at the runtime receiver is also what gives `invokeinterface`
+/// any reach at all: an interface's own declaration has no `Code`.
+///
+/// Fail-closed on every shape where "the method found by walking up from the
+/// receiver" might NOT be the method real dispatch selects:
+///
+/// * the receiver class must be a loaded, non-interface, non-array class;
+/// * the selected method must not be `private` (a private method is never
+///   inherited, so a walk that finds one from a subclass receiver found
+///   something dispatch would not);
+/// * and if the selected method is declared somewhere OTHER than where the
+///   constant-pool reference resolves, it must be genuinely an override:
+///   `public`/`protected`, or package-private within the same runtime package.
+///   A package-private method in a different package does NOT override
+///   (JVMS §5.4.5), and the walk cannot tell the difference on its own.
+pub(super) fn resolve_receiver_inline_site(
+    shared: &SharedVm,
+    requesting_class_id: ClassId,
+    receiver_class_id: u32,
+    cp_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+) -> Option<cratonvm_jit::InlineSite> {
+    resolve_inline_site_from(
+        shared,
+        requesting_class_id,
+        Some(ClassId::new(receiver_class_id)),
+        cp_class,
+        callee_method,
+        callee_desc,
+    )
+}
+
+/// Shared core of [`resolve_inline_site`] and [`resolve_receiver_inline_site`].
+///
+/// `receiver_class_id` selects which of the two contracts applies: `None`
+/// resolves from `callee_class` (constant-pool resolution), `Some` starts the
+/// selection walk at that runtime class and applies the override-legality
+/// checks documented on [`resolve_receiver_inline_site`].
+fn resolve_inline_site_from(
+    shared: &SharedVm,
+    requesting_class_id: ClassId,
+    receiver_class_id: Option<ClassId>,
     callee_class: &str,
     callee_method: &str,
     callee_desc: &str,
@@ -5220,15 +5341,57 @@ pub(super) fn resolve_inline_site(
         return None;
     }
 
+    // Taken BEFORE the class-manager guard. Holding two of this subsystem's
+    // locks at once is a lock-order obligation, and every other reader of
+    // `lambda_proxies` here takes it without `class_manager` held; a proxy's
+    // dispatch is synthesised elsewhere entirely, so one is never inlineable.
+    if let Some(receiver_id) = receiver_class_id {
+        if shared
+            .classes
+            .lambda_proxies
+            .read()
+            .contains_key(&receiver_id)
+        {
+            return None;
+        }
+    }
+
     let cm = shared.classes.class_manager.read();
-    let callee_class_id = cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
+    let cp_class_id = cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
     let store = cm.class_store();
+    // Where the JVMS method-selection walk starts. For a guarded site that is
+    // the RUNTIME receiver class; `find_method_recursive` performs the
+    // maximally-specific default-method selection only when handed the
+    // receiver, which is the same reason the interpreter's own dispatch
+    // redirects to the receiver id for interface calls.
+    let search_start = receiver_class_id.unwrap_or(cp_class_id);
+    if let Some(receiver_id) = receiver_class_id {
+        let receiver = store.get(receiver_id)?;
+        // A guard admits an EXACT class, so an interface or an array class is
+        // never a class a receiver can have here.
+        if receiver.is_interface() || receiver.name.starts_with('[') {
+            return None;
+        }
+    }
     let (method, declaring_id) = crate::classloading::find_method_recursive(
-        callee_class_id,
+        search_start,
         callee_method,
         callee_desc,
         store,
     )?;
+    if let Some(receiver_id) = receiver_class_id {
+        if !receiver_resolution_is_dispatch_faithful(
+            store,
+            receiver_id,
+            cp_class_id,
+            declaring_id,
+            method,
+            callee_method,
+            callee_desc,
+        ) {
+            return None;
+        }
+    }
     // Same rule for an inherited native: resolution may start at a subclass
     // while the executable override is registered on the declaring class.
     // Checking exactly the declaring class still permits a real bytecode
@@ -5244,6 +5407,17 @@ pub(super) fn resolve_inline_site(
     {
         return None;
     }
+    // The class the SPLICED BODY belongs to, which is what an invalidation
+    // dependency must name. For a constant-pool resolution this stays the
+    // declared name (unchanged behaviour); for a receiver resolution the
+    // declared name is a supertype that may own no body at all, so naming it
+    // would record a dependency on a class whose redefinition cannot affect
+    // the code, and miss the one whose redefinition can.
+    let inlined_body_class_name = if receiver_class_id.is_some() {
+        declaring_class_name.to_string()
+    } else {
+        callee_class.to_string()
+    };
 
     if method.is_synchronized() {
         return None;
@@ -5584,11 +5758,125 @@ pub(super) fn resolve_inline_site(
         ldc_info,
         ldc2w_info,
         needs_heap,
-        class_name: callee_class.to_string(),
+        class_name: inlined_body_class_name,
         method_name: callee_method.to_string(),
         descriptor: callee_desc.to_string(),
         elided_invoke_pcs,
     })
+}
+
+/// Whether a method reached by walking up from the RUNTIME RECEIVER is the
+/// method real dispatch would select at a site declared against `cp_class_id`.
+///
+/// `find_method_recursive` implements JVMS selection, but selection is only
+/// defined relative to a resolved method: a candidate overrides the resolved
+/// method only if it is accessible to it (JVMS §5.4.5). A package-private
+/// method in a *different* runtime package has the same name and descriptor and
+/// is NOT an override — dispatch runs the resolved method, the walk finds the
+/// impostor. Everything below is a fail-closed check for that class of
+/// disagreement; a `false` answer means "do not inline", never "inline
+/// something else".
+#[allow(clippy::too_many_arguments)]
+fn receiver_resolution_is_dispatch_faithful(
+    store: &crate::classloading::ClassStore,
+    receiver_id: ClassId,
+    cp_class_id: ClassId,
+    declaring_id: ClassId,
+    method: &cratonvm_reader::method::ClassFileMethod,
+    callee_method: &str,
+    callee_desc: &str,
+) -> bool {
+    // A virtual/interface site never dispatches to a static method, and a
+    // private method is never inherited — a walk that reached one from a
+    // subclass receiver found something dispatch could not.
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
+    if method.is_static()
+        || method
+            .access_flags
+            .contains(MethodAccessFlags::PRIVATE)
+        || method.is_abstract()
+    {
+        return false;
+    }
+    // `<init>`/`<clinit>` are not virtually dispatched at all.
+    if callee_method.starts_with('<') {
+        return false;
+    }
+    // The receiver must actually be a subtype of the declared class, or the
+    // profile handed us a class id from a different site entirely.
+    if !class_is_assignable_to(store, receiver_id, cp_class_id) {
+        return false;
+    }
+    // Where the constant-pool reference itself resolves. If selection landed on
+    // the SAME method, there is no override question to answer.
+    let resolved = crate::classloading::find_method_recursive(
+        cp_class_id,
+        callee_method,
+        callee_desc,
+        store,
+    );
+    let Some((_, resolved_declaring_id)) = resolved else {
+        // The declared site does not resolve at all. That is a shape this
+        // resolver has no model for; refuse rather than guess.
+        return false;
+    };
+    if resolved_declaring_id == declaring_id {
+        return true;
+    }
+    // A genuine override: public or protected overrides across any package.
+    if method
+        .access_flags
+        .intersects(MethodAccessFlags::PUBLIC | MethodAccessFlags::PROTECTED)
+    {
+        return true;
+    }
+    // Package-private: an override only within the same runtime package —
+    // same package NAME and same defining loader.
+    let (Some(selected), Some(resolved_owner)) =
+        (store.get(declaring_id), store.get(resolved_declaring_id))
+    else {
+        return false;
+    };
+    selected.loader_id == resolved_owner.loader_id
+        && runtime_package_of(&selected.name) == runtime_package_of(&resolved_owner.name)
+}
+
+/// The package part of an internal class name (`a/b/C` -> `a/b`), empty for the
+/// unnamed package.
+fn runtime_package_of(internal_name: &str) -> &str {
+    match internal_name.rfind('/') {
+        Some(i) => &internal_name[..i],
+        None => "",
+    }
+}
+
+/// Whether `sub` is `sup` or inherits/implements it.
+fn class_is_assignable_to(
+    store: &crate::classloading::ClassStore,
+    sub: ClassId,
+    sup: ClassId,
+) -> bool {
+    if sub == sup {
+        return true;
+    }
+    let mut stack = vec![sub];
+    let mut seen: std::collections::HashSet<ClassId> = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if id == sup {
+            return true;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(class) = store.get(id) else {
+            continue;
+        };
+        stack.extend(class.interfaces.iter().copied());
+        if let Some(sc) = class.superclass {
+            stack.push(sc);
+        }
+    }
+    false
 }
 
 /// Get the bytecode length of an instruction from its opcode ALONE (for the
