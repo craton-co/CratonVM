@@ -152,9 +152,24 @@ invalidates a Spring Boot run).
 | `cratonvm-kafkabp` | `origin/dev` @ `3db59eb9b`, unmodified | 3/3 **FAIL** | 2/2 **FAIL** |
 | `cratonvm-kafkabp-r2` | + defect 1 | 3/3 **PASS** | — |
 | `cratonvm-kafkabp-r3` | + defect 2 | 3/3 **PASS** | 2/2 **PASS** |
+| `cratonvm-kafkabp-r4` | + `origin/dev` merged forward | 9/10 **PASS**, 1 HANG | 2/2 **PASS** |
 
 Every passing run reported `SBRUNNER_RESULT tests=3 failed=0 aborted=0
 skipped=0 containersFailed=0`.
+
+**The one `r4` HANG is pre-existing load sensitivity, not this change.** It
+happened in the only run that overlapped a concurrent `regression-suite`
+build/run on the same box; its log stops at
+`SocketServer listenerType=CONTROLLER … Enabling request processing` with the
+controller fencing broker 0 for a timed-out session — the broker never
+finished starting, and no test method ever ran. Re-running the identical
+binary six times with the box otherwise idle gave **6/6 PASS**, with wall
+times ranging 76–177 s, which is the same starvation pressure short of the
+ceiling. This class is also on record as a 300 s HANG in the
+[08-02 full-suite round](../../../../apps/spring-boot-suite-runner/RESULTS-20260802-azure-fullsuite.md),
+i.e. long before either fix. Across all binaries today the failure counts are
+0 hangs in 5 baseline runs and 1 in 12 post-fix runs — no signal, and the one
+event has a load explanation in its own log.
 
 `probes/MapConditionalMutatorProbe.java`, same host, same JDK: the baseline
 binary dies on the very first `remove(k,v)` with
@@ -166,7 +181,7 @@ ClassCastException: java.util.LinkedHashMap$Node cannot be cast to java.util.Lin
   at java/util/HashMap.remove(HashMap.java:1158)
 ```
 
-while `r3` prints `PROBE PASS` — 41 assertions, matching HotSpot line for
+while `r3` prints `PROBE PASS` — 38 assertions, matching HotSpot line for
 line.
 
 `regression-suite/run.sh` against `r3` (it diffs CratonVM against HotSpot):
