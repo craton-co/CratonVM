@@ -3193,6 +3193,22 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
             return jit_newarray_finish(obj_ref, atype, length);
         }
     }
+    // Second attempt, BEFORE forcing a GC — the step `gc_alloc_array` takes and
+    // this helper did not (SB-LOADER-ZIPCONTENT, 2026-08-04). The interpreter
+    // runs `try_alloc_array_full` here, so a young generation that cannot serve
+    // the request spills into old gen and the mutator continues; the spill
+    // itself arms `note_young_spill_pressure`, which schedules the collection at
+    // the next native-call boundary where roots are pinned and remappable.
+    //
+    // Without it the JIT path forced a full STW GC for EVERY array the young
+    // free list could not fit. On `ZipContentTests` that was ~750 forced
+    // collections, one per 8 KB `byte[]`, each freeing ~10 KB — the difference
+    // between "the class is slow" and "the class does not finish". The young
+    // probe above is unchanged, so a healthy heap never reaches this line and
+    // pays nothing.
+    if let Some(obj_ref) = heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
+        return jit_newarray_finish(obj_ref, atype, length);
+    }
     // Slow path: young gen full (or the probe-then-alloc race lost the slot).
     // Mirror the interpreter's `gc_alloc_array` (runtime/interpreter.rs:840):
     // retire the TLAB, run an orchestrated STW GC, then retry the fallible
