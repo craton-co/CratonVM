@@ -7934,21 +7934,6 @@ pub(crate) fn files_write_string_impl(
     p57_files_write_bytes(ctx, path_obj, content.as_bytes(), options)
 }
 
-/// Build a *typed* `java.nio.file.FileAlreadyExistsException` for `path`
-/// (mirrors [`p57_no_such_file`]) — what `CREATE_NEW` owes its caller when the
-/// file is already there.
-pub(crate) fn p57_file_already_exists(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
-    let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/FileAlreadyExistsException", 4);
-    // Pin across the create_string below — a moving young GC there would
-    // relocate the fresh exception (native stale-local family).
-    let exc_pin = ctx.pin_native_root(exc);
-    let file_str = ctx.create_string(path);
-    let exc = ctx.read_native_pin(exc_pin, exc);
-    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
-    ctx.unpin_native_roots(exc_pin);
-    MethodCallFailed::ExceptionThrown(exc)
-}
-
 /// Shared back end for the `Files.write` / `Files.writeString` statics.
 ///
 /// Each of those was `std::fs::write(&p, bytes)`, which
