@@ -45,18 +45,42 @@ install, no `rt.jar`, one self-contained binary.
 
 ## Performance
 
-CPU, vs HotSpot JDK 25 C2 (same flags both sides, medians of alternating
-fresh-process runs — full methodology in [BENCHMARK.md](BENCHMARK.md)):
+CPU, vs HotSpot JDK 25 C2, re-measured **2026-08-04** on `dev` (`12b8cbdea`):
+same flags both sides (`-Xmx8g`), one phase per fresh process, arms
+**alternated with the order flipped on alternate pairs**, 9 pairs per phase, no
+sample discarded, and every run's checksum verified against HotSpot's — full
+methodology in [BENCHMARK.md](BENCHMARK.md).
 
-| Benchmark               | JDK 25 C2 | CratonVM  | Ratio |
-|-------------------------|-----------|-----------|-------|
-| Arithmetic (2B ops)     | 2,006 ms  | 4,895 ms  | 2.44x |
-| Fibonacci(44)           | 1,719 ms  | 4,790 ms  | 2.79x |
-| Sieve (100K × 20K)      | 2,851 ms  | 6,508 ms  | 2.28x |
-| Matrix 1280×1280        | 2,349 ms  | 6,875 ms  | 2.93x |
-| HashMap (10M put/get)   | 1,017 ms  | 1,780 ms  | 1.75x |
-| String/Regex (100K)     | 55 ms     | 423 ms    | 7.7x  |
-| Binary Trees (depth 18) | 176 ms    | 1,468 ms  | 8.34x |
+| Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | was (2026-07) |
+|-------------------------|-----------|-----------|-----------|---------------|
+| Arithmetic (2B ops)     | 1,860 ms  | 3,641 ms  | 1.96x     | 2.44x |
+| Fibonacci(44)           | 1,493 ms  | 8,612 ms  | 5.77x     | 2.79x |
+| Sieve (100K × 20K)      | 2,412 ms  | 15,680 ms | 6.50x     | 2.28x — **live regression, see below** |
+| Matrix 1280×1280        | 2,124 ms  | 2,111 ms  | **0.99x** | 2.93x |
+| HashMap (10M put/get)   | 995 ms    | 2,060 ms  | 2.07x     | 1.75x |
+| String/Regex (100K)     | 51 ms     | 285 ms    | 5.59x     | 7.7x  |
+| Binary Trees (depth 18) | 177 ms    | 1,690 ms  | 9.55x     | 8.34x |
+
+Run-to-run spread was under 2% (CV) on six of the seven CratonVM rows and 7.6%
+on Binary Trees. The 1-minute load average was 2.3–4.1 throughout, above the
+perf gate's own 2.0 ceiling, so treat the **ratios** as the durable content and
+the absolute times as this host on this day.
+
+**Matrix is the headline: CratonVM now matches HotSpot C2** (0.99x, from
+2.93x). Arithmetic and String/Regex also closed materially. Fibonacci, HashMap
+and Binary Trees moved the other way against numbers taken in July on a
+different host, and the July absolutes were never re-measured under the current
+protocol — see BENCHMARK.md before reading those three as regressions.
+
+**Sieve's 6.50x is a live regression and is not the steady state.** The same
+phase measured 2,350 ms — *faster than HotSpot* — on the immediately preceding
+build. The cause is one method: `CratonBench.sieve([ZI)I` is now lowered by the
+optimizing (C2/IR) tier, where it was previously refused and fell through to
+the single-pass backend, and the IR body is **6.4x slower than the C1 body it
+replaced**. Confirmed by an interleaved A/B of the two builds either side of
+the change: 2,324–2,487 ms → 15,662–15,949 ms. Checksums are unaffected, so
+this is a throughput defect and not a correctness one. Tracked in
+[docs/known-issues/c2/](docs/known-issues/c2/).
 
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)

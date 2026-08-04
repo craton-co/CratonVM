@@ -194,6 +194,14 @@ that remain — because the methods that were hiding behind the invoke terms are
 constructors, and constructors write reference fields. Run-to-run variation on
 these counts is ±1–3 events.
 
+> **`cov-03` closed later the same day and the prediction held.** Measured on
+> exactly this tree (`fb33aa5ac` → `84b519382`), though on
+> `ConditionalOnPropertyTests` alone rather than all three workloads: its two
+> rows **67 + 3 → 0**, builder refusals **72 → 2**, bodies
+> **588 → 660 (+12.3%)**. The lane the survey sized at **43** was **70** by the
+> time it landed, entirely because of the constructors this lane admitted. See
+> [`cov-03`'s closeout](cov-03-field-stores-and-wide-fields-RETIRED-20260803.md).
+
 Bail line numbers move with the edit. In the fixed binary the invoke bails are
 `ir.rs:5555` (`0xb7` — the old `5204`/`5219` pair merged, since a receiver that
 is not a fresh `Op::New` is now a call rather than a refusal), `ir.rs:5597`

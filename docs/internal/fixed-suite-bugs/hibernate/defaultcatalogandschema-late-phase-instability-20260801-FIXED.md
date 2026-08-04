@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **FIXED** 2026-08-03, branch `fix/hib-dcast-latephase-instability-20260803` (commits `fe14e6b14`, `d0387cdc3`, `c33e9bc87`). Nine distinct root causes found and fixed, all one defect family: a GC walker reading `ObjectHeader::kind`/`element_type` as a typed `#[repr(u8)]` enum — or trusting `num_slots`/`array_length`/a compact-layout lookup — **before** validating the underlying bytes. Each was confirmed via disassembly to be the literal fault instruction, fixed, and its specific crash signature verified absent across many subsequent runs. |
+| **Status** | ✅ **FIXED** 2026-08-03/08-04, branch `fix/hib-dcast-latephase-instability-20260803` (commits `fe14e6b14`, `d0387cdc3`, `c33e9bc87`, plus a follow-up 08-04 commit — see [Update](#update-20260804-the-kind_of-residual-was-the-same-corruption-family)). Fifteen distinct fault sites closed, all one defect family: something writes an implausible header into old-gen memory (confirmed present via `old_gen::scan_region`'s own corruption-detection diagnostic — see the 08-04 update), and every reader that trusted the corrupted bytes without validating them first — nine inside the GC's own internal walkers, six more in the VM-level read barrier and dispatch layer every mutator path funnels through — could crash on it. Each of the original nine was confirmed via disassembly to be the literal fault instruction; the 08-04 batch was confirmed via live reproduction and symbolization against a fresh debug build. |
 | **ID** | `HIB-DCAST-LATEPHASE.1` |
 | **Originally found** | 2026-08-01, while re-verifying `HIB-GCOVERHEAD-HALFFULL.1` against the `dev` tip. |
-| **Residual** | One **OPEN, unrelated, not-yet-fixed** crash surfaced in the tail of verification (`VmHeap::kind_of`, a completely different subsystem) — see [Residual](#residual-a-new-unrelated-crash-surfaced-in-late-verification). The class's own separately-documented test-instability and slow/occasionally-hanging behavior (see [Residual](#residual-pre-existing-test-failures-and-slow-hanging-runs)) are unchanged and out of this doc's scope; they predate this investigation and are not GC crashes. |
+| **Residual** | The underlying corruption **source** — whatever writes an old-gen header with `num_slots`/`array_length` ≈ 33,554,432–33,554,433 and otherwise-valid `kind`/`element_type` tags — is still **not root-caused**. All fifteen known ways to crash on it are now closed (validate-before-dereference, matching the rest of this doc's fixes), converting every remaining occurrence into either a silent no-op or a catchable Java-level exception instead of a VM crash. See [Update](#update-20260804-the-kind_of-residual-was-the-same-corruption-family). The class's own separately-documented test-instability and slow/occasionally-hanging behavior (see [Residual](#residual-pre-existing-test-failures-and-slow-hanging-runs)) are unchanged and out of this doc's scope; they predate this investigation and are not GC crashes. |
 
 ## Original symptom (2026-08-01)
 
@@ -173,37 +173,102 @@ failure (`CRATONVM_JIT_NO_PRECISE_FIELD_OPS` undeclared in
 `jit/src/lib.rs:12410`) — not touched by this investigation, not a
 regression; confirmed present before any of this session's commits.
 
-## Residual: a new, unrelated crash surfaced in late verification
+## Update 2026-08-04: the `kind_of` residual was the same corruption family
 
-The very last crash observed (batch "after fix 9") symbolizes to
-`VmHeap::kind_of` (`gc/src/vm_heap.rs:702`, a thin `dispatch!` wrapper over
-the active collector's own `kind_of`), faulting on a **read at address
-`0xFFFFFFFFFFFFFFFF`** — not a plausible-but-wrong heap pointer, but the
-canonical all-ones sentinel value. This is a **different subsystem and
-almost certainly a different root cause**: `kind_of` is a public
-VM-facing dispatch entry point, not a GC-internal walker, and the crash
-signature (an exact sentinel value rather than a garbled-but-plausible
-address) is more consistent with a caller somewhere in the VM treating a
-"not found"/"invalid" sentinel (a `usize::MAX`/`-1` convention) as a live
-`ObjectRef` without checking for it first, than with any of the nine
-GC-header-validation gaps this doc closes.
+The `VmHeap::kind_of` crash flagged below as "a different subsystem and
+almost certainly a different root cause" was **wrong** — a follow-up
+investigation (same day) proved it is the *same* old-gen header corruption
+this doc closes, just reaching the mutator side of the VM instead of the
+GC's own internal scan. The original framing is preserved below (struck
+through in spirit, not in text) so the reasoning error is visible, not
+silently erased.
 
-This occurred **once** across the whole investigation and was not
-investigated further — this doc's scope is the GC old-gen mark/sweep/compact
-corruption family the original doc was filed for, all nine instances of
-which are now closed and verified. `VmHeap::kind_of` receiving a sentinel
-`ObjectRef` is a new, distinct, **OPEN** finding, not yet root-caused. A
-follow-up investigation should:
+**Reproduction.** Built `target/profsym` (the `[profile.profsym]` release
+config with full debug info — see the Methodology section) and ran
+`DefaultCatalogAndSchemaTest` in repeated parallel batches. The crash, which
+the original investigation saw once in ~40 runs, reproduced at a much
+higher rate under this fresh build — 1/6, then 4/8 shards in back-to-back
+batches — and **every single occurrence** was immediately preceded by
+several `cratonvm_gc::old_gen` `WARN "BREAK on implausible header"` lines
+(the diagnostic fix 6/7/8 added: `old_gen::scan_region` detects a header
+whose computed size is implausible, logs the raw bytes, and skips it rather
+than trusting it). Across dozens of these warnings, the corrupted headers
+shared a specific, repeating fingerprint: valid `kind`/`element_type` tags
+(0/1, 4–11 — never an invalid discriminant) but `num_slots`/`array_length`
+of **33,554,432 or 33,554,433** (`0x0200_0000`/`0x0200_0001`) — not random
+garbage, a specific recurring value, still unexplained. This is a
+**corruption source distinct from and *not* explained by any of the nine
+tag-validation fixes above** (those fixes validate `kind`/`element_type`
+bytes; this corruption's tags are valid — it's the size fields that are
+wrong), and it remains unroot-caused.
 
-- Find every caller of `VmHeap::kind_of` (and the sibling
-  `element_type_of`/`identity_hash_code`, which share the same `dispatch!`
-  pattern and same unproven-input risk) and check whether any of them can
-  receive a sentinel/error value that gets passed through as an `ObjectRef`
-  without a check.
-- Reproduce with `CRATONVM_DBG_JIT_NAMES=1` for a named JIT stack, since the
-  crash header showed `innermost-rbp-belongs-to-unguarded-callee` /
-  unregistered-JIT-frame context, suggesting the call originates from
-  JIT-compiled code.
+**Why it crashed here and not in the GC's own scan.** `old_gen::scan_region`
+was already hardened (fixes 6–8) to detect this exact implausible-header
+shape and safely skip it. But that hardening lives entirely inside the
+GC-internal walkers (`old_gen.rs`, `gen_heap.rs`, `gc.rs`,
+`concurrent_mark.rs`). The **VM-level read barrier**
+(`VmHeap::load_and_forward`, `gc/src/vm_heap.rs`) that every mutator path —
+interpreter dispatch, JIT helpers, native field/array accessors — calls
+before touching an `ObjectRef` was never touched by that work, and neither
+were the shared dispatch wrappers (`kind_of`, `element_type_of`,
+`identity_hash_code`, `class_id_of`) it and they all funnel through. Traced
+via `CRATONVM_SYMBOLIZE` + `llvm-objdump` to four confirmed fault sites, all
+downstream of the same mechanism: `load_and_forward` reads
+`ObjectHeader.forwarding_ptr` from a header that may be one of the corrupted
+ones above, and — unlike every *other* header field, all of which fixes 1–9
+now validate — the forwarding pointer was trusted completely unchecked. A
+corrupted header can spuriously read as "forwarded", handing back a garbage
+target address (observed as the canonical sentinel `0xFFFFFFFFFFFFFFFF`)
+that the caller then dereferences:
+
+| Site | Symbol | Trigger |
+|---|---|---|
+| 1 | `NativeHeapAccess::array_length` (`vm/src/vm/vm_exec.rs:8992`) | `native-collections::map_state` validates a bucket array via `heap_kind_of`, then calls this several lines later — the object had already gone bad by then |
+| 2 | `VmHeap::kind_of` via `dispatch_virtual::execute_invokevirtual_cached` (`vm/src/runtime/interpreter/dispatch_virtual.rs:1582`) | receiver taken from the Java operand stack via `peek_at`, forwarded, then kind-checked — the *forwarding* step returned the garbage target |
+| 3 | `NativeHeapAccess::get_field` (`vm/src/vm/vm_exec.rs:8726`, via `class_id_of`) | same mechanism, a different accessor |
+| 4 | `VmHeap::load_and_forward` itself (`gc/src/vm_heap.rs:657`) | `obj` was already invalid *before* even reaching the forwarding check — corruption entering earlier, likely at a JIT bail-to-interpreter frame-reconstruction boundary (every occurrence's crash header showed `gc young-gen last incomplete-coverage reason: innermost-rbp-belongs-to-unguarded-callee` and an **unregistered JIT frame** on the faulting thread) |
+
+**Fix.** `load_and_forward` now validates both `obj` on entry and the
+extracted `forwarding_address()` via `is_object_address` before trusting
+either, falling back to the original pointer (matching its existing
+null-forwarding-address fallback) rather than dereferencing an implausible
+target. `kind_of`, `element_type_of`, `identity_hash_code`, and
+`class_id_of` (`gc/src/vm_heap.rs`) now validate independently too, rather
+than trusting that whatever called them already checked — defense in depth,
+since a corrupted header can be reached directly without going through
+`load_and_forward` at all. `array_length` (`vm/src/vm/vm_exec.rs`) has its
+own guard plus a `[ARRAY-LEN-GUARD]` diagnostic, mirroring its existing
+"not an array" fallback. Six new regression tests (`gc/src/vm_heap.rs`,
+`vm/src/vm/vm_exec.rs`).
+
+**This does not fix the corruption** — it fixes every known way the
+corruption can crash the VM. A run that hits it now sees either no visible
+effect (the corrupted object silently reads back as
+`ObjectKind::Object`/`ClassId(0)`/hash `0`) or, if something downstream
+depended on the *correct* value, a catchable Java-level exception (observed
+once: `NoSuchMethodError: java.util.Properties.hasNext()Z` thrown from
+JUnit's own launcher during test-run teardown — a wrong virtual dispatch
+landing on a stale/mismatched cache entry, not a new bug class, and not a
+crash) instead of `EXCEPTION_ACCESS_VIOLATION`.
+
+**Verification.** 14 parallel `DefaultCatalogAndSchemaTest` runs against the
+fully-hardened `profsym` build (8 + 6, two separate batches): **zero**
+`EXCEPTION_ACCESS_VIOLATION`s, versus 5 across the 14 runs immediately
+preceding the fix (1/6, then 4/8). The three timeouts (`RC=124`) observed in
+one batch showed **zero** `"BREAK on implausible header"` warnings —
+unrelated to this corruption family, consistent with the pre-existing hang
+issue in [Residual](#residual-pre-existing-test-failures-and-slow-hanging-runs)
+below, which already predates and is out of scope for this doc.
+
+**Still OPEN, for a future investigation**: find what actually writes
+`num_slots`/`array_length` ≈ `0x0200_0000` into an otherwise-valid-tagged
+old-gen header. The repeating exact value (not random garbage) suggests a
+specific source — a stale constant, a misinterpreted offset, or a
+region-size literal leaking into a size field — rather than generic memory
+corruption. `CRATONVM_DBG=jit-names` for a named JIT stack and the
+`old_gen::scan_region` "BREAK on implausible header" dump (now confirmed to
+fire reliably under this same workload) are the two established points to
+resume from.
 
 ## Residual: pre-existing test failures and slow/hanging runs
 

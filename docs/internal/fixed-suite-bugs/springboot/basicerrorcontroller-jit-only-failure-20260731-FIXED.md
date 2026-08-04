@@ -171,7 +171,7 @@ worth knowing before someone reads a red run as a regression. Earlier rounds on
 the same branch lost one run to a stall (`main` parked in `Thread.join()` inside
 Spring Boot's two-thread `OnClassCondition` filtering) and one to a SIGSEGV in
 an unmapped code buffer — about 2 events in 54 runs. Both are filed:
-`docs/known-issues/springboot/onclasscondition-join-never-returns-20260801.md`
+`docs/internal/fixed-suite-bugs/springboot/onclasscondition-join-never-returns-20260801-FIXED.md`
 and — root-caused and closed on 2026-08-03 —
 `docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`,
 each with its sample size stated. Arm `--stack-dump-on-timeout` when running the

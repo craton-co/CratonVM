@@ -4135,6 +4135,7 @@ pub mod servlet;
 // MXBean introspection path during KC16 boot).
 pub mod http2;
 pub mod jmx_openmbean;
+pub mod date_format_fast;
 pub mod t27_tls;
 pub mod t27_tls_cbc;
 pub mod t3_impl;
@@ -17619,6 +17620,17 @@ pub fn register_essential_natives_with_shims(
     // analogous SSLSession bug, BUG-TC0622).
     crate::phases_late::register_p68_security_cert(registry);
     register_real_buffer_constructor_natives(registry);
+    // A faithful native `DateFormat.format(Date)` for exactly-SimpleDateFormat
+    // receivers. Registered here — in the real-JDK path, after the phase
+    // registrations — because it must WIN over any earlier entry for the same
+    // triple, and because it deliberately does nothing in synthetic-JDK mode
+    // (it reads real `java.text` field layouts and falls back through
+    // `invoke_virtual_bytecode_only`, which needs the real bodies present).
+    // Every unsupported shape falls through to that bytecode, and every
+    // supported one is cross-checked against it once per output shape — see the
+    // module doc.
+    date_format_fast::register_date_format_fast(registry);
+
     // WP5.4 — TLS ALPN extension (`h2` / `http/1.1`) and SNI dispatch.
     t27_tls::register_alpn_real(registry);
     // WP5.5 — JDK 11+ java.net.http.HttpClient (sync + async, HTTP/1.1 + HTTP/2).
@@ -19389,11 +19401,9 @@ pub fn register_essential_natives_with_shims(
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
-        let epoch_sec = date_millis.div_euclid(1000);
-        let (total_sec, standard_sec) = legacy_offset_and_standard(ctx, &id, epoch_sec);
-        let total_ms = total_sec.saturating_mul(1000);
-        let dst_ms = (total_sec - standard_sec).saturating_mul(1000);
-        (total_ms, dst_ms)
+        // Single owner of the legacy-ZoneInfo rule — `date_format_fast` calls
+        // the same helper directly, without a Java dispatch per format.
+        crate::tzdb::legacy_offsets_ms(ctx, &id, date_millis)
     }
 
     // `sun.util.calendar.ZoneInfoFile`'s real conversion from tzdb rules to
