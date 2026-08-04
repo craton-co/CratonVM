@@ -406,6 +406,15 @@ struct Lowerer<'a> {
     /// for that bci. Populated as nodes are lowered; used to anchor each
     /// safepoint snapshot to a native offset for `DeoptimizationPoint`.
     bci_native: HashMap<usize, usize>,
+    /// Bytecode pc of the node currently being lowered — the throw-site bci
+    /// every exceptional exit emitted while lowering it belongs to.
+    ///
+    /// Set from `Node::bytecode_pc` at the top of `lower_data_node` /
+    /// `lower_terminator` (a node with no pc keeps the previous value rather
+    /// than resetting to 0: the pc-less nodes are the scheduler's own control
+    /// glue, which emits no exceptional exit of its own). Read by
+    /// [`Self::push_call_exc_patch`].
+    cur_bci: usize,
     /// real-frame-deopt: native offsets of `JMP rel32` instructions emitted by
     /// failed guards that must be patched to jump to the shared deopt stub.
     deopt_stub_patches: Vec<usize>,
@@ -516,6 +525,15 @@ struct Lowerer<'a> {
     /// installs around every JIT call regardless of backend — so `Op::Throw`
     /// needs no `needs_context` plumbing of its own.
     throw_exception: usize,
+    /// `jit_set_throw_bci(bci)` — stamps THIS method's own throw-site bci onto
+    /// `JitSignals::athrow_bci`, overwriting whatever a callee's compiled
+    /// `athrow` lowering left there. Called from the shared exceptional-exit
+    /// stub ([`Self::emit_call_exc_stub`]); see that function for why an exit
+    /// without it silently drops a `finally`.
+    ///
+    /// `RequiredPtr` in `JitRuntimeHelpers`, and the SAME helper the
+    /// single-pass backend's `emit_exception_check_stub` calls.
+    set_throw_bci: usize,
     /// Cooperative GC poll flag and no-argument slow path. IR values are
     /// canonicalized in frame slots, so the slow-path call needs no spill.
     safepoint_flag_addr: usize,
@@ -627,8 +645,15 @@ struct Lowerer<'a> {
     /// shadow space AND the arg-staging region so spills never overlap them.
     spill_cap_off: i32,
     /// Native offsets of `JE rel32` instructions emitted after each dispatch
-    /// call (the exception sentinel check) that jump to the shared bail stub.
-    call_exc_patches: Vec<usize>,
+    /// call (the exception sentinel check) that jump to the shared bail stub,
+    /// each paired with the bytecode pc of the instruction whose exceptional
+    /// exit it is.
+    ///
+    /// The bci is not decoration: the bail stub stamps it onto
+    /// `JitSignals::athrow_bci` (`helpers.set_throw_bci`) so the interpreter's
+    /// post-JIT routing range-tests THIS method's own exception table against
+    /// THIS method's throw site. See [`Self::emit_call_exc_stub`].
+    call_exc_patches: Vec<(usize, usize)>,
     /// fib44-fix follow-up: native offsets of the rel32 operand of each direct
     /// self-recursive `CALL` (invoke_kind 4), patched at finalize to target the
     /// method's own entry (code offset 0). See `lower_self_call` / Op::Call.
@@ -970,6 +995,7 @@ impl<'a> Lowerer<'a> {
             _num_locals: num_locals,
             frame_size,
             bci_native: HashMap::new(),
+            cur_bci: 0,
             deopt_stub_patches: Vec::new(),
             deopt_boxes: Vec::new(),
             invoke_dispatch: helpers.invoke_dispatch,
@@ -995,6 +1021,7 @@ impl<'a> Lowerer<'a> {
             instanceof_check: helpers.instanceof_check,
             checkcast: helpers.checkcast,
             throw_exception: helpers.throw_exception,
+            set_throw_bci: helpers.set_throw_bci,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
@@ -2254,7 +2281,7 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub
         let exc_patch = self.buf.pos();
         self.buf.emit(&[0; 4]);
-        self.call_exc_patches.push(exc_patch);
+        self.push_call_exc_patch(exc_patch);
 
         self.patch_rel32_to_here(done_patch);
         self.store_rax(slot);
@@ -2774,7 +2801,7 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&[0x0F, 0x85]); // JNE shared bail stub
             let patch = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-            self.call_exc_patches.push(patch);
+            self.push_call_exc_patch(patch);
         }
         let rel = self.buf.pos() as i32 - (fast_skip_patch as i32 + 4);
         // ir_lower self-call stack-sample -- tolerated on an overflowed buffer; see
@@ -2823,7 +2850,7 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&[0x0F, 0x85]); // JNE bail_stub
         let exc_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-        self.call_exc_patches.push(exc_patch);
+        self.push_call_exc_patch(exc_patch);
         // .keep:
         let keep_off = self.buf.pos();
         let rel = keep_off as i32 - (keep_patch as i32 + 4);
@@ -2932,6 +2959,17 @@ fn reloc_emit_enabled() -> bool {
     }
 
     // ── Inline caches (jit-inlining-and-ir-calls) ────────────────────
+
+    /// Record one exceptional-exit branch for [`Self::emit_call_exc_stub`],
+    /// tagged with the bytecode pc currently being lowered.
+    ///
+    /// Every site that jumps to the shared bail stub goes through here so no
+    /// exit can reach the stub without a throw-site bci — the defect the stub's
+    /// own doc comment describes.
+    fn push_call_exc_patch(&mut self, patch: usize) {
+        let bci = self.cur_bci;
+        self.call_exc_patches.push((patch, bci));
+    }
 
     /// Emit `Jcc rel32` with a placeholder displacement; returns the native
     /// offset of the 4-byte operand. `cc` is the second opcode byte:
@@ -3309,7 +3347,7 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&[0x0F, 0x85]);
             let patch = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-            self.call_exc_patches.push(patch);
+            self.push_call_exc_patch(patch);
             // .keep: patch the JNE above to land here.
             let keep_off = self.buf.pos();
             let rel = keep_off as i32 - (keep_patch as i32 + 4);
@@ -3320,7 +3358,7 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
             let patch = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-            self.call_exc_patches.push(patch);
+            self.push_call_exc_patch(patch);
         }
         self.store_rax(slot);
     }
@@ -3350,7 +3388,7 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub
             let exc_patch = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-            self.call_exc_patches.push(exc_patch);
+            self.push_call_exc_patch(exc_patch);
             return;
         }
         // JNE .keep — common path: not the sentinel, keep the real RAX.
@@ -3368,7 +3406,7 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit(&[0x0F, 0x85]); // JNE bail_stub
         let patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-        self.call_exc_patches.push(patch);
+        self.push_call_exc_patch(patch);
         let keep_off = self.buf.pos();
         let rel = keep_off as i32 - (keep_patch as i32 + 4);
         // ir_lower helper-sentinel keep -- tolerated on an overflowed buffer;
@@ -3454,6 +3492,7 @@ fn reloc_emit_enabled() -> bool {
         // publishes the node to `defined_nodes` and moves the spill watermark.
         if let Some(pc) = self.graph.nodes[id as usize].bytecode_pc {
             let here = self.buf.pos();
+            self.cur_bci = pc;
             self.bci_native
                 .entry(pc)
                 .and_modify(|e| {
@@ -3686,6 +3725,7 @@ fn reloc_emit_enabled() -> bool {
         // `bytecode_pc` here does not borrow `self`.
         if let Some(pc) = self.graph.nodes[id as usize].bytecode_pc {
             let here = self.buf.pos();
+            self.cur_bci = pc;
             self.bci_native
                 .entry(pc)
                 .and_modify(|e| {
@@ -3904,7 +3944,7 @@ fn reloc_emit_enabled() -> bool {
                 self.buf.emit_byte(0xE9); // JMP shared exception epilogue
                 let exception_patch = self.buf.pos();
                 self.buf.emit(&[0; 4]);
-                self.call_exc_patches.push(exception_patch);
+                self.push_call_exc_patch(exception_patch);
                 let ok = self.buf.pos();
                 let rel = ok as i32 - (ok_patch as i32 + 4);
                 Self::patch_or_bail(&mut self.buf, ok_patch, rel);
@@ -3942,7 +3982,7 @@ fn reloc_emit_enabled() -> bool {
                 self.buf.emit_byte(0xE9); // JMP shared exception epilogue
                 let exception_patch = self.buf.pos();
                 self.buf.emit(&[0; 4]);
-                self.call_exc_patches.push(exception_patch);
+                self.push_call_exc_patch(exception_patch);
                 let allocated = self.buf.pos();
                 let rel = allocated as i32 - (allocated_patch as i32 + 4);
                 // allocation success -- tolerated on an overflowed buffer; see
@@ -4016,7 +4056,7 @@ fn reloc_emit_enabled() -> bool {
                 self.buf.emit_byte(0xE9); // JMP shared exception epilogue
                 let exception_patch = self.buf.pos();
                 self.buf.emit(&[0; 4]);
-                self.call_exc_patches.push(exception_patch);
+                self.push_call_exc_patch(exception_patch);
                 let allocated = self.buf.pos();
                 let rel = allocated as i32 - (allocated_patch as i32 + 4);
                 Self::patch_or_bail(&mut self.buf, allocated_patch, rel);
@@ -4853,7 +4893,7 @@ fn reloc_emit_enabled() -> bool {
                 self.buf.emit_byte(0xE9); // JMP shared exception epilogue
                 let exception_patch = self.buf.pos();
                 self.buf.emit(&[0; 4]);
-                self.call_exc_patches.push(exception_patch);
+                self.push_call_exc_patch(exception_patch);
                 let resolved = self.buf.pos();
                 let rel = resolved as i32 - (resolved_patch as i32 + 4);
                 Self::patch_or_bail(&mut self.buf, resolved_patch, rel);
@@ -5170,6 +5210,9 @@ fn reloc_emit_enabled() -> bool {
         {
             self.emit_safepoint_poll();
         }
+        if let Some(pc) = self.graph.nodes[term as usize].bytecode_pc {
+            self.cur_bci = pc;
+        }
         let node = &self.graph.nodes[term as usize];
         match &node.op {
             // ── cov-07: athrow ─────────────────────────────────────────
@@ -5192,13 +5235,13 @@ fn reloc_emit_enabled() -> bool {
             // exception_with_bci`), which is what gives the routing a real
             // throw pc for the range test against this method's own
             // exception table — exactly the RBC.6 fix the single-pass
-            // backend already ships. Nothing else has to stamp it: this is
-            // the ONE terminator whose own helper call does that job, unlike
-            // a nested `Op::Call`'s exceptional exit, which needs a SEPARATE
-            // stamp (`jit_set_throw_bci`) the single-pass backend's shared
-            // exception-check stub emits and the IR tier's `call_exc_patches`
-            // stub does not yet — a pre-existing gap this lane does not own
-            // (see the closeout doc).
+            // backend already ships. This is the ONE terminator whose own
+            // helper call does that job; a nested `Op::Call` /
+            // `Op::CheckCast` exceptional exit needs the SEPARATE
+            // `jit_set_throw_bci` stamp, which `emit_call_exc_stub` now emits
+            // per distinct throw-site bci (cov-07 residual, closed — see that
+            // function). The stub re-stamps this bci on the way out, which is
+            // a no-op for this arm and keeps the stub's contract uniform.
             Op::Throw => {
                 let exc = node.inputs[2];
                 self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(exc));
@@ -5209,7 +5252,7 @@ fn reloc_emit_enabled() -> bool {
                 self.buf.emit_byte(0xE9); // JMP shared exception epilogue
                 let exception_patch = self.buf.pos();
                 self.buf.emit(&[0; 4]);
-                self.call_exc_patches.push(exception_patch);
+                self.push_call_exc_patch(exception_patch);
             }
             Op::Return => {
                 if node.inputs.len() > 1 {
@@ -5891,25 +5934,74 @@ fn reloc_emit_enabled() -> bool {
         true
     }
 
-    /// Gap B: emit the single shared call-exception bail stub (if any `Op::Call`
+    /// Gap B: emit the shared call-exception bail stub (if any `Op::Call`
     /// emitted a sentinel check) and patch every dispatch site's `JE` to it. On
     /// entry `RAX` already holds the `i64::MIN` sentinel the helper returned when
-    /// the callee threw; the stub just runs the epilogue, returning the sentinel
-    /// so the VM's post-JIT path takes the pending exception (the same protocol
-    /// the single-pass backend uses).
+    /// the callee threw; the stub stamps this method's own throw-site bci, then
+    /// runs the epilogue, returning the sentinel so the VM's post-JIT path takes
+    /// the pending exception (the same protocol the single-pass backend uses).
+    ///
+    /// # One stub per DISTINCT throw-site bci, not one shared stub
+    ///
+    /// This is the IR half of RBC.6, and it was the gap cov-07's closeout doc
+    /// flagged and did not own (`docs/known-issues/hibernate/
+    /// offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-
+    /// 20260804.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
+    /// as *this* method's throw site and range-tested against `[start_pc,
+    /// end_pc)` of every entry in this method's own exception table. Until this
+    /// stub stamped it, that field still held whatever the CALLEE's compiled
+    /// `athrow` lowering left there — a pc in a different method, which lands
+    /// inside this method's protected region only by coincidence.
+    ///
+    /// A typed handler survives that coincidence often enough to look healthy
+    /// (it is also matched on exception class), but a catch-all (`catch_type ==
+    /// 0`, i.e. a javac `finally`) has nothing else to match on: a foreign bci
+    /// outside the region silently drops it and the `finally` never runs.
+    /// Witness: `FinallyBalanceProbe.java` — `try { n++; thrower(); } finally {
+    /// n--; }` leaked one count per throw under the single-pass JIT until RBC.6
+    /// fixed it there (`x64/deopt_stubs.rs`, `emit_exception_check_stub`), and
+    /// leaked again once cov-07 let the same method shape reach THIS tier.
+    ///
+    /// Grouping by bci keeps the cost at one small pad per distinct fallible
+    /// bytecode rather than one per branch site.
+    ///
+    /// `Op::Throw`'s own exit already passes its bci to `jit_throw_exception`,
+    /// which stamps it; re-stamping the same value here is a no-op for it and
+    /// keeps the stub's contract uniform — every exit through it leaves an
+    /// `athrow_bci` belonging to THIS method.
     fn emit_call_exc_stub(&mut self) {
         if self.call_exc_patches.is_empty() {
             return;
         }
-        let stub_off = self.buf.pos();
-        // Shares the method epilogue so the shadow `top` watermark is restored
-        // here too — this is the path a callee's `i64::MIN` exception/deopt
-        // sentinel takes, skipping the call site's matching shadow reload.
-        self.emit_epilogue();
         let patches = std::mem::take(&mut self.call_exc_patches);
-        for p in patches {
-            let rel = stub_off as i32 - (p as i32 + 4);
-            if !Self::patch_or_bail(&mut self.buf, p, rel) {
+        let mut stub_by_bci: HashMap<usize, usize> = HashMap::new();
+        for (patch, bci) in patches {
+            let stub_off = match stub_by_bci.get(&bci) {
+                Some(&off) => off,
+                None => {
+                    let off = self.buf.pos();
+                    stub_by_bci.insert(bci, off);
+                    // Stamp this method's own throw-site bci over whatever the
+                    // callee left behind. The argument registers are dead here —
+                    // the method is about to return — and RAX is reloaded with
+                    // the sentinel afterwards because the helper call clobbers
+                    // it.
+                    if self.set_throw_bci != 0 {
+                        self.emit_mov_reg_imm64(CALL_ARG_REGS[0], bci as u64);
+                        self.emit_mov_reg_imm64(RAX, self.set_throw_bci as u64);
+                        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                    }
+                    self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+                    // Shares the method epilogue so the shadow `top` watermark
+                    // is restored here too — this is the path a callee's
+                    // `i64::MIN` exception/deopt sentinel takes, skipping the
+                    // call site's matching shadow reload.
+                    self.emit_epilogue();
+                    off
+                }
+            };
+            let rel = stub_off as i32 - (patch as i32 + 4);
+            if !Self::patch_or_bail(&mut self.buf, patch, rel) {
                 break;
             }
         }
