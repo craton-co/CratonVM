@@ -3,7 +3,8 @@
 
 //! `osr-01` step 3: every door into the JIT backend goes through one gate.
 //!
-//! `docs/known-issues/c2/osr-01-entry-metadata-contract.md` asks for "a single
+//! The `osr-01` lane brief (retired to
+//! `osr-01-entry-metadata-contract-RETIRED-20260804.md`) asks for "a single
 //! entry point for *produce an OSR-capable artifact*, so the direct path in
 //! `invoke.rs` and the `try_compile` path cannot drift again", and
 //! `docs/feature-designs/jit-osr-entry-metadata.md` settles the shape: a shared

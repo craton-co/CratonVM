@@ -4,8 +4,9 @@
 //! The two pc spaces the OSR entry metadata lives in, kept apart by the type
 //! system.
 //!
-//! `docs/known-issues/c2/osr-01-entry-metadata-contract.md` asks for
-//! "a newtype (or at minimum a debug assertion at each boundary) separating
+//! The `osr-01` lane brief (retired to
+//! `osr-01-entry-metadata-contract-RETIRED-20260804.md`) asks for "a newtype
+//! (or at minimum a debug assertion at each boundary) separating
 //! interpreter-bci space from output-pc space", because every one of the four
 //! near-misses that lane found was the same thing: **a plausible integer in the
 //! wrong coordinate space**. [`crate::osr_contract`] catches the *consequence*
