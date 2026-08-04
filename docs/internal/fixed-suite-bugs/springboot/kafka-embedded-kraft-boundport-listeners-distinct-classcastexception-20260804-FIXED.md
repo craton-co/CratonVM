@@ -547,7 +547,29 @@ the moment the line changes — which is the guard, verified by injection.
 
 **Validation:** HotSpot control green on both probes; the landed binary PASS on
 JIT and `--nojit`; `regression-suite/run.sh` **25/25**; `cratonvm-native-
-collections` **94 lib + 86 integration**; `KafkaAutoConfigurationIntegrationTests`
-**4/4 PASS** at 25–49 s on a quiet box (one earlier red at host load 68 was a
-controller-starvation `TimeoutException` — `writeNoOpRecord took 10717 ms` —
-with none of this defect's signatures in the log).
+collections` **94 lib + 86 integration**.
+
+`KafkaAutoConfigurationIntegrationTests` on the landed binary: **8 PASS, 2
+red**, both reds explained and neither reproducible.
+
+* One `containersFailed=1` at host load 68 — controller starvation
+  (`writeNoOpRecord took 10717 ms`), with none of this defect's signatures in
+  the log.
+* One 1500 s **HANG**. Its own log rules out starvation: the broker reached
+  `Enabling request processing` and the controller stayed healthy the whole
+  time (292–295 events per 60 s, average ~17 ms, slowest 64 ms). What it did
+  overlap was three more embedded-KRaft clusters I had started on the same box
+  — and those three runs of the *same binary* each passed in 25 s while this
+  one hung.
+
+Settled by re-running **serially**, interleaved, on a quiet box: `dev` tip
+**4/4 PASS** and the landed binary **4/4 PASS**, no hangs on either arm. This
+class has been HANG-prone since the 08-02 full-suite round, long before either
+change.
+
+Method note, since it nearly cost a wrong conclusion: the HANG was in a
+detached job whose completion I did not wait for, and the first write-up of
+this section said "4/4 PASS" because it counted only the runs I had watched.
+Read the whole log of every job you start, including the ones you overtook —
+and do not run several embedded-broker tests concurrently, because it
+manufactures exactly the failure mode you are trying to rule out.
