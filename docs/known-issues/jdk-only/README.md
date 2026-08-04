@@ -35,8 +35,12 @@ grep.
   functions side by side; a 29-shape table pins the `(cold, warm)` verdict pair.
   Deletion still needs RKC16N.6 fixed.
 * **8** — one list plus one *stated* exception, with the divergence asserted by
-  a test instead of described in two comments. Reconciliation still needs the
-  `StringJoiner` heap-integrity defect fixed.
+  a test instead of described in two comments. **The `StringJoiner` defect did
+  not reproduce**: with the class protected on both paths — the exact merge this
+  record says reintroduces it — 40,000 `add()` calls under `-Xmx64m` came back
+  byte-identical to HotSpot in both modes. That is a microprobe and the defect
+  was found in a suite, so the asymmetry stays until H2 and Hibernate confirm
+  it; the code is unchanged.
 * **7** — the marker undercount that made this tier-1 is gone: a census constant
   names all eight sites plus the ninth, the probe has one implementation instead
   of three, and a gate fails on a partial sweep. No site is deleted; that still
@@ -199,10 +203,12 @@ records are systematically wrong in the same direction.
    * **RKC16N.6** — real-JDK `java/lang/String` bytecode resolution during JDK
      `<clinit>`s. Until this is fixed, both `String` lists have to stay.
    * **The `StringJoiner` heap-reference-integrity defect** (HIB-CV-32 family).
-     Until this is fixed, the two real-protected-stub paths have to disagree.
-     Worth re-checking whether it still reproduces before assuming it does —
-     `sj_real_layout` and an old-gen corruption fix have both landed since it
-     was diagnosed.
+     **Probably already gone** — it did not reproduce on 2026-08-04 under the
+     exact merge that is supposed to trigger it, with collector pressure and a
+     HotSpot control. What is missing is a suite run (H2, Hibernate), because
+     the defect was found in a suite and a microprobe has repeatedly failed to
+     predict a real library here. Cheapest of the three blockers to retire, and
+     the one most likely to be retired already.
    * **Real `ThreadPoolExecutor` field initialisation** so
      `Executors.new*ThreadPool()` returns objects built by the real `<init>`.
      Until this is fixed, reclassifying `native_es_execute` drops it under

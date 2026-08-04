@@ -56,14 +56,61 @@ Nothing above touches that. Both naive directions still reintroduce a known
 defect, for the reasons in *Blast radius* below, and the test now enforces that
 neither is taken by accident.
 
-One thing worth re-checking before assuming the defect is still live: it was
-diagnosed 2026-07-10, `native-collections` has since grown `sj_real_layout`
-(which resolves the real class's field indices by name), and a large old-gen
-corruption family was closed 2026-08-04. Whether the guard still trips is a
-question for a run, not a reading — and the run is cheap: add
-`java/util/StringJoiner` to `real_protected_stub_class_common`, delete the
-`_cold` exception, and exercise a `StringJoiner` whose second and subsequent
-`add()` calls must be observable in `toString()`.
+### The defect did not reproduce — measured 2026-08-04
+
+It was diagnosed 2026-07-10. Since then `native-collections` grew
+`sj_real_layout` (which resolves the real class's field indices by name) and a
+large old-gen corruption family closed 2026-08-04. So the asymmetry was worth
+re-testing rather than assuming, and the test is cheap.
+
+**Method.** `java/util/StringJoiner` added to
+`real_protected_stub_class_common` and the `_cold` exception deleted — i.e.
+exactly the "make them match" merge this record says reintroduces the defect —
+then rebuilt (binary mtime and size both confirmed changed; the first attempt
+at this experiment reported PASS against a binary whose build had failed, so
+the rerun aborts on a non-zero build status) and run against a real JDK 21
+image on Linux.
+
+**Result: PASS, byte-identical to HotSpot, in both modes.**
+
+Two probes. The first is the one this record's *How to verify* section asks
+for — a `StringJoiner` whose second and subsequent `add()` calls must be
+observable in `toString()`; all three adds and a 2,000-iteration hot loop came
+back correct. The second adds real collector pressure, because the guard in
+question lives in `gen_heap::read_slot` and a probe that never collects is a
+weak witness even though the documented symptom is immediate: 40,000 `add()`
+calls under `-Xmx64m` with a 512-byte allocation and a `StringBuilder` churn per
+iteration, with seven intermediate consistency checks.
+
+```
+HOTSPOT (control)        SJGC len=120001 commas=39999 checks=7  VERDICT=PASS
+merged, --jdk-only       SJGC len=120001 commas=39999 checks=7  VERDICT=PASS
+merged, --real-jdk       SJGC len=120001 commas=39999 checks=7  VERDICT=PASS
+```
+
+No "corrupt Value cell", no exception, no crash.
+
+### Why this is not yet enough to land the merge
+
+**It is a microprobe, and the defect was found in a suite.** The Copy B comment
+is explicit that the failure was *"something specific to this being a
+natively-registered bootstrap class, not the bytecode pattern itself"* and that
+an equivalent user-defined class with the identical shape did **not** reproduce
+it. My probes use the real bootstrap `java.util.StringJoiner`, which is the
+right shape — but a passing microprobe has repeatedly failed to predict a real
+library in this codebase, and the HIB-CV-32 family is named after Hibernate.
+
+The remaining step is therefore a suite run, not another probe: apply the merge
+and run H2 and Hibernate, which are where the "corrupt Value cell" guard trips
+were observed. Until that exists, **the asymmetry stays**, and the code and the
+divergence test are unchanged.
+
+Also unmeasured: the other ten classes. This record asks for a decision *per
+class*, and only `StringJoiner` has been tested. The other ten have never been
+checked for agreement in practice, only assumed equal — that assumption is now
+enforced by
+`real_protected_stub_paths_diverge_on_exactly_stringjoiner`, which is a
+different thing from being verified.
 
 ## What is wrong
 
