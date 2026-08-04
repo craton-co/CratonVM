@@ -490,13 +490,60 @@ single-pass bodies the inliner was asked about, how many got a splice, and the
 refusal histogram for the rest. Every number is a count, so a loaded host does
 not affect it, and no conclusion about speed can be drawn from it.
 
-`cov-01` demonstrated the dependency by accident. `getstatic <A>;
-invokevirtual tag` — the single most ordinary virtual-call shape there is, and
-the exact shape of every entry point in the fixture — was refused by the IR
-builder only because it had no `0xb2` arm. The moment `getstatic` lowered,
-`callA` was compiled by C2 on its next promotion, its `inline_tally` was empty,
-and the guard-hit check failed with `speculative_sites == 0`. The test now pins
-the tier explicitly, so the dependency is stated rather than relied on.
+### The feature needs TWO opt-ins, and the second one is the profile
+
+`CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` buys the lowering. The *evidence* is a
+separate gate: `SharedVm::new` calls `jit::profile::enable_profiling(true)`
+only under `CRATONVM_TIER_PGO`, so with that flag unset every
+`record_receiver` short-circuits, `classify_receiver_shape` sees
+`Unprofiled`, and **every virtual site is refused `no-profile-evidence`**.
+Measured, not assumed — on `regression-suite/perf/GuardedInlineReachProbe.java`
+with only the inlining flag set: 15 `no-profile-evidence` refusals and zero
+splices. The harness sets both flags for this reason, and anyone measuring this
+by hand must too, or they will conclude the lowering does not work.
+
+### The measurement, 2026-08-04
+
+`GuardedInlineReachProbe` (ordinary virtual and interface dispatch: a
+single-implementation interface site, a two-class overriding site, a
+three-implementation site, `java.util` calls through `List`/`Map`, and
+`StringBuilder`), both flags on, one run:
+
+```
+  installed bodies             18
+  single-pass                   5   27.8%   <- the only population this feature can reach
+  optimizing (IR)              13   72.2%   <- out of reach; the IR tier plans no inline
+  single-pass w/ a splice       0    0.0% of single-pass
+  refusals: callee-unresolved 17, receiver-not-dominant 1
+```
+
+**Nearly three quarters of the installed bodies are out of reach**, and the
+answer is sharper than "the tiers split the population": the methods this
+feature targets are exactly the ones that get *promoted*. `CRATONVM_DBG_JITC=1`
+shows `monomorphicInterface`, `bimorphicVirtual`, `collectionStep` and friends
+each compiled three times — C1 first, then C2, whose artifact supersedes it —
+and their virtual sites reported by the IR path as
+`ir-direct-call MISSED …$Op.apply`. The single-pass artifact carrying the guard
+is the one that gets replaced.
+
+So in a warm run, guarded inlining's population is *the methods the optimizing
+tier refuses*, and it shrinks every time a `cov-*` lane lands. That is the
+answer to "is this worth extending?": extending the SINGLE-PASS lowering is
+work with a shrinking denominator. The version worth building, if any, is a
+guarded-inline lowering on the IR path — and item 2 of §10 is where that would
+be decided, with this instrument as the evidence.
+
+`cov-01` demonstrated the same dependency by accident, before there was an
+instrument for it.
+
+`getstatic <A>; invokevirtual tag` — the single most ordinary virtual-call
+shape there is, and the exact shape of every entry point in the fixture — was
+refused by the IR builder only because it had no `0xb2` arm. The moment
+`getstatic` lowered, `callA` was compiled by C2 on its next promotion, its
+`inline_tally` was empty, and the guard-hit check failed with
+`speculative_sites == 0`. The test now pins the tier with
+`CRATONVM_JIT_IR_CALL_VIRTUAL=0`, so the dependency is stated rather than
+relied on.
 
 ## 10. Still open
 
