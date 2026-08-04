@@ -1122,6 +1122,22 @@ pub fn dump_method_stats_to_stderr() {
             crate::osr_coords::osr_coordinate_mismatches(),
             crate::stale_install_epoch_refusals(),
         );
+        // The OSR lifecycle, on the same line's heels and for the same reason:
+        // the counters were ungated by the `osr-02` lane precisely because "a
+        // silent OSR exit is indistinguishable from never having entered", and
+        // then nothing printed them. This is also the only thing that makes
+        // OVER-refusal visible — a new entry-time refusal that quietly costs a
+        // workload its OSR shows up here as `osr_entered` collapsing while
+        // `osr_refused_entry` rises, and nowhere else. Read `osr_exited`
+        // against `osr_entered`, never alone.
+        eprintln!(
+            "[cratonvm] OSR lifecycle: {}",
+            crate::metrics::osr_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
     let Some(core) = DIAG_CORE.get() else {
         return;
