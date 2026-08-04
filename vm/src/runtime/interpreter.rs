@@ -3840,6 +3840,30 @@ pub fn pop_and_recycle_frame_with_reason(
         if let Some(caller) = thread.frames.last_mut() {
             caller.exec_epoch = caller.exec_epoch.wrapping_add(1);
         }
+        // Harvest this activation's loop work towards the method's tier-up
+        // counter. This is the ONLY point at which the count is complete and
+        // still attributable: `Frame::backward_count` is reset on every reuse,
+        // so a loop that runs a few hundred iterations per call — the shape of
+        // `ConstantPool.<init>` and `ClassParser.readFields` in Tomcat's
+        // annotation scan — is otherwise thrown away wholesale, over and over,
+        // and never reaches the OSR back-edge threshold within any one frame.
+        //
+        // Harvesting HERE rather than on a back-edge stride is deliberate: a
+        // stride can only ever credit loops longer than the stride, which is
+        // exactly the set this gap does NOT contain. Every iteration counts,
+        // however short the loop, at a cost of one hash + one relaxed atomic
+        // per *invocation that actually looped*.
+        if f.backward_count > 0 && loop_work_tierup_enabled() {
+            let key = cratonvm_jit_api::invoc_key_parts(
+                f.class_id.as_u32(),
+                f.method_name(),
+                f.method_descriptor(),
+            );
+            shared
+                .jit
+                .profile_store
+                .add_loop_work(key, f.backward_count);
+        }
         if crate::runtime::env_cache::frame_trace() {
             eprintln!(
                 "[FRAME_POP] depth={} {}.{}{}",
@@ -3933,14 +3957,6 @@ pub(crate) enum OsrBackoffOutcome {
     ThrowJava(ObjectRef),
 }
 
-/// Back-edges of loop work credited as one method invocation for tier-up.
-///
-/// 512 keeps the accounting cheap (one relaxed atomic per 512 iterations) while
-/// staying well inside the shape that matters: a 300-iteration constant-pool
-/// loop called once per class credits an invocation roughly every other class,
-/// so a few hundred classes carry the method over the threshold.
-const LOOP_WORK_STRIDE: u32 = 512;
-
 /// `CRATONVM_JIT=loop-work-tierup` — count loop iterations towards the method
 /// invocation threshold. Read once and cached; this sits on the interpreter's
 /// back-edge path. Default-OFF → behaviour byte-for-byte unchanged.
@@ -4017,26 +4033,15 @@ pub(crate) fn try_osr_with_backoff(
     // calls (`Constant.readConstant`, `ConstantUtf8.getInstance`) compile fine.
     // See docs/known-issues/tomcat/webapp-deploy-annotation-scan-interpreted-226x.md.
     //
-    // Credit a chunk of loop work as one invocation, the way HotSpot sums its
-    // invocation and back-edge counters against a single threshold. This reuses
-    // the existing counter and compile path exactly — no new state, and no OSR
-    // involvement: the method simply crosses the ordinary threshold and its NEXT
-    // call runs compiled. One modulo per back-edge, one relaxed atomic per
-    // `LOOP_WORK_STRIDE` iterations.
+    // Credit loop work towards that same invocation counter, the way HotSpot
+    // sums its invocation and back-edge counters against a single threshold.
+    // This reuses the existing counter and compile path exactly — no new state,
+    // and no OSR involvement: the method simply crosses the ordinary threshold
+    // and its NEXT call runs compiled.
     //
-    // Default-OFF pending the A/B: `CRATONVM_JIT=loop-work-tierup`.
-    if loop_work_tierup_enabled() {
-        let f = &thread.frames[*frame_idx];
-        let bc = f.backward_count;
-        if bc > 0 && bc % LOOP_WORK_STRIDE == 0 {
-            let key = cratonvm_jit_api::invoc_key_parts(
-                f.class_id.as_u32(),
-                f.method_name(),
-                f.method_descriptor(),
-            );
-            shared.jit.profile_store.increment_invocation(key);
-        }
-    }
+    // The credit itself is applied in `pop_and_recycle_frame_with_reason`, at
+    // the one point where an activation's back-edge count is both complete and
+    // still attributable. See `ProfileStore::add_loop_work`.
     if !thread.frames[*frame_idx].should_try_osr(entry_pc, osr_backedge_threshold) {
         return OsrBackoffOutcome::Skip;
     }
