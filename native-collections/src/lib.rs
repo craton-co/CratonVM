@@ -41362,6 +41362,28 @@ fn chm_seg_get(
                     return Ok(None);
                 }
             };
+            if chm_trace() {
+                eprintln!(
+                    "[chm]   cmp key={:p}({:?}) node_key={:p}({:?}) strings_equal={:?} unbox=({:?},{:?}) cid=({:?},{:?}) eq={:?}",
+                    key.as_ptr(),
+                    ctx.read_string(key),
+                    node_key.as_ptr(),
+                    ctx.read_string(node_key),
+                    ctx.java_strings_equal(key, node_key),
+                    unbox_wrapper(ctx, key),
+                    unbox_wrapper(ctx, node_key),
+                    ctx.class_id_of_object(key),
+                    ctx.class_id_of_object(node_key),
+                    map_keys_equal(ctx, key, node_key)
+                );
+                eprintln!(
+                    "[chm]   key slots 0={:?} 1={:?} | node_key slots 0={:?} 1={:?}",
+                    ctx.get_field(key, 0),
+                    ctx.get_field(key, 1),
+                    ctx.get_field(node_key, 0),
+                    ctx.get_field(node_key, 1),
+                );
+            }
             if map_keys_equal(ctx, key, node_key)? {
                 let node_value = read_pinned_elem(ctx, node_value_pin, node_value);
                 // CHM-mapper-deadlock fix (2026-07-21): reservation markers
