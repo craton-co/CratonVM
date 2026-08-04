@@ -602,6 +602,14 @@ pub const INVENTORY: &[E] = &[
     // Default-ON: `x64::escape_analysis::bulk_byte_loops_enabled` reads
     // `0`/`false`/`off` (trimmed, case-insensitive) as the kill switch.
     E { group: Group::JIT, token: "bulk-byte-loops", on_key: Some("CRATONVM_JIT_BULK_BYTE_LOOPS"), off_key: None, off_word: Some("0") },
+    // Default-ON (PERF-01): the optimizing tier declines a method whose loops
+    // the single-pass backend would VECTORISE, because an IR body for one of
+    // those is a downgrade — measured at 6.4x on `CratonBench.sieve`.
+    // `CRATONVM_JIT='-c1-vector-veto'` hands those methods back to the IR
+    // tier, which is how the regression is reproduced and how a probe that
+    // wants IR codegen for a sieve-shaped method gets it (this term sits
+    // AFTER `CRATONVM_JIT_FORCE_C2` in the admission chain).
+    E { group: Group::JIT, token: "c1-vector-veto", on_key: Some("CRATONVM_JIT_C1_VECTOR_VETO"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "c2-first-call", on_key: Some("CRATONVM_JIT_C2_FIRST_CALL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "c2-supersede", on_key: Some("CRATONVM_C2_SUPERSEDE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "callee-oop-flush", on_key: None, off_key: Some("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH"), off_word: None },

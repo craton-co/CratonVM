@@ -1,8 +1,9 @@
-# `Arrays.sort(long[])` throws a bogus `ArrayIndexOutOfBoundsException` under OSR
+# `Arrays.sort(long[])` throws a bogus `ArrayIndexOutOfBoundsException` under OSR — FIXED
 
 | | |
 |---|---|
-| **Status** | OPEN — reproducible in two lines, narrowed to ONE method's OSR artifact |
+| **Status** | ✅ **FIXED** 2026-08-04 — retired from `docs/known-issues/jit/` |
+| **Cause** | the OSR publication stripped the register home from every slot that is *ever* a cat-2 high half, including slots that are live cat-1 locals in a disjoint range |
 | **Severity** | high — `Arrays.sort` is not a corner of the JDK, and the failure is a *wrong index*, i.e. silent data corruption is one branch away |
 | **HotSpot** | PASS |
 | **CratonVM** | FAIL on the FIRST sort, every run, JIT on |
@@ -146,11 +147,94 @@ loop expecting it to fail.
    method still compiles — so the two artifacts for the same bytecode disagree,
    which is exactly what that differ is for.
 
+## The defect
+
+`x64::osr::publish_entry_metadata` strips the OSR register assignment for
+cat-2 high-half slots, so the trampoline cannot seed a dead half over a live
+local that shares its register (a real bug, fixed earlier — a `long` loop
+counter reset to 0 mid-loop). It took the slot set from
+`wide_local_high_halves`, **a whole-method scan**: every `lstore N`/`dstore N`
+anywhere in the method marks `N+1`.
+
+Under legal JVM slot reuse the same index is routinely a live cat-1 local in a
+*disjoint* range. In `mixedInsertionSort`:
+
+| slot | first region | second/third region |
+|---|---|---|
+| 5 | `int i` | `long pin` |
+| 6 | `long ai` base | `pin` high half |
+| **7** | **`ai` high half** | **`int i` loop counter** |
+| 8 | `int p` | `long a1` base |
+| 9 | `long ai` base | `a1` high half |
+
+Slot 7 is named a high half by the whole-method scan, so its OSR register
+assignment was nulled. The trampoline then seeded only its FRAME slot, while
+the compiled body kept reading its REGISTER (`reg_for_local` is deliberately
+unaffected by the strip). An OSR entry into the second region therefore ran
+with a garbage `i`, and `while (ai < a[--i])` walked off the front of the
+array — the hundreds-of-millions index in the exception.
+
+`classify_local_kinds` already draws exactly the needed distinction: a high
+half that is independently accessed is `Ambiguous`, an untouched one is
+`HighHalf`. The fix filters the strip on that, so only a slot that is *nothing
+but* a high half loses its home.
+
+The hazard the strip exists for is still covered for the reused slots, and more
+precisely, by the per-entry-PC dead mask built immediately below it: at a PC
+where such a slot really is the dead high half it is not live-in, so it lands
+in the blanket set and is masked if — and only if — its register is genuinely
+shared with a live local.
+
+## Why the narrowing took four wrong guesses
+
+Each of these was measured and eliminated before the right one; they are listed
+because each is a plausible first suspect for any future OSR miscompile:
+multi-pc entry (`CRATONVM_JIT_OSR_SINGLE_PC`), the dead-local entry relaxation
+(`CRATONVM_JIT_OSR_DEAD_LOCALS`), the trampoline's frame-slot-store elision
+(`CRATONVM_JIT_OSR_SEED_FRAME_SLOTS`, added here), and the operand-stack width
+source (`CRATONVM_DBG=stack-kinds` — clean, every accepted entry is
+`emitter_depth=0`).
+
+What actually cracked it was three Java-level variants of the same method,
+which cost minutes rather than a build each:
+
+| variant | verdict | what it proves |
+|---|---|---|
+| verbatim `long[]` | FAIL | the baseline |
+| every local hoisted so NO slot is reused | **PASS** | it is the slot reuse |
+| same shape over `int[]` (same reuse, no cat-2) | **PASS** | it needs a cat-2 in the reuse set |
+
+Those two passes together name the defect: a slot that is cat-2 in one range
+and cat-1 in another. `probes/MixedInsertionSortProbe.java` (verbatim + the
+hoisted variant) and `probes/IntMixedProbe.java` are kept as that pair.
+
+## Verification
+
+| probe | before | after |
+|---|---|---|
+| `probes/SortProbe.java` (`Arrays.sort(long[])`, n=20000) | FAIL rep 0 | **PASS** 60 sorts |
+| `probes/MixedInsertionSortProbe.java` verbatim | FAIL rep 0 | **PASS** 300 sorts |
+| `probes/MixedInsertionSortProbe.java` no-reuse variant | PASS | PASS |
+| `probes/IntMixedProbe.java` | PASS | PASS |
+
+1880 `cratonvm-jit` unit tests pass, including the new
+`only_pure_high_halves_may_lose_their_osr_register_home`, which pins the
+predicate at the level the bug lived. The `x64_artifact_corpus` differ — which
+asserts on `osr_local_assignments` directly — passes all 3.
+
+`probes/HandoffLayersProbe.java` and `probes/ExecDispatchProbe.java` run again
+(they sort a `long[]` of samples and died before printing anything), which
+unblocks the AQS/handoff-latency work.
+
 ## Blast radius
 
-Anything that sorts a `long[]` (or, untested, any primitive array through the
-same `DualPivotQuicksort` kernels) with ≥1000 elements. That includes
-`probes/HandoffLayersProbe.java` and `probes/ExecDispatchProbe.java`, which is
-how it was found — both compute percentiles by sorting their sample array, so
-the AQS/handoff latency work is blocked on this until it is fixed or the probes
-are changed to avoid `Arrays.sort`.
+Far wider than `Arrays.sort`. The trigger is any method that (a) reuses a local
+slot as both a cat-2 base/high-half and a cat-1 local across disjoint live
+ranges — which javac emits routinely for `long`/`double` locals in sibling
+blocks — and (b) gets an OSR entry into the range where the slot is the cat-1
+local. `Arrays.sort(long[])` is simply the most-executed instance: it failed on
+the FIRST sort of ≥1000 elements, every run.
+
+A wrong index is the loud symptom. The quiet one is a wrong *value* in the
+reused slot with no exception at all, which is why both replacement probes
+check the sorted result and not just the absence of a throw.
