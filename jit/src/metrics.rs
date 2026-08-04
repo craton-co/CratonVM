@@ -1376,7 +1376,7 @@ pub fn clear_reports() {
 ///
 /// Same shape as [`SCHEDULING_EVENTS`]: a closed set, a fixed array of relaxed
 /// counters, no allocation and no initialization order.
-pub const OSR_EVENTS: [&str; 4] = [
+pub const OSR_EVENTS: [&str; 9] = [
     // An OSR entry was actually taken: the trampoline ran and control reached
     // compiled code at a back edge. The denominator for everything below.
     "osr_entered",
@@ -1394,10 +1394,50 @@ pub const OSR_EVENTS: [&str; 4] = [
     // nothing was built, so no `osr_pc_to_native` verdict exists to memo, and
     // the per-pc reject memo cannot suppress the next request.
     "osr_compile_declined",
+    // ── Where the exit landed ────────────────────────────────────────────
+    //
+    // `osr_exit_points` "exists and is populated … but nothing cross-checks it
+    // against where exits are actually taken" — the lane's step 4. These four
+    // partition `osr_exited`'s stashed-frame half exactly
+    // (`crate::osr_exit::OsrExitSite`), so their sum is the number of exits
+    // that arrived carrying a reconstructed frame.
+    //
+    // An exit at a true loop-boundary map — in `osr_exit_points` AND recorded
+    // with reason `OsrExit`. A whole number of iterations completed and the
+    // header has not been re-entered: the shape the in-place transfer was
+    // designed for.
+    "osr_exit_at_loop_boundary",
+    // An exit at a recorded deopt point that is NOT a loop boundary — an
+    // `invokedynamic` uncommon trap (which shares the exit-map machinery, so
+    // set membership alone could never have told the two apart), or a
+    // speculative-BCE guard. Legitimate. Read it against the row above: an OSR
+    // population that leaves predominantly off the loop boundary is entering
+    // bodies that trap, not bodies that run.
+    "osr_exit_off_loop_boundary",
+    // The two sets disagree: an `OsrExit`-reason point whose bci is missing
+    // from `osr_exit_points`. One function writes both, and the loop transform
+    // moves both between coordinate spaces, so **this must read zero** — it is
+    // the cross-check itself, not a classification.
+    "osr_exit_map_missing",
+    // Neither: the artifact records no deopt point at the bci the frame names.
+    // **Expected to stay zero** — non-zero means a stash reached an artifact
+    // that cannot describe it, and the transfer refuses.
+    "osr_exit_bci_unrecorded",
+    // The admission-time form of the lane's "what to refuse": the artifact has
+    // a bci naming more than one resume image, and the by-bci lookups the
+    // resume path uses would pick one arbitrarily. Refused at ENTRY, where
+    // nothing has run — refusing at exit would force the safe reject, which
+    // after a committed body re-runs every iteration since entry.
+    "osr_entry_refused_ambiguous_image",
 ];
 
 /// One relaxed counter per [`OSR_EVENTS`] entry.
 static OSR_COUNTERS: [AtomicU64; OSR_EVENTS.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
