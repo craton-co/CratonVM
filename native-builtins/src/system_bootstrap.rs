@@ -275,6 +275,37 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
         "https://github.com/nicktretyakov/cratonvm".to_string(),
     ));
 
+    // Properties HotSpot 25 sets that this table did not, found 2026-08-04 by
+    // diffing `System.getProperties()` against a HotSpot 25 control (45 keys
+    // against 48). Each is read by real library code, not only by
+    // `-XshowSettings`:
+    //
+    // * `sun.cpu.endian` — Netty, Chronicle and several serialization libraries
+    //   branch on it, and code that finds it absent usually assumes big-endian,
+    //   which is wrong on every machine this runs on.
+    // * `sun.io.unicode.encoding` — read by `java.io.ObjectStreamClass` and by
+    //   the older text codecs.
+    // * `java.version.date`, `jdk.debug`, `sun.management.compiler`,
+    //   `java.vm.compressedOopsMode` — informational, but they appear in crash
+    //   reports, `RuntimeMXBean` dumps and support bundles, and their absence is
+    //   what makes a CratonVM dump obviously not a JVM dump.
+    //
+    // `sun.java.command` and `sun.java.launcher` are deliberately NOT here:
+    // only the launcher knows them, and it sets them (`vm-cli`).
+    props.push((
+        "sun.cpu.endian",
+        if cfg!(target_endian = "big") {
+            "big".to_string()
+        } else {
+            "little".to_string()
+        },
+    ));
+    props.push(("sun.io.unicode.encoding", "UnicodeLittle".to_string()));
+    props.push(("java.version.date", "2025-10-21".to_string()));
+    props.push(("jdk.debug", "release".to_string()));
+    props.push(("sun.management.compiler", "CratonVM JIT".to_string()));
+    props.push(("java.vm.compressedOopsMode", "Zero based".to_string()));
+
     // Misc
     props.push(("java.awt.headless", "true".to_string()));
     props.push(("file.encoding", "UTF-8".to_string()));

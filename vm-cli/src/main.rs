@@ -3381,6 +3381,51 @@ fn run() -> Result<()> {
     // System properties from -Dkey=value flags
     config.system_properties = system_properties;
 
+    // `sun.java.command` and `sun.java.launcher`, which HotSpot's launcher sets
+    // and this one did not. Measured absent 2026-08-04 by diffing
+    // `System.getProperties()` against HotSpot 25.
+    //
+    // Not cosmetic. `sun.java.command` is how a process identifies itself to
+    // itself: Spring Boot's `ApplicationHome`, log4j/logback default file
+    // naming, JMX `RuntimeMXBean`, and several agent/attach paths read it, and
+    // a `null` there turns into a wrong log path or a silent feature-off rather
+    // than an error. The launcher is the only layer that knows the value, which
+    // is why the property table in `native-builtins` cannot supply it.
+    //
+    // Format follows the launcher: the main class (dotted, as typed) or the jar
+    // path, then the program arguments, space-separated. An explicit `-D` wins,
+    // matching `java -Dsun.java.command=…`.
+    if !config
+        .system_properties
+        .iter()
+        .any(|(k, _)| k == "sun.java.command")
+    {
+        let head = args
+            .jar
+            .clone()
+            .or_else(|| args.class_name.clone())
+            .unwrap_or_default();
+        if !head.is_empty() {
+            let command = if args.args.is_empty() {
+                head
+            } else {
+                format!("{head} {}", args.args.join(" "))
+            };
+            config
+                .system_properties
+                .push(("sun.java.command".to_string(), command));
+        }
+    }
+    if !config
+        .system_properties
+        .iter()
+        .any(|(k, _)| k == "sun.java.launcher")
+    {
+        config
+            .system_properties
+            .push(("sun.java.launcher".to_string(), "SUN_STANDARD".to_string()));
+    }
+
     // Container support (enabled by default, disabled with --XX:-UseContainerSupport)
     if args.disable_container_support {
         config = config.with_container_support(false);
