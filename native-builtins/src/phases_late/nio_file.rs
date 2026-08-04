@@ -158,7 +158,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "getNameCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let count = p57_parse_root(&p).1.len() as i32;
+        let count = p57_name_elements(&p).len() as i32;
         Ok(Some(Value::Int(count)))
     });
 
@@ -169,7 +169,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         // FIX (finding 4): match the JDK — index < 0 or >= name count throws
         // IllegalArgumentException instead of silently returning an empty path.
         if idx < 0 || idx as usize >= parts.len() {
@@ -194,7 +194,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         let count = parts.len() as i32;
         // FIX (finding 4): match the JDK — beginIndex must be in [0,count),
         // endIndex in (beginIndex,count]; otherwise IllegalArgumentException.
@@ -282,7 +282,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, parts.len());
         for (i, part) in parts.iter().enumerate() {
@@ -6434,7 +6434,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "getNameCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let count = p57_parse_root(&p).1.len();
+        let count = p57_name_elements(&p).len();
         Ok(Some(Value::Int(count as i32)))
     });
 
@@ -6445,7 +6445,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         // FIX (finding 4): JDK throws IllegalArgumentException for out-of-range index.
         if idx < 0 || idx as usize >= parts.len() {
             return Err(RuntimeError::IllegalArgumentException {
@@ -6511,7 +6511,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, parts.len());
         // Pin across the Path/iterator allocs below — a moving young GC there
@@ -6541,7 +6541,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         let p = p57_read_path(ctx, this);
-        let parts: Vec<String> = p57_parse_root(&p).1;
+        let parts: Vec<String> = p57_name_elements(&p);
         let count = parts.len() as i32;
         // FIX (finding 4): JDK throws IllegalArgumentException for an out-of-range range.
         if begin < 0 || begin >= count || end <= begin || end > count {
@@ -7346,6 +7346,32 @@ pub(crate) fn p57_parse_root(s: &str) -> (Option<String>, Vec<String>) {
     }
 }
 
+/// The name elements a `Path` exposes through `getNameCount`/`getName`/
+/// `subpath`/`iterator`.
+///
+/// This is [`p57_parse_root`]'s name list with one correction: the **empty
+/// path** has exactly ONE name element — the empty string — not zero.
+/// `sun.nio.fs.UnixPath`/`WindowsPath` both special-case it that way
+/// (`Paths.get("").getNameCount()` is 1 on HotSpot and `getName(0)` returns the
+/// empty path), because an empty path denotes the default directory and must
+/// still be iterable. `p57_parse_root` splits on separators and filters empty
+/// segments, so it reports 0, and `getName(0)`/`subpath(0,1)`/`iterator()` then
+/// threw `IllegalArgumentException` / yielded nothing where HotSpot hands back
+/// the empty name.
+///
+/// Only the empty string reaches this arm: any other relative input has at
+/// least one non-empty segment, and any rooted input reports a root. Kept
+/// separate from `p57_parse_root` on purpose — [`p57_normalize_path`] and
+/// [`p57_relativize`] must keep seeing zero elements there, since HotSpot's
+/// `Paths.get("").relativize(Paths.get("a"))` is `a`, not `../a`.
+pub(crate) fn p57_name_elements(path: &str) -> Vec<String> {
+    let (root, names) = p57_parse_root(path);
+    if root.is_none() && names.is_empty() {
+        return vec![String::new()];
+    }
+    names
+}
+
 /// POSIX (`sun.nio.fs.UnixPath`) `getParent()` semantics, the Unix twin of
 /// [`p57_win_parent_of`]: a pure last-separator split that keeps `.`/`..` name
 /// elements verbatim. Rust's `std::path::Path::parent()` normalizes a trailing
@@ -7520,6 +7546,34 @@ pub(crate) mod p57_win_path_tests {
         assert_eq!(p57_trim_path_trailing_separator("C:/"), "C:/");
         assert_eq!(p57_trim_path_trailing_separator("\\\\server\\share\\"), "\\\\server\\share\\");
         assert_eq!(p57_trim_path_trailing_separator("\\"), "\\");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod p57_name_element_tests {
+    //! The empty path's name list, on every host. HotSpot:
+    //! `Paths.get("").getNameCount()` is 1 and `getName(0)` is the empty path,
+    //! on both `UnixPath` and `WindowsPath`.
+    use super::{p57_name_elements, p57_parse_root};
+
+    #[test]
+    fn the_empty_path_has_one_empty_name_element() {
+        assert_eq!(p57_name_elements(""), vec![String::new()]);
+        // …and `p57_parse_root` must keep reporting zero there, because
+        // `normalize`/`relativize` depend on it: HotSpot's
+        // `Paths.get("").relativize(Paths.get("a"))` is `a`, not `../a`.
+        assert!(p57_parse_root("").1.is_empty());
+    }
+
+    #[test]
+    fn every_other_path_is_unchanged() {
+        // Rooted paths report a root, so the empty-name arm cannot fire even
+        // when they have no name elements.
+        let root = if cfg!(windows) { "C:/" } else { "/" };
+        assert!(p57_name_elements(root).is_empty());
+        assert_eq!(p57_name_elements("a/b"), vec!["a", "b"]);
+        assert_eq!(p57_name_elements("a"), vec!["a"]);
+        assert_eq!(p57_name_elements("a/b/"), vec!["a", "b"]);
     }
 }
 
@@ -16000,12 +16054,16 @@ pub(crate) fn p98_walk_dir(
                     .file_type()
                     .map(|t| t.is_dir() || (follow_links && t.is_symlink() && ep.is_dir()))
                     .unwrap_or(false);
+                // HOST path (not a virtual-FS sentinel): build it through
+                // `p57_alloc_path` so the stored string is the `/`-canonical
+                // internal form every other Path native expects. Setting field 0
+                // directly left `entry.path()`'s host separators in place, so on
+                // Windows a Path handed to a FileVisitor compared unequal to the
+                // otherwise-identical Path the caller built, and `startsWith`/
+                // `relativize`/`getNameCount` against it all disagreed.
                 if is_dir {
-                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo = p57_alloc_path(ctx, &es);
                     let epo_pin = p98_pin(ctx, epo);
-                    let s = ctx.create_string(&es);
-                    let epo_now = p98_read_pin(ctx, epo_pin);
-                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
                     if !p98_walk_dir(
                         ctx,
                         &es,
@@ -16018,11 +16076,8 @@ pub(crate) fn p98_walk_dir(
                         return Ok(false);
                     }
                 } else if !skip_file_callbacks {
-                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo = p57_alloc_path(ctx, &es);
                     let epo_pin = p98_pin(ctx, epo);
-                    let s = ctx.create_string(&es);
-                    let epo_now = p98_read_pin(ctx, epo_pin);
-                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
                     let fa = p98_alloc_basic_file_attributes(
                         ctx,
                         false,
