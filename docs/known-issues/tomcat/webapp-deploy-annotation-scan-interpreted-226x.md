@@ -91,11 +91,27 @@ So the JAR/zip/inflate path is fine (`probes/JarEntryReadCostProbe.java`: 30.5
 vs 62.7 MiB/s entry reads, raw `Inflater` 938 vs 1254 MiB/s — both under 2x).
 The cost is the per-byte class-file parse.
 
+> **Update 2026-08-04 (later) — three candidate root causes measured and
+> FALSIFIED, and the section below is wrong about the mechanism.** See
+> § What this is NOT — measured, which supersedes both this section and
+> § Root cause. Short version: the cost is **general interpreter throughput**,
+> not any single gate, and no tier-up lever moves it. `--nojit` is now measured
+> *faster* than the default on a quiet host, so compiled code contributes
+> nothing here at all.
+
 ## Where the cost is, decomposed (2026-08-04)
 
 > This section supersedes § Root cause below on the question of *what* is slow.
 > That section's shape — "this code never got compiled" — survives, but it
 > names the wrong code, and the difference decides which fix is worth building.
+>
+> ⚠️ **The per-byte model below does not describe the real parse.** These
+> stages are *synthetic* per-byte loops written by the probe; `ClassParser`
+> itself reads in BULK. Counted with `--dump-native-registry` over the real
+> scan (156 classes): 12,643 `DataInputStream.readUnsignedShort`, 4,768
+> `readInt`, 938 bulk `ByteArrayInputStream.read([BII)` — and ~35k native calls
+> in total, which cannot account for ~400 ms. `readUnsignedByte` does not even
+> reach the top of the list. Do not plan against "~950 ns per byte".
 
 `probes/AnnotationScanSplitProbe.java` runs five stages over the **same
 in-memory class bytes**, each loop inlined into a named static method (never a
@@ -202,12 +218,81 @@ The `CallFloorProbe` contrast is the useful part: **when this VM compiles a
 method it is within a few x of HotSpot.** The 234x is "this code never got
 compiled", not "the compiler emits bad code".
 
-## What this is NOT
+## What this is NOT — measured (2026-08-04, branch `perf/annotation-scan-monitor-wall-20260804`)
+
+Everything in this section was measured on a **quiet host** (load ≈ 6–7; see
+§ Measuring this at all) against the real `AnnotationScanCostProbe`, not a
+microbenchmark. Baseline for all rows: **HotSpot ≈ 8 µs/class, CratonVM
+≈ 1950 µs/class ⇒ ≈ 240x**, which reproduces this doc's 226–234x exactly.
+
+**Not the monitor / `synchronized` cost.** Microbenchmarks are seductive here:
+`SingleByteReadCostProbe` prices an uncontended `synchronized` round trip at
+605.9 ns against HotSpot's 2.6 ns — 233x, temptingly equal to the headline
+ratio. It is a coincidence. In the real scan's profile the only monitor symbol
+that appears at all is `complete_jmx_monitor_enter`, at 1.47%.
+
+**Not the `ACC_SYNCHRONIZED` JIT-admission gate.** `ByteArrayInputStream.read()`
+genuinely never compiles — `jit_bridge.rs` rejected every `ACC_SYNCHRONIZED`
+method on the invocation-counter path, *before* it was ever counted, which is
+why `jit-method-stats` reported it neither compiled nor
+`hot_but_stuck_in_interpreter`. Admitting them (`CRATONVM_JIT=sync-methods`,
+default-off) changes this workload by **nothing**: 2237/2064 → 2140/2096
+µs/class. The gap is real and worth closing on its own merits; it is not this.
+
+**Not the outer loops failing to tier up** — though that gap is real too, and
+is the most interesting negative result here. `ConstantPool.<init>`,
+`ClassParser.readFields` and `readMethods` are invisible to *both* tier-up
+counters: the method counter accumulates globally but they run once per class
+(468 calls, under the 500 threshold), and the OSR trigger reads
+`Frame::backward_count`, which is **per-frame and reset on every invocation**,
+so a ~74-iteration constant-pool loop never approaches the 1000-back-edge
+threshold *within one frame* — permanently, not as a warm-up artifact. The
+stock scan reports `osr=0`: not one OSR body in the entire run.
+`CRATONVM_JIT=loop-work-tierup` (default-off) fixes that — `ConstantPool.<init>`
+compiles, tracked methods 9 → 10 — and buys **2–3%, inside the noise**.
+
+**So it is not a gate at all — it is interpreter throughput.** The decisive
+measurement: on a quiet host `--nojit` is *faster* than the default
+(1911/1868 vs 1978/1952 µs/class). Compiled code contributes nothing to this
+workload; compilation overhead slightly outweighs it. The `perf` profile is
+correspondingly flat — `execute_frame_from_index` 11%, then a long tail at
+1–4% each (`is_object_address`, `execute_instruction`, `memcmp`,
+`execute_invokevirtual_cached`, `resolve_field_ref_loader_aware`,
+`slot_for_exact`, `load_class_concurrent`) — with no hotspot to remove.
+
+**Consequence for the exit criteria below: they are not reachable by tiering
+work.** ~240x against an interpreter that the JIT cannot help is a
+general-throughput problem. Anyone picking this up should either attack
+interpreter dispatch cost broadly, or re-scope the exit criteria.
+
+Still true from the original triage:
 
 * Not the `seek0`/`ExpandWar` defect — that is fixed and verified separately;
   the `ExpandWar` error no longer appears in these runs.
 * Not JAR/zip/inflate throughput (under 2x, measured above).
 * Not GC and not a hang — the deploys complete, just late.
+
+## Measuring this at all
+
+The Azure build host is shared, and during this investigation its load ran
+between 6 and 178. The **same binary and configuration** measured 2237 and
+14789 µs/class an hour apart, and the HotSpot column swung 13.5 → 99.0 µs/class
+across three interleaved rounds. Any number in this doc taken at load > 10 is
+noise. Check `/proc/loadavg` first; interleave the arms in both directions; and
+prefer CratonVM-vs-CratonVM A/B over the cross-VM ratio.
+
+Two levers here are **partially inert**, which is worse than useless because
+they read as clean negatives:
+
+* `CRATONVM_JIT=threshold=N` moves the *counting-site* threshold but **not**
+  the tiered manager's own — `jit-method-stats` still prints
+  `c1_threshold=500` at `threshold=10`.
+* Crossing the invocation threshold does not by itself nominate anything: the
+  only site that acts on the counter is the dispatch site, and it tests
+  `cnt == threshold || (cnt - threshold) % 64 == 0` against the value **its
+  own** increment returned. `CRATONVM_DBG=loop-work` was added to make this
+  visible — it caught `ConstantPool.<init>` sitting at a count of **1149**,
+  more than twice the threshold, still never nominated.
 
 ## Prior art
 
@@ -248,6 +333,12 @@ pwsh apps/tomcat-suite-runner/run-one.ps1 -Vm craton -Exe <cratonvm.exe> -Class 
 ```
 
 ## Exit criteria
+
+> ⚠️ **Not reachable by tiering work** — see § What this is NOT — measured.
+> Every JIT-admission and tier-up lever tried on 2026-08-04 moved this by ≤3%,
+> and `--nojit` is *faster* than the default, so the remaining distance is
+> interpreter throughput. Closing this doc means either a broad interpreter
+> dispatch improvement or a re-scoped criterion.
 
 `AnnotationScanCostProbe` within ~5x of HotSpot per class, which should bring
 the `examples` redeploy under the ~1 s the `list` assertion needs and the
