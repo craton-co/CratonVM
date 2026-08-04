@@ -497,9 +497,17 @@ pub struct JvmThread {
     /// name — two `String` allocations, two further `class_manager` read
     /// acquisitions and a full `resolve_class_loader_aware`. This side table
     /// skips all of it for the sites where that revalidation is a tautology.
-    /// See [`crate::runtime::interpreter::field_access::FieldSiteCache`] for the
-    /// validity argument.
-    pub field_sites: crate::runtime::interpreter::field_access::FieldSiteCache,
+    /// See [`crate::runtime::interpreter::site_cache`] for the validity
+    /// argument — read it before adding a `put` call site.
+    pub field_sites: crate::runtime::interpreter::FieldSiteCache,
+
+    /// Per-thread resolved-method site cache — the same "resolved constant
+    /// pool" for the `(descriptor, num_params)` pair that the argument-popping
+    /// helpers need. On the inline-cache HIT path those used to call
+    /// `resolve_method_ref` for two of its four return values, paying a
+    /// `resolution_cache` read lock, a hash probe and three `Arc<str>`
+    /// clone/drop pairs per invoke.
+    pub method_sites: crate::runtime::interpreter::MethodSiteCache,
 
     /// Thread-local cache for the vtable-fast native-shadow guard.
     ///
@@ -723,7 +731,8 @@ impl JvmThread {
             jit_hashmap_string_node_cache: Vec::new(),
             string_case_cache: Vec::new(),
             invoke_cache: InvokeCache::new(),
-            field_sites: crate::runtime::interpreter::field_access::FieldSiteCache::new(),
+            field_sites: crate::runtime::interpreter::FieldSiteCache::new(),
+            method_sites: crate::runtime::interpreter::MethodSiteCache::new(),
             native_shadow_cache: FxHashMap::default(),
             kind: ThreadKind::Platform,
             pin_count: 0,

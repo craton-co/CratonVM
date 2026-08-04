@@ -105,7 +105,7 @@ fn maybe_dump_shutdown_reports() {
     // `CRATONVM_DBG=field-site`; a run that never sets it prints nothing. This
     // is what proves the lever is live before anyone times it — an inert gate
     // reports `hit=0` here rather than hiding inside a timing wash.
-    cratonvm_vm::runtime::interpreter::field_site_stats::dump();
+    cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
 
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
