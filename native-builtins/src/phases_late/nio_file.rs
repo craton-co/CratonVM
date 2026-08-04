@@ -4678,16 +4678,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
-    r.register(files, "writeString", "(Ljava/nio/file/Path;Ljava/lang/CharSequence;[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;", |ctx, args| {
-        let path_obj = obj_arg(args, 0)?;
-        let content_ref = obj_arg(args, 1)?;
-        let p = p57_read_path(ctx, path_obj);
-        let content = ctx.read_string(content_ref).unwrap_or_default();
-        match std::fs::write(&p, &content) {
-            Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
-            Err(e) => Err(RuntimeError::IllegalStateException { message: format!("IOException: {}", e) }.into()),
-        }
-    });
+    r.register(
+        files,
+        "writeString",
+        "(Ljava/nio/file/Path;Ljava/lang/CharSequence;[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;",
+        files_write_string_impl,
+    );
 
     fn read_all_lines_impl(
         ctx: &mut dyn NativeContext,
@@ -5217,6 +5213,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(e) => Err(p57_io_error(&e)),
                 };
             }
+            // NOFOLLOW_LINKS has to be answered BEFORE the missing-file
+            // pre-check below, because the two disagree about a *dangling*
+            // symlink: `Path::exists()` is a `stat`, so it reports the link as
+            // absent, and without this the pre-check would return
+            // `NoSuchFileException` — which callers legitimately catch and
+            // recover from — where the kernel's `O_NOFOLLOW` would have said
+            // `ELOOP`. The delegation to `newFileChannel` below carries the same
+            // check for every other case; this one has to be here.
+            if fsp_scan_open_options(ctx, args.get(2).copied()).nofollow {
+                if let Some(refused) = p57_nofollow_reject(&p) {
+                    return Err(refused);
+                }
+            }
             // Preserve the NIO missing-file contract: opening a non-existent
             // path for READ — or for WRITE without CREATE/CREATE_NEW — must throw
             // `java.nio.file.NoSuchFileException`, which frameworks catch to treat
@@ -5571,6 +5580,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // JDK FileChannel.open contract: a channel with neither READ nor
             // WRITE is read-only; WRITE without READ is write-only.
             let readable = read_opt || !writable;
+            // NOFOLLOW_LINKS: refuse a symlink final component before the open.
+            // This registration is the funnel for `FileChannel.open`, for
+            // `Files.newByteChannel` (which delegates here) and for the JDK's
+            // own `newOutputStream`/`newInputStream` defaults, so one check here
+            // covers all four. `set_obj`'s toString already told us the answer.
+            if fsp_scan_open_options(ctx, set_obj.map(|o| Value::Object(Some(o)))).nofollow {
+                if let Some(refused) = p57_nofollow_reject(&p) {
+                    return Err(refused);
+                }
+            }
             // Real `FileChannel.open` throws `java.nio.file.NoSuchFileException`
             // (not a bare `IOException`) when the target is missing — callers
             // like `FileSystemResource.readableChannel()` explicitly catch
@@ -5971,35 +5990,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         });
     } // end #[cfg(feature = "synthetic-jdk")] BufferedReader.read shims
 
-    // Phase B (RB.8): helper — scan an OpenOption[] looking for APPEND.
-    fn open_options_include_append(ctx: &dyn NativeContext, val: Option<&Value>) -> bool {
-        let arr = match val {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return false,
-        };
-        let len = ctx.array_length(arr);
-        for i in 0..len {
-            if let Value::Object(Some(opt)) = ctx.get_array_element(arr, i) {
-                // OpenOption subclass — StandardOpenOption has an
-                // `ordinal()` surrogate via its `name()` String.
-                if let Some(n) = ctx.read_string(opt) {
-                    if n.eq_ignore_ascii_case("APPEND") {
-                        return true;
-                    }
-                }
-                // Enum constants expose their name as field 0 (name)
-                // in our synthetic layout.
-                if let Value::Object(Some(ns)) = ctx.get_field(opt, 0) {
-                    if let Some(n) = ctx.read_string(ns) {
-                        if n.eq_ignore_ascii_case("APPEND") {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
-    }
+    // (The APPEND-only OpenOption[] scanner that used to live here is gone:
+    // `fsp_scan_open_options` reads the same array and also reports CREATE_NEW
+    // and NOFOLLOW_LINKS, which this path has to honour too.)
 
     // Phase B (RB.8): Files.newBufferedWriter — open the path for
     // writing via the fd_table and return a synthetic BufferedWriter
@@ -6007,12 +6000,25 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // minimal BufferedWriter natives registered below forward
     // write/flush/close/newLine to the fd. Charset argument is
     // currently honoured via UTF-8 output (matching the JDK default).
+    // Takes the path as a `&str`, not an `ObjectRef`: the caller has to read it
+    // BEFORE scanning the options (that scan can re-enter `toString()` and move
+    // the `Path`), so there is no reason to carry the object this far.
     fn open_buffered_writer(
         ctx: &mut dyn NativeContext,
-        path_obj: ObjectRef,
-        append: bool,
+        p: &str,
+        flags: P57OpenFlags,
     ) -> MethodCallResult {
-        let p = p57_read_path(ctx, path_obj);
+        let p = p.to_string();
+        // NOFOLLOW_LINKS: refuse a symlink final component before the open.
+        if flags.nofollow {
+            if let Some(refused) = p57_nofollow_reject(&p) {
+                return Err(refused);
+            }
+        }
+        if flags.create_new && std::path::Path::new(&p).exists() {
+            return Err(p57_file_already_exists(ctx, &p));
+        }
+        let append = flags.append;
         // GAP I2 — see `newFileChannel`.
         match crate::capability_gate::open_write_gated(&*ctx, &p, append) {
             Ok(fd) => {
@@ -6052,9 +6058,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             "newBufferedWriter",
             "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/BufferedWriter;",
             |ctx, args| {
-                let path_obj = obj_arg(args, 0)?;
-                let append = open_options_include_append(ctx, args.get(1));
-                open_buffered_writer(ctx, path_obj, append)
+                let p = p57_read_path(ctx, obj_arg(args, 0)?);
+                let flags = fsp_scan_open_options(ctx, args.get(1).copied());
+                open_buffered_writer(ctx, &p, flags)
             },
         );
         r.register(
@@ -6062,9 +6068,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "newBufferedWriter",
         "(Ljava/nio/file/Path;Ljava/nio/charset/Charset;[Ljava/nio/file/OpenOption;)Ljava/io/BufferedWriter;",
         |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let append = open_options_include_append(ctx, args.get(2));
-            open_buffered_writer(ctx, path_obj, append)
+            let p = p57_read_path(ctx, obj_arg(args, 0)?);
+            let flags = fsp_scan_open_options(ctx, args.get(2).copied());
+            open_buffered_writer(ctx, &p, flags)
         },
     );
     } // end if CRATONVM_SYNTHETIC_BUFFERED_WRITER — synthetic fd-backed newBufferedWriter
@@ -6888,25 +6894,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         files_cls,
         "write",
         "(Ljava/nio/file/Path;[B[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let arr = obj_arg(args, 1)?;
-            let p = p57_read_path(ctx, path_obj);
-            let len = ctx.array_length(arr);
-            let bytes: Vec<u8> = (0..len)
-                .map(|i| match ctx.get_array_element(arr, i) {
-                    Value::Int(v) => v as u8,
-                    _ => 0,
-                })
-                .collect();
-            match std::fs::write(&p, &bytes) {
-                Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }
-                .into()),
-            }
-        },
+        files_write_bytes_impl,
     );
     fn write_iterable_impl(
         ctx: &mut dyn NativeContext,
@@ -6914,7 +6902,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     ) -> cratonvm_types::error::MethodCallResult {
         let path_obj = obj_arg(args, 0)?;
         let iterable = obj_arg(args, 1)?;
-        let p = p57_read_path(ctx, path_obj);
+        let options = args.get(2).copied();
+        let opts_obj = match options {
+            Some(Value::Object(Some(o))) => Some(o),
+            _ => None,
+        };
+        // Everything below re-enters Java repeatedly (iterator/hasNext/next/
+        // toString), so the Path, the OpenOption[] and the Iterator all have to
+        // be pinned — `path_pin` FIRST, since unpinning is by batch base.
+        let path_pin = ctx.pin_native_root(path_obj);
+        let opts_pin = opts_obj.map(|o| ctx.pin_native_root(o));
         let it_val = ctx
             .invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])
             .ok()
@@ -6922,19 +6919,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let it = match it_val {
             Some(Value::Object(Some(o))) => o,
             _ => {
-                return Err(RuntimeError::IllegalStateException {
+                ctx.unpin_native_roots(path_pin);
+                return Err(RuntimeError::IOException {
                     message: "Files.write(Iterable): null iterator".to_string(),
                 }
-                .into())
+                .into());
             }
         };
+        let it_pin = ctx.pin_native_root(it);
         let mut out = String::new();
         loop {
+            let it = ctx.read_native_pin(it_pin, it);
             let has = ctx.invoke_virtual(it, "hasNext", "()Z", &[]).ok().flatten();
             match has {
                 Some(Value::Int(1)) => {}
                 _ => break,
             }
+            let it = ctx.read_native_pin(it_pin, it);
             let nxt = ctx
                 .invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])
                 .ok()
@@ -6957,13 +6958,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             out.push_str(&s);
             out.push('\n');
         }
-        match std::fs::write(&p, out.as_bytes()) {
-            Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
-            Err(e) => Err(RuntimeError::IllegalStateException {
-                message: format!("IOException: {}", e),
-            }
-            .into()),
-        }
+        // The iteration above re-entered Java (`hasNext`/`next`/`toString`), so
+        // the pinned `Path` is the only reference still safe to return.
+        let path_obj = ctx.read_native_pin(path_pin, path_obj);
+        let options = match (opts_obj, opts_pin) {
+            (Some(o), Some(h)) => Some(Value::Object(Some(ctx.read_native_pin(h, o)))),
+            _ => None,
+        };
+        ctx.unpin_native_roots(path_pin);
+        p57_files_write_bytes(ctx, path_obj, out.as_bytes(), options)
     }
     r.register(
         files_cls,
@@ -7842,23 +7845,38 @@ pub(crate) fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectR
     obj
 }
 
-/// Inspect a `Set<OpenOption>` or `OpenOption[]` for APPEND/CREATE-NEW.
+/// The `OpenOption`s the nio open paths act on, as scanned by
+/// [`fsp_scan_open_options`].
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct P57OpenFlags {
+    /// `StandardOpenOption.APPEND` — open at end-of-file instead of truncating.
+    pub append: bool,
+    /// `StandardOpenOption.CREATE_NEW` — fail if the file already exists.
+    pub create_new: bool,
+    /// `LinkOption.NOFOLLOW_LINKS`. It implements `OpenOption` as well as
+    /// `CopyOption`, so it is legal in every `open`/`newXStream` varargs list —
+    /// see [`p57_nofollow_reject`] for what it obliges us to do.
+    pub nofollow: bool,
+}
+
+/// Inspect a `Set<OpenOption>` or `OpenOption[]` for APPEND / CREATE_NEW /
+/// NOFOLLOW_LINKS.
 ///
 /// `Files.newOutputStream(path, opts...)` packages varargs as an OpenOption[]
 /// before dispatching to the provider; the provider's default impl converts
 /// the array to a `HashSet<OpenOption>` and then forwards to `newByteChannel`.
-/// We need to honour APPEND (open-for-append vs truncate-on-open) and
-/// CREATE_NEW (fail-if-exists, per spec) regardless of which container the
-/// caller passes us. CREATE/WRITE are implied for an output stream and need
-/// no flag.
+/// We need to honour APPEND (open-for-append vs truncate-on-open),
+/// CREATE_NEW (fail-if-exists, per spec) and NOFOLLOW_LINKS (refuse a symlink
+/// final component) regardless of which container the caller passes us.
+/// CREATE/WRITE are implied for an output stream and need no flag.
 pub(crate) fn fsp_scan_open_options(
     ctx: &mut dyn NativeContext,
     container: Option<Value>,
-) -> (bool /*append*/, bool /*create_new*/) {
-    let (mut append, mut create_new) = (false, false);
+) -> P57OpenFlags {
+    let mut flags = P57OpenFlags::default();
     let obj = match container {
         Some(Value::Object(Some(o))) => o,
-        _ => return (append, create_new),
+        _ => return flags,
     };
     // Try as array first: array_length returns 0 for non-array objects.
     let arr_len = ctx.array_length(obj);
@@ -7883,30 +7901,80 @@ pub(crate) fn fsp_scan_open_options(
             }
             if let Some(n) = name {
                 if n.eq_ignore_ascii_case("APPEND") {
-                    append = true;
+                    flags.append = true;
                 }
                 if n.eq_ignore_ascii_case("CREATE_NEW") {
-                    create_new = true;
+                    flags.create_new = true;
+                }
+                if n.eq_ignore_ascii_case("NOFOLLOW_LINKS") {
+                    flags.nofollow = true;
                 }
             }
         }
-        return (append, create_new);
+        return flags;
     }
     // Set: rely on toString() — `HashSet.toString()` yields `[APPEND, WRITE]`
     // etc. Substring match is robust enough and avoids invoking iterator().
+    // NB none of the three tokens is a substring of another StandardOpenOption
+    // name (in particular `TRUNCATE_EXISTING` does not contain `CREATE`), so
+    // the substring test cannot over-match.
     if let Ok(Some(Value::Object(Some(s)))) =
         ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[])
     {
         if let Some(n) = ctx.read_string(s) {
-            if n.to_ascii_uppercase().contains("APPEND") {
-                append = true;
-            }
-            if n.to_ascii_uppercase().contains("CREATE_NEW") {
-                create_new = true;
-            }
+            let n = n.to_ascii_uppercase();
+            flags.append = n.contains("APPEND");
+            flags.create_new = n.contains("CREATE_NEW");
+            flags.nofollow = n.contains("NOFOLLOW_LINKS");
         }
     }
-    (append, create_new)
+    flags
+}
+
+/// The message HotSpot puts on the `IOException` an `O_NOFOLLOW` open raises.
+///
+/// Verified against OpenJDK 21 on Linux: `UnixChannelFactory` special-cases
+/// `ELOOP` when `NOFOLLOW_LINKS` was requested and throws a **plain
+/// `java.io.IOException`** — not a `FileSystemException` — carrying the errno
+/// string with this suffix and *no* path prefix. Callers assert on the type
+/// (`assertThatIOException`), so the type is what matters; the text is here so
+/// a diagnostic log reads the same on both VMs.
+pub(crate) const P57_NOFOLLOW_ELOOP_MESSAGE: &str =
+    "Too many levels of symbolic links (NOFOLLOW_LINKS specified)";
+
+/// Enforce `LinkOption.NOFOLLOW_LINKS` on an open: refuse when the **final**
+/// component of `path` is itself a symbolic link.
+///
+/// The platform providers implement this by adding `O_NOFOLLOW` to the open
+/// flags, so the kernel fails the open with `ELOOP` *before* anything is
+/// created or truncated. That distinction is the whole point of the option:
+/// `ApplicationPid.write` uses it so a PID file that an attacker has replaced
+/// with a link cannot be used to write through to the link's target. Following
+/// the link "successfully" is exactly the outcome the caller asked us to
+/// prevent, and it is silent.
+///
+/// We approximate `O_NOFOLLOW` with an `lstat` (`symlink_metadata`, which does
+/// NOT resolve the final component) taken immediately before the open. Only the
+/// last component is inspected — `NOFOLLOW_LINKS` says nothing about symlinks
+/// higher up the path, and the JDK likewise happily writes to
+/// `<symlinked-dir>/file`.
+///
+/// Returns `Some(exception)` when the open must be refused, `None` when it may
+/// proceed. A path that does not exist at all is *not* refused here: an
+/// `O_NOFOLLOW|O_CREAT` open of a missing name succeeds, and only a **dangling
+/// symlink** — which `symlink_metadata` reports as a symlink even though
+/// `Path::exists()` (a `stat`) says the path is absent — still `ELOOP`s.
+pub(crate) fn p57_nofollow_reject(path: &str) -> Option<MethodCallFailed> {
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return None;
+    }
+    Some(
+        RuntimeError::IOException {
+            message: P57_NOFOLLOW_ELOOP_MESSAGE.to_string(),
+        }
+        .into(),
+    )
 }
 
 /// `Files.newInputStream` / `FileSystemProvider.newInputStream` — a **lazy**
@@ -7947,6 +8015,14 @@ pub(crate) fn fsp_new_input_stream(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(p57_no_such_file(ctx, &p)),
             Err(e) => Err(p57_io_error(&e)),
         };
+    }
+    // NOFOLLOW_LINKS is legal on the READ side too (`O_RDONLY|O_NOFOLLOW` still
+    // ELOOPs), and callers use it to be sure they read the file they named and
+    // not whatever a link now points at. Options sit one slot past the Path.
+    if fsp_scan_open_options(ctx, args.get(path_index + 1).copied()).nofollow {
+        if let Some(refused) = p57_nofollow_reject(&p) {
+            return Err(refused);
+        }
     }
     // GAP I2 — see `newFileChannel`. The check runs before the fd is reserved
     // and before `open`, so a refusal leaves nothing behind.
@@ -8038,18 +8114,18 @@ pub(crate) fn fsp_new_output_stream(
         }
         .into());
     }
-    let (append, create_new) = fsp_scan_open_options(ctx, args.get(2).copied());
+    let flags = fsp_scan_open_options(ctx, args.get(2).copied());
+    let (append, create_new) = (flags.append, flags.create_new);
+    // NOFOLLOW_LINKS must refuse a symlink final component BEFORE the open —
+    // otherwise we follow the link and truncate/overwrite its target, which is
+    // the precise outcome the option exists to prevent.
+    if flags.nofollow {
+        if let Some(refused) = p57_nofollow_reject(&p) {
+            return Err(refused);
+        }
+    }
     if create_new && std::path::Path::new(&p).exists() {
-        // CREATE_NEW + existing file ⇒ FileAlreadyExistsException
-        let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/FileAlreadyExistsException", 4);
-        // Pin across the create_string below — a moving young GC there would
-        // relocate the fresh exception (native stale-local family).
-        let exc_pin = ctx.pin_native_root(exc);
-        let file_str = ctx.create_string(&p);
-        let exc = ctx.read_native_pin(exc_pin, exc);
-        ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
-        ctx.unpin_native_roots(exc_pin);
-        return Err(MethodCallFailed::ExceptionThrown(exc));
+        return Err(p57_file_already_exists(ctx, &p));
     }
     // GAP I2 — see `newFileChannel`.
     let fd = match crate::capability_gate::open_write_gated(&*ctx, &p, append) {
@@ -8093,6 +8169,137 @@ pub(crate) fn fsp_new_output_stream(
     ctx.set_field(fos, 0, Value::Object(Some(fd_obj)));
     ctx.unpin_native_roots(fos_pin);
     Ok(Some(Value::Object(Some(fos))))
+}
+
+/// `Files.write(Path, byte[], OpenOption...)`.
+///
+/// Registered twice (here and in `register_p71_files_bridge`) for the same
+/// (class, name, descriptor); registration is last-writer-wins, so both point
+/// at this one function and it no longer matters which runs last.
+pub(crate) fn files_write_bytes_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let path_obj = obj_arg(args, 0)?;
+    let arr = obj_arg(args, 1)?;
+    // Reading a byte[] out element-by-element does not allocate, so nothing
+    // moves between here and `p57_files_write_bytes` (which pins for itself).
+    let len = ctx.array_length(arr);
+    let bytes: Vec<u8> = (0..len)
+        .map(|i| match ctx.get_array_element(arr, i) {
+            Value::Int(v) => v as u8,
+            _ => 0,
+        })
+        .collect();
+    p57_files_write_bytes(ctx, path_obj, &bytes, args.get(2).copied())
+}
+
+/// `Files.writeString(Path, CharSequence, OpenOption...)`.
+///
+/// Split out of the registration closure because the non-`String`
+/// `CharSequence` case needs a re-entrant `toString()`, and everything held
+/// across it has to be pinned.
+pub(crate) fn files_write_string_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let path_obj = obj_arg(args, 0)?;
+    let content_ref = obj_arg(args, 1)?;
+    let options = args.get(2).copied();
+    // Fast path: a real String needs no re-entrant call, so nothing can move.
+    if let Some(content) = ctx.read_string(content_ref) {
+        return p57_files_write_bytes(ctx, path_obj, content.as_bytes(), options);
+    }
+    // A `CharSequence` need not be a `String` — `StringBuilder` and
+    // `CharBuffer` are the common other cases, and this used to
+    // `unwrap_or_default()` them into an EMPTY file with no error. `toString()`
+    // re-enters and can move both the `Path` we return and the `OpenOption[]`
+    // we still have to scan, so pin the pair across it.
+    let opts_obj = match options {
+        Some(Value::Object(Some(o))) => Some(o),
+        _ => None,
+    };
+    let path_pin = ctx.pin_native_root(path_obj);
+    let opts_pin = opts_obj.map(|o| ctx.pin_native_root(o));
+    let content = match ctx.invoke_virtual(content_ref, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let path_obj = ctx.read_native_pin(path_pin, path_obj);
+    let options = match (opts_obj, opts_pin) {
+        (Some(o), Some(h)) => Some(Value::Object(Some(ctx.read_native_pin(h, o)))),
+        _ => options,
+    };
+    ctx.unpin_native_roots(path_pin);
+    p57_files_write_bytes(ctx, path_obj, content.as_bytes(), options)
+}
+
+/// Shared back end for the `Files.write` / `Files.writeString` statics.
+///
+/// Each of those was `std::fs::write(&p, bytes)`, which
+///
+/// * ignored **every** `OpenOption` — `APPEND` truncated instead of appending,
+///   `CREATE_NEW` silently overwrote, and `NOFOLLOW_LINKS` wrote straight
+///   through a symbolic link to its target;
+/// * bypassed the capability gate (GAP I2), leaving the whole `Files.write`
+///   surface invisible to any installed path policy; and
+/// * reported failure as `IllegalStateException`, which is **not** an
+///   `IOException` — so the `catch (IOException)` that callers of a method
+///   declared `throws IOException` write could never match it, and neither
+///   could AssertJ's `assertThatIOException`.
+///
+/// Routing through the same gated open `newOutputStream` already used fixes all
+/// three at once. See
+/// docs/known-issues/springboot/nio-write-ignores-nofollow-links-symlink-20260804.md.
+pub(crate) fn p57_files_write_bytes(
+    ctx: &mut dyn NativeContext,
+    path_obj: ObjectRef,
+    bytes: &[u8],
+    options: Option<Value>,
+) -> MethodCallResult {
+    let p = p57_read_path(ctx, path_obj);
+    // The option scan can fall back to `toString()`, which allocates and may
+    // therefore move `path_obj` (this method returns it).
+    let path_pin = ctx.pin_native_root(path_obj);
+    let flags = fsp_scan_open_options(ctx, options);
+    let path_obj = ctx.read_native_pin(path_pin, path_obj);
+    ctx.unpin_native_roots(path_pin);
+
+    if flags.nofollow {
+        if let Some(refused) = p57_nofollow_reject(&p) {
+            return Err(refused);
+        }
+    }
+    if flags.create_new && std::path::Path::new(&p).exists() {
+        return Err(p57_file_already_exists(ctx, &p));
+    }
+    // GAP I2 — see `newFileChannel`.
+    let fd = match crate::capability_gate::open_write_gated(&*ctx, &p, flags.append) {
+        Ok(fd) => fd,
+        // A refusal is a `SecurityException`, not one of the typed
+        // `java.nio.file` I/O exceptions.
+        Err(cratonvm_native_api::fd_table::FdCapabilityError::Denied(denied)) => {
+            return Err(denied.into())
+        }
+        Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
+            return Err(match e.kind() {
+                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p),
+                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p),
+                _ => p57_io_error(&e),
+            })
+        }
+    };
+    let mut outcome = ctx.fd_table().write_bytes(fd, bytes);
+    if outcome.is_ok() {
+        outcome = ctx.fd_table().flush(fd);
+    }
+    // Close regardless: `Files.write` is a complete open-write-close, and a
+    // leaked fd here would strand the file handle for the rest of the run.
+    let _ = ctx.fd_table().close(fd);
+    match outcome {
+        Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
+        Err(e) => Err(p57_io_error(&e)),
+    }
 }
 
 /// Build a *typed* `java.nio.file.NoSuchFileException` for `path` and return it
@@ -16710,25 +16917,7 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
         f,
         "write",
         "(Ljava/nio/file/Path;[B[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let arr = obj_arg(args, 1)?;
-            let p = p57_read_path(ctx, path_obj);
-            let len = ctx.array_length(arr);
-            let bytes: Vec<u8> = (0..len)
-                .map(|i| match ctx.get_array_element(arr, i) {
-                    Value::Int(v) => v as u8,
-                    _ => 0,
-                })
-                .collect();
-            match std::fs::write(&p, &bytes) {
-                Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }
-                .into()),
-            }
-        },
+        files_write_bytes_impl,
     );
     // Both `Files.copy` stream overloads returned 0 without moving a single
     // byte. The caller was told "copied 0 bytes" — a legal-looking answer for

@@ -12066,16 +12066,34 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    r.register(
-        sf,
-        "getDefault",
-        "()Ljavax/net/SocketFactory;",
-        |ctx, _args| {
-            let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
-            ctx.set_field(f, 0, Value::Object(None));
-            Ok(Some(Value::Object(Some(f))))
-        },
-    );
+    // `SSLSocketFactory.getDefault()` is deliberately NOT registered here.
+    //
+    // REGRESSION 2026-08-04: this spot carried a second registration of the
+    // exact triple (`javax/net/ssl/SSLSocketFactory`, `getDefault`,
+    // `()Ljavax/net/SocketFactory;`) that `phases_late::ssl_security`'s
+    // `register_p68_ssl` already owns. `register()` is documented
+    // last-registration-wins on the exact triple (see
+    // `NativeMethodRegistry::register`), and `register_p68_ssl` runs FIRST in
+    // `register_essential_natives_with_shims` — so this later, stale copy,
+    // which set field 0 to `Value::Object(None)`, silently overwrote the
+    // fixed one and every caller got a factory with no owning `SSLContext`.
+    // The layered `createSocket(Socket,String,int,boolean)` overload then
+    // threw `IllegalStateException: SSLSocketFactory has no owning
+    // SSLContext` before any network I/O, which is how a fix that "looked
+    // present and correct" in `ssl_security.rs` had no runtime effect: it
+    // took out every Spring Boot test going through
+    // `ModifiedClassPathClassLoader` (Aether/Apache HttpClient resolving
+    // `@ClassPathOverrides` coordinates against Maven Central over HTTPS).
+    //
+    // The sibling `SSLContext.getDefault()` duplicate in this same function
+    // IS intentional and documented (see `register_re6_ssl_context`) — that
+    // one deliberately relies on the ordering to win. This one never did; it
+    // was simply never updated when the 2026-07-23 fix landed. Same bug shape
+    // as the `TimeZone.getDefault()` duplicate removed 2026-08-03 (see
+    // `native-builtins/src/lib.rs`). Guarded by
+    // `native-builtins/tests/registry_contracts.rs::
+    // ssl_default_factory_and_context_have_the_documented_single_owner`.
+    // See `docs/internal/fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 }
 
 // ===========================================================================
