@@ -3462,6 +3462,9 @@ fn reloc_emit_enabled() -> bool {
         use crate::x64::isel::Rule;
 
         let plan = self.mir.as_ref()?;
+        if std::env::var_os("MIRDBG").is_some() {
+            eprintln!("[mirdbg] lookup n{id} blk={block_idx} -> {:?}", plan.tile_of.get(id as usize));
+        }
         let (tb, ti) = (*plan.tile_of.get(id as usize)?)?;
         if usize::try_from(tb).ok()? != block_idx {
             return None;
@@ -3471,6 +3474,9 @@ fn reloc_emit_enabled() -> bool {
             .get(usize::try_from(tb).ok()?)?
             .tiles
             .get(usize::try_from(ti).ok()?)?;
+        if std::env::var_os("MIRDBG").is_some() {
+            eprintln!("[mirdbg] n{id} root={} rule={:?} covered={:?} insts={:?}", tile.root, tile.rule, tile.covered, tile.insts);
+        }
         if tile.root != id || tile.rule != Rule::AluReg {
             return None;
         }
