@@ -121,9 +121,32 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     And **A/B the same workload against the pre-fix binary**; an aggregate and a
     single run are not comparable numbers, however much they look like a
     before/after.
-  * **`Properties` writing a `Float` over a reference slot** is in the group
-    item 1 calls the highest-risk in `native-collections`, and it is on the
-    bootstrap path.
+  * **`Properties` — diagnosed 2026-08-04, not yet fixed, and the fix shape is
+    already in the same file.** The frames put all four writes at
+    `new Properties()`, and the values name themselves: slot 5 `Int(0)`, slot 6
+    `Int(12)`, slot 7 `Float(0.75)` — `count`, `threshold` and `loadFactor`,
+    i.e. `native_map_init` writing a `HashMap`-shaped layout by raw slot index
+    onto a real `java.util.Properties`, where those slots are `defaults`/`map`
+    references and slot 2 is an `int`. It is in the group item 1 calls the
+    highest-risk in `native-collections`, and it is on the bootstrap path.
+
+    `native-collections/src/lib.rs` already demonstrates the correct pattern
+    twice, so this does not need inventing:
+    `native_props_init_defaults` resolves `defaults` with
+    `ctx.resolve_field_index("java/util/Properties", "defaults")` and writes
+    *both* the model slot and the real one, with a comment explaining that on a
+    real layout the inherited `Hashtable` fields push `defaults` onto
+    `loadFactor`; and `try_set_jdk_map_field(ctx, this, "loadFactor", …)` is the
+    by-name setter. `native_map_init` is the one still writing raw indices.
+
+    Not attempted here because `native_map_init` is shared by every map type
+    and is hot, so converting it is its own change with its own A/B — not
+    something to bolt onto a `VarHandle` fix. Note also that
+    `native_props_init` writes `Value::Object(None)` to `PROPS_FIELD_DEFAULTS`
+    (slot 3 = `loadFactor` on the real layout) and **the hunter does not report
+    it**: `overlay_write_is_destructive` only flags `Object(Some(_))` over a
+    primitive, so a null write is invisible. The census is a floor for that
+    reason too.
   * **Both built-in class loaders take `Int` writes over four reference slots
     each.** Whatever those slots hold on the real classes, they are not integers.
   * `URI` and `Properties` each mismatch in both directions, which rules out a
