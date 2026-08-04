@@ -5,7 +5,7 @@
 //! NOT-YET-LOADED class must still compile, and the compiled site must resolve
 //! that class correctly the first time the cold branch is finally taken.
 //!
-//! Before the fix (`docs/internal/jit-compile-bail-unresolved-new-cold-class.md`)
+//! Before the fix (`jit-compile-bail-unresolved-new-cold-class.md`)
 //! the compile-time resolver returned "unresolvable" for such a site, which
 //! bailed the WHOLE compile; after `MAX_TIER_FAIL_RETRIES` the method was never
 //! retried and interpreted forever. json-smart's `JSONParserBase.readMain`

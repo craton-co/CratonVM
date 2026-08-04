@@ -1,7 +1,7 @@
 # WebSocket close-delay harness (`wsdead-*`)
 
 The scripts behind
-[`docs/internal/fixed-suite-bugs/tomcat/wsremoteendpoint-server-close-never-completes-FIXED.md`](../docs/internal/fixed-suite-bugs/tomcat/wsremoteendpoint-server-close-never-completes-FIXED.md)
+`fixed-suite-bugs/tomcat/wsremoteendpoint-server-close-never-completes-FIXED.md`
 and
 [`docs/known-issues/tomcat/websocket-async-send-interframe-latency-20260801.md`](../docs/known-issues/tomcat/websocket-async-send-interframe-latency-20260801.md).
 

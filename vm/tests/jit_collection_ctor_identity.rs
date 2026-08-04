@@ -23,7 +23,7 @@
 //! count, different iteration order — so a JIT-created map and an
 //! interpreter-created map holding identical entries iterated differently.
 //! Found as a json-smart parse -> serialize -> re-parse round-trip mismatch
-//! (`docs/internal/jsonsmart-parser-jit-retired-20260727.md`), which only
+//! (`jsonsmart-parser-jit-retired-20260727.md`), which only
 //! misfired in the narrow window where one map predated the tier-up of
 //! `JSONParserBase.readObject` and the other followed it.
 //!

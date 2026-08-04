@@ -4725,7 +4725,7 @@ fn build_factory_bean_subclass_wrapper(
             };
             // Define into the CONCRETE class's own loader, like `cce_enhance`
             // above (see its `super_loader_id` comment and
-            // `docs/internal/configproxy-cglib-loaderid-fixed-20260727.md`):
+            // `configproxy-cglib-loaderid-fixed-20260727.md`):
             // a generated subclass has to sit in its superclass's runtime
             // package `(defining loader, package name)` or `same_runtime_package`
             // refuses every package-private override it declares. Hardcoding

@@ -22,7 +22,7 @@ pub const HEADER_SIZE: usize = 32;
 // emitted code addresses backwards from the object base. Convert the affected
 // emitters to disp32 before allowing HEADER_SIZE to grow beyond this limit;
 // the authoritative site inventory is
-// `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §6.2
+// `arch-2026-07-26/x64-flag-skew-and-contracts.md` §6.2
 // (the older "jit/src/x64.rs:6690-6813" citation was stale — that range holds
 // loop/BCE analysis, not an emitter).
 const _: () = assert!(
@@ -64,7 +64,7 @@ const _: () = assert!(
 // MARK_INFLATED != 0` test would have aliased FORWARDED onto INFLATED and
 // handed a relocation address to `inflated_monitor()` as a `Monitor*`. Every
 // consumer in `vm/src/threading/monitor.rs` was audited for this before the
-// state was claimed; see `docs/internal/arch-2026-07-26/header-shrink.md` §4.
+// state was claimed; see `arch-2026-07-26/header-shrink.md` §4.
 
 /// Mark word state: no lock held. Identity hash code may live in upper bits
 /// (caller-managed).
@@ -79,7 +79,7 @@ pub const MARK_INFLATED: u64 = 0b10;
 /// **Not yet produced by anything.** This is the encoding half of the
 /// `ObjectHeader` 32→24 shrink; the `forwarding_ptr` field is still the live
 /// mechanism and remains the single source of truth until the consumers listed
-/// in `docs/internal/arch-2026-07-26/header-shrink.md` §6 are migrated in one
+/// in `arch-2026-07-26/header-shrink.md` §6 are migrated in one
 /// atomic change. It is landed now, with round-trip coverage, so the second
 /// pass adopts a tested encoding instead of inventing one.
 pub const MARK_FORWARDED: u64 = 0b11;
@@ -223,12 +223,12 @@ pub const FORWARDING_PTR_OFFSET: usize = 16;
 /// Byte offset of the `identity_hash_code` field within [`ObjectHeader`].
 ///
 /// Added per request R3 of
-/// `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §7: this was
+/// `arch-2026-07-26/x64-flag-skew-and-contracts.md` §7: this was
 /// the only header field without a named constant, and it is baked as a literal
 /// in at least two places outside `types` (`jit/src/x64.rs` derived its own via
 /// `offset_of!` to avoid one; `vm/src/jit/helpers.rs` still writes a bare
 /// `raw_ptr.add(8)`). Those should re-export this constant — see
-/// `docs/internal/arch-2026-07-26/header-shrink.md` §6.
+/// `arch-2026-07-26/header-shrink.md` §6.
 pub const IDENTITY_HASH_CODE_OFFSET: usize = 8;
 
 // Compile-time check that the offset is correct.
@@ -616,7 +616,7 @@ impl ObjectHeader {
     /// strong `Arc<Monitor>` reference the mark word owns to the destination
     /// copy; it must not be released against the source afterwards, or the
     /// live destination is left with a dangling `Monitor*`. See
-    /// `docs/internal/arch-2026-07-26/header-shrink.md` §4.
+    /// `arch-2026-07-26/header-shrink.md` §4.
     #[inline(always)]
     pub fn make_forwarded(target: usize) -> u64 {
         assert!(
@@ -1214,7 +1214,7 @@ mod tests {
     // ---------------------------------------------------------------------
     //  Header-shrink contracts (arch-2026-07-26, slug `header-shrink`)
     //
-    //  See docs/internal/arch-2026-07-26/header-shrink.md. These pin the
+    //  See arch-2026-07-26/header-shrink.md. These pin the
     //  layout arithmetic the shrink depends on and the mark-word encoding it
     //  will adopt, so a wrong offset trips a test instead of miscomputing a
     //  heap address.

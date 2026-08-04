@@ -407,7 +407,7 @@ pub struct LedgerEntry {
     pub status: LedgerStatus,
     /// ISO-8601 timestamp the divergence was first seen.
     pub first_seen: String,
-    /// Cross-link to the `docs/internal/*` / `MEMORY.md` note, if any.
+    /// Cross-link to the `*` / `MEMORY.md` note, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linked_doc: Option<String>,
 

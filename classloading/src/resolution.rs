@@ -580,7 +580,7 @@ impl ResolutionCache {
     /// entry the first did not. The "sees through proxy/intermediate classes"
     /// behaviour described above therefore does not occur for methods. Fixing
     /// it requires a change in the producer (not this crate); see
-    /// `docs/internal/arch-2026-07-26/classloading-verify-and-resolve.md`,
+    /// `arch-2026-07-26/classloading-verify-and-resolve.md`,
     /// "cross-owner requests". Left as-is deliberately rather than papered
     /// over here, because a same-crate change cannot make the field carry
     /// information the producer never wrote.
@@ -1314,7 +1314,7 @@ pub enum CachedInvokeTarget<JitMethod = ()> {
     /// Interpreter intrinsic: a hot JDK method resolved once at IC-fill time
     /// to a direct intrinsic handler. Steady-state dispatch pays no native
     /// registry probe, no class-manager `RwLock`, and no descriptor parse.
-    /// See `docs/feature_roadmap_interpreter_intrinsic_table.md`.
+    /// See `gaps/feature_roadmap_interpreter_intrinsic_table.md`.
     Intrinsic {
         /// The resolved intrinsic identity — kept for the hit counter, the
         /// on/off debug flag, and `Debug` formatting.

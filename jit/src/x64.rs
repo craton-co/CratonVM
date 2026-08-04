@@ -82,7 +82,7 @@ pub use cpu_features::{
 /// than written as a literal `8`, so the planned 32→16-byte `ObjectHeader`
 /// shrink (fold `forwarding_ptr` + `identity_hash_code` into the mark word)
 /// cannot silently leave this emission pointing at the wrong dword. See
-/// `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
+/// `arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
 const IDENTITY_HASH_CODE_OFFSET: usize =
     std::mem::offset_of!(cratonvm_types::ObjectHeader, identity_hash_code);
 
@@ -706,7 +706,7 @@ struct Compiler {
     /// finds the value), but it silently defeated the OSR-exit/invokedynamic
     /// uncommon-trap deopt snapshot's operand-stack decoding at any later
     /// safepoint that read the slot — see
-    /// `docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`.
+    /// `fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`.
     /// Recording the real marks here lets the reconstruction restore them
     /// instead of guessing `false`.
     branch_target_stack_oop_marks: FxHashMap<usize, Vec<bool>>,
@@ -833,7 +833,7 @@ struct Compiler {
     /// for PCs the forward dataflow never reached (e.g. exception-handler-only
     /// entries), where no precise local marking is emitted and the GC falls
     /// back to the conservative frame sweep. See
-    /// `docs/precise-jit-stack-maps-design.md` (Stage 2).
+    /// `fixed-suite-bugs/app-jvm-bugs/precise-jit-stack-maps-design.md` (Stage 2).
     local_oop_masks: Vec<u64>,
     /// Stage 2 — companion to `local_oop_masks`: whether the forward local-oop
     /// dataflow reached each PC. Only `reached` PCs get precise local entries.
@@ -862,7 +862,7 @@ struct Compiler {
     /// wholesale, and the safe-reject fallback re-runs the interpreter from
     /// the pre-OSR-entry frame, silently re-executing every loop iteration
     /// the OSR-compiled code already committed
-    /// (`docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`).
+    /// (`fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`).
     local_liveness: Vec<u64>,
     /// Parallel coverage bitmap for [`Self::local_liveness`]: `false` at a pc
     /// no basic block covers, where the liveness answer is the `0` default
@@ -1862,7 +1862,7 @@ impl Compiler {
         // work — Hibernate `ZonedDateTimeTest` / `OffsetDateTimeTest` (1–3 s,
         // reproduced on a pristine dev build) and the Windows
         // `DateSymbolsProbe` repro. See
-        // `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
+        // `jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
         //
         // Keyed on its own opt-out alone, the DEFAULT path is byte-identical
         // (`precise_reg_spill_disabled()` is opt-in and unset), and the
@@ -1958,7 +1958,7 @@ impl Compiler {
         // themselves: `pop_stack` reclaims them but the popped `StackSlot::Frame`s
         // stay live until `emit_stack_arg_setup` marshals them, so an aliased
         // reservation reverses the arguments into themselves and the callee gets
-        // arg0 in every slot (docs/known-issues/jit-direct-call-arg1-clobbered-by-arg0.md).
+        // arg0 in every slot (fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md).
         //
         // The copy needs one slot per argument, and a call site's arguments are
         // themselves on the operand stack, so `max_stack` slots of headroom is
@@ -2617,7 +2617,7 @@ impl Compiler {
     /// `pc + 3` and refused five ordinary Spring/bytebuddy methods this way
     /// (`ResolvableType.isAssignableFrom`, `TypeMappedAnnotations.get`, …),
     /// blaming their bytecode. See
-    /// `docs/internal/jit-tailcall-swallows-shared-return-FIXED-20260803.md`.
+    /// `jit-tailcall-swallows-shared-return-FIXED-20260803.md`.
     ///
     /// So when this fires, suspect a fusion before you suspect the classfile:
     /// `note_unresolved_branch_target` records the target and the nearest PC
@@ -2712,7 +2712,7 @@ mod tests;
 // Flag-skew and header-offset contracts
 // ---------------------------------------------------------------------------
 //
-// Companion doc: `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md`.
+// Companion doc: `arch-2026-07-26/x64-flag-skew-and-contracts.md`.
 //
 // These tests defend two properties that no build error would catch:
 //

@@ -50,7 +50,7 @@ workflow is advisory; do not add to that list to make a branch green.
 **Steps 1 and 4 are not green today.** `cargo fmt --all --check` reports over a
 thousand diffs tree-wide, and `cargo test --workspace` has a residual failure
 set that predates any given change. Both are tracked in
-[`docs/internal/jit-regressions-hidden-by-unbuildable-test-targets-20260730.md`](docs/internal/jit-regressions-hidden-by-unbuildable-test-targets-20260730.md).
+`jit-regressions-hidden-by-unbuildable-test-targets-20260730.md`.
 Compare your run against that list rather than against zero, and note in the PR
 which entries you saw — a *new* name in the output is the signal.
 

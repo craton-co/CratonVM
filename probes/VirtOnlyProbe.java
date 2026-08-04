@@ -75,7 +75,7 @@ public final class VirtOnlyProbe {
         // Both routes were dead until 2026-08-03: every OSR entry was refused
         // `osr-entry-unresumable-exit`, so at 200 every rung silently measured
         // the INTERPRETER at ~90 ns/op, identically under `--nojit`. See
-        // docs/internal/osr-entry-unresumable-exit-FIXED-20260803.md. The cheap
+        // osr-entry-unresumable-exit-FIXED-20260803.md. The cheap
         // check, either way: the control rung must land near HotSpot's ~1
         // ns/op, not near 90.
         for (int r = 0; r < 1200; r++) {

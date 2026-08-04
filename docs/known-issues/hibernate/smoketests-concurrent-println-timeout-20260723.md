@@ -222,7 +222,7 @@ do not read it as a CHM cost. The allocation rows are clean.
   historical run worse, and its 2026-07-08 justification was a correctness
   guard, not a throughput one. HIB-TEMPORAL.1 was subsequently fixed and
   removed on 2026-07-29; see
-  `docs/internal/jit-bans/hib-temporal-1-retired-20260729.md`.
+  `jit-bans/hib-temporal-1-retired-20260729.md`.
 - `CRATONVM_JIT_VIRTUAL_TIERUP` — no longer a lever.
 
 ## Prior investigation

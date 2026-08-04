@@ -374,7 +374,7 @@ loaders, one shared interface name, a method whose descriptor mentions it.
 
 ## Related
 
-* `docs/internal/loader-identity.md` — per-file tally of remaining
+* `loader-identity.md` — per-file tally of remaining
   `find_class_by_name` call sites.
 * `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`
 * `docs/known-issues/c2/vm-process-global-state.md` — the `vm/src/` half of

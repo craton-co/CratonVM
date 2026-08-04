@@ -515,7 +515,7 @@ pub(super) fn is_global_resolution_namespace(name: &str) -> bool {
 /// unconditionally, without touching the global `CRATONVM_LOADER_AWARE_
 /// RESOLUTION` gate's default (which stays off pending the full Tomcat /
 /// Hibernate / WildFly custom-loader soak it was written for — see
-/// `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`).
+/// `fixed-suite-bugs/hibernate/hib-proxyclassreuse-loader-blind-class-resolution-FIXED.md`).
 ///
 /// Rationale (context.groovy bug cluster): `GroovyShell.evaluate` compiles
 /// each script through its own fresh `GroovyClassLoader$InnerLoader`

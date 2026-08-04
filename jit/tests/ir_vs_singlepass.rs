@@ -4544,7 +4544,7 @@ fn try_catch_nonparam_handler_local_stays_single_pass() {
 
 // ── COV-02: integral / reference array element access, arraylength, dup_x1 ──
 //
-// `docs/known-issues/c2/cov-02-array-element-access.md`. Before this lane
+// `docs/known-issues/c2/archive/cov-02-array-element-access.md`. Before this lane
 // `IrBuilder::build` had arms for `faload`/`daload`/`fastore`/`dastore` and for
 // no integral or reference array access at all — the arms an FP kernel needs,
 // not the arms Java uses. These cases are the differential the doc asks for:
@@ -5910,7 +5910,7 @@ fn wide_statics_stay_on_single_pass_with_their_value_tier_off() {
 // ---------------------------------------------------------------------------
 // cov-04 — the invoke arms: a real `<init>` CALL, and the elision that outranks it
 //
-// `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`. The census on the three
+// `cov-04-the-invoke-arms-RETIRED-20260803.md`. The census on the three
 // Spring Boot workloads found that EVERY refusal in the `0xb7` arm was an
 // `<init>` — 29 a `super(...)`/`this(...)` chain call in a compiled
 // constructor, 23 a `new X(args)` site — and none was a non-`<init>`
@@ -6105,7 +6105,7 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
     // `CRATONVM_DBG_SCALAR_NEW=1` reports `scalar-replaced 1/1` for the elidable
     // arm, so escape analysis OFFERS the replacement and the emitted body
     // allocates anyway. The offer and the emitted code disagree; see the
-    // residual in `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`.
+    // residual in `cov-04-the-invoke-arms-RETIRED-20260803.md`.
     //
     // If this assertion ever fails because arm 1's count went to ZERO, that is
     // an improvement, not a regression: change it to 0 and delete that residual.
@@ -6355,7 +6355,7 @@ fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
 // ---------------------------------------------------------------------------
 // cov-05 increment 1 — `instanceof` (0xc1) against an already-loaded target
 //
-// `docs/known-issues/c2/cov-05-checkcast-and-instanceof.md`. The largest
+// `cov-05-checkcast-and-instanceof-RETIRED-20260804.md`. The largest
 // single whole-method refusal in the survey (306 events, more than every
 // opcode gap combined). This lane's whole premise is "give the IR tier the
 // test the other backend already performs" — `Op::InstanceOf` lowers to a
@@ -6786,7 +6786,7 @@ fn ir_vs_singlepass_mixed_checkcast_and_instanceof_in_one_method() {
 
 // ── cov-07: athrow ────────────────────────────────────────────────────────
 //
-// `docs/known-issues/c2/cov-07-athrow.md`. Before this lane, `scan.has_athrow`
+// `cov-07-athrow-RETIRED-20260804.md`. Before this lane, `scan.has_athrow`
 // refused every method containing an `athrow` (0xbf) from the optimizing
 // pipeline outright — the blanket exclusion this lane removes. `Op::Throw`
 // reuses the exact `jit_throw_exception(exc_ptr, bci) -> i64::MIN` call and

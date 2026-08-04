@@ -2034,7 +2034,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // runs real bytecode and NPEs in `reconcileState` on `root.state`. Gate
     // behind synthetic-jdk only so real Phaser bytecode runs in real-JDK mode
     // (same fix pattern as register_blocking_queue_natives above) —
-    // docs/gaps/gap-phaser-real-bytecode-state.md.
+    // gaps/gap-phaser-real-bytecode-state.md.
     #[cfg(feature = "synthetic-jdk")]
     register_phaser_natives(registry);
     register_priority_blocking_queue_natives(registry);
@@ -2048,7 +2048,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // synthetic-jdk only so the self-contained real STPE bytecode runs in
     // real-JDK mode (same fix pattern as register_blocking_queue_natives /
     // register_phaser_natives above). See
-    // docs/known-issues/tomcat-suite-bugs/11-stpe-mainlock-npe-teardown-regression.md.
+    // fixed-suite-bugs/tomcat/11-stpe-mainlock-npe-teardown-regression.md.
     #[cfg(feature = "synthetic-jdk")]
     register_executors_scheduled_natives(registry);
     register_concurrent_completeness_natives(registry);
@@ -3373,7 +3373,7 @@ fn al_ensure_capacity(
     // `stream()`. Every caller of this function hits the exact same hazard on
     // `this` after the call returns (`al_set_size` etc.), so this is `add`/
     // `add(int,Object)`/`addAll`'s shared, hottest allocation site. See
-    // docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
+    // fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md.
     let this_pin = ctx.pin_native_root(this);
     let old_buf_pin = data.map(|d| ctx.pin_native_root(d)).unwrap_or(usize::MAX);
     let new_buf = alloc_ref_array(ctx, new_cap);
@@ -5371,7 +5371,7 @@ fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         // live via CRATONVM_DBG_STALE_OBJREF during WildFly
         // parallel-extension-add (same "Family 1" pattern as
         // native_hashmap_get_exact's `map_keys_equal` fix -- see
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
         let d_pin = ctx.pin_native_root(d);
         for i in 0..size {
             let d_cur = ctx.read_native_pin(d_pin, d);
@@ -7186,7 +7186,7 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // dropping that entry silently empties a live `HashMap<Integer,?>`: `get`
     // returns null, `size()` returns 0, `keySet()` iterates nothing, and no
     // exception is raised anywhere. That is the
-    // `docs/internal/fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`
+    // `fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`
     // failure: Hibernate's `ParameterMetadataImpl.queryParametersByPosition` is
     // exactly this shape (fresh exact-class `HashMap`, boxed-Integer keys, long
     // lived), and losing it reports `No parameter labelled '?1' in query with
@@ -8117,7 +8117,7 @@ fn native_map_put_evict_pinned(
     // stays valid for this whole function's lifetime, so re-read through
     // it here -- before it is used to seed the new `this_pin` below -- to
     // guarantee `this` is current regardless of how many GCs the walk
-    // triggered. See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // triggered. See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     this = ctx.read_native_pin(put_pin_base, this);
 
     // Key not found — append at the TAIL of the chain. This matches HotSpot
@@ -8304,7 +8304,7 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // same plain-HashMap bucket code) via
     // native_chm_compute_if_present -> native_map_compute_if_present ->
     // native_map_get -> native_hashmap_get_exact. See
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key_val);
     let key_for_hash = read_pinned_elem(ctx, key_pin, key_val);
@@ -8703,8 +8703,8 @@ fn native_map_remove_pinned(
         // leaves the plain Rust-local `head`/`buckets` dangling -- observed
         // as `get_field`/`set_field` OOB drops on a genuine, unrelated,
         // freshly-allocated `java/lang/Object` now sitting at the stale
-        // address (docs/known-issues/tomcat-08-07/
-        // dohead-post-fix-sporadic-residuals.md's header-count residual).
+        // address (fixed-suite-bugs/tomcat/
+        // dohead-post-fix-sporadic-residuals-FIXED.md's header-count residual).
         let head_pin = ctx.pin_native_root(head);
         let head_matches =
             node_matches_inner(ctx, head_pin, head, is_null_key, hash, key_pin, key_val, identity_mode)?;
@@ -15750,7 +15750,7 @@ fn stream_make_lazy_derived(
     // exactly the "cursor" Iterator bug (`next()` returns `this`; real
     // per-element consumption happens inside the mapper/filter/etc that was
     // about to be appended to the chain) documented in
-    // docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+    // fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
     // The actual drive now happens inline, one element at a time through the
     // FULL chain, the first time a terminal genuinely needs concrete
     // elements (`stream_pull_internal` / `stream_pull_synthetic_downstream`).
@@ -16074,7 +16074,7 @@ fn stream_pull_internal(
         // through `chain`, one `tryAdvance` at a time -- NOT via
         // `stream_source_elems` (which would fully drain the raw source with
         // a dumb append-only collector BEFORE any op in `chain` ever runs).
-        // See docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+        // See fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
         if let Some(spl) = stream_lazy_spliterator(ctx, stream) {
             let mut emit_stopped = false;
             {
@@ -16402,7 +16402,7 @@ where
 // state change during that disconnected raw drain, so it never returns
 // `false`, and the drain runs until `drain_spliterator_to_array`'s
 // 1,000,000-iteration safety cap. See
-// docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+// fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
 //
 // `drain_spliterator_inline` below fixes this by driving `tryAdvance` itself
 // and running EACH element through the chain from inside the reentrant
@@ -16966,7 +16966,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     // `cratonvm/internal/StreamChainCollector` consumer used by
     // `drain_spliterator_inline` to drive a lazy spliterator's elements
     // straight through their downstream op-chain, one `tryAdvance` at a
-    // time. See docs/known-issues/keycloak/stream-eager-drain-inline-fix-20260715.md.
+    // time. See fixed-suite-bugs/stream-eager-drain-inline-fix-20260715-FIXED.md.
     r.register(
         STREAM_CHAIN_COLLECTOR_CLASS,
         "accept",
@@ -17853,7 +17853,7 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // resync and can move `this` again via its own allocations. Confirmed
     // live via CRATONVM_DBG_STALE_OBJREF under concurrent stream map/flatMap
     // stress at -Xmx32m; see
-    // docs/known-issues/stream-arraylist-gc-pressure-heap-corruption.md.
+    // fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md.
     let this_pin = ctx.pin_native_root(this);
     let this = ctx.read_native_pin(this_pin, this);
     let this = resync_values_view(ctx, this);
@@ -17977,7 +17977,7 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// incorrectly-forwarded native root slipped through a moving-GC window — the
 /// exact failure shape suspected (never confirmed) behind the intermittent
 /// `ConfigurationTest::testDatabaseProperties` `ClassCastException`, see
-/// docs/internal/fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md
+/// fixed-suite-bugs/keycloak/keycloak-quarkus-runtime-config-resolution-mismatches.md
 /// ("Residual" section). That race stopped reproducing before this canary could
 /// be validated against it; kept as a near-zero-overhead tripwire (one class-id
 /// comparison per element; no allocation/formatting unless it actually fires,
@@ -18612,7 +18612,7 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             // `spl`/`consumer` and re-read it before that final use. Confirmed
             // live via CRATONVM_DBG_STALE_OBJREF during WildFly parallel-boot
             // ServiceLoader stream draining -- see
-            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
             let this_pin = ctx.pin_native_root(this);
             let spl_pin = ctx.pin_native_root(spl);
             const SAFETY_CAP: usize = 1_000_000;
@@ -19813,7 +19813,7 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     // not consulted yet. Validation does happen, but one call later and only
     // partially: the SAM natives (`native_collfn_supplier_get` and friends)
     // check `collector_tag_of` and degrade to an empty list/map rather than
-    // failing. See `docs/known-issues/c2/collections-interception.md`, Residual 1.
+    // failing. See `docs/feature-designs/collections-interception.md`, Residual 1.
     // Left as-is deliberately: there is no way for a native to decline a call
     // (`MethodCallResult` has no "not handled" arm), so the only fail-closed
     // options are to throw — which would break any legitimate default-method
@@ -26223,7 +26223,7 @@ pub fn comparator_compare(
                     // (the second element, computed AFTER that hazard) must
                     // be re-read — `a`/`b` are raw `ObjectRef`-carrying
                     // `Value`s just like `comparator`. See
-                    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+                    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
                     let comparator_pin = ctx.pin_native_root(comparator);
                     let b_pin = pin_value(ctx, b);
                     let ia = comparing_key_as_i64(
@@ -26343,7 +26343,7 @@ pub fn comparator_compare(
             // (the key extractor) and trigger a moving GC; `key_fn` AND
             // `b` (the second element, used AFTER that hazard) are both
             // raw `ObjectRef`-carrying `Value`s that must be re-read. See
-            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
             let key_fn_pin = ctx.pin_native_root(key_fn);
             let b_pin = pin_value(ctx, b);
             let ka = ctx
@@ -26357,8 +26357,8 @@ pub fn comparator_compare(
             let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
             let b = read_pinned_elem(ctx, b_pin, b);
             // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
-            // docs/known-issues/wildfly-remoting-classcastexception-
-            // parallel-extension-add.md): `ka` -- the FIRST extracted key --
+            // fixed-suite-bugs/wildfly/
+            // wildfly-remoting-classcastexception-parallel-extension-add-FIXED.md): `ka` -- the FIRST extracted key --
             // was read raw here and reused below at `natural_compare(ctx,
             // &ka, &kb)`, but the very next line's `invoke_virtual` (computing
             // `kb`) is exactly as GC-capable as the first one that produced
@@ -26414,7 +26414,7 @@ pub fn comparator_compare(
             // fix (class_id 1295/1299 traces via `Comparator.lambda$
             // thenComparing$...` and `ResourceAttributesXMLContentReader
             // .<init>`). See
-            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
             let comparator_pin = ctx.pin_native_root(comparator);
             let a_pin = pin_value(ctx, a);
             let b_pin = pin_value(ctx, b);
@@ -26497,7 +26497,7 @@ fn compare_with_key_function(
     // `apply` call can run arbitrary interpreted bytecode and trigger a
     // moving GC; `key_fn` AND `b` (used after that hazard) both need
     // re-reading. See
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let key_fn_pin = ctx.pin_native_root(key_fn);
     let b_pin = pin_value(ctx, b);
     let ka = ctx
@@ -26999,7 +26999,7 @@ fn native_comparator_then_comparing_double(
 // size, len, emptyValue) — writing through the legacy indices above then
 // silently lands on the wrong real fields (wrong type too: `elts` is a
 // String[], not an ArrayList). See
-// docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md.
+// fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md.
 // `sj_real_layout` resolves the real class's actual field indices by name
 // when present; every entry point below branches on it. This is
 // intentionally still a full from-scratch Rust reimplementation of
@@ -30289,7 +30289,7 @@ fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     // that follows, unpinned otherwise. Confirmed live via
     // CRATONVM_DBG_STALE_OBJREF during WildFly parallel-extension-add (same
     // "Family 1" pattern as native_hashmap_get_exact's fix -- see
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
     let this_pin = ctx.pin_native_root(this);
     // Cap the eager bucket-table allocation to what the heap can hold (see
     // `alloc_bucket_table`); `cap` is rebound to the actual table length so
@@ -35828,7 +35828,7 @@ fn tree_compare(
 /// must be re-read after every comparator invocation, not just once at
 /// entry — hence pinning both here and returning their current values
 /// alongside the search result, so callers never reuse a pre-search copy.
-/// See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+/// See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
 fn tm_binary_search(
     ctx: &mut dyn NativeContext,
     owner: ObjectRef,
@@ -35865,7 +35865,7 @@ fn tm_binary_search(
     // array on a miss). This — plus the sibling `a`/`b` reuse inside
     // `comparator_compare`'s own dispatch arms — was the actual root cause
     // of the residual panics that survived the owner/data/comparator-only
-    // fix. See docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fix. See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let mut key = *key;
     let key_pin = pin_value(ctx, key);
     let mut low: usize = 0;
@@ -37254,7 +37254,7 @@ fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value,
 /// `ClassCastException: class java.lang.Object cannot be cast to class
 /// java.lang.Comparable` (the stale key decoded as whatever now occupies the
 /// address); see the sibling
-/// `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md`
+/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md`
 /// for the same defect in `PriorityBlockingQueue`.
 ///
 /// Pin the whole snapshot once, then read each element back through its pin
@@ -38845,7 +38845,7 @@ fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(data) = data_opt {
         // Family-1 stale-ObjectRef fix: `tree_compare`/`native_ts_add` can
         // run a user Comparator/lambda and trigger a moving GC. See
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
         let data_pin = ctx.pin_native_root(data);
         let result_pin = ctx.pin_native_root(result);
         let mut data = data;
@@ -39193,7 +39193,7 @@ fn native_ts_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // local reused across every iteration, and `elems` (collected up front)
     // sat entirely unpinned in a Rust `Vec` across the whole loop — pin both
     // before the loop starts and refresh on every iteration. See
-    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let this_pin = ctx.pin_native_root(this);
     let (_, elem_pins) = pin_value_slice(ctx, &elems);
     let mut changed = false;
@@ -44526,7 +44526,7 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
     // shared loop above so each yielded `Map.Entry` is wrapped in
     // `UnmodifiableMapEntry` (setValue() must throw, not silently mutate the
     // backing map through the "locked" view — see
-    // docs/known-issues/tomcat-08-07/parametermap-immutability-not-locked.md).
+    // fixed-suite-bugs/tomcat/parametermap-immutability-not-locked-FIXED.md).
     {
         let c = UNMOD_ENTRY_SET_CLASS;
         r.register(

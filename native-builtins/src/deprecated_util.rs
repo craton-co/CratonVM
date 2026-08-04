@@ -134,7 +134,7 @@ fn jdn_to_julian(jdn: i64) -> (i64, i64, i64) {
 /// specified in terms of `GregorianCalendar`'s default Julian/Gregorian
 /// hybrid calendar: dates before 1582-10-15 (Gregorian) are interpreted as
 /// Julian calendar dates, not proleptic-Gregorian ones — see
-/// `docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md`'s
+/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md`'s
 /// `TestPreparedStatement.testDate8` writeup for the ~10-day discrepancy
 /// this produces if the cutover is ignored.
 pub(crate) fn date_fields_to_millis(

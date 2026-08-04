@@ -28,7 +28,7 @@ pub(crate) fn register_phase57_natives(registry: &mut NativeMethodRegistry) {
     // `this.fd` null (length()=0/read()=-1). Both crates must skip together — each
     // shadows the real ctor via native-override priority. Opt back into synthetic
     // with CRATONVM_SYNTHETIC_RAF=1. (SEGV/Cleaner crashes that once gated this are
-    // fixed: docs/internal/app-jvm-bugs/real-raf-segv-root-cause.md.)
+    // fixed: app-jvm-bugs/real-raf-segv-root-cause.md.)
     if crate::vmflags().io.synthetic_raf_forced {
         register_phase57_random_access_file(registry);
     }
@@ -1069,7 +1069,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // later native then operated on an object with none of the expected
     // slots — `Path.register` reported "service is closed or unknown" and
     // `WatchService.close` wrote past the receiver's layout. See
-    // `docs/internal/springboot/filewatcher-watchservice-surface-FIXED-20260801.md`.
+    // `springboot/filewatcher-watchservice-surface-FIXED-20260801.md`.
 
     r.register(
         fs_class,
@@ -4919,7 +4919,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // saw the FileAlreadyExistsException it catches to translate into
             // DbException(FILE_RENAME_FAILED_2), letting
             // TestFileSystem.testMoveTo's move-onto-existing-file case
-            // through instead of rejecting it (docs/known-issues/h2-suite-bugs/
+            // through instead of rejecting it (
             // bug-h2-files-setposixfilepermissions-FIXED.md residual chain).
             // ATOMIC_MOVE also implies replacement: it is specified as a single
             // filesystem operation, which on every platform CratonVM targets is
@@ -5708,7 +5708,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
     r.register(fc_cls, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // See docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
+        // See docs/known-issues/h2/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
         // this native is registered on the literal "java/nio/channels/FileChannel"
         // class to service a synthetic single-field FileChannel, but native
         // overrides shadow ALL dispatch for that class name -- including a real
@@ -6994,10 +6994,10 @@ pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) ->
     // This fallback's `invoke_virtual(path_obj, "toString", ...)` was written
     // assuming dispatch lands somewhere OTHER than back here — either the
     // (separate) dead-dispatch-to-Object.toString() bug fixed the same day in
-    // `docs/internal/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+    // `fixed-suite-bugs/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
     // or a genuine delegating wrapper's own real bytecode `toString()`. A
     // THIRD same-day fix
-    // (`docs/internal/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`,
+    // (`fixed-suite-bugs/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`,
     // `vm_exec.rs`'s `invoke_on_class_shared_inner`) made dispatch correctly
     // receiver-aware: ANY Path-subtype receiver's `toString()` now routes
     // straight back to this exact native (`p57_path_display_string` ->
@@ -7007,7 +7007,7 @@ pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) ->
     // EXCEPTION_STACK_OVERFLOW, not a Java StackOverflowError (native
     // recursion via `ctx.invoke_virtual` is invisible to every one of the
     // interpreter's counted recursion guards; see
-    // `docs/known-issues/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md`).
+    // `fixed-suite-bugs/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow-FIXED.md`).
     //
     // A thread-local re-entrancy flag breaks the cycle: the first call takes
     // the real dispatch as before (the common, legitimate delegating-wrapper
@@ -13112,7 +13112,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // close()V
     r.register(fc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // See docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
+        // See docs/known-issues/h2/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
         // this native is registered on the literal "java/nio/channels/FileChannel"
         // class to service a synthetic single-field FileChannel, but native
         // overrides shadow ALL dispatch for that class name -- including a real

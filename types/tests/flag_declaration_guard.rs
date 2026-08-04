@@ -34,7 +34,7 @@
 //! keeps whatever the developer's ambient environment says — the test passes or
 //! fails for a reason unrelated to what it claims to check. The mirror-image
 //! defect (`set_var` on a *declared* flag) is written up in
-//! `docs/internal/libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
+//! `libcratonvm-no-jdk-test-order-dependent-fixed-20260730.md`.
 //!
 //! # Precision
 //!

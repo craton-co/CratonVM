@@ -517,7 +517,7 @@ pub(super) fn execute_invokestatic(
 
 // ───────────────────────── Interpreter intrinsic table ─────────────────────
 //
-// See `docs/feature_roadmap_interpreter_intrinsic_table.md`. An intrinsic is a
+// See `gaps/feature_roadmap_interpreter_intrinsic_table.md`. An intrinsic is a
 // hot JDK method (`String.length`, `Object.getClass`, `System.arraycopy`, …)
 // resolved ONCE at inline-cache fill time into a `CachedInvokeTarget::Intrinsic`
 // entry. The steady-state hit pops args and calls the stored callback with no
@@ -1647,7 +1647,7 @@ pub(super) fn execute_invokestatic_cached(
             // (e.g. `0xFFFC_…`, a BC safegcd accumulator) as `Value::Int`,
             // dropping the high bits before it reached the callee's locals.
             // The non-cached `execute_invokestatic` path already decodes this
-            // way. See docs/bc-ec-mod-mododdinverse-investigation.md.
+            // way. See gaps/bc-ec-mod-mododdinverse-investigation.md.
             const MAX_INLINE_ARGS: usize = 16;
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
             let pd_byte = |i: usize| -> u8 { nth_param_tag_byte(&cached.method_descriptor, i) };
