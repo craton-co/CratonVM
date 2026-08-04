@@ -5719,3 +5719,448 @@ fn wide_statics_stay_on_single_pass_with_their_value_tier_off() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// cov-04 — the invoke arms: a real `<init>` CALL, and the elision that outranks it
+//
+// `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`. The census on the three
+// Spring Boot workloads found that EVERY refusal in the `0xb7` arm was an
+// `<init>` — 29 a `super(...)`/`this(...)` chain call in a compiled
+// constructor, 23 a `new X(args)` site — and none was a non-`<init>`
+// `invokespecial` with no lowering. One test per shape, plus the guard on the
+// transform the lane must not lose.
+// ---------------------------------------------------------------------------
+
+/// Stands in for the VM heap so a live (escaping) `Op::New` has something to
+/// return. `jit_new_object`'s ABI: `(vm_ptr, class_id, num_fields) -> oop`,
+/// `0` on failure. Zero-initialised, 8-aligned and above the
+/// `TEST_REGION_BOUNDS` floor exactly like [`make_object`]'s buffers, and
+/// deliberately leaked — JIT-emitted code holds the raw address.
+///
+/// Each test that counts allocations owns its **own** counter and its own
+/// `extern "C"` wrapper around this, declared inside the test body. A single
+/// shared counter is wrong here and was wrong once: `cargo test` runs these
+/// tests on concurrent threads, so a global would have the two allocating tests
+/// incrementing each other's expected values. That is a flaky test, which this
+/// directory's rule 5 rates worse than no test — and it cost a real diagnosis,
+/// because the interference looked exactly like "escape analysis failed to
+/// scalar-replace" until `CRATONVM_DBG_SCALAR_NEW=1` said `1/1`.
+fn leak_zeroed_object(num_fields: i64) -> i64 {
+    let words = (HEADER_SIZE + num_fields as usize * SLOT_SIZE)
+        .div_ceil(8)
+        .max(1);
+    let buf: Vec<u64> = vec![0u64; words];
+    let ptr = buf.as_ptr() as i64;
+    std::mem::forget(buf);
+    ptr
+}
+
+/// [`compile_with_dispatch`] plus the two resolvers the `new` / `<init>` path
+/// needs: `cp_new_resolver` (allocation layout) and `cp_elidable_init_resolver`
+/// (which `<init>()V` calls may be elided rather than emitted).
+fn compile_with_dispatch_and_new(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    invoke_resolver: &dyn Fn(u16) -> Option<(String, String, String)>,
+    new_resolver: &dyn Fn(u16) -> Option<cratonvm_jit::JitNewSite>,
+    elidable_init_resolver: &dyn Fn(u16) -> bool,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        None,
+        Some(invoke_resolver),
+        None,
+        Some(new_resolver),
+        None,
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        Some(elidable_init_resolver),
+        true,  // optimize (C2 / IR pipeline)
+        true,  // ir_emit_calls
+        true,  // ir_emit_special_calls
+        true,  // ir_emit_long
+        true,  // ir_emit_virtual_calls
+        false, // ir_emit_fp
+        None,
+    )
+}
+
+#[test]
+fn ir_invokespecial_super_constructor_chain_is_called() {
+    // cov-04 group A — 29 of the 68 events measured at `48fba3a31`, and the
+    // whole of the 35 compiles the `is_special && mn == "<init>"` term used to
+    // discard. (Counts are baseline-relative; the shape is not. See the
+    // closeout.) A compiled CONSTRUCTOR's `super(...)` / `this(...)` chain
+    // call: the receiver is `this` — a parameter, never a fresh `Op::New` — so
+    // the elision path is structurally inapplicable and the only correct
+    // lowering is a real call.
+    //
+    //   int <init>(Corpus this, int n) { super(n); return this.f0; }
+    //   aload_0; iload_1; invokespecial #2 <init>(I)V; aload_0; getfield #4; ireturn
+    //
+    // The dispatch stub WRITES `n * 3` into the receiver's field 0, which the
+    // method reads back and returns. Exact edits that trip this test: restore
+    // the `is_special && mn == "<init>"` bulk-disable (compile returns None),
+    // or drop the call emission (returns 0), or swap receiver and argument
+    // (writes to the wrong address).
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
+    unsafe extern "C" fn ctor_dispatch(_vm: i64, _info: i64, args_ptr: i64, num_args: i64) -> i64 {
+        assert_eq!(num_args, 2, "<init>(I)V takes (receiver, int)");
+        let p = args_ptr as *const i64;
+        let recv = *p;
+        let n = *p.add(1) as i32;
+        let off = HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET;
+        std::ptr::write_unaligned((recv as *mut u8).add(off) as *mut i32, n * 3);
+        0 // `<init>` returns void
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = ctor_dispatch as *const () as usize;
+    helpers.getfield = legacy_getfield as *const () as usize;
+    let code = vec![
+        0x2a, 0x1b, 0xb7, 0x00, 0x02, // aload_0; iload_1; invokespecial #2
+        0x2a, 0xb4, 0x00, 0x04, 0xac, // aload_0; getfield #4; ireturn
+    ];
+    let cm = cached("<init>", "(Lpkg/Corpus;I)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Super".into(), "<init>".into(), "(I)V".into()))
+        } else {
+            None
+        }
+    };
+    let field_resolver = |cp: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
+        if cp == 4 {
+            Some((0, b'I', None))
+        } else {
+            None
+        }
+    };
+    let ir = try_compile(
+        &cm,
+        None,
+        Some(&field_resolver),
+        None,
+        Some(&resolver),
+        None,
+        None,
+        None,
+        None,
+        None,
+        &helpers,
+        None,
+        None,
+        None,
+        None,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        None,
+    )
+    .expect(
+        "a constructor's super(...) chain call must lower through the optimizing \
+         tier — cov-04 group A",
+    );
+    assert!(
+        ir.used_ir_backend,
+        "the point of this test is the IR arm; a single-pass fallback proves nothing",
+    );
+    let dummy_vm = [0u8; 64];
+    for n in [7i64, -3, 0, 5] {
+        let mut obj = make_object(&[0]);
+        let args = [obj.as_mut_ptr() as i64, n];
+        // SAFETY: `obj` is a live 8-aligned synthetic object with one int field;
+        // the stub writes only that field and `getfield #4` reads only it.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &args) }
+            .unwrap_or_else(|e| panic!("super-ctor chain call n={n}: {e:?}"));
+        assert_eq!(
+            r,
+            n * 3,
+            "the super constructor must actually RUN: 0 means the call was never \
+             emitted, anything else means the receiver/arg pair is wrong"
+        );
+        drop(obj);
+    }
+}
+
+#[test]
+fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
+    // The transform cov-04 must not lose. Once a `<init>` can take an
+    // `invoke_info` entry, an elidable `<init>()V` on a fresh `Op::New` has TWO
+    // available lowerings, and the builder must keep choosing ELISION — a call
+    // here arg-escapes the allocation and defeats scalar replacement.
+    //
+    //   int f(int n) { Corpus c = new Corpus(); c.f0 = n; return c.f0; }
+    //   new #3; dup; invokespecial #2 <init>()V; astore_1;
+    //   aload_1; iload_0; putfield #4; aload_1; getfield #4; ireturn
+    //
+    // The SAME bytecode is compiled twice — once with the site elidable, once
+    // not — so the assertion is a comparison rather than a claim about one run:
+    //
+    //   elidable  → the dispatch helper must NOT be reached (elision chosen)
+    //   !elidable → the dispatch helper MUST be reached exactly once per call
+    //
+    // Exact edit that trips this test: put the `invoke_info` branch of the
+    // `0xb7` arm ahead of the elision branch. The elidable arm then dispatches
+    // and `must_not_dispatch` panics.
+    //
+    // The allocation count is asserted too, but it is NOT the property this
+    // lane owns and the two arms agree on it: the object is really allocated in
+    // both. That is worth pinning precisely because it is surprising —
+    // `CRATONVM_DBG_SCALAR_NEW=1` reports `scalar-replaced 1/1` for the elidable
+    // arm, so escape analysis OFFERS the replacement and the emitted body
+    // allocates anyway. The offer and the emitted code disagree; see the
+    // residual in `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`.
+    //
+    // If this assertion ever fails because arm 1's count went to ZERO, that is
+    // an improvement, not a regression: change it to 0 and delete that residual.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
+    unsafe extern "C" fn must_not_dispatch(_vm: i64, _i: i64, _a: i64, _n: i64) -> i64 {
+        // Deliberately a hard failure rather than a plausible return value: a
+        // stub that quietly returned 0 here would let an un-elided <init> pass.
+        panic!("an elidable <init>()V on a fresh `new` was DISPATCHED, not elided");
+    }
+    // Test-local, never shared: see `leak_zeroed_object`.
+    static CTOR_DISPATCHES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static ALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    unsafe extern "C" fn counting_dispatch(_vm: i64, _i: i64, _a: i64, num_args: i64) -> i64 {
+        assert_eq!(num_args, 1, "<init>()V takes the receiver and nothing else");
+        CTOR_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        0
+    }
+    unsafe extern "C" fn counting_alloc(_vm: i64, _class_id: i64, num_fields: i64) -> i64 {
+        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        leak_zeroed_object(num_fields)
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = must_not_dispatch as *const () as usize;
+    helpers.new_object = counting_alloc as *const () as usize;
+    helpers.getfield = legacy_getfield as *const () as usize;
+    helpers.putfield_int = legacy_putfield_int as *const () as usize;
+    let code = vec![
+        0xbb, 0x00, 0x03, // new #3
+        0x59, // dup
+        0xb7, 0x00, 0x02, // invokespecial #2  <init>()V
+        0x4c, // astore_1
+        0x2b, 0x1a, 0xb5, 0x00, 0x04, // aload_1; iload_0; putfield #4
+        0x2b, 0xb4, 0x00, 0x04, // aload_1; getfield #4
+        0xac, // ireturn
+    ];
+    let cm = cached("f", "(I)I", code, 2, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Corpus".into(), "<init>".into(), "()V".into()))
+        } else {
+            None
+        }
+    };
+    let field_resolver = |cp: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
+        if cp == 4 {
+            Some((0, b'I', None))
+        } else {
+            None
+        }
+    };
+    let new_resolver = |cp: u16| -> Option<cratonvm_jit::JitNewSite> {
+        if cp == 3 {
+            Some(cratonvm_jit::JitNewSite::Resolved {
+                class_id: 7,
+                num_fields: 1,
+                has_prim_init: false,
+                has_finalizer: false,
+            })
+        } else {
+            None
+        }
+    };
+    let compile = |elidable: &dyn Fn(u16) -> bool, helpers: &JitRuntimeHelpers| {
+        try_compile(
+            &cm,
+            None,
+            Some(&field_resolver),
+            None,
+            Some(&resolver),
+            None,
+            Some(&new_resolver),
+            None,
+            None,
+            None,
+            helpers,
+            None,
+            None,
+            None,
+            Some(elidable),
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            None,
+        )
+    };
+    let dummy_vm = [0u8; 64];
+
+    // Arm 1 — the site IS elidable: elision must win over the (now available)
+    // call, so `must_not_dispatch` must never run.
+    let elidable = |cp: u16| -> bool { cp == 2 };
+    let ir = compile(&elidable, &helpers)
+        .expect("an elidable trivial-<init> allocation must still compile");
+    assert!(ir.used_ir_backend, "this test is about the IR arm");
+    for (i, n) in [11i64, 0, -4].into_iter().enumerate() {
+        // SAFETY: every pointer the emitted code touches comes from
+        // `counting_alloc`, which hands out live leaked 8-aligned buffers.
+        // Reaching `must_not_dispatch` is the failure this arm is here for.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
+            .unwrap_or_else(|e| panic!("elidable-init method n={n}: {e:?}"));
+        assert_eq!(r, n, "the field written is the field read back");
+        assert_eq!(
+            ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
+            i + 1,
+            "documenting current behaviour, not requiring it: escape analysis \
+             offers this `new` as scalar-replaceable and the emitted body \
+             allocates anyway (see the residual). 0 here would be an improvement"
+        );
+    }
+    let allocs_after_arm1 = ALLOCS.load(std::sync::atomic::Ordering::SeqCst);
+
+    // Arm 2 — the control. Identical bytecode, but the elision analysis
+    // DECLINES the site, so the constructor must be really called. Without this
+    // arm the test above would also pass on a builder that silently dropped
+    // every `<init>`.
+    let mut call_helpers = helpers;
+    call_helpers.invoke_dispatch = counting_dispatch as *const () as usize;
+    let not_elidable = |_cp: u16| -> bool { false };
+    let ir2 = compile(&not_elidable, &call_helpers)
+        .expect("a non-elidable <init>()V on a fresh `new` must still compile — cov-04");
+    assert!(ir2.used_ir_backend, "this test is about the IR arm");
+    for (i, n) in [11i64, 0, -4].into_iter().enumerate() {
+        // SAFETY: as above.
+        let r = unsafe { ir2.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
+            .unwrap_or_else(|e| panic!("non-elidable-init method n={n}: {e:?}"));
+        assert_eq!(r, n, "the field written is the field read back");
+        assert_eq!(
+            CTOR_DISPATCHES.load(std::sync::atomic::Ordering::SeqCst),
+            i + 1,
+            "a constructor the elision analysis declines must be CALLED, once \
+             per invocation"
+        );
+        assert_eq!(
+            ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
+            allocs_after_arm1 + i + 1,
+            "and its receiver arg-escapes into that call, so the allocation must \
+             survive — once per invocation, never scalar-replaced"
+        );
+    }
+}
+
+#[test]
+fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
+    // cov-04 group B — 39 of the 68 events measured at `48fba3a31`: a method
+    // containing a
+    // `new` whose constructor the elision analysis declines. Two things had to
+    // change for this to compile — the `<init>` call itself, and
+    // `call_eligible`, which discarded `invoke_info` for the WHOLE method
+    // whenever `scan.new_ops` was non-empty, on the premise that the lowerer
+    // had no allocation path. It has one: `ir_lower`'s `Op::New` arm, through
+    // the shared TLAB-aware stub.
+    //
+    //   int f(int n) { return sink(new Corpus(n)); }
+    //   new #3; dup; iload_0; invokespecial #2 <init>(I)V; invokestatic #5; ireturn
+    //
+    // `<init>` writes `n * 5` into field 0; `sink` reads field 0 back. The
+    // assertion therefore covers the allocation, the constructor call, the
+    // argument marshalling, and the identity of the object handed on after it.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
+    unsafe extern "C" fn ctor_or_sink(_vm: i64, _info: i64, args_ptr: i64, num_args: i64) -> i64 {
+        let p = args_ptr as *const i64;
+        let off = HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET;
+        match num_args {
+            // `<init>(I)V` — (receiver, int)
+            2 => {
+                let recv = *p;
+                let n = *p.add(1) as i32;
+                std::ptr::write_unaligned((recv as *mut u8).add(off) as *mut i32, n * 5);
+                0
+            }
+            // `sink(LCorpus;)I` — (object)
+            1 => {
+                let obj = *p;
+                std::ptr::read_unaligned((obj as *const u8).add(off) as *const i32) as i64
+            }
+            n => panic!("unexpected arg count {n}"),
+        }
+    }
+    // Test-local, never shared: see `leak_zeroed_object`.
+    static ALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    unsafe extern "C" fn counting_alloc(_vm: i64, _class_id: i64, num_fields: i64) -> i64 {
+        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        leak_zeroed_object(num_fields)
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = ctor_or_sink as *const () as usize;
+    helpers.new_object = counting_alloc as *const () as usize;
+    let code = vec![
+        0xbb, 0x00, 0x03, // new #3
+        0x59, // dup
+        0x1a, // iload_0
+        0xb7, 0x00, 0x02, // invokespecial #2  <init>(I)V
+        0xb8, 0x00, 0x05, // invokestatic #5   sink(LCorpus;)I
+        0xac, // ireturn
+    ];
+    let cm = cached("f", "(I)I", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        match cp {
+            2 => Some(("pkg/Corpus".into(), "<init>".into(), "(I)V".into())),
+            5 => Some((
+                "pkg/Helper".into(),
+                "sink".into(),
+                "(Lpkg/Corpus;)I".into(),
+            )),
+            _ => None,
+        }
+    };
+    let new_resolver = |cp: u16| -> Option<cratonvm_jit::JitNewSite> {
+        if cp == 3 {
+            Some(cratonvm_jit::JitNewSite::Resolved {
+                class_id: 7,
+                num_fields: 1,
+                has_prim_init: false,
+                has_finalizer: false,
+            })
+        } else {
+            None
+        }
+    };
+    // Nothing is elidable here: this is the case the elision analysis DECLINES.
+    let elidable = |_cp: u16| -> bool { false };
+    let ir = compile_with_dispatch_and_new(&cm, &helpers, &resolver, &new_resolver, &elidable)
+        .expect(
+            "a `new X(n)` with a non-elidable constructor must lower through the \
+             optimizing tier — cov-04 group B",
+        );
+    assert!(ir.used_ir_backend, "this test is about the IR arm");
+    let dummy_vm = [0u8; 64];
+    for (i, n) in [3i64, -2, 0, 9].into_iter().enumerate() {
+        // SAFETY: every pointer the emitted code touches comes from
+        // `counting_alloc`, which hands out live leaked 8-aligned buffers.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
+            .unwrap_or_else(|e| panic!("new + non-elidable ctor n={n}: {e:?}"));
+        assert_eq!(r, n * 5, "constructor side effect must be visible to `sink`");
+        assert_eq!(
+            ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
+            i + 1,
+            "an object passed to a call arg-escapes: it must be really allocated, \
+             once per invocation, not scalar-replaced",
+        );
+    }
+}
