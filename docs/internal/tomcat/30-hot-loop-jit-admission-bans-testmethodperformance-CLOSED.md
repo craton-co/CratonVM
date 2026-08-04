@@ -3,7 +3,7 @@
 **Status:** ✅ **CLOSED 2026-07-31.** Every admission ban this document names is
 settled, the "next lever" its last update identified is implemented, and every
 remaining item — its own residual plus the two adopted from
-[32](32-doc04-residual-perf-assertions-CLOSED.md) — has been root-caused to
+[32](../fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md) — has been root-caused to
 **one mechanism that is not an admission ban and is owned by other documents**:
 every `invokevirtual` from compiled code takes the generic dispatch helper. See
 [§ Adopted](#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32-and-where-they-went)
@@ -15,9 +15,9 @@ dropped: the per-pc local→location map it said ban 1b needed, and its claim
 that ban 2 had been lifted. A third — that 30.A/30.B are "codegen quality" —
 is corrected in § Adopted.
 
-Residual of [24](24-stringcache-oom-under-load-FIXED.md)
+Residual of [24](../fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md)
 (whose `OutOfMemoryError` is FIXED). Family of
-[31](31-synchronized-code-never-jit-compiled-FIXED.md),
+[31](../fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md),
 and of the retired
 [04](04-embedded-server-throughput-wall-CLOSED.md) /
 [29](29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md).
@@ -45,7 +45,7 @@ and of the retired
 iterations of `mb.setBytes(...); mb.toStringType();` and then 6 × 100 000 000
 of `Method.bytesToString(...)`. HotSpot finishes the class in **41.2 s**.
 
-Measured on the post-[24](24-stringcache-oom-under-load-FIXED.md) binary, from
+Measured on the post-[24](../fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md) binary, from
 the class's own printout:
 
 ```
@@ -101,7 +101,7 @@ code, so all 600 000 000 iterations of loop control interpreted.
 That ban's premise was removed on 2026-07-30 by lowering a resolved
 `StringConcatFactory` site to a direct call instead of an uncommon trap
 (`make_jit_string_concat_site_from_parts` / `execute_jit_string_concat_raw`,
-the `0xba` arm in `jit/src/x64.rs`). RBC.7 now only covers *unbridged*
+the `0xba` arm in `../../../jit/src/x64.rs`). RBC.7 now only covers *unbridged*
 bootstraps.
 
 **And the loop still did not OSR**, because a completely independent gate
@@ -179,10 +179,10 @@ the re-derivation below for why.
 
 #### It found a real miscompile on the way
 
-The differential written for this change (`probes/OsrDeadLocalProbe.java`,
+The differential written for this change (`../../../probes/OsrDeadLocalProbe.java`,
 eight coalescing shapes, FNV-checksummed) failed on its first run — and the
 failure reproduced with `CRATONVM_JIT_OSR_DEAD_LOCALS=0`, i.e. **on plain
-`dev`**, independent of this change. Narrowed to `probes/SlotReuseCategoryProbe.java`:
+`dev`**, independent of this change. Narrowed to `../../../probes/SlotReuseCategoryProbe.java`:
 
 ```
                        HotSpot / --nojit   CratonVM JIT
@@ -214,7 +214,7 @@ Fixed in `86e5122b5`: `find_non_float_locals` scans the GPR-category accesses,
 and a slot in both scans gets neither a GPR nor an XMM home, so both categories
 use the frame slot and the trampoline seeds it. This costs nothing on the int
 side — such slots already had no GPR home. The sibling shape (a category-2's
-dead high half reused for a real local, `probes/HighHalfReuseProbe.java`) does
+dead high half reused for a real local, `../../../probes/HighHalfReuseProbe.java`) does
 **not** reproduce, so `wide_local_high_halves` was left alone.
 
 > **On the regression gate for this one.** The deterministic gate is the
@@ -230,7 +230,7 @@ dead high half reused for a real local, `probes/HighHalfReuseProbe.java`) does
 > parallelism, and its very first single-round version passed under default
 > parallelism while failing under `--test-threads=1`. A test that silently
 > passes two times in three on broken code is worse than no test, because it
-> reads as coverage. `probes/SlotReuseCategoryProbe.java` remains the
+> reads as coverage. `../../../probes/SlotReuseCategoryProbe.java` remains the
 > end-to-end reproduction, run by hand against a real binary.
 
 This is the third time a "just throughput" Tomcat doc has turned out to contain
@@ -273,7 +273,7 @@ chain that does not compile — every one of its neighbours does:
 | `ByteChunk.toStringInternal(a, b)` | ✅ C1 full-compile |
 
 Its measured share is ~4 µs of a ~38 µs iteration (~10%). The canonical
-analysis of this gate is [23](23-charsetcache-pathological-slowdown.md),
+analysis of this gate is [23](../fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md),
 which remains OPEN on its own residual (a thread-scaling wall in the dispatch
 helper, not an admission question).
 
@@ -320,7 +320,7 @@ needed; the knob's continued existence is not an open issue.
 
 ## Where the time actually goes (re-derived 2026-07-31)
 
-`probes/MbChainCostProbe.java` decomposes the per-iteration chain into the
+`../../../probes/MbChainCostProbe.java` decomposes the per-iteration chain into the
 frames it is actually made of. Every stage is a plain static method with the
 loop **inline** — an earlier revision drove the stages through a `Runnable` and
 measured ~3.4 µs per call on CratonVM, which buried everything it was meant to
@@ -339,7 +339,7 @@ compare. Six blocks of 100 000; steady-state block, ns/op:
 | `byteChunkToString` | 29 | 33 883 | 1168× |
 | `mbFullChain` | 28 | ~38 000 | ~1350× |
 
-And `probes/AllocScalingProbe.java`, ten blocks of 200 000:
+And `../../../probes/AllocScalingProbe.java`, ten blocks of 200 000:
 
 | shape | HotSpot | CratonVM | ratio |
 |---|---|---|---|
@@ -369,7 +369,7 @@ Read those two tables together and the doc's original thesis collapses:
 
 ### The residual, named as precisely as this document can name it
 
-`probes/CharsetDecodeShapeProbe.java` splits `Charset.decode`'s cost into its
+`../../../probes/CharsetDecodeShapeProbe.java` splits `Charset.decode`'s cost into its
 fixed per-call and marginal per-byte parts, by decoding payloads of 3, 30, 300
 and 3000 bytes in one process. (Run while the full-suite A/B was occupying the
 box, so the absolute figures are roughly 2× inflated against the quiet-host
@@ -394,7 +394,7 @@ Two separate terms fall out:
 
 One concrete but **unverified** lead for the fixed term, recorded for whoever
 picks it up: `native_charset_decode_bytebuf` → `decode_with_charset`
-(`native-builtins/src/charset.rs`) reads the `Charset` object's `name` String
+(`../../../native-builtins/src/charset.rs`) reads the `Charset` object's `name` String
 out of the heap, converts it to a Rust `String`, runs it through
 `normalize_charset_name` (a second allocation), and then dispatches into the
 transcoding engine **by name string** — on every call, independent of payload.
@@ -434,12 +434,12 @@ ban lifted), arm B = `CRATONVM_JIT_OSR_DEAD_LOCALS=0` +
   uncompilable on `dev` in the previous revision — `E0063: missing fields
   service_callee_deopt and set_throw_bci`. That was fixed on `dev` in the
   interim; verified here.)
-* **`probes/OsrDeadLocalProbe.java`** — HotSpot, CratonVM JIT, CratonVM with
+* **`../../../probes/OsrDeadLocalProbe.java`** — HotSpot, CratonVM JIT, CratonVM with
   the kill switch, `--nojit`, and `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET=1` all
   return `acc=5697627218349681645` at 400k iterations and
   `acc=-3383397992731040631` at 3M.
-* **`probes/SlotReuseCategoryProbe.java`**, **`probes/HighHalfReuseProbe.java`**,
-  **`probes/OsrDoubleShapeProbe.java`** — all arms identical to HotSpot.
+* **`../../../probes/SlotReuseCategoryProbe.java`**, **`../../../probes/HighHalfReuseProbe.java`**,
+  **`../../../probes/OsrDoubleShapeProbe.java`** — all arms identical to HotSpot.
 * **Tomcat `util.{buf,collections,http}` / `catalina.util`** (the same 63-class
   set `cd50a2208` used): **55 classes completed, 0 status differences**. The
   non-PASS classes are identical on both sides — `TestByteChunkLargeHeap` and
@@ -473,7 +473,7 @@ ban lifted), arm B = `CRATONVM_JIT_OSR_DEAD_LOCALS=0` +
   So **nothing in the 646-class suite is attributable to either knob.** The
   `TestHttpServletDoHead*` family in particular ran 67-99 s standalone against
   a 300 s in-suite timeout — the documented straddle — and all 8 sit in
-  families `00-INDEX.md` already records as environmental (that timing
+  families `../fixed-suite-bugs/tomcat/00-INDEX.md` already records as environmental (that timing
   straddle, Tribes multicast, HTTP/2).
 
 > **Warning to anyone measuring this.** `TestDefaultServlet` has a
@@ -566,7 +566,7 @@ For the decomposition rather than the class:
 
 ## Adopted 2026-07-31 — two residuals from the retired tomcat/32, and where they went
 
-[32](32-doc04-residual-perf-assertions-CLOSED.md)
+[32](../fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md)
 closed and moved two of its items here. Both were filed as *"codegen quality —
 the hot methods compile, and the compiled output is ~100x off HotSpot"*.
 
@@ -578,7 +578,7 @@ below; the items themselves are re-homed, and this document closes.
 
 ### The measurement that unifies them
 
-`probes/CallCostCompareProbe.java` times a user-defined class shaped exactly
+`../../../probes/CallCostCompareProbe.java` times a user-defined class shaped exactly
 like `Calendar` (a virtual `get` that calls a guard method and then indexes an
 `int[]`) alongside the real thing, in one process, ns/op:
 
@@ -607,7 +607,7 @@ trivially devirtualizable, and it still takes the generic path 99 373 times.
 ### The one prerequisite: `final` / CHA devirtualization
 
 **`invokevirtual` cannot take the direct-call path at all.** That path admits
-only `invokestatic` and non-`<init>` `invokespecial` (`jit/src/lib.rs`, the
+only `invokestatic` and non-`<init>` `invokespecial` (`../../../jit/src/lib.rs`, the
 `ir_direct && (is_static || is_special)` guard) — statically bound calls, where
 the resolved callee is the only possible target. A `final` method is *also* the
 only possible target, by JVMS guarantee, and is not admitted. So `Calendar.get`
@@ -620,7 +620,7 @@ The raw JIT-to-JIT gate (`direct_jit_callee_calls_enabled`) was closed under
 moving-young for most of this investigation, and forcing it open *appeared* to
 buy ~1.8× on the Calendar path. **That measurement did not survive.** It
 compared two different binaries. `dev` then fixed the underlying defect
-([`jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md`](../../jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md)
+([`jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md`](../jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md)
 — a `rel8` `JNE` in the PIC cascade silently truncated by `rel as u8`, landing
 inside the pre-call shadow-stack push) and reopened the gate by default. Re-run
 properly as a one-knob A/B on ONE binary, `CRATONVM_JIT_DIRECT_CALLEE_CALLS`
@@ -649,8 +649,8 @@ is what is measured. `String.format` is a **Rust intrinsic** on CratonVM
 (measured 1.5× HotSpot, 2 840 vs 1 933 ns), so the assertion reduces to
 "compiled Java must beat a Rust intrinsic".
 
-Decomposed with `probes/DateFormatChainProbe.java` and
-`probes/DateFormatPatternProbe.java` (ns/op, HotSpot vs CratonVM):
+Decomposed with `../../../probes/DateFormatChainProbe.java` and
+`../../../probes/DateFormatPatternProbe.java` (ns/op, HotSpot vs CratonVM):
 
 | stage | HotSpot | CratonVM |
 |---|---|---|
@@ -664,7 +664,7 @@ Decomposed with `probes/DateFormatChainProbe.java` and
 
 * *"Both hot methods compile, so this is codegen quality."* They do compile —
   but so does everything else on the path. `SimpleDateFormat.format("ss")` in
-  isolation (`probes/SdfOnlyProbe.java`) costs **51 µs with
+  isolation (`../../../probes/SdfOnlyProbe.java`) costs **51 µs with
   `hot_but_stuck_in_interpreter=0`** — zero compile failures anywhere. The cost
   is the ~40 dispatch-helper round trips the format performs, not the quality of
   any compiled body.
@@ -679,7 +679,7 @@ Closing 30.A means `SimpleDateFormat.format` at ≲ 4.7 µs against today's 193 
 — **41×** — on a path whose per-call cost is 200-1000× HotSpot. That is the
 dispatch work above, not a fix to this test.
 
-**Re-homed to** [`jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md`](../../jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md)
+**Re-homed to** [`jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md`](../jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md)
 (prerequisite 1) with the devirtualization gap (prerequisite 2) recorded there.
 
 ### 30.B — `TestAsyncMessagesPerformance`'s SEQ2 residual (was 32.3)

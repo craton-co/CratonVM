@@ -1,5 +1,19 @@
 # The original lane briefs, recovered
 
+**2026-08-03 — two files joined them on the opposite terms**, moved here whole
+rather than deleted by the commit that landed them, because those lanes are
+**finished** rather than first-incremented.
+
+| file | retired by | what is genuinely finished | what is not |
+|---|---|---|---|
+| `cov-02-array-element-access.md` | [closeout](../../../internal/cov-02-array-element-access-RETIRED-20260803.md) | all seven owned opcodes, plus `laload`/`saload`/`lastore`/`castore`/`sastore` for symmetry. Measured refusals for the seven 79 → **0**; optimizing-backend bodies 591 → **652** across the survey's three Spring Boot workloads | `aastore` (0x53), declined on purpose — it needs the SATB + card write barriers, and the refusal is written into the builder. Two measured events. `dup2` (0x5c), one event, no owner |
+| `meas-02-the-bench-suite-does-not-reach-c2.md` | [closeout](../../../internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md) | all three of its asks: the gate records per-phase C2 reach, the survey has a C2-reach column, and one candidate (`bench/CratonBenchC2.java`) is characterised. It also found the gate could not compile its own benchmark under its own `LC_ALL=C` | the candidate is not anchored — deliberately, and blocked on a quiet host and on an unexplained 17x run-to-run swing, not on a decision |
+
+Read the closeouts; these copies of the briefs are here so their reasoning
+stays readable, not because anything in them is still open.
+
+## The other nine
+
 These nine files are the lane docs this directory shipped with. Each was
 **deleted by the commit that implemented its first increment**, so the brief
 went away at the moment the work stopped being hypothetical — and with it the

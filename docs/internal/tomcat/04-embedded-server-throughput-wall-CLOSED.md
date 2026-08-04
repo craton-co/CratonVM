@@ -1,13 +1,13 @@
 # Group 04 — Embedded-server deployment throughput wall  (CLOSED 2026-07-27)
 
-Retired from `docs/known-issues/tomcat/` on 2026-07-27. Every defect this
+Retired from `../../known-issues/tomcat` on 2026-07-27. Every defect this
 group documented is fixed; what was left of its "residual wall" was re-derived
 from scratch and turned out to have a single, different, and now separately
 tracked owner:
 
-* **`docs/internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`** —
+* **`../fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`** —
   the synchronized-method JIT admission defect, fixed on 2026-07-28.
-* **`docs/internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md`** — the
+* **`../fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md`** — the
   four per-test residuals that are not deploy throughput.
 
 The rest of this file is the closing evidence, then the group's own history.
@@ -116,7 +116,7 @@ finishing, and every HotSpot column is from the same window).
 >   `DateFormatCache` beats `String.format`. It fails for a reason specific to
 >   this VM's *shape*, not merely its speed: `java.util.Formatter.format` —
 >   what `String.format` delegates to — is registered as a Rust
->   `NativeKind::Intrinsic` (`native-builtins/src/lib.rs`,
+>   `NativeKind::Intrinsic` (`../../../native-builtins/src/lib.rs`,
 >   `register_formatter_natives`), so it runs near HotSpot speed while
 >   everything it is raced against is ordinary interpreted bytecode.
 >   Re-measured 2026-07-27 with `probes/DateFmtProbe.java`:
@@ -174,7 +174,7 @@ finishing, and every HotSpot column is from the same window).
 > native was missed, dispatch hit the abstract method, and the accepted socket
 > was aborted before the request was read. Fixed by also registering the
 > covariant `SocketChannel` / `ServerSocketChannel` return descriptors
-> (`native-io/src/socket_channel.rs`). A significant fraction of the "server
+> (`../../../native-io/src/socket_channel.rs`). A significant fraction of the "server
 > tests HANG" population was this functional reset, not throughput.
 
 **Original symptom (for the record):** embedded-server classes deploy a webapp

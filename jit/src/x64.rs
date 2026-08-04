@@ -1817,7 +1817,7 @@ impl Compiler {
         // work — Hibernate `ZonedDateTimeTest` / `OffsetDateTimeTest` (1–3 s,
         // reproduced on a pristine dev build) and the Windows
         // `DateSymbolsProbe` repro. See
-        // `docs/known-issues/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+        // `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
         //
         // Keyed on its own opt-out alone, the DEFAULT path is byte-identical
         // (`precise_reg_spill_disabled()` is opt-in and unset), and the

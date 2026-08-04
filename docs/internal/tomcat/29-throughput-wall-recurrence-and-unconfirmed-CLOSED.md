@@ -28,7 +28,7 @@ at the bottom for provenance.
 `AssertionError: Failed to set last modified for [...\webapps\myapp]`.
 Deterministic, reproduced identically in both reruns, passes on HotSpot.
 
-*Root cause:* `native-builtins/src/phases_late/nio_file.rs` implemented the
+*Root cause:* `../../../native-builtins/src/phases_late/nio_file.rs` implemented the
 `java/io/File.setLastModified(J)Z` native as
 `OpenOptions::new().write(true).open(path)` + `File::set_modified`. That
 spelling cannot open a **directory** on any platform — Windows `CreateFileW`
@@ -73,10 +73,10 @@ That is fixture-state pollution, not a functional bug in the deploy path.
 
 | cache | file |
 |---|---|
-| `cached_outer_jar` | `native-builtins/src/net_phase_e.rs` |
-| `cached_nested_jar` | `native-builtins/src/net_phase_e.rs` |
-| `jar_bytes_cached` | `native-builtins/src/phases_late/nio_file.rs` |
-| `jar_index` | `native-builtins/src/phases_late/nio_file.rs` |
+| `cached_outer_jar` | `../../../native-builtins/src/net_phase_e.rs` |
+| `cached_nested_jar` | `../../../native-builtins/src/net_phase_e.rs` |
+| `jar_bytes_cached` | `../../../native-builtins/src/phases_late/nio_file.rs` |
+| `jar_index` | `../../../native-builtins/src/phases_late/nio_file.rs` |
 
 They were introduced to stop a Spring Boot fat-jar autoconfig walk from
 re-reading a 100 MB archive per lookup, on the assumption that a classpath jar
