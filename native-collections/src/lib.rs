@@ -41298,6 +41298,33 @@ fn chm_seg_get(
     }
     drop(read_guard); // critical section ends — comparisons run lock-free
 
+    if chm_trace() {
+        eprintln!(
+            "[chm] seg_get seg={:p} hash={hash:#x} cap={cap} idx={idx} chain={:?}",
+            seg.as_ptr(),
+            chain
+                .iter()
+                .map(|(h, k, v)| (
+                    format!("{h:#x}"),
+                    match k {
+                        Value::Object(Some(o)) => ctx.read_string(*o),
+                        other => Some(format!("{other:?}")),
+                    },
+                    format!("{v:?}")
+                ))
+                .collect::<Vec<_>>()
+        );
+        let raw0 = ctx.get_array_element(buckets, idx);
+        if let Value::Object(Some(n)) = raw0 {
+            eprintln!(
+                "[chm]   node slots: 0={:?} 1={:?} 2={:?} 3={:?}",
+                ctx.get_field(n, 0),
+                ctx.get_field(n, 1),
+                ctx.get_field(n, 2),
+                ctx.get_field(n, 3)
+            );
+        }
+    }
     let chain_pins: Vec<(usize, usize)> = chain
         .iter()
         .map(|(_, key, value)| (pin_value(ctx, *key), pin_value(ctx, *value)))
