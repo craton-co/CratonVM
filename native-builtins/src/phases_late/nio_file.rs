@@ -7626,6 +7626,7 @@ pub(crate) mod p57_normalize_relativize_tests {
     };
 
     #[test]
+    #[cfg(windows)]
     fn normalize_preserves_root_and_leading_dotdot() {
         // `..` must not pop above the root.
         assert_eq!(p57_normalize_path("C:/a/../../b"), "C:/b");
@@ -7644,6 +7645,7 @@ pub(crate) mod p57_normalize_relativize_tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn relativize_backtracks_with_dotdot() {
         assert_eq!(p57_relativize("C:/a/b", "C:/a/x").as_deref(), Some("../x"));
         assert_eq!(p57_relativize("a/b/c", "a/b").as_deref(), Some(".."));
@@ -7659,6 +7661,58 @@ pub(crate) mod p57_normalize_relativize_tests {
         // Different roots → None (caller falls back to target).
         assert_eq!(p57_relativize("C:/a", "D:/b"), None);
         assert_eq!(p57_relativize("C:/a", "rel/b"), None);
+    }
+
+    /// The POSIX twins. These are the same two functions on a host where a
+    /// drive prefix and a backslash are NOT path syntax; every expectation was
+    /// cross-checked against the host JDK 25 on Linux (`NormMatrix` repro).
+    #[test]
+    #[cfg(not(windows))]
+    fn normalize_preserves_root_and_leading_dotdot_posix() {
+        // `..` must not pop above the root.
+        assert_eq!(p57_normalize_path("/a/../../b"), "/b");
+        assert_eq!(p57_normalize_path("/.."), "/");
+        // Leading `..` on a relative path is kept.
+        assert_eq!(p57_normalize_path("../../a"), "../../a");
+        assert_eq!(p57_normalize_path("a/../../b"), "../b");
+        // Ordinary collapses.
+        assert_eq!(p57_normalize_path("/a/./b/.."), "/a");
+        assert_eq!(p57_normalize_path("a/./b/.."), "a");
+        assert_eq!(p57_normalize_path("a/../b"), "b");
+        assert_eq!(p57_normalize_path("/a/b"), "/a/b");
+        // A drive prefix is an ordinary NAME here, so `..` cancels it and the
+        // Windows parser's "root" reading (`C:b`) is wrong on this host.
+        assert_eq!(p57_normalize_path("C:a/../b"), "b");
+        assert_eq!(p57_normalize_path("C:/a/../../b"), "b");
+        // `\` is a filename character: `a\b` is ONE name, so the `..` that
+        // follows cancels the whole thing (the Windows parser answered `a/c`).
+        assert_eq!(p57_normalize_path("a\\b/../c"), "c");
+        // No UNC: `//s/sh/a/..` is just `/s/sh`.
+        assert_eq!(p57_normalize_path("//s/sh/a/.."), "/s/sh");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn relativize_backtracks_with_dotdot_posix() {
+        assert_eq!(p57_relativize("/a/b", "/a/x").as_deref(), Some("../x"));
+        assert_eq!(p57_relativize("a/b/c", "a/b").as_deref(), Some(".."));
+        assert_eq!(p57_relativize("/a/b", "/a/b/c/d").as_deref(), Some("c/d"));
+        assert_eq!(p57_relativize("/a", "/a").as_deref(), Some(""));
+        assert_eq!(p57_relativize("a/b", "a/b/c").as_deref(), Some("c"));
+        // Case-SENSITIVE name matching off Windows.
+        assert_eq!(p57_relativize("/A/b", "/a/x").as_deref(), Some("../../a/x"));
+        // Drive prefixes are ordinary names, so these ARE relativizable here.
+        assert_eq!(
+            p57_relativize("C:/a", "D:/b").as_deref(),
+            Some("../../D:/b")
+        );
+        // `\` never splits a name.
+        assert_eq!(
+            p57_relativize("/a\\b", "/a\\x").as_deref(),
+            Some("../a\\x")
+        );
+        // Absolute vs relative → None (caller falls back to target).
+        assert_eq!(p57_relativize("/a", "rel/b"), None);
     }
 }
 
@@ -9495,12 +9549,15 @@ pub(crate) fn p57_read_to_string(p: &str) -> std::io::Result<String> {
 ///   * a leading `..` on a **relative** path is **kept** (it can't be resolved
 ///     without a base): `..\..\a` → `..\..\a` (not `a`).
 /// Output is `/`-canonical (the internal form; `p57_alloc_path` folds, `toString`
-/// renders the host separator), so this is platform-neutral.
+/// renders the host separator). Roots and name elements are parsed in the HOST
+/// platform's syntax ([`p57_parse_root`]): on Unix `C:a/../b` normalizes to `b`
+/// (the drive prefix is an ordinary name, not a root that a `..` cannot escape)
+/// and `a\b/../c` to `c` (one name element, not two).
 pub(crate) fn p57_normalize_path(path: &str) -> String {
     if let Some((tag, container, entry)) = vfs_decode(path) {
         return vfs_encode(tag, &container, &p57_normalize_path(&entry));
     }
-    let (root, names) = p57_parse_win_root(path);
+    let (root, names) = p57_parse_root(path);
     let has_root = root.is_some();
     let mut stack: Vec<&str> = Vec::new();
     for name in &names {
@@ -9546,8 +9603,8 @@ pub(crate) fn p57_normalize_path(path: &str) -> String {
 /// two paths have different roots / absoluteness, which can't be relativized.
 /// Output is `/`-canonical and relative (no root).
 pub(crate) fn p57_relativize(base: &str, target: &str) -> Option<String> {
-    let (rb, bn) = p57_parse_win_root(base);
-    let (rt, tn) = p57_parse_win_root(target);
+    let (rb, bn) = p57_parse_root(base);
+    let (rt, tn) = p57_parse_root(target);
     // Roots must match (case-insensitively, matching WindowsPath); one absolute
     // and one relative cannot be relativized.
     let norm_root = |r: &Option<String>| r.as_ref().map(|s| s.to_ascii_lowercase());
@@ -9603,17 +9660,31 @@ pub(crate) fn p57_resolve_paths(base: &str, other: &str) -> String {
     if other.is_empty() {
         return base.to_string();
     }
-    // Check if `other` is absolute (Unix or Windows)
-    if other.starts_with('/')
-        || (other.len() >= 2 && other.as_bytes()[1] == b':')
-        || other.starts_with('\\')
-    {
+    // Is `other` absolute? A drive prefix (`C:...`) and a leading `\` are
+    // Windows syntax ONLY. On Unix both are ordinary relative filenames —
+    // `a:b` is a perfectly legal Unix name — and treating them as absolute
+    // made `dir.resolve("a:b")` answer `a:b` instead of `dir/a:b`, silently
+    // dropping the base. Same family as `p57_parse_root`.
+    let other_is_absolute = if cfg!(windows) {
+        other.starts_with('/')
+            || (other.len() >= 2 && other.as_bytes()[1] == b':')
+            || other.starts_with('\\')
+    } else {
+        other.starts_with('/')
+    };
+    if other_is_absolute {
         return other.to_string();
     }
     if base.is_empty() {
         return other.to_string();
     }
-    let sep = if base.contains('\\') { '\\' } else { '/' };
+    // Likewise the join separator: `\` in a Unix path is part of a filename,
+    // never a separator, so it must not select `\` as the joiner.
+    let sep = if cfg!(windows) && base.contains('\\') {
+        '\\'
+    } else {
+        '/'
+    };
     let base_trimmed = base.trim_end_matches(sep);
     format!("{base_trimmed}{sep}{other}")
 }
