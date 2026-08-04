@@ -1461,8 +1461,11 @@ pub static PATTERNS: &[Pattern] = &[
             ..Enc::BASE
         },
         disp: DispPolicy::Smallest,
-        // LEA reads no memory: it computes the effective address only.
-        cost: Cost::new(3, 1, 1),
+        // LEA reads no memory: it computes the effective address only. Two
+        // bytes, not the 64-bit row's three: no REX. That is the *floor* for a
+        // base-only operand; `MInst::cost` adds the address's own extra bytes,
+        // so the anchored `LEA EAX, [RAX+RAX*n]` still prices at 3.
+        cost: Cost::new(2, 1, 1),
         ..Pattern::BASE
     },
     Pattern {
