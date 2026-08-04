@@ -13275,9 +13275,24 @@ mod tests {
                 .iter()
                 .any(|t| t.rule == Rule::AluImm && t.covered.len() > 1)
         });
+        let dump: Vec<String> = schedule
+            .blocks
+            .iter()
+            .map(|b| {
+                let sel = select_block(&graph, &b.nodes, b.terminator, &opts);
+                format!(
+                    "nodes={:?} tiles={:?}",
+                    b.nodes,
+                    sel.tiles
+                        .iter()
+                        .map(|t| (t.root, t.rule, t.covered.clone()))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .collect();
         assert!(
             absorbing,
-            "precondition: `a + 7` must tile as an absorbing `Rule::AluImm`"
+            "precondition: `a + 7` must tile as an absorbing `Rule::AluImm`: {dump:?}"
         );
 
         // And it is not emitted: the byte-equality oracle sees no disagreement,
