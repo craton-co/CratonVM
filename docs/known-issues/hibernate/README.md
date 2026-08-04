@@ -27,6 +27,29 @@ No doc was moved or newly filed for any of these three — do not re-open them
 as regressions on a future ABORTED sighting without first checking whether
 HotSpot aborts the same tests for the same reason.
 
+**2026-08-04 re-verification, plus the temporal siblings:** the same fresh
+50-class residual rerun (`apps/hib-suite-runner/runs/run-20260804-113511-custom/`)
+reported ABORTED again for the three classes above (identical
+found/ok/aborted counts) plus three `type.temporal` classes with the same
+"JUnit `Assumptions` self-skip baked into the test" shape:
+`InstantTests` (`found=204 ok=112 aborted=92`, matching the fully-fixed
+baseline in `hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md`),
+`LocalDateTimeTest` (`found=162 ok=90 aborted=72`, matching
+`hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md`), and
+`OffsetTimeTest` (`found=396 ok=176 aborted=88 skipped=132`, confirmed
+byte-identical against a direct real-HotSpot `CratonRunner` re-run the same
+day — not previously documented since the finding is "matches its temporal
+siblings", not a new defect).
+
+These six classes are now tracked in
+`apps/hib-suite-runner/known-benign-aborts.tsv` (force-added past the `apps/`
+gitignore, same as `class-overrides.tsv`), which `run-hib.sh categorize`
+consults so a class listed there is routed to `passed.txt` instead of
+`others.txt` — but **only** when its found/ok/aborted counts match the
+table's recorded baseline exactly, so a future ABORTED sighting with
+different counts still surfaces as a residual. Check the table with
+`run-hib.sh benign-aborts`.
+
 ## HANG classes in the fresh 4548-class run (2026-07-31) — one harness gap (now fixed, and hiding two real VM defects), two stale-binary/contention margins
 
 Four more classes report `HANG` (`process-died rc=124`) in the same
@@ -132,6 +155,20 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   moving-young tax, not reopened. See the hib-120s doc's own 2026-07-30/31
   recurrence section for the full A/B table.
 
+  **Correction (2026-08-04):** a fresh 50-class residual run
+  (`run-20260804-113511-custom`) shows these two classes have diverged.
+  `BatchTest` no longer belongs in this bullet at all — today it fails 100%
+  of the time with a genuine, JIT-only `ConstraintViolationException` (a
+  unique-index collision), not a timeout; see
+  [`batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`](batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md).
+  `DynamicBatchFetchTest` still trips the same internal 120s `TimeoutException`
+  as before, but its log now shows 8-9 `[moving-young] fallback` events during
+  `testMultiLoad` where the 07-30/31 table above recorded **zero** `[GC]`
+  lines — the "moving-young mechanism cannot be involved because it's never
+  even requested" argument no longer holds as literally stated (though the
+  overall throughput-margin verdict was not retested/overturned). See the
+  hib-120s doc's own new 2026-08-04 correction section for detail.
+
 ## Resolved (2026-07-30) — retired to `fixed-suite-bugs/hibernate/`
 
 - **HIB-BYTEBUDDY ban removed for good.** The 302-class crash spike was an older runtime
@@ -176,6 +213,17 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
 ## Open
 
+- [`InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT](hib-inpredicate-dispatch-heavy-jit-timeout-20260707-REOPENED-20260804.md)
+  (REOPENED 2026-08-04) — moved back here from
+  `../../internal/fixed-suite-bugs/hibernate/` after a fresh 2026-08-04 `dev`
+  tip run (`a43a74ded`) reproduced the exact original 2026-07-07 symptom:
+  `testInPredicate` fails with `TimeoutException ... timed out after 120
+  seconds` under default JIT (155-183s solo repro), while `--nojit` passes
+  cleanly in ~71.5s. The 2026-07-08 "RETIRED" verdict on the original doc was
+  premature — it closed on the strength of one passing run. Root cause not
+  freshly re-confirmed this session (the original dispatch-heavy JIT tier-up
+  analysis is the leading hypothesis, not re-proven); the real fix it points
+  at (lock-free per-hit tier-up dispatch) was never landed.
 - [`Type.getTypeName()` dispatches on `java/lang/Integer` during a SessionFactory rebuild cascade](gettypename-wrong-receiver-in-sessionfactory-rebuild-cascade-20260801.md)
   (OPEN, **not reproduced**; rewritten 2026-08-01 after re-reading the witness logs line by line —
   its first version's causal story was wrong) — a `Class` mirror resolving as the class it

@@ -5727,7 +5727,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
     r.register(fc_cls, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // See docs/known-issues/h2/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
+        // See docs/known-issues/h2/!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
         // this native is registered on the literal "java/nio/channels/FileChannel"
         // class to service a synthetic single-field FileChannel, but native
         // overrides shadow ALL dispatch for that class name -- including a real
@@ -13319,7 +13319,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // close()V
     r.register(fc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // See docs/known-issues/h2/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
+        // See docs/known-issues/h2/!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
         // this native is registered on the literal "java/nio/channels/FileChannel"
         // class to service a synthetic single-field FileChannel, but native
         // overrides shadow ALL dispatch for that class name -- including a real

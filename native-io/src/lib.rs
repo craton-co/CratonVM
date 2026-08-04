@@ -8008,7 +8008,7 @@ fn native_fc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // asynchronously, whenever the background Cleaner thread happened to
     // run -- a real resource-lifecycle correctness gap in its own right
     // (independent of any specific caller), and a contributing factor to
-    // `docs/known-issues/h2/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md`'s
+    // `docs/known-issues/h2/!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md`'s
     // `OverlappingFileLockException` investigation (that doc's residual
     // occurrences trace to a separate, H2-level chunk-reclaim race --
     // see the doc for the full picture).
