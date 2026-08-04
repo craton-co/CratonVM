@@ -203,16 +203,18 @@ needs a frame walk, and is left open — see "Still open" below.
 ## Verification
 
 Azure Linux host, JDK `25.0.3+9`, fixture root
-`/data/data/springboot-jsonreader-deprecation-20260718`, binary
-`cratonvm-zipgc-r10` built from this branch, `-Xmx 2g`, `-Parallel 2`.
+`/data/data/springboot-jsonreader-deprecation-20260718`, binary built from this
+branch after merging `origin/dev` forward, `-Xmx 2g`, `-Parallel 2`.
 
 Whole `loader/spring-boot-loader` module — **54 classes, a strict superset of
 the 15-class residual shard this document was opened for**:
 
 | mode | PASS | FAIL | CRASH | HANG | EMPTY | shard wall |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| JIT | **52** | 0 | 0 | 0 | 2 | 396.6 s |
-| no-JIT | **52** | 0 | 0 | 0 | 2 | 311.5 s |
+| JIT | **52** | 0 | 0 | 0 | 2 | 407.3 s |
+| no-JIT | **52** | 0 | 0 | 0 | 2 | 211.0 s |
+
+(`ZipContentTests` alone: 338.5 s of the JIT shard's wall time.)
 
 The two `EMPTY` classes are correct: `AbstractLauncherTests` is declared
 `abstract`, and `VirtualZipPerformanceTests` is
@@ -226,10 +228,13 @@ Unit tests added with the fixes (`cargo test -p cratonvm-gc --lib`,
 coalesced one is not; an `Int` fixup widens into a `J` field and a matching one
 is left alone; the near-call decoder accepts `E8 rel32` / `FF /2` (with and
 without REX) and rejects `mov %rax,-0x8(%rbp)`, a displacement `FF`, and
-`FF /1`. `cratonvm-gc --lib` is 968/968. `cratonvm-vm --lib` is 2395/2396; the
-one failure, `layout_immunity_is_not_open_coded`, is a source-scanning guard
-over a file this branch never touched and **fails identically on unmodified
-`dev`**.
+`FF /1`. On the merged tree `cratonvm-gc --lib` is 968/968, `cratonvm-vm --lib`
+is 2391/2391, and `cratonvm-native-builtins --lib` is 3249/3249.
+
+One caveat on the `cratonvm-vm` run: at cargo's default thread count the test
+binary exits 1 *after* reporting `0 failed`, and exits 0 under
+`--test-threads 4`. That is a teardown race in the harness process, arrived
+with the `dev` merge, and touches no code this branch changed.
 
 ## Still open (not blocking this closure)
 
