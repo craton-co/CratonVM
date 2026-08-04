@@ -3499,14 +3499,38 @@ fn reloc_emit_enabled() -> bool {
         if !mir_tile_is_emittable(tile, id) {
             return None;
         }
-        // The linear-scan read cache is XMM-only today, so no `AluRR` operand
-        // can be register-resident. Asked rather than assumed: if it ever grows
-        // a GP class, this path must be revisited before it silently reads a
-        // stale frame word.
+        self.encode_tile_frame_homed(tile)
+    }
+
+    /// The frame word `id` lives in, **and** the fact that it lives there.
+    ///
+    /// The level-2 encoder's whole premise is that an operand can be read out
+    /// of its frame word. The linear-scan read cache makes that false for a
+    /// value it has published into a register — today only for `Float`/`Double`
+    /// (the file is XMM-only), which no integer tile can name. Asked rather
+    /// than assumed, per operand: the day the allocator grows a GP class, this
+    /// returns `None` and the tile is declined, instead of silently encoding a
+    /// load of a stale word.
+    fn frame_operand(&self, id: NodeId) -> Option<i32> {
         if self.resident_xmm(id).is_some() {
             return None;
         }
-        self.encode_tile_frame_homed(tile)
+        self.slot_of_checked(id).ok()
+    }
+
+    /// The frame word a tile will STORE its result into.
+    ///
+    /// `planned_slot_off` rather than `slot_of_checked` because the destination
+    /// has not been allocated yet when the encoder runs — the emit path calls
+    /// `alloc_slot` afterwards and checks the two agree. The residency gate is
+    /// the same one [`Self::frame_operand`] applies, for the same reason: a
+    /// value the allocator publishes into a register is a value whose frame
+    /// word is not the whole truth.
+    fn frame_destination(&self, id: NodeId) -> Option<i32> {
+        if self.resident_xmm(id).is_some() {
+            return None;
+        }
+        self.planned_slot_off(id).ok()
     }
 
     /// What the level-2 encoder *would* emit for `id`, whatever the rule.
@@ -3535,9 +3559,6 @@ fn reloc_emit_enabled() -> bool {
             .tiles
             .get(usize::try_from(ti).ok()?)?;
         if tile.root != id || tile.covered.as_slice() != [id] {
-            return None;
-        }
-        if self.resident_xmm(id).is_some() {
             return None;
         }
         self.encode_tile_frame_homed(tile)
@@ -3575,7 +3596,7 @@ fn reloc_emit_enabled() -> bool {
                         return None;
                     }
                     let mut acc = FrameAccess::new();
-                    enc_frame_load(RAX, self.slot_of_checked(src).ok()?, &mut acc);
+                    enc_frame_load(RAX, self.frame_operand(src)?, &mut acc);
                     out.push(&acc)?;
                     rax_holds = Some(src);
                 }
@@ -3591,11 +3612,11 @@ fn reloc_emit_enabled() -> bool {
                     }
                     if rax_holds != Some(lhs) {
                         let mut acc = FrameAccess::new();
-                        enc_frame_load(RAX, self.slot_of_checked(lhs).ok()?, &mut acc);
+                        enc_frame_load(RAX, self.frame_operand(lhs)?, &mut acc);
                         out.push(&acc)?;
                     }
                     let mut acc = FrameAccess::new();
-                    enc_frame_load(RCX, self.slot_of_checked(rhs).ok()?, &mut acc);
+                    enc_frame_load(RCX, self.frame_operand(rhs)?, &mut acc);
                     out.push(&acc)?;
                     // Level 3. `select` refuses rather than inventing an
                     // encoding, and every row it can answer with names the
@@ -3609,7 +3630,7 @@ fn reloc_emit_enabled() -> bool {
                     .ok()?;
                     out.push_bytes(&sel.encoded.bytes)?;
                     let mut acc = FrameAccess::new();
-                    enc_frame_store(RAX, self.planned_slot_off(dst).ok()?, &mut acc);
+                    enc_frame_store(RAX, self.frame_destination(dst)?, &mut acc);
                     out.push(&acc)?;
                     rax_holds = None;
                 }
@@ -3633,13 +3654,13 @@ fn reloc_emit_enabled() -> bool {
                     }
                     if rax_holds != Some(lhs) {
                         let mut acc = FrameAccess::new();
-                        enc_frame_load(RAX, self.slot_of_checked(lhs).ok()?, &mut acc);
+                        enc_frame_load(RAX, self.frame_operand(lhs)?, &mut acc);
                         out.push(&acc)?;
                     }
                     let sel = select(&Req::new(op, ty, Operand::Gpr(RAX), Operand::Imm(imm))).ok()?;
                     out.push_bytes(&sel.encoded.bytes)?;
                     let mut acc = FrameAccess::new();
-                    enc_frame_store(RAX, self.planned_slot_off(dst).ok()?, &mut acc);
+                    enc_frame_store(RAX, self.frame_destination(dst)?, &mut acc);
                     out.push(&acc)?;
                     rax_holds = None;
                 }
