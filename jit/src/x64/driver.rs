@@ -104,7 +104,22 @@ pub fn compile(
     inline_sites: HashMap<usize, crate::InlineSite>,
     string_layout: Option<crate::StringFieldLayout>,
 ) -> Option<CompiledMethod> {
+    // This wrapper does NOT take an admission token, and that is deliberate.
+    //
+    // It is the legacy test entry point — its "arg index == JVM slot"
+    // assumption is wrong for any method with a `long`/`double` parameter, so
+    // no production path can use it, and none does (the only callers outside
+    // this crate are two `#[cfg(test)]` fixtures in `vm/src/vm.rs`). Threading
+    // a token through it would have meant editing ~140 unit-test call sites to
+    // gate a function production cannot use.
+    //
+    // The escape it leaves is still visible: `for_backend_test` does not open
+    // the thread scope, so anything reaching the backend this way is counted by
+    // `compile_gate::ungated_backend_entries()`, which the VM asserts is zero
+    // over a real run. `compile_with_param_slots` — the entry point the three
+    // real doors use — is the one that requires the token.
     compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
         code,
         code_len,
         num_params,
@@ -243,6 +258,24 @@ pub(super) fn gc_inert_selfrec_candidate(
 /// "arg index == slot" behavior (see the [`compile`] wrapper).
 #[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
+    // ── The admission gate, enforced by the type system ───────────────
+    //
+    // Proof that the caller passed `compile_gate::admit` — the kill switch,
+    // the permanent bail-list, the bisect levers, the code-cache cap, and the
+    // compile-epoch witness opened BEFORE any constant-pool read. There are
+    // three doors into this function and for a long time only one of them
+    // asked all of that; the other two carried hand-copied subsets, each added
+    // after its own bug. `osr-01`'s brief asked for the paths to be unable to
+    // "drift again", and this parameter is what makes a fourth door written
+    // without the gate a *compile error* rather than a red test.
+    //
+    // The `jit` crate's own tests are not doors — they hand this function
+    // hand-built bytecode with no method identity to admit — and they use
+    // `CompileAdmission::for_backend_test()`, which is deliberately still
+    // visible to `compile_gate::ungated_backend_entries()`.
+    //
+    // Unused in the body on purpose: it is a capability, not data.
+    admission: &crate::compile_gate::CompileAdmission,
     code: &[u8],
     code_len: usize,
     num_params: usize,
@@ -337,6 +370,25 @@ pub fn compile_with_param_slots(
     // this is always consistent with an invokedynamic-free method there).
     indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
 ) -> Option<CompiledMethod> {
+    // The drift witness for `compile_gate`. Every production door must hold an
+    // admission token when it gets here; this counts the entries that do not,
+    // which is how a FOURTH door added later announces itself instead of
+    // silently skipping the admission checks the way the OSR and eager
+    // first-call doors did for months. Behaviour-named on purpose: a check that
+    // scanned the source for `compile_with_param_slots(` would have died the
+    // day `x64.rs` was split, as five checks in this repository did.
+    //
+    // Non-zero inside this crate's own tests is expected and meaningless — a
+    // unit test calling the backend is not a door. The assertion that matters
+    // lives in the VM.
+    //
+    // Kept even though `admission` is now required by the signature: the two
+    // layers fail differently. The parameter stops a door written *without*
+    // the gate; this counter stops a door written *with*
+    // `CompileAdmission::for_backend_test()`, which the type system cannot
+    // tell apart from a real one.
+    let _ = admission;
+    crate::compile_gate::note_backend_entry();
     // A class-`ldc` calls a helper that takes the VM context as its first
     // argument, exactly like a string-`ldc`, so it forces the context form of
     // the artifact too.

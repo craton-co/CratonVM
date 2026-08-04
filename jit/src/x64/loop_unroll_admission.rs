@@ -1181,6 +1181,7 @@ fn a_transformed_methods_published_deopt_bcis_are_interpreter_bcis() {
 /// takes no `indy_info`, so this goes to `compile_with_param_slots`.
 fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
     compile_with_param_slots(
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
         code,
         code.len(),
         1,     // num_params: (int n)
