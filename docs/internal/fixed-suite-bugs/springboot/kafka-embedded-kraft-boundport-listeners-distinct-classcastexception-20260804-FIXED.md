@@ -487,3 +487,67 @@ code, unrelated to this doc.
 
 - `module/spring-boot-kafka` —
   `org.springframework.boot.kafka.autoconfigure.KafkaAutoConfigurationIntegrationTests`
+
+---
+
+## Follow-up 2026-08-04 — the same trap on the HashMap side
+
+Defect 3 left a note that the identical primitive-marker trap sat on the
+plain-`HashMap` view-set paths, "not broken today only because
+`java/util/HashMap$Node` is in practice a synthetic stub". **That reason was
+wrong**, and the corrected mechanism is worth having, because it is the thing
+that decides whether the trap is armed.
+
+`java/util/HashMap$Node` is loaded and REAL — it is in `--dump-class-origins`.
+There are simply two node allocators, and they differ in class:
+
+| Allocator | Used by | Class | Descriptors? |
+|---|---|---|---|
+| `native_map_put_evict_pinned` | every ordinary `put` | `ClassId::new(0)` → `cratonvm/synthetic/AnonymousObject$4` | **no** |
+| `map_alloc_node` | the five view/snapshot set builders | real `java/util/HashMap$Node` | **yes** |
+
+Plain `HashSet.remove` works because HashSet's nodes never reach the allocator
+that binds to the real class — not because that class is a stub.
+
+So the raw `Value::Int(1)` marker was **already being destroyed today**, on
+every view-set snapshot node: ~1000 coerced-to-null writes in a program that
+does nothing but iterate an `entrySet`. Nothing read them back (the view
+branches of `native_hs_contains`/`native_hs_remove` resolve membership against
+the source map's `containsKey`/`get`), so no test failed — and it drowned
+`CRATONVM_DBG=overlay` in benign noise, which is exactly what made that
+detector's output easy to mis-scope while Defect 3 was being fixed.
+
+Fixed by `a6bc95030` + `e5a9f6f10`: every PRESENT marker now goes through
+`present_marker()` and is a reference (the element itself — no allocation, no
+Java dispatch). A null element has no reference to mark itself with, so
+`native_hs_add`/`native_hs_remove` settle that one case with `containsKey`.
+
+**Measured outcome:** destructive native `set_field` writes over the same
+program went **1000 → 0**. `LinkedHashMapNodeProbe` grew a map-view section
+and a null-element section (80 → 102 assertions, HotSpot green), plus a
+`SetSurface` probe over the whole set surface.
+
+### The part that is NOT fixed, measured rather than assumed
+
+Binding the ordinary-put node to the real class is still **not** safe, and the
+marker was only one of the reasons. Built exactly that way on top of the fix:
+
+```
+             pre-fix + real node class   post-fix + real node class
+node probe   PROBE FAIL (9)              still FAIL
+SetSurface   SETSURFACE FAIL 7           still FAIL, incl.
+                                         Map$Entry.getKey() == null
+                                         keySet().remove leaves map unshrunk
+```
+
+Whatever else that node's real descriptors change has not been chased down, so
+switching the class is its own validated project, not a tidy-up. The comment
+at the allocation says so, and the probe sections go loudly red (9 failures)
+the moment the line changes — which is the guard, verified by injection.
+
+**Validation:** HotSpot control green on both probes; the landed binary PASS on
+JIT and `--nojit`; `regression-suite/run.sh` **25/25**; `cratonvm-native-
+collections` **94 lib + 86 integration**; `KafkaAutoConfigurationIntegrationTests`
+**4/4 PASS** at 25–49 s on a quiet box (one earlier red at host load 68 was a
+controller-starvation `TimeoutException` — `writeNoOpRecord took 10717 ms` —
+with none of this defect's signatures in the log).
