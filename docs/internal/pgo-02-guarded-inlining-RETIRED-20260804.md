@@ -81,6 +81,20 @@ This is the second finding of the lane and arguably the more transferable one:
 **a JIT test that does not assert the method compiled is a test of the
 interpreter.**
 
+Adding the assertion then produced two more traps worth carrying:
+
+* **Compilation is asynchronous.** A release build runs the 700-call warm-up in
+  ~80 ms — routinely faster than the background worker installs the artifact —
+  so a single cache read is a race. It passed on Windows/debug and failed on
+  Linux/release. `compiled_tally` now polls while continuing to call the
+  method, which gives the worker both the trigger and the time.
+* **A test that shells out to `target/release/cratonvm` runs whatever binary is
+  on disk.** `cargo test -p cratonvm-vm` does not rebuild `-p cratonvm-cli`, so
+  `jit_ir_athrow_dispatch` "failed on this branch" purely because the binary
+  predated the dev merge that carried its own fix; rebuilding the binary made
+  it pass. Worse, that test SKIPS in 0.00s and reports "1 passed" when the
+  binary is absent — which is what a first baseline attempt measured.
+
 ## A silent no-op in class-load invalidation
 
 `vm_init.rs`'s `load_class` invalidated for the newly loaded class and its

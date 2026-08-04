@@ -424,6 +424,16 @@ interpreter, and proved nothing about the compiled path. Found with
 check that depends on a compiled artifact now asserts that artifact exists, so
 the same silent regression to "correct, but interpreted" fails loudly.
 
+**And it waits for the artifact rather than racing it.** Compilation is
+asynchronous: crossing the invocation threshold *enqueues* the method and a
+background worker installs it later. A release build runs the 700-call warm-up
+in ~80 ms, routinely faster than the worker, so a single cache read reported
+"never JIT-compiled" on Linux/release while passing on Windows/debug, where the
+interpreter is slow enough that the worker always won. `compiled_tally` keeps
+calling the method while it waits — which gives the worker both the trigger and
+the time — and still fails if the artifact never appears, because "eventually
+compiles" is the claim under test.
+
 | Check | What it pins |
 |---|---|
 | `check_guard_hit` | monomorphic-A site: correct results past the threshold AND `speculative_sites >= 1`, so a correct result cannot come from plain dispatch and pass |
