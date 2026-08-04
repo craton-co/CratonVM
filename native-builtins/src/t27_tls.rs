@@ -4878,9 +4878,31 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         // resolver hits the same gap on the READ side, where there is no
         // equivalent fallback. `get_field` is required (M4a, this trait's
         // own doc) to bounds-check and fail safe on an out-of-declared-range
-        // index, so scanning a small fixed range unconditionally is safe:
-        // true out-of-bounds reads just come back `Value::Object(None)` and
-        // are silently skipped, never a bad memory access.
+        // index, so probing past the end is memory-safe: true out-of-bounds
+        // reads come back `Value::Object(None)` and are silently skipped,
+        // never a bad memory access.
+        //
+        // Memory-safe is not the same as free, though, and the unconditional
+        // fixed-range scan this used to do was neither silent nor correct as a
+        // *slot computation*. `gen_heap::get_field`'s guard classifies the
+        // read, and for a receiver whose class layout is fine it takes the arm
+        // that says so outright — "caller used slot index past receiver's
+        // layout ... the bug is in the caller's slot computation". Probing
+        // 0..8 at every node made this resolver that caller: one `TestSsl` run
+        // emitted **90** such warnings, all for
+        // `TesterSupport$ClientSSLSocketFactory` (`num_slots=3`,
+        // `real_field_count=Some(3)`, indices 3..7) — a real bytecode class
+        // whose declared layout was available and simply not consulted.
+        //
+        // So consult it, and keep the fixed range only for the case that
+        // actually needs it. `class_num_total_fields` returns 0 both for "no
+        // fields" and for "metadata not available" (its own doc: 0 if the
+        // class isn't loaded), which is exactly the synthetic-carrier gap
+        // above — a carrier holding 1 real slot reports 0. Treating 0 as
+        // "unknown, fall back to probing" keeps that path byte-for-byte, while
+        // any class that reports a real count is scanned to its own bound and
+        // stops generating warnings. A carrier is never missed, because the
+        // fallback still covers precisely the objects whose count is unknown.
         const FIELD_SCAN_RANGE: usize = 8;
         const MAX_DEPTH: usize = 6;
         const MAX_VISITED: usize = 64;
@@ -4898,7 +4920,16 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
                 if sslcontext_cid == Some(cid) {
                     return Some(obj);
                 }
-                for i in 0..FIELD_SCAN_RANGE {
+                // Bound the probe by the receiver's OWN declared layout when
+                // that layout is known; probe blind only when it is not (see
+                // the `FIELD_SCAN_RANGE` comment above).
+                let declared = ctx.class_num_total_fields(cid);
+                let scan = if declared > 0 {
+                    declared
+                } else {
+                    FIELD_SCAN_RANGE
+                };
+                for i in 0..scan {
                     if let Value::Object(Some(candidate)) = ctx.get_field(obj, i) {
                         let sub_cid = ctx.class_id_of_object(candidate);
                         if sslcontext_cid == Some(sub_cid) {
