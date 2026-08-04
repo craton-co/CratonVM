@@ -13812,6 +13812,46 @@ fn basic_file_attributes_syn_mode(ctx: &dyn NativeContext, attrs: ObjectRef) -> 
     }
 }
 
+/// The real `sun.nio.fs.UnixFileAttributes` stores every timestamp as a
+/// SECONDS + NANOS *pair* (`st_mtime_sec`/`st_mtime_nsec`, `st_atime_sec`/
+/// `st_atime_nsec`, `st_birthtime_sec`/`st_birthtime_nsec`). It has never had
+/// an unsplit `st_mtime`/`st_atime`/`st_birthtime` field on any JDK this VM
+/// targets. Returns `(seconds field, nanos field, legacy millis field)`; the
+/// third is only used by a synthetic `UnixFileAttributes` shim that declares
+/// the unsplit spelling.
+///
+/// Why this needs a helper rather than a literal: `set_field_by_name` on a
+/// name the class does not declare is a SILENT no-op, and `get_field_by_name`
+/// answers a non-`Long`. Storing and loading through the same wrong name made
+/// this bridge perfectly self-consistent while agreeing with nothing — every
+/// `BasicFileAttributeView.readAttributes()` on a Unix host reported
+/// 1970-01-01 for all three times regardless of the file's real timestamps,
+/// even though `setTimes` had written them to the inode correctly. The
+/// Windows carrier's names (`creationTime`/`lastAccessTime`/`lastWriteTime`)
+/// happen to be genuine, which is why this only ever showed up on Linux.
+/// See docs/known-issues/springboot/jarmode-tools-extract-timestamp-preservation.md.
+fn unix_attr_time_fields(which: &str) -> (&'static str, &'static str, &'static str) {
+    match which {
+        "creation" => ("st_birthtime_sec", "st_birthtime_nsec", "st_birthtime"),
+        "access" => ("st_atime_sec", "st_atime_nsec", "st_atime"),
+        "ctime" => ("st_ctime_sec", "st_ctime_nsec", "st_ctime"),
+        _ => ("st_mtime_sec", "st_mtime_nsec", "st_mtime"),
+    }
+}
+
+fn attrs_declares_field(ctx: &dyn NativeContext, attrs: ObjectRef, field: &str) -> bool {
+    ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(attrs), field)
+        .is_some()
+}
+
+fn attrs_long_field(ctx: &dyn NativeContext, attrs: ObjectRef, field: &str) -> i64 {
+    match ctx.get_field_by_name(attrs, field) {
+        Value::Long(v) => v,
+        Value::Int(v) => v as i64,
+        _ => 0,
+    }
+}
+
 pub(crate) fn basic_file_attributes_time_millis(
     ctx: &dyn NativeContext,
     attrs: ObjectRef,
@@ -13829,23 +13869,43 @@ pub(crate) fn basic_file_attributes_time_millis(
             _ => 0,
         };
     }
-    let field = if basic_file_attributes_is_windows(ctx, attrs) {
-        match which {
+    if basic_file_attributes_is_windows(ctx, attrs) {
+        let field = match which {
             "creation" => "creationTime",
             "access" => "lastAccessTime",
             _ => "lastWriteTime",
-        }
-    } else {
-        match which {
-            "creation" => "st_birthtime",
-            "access" => "st_atime",
-            _ => "st_mtime",
-        }
-    };
-    match ctx.get_field_by_name(attrs, field) {
-        Value::Long(v) => v,
-        _ => 0,
+        };
+        return attrs_long_field(ctx, attrs, field);
     }
+    let (sec_field, nsec_field, legacy_field) = unix_attr_time_fields(which);
+    if attrs_declares_field(ctx, attrs, sec_field) {
+        let seconds = attrs_long_field(ctx, attrs, sec_field);
+        let nanos = attrs_long_field(ctx, attrs, nsec_field);
+        return seconds
+            .saturating_mul(1_000)
+            .saturating_add(nanos.div_euclid(1_000_000));
+    }
+    attrs_long_field(ctx, attrs, legacy_field)
+}
+
+/// Inverse of `basic_file_attributes_time_millis` for the Unix carrier.
+fn unix_attr_store_time(
+    ctx: &mut dyn NativeContext,
+    attrs: ObjectRef,
+    which: &str,
+    millis: i64,
+) {
+    let (sec_field, nsec_field, legacy_field) = unix_attr_time_fields(which);
+    if attrs_declares_field(ctx, attrs, sec_field) {
+        ctx.set_field_by_name(attrs, sec_field, Value::Long(millis.div_euclid(1_000)));
+        ctx.set_field_by_name(
+            attrs,
+            nsec_field,
+            Value::Long(millis.rem_euclid(1_000) * 1_000_000),
+        );
+        return;
+    }
+    ctx.set_field_by_name(attrs, legacy_field, Value::Long(millis));
 }
 
 pub(crate) fn basic_file_attributes_is_dir(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
@@ -14307,9 +14367,23 @@ pub(crate) fn basic_file_attributes_store(
             "st_mode",
             Value::Int(type_bits | (unix_perm_bits & 0o7777)),
         );
-        ctx.set_field_by_name(attrs, "st_birthtime", Value::Long(creation_millis));
-        ctx.set_field_by_name(attrs, "st_atime", Value::Long(access_millis));
-        ctx.set_field_by_name(attrs, "st_mtime", Value::Long(modified_millis));
+        unix_attr_store_time(ctx, attrs, "creation", creation_millis);
+        unix_attr_store_time(ctx, attrs, "access", access_millis);
+        unix_attr_store_time(ctx, attrs, "modified", modified_millis);
+        // `UnixFileAttributes.creationTime()` (real JDK bytecode) only trusts
+        // `st_birthtime_*` when this flag is set, and falls back to `ctime()`
+        // otherwise; `ctime()` reads `st_ctime_*`, which `std::fs::Metadata`
+        // cannot supply portably. Mirror the modified time there so a caller
+        // that reaches the real accessor instead of our override sees a
+        // plausible value rather than 1970. Callers with no backing inode
+        // (jar-FS / jrt-FS / directory walks) pass 0 and correctly report the
+        // birth time as unavailable.
+        ctx.set_field_by_name(
+            attrs,
+            "birthtime_available",
+            Value::Int(i32::from(creation_millis != 0)),
+        );
+        unix_attr_store_time(ctx, attrs, "ctime", modified_millis);
         ctx.set_field_by_name(attrs, "st_size", Value::Long(size));
     }
 }
