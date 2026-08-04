@@ -24,10 +24,57 @@
 >    lock-bearing bodies, which is doc 31's subject, not an admission ban.
 > 2. **A separate degradation term was found and fixed**, and it is not in this
 >    doc's model at all: the cost is not flat, it *rises* within one process.
->    See [loader-latch-degrades-every-deploy.md](loader-latch-degrades-every-deploy.md).
+>    See `fixed-suite-bugs/tomcat/loader-latch-degrades-every-deploy-FIXED.md`.
 >    Defining one class through any user-defined loader used to make the whole
->    VM ~1.8x slower permanently. Fixed; worth 3.5x on the probe and **nothing
+>    VM ~1.8x slower permanently. Fixed; worth 1.6x on the probe and **nothing
 >    measurable on the test classes**, which is why this doc stays OPEN.
+
+> **Update 2026-08-04 — the "still absent" list above is itself half stale.**
+>
+> Two of the four frames now compile. `CRATONVM_DBG=jit-compiled` over
+> `probes/LoaderStepOneShotProbe.java` (`lib all 6`) lists **27 methods, 3 of
+> them constructors**, and includes `ClassParser.parse`; over
+> `probes/LoaderStepCostProbe.java` it lists **31**, adding
+> `ConstantPool.<init>`, `Constant.<init>` and `JavaClass.<init>`. So of the
+> four, only the **JDK's own two** — `BufferedInputStream.read` and
+> `DataInputStream.readUnsignedByte` — are reliably never compiled, and those
+> are exactly the `synchronized` bodies doc 31 owns. Anything arguing "the
+> parse never compiles" is arguing from a census that no longer holds; the
+> binding constraint is the per-class *flat* cost (~3 300–3 500 µs against
+> HotSpot's ~16 µs), not compiled-vs-interpreted coverage of the BCEL classes.
+>
+> The loader-latch doc retired the same day, so the degradation term in
+> correction 2 is now closed on measurement rather than on a wall-clock
+> estimate: a positive-control build with the fix reverted steps **1.60x** at
+> the first class definition and the shipped build is flat, and the "~1.5x
+> second-loader step" that doc carried as an open residual **does not exist**
+> and has been withdrawn.
+
+## Untaken levers
+
+Recorded here rather than lost when the loader-latch doc retired. Neither is
+the binding constraint on this doc's classes; both are structurally real.
+
+* **`invokespecial` call sites stop feeding the tiered manager once cached.**
+  `vm/src/runtime/interpreter/dispatch_virtual.rs`'s invocation-counter block
+  opens with `if !is_special`, and it gates *counting* as well as promotion —
+  so once a constructor / private / `super` call site is in the inline cache it
+  no longer increments the JIT invocation counter. The uncached route in
+  `vm/src/runtime/interpreter.rs` still counts every method regardless of
+  opcode, which is why the census above finds constructors compiled anyway, so
+  the obvious framing ("constructors are invisible to tier-up") is **not**
+  what the code does. Splitting counting from promotion is the small change;
+  what makes it a project rather than a fix is the blast radius — widening
+  which methods reach the optimizing tier moves work off the single-pass
+  backend, whose loop lowerings have no IR-tier equivalent, so it needs
+  `regression-suite/perf/c2-reach.sh` plus a CratonBench pass before it can
+  land.
+* **`new` has no per-call-site class-resolution cache.**
+  `opcodes.rs`'s `Instruction::New` re-resolves its constant-pool entry on
+  every execution, unlike `put_field`/`put_method`. This is what amplified the
+  loader latch into a VM-wide 1.6x; with the latch fixed it is no longer a
+  step, but it is still a per-`new` cost that a constant-pool parse pays once
+  per entry.
 
 ## Symptom
 

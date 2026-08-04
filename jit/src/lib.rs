@@ -15194,6 +15194,50 @@ fn try_compile_inner(
                         {
                             compiled.has_dispatch = true;
                         }
+                        // cov-07 companion: `Op::Throw` owes the same flag, and
+                        // for the same reason. It is the ONE `has_dispatch` arm
+                        // cov-07 did not bring across when it admitted `athrow`
+                        // to this tier.
+                        //
+                        // The single-pass backend has carried this since RBC.6
+                        // (`emitted_athrow` forces `has_dispatch` in
+                        // `x64/driver.rs`), and the RBC.6-relaxation comment at
+                        // the `has_athrow` gate above states the resulting
+                        // invariant outright: "any method containing `athrow` is
+                        // ALWAYS entered through `execute_jit_call`'s
+                        // dispatch-aware slow path, never the raw fast-path that
+                        // would leak the sentinel as a return value". That
+                        // invariant is the whole reason lowering `athrow` is
+                        // safe — and this tier silently did not hold it.
+                        //
+                        // `jit_throw_exception` stashes the throwable and returns
+                        // the `i64::MIN` sentinel, but — unlike every other
+                        // sentinel producer — does NOT set `JIT_DEOPT_PENDING`.
+                        // The dispatch-aware entry does not need it to: that path
+                        // drains `sig.exception` and routes it unconditionally.
+                        // The `!has_dispatch` fast entry has no such drain — it
+                        // consults `deopt_signaled`, which is therefore false —
+                        // so the stashed exception is dropped and the method
+                        // returns as though it completed normally.
+                        //
+                        // For a `void` method that is invisible (no return value
+                        // whose bits could look wrong), so it presents as a throw
+                        // that simply did not happen. Witness: JUnit Platform's
+                        // sneaky-throw idiom, where `throwAs(t)` is `checkcast
+                        // <erased>; athrow` and nothing else — so
+                        // `throwAsUncheckedException` falls through to its
+                        // `return null`, its caller throws that null, and the
+                        // ORIGINAL exception is lost behind a helpful-NPE.
+                        //
+                        // Measured with the caller forced interpreted
+                        // (`CRATONVM_JIT_DENY`), which isolates the compiled
+                        // callee → interpreted caller edge this governs: 1 792 397
+                        // swallowed throws in 1 800 000 iterations before, 0 after.
+                        //
+                        // Pinned by `vm/tests/jit_ir_athrow_dispatch.rs`.
+                        if graph.nodes.iter().any(|n| matches!(n.op, ir::Op::Throw)) {
+                            compiled.has_dispatch = true;
+                        }
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
                         // for the code's lifetime, and mark the method as using
