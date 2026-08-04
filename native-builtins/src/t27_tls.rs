@@ -4816,7 +4816,17 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             if let Some(f) = huc_default_ssl_socket_factory() {
                 return Ok(Some(Value::Object(Some(f))));
             }
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 0);
+            // FIX (sslsocketfactory-getdefault-aether-resolution-regression-
+            // 20260804): this fallback used to mint a BARE 0-field carrier.
+            // The JDK documents the unset default as
+            // `SSLSocketFactory.getDefault()`, and a caller that takes this
+            // factory to the layered
+            // `createSocket(Socket,String,int,boolean)` overload reads its
+            // field 0 for the owning `SSLContext` — so the bare carrier threw
+            // `IllegalStateException: SSLSocketFactory has no owning
+            // SSLContext`. Hand back the same wired carrier `getDefault()`
+            // does.
+            let obj = default_ssl_socket_factory_obj(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4991,7 +5001,27 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         "getSSLSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 0);
+            // FIX (sslsocketfactory-getdefault-aether-resolution-regression-
+            // 20260804): same bare-0-field carrier bug as
+            // `getDefaultSSLSocketFactory` above — see that comment.
+            //
+            // The JDK's instance default is whatever
+            // `setDefaultSSLSocketFactory` published, falling back to
+            // `SSLSocketFactory.getDefault()`. Read that back rather than
+            // minting an unrelated placeholder.
+            //
+            // Known remaining gap (NOT this doc's bug, and deliberately not
+            // fixed here): a per-connection `setSSLSocketFactory(...)` is
+            // still not readable back through this getter. That setter
+            // captures the connection's client identity but never stores the
+            // factory object, and storing it needs a new GC-rooted
+            // per-connection table (scan + post-move remap), like
+            // `huc_default_factory_slot` has. Both branches below at least
+            // return a factory that CAN open a layered socket.
+            if let Some(f) = huc_default_ssl_socket_factory() {
+                return Ok(Some(Value::Object(Some(f))));
+            }
+            let obj = default_ssl_socket_factory_obj(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -10400,6 +10430,50 @@ pub(crate) fn set_runtime_default_ssl_context(ctx_obj: ObjectRef) {
 /// object instead of always allocating a fresh, unconfigured one.
 pub(crate) fn get_runtime_default_ssl_context() -> Option<ObjectRef> {
     *default_ssl_context_slot().lock()
+}
+
+/// The process-wide default `SSLContext`, created and cached on first use.
+///
+/// This is the JDK's documented `SSLContext.getDefault()` lazy-init contract
+/// ("the default context is created if it is not yet created"). It lived
+/// inline in exactly one caller — `phases_late::ssl_security`'s
+/// `SSLSocketFactory.getDefault()` registration — while three other natives
+/// that also hand back a `javax/net/ssl/SSLSocketFactory` minted a *bare*
+/// carrier instead. The layered
+/// `SSLSocketFactory.createSocket(Socket,String,int,boolean)` overload reads
+/// the owning context out of the carrier's field 0, so every one of those
+/// bare factories threw
+/// `IllegalStateException: SSLSocketFactory has no owning SSLContext`
+/// instead of connecting. Converting the idiom rather than each site is what
+/// keeps a future fourth caller from re-introducing it. See
+/// `docs/known-issues/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804.md`.
+pub(crate) fn default_ssl_context_or_create(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+) -> ObjectRef {
+    if let Some(existing) = get_runtime_default_ssl_context() {
+        return existing;
+    }
+    let new_ctx = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
+    let name = ctx.create_string("TLS");
+    ctx.set_field(new_ctx, 0, Value::Object(Some(name)));
+    ctx.set_field(new_ctx, 1, Value::Int(1));
+    set_runtime_default_ssl_context(new_ctx);
+    new_ctx
+}
+
+/// Mint the object `SSLSocketFactory.getDefault()` hands back: the same
+/// 1-slot synthetic carrier `SSLContext.getSocketFactory()` returns, with
+/// field 0 set to the process default `SSLContext`.
+///
+/// `HttpsURLConnection`'s default/instance factory getters use it too — the
+/// JDK documents both as defaulting to `SSLSocketFactory.getDefault()`.
+pub(crate) fn default_ssl_socket_factory_obj(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+) -> ObjectRef {
+    let ssl_ctx = default_ssl_context_or_create(ctx);
+    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
+    ctx.set_field(obj, 0, Value::Object(Some(ssl_ctx)));
+    obj
 }
 
 /// GC root scan for `default_ssl_context_slot` -- mirrors
