@@ -427,7 +427,7 @@ fn compile_despec_arraycopy_with_dispatch(
         helpers,
         HashSet::new(),
         HashMap::new(),
-        HashMap::new(), // inline_guard_class_ids (PGO-02)
+        HashMap::new(), // inline_guard_variants (PGO-02)
         None, // string_layout
         &[],
         0,

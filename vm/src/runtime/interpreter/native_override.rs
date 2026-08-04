@@ -148,8 +148,8 @@ pub(crate) fn is_class_mirror_native_override(
 /// bytecode invokes already prefer the registered native, but this call
 /// pattern (through the lambda-backed `ComputeValue` plumbing) can resolve
 /// through a dispatch path whose concrete-bytecode precedence needs this
-/// explicit shared gate — see docs/known-issues/springboot/
-/// core-spring-boot-test-config-data-and-classpath-scan-cluster.md Cluster C
+/// explicit shared gate — see fixed-suite-bugs/springboot/
+/// core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md Cluster C
 /// "Residual 5" (fixed under `--nojit` without this gate; JIT mode still hit
 /// the original always-null-returning symptom until this was added).
 pub(crate) fn is_classvalue_native_override(
@@ -1865,7 +1865,7 @@ pub(crate) fn is_file_channel_impl_open_native_override(
 /// `native-builtins/src/phases_late/nio_file.rs` are unreachable and every
 /// `Files.createSymbolicLink` in the VM dies with a bare
 /// `UnsupportedOperationException` — see
-/// `docs/internal/fixed-suite-bugs/springboot/files-createsymboliclink-unsupported-FIXED.md`.
+/// `fixed-suite-bugs/springboot/files-createsymboliclink-unsupported-FIXED.md`.
 ///
 /// The real `sun.nio.fs.*` provider names are listed alongside the base for the
 /// same reason `newFileChannel` lists them: a cached dispatch site can carry a
@@ -2719,39 +2719,11 @@ pub(super) fn force_native_over_real_jdk_bytecode(
         return true;
     }
     // JDK-ONLY-WAVE2: the forced-native `java/lang/String` policy, INVERTED-
-    // EXCLUSION form. Read it as: for `java/lang/String`, ONLY these seven
-    // shapes may go on to force a native; every other String method returns
-    // `false` right here and runs real bytecode.
-    //
-    // Its twin is the POSITIVE, 21-method `java/lang/String` arm of
-    // `check_override` in `vm/src/vm/vm_exec.rs::invoke_on_class_shared_inner`.
-    // This one governs the WARM path (memoized force-native gate); that one
-    // governs the COLD path (first call at a site). THE TWO MUST BE DELETED
-    // TOGETHER: drop either alone and cold and warm dispatch disagree about
-    // which implementation of `String.equals`/`hashCode`/`substring` runs, so
-    // a String method's observable behaviour starts depending on how many times
-    // its call site has executed — the precise class of JIT-state-dependent bug
-    // §7 centralisation exists to prevent. What must replace both: nothing;
-    // `String`'s natives are registered as `Intrinsic` and
-    // `resolve_dispatch` step 2 takes them on kind alone, with no name list.
+    // EXCLUSION form. See [`warm_forced_native_string_candidate`] for the
+    // whitelist itself, for its relationship to the POSITIVE 21-name form in
+    // `check_override`, and for why the two must be deleted together.
     if class_name == "java/lang/String"
-        && !matches!(
-            (method_name, method_descriptor),
-            (
-                "replaceAll",
-                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
-            ) | (
-                "replaceFirst",
-                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
-            ) | ("matches", "(Ljava/lang/String;)Z")
-                | (
-                    "replace",
-                    "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
-                )
-                | ("substring", "(II)Ljava/lang/String;")
-                | ("<init>", "([BLjava/lang/String;)V")
-                | ("<init>", "([BIILjava/lang/String;)V")
-        )
+        && !warm_forced_native_string_candidate(method_name, method_descriptor)
     {
         return false;
     }
@@ -3030,8 +3002,8 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // set. Once `execute(Runnable)` (invoked via `invokeinterface
     // Executor.execute`/`ExecutorService.execute`) resolves to the concrete
     // class's own real bytecode, that bytecode reads the never-initialized
-    // `ctl` AtomicInteger and NPEs immediately (docs/known-issues/
-    // threadpoolexecutor-execute-npe-on-ctl-regression.md). Force the
+    // `ctl` AtomicInteger and NPEs immediately (fixed-suite-bugs/
+    // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md). Force the
     // registered native (`native_es_execute`) to win for this triple;
     // `intercept_force_registered_native` additionally checks the receiver's
     // real `workers` field so a genuinely real, bytecode-constructed
@@ -3298,7 +3270,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // and even standard level names through `KnownLevel.findByName`, which
     // on JDK 25 throws internally (a `Module`-null NPE the method's own
     // catch-all reports as a generic `IllegalArgumentException: Bad level`)
-    // — see `docs/internal/gaps/kc16-blocker-map.md`'s KC16 investigation.
+    // — see `gaps/kc16-blocker-map.md`'s KC16 investigation.
     // This broke WildFly's own `host.xml`/`domain.xml` parsing of
     // `<level name="WARN"/>` (org.jboss.logmanager's extended levels) before
     // it ever reached a genuinely-unknown name. Force the registered native
@@ -4137,7 +4109,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // completely unreachable. Confirmed via runtime instrumentation: a tight
     // `text.substring(pos, pos+5)` loop over a large parent `String` cost
     // O(n^2) instead of O(subLen) with this entry absent (see
-    // `docs/known-issues/substring-large-parent-quadratic-allocation.md`).
+    // `fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`).
     if class_name == "java/lang/String"
         && method_name == "substring"
         && method_descriptor == "(II)Ljava/lang/String;"
@@ -5132,7 +5104,7 @@ pub(super) fn redefine_immune_forced_native(
         // registered native. Keep in sync with vm_exec.rs's
         // invoke_on_class_shared_inner check_override entry for the same
         // triples; see
-        // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+        // fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
         || (class_name == "java/util/logging/FileHandler"
             && matches!(
                 method_name,
@@ -5274,16 +5246,229 @@ pub(super) fn should_force_registered_native_over_bytecode_precomputed(
             || redefine_immune_forced_native(class_name, method_name, method_descriptor))
 }
 
-/// Dispatch a force-native override via `safe_native_call`, pushing any return
-/// value onto the caller operand stack.
+/// Route a force-native interception through §7 policy, and count it.
+///
+/// # The gap this closes
+///
+/// [`intercept_force_registered_native`] and its cached twin are reached from
+/// **seven** call sites across `dispatch_static`, `dispatch_virtual` and
+/// `invoke`, and both used to end in a bare `safe_native_call` on a callback
+/// from `NativeMethodRegistry::find`. No `dispatch_policy`, no
+/// `resolve_native_dispatch_wave1`, no `record_invocation`. Their entire
+/// purpose is to make a registered native beat *concrete real-JDK bytecode*,
+/// which is precisely the inversion §1.4 forbids under `JdkOnly` — so under
+/// `--jdk-only` these were seven unguarded holes in contract §11's *"every
+/// strict-mode native dispatch"*, and in `Compatible` they were seven
+/// dispatches missing from the §4 census. Every sibling dispatch route
+/// (`invoke_or_native`, `try_stackless_invoke` steps 1 and 6,
+/// `invoke_on_class_shared_inner`) was routed in wave 1; these two were not.
+///
+/// # Why `bytecode_available: true`
+///
+/// Unlike `resolve_step1_native`, which runs before any method resolution and
+/// passes `false` because it genuinely does not know, these sites are only
+/// reached *because* `force_native_over_real_jdk_bytecode` said this triple's
+/// real bytecode must lose. Concrete bytecode existing is the premise of the
+/// call, so `true` is the honest input to §7 step 3 — and it is what makes a
+/// strict run fall through to that bytecode instead of running the shadow.
+///
+/// # `Compatible` is bit-for-bit unchanged
+///
+/// `compat_native_wins` is `true` — exactly the unconditional "a registered
+/// native wins here" the `find` call encoded — and in `Compatible` mode
+/// `resolve_native_dispatch_wave1` is a pure function of that boolean. The
+/// added cost is one relaxed `fetch_add` for the census.
+///
+/// # The three answers
+///
+/// * `Ok(Some(cb))` — dispatch it, and the invocation has been counted.
+/// * `Ok(None)` — nothing registered, or §7 step 3 sent a `Bridge` to the real
+///   bytecode. The interceptor declines, and the call proceeds to that
+///   bytecode. The shadow attempt is already recorded by the resolver.
+/// * `Err(violation)` — §1.3, a `SyntheticStub` under `--jdk-only`. Raised
+///   rather than declined, matching `invoke_on_class_shared_inner`, so it is
+///   counted as a `SyntheticNativeInvocation`. Swallowing it would run the real
+///   bytecode quietly and leave a strict run reporting zero synthetic-stub
+///   invocations for a call that was one — the exact false-green contract §11
+///   must be immune to.
 #[inline]
+fn admit_forced_native(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> Result<Option<cratonvm_native_api::NativeCallback>, cratonvm_types::error::JdkOnlyViolation> {
+    let Some(id) = shared
+        .natives
+        .native_methods
+        .resolve_id(class_name, method_name, method_descriptor)
+    else {
+        return Ok(None);
+    };
+    admit_forced_native_id(shared, id, class_name, method_name, method_descriptor)
+}
+
+/// [`admit_forced_native`] for a caller that already holds the resolved
+/// [`cratonvm_native_api::NativeMethodId`].
+///
+/// The cached interceptor gets its id from the call site's generation-keyed
+/// `NativeCallSite` memo, which exists because the plain
+/// `NativeMethodRegistry::find` it replaced was measured as the #2 hottest
+/// symbol (~7% of samples) on `TestResponsePerformance`. Routing that path
+/// through the string-hashing sibling would hand that back; taking the id
+/// keeps the warm cost at two array indexes, the policy call, and one relaxed
+/// `fetch_add`.
+#[inline]
+fn admit_forced_native_id(
+    shared: &SharedVm,
+    id: cratonvm_native_api::NativeMethodId,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> Result<Option<cratonvm_native_api::NativeCallback>, cratonvm_types::error::JdkOnlyViolation> {
+    let registry = &shared.natives.native_methods;
+    let Some(callback) = registry.callback_of(id) else {
+        return Ok(None);
+    };
+    let kind = registry
+        .kind_of_id(id)
+        .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
+    match crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::dispatch_policy(shared),
+        class_name,
+        method_name,
+        method_descriptor,
+        Some((callback, kind)),
+        true,
+        true,
+    ) {
+        // §1.3 — a `SyntheticStub` may not be invoked under `--jdk-only`.
+        // Raised rather than silently declined, matching
+        // `invoke_on_class_shared_inner`: the violation is counted as a
+        // `SyntheticNativeInvocation` by the caller that turns it into
+        // `VmError::JdkOnly`, and swallowing it here would drop that census
+        // entry while quietly running the real bytecode — a strict run would
+        // then report zero synthetic-stub invocations for a call that was one.
+        Some(crate::vm::DispatchDecision::Reject(violation)) => Err(violation),
+        Some(decision) => match decision.native_callback() {
+            Some(admitted) => {
+                // Counted at the point of actual dispatch, matching every
+                // other route: the caller calls `safe_native_call` next.
+                registry.record_invocation(id);
+                Ok(Some(admitted))
+            }
+            None => Ok(None),
+        },
+        // §7 step 3 under `JdkOnly`: concrete bytecode beats this bridge. The
+        // shadow attempt was already recorded by the resolver.
+        None => Ok(None),
+    }
+}
+
+/// Every dispatch site that carries the `ThreadPoolExecutor.execute`
+/// receiver-shape check, as `(file, enclosing function)`.
+///
+/// JDK-ONLY-WAVE2. `native_es_execute` is a compatibility stand-in for
+/// CratonVM's synthetic 2-field `Executors.new*ThreadPool()` objects, but it is
+/// registered on `ThreadPoolExecutor.execute`, whose real class bytecode is
+/// **always** loaded — so the general `SyntheticStub` / `CRATONVM_REAL` yield
+/// logic cannot disambiguate it: that logic is *class*-scoped and the question
+/// here is per-*instance*. Hence the receiver-shape probe, once per dispatch
+/// route.
+///
+/// # Why this list exists
+///
+/// The wave-1 markers named **four** of these eight, and misplaced one of the
+/// four. That undercount is the actual hazard: a mechanical "delete every
+/// marked `ThreadPoolExecutor` site" sweep leaves the unmarked half enforcing a
+/// policy the marked half no longer applies — the same cold-path/warm-path
+/// split as the forced-native `String` lists, with a worse failure mode.
+///
+/// # The ninth site
+///
+/// `force_native_over_real_jdk_bytecode` returns `true` for the
+/// `(ThreadPoolExecutor, execute, (Ljava/lang/Runnable;)V)` triple with **no
+/// receiver awareness at all**. That is the unconditional decision the eight
+/// exist to override, and it has to be deleted in the same change or the
+/// overrides cannot be.
+///
+/// # What must replace all nine
+///
+/// Per the wave-1 marker, in this order — the order matters, and getting it
+/// wrong aborts the process rather than throwing:
+///
+/// 1. give real `ThreadPoolExecutor` objects correct Java field initialisation
+///    so `Executors.new*ThreadPool()` returns objects built by the real
+///    `<init>` (`docs/jdk-only-runtime-services.md` P1). Until this lands,
+///    reclassifying below **drops** `native_es_execute` under
+///    `CRATONVM_NO_STUBS` / `--jdk-only` and synthetic-receiver executors lose
+///    their only implementation;
+/// 2. reclassify `native_es_execute` as `NativeKind::SyntheticStub` — it is
+///    currently tagged such that the general yield logic does not apply to it;
+/// 3. delete the ninth site;
+/// 4. delete these eight. Contract §7 step 3 ("concrete bytecode beats a
+///    registered `Bridge` or `SyntheticStub`") then produces the same answer
+///    structurally, for every receiver, with no field probe and no class-name
+///    list.
+///
+/// Deleting the eight *before* step 2 restores the `ctx.invoke_virtual`
+/// self-recursion that step 1's `FIXED` doc records: a native stack overflow
+/// and process abort, not a catchable `StackOverflowError`.
+///
+/// # Not in this list
+///
+/// `native-builtins`' own `executor_has_real_workers` (~8 call sites there,
+/// plus a deliberately-separate twin in `native-collections` to avoid a
+/// cross-crate dependency) is defence in depth *inside the callee*, not a
+/// dispatch decision. It is listed here only so a wave-2 grep does not mistake
+/// it for one — and so nobody deletes the check and its backstop in one change.
+#[cfg(test)]
+pub(crate) const THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES: &[(&str, &str)] = &[
+    ("vm/src/vm/vm_exec.rs", "invoke_or_native"),
+    ("vm/src/vm/vm_exec.rs", "invoke_on_class_shared_inner"),
+    (
+        "vm/src/runtime/interpreter/invoke.rs",
+        "try_stackless_invoke step 1",
+    ),
+    (
+        "vm/src/runtime/interpreter/invoke.rs",
+        "try_stackless_invoke step 6",
+    ),
+    (
+        "vm/src/runtime/interpreter/native_override.rs",
+        "intercept_force_registered_native",
+    ),
+    (
+        "vm/src/runtime/interpreter/native_override.rs",
+        "intercept_force_registered_native_cached",
+    ),
+    (
+        "vm/src/runtime/interpreter/dispatch_virtual.rs",
+        "populate_virtual_invoke_cache",
+    ),
+    (
+        "vm/src/runtime/interpreter/dispatch_virtual.rs",
+        "populate_virtual_invoke_cache force-native arm",
+    ),
+];
+
 /// Whether `recv` (the receiver of a `ThreadPoolExecutor.execute()` call) is
 /// a genuinely real, bytecode-constructed `ThreadPoolExecutor` rather than
 /// one of CratonVM's synthetic 2-field `Executors.new*ThreadPool()` stand-ins.
 /// Mirrors `native-builtins::executor_has_real_workers` (same check, same
 /// field) but works from the interpreter, which only has `SharedVm`/`JvmThread`
 /// -- not a `NativeContext` -- available at this dispatch point.
-pub(super) fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool {
+///
+/// **The single implementation.** Two sites in `vm_exec.rs` used to re-inline
+/// the `workers`-field probe by hand, giving three copies of one predicate —
+/// and both inlined copies took a plain `read()` where the note below explains
+/// why `read_recursive()` is required. They call this now.
+///
+/// (The `#[inline]` here was previously attached to an orphaned doc comment —
+/// *"Dispatch a force-native override via `safe_native_call`"* — describing a
+/// function that no longer exists next to it. Restored onto its real subject.)
+#[inline]
+pub(crate) fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool {
     let Value::Object(Some(recv)) = recv else {
         return false;
     };
@@ -5652,17 +5837,28 @@ pub(super) fn intercept_force_registered_native(
     // real `<init>` ran, so its real `workers` field is populated) must keep
     // running its own real `execute()` -- only CratonVM's synthetic 2-field
     // `Executors.new*ThreadPool()` objects need the forced native. See
-    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    // fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     if class_name == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && threadpool_executor_has_real_workers(shared, &args[0])
     {
         return None;
     }
-    let cb = shared
-        .natives
-        .native_methods
-        .find(class_name, method_name, method_descriptor)?;
+    // §7 routing. This was a bare `find`, so the dispatch below ran with no
+    // policy check and no census count — see `admit_forced_native` for why
+    // that made this one of seven unguarded strict-mode holes. `None` here
+    // means the policy refused, and declining to intercept hands the call to
+    // the real bytecode this site exists to override, which is §7 step 3's
+    // answer.
+    let cb = match admit_forced_native(shared, class_name, method_name, method_descriptor) {
+        Ok(Some(cb)) => cb,
+        Ok(None) => return None,
+        Err(violation) => {
+            return Some(Err(MethodCallFailed::InternalError(VmError::JdkOnly(
+                violation,
+            ))));
+        }
+    };
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!("[ccs-probe] intercept_force_registered_native: dispatching native callback");
     }
@@ -5825,14 +6021,14 @@ pub(super) fn intercept_force_registered_native_cached(
     // real `<init>` ran, so its real `workers` field is populated) must keep
     // running its own real `execute()` -- only CratonVM's synthetic 2-field
     // `Executors.new*ThreadPool()` objects need the forced native. See
-    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    // fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     if class_name == "java/util/concurrent/ThreadPoolExecutor"
         && method_name == "execute"
         && threadpool_executor_has_real_workers(shared, &args[0])
     {
         return None;
     }
-    // Site A1 of `docs/internal/arch-2026-07-26/native-dispatch-memoization.md`
+    // Site A1 of `arch-2026-07-26/native-dispatch-memoization.md`
     // §3 Step 2. Perf (2026-07-19, TestResponsePerformance residual): memoize
     // the resolved callback per invoke-cache entry, same shape as
     // `force_native_cache` above -- `NativeMethodRegistry::find` was the #2
@@ -5853,12 +6049,29 @@ pub(super) fn intercept_force_registered_native_cached(
     // at the top of this function), so this cell only ever sees this entry's
     // own triple. The `java/lang/ClassLoader` re-target earlier in this
     // function deliberately stays on plain `find` for that reason.
-    let cb = cached.native_call_site().callback(
+    //
+    // §7 routing (2026-08-04). This ended in a bare `safe_native_call` on the
+    // memoized callback — no `dispatch_policy`, no
+    // `resolve_native_dispatch_wave1`, no census count — which made it one of
+    // seven unguarded strict-mode holes; see `admit_forced_native`. The memo
+    // is kept: `resolve` hands back the `NativeMethodId` without re-hashing,
+    // and `admit_forced_native_id` takes it from there, so the perf argument
+    // above survives intact.
+    let id = cached.native_call_site().resolve(
         &shared.natives.native_methods,
         class_name,
         method_name,
         method_descriptor,
     )?;
+    let cb = match admit_forced_native_id(shared, id, class_name, method_name, method_descriptor) {
+        Ok(Some(cb)) => cb,
+        Ok(None) => return None,
+        Err(violation) => {
+            return Some(Err(MethodCallFailed::InternalError(VmError::JdkOnly(
+                violation,
+            ))));
+        }
+    };
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native_cached: dispatching native callback"
@@ -6268,56 +6481,495 @@ pub(super) fn synthetic_stub_kind_should_yield_to_real_bytecode(
 /// classes whose SyntheticStub natives exist only for stub-phase bootstraps
 /// and must yield to loaded real bytecode.
 ///
-/// JDK-ONLY-WAVE2: real-protected-stub class allow-list, COPY 2 OF 2. The other
-/// copy is inline in `vm/src/vm/vm_exec.rs::invoke_or_native`, and **the two
-/// are not identical**: that one lists `java/util/StringJoiner`, this one
-/// deliberately does not (see the comment inside). Wave 2 must RECONCILE them
-/// — decide what StringJoiner should do on both paths — not assume they are
-/// duplicates and delete one. What must replace them: `NativeKind` alone; under
-/// `--jdk-only` no `SyntheticStub` dispatches, so no class needs protecting
-/// from one and the entire list becomes dead.
+/// The `java/lang/String` shapes that may go on to force a native on the
+/// **warm** (memoized, per-call-site-cached) dispatch path.
+///
+/// Read the call site as: for `java/lang/String`, only these may proceed;
+/// every other `String` method returns `false` right there and runs real
+/// bytecode. Being on this list is permission to *reach* a later decision, not
+/// a decision — a shape here still has to match one of the blocks below to be
+/// forced.
+///
+/// # JDK-ONLY-WAVE2: this is one of three copies of one policy
+///
+/// The other two are the POSITIVE, 21-**name** (descriptor-blind) arm of
+/// `check_override` in `vm/src/vm/vm_exec.rs::invoke_on_class_shared_inner`
+/// (the COLD path — a genuine vtable miss, in practice the first call at a
+/// site), and the JIT's `String.toLowerCase(Locale)` direct-call ladder. THE
+/// FIRST TWO MUST BE DELETED TOGETHER: drop either alone and cold and warm
+/// dispatch disagree about which implementation of `String.equals` /
+/// `hashCode` / `substring` runs, so a `String` method's observable behaviour
+/// starts depending on how many times its call site has executed — the precise
+/// class of JIT-state-dependent bug §7 centralisation exists to prevent.
+///
+/// What must replace both: nothing. `String`'s natives should be registered
+/// `Intrinsic` and taken by `resolve_dispatch` step 2 on kind alone, with no
+/// name list at all.
+///
+/// # The five entries that used to be dead
+///
+/// `substring(I)`, `charAt`, `length`, `isEmpty` and `startsWith` were added
+/// (h2-bnf-perf, 2026-07-23) to a block *below* this exclusion, as a measured
+/// fix for an H2 BNF-autocomplete workload whose grammar scanner is dominated
+/// by exactly those four calls in tight loops. None of them was on the
+/// whitelist, so control never reached that block: the two halves of the same
+/// policy defeated each other, in the same function, and nothing reported it.
+/// The fix had never worked.
+///
+/// They are on the list now, which makes the warm path agree with the cold one
+/// for these five — the cold path has forced them since "RKC16N.6 RECON".
+/// That is a *reduction* in divergence, not a new behaviour: before this, the
+/// first call at a site ran the native and every subsequent call ran bytecode.
+///
+/// Scoped deliberately: these five have locale- and Unicode-independent
+/// semantics (plain UTF-16 indexing and content comparison) that are trivially
+/// equivalent to the real-JDK bytecode for every input. The rest of
+/// `check_override`'s 21 names — `trim`, `toLowerCase`, `toUpperCase`,
+/// `compareTo*`, `split` — are **not** added, because they have Unicode/locale
+/// edge cases that need their own from-scratch correctness review. Forcing
+/// those would be a correctness change wearing a performance change's clothes.
+///
+/// The residual cold/warm disagreement is therefore known, deliberate and
+/// enumerated in `forced_native_string_policy_divergence_is_exactly_the_
+/// unicode_sensitive_names`.
+#[inline]
+pub(crate) fn warm_forced_native_string_candidate(
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    matches!(
+        (method_name, method_descriptor),
+        // The SBR-02 fast-regex family (`CRATONVM_NATIVE_STRING_REGEX`,
+        // default-ON). A deliberate, flagged optimisation, not an RKC16N.6
+        // workaround — under contract §1.4 these belong as reviewed
+        // `NativeKind::Intrinsic` registrations, which win with no name list.
+        (
+            "replaceAll",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
+        ) | (
+            "replaceFirst",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
+        ) | ("matches", "(Ljava/lang/String;)Z")
+            | (
+                "replace",
+                "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"
+            )
+            // The quadratic-parent-allocation fix.
+            | ("substring", "(II)Ljava/lang/String;")
+            // Charset-name constructors.
+            | ("<init>", "([BLjava/lang/String;)V")
+            | ("<init>", "([BIILjava/lang/String;)V")
+            // The five h2-bnf shapes that were unreachable until 2026-08-04.
+            | ("substring", "(I)Ljava/lang/String;")
+            | ("charAt", "(I)C")
+            | ("length", "()I")
+            | ("isEmpty", "()Z")
+            | ("startsWith", "(Ljava/lang/String;)Z")
+    )
+}
+
+/// The `java/lang/String` method **names** the COLD path forces native.
+///
+/// Extracted from `check_override`'s inline `matches!` so the two halves of
+/// this policy can be compared by a test instead of by a reader diffing two
+/// files. Matched by name only — every overload of every listed method — which
+/// is itself part of the divergence: the warm path is keyed on (name,
+/// descriptor).
+///
+/// > RKC16N.6 RECON (Session 94): real-JDK `java/lang/String` bytecode
+/// > resolution is failing for these basic methods during JDK class clinits
+/// > like `java/nio/charset/StandardCharsets.<clinit>`; route to our
+/// > layout-neutral natives (registered in `register_essential_natives`) so the
+/// > boot can advance past `String` dispatch. **Drop when RKC16N.6 lands a
+/// > permanent fix.**
+///
+/// That is the actual defect. Both lists are workarounds for it, and deleting
+/// this one before it is fixed regresses boot —
+/// `java/nio/charset/StandardCharsets.<clinit>` is on the critical path.
+pub(crate) fn cold_forced_native_string_name(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "charAt"
+            | "length"
+            | "isEmpty"
+            | "equals"
+            | "hashCode"
+            | "indexOf"
+            | "lastIndexOf"
+            | "substring"
+            | "startsWith"
+            | "endsWith"
+            | "trim"
+            | "toString"
+            | "concat"
+            | "replace"
+            | "toLowerCase"
+            | "toUpperCase"
+            | "compareTo"
+            | "compareToIgnoreCase"
+            | "equalsIgnoreCase"
+            | "contains"
+            | "split"
+    )
+}
+
+/// JDK-ONLY-WAVE2: real-protected-stub class allow-list — **one predicate, both
+/// dispatch paths** as of 2026-08-04.
+///
+/// It used to be two independently-maintained copies — this one and an inline
+/// `matches!` in `vm_exec::invoke_or_native` — which is how they came to
+/// differ: the cold copy listed `java/util/StringJoiner` and this one
+/// deliberately omitted it, so a `SyntheticStub` native's yield-to-real-bytecode
+/// verdict depended on how many times its call site had executed. The copies
+/// were first centralised into one list plus one stated exception
+/// (`real_protected_stub_class_cold`), and the exception was retired once the
+/// defect that forced it was measured not to reproduce — see
+/// [`real_protected_stub_class_common`] for that measurement.
+///
+/// What must ultimately replace this list: `NativeKind` alone. Under
+/// `--jdk-only` a `SyntheticStub` never dispatches, so no class needs
+/// protecting from one and the entire list becomes dead.
 pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
     crate::runtime::env_cache::real_bytecode_selector().prefers_real(class_name)
-        || matches!(
-            class_name,
-            "java/util/concurrent/locks/ReentrantLock"
-                | "java/util/concurrent/LinkedBlockingDeque"
-                | "java/util/concurrent/atomic/AtomicBoolean"
-                | "java/util/EnumSet"
-                // The fallback bridge is needed only if bootstrap had to
-                // synthesize Instant.  With a loaded real JDK Instant, every
-                // factory must run its real bytecode so the result has the
-                // real field layout and ISO-8601 `toString()` semantics.
-                | "java/time/Instant"
-                // Spring Boot's loader decodes central-directory DOS times via
-                // ZonedDateTime.of(...). The synthetic bridge stores its
-                // fields in a compact layout that is incompatible with the
-                // loaded JDK class, turning historical ZIP timestamps into
-                // the current clock value when converted to an Instant.
-                | "java/time/ZonedDateTime"
-                // NOT "java/util/StringJoiner" (2026-07-10): yielding this
-                // class's SyntheticStub natives to real bytecode here exposes
-                // a deterministic heap-reference-integrity defect (the
-                // `gen_heap::read_slot` "corrupt Value cell"/HIB-CV-32 guard
-                // fires reading StringJoiner's own `size`/`elts` fields back
-                // after a `putfield`, on the SECOND `add()` call onward) that
-                // does not reproduce for an equivalent user-defined class with
-                // the identical bytecode shape and field count/layout (ruled
-                // out via a standalone MicroProbe repro) — something specific
-                // to this being a natively-registered bootstrap class, not the
-                // bytecode pattern itself. See docs/known-issues/
-                // stringjoiner-synthetic-native-real-jdk-field-mismatch.md. Path 2
-                // (`invoke_or_native` in vm/src/vm/vm_exec.rs) still protects
-                // StringJoiner via its own, separate, long-standing allowlist
-                // — this only reverts the NEW path-1 (interpreter
-                // try_stackless_invoke) preference added here, back to the
-                // proven-safe pre-existing behavior (always dispatch to the
-                // SyntheticStub native uniformly for this class at this path).
-                | "java/io/FileInputStream"
-                | "java/lang/ref/Cleaner"
-                | "java/lang/ref/Cleaner$Cleanable"
-                | "java/lang/management/ManagementFactory"
-        )
+        || real_protected_stub_class_common(class_name)
+}
+
+/// The eleven classes **both** dispatch paths yield to real bytecode.
+///
+/// Kept as a `matches!` over string literals rather than a slice scan: this is
+/// on the native-dispatch path, and `matches!` compiles to a length-bucketed
+/// comparison chain rather than eleven `str` equality calls.
+#[inline]
+fn real_protected_stub_class_common(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/util/concurrent/locks/ReentrantLock"
+            | "java/util/concurrent/LinkedBlockingDeque"
+            | "java/util/concurrent/atomic/AtomicBoolean"
+            | "java/util/EnumSet"
+            // The fallback bridge is needed only if bootstrap had to
+            // synthesize Instant.  With a loaded real JDK Instant, every
+            // factory must run its real bytecode so the result has the
+            // real field layout and ISO-8601 `toString()` semantics.
+            | "java/time/Instant"
+            // Spring Boot's loader decodes central-directory DOS times via
+            // ZonedDateTime.of(...). The synthetic bridge stores its
+            // fields in a compact layout that is incompatible with the
+            // loaded JDK class, turning historical ZIP timestamps into
+            // the current clock value when converted to an Instant.
+            | "java/time/ZonedDateTime"
+            | "java/io/FileInputStream"
+            | "java/lang/ref/Cleaner"
+            | "java/lang/ref/Cleaner$Cleanable"
+            | "java/lang/management/ManagementFactory"
+            // Protected on BOTH paths since 2026-08-04. It was cold-path-only
+            // from 2026-07-10, because yielding this class's SyntheticStub
+            // natives to real bytecode on the warm path once tripped a
+            // deterministic heap-reference-integrity defect: the
+            // `gen_heap::read_slot` "corrupt Value cell" / HIB-CV-32 guard
+            // fired reading `StringJoiner`'s own `size` / `elts` back after a
+            // `putfield`, from the SECOND `add()` onward. Re-measured
+            // 2026-08-04 with the merge applied — 40k `add()` calls under
+            // `-Xmx64m` with per-iteration allocation churn, seven intermediate
+            // consistency checks, against a HotSpot control — and it did not
+            // reproduce on either `--jdk-only` or `--real-jdk`.
+            //
+            // Dropping it from the cold path instead is the other half of the
+            // trap and is NOT an option: the synthetic `add()` writes a 5-field
+            // fake layout (`delim/prefix/suffix/elements-ArrayList/emptyValue`)
+            // over the real 7-field class
+            // (`prefix/delimiter/suffix/elts[]/size/len/emptyValue`), reads
+            // slot 3 — real `elts`, null — and no-ops, so `size` never moves
+            // and `toString()` renders just prefix+suffix. A silently empty
+            // join, not a crash. See
+            // `fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`.
+            | "java/util/StringJoiner"
+    )
+}
+
+/// Every class the allow-list protects, as a floor corpus for
+/// `every_allowlisted_class_is_protected`.
+///
+/// Not a dispatch input — the predicate above stays a `matches!`. It exists so
+/// that deleting a class from the allow-list fails a test instead of silently
+/// handing that class's `SyntheticStub` natives back to a synthetic layout.
+#[cfg(test)]
+pub(crate) const REAL_PROTECTED_STUB_CORPUS: &[&str] = &[
+    "java/util/concurrent/locks/ReentrantLock",
+    "java/util/concurrent/LinkedBlockingDeque",
+    "java/util/concurrent/atomic/AtomicBoolean",
+    "java/util/EnumSet",
+    "java/time/Instant",
+    "java/time/ZonedDateTime",
+    "java/io/FileInputStream",
+    "java/lang/ref/Cleaner",
+    "java/lang/ref/Cleaner$Cleanable",
+    "java/lang/management/ManagementFactory",
+    "java/util/StringJoiner",
+];
+
+#[cfg(test)]
+mod real_protected_stub_tests {
+    use super::*;
+
+    /// Every class the allow-list is supposed to protect is still protected.
+    ///
+    /// This replaces `real_protected_stub_paths_diverge_on_exactly_stringjoiner`
+    /// (2026-07-10 → 2026-08-04), which froze the one-class divergence between
+    /// the warm and cold dispatch paths. There is now a single predicate, so
+    /// there is nothing left to compare the paths against — an "the paths
+    /// agree" assertion over one function would be a guard that cannot fail.
+    /// What can still regress is a class silently leaving the list, so that is
+    /// what is asserted, with a floor on the corpus size so that emptying the
+    /// corpus does not make the test vacuous either.
+    ///
+    /// It does not cover the `CRATONVM_REAL` env selection, which the predicate
+    /// ORs in from `real_bytecode_selector()`; that widens the list, never
+    /// narrows it.
+    #[test]
+    fn every_allowlisted_class_is_protected() {
+        assert!(
+            REAL_PROTECTED_STUB_CORPUS.len() >= 11,
+            "the corpus shrank to {} entries; a class was removed from the \
+             real-protected-stub allow-list. That hands its `SyntheticStub` natives \
+             back to a synthetic field layout over the real JDK class — for \
+             `StringJoiner` that was a silently empty join, not a crash. If the \
+             removal is intended, lower this floor deliberately and say why.",
+            REAL_PROTECTED_STUB_CORPUS.len()
+        );
+        for class in REAL_PROTECTED_STUB_CORPUS {
+            assert!(
+                real_protected_stub_class(class),
+                "{class} is in REAL_PROTECTED_STUB_CORPUS but the allow-list no longer \
+                 protects it; restore it to `real_protected_stub_class_common` or \
+                 remove it from the corpus and lower the floor above"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod threadpool_receiver_shape_tests {
+    use super::THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES;
+
+    /// The `vm` crate's source root, for the scan below.
+    fn vm_src(rel: &str) -> String {
+        // `rel` is repo-relative (`vm/src/...`) so the census constant reads
+        // the way a `rg` invocation would; strip the crate prefix to get a
+        // path under this crate's manifest dir.
+        let under_crate = rel.strip_prefix("vm/").expect("census paths are vm-crate paths");
+        let path = format!("{}/{under_crate}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+    }
+
+    /// Exactly eight dispatch sites consult the receiver-shape probe, and a
+    /// partial deletion fails here rather than silently leaving half the
+    /// duplication enforcing a policy the other half no longer applies.
+    ///
+    /// Counts calls to the probe helper, which is now the *only*
+    /// implementation — the two hand-inlined copies in `vm_exec.rs` were folded
+    /// into it, so a site cannot hide from this scan by writing the `workers`
+    /// lookup out longhand without also tripping
+    /// `no_hand_inlined_workers_probe_outside_the_helper` below.
+    ///
+    /// Deliberately an equality, not a floor: this list only ever shrinks, and
+    /// it shrinks all at once. See
+    /// [`THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES`] for the order the removal
+    /// has to happen in.
+    #[test]
+    fn exactly_eight_dispatch_sites_probe_the_threadpool_receiver_shape() {
+        let mut files: Vec<&str> = THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+
+        // Assembled at runtime so this scanner's own source does not contain
+        // the string it looks for. Spelling the needle as a literal made the
+        // first version of this test count itself — twice, once for the
+        // `match_indices` argument and once for a doc-comment mention. That is
+        // a fine demonstration that the scan works and a poor gate.
+        let needle = format!("{}(", "threadpool_executor_has_real_workers");
+
+        let mut total = 0usize;
+        for file in &files {
+            let src = vm_src(file);
+            // Skip the definition itself; every other occurrence is a call,
+            // and doc-comment mentions of the name carry no `(`.
+            total += src
+                .match_indices(needle.as_str())
+                .filter(|(i, _)| !src[..*i].ends_with("fn "))
+                .count();
+        }
+        assert_eq!(
+            total,
+            THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES.len(),
+            "found {total} call(s) to the ThreadPoolExecutor receiver-shape probe across {files:?}, \
+             but THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES lists {}. If you deleted some sites, \
+             delete ALL of them together with the receiver-blind ninth site in \
+             `force_native_over_real_jdk_bytecode` — and only after `native_es_execute` is \
+             reclassified, or a native calling `.execute()` on a real executor recurses into \
+             itself and aborts the process. If you ADDED one, add it to the census constant.",
+            THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES.len()
+        );
+    }
+
+    /// Nobody re-inlines the `workers`-field probe by hand.
+    ///
+    /// Two sites used to, which is how the predicate came to have three
+    /// implementations, two of which took a plain `read()` where the helper
+    /// documents that a nested `read_recursive()` is required — a lock-order
+    /// panic in debug builds and a potential deadlock in release.
+    #[test]
+    fn no_hand_inlined_workers_probe_outside_the_helper() {
+        for file in ["vm/src/vm/vm_exec.rs"] {
+            let src = vm_src(file);
+            assert!(
+                !src.contains(r#"resolve_field_index_in_hierarchy(recv_class_id, "workers""#),
+                "{file} hand-inlines the ThreadPoolExecutor `workers` probe again; call \
+                 `threadpool_executor_has_real_workers` instead — it is the one implementation, \
+                 and it takes `read_recursive()` for the reason its doc comment gives"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod forced_native_string_tests {
+    use super::*;
+
+    /// Every `java/lang/String` shape either path mentions, with the exact
+    /// (cold, warm) verdict pair expected of it.
+    ///
+    /// Descriptors are the real JDK 25 ones. `cold` is
+    /// [`cold_forced_native_string_name`] — descriptor-blind, so every overload
+    /// of a listed name gets the same answer. `warm` is whether the shape gets
+    /// past [`warm_forced_native_string_candidate`]'s exclusion.
+    const STRING_POLICY: &[(&str, &str, bool, bool)] = &[
+        // ---- agreed: forced on BOTH paths ------------------------------
+        ("substring", "(I)Ljava/lang/String;", true, true),
+        ("substring", "(II)Ljava/lang/String;", true, true),
+        ("charAt", "(I)C", true, true),
+        ("length", "()I", true, true),
+        ("isEmpty", "()Z", true, true),
+        ("startsWith", "(Ljava/lang/String;)Z", true, true),
+        // ---- warm-only: not on the cold name list at all ---------------
+        // The SBR-02 fast-regex family and the charset-name constructors.
+        // `check_override` never listed them, so the cold path runs real
+        // bytecode for the first call at a site and the native thereafter.
+        (
+            "replaceAll",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            false,
+            true,
+        ),
+        (
+            "replaceFirst",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            false,
+            true,
+        ),
+        ("matches", "(Ljava/lang/String;)Z", false, true),
+        ("<init>", "([BLjava/lang/String;)V", false, true),
+        ("<init>", "([BIILjava/lang/String;)V", false, true),
+        // `replace` is on the cold NAME list, so the cold path forces every
+        // overload; the warm path admits only the `CharSequence` one.
+        (
+            "replace",
+            "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;",
+            true,
+            true,
+        ),
+        ("replace", "(CC)Ljava/lang/String;", true, false),
+        // ---- cold-only: the Unicode/locale-sensitive residue ------------
+        // Deliberately NOT admitted to the warm path: each needs its own
+        // from-scratch correctness review against the real JDK bytecode
+        // before a native may shadow it. This is the remaining divergence,
+        // and it is a decision, not an oversight.
+        ("trim", "()Ljava/lang/String;", true, false),
+        ("toLowerCase", "()Ljava/lang/String;", true, false),
+        ("toLowerCase", "(Ljava/util/Locale;)Ljava/lang/String;", true, false),
+        ("toUpperCase", "()Ljava/lang/String;", true, false),
+        ("compareTo", "(Ljava/lang/String;)I", true, false),
+        ("compareToIgnoreCase", "(Ljava/lang/String;)I", true, false),
+        ("equalsIgnoreCase", "(Ljava/lang/String;)Z", true, false),
+        ("split", "(Ljava/lang/String;)[Ljava/lang/String;", true, false),
+        // ---- cold-only: plain, but never reviewed for the warm path -----
+        ("equals", "(Ljava/lang/Object;)Z", true, false),
+        ("hashCode", "()I", true, false),
+        ("indexOf", "(Ljava/lang/String;)I", true, false),
+        ("lastIndexOf", "(Ljava/lang/String;)I", true, false),
+        ("endsWith", "(Ljava/lang/String;)Z", true, false),
+        ("toString", "()Ljava/lang/String;", true, false),
+        ("concat", "(Ljava/lang/String;)Ljava/lang/String;", true, false),
+        ("contains", "(Ljava/lang/CharSequence;)Z", true, false),
+        // ---- on neither path -------------------------------------------
+        ("chars", "()Ljava/util/stream/IntStream;", false, false),
+        ("strip", "()Ljava/lang/String;", false, false),
+    ];
+
+    /// The cold and warm halves of the forced-native `String` policy disagree
+    /// for a **known, enumerated** set of shapes, and agree everywhere else.
+    ///
+    /// This is not an "the two lists are equal" assertion — they are not equal,
+    /// and cannot be made equal without forcing natives for `trim` /
+    /// `toLowerCase` / `compareTo*`, which is a correctness change nobody has
+    /// reviewed. What it freezes is *which* shapes disagree, so that changing
+    /// either half without the other fails here instead of silently making a
+    /// `String` method's behaviour depend on how many times its call site has
+    /// executed.
+    #[test]
+    fn forced_native_string_policy_divergence_is_exactly_the_unicode_sensitive_names() {
+        for &(name, descriptor, want_cold, want_warm) in STRING_POLICY {
+            assert_eq!(
+                cold_forced_native_string_name(name),
+                want_cold,
+                "cold-path verdict changed for String.{name}{descriptor}. The cold path is \
+                 `check_override`'s 21-NAME list; it is descriptor-blind, so every overload \
+                 moves together."
+            );
+            assert_eq!(
+                warm_forced_native_string_candidate(name, descriptor),
+                want_warm,
+                "warm-path verdict changed for String.{name}{descriptor}. If you meant to \
+                 admit it, update this table AND check the cold path agrees — a shape forced \
+                 on one path only behaves differently depending on how many times its call \
+                 site has run."
+            );
+        }
+    }
+
+    /// The five h2-bnf shapes reach a decision instead of being cut off by the
+    /// exclusion above them.
+    ///
+    /// They were added (2026-07-23) to a block *below* the exclusion without
+    /// being added to the exclusion's whitelist, so control never reached them:
+    /// a landed, root-caused, measured performance fix that had never once
+    /// executed. This is the regression test for that shape of mistake — a
+    /// whitelist and the block it guards drifting apart inside one function.
+    #[test]
+    fn the_h2_bnf_string_entries_are_reachable() {
+        for (name, descriptor) in [
+            ("substring", "(I)Ljava/lang/String;"),
+            ("charAt", "(I)C"),
+            ("length", "()I"),
+            ("isEmpty", "()Z"),
+            ("startsWith", "(Ljava/lang/String;)Z"),
+        ] {
+            assert!(
+                warm_forced_native_string_candidate(name, descriptor),
+                "String.{name}{descriptor} is excluded before the h2-bnf block that names it \
+                 can run, so that block is dead code again"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode("java/lang/String", name, descriptor),
+                "String.{name}{descriptor} passes the exclusion but no block below forces it; \
+                 the warm path now disagrees with `check_override`, which has forced this \
+                 name since RKC16N.6"
+            );
+        }
+    }
 }
 
 /// [`try_stackless_invoke`] step 1's primary native lookup, routed through the

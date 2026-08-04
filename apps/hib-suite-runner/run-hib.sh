@@ -19,6 +19,13 @@
 # next to this script (see that file's header for why it is tracked and how to
 # check it is actually loaded).
 #
+# A separate handful of classes report class-level ABORTED for reasons that
+# have nothing to do with CratonVM (JUnit `Assumptions.abort(...)` self-skips
+# baked into the test, byte-identical on HotSpot). `categorize` treats those
+# as pass-equivalent via the TRACKED table `known-benign-aborts.tsv`, next to
+# this script — see that file's header for the exact-count-match rule that
+# keeps a real regression from being silently swallowed.
+#
 # Any extra CratonVM tuning goes through the environment: every CRATONVM_* env
 # var is inherited by the VM child processes automatically.
 # =============================================================================
@@ -39,6 +46,12 @@ OVERRIDES="${HIB_CLASS_OVERRIDES:-}"
 if [ -z "$OVERRIDES" ]; then
   if [ -f "$SELF_DIR/class-overrides.tsv" ]; then OVERRIDES="$SELF_DIR/class-overrides.tsv"
   else OVERRIDES="$HERE/class-overrides.tsv"; fi
+fi
+# Same story for the known-benign-ABORTED table consulted by `categorize`.
+BENIGN_ABORTS="${HIB_KNOWN_BENIGN_ABORTS:-}"
+if [ -z "$BENIGN_ABORTS" ]; then
+  if [ -f "$SELF_DIR/known-benign-aborts.tsv" ]; then BENIGN_ABORTS="$SELF_DIR/known-benign-aborts.tsv"
+  else BENIGN_ABORTS="$HERE/known-benign-aborts.tsv"; fi
 fi
 
 # --- JDK autodetect ----------------------------------------------------------
@@ -100,6 +113,7 @@ OPTIONS:
 SUB-COMMANDS:
   run-hib.sh categorize        rebuild passed.txt / others.txt from a full run
   run-hib.sh overrides         print the loaded per-class override table and exit
+  run-hib.sh benign-aborts     print the loaded known-benign-aborts table and exit
 
 CATEGORIES (regenerate authoritatively with:  run-hib.sh categorize):
   passed.txt  / others.txt    in this folder
@@ -110,6 +124,15 @@ PER-CLASS OVERRIDES:
   Every run prints `overrides=N (loaded)` in its mode header; `overrides=0
   (MISSING ...)` means the table is gone and known-slow classes will be
   misreported as HANG. Check it with `run-hib.sh overrides`.
+
+KNOWN-BENIGN ABORTS:
+  known-benign-aborts.tsv (tracked in git, next to this script) lists classes
+  whose class-level ABORTED status is a confirmed HotSpot-parity JUnit
+  Assumptions self-skip, not a CratonVM bug. `categorize` treats a class as
+  pass-equivalent (routes it to passed.txt instead of others.txt) only when
+  its found/ok/aborted counts match the table EXACTLY, so a real regression
+  on one of these classes still surfaces. Check it with
+  `run-hib.sh benign-aborts`.
 
 ENV PASS-THROUGH:
   Any CRATONVM_* variable in your environment is inherited by the VM, e.g.
@@ -182,6 +205,43 @@ print_overrides() {
   done
 }
 
+# --- known-benign-aborts table: confirmed HotSpot-parity ABORTED classes -----
+# `categorize` (below) treats a class as pass-equivalent only when its
+# found/ok/aborted counts match this table EXACTLY, so a future regression
+# that changes the abort profile (a new failure appears, or the count of
+# self-skips shifts) still lands in others.txt like any other residual
+# instead of being silently swallowed. See the table's own header comment
+# for format and rationale.
+declare -A BENIGN_FOUND=() BENIGN_OK=() BENIGN_ABORTED=()
+BENIGN_STATE="not loaded"
+
+load_benign_aborts() {
+  BENIGN_FOUND=(); BENIGN_OK=(); BENIGN_ABORTED=()
+  if [ ! -f "$BENIGN_ABORTS" ]; then
+    BENIGN_STATE="MISSING $BENIGN_ABORTS"
+    echo "WARNING: known-benign-aborts table not found: $BENIGN_ABORTS" >&2
+    echo "WARNING: confirmed-benign ABORTED classes will be re-flagged into others.txt by the next categorize run." >&2
+    return 0
+  fi
+  local cls ef eo ea _rest
+  while IFS=$'\t' read -r cls ef eo ea _rest || [ -n "${cls:-}" ]; do
+    cls="${cls%$'\r'}"; ef="${ef%$'\r'}"; eo="${eo%$'\r'}"; ea="${ea%$'\r'}"
+    case "$cls" in ''|\#*) continue;; esac
+    BENIGN_FOUND["$cls"]="$ef"; BENIGN_OK["$cls"]="$eo"; BENIGN_ABORTED["$cls"]="$ea"
+  done < "$BENIGN_ABORTS"
+  BENIGN_STATE="${#BENIGN_FOUND[@]} (loaded)"
+}
+
+print_benign_aborts() {
+  load_benign_aborts
+  echo "known-benign-aborts table: $BENIGN_ABORTS"
+  echo "state: $BENIGN_STATE"
+  local k
+  for k in "${!BENIGN_FOUND[@]}"; do
+    printf '  %s  found=%s ok=%s aborted=%s\n' "$k" "${BENIGN_FOUND[$k]}" "${BENIGN_OK[$k]}" "${BENIGN_ABORTED[$k]}"
+  done
+}
+
 # --- categorize sub-command: (re)build passed.txt / others.txt ----------------
 if [ "${1:-}" = "categorize" ]; then
   echo "[categorize] running the full testlist once (JIT on, real JDK) to split passed/others ..."
@@ -192,10 +252,12 @@ fi
 
 # --- arg parse ---------------------------------------------------------------
 SHOW_OVERRIDES=0
+SHOW_BENIGN_ABORTS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     categorize) shift;;
     overrides)  SHOW_OVERRIDES=1; shift;;
+    benign-aborts) SHOW_BENIGN_ABORTS=1; shift;;
     --no-overrides) USE_OVERRIDES=0; shift;;
     --category) CATEGORY="$2"; shift 2;;
     --count)    COUNT="$2"; shift 2;;
@@ -214,6 +276,7 @@ done
 
 load_overrides
 if [ "$SHOW_OVERRIDES" = 1 ]; then print_overrides; exit 0; fi
+if [ "$SHOW_BENIGN_ABORTS" = 1 ]; then print_benign_aborts; exit 0; fi
 
 # The forked VMs inherit this script's working directory, and Hibernate's own
 # test infrastructure resolves its JDBC URL through
@@ -355,9 +418,28 @@ echo "=== run-hib $TS :: category=$CATEGORY start=$START count=$COUNT -> $SLN cl
 if [ "$CATEGORIZE" = 1 ]; then
   RUN="$OUTROOT/categorize-$TS"
   run_mode "categorize" on real "$SLICE" "$RUN"
-  awk -F'\t' 'NR>1 && $3=="PASS"{print $2}' "$RUN/results.tsv" | sort -u > "$HERE/passed.txt"
-  awk -F'\t' 'NR>1 && $3!="PASS"{print $2}' "$RUN/results.tsv" | sort -u > "$HERE/others.txt"
-  echo "rebuilt passed.txt=$(grep -c '' "$HERE/passed.txt")  others.txt=$(grep -c '' "$HERE/others.txt")"
+  load_benign_aborts
+  : > "$HERE/passed.txt"; : > "$HERE/others.txt"
+  RECLASSIFIED=0
+  while IFS=$'\t' read -r ridx rcls rstatus rfound rok rfailed rabort rskip rms rsig; do
+    [ "$ridx" = "idx" ] && continue     # header row
+    [ -z "${ridx:-}" ] && continue
+    if [ "$rstatus" = "PASS" ]; then
+      echo "$rcls" >> "$HERE/passed.txt"
+    elif [ "$rstatus" = "ABORTED" ] && [ -n "${BENIGN_FOUND[$rcls]:-}" ] \
+         && [ "$rfound" = "${BENIGN_FOUND[$rcls]}" ] \
+         && [ "$rok" = "${BENIGN_OK[$rcls]}" ] \
+         && [ "$rabort" = "${BENIGN_ABORTED[$rcls]}" ]; then
+      # Confirmed HotSpot-parity self-skip, exact-count match: pass-equivalent.
+      echo "$rcls" >> "$HERE/passed.txt"
+      RECLASSIFIED=$((RECLASSIFIED+1))
+    else
+      echo "$rcls" >> "$HERE/others.txt"
+    fi
+  done < "$RUN/results.tsv"
+  sort -u -o "$HERE/passed.txt" "$HERE/passed.txt"
+  sort -u -o "$HERE/others.txt" "$HERE/others.txt"
+  echo "rebuilt passed.txt=$(grep -c '' "$HERE/passed.txt")  others.txt=$(grep -c '' "$HERE/others.txt")  known-benign-aborts=$BENIGN_STATE reclassified=$RECLASSIFIED"
   rm -f "$SLICE"; exit 0
 fi
 

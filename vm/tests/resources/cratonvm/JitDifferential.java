@@ -187,7 +187,7 @@ public class JitDifferential {
     // ----------------------------------------------------------------------
     // A compiled `getstatic` is a direct load against the declaring class's
     // statics block, not a `jit_getstatic` call
-    // (docs/internal/jit-getstatic-costs-a-helper-call-FIXED-20260803.md). The
+    // (jit-getstatic-costs-a-helper-call-FIXED-20260803.md). The
     // load WIDTH and EXTENSION are picked from the field's descriptor: MOVSXD
     // for the int category, a 32-bit zero-extending MOV for float, a 64-bit MOV
     // for long/double/reference. Every rung below is therefore a negative, a

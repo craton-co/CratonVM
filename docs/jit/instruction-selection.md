@@ -4,8 +4,10 @@
 production pipeline calls it. See [Wiring](#wiring) for what the call site has
 to do, and
 `docs/feature-designs/jit-machine-level-and-instruction-selection.md` for the
-increment order that wiring should follow — which, as of 2026-08-03, puts the
-32-bit rows of §6 item 2 *before* any wiring at all.
+increment order that wiring should follow. As of **2026-08-04 there IS a
+production caller**, behind `CRATONVM_JIT=ir-isel-emit` (default off): §6
+items 2, 5 and 9 are closed, and `ir_lower` emits `Rule::AluReg` tiles through
+this table with a byte-equality oracle over the whole compile.
 
 **Where:** `jit/src/x64/isel.rs`, below the `// IR-level instruction selection`
 banner. The memory-ordering rule it depends on is in `jit/src/ir_schedule.rs`.
@@ -42,14 +44,19 @@ joint statement of that gap.
 (`CRATONVM_JIT=ir-isel-shadow`, default off, emits nothing) ran over 850 Spring
 Boot methods on 2026-08-03: `select_block` covers **15.7–19.0%** of scheduled
 data nodes; the rest fall to `Rule::Generic`. **`Rule::AluImm` and `Rule::Lea`
-fire ZERO times** — the table is 64-bit and Java arithmetic is 32-bit. Of the
-four rules that do fire, `TestBranch` (60 tiles) is byte-for-byte what
+fired ZERO times** — the table was 64-bit and Java arithmetic is 32-bit. Of the
+four rules that did fire, `TestBranch` (60 tiles) is byte-for-byte what
 `ir_lower` already emits.
 
 An earlier ten-shape synthetic corpus said 38.2% and fired `Lea` once. It was
-double the truth and named the wrong rules. That ranks §6's gap list
-unambiguously: **the 32-bit rows first, before any production wiring.** Full
-figures: `docs/feature-designs/jit-machine-level-and-instruction-selection.md`.
+double the truth and named the wrong rules. That ranked §6's gap list
+unambiguously: **the 32-bit rows first, before any production wiring.**
+
+Both row gaps are now closed (§6 items 2 and 5) and re-measured on
+CratonBenchC2, whose node mix is framework-shaped rather than kernel-shaped:
+**23.6% / 24.0% / 32.3%** across its three phases, with `Rule::Lea` firing
+**26 tiles** where it previously fired none. Full figures:
+`docs/feature-designs/jit-machine-level-and-instruction-selection.md`.
 
 ---
 
@@ -295,13 +302,16 @@ Ordered by value.
 1. ~~**The module is not compiled.**~~ Done 2026-08-01 (§0). Its tests run and
    pass; everything below is now a claim about the table's *contents*, not
    about whether anything checked them.
-2. **No 32-bit immediate or `LEA` rows** — ranked first by measurement, not by
-   intuition. `Rule::AluImm` fires zero times on an integer corpus (§0), and
-   `Rule::Lea` refuses `Ty::I32` (item 5 below). Most Java arithmetic is `int`,
-   so between them these two gaps are the whole result. Same anchoring problem
-   as item 3: `ir_lower` emits the 64-bit forms, so a `*_r32_imm8` row has no
-   hand-written emitter to reproduce, and the fix is to anchor the row to the
-   32-bit sequence `lower_data_node` *would* emit rather than to invent one.
+2. ~~**No 32-bit immediate or `LEA` rows.**~~ **Both closed** — the immediates
+   2026-08-03 (eight rows, anchored to `x64.rs`'s constant-folding fast path),
+   the `LEA` 2026-08-04 (`lea_r32_m`, anchored to `x64/arith.rs`'s
+   `emit_imul_const`: `8D 04 40` / `8D 04 80` / `8D 04 C0`). Both halves each
+   time — `MInst::pattern_name` maps the new shape too, without which
+   `require_encodable` discards the tile whatever the table holds.
+
+   `Rule::Lea` now fires on real code: **26 tiles** across CratonBenchC2's
+   three phases, against zero before. `Rule::AluImm` needed a third thing that
+   was not a row — see item 10.
 3. **`AluRM` has no `PATTERNS` row.** The load-fold *gate* is implemented and
    tested; the *encoding* is not. Needs `add/sub/and/or/xor/cmp_{r64,r32}_m`
    rows (`03/2B/23/0B/33/3B /r`, `reg: Dst`, `rm: Mem`,
@@ -316,12 +326,12 @@ Ordered by value.
    `ir_lower`'s knowledge. The selector proves the fold legal (the part that
    fails silently) and leaves the address shape to the lowering. Closing this
    means teaching `AddrSource::Expr` how `ir_lower` computes a field address.
-5. **`Rule::Lea` refuses `Ty::I32`.** 32-bit `LEA` (`8D /r`, REX.W clear) is
-   *correct* for Java `int` arithmetic — it truncates to 32 bits, which is
-   exactly Java's wrap — and would be the single biggest win here, since most
-   Java arithmetic is `int`. It needs (a) a `lea_r32_m` row and (b) a proof
-   that the high half of the destination slot is never observed. `Op::Return`
-   copies a whole 64-bit slot, which is where that proof has to start.
+5. ~~**`Rule::Lea` refuses `Ty::I32`.**~~ **Closed 2026-08-04.** The proof the
+   item asked for turned out to be simpler than it expected and did not need to
+   start at `Op::Return`: a 32-bit `LEA` zero-extends into the destination,
+   which is the *same* high half `ADD EAX, ECX` leaves — and that is what
+   `ir_lower`'s `Op::Add`/`Op::Mul` `Int` arms already emit. The row therefore
+   raises no observability question the tree does not already answer.
 6. **`SetCc` has no row.** SETcc's destination is an 8-bit register, and
    `SPL`/`BPL`/`SIL`/`DIL` require a REX prefix that `AH`/`CH`/`DH`/`BH` must
    not have. The table has no `Constraint` for that, and a row that emitted
@@ -338,9 +348,29 @@ Ordered by value.
    R12 needing a SIB byte. Those are `Mem`'s job and the table already states
    them (`Constraint::IndexNotRsp`, `base_requires_sib`); the register
    allocator has to honour them when it lowers an `IrAddr`.
-9. **No end-to-end byte comparison.** Nothing yet checks that selecting a block
-   and emitting the tiles produces the same *observable behaviour* as
-   `ir_lower`'s output. That needs the wiring in §7 and a differential run.
+9. ~~**No end-to-end byte comparison.**~~ **Closed 2026-08-04**, and it is
+   stronger than "same observable behaviour": `CRATONVM_JIT=ir-isel-verify`
+   compiles through both paths and compares the **bytes**, per node, over a
+   whole workload, refusing the compile on any disagreement. Scope is
+   `Rule::AluReg`, the only rule whose bytes are provably identical to the
+   per-opcode arm's. `ir-isel-emit` then makes those tiles the emitted bytes.
+   See `docs/feature-designs/jit-machine-level-and-instruction-selection.md`
+   increment 2.
+10. **The cost model prices instructions, not operands** — and that, not the
+   missing rows, is what kept `Rule::AluImm` at zero. `ADD EAX, ECX` is two
+   bytes and `ADD EAX, 7` is three, so the register form wins; under a
+   frame-homed allocation the register operand also costs a
+   `MOV r64, [RBP-disp]` that the immediate form does not. `SelectOptions::
+   frame_homed` states the allocation and `Tile::frame_homed` re-prices every
+   candidate from its own operand set. The remaining half is that a consumer
+   which is not frame-homed needs a different answer again, and there is no
+   such consumer yet.
+
+   A second cause, worth knowing before blaming a row: `ValueUses::single_use`
+   is `count == 1` **and not pinned**, and a safepoint snapshot names almost
+   every live constant. So a tile usually cannot *absorb* the constant even
+   when it can use it as an immediate, and the two forms end up competing over
+   one node rather than two.
 
 ### The seven new `PATTERNS` rows
 

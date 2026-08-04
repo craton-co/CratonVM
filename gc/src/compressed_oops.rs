@@ -106,7 +106,7 @@
 //!
 //! Full derivation, including the honest footprint arithmetic and how this
 //! interacts with shrinking `ObjectHeader` from 32 to 16 bytes, is in
-//! `docs/internal/arch-2026-07-26/value-repr-and-compressed-oops.md`.
+//! `arch-2026-07-26/value-repr-and-compressed-oops.md`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

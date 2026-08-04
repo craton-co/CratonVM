@@ -3,8 +3,8 @@
 
 //! Interpreter intrinsic handlers for `java/lang/Math`.
 //!
-//! See `docs/internal/intrinsic_table_contract.md` and
-//! `docs/feature_roadmap_interpreter_intrinsic_table.md`.
+//! See `intrinsic_table_contract.md` and
+//! `gaps/feature_roadmap_interpreter_intrinsic_table.md`.
 //!
 //! Hard project rule (`feedback_no_synthetic_stubs`): these handlers MUST be
 //! byte-for-byte behaviour-identical to the normal native-registry dispatch

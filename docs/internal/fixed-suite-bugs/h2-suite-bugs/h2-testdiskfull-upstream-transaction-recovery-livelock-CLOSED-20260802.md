@@ -199,7 +199,7 @@ name the blocker and its status directly.
 
 * The retired `bug-h2-testdiskfull-classid0-corruption-segv-cce` write-up — the
   crashes this class used to show, now fixed.
-* `bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md` — `Chunk N not
+* `!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md` — `Chunk N not
   found` is upstream fault-injection flakiness and shows on HotSpot too (58 of
   150 runs here).
 

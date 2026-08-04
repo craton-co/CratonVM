@@ -17,8 +17,8 @@
 //! so `classloading` (the cache entry), `native-builtins` (the handlers), and
 //! `vm` (the interpreter integration) can all name the same type.
 //!
-//! See `docs/feature_roadmap_interpreter_intrinsic_table.md` and
-//! `docs/internal/intrinsic_table_contract.md`.
+//! See `gaps/feature_roadmap_interpreter_intrinsic_table.md` and
+//! `intrinsic_table_contract.md`.
 
 /// One variant per supported interpreter intrinsic. Each maps to exactly one
 /// `(class, name, descriptor)` triple and one handler function — the mapping

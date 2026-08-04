@@ -65,7 +65,7 @@ helper, i.e. from inside compiled code. So the eviction can run while a frame of
 the evicted body is on that same thread's stack. `RetainedCode` is what makes
 their release go through the retirement queue rather than through a bare `Arc`
 drop; see
-`docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
+`jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
 
 Every install into all three funnels through `jit_entry_publishable`, which
 refuses an address that is a live `jit_entry_owners` key with a dead `Weak`, or
@@ -229,7 +229,7 @@ above was not merely untidy — it was the bug. `try_call_compiled_entry_reentra
 callee holding no reference at all, on a `SAFETY` comment claiming the registry
 owned the artifact. That made JIT→JIT dispatch the one way into a compiled body
 that holds no owning reference to it, and it is the mechanism behind
-`docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
+`jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
 
 It now pins. To make that affordable per dispatch, `JitCodeRange` carries a
 `Weak<CompiledMethod>` and `pin_jit_code_range_owner` upgrades it lock-free

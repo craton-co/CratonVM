@@ -13,6 +13,55 @@ reports a violation while continuing in the exact state the contract forbids.**
 > `C:\craton\wt-jdk-only` (branch `feat/jdk-only-mode`), read 2026-07-31. The
 > *defect* is unchanged; only its shape is.
 
+## What changed on 2026-08-04 — the migration has a work list now
+
+The scale section below scopes this at **52 live call sites in 27 files**, which
+is a grep, and grep is why the item reads as intractable. The
+`requested_by` instrument ([observability item 9], closed the same day) turns it
+into a census: `admit_compatibility_class` is `#[track_caller]`, threaded
+through `fabricate_class` and all three `ensure_*` entry points, so every
+recorded violation now names the Rust call site that asked.
+
+A `--jdk-only` boot against a real JDK 21 image fabricates 14 classes from
+**three** call sites:
+
+| Class(es) | Call site | Verdict |
+|---|---|---|
+| the 11 `cratonvm/internal/Unmodifiable*` | `vm/src/vm/vm_init.rs:1227` | **stay `CompatibilityStub`** — see below |
+| `cratonvm/synthetic/AnonymousObject$N` | `vm/src/vm/vm_exec.rs:9814` | **migrated** to `ensure_generated_class(VmInternal)` |
+| `java/util/Enumeration$Impl` | `vm/src/vm/vm_init.rs:1052` | step 2 below, still open |
+| `java/util/Comparator$Native` | `vm/src/vm/vm_init.rs:1110` | step 2 below, still open |
+
+That is the difference between a to-do list and a list of names. The other ~49
+call sites exist, but they are reached by workloads a trivial strict boot does
+not run; the way to size them is to take this census from the workload you care
+about, not to migrate 52 sites blind.
+
+**The `Unmodifiable*` family is adjudicated as staying.** They are the largest
+group and the most tempting to reclassify — no class file exists under
+`cratonvm/internal/UnmodifiableList`, which is the `VmInternal` shape. But they
+stand in for `java.util.Collections$UnmodifiableList` and friends: the real
+`Collections.unmodifiableList()` bytecode is not running, and that is a
+compatibility substitution whatever the stand-in is named. Migrating them is the
+dangerous direction in *Blast radius* — it silences the violation, keeps
+fabricating, and makes the zero-stub census green while the substitution
+continues.
+
+[observability item 9]: ../../internal/jdk-only-observability-surface-FIXED-20260804.md
+
+## What is still open
+
+* **Step 1**, the migration itself, for everything except
+  `AnonymousObject$N`. The judgement per site is unchanged; what is new is that
+  the census tells you which sites a given workload actually reaches.
+* **Step 2** — making `vm_init.rs`'s bootstrap block fail loudly under
+  `JdkOnly` instead of fabricating `Enumeration$Impl` / `Comparator$Native`
+  behind a recorded violation. Untouched, and it is the one with real risk: a
+  strict boot that refuses these either proves the natives bound to them are
+  already refused (in which case the classes were dead weight) or stops booting.
+  That is a run, not an argument, and it has not been done.
+* **Step 3**, deleting `ensure_synthetic_class`, which step 1 gates.
+
 ## What is wrong
 
 `classloading/src/class_manager.rs` ~2918:

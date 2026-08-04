@@ -5,7 +5,7 @@
  * with {@code new int[6]}, and array allocation has no arm in the IR builder's
  * opcode match — so it produced zero IR bodies and both lanes of every A/B
  * agreed for a reason that had nothing to do with the contract
- * (docs/internal/jit-ir-relocation-map-contract.md). This one allocates an
+ * (jit-ir-relocation-map-contract.md). This one allocates an
  * OBJECT, which the optimizing tier does lower.
  *
  * Four properties are needed at once, or the probe measures nothing:

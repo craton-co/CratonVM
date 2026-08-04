@@ -322,5 +322,5 @@ answer each time rather than hitting a recorded alias.
 * `docs/known-issues/c2/classloading-identity-audit.md` — *Open 3* is this
   document; *Fixed 1* (`upgrade_synthetic_class` re-key) is the template the
   migration branch follows; *Open 5* is *Remaining 4* above.
-* `docs/internal/loader-identity.md` — per-file tally of remaining
+* `loader-identity.md` — per-file tally of remaining
   `find_class_by_name` call sites.

@@ -1,4 +1,76 @@
-# `System.exit(N)` bypasses the JDK-only census entirely — the runs most likely to need it produce none
+# `System.exit(N)` bypassed the JDK-only census — CLOSED 2026-08-04
+
+**Status:** FIXED.
+
+## What changed
+
+`vm-cli`'s pre-exit hook now writes the census. The obstacle was never access —
+the hook already resolves the live VM — it was **locking**: all three writers
+take the class-manager lock, and a blocking acquire from an arbitrary Java
+thread is both a deadlock risk and a lock-order violation, which would turn a
+lost file into a hung process. That is strictly worse than the bug.
+
+So:
+
+* each of the three writers gained a `_with(cm: Option<&ClassManager>)` form;
+* `SharedVm::try_write_jdk_only_dumps_for_exit` takes **one** non-blocking
+  `OrderedPlRwLock::try_read_untracked` and passes the result to all three, so
+  the artefacts describe the same instant. The `_untracked` spelling is new and
+  documented as sound *only because it cannot block*: the tracked `try_read`
+  panics on a descending-order acquisition, which is right for ordinary code
+  and wrong for a terminal path whose job is to write a file and let the
+  process die. There is no retry loop and no timeout, deliberately;
+* on failure each artefact is written in a labelled `"partial": true` form.
+
+**The partial forms are shaped so they cannot read as green**, which the record
+called the single worst outcome available. The class-origin census omits
+`counts` entirely rather than zero-filling it; the report omits the four class
+buckets rather than writing `"compatibility_classes": 0`; the native census
+writes `real_declaring_method: null` rather than `{"loaded": false, …}` — that
+last is a *measurement* saying the run never touched the class, and it would be
+a lie.
+
+Both writers share one `WRITTEN` latch, so a `System.exit` racing a normal
+shutdown cannot interleave. The launcher's `--dump-*` paths are published to a
+`OnceLock` right after `Args::parse_from`, because the hook is a bare `fn(i32)`
+installed before parsing; that is launcher state (one process, one command
+line), not the per-VM state contract §2 is about, and it sits alongside the
+equally process-global `PRE_EXIT_HOOK` it cooperates with.
+
+## Verification
+
+A `--jdk-only --jdk-only-report … --dump-class-origins …` run of a program
+whose `main` ends in `System.exit(7)`, against a real JDK 21 image:
+
+```
+PROBE: about to exit
+[cratonvm] System.exit(7) called — process terminating
+[cratonvm] wrote JDK-only census on System.exit
+```
+
+Both files present, both complete (no `"partial"` key — the lock was free), and
+the report's violation list matches the same program returning normally.
+`Compatible` mode adds exactly zero work: the three-`is_none()` guard returns
+before touching a lock or the filesystem.
+
+`Runtime.exit(int)` shares `invoke_pre_exit_hook` with `System.exit(int)`, so
+it is covered by construction.
+
+## Not verified by a run, and worth knowing
+
+The **partial** path itself. Reaching it needs the class-manager lock held at
+the instant of `System.exit`, which is a race, not something a probe can
+schedule. The degraded renderers are exercised as pure functions instead; what
+a run has not shown is a real thread losing that race. The failure mode if the
+degraded path is wrong is a mislabelled file, not a hang — the try-lock is
+what rules the hang out, and that is structural.
+
+---
+
+*The original filing follows unchanged.*
+
+---
+
 
 **Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31 from the wave-1
 re-land. Not a correctness bug: nothing runs wrong, and `Compatible` mode is
@@ -54,7 +126,7 @@ exists to describe.
 
 It also interacts with the other observability gaps. `--trace-jdk-only` drains
 its append-only logs at `Vm::new` and at shutdown (see
-[the observability record](observability-surface-has-three-unfilled-holes.md)),
+[the observability record](jdk-only-observability-surface-FIXED-20260804.md)),
 and the shutdown drain is inside `finish_jdk_only` — so a `System.exit` run also
 loses every class-origin violation recorded after boot, not just the files.
 
@@ -145,6 +217,6 @@ race the shutdown one.
 
 ## Related
 
-* [The observability surface](observability-surface-has-three-unfilled-holes.md)
+* [The observability surface](jdk-only-observability-surface-FIXED-20260804.md)
   — the instruments this record is about delivering. In particular,
   `--trace-jdk-only`'s shutdown drain is lost on the same path.

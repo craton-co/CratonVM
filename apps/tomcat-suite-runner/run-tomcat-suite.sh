@@ -117,7 +117,7 @@ run_one() {
     # dynamic growth), so a humongous array that size can't fit even at
     # -Xmx8g even though HotSpot's region-based G1 handles it fine at 8g.
     # CratonVM's OWN G1 backend (gc/src/g1.rs, production-status per
-    # docs/internal/gaps/gc-tuning.md) doesn't have that fixed split and
+    # gaps/gc-tuning.md) doesn't have that fixed split and
     # passes both classes cleanly -- TestByteChunkLargeHeap at -Xmx8g,
     # TestCharChunkLargeHeap needs -Xmx10g (measured; HotSpot needs neither
     # bump, its G1 is somewhat more memory-efficient at this extreme). Never

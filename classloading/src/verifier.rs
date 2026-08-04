@@ -4232,6 +4232,95 @@ mod tests {
         assert!(verify_class_structural_bytecode(&class).is_err());
     }
 
+    // ---------------------------------------------------------------------
+    // JVMS §4.7.3 `catch_type`, enforced by `bytecode_verifier::catch_type_of`
+    //
+    // Not part of the structural scan: the rule is a constant-pool
+    // cross-check, so it runs on the type-state pass rather than the
+    // hierarchy-independent one. `cratonvm_reader` enforces the same rule
+    // while it decodes the `Code` attribute and therefore rejects malformed
+    // *bytes* first — which is why the corpus case for this shape
+    // (`handler_with_a_non_class_catch_type_rejected`) asserts at the reader.
+    // These are the verifier's own half, reached the way any in-memory
+    // `CodeAttribute` producer reaches it — synthetic stubs, cached class data,
+    // tests — where no reader ever saw the bytes.
+    // ---------------------------------------------------------------------
+
+    /// `sipush 1; pop; return; astore_1; return` — a region guarded over
+    /// `0..4` whose handler entry at 5 is reached only along the exception
+    /// edge. Instruction boundaries at 0, 3, 4, 5, 6.
+    fn catch_type_body() -> Vec<u8> {
+        vec![0x11, 0x00, 0x01, 0x57, 0xb1, 0x4c, 0xb1]
+    }
+
+    /// [`catch_type_body`] guarded by a single handler with the given
+    /// `catch_type`, over a caller-supplied constant pool.
+    fn catch_type_class(raw_id: u32, cp: ConstantPool, catch_type: u16) -> Class {
+        let mut class = make_pre_java7_class_with_id(
+            raw_id,
+            vec![structural_method(
+                "m",
+                "()V",
+                1,
+                2,
+                catch_type_body(),
+                vec![cratonvm_reader::attribute::ExceptionTableEntry {
+                    start_pc: 0,
+                    end_pc: 4,
+                    handler_pc: 5,
+                    catch_type,
+                }],
+            )],
+        );
+        class.constant_pool = cp;
+        class
+    }
+
+    #[test]
+    fn rejects_a_handler_whose_catch_type_is_not_a_class() {
+        // Entry #1 is a Utf8, not a CONSTANT_Class.
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,                  // 0
+            ConstantPoolEntry::Utf8("not a class".into()), // 1
+        ]);
+        let class = catch_type_class(92_101, cp, 1);
+        let err = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true)
+            .expect_err("a catch_type that is not a CONSTANT_Class must be rejected");
+        assert!(err.to_string().contains("CONSTANT_Class"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_handler_whose_catch_type_is_out_of_range() {
+        // Nothing at index 7 at all — the pre-fix fallback silently typed the
+        // handler entry as `java/lang/Throwable` and verified clean.
+        let class = catch_type_class(92_102, empty_cp(), 7);
+        let err = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true)
+            .expect_err("an out-of-range catch_type must be rejected");
+        assert!(err.to_string().contains("CONSTANT_Class"), "{err}");
+    }
+
+    /// The valid counterparts: without these, the two rejections above are
+    /// satisfied by a verifier that refuses every handler.
+    #[test]
+    fn accepts_a_handler_whose_catch_type_is_a_class() {
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,                          // 0
+            ConstantPoolEntry::Utf8("java/lang/Exception".into()), // 1
+            ConstantPoolEntry::ClassReference { name_index: 1 },   // 2
+        ]);
+        let class = catch_type_class(92_103, cp, 2);
+        verify_class_bytecode_inner(&class, &PermissiveHierarchy, true)
+            .expect("a CONSTANT_Class catch_type must verify");
+    }
+
+    #[test]
+    fn accepts_a_catch_all_handler() {
+        // `catch_type == 0` is the `finally` form and names no pool entry.
+        let class = catch_type_class(92_104, empty_cp(), 0);
+        verify_class_bytecode_inner(&class, &PermissiveHierarchy, true)
+            .expect("a catch-all handler must verify");
+    }
+
     #[test]
     fn structural_rejects_local_index_past_max_locals() {
         // `istore_3` with max_locals = 1.

@@ -2,7 +2,7 @@
 
 **Status:** 🔴 **OPEN**, found 2026-07-31 by `probes/ByteBufferBulkProbe` while
 verifying the bulk-copy rewrite in
-[tomcat/32.3](../internal/fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md).
+tomcat/32.3.
 
 All three **pre-date** that rewrite — confirmed by running the probe on the
 pre-fix binary, which produces a byte-identical checksum to the post-fix one

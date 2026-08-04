@@ -2270,7 +2270,7 @@ fn ois_read_value(ctx: &mut dyn NativeContext, addr: usize) -> Value {
 // `jdk/internal/misc/VM.latestUserDefinedLoader0()` native — which every
 // real-JDK `ObjectInputStream.readObject()` reaches via `resolveClass()` —
 // must be registered in the DEFAULT build, where neither feature is on.
-// See docs/internal/fixed-suite-bugs/h2/ for the H2 regression this caused.
+// See fixed-suite-bugs/h2/ for the H2 regression this caused.
 pub(crate) use crate::classloader::latest_user_defined_loader_class;
 
 /// Materialize a `TC_OBJECT` whose opening tag has already been consumed.

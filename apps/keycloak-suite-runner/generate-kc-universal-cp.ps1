@@ -11,7 +11,7 @@
   now it was hand-patched jar-by-jar whenever a NoClassDefFoundError /
   NoSuchMethodError surfaced a missing dependency (see e.g. the smallrye-config
   and quarkus-core classpath-gap fixes in docs/known-issues and
-  docs/internal/fixed-suite-bugs).
+  fixed-suite-bugs).
 
   Every Maven module under apps/keycloak already has its own
   `cratonvm-full-cp.txt` (a `mvn dependency:build-classpath` dump for that
