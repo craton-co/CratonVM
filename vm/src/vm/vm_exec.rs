@@ -1493,6 +1493,135 @@ fn youngscan_mark_found() -> bool {
     YOUNGSCAN_FOUND.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// ARCH-2026-08-04 A3 — one mask for every native-funnel diagnostic
+// ---------------------------------------------------------------------------
+//
+// `safe_native_call_impl` is the choke point for essentially every native
+// dispatch in the VM, and prior notes put the per-call floor at ~8.4 ns against
+// HotSpot's ~1. It had accreted **thirteen** independent diagnostic
+// subsystems, each with its own gate function, interleaved with the real work:
+// the pin-underflow guard, dispatch tracing, VM-state publication, the native
+// ring, the straystack thread-local, EC watch, memwatch, the young scan, the
+// linkage dump, stale-objref naming, remap tracing, altrace, and the unpin
+// ring.
+//
+// Every gate was individually cheap — a memoized `OnceLock` read, a lesson
+// already learned here when uncached `getenv` probes measured ~7% of a
+// HashMapOnly-4M run. But thirteen of them are not cheap: thirteen loads,
+// thirteen branches the front end must predict, and a 671-line function body
+// whose cold half sits in the middle of the hot one.
+//
+// This collapses all thirteen into a single `u32`. The common case — every
+// diagnostic off, which is every production run — tests one value once before
+// the callback and once after, and never touches the cold code.
+//
+// **The split is by mutability, and it is not cosmetic.** Eleven gates are
+// startup-static (memoized env reads) and are computed once. Two are *not*:
+// `dispatch_trace::enable()` is called at runtime by the stack-dump watchdog so
+// a hang in native code still leaves a breadcrumb, and `native_ring::enable()`
+// is likewise toggleable. Baking either into the memoized half would silently
+// disable a diagnostic exactly when it is being switched on to chase a hang —
+// so they are re-read on every call, which is what they cost today anyway.
+mod native_diag {
+    // Startup-static bits (memoized env reads).
+    pub const BLOCKGC: u32 = 1 << 0;
+    pub const VM_STATE: u32 = 1 << 1;
+    pub const STRAYSTACK: u32 = 1 << 2;
+    pub const EC_WATCH: u32 = 1 << 3;
+    pub const MEMWATCH: u32 = 1 << 4;
+    pub const YOUNGSCAN: u32 = 1 << 5;
+    pub const LINKAGE: u32 = 1 << 6;
+    pub const ALTRACE: u32 = 1 << 7;
+    pub const UNPIN_RING: u32 = 1 << 8;
+    pub const STALE_OBJREF: u32 = 1 << 9;
+    pub const REMAP_TRACE: u32 = 1 << 10;
+    // Runtime-toggleable bits — re-read every call, never memoized.
+    pub const DISPATCH_TRACE: u32 = 1 << 11;
+    pub const RING: u32 = 1 << 12;
+}
+
+/// The eleven startup-static diagnostic bits, computed once.
+#[inline]
+fn native_diag_static() -> u32 {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        let mut m = 0;
+        if blockgc_dbg() {
+            m |= native_diag::BLOCKGC;
+        }
+        if JvmThread::vm_state_diagnostics_enabled() {
+            m |= native_diag::VM_STATE;
+        }
+        if youngscan_straystack_enabled() {
+            m |= native_diag::STRAYSTACK;
+        }
+        if crate::runtime::ec_watch::native_enabled() {
+            m |= native_diag::EC_WATCH;
+        }
+        if crate::runtime::memwatch::is_watching() {
+            m |= native_diag::MEMWATCH;
+        }
+        if youngscan_enabled() {
+            m |= native_diag::YOUNGSCAN;
+        }
+        if crate::runtime::interpreter::dbg_linkage() {
+            m |= native_diag::LINKAGE;
+        }
+        if crate::memory::gc::altrace_enabled_vm() {
+            m |= native_diag::ALTRACE;
+        }
+        if unpin_ring_enabled() {
+            m |= native_diag::UNPIN_RING;
+        }
+        if cratonvm_gc::stale_objref_debug::enabled() {
+            m |= native_diag::STALE_OBJREF;
+        }
+        if crate::runtime::interpreter::remap_trace_on() {
+            m |= native_diag::REMAP_TRACE;
+        }
+        m
+    })
+}
+
+/// The two runtime-toggleable bits. Two relaxed loads, deliberately not cached.
+#[inline]
+fn native_diag_dynamic() -> u32 {
+    let mut m = 0;
+    if crate::dispatch_trace::is_enabled() {
+        m |= native_diag::DISPATCH_TRACE;
+    }
+    // Covers BOTH of `record_enter`'s gates (the ring and
+    // `CRATONVM_TRACK_NATIVE`); see `native_ring::any_recording_enabled`.
+    if cratonvm_native_api::native_ring::any_recording_enabled() {
+        m |= native_diag::RING;
+    }
+    m
+}
+
+/// Every diagnostic gate on the native funnel, as one word.
+///
+/// Zero on any run with no diagnostics armed, which is the case this exists to
+/// make fast.
+#[inline]
+fn native_diag_mask() -> u32 {
+    native_diag_static() | native_diag_dynamic()
+}
+
+/// Per-call diagnostic state that has to survive across the callback.
+///
+/// All-zero/`None` on the fast path, and constructed without touching any of
+/// the cold code.
+#[derive(Default)]
+struct NativeDiagState {
+    /// Resolved native name, when `CRATONVM_DBG_VM_STATE` is on.
+    vm_state_name: Option<String>,
+    /// Ring token from `record_enter`; `None` when the ring never ran.
+    ring_idx: Option<usize>,
+    /// Whether the straystack thread-local was pushed and must be popped.
+    straystack_pushed: bool,
+}
+
 pub fn safe_native_call(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -1515,56 +1644,90 @@ pub(crate) fn safe_native_call_prevalidated_objects(
     safe_native_call_impl(shared, thread, callback, args, true)
 }
 
-fn safe_native_call_impl(
-    shared: &SharedVm,
-    thread: &mut JvmThread,
-    callback: NativeCallback,
-    args: &[Value],
-    prevalidated_objects: bool,
-) -> MethodCallResult {
-    // DIAGNOSTIC-ONLY (cceres3): pin-stack underflow detector. A native that
-    // returns with FEWER pins than it entered with truncated its CALLER's
-    // pins (`unpin_native_roots` is a truncate) — every handle the caller
-    // still holds now dangles and `read_native_pin` silently degrades to the
-    // raw, possibly-stale fallback. The guard fires on every exit path
-    // (including unwind) via Drop and names the culprit at the funnel.
-    struct PinFloorGuard {
-        floor: usize,
-        thread: *const JvmThread,
-        callee_addr: usize,
-    }
-    impl Drop for PinFloorGuard {
-        fn drop(&mut self) {
-            // SAFETY: the guard lives strictly within this call frame; the
-            // thread outlives it (debug-only read of a Vec length).
-            let len = unsafe { (*self.thread).native_pin_roots.len() };
-            if len < self.floor {
-                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                    let callee = cratonvm_native_api::native_ring::name_of(self.callee_addr)
-                        .unwrap_or_else(|| format!("<cb@{:#x}>", self.callee_addr));
-                    eprintln!(
-                        "[blockgc] PIN-UNDERFLOW callee={callee} entry_pins={} exit_pins={len} — this native truncated its caller's pins",
-                        self.floor,
-                    );
-                }
+/// DIAGNOSTIC-ONLY (cceres3): pin-stack underflow detector.
+///
+/// A native that returns with FEWER pins than it entered with truncated its
+/// CALLER's pins (`unpin_native_roots` is a truncate) — every handle the caller
+/// still holds now dangles and `read_native_pin` silently degrades to the raw,
+/// possibly-stale fallback. The guard fires on every exit path (including
+/// unwind) via `Drop` and names the culprit at the funnel.
+///
+/// Lifted out of `safe_native_call_impl` in ARCH-2026-08-04 A3 so the funnel
+/// can construct it behind one mask test rather than its own gate call.
+struct PinFloorGuard {
+    floor: usize,
+    thread: *const JvmThread,
+    callee_addr: usize,
+}
+
+impl Drop for PinFloorGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard lives strictly within one `safe_native_call_impl`
+        // frame; the thread outlives it (debug-only read of a Vec length).
+        let len = unsafe { (*self.thread).native_pin_roots.len() };
+        if len < self.floor {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                let callee = cratonvm_native_api::native_ring::name_of(self.callee_addr)
+                    .unwrap_or_else(|| format!("<cb@{:#x}>", self.callee_addr));
+                eprintln!(
+                    "[blockgc] PIN-UNDERFLOW callee={callee} entry_pins={} exit_pins={len} — this native truncated its caller's pins",
+                    self.floor,
+                );
             }
         }
     }
-    let _pin_floor_guard = if blockgc_dbg() {
-        Some(PinFloorGuard {
-            floor: thread.native_pin_roots.len(),
-            thread: thread as *const JvmThread,
-            callee_addr: callback as usize,
+}
+
+/// Resolve a callback's human name, falling back to its address.
+///
+/// Every diagnostic below wants this and none of them are on the fast path, so
+/// it lives here rather than being recomputed inline six times.
+#[cold]
+#[inline(never)]
+fn native_callee_name(callback: NativeCallback) -> String {
+    cratonvm_native_api::native_ring::name_of(callback as usize)
+        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize))
+}
+
+/// Format the top `n` Java frames, one per line, for a diagnostic dump.
+#[cold]
+#[inline(never)]
+fn native_diag_java_stack(thread: &JvmThread, n: usize, prefix: &str) -> String {
+    thread
+        .frames
+        .iter()
+        .rev()
+        .take(n)
+        .map(|f| {
+            format!(
+                "{prefix}{}.{}{} pc={}",
+                f.class_name(),
+                f.method_name(),
+                f.method_descriptor(),
+                f.pc
+            )
         })
-    } else {
-        None
-    };
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Everything the native funnel does *before* the callback when a diagnostic is
+/// armed. Never reached on an all-off run.
+#[cold]
+#[inline(never)]
+fn native_diag_pre_call(
+    diag: u32,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+) -> NativeDiagState {
+    let mut st = NativeDiagState::default();
+
     // letsgo postmortem: record native dispatch with the caller frame's
     // identity so a SEGV inside a native callback leaves a breadcrumb of
     // *who* called it. The callback itself is an opaque fn-pointer, but
     // the top Java frame is the invokevirtual/invokestatic site.
-    if crate::dispatch_trace::is_enabled() {
+    if diag & native_diag::DISPATCH_TRACE != 0 {
         let (cls, mth, des) = match thread.frames.last() {
             Some(f) => (
                 f.class_name().to_string(),
@@ -1582,8 +1745,7 @@ fn safe_native_call_impl(
         // which native is hung when a single bytecode method spins in a
         // tight loop calling natives (e.g. an `Enumeration` that never
         // exhausts). The `des` slot carries the native triple.
-        let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
-            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+        let callee = native_callee_name(callback);
         crate::dispatch_trace::record_native(
             thread.thread_id.0 as usize,
             &cls,
@@ -1591,6 +1753,134 @@ fn safe_native_call_impl(
             &format!("{des}  ->NATIVE {callee}"),
         );
     }
+
+    // T19.H1 — record the native into the process-global ring buffer.
+    // `safe_native_call` is the central choke point for nearly every native
+    // dispatch path, so recording here (rather than only at the two interpreter
+    // call sites) means a hang inside *any* native leaves a `STILL-IN-NATIVE`
+    // breadcrumb the watchdog can dump.
+    if diag & native_diag::VM_STATE != 0 {
+        let name = native_callee_name(callback);
+        thread.set_vm_state(format!("native:{name}"));
+        st.vm_state_name = Some(name);
+    }
+    if diag & native_diag::RING != 0 {
+        st.ring_idx = Some(cratonvm_native_api::native_ring::record_enter(
+            callback as usize,
+        ));
+    }
+
+    // DBG (CRATONVM_DBG_STRAYSTACK): track the innermost native name on a
+    // thread-local stack so the stray-receiver dump can name the culprit.
+    if diag & native_diag::STRAYSTACK != 0 {
+        let nm = native_callee_name(callback);
+        CURRENT_NATIVE_STACK.with(|s| s.borrow_mut().push((callback as usize, nm)));
+        st.straystack_pushed = true;
+    }
+
+    st
+}
+
+/// Everything the native funnel does *after* the callback when a diagnostic is
+/// armed, up to (but not including) result handling. Never reached on an
+/// all-off run.
+#[cold]
+#[inline(never)]
+fn native_diag_post_call(
+    diag: u32,
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    st: &NativeDiagState,
+) {
+    if st.straystack_pushed {
+        CURRENT_NATIVE_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+    if let Some(idx) = st.ring_idx {
+        cratonvm_native_api::native_ring::record_exit(idx);
+    }
+    if st.vm_state_name.is_some() {
+        thread.set_vm_state("native:return");
+    }
+
+    // DBG (bc math-ec, CRATONVM_DBG_ECWATCH_NATIVE): the native callback is the
+    // suspected raw-writer of `0x4` into an EC reference field. Re-read every
+    // watched EC ref cell now that this native has returned; any that flipped to
+    // a non-zero `<0x1000` value was corrupted by THIS native. Gated separately
+    // (expensive: O(watch-list) per native).
+    if diag & native_diag::EC_WATCH != 0 {
+        let hits = crate::runtime::ec_watch::detect(shared.vm_identity);
+        if !hits.is_empty() {
+            let native = native_callee_name(callback);
+            for (holder, idx, expected, now) in hits {
+                eprintln!(
+                    "[ecwatch] CORRUPTED holder@0x{holder:x} fld[{idx}]: 0x{expected:x} -> 0x{now:x}  by NATIVE {native}"
+                );
+            }
+            eprintln!("[ecwatch] Java stack at corruption (top first):");
+            eprintln!("{}", native_diag_java_stack(thread, 24, "[ecwatch]   "));
+        }
+    }
+
+    // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of the watched absolute
+    // address after EVERY native return — a HIT here (vs at a bytecode
+    // safepoint) blames the just-returned native directly.
+    if diag & native_diag::MEMWATCH != 0 {
+        crate::runtime::memwatch::poll_with(
+            || format!("native:{}", native_callee_name(callback)),
+            || native_diag_java_stack(thread, 28, "  "),
+        );
+    }
+
+    // DBG (bc math-ec, CRATONVM_DBG_YOUNGSCAN): robust catch-all for the `0x4`
+    // mutator write. We PROVED the `0x4` is written to a YOUNG object's
+    // reference field between GCs (NOT by the GC: it is present in young at GC
+    // entry — `[small4] PRE-GC YOUNG`). The victim CLASS varies run-to-run
+    // (HexFormat, Level, EC types) so watching specific classes is unreliable;
+    // instead scan the WHOLE young from-space after natives. ONE-SHOT: on the
+    // first `0x4` found, dump the victim + the just-returned native + the full
+    // Java stack (the corruptor is this native, or a bytecode in the top frame
+    // just before it), then stop. STRIDE (CRATONVM_YOUNGSCAN_STRIDE, default 1)
+    // throttles the whole-young walk on slow runs.
+    if diag & native_diag::YOUNGSCAN != 0 && !youngscan_found() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        if n % youngscan_stride() == 0 {
+            if let Some((addr, cid, fld, payload, nbr)) = shared.mem.heap.dbg_first_young_small_ref()
+            {
+                if !youngscan_mark_found() {
+                    let native = native_callee_name(callback);
+                    let is_arr = fld & 0x4000_0000 != 0;
+                    eprintln!(
+                        "[youngscan] FIRST 0x4 in YOUNG: holder@0x{addr:x} cid={cid} {}[{}] -> 0x{payload:x}  nbr_disc=0x{nbr:x}  (just-returned NATIVE {native})",
+                        if is_arr { "arr" } else { "fld" }, fld & 0x3fff_ffff,
+                    );
+                    eprintln!("[youngscan] Java stack (top first):");
+                    eprintln!("{}", native_diag_java_stack(thread, 30, "[youngscan]   "));
+                }
+            }
+        }
+    }
+}
+
+fn safe_native_call_impl(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    callback: NativeCallback,
+    args: &[Value],
+    prevalidated_objects: bool,
+) -> MethodCallResult {
+    // ARCH-2026-08-04 A3 — the funnel's thirteen diagnostic gates, as one word.
+    // Zero on every production run; see the `native_diag` module header.
+    let diag = native_diag_mask();
+    let _pin_floor_guard = (diag & native_diag::BLOCKGC != 0).then(|| PinFloorGuard {
+        floor: thread.native_pin_roots.len(),
+        thread: thread as *const JvmThread,
+        callee_addr: callback as usize,
+    });
     // Object arguments have just left the GC-visible operand stack. Refresh
     // forwarded addresses before pinning them: pinning a stale from-space
     // pointer preserves the bug rather than rooting the evacuated object.
@@ -1726,33 +2016,12 @@ fn safe_native_call_impl(
     }
     let native_args = remapped_args.as_deref().unwrap_or(args);
 
-    // T19.H1 — record the native into the process-global ring buffer.
-    // `safe_native_call` is the central choke point for nearly every
-    // native dispatch path, so recording here (rather than only at the
-    // two interpreter call sites) means a hang inside *any* native
-    // leaves a `STILL-IN-NATIVE` breadcrumb the watchdog can dump.
-    let native_state = if JvmThread::vm_state_diagnostics_enabled() {
-        Some(
-            cratonvm_native_api::native_ring::name_of(callback as usize)
-                .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize)),
-        )
+    // Dispatch tracing, VM-state publication, the native ring and the
+    // straystack thread-local all live behind this one test (A3).
+    let diag_state = if diag != 0 {
+        native_diag_pre_call(diag, thread, callback)
     } else {
-        None
-    };
-    if let Some(name) = &native_state {
-        thread.set_vm_state(format!("native:{name}"));
-    }
-    let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
-
-    // DBG (CRATONVM_DBG_STRAYSTACK): track the innermost native name on a
-    // thread-local stack so the stray-receiver dump can name the culprit.
-    let _dbg_native = if youngscan_straystack_enabled() {
-        let nm = cratonvm_native_api::native_ring::name_of(callback as usize)
-            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
-        CURRENT_NATIVE_STACK.with(|s| s.borrow_mut().push((callback as usize, nm)));
-        true
-    } else {
-        false
+        NativeDiagState::default()
     };
 
     // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
@@ -1813,115 +2082,10 @@ fn safe_native_call_impl(
             callback(&mut ctx, native_args)
         }))
     };
-    if _dbg_native {
-        CURRENT_NATIVE_STACK.with(|s| {
-            s.borrow_mut().pop();
-        });
-    }
-    cratonvm_native_api::native_ring::record_exit(_ring_idx);
-    if native_state.is_some() {
-        thread.set_vm_state("native:return");
-    }
-
-    // DBG (bc math-ec, CRATONVM_DBG_ECWATCH_NATIVE): the native callback above
-    // is the suspected raw-writer of `0x4` into an EC reference field. Re-read
-    // every watched EC ref cell now that this native has returned; any that
-    // flipped to a non-zero `<0x1000` value was corrupted by THIS native.
-    // Gated separately (expensive: O(watch-list) per native).
-    if crate::runtime::ec_watch::native_enabled() {
-        let hits = crate::runtime::ec_watch::detect(shared.vm_identity);
-        if !hits.is_empty() {
-            let native = cratonvm_native_api::native_ring::name_of(callback as usize)
-                .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
-            for (holder, idx, expected, now) in hits {
-                eprintln!(
-                    "[ecwatch] CORRUPTED holder@0x{holder:x} fld[{idx}]: 0x{expected:x} -> 0x{now:x}  by NATIVE {native}"
-                );
-            }
-            eprintln!("[ecwatch] Java stack at corruption (top first):");
-            for f in thread.frames.iter().rev().take(24) {
-                eprintln!(
-                    "[ecwatch]   {}.{}{} pc={}",
-                    f.class_name(),
-                    f.method_name(),
-                    f.method_descriptor(),
-                    f.pc,
-                );
-            }
-        }
-    }
-
-    // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of the watched
-    // absolute address after EVERY native return — a HIT here (vs at a
-    // bytecode safepoint) blames the just-returned native directly.
-    {
-        let cb = callback as usize;
-        crate::runtime::memwatch::poll_with(
-            || {
-                let native = cratonvm_native_api::native_ring::name_of(cb)
-                    .unwrap_or_else(|| format!("<cb@{cb:#x}>"));
-                format!("native:{native}")
-            },
-            || {
-                thread
-                    .frames
-                    .iter()
-                    .rev()
-                    .take(28)
-                    .map(|f| {
-                        format!(
-                            "  {}.{}{} pc={}",
-                            f.class_name(),
-                            f.method_name(),
-                            f.method_descriptor(),
-                            f.pc
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            },
-        );
-    }
-
-    // DBG (bc math-ec, CRATONVM_DBG_YOUNGSCAN): robust catch-all for the `0x4`
-    // mutator write. We PROVED the `0x4` is written to a YOUNG object's
-    // reference field between GCs (NOT by the GC: it is present in young at GC
-    // entry — `[small4] PRE-GC YOUNG`). The victim CLASS varies run-to-run
-    // (HexFormat, Level, EC types) so watching specific classes is unreliable;
-    // instead scan the WHOLE young from-space after natives. ONE-SHOT: on the
-    // first `0x4` found, dump the victim + the just-returned native + the full
-    // Java stack (the corruptor is this native, or a bytecode in the top frame
-    // just before it), then stop. STRIDE (CRATONVM_YOUNGSCAN_STRIDE, default 1)
-    // throttles the whole-young walk on slow runs.
-    if youngscan_enabled() && !youngscan_found() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::Relaxed);
-        if n % youngscan_stride() == 0 {
-            if let Some((addr, cid, fld, payload, nbr)) =
-                shared.mem.heap.dbg_first_young_small_ref()
-            {
-                if !youngscan_mark_found() {
-                    let native = cratonvm_native_api::native_ring::name_of(callback as usize)
-                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
-                    let is_arr = fld & 0x4000_0000 != 0;
-                    eprintln!(
-                        "[youngscan] FIRST 0x4 in YOUNG: holder@0x{addr:x} cid={cid} {}[{}] -> 0x{payload:x}  nbr_disc=0x{nbr:x}  (just-returned NATIVE {native})",
-                        if is_arr { "arr" } else { "fld" }, fld & 0x3fff_ffff,
-                    );
-                    eprintln!("[youngscan] Java stack (top first):");
-                    for f in thread.frames.iter().rev().take(30) {
-                        eprintln!(
-                            "[youngscan]   {}.{}{} pc={}",
-                            f.class_name(),
-                            f.method_name(),
-                            f.method_descriptor(),
-                            f.pc,
-                        );
-                    }
-                }
-            }
-        }
+    // Straystack pop, ring exit, VM-state reset, EC watch, memwatch and the
+    // young scan all live behind this one test (A3).
+    if diag != 0 {
+        native_diag_post_call(diag, shared, thread, callback, &diag_state);
     }
 
     let mut out: MethodCallResult = match result {
@@ -2042,10 +2206,9 @@ fn safe_native_call_impl(
     // hands its caller something that is only catchable if the caller's
     // dispatch arm converts it. Name the native and the Java call site here,
     // at the boundary, so the routing can be followed from its origin.
-    if crate::runtime::interpreter::dbg_linkage() {
+    if diag & native_diag::LINKAGE != 0 {
         if let Err(MethodCallFailed::InternalError(VmError::Linkage(l))) = &out {
-            let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
-                .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+            let callee = native_callee_name(callback);
             crate::runtime::interpreter::dbg_linkage_dump(
                 thread,
                 "native return",
@@ -2068,9 +2231,8 @@ fn safe_native_call_impl(
             // site can be fixed at the source.
             if let Value::Object(Some(o)) = v {
                 let healed = shared.mem.heap.load_and_forward(*o);
-                if healed.as_ptr() != o.as_ptr() && cratonvm_gc::stale_objref_debug::enabled() {
-                    let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
-                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                if healed.as_ptr() != o.as_ptr() && diag & native_diag::STALE_OBJREF != 0 {
+                    let callee = native_callee_name(callback);
                     // The cached-dispatch callback pointer often has no ring
                     // name; the top Java frame names the method this native
                     // implements, which is the actionable identity.
@@ -2099,7 +2261,7 @@ fn safe_native_call_impl(
             }
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);
-                if crate::runtime::interpreter::remap_trace_on() {
+                if diag & native_diag::REMAP_TRACE != 0 {
                     let site = thread
                         .frames
                         .last()
@@ -2112,10 +2274,9 @@ fn safe_native_call_impl(
                     );
                 }
             }
-            if crate::memory::gc::altrace_enabled_vm() {
+            if diag & native_diag::ALTRACE != 0 {
                 if let Value::Object(Some(o)) = v {
-                    let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
-                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                    let callee = native_callee_name(callback);
                     let cid = shared.mem.heap.class_id_of(*o);
                     let cname = shared
                         .classes
@@ -2156,9 +2317,8 @@ fn safe_native_call_impl(
     // an exception ref has already gone stale, a native may leave the live
     // exception as a handoff pin above the argument-root watermark; do not use
     // those temporary pins to reinterpret normal object returns.
-    if unpin_ring_enabled() && pin_base < thread.native_pin_roots.len() {
-        let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
-            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+    if diag & native_diag::UNPIN_RING != 0 && pin_base < thread.native_pin_roots.len() {
+        let callee = native_callee_name(callback);
         UNPIN_RING.with(|r| {
             let mut r = r.borrow_mut();
             if r.len() >= 6 {
@@ -23288,6 +23448,210 @@ impl Drop for JniImplicitFrameGuard {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod native_diag_tests {
+    use super::*;
+
+    /// Serialises the tests that toggle `native_ring`'s process-global
+    /// `ENABLED`.
+    ///
+    /// libtest runs these on parallel threads and the flag is global, so
+    /// without this one test's `enable(false)` lands between another's
+    /// `enable(true)` and its assertion. That is a genuinely flaky failure that
+    /// looks exactly like the bug the assertion is written to catch, which is
+    /// the worst kind: it would have been "fixed" by weakening the assertion.
+    static RING_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The memoized half must contain ONLY startup-static gates.
+    ///
+    /// ARCH-2026-08-04 A3 folded thirteen diagnostic gates on the native funnel
+    /// into one word, computing eleven of them once. Two —
+    /// `dispatch_trace::enable()` (called at runtime by the stack-dump watchdog
+    /// so a hang in native code still leaves a breadcrumb) and
+    /// `native_ring::enable()` — are toggleable *after* the first native call.
+    /// Memoizing either would silently disable a diagnostic at exactly the
+    /// moment someone switched it on to chase a hang, and nothing in the
+    /// funnel's behaviour would reveal it. Pin the split.
+    #[test]
+    fn the_memoized_half_never_holds_a_runtime_toggleable_bit() {
+        let stat = native_diag_static();
+        assert_eq!(
+            stat & native_diag::DISPATCH_TRACE,
+            0,
+            "DISPATCH_TRACE is toggled at runtime by the stack-dump watchdog; \
+             it must be re-read per call, not memoized"
+        );
+        assert_eq!(
+            stat & native_diag::RING,
+            0,
+            "RING is toggled at runtime via native_ring::enable(); it must be \
+             re-read per call, not memoized"
+        );
+    }
+
+    /// Toggling the ring at runtime must move the mask, both directions.
+    ///
+    /// This is the behavioural half of the test above: it proves the dynamic
+    /// bit is actually re-read rather than merely absent from the memo.
+    #[test]
+    fn the_ring_bit_tracks_runtime_toggling() {
+        let _serialise = RING_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let was = cratonvm_native_api::native_ring::is_enabled();
+
+        cratonvm_native_api::native_ring::enable(true);
+        assert_ne!(
+            native_diag_mask() & native_diag::RING,
+            0,
+            "enabling the ring must set RING in the mask; if it does not, the \
+             funnel will skip record_enter/record_exit and the watchdog's \
+             STILL-IN-NATIVE breadcrumb is lost"
+        );
+
+        cratonvm_native_api::native_ring::enable(false);
+        // `any_recording_enabled` also covers CRATONVM_TRACK_NATIVE, which is a
+        // separate env gate — only assert the bit clears when that is off too.
+        if !cratonvm_native_api::native_ring::any_recording_enabled() {
+            assert_eq!(
+                native_diag_mask() & native_diag::RING,
+                0,
+                "disabling the ring must clear RING in the mask"
+            );
+        }
+
+        cratonvm_native_api::native_ring::enable(was);
+    }
+
+    /// Every bit is distinct.
+    ///
+    /// Thirteen hand-assigned shifts collapsed from thirteen hand-written gate
+    /// calls. A duplicated shift would silently alias two diagnostics — arming
+    /// one would arm the other, and disarming one would disarm both — with no
+    /// symptom until somebody chased a hang with the wrong dump in hand.
+    #[test]
+    fn every_diagnostic_bit_is_distinct() {
+        let bits = [
+            ("BLOCKGC", native_diag::BLOCKGC),
+            ("VM_STATE", native_diag::VM_STATE),
+            ("STRAYSTACK", native_diag::STRAYSTACK),
+            ("EC_WATCH", native_diag::EC_WATCH),
+            ("MEMWATCH", native_diag::MEMWATCH),
+            ("YOUNGSCAN", native_diag::YOUNGSCAN),
+            ("LINKAGE", native_diag::LINKAGE),
+            ("ALTRACE", native_diag::ALTRACE),
+            ("UNPIN_RING", native_diag::UNPIN_RING),
+            ("STALE_OBJREF", native_diag::STALE_OBJREF),
+            ("REMAP_TRACE", native_diag::REMAP_TRACE),
+            ("DISPATCH_TRACE", native_diag::DISPATCH_TRACE),
+            ("RING", native_diag::RING),
+        ];
+        let mut seen = 0u32;
+        for (name, bit) in bits {
+            assert_eq!(bit.count_ones(), 1, "{name} must be a single bit");
+            assert_eq!(seen & bit, 0, "{name} aliases an earlier diagnostic bit");
+            seen |= bit;
+        }
+        assert_eq!(seen.count_ones(), bits.len() as u32);
+    }
+
+    /// The pre-call helper acts on exactly the bits it is given.
+    ///
+    /// The other half of the A3 transcription risk: the mask can be composed
+    /// correctly and still be *consumed* with the wrong bit at a use site. This
+    /// drives `native_diag_pre_call` with synthetic masks and checks that each
+    /// bit produces its own effect and no other — which the armed-flag route
+    /// cannot check, because these diagnostics are all fire-on-anomaly and
+    /// print nothing on a healthy run.
+    #[test]
+    fn pre_call_acts_only_on_the_bits_it_is_given() {
+        fn probe(_ctx: &mut dyn cratonvm_native_api::NativeContext, _a: &[Value]) -> MethodCallResult {
+            Ok(None)
+        }
+        let cb: NativeCallback = probe;
+        let mut thread = JvmThread::new(ThreadId(4242), "a3-pre-call-probe");
+
+        // Nothing armed: no ring token, no straystack push, no vm-state name.
+        let st = native_diag_pre_call(0, &mut thread, cb);
+        assert!(st.ring_idx.is_none(), "mask 0 must not enter the ring");
+        assert!(!st.straystack_pushed, "mask 0 must not push straystack");
+        assert!(st.vm_state_name.is_none(), "mask 0 must not name the callee");
+
+        // RING alone: a token, and nothing else.
+        let _serialise = RING_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let was = cratonvm_native_api::native_ring::is_enabled();
+        cratonvm_native_api::native_ring::enable(true);
+        let st = native_diag_pre_call(native_diag::RING, &mut thread, cb);
+        assert!(
+            st.ring_idx.is_some(),
+            "the RING bit must reach native_ring::record_enter"
+        );
+        assert!(!st.straystack_pushed);
+        assert!(st.vm_state_name.is_none());
+        if let Some(idx) = st.ring_idx {
+            cratonvm_native_api::native_ring::record_exit(idx);
+        }
+        cratonvm_native_api::native_ring::enable(was);
+
+        // STRAYSTACK alone: a push, and nothing else. Pop it back.
+        let st = native_diag_pre_call(native_diag::STRAYSTACK, &mut thread, cb);
+        assert!(
+            st.straystack_pushed,
+            "the STRAYSTACK bit must push the thread-local native stack"
+        );
+        assert!(st.ring_idx.is_none());
+        assert!(st.vm_state_name.is_none());
+        CURRENT_NATIVE_STACK.with(|s| {
+            assert_eq!(
+                s.borrow().len(),
+                1,
+                "STRAYSTACK must have pushed exactly one entry"
+            );
+            s.borrow_mut().pop();
+        });
+
+        // VM_STATE alone: a resolved name, and nothing else.
+        let st = native_diag_pre_call(native_diag::VM_STATE, &mut thread, cb);
+        assert!(
+            st.vm_state_name.is_some(),
+            "the VM_STATE bit must resolve the callee name"
+        );
+        assert!(st.ring_idx.is_none());
+        assert!(!st.straystack_pushed);
+    }
+
+    /// With no diagnostics armed the mask is zero — the fast path is real.
+    ///
+    /// A default `cargo test` process sets none of the thirteen env vars, so
+    /// this is the shape every production run takes. If this ever starts
+    /// failing, some gate acquired a default-on reading and every native call
+    /// in the VM is now paying for the cold path.
+    #[test]
+    fn a_default_process_arms_nothing() {
+        let _serialise = RING_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let was = cratonvm_native_api::native_ring::is_enabled();
+        cratonvm_native_api::native_ring::enable(false);
+        if cratonvm_native_api::native_ring::any_recording_enabled()
+            || crate::dispatch_trace::is_enabled()
+        {
+            // Another test in this process armed a dynamic gate; the static
+            // half is still the meaningful assertion.
+            assert_eq!(
+                native_diag_static(),
+                0,
+                "no CRATONVM_DBG_* var is set in a default test process, so \
+                 every memoized diagnostic bit must be clear"
+            );
+        } else {
+            assert_eq!(
+                native_diag_mask(),
+                0,
+                "no diagnostic is armed in a default test process, so the \
+                 native funnel's mask must be zero"
+            );
+        }
+        cratonvm_native_api::native_ring::enable(was);
+    }
+}
 
 #[cfg(test)]
 mod tests {
