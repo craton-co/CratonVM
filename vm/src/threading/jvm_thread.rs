@@ -487,6 +487,20 @@ pub struct JvmThread {
     /// `active_jit_executions` = 2 and 3.
     pub invoke_cache: InvokeCache<cratonvm_jit::RetainedCode>,
 
+    /// Per-thread resolved-field site cache — the interpreter's "resolved
+    /// constant pool" for `getfield`/`putfield`/`getstatic`/`putstatic`.
+    ///
+    /// The authoritative `SharedVm::resolution_cache` already memoizes
+    /// `(referencing class, cp index) -> ResolvedField`, but reaching it costs an
+    /// `OrderedPlRwLock` read, and `resolve_field_ref_loader_aware` then
+    /// *revalidates* every hit by re-deriving the field-owning class from its
+    /// name — two `String` allocations, two further `class_manager` read
+    /// acquisitions and a full `resolve_class_loader_aware`. This side table
+    /// skips all of it for the sites where that revalidation is a tautology.
+    /// See [`crate::runtime::interpreter::field_access::FieldSiteCache`] for the
+    /// validity argument.
+    pub field_sites: crate::runtime::interpreter::field_access::FieldSiteCache,
+
     /// Thread-local cache for the vtable-fast native-shadow guard.
     ///
     /// On invoke-cache misses, `execute_invokevirtual_vtable_fast` checks whether
@@ -709,6 +723,7 @@ impl JvmThread {
             jit_hashmap_string_node_cache: Vec::new(),
             string_case_cache: Vec::new(),
             invoke_cache: InvokeCache::new(),
+            field_sites: crate::runtime::interpreter::field_access::FieldSiteCache::new(),
             native_shadow_cache: FxHashMap::default(),
             kind: ThreadKind::Platform,
             pin_count: 0,

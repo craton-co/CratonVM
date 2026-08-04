@@ -152,14 +152,25 @@ pub(crate) fn resolve_field_ref(
 /// global store. Behaviour is unchanged whenever the referencing class is
 /// NOT user-loader-owned (gate off, or a built-in defining loader) — that
 /// case still resolves via the same global `load_class_concurrent` path.
-/// `CRATONVM_JIT=field-cache-fastpath` — let a resolution-cache hit short-circuit
-/// the loader-aware revalidation when the caller is not loader-sensitive. Read
-/// once and cached; this sits on the interpreter's field path. Default-OFF →
-/// behaviour byte-for-byte unchanged.
-fn field_cache_fastpath_enabled() -> bool {
+/// `CRATONVM_JIT=field-site-cache` — enable the per-thread resolved-field site
+/// cache ([`FieldSiteCache`]). Read once and cached; this sits on the
+/// interpreter's field path. Default-OFF → behaviour byte-for-byte unchanged.
+fn field_site_cache_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FIELD_CACHE_FASTPATH").is_some()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FIELD_SITE_CACHE").is_some()
+    })
+}
+
+/// `CRATONVM_JIT=field-site-cache-loader` — additionally admit
+/// **loader-sensitive** sites resolved from the loader-local lookup, guarded by
+/// the loader-resolution epoch as well. Implies `field-site-cache`; on its own
+/// it does nothing. Default-OFF and measured separately, because it is the arm
+/// with the wider correctness surface.
+fn field_site_cache_loader_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FIELD_SITE_CACHE_LOADER").is_some()
     })
 }
 
@@ -169,6 +180,25 @@ pub(super) fn resolve_field_ref_loader_aware(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<ResolvedField, MethodCallFailed> {
+    // ---- Resolved constant pool: per-thread site cache ------------------
+    // A hit here answers the whole function with an array index, two integer
+    // tag compares and two relaxed atomic loads — no lock, no allocation, no
+    // class resolution. Only sites whose loader-aware revalidation was proven
+    // redundant at fill time are ever stored; see `FieldSiteCache`.
+    let epochs_at_entry = if field_site_cache_enabled() {
+        if let Some(hit) = thread.field_sites.get(current_class_id, cp_index) {
+            field_site_stats::bump(field_site_stats::HIT);
+            return Ok(hit);
+        }
+        field_site_stats::bump(field_site_stats::MISS);
+        // Read BEFORE resolving; see `FieldSiteCache::put`.
+        (
+            cratonvm_classloading::class_definition_epoch(),
+            super::constants::resolution_epoch(),
+        )
+    } else {
+        (0, 0)
+    };
     // A field cache entry may have been populated by a loader-blind helper
     // (verification, JIT metadata, or an earlier legacy path) before this
     // opcode reaches its loader-aware resolver. Do not trust such an entry
@@ -181,37 +211,6 @@ pub(super) fn resolve_field_ref_loader_aware(
         .read()
         .get_field(current_class_id, cp_index)
         .cloned();
-
-    // FAST PATH: a cache hit for a caller that is NOT loader-sensitive is
-    // already the answer, and the validation below is a tautology for it.
-    //
-    // What that validation costs on EVERY field access, cache hit included:
-    // two `String` allocations (`class_name.to_string()` and
-    // `field_name.to_string()`), two further `class_manager.read()`
-    // acquisitions, and a full `resolve_class_loader_aware` — which is where
-    // this workload's `load_class_concurrent` samples come from. It is the most
-    // expensive thing on the interpreter's field path, and Tomcat's annotation
-    // scan executes ~1.2M instance field accesses against ~2.0M bytecodes in
-    // total (`CRATONVM_DBG=hotpath-counts`).
-    //
-    // The header comment above states the concern precisely: an entry may have
-    // been populated by a loader-blind helper, so it must not be trusted
-    // blindly **for a user-loader caller**.
-    // `should_use_loader_initiated_resolution` is exactly that question, takes
-    // only the class id, and needs none of the strings — so ask it first. When
-    // it is false, loader-blind and loader-aware resolution agree by
-    // construction, so re-deriving the owner can only reproduce
-    // `cached.declaring_class_id` and the `cache_matches_owner` test below is
-    // guaranteed to pass.
-    //
-    // Default-OFF pending the A/B: `CRATONVM_JIT=field-cache-fastpath`.
-    if field_cache_fastpath_enabled() {
-        if let Some(hit) = &cached {
-            if !should_use_loader_initiated_resolution(shared, current_class_id) {
-                return Ok(hit.clone());
-            }
-        }
-    }
 
     let (field_class_name, field_name) = {
         let cm = shared.classes.class_manager.read();
@@ -281,6 +280,10 @@ pub(super) fn resolve_field_ref_loader_aware(
         None
     };
 
+    // Whether the owner came from the loader-LOCAL lookup rather than the
+    // re-entrant resolver. Only the former has a writable validity condition
+    // (the two epochs); see `fill_field_site`.
+    let loader_local = loader_local_id.is_some();
     let field_class_id = match loader_local_id {
         Some(id) => id,
         None => resolve_class_loader_aware(shared, thread, current_class_id, &field_class_name)?,
@@ -292,18 +295,334 @@ pub(super) fn resolve_field_ref_loader_aware(
                 || cm.is_subclass_of(field_class_id, cached.declaring_class_id)
         };
         if cache_matches_owner {
+            fill_field_site(
+                thread,
+                current_class_id,
+                cp_index,
+                loader_sensitive,
+                loader_local,
+                epochs_at_entry,
+                &cached,
+            );
             return Ok(cached);
         }
     }
 
-    resolve_field_in_class(
+    let resolved = resolve_field_in_class(
         shared,
         current_class_id,
         cp_index,
         field_class_id,
         field_class_name,
         field_name,
-    )
+    )?;
+    fill_field_site(
+        thread,
+        current_class_id,
+        cp_index,
+        loader_sensitive,
+        loader_local,
+        epochs_at_entry,
+        &resolved,
+    );
+    Ok(resolved)
+}
+
+/// Offer a freshly-resolved site to the per-thread [`FieldSiteCache`].
+///
+/// A **loader-blind** site (`loader_sensitive == false`) is always offered: its
+/// owner resolution reads the global name → `ClassId` mapping and nothing else,
+/// so the class-definition epoch alone is a complete validity condition.
+///
+/// A **loader-sensitive** site is offered only under
+/// `CRATONVM_JIT=field-site-cache-loader`, and only when the owner came back
+/// from the loader-local lookup (`loader_local` — `class_defined_by_loader_exact`
+/// or the initiating-resolution memo) rather than from a re-entrant
+/// `resolve_class_loader_aware`. That restriction is what makes the validity
+/// condition writable: those two sources are covered exactly by the
+/// class-definition and loader-resolution epochs. A site that needed the
+/// re-entrant resolver keeps paying full revalidation every time, as before.
+///
+/// This split exists because the two cases have different reach. Tomcat's
+/// annotation scan run from a plain classpath is loader-blind, but the same
+/// code inside a real webapp deploy runs under a user-defined loader — so a
+/// fix that only covered the first would be measurable on the probe and inert
+/// where it matters. `CRATONVM_DBG=field-site`'s `reject_loader` counter is
+/// what says which case a given workload is in.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn fill_field_site(
+    thread: &mut JvmThread,
+    current_class_id: ClassId,
+    cp_index: u16,
+    loader_sensitive: bool,
+    loader_local: bool,
+    epochs_at_entry: (u64, u64),
+    resolved: &ResolvedField,
+) {
+    if !field_site_cache_enabled() {
+        return;
+    }
+    if loader_sensitive && !(loader_local && field_site_cache_loader_enabled()) {
+        field_site_stats::bump(field_site_stats::REJECT_LOADER);
+        return;
+    }
+    thread
+        .field_sites
+        .put(current_class_id, cp_index, epochs_at_entry, resolved.clone());
+    field_site_stats::bump(field_site_stats::FILL);
+}
+
+/// Number of direct-mapped slots. A power of two so the index is a mask.
+/// BCEL's class parser — the workload this was written for — touches on the
+/// order of a hundred distinct field sites in its hot loop, so 1024 slots make
+/// conflict misses vanishingly rare while costing ~32 KiB per thread that
+/// actually executes a field access (the table is allocated lazily).
+const FIELD_SITE_SLOTS: usize = 1024;
+
+/// Per-thread resolved-field site cache — a direct-mapped, lock-free
+/// "resolved constant pool" for the four field opcodes.
+///
+/// # Why a hit may skip the loader-aware revalidation
+///
+/// [`resolve_field_ref_loader_aware`] answers a field reference in two steps:
+/// resolve the *owning class* from its name, then locate the field in it. The
+/// second step is memoized by `SharedVm::resolution_cache`; the first is not,
+/// and re-running it is what costs two `String` allocations, two extra
+/// `class_manager` read acquisitions and a full `resolve_class_loader_aware`
+/// on **every** access, cache hit included.
+///
+/// # The validity condition
+///
+/// A stored answer stays correct exactly as long as all three of:
+///
+/// 1. **The class-name → `ClassId` mapping has not changed.**
+///    `cratonvm_classloading::class_definition_epoch` is the counter whose
+///    whole purpose is this question — it is bumped by every `loaded_classes`
+///    insert, remove and bulk retain.
+/// 2. **No cached resolution has been invalidated.**
+///    [`super::constants::resolution_epoch`] covers the rest of the input set:
+///    the per-loader initiating-resolution memo (whose entries are what
+///    `lookup_loader_initiated` answers from, and which changes without
+///    touching `loaded_classes`), and the four sites that fire classloading's
+///    resolution-invalidate hook. Two of those — `upgrade_synthetic_class` and
+///    `recompute_subclass_layouts` — move a class's **field layout in place**,
+///    keeping its `ClassId`, its name and the redefine latch; this epoch is the
+///    only signal for them.
+/// 3. **No class has been redefined in place.**
+///    `cratonvm_classloading::any_class_redefined` latches on the first
+///    redefine and permanently disables the cache. Redefinition is a
+///    JVMTI/Mockito scenario, not a throughput one, so the conservative latch
+///    is the right trade.
+///
+/// All three are single atomic loads, checked on every hit. Any change makes
+/// the whole table miss and the caller falls through to the authoritative slow
+/// path, which re-fills.
+///
+/// # What is admitted
+///
+/// **Loader-blind** sites (`loader_sensitive == false`) always: their owner
+/// resolution reads the global name mapping and nothing else.
+///
+/// **Loader-sensitive** sites only under `CRATONVM_JIT=field-site-cache-loader`,
+/// and only when the owner came back from the loader-LOCAL lookup
+/// (`class_defined_by_loader_exact` or the initiating-resolution memo) rather
+/// than from a re-entrant `resolve_class_loader_aware`. That restriction is
+/// what keeps the condition above complete: both of those sources are covered
+/// by epochs 1 and 2, whereas driving a loader's own `loadClass` can consult
+/// state neither counter observes.
+///
+/// `loader_sensitive` itself is stable for a given site — it is a function of
+/// the referencing class's defining loader (fixed once the class exists), the
+/// owner name spelled in the constant pool (fixed by the classfile), and the
+/// process-wide `loader_aware_resolution` gate (read once) — so a site admitted
+/// here can never later *become* loader-sensitive.
+pub struct FieldSiteCache {
+    /// Lazily allocated; a thread that never executes a field opcode pays
+    /// nothing. `None` in a slot means empty.
+    slots: Option<Box<[Option<FieldSite>]>>,
+    /// `class_definition_epoch()` as of the last time the table was known
+    /// valid. A change wipes the table rather than validating per entry, so a
+    /// hit is two integer compares.
+    epoch: u64,
+    /// `super::constants::resolution_epoch()` likewise.
+    resolution_epoch: u64,
+}
+
+struct FieldSite {
+    class_id: ClassId,
+    cp_index: u16,
+    resolved: ResolvedField,
+}
+
+impl FieldSiteCache {
+    pub fn new() -> Self {
+        Self {
+            slots: None,
+            epoch: 0,
+            resolution_epoch: 0,
+        }
+    }
+
+    /// Direct-mapped slot index. Fibonacci-hash the pair so that the low bits
+    /// of a `cp_index` (which are far from uniform — a class's field refs
+    /// cluster in a narrow index range) do not alias across classes.
+    #[inline]
+    fn slot_of(class_id: ClassId, cp_index: u16) -> usize {
+        let key = ((class_id.as_u32() as u64) << 16) | cp_index as u64;
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize & (FIELD_SITE_SLOTS - 1)
+    }
+
+    /// Revalidate the table against the two global counters, wiping it if
+    /// either moved. Returns `false` when this cache must not be used at all.
+    #[inline]
+    fn revalidate(&mut self) -> bool {
+        if cratonvm_classloading::any_class_redefined() {
+            // Latched off for the rest of the process: drop the memory too.
+            if self.slots.is_some() {
+                self.slots = None;
+            }
+            return false;
+        }
+        let now = cratonvm_classloading::class_definition_epoch();
+        let now_res = super::constants::resolution_epoch();
+        if now != self.epoch || now_res != self.resolution_epoch {
+            self.epoch = now;
+            self.resolution_epoch = now_res;
+            self.clear();
+        }
+        true
+    }
+
+    #[inline]
+    pub fn get(&mut self, class_id: ClassId, cp_index: u16) -> Option<ResolvedField> {
+        if !self.revalidate() {
+            return None;
+        }
+        let idx = Self::slot_of(class_id, cp_index);
+        let site = self.slots.as_ref()?[idx].as_ref()?;
+        if site.class_id == class_id && site.cp_index == cp_index {
+            Some(site.resolved.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Publish a resolved site.
+    ///
+    /// `epochs_at_entry` is `(class_definition_epoch, resolution_epoch)` as read
+    /// **before** the resolution that produced `resolved`. If either has moved
+    /// since, the answer may already describe superseded state and the insert is
+    /// dropped: caching it would let this thread serve a stale field for as long
+    /// as the epochs then stay put. Snapshotting at insert time instead would
+    /// swallow exactly that race.
+    #[inline]
+    pub fn put(
+        &mut self,
+        class_id: ClassId,
+        cp_index: u16,
+        epochs_at_entry: (u64, u64),
+        resolved: ResolvedField,
+    ) {
+        if !self.revalidate() {
+            return;
+        }
+        // `revalidate` has just set both fields to the live values.
+        if epochs_at_entry != (self.epoch, self.resolution_epoch) {
+            return;
+        }
+        let idx = Self::slot_of(class_id, cp_index);
+        let slots = self
+            .slots
+            .get_or_insert_with(|| (0..FIELD_SITE_SLOTS).map(|_| None).collect());
+        slots[idx] = Some(FieldSite {
+            class_id,
+            cp_index,
+            resolved,
+        });
+    }
+
+    /// Drop every entry, keeping the allocation.
+    pub fn clear(&mut self) {
+        if let Some(slots) = self.slots.as_mut() {
+            for slot in slots.iter_mut() {
+                *slot = None;
+            }
+        }
+    }
+}
+
+impl Default for FieldSiteCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for FieldSiteCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let live = self
+            .slots
+            .as_ref()
+            .map(|s| s.iter().filter(|e| e.is_some()).count())
+            .unwrap_or(0);
+        write!(f, "FieldSiteCache({live} live, epoch={})", self.epoch)
+    }
+}
+
+/// `CRATONVM_DBG=field-site` — prove the site cache is actually firing before
+/// anyone times it. Four counters, printed on a power-of-two schedule so the
+/// output stays bounded; an inert lever shows up immediately as `hit=0`.
+pub mod field_site_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub(super) const HIT: usize = 0;
+    pub(super) const MISS: usize = 1;
+    pub(super) const FILL: usize = 2;
+    pub(super) const REJECT_LOADER: usize = 3;
+
+    static COUNTS: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FIELD_SITE").is_some())
+    }
+
+    #[inline]
+    pub(super) fn bump(index: usize) {
+        if !on() {
+            return;
+        }
+        let n = COUNTS[index].fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 1_000_000 == 1 {
+            eprintln!(
+                "[field-site] hit={} miss={} fill={} reject_loader={}",
+                COUNTS[HIT].load(Ordering::Relaxed),
+                COUNTS[MISS].load(Ordering::Relaxed),
+                COUNTS[FILL].load(Ordering::Relaxed),
+                COUNTS[REJECT_LOADER].load(Ordering::Relaxed),
+            );
+        }
+    }
+
+    /// Final tally, printed at VM shutdown so a short run still reports.
+    pub fn dump() {
+        if !on() {
+            return;
+        }
+        eprintln!(
+            "[field-site] FINAL hit={} miss={} fill={} reject_loader={}",
+            COUNTS[HIT].load(Ordering::Relaxed),
+            COUNTS[MISS].load(Ordering::Relaxed),
+            COUNTS[FILL].load(Ordering::Relaxed),
+            COUNTS[REJECT_LOADER].load(Ordering::Relaxed),
+        );
+    }
 }
 
 /// Shared tail of [`resolve_field_ref`] / [`resolve_field_ref_loader_aware`]:
