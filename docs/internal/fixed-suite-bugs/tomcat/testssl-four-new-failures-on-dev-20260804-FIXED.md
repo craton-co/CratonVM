@@ -192,8 +192,31 @@ Verified:
 * the pre-fix binary fails the new regression test (`swallowed=199153` of
   200 000), the post-fix binary passes it;
 * `cratonvm-jit` 1892 unit tests + all integration targets pass;
-* `TestSsl` on Windows is unchanged at 21 tests / 1 pre-existing by-design
-  failure, before and after.
+* `TestSsl` on Windows is unchanged before and after: 21 tests, with
+  `testClientInitiatedRenegotiation[JSSE]` the one by-design failure.
+
+One correction to that last line, because the first version of it was too
+clean. `TestSsl.testPost[JSSE]` **flakes**, and it flaked during this work in a
+way that initially looked like a regression from the fix. Measured over 11
+runs on the same host:
+
+| arm | `testPost` failures |
+|---|---|
+| pre-fix (`dev`, no athrow fix) | 2 / 7 |
+| with the athrow fix | 2 / 4 |
+
+So it fails on both arms and is **not** attributable to the fix — the first
+three pre-fix runs simply happened to be clean, which is exactly how a flaky
+test manufactures a false regression. The failure is always the same shape: a
+mid-stream EOF while reading the response back, e.g. `Byte in position
+[5930928] had value [-1] rather than [1]`, from one of the four concurrent
+threads `testPost` starts to POST ~6 MiB each over TLS. No exception is
+printed, so it is the read-loop's own EOF branch, not the `catch`.
+
+This is a pre-existing flake in the TLS suite and wants its own page; it is
+recorded here only so the next person who sees `Failures: 2` on this class
+does not spend the afternoon bisecting it, and so nobody reads a single clean
+`TestSsl` run as proof that a JIT change is safe.
 
 **Not** verified: the four tests were never re-run on the Azure Linux fixture,
 because Windows never reproduced them (that measurement is the section above,
