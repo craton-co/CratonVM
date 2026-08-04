@@ -31,6 +31,14 @@ import java.util.concurrent.CountDownLatch;
  * NB the counters are deliberately NOT atomic: a plain `++` under a correct
  * monitor is exact, and is the only thing that can detect a monitor that
  * stopped excluding.
+ *
+ * ⚠️ In the default CORE run the flag is OFF, so this exercises the ORDINARY
+ * interpreted/synchronized path — a real check, but NOT the compiled one it was
+ * written for. To cover that path it must be run explicitly:
+ *
+ *     CRATONVM_JIT=sync-methods ONLY=RSyncMethodJit bash regression-suite/run.sh
+ *
+ * Fold it into the default set only when that flag's default flips.
  */
 public class RSyncMethodJit {
 
