@@ -1913,6 +1913,15 @@ pub struct CompiledMethod {
     /// into a hot loop forever (instead of one fresh OSR compile) routes
     /// every callee through the slow dispatch helper.
     pub compiled_via_osr: bool,
+    /// The bytecode pc this OSR artifact was COMPILED FOR, when it was.
+    ///
+    /// `osr_pc_to_native` carries an offset for every pc the codegen accepted
+    /// as an entry, so one artifact can legitimately be entered at several loop
+    /// headers — and `can_osr_enter` allows exactly that. This field records
+    /// which pc the compile was actually requested for, so
+    /// `CRATONVM_JIT_OSR_SINGLE_PC=1` can restrict entry to it and answer
+    /// whether a multi-pc entry is sound, without guessing from a trace.
+    pub osr_compiled_entry_pc: Option<usize>,
     /// RBC.5 — raw class ids of the declaring classes of every
     /// getstatic/putstatic site in this method, recorded at compile time
     /// from the already-resolved `static_field_info`. JIT code reads static
@@ -2169,6 +2178,7 @@ impl CompiledMethod {
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
             compiled_via_osr: false,
+            osr_compiled_entry_pc: None,
             static_init_classes: Vec::new(),
             static_inits_done: std::sync::atomic::AtomicBool::new(false),
             oop_maps_sorted: false,
@@ -2237,6 +2247,7 @@ impl CompiledMethod {
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
             compiled_via_osr: false,
+            osr_compiled_entry_pc: None,
             static_init_classes: Vec::new(),
             static_inits_done: std::sync::atomic::AtomicBool::new(false),
             oop_maps_sorted: false,
@@ -2593,6 +2604,20 @@ impl CompiledMethod {
     /// point — and that switch is the documented escape hatch for this
     /// relaxation, so it is exactly the path that wants coverage.
     pub fn can_osr_enter_with(&self, entry_pc: usize, allow_dead_locals: bool) -> bool {
+        // Diagnosis lever, default OFF. `Arrays.sort(long[])` on >=1000
+        // elements throws an AIOOBE with a garbage index under OSR
+        // (`probes/SortProbe.java`), and the trace shows artifacts compiled
+        // for one pc being entered at another (`partitionDualPivot` compiled
+        // at 117, entered at 93; `mixedInsertionSort` compiled at 282, entered
+        // at 368). Restricting entry to the compiled pc separates "the second
+        // entry point is wrong" from "the body is wrong".
+        if osr_single_pc_entry_only() {
+            if let Some(compiled_pc) = self.osr_compiled_entry_pc {
+                if compiled_pc != entry_pc {
+                    return false;
+                }
+            }
+        }
         if !allow_dead_locals
             && self
                 .osr_dead_mask
@@ -3750,6 +3775,39 @@ impl CompiledMethod {
 /// method's own parameter (`String[] args`, local 0) is dead at the loop head.
 /// A once-invoked method with its hot loop inline has no other route into
 /// compiled code.
+/// `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` — make the OSR trampoline write every
+/// seeded local to its frame slot as well as its register home, instead of
+/// eliding the store for register-resident locals.
+///
+/// Diagnosis lever for the `mixedInsertionSort` OSR miscompile
+/// (`docs/known-issues/jit/arrays-sort-long-osr-miscompile-20260803.md`). The
+/// elision assumes the compiled body re-establishes a local's frame slot
+/// before any operation that needs a memory operand; if that is not true on
+/// every path reachable from an OSR entry, the slot holds whatever the
+/// trampoline's own frame left there.
+fn osr_always_seed_frame_slot() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_SEED_FRAME_SLOTS") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+            Err(_) => false,
+        },
+    )
+}
+
+/// `CRATONVM_JIT_OSR_SINGLE_PC` — see [`CompiledMethod::osr_compiled_entry_pc`].
+fn osr_single_pc_entry_only() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_SINGLE_PC") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+            Err(_) => false,
+        },
+    )
+}
+
 fn osr_dead_local_entry_allowed() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -4113,7 +4171,7 @@ unsafe fn emit_osr_trampoline(
             None
         };
         let has_register_home = dst_reg_opt.is_some() || xmm_opt.is_some();
-        if !has_register_home {
+        if !has_register_home || osr_always_seed_frame_slot() {
             let frame_neg_off = -((i as i32 + 1) * 8);
             tramp.emit(&[0x48, 0x89, 0x85]);
             tramp.emit(&frame_neg_off.to_le_bytes());

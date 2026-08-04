@@ -1251,6 +1251,7 @@ pub(super) fn compile_osr_artifact(
                 return None;
             };
             cm.compiled_via_osr = true;
+            cm.osr_compiled_entry_pc = Some(entry_pc);
             // Hand the baked callee entries to `put_osr` ->
             // `prepare_for_publication`, which upgrades each to a strong `Arc`
             // in `_direct_callee_roots`. Without this the OSR body's direct

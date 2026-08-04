@@ -2,7 +2,7 @@
 > corruption this doc was opened for is fixed and extinct (0 of 218 classes).
 > `HIB-LONGTAIL.1` itself is still in place; what remains of it is three
 > classes, tracked in
-> [`docs/known-issues/h2/h2-jitban-residuals-20260726.md`](../../../known-issues/h2/h2-jitban-residuals-20260726.md).
+> [`docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md`](../../../known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md).
 > The 9-vs-10 discrepancy in the body below is corrected there: **ten** classes
 > regressed, and the "9" was the net PASS delta (158 → 149), because
 > `TestMvccMultiThreaded2` improved in the same run. Six of the ten are now

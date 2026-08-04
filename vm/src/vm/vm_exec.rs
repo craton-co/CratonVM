@@ -2647,9 +2647,34 @@ thread_local! {
     /// round-robin working set behind it, same shape as
     /// `gen_heap::compact_field_slot`'s cache. Entries: (vm_key, class_id,
     /// slot, byte); vacant slots have vm_key == 0 (never a real address).
+    /// Direct-mapped, not round-robin, and 64 entries rather than 8.
+    ///
+    /// The 8-entry linear ring was sized for the `String.value`/`coder` +
+    /// `Matcher` scalars rotation. A native that reads a dozen fields across
+    /// four classes per call — `date_format_fast` touches ~14 distinct
+    /// (class, slot) pairs per `format` — overflows it on every call, so every
+    /// access fell through to the `RwLock` + hash tier.
+    /// `resolve_field_descriptor_byte_cached` was then **15.3%** of that
+    /// native in a perf profile, with `coerce_field_value_by_descriptor`
+    /// another 3.6%. Indexing instead of scanning also drops the 8-way compare
+    /// on the common hit.
+    ///
+    /// Eviction stays correctness-neutral: a colliding write simply replaces
+    /// the entry and the next miss re-walks immutable class metadata. The
+    /// stored `(vm_key, class_id, slot)` triple is still verified on every hit,
+    /// so a collision can only cost a re-walk, never return another field's
+    /// descriptor.
     static FIELD_DESCRIPTOR_RING:
-        std::cell::RefCell<([(usize, u32, usize, u8); 8], usize)> =
-        const { std::cell::RefCell::new(([(0, 0, 0, 0); 8], 0)) };
+        std::cell::RefCell<[(usize, u32, usize, u8); 64]> =
+        const { std::cell::RefCell::new([(0, 0, 0, 0); 64]) };
+}
+
+/// Bucket for [`FIELD_DESCRIPTOR_RING`]. Slot indices are small and dense, so
+/// mixing the class id in keeps two classes' slot 0 from colliding.
+#[inline]
+fn field_descriptor_bucket(class_id: u32, slot_index: usize) -> usize {
+    // Widening: u32 -> usize (value preserved).
+    ((class_id as usize).wrapping_mul(31).wrapping_add(slot_index)) & 63
 }
 
 /// Record a definitive (byte, or 0 = confirmed-negative) descriptor result
@@ -2658,9 +2683,8 @@ fn field_descriptor_remember(vm_key: usize, class_id: u32, slot_index: usize, by
     FIELD_DESCRIPTOR_LAST.with(|last| last.set(Some((vm_key, class_id, slot_index, byte))));
     FIELD_DESCRIPTOR_RING.with(|cell| {
         let mut ring = cell.borrow_mut();
-        let next = ring.1;
-        ring.0[next] = (vm_key, class_id, slot_index, byte);
-        ring.1 = (next + 1) % ring.0.len();
+        let idx = field_descriptor_bucket(class_id, slot_index);
+        ring[idx] = (vm_key, class_id, slot_index, byte);
     });
 }
 
@@ -2697,15 +2721,12 @@ fn resolve_field_descriptor_byte_cached(
     }) {
         return if cached == 0 { None } else { Some(cached) };
     }
-    // Second tier: the round-robin ring (see FIELD_DESCRIPTOR_RING's doc).
+    // Second tier: the direct-mapped table (see FIELD_DESCRIPTOR_RING's doc).
     let ring_hit = FIELD_DESCRIPTOR_RING.with(|cell| {
         let ring = cell.borrow();
-        ring.0
-            .iter()
-            .find(|(vm, cid, slot, _)| {
-                *vm == vm_key && *cid == class_id.as_u32() && *slot == slot_index
-            })
-            .map(|&(_, _, _, byte)| byte)
+        let entry = ring[field_descriptor_bucket(class_id.as_u32(), slot_index)];
+        (entry.0 == vm_key && entry.1 == class_id.as_u32() && entry.2 == slot_index)
+            .then_some(entry.3)
     });
     if let Some(byte) = ring_hit {
         FIELD_DESCRIPTOR_LAST
@@ -14138,7 +14159,7 @@ pub(super) fn convert_element_value(
 // `slot_for_exact` / `find_method_recursive` / `invoke_or_native` samples. It
 // proves the VM is dispatching and says nothing about *what*, which is the
 // entire diagnosis: the `nioMemLZF:` residual in
-// `docs/known-issues/h2/h2-jitban-residuals-20260726.md` read as "a long
+// `docs/known-issues/h2/h2-jitban-longtail1-ban-stays-testmetadata.md` read as "a long
 // interpreter tail with no second hot spot to attack" for two revisions purely
 // because nobody had the callee histogram.
 //
