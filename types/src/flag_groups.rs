@@ -752,6 +752,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "scan-cache", on_key: None, off_key: Some("CRATONVM_NO_JIT_SCAN_CACHE"), off_word: None },
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None },
     E { group: Group::JIT, token: "shadow-nopush", on_key: Some("CRATONVM_SHADOW_NOPUSH"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "sync-methods", on_key: Some("CRATONVM_JIT_SYNC_METHODS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "shadow-noreload", on_key: Some("CRATONVM_SHADOW_NORELOAD"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "shadow-pin", on_key: Some("CRATONVM_SHADOW_PIN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "shadow-raw-reload", on_key: Some("CRATONVM_SHADOW_RAW_RELOAD"), off_key: None, off_word: None },
