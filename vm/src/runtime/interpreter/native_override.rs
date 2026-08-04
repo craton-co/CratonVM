@@ -5279,21 +5279,32 @@ pub(super) fn should_force_registered_native_over_bytecode_precomputed(
 /// `resolve_native_dispatch_wave1` is a pure function of that boolean. The
 /// added cost is one relaxed `fetch_add` for the census.
 ///
-/// Returns `None` when the policy refuses, which the interceptors surface by
-/// declining to intercept — so the caller falls through to real bytecode,
-/// which is §7 step 3's answer, rather than raising. A refusal that *has* no
-/// bytecode to fall through to cannot occur here by the premise above.
+/// # The three answers
+///
+/// * `Ok(Some(cb))` — dispatch it, and the invocation has been counted.
+/// * `Ok(None)` — nothing registered, or §7 step 3 sent a `Bridge` to the real
+///   bytecode. The interceptor declines, and the call proceeds to that
+///   bytecode. The shadow attempt is already recorded by the resolver.
+/// * `Err(violation)` — §1.3, a `SyntheticStub` under `--jdk-only`. Raised
+///   rather than declined, matching `invoke_on_class_shared_inner`, so it is
+///   counted as a `SyntheticNativeInvocation`. Swallowing it would run the real
+///   bytecode quietly and leave a strict run reporting zero synthetic-stub
+///   invocations for a call that was one — the exact false-green contract §11
+///   must be immune to.
 #[inline]
 fn admit_forced_native(
     shared: &SharedVm,
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
-) -> Option<cratonvm_native_api::NativeCallback> {
-    let id = shared
+) -> Result<Option<cratonvm_native_api::NativeCallback>, cratonvm_types::error::JdkOnlyViolation> {
+    let Some(id) = shared
         .natives
         .native_methods
-        .resolve_id(class_name, method_name, method_descriptor)?;
+        .resolve_id(class_name, method_name, method_descriptor)
+    else {
+        return Ok(None);
+    };
     admit_forced_native_id(shared, id, class_name, method_name, method_descriptor)
 }
 
@@ -5314,13 +5325,15 @@ fn admit_forced_native_id(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
-) -> Option<cratonvm_native_api::NativeCallback> {
+) -> Result<Option<cratonvm_native_api::NativeCallback>, cratonvm_types::error::JdkOnlyViolation> {
     let registry = &shared.natives.native_methods;
-    let callback = registry.callback_of(id)?;
+    let Some(callback) = registry.callback_of(id) else {
+        return Ok(None);
+    };
     let kind = registry
         .kind_of_id(id)
         .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
-    let decision = crate::vm::resolve_native_dispatch_wave1(
+    match crate::vm::resolve_native_dispatch_wave1(
         crate::vm::dispatch_policy(shared),
         class_name,
         method_name,
@@ -5328,12 +5341,28 @@ fn admit_forced_native_id(
         Some((callback, kind)),
         true,
         true,
-    )?;
-    let admitted = decision.native_callback()?;
-    // Counted at the point of actual dispatch, matching every other route:
-    // the caller calls `safe_native_call` on the next statement.
-    registry.record_invocation(id);
-    Some(admitted)
+    ) {
+        // §1.3 — a `SyntheticStub` may not be invoked under `--jdk-only`.
+        // Raised rather than silently declined, matching
+        // `invoke_on_class_shared_inner`: the violation is counted as a
+        // `SyntheticNativeInvocation` by the caller that turns it into
+        // `VmError::JdkOnly`, and swallowing it here would drop that census
+        // entry while quietly running the real bytecode — a strict run would
+        // then report zero synthetic-stub invocations for a call that was one.
+        Some(crate::vm::DispatchDecision::Reject(violation)) => Err(violation),
+        Some(decision) => match decision.native_callback() {
+            Some(admitted) => {
+                // Counted at the point of actual dispatch, matching every
+                // other route: the caller calls `safe_native_call` next.
+                registry.record_invocation(id);
+                Ok(Some(admitted))
+            }
+            None => Ok(None),
+        },
+        // §7 step 3 under `JdkOnly`: concrete bytecode beats this bridge. The
+        // shadow attempt was already recorded by the resolver.
+        None => Ok(None),
+    }
 }
 
 /// Every dispatch site that carries the `ThreadPoolExecutor.execute`
@@ -5821,7 +5850,15 @@ pub(super) fn intercept_force_registered_native(
     // means the policy refused, and declining to intercept hands the call to
     // the real bytecode this site exists to override, which is §7 step 3's
     // answer.
-    let cb = admit_forced_native(shared, class_name, method_name, method_descriptor)?;
+    let cb = match admit_forced_native(shared, class_name, method_name, method_descriptor) {
+        Ok(Some(cb)) => cb,
+        Ok(None) => return None,
+        Err(violation) => {
+            return Some(Err(MethodCallFailed::InternalError(VmError::JdkOnly(
+                violation,
+            ))));
+        }
+    };
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!("[ccs-probe] intercept_force_registered_native: dispatching native callback");
     }
@@ -6026,7 +6063,15 @@ pub(super) fn intercept_force_registered_native_cached(
         method_name,
         method_descriptor,
     )?;
-    let cb = admit_forced_native_id(shared, id, class_name, method_name, method_descriptor)?;
+    let cb = match admit_forced_native_id(shared, id, class_name, method_name, method_descriptor) {
+        Ok(Some(cb)) => cb,
+        Ok(None) => return None,
+        Err(violation) => {
+            return Some(Err(MethodCallFailed::InternalError(VmError::JdkOnly(
+                violation,
+            ))));
+        }
+    };
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native_cached: dispatching native callback"
