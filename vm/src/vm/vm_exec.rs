@@ -5549,15 +5549,21 @@ fn compact_java_strings_equal(
     let right_elements = shared.mem.heap.array_length(right_value);
     if left_storage == right_storage {
         // Same representation: one raw payload compare, no decoding at all.
-        let stride = if left_storage == STRING_STORAGE_LATIN1 {
-            1
-        } else {
+        //
+        // Bytes per ELEMENT, not per code unit: `array_length` already counts
+        // elements, and a UTF16 String's value array is a `byte[]` whose length
+        // is the byte count. Only a `char[]` has 2-byte elements. (Deriving the
+        // span from the unit count instead would read twice the payload of
+        // every UTF16 String.)
+        let element_bytes = if left_storage == STRING_STORAGE_CHARS {
             2
+        } else {
+            1
         };
         let left_raw =
-            unsafe { std::slice::from_raw_parts(left_data, left_elements * stride) };
+            unsafe { std::slice::from_raw_parts(left_data, left_elements * element_bytes) };
         let right_raw =
-            unsafe { std::slice::from_raw_parts(right_data, right_elements * stride) };
+            unsafe { std::slice::from_raw_parts(right_data, right_elements * element_bytes) };
         return Some(left_raw == right_raw);
     }
     let left_units = string_unit_count(left_elements, left_storage)?;
@@ -23875,6 +23881,25 @@ mod tests {
             compact_java_string_hash(&shared, a),
             compact_java_string_hash(&shared, b)
         );
+    }
+
+    /// Non-Latin1 content, which is the UTF16 `byte[]` payload on a real-JDK
+    /// String and a `char[]` payload here. Both are 2 bytes per code unit but
+    /// only one of them is 2 bytes per *array element*, and the same-storage
+    /// compare spans `array_length` elements — so getting that conversion
+    /// backwards reads past the end of every UTF16 String.
+    #[test]
+    fn non_latin1_strings_round_trip_through_the_compact_readers() {
+        let shared = test_shared();
+        let a = super::create_java_string_uninterned(&shared, "kπ0");
+        let b = super::create_java_string_uninterned(&shared, "kπ0");
+        let c = super::create_java_string_uninterned(&shared, "kπ1");
+        assert_eq!(compact_java_strings_equal(&shared, a, b), Some(true));
+        assert_eq!(compact_java_strings_equal(&shared, a, c), Some(false));
+        let expected = "kπ0"
+            .encode_utf16()
+            .fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(unit as i32));
+        assert_eq!(compact_java_string_hash(&shared, a), Some(expected));
     }
 
     /// Different characters still compare unequal — the fix must not make
