@@ -14678,34 +14678,30 @@ pub fn invoke_or_native(
         // single native dispatch VM-wide. `find_with_kind` above folds both
         // lookups into one hash computation. See its doc comment.
         let synthetic_stub_native = native_kind == cratonvm_native_api::NativeKind::SyntheticStub;
-        // JDK-ONLY-WAVE2: real-protected-stub class allow-list, COPY 1 OF 2.
-        // The other copy is `real_protected_stub_class` in
-        // `vm/src/runtime/interpreter/invoke.rs`, and the two are NOT identical:
-        // this one includes `java/util/StringJoiner`, that one deliberately
-        // omits it (see the long comment there — yielding StringJoiner's stub
-        // to real bytecode on the interpreter path trips a heap-reference
-        // integrity defect). Wave 2 must RECONCILE them, not assume they are
-        // the same list and delete one; deleting either without the other
-        // desynchronises the two dispatch paths for this exact class.
-        // What must replace it: `NativeKind` alone. Under `--jdk-only` a
-        // `SyntheticStub` never dispatches, so no class needs "protecting"
-        // from one and the whole allow-list becomes dead.
+        // JDK-ONLY-WAVE2: real-protected-stub class allow-list, cold path.
+        //
+        // This was an inline `matches!` maintained by hand alongside a second
+        // copy in `real_protected_stub_class`, and the two had drifted: this
+        // one listed `java/util/StringJoiner`, the other deliberately omitted
+        // it. Both predicates now come from one list plus one *stated*
+        // exception in `native_override.rs`, asserted by
+        // `real_protected_stub_paths_diverge_on_exactly_stringjoiner`, so the
+        // divergence is a decision a reader can find rather than a difference
+        // between two files.
+        //
+        // `_cold` is the right one HERE: this is `invoke_or_native`, the
+        // vtable-miss route, and `StringJoiner` is protected on this path and
+        // not on the warm one. Do not "simplify" it to the warm predicate —
+        // that hands `StringJoiner.add()` back to a 5-field synthetic layout
+        // over a 7-field real class, which makes it a silent no-op.
+        //
+        // Wave 2 must RECONCILE the two, not merge them; both naive directions
+        // reintroduce a known defect. What must ultimately replace both:
+        // `NativeKind` alone — under `--jdk-only` a `SyntheticStub` never
+        // dispatches, so no class needs "protecting" from one and the whole
+        // allow-list becomes dead.
         let real_protected_stub = synthetic_stub_native
-            && (crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class)
-                || matches!(
-                    effective_class,
-                    "java/util/concurrent/locks/ReentrantLock"
-                        | "java/util/concurrent/LinkedBlockingDeque"
-                        | "java/util/concurrent/atomic/AtomicBoolean"
-                        | "java/util/EnumSet"
-                        | "java/time/Instant"
-                        | "java/time/ZonedDateTime"
-                        | "java/util/StringJoiner"
-                        | "java/io/FileInputStream"
-                        | "java/lang/ref/Cleaner"
-                        | "java/lang/ref/Cleaner$Cleanable"
-                        | "java/lang/management/ManagementFactory"
-                ));
+            && crate::runtime::interpreter::real_protected_stub_class_cold(effective_class);
         let has_real = real_protected_stub && {
             let cm = shared.classes.class_manager.read();
             cm.get_loaded_class_id(effective_class)
@@ -20008,48 +20004,20 @@ fn invoke_on_class_shared_inner(
                         // permanent fix.
                         //
                         // JDK-ONLY-WAVE2: the forced-native `java/lang/String`
-                        // policy, POSITIVE FORM (21 methods). Its twin is the
-                        // INVERTED-EXCLUSION form in
-                        // `vm/src/runtime/interpreter/invoke.rs::force_native_over_real_jdk_bytecode`
-                        // (`class == "java/lang/String" && !matches!(..7 shapes..)
-                        // => return false`). This arm is the COLD path
-                        // (`invoke_on_class_shared_inner`, first call at a
-                        // site); that one is the WARM path (memoized
-                        // force-native gate). THEY MUST BE DELETED TOGETHER:
-                        // removing one alone makes cold and warm dispatch
-                        // disagree about which implementation of `String.equals`
-                        // / `hashCode` / `substring` runs, and the observable
-                        // behaviour of a String method then depends on how many
-                        // times its call site has executed. What must replace
-                        // both: nothing — these natives are registered as
-                        // `Intrinsic`, so `resolve_dispatch` step 2 takes them
-                        // on their own merit with no class-name list at all;
-                        // any that are NOT intrinsic-grade are `SyntheticStub`s
-                        // shadowing real `String` bytecode and must go.
+                        // policy, POSITIVE FORM (21 method names, matched
+                        // descriptor-blind). The list itself now lives in
+                        // `cold_forced_native_string_name`, beside the WARM
+                        // path's inverted-exclusion twin
+                        // (`warm_forced_native_string_candidate`), so the two
+                        // halves of one policy can be compared by a test
+                        // instead of by a reader diffing two files — see that
+                        // function for the RKC16N.6 defect they both work
+                        // around, for the five entries that were statically
+                        // unreachable until 2026-08-04, and for why they must
+                        // be deleted together.
                         || (class_name == "java/lang/String"
-                            && matches!(
+                            && crate::runtime::interpreter::cold_forced_native_string_name(
                                 method_name,
-                                "charAt"
-                                | "length"
-                                | "isEmpty"
-                                | "equals"
-                                | "hashCode"
-                                | "indexOf"
-                                | "lastIndexOf"
-                                | "substring"
-                                | "startsWith"
-                                | "endsWith"
-                                | "trim"
-                                | "toString"
-                                | "concat"
-                                | "replace"
-                                | "toLowerCase"
-                                | "toUpperCase"
-                                | "compareTo"
-                                | "compareToIgnoreCase"
-                                | "equalsIgnoreCase"
-                                | "contains"
-                                | "split"
                             ))
                         // Compact strings are stored in byte[] and OpenJDK's
                         // UTF-16 copy loop is prohibitively expensive before
