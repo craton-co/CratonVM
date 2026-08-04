@@ -62,9 +62,10 @@ fn invoke_void(vm: &mut Vm, method: &str, args: &[Value]) {
 
 fn method_descriptor(method: &str) -> &'static str {
     match method {
-        "callA" | "callCurrent" | "callThrowerCaught" | "callOverride" | "callIface" => "(I)I",
-        "callPoly" => "(II)I",
-        "setCurrent" => "(I)V",
+        "callA" | "callCurrent" | "callThrowerCaught" | "callOverride" | "callIface"
+        | "callDivider" => "(I)I",
+        "callPoly" | "callBimorphic" => "(II)I",
+        "setCurrent" | "setDivisor" => "(I)V",
         other => panic!("unknown method: {other}"),
     }
 }
@@ -142,8 +143,129 @@ fn run_all_checks() -> Result<(), String> {
     check_guard_miss(&mut vm)?;
     check_override_receiver(&mut vm)?;
     check_interface_site(&mut vm)?;
+    check_bimorphic(&mut vm)?;
+    check_uncaught_from_inlined_frame(&mut vm)?;
     check_thrower(&mut vm)?;
     check_polymorphic(&mut vm)?;
+    Ok(())
+}
+
+/// Two receiver classes, both overriding, in an even mix — the Bimorphic
+/// verdict, and the two-guard chain that emits it.
+///
+/// Results alone cannot tell a two-guard site from a one-guard site: with only
+/// the first guard emitted, a `C` receiver simply misses and dispatches, which
+/// is also correct. So this checks the SPLICED BYTE COUNT. `B.tag` and `C.tag`
+/// are 6 bytecodes each (`iload_1; sipush; iadd; ireturn`), so a bimorphic
+/// splice charges 12 and a monomorphic one 6.
+fn check_bimorphic(vm: &mut Vm) -> Result<(), String> {
+    for i in 0..CALLS {
+        let which = i % 2;
+        let got = invoke_int(vm, "callBimorphic", &[Value::Int(i), Value::Int(which)]);
+        let want = i + if which == 0 { 1000 } else { 2000 };
+        if got != want {
+            return Err(format!(
+                "check_bimorphic: callBimorphic({i}, {which}) = {got}, want {want}"
+            ));
+        }
+    }
+    let tally = compiled_tally(vm, "callBimorphic")?;
+    if tally.speculative_sites == 0 {
+        return Err(format!(
+            "check_bimorphic: callBimorphic compiled but speculative_sites == 0 (tally={tally:?})"
+        ));
+    }
+    if tally.inlined_bytecodes < 12 {
+        return Err(format!(
+            "check_bimorphic: only {} callee bytecodes spliced (tally={tally:?}) — a Bimorphic \
+             verdict must splice BOTH receiver classes' bodies (6 + 6); one body means the \
+             second guard was never emitted and the site degraded to monomorphic",
+            tally.inlined_bytecodes
+        ));
+    }
+    Ok(())
+}
+
+/// §8 item 7: an UNCAUGHT exception propagating out of a guard-hit inlined
+/// frame.
+///
+/// The callee divides by an instance field. Warm up with a non-zero divisor so
+/// the site compiles with a guard baked in, then set the divisor to 0: the
+/// spliced `idiv` raises ArithmeticException inside an inlined frame, with no
+/// handler in that frame and none in the caller either.
+///
+/// The control is the SAME call before the method was ever compiled — if the
+/// compiled path disagrees with the interpreter about what escapes, that is
+/// the bug this check exists for, and comparing against a hard-coded string
+/// would only prove the compiler agrees with the test author.
+fn check_uncaught_from_inlined_frame(vm: &mut Vm) -> Result<(), String> {
+    // Interpreted control, before any warmup of this entry point.
+    invoke_void(vm, "setDivisor", &[Value::Int(0)]);
+    let interpreted = vm.invoke(
+        "cratonvm/PgoGuardedVirtualInline",
+        "callDivider",
+        "(I)I",
+        &[Value::Int(9)],
+    );
+    let interpreted = match interpreted {
+        Err(e) => format!("{e:?}"),
+        Ok(v) => {
+            return Err(format!(
+                "check_uncaught_from_inlined_frame: interpreted callDivider(9) with divisor 0 \
+                 returned {v:?} instead of raising — the fixture does not divide by zero, so \
+                 the compiled comparison below would be vacuous"
+            ))
+        }
+    };
+
+    // Warm up past the compile threshold with a safe divisor.
+    invoke_void(vm, "setDivisor", &[Value::Int(1)]);
+    for i in 0..CALLS {
+        let got = invoke_int(vm, "callDivider", &[Value::Int(i)]);
+        if got != i {
+            return Err(format!(
+                "check_uncaught_from_inlined_frame: callDivider({i}) = {got}, want {i}"
+            ));
+        }
+    }
+    let tally = compiled_tally(vm, "callDivider")?;
+
+    // Now the same division raises, from inside whatever the compiled body is.
+    invoke_void(vm, "setDivisor", &[Value::Int(0)]);
+    let compiled = vm.invoke(
+        "cratonvm/PgoGuardedVirtualInline",
+        "callDivider",
+        "(I)I",
+        &[Value::Int(9)],
+    );
+    let compiled = match compiled {
+        Err(e) => format!("{e:?}"),
+        Ok(v) => {
+            return Err(format!(
+                "check_uncaught_from_inlined_frame: compiled callDivider(9) with divisor 0 \
+                 returned {v:?} — the exception was swallowed (tally={tally:?})"
+            ))
+        }
+    };
+    if compiled != interpreted {
+        return Err(format!(
+            "check_uncaught_from_inlined_frame: compiled and interpreted disagree about the \
+             escaping exception.\n  interpreted: {interpreted}\n  compiled:    {compiled}\n  \
+             (tally={tally:?})"
+        ));
+    }
+    // State which path was actually exercised. A refusal here is a legitimate
+    // outcome — `try_emit_inline`'s deopt-metadata postcondition refuses any
+    // body that publishes a deopt point, and an inlined `idiv` may do exactly
+    // that — but it means this check covered the DISPATCH path, not the
+    // spliced one, and that difference must not be silent.
+    if tally.speculative_sites == 0 {
+        eprintln!(
+            "[pgo02] note: callDivider was not spliced (tally={tally:?}); the uncaught-exception \
+             check above exercised the guard-miss/dispatch path. See \
+             docs/feature-designs/profile-guided-inlining.md §8."
+        );
+    }
     Ok(())
 }
 

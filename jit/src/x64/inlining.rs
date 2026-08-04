@@ -43,6 +43,21 @@ impl Compiler {
     /// values came back as 0). Snapshotting + rollback here makes a bail
     /// fully transparent.
     pub(super) fn try_emit_inline(&mut self, pc: usize) -> bool {
+        let Some(site) = self.inline_sites.get(&pc).cloned() else {
+            return false;
+        };
+        self.try_emit_inline_site(pc, &site)
+    }
+
+    /// [`Self::try_emit_inline`] for a body that is NOT the `inline_sites`
+    /// entry for `pc`.
+    ///
+    /// A bimorphic site splices two different callee bodies behind two guards
+    /// at one caller pc — two overriding subclasses are two different methods,
+    /// which is the entire point of a two-way split — so exactly one of them
+    /// can be the `inline_sites` entry. Both go through this function, so both
+    /// get the same rollback set and the same deopt-metadata postcondition.
+    pub(super) fn try_emit_inline_site(&mut self, pc: usize, site: &crate::InlineSite) -> bool {
         let buf_checkpoint = self.buf.pos();
         let stack_checkpoint = self.stack.clone();
         let oop_marks_checkpoint = self.stack_oop_marks.clone();
@@ -92,7 +107,7 @@ impl Compiler {
         self.slot_mirror = None;
         self.slot_mirror_suppressed = true;
         let deopt_points_checkpoint = self.deopt_points.len();
-        let inline_ok = self.try_emit_inline_body(pc);
+        let inline_ok = self.try_emit_inline_body(pc, site);
         self.slot_mirror_suppressed = mirror_suppressed_checkpoint;
         self.slot_mirror = None;
         // PGO-02 §3, enforced rather than argued.
@@ -162,11 +177,8 @@ impl Compiler {
     /// return from anywhere inside is safe precisely because of that
     /// wrapper — the bail sites here therefore no longer need to unwind
     /// `next_spill_offset` by hand.
-    fn try_emit_inline_body(&mut self, pc: usize) -> bool {
-        let site = match self.inline_sites.get(&pc) {
-            Some(s) => s.clone(),
-            None => return false,
-        };
+    fn try_emit_inline_body(&mut self, pc: usize, site: &crate::InlineSite) -> bool {
+        let site = site.clone();
         #[cfg(test)]
         if super::INLINE_TEST_PUBLISHES_DEOPT.with(std::cell::Cell::get) {
             self.force_inline_deopt_publication();

@@ -804,7 +804,7 @@ struct Compiler {
     inline_sites: FxHashMap<usize, crate::InlineSite>,
     // PGO-02: see the `inline_guard_class_ids` parameter doc on
     // `compile_with_param_slots`.
-    inline_guard_class_ids: FxHashMap<usize, u32>,
+    inline_guard_variants: FxHashMap<usize, Vec<(u32, crate::InlineSite)>>,
     /// Compile-time resolved `java/lang/String` field layout, for the String
     /// call-site intrinsics. `None` ⇒ String layout unavailable (intrinsic
     /// codegen bails to normal dispatch). See `crate::StringFieldLayout`.
@@ -2273,7 +2273,7 @@ impl Compiler {
             sr_monitor_at: FxHashMap::default(),
             sr_monitor_scalar_ops: std::collections::HashSet::new(),
             inline_sites: FxHashMap::default(),
-            inline_guard_class_ids: FxHashMap::default(),
+            inline_guard_variants: FxHashMap::default(),
             string_layout: None,
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),

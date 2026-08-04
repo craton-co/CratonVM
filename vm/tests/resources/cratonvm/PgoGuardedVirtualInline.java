@@ -44,6 +44,20 @@ public class PgoGuardedVirtualInline {
         }
     }
 
+    // An overriding body that divides by an instance field. Every bytecode in
+    // it is inlineable (iload/aload/getfield/idiv/ireturn — no `new`, no
+    // `athrow`, no exception table), so the guarded inliner can splice it; set
+    // `divisor` to 0 and the spliced body raises ArithmeticException from
+    // INSIDE an inlined frame, with no handler anywhere in the caller.
+    static class Divider extends A {
+        int divisor = 1;
+
+        @Override
+        int tag(int x) {
+            return x / divisor;
+        }
+    }
+
     interface Tagger {
         int itag(int x);
     }
@@ -61,7 +75,12 @@ public class PgoGuardedVirtualInline {
     private static final A ONLY_D = new D();
     private static final A THROWS_AT_7 = new Thrower();
     private static final Tagger ONLY_IMPL = new OnlyImpl();
+    private static final Divider DIVIDER = new Divider();
     private static A current = ONLY_A;
+
+    public static void setDivisor(int d) {
+        DIVIDER.divisor = d;
+    }
 
     public static void setCurrent(int which) {
         current = switch (which) {
@@ -98,6 +117,26 @@ public class PgoGuardedVirtualInline {
     // no diagnostic.
     public static int callOverride(int x) {
         return ONLY_B.tag(x);
+    }
+
+    // Two receiver classes in an even mix, BOTH overriding `tag`. The top two
+    // hold 100% of the observations, which clears the Bimorphic threshold, and
+    // the two bodies are different methods — so each guard must carry its own.
+    // A one-guard lowering still produces correct answers here (the second
+    // class simply misses and dispatches), which is why the test checks the
+    // spliced byte count and not only the results.
+    public static int callBimorphic(int x, int which) {
+        A recv = (which & 1) == 0 ? ONLY_B : ONLY_C;
+        return recv.tag(x);
+    }
+
+    // An UNCAUGHT exception raised inside a guard-hit inlined body. No `try`
+    // anywhere in this method, so the site is not in a protected range and the
+    // guarded inliner may speculate on it; once `divisor` is 0 the spliced
+    // `idiv` raises ArithmeticException with no handler in the inlined frame
+    // and none in this one either.
+    public static int callDivider(int x) {
+        return DIVIDER.tag(x);
     }
 
     // Interface reach: `invokeinterface Tagger.itag`, one implementation.

@@ -6946,14 +6946,24 @@ impl Compiler {
                     // scopes are populated, so this relies on — and does not
                     // change — the existing guarantee that nothing inside an
                     // inlined body publishes a deopt point).
-                    let mut guarded_virtual_done_patch: Option<usize> = None;
+                    let mut guarded_virtual_done_patches: Vec<usize> = Vec::new();
                     if op != 0xb7 {
-                        if let (Some(guard_class_id), Some(site)) = (
-                            self.inline_guard_class_ids.get(&pc).copied(),
-                            self.inline_sites.get(&pc).cloned(),
-                        ) {
-                            let recv_depth = site.callee_num_args;
-                            if recv_depth >= 1 && self.stack.len() >= recv_depth {
+                        if let Some(variants) = self.inline_guard_variants.get(&pc).cloned() {
+                            // Every variant is the SAME call site, so every
+                            // body pops the same operand shape. A disagreement
+                            // means the two were resolved from different
+                            // descriptors, which this lowering has no model
+                            // for — refuse the whole site rather than emit two
+                            // guards over two different stack effects.
+                            let recv_depth = variants
+                                .first()
+                                .map(|(_, site)| site.callee_num_args)
+                                .unwrap_or(0);
+                            let uniform = !variants.is_empty()
+                                && variants
+                                    .iter()
+                                    .all(|(_, site)| site.callee_num_args == recv_depth);
+                            if uniform && recv_depth >= 1 && self.stack.len() >= recv_depth {
                                 let recv_slot = self.stack[self.stack.len() - recv_depth];
 
                                 // Full state snapshot from BEFORE any guard byte
@@ -6972,65 +6982,128 @@ impl Compiler {
                                     self.exception_check_stubs.len();
                                 let deopt_stubs_checkpoint = self.deopt_stubs.len();
                                 let forward_patches_checkpoint = self.forward_patches.len();
-                                let jump_table_patches_checkpoint =
-                                    self.jump_table_patches.len();
+                                let jump_table_patches_checkpoint = self.jump_table_patches.len();
                                 let self_call_patches_checkpoint = self.self_call_patches.len();
-                                let bounds_check_stubs_checkpoint =
-                                    self.bounds_check_stubs.len();
+                                let bounds_check_stubs_checkpoint = self.bounds_check_stubs.len();
                                 let null_check_store_stubs_checkpoint =
                                     self.null_check_store_stubs.len();
 
-                                // Guard: null receiver -> miss. Class mismatch ->
-                                // miss. Peeked, not popped — try_emit_inline does
-                                // its own popping on the hit path below, and the
-                                // miss path needs the receiver+args untouched for
-                                // the normal-dispatch code that runs next.
+                                // The receiver is loaded and null-checked ONCE,
+                                // ahead of the guard chain: `null` fails every
+                                // guard, and re-testing it per variant would be
+                                // pure code size. Peeked, not popped —
+                                // try_emit_inline_site does its own popping on
+                                // each hit path, and the miss tail needs the
+                                // receiver+args untouched for the normal-dispatch
+                                // code that runs next.
                                 self.load_slot_to_reg(RAX, recv_slot);
                                 self.emit_test_r64_r64(RAX);
-                                let mut miss_patches: Vec<usize> = Vec::with_capacity(2);
-                                miss_patches.push(self.emit_jcc_rel32_patch(0x84)); // JZ
-                                // CMP DWORD [RAX+0], guard_class_id — identical
-                                // encoding to the String/CRC32 intrinsic guard
-                                // above (81 /7 id, ModRM 0x78 = mod00 /7 rm=RAX).
-                                self.buf.emit(&[0x81, 0x78, 0x00]);
-                                self.buf.emit(&guard_class_id.to_le_bytes());
-                                miss_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+                                let null_miss_patch = self.emit_jcc_rel32_patch(0x84); // JZ
 
-                                if self.try_emit_inline(pc) {
-                                    // Hit: skip the about-to-be-emitted
-                                    // normal-dispatch bytes entirely.
-                                    guarded_virtual_done_patch =
-                                        Some(self.emit_jmp_rel32_patch());
-                                    // Land every guard-miss branch right here —
-                                    // the start of the UNCHANGED normal-dispatch
-                                    // code that is about to run next.
-                                    for p in miss_patches {
-                                        self.patch_rel32_to_here(p);
+                                // The guard chain. Variant k's mismatch edge
+                                // lands at variant k+1's `CMP`; the last one's
+                                // lands at the normal-dispatch code below. A hit
+                                // jumps PAST that code entirely.
+                                let mut pending_miss: Option<usize> = None;
+                                let mut spliced_any = false;
+                                for (guard_class_id, site) in &variants {
+                                    // Per-variant checkpoint: if THIS body cannot
+                                    // be spliced, only this variant's bytes are
+                                    // rewound — the ones already emitted for
+                                    // earlier variants stay.
+                                    let variant_buf_checkpoint = self.buf.pos();
+                                    let variant_exception_stubs = self.exception_check_stubs.len();
+                                    let variant_deopt_stubs = self.deopt_stubs.len();
+                                    let variant_forward_patches = self.forward_patches.len();
+                                    let variant_jump_table_patches = self.jump_table_patches.len();
+                                    let variant_self_call_patches = self.self_call_patches.len();
+                                    let variant_bounds_stubs = self.bounds_check_stubs.len();
+                                    let variant_null_store_stubs =
+                                        self.null_check_store_stubs.len();
+
+                                    // Land the previous variant's mismatch edge
+                                    // exactly here. If this variant then fails and
+                                    // rewinds, the same offset becomes the start of
+                                    // whatever is emitted next — the following
+                                    // variant's `CMP`, or the normal-dispatch code
+                                    // — which is the correct landing spot either
+                                    // way.
+                                    if let Some(prev) = pending_miss.take() {
+                                        self.patch_rel32_to_here(prev);
                                     }
-                                    // The inline body already consumed the
-                                    // receiver+args and pushed its result via the
-                                    // same push_from_rax / push_from_rax_as_xmm0
-                                    // convention the normal-dispatch code below
-                                    // also uses. Restore the compiler's SYMBOLIC
-                                    // state (not the already-emitted bytes) to
-                                    // exactly what it was before the guard, so
-                                    // that code — the only Rust-level
-                                    // continuation from here, run unconditionally
-                                    // — pops the SAME receiver+args positions and
-                                    // pushes the canonical result shape for every
-                                    // bytecode that follows, regardless of which
-                                    // machine-code path a given execution
-                                    // actually takes at runtime.
-                                    self.stack = stack_checkpoint;
-                                    self.stack_oop_marks = oop_marks_checkpoint;
-                                    self.next_spill_offset = spill_checkpoint;
+
+                                    // CMP DWORD [RAX+0], guard_class_id —
+                                    // identical encoding to the String/CRC32
+                                    // intrinsic guard above (81 /7 id, ModRM 0x78
+                                    // = mod00 /7 rm=RAX).
+                                    self.buf.emit(&[0x81, 0x78, 0x00]);
+                                    self.buf.emit(&guard_class_id.to_le_bytes());
+                                    let this_miss = self.emit_jcc_rel32_patch(0x85); // JNE
+
+                                    if self.try_emit_inline_site(pc, site) {
+                                        // Hit: skip every later guard AND the
+                                        // normal-dispatch bytes entirely.
+                                        guarded_virtual_done_patches
+                                            .push(self.emit_jmp_rel32_patch());
+                                        spliced_any = true;
+                                        pending_miss = Some(this_miss);
+                                        // The inline body consumed the
+                                        // receiver+args and pushed its result via
+                                        // the same push_from_rax /
+                                        // push_from_rax_as_xmm0 convention the
+                                        // normal-dispatch code below also uses.
+                                        // Restore the compiler's SYMBOLIC state
+                                        // (not the already-emitted bytes) to
+                                        // exactly what it was before the guard
+                                        // chain, so the NEXT variant sees the same
+                                        // operand stack this one did, and so the
+                                        // dispatch code — the only Rust-level
+                                        // continuation from here, run
+                                        // unconditionally — pops the SAME
+                                        // receiver+args positions and pushes a
+                                        // canonically-shaped result regardless of
+                                        // which machine-code path a given
+                                        // execution actually takes at runtime.
+                                        self.stack = stack_checkpoint.clone();
+                                        self.stack_oop_marks = oop_marks_checkpoint.clone();
+                                        self.next_spill_offset = spill_checkpoint;
+                                    } else {
+                                        // try_emit_inline_site already rolled back
+                                        // its OWN side effects; rewind this
+                                        // variant's guard bytes too, so the site is
+                                        // byte-identical to never having offered
+                                        // this variant.
+                                        self.buf.rewind_to(variant_buf_checkpoint);
+                                        self.stack = stack_checkpoint.clone();
+                                        self.stack_oop_marks = oop_marks_checkpoint.clone();
+                                        self.next_spill_offset = spill_checkpoint;
+                                        self.exception_check_stubs
+                                            .truncate(variant_exception_stubs);
+                                        self.deopt_stubs.truncate(variant_deopt_stubs);
+                                        self.forward_patches.truncate(variant_forward_patches);
+                                        self.jump_table_patches
+                                            .truncate(variant_jump_table_patches);
+                                        self.self_call_patches.truncate(variant_self_call_patches);
+                                        self.bounds_check_stubs.truncate(variant_bounds_stubs);
+                                        self.null_check_store_stubs
+                                            .truncate(variant_null_store_stubs);
+                                    }
+                                }
+
+                                if spliced_any {
+                                    // Every remaining miss edge — the null check
+                                    // and the last guard — lands at the exact
+                                    // start of the UNCHANGED normal-dispatch code
+                                    // that runs next.
+                                    self.patch_rel32_to_here(null_miss_patch);
+                                    if let Some(last) = pending_miss {
+                                        self.patch_rel32_to_here(last);
+                                    }
                                 } else {
-                                    // try_emit_inline already rolled back its OWN
-                                    // side effects (see its doc comment); rewind
-                                    // the guard bytes and their checkpointed
-                                    // state too, so the fall-through below is
-                                    // byte-identical to never having attempted
-                                    // this guard.
+                                    // No variant could be spliced: rewind the
+                                    // shared receiver load and null check too, so
+                                    // the fall-through is byte-identical to never
+                                    // having attempted a guard.
                                     self.buf.rewind_to(buf_checkpoint);
                                     self.stack = stack_checkpoint;
                                     self.stack_oop_marks = oop_marks_checkpoint;
@@ -9505,7 +9578,7 @@ impl Compiler {
                             }
                         }
                     }
-                    if let Some(done) = guarded_virtual_done_patch {
+                    for done in guarded_virtual_done_patches {
                         self.patch_rel32_to_here(done);
                     }
                     if op == 0xb9 {

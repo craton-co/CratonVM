@@ -5155,7 +5155,7 @@ impl InlineBackendCaps {
     ///    too (statically bound DirectBind splicing, pre-existing);
     ///  * the `0xb6 | 0xb7 | 0xb9` arm's `op == 0xb6 || op == 0xb9` case NOW
     ///    ALSO consults `inline_sites` plus a companion
-    ///    `inline_guard_class_ids` map, when both carry an entry for the
+    ///    `inline_guard_variants` map, when both carry an entry for the
     ///    pc — populated together, only for an admitted `Monomorphic`
     ///    verdict. See `docs/feature-designs/profile-guided-inlining.md` §5
     ///    for the exact guard-then-splice lowering and why a miss falls
@@ -15643,19 +15643,24 @@ fn try_compile_inner(
     let mut pic_slots: Vec<(usize, *const JitPICSlot)> = Vec::new();
     let mut owned_pic_slots: Vec<Box<JitPICSlot>> = Vec::new();
     let mut inline_sites: HashMap<usize, InlineSite> = HashMap::new();
-    // PGO-02: guard_class_id for every admitted Monomorphic virtual/
-    // interface inline plan, keyed by the same pc as inline_sites. Kept as
-    // a separate map rather than a new InlineSite field because
+    // PGO-02: the guarded variants of every admitted speculative virtual/
+    // interface inline plan — `(receiver class id, the body THAT CLASS
+    // dispatches to)`, in guard order, keyed by the same pc as inline_sites.
+    // One entry for a Monomorphic verdict, two for a Bimorphic one.
+    //
+    // Element [0] is also the `inline_sites` entry for the pc, so the
+    // backend's buffer/frame reservations count it exactly once; element [1]
+    // lives only here and the backend adds it to those reservations
+    // explicitly (see `x64::driver`'s `extra_guard_bodies`).
+    //
+    // Kept as a separate map rather than a new InlineSite field because
     // vm/src/runtime/interpreter/invoke.rs constructs InlineSite with an
     // exhaustive struct literal (adding a field there would break the vm
     // crate). NOT threaded through the loop-unroll pc replication below
     // (unlike inline_sites itself) - a loop-unrolled copy of a guarded
     // virtual call site simply won't find an entry here and falls back to
-    // normal dispatch, which is always correct, just not optimized. Bimorphic
-    // is deliberately not carried here yet either: this increment is scoped
-    // to plan_inline's Monomorphic verdict only ("the narrowest speculation
-    // that is worth anything" - see the retired pgo-02 doc).
-    let mut inline_guard_class_ids: HashMap<usize, u32> = HashMap::new();
+    // normal dispatch, which is always correct, just not optimized.
+    let mut inline_guard_variants: HashMap<usize, Vec<(u32, InlineSite)>> = HashMap::new();
     // jit-inlining-and-ir-calls: HotSpot-shaped inlining budget. `hot_loops` is
     // derived once from the profile plus the bytecode; a caller that executes
     // any hot loop gets the larger whole-method budget, and each site inside
@@ -15927,32 +15932,26 @@ fn try_compile_inner(
                                 receiver_callee_resolver: Some(&receiver_body),
                             });
                             inline_tally.record(&plan);
-                            // PGO-02: the backend only has codegen for
-                            // Monomorphic guarded splicing this increment
-                            // (InlineBackendCaps has ONE flag covering both
-                            // Monomorphic and Bimorphic, but there is no
-                            // Bimorphic emitter yet — see
-                            // docs/feature-designs/profile-guided-inlining.md).
-                            // A Bimorphic admission is plan_inline's own true
-                            // verdict (tallied above as such), but recording
-                            // inline_sites/a dependency for a splice the
-                            // backend will never actually emit would be a
-                            // permanent, pointless invalidation liability —
-                            // treat it as not-actionable here instead.
-                            let backend_can_emit = plan.is_admitted()
-                                && !matches!(plan.verdict, InlineVerdict::Bimorphic { .. });
-                            if backend_can_emit {
-                                // The body to splice. For a guarded site it is
-                                // the one the GUARD'S CLASS dispatches to,
+                            // PGO-02: the backend emits both speculative
+                            // verdicts now — Monomorphic (one guard) and
+                            // Bimorphic (a two-guard chain sharing one receiver
+                            // load, one null check and one dispatch tail). See
+                            // docs/feature-designs/profile-guided-inlining.md
+                            // §5, and `x64::bytecode_walk`'s guard chain.
+                            if plan.is_admitted() {
+                                // The bodies to splice. For a guarded site each
+                                // is the one ITS GUARD'S CLASS dispatches to,
                                 // which `plan_inline` resolved and carried on
                                 // the plan — never the constant-pool callee,
                                 // which is a different method wherever the
                                 // speculated class overrides the declared one.
-                                let spliced = match plan.verdict {
-                                    InlineVerdict::Monomorphic { .. } => {
-                                        plan.speculative_sites.first().cloned()
-                                    }
-                                    _ => cp_site.clone().map(|s| (0u32, s)),
+                                // A statically bound site has exactly one body
+                                // and no guard, so its `0` class id is never
+                                // compared against anything.
+                                let variants: Vec<(u32, InlineSite)> = if plan.is_speculative() {
+                                    plan.speculative_sites.clone()
+                                } else {
+                                    cp_site.clone().map(|s| (0u32, s)).into_iter().collect()
                                 };
                                 // An admitted plan with no body is
                                 // unrepresentable — `plan_inline` refuses both
@@ -15961,15 +15960,20 @@ fn try_compile_inner(
                                 // than unwrapped so a future verdict that
                                 // forgets to carry one leaves the SITE on
                                 // normal dispatch instead of panicking.
-                                if let Some((guard_class_id, spliced)) = spliced {
-                                    if matches!(plan.verdict, InlineVerdict::Monomorphic { .. }) {
-                                        inline_guard_class_ids.insert(pc, guard_class_id);
+                                if let Some((_, primary)) = variants.first().cloned() {
+                                    if plan.is_speculative() {
+                                        inline_guard_variants.insert(pc, variants.clone());
                                     }
                                     inline_budget_remaining = inline_budget_remaining
                                         .saturating_sub(plan.expansion_cost);
-                                    if spliced.needs_heap {
+                                    // EVERY spliced body's requirement, not just
+                                    // the first: a second guarded body that
+                                    // touches the heap needs the context just as
+                                    // much as the first one does.
+                                    if variants.iter().any(|(_, s)| s.needs_heap) {
                                         needs_heap = true;
                                     }
+                                    let spliced = primary;
                                     // The invalidation channel. Deduplicated:
                                     // the scans are `.any()` predicates run on
                                     // every class define, so a repeated triple
@@ -16850,7 +16854,7 @@ fn try_compile_inner(
         helpers,
         std::collections::HashSet::new(), // non_escaping_new — escape analysis done inside x64 too
         inline_sites,
-        inline_guard_class_ids,
+        inline_guard_variants,
         string_layout,
         &param_jvm_slots,
         param_slot_span,
