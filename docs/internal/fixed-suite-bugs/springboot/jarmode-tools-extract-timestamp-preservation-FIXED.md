@@ -132,6 +132,28 @@ Spring on the classpath: write a jar whose entries carry explicit FileTimes,
 read them back through `JarFile` and `ZipFile`, extract each entry, push its
 time onto the extracted file with `setTimes`, and read it back.
 
+## Collateral-damage check
+
+The attributes carrier is shared, so the whole `residual-azure-20260802-32.tsv`
+list was re-run with the fixed binary (`jarmodets-resid32-20260804`) and diffed
+row-for-row against the `craton-residual32-20260804` baseline. 32 rows in, 32
+rows out; the **only** status changes are the two target classes:
+
+```
+< ExtractCommandTests        FAIL 1/22      > ExtractCommandTests        PASS 0/22
+< ExtractLayersCommandTests  FAIL 3/6       > ExtractLayersCommandTests  PASS 0/6
+```
+
+One further row differs without changing status:
+`KafkaAutoConfigurationIntegrationTests` FAIL 0/0 → FAIL 0/3 — a known
+hang-class whose run got far enough to report three tests this time. It is
+FAIL in both arms and is unrelated to file attributes.
+
+Also green with the fixed binary: the full core regression suite,
+**23 passed / 0 failed** (`CV=<fixed> JDK=/data/data/jdk25-real bash
+regression-suite/run.sh`), and `cargo check -p cratonvm-native-builtins` on
+Windows, since the change is in a file with `#[cfg(windows)]` branches.
+
 ## Deliberate non-changes
 
 * **A `ZipEntry`'s `getLastAccessTime()`/`getCreationTime()` still diverge
