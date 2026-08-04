@@ -786,6 +786,31 @@ The one failure — `native_override::redefine_immunity_tests::layout_immunity_i
 — **was baselined against an unmodified `dev` worktree and fails there
 identically.** It is not caused by this branch.
 
+## One flake was found, and it was mine
+
+A second, intermittent failure —
+`vm::vm_exec::tests::t19_h6_cas_field_double_field_roundtrip` — appeared in
+2 of 19 full-suite runs. It never failed in isolation (0/20), only inside the
+suite, which libtest runs on parallel threads.
+
+Cause: two of the A3 `native_diag_tests` called `native_ring::enable(true)`, a
+**process-global**. While it is on, every other test doing a native call takes
+the process-wide `RING.lock()`. Serialising the three ring tests against *each
+other* — which the A3 commit did — does nothing about the rest of the suite
+running beside them.
+
+Fixed: the `pre_call` test no longer enables the ring at all (`record_enter`
+returns its `DISABLED_TOKEN` when off, so `ring_idx` is still `Some(..)` and the
+assertion still proves the bit routed there — the enable was never needed), and
+the toggle test now samples both masks, restores the global, and only then
+asserts, instead of asserting inside the window.
+
+0 occurrences in 12 runs since. Stated precisely because the numbers do not
+support more: **2/19 against 0/10 on dev is not statistically conclusive** — a
+true ~10% rate shows zero in ten runs about a third of the time. What is not in
+doubt is that the interference mechanism was real, was introduced by A3, and is
+gone.
+
 No performance A/B was run for **A3 or A8**. Both are argued structurally and
 the nanoseconds are explicitly not claimed; §A3 and §A8 say what would have to be
 measured and under what conditions.
