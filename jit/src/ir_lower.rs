@@ -10336,6 +10336,101 @@ mod tests {
         }
     }
 
+    /// COV-02: an `aaload` result is a GC ROOT, and this is the executed proof.
+    ///
+    /// `emit_safepoint_map` decides what to publish by scanning
+    /// `graph.nodes[id].ty != IrType::Ref`, and `plan_slots` decides which pool
+    /// a node's frame word comes from. Both answers hang on the ONE thing the
+    /// `aaload` builder arm chooses: the node's `IrType`. Typing it `Int`
+    /// compiles, passes every value-differential in
+    /// `jit/tests/ir_vs_singlepass.rs`, and loses the element at the first
+    /// relocating collection — a failure that surfaces nowhere near here.
+    ///
+    /// The brief's own suggestion for proving this — run it under
+    /// `CRATONVM_MOVING_YOUNG` — cannot work: `JIT_PUBLISHES_RELOCATION_CONTRACT`
+    /// is `false`, so a young collection that meets an unprovable compiled frame
+    /// falls back to the non-moving sweep instead of relocating, and an
+    /// unpublished root produces no observable stale pointer. See
+    /// `docs/internal/cov-02-array-element-access-RETIRED-20260803.md`. So the
+    /// property is asserted where it is actually decided.
+    ///
+    /// **Anti-vacuity, executed rather than argued.** The mutation was run:
+    /// with `0x32`'s arm in `ir.rs` changed to `(MemKind::Ref, IrType::Int)`,
+    /// this test fails with `left: Int, right: Ref` and nothing else in the
+    /// crate's 1,869 lib tests notices. That is the edit to repeat if this test
+    /// is ever suspected of measuring something else.
+    ///
+    /// It has already been wrong once in the other direction: it first asserted
+    /// `class == SlotClass::Ref` and failed on an honest tree, because in a
+    /// method this short the element is still deopt-visible and gets pinned.
+    /// See the comment at the assertion.
+    #[test]
+    fn an_aaload_result_is_reference_typed_and_takes_a_reference_slot() {
+        use crate::ir::{IrBuilder, MemKind};
+
+        // static Object get(Object[] a, int i) { return a[i]; }
+        //   aload_0; iload_1; aaload; areturn      (+2 bytes of padding)
+        let code = [0x2a, 0x1b, 0x32, 0xb0, 0x00, 0x00];
+        let graph = IrBuilder::new(2, 2)
+            .build(&code, 4)
+            .expect("the aaload corpus must build");
+
+        let loads: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.op, Op::ArrayLoad(MemKind::Ref)))
+            .map(|(id, _)| id as NodeId)
+            .collect();
+        assert_eq!(
+            loads.len(),
+            1,
+            "precondition: exactly one `aaload` node, or this test is measuring \
+             something else"
+        );
+        let load = loads[0];
+        assert_eq!(
+            graph.nodes[load as usize].ty,
+            IrType::Ref,
+            "an `aaload` result is a reference; `emit_safepoint_map` skips every \
+             node whose `ty` is not `Ref`, so an `Int` here is an unpublished \
+             root at every later safepoint"
+        );
+
+        // …and no primitive may ever inherit the word it lands in, because
+        // `emit_safepoint_map` will name that word as a root.
+        //
+        // Asserted as an ALIASING property rather than as `class ==
+        // SlotClass::Ref`, which is what this test tried first and which is
+        // wrong: in a method this short the element is still on the operand
+        // stack at the `areturn` bci, so a safepoint snapshot names it and
+        // `plan_slots` pins it (`SlotClass::Pinned` — shares with nothing at
+        // all, strictly stronger than the reference pool). Which of the two it
+        // gets depends on where the value dies, i.e. on the fixture. What must
+        // hold for every fixture is that no `Prim` sits on its colour.
+        let schedule = ir_schedule::schedule(&graph);
+        let plan = plan_slots(&graph, &schedule, None);
+        let class = plan.class[load as usize].expect("the element must get a frame word");
+        assert_ne!(
+            class,
+            SlotClass::Prim,
+            "an `aaload` result took a word from the PRIMITIVE pool; the \
+             collector would then follow whatever int recycled it as an object \
+             pointer"
+        );
+        let color = plan.node_color[load as usize].expect("a coloured element");
+        for (id, other) in plan.node_color.iter().enumerate() {
+            if id == load as usize || *other != Some(color) {
+                continue;
+            }
+            assert_ne!(
+                plan.class[id],
+                Some(SlotClass::Prim),
+                "n{id} is a primitive sharing the `aaload` element's frame word",
+            );
+        }
+    }
+
     /// Every value a deopt frame names keeps a dedicated slot: the deopt
     /// producer reads it at a native offset chosen at run time, so "dead by
     /// then" is not a question this file can answer.
