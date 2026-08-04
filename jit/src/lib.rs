@@ -10278,13 +10278,20 @@ fn ir_call_is_identity_hash(node: &ir::Node, info_ptr: usize) -> bool {
 // gate, both of which need monitors to exist before they can decide anything.
 // Wire them in the same change as the variants, not before.
 //
-// `athrow` ⇒ `EaOp::Throw` cannot be wired at all: `ir::Op` has no throw and
-// `ir::IrBuilder` rejects the whole method when `scan.has_athrow` (there is no
-// athrow lowering — see the `ir_reject("scan.has_athrow")` gate). So no IR
-// graph reaching this bridge contains a throw, and `EaOp::Throw` stays
-// producerless until handler bodies are compiled. Note for whoever does that:
-// `escape_analysis::program_order_proves_dominance` explicitly assumes the
-// absence of exception control flow and must gain a `may_throw` term then.
+// `athrow` ⇒ `EaOp::Throw` — WIRED, cov-07. `ir::Op::Throw` now exists
+// (`IrBuilder::build`'s `0xbf` arm) and maps below with NO operand
+// re-packing: its `[ctrl, mem, exc]` layout is forwarded verbatim by the
+// second pass's default arm, exactly like `Op::Return`'s `[ctrl, val]` — the
+// escape rule at `escape_analysis::Op::Return | Op::Throw` iterates every
+// input and filters by `is_ref_producer`, so the extra non-ref `ctrl`/`mem`
+// inputs are harmless.
+//
+// `escape_analysis::program_order_proves_dominance` was NOT given a
+// `may_throw` term, and does not need one: `Op::Throw` always LEAVES the
+// frame (the compiled body never branches to an in-method handler — see
+// `Op::Throw`'s own doc comment in `ir.rs`), so it cannot create a control
+// edge back to a lower-id load, which is the only thing that predicate
+// guards against. See `docs/internal/cov-07-athrow-RETIRED-*.md`.
 
 /// Map a single `ir::Op` variant to its `escape_analysis::Op` counterpart.
 fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
@@ -10308,6 +10315,8 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         // attribute the monitor to the memory token.
         ir::Op::MonitorEnter => EaOp::MonitorEnter,
         ir::Op::MonitorExit => EaOp::MonitorExit,
+        // cov-07. No re-packing needed — see the section comment above.
+        ir::Op::Throw => EaOp::Throw,
         ir::Op::New {
             class_id,
             num_fields,
@@ -10394,6 +10403,7 @@ fn ea_control_preds(node: &ir::Node) -> &[ir::NodeId] {
         ir::Op::Merge | ir::Op::Region => node.inputs.as_slice(),
         // Everything else pins control at input 0 (when it has one at all).
         ir::Op::Return
+        | ir::Op::Throw
         | ir::Op::If
         | ir::Op::Proj(_)
         | ir::Op::Guard { .. }

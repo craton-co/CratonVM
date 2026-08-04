@@ -106,7 +106,7 @@ read each lane's "first increment".
 | ~~`cov-04`~~ | ~~`ir.rs` invoke arms + `<init>` elision~~ | ~~69 → 81~~ | **CLOSED 2026-08-03** — all three invoke sites at zero. Every one was an `<init>`. [Closeout](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md) |
 | [`cov-05`](cov-05-checkcast-and-instanceof.md) | one `ir_compatible` conjunct | 306 | biggest refusal anywhere; `instanceof` first, `checkcast` needs `cov-07`'s answer |
 | [`cov-06`](cov-06-array-allocation.md) | two `ir_compatible` conjuncts + `0xbc`/`0xbd`/`0xc5` | 141 | the conjunct exists *because* the arm is missing — one piece of work, not two |
-| [`cov-07`](cov-07-athrow.md) | one `ir_compatible` conjunct | 89 | framed as a question; **"keep the refusal" is a legitimate outcome** |
+| ~~`cov-07`~~ | ~~one `ir_compatible` conjunct~~ | ~~89~~ | **CLOSED 2026-08-04** — the question answered itself: `athrow` reuses the exact sentinel-drain protocol `checkcast` (cov-05) already uses, not a second answer to where an exception goes. `scan.has_athrow` refusals 46 → **0** on `ConditionalOnPropertyTests`. [Closeout](../../internal/cov-07-athrow-RETIRED-20260804.md) |
 | ~~`meas-02`~~ **closed 2026-08-03** | `regression-suite/perf/`, `bench/` | — | the gate records its own C2 reach now — [`docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md`](../../internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md) |
 
 Three of them (`cov-05`, `cov-06`, `cov-07`) each delete **exactly one**

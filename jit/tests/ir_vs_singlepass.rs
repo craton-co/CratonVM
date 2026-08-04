@@ -6783,3 +6783,121 @@ fn ir_vs_singlepass_mixed_checkcast_and_instanceof_in_one_method() {
         "the checkcast failure after the instanceof must still bail the method"
     );
 }
+
+// ── cov-07: athrow ────────────────────────────────────────────────────────
+//
+// `docs/known-issues/c2/cov-07-athrow.md`. Before this lane, `scan.has_athrow`
+// refused every method containing an `athrow` (0xbf) from the optimizing
+// pipeline outright — the blanket exclusion this lane removes. `Op::Throw`
+// reuses the exact `jit_throw_exception(exc_ptr, bci) -> i64::MIN` call and
+// sentinel-drain protocol the single-pass backend's own `0xbf` arm already
+// uses (see `Op::Throw`'s doc comment in `ir.rs`), so the correctness case
+// that matters HERE is: does the IR-compiled method produce the IDENTICAL raw
+// sentinel a single-pass compile of the same bytecode does. End-to-end
+// handler-dispatch correctness (does the interpreter's
+// `route_jit_exception_through_method` actually run the right `catch`/
+// `finally`) is a VM-level question this jit-crate-only harness cannot
+// exercise — see `vm/tests/jit_local_exception_handler_tests.rs`, whose
+// existing `JitLocalHandler.java`/`AthrowCountBisect.java` golden-checksum
+// suite is real Java containing real `throw` statements and now exercises
+// this lane's lowering directly once a method tiers up to C2 (or is forced
+// there with `CRATONVM_JIT_FORCE_C2=1`).
+
+/// `static void f() { throw null; }` — `aconst_null; athrow`. No exception
+/// table at all: the simplest possible admission case, and it pins that a
+/// throw-only method (no `Op::Return` anywhere in the graph) does not trip
+/// `ir_verify`'s reachability lane, which used to require a live `Op::Return`
+/// unconditionally.
+fn unconditional_athrow_code() -> Vec<u8> {
+    vec![
+        0x01, // 0: aconst_null
+        0xbf, // 1: athrow
+    ]
+}
+
+#[test]
+fn athrow_no_longer_refuses_ir_admission() {
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
+    let mut helpers = dummy_helpers();
+    // A real `jit_throw_exception` observable-behaviour stand-in: always
+    // returns the `i64::MIN` deopt sentinel, exactly like the production
+    // helper (`vm/src/jit/helpers.rs`) does on every path. `dummy_helpers`'s
+    // default `throw_exception: s` is a panicking stub — swapped out here
+    // because this test, unlike the admission-only try/catch tests above,
+    // actually EXECUTES the throw.
+    unsafe extern "C" fn always_sentinel(_exc_ptr: i64, _bci: i64) -> i64 {
+        i64::MIN
+    }
+    helpers.throw_exception = always_sentinel as *const () as usize;
+    let cm = cached("f", "()V", unconditional_athrow_code(), 0, 0);
+    let ir = compile_opt(&cm, &helpers, true)
+        .expect("a throw-only method must still compile on the optimizing tier");
+    assert!(
+        ir.used_ir_backend,
+        "cov-07: `scan.has_athrow` must no longer refuse the whole method — \
+         `Op::Throw` gives the IR builder a real lowering"
+    );
+    let sp = compile_opt(&cm, &helpers, false).expect("single-pass compiles");
+    // SAFETY: both bodies were produced by the JIT from valid bytecode into
+    // executable memory; `always_sentinel` never dereferences its arguments.
+    let r_ir = unsafe { ir.try_call(&[]) }.expect("IR call");
+    let r_sp = unsafe { sp.try_call(&[]) }.expect("single-pass call");
+    assert_eq!(
+        r_ir, i64::MIN,
+        "an IR-compiled unconditional throw must propagate the deopt/exception \
+         sentinel, exactly like a plain return would propagate a value"
+    );
+    assert_eq!(
+        r_ir, r_sp,
+        "IR vs single-pass must agree on the raw sentinel for an identical throw"
+    );
+}
+
+/// `static int f(int n) { if (n > 0) return n; throw null; }` — the throw sits
+/// on a branch nothing in this test's cases takes, exactly the "handler /
+/// throw is unreachable, only the reachable code is asserted" shape the
+/// try/catch RBC.6 tests above use. Pins that ADMITTING an athrow does not
+/// disturb the surrounding method's ordinary control flow, DCE, scheduler or
+/// escape analysis — `Op::Throw` must be seeded as a DCE root, classified as
+/// a control node by the scheduler, and excluded from
+/// `program_order_proves_dominance`'s dominance stand-in exactly as
+/// `Op::Return` is (see the plumbing this lane touched).
+fn athrow_never_taken_code() -> Vec<u8> {
+    vec![
+        0x1a, // 0: iload_0
+        0x9d, 0x00, 0x05, // 1: ifgt +5 -> 6
+        0x01, // 4: aconst_null
+        0xbf, // 5: athrow
+        0x1a, // 6: iload_0
+        0xac, // 7: ireturn
+    ]
+}
+
+#[test]
+fn athrow_never_taken_branch_matches_single_pass() {
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
+    let mut helpers = dummy_helpers();
+    unsafe extern "C" fn always_sentinel(_exc_ptr: i64, _bci: i64) -> i64 {
+        i64::MIN
+    }
+    helpers.throw_exception = always_sentinel as *const () as usize;
+    let cm = cached("f", "(I)I", athrow_never_taken_code(), 1, 1);
+    let ir = compile_opt(&cm, &helpers, true)
+        .expect("a method with a never-taken athrow must compile on the optimizing tier");
+    assert!(
+        ir.used_ir_backend,
+        "cov-07: athrow no longer refuses IR admission"
+    );
+    let sp = compile_opt(&cm, &helpers, false).expect("single-pass compiles");
+    for n in [1i64, 7, 1000] {
+        // SAFETY: pure-int bytecode; the athrow branch is never taken by these
+        // inputs, so `always_sentinel` is never reached.
+        let r_ir = unsafe { ir.try_call(&[n]) }.expect("IR call");
+        let r_sp = unsafe { sp.try_call(&[n]) }.expect("single-pass call");
+        assert_eq!(
+            r_ir as i32, r_sp as i32,
+            "IR vs single-pass diverge for n={n}"
+        );
+        assert_eq!(r_ir as i32, n as i32, "wrong result for n={n}");
+    }
+}

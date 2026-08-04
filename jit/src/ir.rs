@@ -376,6 +376,28 @@ pub enum Op {
         name_len: usize,
     },
 
+    // ── cov-07 ────────────────────────────────────────────────────
+    /// `athrow` (0xbf). Inputs `[ctrl, mem, exc]`, produces no value — it is a
+    /// terminator, like [`Op::Return`], never a data node.
+    ///
+    /// Lowered as a call to `helpers.throw_exception` (`jit_throw_exception`),
+    /// the SAME helper and the SAME `(exc_ptr, bci)` ABI the single-pass
+    /// backend's `0xbf` arm already uses — this is not a second, divergent
+    /// answer to where an exception goes. That helper always stashes the
+    /// exception (or, on a null reference, the JVMS-mandated NPE) and returns
+    /// the `i64::MIN` deopt sentinel; it never branches to an in-method
+    /// handler itself. `route_jit_exception_through_method`
+    /// (`vm/src/runtime/interpreter/exception_dispatch.rs`) does that
+    /// resolution afterwards, in the INTERPRETER, from the bci baked into this
+    /// call — exactly the mechanism `Op::CheckCast`'s helper-thrown
+    /// `ClassCastException` already reaches via the shared
+    /// `emit_call_return_check` sentinel-drain protocol. See
+    /// `docs/internal/cov-07-athrow-RETIRED-*.md` for the full reasoning,
+    /// including why `escape_analysis::program_order_proves_dominance` does
+    /// NOT need a `may_throw` term for this: a throw always LEAVES the frame,
+    /// it never creates a control edge back into normal flow.
+    Throw,
+
     // ── Parameters ───────────────────────────────────────────────────
     /// Method parameter at index `i` (no inputs — defined at Start).
     Param(u16),
@@ -536,7 +558,7 @@ impl Op {
     pub fn is_control(&self) -> bool {
         matches!(
             self,
-            Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_)
+            Op::Start | Op::Return | Op::Throw | Op::If | Op::Merge | Op::Region | Op::Proj(_)
         )
     }
 
@@ -2884,6 +2906,10 @@ impl Op {
             // cov-05: same reasoning, plus the helper can stash a pending
             // ClassCastException and return the deopt/exception sentinel.
             Op::CheckCast { .. } => (3, MemAccess::Opaque), // [ctrl, mem, obj]
+            // cov-07: same Opaque classification — `jit_throw_exception` can
+            // allocate an NPE (a null athrow), touches thread-local pending-
+            // exception state, and is a safepoint.
+            Op::Throw => (3, MemAccess::Opaque), // [ctrl, mem, exc]
             Op::LambdaIntToDouble => (4, MemAccess::Opaque), // [ctrl, mem, lambda, index]
             Op::MonitorEnter => (3, MemAccess::MonitorEnter), // [ctrl, mem, obj]
             Op::MonitorExit => (3, MemAccess::MonitorExit), // [ctrl, mem, obj]
@@ -5397,6 +5423,36 @@ impl IrBuilder {
                     self.push(len);
                     pc += 1;
                 }
+                // athrow — cov-07. Pop the exception ref and terminate the
+                // block: this never falls through and produces no value,
+                // exactly like `ireturn`/`areturn` above — a later bytecode pc
+                // is reachable only via a real branch target (goto/if), never
+                // by falling out of this arm.
+                //
+                // Lowered as a call to `helpers.throw_exception` with THIS
+                // instruction's own bci baked in as an immediate — the SAME
+                // `(exc_ptr, bci)` call the single-pass backend's `0xbf` arm
+                // makes (`x64/bytecode_walk.rs`), so handler resolution reuses
+                // the exact machinery a callee-thrown or `checkcast`-thrown
+                // exception already goes through:
+                // `route_jit_exception_through_method`
+                // (`vm/src/runtime/interpreter/exception_dispatch.rs`), run in
+                // the INTERPRETER after the compiled frame exits via the
+                // shared `i64::MIN` sentinel. See `Op::Throw`'s doc comment
+                // for why this is not a second, divergent answer to where an
+                // exception goes.
+                0xbf => {
+                    let exc = self.pop();
+                    let throw = self.graph.add(
+                        Op::Throw,
+                        IrType::Void,
+                        vec![self.ctrl, self.mem, exc],
+                        Some(pc),
+                    );
+                    self.graph.exit = throw;
+                    self.ctrl = NO_NODE;
+                    pc += 1;
+                }
                 // checkcast / instanceof — cov-05. Both admitted ONLY for a
                 // site whose target class is already resolved and loaded at
                 // compile time: `checkcast_info`/`instanceof_info` are
@@ -6777,11 +6833,25 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // still compilable via the x64 single-pass backend; we just decline to
     // route it through the IR pipeline until we've gained more confidence.
 
-    // RBC.6 — the IR pipeline has no athrow lowering; only the x64
-    // single-pass backend emits the stash-pending-exception sequence.
-    if scan.has_athrow {
-        return ir_reject("scan.has_athrow");
-    }
+    // cov-07: `athrow` (0xbf) is NOT refused here any more. `IrBuilder::build`
+    // now lowers it (`Op::Throw`), reusing the exact `jit_throw_exception`
+    // sentinel-drain protocol `Op::CheckCast`'s helper-thrown
+    // `ClassCastException` already uses (cov-05) — see `Op::Throw`'s doc
+    // comment. `scan.has_athrow` itself is unchanged and still recorded;
+    // nothing in this function reads it any more, but the scan field stays
+    // for the debug trace and for any future caller that needs "does this
+    // method contain an athrow" without re-decoding.
+    //
+    // What is NOT relaxed by this: a method whose handler reads a
+    // non-parameter local still needs a precise resume frame, and the IR
+    // tier has no way to publish one (that machinery is x64-only, gated
+    // behind `precise_exception_frame_sites_supported`). That case is
+    // excluded by `precise_exception_frames` (RBC.6, checked by this
+    // function's caller) independently of which opcode throws — it gates on
+    // ANY non-empty `exception_table`, not on `has_athrow` — so an
+    // athrow-bearing method that needs precise locals was already refused
+    // there before it ever reached this conjunct. See
+    // `docs/internal/cov-07-athrow-RETIRED-*.md`.
 
     // invokedynamic-uncommon-trap fix: the IR builder has no lowering for
     // 0xba (it bails cleanly via the main loop's `_ => return None` if one
@@ -6874,19 +6944,20 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     //    reported "open" (docs/internal/jit-ir-relocation-map-contract.md). A
     //    method the builder will refuse must be refused HERE, cheaply and with
     //    a reason, not after a full graph build.
-    //  * `checkcast` / `instanceof` — NEITHER is refused here as of cov-05.
+    //  * `checkcast` / `instanceof` / `athrow` — NONE of the three is refused
+    //    here (as of cov-05 for the first two, cov-07 for the third).
     //    `instanceof` produces an `int`, cannot throw, and has no
-    //    control-flow consequence. `checkcast` (0xc0) CAN throw
-    //    `ClassCastException` on a definitive refusal, but that is the same
-    //    generic "helper stashed a pending exception, drain it through the
-    //    shared epilogue" protocol every other fallible `Opaque` call in this
-    //    tier already has (`Op::ConstClass`'s resolution failure is the
-    //    existing precedent) — not a jump into a LOCAL exception-table
-    //    handler inside this compiled frame, which is what `scan.has_athrow`
-    //    above and `precise_exception_frames` (checked by this function's
-    //    caller) actually guard against. See
-    //    `docs/internal/cov-05-checkcast-and-instanceof-RETIRED-*.md` for the
-    //    full reasoning distinguishing this from `athrow`'s gap.
+    //    control-flow consequence. `checkcast` (0xc0) and `athrow` (0xbf) CAN
+    //    throw, but both reach the SAME generic "helper stashed a pending
+    //    exception, drain it through the shared epilogue" protocol every
+    //    other fallible `Opaque` call in this tier already has
+    //    (`Op::ConstClass`'s resolution failure is the existing precedent) —
+    //    neither is a jump into a LOCAL exception-table handler inside this
+    //    compiled frame, which is what `precise_exception_frames` (checked by
+    //    this function's caller) guards against, independently of which
+    //    opcode throws. See
+    //    `docs/internal/cov-05-checkcast-and-instanceof-RETIRED-*.md` and
+    //    `docs/internal/cov-07-athrow-RETIRED-*.md`.
     //
     //    `IrBuilder::build`'s 0xc0/0xc1 arms additionally require the target
     //    class to be resolved-and-loaded at compile time (via
@@ -7676,9 +7747,14 @@ mod tests {
         );
         scan.typecheck_ops.clear();
         scan.checkcast_ops.clear();
-        // athrow: no IR lowering exists.
+        // cov-07: athrow no longer refuses the whole method — `Op::Throw`
+        // gives the IR builder a real lowering, reusing the same generic
+        // sentinel-drain protocol `checkcast` above already relies on.
         scan.has_athrow = true;
-        assert!(!ir_compatible(&scan));
+        assert!(
+            ir_compatible(&scan),
+            "cov-07: athrow no longer refuses the whole method"
+        );
         scan.has_athrow = false;
         // invokedynamic: no IR builder arm.
         scan.indy_ops = vec![(0, 1)];
@@ -7895,14 +7971,16 @@ mod tests {
         );
     }
 
-    /// An opcode the builder cannot lower (`athrow`, 0xbf — the rethrow every
-    /// `finally` ends with) must no longer disqualify the WHOLE method when it
-    /// appears only inside a handler body. Before the skip, the linear walk
-    /// fell into the handler and hit `_ => return None`.
-    ///
-    /// (The `lib.rs` gate additionally consults `scan.has_athrow`, so this
-    /// particular shape is still refused one level up; the test pins the
-    /// builder's own behaviour, which is what the skip changes.)
+    /// Before STUB-S8, an unsupported opcode reachable only through an
+    /// exception edge (here `athrow`, 0xbf, inside a handler body — the
+    /// rethrow every `finally` ends with) disqualified the WHOLE method: the
+    /// linear walk fell into the handler and hit `_ => return None`. This
+    /// test pins the builder's own behaviour, independent of whether 0xbf has
+    /// a lowering arm: STUB-S8 skips handler bytecode outright, so the
+    /// builder never visits this athrow at all, whether or not cov-07 gave
+    /// 0xbf a real arm for the REACHABLE case. (As of cov-07, `athrow` no
+    /// longer disqualifies a method one level up in `ir_compatible` either —
+    /// but that is a different gate than the one this test exercises.)
     #[test]
     fn test_unsupported_opcode_in_handler_does_not_bail_the_method() {
         let code: Vec<u8> = vec![

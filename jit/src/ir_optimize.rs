@@ -990,7 +990,10 @@ fn loop_body(
                 continue;
             }
             let op = &graph.nodes[u as usize].op;
-            if op.is_control() && !matches!(op, Op::Return) {
+            // cov-07: `Op::Throw`, like `Op::Return`, always leaves the frame
+            // and never flows control back into the loop body — exclude it
+            // from the forward-reachable set for the same reason.
+            if op.is_control() && !matches!(op, Op::Return | Op::Throw) {
                 if forward.insert(u) {
                     work.push(u);
                 }
@@ -2161,6 +2164,12 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
             matches!(
                 n.op,
                 Op::Return
+                    // cov-07: a throw is an observable program exit exactly
+                    // like a return — see the seeding comment above `Op::
+                    // Return`. Its exception-ref INPUT is what must stay
+                    // reachable (deleting the throw would silently turn
+                    // `throw e;` into nothing).
+                    | Op::Throw
                     | Op::Store(_)
                     | Op::Call { .. }
                     // cov-01: all three are observable side effects whose value
