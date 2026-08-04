@@ -3,6 +3,15 @@
 **Status:** OPEN (2026-07-23; re-diagnosed 2026-07-28). Not closable by
 incremental tuning — see "What closure actually requires".
 
+**2026-08-04 note:** this same test method also hits a *different*, fatal
+symptom on current dev — a stale-pointer receiver crash that kills the whole
+suite process, unrelated to the throughput gap this doc tracks. See
+[`smoketests-stale-pointer-nosuchmethod-crash-20260804.md`](smoketests-stale-pointer-nosuchmethod-crash-20260804.md)
+(a witness of the already-tracked, still-open DoHead Layer-1 register-invisible-root
+family, not a new mechanism). Do not conflate the two when triaging future
+`SmokeTests` failures: this doc is throughput (120s timeout under load), the
+other is a one-shot fatal crash from GC/JIT root-precision.
+
 `org.hibernate.orm.test.sql.exec.SmokeTests#testQueryConcurrency` runs 50 forks x
 400 iterations (20 000 transactions, 3 HQL queries each) on a 5-thread pool. It
 hits Hibernate's 120-second per-method limit while the other 16 tests in the
@@ -222,7 +231,7 @@ do not read it as a CHM cost. The allocation rows are clean.
   historical run worse, and its 2026-07-08 justification was a correctness
   guard, not a throughput one. HIB-TEMPORAL.1 was subsequently fixed and
   removed on 2026-07-29; see
-  `docs/internal/jit-bans/hib-temporal-1-retired-20260729.md`.
+  `jit-bans/hib-temporal-1-retired-20260729.md`.
 - `CRATONVM_JIT_VIRTUAL_TIERUP` — no longer a lever.
 
 ## Prior investigation

@@ -131,7 +131,7 @@ Row notes (historical, from the table this replaced):
   cpu 15) and showed **no difference**: 4131/4004 on cpu 13 against 4063/4042
   on cpu 15. Treat any 07-25-era absolute in this document as unverified until
   re-measured. Full detail:
-  [`hashmap-half-gap-20260730.md`](docs/internal/performance/hashmap-half-gap-20260730.md).
+  `hashmap-half-gap-20260730.md`.
 
   String/Regex's 07-25 row is left as recorded — it has not been re-measured
   and it was the *smaller* of the two claims (3.57x → 7.7x), but it came out of
@@ -158,7 +158,7 @@ Row notes (historical, from the table this replaced):
   proves the recursive caller has no live oops. The merged-binary alternating
   acceptance reduced the HotSpot gap by **71.90%**. Full measurements and
   generated-code evidence are in
-  [`fibonacci-half-gap-20260730.md`](docs/internal/performance/fibonacci-half-gap-20260730.md).
+  `fibonacci-half-gap-20260730.md`.
 - **Binary Trees** was measured at `-Xmx8g` as seven alternating
   fresh-process pairs; all fourteen checksums were `68332206`.
   A July 2026 dev regression that temporarily quadrupled this row was
@@ -176,7 +176,7 @@ Row notes (historical, from the table this replaced):
   "young GC always falls back to non-moving sweep for this workload" defect
   by forcing ~6x more young collections) and was reverted. Full measurement
   history, isolation methodology, and the root-cause writeup are in
-  [`binarytrees-bt18-half-gap-20260730.md`](docs/internal/performance/binarytrees-bt18-half-gap-20260730.md).
+  `binarytrees-bt18-half-gap-20260730.md`.
 - **Sieve** is three counted `boolean[]` loops, and single-pass BCE refuses
   inclusive (`<=`) loops and non-`arr.length` bounds, so every element kept a
   null and bounds check. A 2026-07-30 change added three fall-through-only
@@ -187,7 +187,7 @@ Row notes (historical, from the table this replaced):
   runs checksum `9592`) cut the HotSpot gap by **94.35%** and **95.30%**,
   moving the ratio from 1.85x to **1.05x**. Full measurements, the guard
   contract, and the differential probe are in
-  [`cratonbench-sieve-half-gap-20260730.md`](docs/internal/performance/cratonbench-sieve-half-gap-20260730.md).
+  `cratonbench-sieve-half-gap-20260730.md`.
 
 ### The performance gate
 
@@ -321,7 +321,7 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > 2026-07-30 with the same binary alternating cpu 13 and cpu 15, and showed no
 > difference (4131/4004 against 4063/4042). **Do not build on any absolute
 > number in this block without re-measuring it.** See
-> [`hashmap-half-gap-20260730.md`](docs/internal/performance/hashmap-half-gap-20260730.md).
+> `hashmap-half-gap-20260730.md`.
 >
 > The original 2026-07-25 text is kept below, unedited, because it documents
 > what was believed and how it was argued.

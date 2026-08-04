@@ -4,7 +4,7 @@
 //! # Semantic differential fuzzer vs HotSpot
 //!
 //! Industrializes the manual "run it on HotSpot and eyeball the diff" loop
-//! that has produced nearly every bug in `docs/internal/*` and `MEMORY.md`.
+//! that has produced nearly every bug in `*` and `MEMORY.md`.
 //! Generate / mutate Java programs, run them on **both** CratonVM and a real
 //! JDK, and **diff observable behavior** — stdout, stderr, thrown exception
 //! type + message, and process exit code — automatically.

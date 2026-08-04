@@ -5,7 +5,7 @@
 | **Status** | ✅ FIXED 2026-07-08 — `native_lhm_put` now treats a slot-0/`java.lang.Object` class-id read from a receiver that already reached the `LinkedHashMap` native as untrusted and skips the impossible virtual `Object.removeEldestEntry` call. |
 | **Area** | VM — JIT/GC precise-root-tracking ("Layer 1"), surfacing here via the native `LinkedHashMap` shim's `removeEldestEntry` guard (`../../../../native-collections/src/lib.rs`) |
 | **Symptom** | `java.lang.NoSuchMethodError: java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z` |
-| **Severity** | formerly blocked `org.hibernate.orm.test.jpa.criteria.InPredicateTest`; fixed Azure probe now passes under default JIT (`ok=1`, 55.971s). |
+| **Severity** | formerly blocked `org.hibernate.orm.test.jpa.criteria.InPredicateTest`; fixed Azure probe now passes under default JIT (`ok=1`, 55.971s). This NSME fix is unaffected and still verified not to reproduce, but note `InPredicateTest` itself is not fully green — the *separate* dispatch-heavy JIT timeout this doc's own text discusses below reopened 2026-08-04, see the status note in the paragraph after this table. |
 | **Discovered** | 2026-07-06. Root cause traced same day. |
 
 ## 2026-07-08 fix — slot-0/Object reads no longer dispatch `Object.removeEldestEntry`
@@ -53,7 +53,10 @@ Superseded by the 2026-07-08 fix above; retained for historical context.
 
 `InPredicateTest` no longer throws this NSME as of `dev@fa1c505f` — it now times
 out earlier in the same test method instead (`TimeoutException` @ 120s), see
-[hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md](hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md).
+[hib-inpredicate-dispatch-heavy-jit-timeout-20260707-REOPENED-20260804.md](../../../known-issues/hibernate/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-REOPENED-20260804.md)
+(moved back to `known-issues/` 2026-08-04 — the timeout reproduced again on a
+fresh `dev` tip run, so this class is not fully clear of the timeout even
+though this doc's own NSME fix is unaffected and still holds).
 Stack-dump sampling of a clean, uncontended repro shows the test consistently
 timing out inside `SqmCriteriaNodeBuilder.in()` (criteria-predicate
 construction), which runs **before** `session.createQuery(cr)` — the call that

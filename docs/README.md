@@ -201,8 +201,8 @@ preserved links does not block normal documentation work.
 ## Issue and evidence taxonomy
 
 - `docs/known-issues/` contains unresolved bugs and active investigations.
-- After a bug is fixed and covered, move its document to `docs/internal/`.
-- `docs/internal/` is non-normative historical evidence and audit material.
+- After a bug is fixed and covered, move its document to ``.
+- `` is non-normative historical evidence and audit material.
 - `docs/architecture/` describes current architecture that remains useful
   outside a single fix.
 - `docs/feature-designs/` contains proposals and must state when work is not yet

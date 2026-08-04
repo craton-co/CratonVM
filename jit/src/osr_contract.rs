@@ -3,7 +3,7 @@
 
 //! The OSR entry-metadata contract, as executable checks.
 //!
-//! `docs/known-issues/c2/osr-01-entry-metadata-contract.md`. OSR entry works;
+//! `docs/known-issues/c2/archive/osr-01-entry-metadata-contract.md`. OSR entry works;
 //! what had no owner is the *contract between* the seven pieces of metadata it
 //! rides on. Every near-miss this campaign found in that area was the same bug
 //! class — **a plausible integer in the wrong coordinate space**.

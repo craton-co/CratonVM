@@ -304,7 +304,7 @@ pub(super) fn compile_osr_artifact(
             // the OSR'd code) get silently RE-EXECUTED by the interpreter from
             // the stale resume state — e.g. an `ArrayList` ending up with extra
             // duplicate elements with no exception anywhere. See
-            // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
+            // fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
             // for the full repro and trace. Like `has_athrow` above,
             // method-entry compilation (unaffected by this OSR-only bail path)
             // remains available, so do NOT bail-list here.
@@ -793,7 +793,7 @@ pub(super) fn compile_osr_artifact(
             // indy uncommon trap: the bail resumes the pre-OSR interpreter
             // frame at the stale back-edge, silently re-running a loop whose
             // side effects already committed (see
-            // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
+            // fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
             // Admit only sites lowered by the StringConcatFactory bridge, which
             // emits a direct call and never deopts at the indy bci. `indy_info`
             // drops sites it cannot resolve, so a length mismatch also means
@@ -2089,7 +2089,7 @@ pub(super) fn is_elidable_construction(
     // different order than an interpreter-created one holding the same keys —
     // found as a json-smart parse/serialize/re-parse round-trip mismatch at the
     // exact iteration `JSONParserBase.readObject` tiered up
-    // (docs/internal/jsonsmart-parser-jit-retired-20260727.md). The companion
+    // (jsonsmart-parser-jit-retired-20260727.md). The companion
     // `map_resize` fix makes the fallback capacity correct; this one keeps the
     // native constructor running in the first place.
     if shared
@@ -5865,7 +5865,7 @@ pub(super) fn execute_jit_call(
     //     NaN-tag int space (BC safegcd 0xFFFC_… accumulator) was decoded by
     //     the prior unconditional `to_value()` as `Value::Int`, truncating to
     //     the low 32 bits. `decode_by_descriptor(b'J')` reinterprets the raw
-    //     i64 bit-exact. See docs/bc-ec-mod-mododdinverse-investigation.md.
+    //     i64 bit-exact. See gaps/bc-ec-mod-mododdinverse-investigation.md.
     let is_static = cached.is_static;
     // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
     // arm below can restore them before the slow path re-pops the args. See

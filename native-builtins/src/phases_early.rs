@@ -3559,7 +3559,7 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
     // buggy `read()` (`ch as i32` used as a byte index instead of
     // `ch.len_utf8()`) sent an earlier investigation down a blind alley
     // chasing a registration that could never run — see
-    // docs/known-issues/tomcat-08-07/stringreader-read-never-advances-infinite-loop.md.
+    // fixed-suite-bugs/stringreader-read-never-advances-infinite-loop-FIXED.md.
     // Removed rather than fixed in place; the real, live StringReader
     // natives are `native_sr_*` in native-io/src/lib.rs.
     r.set_category(__prev_cat);
@@ -9521,7 +9521,7 @@ fn tpe_time_unit_by_name(ctx: &mut dyn NativeContext, name: &str) -> Option<Obje
 /// just for direct `new ThreadPoolExecutor(...)` calls.
 /// Falls back to the old two-slot legacy write if queue/unit construction
 /// fails, so callers never see a fully-uninitialized object.
-/// See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
+/// See fixed-suite-bugs/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md.
 pub(crate) fn initialize_real_thread_pool_executor(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -9607,7 +9607,7 @@ pub(crate) fn initialize_real_thread_pool_executor(
     // would read as an all-zero header on first use (AbstractMethodError /
     // stale-pointer livelock under java/util/concurrent/ExecutorService
     // dispatch; see
-    // docs/known-issues/hibernate/hib-misc-residuals-20260716.md,
+    // fixed-suite-bugs/hibernate/hib-misc-residuals-20260716-FIXED.md,
     // ZonedDateTimeTest/LocalDateTimeTest). Always hand back the CURRENT
     // address so every caller (both the <init> dispatch, which ignores this
     // for void methods, and the factory shims, which do not) sees the live
@@ -10073,7 +10073,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     // newFixedThreadPool()/newCachedThreadPool()/newSingleThreadExecutor()
     // never return an STPE. Because register_executors_scheduled_natives
     // (native_stpe_*) is gated off in real-JDK mode (see
-    // docs/internal/tomcat-suite-bugs/11-stpe-mainlock-npe-teardown-regression.md),
+    // fixed-suite-bugs/tomcat/11-stpe-mainlock-npe-teardown-regression.md),
     // no native shadowed these mistagged objects' methods, so real inherited
     // ScheduledThreadPoolExecutor/ThreadPoolExecutor bytecode ran against a
     // 2-field synthetic object whose ctl/workQueue/mainLock/workers fields
@@ -10100,7 +10100,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     // ScheduledThreadPoolExecutor construction) — these objects are now
     // genuinely real, so the drop_real_layout_synthetic assumption holds and
     // real submit/execute/shutdown/shutdownNow bytecode runs end-to-end.
-    // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
+    // See fixed-suite-bugs/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md.
     r.register(
         ex,
         "newFixedThreadPool",
@@ -14942,7 +14942,7 @@ fn cipher_do_final(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallRe
             // instead of the catchable `OutOfMemoryError` HotSpot throws. Use
             // the fallible `try_new_array` (same `try_new_ref_array`/
             // `try_alloc_array_full` idiom as the `ArrayList(int)` abend fix,
-            // see `docs/internal/gaps/crash-01-arraylist-capacity-oom-abend.md`)
+            // see `gaps/crash-01-arraylist-capacity-oom-abend.md`)
             // and throw a catchable OOME on `None` instead.
             let Some(arr) = ctx.try_new_array(cratonvm_types::ArrayElementType::Byte, bytes.len())
             else {
@@ -19154,7 +19154,7 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // a hardcoded `"INFO: \n"` regardless of the record's actual level or
     // message -- misdiagnosed for a time as a VM interpreter/JIT
     // correctness bug (see the retraction in
-    // docs/known-issues/springboot/exception-table-method-state-loss-cluster.md)
+    // fixed-suite-bugs/springboot/exception-table-method-state-loss-cluster.md)
     // before this stale stub was found. Real `Formatter`/`SimpleFormatter`
     // bytecode verified working directly for the message/level path (via
     // `Formatter.formatMessage`, already natively bridged further down in
@@ -20970,7 +20970,7 @@ fn native_arrays_support_vectorized_mismatch(
 // T2.3 completion — items 2/3/6/8/12 of the java.util.* roadmap.
 // ===========================================================================
 //
-// Scope per `docs/roadmap-100.md`:
+// Scope per `history/roadmap-100.md`:
 //   T2.3.2 — `ConcurrentHashMap.tabAt` / `casTabAt` / `setTabAt`
 //   T2.3.3 — `ArrayList.elementData(int)` package-private accessor
 //   T2.3.6 — `Arrays.parallelSort` for `[I`, `[J`, `[D`, `[Ljava/lang/Object;`

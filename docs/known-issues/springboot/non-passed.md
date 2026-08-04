@@ -2,11 +2,20 @@
 > re-verified when a fix lands, so treat every entry as "was failing when this
 > was captured", not as current status.
 >
-> Known stale as of 2026-08-04:
-> `loader/spring-boot-jarmode-tools` `ExtractCommandTests` (22/22) and
-> `ExtractLayersCommandTests` (6/6) now PASS with JIT and `--nojit` — see
-> `docs/internal/fixed-suite-bugs/springboot/jarmode-tools-extract-timestamp-preservation-FIXED.md`.
-> The other four `jarmode-tools` rows below are still red and untriaged.
+> Known stale as of 2026-08-04: **all six `loader/spring-boot-jarmode-tools`
+> rows below now PASS**, on HotSpot and on CratonVM with JIT and `--nojit`.
+> `ExtractCommandTests`/`ExtractLayersCommandTests` were a real VM defect —
+> `fixed-suite-bugs/springboot/jarmode-tools-extract-timestamp-preservation-FIXED.md`.
+> The other four were **never CratonVM defects**: HotSpot failed them
+> identically, because this fixture checkout's expected-output resources are
+> CRLF while `println` on Linux emits LF —
+> `fixed-suite-bugs/springboot/jarmode-tools-crlf-fixture-phantom-failures-FIXED.md`.
+>
+> That doc also covers the runner gap that let HotSpot-shared failures be filed
+> as CratonVM defects, now fixed (`BOTH-FAIL`). **A HotSpot control over the
+> whole 32-class residual list found 5 such rows** — the four above plus
+> `ChangelogWriterTests`, which is still red here and still fails on HotSpot
+> too, i.e. it is a fixture failure, not a VM one.
 
 1 CRASH
 Module	Class	Seconds

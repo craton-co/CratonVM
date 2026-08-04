@@ -335,7 +335,7 @@ inline cuts ~74 % of the frame-record overhead (CALL added ~10.8 s; inline adds
   call restoration store into that cell, and the VM reads/writes the same
   mirror. The separate OSR trampoline shares the same centralized GS/FS prefix
   selector. Unsupported targets or a failed probe retain the helper path. See
-  `docs/internal/performance/fibonacci-half-gap-20260730.md`.
+  `performance/fibonacci-half-gap-20260730.md`.
 - **Multi-thread.** The mirror is per-thread (TLS), identical to the CALL path's
   per-thread `TOP_RBP`. The `MTRegex` GC-root stress repro is **flaky on both
   inline-on and inline-off** — it exercises the *documented, pre-existing*

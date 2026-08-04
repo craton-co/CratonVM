@@ -226,7 +226,7 @@ static NEXT_TM_ID: OnceLock<RwLock<i32>> = OnceLock::new();
 // identical `pub(crate)`-promotion precedent already applied to
 // `jca::provider_chain::find`/`make_provider` for the sibling
 // `KeyManagerFactory.getProvider()` fix (see this crate's
-// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
+// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
 pub(crate) fn km_registry() -> &'static RwLock<HashMap<i32, KeyManagerState>> {
     KM_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }

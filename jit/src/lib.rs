@@ -52,7 +52,7 @@
 //! `precise_jit_maps_enabled` on 2026-07-07 and the prose was not updated.
 //! `skip_list.rs` carried a second, private copy of this switch that kept its
 //! own default of `false`, which is how a ~950-line ban list ended up inert for
-//! weeks — see docs/internal/is-known-miscompile-block-retired-20260727.md.)
+//! weeks — see is-known-miscompile-block-retired-20260727.md.)
 //! With that allocator active, a Java local
 //! (including an object reference) may live **exclusively in a callee-saved GPR**
 //! between bytecode aload/astore opcodes — the value need not be present in the
@@ -368,7 +368,7 @@ pub struct ExecutableBuffer {
     /// Four independent estimates allocate executable buffers, and the warning
     /// named none of them — so an overflow flood was attributed by arithmetic
     /// on the printed `len`, and got attributed to the WRONG one
-    /// (`docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`
+    /// (`fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`
     /// blamed the single-pass backend's estimate for a flood that was entirely
     /// the optimizing tier's).
     tag: &'static str,
@@ -619,7 +619,7 @@ impl ExecutableBuffer {
     /// the landing site is normally the middle of an earlier instruction. The
     /// inline-PIC cascade shipped exactly that — `JNE -128` into the body of
     /// the pre-call spill/shadow-push run, which then ran as an unguarded
-    /// infinite push loop (`docs/internal/jit-raw-jit-to-jit-shadow-stack-
+    /// infinite push loop (`jit-raw-jit-to-jit-shadow-stack-
     /// overflow-FIXED-20260731.md`), and the same wrap reappeared as a
     /// deterministic SIGILL in the `CRATONVM_NO_MOVING_YOUNG=1` lane, whose
     /// larger slot bodies pushed the same branch past 127 bytes.
@@ -908,7 +908,7 @@ static RECENT_FREE_ACTIVE: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
 /// some *other* thread entered compiled code — the count is sampled at the
 /// unmap, not at the decision. A crash report that names only the count
 /// therefore reads as damning when it is not; see
-/// `docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
+/// `jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
 static RECENT_FREE_FLAGS: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
 
@@ -1724,7 +1724,7 @@ pub fn jit_code_region_covering(addr: usize) -> JitRegionLookup {
 ///     Nothing resumes from any of them in a way the owning frame's own
 ///     published roots do not already cover.
 ///
-/// See `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`.
+/// See `fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLayout {
     /// Java locals: slot `i` at `[rbp - (i + 1) * 8]`.
@@ -4435,7 +4435,7 @@ unsafe fn osr_trampoline(
 /// applies the per-site tier via [`inline_site_expansion_cost_tiered`].
 /// Lowering this constant back to 35 would make the hot tier unreachable.
 ///
-/// See `docs/internal/arch-2026-07-26/jit-inlining-and-ir-calls.md`.
+/// See `arch-2026-07-26/jit-inlining-and-ir-calls.md`.
 pub const MAX_INLINE_BYTECODE_SIZE: usize = 325;
 
 /// Callee-size cap for a call site with **no evidence of hotness** —
@@ -5959,7 +5959,7 @@ mod profile_guided_inlining_tests {
         // only because correctness here rests on the exact class-id guard, not
         // on the dependency: an `app/Tiny` receiver fails the `CMP` and takes
         // the dispatch path. The cost is a stale speculation nothing retires.
-        // See `docs/jit/profile-guided-inlining.md`.
+        // See `docs/feature-designs/profile-guided-inlining.md`.
         assert!(!class_load_evicts(
             &recorded,
             "app/Tiny",
@@ -6413,7 +6413,7 @@ pub enum JitLdcConstant {
 /// bailed, and after `MAX_TIER_FAIL_RETRIES` the method interpreted forever
 /// (json-smart's `JSONParserBase.readMain` — 293,940 interpreted invocations
 /// of a workload's hottest method; see
-/// `docs/internal/jit-compile-bail-unresolved-new-cold-class.md`).
+/// `jit-compile-bail-unresolved-new-cold-class.md`).
 ///
 /// [`JitNewSite::Deferred`] separates the two: the site compiles, and the
 /// class is resolved at RUN TIME by the `new_object_cp` /
@@ -6581,7 +6581,7 @@ impl StringFieldLayout {
     ///   schema name (used as a `HashMap` key, so its hash was cached), and
     ///   wrote `CREATE SEQUENCE ""."SEQ1"` into its persisted metadata —
     ///   after which reopening the database failed with `Schema  not found`
-    ///   (`docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`).
+    ///   (`fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`).
     ///   `hashCode()` had the mirror defect: it read `hashIsZero` as the
     ///   cached hash, so `"".hashCode()` returned 1.
     /// * for the LEGACY arm the fixed `+8` happens to be right for field
@@ -6865,7 +6865,7 @@ pub enum JitIntrinsic {
     //
     // Both classes hold a single `private int crc` at instance field slot 0
     // (`CRC_FIELD_SLOT`), the running (uncomplemented) CRC state — see
-    // docs/internal/crc_layout_contract.md and native-builtins/src/
+    // gaps/crc_layout_contract.md and native-builtins/src/
     // zip_crc32c.rs. Each intrinsic threads that slot: load slot 0, fold the
     // input byte(s), store back. `update(I)V` folds one byte; `update([BII)V`
     // folds a `byte[]` range (with inline null + bounds guards). A receiver
@@ -7600,7 +7600,7 @@ pub fn try_resolve_intrinsic(
     // java.util.zip.CRC32 / CRC32C `update` call-site intrinsics (Phase 4c).
     //
     // The foundation wave (commit 2fb0df0) pinned the receiver layout
-    // (docs/internal/crc_layout_contract.md): both classes carry exactly one
+    // (gaps/crc_layout_contract.md): both classes carry exactly one
     // instance field — `private int crc` at slot 0 — holding the running,
     // uncomplemented CRC state. It also added a bit-exact native CRC32C
     // (native-builtins/src/zip_crc32c.rs) that serves as the differential
@@ -8691,7 +8691,7 @@ struct JitKey {
     // `ClassLoader(null)` re-loading an old H2 jar's own
     // `org.h2.mvstore.RootReference` alongside the identically-named class
     // already on the application classpath — see
-    // `docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md`'s
+    // `fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md`'s
     // `TestUpgrade` residual) are DISTINCT classes with unrelated bytecode,
     // but the interpreter's own dispatch (`resolve_method_ref` /
     // `execute_invoke_kind` / `try_stackless_invoke`) already correctly
@@ -10421,7 +10421,7 @@ fn ir_call_is_identity_hash(node: &ir::Node, info_ptr: usize) -> bool {
 // frame (the compiled body never branches to an in-method handler — see
 // `Op::Throw`'s own doc comment in `ir.rs`), so it cannot create a control
 // edge back to a lower-id load, which is the only thing that predicate
-// guards against. See `docs/internal/cov-07-athrow-RETIRED-*.md`.
+// guards against. See `cov-07-athrow-RETIRED-*.md`.
 
 /// Map a single `ir::Op` variant to its `escape_analysis::Op` counterpart.
 fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
@@ -11912,8 +11912,8 @@ pub fn jit_direct_call_requires_dispatch(
 /// can select the caller's oop map for the callee's frame and lose live
 /// roots. This exact mechanism produced the IVFKnn stress-test
 /// stale-precise-root-mirror corruption (see
-/// docs/known-issues/elasticsearch-suite/
-/// ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md).
+/// fixed-suite-bugs/elasticsearch-suite/
+/// ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b-FIXED.md).
 /// Closed by two companion fixes that ship alongside this flag:
 /// [`Compiler::emit_post_call_rbp_republish`] (re-publishes the caller's RBP
 /// after every raw JIT-to-JIT return) and `JitEntryGuard::enter_with_compiled`
@@ -11989,7 +11989,7 @@ fn single_pass_only_lowering_for(
 /// and every one of them used to decline in silence, producing the identical
 /// observable: no IR body. That is what made "the optimizing tier emits nothing"
 /// unfalsifiable for the whole of the relocation-contract investigation
-/// (`docs/internal/jit-ir-relocation-map-contract.md`): the absence never named
+/// (`jit-ir-relocation-map-contract.md`): the absence never named
 /// which stage produced it. Each stage now reports under this flag.
 pub fn ir_stage_reporting() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
@@ -12041,7 +12041,7 @@ pub fn moving_young_disables_optimizing_tier() -> bool {
              compiles, but through the single-pass C1 backend only — the IR optimizer, its \
              inline caches and its direct-call lowering contribute nothing. \
              `CRATONVM_NO_MOVING_YOUNG=1` restores the optimizing tier and gives up compaction. \
-             See docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md",
+             See jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md",
         );
     }
     true
@@ -12149,7 +12149,7 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
     // callee's handler frame from its incoming arguments and lost every other
     // local). Anyone reading a failure of this class as evidence against this
     // gate between 2026-07-31 and 2026-08-01 was reading the wrong defect; see
-    // docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md.
+    // fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md.
     //
     // The class is not immune to two intermittent failures unrelated to this
     // gate — a stall in Spring Boot's two-thread `OnClassCondition` filtering
@@ -12164,7 +12164,7 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
     // callee's handler frame from its incoming arguments and lost every other
     // local). Anyone reading a failure of this class as evidence against this
     // gate between 2026-07-31 and 2026-08-01 was reading the wrong defect; see
-    // docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md.
+    // fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md.
     //
     // The OPTIMIZING-TIER gate stays scoped as
     // `moving_young_relocates_compiled_frames()` — that one protects frames
@@ -13425,8 +13425,8 @@ fn try_compile_inner(
                     // `StringCache.toString`, refused for its `synchronized`
                     // block's javac-generated monitor handler; it sits in the
                     // middle of a 600M-call hot chain whose neighbours both
-                    // compile. See docs/internal/fixed-suite-bugs/tomcat/
-                    // 30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md.)
+                    // compile. See tomcat/
+                    // 30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md.)
                     jitc_bail!("rbc6-handler-reads-unsafe-local");
                 }
                 precise_exception_frames = true;
@@ -13462,7 +13462,7 @@ fn try_compile_inner(
     // exercise IR codegen could not reach it at all, no matter how it was
     // shaped. That is not a hypothetical: the whole IR relocation-map contract
     // could not be measured for want of one live IR frame at a young collection
-    // (`docs/internal/jit-ir-relocation-map-contract.md`), and every probe
+    // (`jit-ir-relocation-map-contract.md`), and every probe
     // written for it was defeated by this one bit.
     //
     // It changes WHICH tier compiles a method, never what a compiled method
@@ -13474,7 +13474,7 @@ fn try_compile_inner(
     // failing any one of them falls silently through to the single-pass
     // backend. That silence is what left "why does the optimizing tier produce
     // no bodies?" unanswerable for the whole relocation-contract investigation
-    // (`docs/internal/jit-ir-relocation-map-contract.md`) — every term's
+    // (`jit-ir-relocation-map-contract.md`) — every term's
     // failure looks exactly like every other's, and like the tier being off.
     // Under `CRATONVM_DBG_JITC` / `CRATONVM_DBG_IR_COMPILES` each candidate now
     // reports which term declined it. Evaluated lazily (and only under the
@@ -13538,7 +13538,7 @@ fn try_compile_inner(
         // in exchange for a frame that cannot occur: the runtime vetoes
         // moving-young whenever an un-rewritable compiled frame is live, so a
         // relocating cycle never sees one. See
-        // `docs/internal/jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`
+        // `jit-optimizing-tier-moving-young-gate-RETIRED-20260731.md`
         // and `moving_young_relocates_compiled_frames` for the invariant.
         //
         // This scopes the gate; it does not remove it. When the JIT publishes a
@@ -13566,7 +13566,7 @@ fn try_compile_inner(
         // case of — the optimizing tier replaces a C1 body whenever it CAN,
         // with no evidence the replacement is faster, and every `cov-*` lane
         // widens the set of methods that happens to — is written up in
-        // `docs/known-issues/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
+        // `docs/known-issues/c2/archive/perf-01-sieve-ir-body-6x-slower-than-c1.md`
         // and is not solved here.
         && single_pass_only_lowering_for(code, code_len, cached).is_none()
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
@@ -13950,7 +13950,7 @@ fn try_compile_inner(
         // cov-05: resolve `checkcast` (0xc0) / `instanceof` (0xc1) sites for
         // the IR builder — 306 events, the largest single whole-method
         // refusal in the survey, more than every opcode gap combined:
-        // `docs/known-issues/c2/cov-05-checkcast-and-instanceof.md`.
+        // `cov-05-checkcast-and-instanceof-RETIRED-20260804.md`.
         //
         // Admits a site ONLY when its target class is already resolved and
         // loaded at compile time. `cp_new_resolver` already answers exactly
@@ -14050,7 +14050,7 @@ fn try_compile_inner(
         // cov-04 census. The invoke bails in `IrBuilder::build` report a line
         // number and a bytecode pc; neither says *which callee*, and the whole
         // first increment of
-        // `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`
+        // `cov-04-the-invoke-arms-RETIRED-20260803.md`
         // was "group them by callee before writing code". Under
         // `CRATONVM_DBG=ir-compiles` (or `jitc`) hand the builder a
         // diagnostic-only `pc → "0xNN cn.mn desc"` map so each bail names its
@@ -14875,6 +14875,50 @@ fn try_compile_inner(
                             .iter()
                             .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }))
                         {
+                            compiled.has_dispatch = true;
+                        }
+                        // cov-07 companion: `Op::Throw` owes the same flag, and
+                        // for the same reason. It is the ONE `has_dispatch` arm
+                        // cov-07 did not bring across when it admitted `athrow`
+                        // to this tier.
+                        //
+                        // The single-pass backend has carried this since RBC.6
+                        // (`emitted_athrow` forces `has_dispatch` in
+                        // `x64/driver.rs`), and the RBC.6-relaxation comment at
+                        // the `has_athrow` gate above states the resulting
+                        // invariant outright: "any method containing `athrow` is
+                        // ALWAYS entered through `execute_jit_call`'s
+                        // dispatch-aware slow path, never the raw fast-path that
+                        // would leak the sentinel as a return value". That
+                        // invariant is the whole reason lowering `athrow` is
+                        // safe — and this tier silently did not hold it.
+                        //
+                        // `jit_throw_exception` stashes the throwable and returns
+                        // the `i64::MIN` sentinel, but — unlike every other
+                        // sentinel producer — does NOT set `JIT_DEOPT_PENDING`.
+                        // The dispatch-aware entry does not need it to: that path
+                        // drains `sig.exception` and routes it unconditionally.
+                        // The `!has_dispatch` fast entry has no such drain — it
+                        // consults `deopt_signaled`, which is therefore false —
+                        // so the stashed exception is dropped and the method
+                        // returns as though it completed normally.
+                        //
+                        // For a `void` method that is invisible (no return value
+                        // whose bits could look wrong), so it presents as a throw
+                        // that simply did not happen. Witness: JUnit Platform's
+                        // sneaky-throw idiom, where `throwAs(t)` is `checkcast
+                        // <erased>; athrow` and nothing else — so
+                        // `throwAsUncheckedException` falls through to its
+                        // `return null`, its caller throws that null, and the
+                        // ORIGINAL exception is lost behind a helpful-NPE.
+                        //
+                        // Measured with the caller forced interpreted
+                        // (`CRATONVM_JIT_DENY`), which isolates the compiled
+                        // callee → interpreted caller edge this governs: 1 792 397
+                        // swallowed throws in 1 800 000 iterations before, 0 after.
+                        //
+                        // Pinned by `vm/tests/jit_ir_athrow_dispatch.rs`.
+                        if graph.nodes.iter().any(|n| matches!(n.op, ir::Op::Throw)) {
                             compiled.has_dispatch = true;
                         }
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
@@ -15780,7 +15824,7 @@ fn try_compile_inner(
                         // re-run — safe only when nothing observable
                         // happened before this call, an invariant this scan
                         // cannot verify and the JDT `Parser` stack-corruption
-                        // bug violates (docs/known-issues/
+                        // bug violates (fixed-suite-bugs/
                         // jasper-jdt-parser-arrayindexoutofbounds.md: a
                         // `stack[ptr--]` decrement already committed earlier
                         // in the same method gets re-executed on re-run).
@@ -16368,7 +16412,7 @@ fn try_compile_inner(
     // DOUBLE-EXECUTES every side effect already committed before the trap —
     // e.g. a `stack[ptr--]` decrement already written to the heap. This was
     // the root cause of the JDT `Parser` stack-corruption bug
-    // (docs/known-issues/jasper-jdt-parser-arrayindexoutofbounds.md): an
+    // (fixed-suite-bugs/jasper-jdt-parser-arrayindexoutofbounds.md): an
     // always-deopting reference-array `System.arraycopy` call inside a method
     // with a live `this` made every single invocation re-run from entry.
     let param_oop_mask =
@@ -16772,7 +16816,7 @@ fn is_category2_opcode(op: u8) -> bool {
 /// the coarse method-level gate — is what let the OSR-exit snapshot at
 /// `getstatic System.out` + an `if`/`else`-computed `makeConcatWithConstants`
 /// argument decode its operand stack precisely; see
-/// `docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`.
+/// `fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`.
 pub fn indy_arg_type_tags(descriptor: &str) -> Vec<u8> {
     let bytes = descriptor.as_bytes();
     let mut tags = Vec::new();
@@ -19071,7 +19115,7 @@ mod tests {
 
     // ── cold-`new` fix: a `new` of a NOT-YET-LOADED class must still compile ──
     //
-    // The gap this guards (docs/internal/jit-compile-bail-unresolved-new-cold-class.md):
+    // The gap this guards (jit-compile-bail-unresolved-new-cold-class.md):
     // `resolve_jit_new_site` only sees already-loaded classes, so a hot method
     // whose only un-taken branch does `throw new SomeException(...)` reported
     // `None`, `try_compile_inner` bailed the WHOLE compile at the `new_resolve`
@@ -21720,7 +21764,7 @@ mod tests {
     /// `BasicErrorControllerIntegrationTests` before it existed: 50 published
     /// bodies per run released outside the queue, seven of them with
     /// `active_jit_executions` at 1, 2 or 3 — the crash signature of
-    /// `docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
+    /// `jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`.
     #[test]
     fn retained_code_releases_a_published_body_through_the_queue() {
         let cache = JitCache::new();
@@ -23453,7 +23497,7 @@ mod tests {
     /// `StringConcatFactory`, guarded by the `assertionsDisabled` dead
     /// branch), so this blanket veto forced hot per-call-site methods that
     /// merely CONTAIN a dead assert into the interpreter forever (see
-    /// `docs/internal/...binary-docvalues-range-hang...md` for the concrete
+    /// `...binary-docvalues-range-hang...md` for the concrete
     /// Lucene `FSTCompiler`/`NodeHash` repro).
     ///
     /// The new design: the scanner accepts 0xba and simply records the site
@@ -24298,7 +24342,7 @@ mod layout_constant_inventory {
                      inventory records {want}x. Both files emit object-header \
                      displacements into machine code, and neither is covered by \
                      the substring tripwire in x64.rs. Update \
-                     docs/internal/arch-2026-07-26/layout-constant-hazards.md and \
+                     arch-2026-07-26/layout-constant-hazards.md and \
                      header-shrink.md §6.6 in the same change, and confirm the new \
                      or moved site is value-safe at the new layout — the disp8 \
                      sites in ir_lower.rs silently address backwards past 127."

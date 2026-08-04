@@ -83,12 +83,12 @@ accumulated rather than being factored:
 * `invoke_or_native` — calling `.execute()` on a genuinely-real executor from
   native code (`ctx.invoke_virtual`) recursed back into the same native forever:
   *"a real stack overflow, confirmed via gdb"*. See
-  `docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`.
+  `fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`.
 * `try_stackless_invoke` steps 1 and 6, and both `populate_virtual_invoke_cache`
   sites — without them a real `ThreadPoolExecutor` was shunted into
   `native_es_execute`'s "run inline" fallback, silently degrading async
   execution to synchronous. See
-  `docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md`.
+  `fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md`.
   Step 6 is called out as *"a SEPARATE, independent double-check … that runs
   even after real bytecode was already resolved at step 4/5."*
 * The cache sites are the subtle ones: `populate_virtual_invoke_cache` had to
