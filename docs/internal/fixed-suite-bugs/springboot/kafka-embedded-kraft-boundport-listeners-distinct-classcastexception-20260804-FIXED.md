@@ -153,6 +153,7 @@ invalidates a Spring Boot run).
 | `cratonvm-kafkabp-r2` | + defect 1 | 3/3 **PASS** | — |
 | `cratonvm-kafkabp-r3` | + defect 2 | 3/3 **PASS** | 2/2 **PASS** |
 | `cratonvm-kafkabp-r4` | + `origin/dev` merged forward | 9/10 **PASS**, 1 HANG | 2/2 **PASS** |
+| `cratonvm-kafkabp-r5` | final merged state, as landed on `dev` | 3/3 **PASS** | 2/2 **PASS** |
 
 Every passing run reported `SBRUNNER_RESULT tests=3 failed=0 aborted=0
 skipped=0 containersFailed=0`.
