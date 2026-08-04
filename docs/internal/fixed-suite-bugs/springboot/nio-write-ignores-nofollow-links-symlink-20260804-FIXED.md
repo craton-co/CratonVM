@@ -111,8 +111,14 @@ time: `Files.writeString` silently wrote an **empty file** for any
 
 ## Validation
 
-Binaries: `cratonvm-nf-baseline` (dev `3db59eb9`) and `cratonvm-nf-fixed`,
-release builds on the Azure Linux host. HotSpot reference as noted per row.
+Three release binaries, all built on the Azure Linux host:
+
+* **baseline** — dev `3db59eb9`, where the work started;
+* **fixed / merged** — this branch after merging `origin/dev` `b6f0ecdb`;
+* **dev control** — `origin/dev` `b6f0ecdb` on its own, so that the 14 dev
+  commits merged in mid-flight cannot be mistaken for this change's fallout.
+
+HotSpot reference as noted per row.
 
 ### 1. The reported test — `ApplicationPidTests`
 
@@ -124,6 +130,10 @@ SbRunner, real JDK 25 (`/data/jdk25-real-20260717/jdk-25.0.3+9`),
 | HotSpot 25 | `tests=13 failed=0` |
 | CratonVM **baseline** | `tests=13 failed=1` — `whenSymlinkToTargetExistsAtPidFileLocationWriteThrows` |
 | CratonVM **fixed** | `tests=13 failed=0` |
+| CratonVM **merged** | `tests=13 failed=0` |
+
+`ApplicationTempTests`, the adjacent class, reports `tests=6 failed=0` on all
+four.
 
 ### 2. `probes/NoFollowLinksOpenProbe.java` — every open path
 
@@ -139,33 +149,41 @@ normally, a symlinked *directory* mid-path is not the final component).
 | HotSpot 21 | `PASS=19 FAIL=0` |
 | CratonVM **baseline** | `PASS=6 FAIL=13` |
 | CratonVM **fixed** | `PASS=19 FAIL=0` |
+| CratonVM **merged** | `PASS=19 FAIL=0` |
 
 The six baseline passes are exactly the negative controls, so the probe is not
 passing vacuously in either direction.
 
-### 3. Regression suite — no fallout
+### 3. Regression suite — no fallout, and the branch is fully green
 
-`regression-suite/run.sh` (default CORE set, JDK 17, `TIMEOUT=90`), run on both
-binaries. **Identical failure sets**: `RSerial RChannelInterrupt RAtomicArray
-RDirectBufferElem RNioNoFollow` — 18 passed, 5 failed on each. The four
-non-`RNioNoFollow` failures are pre-existing on this host and unrelated.
+`regression-suite/run.sh`, default CORE set, real JDK 25
+(`/data/jdk25-real-20260717/jdk-25.0.3+9`), `TIMEOUT=120`. The control is a
+release build of **`origin/dev` at `b6f0ecdb`** — the same commit this branch
+was merged with, not the older `3db59eb9` the work started from, so no
+intervening dev commit can be mistaken for fallout.
 
-The new `RNioNoFollow` vector changed *mode* between the two binaries, which is
-the signal:
+| Binary | Result |
+| --- | --- |
+| `origin/dev` control | **23 passed, 0 failed** |
+| this branch (merged) | **24 passed, 0 failed** |
 
-* baseline — `rc=1`, `java/lang/AssertionError: writeString through a symlink:
-  no-exception`: the bug, caught at the first assertion.
-* fixed — all 26 checks pass and the class prints `CK RNioNoFollow checks=26`,
-  `CK RNioNoFollow refusals=io,io,io,io,io,io,io,io` and `PASS RNioNoFollow` —
-  byte-identical to HotSpot's own output for the same class; the harness then
-  scores it `rc=124` because the VM does not exit after `main()` returns.
+The one extra class is `RNioNoFollow` itself. Every pre-existing vector holds
+its status exactly; this change moves nothing.
 
-That trailing hang is **not** this fix. It reproduces on a five-line class whose
-only content is `FileChannel.open(p, READ)` (`[cratonvm] main() returned; VM
-held alive by 2 non-daemon thread(s)`), it does not occur without that call, and
-it is why the pre-existing CORE class `RChannelInterrupt` — which also opens a
-`FileChannel` — scores `rc=124` on this same host. It is a JDK-17-on-Linux
-artifact of this build host, not of the reference environment the suite targets.
+The same vector run against the control binary under the same JDK is `rc=1`,
+`java/lang/AssertionError: writeString through a symlink: no-exception` — so it
+is a genuine discriminator and not green by construction.
+
+> A JDK-17 aside, because the first pass of this validation was run that way and
+> the numbers look alarming: on JDK 17 both binaries score 18 passed / 5 failed
+> with the *identical* set `RSerial RChannelInterrupt RAtomicArray
+> RDirectBufferElem RFileTimes`, and `RNioNoFollow` adds a sixth by hanging
+> after it has printed `PASS`. That hang reproduces on a five-line class whose
+> only content is `FileChannel.open(p, READ)` (`[cratonvm] main() returned; VM
+> held alive by 2 non-daemon thread(s)`) and does not occur without that call,
+> which is also why the pre-existing CORE class `RChannelInterrupt` reds there.
+> None of it survives on the reference JDK 25. JDK 17 is not the suite's
+> reference and these numbers should not be read as a baseline.
 
 ### 4. The rewritten write path is byte-exact
 
@@ -176,6 +194,18 @@ all of them: a 4 MiB + 7 byte payload round-trips whole (length **and**
 content), a 3-byte write over that file leaves `Files.size() == 3` (truncation,
 not a stale tail), and `Files.write(path, List.of("alpha", "beta"))` still
 produces exactly `alpha\nbeta\n`.
+
+All 27 of the vector's checks pass, and the class's full stdout —
+`CK RNioNoFollow danglingReadOnly=java.io.IOException`,
+`CK RNioNoFollow checks=27`,
+`CK RNioNoFollow refusals=io,io,io,io,io,io,io,io`, `PASS RNioNoFollow` — is
+byte-identical to HotSpot's for the same class.
+
+### 4a. Crate tests
+
+`cargo test --release -p cratonvm-native-builtins`: **3250 passed, 0 failed**
+(lib) plus `aes_gcm_kat` 5/5, `registry_contracts` 5/5,
+`shim_inheritance_guard` 3/3 and `stub_ratchet` 4/4 — 0 failed anywhere.
 
 ### 5. Blast radius in the Spring Boot tree
 
