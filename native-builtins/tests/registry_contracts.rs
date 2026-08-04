@@ -514,3 +514,71 @@ fn no_native_mints_a_field_less_ssl_socket_factory_carrier() {
         violations.join("\n  ")
     );
 }
+
+/// Phase 61 must not take ownership of any `java.nio.file.Path` native away
+/// from phase 57.
+///
+/// `NativeMethodRegistry::register` overwrites the slot in place, so the LAST
+/// registration of a triple is the one that runs, and
+/// `register_synthetic_overrides` calls phase 57 and then phase 61.
+/// `register_p61_files_path` used to re-register six Path methods that phase 57
+/// already owned; the `resolve` pair among them joined with
+/// `std::path::Path::join` and stored the result without going through
+/// `p57_alloc_path`, so they skipped the normalize-at-construction step and
+/// silently re-introduced the trailing-separator defect from
+/// `docs/internal/fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization.md`.
+///
+/// The assertion compares the WINNING registration site against the site that
+/// wins when phase 57 registers alone, rather than asserting a registration
+/// merely exists — a presence check passes just as happily when a later phase
+/// has displaced the good implementation. Line numbers are compared between two
+/// runtime observations, so ordinary edits to the file do not move the goalposts.
+#[test]
+fn p61_does_not_displace_phase57_path_natives() {
+    fn winner(registry: &NativeMethodRegistry, name: &str, descriptor: &str) -> Option<String> {
+        // `census()` is sorted by (class, name, descriptor) with a stable sort,
+        // so duplicate triples stay in registration order: the last row is the
+        // live owner.
+        registry
+            .census()
+            .into_iter()
+            .filter(|e| e.class == "java/nio/file/Path" && e.name == name && e.descriptor == descriptor)
+            .next_back()
+            .and_then(|e| e.registered_by)
+    }
+
+    // These six are the ones phase 61 used to duplicate. `getParent` and
+    // `getNameCount` had already been hand-synced to their phase-57 twins,
+    // which is exactly the drift hazard this test removes.
+    let surface = [
+        ("getFileName", "()Ljava/nio/file/Path;"),
+        ("getParent", "()Ljava/nio/file/Path;"),
+        ("toAbsolutePath", "()Ljava/nio/file/Path;"),
+        ("resolve", "(Ljava/lang/String;)Ljava/nio/file/Path;"),
+        ("resolve", "(Ljava/nio/file/Path;)Ljava/nio/file/Path;"),
+        ("getNameCount", "()I"),
+    ];
+
+    let mut phase57_only = NativeMethodRegistry::new();
+    cratonvm_native_builtins::phases_late::register_phase57_nio_file(&mut phase57_only);
+
+    let mut full = NativeMethodRegistry::new();
+    cratonvm_native_builtins::register_synthetic_overrides(&mut full);
+
+    for (name, descriptor) in surface {
+        let expected = winner(&phase57_only, name, descriptor);
+        assert!(
+            expected.is_some(),
+            "phase 57 no longer registers java/nio/file/Path.{name}{descriptor} — \
+             this test has nothing left to guard and would pass vacuously"
+        );
+        assert_eq!(
+            winner(&full, name, descriptor),
+            expected,
+            "java/nio/file/Path.{name}{descriptor} is owned by a LATER registration \
+             than phase 57's. A duplicate registration of a Path native silently \
+             replaces the phase-57 implementation (last write wins); delete it \
+             instead of keeping a copy in sync."
+        );
+    }
+}

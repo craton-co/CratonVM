@@ -15019,139 +15019,34 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
     );
 
     // --- Path expansion ---
-    let path = "java/nio/file/Path";
-    r.register(
-        path,
-        "getFileName",
-        "()Ljava/nio/file/Path;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let path_str = match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // jar-FS aware: operate on the in-jar entry portion.
-            let entry = jarfs_decode(&path_str)
-                .map(|(_, e)| e)
-                .unwrap_or_else(|| path_str.clone());
-            let fname = std::path::Path::new(&entry)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(fname);
-            ctx.set_field(p, 0, Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(p))))
-        },
-    );
-    // keycloak-15: route through the shared `p57_parent_of` (jar-FS aware +
-    // Windows last-separator split that keeps `.`/`..`) instead of Rust's
-    // `Path::parent()`, which normalizes a trailing `.` and over-trims. This is
-    // the last-registered (winning) `getParent`; keep it identical to the
-    // earlier registration so behaviour does not depend on phase order.
-    r.register(path, "getParent", "()Ljava/nio/file/Path;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let p = p57_read_path(ctx, this);
-        let parent = p57_parent_of(&p);
-        if parent.is_empty() {
-            Ok(Some(Value::Object(None)))
-        } else {
-            let result = p57_alloc_path(ctx, &parent);
-            Ok(Some(Value::Object(Some(result))))
-        }
-    });
-    r.register(
-        path,
-        "toAbsolutePath",
-        "()Ljava/nio/file/Path;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let path_str = match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Object(Some(this)))),
-            };
-            // jar-FS paths are already absolute within the mounted filesystem.
-            let abs = if jarfs_decode(&path_str).is_some() {
-                path_str
-            } else {
-                p57_absolute_path_string(&path_str)
-            };
-            let p = p57_alloc_path(ctx, &abs);
-            Ok(Some(Value::Object(Some(p))))
-        },
-    );
-    r.register(
-        path,
-        "resolve",
-        "(Ljava/lang/String;)Ljava/nio/file/Path;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let base = match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let other = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let resolved = if jarfs_decode(&base).is_some() {
-                p57_resolve_paths(&base, &other)
-            } else {
-                std::path::Path::new(&base)
-                    .join(&other)
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(&resolved);
-            ctx.set_field(p, 0, Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(p))))
-        },
-    );
-    r.register(
-        path,
-        "resolve",
-        "(Ljava/nio/file/Path;)Ljava/nio/file/Path;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let base = match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let other = if let Some(Value::Object(Some(o))) = args.get(1) {
-                match ctx.get_field(*o, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                }
-            } else {
-                String::new()
-            };
-            let resolved = if jarfs_decode(&base).is_some() || jarfs_decode(&other).is_some() {
-                p57_resolve_paths(&base, &other)
-            } else {
-                std::path::Path::new(&base)
-                    .join(&other)
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let s = ctx.create_string(&resolved);
-            ctx.set_field(p, 0, Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(p))))
-        },
-    );
-    r.register(path, "getNameCount", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let path_str = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        let entry = vfs_decode(&path_str).map(|(_, _, e)| e).unwrap_or(path_str);
-        // keycloak-15: count name elements after the (explicitly parsed) Windows
-        // drive/UNC root, not std::path components (which mis-count `C:` as a name).
-        let count = p57_parse_root(&entry).1.len() as i32;
-        Ok(Some(Value::Int(count.max(0))))
-    });
+    //
+    // NO `java/nio/file/Path` REGISTRATIONS BELONG HERE. This function used to
+    // re-register six of them — `getFileName`, `getParent`, `toAbsolutePath`,
+    // `resolve(String)`, `resolve(Path)`, `getNameCount` — all of which
+    // `register_phase57_nio_file` already owns. `NativeMethodRegistry::register`
+    // overwrites the slot in place, so the LAST registration wins, and phase 61
+    // runs after phase 57 (`register_all_natives`): every one of these silently
+    // took over from the phase-57 implementation wherever that path is used
+    // (synthetic-JDK mode; the shipping real-JDK VM calls
+    // `register_phase57_nio_file` directly from `vm_init.rs` and never gets
+    // here, which is the only reason this went unnoticed).
+    //
+    // They were not equivalent. The `resolve` pair joined with
+    // `std::path::Path::join` and wrote the result straight into the object
+    // instead of going through `p57_alloc_path`, so they skipped the
+    // normalize-at-construction step that `sun.nio.fs.UnixPath`/`WindowsPath`
+    // perform — which is exactly the trailing-separator defect
+    // `docs/internal/fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization.md`
+    // was filed for, re-introduced one phase later. `getFileName` used
+    // `jarfs_decode` (missing jrt) and dropped the root/null contract;
+    // `getNameCount` and `getParent` had already been hand-synced to their
+    // phase-57 twins by earlier sessions, which is a standing invitation to
+    // drift.
+    //
+    // Deleting them is strictly better than keeping them identical: there is
+    // one implementation, and phase order stops being load-bearing. See
+    // `p61_registers_no_duplicate_path_natives` in `registry_contracts.rs`,
+    // which fails if any of them come back.
     r.set_category(__prev_cat);
 }
 
