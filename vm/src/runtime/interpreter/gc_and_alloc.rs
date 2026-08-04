@@ -215,6 +215,9 @@ pub(super) fn stw_take_over_and_wait(
     counted_os_tids: &[u32],
 ) -> crate::jit::xt_root_scan::TakenOver {
     use crate::jit::xt_root_scan as xt;
+    // Per-cycle cross-thread coverage starts here, so whatever the sweep reads
+    // later describes THIS collection rather than whichever one last ran a pass.
+    cratonvm_gc::gc_quiescence::reset_xt_cycle();
     // The forcible take-over is only sound on a heap that can collect while a
     // frozen peer holds an un-retired TLAB and un-rewritable roots:
     // Generational degrades to the non-moving sweep that consumes the JIT

@@ -13469,6 +13469,14 @@ fn report_doomed_referrers(
         }
     }
 
+    // Cross-thread peer-scan coverage for THIS cycle. A sweep with
+    // `UNCLASSIFIED > 0` marked from a root set that provably omitted a
+    // running peer's JIT frames, and no amount of heap-side scanning can see
+    // those roots — they are in registers and stack slots, not in the heap or
+    // the root slice.
+    let (xt_passes, xt_taken, xt_unclassified, xt_roots, xt_hw, xt_hw_roots) =
+        crate::gc_quiescence::xt_cycle_coverage();
+
     // Report what was actually SCANNED beside what was found. A zero in the
     // young or root column is only an elimination if that scan covered
     // something: `young_from.used()` can be near zero right after a young
@@ -13477,11 +13485,18 @@ fn report_doomed_referrers(
     eprintln!(
         "[{label}-referrers] doomed={} DEFECTS(live_old={live_old} young={young} \
          root={root_hits}) benign(dead_old={dead_old} unowned={unowned}) \
-         scanned(old_bytes={} young_bytes={} roots={})",
+         scanned(old_bytes={} young_bytes={} roots={}) \
+         xt(passes={} taken_over={} UNCLASSIFIED={} xt_roots={} hw_windows={} hw_roots={})",
         doomed.len(),
         old_gen.capacity(),
         young_from.used(),
         roots.len(),
+        xt_passes,
+        xt_taken,
+        xt_unclassified,
+        xt_roots,
+        xt_hw,
+        xt_hw_roots,
     );
 }
 
