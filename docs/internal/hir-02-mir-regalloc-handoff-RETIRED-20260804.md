@@ -245,6 +245,18 @@ answer a performance question by construction.
     `an_empty_pool_refuses_instead_of_helping_itself_to_the_scalar_file`,
     `the_three_xmm_authorities_are_stated_in_one_place`.
 
+`regression-suite/run.sh` was run on the same host and is **not usable as a
+verdict**: another session's Spring Boot suite held the 16-core box at load
+51–242 throughout, and three of the four CratonVM failures are `rc=124`
+timeouts, with a fourth (`RMapResizeGc`) reported as "output differs from
+HotSpot" while the HotSpot section is **empty** — the oracle timed out, and
+CratonVM's own line says `PASS`. The two non-timeout failures were baselined
+the cheap way and are JIT-independent: `RSerial` and `RFileTimes` fail
+**identically under `--nojit`**, which excludes every change on this branch.
+
+The load-insensitive evidence is what this section rests on instead: 1 906 unit
+tests, and three checksummed workloads compared across four modes.
+
 **Pre-existing red on `origin/dev`, baselined on an unmodified checkout of it
 and not caused by this branch:**
 
