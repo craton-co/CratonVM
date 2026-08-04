@@ -3462,9 +3462,6 @@ fn reloc_emit_enabled() -> bool {
         use crate::x64::isel::Rule;
 
         let plan = self.mir.as_ref()?;
-        if std::env::var_os("MIRDBG").is_some() {
-            eprintln!("[mirdbg] lookup n{id} blk={block_idx} -> {:?}", plan.tile_of.get(id as usize));
-        }
         let (tb, ti) = (*plan.tile_of.get(id as usize)?)?;
         if usize::try_from(tb).ok()? != block_idx {
             return None;
@@ -3474,9 +3471,6 @@ fn reloc_emit_enabled() -> bool {
             .get(usize::try_from(tb).ok()?)?
             .tiles
             .get(usize::try_from(ti).ok()?)?;
-        if std::env::var_os("MIRDBG").is_some() {
-            eprintln!("[mirdbg] n{id} op={:?} ty={:?} root={} rule={:?} covered={:?} insts={:?}", self.graph.nodes[id as usize].op, self.graph.nodes[id as usize].ty, tile.root, tile.rule, tile.covered, tile.insts);
-        }
         if tile.root != id || tile.rule != Rule::AluReg {
             return None;
         }
@@ -7654,7 +7648,17 @@ pub mod mir_totals {
 fn build_mir_plan(graph: &Graph, schedule: &Schedule) -> Option<MirPlan> {
     use crate::x64::isel::{select_block, SelectOptions};
 
-    let opts = SelectOptions::default();
+    // `frame_homed: true` is the one departure from `shadow_select_method`'s
+    // options, and it is a statement about the consumer rather than a tuning
+    // knob: `encode_tile_frame_homed` puts every value in its frame word, so
+    // the two-address copy the cost model would otherwise charge the ALU form
+    // does not exist. Left `false` it makes `Rule::Lea` outbid `Rule::AluReg`
+    // on `a + b` whenever `a` is live afterwards, and the `LEA` that wins is a
+    // byte longer than the `ADD` it replaced.
+    let opts = SelectOptions {
+        frame_homed: true,
+        ..SelectOptions::default()
+    };
     let mut blocks = Vec::with_capacity(schedule.blocks.len());
     let mut tile_of: Vec<Option<(u32, u32)>> = vec![None; graph.nodes.len()];
     for (bi, block) in schedule.blocks.iter().enumerate() {
@@ -13122,15 +13126,19 @@ mod tests {
     // row — it names the hand-written emitter it reproduces — and these are the
     // same check at method scale.
 
-    /// `int f(int a, int b) { return (a + b) * a; }`. Two `Rule::AluReg` roots
-    /// (the add and the multiply), which is why this shape and not another.
+    /// `int f(int a, int b) { return (a + b) * a; }` — `iload_0; iload_1;
+    /// iadd; iload_0; imul; ireturn`, and the length is **6**, the whole
+    /// method. (The neighbouring shadow tests pass 4, which truncates after the
+    /// `iload_0` and leaves the multiply out of the graph entirely; that costs
+    /// them nothing because they only count, but it would make every assertion
+    /// below about `Rule::AluReg` vacuous.)
     #[cfg(test)]
     const MIR_ALU_CODE: [u8; 8] = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0xac, 0, 0];
 
     #[cfg(test)]
     fn mir_emitted_bytes(mode: Option<MirMode>) -> Vec<u8> {
         let _force = mode.map(MirForce::set);
-        let cm = compile_via_ir(&MIR_ALU_CODE, 4, 2, 2).expect("compiles");
+        let cm = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
         // SAFETY: the artifact is alive for the duration of this borrow, and
         // `code_len` is what the emitter wrote.
         unsafe {
@@ -13201,7 +13209,7 @@ mod tests {
 
         let _inject = MirInject::on();
         let _force = MirForce::set(MirMode::Verify);
-        let refused = compile_via_ir(&MIR_ALU_CODE, 4, 2, 2);
+        let refused = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2);
         assert!(
             refused.is_none(),
             "a disagreeing method must lose its optimized body, not ship it"
@@ -13224,7 +13232,7 @@ mod tests {
         let _guard = mir_totals::TEST_LOCK.lock();
         mir_totals::reset();
 
-        compile_via_ir(&MIR_ALU_CODE, 4, 2, 2).expect("compiles");
+        compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
 
         assert_eq!(
             mir_totals::read(),
@@ -13257,8 +13265,12 @@ mod tests {
 
         // Precondition: the shape really does produce an absorbing tile, or the
         // test proves nothing about absorption.
+        let opts = SelectOptions {
+            frame_homed: true,
+            ..SelectOptions::default()
+        };
         let absorbing = schedule.blocks.iter().any(|b| {
-            let sel = select_block(&graph, &b.nodes, b.terminator, &SelectOptions::default());
+            let sel = select_block(&graph, &b.nodes, b.terminator, &opts);
             sel.tiles
                 .iter()
                 .any(|t| t.rule == Rule::AluImm && t.covered.len() > 1)
@@ -14070,8 +14082,21 @@ mod tests {
     fn the_register_read_path_is_gated_on_publication() {
         // Only the emitter, not this module: the assertion below quotes the
         // very strings it looks for.
+        //
+        // The boundary is the test module, NAMED. It used to be "everything up
+        // to the first `#[cfg(test)]`", which is a position rather than a
+        // boundary: the first test-only helper added anywhere above
+        // `set_residency` truncates the scanned region and the count silently
+        // collapses to zero — a gate that fails open. (`FrameAccessList::
+        // corrupt_last_byte` is the one that did it.) The precondition below is
+        // the other half: a scan whose corpus went missing must say so.
         let src = include_str!("ir_lower.rs");
-        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let body = src.split("\nmod tests {").next().unwrap_or(src);
+        assert!(
+            body.contains("fn resident_xmm"),
+            "the scanned region no longer contains the emitter — the test \
+             module boundary moved"
+        );
         let reads: Vec<String> = body
             .lines()
             .map(|l| l.trim().to_string())

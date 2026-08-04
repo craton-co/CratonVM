@@ -3952,6 +3952,26 @@ pub struct SelectOptions {
     /// [`AddrSource::Opaque`], so a lowering has to teach the memory operand to
     /// `ir_lower` before this is worth turning on.
     pub fold_loads: bool,
+    /// The consumer will encode these tiles against a **frame-homed**
+    /// allocation: every value lives in its frame word, and an instruction's
+    /// operands are loaded into scratch registers on the spot.
+    ///
+    /// This is not a hint, it is a statement about the allocation, and it
+    /// changes what the cost model is measuring. The two-address fixup — the
+    /// `MInst::Move` that copies a still-live left operand before an x86 ALU
+    /// instruction overwrites it — does not exist under frame homing: the
+    /// destination's register never *held* the left operand, so "copy it there"
+    /// and "load it there" are the same instruction, and the ALU form pays
+    /// nothing for a live left operand.
+    ///
+    /// Off by default, deliberately. Increments 0 and 1 measured coverage with
+    /// it off; flipping the default would silently re-base those figures.
+    ///
+    /// What it decides, concretely: with a live left operand and this `false`,
+    /// `Rule::Lea` outbids `Rule::AluReg` on the strength of a copy the
+    /// consumer would never have emitted, and `a + b` selects an `LEA` that is
+    /// a byte longer than the `ADD` it replaced.
+    pub frame_homed: bool,
 }
 
 impl Default for SelectOptions {
@@ -3959,6 +3979,7 @@ impl Default for SelectOptions {
         SelectOptions {
             require_encodable: true,
             fold_loads: false,
+            frame_homed: false,
         }
     }
 }
@@ -4066,8 +4087,14 @@ fn commutative(op: &IrOp) -> bool {
 /// That is only legal when `lhs` dies at this node — one consumer, and no deopt
 /// frame naming it. Otherwise the tile pays for a `MOV` first, and that cost is
 /// exactly what makes the non-destructive `LEA` win the comparison.
-fn needs_copy(ctx: &SelCtx, lhs: NodeId) -> bool {
-    !ctx.uses.single_use(lhs)
+///
+/// Under [`SelectOptions::frame_homed`] there is no coalescing to protect:
+/// the destination's register never held the left operand, so the consumer
+/// loads it either way and the copy is not a copy. Answering `true` there would
+/// price a `MOV` nobody emits — and that fiction is what makes `LEA` outbid the
+/// `ADD` it is a byte longer than.
+fn needs_copy(ctx: &SelCtx, lhs: NodeId, opts: &SelectOptions) -> bool {
+    !opts.frame_homed && !ctx.uses.single_use(lhs)
 }
 
 /// `LEA` for an add / shift / multiply tree.
@@ -4143,7 +4170,7 @@ fn tiles_alu(
     // 64-bit frame slot. Always `Ty::I64`, so the copy has a table row for
     // both `int` and `long` operands.
     let prefix = |lhs: NodeId| -> Vec<MInst> {
-        if needs_copy(ctx, lhs) {
+        if needs_copy(ctx, lhs, opts) {
             vec![MInst::Move {
                 dst: root,
                 ty: Ty::I64,
@@ -6708,6 +6735,44 @@ mod tests {
         let t = s.tiles.iter().find(|t| t.root == add).expect("root");
         assert_eq!(t.rule, Rule::Lea, "a live operand makes the copy real");
         assert!(matches!(t.insts.as_slice(), [MInst::Lea { .. }]));
+    }
+
+    /// …and under [`SelectOptions::frame_homed`] the copy is *not* real, so the
+    /// same graph selects the `ADD` again.
+    ///
+    /// This is the option earning its keep rather than being a preference. The
+    /// consumer that sets it (`ir_lower`'s level-2 encoder) loads the left
+    /// operand into the destination register whatever the tile says, so a
+    /// `MInst::Move` prefix costs nothing and buys nothing — and priced as
+    /// though it cost something it hands `a + b` an `LEA` a byte longer than
+    /// the `ADD` it replaced.
+    ///
+    /// The exact edit that trips it: drop the `!opts.frame_homed &&` from
+    /// `needs_copy`. Both assertions below flip.
+    #[test]
+    fn frame_homing_removes_the_copy_that_makes_lea_win() {
+        let mut graph = g();
+        let p = param(&mut graph, 0);
+        let q = param(&mut graph, 1);
+        let add = bin(&mut graph, IrOp::Add, p, q);
+        let _keep = second_use(&mut graph, p);
+        let block = vec![add];
+        let opts = SelectOptions {
+            frame_homed: true,
+            ..SelectOptions::default()
+        };
+        let s = select_block(&graph, &block, None, &opts);
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(
+            t.rule,
+            Rule::AluReg,
+            "frame homing means there is no copy to avoid"
+        );
+        assert!(
+            matches!(t.insts.as_slice(), [MInst::AluRR { .. }]),
+            "and no `MInst::Move` prefix either: {:?}",
+            t.insts
+        );
     }
 
     /// Ranking is micro-ops first. A three-byte `MOV` plus a three-byte `ADD`
