@@ -3862,11 +3862,45 @@ pub struct Tile {
     pub rule: Rule,
 }
 
+/// What one operand costs to bring in from its frame word: `MOV r64, [RBP -
+/// disp8]`, four bytes and one micro-op, at a load's latency.
+///
+/// The disp8 form deliberately — it is the common case and the *smaller*
+/// figure, so a cost model that consults this never over-states what an
+/// immediate form saves.
+const FRAME_LOAD_COST: SeqCost = SeqCost {
+    bytes: 4,
+    uops: 1,
+    latency: 4,
+};
+
+
 impl Tile {
     fn new(root: NodeId, covered: Vec<NodeId>, insts: Vec<MInst>, rule: Rule) -> Tile {
+        Tile::new_with_extra(root, covered, insts, rule, SeqCost::default())
+    }
+
+    /// As [`Tile::new`], plus a cost the *instructions* do not carry.
+    ///
+    /// One caller, and it is not a fudge factor: under
+    /// [`SelectOptions::frame_homed`] an operand that stays a register is an
+    /// operand the consumer has to load out of its frame word, and
+    /// [`MInst::cost`] prices instructions rather than operands. Without this
+    /// the register form of `x + 7` costs two bytes and the immediate form
+    /// three, so the immediate form loses — while actually emitting four bytes
+    /// *fewer*, because it drops the load that materialises the constant into
+    /// a register.
+    fn new_with_extra(
+        root: NodeId,
+        covered: Vec<NodeId>,
+        insts: Vec<MInst>,
+        rule: Rule,
+        extra: SeqCost,
+    ) -> Tile {
         let cost = insts
             .iter()
-            .fold(SeqCost::default(), |acc, i| acc.then(i.cost()));
+            .fold(SeqCost::default(), |acc, i| acc.then(i.cost()))
+            .then(extra);
         Tile {
             root,
             covered,
@@ -4270,7 +4304,24 @@ fn tiles_alu(
         lhs,
         rhs,
     });
-    out.push(Tile::new(root, vec![root], insts, Rule::AluReg));
+    // Under frame homing the right operand has to be loaded out of its frame
+    // word before this instruction can name it, and the immediate form above
+    // does not pay that. Both forms load the LEFT operand, so only the delta
+    // belongs here. Charged to the tile rather than to `MInst::cost` because it
+    // is a property of the ALLOCATION, not of the instruction — the same
+    // register form costs nothing extra once operands live in registers.
+    let extra = if opts.frame_homed {
+        FRAME_LOAD_COST
+    } else {
+        SeqCost::default()
+    };
+    out.push(Tile::new_with_extra(
+        root,
+        vec![root],
+        insts,
+        Rule::AluReg,
+        extra,
+    ));
     out
 }
 
@@ -6748,6 +6799,61 @@ mod tests {
         let t = s.tiles.iter().find(|t| t.root == add).expect("root");
         assert_eq!(t.rule, Rule::Lea, "a live operand makes the copy real");
         assert!(matches!(t.insts.as_slice(), [MInst::Lea { .. }]));
+    }
+
+    /// The immediate form wins under frame homing, and loses without it.
+    ///
+    /// Measured, not assumed: with `frame_homed` off the level-2 encoder took
+    /// 39 tiles across CratonBenchC2's three phases and `Rule::AluImm` was
+    /// selected **zero** times — not because the rows were missing (increment 1
+    /// added them) and not because the constant was folded away, but because
+    /// `ADD EAX, ECX` is two bytes and `ADD EAX, 7` is three. The cost model
+    /// prices instructions; under frame homing the register operand also costs
+    /// a `MOV r64, [RBP-disp8]` that the immediate form does not, and pricing
+    /// only the instruction hides four bytes and a micro-op.
+    ///
+    /// The constant is deliberately given a second consumer here, because that
+    /// is what real code looks like: `ValueUses::single_use` requires
+    /// `count == 1` AND not pinned, and a safepoint snapshot names almost every
+    /// live constant — so the tile usually cannot absorb it and the two forms
+    /// really are competing over one node.
+    ///
+    /// The exact edit that trips it: drop the `opts.frame_homed` arm from
+    /// `tiles_alu`'s `extra`. The first assertion flips back to `AluReg`.
+    #[test]
+    fn frame_homing_makes_the_immediate_form_win() {
+        let build = || {
+            let mut graph = g();
+            let p = param(&mut graph, 0);
+            let k = konst(&mut graph, 7);
+            let add = bin(&mut graph, IrOp::Add, p, k);
+            // A second consumer, so the constant is not absorbable and both
+            // candidate tiles cover exactly the add.
+            let _other = bin(&mut graph, IrOp::Sub, p, k);
+            (graph, add)
+        };
+
+        let (graph, add) = build();
+        let block = vec![add];
+        let homed = SelectOptions {
+            frame_homed: true,
+            ..SelectOptions::default()
+        };
+        let s = select_block(&graph, &block, None, &homed);
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(
+            t.rule,
+            Rule::AluImm,
+            "the immediate form drops a frame load the register form pays"
+        );
+        assert_eq!(t.covered.as_slice(), [add], "the constant is still live");
+
+        // And the default is untouched, which is what keeps increments 0 and
+        // 1's coverage figures comparable.
+        let (graph, add) = build();
+        let s = select_block(&graph, &vec![add], None, &SelectOptions::default());
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(t.rule, Rule::AluReg);
     }
 
     /// …and under [`SelectOptions::frame_homed`] the copy is *not* real, so the
