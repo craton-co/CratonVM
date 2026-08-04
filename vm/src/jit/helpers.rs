@@ -9646,8 +9646,13 @@ fn call_integer_native_raw_inner(
                 // boxing-dominated compiled loop keeps spilling wrappers into
                 // old gen until `alloc_young_initialized` hard-aborts.
                 if vm.mem.heap.young_spill_pressure() {
+                    // `|| old_gen_needs_gc()`: same reasoning as the
+                    // `safe_native_call` hook this mirrors — the young trigger
+                    // cannot see pressure that has gone into old gen, which is
+                    // where every spill lands. See `vm_exec.rs`.
                     if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
-                        && vm.mem.heap.needs_gc_for_jit_allocation()
+                        && (vm.mem.heap.needs_gc_for_jit_allocation()
+                            || vm.mem.heap.old_gen_needs_gc())
                     {
                         crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
                     }
