@@ -11882,22 +11882,20 @@ pub fn force_c2_enabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FORCE_C2").is_some()
 }
 
-/// PERF-01: would the single-pass backend vectorise a byte-array loop in this
-/// method?
+/// PERF-01: which single-pass-only lowering, if any, applies to this method?
 ///
 /// A thin adapter — it exists to convert this crate's exception table into the
-/// `(start, end, handler)` triples `find_bypassable_loop_headers` wants, which
-/// is the same conversion `set_pending_exception_ranges` does at backend
-/// entry. The decision itself lives in `x64::single_pass_has_bulk_byte_lowering`,
-/// next to the detectors, and is shared with the code that emits the
-/// pre-headers so the two cannot disagree.
+/// `(start, end, handler)` triples `find_bypassable_loop_headers` wants, the
+/// same conversion `set_pending_exception_ranges` does at backend entry. The
+/// decision, and the enumeration behind it, live in `x64::single_pass_only`.
 ///
-/// Called once per compile request, on the compile path only.
-fn single_pass_vectorises_a_loop(
+/// Called once per compile request, on the compile path only, and rejected on
+/// a raw-byte scan before it does any analysis.
+fn single_pass_only_lowering_for(
     code: &[u8],
     code_len: usize,
     cached: &CachedBytecodeMethod,
-) -> bool {
+) -> Option<x64::SinglePassOnly> {
     let ranges: Vec<(usize, usize, usize)> = cached
         .exception_table
         .iter()
@@ -11909,7 +11907,7 @@ fn single_pass_vectorises_a_loop(
             )
         })
         .collect();
-    x64::single_pass_has_bulk_byte_lowering(code, code_len, &ranges)
+    x64::single_pass_only_lowering(code, code_len, &ranges)
 }
 
 /// Is per-stage reporting of the optimizing tier's refusals switched on?
@@ -13428,10 +13426,11 @@ fn try_compile_inner(
         } else if precise_exception_frames {
             "precise exception frames required (RBC.6: a handler reads a non-parameter local)"
                 .to_string()
-        } else if single_pass_vectorises_a_loop(code, code_len, cached) {
-            "the single-pass backend vectorises a byte-array loop in this method and the \
-             IR tier would emit a scalar one"
-                .to_string()
+        } else if let Some(k) = single_pass_only_lowering_for(code, code_len, cached) {
+            format!(
+                "the single-pass backend has {} here and the IR tier has no equivalent",
+                k.label()
+            )
         } else {
             let cat2 = method_uses_category2(code, code_len, &cached.method_descriptor);
             let fp = method_uses_fp(code, code_len, &cached.method_descriptor);
@@ -13497,7 +13496,7 @@ fn try_compile_inner(
         // widens the set of methods that happens to — is written up in
         // `docs/known-issues/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
         // and is not solved here.
-        && !single_pass_vectorises_a_loop(code, code_len, cached)
+        && single_pass_only_lowering_for(code, code_len, cached).is_none()
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
         // tier used to refuse EVERY method with a `try`/`catch`, which is an
         // enormous population of ordinary Java and cost ~7x on each of them
