@@ -57,4 +57,30 @@ fn chm_registry() {
             .is_some();
         println!("registry {c}.{name}{desc} -> {found}");
     }
+    for (hc, hn, hd) in [
+        ("java/util/HashMap", "get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+        ("java/util/HashMap", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+    ] {
+        let found = vm.shared.natives.native_methods.find(hc, hn, hd).is_some();
+        println!("registry {hc}.{hn}{hd} -> {found}");
+    }
+    let cm = vm.shared.classes.class_manager.read();
+    for name in ["java/lang/String", "java/util/HashMap"] {
+        match cm.get_loaded_class_id(name) {
+            Some(id) => {
+                let cls = cm.get_class(id).unwrap();
+                println!(
+                    "class {name} id={id:?} synthetic_stub={} total_fields={} fields={:?}",
+                    cls.is_synthetic_stub,
+                    cls.num_total_fields,
+                    cls.fields
+                        .iter()
+                        .filter(|f| !f.is_static())
+                        .map(|f| (f.name.to_string(), f.descriptor.to_string()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            None => println!("class {name} NOT LOADED"),
+        }
+    }
 }
