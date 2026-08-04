@@ -15300,6 +15300,18 @@ fn try_compile_inner(
                     // Hoisted out of the `if let` (same call, same arguments,
                     // same control flow) purely so the timer can stop before
                     // the post-lowering bookkeeping below.
+                    // The drift witness, optimizing half. `lower_inner`
+                    // installs an executable buffer itself and never goes
+                    // through `x64::compile_with_param_slots`, so without this
+                    // the witness covered only the single-pass backend — a
+                    // future door reaching the IR lowerer directly would have
+                    // produced a body with no admission and no count. This path
+                    // is reachable only from the gated
+                    // `try_compile_with_invokespecial_resolver`, so it is
+                    // expected to add nothing to `ungated_backend_entries()`;
+                    // the point is that it would stop being true if that
+                    // changed.
+                    compile_gate::note_backend_entry();
                     let metrics_lower = metrics.phase(metrics::Phase::Lower);
                     let lowered = ir_lower::lower_inner(
                         &graph,
