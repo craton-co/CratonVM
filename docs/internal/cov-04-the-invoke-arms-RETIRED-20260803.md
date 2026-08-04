@@ -153,62 +153,67 @@ allocations.
 every round with the arm order flipped between them. Every number below is a
 count, so the host's load does not enter into it.
 
-**The base arm is `origin/dev` at `86a296cab`, which already carries `cov-02`.**
-`cov-02` landed while this lane was open and edits the same match statement, so
-measuring against the pre-`cov-02` tree would have credited this lane with its
-neighbour's 65 bodies. The pre-merge A/B against `48fba3a31` agreed on every
-conclusion below (invoke refusals 69 → 0, bodies +30); this is the one that
-describes the tree that will exist.
+**The base arm is `origin/dev` at `95152daea`, which already carries `cov-01`
+and `cov-02`.** Both landed while this lane was open and both edit the same
+match statement, so measuring against the tree this lane branched from would
+have credited it with two neighbours' bodies. It also matters in the other
+direction, and this is the part worth carrying: **every one of them made this
+lane bigger.** A method blocked on `ldc` never reached its `invokespecial`, so
+`cov-01`'s landing roughly doubled the `0xb7` site. Measured three times against
+three different baselines, this lane removed 69, then 69, then **106** invoke
+refusals — same code, same corpus, different neighbours.
 
 | | base r1 | base r2 | fix r1 | fix r2 |
 |---|---:|---:|---:|---:|
-| compile requests | 1,940 | 1,942 | 1,938 | 1,942 |
-| admitted to the optimizing pipeline | 976 | 977 | 974 | 975 |
-| **bodies the optimizing backend produced** | **655** | **656** | **683** | **683** |
-| builder refusals, all sites | 112 | 112 | 67 | 67 |
-| **invoke refusals** | **69** | **69** | **0** | **0** |
-| opcode-gap events | 200 | 200 | 214 | 215 |
+| compile requests | 1,938 | 1,944 | 1,933 | 1,935 |
+| admitted to the optimizing pipeline | 974 | 977 | 971 | 970 |
+| **bodies the optimizing backend produced** | **778** | **781** | **850** | **849** |
+| builder refusals, all sites | 159 | 159 | 85 | 85 |
+| **invoke refusals** | **106** | **106** | **0** | **0** |
+| opcode-gap events | 13 | 13 | 13 | 13 |
 
-**The invoke arms refuse nothing on this corpus any more** — `5428`, `5470` and
-`5520` are all zero in both fixed rounds — and **bodies rose by 28**, 655 → 683.
-All twelve runs pass (`failed=0 aborted=0 containersFailed=0`) in both arms.
+**The invoke arms refuse nothing on this corpus any more** — `5555`, `5597` and
+`5647` are all zero in both fixed rounds — and **bodies rose by 70**, 778 → 849
+(+9%). All twelve runs pass (`failed=0 aborted=0 containersFailed=0`) in both
+arms.
 
-The other half, which the brief insists be quoted: of the 69 methods that
-stopped failing here, 28 became a body and the rest moved to the next gap they
-meet.
+The other half, which the brief insists be quoted: of the 106 methods that
+stopped failing here, ~70 became a body and the rest moved to the next gap they
+meet — which, with `cov-01` and `cov-02` closed, is almost entirely `cov-03`:
 
 | where the rest went | base | fix |
 |---|---:|---:|
-| `putfield` of a non-`I/Z/B/C/S` tag (`cov-03`; `ir.rs:5210`→`5260`) | 37 | **60** |
-| `ldc` `0x12` (`cov-01`) | 92 | 102 |
-| `getstatic` `0xb2` (`cov-01`) | 93 | 96 |
-| `ldc_w` `0x13` (`cov-01`) | 7 | 8 |
-| a `new` whose site is `JitNewSite::Deferred` (`ir.rs:5304`) | 0 | 1 |
+| `putfield` of a non-`I/Z/B/C/S` tag (`cov-03`; `ir.rs:5337`→`5387`) | 45 | **78** |
+| `getfield` of a `long`/`float`/`double` (`cov-03`) | 6 | 4 |
+| a `new` whose site is `JitNewSite::Deferred` | 2 | 3 |
+| the opcode gap (`0xbc`, `0x53`, `0xb3`, `0x5c`) | 13 | 13 |
 
-Which is the ranking-shift the directory's own re-run rule predicts: `cov-03`'s
-`putfield` row grew by 23 and is now the largest builder refusal in the corpus
-by a wide margin — larger than every other structural refusal combined —
-because the methods that were hiding behind the invoke terms are constructors,
-and constructors write reference fields. Run-to-run variation on these counts is
-±1–2 events.
+Which is the ranking-shift the directory's own re-run rule predicts. `cov-03`'s
+`putfield` row grew by 33 and now accounts for **78 of the 85** builder refusals
+that remain — because the methods that were hiding behind the invoke terms are
+constructors, and constructors write reference fields. Run-to-run variation on
+these counts is ±1–3 events.
 
 Bail line numbers move with the edit. In the fixed binary the invoke bails are
-`ir.rs:5428` (`0xb7` — the old `5204`/`5219` pair merged, since a receiver that
-is not a fresh `Op::New` is now a call rather than a refusal), `ir.rs:5470`
-(`0xb6`/`0xb8`) and `ir.rs:5520` (`0xb9`).
+`ir.rs:5555` (`0xb7` — the old `5204`/`5219` pair merged, since a receiver that
+is not a fresh `Op::New` is now a call rather than a refusal), `ir.rs:5597`
+(`0xb6`/`0xb8`) and `ir.rs:5647` (`0xb9`).
 
 The brief asks for both halves to be quoted, and warns that a method which stops
 failing here and immediately fails on the next unlowered opcode is a real
-outcome and is not a body. That is most of what happened, and it was expected:
-`getstatic` + `ldc` is now **96% of the whole remaining opcode gap** (206 of
-214) with `cov-02` closed, and it is untouched.
+outcome and is not a body. That did happen — 36 of the 106 — but with `cov-01`
+and `cov-02` closed the opcode gap is down to **13 events on this whole corpus**,
+so nearly all of the shortfall lands on `cov-03` rather than dispersing.
 
 ### Correctness across a wider corpus
 
 The change admits a whole new population — every method containing a `new` —
 to the optimizing tier, so the three-workload A/B is not enough on its own. The
 **79-class Spring Boot regression list** (`/data/data/regr-list.tsv`) was run on
-both arms, interleaved per class with the arm order flipped between classes:
+both arms, interleaved per class with the arm order flipped between classes.
+Run twice, once per baseline, the second time after `cov-01` and `cov-02` had
+raised the fixed arm to 850 bodies — because "more C2 code executes" is exactly
+the condition under which a miscompile would show:
 
 | verdict | base | fix |
 |---|---:|---:|
@@ -217,8 +222,8 @@ both arms, interleaved per class with the arm order flipped between classes:
 | NOSUMMARY | 1 | 1 |
 | no classpath built | 1 | 1 |
 
-**Zero verdict mismatches across all 79.** Not one class changes state in
-either direction.
+**Zero verdict mismatches across all 79, both times.** Not one class changes
+state in either direction.
 
 Unit coverage, `jit/tests/ir_vs_singlepass.rs`:
 
@@ -238,7 +243,8 @@ Unit coverage, `jit/tests/ir_vs_singlepass.rs`:
 
 Each test names the exact edit that trips it, per this directory's rule 5. On
 the merged tree `cargo test --release -p cratonvm-jit --lib` is 1,868 / 0 and
-`--test ir_vs_singlepass` is 109 / 0 (this lane's three plus `cov-02`'s).
+`--test ir_vs_singlepass` is 121 / 0 (this lane's three plus `cov-01`'s and
+`cov-02`'s).
 
 ### One trap worth naming
 

@@ -106,42 +106,45 @@ are in the same function.
 **`cov-04` closed 2026-08-03** →
 [`docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).
 It was the one lane whose brief refused to size itself, and the grouping it
-demanded first contradicted both cases it had offered. **All 68 invoke bails
-were an `<init>`** — none was the "superclass or private `invokespecial` the arm
-has no path for" the brief led with, which inc 24 had already handled. They
-split 29 / 39 between a compiled constructor's `super(...)`/`this(...)` chain
-call (refused by a term whose comment claimed such a method "also has a `new`",
-which 35 of them did not) and a method containing a `new` (refused by a
+demanded first contradicted both cases it had offered. **Every invoke bail was
+an `<init>`** — none was the "superclass or private `invokespecial` the arm has
+no path for" the brief led with, which inc 24 had already handled. They split
+29 / 39 between a compiled constructor's `super(...)`/`this(...)` chain call
+(refused by a term whose comment claimed such a method "also has a `new`", which
+35 of them did not) and a method containing a `new` (refused by a
 `call_eligible` term whose stated reason — that the lowerer has no allocation
-path — expired when `ir_lower` grew one). Both terms are gone. Two things to
-carry into the neighbouring lanes:
+path — expired when `ir_lower` grew one). Both terms are gone.
 
-1. `ir.rs:5264`'s 13 events were **not** "the site was never resolved at compile
+Measured against `origin/dev` at `95152daea`, **with `cov-01` and `cov-02`
+already in it**: invoke refusals **106 → 0**, bodies **778 → 849 (+9%)**, and
+`cov-03`'s `putfield` row grew 45 → **78**, which is now **78 of the 85**
+builder refusals that remain. Correctness: the 79-class Spring Boot regression
+list, both arms interleaved, **zero verdict mismatches** (65 PASS / 12
+pre-existing FAIL, identical sets) — run once per baseline, the second time with
+the fixed arm producing 850 bodies.
+
+Three things to carry into the neighbouring lanes:
+
+1. **Every neighbour that lands makes the next lane bigger.** A method blocked
+   on `ldc` never reached its `invokespecial`, so `cov-01`'s landing roughly
+   doubled the `0xb7` site. This lane removed 69, then 69, then **106** invoke
+   refusals across three baselines — same code, same corpus, different
+   neighbours. Do not quote a lane's size without naming the tree it was
+   measured on.
+2. `ir.rs:5264`'s 13 events were **not** "the site was never resolved at compile
    time". Their callees are `StringBuilder.append` and `Class.getName`; they
    were collateral from a whole-method discard triggered by a constructor
    elsewhere in the same method. A bail site names the *first* thing the builder
    could not lower, which is rarely the thing that caused it — so read a
    structural-refusal row as "where the method died", never as "why".
-2. Both removed terms carried a comment stating a premise that was false when
+3. Both removed terms carried a comment stating a premise that was false when
    read and had been true when written. Rule 1 applies to a term's *comment*
    just as much as to a report's claim.
 
-Measured after, against `origin/dev` **with `cov-02` already in it**: invoke
-refusals 69 → **0**, bodies 655 → **683**, and `cov-03`'s `putfield` row grew
-37 → **60**, which makes it the largest builder refusal in the corpus by a wide
-margin — larger than every other structural refusal combined. That is the
-re-run rule below firing: the methods that were hiding behind the invoke terms
-are constructors, and constructors write reference fields. Correctness: the
-79-class Spring Boot regression list, both arms interleaved, **zero verdict
-mismatches** (65 PASS / 12 pre-existing FAIL, identical sets).
-
-With `cov-02` and `cov-04` both closed, `getstatic` + `ldc` is **96% of the
-whole remaining opcode gap** (206 of 214), and the only two structural refusals
-left are `cov-03`'s.
-
-**A third re-run trigger, alongside `cov-05`/`cov-06`/`cov-07`:** `cov-04` has
-already moved the `cov-01`/`cov-02`/`cov-03` rankings. Re-derive them before
-sizing any of those three from the survey's table.
+**With `cov-01`, `cov-02` and `cov-04` closed, `cov-03` is the whole remaining
+builder story** — 78 of 85 refusals — and the opcode gap is down to **13 events
+across the entire corpus**. Everything else left is in `ir_compatible`
+(`cov-05`/`cov-06`/`cov-07`).
 
 **Re-run the survey after any of `cov-05`/`cov-06`/`cov-07` lands.** Lifting a
 whole-method conjunct admits methods that were hiding behind it, and they fail

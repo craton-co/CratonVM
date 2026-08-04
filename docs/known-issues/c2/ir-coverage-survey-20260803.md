@@ -62,13 +62,12 @@ from a workload that does not reach it.
 
 `getstatic` + `ldc`/`ldc_w` is **189 of 273 — 69%** of every opcode gap.
 
-> **Stale since `cov-02` and `cov-04` landed (2026-08-03).** Re-measured on the
-> same three workloads with both lanes in, this table reads **214** events, not
-> 273, and every `cov-02` row is **zero**: `ldc` 92→**102**, `getstatic`
-> 93→**96**, `ldc_w` 7→**8**, `newarray` `0xbc` **5**, `0x53` **2**, `0x5c`
-> **1**. `getstatic` + `ldc`/`ldc_w` is therefore no longer 69% of the bucket —
-> it is **96% of it** (206 of 214), and `cov-01` is now very nearly the whole
-> opcode gap. Re-derive before sizing anything from these rows.
+> **Superseded — `cov-01`, `cov-02` and `cov-04` all closed 2026-08-03.**
+> Re-measured on the same three workloads with all three in, this whole table
+> is **13 events**, not 273: `newarray` `0xbc` 7, `0x53` 4, `0xb3` 1, `0x5c` 1,
+> and every `cov-01` and `cov-02` row is **zero**. The opcode gap is no longer
+> where the tier loses methods — `cov-03`'s `putfield` is (78 of the 85
+> structural refusals that remain). Do not size anything from these rows.
 
 ### The asymmetry worth staring at
 
@@ -99,20 +98,22 @@ fixture's node mix"* — showing up in the code rather than in a plan.
 **The four `cov-04` rows are one cause, not four, and this table says so
 misleadingly.** Closed 2026-08-03 —
 [`docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).
-All 69 events are an `<init>`: two whole-method terms discarded the method's
-entire `invoke_info` map, and the builder then bailed at whichever invoke came
-first in bytecode order. That is why `5264`'s callees are `StringBuilder.append`
-and `Class.getName` — sites that were never the problem. A bail site records
-where a method died; it does not record why, and a row that reads like an
-opcode-shaped gap can be neither.
+Every one of the events is an `<init>`: two whole-method terms discarded the
+method's entire `invoke_info` map, and the builder then bailed at whichever
+invoke came first in bytecode order. That is why `5264`'s callees are
+`StringBuilder.append` and `Class.getName` — sites that were never the problem.
+A bail site records where a method died; it does not record why, and a row that
+reads like an opcode-shaped gap can be neither.
 
-> **Also stale since `cov-04` landed.** With the four `cov-04` rows at zero the
-> table reads **67** events, not 112, and only three rows survive: `ir.rs:5085`
-> is **60** (not 37), the `getfield` row is **6**, and one new event is a `new`
-> whose site is `JitNewSite::Deferred`. `cov-03` therefore owns 66 of the 67 —
-> the largest builder refusal in the corpus by a wide margin, larger than every
-> other structural refusal combined. The methods that were hiding behind the
-> invoke terms are constructors, and constructors write reference fields.
+> **Superseded, and the counts moved in both directions.** With `cov-01` and
+> `cov-02` in, this table had grown to **159** events before `cov-04` landed —
+> the invoke rows nearly doubling, because a method blocked on `ldc` never
+> reached its `invokespecial`. With `cov-04` in as well it reads **85**, and
+> only three rows survive: `putfield` **78**, `getfield` **4**, and a `new`
+> whose site is `JitNewSite::Deferred` **3**. `cov-03` therefore owns 78 of the
+> 85 and is the whole remaining builder story. The methods that were hiding
+> behind the invoke terms are constructors, and constructors write reference
+> fields.
 
 `ir.rs:5085` is the second asymmetry. The `getfield` arm was taught to handle
 reference fields, and its own comment records why: *"This was the single largest
