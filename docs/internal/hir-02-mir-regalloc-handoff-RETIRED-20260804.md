@@ -108,22 +108,28 @@ pair — and the shadow pass measures with `SelectOptions::default()`, i.e.
 | methods through the machine list | 9 | 5 | 5 |
 | tiles the encoder emitted | 12 | 6 | 9 |
 | **byte mismatches** | **0** | **0** | **0** |
-| tiles it could encode but may not emit | 5 | 0 | 7 |
-| …bytes the per-opcode arms wrote for them | 115 | — | 150 |
-| …bytes the encoder would have written | **85** | — | **114** |
+| tiles it could encode but may not emit | 3–5 | 0 | 7 |
+| …bytes the per-opcode arms wrote for them | 69–115 | — | 150 |
+| …bytes the encoder would have written | **51–85** | — | **114** |
 
 Every phase produced a **bit-identical checksum** in all four modes (off,
 shadow, verify, emit): `2893201123071733440`, `-1727289071355132288`,
 `97968176938830464`.
 
 The last three rows are increment 2b's price tag, and they are the reason to
-keep the machine level rather than delete it: **265 bytes → 199 over 12 nodes,
-a quarter smaller**, on rules increment 2's oracle cannot cover. That is a
-number, not an argument, and it is what the next lane should be sized from.
+keep the machine level rather than delete it: on `pipeline`, which reproduced
+exactly across two binaries, **150 bytes → 114 over seven nodes — a quarter
+smaller**, on rules increment 2's oracle cannot cover. That is a number, not an
+argument, and it is what the next lane should be sized from.
 
-They also explain why the emitted-tile count *fell* from 39 to 27 when the
-operand pricing landed: those twelve nodes were only `Rule::AluReg` because the
-cost model could not see the load. Fewer tiles emitted, and a truer tiling.
+`dispatch` is given as a range on purpose: which methods reach the optimizing
+tier varies run to run on a loaded host (6–9 of them here), so its absolute
+figures are not reproducible even though its *ratio* is — 51/69 against
+114/150. Do not quote a single number for it.
+
+The same measurement explains why the emitted-tile count *fell*, from 39 to 27,
+when the operand pricing landed: those nodes were only `Rule::AluReg` because
+the cost model could not see the load. Fewer tiles emitted, and a truer tiling.
 
 ---
 
@@ -293,8 +299,8 @@ rather than here:
   the byte-equality oracle by construction — dropping a frame load is the
   point, so the bytes differ. They need a differential-execution oracle, which
   is `verify-01`'s harness, and a decision about whether the saving is worth
-  it — and verify mode has already priced it: **265 bytes → 199 over 12 nodes**
-  on this corpus (`shadow_tiles`, `arm_bytes`, `enc_bytes` on the
-  `[ir-isel] MIR TOTALS` line).
+  it — and verify mode has already priced it: **150 bytes → 114 over seven
+  nodes** on the `pipeline` phase (`shadow_tiles`, `arm_bytes`, `enc_bytes` on
+  the `[ir-isel] MIR TOTALS` line).
 * **Increment 3**, on the terms in §6.
 * **The XMM overlap**, which increment 3's prologue would remove (§5).

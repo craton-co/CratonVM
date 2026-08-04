@@ -359,7 +359,8 @@ a differential-execution oracle — `verify-01`'s harness — and a decision abo
 whether the saving is worth it. Verify mode already reports the size of the
 prize, on the `[ir-isel] MIR TOTALS` line: `shadow_tiles` is how many such tiles
 there were, `arm_bytes` and `enc_bytes` what the two paths would have written
-for exactly those nodes.
+for exactly those nodes. On CratonBenchC2's `pipeline` phase, reproduced across
+two binaries: **150 bytes → 114 over seven nodes**.
 
 ### Increment 3 — registers · **not built, deliberately**
 
