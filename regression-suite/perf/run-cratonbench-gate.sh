@@ -60,7 +60,7 @@
 #                    whole point of MEAS-02 — and the whole extra output was
 #                    counted at 0-4 lines / 0-419 bytes per phase, against a
 #                    shortest phase of 165 ms. See
-#                    docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md
+#                    meas-02-bench-suite-c2-reach-RETIRED-20260803.md
 #                    §6. Keep the flag for strict parity with an older result
 #                    set, and re-count if a phase ever starts issuing compile
 #                    requests in bulk.

@@ -342,7 +342,7 @@ pub enum Op {
     /// this node, because the not-yet-loaded resolution path can run a user
     /// classloader. Never throws and has no control-flow consequence, unlike
     /// its sibling `checkcast` (0xc0) below. See
-    /// `docs/internal/cov-05-checkcast-and-instanceof-RETIRED-*.md`.
+    /// `cov-05-checkcast-and-instanceof-RETIRED-*.md`.
     InstanceOf {
         name_ptr: usize,
         name_len: usize,
@@ -392,7 +392,7 @@ pub enum Op {
     /// call — exactly the mechanism `Op::CheckCast`'s helper-thrown
     /// `ClassCastException` already reaches via the shared
     /// `emit_call_return_check` sentinel-drain protocol. See
-    /// `docs/internal/cov-07-athrow-RETIRED-*.md` for the full reasoning,
+    /// `cov-07-athrow-RETIRED-*.md` for the full reasoning,
     /// including why `escape_analysis::program_order_proves_dominance` does
     /// NOT need a `may_throw` term for this: a throw always LEAVES the frame,
     /// it never creates a control edge back into normal flow.
@@ -5586,7 +5586,7 @@ impl IrBuilder {
                     // did so at stage one of the pipeline, invisibly. That is
                     // why the relocation-map contract could never be exercised:
                     // every probe written for it read a field
-                    // (docs/internal/jit-ir-relocation-map-contract.md).
+                    // (jit-ir-relocation-map-contract.md).
                     //
                     // The constraint belongs where the displacement is emitted.
                     // `ir_lower` lowers `Op::Load` through the checked
@@ -6817,7 +6817,7 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
 /// The builder answers `Option<Graph>`, so every refusal is indistinguishable
 /// from "the optimizing tier is switched off" — both present as zero IR bodies,
 /// and this investigation drew the second conclusion from the first twice
-/// (`docs/internal/jit-ir-relocation-map-contract.md`). Fifteen distinct
+/// (`jit-ir-relocation-map-contract.md`). Fifteen distinct
 /// `return None` sites share one observable outcome; only the site tells them
 /// apart, and nothing reported it.
 ///
@@ -6935,7 +6935,7 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // ANY non-empty `exception_table`, not on `has_athrow` — so an
     // athrow-bearing method that needs precise locals was already refused
     // there before it ever reached this conjunct. See
-    // `docs/internal/cov-07-athrow-RETIRED-*.md`.
+    // `cov-07-athrow-RETIRED-*.md`.
 
     // invokedynamic-uncommon-trap fix: the IR builder has no lowering for
     // 0xba (it bails cleanly via the main loop's `_ => return None` if one
@@ -7027,6 +7027,20 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     }
 
     // ── Surviving exclusions — real missing lowerings, not budgets ───
+    //  * ARRAY allocation of every arity. `newarray` (0xbc) and `anewarray`
+    //    (0xbd) have no arm in `IrBuilder::build`'s opcode match and `Op::New
+    //    Array` is constructed nowhere, so a method containing either bails at
+    //    the builder's `_ =>` catch-all; `multianewarray` additionally needs a
+    //    resolver-shaped helper sequence the lowerer cannot synthesize.
+    //
+    //    This used to be a `> IR_MAX_ALLOCATIONS` budget on `anewarray_ops`,
+    //    which ADMITTED up to 16 array allocations into a pipeline that cannot
+    //    lower one. Admission and the builder disagreeing is not merely untidy:
+    //    it is what made the optimizing tier produce zero bodies on every probe
+    //    written for the relocation-map contract while every gate upstream
+    //    reported "open" (jit-ir-relocation-map-contract.md). A
+    //    method the builder will refuse must be refused HERE, cheaply and with
+    //    a reason, not after a full graph build.
     //  * `multianewarray` (0xc5) — no arm in `IrBuilder::build`'s opcode
     //    match and `Op::NewArray` cannot represent a multi-dimensional
     //    allocation. Unlike `newarray`/`anewarray` (cov-06's first two
@@ -7050,8 +7064,8 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     //    compiled frame, which is what `precise_exception_frames` (checked by
     //    this function's caller) guards against, independently of which
     //    opcode throws. See
-    //    `docs/internal/cov-05-checkcast-and-instanceof-RETIRED-*.md` and
-    //    `docs/internal/cov-07-athrow-RETIRED-*.md`.
+    //    `cov-05-checkcast-and-instanceof-RETIRED-*.md` and
+    //    `cov-07-athrow-RETIRED-*.md`.
     //
     //    `IrBuilder::build`'s 0xc0/0xc1 arms additionally require the target
     //    class to be resolved-and-loaded at compile time (via

@@ -154,8 +154,154 @@ const R11: u8 = 11;
 
 // XMM scratch registers for the FP value tier (inc 30). Analogous to RAX/RCX:
 // XMM0 holds the first operand / result, XMM1 the second operand / a mask.
-const XMM0: u8 = 0;
-const XMM1: u8 = 1;
+const XMM0: u8 = crate::regalloc::xmm_roles::IR_FP_SCRATCH[0];
+const XMM1: u8 = crate::regalloc::xmm_roles::IR_FP_SCRATCH[1];
+
+/// The bytes of one `[RBP - disp]` access, without a heap allocation.
+///
+/// Seven is the longest form ([`enc_frame_load`]'s disp32 branch: REX + opcode
+/// + ModRM + four displacement bytes).
+#[derive(Clone, Copy)]
+struct FrameAccess {
+    bytes: [u8; 7],
+    len: usize,
+}
+
+impl FrameAccess {
+    fn new() -> FrameAccess {
+        FrameAccess {
+            bytes: [0; 7],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, b: u8) {
+        if let Some(cell) = self.bytes.get_mut(self.len) {
+            *cell = b;
+            self.len += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // `len` only ever advances through `push`, which bounds-checks.
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
+}
+
+/// The bytes of one whole tile, without a heap allocation.
+///
+/// Bounded on purpose. The widest sequence [`Lowerer::encode_tile_frame_homed`]
+/// can produce is two disp32 frame loads (7 each), a four-byte ALU instruction
+/// and a disp32 store (7) — 25 bytes. A tile that would need more is a tile
+/// this encoder has not been proved byte-equal for, and [`Self::push`] answers
+/// it with `None` rather than with a truncated instruction stream.
+#[derive(Clone, Copy)]
+struct FrameAccessList {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl FrameAccessList {
+    fn new() -> FrameAccessList {
+        FrameAccessList {
+            bytes: [0; 32],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, acc: &FrameAccess) -> Option<()> {
+        self.push_bytes(acc.as_slice())
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
+        // An empty push is a refusal, not a no-op: `enc_frame_load` writes
+        // nothing for a register it cannot encode, and swallowing that would
+        // drop the load.
+        if bytes.is_empty() {
+            return None;
+        }
+        let end = self.len.checked_add(bytes.len())?;
+        self.bytes.get_mut(self.len..end)?.copy_from_slice(bytes);
+        self.len = end;
+        Some(())
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Make this tile's bytes wrong, on purpose.
+    ///
+    /// The forcing function for the byte-equality oracle: a check that has
+    /// never been shown to fail is a check nobody knows the polarity of. See
+    /// `an_injected_wrong_byte_is_caught_by_the_oracle`.
+    #[cfg(test)]
+    fn corrupt_last_byte(&mut self) {
+        if let Some(last) = self.len.checked_sub(1).and_then(|i| self.bytes.get_mut(i)) {
+            *last ^= 0xFF;
+        }
+    }
+}
+
+/// `MOV reg, [RBP - offset]`, REX.W, smallest displacement form.
+///
+/// Extracted from `Lowerer::load_to_rax` / `load_to_rcx` so the level-2 tile
+/// encoder and the per-opcode emitters produce these bytes from **one** piece
+/// of code rather than from two that agree today. The byte-equality oracle
+/// increment 2 rests on is only as strong as that: two copies of a frame access
+/// can drift, and the drift would be invisible to a test that drives just one
+/// of them.
+///
+/// `reg` must be 0-7. There is no REX.R here — the callers are RAX and RCX,
+/// which is what makes the output identical to the literals it replaced — so a
+/// high register would silently encode as its low counterpart. Rather than
+/// widen the encoding (which would change the bytes) the function refuses: it
+/// writes nothing and the caller sees an empty accessor.
+fn enc_frame_load(reg: u8, offset: i32, out: &mut FrameAccess) {
+    if reg >= 8 {
+        return;
+    }
+    let neg = -offset;
+    out.push(0x48);
+    out.push(0x8B);
+    if (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&neg) {
+        // 48 8B 45 disp8 — mod=01, reg=<reg>, r/m=RBP(101)
+        out.push(0x45 | ((reg & 7) << 3));
+        out.push(neg as u8);
+    } else {
+        // 48 8B 85 disp32 — mod=10
+        out.push(0x85 | ((reg & 7) << 3));
+        for b in neg.to_le_bytes() {
+            out.push(b);
+        }
+    }
+}
+
+/// `MOV [RBP - offset], reg`, REX.W, smallest displacement form. The store half
+/// of [`enc_frame_load`]; the same `reg < 8` rule applies for the same reason.
+fn enc_frame_store(reg: u8, offset: i32, out: &mut FrameAccess) {
+    if reg >= 8 {
+        return;
+    }
+    let neg = -offset;
+    out.push(0x48);
+    out.push(0x89);
+    if (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&neg) {
+        // 48 89 45 disp8 — mod=01, reg=<reg>, r/m=RBP(101)
+        out.push(0x45 | ((reg & 7) << 3));
+        out.push(neg as u8);
+    } else {
+        // 48 89 85 disp32 — mod=10
+        out.push(0x85 | ((reg & 7) << 3));
+        for b in neg.to_le_bytes() {
+            out.push(b);
+        }
+    }
+}
 
 // Platform C-ABI integer argument registers for the `invoke_dispatch` helper
 // call (Gap B `Op::Call`). The helper's 4 args (vm_ptr, info_ptr, args_ptr,
@@ -579,6 +725,66 @@ struct Lowerer<'a> {
     /// register through its home word. Reported as
     /// `CompilationReport::reloads`.
     ls_reloads: usize,
+
+    // ── Level 2: the machine list ────────────────────────────────────
+    //
+    // Empty and `MirMode::Off` unless `CRATONVM_JIT=ir-isel-emit` or
+    // `ir-isel-verify` is set. See [`MirPlan`].
+    /// The selector's output for this method, one entry per scheduled block.
+    mir: Option<MirPlan>,
+    /// What to do with it.
+    mir_mode: MirMode,
+    /// Tiles whose bytes this compile took from the level-2 encoder
+    /// (`MirMode::Emit`) or checked against the per-opcode arms
+    /// (`MirMode::Verify`).
+    mir_tiles: usize,
+    /// Byte disagreements between the two paths. Non-zero refuses the compile:
+    /// increment 2 is where fail-closed returns.
+    mir_mismatches: usize,
+    /// Verify mode only, and it decides whether there is a next increment:
+    /// tiles the encoder can express but is NOT allowed to emit, because their
+    /// bytes are not identical to the per-opcode arm's.
+    mir_shadow_tiles: usize,
+    /// Bytes the per-opcode arms wrote for those tiles' nodes…
+    mir_arm_bytes: usize,
+    /// …and bytes the level-2 encoder would have written instead.
+    mir_enc_bytes: usize,
+}
+
+/// What the level-2 machine list is for on this compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MirMode {
+    /// Not built. The default, and every compile that does not set a flag.
+    Off,
+    /// Built, and checked against the per-opcode arms byte for byte. The
+    /// **per-opcode arms still emit** — this mode changes no emitted byte, so a
+    /// disagreement is a diagnosis rather than a wrong instruction. It is the
+    /// method-scale form of the anchoring property each `PATTERNS` row carries
+    /// per row, and it is the gate increment 2 has to pass on a real corpus
+    /// before [`MirMode::Emit`] is worth running.
+    Verify,
+    /// Built, and it emits. The per-opcode arm is not run for a node a tile
+    /// covers.
+    Emit,
+}
+
+/// Level 2 — the machine list, as a value the emitter can consume.
+///
+/// Deliberately not a new IR, a crate or a trait hierarchy: it is the
+/// selector's own `Vec<MInst>` per block, and the two side tables that already
+/// existed (`SlotPlan`, the frame plan; `RegResidency`, the allocation) stay
+/// where they are. That is the whole artifact
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md` says
+/// level 2's first form should be.
+struct MirPlan {
+    /// One selection per scheduled block, in block order.
+    blocks: Vec<crate::x64::isel::BlockSelection>,
+    /// `tile_of[node]` = index into `blocks[b].tiles` of the tile rooted at
+    /// `node`, for the block `b` the node was scheduled into.
+    ///
+    /// A node a tile *absorbed* is deliberately absent: it has no tile of its
+    /// own, and the encoder must never be asked to emit one for it.
+    tile_of: Vec<Option<(u32, u32)>>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -833,6 +1039,13 @@ impl<'a> Lowerer<'a> {
             reg_live: Vec::new(),
             ls_spills: 0,
             ls_reloads: 0,
+            mir: None,
+            mir_mode: MirMode::Off,
+            mir_tiles: 0,
+            mir_mismatches: 0,
+            mir_shadow_tiles: 0,
+            mir_arm_bytes: 0,
+            mir_enc_bytes: 0,
         }
     }
 
@@ -841,6 +1054,13 @@ impl<'a> Lowerer<'a> {
     fn set_residency(&mut self, residency: RegResidency) {
         self.reg_live = vec![false; residency.reg_of.len()];
         self.reg_of = residency.reg_of;
+    }
+
+    /// Install the level-2 machine list. Called once, after construction and
+    /// before any emission, only when a machine-level flag is on.
+    fn set_mir(&mut self, plan: MirPlan, mode: MirMode) {
+        self.mir = Some(plan);
+        self.mir_mode = mode;
     }
 
     /// The XMM register `id`'s value is CURRENTLY resident in, if any.
@@ -1002,6 +1222,46 @@ impl<'a> Lowerer<'a> {
     /// the nodes `prealloc_phi_slots` and `lower_data_node` allocate for), and
     /// refuses the compile rather than inventing an offset.
     fn alloc_slot_checked(&mut self, id: NodeId) -> CompileResult<i32> {
+        let offset = self.planned_slot_off(id)?;
+        // `planned_slot_off` already proved the offset non-zero and inside the
+        // frame; re-deriving the `NonZeroU32` here keeps the "no zero offsets"
+        // invariant enforced at the write, not merely upstream of it.
+        let located = u32::try_from(offset)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                Bailout::new(BailoutReason::Internal(
+                    "ir_lower: spill offset 0 would encode [rbp - 0] (saved caller RBP)",
+                ))
+            })?;
+        let cell = self.node_slot.get_mut(id as usize).ok_or_else(|| {
+            Bailout::new(BailoutReason::Internal("ir_lower: node id out of range"))
+        })?;
+        *cell = Some(located);
+        // Watermark, not a cursor: the highest word any emitted node's slot has
+        // reached. Every safepoint's `live_frame_hi` is read off this, and with
+        // reuse it stops growing once the peak live set is reached.
+        self.spill_high_water = self.spill_high_water.max(offset.saturating_add(8));
+        // Relocation contract: a slot becomes publishable the moment the
+        // emitting code writes it. `alloc_slot` is called at the point of
+        // emission for every node EXCEPT phis, whose slots are reserved up
+        // front by `prealloc_phi_slots` and written later by edge copies —
+        // those are marked separately, after the prologue zeroes them.
+        if !matches!(self.graph.nodes[id as usize].op, Op::Phi) {
+            self.defined_nodes[id as usize] = true;
+        }
+        Ok(offset)
+    }
+
+    /// The frame offset [`Self::alloc_slot_checked`] *will* assign `id`, without
+    /// assigning it.
+    ///
+    /// Split out so the level-2 tile encoder can encode a store to a
+    /// destination slot before the destination has been allocated, and get the
+    /// same answer the allocating path would — by calling the same code, not by
+    /// repeating the arithmetic. Every refusal below is the allocating path's
+    /// refusal, unchanged; only the three mutations live in the caller.
+    fn planned_slot_off(&self, id: NodeId) -> CompileResult<i32> {
         let color = match self.slot_plan.node_color.get(id as usize).copied().flatten() {
             Some(color) => color,
             None => {
@@ -1044,7 +1304,7 @@ impl<'a> Lowerer<'a> {
         // `first_spill > 0` and colours are non-negative, so this cannot be
         // `None` — but the conversion is where the "no zero offsets" invariant
         // is *enforced* rather than assumed, so it is checked, not asserted.
-        let located = u32::try_from(offset)
+        u32::try_from(offset)
             .ok()
             .and_then(NonZeroU32::new)
             .ok_or_else(|| {
@@ -1052,22 +1312,6 @@ impl<'a> Lowerer<'a> {
                     "ir_lower: spill offset 0 would encode [rbp - 0] (saved caller RBP)",
                 ))
             })?;
-        let cell = self.node_slot.get_mut(id as usize).ok_or_else(|| {
-            Bailout::new(BailoutReason::Internal("ir_lower: node id out of range"))
-        })?;
-        *cell = Some(located);
-        // Watermark, not a cursor: the highest word any emitted node's slot has
-        // reached. Every safepoint's `live_frame_hi` is read off this, and with
-        // reuse it stops growing once the peak live set is reached.
-        self.spill_high_water = self.spill_high_water.max(offset.saturating_add(8));
-        // Relocation contract: a slot becomes publishable the moment the
-        // emitting code writes it. `alloc_slot` is called at the point of
-        // emission for every node EXCEPT phis, whose slots are reserved up
-        // front by `prealloc_phi_slots` and written later by edge copies —
-        // those are marked separately, after the prologue zeroes them.
-        if !matches!(self.graph.nodes[id as usize].op, Op::Phi) {
-            self.defined_nodes[id as usize] = true;
-        }
         Ok(offset)
     }
 
@@ -2242,41 +2486,23 @@ fn reloc_emit_enabled() -> bool {
     /// within ±128 bytes of RBP, so the disp8 form is the common case
     /// and saves 3 bytes per frame access.
     fn load_to_rax(&mut self, offset: i32) {
-        let neg = -(offset as i32);
-        if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
-            // 48 8B 45 disp8  — mod=01, reg=RAX(0), r/m=RBP(101)
-            self.buf.emit(&[0x48, 0x8B, 0x45, neg as u8]);
-        } else {
-            // 48 8B 85 disp32 — mod=10
-            self.buf.emit(&[0x48, 0x8B, 0x85]);
-            self.buf.emit(&neg.to_le_bytes());
-        }
+        let mut bytes = FrameAccess::new();
+        enc_frame_load(RAX, offset, &mut bytes);
+        self.buf.emit(bytes.as_slice());
     }
 
     /// MOV RCX, [RBP - offset]
     fn load_to_rcx(&mut self, offset: i32) {
-        let neg = -(offset as i32);
-        if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
-            // 48 8B 4D disp8  — mod=01, reg=RCX(1), r/m=RBP(101)
-            self.buf.emit(&[0x48, 0x8B, 0x4D, neg as u8]);
-        } else {
-            // 48 8B 8D disp32 — mod=10
-            self.buf.emit(&[0x48, 0x8B, 0x8D]);
-            self.buf.emit(&neg.to_le_bytes());
-        }
+        let mut bytes = FrameAccess::new();
+        enc_frame_load(RCX, offset, &mut bytes);
+        self.buf.emit(bytes.as_slice());
     }
 
     /// MOV [RBP - offset], RAX
     fn store_rax(&mut self, offset: i32) {
-        let neg = -(offset as i32);
-        if (i8::MIN as i32..=i8::MAX as i32).contains(&neg) {
-            // 48 89 45 disp8  — mod=01, reg=RAX(0), r/m=RBP(101)
-            self.buf.emit(&[0x48, 0x89, 0x45, neg as u8]);
-        } else {
-            // 48 89 85 disp32 — mod=10
-            self.buf.emit(&[0x48, 0x89, 0x85]);
-            self.buf.emit(&neg.to_le_bytes());
-        }
+        let mut bytes = FrameAccess::new();
+        enc_frame_store(RAX, offset, &mut bytes);
+        self.buf.emit(bytes.as_slice());
     }
 
     /// MOV RAX, imm64
@@ -2478,9 +2704,13 @@ fn reloc_emit_enabled() -> bool {
 
         let block = &self.schedule.blocks[block_idx];
 
-        // Emit data nodes
+        // Emit data nodes.
+        //
+        // The level-2 detour is a no-op unless a machine-level flag is on; see
+        // `lower_data_node_through_mir`, which falls through to the per-opcode
+        // arm for every node no tile covers.
         for &node_id in &block.nodes {
-            self.lower_data_node(node_id);
+            self.lower_data_node_through_mir(block_idx, node_id);
         }
 
         // Emit terminator
@@ -3157,6 +3387,296 @@ fn reloc_emit_enabled() -> bool {
             // `Self::patch_or_bail` / `patch_rel32_to_here`.
             Self::patch_or_bail(&mut self.buf, p, rel);
         }
+    }
+
+    // ── Level 2: the machine list, emitting ──────────────────────────────
+    //
+    // Increment 2 of
+    // `docs/feature-designs/jit-machine-level-and-instruction-selection.md`:
+    // the selector's tiles become bytes, through the same `PATTERNS` table
+    // whose every row is anchored to a hand-written emitter, against the
+    // trivial allocation `ir_lower` has always used — every value in its frame
+    // word, RAX the destination, RCX the second operand.
+    //
+    // The whole increment is the byte-equality oracle. `MirMode::Verify` runs
+    // the per-opcode arm AND the tile encoder and compares; `MirMode::Emit`
+    // runs only the encoder. A mismatch in either mode refuses the compile.
+
+    /// The one entry point `lower_block` calls. Falls through to
+    /// [`Self::lower_data_node`] whenever the machine list has nothing to say
+    /// about `id`, which is every node on every compile that has not set a
+    /// machine-level flag.
+    fn lower_data_node_through_mir(&mut self, block_idx: usize, id: NodeId) {
+        let bytes = match self.mir_mode {
+            MirMode::Off => None,
+            MirMode::Verify | MirMode::Emit => self.mir_tile_bytes(block_idx, id),
+        };
+        let Some(bytes) = bytes else {
+            // Not emittable. In verify mode, still ask what the encoder WOULD
+            // have produced, and price it against what the arm writes — that
+            // difference is the size of the next increment, and it is the one
+            // number that decides whether there should be one.
+            if self.mir_mode == MirMode::Verify {
+                let shadow = self.mir_shadow_tile_bytes(block_idx, id);
+                let before = self.buf.pos();
+                self.lower_data_node(id);
+                let after = self.buf.pos();
+                if let Some(shadow) = shadow {
+                    self.mir_shadow_tiles += 1;
+                    self.mir_arm_bytes += after.saturating_sub(before);
+                    self.mir_enc_bytes += shadow.as_slice().len();
+                }
+                return;
+            }
+            self.lower_data_node(id);
+            return;
+        };
+        self.mir_tiles += 1;
+        if self.mir_mode == MirMode::Verify {
+            // The per-opcode arm is still the thing that emits, so this mode
+            // cannot produce a wrong instruction — only a wrong verdict.
+            let before = self.buf.pos();
+            self.lower_data_node(id);
+            let after = self.buf.pos();
+            let agreed = self
+                .buf
+                .as_slice()
+                .get(before..after)
+                .is_some_and(|emitted| emitted == bytes.as_slice());
+            if !agreed {
+                self.mir_mismatches += 1;
+            }
+            return;
+        }
+        // `MirMode::Emit`. Everything the per-opcode arm does besides emitting
+        // has to happen here too, in the same order: the bci anchor is read at
+        // the position the first byte lands on, and the slot allocation is what
+        // publishes the node to `defined_nodes` and moves the spill watermark.
+        if let Some(pc) = self.graph.nodes[id as usize].bytecode_pc {
+            let here = self.buf.pos();
+            self.bci_native
+                .entry(pc)
+                .and_modify(|e| {
+                    if here < *e {
+                        *e = here;
+                    }
+                })
+                .or_insert(here);
+        }
+        let slot = self.alloc_slot(id);
+        // The encoder wrote its store against `planned_slot_off`; if the
+        // allocating path just disagreed, the artifact is already wrong and no
+        // later check would notice. Refuse.
+        if self.planned_slot_off(id).ok() != Some(slot) {
+            self.mir_mismatches += 1;
+            self.latch_bailout(Bailout::new(BailoutReason::Internal(
+                "ir_lower: the level-2 encoder and alloc_slot disagreed on a destination slot",
+            )));
+            return;
+        }
+        self.buf.emit(bytes.as_slice());
+    }
+
+    /// The bytes the level-2 encoder produces for the tile rooted at `id`, or
+    /// `None` when there is no such tile or the encoder declines it.
+    ///
+    /// Declining is the normal answer and costs nothing: the caller lowers the
+    /// node the way it always did. What must never happen is a tile that
+    /// *absorbed* other nodes being emitted here — those nodes would then be
+    /// computed nowhere — so the cover list is checked against the root and
+    /// nothing else.
+    fn mir_tile_bytes(&self, block_idx: usize, id: NodeId) -> Option<FrameAccessList> {
+        let plan = self.mir.as_ref()?;
+        let (tb, ti) = (*plan.tile_of.get(id as usize)?)?;
+        if usize::try_from(tb).ok()? != block_idx {
+            return None;
+        }
+        let tile = plan
+            .blocks
+            .get(usize::try_from(tb).ok()?)?
+            .tiles
+            .get(usize::try_from(ti).ok()?)?;
+        if !mir_tile_is_emittable(tile, id) {
+            return None;
+        }
+        self.encode_tile_frame_homed(tile)
+    }
+
+    /// The frame word `id` lives in, **and** the fact that it lives there.
+    ///
+    /// The level-2 encoder's whole premise is that an operand can be read out
+    /// of its frame word. The linear-scan read cache makes that false for a
+    /// value it has published into a register — today only for `Float`/`Double`
+    /// (the file is XMM-only), which no integer tile can name. Asked rather
+    /// than assumed, per operand: the day the allocator grows a GP class, this
+    /// returns `None` and the tile is declined, instead of silently encoding a
+    /// load of a stale word.
+    fn frame_operand(&self, id: NodeId) -> Option<i32> {
+        if self.resident_xmm(id).is_some() {
+            return None;
+        }
+        self.slot_of_checked(id).ok()
+    }
+
+    /// The frame word a tile will STORE its result into.
+    ///
+    /// `planned_slot_off` rather than `slot_of_checked` because the destination
+    /// has not been allocated yet when the encoder runs — the emit path calls
+    /// `alloc_slot` afterwards and checks the two agree. The residency gate is
+    /// the same one [`Self::frame_operand`] applies, for the same reason: a
+    /// value the allocator publishes into a register is a value whose frame
+    /// word is not the whole truth.
+    fn frame_destination(&self, id: NodeId) -> Option<i32> {
+        if self.resident_xmm(id).is_some() {
+            return None;
+        }
+        self.planned_slot_off(id).ok()
+    }
+
+    /// What the level-2 encoder *would* emit for `id`, whatever the rule.
+    ///
+    /// Verify mode only, and it emits nothing: this is how the next increment
+    /// gets sized with a number instead of an argument. `mir_tile_bytes` is
+    /// restricted to `Rule::AluReg` because that is the only rule whose bytes
+    /// are provably identical to the per-opcode arm's — and byte equality is
+    /// increment 2's whole oracle. The rules that would *improve* the code
+    /// (`AluImm` drops a frame load) cannot ride that oracle by construction,
+    /// so what they are worth has to be measured separately, against the bytes
+    /// the arms actually wrote.
+    ///
+    /// Restricted to tiles covering exactly their own root, for the same reason
+    /// [`mir_tile_is_emittable`] is: a tile that absorbed other nodes cannot be
+    /// compared against one node's byte range.
+    fn mir_shadow_tile_bytes(&self, block_idx: usize, id: NodeId) -> Option<FrameAccessList> {
+        let plan = self.mir.as_ref()?;
+        let (tb, ti) = (*plan.tile_of.get(id as usize)?)?;
+        if usize::try_from(tb).ok()? != block_idx {
+            return None;
+        }
+        let tile = plan
+            .blocks
+            .get(usize::try_from(tb).ok()?)?
+            .tiles
+            .get(usize::try_from(ti).ok()?)?;
+        if tile.root != id || tile.covered.as_slice() != [id] {
+            return None;
+        }
+        self.encode_tile_frame_homed(tile)
+    }
+
+    /// Encode one tile against the frame-homed allocation.
+    ///
+    /// "Frame-homed" is not a simplification of a register allocation — it *is*
+    /// this backend's allocation, the one `ir_lower::frame_word_off` states by
+    /// returning `Err` for `ValueLoc::Reg`. Every value lives in its frame word;
+    /// RAX carries the tile's destination and RCX its second operand, exactly as
+    /// the per-opcode arms use them. That is what makes byte equality reachable
+    /// at all, and it is why increment 3 (real registers) is a separate step
+    /// with a prologue prerequisite.
+    ///
+    /// The two-address `MInst::Move` prefix costs nothing here and is not
+    /// dropped: "copy the left operand into the destination's register" and
+    /// "load the left operand" are the same instruction when the destination's
+    /// register is RAX, so the tracker below emits it once whether the selector
+    /// asked for the copy or coalesced it away.
+    fn encode_tile_frame_homed(&self, tile: &crate::x64::isel::Tile) -> Option<FrameAccessList> {
+        use crate::x64::isel::{select, MInst, Operand, Req, Ty};
+
+        let mut out = FrameAccessList::new();
+        // Which value RAX currently holds, if the tile has already loaded one.
+        let mut rax_holds: Option<NodeId> = None;
+        for inst in &tile.insts {
+            match *inst {
+                MInst::Move {
+                    dst,
+                    ty: Ty::I64,
+                    src,
+                } => {
+                    if dst != tile.root {
+                        return None;
+                    }
+                    let mut acc = FrameAccess::new();
+                    enc_frame_load(RAX, self.frame_operand(src)?, &mut acc);
+                    out.push(&acc)?;
+                    rax_holds = Some(src);
+                }
+                MInst::AluRR {
+                    op,
+                    ty,
+                    dst,
+                    lhs,
+                    rhs,
+                } => {
+                    if dst != tile.root {
+                        return None;
+                    }
+                    if rax_holds != Some(lhs) {
+                        let mut acc = FrameAccess::new();
+                        enc_frame_load(RAX, self.frame_operand(lhs)?, &mut acc);
+                        out.push(&acc)?;
+                    }
+                    let mut acc = FrameAccess::new();
+                    enc_frame_load(RCX, self.frame_operand(rhs)?, &mut acc);
+                    out.push(&acc)?;
+                    // Level 3. `select` refuses rather than inventing an
+                    // encoding, and every row it can answer with names the
+                    // hand-written emitter it reproduces byte for byte.
+                    let sel = select(&Req::new(
+                        op,
+                        ty,
+                        Operand::Gpr(RAX),
+                        Operand::Gpr(RCX),
+                    ))
+                    .ok()?;
+                    out.push_bytes(&sel.encoded.bytes)?;
+                    let mut acc = FrameAccess::new();
+                    enc_frame_store(RAX, self.frame_destination(dst)?, &mut acc);
+                    out.push(&acc)?;
+                    rax_holds = None;
+                }
+                // `dst <- lhs op imm`. Reachable only from the SHADOW path —
+                // `mir_tile_is_emittable` admits `Rule::AluReg` and nothing
+                // else — because this form is not byte-equal to anything: the
+                // per-opcode arm materialises the constant into RCX and uses
+                // the register form, and dropping that load is the whole point.
+                // It is encoded here so the saving can be *measured* before it
+                // is spent.
+                MInst::AluRI {
+                    op,
+                    ty,
+                    dst,
+                    lhs,
+                    imm,
+                    form: _,
+                } => {
+                    if dst != tile.root {
+                        return None;
+                    }
+                    if rax_holds != Some(lhs) {
+                        let mut acc = FrameAccess::new();
+                        enc_frame_load(RAX, self.frame_operand(lhs)?, &mut acc);
+                        out.push(&acc)?;
+                    }
+                    let sel = select(&Req::new(op, ty, Operand::Gpr(RAX), Operand::Imm(imm))).ok()?;
+                    out.push_bytes(&sel.encoded.bytes)?;
+                    let mut acc = FrameAccess::new();
+                    enc_frame_store(RAX, self.frame_destination(dst)?, &mut acc);
+                    out.push(&acc)?;
+                    rax_holds = None;
+                }
+                // Anything else is a shape this encoder has not been proved
+                // byte-equal for. Refusing is free; guessing is not.
+                _ => return None,
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        #[cfg(test)]
+        if mir_injecting_a_wrong_byte() {
+            out.corrupt_last_byte();
+        }
+        Some(out)
     }
 
     fn lower_data_node(&mut self, id: NodeId) {
@@ -7036,7 +7556,13 @@ fn verify_slot_colouring(
 /// The consequence worth stating plainly: this wiring is **FP-only**. An `int`
 /// loop counter gets nothing out of it. That is the price of not touching the
 /// prologue, and it is the first thing to revisit — see the doc.
-const IR_LOWER_LS_XMMS: [u8; 4] = [2, 3, 4, 5];
+///
+/// The literal lives in `regalloc::xmm_roles`, with the other two XMM
+/// authorities — `ir_lower`'s own scratch pair below and `vec_emit`'s vector
+/// pool — so that a wiring which puts two of them on one register is a visible
+/// fact rather than a discovery. See that module for why the vector pool
+/// overlaps this file completely and cannot yet be separated.
+const IR_LOWER_LS_XMMS: [u8; 4] = crate::regalloc::xmm_roles::IR_LINEAR_SCAN;
 
 /// `CRATONVM_JIT_IR_ISEL_SHADOW` — run the instruction selector over this
 /// compile's blocks, count what it would have produced, and **discard it**.
@@ -7060,6 +7586,257 @@ fn isel_shadow_enabled() -> bool {
 /// `CRATONVM_DBG=ir-isel` — print one shadow-selection line per compile.
 fn isel_shadow_reporting() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_ISEL").is_some()
+}
+
+/// `CRATONVM_JIT=ir-isel-verify` — build the level-2 machine list and check the
+/// tile encoder against the per-opcode arms, byte for byte. Default **off**.
+///
+/// Changes no emitted byte: the per-opcode arms still emit, and the encoder's
+/// output is compared against what they wrote. This is the method-scale form of
+/// the anchoring property each `PATTERNS` row carries per row, and it is the
+/// gate [`isel_emit_enabled`] has to pass on a real corpus first.
+fn isel_verify_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(mode) = mir_forced() {
+            return mode == MirMode::Verify;
+        }
+    }
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ISEL_VERIFY") {
+        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// `CRATONVM_JIT=ir-isel-emit` — the level-2 machine list emits, for the tiles
+/// the encoder covers. Default **off**.
+///
+/// Fail-closed, unlike `ir-isel-shadow`: a block the selector does not cover, a
+/// tile whose bytes disagree with the destination slot the allocator hands out,
+/// or an encoder refusal *after* the tile was admitted all discard the
+/// artifact, and the method runs in a lower tier. That is always valid, and it
+/// is the trade increment 0 was explicitly exempt from because its documented
+/// effect was a count.
+fn isel_emit_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(mode) = mir_forced() {
+            return mode == MirMode::Emit;
+        }
+    }
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ISEL_EMIT") {
+        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for the two machine-level flags, so a unit test never
+    /// depends on the process environment. Thread-local, so parallel tests
+    /// cannot see each other's setting.
+    static MIR_FORCE: std::cell::Cell<Option<MirMode>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn mir_forced() -> Option<MirMode> {
+    MIR_FORCE.with(|c| c.get())
+}
+
+/// Scoped override of the machine-level mode for one test.
+#[cfg(test)]
+struct MirForce;
+
+#[cfg(test)]
+impl MirForce {
+    fn set(mode: MirMode) -> MirForce {
+        MIR_FORCE.with(|c| c.set(Some(mode)));
+        MirForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for MirForce {
+    fn drop(&mut self) {
+        MIR_FORCE.with(|c| c.set(None));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: make the level-2 encoder produce a deliberately wrong byte,
+    /// so the byte-equality oracle can be observed *failing*. A guard nobody
+    /// has ever seen fail is a guard of unknown polarity.
+    static MIR_INJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn mir_injecting_a_wrong_byte() -> bool {
+    MIR_INJECT.with(|c| c.get())
+}
+
+/// Scoped byte injection for one test.
+#[cfg(test)]
+struct MirInject;
+
+#[cfg(test)]
+impl MirInject {
+    fn on() -> MirInject {
+        MIR_INJECT.with(|c| c.set(true));
+        MirInject
+    }
+}
+
+#[cfg(test)]
+impl Drop for MirInject {
+    fn drop(&mut self) {
+        MIR_INJECT.with(|c| c.set(false));
+    }
+}
+
+/// Process totals for the level-2 machine list, so a corpus run has a number
+/// rather than a stream of per-compile lines.
+///
+/// Read them with [`mir_totals::read`]; the `--dump-jit-stats` style consumers
+/// and the corpus probe both go through it. Plain atomics rather than a mutex:
+/// this runs inside the compile path, on the compiler thread, and a torn read
+/// of a diagnostic counter is not worth a lock.
+pub mod mir_totals {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static METHODS: AtomicU64 = AtomicU64::new(0);
+    static TILES: AtomicU64 = AtomicU64::new(0);
+    static MISMATCHES: AtomicU64 = AtomicU64::new(0);
+    static SHADOW_TILES: AtomicU64 = AtomicU64::new(0);
+    static ARM_BYTES: AtomicU64 = AtomicU64::new(0);
+    static ENC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn record(
+        tiles: usize,
+        mismatches: usize,
+        shadow_tiles: usize,
+        arm_bytes: usize,
+        enc_bytes: usize,
+    ) {
+        METHODS.fetch_add(1, Relaxed);
+        TILES.fetch_add(tiles as u64, Relaxed);
+        MISMATCHES.fetch_add(mismatches as u64, Relaxed);
+        SHADOW_TILES.fetch_add(shadow_tiles as u64, Relaxed);
+        ARM_BYTES.fetch_add(arm_bytes as u64, Relaxed);
+        ENC_BYTES.fetch_add(enc_bytes as u64, Relaxed);
+    }
+
+    /// `(methods, tiles, mismatches)` since process start.
+    pub fn read() -> (u64, u64, u64) {
+        (
+            METHODS.load(Relaxed),
+            TILES.load(Relaxed),
+            MISMATCHES.load(Relaxed),
+        )
+    }
+
+    /// `(shadow_tiles, arm_bytes, encoder_bytes)` — verify mode's sizing of the
+    /// increment that would emit the rules byte equality cannot cover.
+    ///
+    /// `arm_bytes - encoder_bytes` is what those tiles would save, over exactly
+    /// the nodes they cover, on this workload. A zero `shadow_tiles` means the
+    /// question does not arise; it does not mean the saving is zero.
+    pub fn read_shadow() -> (u64, u64, u64) {
+        (
+            SHADOW_TILES.load(Relaxed),
+            ARM_BYTES.load(Relaxed),
+            ENC_BYTES.load(Relaxed),
+        )
+    }
+
+    /// Zero the accumulator. Tests only — hold [`TEST_LOCK`] across the reset
+    /// AND the read, or two tests reading one global see each other's counts.
+    #[cfg(test)]
+    pub fn reset() {
+        for c in [
+            &METHODS,
+            &TILES,
+            &MISMATCHES,
+            &SHADOW_TILES,
+            &ARM_BYTES,
+            &ENC_BYTES,
+        ] {
+            c.store(0, Relaxed);
+        }
+    }
+
+    /// Serialises the tests that read the counters above. Its own lock, not
+    /// `isel::SHADOW_TEST_LOCK`: these are different globals, and sharing one
+    /// mutex between two unrelated accumulators is how a later test ends up
+    /// holding the wrong one.
+    #[cfg(test)]
+    pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
+/// May the level-2 encoder answer for node `id`'s lowering with this tile?
+///
+/// Three conditions, and the third is the one that is not obvious. The caller
+/// skips **every** node a tile covers, so a tile that absorbed a node the
+/// encoder does not actually fold leaves that node computed nowhere — the same
+/// failure `BlockSelection::covers` exists to make unrepresentable, one level
+/// further down. `Rule::AluReg` never absorbs, so today this clause is
+/// insurance rather than a live filter; a rule added to the set below without a
+/// fold is exactly what it is insurance against.
+fn mir_tile_is_emittable(tile: &crate::x64::isel::Tile, id: NodeId) -> bool {
+    use crate::x64::isel::Rule;
+
+    tile.root == id && tile.rule == Rule::AluReg && tile.covered.as_slice() == [id]
+}
+
+/// Build the level-2 machine list for one method, or refuse.
+///
+/// `None` means "do not compile this method through the machine level" and is
+/// returned for exactly one reason: a block the selector did not cover. That is
+/// the invariant `BlockSelection::covers` exists for — a node covered zero times
+/// is a dropped instruction — and increment 0 measured it holding on all 1 911
+/// blocks of a real Spring Boot workload, so a violation here is a compiler bug
+/// and not a shape to work around.
+///
+/// `SelectOptions::default()` for the same reason `shadow_select_method` uses
+/// it: `require_encodable: true`, and `fold_loads: false` because the fold's
+/// address half is still `AddrSource::Opaque`.
+fn build_mir_plan(graph: &Graph, schedule: &Schedule) -> Option<MirPlan> {
+    use crate::x64::isel::{select_block, SelectOptions};
+
+    // `frame_homed: true` is the one departure from `shadow_select_method`'s
+    // options, and it is a statement about the consumer rather than a tuning
+    // knob: `encode_tile_frame_homed` puts every value in its frame word, so
+    // the two-address copy the cost model would otherwise charge the ALU form
+    // does not exist. Left `false` it makes `Rule::Lea` outbid `Rule::AluReg`
+    // on `a + b` whenever `a` is live afterwards, and the `LEA` that wins is a
+    // byte longer than the `ADD` it replaced.
+    let opts = SelectOptions {
+        frame_homed: true,
+        ..SelectOptions::default()
+    };
+    let mut blocks = Vec::with_capacity(schedule.blocks.len());
+    let mut tile_of: Vec<Option<(u32, u32)>> = vec![None; graph.nodes.len()];
+    for (bi, block) in schedule.blocks.iter().enumerate() {
+        let sel = select_block(graph, &block.nodes, block.terminator, &opts);
+        if !sel.covers(&block.nodes) {
+            return None;
+        }
+        let bi = u32::try_from(bi).ok()?;
+        for (ti, tile) in sel.tiles.iter().enumerate() {
+            let ti = u32::try_from(ti).ok()?;
+            if let Some(cell) = tile_of.get_mut(tile.root as usize) {
+                // Two tiles rooted at one node would mean the node is computed
+                // twice; `covers` already refused that, so this is belt and
+                // braces on the index rather than a second policy.
+                if cell.is_some() {
+                    return None;
+                }
+                *cell = Some((bi, ti));
+            }
+        }
+        blocks.push(sel);
+    }
+    Some(MirPlan { blocks, tile_of })
 }
 
 /// `CRATONVM_JIT_IR_LINEAR_SCAN=1` — run the linear-scan allocator and use its
@@ -7715,7 +8492,7 @@ pub fn lower_with_scalar_deopt(
 /// interpreted forever. A single Spring Boot suite class produced **8072** such
 /// warnings in one run, every one of them from this estimate (the report that
 /// first noticed the flood,
-/// `docs/internal/fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
+/// `fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
 /// attributed them to the single-pass backend's estimate — that one accounted
 /// for 10).
 ///
@@ -8096,7 +8873,7 @@ pub(crate) fn lower_inner_with_scopes(
     // 300_000. Downstream it silently emptied Spring Boot's property binding,
     // because `BindHandler.onSuccess(name, target, context, result)` is
     // `aload 4; areturn` over five slots — see
-    // `docs/internal/fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
+    // `fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
     // for the trail from there to `BindResult.isBound() == false` for every
     // property.
     //
@@ -8163,6 +8940,30 @@ pub(crate) fn lower_inner_with_scopes(
         }
     }
 
+    // ── The level-2 machine list (default OFF) ───────────────────────
+    //
+    // Increment 2. Unlike the shadow pass above this one IS fail-closed, in
+    // both its modes: a method whose blocks the selector cannot cover, or whose
+    // tiles disagree with the per-opcode arms, loses its optimized body rather
+    // than getting one nobody checked.
+    let mir_mode = if isel_emit_enabled() {
+        Some(MirMode::Emit)
+    } else if isel_verify_enabled() {
+        Some(MirMode::Verify)
+    } else {
+        None
+    };
+    if let Some(mode) = mir_mode {
+        match build_mir_plan(graph, schedule) {
+            Some(plan) => lowerer.set_mir(plan, mode),
+            None => {
+                return refuse(Bailout::new(BailoutReason::Internal(
+                    "ir_lower: instruction selection did not cover a block",
+                )))
+            }
+        }
+    }
+
     lowerer.emit_prologue();
     lowerer.emit_safepoint_poll();
 
@@ -8182,6 +8983,35 @@ pub(crate) fn lower_inner_with_scopes(
     // net, not a mechanism. It is kept, and upgraded from one sticky bit to a
     // structured reason, so that if a future lowering finds a path the
     // pre-checks miss, the compile still fails closed *and* says why.
+    // The byte-equality oracle's verdict, for the whole method.
+    //
+    // Reported before it is acted on, because a mismatch that only ever shows
+    // up as "this method did not compile" is a mismatch nobody can diagnose.
+    if lowerer.mir_mode != MirMode::Off {
+        // Only the disagreements, and only under the debug switch: a corpus run
+        // compiles thousands of methods, and a per-compile line for each would
+        // bury the one line that matters. The totals are printed once at exit
+        // (`vm-cli::maybe_dump_shutdown_reports`).
+        if lowerer.mir_mismatches != 0 && isel_shadow_reporting() {
+            eprintln!(
+                "[ir-isel] mir mode={:?} tiles={} MISMATCHES={}",
+                lowerer.mir_mode, lowerer.mir_tiles, lowerer.mir_mismatches
+            );
+        }
+        mir_totals::record(
+            lowerer.mir_tiles,
+            lowerer.mir_mismatches,
+            lowerer.mir_shadow_tiles,
+            lowerer.mir_arm_bytes,
+            lowerer.mir_enc_bytes,
+        );
+        if lowerer.mir_mismatches != 0 {
+            return refuse(Bailout::new(BailoutReason::Internal(
+                "ir_lower: the level-2 encoder disagreed with the per-opcode lowering",
+            )));
+        }
+    }
+
     if let Some(bailout) = lowerer.take_latched_bailout() {
         return refuse(bailout);
     }
@@ -11194,7 +12024,7 @@ mod tests {
     /// is `false`, so a young collection that meets an unprovable compiled frame
     /// falls back to the non-moving sweep instead of relocating, and an
     /// unpublished root produces no observable stale pointer. See
-    /// `docs/internal/cov-02-array-element-access-RETIRED-20260803.md`. So the
+    /// `cov-02-array-element-access-RETIRED-20260803.md`. So the
     /// property is asserted where it is actually decided.
     ///
     /// **Anti-vacuity, executed rather than argued.** The mutation was run:
@@ -12445,6 +13275,209 @@ mod tests {
             declared.contains(&"CRATONVM_DBG_IR_ISEL"),
             "`CRATONVM_DBG_IR_ISEL` is not in `types/src/flag_groups.rs`"
         );
+        // Increment 2's two flags, same rule.
+        for key in ["CRATONVM_JIT_IR_ISEL_EMIT", "CRATONVM_JIT_IR_ISEL_VERIFY"] {
+            assert!(
+                declared.contains(&key),
+                "`{key}` is not in `types/src/flag_groups.rs`"
+            );
+        }
+    }
+
+    // ── Increment 2: the machine list emits ───────────────────────────
+    //
+    // The oracle is byte equality on a corpus: compile a method both ways and
+    // compare the emitted bytes. Every `PATTERNS` row carries that property per
+    // row — it names the hand-written emitter it reproduces — and these are the
+    // same check at method scale.
+
+    /// `int f(int a, int b) { return (a + b) * a; }` — `iload_0; iload_1;
+    /// iadd; iload_0; imul; ireturn`, and the length is **6**, the whole
+    /// method. (The neighbouring shadow tests pass 4, which truncates after the
+    /// `iload_0` and leaves the multiply out of the graph entirely; that costs
+    /// them nothing because they only count, but it would make every assertion
+    /// below about `Rule::AluReg` vacuous.)
+    #[cfg(test)]
+    const MIR_ALU_CODE: [u8; 8] = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0xac, 0, 0];
+
+    #[cfg(test)]
+    fn mir_emitted_bytes(mode: Option<MirMode>) -> Vec<u8> {
+        let _force = mode.map(MirForce::set);
+        let cm = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
+        // SAFETY: the artifact is alive for the duration of this borrow, and
+        // `code_len` is what the emitter wrote.
+        unsafe {
+            std::slice::from_raw_parts(cm.entry_ptr() as *const u8, cm.code_len()).to_vec()
+        }
+    }
+
+    /// The level-2 encoder reproduces the per-opcode arms **byte for byte**.
+    ///
+    /// This is increment 2's whole deliverable. `Rule::AluReg`'s seven rows are
+    /// anchored to the exact literals `lower_data_node` emits — `01 C8`,
+    /// `29 C8`, `0F AF C1`, `48 21 C8` and so on — and the frame-homed
+    /// allocation the encoder assumes IS this backend's allocation, so equality
+    /// is reachable rather than approximate.
+    ///
+    /// The exact edit that trips it: change any of those literals in
+    /// `lower_data_node`, or change `enc_frame_load`'s displacement-form choice
+    /// on one side only.
+    #[test]
+    fn the_machine_level_emits_the_same_bytes_as_the_per_opcode_arms() {
+        let _guard = mir_totals::TEST_LOCK.lock();
+        mir_totals::reset();
+
+        let off = mir_emitted_bytes(None);
+        let emit = mir_emitted_bytes(Some(MirMode::Emit));
+        assert!(!off.is_empty(), "precondition: the method compiled to bytes");
+        assert_eq!(off, emit, "the level-2 encoder changed the emitted bytes");
+
+        // Not vacuous: tiles were actually taken. A path that declined every
+        // tile would satisfy the equality above trivially.
+        let (methods, tiles, mismatches) = mir_totals::read();
+        assert_eq!(methods, 1, "exactly one method went through the machine list");
+        assert!(
+            tiles >= 2,
+            "`(a + b) * a` has two AluReg roots; the encoder took {tiles}"
+        );
+        assert_eq!(mismatches, 0);
+    }
+
+    /// Verify mode is the same oracle without the risk: the per-opcode arms
+    /// still emit, and the encoder's answer is compared against what they wrote.
+    #[test]
+    fn verify_mode_agrees_and_changes_no_emitted_byte() {
+        let _guard = mir_totals::TEST_LOCK.lock();
+        mir_totals::reset();
+
+        let off = mir_emitted_bytes(None);
+        let verify = mir_emitted_bytes(Some(MirMode::Verify));
+        assert_eq!(off, verify, "verify mode must not change an emitted byte");
+
+        let (methods, tiles, mismatches) = mir_totals::read();
+        assert_eq!(methods, 1);
+        assert!(tiles >= 2, "verify mode checked {tiles} tiles");
+        assert_eq!(mismatches, 0, "the two paths disagreed");
+    }
+
+    /// The oracle can FAIL. Injected, because a guard nobody has seen fail is a
+    /// guard of unknown polarity — and this one's whole job is to be believed
+    /// when it stays silent over a corpus.
+    ///
+    /// Both halves matter: verify mode must *count* the disagreement, and the
+    /// compile must be *refused* rather than shipped with a body nothing
+    /// checked. Increment 2 is where fail-closed returns.
+    #[test]
+    fn an_injected_wrong_byte_is_caught_by_the_oracle() {
+        let _guard = mir_totals::TEST_LOCK.lock();
+        mir_totals::reset();
+
+        let _inject = MirInject::on();
+        let _force = MirForce::set(MirMode::Verify);
+        let refused = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2);
+        assert!(
+            refused.is_none(),
+            "a disagreeing method must lose its optimized body, not ship it"
+        );
+        let (_, _, mismatches) = mir_totals::read();
+        assert!(
+            mismatches >= 1,
+            "the byte-equality oracle did not notice a corrupted tile"
+        );
+    }
+
+    /// With both flags off — the default, and every compile today — the machine
+    /// list is not built at all.
+    ///
+    /// The counter, not the bytes: "changed no byte" and "did not execute" are
+    /// different claims, and the equality tests above would pass vacuously on a
+    /// path that never ran.
+    #[test]
+    fn the_machine_level_is_off_by_default() {
+        let _guard = mir_totals::TEST_LOCK.lock();
+        mir_totals::reset();
+
+        compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
+
+        assert_eq!(
+            mir_totals::read(),
+            (0, 0, 0),
+            "the machine list was built without being asked"
+        );
+    }
+
+    /// A tile that absorbed another node must never reach the encoder.
+    ///
+    /// `Rule::AluReg` covers exactly its own root, so this guard is insurance
+    /// against a future rule rather than a live filter — which is precisely why
+    /// it is tested directly instead of through a compile. Driven through one it
+    /// would be vacuous: the rules that DO absorb (`Lea`, `AluImm`, the fused
+    /// branches) are already refused a line earlier, by rule.
+    ///
+    /// What it prevents: the caller skips every node a tile covers, so a tile
+    /// that absorbed a node the encoder does not actually fold leaves that node
+    /// computed nowhere. That is the same failure `BlockSelection::covers`
+    /// exists to make unrepresentable, one level lower down.
+    ///
+    /// The exact edit that trips it: delete the `covered.as_slice() == [id]`
+    /// clause from `mir_tile_is_emittable`.
+    #[test]
+    fn the_encoder_refuses_a_tile_that_absorbed_another_node() {
+        use crate::x64::isel::{MInst, Op as SelOp, Rule, Tile, Ty};
+
+        let alu = |dst: NodeId, lhs: NodeId, rhs: NodeId| MInst::AluRR {
+            op: SelOp::Add,
+            ty: Ty::I32,
+            dst,
+            lhs,
+            rhs,
+        };
+        // The shape the encoder handles: one root, nothing absorbed.
+        let plain = Tile::for_test(5, vec![5], vec![alu(5, 3, 4)], Rule::AluReg);
+        assert!(mir_tile_is_emittable(&plain, 5));
+
+        // The same tile, having absorbed node 4.
+        let absorbing = Tile::for_test(5, vec![5, 4], vec![alu(5, 3, 4)], Rule::AluReg);
+        assert!(
+            !mir_tile_is_emittable(&absorbing, 5),
+            "a tile that absorbed node 4 would leave it computed nowhere"
+        );
+
+        // And a rule the encoder has not been proved byte-equal for, however
+        // ordinary its cover list.
+        let other = Tile::for_test(5, vec![5], vec![alu(5, 3, 4)], Rule::AluImm);
+        assert!(!mir_tile_is_emittable(&other, 5));
+        // A tile rooted somewhere else is never this node's answer.
+        assert!(!mir_tile_is_emittable(&plain, 4));
+    }
+
+    /// The two frame-access encoders are the ONE producer of these bytes.
+    ///
+    /// `load_to_rax` / `load_to_rcx` / `store_rax` delegate to them, so the
+    /// level-2 encoder and the per-opcode arms cannot drift apart. This pins the
+    /// literals those methods used to hold inline, in both displacement forms.
+    #[test]
+    fn the_frame_access_encoders_reproduce_the_inline_literals() {
+        let bytes = |f: fn(u8, i32, &mut FrameAccess), reg: u8, off: i32| -> Vec<u8> {
+            let mut a = FrameAccess::new();
+            f(reg, off, &mut a);
+            a.as_slice().to_vec()
+        };
+        // disp8: mod=01, r/m=RBP(101).
+        assert_eq!(bytes(enc_frame_load, RAX, 8), vec![0x48, 0x8B, 0x45, 0xF8]);
+        assert_eq!(bytes(enc_frame_load, RCX, 8), vec![0x48, 0x8B, 0x4D, 0xF8]);
+        assert_eq!(bytes(enc_frame_store, RAX, 8), vec![0x48, 0x89, 0x45, 0xF8]);
+        // disp32: mod=10.
+        let mut want = vec![0x48u8, 0x8B, 0x85];
+        want.extend_from_slice(&(-4096i32).to_le_bytes());
+        assert_eq!(bytes(enc_frame_load, RAX, 4096), want);
+        let mut want = vec![0x48u8, 0x89, 0x85];
+        want.extend_from_slice(&(-4096i32).to_le_bytes());
+        assert_eq!(bytes(enc_frame_store, RAX, 4096), want);
+        // A register these encodings cannot express is a refusal, not a
+        // silently truncated `reg & 7` — which would encode R8 as RAX.
+        assert!(bytes(enc_frame_load, 8, 8).is_empty());
+        assert!(bytes(enc_frame_store, 8, 8).is_empty());
     }
 
     // ── The three `ir::Op` enumerations, checked against each other ──
@@ -13203,8 +14236,21 @@ mod tests {
     fn the_register_read_path_is_gated_on_publication() {
         // Only the emitter, not this module: the assertion below quotes the
         // very strings it looks for.
+        //
+        // The boundary is the test module, NAMED. It used to be "everything up
+        // to the first `#[cfg(test)]`", which is a position rather than a
+        // boundary: the first test-only helper added anywhere above
+        // `set_residency` truncates the scanned region and the count silently
+        // collapses to zero — a gate that fails open. (`FrameAccessList::
+        // corrupt_last_byte` is the one that did it.) The precondition below is
+        // the other half: a scan whose corpus went missing must say so.
         let src = include_str!("ir_lower.rs");
-        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let body = src.split("\nmod tests {").next().unwrap_or(src);
+        assert!(
+            body.contains("fn resident_xmm"),
+            "the scanned region no longer contains the emitter — the test \
+             module boundary moved"
+        );
         let reads: Vec<String> = body
             .lines()
             .map(|l| l.trim().to_string())

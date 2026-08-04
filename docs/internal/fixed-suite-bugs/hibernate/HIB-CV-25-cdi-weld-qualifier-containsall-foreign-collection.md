@@ -100,3 +100,21 @@ WELD-001524: Unable to load proxy class for bean Managed Bean
 
 This is Weld client-proxy (`@ApplicationScoped`) bytecode-generation, an
 **independent** CratonVM gap — file/track separately.
+
+## 2026-08-04 correction — "9/11 PASS" no longer reproduces (unrelated, earlier-in-bootstrap blocker)
+
+A fresh 2026-08-04 residual run shows all 14 classes in this cluster (not
+just the 2 `HibernateSearch*` classes already flagged as a residual above)
+FAILing — but with `java.util.concurrent.RejectedExecutionException` out of
+`WeldStartup.startInitialization` → `ConcurrentBeanDeployer.addClasses` →
+`ForkJoinPool.invokeAll`, a failure that happens **before**
+`BeanAttributesFactory.initQualifiers` (the code this doc's `containsAll`
+fix touches) ever runs. This is not a regression of the `containsAll` fix —
+`native_hs_contains_all` still uses `collect_collection_elements_or_real` —
+it's a separate, later-introduced bug (`CRATONVM_REAL_FORKJOINPOOL` became
+default-on in `16ec5d7ad`, 2026-07-30, exposing an uncovered
+`ForkJoinPool.invokeAll` overload in the real-FJP bridge allow-list) that
+now blocks bootstrap one step earlier, so this doc's fix is currently
+unreachable/unverifiable by the suite rather than wrong. Full analysis:
+[`docs/known-issues/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-20260804.md`](../../../known-issues/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-20260804.md).
+Re-verify this doc's "9/11 PASS" claim once the `invokeAll` gap is fixed.

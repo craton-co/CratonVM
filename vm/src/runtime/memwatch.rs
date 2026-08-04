@@ -37,6 +37,18 @@ fn addr() -> usize {
     })
 }
 
+/// Is a watch address configured at all?
+///
+/// [`addr`] is memoized from `CRATONVM_DBG_MEMWATCH` and never changes after
+/// the first read, so this is a startup-static gate even though `ARMED` below
+/// is not. ARCH-2026-08-04 A3: `safe_native_call_impl` folds this into its
+/// diagnostic mask so an unconfigured run does not reach [`poll_with`] on
+/// every native return.
+#[inline]
+pub(crate) fn is_watching() -> bool {
+    addr() != 0
+}
+
 /// -1 = unprobed, 1 = armed (address readable), 0 = disarmed (unmapped).
 static ARMED: AtomicI8 = AtomicI8::new(-1);
 /// Last observed value (u64::MAX sentinel = no observation yet).

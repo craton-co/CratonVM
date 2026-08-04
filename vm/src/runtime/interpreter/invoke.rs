@@ -269,7 +269,7 @@ pub(super) fn resolved_private_invokevirtual_target(
     // loader's copy — pinning a private call's dispatch to the wrong
     // class's bytecode/constant pool while the receiver stays the caller's
     // own (correct-loader) object. See
-    // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md
+    // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md
     // (TestUpgrade's `RootReference.tryUpdate`/`hasChangesSince` residual).
     let self_match = {
         let cm = shared.classes.class_manager.read();
@@ -329,7 +329,7 @@ pub(super) fn execute_invoke_kind(
         resolve_method_ref(shared, current_class_id, cp_index)?;
     let method_owner_name = Arc::clone(&method_class_name);
 
-    // PGO-01 (docs/known-issues/c2/pgo-01-call-site-evidence-gap.md):
+    // PGO-01 (docs/known-issues/c2/archive/pgo-01-call-site-evidence-gap.md):
     // call-site evidence for invokespecial. invokevirtual/invokeinterface are
     // NOT recorded here — they are covered by the receiver-type profile
     // instead (see MethodProfile's doc comment on `receivers` vs
@@ -411,7 +411,7 @@ pub(super) fn execute_invoke_kind(
     // such a long as `Value::Int`, which `coerce_invoke_arg_for_descriptor`
     // then widened — corrupting `J` args to invokevirtual/special callees.
     // Mirrors `pop_coerced_invoke_args_virtual`. See
-    // docs/bc-ec-mod-mododdinverse-investigation.md.
+    // gaps/bc-ec-mod-mododdinverse-investigation.md.
     let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
         tmp_cv.push(
@@ -670,7 +670,7 @@ pub(super) fn execute_invoke_kind(
     // `java.lang.Thread` mirror while a *stale copy* of its old address still
     // sits in a running or blocked frame's operand stack / local — the
     // frame/operand remap-coverage gap documented in
-    // `docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md`. The
+    // `fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`. The
     // registry and the per-thread `java_thread_obj` field are remapped, but
     // the frame copy is not, so an invoke whose receiver is that copy (the
     // classic `Thread.currentThread().getThreadGroup()` in
@@ -2748,12 +2748,22 @@ pub(super) fn try_stackless_invoke(
         && method_name == "invoke"
         && descriptor == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
     {
-        if let Some(callback) =
-            shared
-                .natives
-                .native_methods
-                .find("java/lang/reflect/Method", method_name, descriptor)
-        {
+        // ONE STATIC, ONE TRIPLE — see the discipline note in
+        // `dispatch_virtual.rs`. A `NativeCallSite` is keyed on the registry
+        // generation alone and does not re-verify the triple on a warm hit, so
+        // a cell must be unreachable with a second triple. The `if` above has
+        // already proven all three components by exact equality, so this cell
+        // sees exactly one. It is its own cell rather than a share of
+        // `dispatch_virtual`'s identically-keyed `NCS_METHOD_INVOKE`, matching
+        // that module's rule that no cell is reachable from more than one call.
+        static NCS_METHOD_INVOKE: cratonvm_native_api::NativeCallSite =
+            cratonvm_native_api::NativeCallSite::new();
+        if let Some(callback) = NCS_METHOD_INVOKE.callback(
+            &shared.natives.native_methods,
+            "java/lang/reflect/Method",
+            method_name,
+            descriptor,
+        ) {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
                 push_invoke_return_value(
@@ -2772,7 +2782,11 @@ pub(super) fn try_stackless_invoke(
         && method_name == "newInstance"
         && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;"
     {
-        if let Some(callback) = shared.natives.native_methods.find(
+        // ONE STATIC, ONE TRIPLE — as above; the guard proves the triple.
+        static NCS_CONSTRUCTOR_NEW_INSTANCE: cratonvm_native_api::NativeCallSite =
+            cratonvm_native_api::NativeCallSite::new();
+        if let Some(callback) = NCS_CONSTRUCTOR_NEW_INSTANCE.callback(
+            &shared.natives.native_methods,
             "java/lang/reflect/Constructor",
             method_name,
             descriptor,
@@ -2924,7 +2938,7 @@ pub(super) fn try_stackless_invoke(
         // (e.g. `org/h2/command/ParserBase.read()V`) onto a receiver whose
         // own, unrelated class of the same name declares that method
         // itself and doesn't extend that ancestor at all. See
-        // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md
+        // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md
         // (TestUpgrade's `ParserBase.getSyntaxError`/`Token.start()` NPE).
         let start_cid = |cm: &crate::classloading::ClassManager| {
             dispatch_class_override.or_else(|| cm.get_loaded_class_id(class_name))
@@ -3010,8 +3024,8 @@ pub(super) fn try_stackless_invoke(
     // ThreadPoolExecutor.execute(Runnable): the registered native
     // (`native_es_execute`) is exempted from the real-JDK-mode registration
     // drop (native-api/src/registry.rs) specifically so it stays available
-    // for CratonVM's synthetic-layout Executors.* stand-ins (docs/known-issues/
-    // threadpoolexecutor-execute-npe-on-ctl-regression.md). But this "native
+    // for CratonVM's synthetic-layout Executors.* stand-ins (fixed-suite-bugs/
+    // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md). But this "native
     // override" step is unconditional -- it has no receiver awareness -- so
     // it was ALSO winning for a genuinely real, bytecode-constructed
     // ThreadPoolExecutor (its own real `workers` field populated), routing
@@ -3019,8 +3033,8 @@ pub(super) fn try_stackless_invoke(
     // "run inline" fallback instead of real async bytecode.
     // `intercept_force_registered_native` above already carries this exact
     // receiver check for the FORCE-native case; mirror it here so a real
-    // receiver's native shadow is dropped too. See docs/known-issues/
-    // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+    // receiver's native shadow is dropped too. See fixed-suite-bugs/
+    // threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
     //
     // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 2
     // OF 4. See COPY 1 in `vm/src/vm/vm_exec.rs::invoke_or_native` for the full
@@ -3481,8 +3495,8 @@ pub(super) fn try_stackless_invoke(
             // a genuinely real ThreadPoolExecutor still gets shunted to
             // `native_es_execute`'s inline "run synchronously" fallback right
             // here, even though the real `execute()` bytecode was correctly
-            // found and would otherwise run. See docs/known-issues/
-            // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+            // found and would otherwise run. See fixed-suite-bugs/
+            // threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
             //
             // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape
             // check, COPY 3 OF 4. See COPY 1 in

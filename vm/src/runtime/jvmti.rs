@@ -2816,7 +2816,7 @@ impl fmt::Debug for JvmtiEnv {
 //     `any_*_listener` fast-path flag. Event *delivery* was process-global,
 //     so re-keying any one downstream table (the field-watchpoint map, say)
 //     produced a subsystem that looked isolated in review and was not. See
-//     `docs/known-issues/c2/vm-process-global-state-round-2.md` § "Still open".
+//     `docs/feature-designs/vm-process-global-state-round-2.md` § "Still open".
 //   * `REAL_AGENT_ENV_BRIDGE: OnceLock<Weak<SharedVm>>` — a single `Weak`,
 //     first-writer-wins. Exactly the shape that made `RedefineClasses`
 //     silently do nothing in a second VM. Verified failure modes:
@@ -2972,7 +2972,7 @@ fn publish_union_listener_flags() {
 /// **This is the entry point production wiring uses.** `SharedVm::new` calls
 /// it with `vm.vm_identity`, so every live VM owns a row and the
 /// [`UNATTRIBUTED_VM`] fallback is reached only by hooks that genuinely have
-/// no VM in scope — see `docs/known-issues/c2/jvmti-delivery-threading.md` for
+/// no VM in scope — see `docs/feature-designs/jvmti-delivery-threading.md` for
 /// the current census. `SharedVm::new` *also* still installs the row-0
 /// manager, and that is not redundant: the six remaining VM-less sites
 /// resolve row 0 through `global_manager()`, an exact lookup with no
@@ -3280,7 +3280,7 @@ pub fn fire_vm_death() {
 /// per VM by definition — it is the event that tells an agent *its* VM is up.
 /// Unlike the class-load / GC hook adapters, this site has no signature
 /// problem; it is simply still on the VM-less call. See
-/// `docs/known-issues/c2/jvmti-delivery-threading.md`.
+/// `docs/feature-designs/jvmti-delivery-threading.md`.
 pub fn fire_vm_init_for_vm(vm: usize) {
     if let Some(m) = manager_for_vm(vm) {
         m.fire_vm_init();
@@ -3358,7 +3358,7 @@ pub fn fire_exception_catch(thread: ThreadId, method: MethodId, location: i64) {
 // ---------------------------------------------------------------------------
 //
 // The interpreter dispatch loop and opcode handlers call these at the sites
-// listed in docs/roadmap-100.md §T17.Δ. The hot-path contract for each of
+// listed in history/roadmap-100.md §T17.Δ. The hot-path contract for each of
 // these is:
 //
 //   1. A single `AtomicBool::Acquire` load on the per-event **union** mirror

@@ -1,4 +1,91 @@
-# The `--jdk-only` observability surface: one hole closed, two still open (`requested_by`, and a polling `--trace-jdk-only`)
+# The `--jdk-only` observability surface — CLOSED 2026-08-04
+
+**Status:** FIXED. All three holes filled; moved out of `docs/known-issues/`
+per that directory's own rule (a record moves here when it is fixed, not when
+it is planned).
+
+## What closed, and the evidence
+
+### 1. `real_declaring_method` — closed during the wave-1 re-land
+
+Unchanged from the filing below.
+
+### 2. `ClassOriginEntry::requested_by` — closed 2026-08-04
+
+The first run of the instrument proved the record had aimed it at the wrong
+half of the population. `ClassManager` is called with a bare name, so the
+filing (and the in-code marker) concluded the requester was the *interpreter's*
+to supply — the frame that ran the `new` / `checkcast` / `Class.forName`. That
+was implemented: `SharedVm::load_class_concurrent_for` takes the violation
+count before the load and calls `ClassManager::attach_origin_requester` after,
+under the same write lock, so no other thread's fabrication can be
+misattributed; the requester is three borrowed `&str`s and nothing is formatted
+or allocated unless a violation was actually recorded.
+
+**And `requested_by` was still `null` on all 415 rows.** Every one of the 14
+compatibility classes a `--jdk-only` boot fabricates arrives through the
+*direct* `ensure_synthetic_class` API — a native asking for an allocation shape
+— which has a Rust caller and no Java frame at all. The Java-frame instrument
+was correct and measured a population that is very nearly empty.
+
+So `admit_compatibility_class` is now `#[track_caller]`, threaded through
+`fabricate_class` and all three `ensure_*` entry points, and records the **Rust
+call site**. The Java frame, where one exists, is layered on top as
+`"org/foo/Bar.baz(Desc) via native-builtins/src/lib.rs:36608"`. Both halves
+answer different questions and both are kept: the Java frame says which
+application code depends on the fabrication, the Rust site says which VM code
+performed it.
+
+Verified on a `--jdk-only` boot against a real JDK 21 image: 14 of 415 rows
+carry a requester, and they name three call sites —
+
+| Class(es) | Requester |
+|---|---|
+| the 11 `cratonvm/internal/Unmodifiable*` | `vm/src/vm/vm_init.rs:1227` |
+| `cratonvm/synthetic/AnonymousObject$N` | `vm/src/vm/vm_exec.rs:9814` |
+| `java/util/Enumeration$Impl` | `vm/src/vm/vm_init.rs:1052` |
+| `java/util/Comparator$Native` | `vm/src/vm/vm_init.rs:1110` |
+
+That table is the finding, not just the fix. The `ensure_synthetic_class`
+record scopes its migration at "52 live call sites in 27 files"; **three of
+them fire on a strict boot.** A migration driven by this census is a different
+size of job from one driven by a grep, which is exactly what the record meant
+by "whether the census is a to-do list or a list of names".
+
+### 3. `--trace-jdk-only` was a poll — closed 2026-08-04
+
+`ClassManager` carries an optional VM-scoped violation sink — a field, not a
+process global (contract §2), so two VMs in one process see only their own —
+which `vm-cli` installs immediately after the `vm-init` drain. The drain then
+advances its origin watermark *without* re-rendering, so each violation prints
+exactly once.
+
+Verified: a class fabricated mid-run appears interleaved with the program's own
+output at the point it happens —
+
+```
+PROBE: start
+[cratonvm][jdk-only:live] compatibility class requested: cratonvm/synthetic/AnonymousObject$3
+PROBE: forName threw java.lang.ClassNotFoundException
+PROBE: about to exit
+```
+
+The remaining four recording sites stay polled, and that is now recorded as a
+decision rather than a deferral. Registration refusals all happen inside
+`Vm::new`, which the first drain immediately follows, so the poll already
+reports them at their real time of occurrence. The three JIT/dispatch sinks are
+**process**-global (see additional-wave2-markers §2); giving them a per-VM live
+sink means giving them a VM first, and a per-VM sink hung off process-global
+state would report another VM's refusals as this one's — worse than reporting
+them late.
+
+---
+
+*The original filing follows unchanged, for the reasoning that produced these
+three items.*
+
+---
+
 
 **Status:** OPEN — JDK-only wave-2 work items, filed 2026-07-31 as three holes,
 re-verified against the re-landed tree the same day and reduced to two. None of
@@ -263,6 +350,6 @@ These are additive diagnostics, so the risk is low — with three exceptions:
 
 ## Related
 
-* [`System.exit(N)` bypasses the JDK-only census entirely](system-exit-bypasses-the-jdk-only-census.md)
+* [`System.exit(N)` bypasses the JDK-only census entirely](jdk-only-system-exit-census-FIXED-20260804.md)
   — the instruments in this record are only as good as the exit paths that
   reach them, and one whole class of run reaches none of them.

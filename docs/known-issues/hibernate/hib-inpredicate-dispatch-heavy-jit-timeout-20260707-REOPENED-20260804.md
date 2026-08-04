@@ -1,13 +1,68 @@
-# `InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT (RETIRED 2026-07-08)
+# `InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT (REOPENED 2026-08-04, previously RETIRED 2026-07-08)
 
 | | |
 |---|---|
-| **Status** | ✅ RETIRED 2026-07-08 — current Azure recheck no longer reproduces the timeout. Fresh `dev@47bbdc3b` reached the later `DomainParameterXref` NSME in 33.697s, and after the LHM guard fix the same class passed under default JIT in 55.971s. Historical 2026-07-07 evidence retained below. |
+| **Status** | ⚠️ **OPEN (REOPENED 2026-08-04)** — moved back here from `fixed-suite-bugs/hibernate/` because a fresh `dev` tip run reproduces the exact original symptom (`TimeoutException` @ 120s on `testInPredicate`). The 2026-07-08 retirement below was wrong to treat this as closed; see "2026-08-04 — REOPENED" for current evidence. Do not re-retire this doc on a single passing run — confirm with an uncontended solo repro first, per the recurring pattern documented below (this is at least the third time this exact class has flipped between passing and timing out). |
 | **Area** | JIT tiered-compilation dispatch overhead, surfaced via `org.hibernate.orm.test.jpa.criteria.InPredicateTest` |
-| **Symptom** | historical: `java.util.concurrent.TimeoutException: testInPredicate(...) timed out after 120 seconds`, class wall time ~330–510s. Current fixed probe: `ok=1`, 55.971s. |
-| **Discovered** | Symptom first observed 2026-07-07 in a contended 4-shard local rerun ([hib-local-windows-rerun-20260707.md](../hib-local-windows-rerun-20260707.md)); root-caused same day with a clean, uncontended single-class rerun (this doc). |
+| **Symptom** | `java.util.concurrent.TimeoutException: testInPredicate(org.hibernate.testing.orm.junit.SessionFactoryScope) timed out after 120 seconds`. Historical (2026-07-07) class wall time ~330–510s; current (2026-08-04) solo repro 155–183s — still 30-50% over the 120s per-test cap. `--nojit` passes cleanly (`ok=1`, ~71.5s). |
+| **Discovered** | Symptom first observed 2026-07-07 in a contended 4-shard local rerun (hib-local-windows-rerun-20260707.md); root-caused same day with a clean, uncontended single-class rerun (this doc). RETIRED 2026-07-08 on the strength of one clean pass. **Reopened 2026-08-04** — see below. |
 
-## 2026-07-08 retirement — current `InPredicateTest` no longer times out
+## 2026-08-04 — REOPENED: fresh `dev` tip reproduces the exact original timeout
+
+A fresh 50-class residual suite run on `dev` tip `a43a74ded` (worktree
+`CratonVM-hib-local-0712-v3`, run `run-20260804-113511-custom`, real JDK, JIT
+on) failed `InPredicateTest` again, with the **identical** signature this doc
+originally tracked:
+
+```
+apps/hib-suite-runner/runs/run-20260804-113511-custom/on-real/shard-1/raw.log:1340
+@@TESTFAIL org.hibernate.orm.test.jpa.criteria.InPredicateTest testInPredicate(SessionFactoryScope) FAILED
+java.util.concurrent.TimeoutException: testInPredicate(org.hibernate.testing.orm.junit.SessionFactoryScope) timed out after 120 seconds
+	at org.junit.jupiter.engine.extension.TimeoutExceptionFactory.create(TimeoutExceptionFactory.java:31)
+	...
+@@RESULT org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=0 failed=1 aborted=0 skipped=0 ms=183120
+```
+
+This is not shard contention noise — re-ran solo, uncontended, from
+`apps/hib-suite-runner`, same binary
+(`C:/craton/CratonVM-hib-local-0712-v3/target/release/cratonvm.exe`):
+
+```
+CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 <cv> --java-home "<jdk25>" --Xmx 1500m \
+  @common.args -Dcraton.batch=1 CratonRunner org.hibernate.orm.test.jpa.criteria.InPredicateTest
+
+# JIT on (default):
+@@RESULT org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=0 failed=1 aborted=0 skipped=0 ms=155019
+=> java.util.concurrent.TimeoutException: testInPredicate(...) timed out after 120 seconds
+
+# --nojit:
+@@RESULT org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=1 failed=0 aborted=0 skipped=0 ms=71469
+```
+
+Same A/B signature as the original 2026-07-07 finding: JIT-on deterministically
+overruns the 120s per-test cap (155–183s here vs. 330–510s originally — faster,
+but still failing), `--nojit` passes comfortably under it (71.5s here vs.
+109.5s originally). No `NoSuchMethodError`/`DomainParameterXref` NSME activity
+was observed in either run (consistent with the historical account below: the
+`.in()` dispatch-heavy loop still burns the timeout budget before the test
+ever reaches the code path that used to throw that NSME).
+
+**What is not re-established here**: this session did not re-run the
+`--stack-dump-on-timeout` profiling or the OSR/precise-JIT-maps A/B tests from
+the original investigation, so it cannot confirm the *exact* mechanism
+(dispatch-heavy per-call JIT tier-up overhead in `SqmCriteriaNodeBuilder.in()`)
+is still the same one at fault today — only that the **symptom** is identical
+down to the failing method, exception type/message, and the JIT-on-fails /
+`--nojit`-passes A/B shape. Given how closely the current numbers track the
+historical ones (same test, same exception, same qualitative JIT-vs-interpreter
+split), the original root-cause analysis below is the leading hypothesis, not
+confirmed fresh. Whether the 2026-07-08 "fix" (the `DomainParameterXref` LHM
+guard, which unblocked a *different*, later bug) ever actually resolved this
+timeout, or whether the 2026-07-08 clean pass was itself a lucky low-load
+reading, is unresolved — worth checking host load / timing variance across
+repeated runs before assuming a code-level regression reintroduced this.
+
+## 2026-07-08 retirement (WRONG — see above) — current `InPredicateTest` no longer times out
 
 This note was rechecked while retiring the later `DomainParameterXref` /
 `LinkedHashMap.removeEldestEntry` NSME. The old timeout symptom is no longer
@@ -27,13 +82,13 @@ context, but this class no longer has an open timeout blocker in current dev.
 
 ## Background — this test's failure mode has changed twice in two days
 
-1. **2026-07-05 (Azure host, `dev@49aaf713`)**: `NullPointerException: Cannot invoke "java.util.Collection.size()" because "values" is null` — fixed 2026-07-06 (`084c8ffb`, see [`hib-inpredicatetest-criteria-values-null-npe-FIXED.md`](hib-inpredicatetest-criteria-values-null-npe-FIXED.md)).
-2. **2026-07-06**: a distinct `NoSuchMethodError` in `LinkedHashMap.removeEldestEntry` dispatch, tracked in [hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md](hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md) and root-caused to the "Layer 1 register-invisible-roots" JIT/GC gap.
+1. **2026-07-05 (Azure host, `dev@49aaf713`)**: `NullPointerException: Cannot invoke "java.util.Collection.size()" because "values" is null` — fixed 2026-07-06 (`084c8ffb`, see `hib-inpredicatetest-criteria-values-null-npe-FIXED.md`).
+2. **2026-07-06**: a distinct `NoSuchMethodError` in `LinkedHashMap.removeEldestEntry` dispatch, tracked in hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md and root-caused to the "Layer 1 register-invisible-roots" JIT/GC gap.
 3. **2026-07-07 (this doc)**: neither the NPE nor the NSME reproduce any more. The class now fails with a `TimeoutException` instead, and — see "Why the NSME doc's symptom no longer appears" below — this is very likely because the test now times out **before ever reaching** the code path that used to throw the NSME, not because that bug is fixed.
 
 ## Confirmed: real, deterministic regression — not host-load noise
 
-The 2026-07-07 4-shard local rerun ([hib-local-windows-rerun-20260707.md](hib-local-windows-rerun-20260707.md)) ran ~20-30 concurrent worktrees/builds on the same box, so its own text flagged this finding as unconfirmed pending "a clean, uncontended rerun." That rerun was done here: fresh worktree off `dev@fa1c505f` (branch `investigate/hib-inpredicate-timeout-20260707`), binary `cvinpredtimeout0707.exe`, **no other builds/tests running concurrently**, single-class invocation:
+The 2026-07-07 4-shard local rerun (hib-local-windows-rerun-20260707.md) ran ~20-30 concurrent worktrees/builds on the same box, so its own text flagged this finding as unconfirmed pending "a clean, uncontended rerun." That rerun was done here: fresh worktree off `dev@fa1c505f` (branch `investigate/hib-inpredicate-timeout-20260707`), binary `cvinpredtimeout0707.exe`, **no other builds/tests running concurrently**, single-class invocation:
 
 ```
 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 <cv-binary> --java-home "C:/Program Files/Java/jdk-25" \
@@ -93,11 +148,18 @@ Disabling JIT entirely is **3–4.6× faster** and drops the class comfortably u
 
 ## Historical note: why the NSME was masked during the 2026-07-07 timeout runs
 
-Before the 2026-07-08 LHM guard fix, the timeout-focused reruns often failed before reaching `DomainParameterXref`'s constructor: `.in()` consumed the 120s+ budget first, so the later `removeEldestEntry` NSME was not always observable in that timing profile. That masking explanation is retained as historical context only. The 2026-07-08 Azure recheck reproduced the NSME on current `dev`, fixed it in the `LinkedHashMap` native guard, and then passed `InPredicateTest` under default JIT; see [hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md](hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md).
+Before the 2026-07-08 LHM guard fix, the timeout-focused reruns often failed before reaching `DomainParameterXref`'s constructor: `.in()` consumed the 120s+ budget first, so the later `removeEldestEntry` NSME was not always observable in that timing profile. That masking explanation is retained as historical context only. The 2026-07-08 Azure recheck reproduced the NSME on current `dev`, fixed it in the `LinkedHashMap` native guard, and then passed `InPredicateTest` under default JIT; see hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md. The 2026-08-04 reopen evidence above shows the same masking still holds today — no NSME activity observed, consistent with `.in()` still eating the whole budget first.
 
-## Recommendation
+## Recommendation (updated 2026-08-04)
+
+**Superseded — this is not closed.** The 2026-07-08 "no active follow-up" verdict below is retained for history but was wrong: it retired the doc on the strength of a single passing run instead of the multi-run pattern the original 2026-07-07 investigation used, and the class has now been observed timing out again on 2026-08-04 (both in-suite and in an uncontended solo repro). Treat `InPredicateTest` as a live, open JIT-timeout residual: JIT-on fails `testInPredicate` at the 120s cap, `--nojit` passes comfortably. The real fix this doc's original root-cause section pointed at (lock-free per-hit tier-up dispatch, `project_wire_tiered_manager`) was never landed, which is consistent with the symptom being able to recur. Before spending further investigation time, get a multi-run (3+) A/B on the current `dev` tip to re-confirm the JIT-vs-`--nojit` split is still deterministic and not itself host-load noise (only one JIT-on and one `--nojit` run were taken this session, per the assignment's "keep it to 1-2 runs" budget).
+
+<details>
+<summary>Original 2026-07-08 retirement text (superseded 2026-08-04, kept for history)</summary>
 
 No active follow-up remains for this note. Keep the dispatch-heavy tier-up analysis as historical context, but current `dev` passes `InPredicateTest` under default JIT after the LHM guard fix.
+
+</details>
 
 ## Repro
 

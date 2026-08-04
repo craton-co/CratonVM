@@ -2200,8 +2200,8 @@ pub(super) fn execute_instruction(
             // FIELD-WATCH (TestUpgrade RootReference/MVMap residual) — every
             // real putfield to any Page/RootReference field, unconditional
             // (not tied to a construction-site guess or a GC-move-fragile
-            // address watch list). See docs/known-issues/h2/
-            // bug-h2-suite-residual-fail-triage.md.
+            // address watch list). See fixed-suite-bugs/h2-suite-bugs/
+            // bug-h2-suite-residual-fail-triage-FIXED.md.
             if crate::runtime::env_cache::dbg_field_watch() {
                 let decl_name = shared
                     .classes

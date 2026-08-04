@@ -88,10 +88,10 @@ not.
 | `max_locals` covers the method's own arguments | yes | `verify_method_structural` (`argument_slots`) | `verifier.rs::structural_rejects_max_locals_smaller_than_the_argument_slots`; corpus `max_locals_smaller_than_arguments_rejected` / `..._accepted` |
 | `ret` index `< max_locals` | yes | `verify_method_structural` | — |
 | `ret` reachable from a `jsr` prologue | yes | `verifier.rs::covered_ret_sites` | — |
-| Handler `0 ≤ start_pc < end_pc ≤ code_length` | yes | `verify_method_structural` | corpus `inverted_handler_range_rejected`; `verifier.rs::structural_rejects_empty_handler_range` |
-| Handler `handler_pc < code_length` | yes | `verify_method_structural` | corpus `handler_pc_past_the_code_array_rejected` |
+| Handler `0 ≤ start_pc < end_pc ≤ code_length` | yes | `reader/attribute.rs::validate_exception_range`, then `verify_method_structural` | `verifier.rs::structural_rejects_inverted_handler_range` / `..._empty_handler_range`; corpus `inverted_handler_range_rejected` (reader-level — see below) |
+| Handler `handler_pc < code_length` | yes | `reader/attribute.rs::validate_exception_range`, then `verify_method_structural` | `verifier.rs::structural_rejects_handler_pc_past_the_code_array`; corpus `handler_pc_past_the_code_array_rejected` (reader-level — see below) |
 | Handler `start_pc` / `end_pc` / `handler_pc` on instruction boundaries | yes | `verify_method_structural` | corpus `handler_pc_inside_an_instruction_rejected` / `well_formed_handler_accepted` |
-| Handler `catch_type` is a `CONSTANT_Class` or 0 | yes | `bytecode_verifier::catch_type_of` | corpus `handler_with_a_non_class_catch_type_rejected` |
+| Handler `catch_type` is a `CONSTANT_Class` or 0 | yes | `reader/attribute.rs::validate_catch_type`, then `bytecode_verifier::catch_type_of` | `verifier.rs::rejects_a_handler_whose_catch_type_is_not_a_class` / `..._is_out_of_range` / `accepts_a_handler_whose_catch_type_is_a_class` / `accepts_a_catch_all_handler`; corpus `handler_with_a_non_class_catch_type_rejected` (reader-level — see below) |
 | Exception table ordering (first-match semantics) | n/a — ordering is a *dispatch* rule, not a validity rule; JVMS imposes no ordering constraint | — | — |
 
 **The structural scan used to run only for `jsr`-bearing classes.** Ordinary
@@ -102,6 +102,24 @@ the type-state walk only consults `handler_pc` as a map key and simply never
 matched it — while the interpreter, which does dispatch there, began decoding at
 a mid-instruction offset. `verify_method` now runs the scan first
 (`bytecode_verifier.rs:190`).
+
+**Three exception-table rules are enforced twice, at two layers.** JVMS §4.7.3
+states `start_pc < end_pc`, `handler_pc < code_length` and "`catch_type` is 0 or
+a `CONSTANT_Class`" as *format* constraints on the `Code` attribute, and
+`cratonvm_reader` checks all three while decoding it — so a class file carrying
+one of those shapes is a `ClassReaderError` and never reaches Pass 3 — on the
+eager and lazy decode paths alike (`decode_attribute` re-runs both checks, so a
+`Code` nested inside another attribute cannot slip past). The verifier keeps its
+own copy of each check regardless, because a `CodeAttribute` built in memory
+rather than decoded from bytes — the `LazyAttribute::new_decoded` form used by
+synthetic stubs, cached class data and tests — reaches the verifier without ever
+passing through the reader. The practical consequence for this table is that a
+**corpus** case for one of these
+three rules can only ever observe the reader's verdict, which is why the three
+corpus cases assert there (`reject_at_parse`) while the verifier's half is
+pinned by the in-memory `verifier.rs` unit tests cited alongside them. The
+boundary-landing rule in the row between them has no reader-side counterpart —
+the reader does not decode instructions — so it stays a pure corpus case.
 
 ### JVMS §4.10.1 / §4.10.2 — type checking
 

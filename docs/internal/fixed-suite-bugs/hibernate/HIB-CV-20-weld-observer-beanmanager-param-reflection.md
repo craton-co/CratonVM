@@ -184,3 +184,34 @@ Localizing it means instrumenting Weld's `BackedAnnotatedType`/observer-validati
 ## Next steps
 
 Trace the live bootstrap: enable Weld debug logging during `CdiSmokeTests` and diff the constructed `AnnotatedType`/observer model element-by-element against HotSpot, focusing on which member of `WeldSEBeanRegistrant` (or which `AnnotatedParameter` view) Weld actually feeds into the `WELD-000409` check.
+
+## 2026-08-04 correction — the whole 14-class CDI cluster FAILs again, by default, on fresh `dev`
+
+This doc's "Layer 2" fix (seed `org.jboss.weld.executor.threadPoolType=NONE`
+by default so Weld avoids `ForkJoinPool.invokeAll` entirely) was itself
+conditioned on `!flags().natives.real_forkjoinpool` (`vm/src/vm/vm_init.rs`).
+Commit `16ec5d7ad` ("wip: deep-audit agent handoff snapshot", 2026-07-30)
+changed `real_forkjoinpool`'s resolution from opt-in
+(`present(CRATONVM_REAL_FORKJOINPOOL)`) to **default-on**
+(`!present(CRATONVM_SYNTHETIC_FORKJOINPOOL) || present(CRATONVM_REAL_FORKJOINPOOL)`)
+— so the `threadPoolType=NONE` seed silently stopped firing by default, and
+every CDI class now goes through Weld's `ConcurrentBeanDeployer` again.
+
+That alone should be fine per this doc's "Real ForkJoinPool fix" section
+(gate ON was verified to make `CdiSmokeTests` etc. PASS) — except the real
+FJP bridge's method allow-list never covered
+`ForkJoinPool.invokeAll(Collection)`, the exact overload
+`AbstractExecutorServices.invokeAllAndCheckForExceptions` calls. That
+overload falls through to real JDK bytecode against the bridge's
+under-initialized `commonPool()` object and throws
+`RejectedExecutionException` at `submissionQueue()` — the identical
+mechanism this doc's own "Layer 2" section describes for the *synthetic*
+pool, just for real-pool mode's uncovered overload instead. Confirmed by a
+fresh 2026-08-04 run: all 14 `cdi.*`/`jpa.cdi.*` classes FAIL with this
+exact stack. Full analysis, evidence, and a confirmed workaround
+(`CRATONVM_SYNTHETIC_FORKJOINPOOL=1`, which restores the `threadPoolType=NONE`
+path and makes `CdiSmokeTests` PASS again) are in
+[`docs/known-issues/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-20260804.md`](../../../known-issues/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-20260804.md).
+This doc's Layers 1/2/3 fixes are all still present and correct — the
+regression is a *new* coverage gap in the real-FJP allow-list exposed only
+once real-FJP became the default, not a reversion of anything fixed here.

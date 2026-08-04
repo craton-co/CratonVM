@@ -12,7 +12,7 @@
 #   * 2026-07-22 -> 2026-07-31: the per-class timeout/mode accommodation for
 #     DefaultCatalogAndSchemaTest was implemented, validated, documented as
 #     "Resolved", and then vanished from run-hib.sh with nothing to flag it.
-#     See docs/known-issues/... (now docs/internal/fixed-suite-bugs/hibernate/
+#     See docs/known-issues/... (now fixed-suite-bugs/hibernate/
 #     qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md).
 #
 # run-hib.sh and this table are force-added (`git add -f`) past the apps/
@@ -44,6 +44,6 @@
 # the suite's flat 300s per-class cap — its clean whole-class runtimes are
 # 620,902-1,804,813 ms. Without a floor it is killed by `timeout` at 300s and
 # reported HANG on every full-suite run, with ms=0 and no @@RESULT, forever.
-# Root cause + evidence: docs/internal/fixed-suite-bugs/hibernate/
+# Root cause + evidence: fixed-suite-bugs/hibernate/
 # qualfiedtablenaming-hang-cluster-20260721-FIXED.md
 org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest	3600	-

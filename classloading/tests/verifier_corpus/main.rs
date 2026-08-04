@@ -76,26 +76,38 @@ impl ClassHierarchy for CorpusHierarchy {
     }
 }
 
+/// Read `bytes` and force every attribute to decode, surfacing the reader's
+/// verdict rather than asserting on it.
+///
+/// The `Code` attribute decodes lazily, so a malformed exception table can
+/// surface either from `read_class` (the fixed-size `start_pc`/`end_pc`/
+/// `handler_pc` bounds, checked while the attribute body is walked) or from
+/// `force_decode_all` (the `catch_type` constant-pool cross-check, which needs
+/// the pool). Both are the same layer as far as the corpus is concerned.
+fn read_and_decode(bytes: &[u8]) -> Result<ClassFile, cratonvm_reader::ClassReaderError> {
+    let mut parsed = cratonvm_reader::read_class(bytes)?;
+    for method in parsed.methods.iter_mut() {
+        force_decode_all(&mut method.attributes, &parsed.constant_pool)?;
+    }
+    Ok(parsed)
+}
+
 /// Parse `bytes` and run Pass 3 over the result.
 ///
 /// A parse failure is an assertion failure, not a rejection: the corpus is
 /// about what the **verifier** does, so every case must be readable. Cases the
 /// reader legitimately rejects (e.g. `code_length == 0`) are covered by the
-/// unit tests in `classloading/src/verifier.rs` instead.
+/// unit tests in `classloading/src/verifier.rs` instead, and by
+/// [`reject_at_parse`] below where the corpus still wants to pin the shape.
 fn verify(bytes: &[u8]) -> Result<(), LinkageError> {
-    let parsed = cratonvm_reader::read_class(bytes).expect("corpus class file must parse");
     let ClassFile {
         version,
         constant_pool,
         access_flags,
         this_class,
-        mut methods,
+        methods,
         ..
-    } = parsed;
-    for method in methods.iter_mut() {
-        force_decode_all(&mut method.attributes, &constant_pool)
-            .expect("corpus Code attribute must decode");
-    }
+    } = read_and_decode(bytes).expect("corpus class file must parse");
 
     let class = Class {
         id: next_id(),
@@ -159,6 +171,39 @@ fn reject(label: &str, bytes: &[u8], expect_msg: &str) {
             assert!(
                 text.contains(expect_msg),
                 "{label}: rejection message should mention {expect_msg:?}, got: {text}"
+            );
+        }
+    }
+}
+
+/// Assert the class never reaches the verifier because the **reader** rejects
+/// it, and that the message mentions `expect_msg`.
+///
+/// Some JVMS §4.7.3 exception-table constraints are format constraints, not
+/// type-state ones: `cratonvm_reader` enforces them while it walks the `Code`
+/// attribute, so bytes carrying those shapes are a `ClassReaderError` and the
+/// verifier is never consulted. That is the correct layering — the malformed
+/// class is refused strictly earlier than a `VerifyError` would refuse it — but
+/// it means the corpus's [`reject`] helper cannot express these cases: it would
+/// panic in [`verify`]'s `expect("must parse")` before making any assertion.
+///
+/// So pin them here instead, at the layer that actually decides. The verifier
+/// keeps its own copy of each of these checks as defence in depth for producers
+/// that build a `CodeAttribute` in memory rather than decoding it from bytes;
+/// that half is exercised directly by `classloading/src/verifier.rs`'s
+/// `structural_rejects_*` and `*_catch_type_*` unit tests.
+fn reject_at_parse(label: &str, bytes: &[u8], expect_msg: &str) {
+    match read_and_decode(bytes) {
+        Ok(_) => panic!("{label}: expected the reader to REJECT these bytes, it parsed them"),
+        Err(e) => {
+            let text = e.to_string();
+            assert!(
+                text.contains(expect_msg),
+                "{label}: rejection message should mention {expect_msg:?}, got: {text}"
+            );
+            assert!(
+                text.contains("JVMS §4.7.3"),
+                "{label}: rejection should cite the rule it enforces, got: {text}"
             );
         }
     }
@@ -406,6 +451,19 @@ fn handler_pc_inside_an_instruction_rejected() {
     reject("handler_pc mid-instruction", &bytes, "instruction boundary");
 }
 
+// The next three cases were written as `reject(...)` — verifier-level
+// rejections — and that was accurate when they were added: the matching check
+// lives in `verify_method_structural` for the first two and in
+// `bytecode_verifier::catch_type_of` for the third, and all three are still
+// there. The reader has since grown the same three §4.7.3 constraints, and it
+// runs first, so these bytes no longer reach Pass 3 at all.
+//
+// The shape stays covered and the rejection stays asserted; only the layer
+// named by the assertion changed. See [`reject_at_parse`] for why they are not
+// simply moved to a `VerifyError` expectation, and the `structural_rejects_*`
+// and `*_catch_type_*` unit tests in `classloading/src/verifier.rs` for the
+// verifier's own half.
+
 #[test]
 fn handler_pc_past_the_code_array_rejected() {
     let bytes = one_method(
@@ -414,7 +472,8 @@ fn handler_pc_past_the_code_array_rejected() {
         MethodSpec::new("m", "()V", 1, 2, handler_body())
             .with_handlers(vec![Handler::catch_all(0, 4, 99)]),
     );
-    reject("handler_pc out of range", &bytes, "handler_pc");
+    // JVMS §4.7.3: `handler_pc` must be a valid index into the code array.
+    reject_at_parse("handler_pc out of range", &bytes, "handler_pc 99");
 }
 
 #[test]
@@ -425,7 +484,12 @@ fn inverted_handler_range_rejected() {
         MethodSpec::new("m", "()V", 1, 2, handler_body())
             .with_handlers(vec![Handler::catch_all(4, 0, 5)]),
     );
-    reject("inverted handler range", &bytes, "range invalid");
+    // JVMS §4.7.3: `start_pc` must be less than `end_pc`.
+    reject_at_parse(
+        "inverted handler range",
+        &bytes,
+        "start_pc 4 must be less than end_pc 0",
+    );
 }
 
 #[test]
@@ -441,7 +505,8 @@ fn handler_with_a_non_class_catch_type_rejected() {
             catch_type: bogus,
         }]),
     );
-    reject("non-Class catch_type", &b.build(), "CONSTANT_Class");
+    // JVMS §4.7.3: `catch_type` is either 0 or a CONSTANT_Class index.
+    reject_at_parse("non-Class catch_type", &b.build(), "CONSTANT_Class");
 }
 
 #[test]

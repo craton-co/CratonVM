@@ -943,7 +943,7 @@ function Test-SilentAbnormalExit([object]$ExitCode, [string]$Stdout, [string]$St
   # main-vm Ok/Err handler, the visibility-first panic hook, the Windows
   # vectored hardware-fault handler, and System.exit/Runtime.exit all print
   # at least one diagnostic line before the process terminates (see
-  # docs/internal/keycloak-empty-stderr-process-exits.md). A zero-output
+  # keycloak-empty-stderr-process-exits.md). A zero-output
   # abnormal exit is therefore the signature of something OUTSIDE the
   # process (OS/AV/resource-pressure termination) killing it before any of
   # that code could run.
@@ -1019,7 +1019,7 @@ function Complete-ProcessRecord {
   if ($status -eq 'SILENTEXIT') {
     $note = "no stdout/stderr captured (rc=$ExitCode)"
     if ($Record.retries -gt 0) { $note += "; unchanged after $($Record.retries) retry(ies)" }
-    $note += '; not a known CratonVM-internal exit path -- see docs/internal/keycloak-empty-stderr-process-exits.md'
+    $note += '; not a known CratonVM-internal exit path -- see keycloak-empty-stderr-process-exits.md'
   } else {
     $noteMatch = [regex]::Match($combined, '(?im)^(?!\s+at\s)(.*(?:Exception|Error|Caused by|KCRUNNER_LOAD_FAIL|panicked|not implemented|NoClassDef|NoSuchMethod|AbstractMethod|AssertionError).*)$')
     if ($noteMatch.Success) {
