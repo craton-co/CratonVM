@@ -700,6 +700,41 @@ pub fn offset_seconds_at_local(
     get_zone_rules(ctx, zone_id).map(|r| offset_at_local(&r, local_epoch_sec))
 }
 
+/// `sun.util.calendar.ZoneInfoFile`'s conversion from tzdb rules to the legacy
+/// `ZoneInfo` representation only models transitions from 1900 onward
+/// (`UTC1900` in that class); a query before that floor falls through to the
+/// zone's CURRENT standard offset with `dstSavings = 0`, not the deep
+/// historical offset `java.time.zone.ZoneRules` would report. Mirrored so the
+/// legacy `TimeZone`/`GregorianCalendar` path matches real HotSpot's legacy
+/// behaviour bug-for-bug — see
+/// `docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md`.
+pub const ZONEINFO_LEGACY_FLOOR_EPOCH_SEC: i64 = -2_208_988_800; // 1900-01-01T00:00:00Z
+
+/// `(total_offset_ms, dst_offset_ms)` for `zone_id` at `date_millis`, under the
+/// legacy `ZoneInfo` rules described on [`ZONEINFO_LEGACY_FLOOR_EPOCH_SEC`].
+///
+/// This is the body behind the registered `ZoneInfo`/`SimpleTimeZone`/
+/// `TimeZone` `getOffset`/`getOffsets` natives. It lives here, rather than
+/// inside those registrations, because `date_format_fast` needs the same
+/// answer WITHOUT paying for a Java dispatch plus a native-funnel entry per
+/// format — and two copies of this rule would be two things to keep in step.
+pub fn legacy_offsets_ms(ctx: &mut dyn NativeContext, zone_id: &str, date_millis: i64) -> (i32, i32) {
+    let epoch_sec = date_millis.div_euclid(1000);
+    let (total_sec, standard_sec) = if epoch_sec < ZONEINFO_LEGACY_FLOOR_EPOCH_SEC {
+        let raw = raw_offset_seconds(ctx, zone_id).unwrap_or(0);
+        (raw, raw)
+    } else {
+        let total = offset_seconds_at_instant(ctx, zone_id, epoch_sec).unwrap_or(0);
+        let standard =
+            standard_offset_seconds_at_instant(ctx, zone_id, epoch_sec).unwrap_or(total);
+        (total, standard)
+    };
+    (
+        total_sec.saturating_mul(1000),
+        (total_sec - standard_sec).saturating_mul(1000),
+    )
+}
+
 pub fn raw_offset_seconds(ctx: &mut dyn NativeContext, zone_id: &str) -> Option<i32> {
     get_zone_rules(ctx, zone_id).map(|r| raw_offset(&r))
 }
