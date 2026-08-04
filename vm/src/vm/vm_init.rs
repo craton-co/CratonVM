@@ -5544,16 +5544,58 @@ impl SharedVm {
             // extends `A`, and a method inlined from `A` was
             // devirtualized under the assumption that `A` had no
             // subclasses, loading `B` breaks that assumption.
-            let superclass = self
-                .classes
-                .class_manager
-                .read()
-                .get_class(*class_id)
-                .and_then(|c| c.superclass.map(|s| s.to_string()));
+            // PGO-02 R3 — two defects fixed here at once.
+            //
+            // 1. This used to be `c.superclass.map(|s| s.to_string())`.
+            //    `superclass` is a `ClassId`, whose `Display` prints the raw
+            //    u32, so the "superclass" handed to the name-keyed scans below
+            //    was a DECIMAL NUMBER — `"42"`, never a class name. The scans
+            //    match against `CompiledMethod::inlined_methods`, which holds
+            //    internal class names, so the whole superclass half of
+            //    class-load invalidation matched nothing and had been a silent
+            //    no-op. Nothing failed when it broke: the guarded/devirtualised
+            //    code stays CORRECT without the eviction (an exact class-id
+            //    guard rechecks the receiver, and a MIC/PIC re-targets), so the
+            //    only symptom was code that should have been retired staying
+            //    resident. That is precisely the failure mode this project
+            //    tracks — a capability that reads as landed but never runs.
+            //
+            // 2. Only the DIRECT superclass was consulted, which is the
+            //    "known coarseness" `docs/feature-designs/profile-guided-
+            //    inlining.md` §4 records: loading `C extends B extends A` did
+            //    not reach a dependency on `A`. Walk the whole supertype
+            //    closure — superclasses AND interfaces — so a speculation on
+            //    any ancestor is retired when a new descendant appears. The
+            //    closure is bounded by hierarchy depth and this runs once per
+            //    class DEFINE, not per call.
+            let supertypes: Vec<String> = {
+                let cm = self.classes.class_manager.read();
+                let store = cm.class_store();
+                let mut names: Vec<String> = Vec::new();
+                let mut stack: Vec<cratonvm_types::ClassId> = Vec::new();
+                let mut seen: std::collections::HashSet<cratonvm_types::ClassId> =
+                    std::collections::HashSet::new();
+                if let Some(class) = store.get(*class_id) {
+                    stack.extend(class.interfaces.iter().copied());
+                    stack.extend(class.superclass);
+                }
+                while let Some(id) = stack.pop() {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let Some(class) = store.get(id) else {
+                        continue;
+                    };
+                    names.push(class.name.to_string());
+                    stack.extend(class.interfaces.iter().copied());
+                    stack.extend(class.superclass);
+                }
+                names
+            };
             {
                 let mut jit = self.jit.jit_cache.write();
                 let _ = jit.invalidate_for_class_change(name);
-                if let Some(ref sup) = superclass {
+                for sup in &supertypes {
                     let _ = jit.invalidate_for_class_change(sup);
                 }
             }
@@ -5566,8 +5608,8 @@ impl SharedVm {
             // entries whose inlined_methods list doesn't already name
             // the newly loaded class.
             let _evicted_by_cha = self.invalidate_jit_for_class(name);
-            if let Some(sup) = superclass {
-                let _evicted_sup = self.invalidate_jit_for_class(&sup);
+            for sup in &supertypes {
+                let _evicted_sup = self.invalidate_jit_for_class(sup);
             }
 
             // Phase 1 — Item 6: `@EnableGpuAsync(warmup = N)` class-load

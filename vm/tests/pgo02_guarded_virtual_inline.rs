@@ -122,13 +122,28 @@ fn test_pgo02_guarded_virtual_inline() {
     }
 }
 
+/// ONE `Vm` for every check.
+///
+/// This file used to build a fresh `Vm` per check. It turned out that only the
+/// FIRST one ever compiled anything — the tiered background compile worker is
+/// process-global and did not warm up again for later VMs — so every check
+/// after `check_guard_hit` ran fully interpreted, including the guard-MISS
+/// check this file calls its single most safety-critical one. They asserted
+/// correct results, got them from the interpreter, and proved nothing about
+/// the compiled path. Found by `CRATONVM_DBG_JITC=1`: exactly one
+/// `bg-compile` line in the whole run.
+///
+/// Every check that depends on a compiled artifact now ASSERTS that the
+/// artifact exists (`compiled_tally`), so the same silent regression to
+/// "correct, but interpreted" fails loudly instead of passing.
 fn run_all_checks() -> Result<(), String> {
-    check_guard_hit()?;
-    check_guard_miss()?;
-    check_override_receiver()?;
-    check_interface_site()?;
-    check_thrower()?;
-    check_polymorphic()?;
+    let mut vm = test_vm();
+    check_guard_hit(&mut vm)?;
+    check_guard_miss(&mut vm)?;
+    check_override_receiver(&mut vm)?;
+    check_interface_site(&mut vm)?;
+    check_thrower(&mut vm)?;
+    check_polymorphic(&mut vm)?;
     Ok(())
 }
 
@@ -140,10 +155,9 @@ fn run_all_checks() -> Result<(), String> {
 /// behind it must be B's. Resolving the callee from the constant-pool class
 /// name instead splices A's body behind a B guard, and every call quietly
 /// returns `x+1` instead of `x+1000`.
-fn check_override_receiver() -> Result<(), String> {
-    let mut vm = test_vm();
+fn check_override_receiver(vm: &mut Vm) -> Result<(), String> {
     for i in 0..CALLS {
-        let got = invoke_int(&mut vm, "callOverride", &[Value::Int(i)]);
+        let got = invoke_int(vm, "callOverride", &[Value::Int(i)]);
         let want = i + 1000;
         if got != want {
             return Err(format!(
@@ -152,6 +166,14 @@ fn check_override_receiver() -> Result<(), String> {
                  B's `tag`"
             ));
         }
+    }
+    // The results above come from the interpreter unless this holds, and the
+    // interpreter was never the thing at risk.
+    let tally = compiled_tally(vm, "callOverride")?;
+    if tally.speculative_sites == 0 {
+        return Err(format!(
+            "check_override_receiver: callOverride compiled but speculative_sites == 0              (tally={tally:?}) — the guarded path never ran, so a wrong spliced body              would not have been observable"
+        ));
     }
     Ok(())
 }
@@ -162,10 +184,9 @@ fn check_override_receiver() -> Result<(), String> {
 /// the speculated receiver class finds `OnlyImpl.itag` and can. Asserts both
 /// the result and that a speculative site was actually admitted, so a
 /// regression back to "correct but never inlined" is visible.
-fn check_interface_site() -> Result<(), String> {
-    let mut vm = test_vm();
+fn check_interface_site(vm: &mut Vm) -> Result<(), String> {
     for i in 0..CALLS {
-        let got = invoke_int(&mut vm, "callIface", &[Value::Int(i)]);
+        let got = invoke_int(vm, "callIface", &[Value::Int(i)]);
         let want = i + 77;
         if got != want {
             return Err(format!(
@@ -173,7 +194,7 @@ fn check_interface_site() -> Result<(), String> {
             ));
         }
     }
-    let tally = compiled_tally(&vm, "callIface")?;
+    let tally = compiled_tally(vm, "callIface")?;
     if tally.speculative_sites == 0 {
         return Err(format!(
             "check_interface_site: callIface compiled but speculative_sites == 0 (tally={tally:?}) \
@@ -220,10 +241,9 @@ fn compiled_tally(vm: &Vm, method: &str) -> Result<cratonvm_jit::InlineDecisionT
 /// (lowered) JIT threshold, must keep returning the correct result once
 /// compiled — the guard-hit path must be observably identical to the
 /// interpreted / unguarded-dispatch result.
-fn check_guard_hit() -> Result<(), String> {
-    let mut vm = test_vm();
+fn check_guard_hit(vm: &mut Vm) -> Result<(), String> {
     for i in 0..CALLS {
-        let got = invoke_int(&mut vm, "callA", &[Value::Int(i)]);
+        let got = invoke_int(vm, "callA", &[Value::Int(i)]);
         let want = i + 1;
         if got != want {
             return Err(format!(
@@ -277,11 +297,10 @@ fn check_guard_hit() -> Result<(), String> {
 /// one of those later calls must dispatch to the actual runtime class's
 /// `tag()`, not silently run A's already-inlined body against a receiver
 /// the guard should have rejected.
-fn check_guard_miss() -> Result<(), String> {
-    let mut vm = test_vm();
-    invoke_void(&mut vm, "setCurrent", &[Value::Int(0)]); // A
+fn check_guard_miss(vm: &mut Vm) -> Result<(), String> {
+    invoke_void(vm, "setCurrent", &[Value::Int(0)]); // A
     for i in 0..CALLS {
-        let got = invoke_int(&mut vm, "callCurrent", &[Value::Int(i)]);
+        let got = invoke_int(vm, "callCurrent", &[Value::Int(i)]);
         let want = i + 1;
         if got != want {
             return Err(format!(
@@ -293,11 +312,21 @@ fn check_guard_miss() -> Result<(), String> {
     // The guard (if the flag admitted one) is now baked in for class A.
     // Switch the receiver and confirm every subsequent call still resolves
     // to the ACTUAL runtime class, not the guarded/inlined body.
+    // Without this the phases below run interpreted and the check is empty:
+    // "a mismatched guard falls back to dispatch" is only a claim about
+    // COMPILED code.
+    let tally = compiled_tally(vm, "callCurrent")?;
+    if tally.speculative_sites == 0 {
+        return Err(format!(
+            "check_guard_miss: callCurrent compiled but speculative_sites == 0              (tally={tally:?}) — no guard was baked in, so switching the receiver              tests nothing"
+        ));
+    }
+
     let cases: &[(i32, i32)] = &[(1, 1000), (2, 2000), (3, 3000)];
     for &(which, offset) in cases {
-        invoke_void(&mut vm, "setCurrent", &[Value::Int(which)]);
+        invoke_void(vm, "setCurrent", &[Value::Int(which)]);
         for i in 0..20 {
-            let got = invoke_int(&mut vm, "callCurrent", &[Value::Int(i)]);
+            let got = invoke_int(vm, "callCurrent", &[Value::Int(i)]);
             let want = i + offset;
             if got != want {
                 return Err(format!(
@@ -313,10 +342,9 @@ fn check_guard_miss() -> Result<(), String> {
 /// A callee that throws, called past the compile threshold: verifies a
 /// guard-eligible call site's exception + catch control flow is unchanged
 /// once compiled.
-fn check_thrower() -> Result<(), String> {
-    let mut vm = test_vm();
+fn check_thrower(vm: &mut Vm) -> Result<(), String> {
     for i in 0..CALLS {
-        let got = invoke_int(&mut vm, "callThrowerCaught", &[Value::Int(i)]);
+        let got = invoke_int(vm, "callThrowerCaught", &[Value::Int(i)]);
         let want = if i == 7 { -1000 - i } else { i + 1 };
         if got != want {
             return Err(format!(
@@ -332,11 +360,10 @@ fn check_thrower() -> Result<(), String> {
 /// classification every call must still dispatch correctly — proving the
 /// widened admission path doesn't corrupt a shape it was never meant to
 /// guard.
-fn check_polymorphic() -> Result<(), String> {
-    let mut vm = test_vm();
+fn check_polymorphic(vm: &mut Vm) -> Result<(), String> {
     for i in 0..CALLS {
         let which = i % 4;
-        let got = invoke_int(&mut vm, "callPoly", &[Value::Int(i), Value::Int(which)]);
+        let got = invoke_int(vm, "callPoly", &[Value::Int(i), Value::Int(which)]);
         let want = i + [1, 1000, 2000, 3000][which as usize];
         if got != want {
             return Err(format!(

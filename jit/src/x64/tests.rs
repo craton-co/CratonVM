@@ -11682,6 +11682,60 @@ fn s31_inline_getter_iload_ireturn() {
     }
 }
 
+/// PGO-02 §3, tested by INJECTING the violation it exists to catch.
+///
+/// An inlined body is entered and left inside one frame — the caller's own —
+/// and `deopt::FrameState::caller` is populated by no producer, so an inlined
+/// scope cannot be described. A deopt point published from inside a spliced
+/// body would therefore name the caller's method with the callee's bci: a
+/// well-formed answer about a stack that never existed. `try_emit_inline`
+/// refuses such a splice.
+///
+/// No production emitter reaches that state today, which is exactly why the
+/// check needs a deliberate violation to prove it fires — asserting "no
+/// production path publishes one" would pass vacuously forever, including
+/// after the day it stopped being true.
+#[test]
+fn inline_publishing_a_deopt_point_is_refused() {
+    let caller_code: Vec<u8> = vec![
+        0x1a, // 0: iload_0
+        0xb8, 0x00, 0x01, // 1: invokestatic #1
+        0xac, // 4: ireturn
+        0, 0, // padding
+    ];
+    let caller_len = 5;
+    let sites = || {
+        let mut sites = HashMap::new();
+        sites.insert(1, make_inline_site(&[0x1a, 0xac], 1, 1, true, b'I'));
+        sites
+    };
+
+    // Control: the splice happens and the spliced code is correct.
+    let inlined = compile_with_inlines(&caller_code, caller_len, 1, 1, sites())
+        .expect("control compile must succeed");
+    // SAFETY: JIT-compiled machine code produced by this compiler from valid
+    // bytecode, in an executable mapping.
+    unsafe {
+        assert_eq!(inlined.try_call(&[42]).expect("test JIT call"), 42);
+    }
+
+    // Injected violation: the same body now publishes deopt metadata.
+    super::INLINE_TEST_PUBLISHES_DEOPT.with(|f| f.set(true));
+    let refused = compile_with_inlines(&caller_code, caller_len, 1, 1, sites());
+    super::INLINE_TEST_PUBLISHES_DEOPT.with(|f| f.set(false));
+
+    let refused = refused.expect(
+        "refusing the splice must fall back to a normal call, not bail the whole method",
+    );
+    assert_ne!(
+        refused.code_bytes(),
+        inlined.code_bytes(),
+        "a body that published deopt metadata must NOT have been spliced — identical \
+         machine code means the postcondition did not fire and an unrepresentable \
+         inlined scope was published"
+    );
+}
+
 #[test]
 fn s31_inline_add_two_params() {
     // Caller: int f(int a, int b) { return add(a, b); }

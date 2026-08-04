@@ -224,6 +224,20 @@ mod simd;
 mod arith;
 mod osr;
 mod deopt_stubs;
+
+/// Test-only switch that makes every inlined body publish deopt metadata.
+///
+/// `try_emit_inline` refuses a splice whose body published any (PGO-02 §3 —
+/// an inlined scope is not representable in deopt metadata, so a point
+/// recorded inside one describes a stack that never existed). A guard nobody
+/// can make fire is a guard nobody has tested, and no production emitter
+/// produces this state today; this is how
+/// `inline_publishing_a_deopt_point_is_refused` produces it deliberately.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static INLINE_TEST_PUBLISHES_DEOPT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 mod safepoint;
 mod frames;
 mod operand_stack;
