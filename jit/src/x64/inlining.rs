@@ -43,6 +43,21 @@ impl Compiler {
     /// values came back as 0). Snapshotting + rollback here makes a bail
     /// fully transparent.
     pub(super) fn try_emit_inline(&mut self, pc: usize) -> bool {
+        let Some(site) = self.inline_sites.get(&pc).cloned() else {
+            return false;
+        };
+        self.try_emit_inline_site(pc, &site)
+    }
+
+    /// [`Self::try_emit_inline`] for a body that is NOT the `inline_sites`
+    /// entry for `pc`.
+    ///
+    /// A bimorphic site splices two different callee bodies behind two guards
+    /// at one caller pc — two overriding subclasses are two different methods,
+    /// which is the entire point of a two-way split — so exactly one of them
+    /// can be the `inline_sites` entry. Both go through this function, so both
+    /// get the same rollback set and the same deopt-metadata postcondition.
+    pub(super) fn try_emit_inline_site(&mut self, pc: usize, site: &crate::InlineSite) -> bool {
         let buf_checkpoint = self.buf.pos();
         let stack_checkpoint = self.stack.clone();
         let oop_marks_checkpoint = self.stack_oop_marks.clone();
@@ -91,12 +106,37 @@ impl Compiler {
         let mirror_suppressed_checkpoint = self.slot_mirror_suppressed;
         self.slot_mirror = None;
         self.slot_mirror_suppressed = true;
-        let inline_ok = self.try_emit_inline_body(pc);
+        let deopt_points_checkpoint = self.deopt_points.len();
+        let inline_ok = self.try_emit_inline_body(pc, site);
         self.slot_mirror_suppressed = mirror_suppressed_checkpoint;
         self.slot_mirror = None;
-        if inline_ok {
+        // PGO-02 §3, enforced rather than argued.
+        //
+        // Every inlined body — statically bound or behind a receiver guard —
+        // is entered and left inside ONE frame, the caller's own, and deopt
+        // metadata has no way to say otherwise: `deopt::FrameState::caller`
+        // exists but no producer populates it, so an inlined scope is not
+        // representable. A deopt point published from inside a spliced body
+        // would therefore name the CALLER's method with the CALLEE's bci — a
+        // well-formed description of a stack that never existed, which is the
+        // exact failure class the 2026-08-01 deopt-metadata audit found three
+        // of.
+        //
+        // The safety argument used to be a claim about the source ("the
+        // emitter contains no `build_and_record_deopt_point` on this path").
+        // That claim is one future edit away from being false, and nothing
+        // would fail when it became false. Check the postcondition instead: if
+        // the body published any deopt metadata, refuse the splice and take
+        // the real call. A refusal costs one dispatch; the alternative costs a
+        // wrong stack.
+        let published_deopt_metadata = self.deopt_stubs.len() > deopt_stubs_checkpoint
+            || self.deopt_points.len() > deopt_points_checkpoint;
+        if inline_ok && !published_deopt_metadata {
             true
         } else {
+            // A body that published deopt metadata is rolled back through the
+            // SAME path a mid-body bail takes — including the deopt lists
+            // themselves, which the truncations below cover.
             // Discard every speculative side effect of the abandoned
             // inline attempt so the fall-through normal-call path starts
             // from exactly the pre-inline machine state.
@@ -116,8 +156,20 @@ impl Compiler {
                 .truncate(bounds_check_stubs_checkpoint);
             self.null_check_store_stubs
                 .truncate(null_check_store_stubs_checkpoint);
+            self.deopt_points.truncate(deopt_points_checkpoint);
             false
         }
+    }
+
+    /// Test-only injection point for the deopt-metadata postcondition above.
+    ///
+    /// A guard nobody can make fire is a guard nobody has tested. This lets
+    /// `inline_publishing_a_deopt_point_is_refused` produce the one state the
+    /// check exists to catch — a spliced body that published deopt metadata —
+    /// without waiting for a future emitter change to produce it accidentally.
+    #[cfg(test)]
+    pub(super) fn force_inline_deopt_publication(&mut self) {
+        self.deopt_stubs.push((self.buf.pos(), 0, 0));
     }
 
     /// Inline-emission body. MUST only be called via [`Self::try_emit_inline`],
@@ -125,11 +177,12 @@ impl Compiler {
     /// return from anywhere inside is safe precisely because of that
     /// wrapper — the bail sites here therefore no longer need to unwind
     /// `next_spill_offset` by hand.
-    fn try_emit_inline_body(&mut self, pc: usize) -> bool {
-        let site = match self.inline_sites.get(&pc) {
-            Some(s) => s.clone(),
-            None => return false,
-        };
+    fn try_emit_inline_body(&mut self, pc: usize, site: &crate::InlineSite) -> bool {
+        let site = site.clone();
+        #[cfg(test)]
+        if super::INLINE_TEST_PUBLISHES_DEOPT.with(std::cell::Cell::get) {
+            self.force_inline_deopt_publication();
+        }
 
         // An inlined callee emits arbitrary code that uses the caller-saved
         // scratch GPRs (R8/R9) and FP temporaries (XMM0-7) — exactly the

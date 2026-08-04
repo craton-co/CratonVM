@@ -265,6 +265,19 @@ artefact we already emit, that a working implementation was replaced.
    wired carrier. Confirmed independently by `probes/SsfSurfaceProbe.java`,
    which fails **all three** entry points on the baseline binary and passes
    all three on the fixed one.
+
+   *Follow-up, same day:* the "known remaining gap" this section originally
+   left open — a per-connection `setSSLSocketFactory` not being readable back
+   — is **also closed now**, and its stated reason was wrong. It claimed the
+   fix needed "a new GC-rooted per-connection table (scan + post-move
+   remap)". It did not: the factory belongs in the real JDK
+   `sslSocketFactory` instance field, which is an ordinary object field and
+   therefore already a GC root and already remapped by the moving collector.
+   The counter-example was in the same file all along —
+   `setHostnameVerifier`/`getHostnameVerifier` store into the real
+   `hostnameVerifier` instance field for exactly that reason, and say so.
+   See the `huc-per-connection-ssf-readback` commit and
+   `probes/HucFactoryReadbackProbe.java`.
 4. **`ssl_security.rs`** — the layered
    `createSocket(Socket,String,int,boolean)` overload no longer converts a
    lost field 0 into a hard `IllegalStateException`. There is no such thing

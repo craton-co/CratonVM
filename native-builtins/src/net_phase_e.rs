@@ -12093,7 +12093,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     // `native-builtins/src/lib.rs`). Guarded by
     // `native-builtins/tests/registry_contracts.rs::
     // ssl_default_factory_and_context_have_the_documented_single_owner`.
-    // See `docs/internal/fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
+    // See `fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 }
 
 // ===========================================================================

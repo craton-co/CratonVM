@@ -669,6 +669,14 @@ pub const INVENTORY: &[E] = &[
     // would work too but would mislabel the row as a default-ON knob, which is
     // the one thing this table is supposed to state unambiguously.
     E { group: Group::JIT, token: "ir-isel-shadow", on_key: Some("CRATONVM_JIT_IR_ISEL_SHADOW"), off_key: None, off_word: None },
+    // Increment 2 of the machine level. `ir-isel-emit` makes the selector's
+    // tiles the emitted bytes; `ir-isel-verify` builds the same machine list and
+    // checks it against the per-opcode arms byte for byte WITHOUT emitting it.
+    // Both default-OFF for the same reason as `ir-isel-shadow` above:
+    // `ir_lower::isel_emit_enabled` / `isel_verify_enabled` answer `false` for
+    // `Err(_)`, so unsetting the key is already the off state.
+    E { group: Group::JIT, token: "ir-isel-emit", on_key: Some("CRATONVM_JIT_IR_ISEL_EMIT"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "ir-isel-verify", on_key: Some("CRATONVM_JIT_IR_ISEL_VERIFY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "precise-field-ops", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_FIELD_OPS"), off_word: None },
     E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None },
@@ -721,6 +729,18 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-dead-locals", on_key: Some("CRATONVM_JIT_OSR_DEAD_LOCALS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
+    // Default-**OFF**, unlike their neighbour `osr-dead-locals` four rows up —
+    // the contrast is the reason these two carry a comment at all.
+    // `jit::osr_always_seed_frame_slot` and `jit::osr_single_pc_entry_only`
+    // both answer `false` for `Err(_)` and admit only `1`/`on`/`true`/`yes`, so
+    // unsetting the key IS the off state and `off_word` stays `None`. Writing
+    // `Some("0")` would mislabel them as default-ON kill switches — the one
+    // thing this table exists to state unambiguously — and would make
+    // `-osr-single-pc` expand to `=0`, which those consumers happen to read as
+    // off only because `0` is absent from their truthy list, not because they
+    // were written to accept an opt-out.
+    E { group: Group::JIT, token: "osr-seed-frame-slots", on_key: Some("CRATONVM_JIT_OSR_SEED_FRAME_SLOTS"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "osr-single-pc", on_key: Some("CRATONVM_JIT_OSR_SINGLE_PC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "poison-free", on_key: Some("CRATONVM_JIT_POISON_FREE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "precise-coverage-pin", on_key: Some("CRATONVM_PRECISE_COVERAGE_PIN"), off_key: None, off_word: None },
     // Wrong-answer A/B lever, not a tuning knob: OFF restores the params-only
@@ -742,6 +762,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "range-bce", on_key: Some("CRATONVM_JIT_RANGE_BCE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "range-scan-legacy", on_key: Some("CRATONVM_JIT_RANGE_SCAN_LEGACY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "reassoc", on_key: Some("CRATONVM_JIT_REASSOC"), off_key: None, off_word: None },
+    // Default-ON kill switch, hence `off_key` only: `CRATONVM_JIT=-retpc-validate`
+    // makes the A5 unregistered-JIT-frame stack scan treat EVERY in-range stack
+    // word as a return address again, the way it did before 2026-08-04. Kept as
+    // a one-flag bisect for the false-positive filter in
+    // `conservative_roots::is_plausible_return_pc`.
+    E { group: Group::JIT, token: "retpc-validate", on_key: None, off_key: Some("CRATONVM_JIT_NO_RETPC_VALIDATE"), off_word: None },
     E { group: Group::JIT, token: "rootsnap-cache", on_key: Some("CRATONVM_ROOTSNAP_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "rootsnap-cache-survive-gc", on_key: Some("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "safepoint-polls", on_key: Some("CRATONVM_JIT_SAFEPOINT_POLLS"), off_key: None, off_word: None },
@@ -829,6 +855,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "default-heap-ergonomics", on_key: Some("CRATONVM_DEFAULT_HEAP_ERGONOMICS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "default-heap-max-mb", on_key: Some("CRATONVM_DEFAULT_HEAP_MAX_MB"), off_key: None, off_word: None },
+    // Default-ON kill switch, hence `off_key` only: `CRATONVM_GC=-defrag-promote`
+    // restores the pre-2026-08-04 non-moving young sweep, which promoted only
+    // objects that had reached `PROMOTION_AGE` and therefore had no way out of
+    // a free list fragmented below any usable block size.
+    E { group: Group::GC, token: "defrag-promote", on_key: None, off_key: Some("CRATONVM_NO_DEFRAG_PROMOTE"), off_word: None },
     // Bisection escape hatches for two GC fixes, both opt-out-only. Enabling
     // either *reinstates a known defect* (stale-address writes in post-GC
     // reference processing; monotonic old-gen fragmentation) — they exist for
@@ -2053,6 +2084,56 @@ mod tests {
             // ...and the positive token clears a stale export.
             let c = case(&[(group.var(), token), (off_key, "1")]);
             assert_eq!(c.resolve().get(off_key), None);
+        }
+    }
+
+    /// The two OSR diagnosis levers declared 2026-08-04 resolve BOTH ways, and
+    /// are default-OFF.
+    ///
+    /// `flag_declaration_guard` only asks whether a name appears in
+    /// [`INVENTORY`]; a row can be listed and still not resolve, and from there
+    /// the two look identical. So this drives the grouped spelling and checks
+    /// the legacy key it must set — and checks the polarity, because these two
+    /// sit four rows from `osr-dead-locals`, which is the opposite: default-ON
+    /// with `"0"` as its kill switch.
+    ///
+    /// The exact edit that trips it: give either row an `off_word`. The
+    /// `off_word.is_none()` assertion fails, and so does the last block —
+    /// `-osr-single-pc` would start expanding to `=0` instead of doing nothing,
+    /// and for a consumer that accepts only `1`/`on`/`true`/`yes` that is an
+    /// opt-out spelling nobody wrote.
+    #[test]
+    fn the_osr_diagnosis_levers_resolve_and_are_default_off() {
+        for (token, key) in [
+            ("osr-seed-frame-slots", "CRATONVM_JIT_OSR_SEED_FRAME_SLOTS"),
+            ("osr-single-pc", "CRATONVM_JIT_OSR_SINGLE_PC"),
+        ] {
+            let e = lookup(Group::JIT, token).unwrap_or_else(|| panic!("{token} is undeclared"));
+            assert_eq!(e.on_key, Some(key));
+            assert!(e.off_key.is_none(), "{token} gained an opt-out key");
+            assert!(
+                e.off_word.is_none(),
+                "{token} is default-OFF; an `off_word` would label it a kill switch"
+            );
+
+            // The positive token reaches the key `jit::osr_always_seed_frame_slot`
+            // and `jit::osr_single_pc_entry_only` actually read.
+            let c = case(&[("CRATONVM_JIT", token)]);
+            assert_eq!(
+                c.resolve().get(key),
+                Some(OsString::from("1")),
+                "CRATONVM_JIT={token} must set {key}"
+            );
+
+            // And the negative spelling exports nothing, rather than a word
+            // those consumers never agreed to read.
+            let spec = format!("-{token}");
+            let c = case(&[("CRATONVM_JIT", spec.as_str())]);
+            assert_eq!(
+                c.resolve().get(key),
+                None,
+                "-{token} must not export a value; these are off by absence"
+            );
         }
     }
 

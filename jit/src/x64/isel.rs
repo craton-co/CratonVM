@@ -1433,6 +1433,41 @@ pub static PATTERNS: &[Pattern] = &[
         cost: Cost::new(3, 1, 1),
         ..Pattern::BASE
     },
+    // 32-bit `LEA`, the form real Java `int` arithmetic asks for.
+    //
+    // Anchored: `x64.rs`'s small-multiply fast path already emits exactly this
+    // row's bytes — `emit_imul_const` (`x64/arith.rs:790`, `:797`, `:804`)
+    // writes `8D 04 40` / `8D 04 80` / `8D 04 C0`, i.e. `LEA EAX, [RAX+RAX*n]`
+    // with no REX prefix. `rex_w: false` plus `RexMode::IfNeeded` reproduces
+    // that byte-for-byte for registers 0-7 and adds REX only where the encoding
+    // requires it.
+    //
+    // Correct for `int` for the same reason `ADD EAX, ECX` is: a 32-bit `LEA`
+    // computes the effective address in 64 bits, truncates to 32 and
+    // zero-extends into the destination, and address arithmetic is congruent
+    // mod 2^32 — so the low half is Java's wrapping result whatever the
+    // operands' widths. The high half it leaves is the *same* high half the
+    // majority of `ir_lower`'s `Int` arms already leave.
+    Pattern {
+        name: "lea_r32_m",
+        emitter: "x64/arith.rs emit_imul_const `[0x8D, 0x04, 0x40|0x80|0xC0]`",
+        op: Op::Lea,
+        ty: Ty::I32,
+        src: OpKind::Mem,
+        enc: Enc {
+            opcode: Opcode::One(0x8D),
+            reg: RegF::Dst,
+            rm: RmF::Mem,
+            ..Enc::BASE
+        },
+        disp: DispPolicy::Smallest,
+        // LEA reads no memory: it computes the effective address only. Two
+        // bytes, not the 64-bit row's three: no REX. That is the *floor* for a
+        // base-only operand; `MInst::cost` adds the address's own extra bytes,
+        // so the anchored `LEA EAX, [RAX+RAX*n]` still prices at 3.
+        cost: Cost::new(2, 1, 1),
+        ..Pattern::BASE
+    },
     Pattern {
         name: "lea_r64_m_disp32",
         emitter: "emit_lea_r64_mem_disp32",
@@ -3611,6 +3646,7 @@ impl MInst {
             MInst::Move { ty: Ty::I64, .. } => Some("mov_r64_r64"),
             MInst::Move { .. } => None,
             MInst::Lea { ty: Ty::I64, .. } => Some("lea_r64_m"),
+            MInst::Lea { ty: Ty::I32, .. } => Some("lea_r32_m"),
             MInst::Lea { .. } => None,
             MInst::AluRR { op, ty, .. } => match (op, ty) {
                 (Op::Add, Ty::I64) => Some("add_r64_r64"),
@@ -3826,6 +3862,19 @@ pub struct Tile {
     pub rule: Rule,
 }
 
+/// What one operand costs to bring in from its frame word: `MOV r64, [RBP -
+/// disp8]`, four bytes and one micro-op, at a load's latency.
+///
+/// The disp8 form deliberately — it is the common case and the *smaller*
+/// figure, so a cost model that consults this never over-states what an
+/// immediate form saves.
+const FRAME_LOAD_COST: SeqCost = SeqCost {
+    bytes: 4,
+    uops: 1,
+    latency: 4,
+};
+
+
 impl Tile {
     fn new(root: NodeId, covered: Vec<NodeId>, insts: Vec<MInst>, rule: Rule) -> Tile {
         let cost = insts
@@ -3876,6 +3925,66 @@ impl Tile {
         )
     }
 
+    /// This tile's cost, re-priced for a frame-homed allocation.
+    ///
+    /// [`MInst::cost`] prices instructions. Under
+    /// [`SelectOptions::frame_homed`] an operand that stays a register is also
+    /// a `MOV r64, [RBP - disp]` the consumer has to emit to bring it in, and
+    /// two candidates for one node can need a *different number* of those:
+    /// `ADD EAX, ECX` loads two values where `ADD EAX, 7` loads one. Pricing
+    /// only the instruction hides four bytes and a micro-op, and hands the node
+    /// to the register form every time.
+    ///
+    /// Every tile loads at least one operand — the value it computes from — so
+    /// the first is free here and only the extras are charged. That keeps this
+    /// a *comparison between candidates for one node* rather than an absolute
+    /// figure competing with [`GENERIC_COST`].
+    ///
+    /// The operand set is a set: `x + x` selects an `LEA [x + x]` that loads
+    /// `x` once, and counting edges rather than values would charge it twice.
+    fn frame_homed(mut self) -> Tile {
+        let mut operands: Vec<NodeId> = Vec::new();
+        for inst in &self.insts {
+            let mut note = |id: NodeId| {
+                if !operands.contains(&id) {
+                    operands.push(id);
+                }
+            };
+            match *inst {
+                MInst::Imm { .. } | MInst::Generic { .. } | MInst::Jcc { .. } => {}
+                MInst::Move { src, .. } => note(src),
+                MInst::Lea { addr, .. } => {
+                    if let Some(b) = addr.base {
+                        note(b);
+                    }
+                    if let Some(i) = addr.index {
+                        note(i);
+                    }
+                }
+                MInst::AluRR { lhs, rhs, .. } => {
+                    note(lhs);
+                    note(rhs);
+                }
+                MInst::AluRI { lhs, .. } => note(lhs),
+                // A folded load's address is the memory node's own, which the
+                // lowering computes; only the kept operand is a frame word.
+                MInst::AluRM { lhs, .. } => note(lhs),
+                MInst::CmpRR { lhs, rhs, .. } => {
+                    note(lhs);
+                    note(rhs);
+                }
+                MInst::CmpRI { lhs, .. } => note(lhs),
+                MInst::TestRR { reg, .. } => note(reg),
+                // `SETcc` reads flags, not a frame word.
+                MInst::SetCc { .. } => {}
+            }
+        }
+        for _ in 1..operands.len() {
+            self.cost = self.cost.then(FRAME_LOAD_COST);
+        }
+        self
+    }
+
     /// The fall-back tile: one node, lowered the old way.
     pub fn generic(root: NodeId) -> Tile {
         Tile::new(
@@ -3884,6 +3993,19 @@ impl Tile {
             vec![MInst::Generic { node: root }],
             Rule::Generic,
         )
+    }
+
+    /// Build a tile directly. Tests only.
+    ///
+    /// In production only the rules construct tiles, so a tile's cover list and
+    /// its instructions always come from one place. A test that needs to hand a
+    /// *deliberately inconsistent* tile to a consumer — `ir_lower::
+    /// mir_tile_is_emittable`'s absorbed-node guard is the one that does —
+    /// cannot obtain one from a rule by construction, which is exactly why that
+    /// guard needs this.
+    #[cfg(test)]
+    pub fn for_test(root: NodeId, covered: Vec<NodeId>, insts: Vec<MInst>, rule: Rule) -> Tile {
+        Tile::new(root, covered, insts, rule)
     }
 
     /// Can the pattern table encode every instruction in this tile?
@@ -3916,6 +4038,26 @@ pub struct SelectOptions {
     /// [`AddrSource::Opaque`], so a lowering has to teach the memory operand to
     /// `ir_lower` before this is worth turning on.
     pub fold_loads: bool,
+    /// The consumer will encode these tiles against a **frame-homed**
+    /// allocation: every value lives in its frame word, and an instruction's
+    /// operands are loaded into scratch registers on the spot.
+    ///
+    /// This is not a hint, it is a statement about the allocation, and it
+    /// changes what the cost model is measuring. The two-address fixup — the
+    /// `MInst::Move` that copies a still-live left operand before an x86 ALU
+    /// instruction overwrites it — does not exist under frame homing: the
+    /// destination's register never *held* the left operand, so "copy it there"
+    /// and "load it there" are the same instruction, and the ALU form pays
+    /// nothing for a live left operand.
+    ///
+    /// Off by default, deliberately. Increments 0 and 1 measured coverage with
+    /// it off; flipping the default would silently re-base those figures.
+    ///
+    /// What it decides, concretely: with a live left operand and this `false`,
+    /// `Rule::Lea` outbids `Rule::AluReg` on the strength of a copy the
+    /// consumer would never have emitted, and `a + b` selects an `LEA` that is
+    /// a byte longer than the `ADD` it replaced.
+    pub frame_homed: bool,
 }
 
 impl Default for SelectOptions {
@@ -3923,6 +4065,7 @@ impl Default for SelectOptions {
         SelectOptions {
             require_encodable: true,
             fold_loads: false,
+            frame_homed: false,
         }
     }
 }
@@ -4030,21 +4173,26 @@ fn commutative(op: &IrOp) -> bool {
 /// That is only legal when `lhs` dies at this node — one consumer, and no deopt
 /// frame naming it. Otherwise the tile pays for a `MOV` first, and that cost is
 /// exactly what makes the non-destructive `LEA` win the comparison.
-fn needs_copy(ctx: &SelCtx, lhs: NodeId) -> bool {
-    !ctx.uses.single_use(lhs)
+///
+/// Under [`SelectOptions::frame_homed`] there is no coalescing to protect:
+/// the destination's register never held the left operand, so the consumer
+/// loads it either way and the copy is not a copy. Answering `true` there would
+/// price a `MOV` nobody emits — and that fiction is what makes `LEA` outbid the
+/// `ADD` it is a byte longer than.
+fn needs_copy(ctx: &SelCtx, lhs: NodeId, opts: &SelectOptions) -> bool {
+    !opts.frame_homed && !ctx.uses.single_use(lhs)
 }
 
 /// `LEA` for an add / shift / multiply tree.
 fn tile_lea(ctx: &SelCtx, root: NodeId, claimed: &[bool], notes: &mut Vec<Note>) -> Option<Tile> {
-    // 32-bit `LEA` (`8D /r` with REX.W clear) is correct for `int` arithmetic —
-    // it truncates to 32 bits, which is exactly Java's wrap — but the table has
-    // no row for it, and emitting the 64-bit form instead would leave garbage in
-    // the high half of a slot that `Op::Return` copies out whole. Refuse rather
-    // than guess; see the doc's "still unvalidated" section.
+    // 32-bit `LEA` (`8D /r` with REX.W clear) is correct for `int` arithmetic:
+    // it truncates to 32 bits, which is exactly Java's wrap, and zero-extends
+    // into the destination — the same high half `ADD EAX, ECX` leaves, which is
+    // what `ir_lower`'s `Op::Add`/`Op::Mul` `Int` arms already emit. The row it
+    // encodes through (`lea_r32_m`) is anchored to `emit_imul_const`'s
+    // `8D 04 40` / `8D 04 80` / `8D 04 C0`. Nothing wider than `I64` gets here:
+    // `int_ty` maps only `Int`/`Long`/`Ref`.
     let ty = ctx.int_ty(root)?;
-    if ty != Ty::I64 {
-        return None;
-    }
     let m = match match_address(ctx, root) {
         Ok(m) => m,
         // `NotAnAddress` only means "this rule does not apply to this node",
@@ -4108,7 +4256,7 @@ fn tiles_alu(
     // 64-bit frame slot. Always `Ty::I64`, so the copy has a table row for
     // both `int` and `long` operands.
     let prefix = |lhs: NodeId| -> Vec<MInst> {
-        if needs_copy(ctx, lhs) {
+        if needs_copy(ctx, lhs, opts) {
             vec![MInst::Move {
                 dst: root,
                 ty: Ty::I64,
@@ -4490,6 +4638,11 @@ fn mark_claims(t: &Tile, claimed: &mut [bool]) {
 /// back to the generic lowering instead of being selected into an instruction
 /// nobody can emit.
 fn admit(t: Tile, opts: &SelectOptions, notes: &mut Vec<Note>) -> Option<Tile> {
+    // The allocation the consumer will encode against changes what a tile
+    // costs, and it changes it differently for different candidates. Applied
+    // here rather than in each rule so that every candidate for a node is
+    // priced the same way — a rule that forgot would look cheap.
+    let t = if opts.frame_homed { t.frame_homed() } else { t };
     if !opts.require_encodable {
         return Some(t);
     }
@@ -6675,6 +6828,101 @@ mod tests {
         assert!(matches!(t.insts.as_slice(), [MInst::Lea { .. }]));
     }
 
+    /// The immediate form wins under frame homing, and loses without it.
+    ///
+    /// Measured, not assumed: with `frame_homed` off the level-2 encoder took
+    /// 39 tiles across CratonBenchC2's three phases and `Rule::AluImm` was
+    /// selected **zero** times — not because the rows were missing (increment 1
+    /// added them) and not because the constant was folded away, but because
+    /// `ADD EAX, ECX` is two bytes and `ADD EAX, 7` is three. The cost model
+    /// prices instructions; under frame homing the register operand also costs
+    /// a `MOV r64, [RBP-disp8]` that the immediate form does not, and pricing
+    /// only the instruction hides four bytes and a micro-op.
+    ///
+    /// The constant is deliberately given a second consumer here, because that
+    /// is what real code looks like: `ValueUses::single_use` requires
+    /// `count == 1` AND not pinned, and a safepoint snapshot names almost every
+    /// live constant — so the tile usually cannot absorb it and the two forms
+    /// really are competing over one node.
+    ///
+    /// The exact edit that trips it: drop the `opts.frame_homed` arm from
+    /// `tiles_alu`'s `extra`. The first assertion flips back to `AluReg`.
+    #[test]
+    fn frame_homing_makes_the_immediate_form_win() {
+        let build = || {
+            let mut graph = g();
+            let p = param(&mut graph, 0);
+            let k = konst(&mut graph, 7);
+            let add = bin(&mut graph, IrOp::Add, p, k);
+            // A second consumer for the CONSTANT only, so it is not absorbable
+            // and both candidates cover exactly the add — and so the left
+            // operand stays single-use, which keeps the two-address copy out of
+            // the comparison. This is a test about operand loads, not copies.
+            let _other = second_use(&mut graph, k);
+            (graph, add)
+        };
+
+        let (graph, add) = build();
+        let block = vec![add];
+        let homed = SelectOptions {
+            frame_homed: true,
+            ..SelectOptions::default()
+        };
+        let s = select_block(&graph, &block, None, &homed);
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(
+            t.rule,
+            Rule::AluImm,
+            "the immediate form drops a frame load the register form pays"
+        );
+        assert_eq!(t.covered.as_slice(), [add], "the constant is still live");
+
+        // And the default is untouched, which is what keeps increments 0 and
+        // 1's coverage figures comparable.
+        let (graph, add) = build();
+        let s = select_block(&graph, &vec![add], None, &SelectOptions::default());
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(t.rule, Rule::AluReg);
+    }
+
+    /// …and under [`SelectOptions::frame_homed`] the copy is *not* real, so the
+    /// same graph selects the `ADD` again.
+    ///
+    /// This is the option earning its keep rather than being a preference. The
+    /// consumer that sets it (`ir_lower`'s level-2 encoder) loads the left
+    /// operand into the destination register whatever the tile says, so a
+    /// `MInst::Move` prefix costs nothing and buys nothing — and priced as
+    /// though it cost something it hands `a + b` an `LEA` a byte longer than
+    /// the `ADD` it replaced.
+    ///
+    /// The exact edit that trips it: drop the `!opts.frame_homed &&` from
+    /// `needs_copy`. Both assertions below flip.
+    #[test]
+    fn frame_homing_removes_the_copy_that_makes_lea_win() {
+        let mut graph = g();
+        let p = param(&mut graph, 0);
+        let q = param(&mut graph, 1);
+        let add = bin(&mut graph, IrOp::Add, p, q);
+        let _keep = second_use(&mut graph, p);
+        let block = vec![add];
+        let opts = SelectOptions {
+            frame_homed: true,
+            ..SelectOptions::default()
+        };
+        let s = select_block(&graph, &block, None, &opts);
+        let t = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(
+            t.rule,
+            Rule::AluReg,
+            "frame homing means there is no copy to avoid"
+        );
+        assert!(
+            matches!(t.insts.as_slice(), [MInst::AluRR { .. }]),
+            "and no `MInst::Move` prefix either: {:?}",
+            t.insts
+        );
+    }
+
     /// Ranking is micro-ops first. A three-byte `MOV` plus a three-byte `ADD`
     /// is *more* bytes than a four-byte `LEA`, but the point of the ordering is
     /// that it would still lose on micro-ops even if it were shorter.
@@ -6840,6 +7088,7 @@ mod tests {
             &SelectOptions {
                 require_encodable: false,
                 fold_loads: false,
+                frame_homed: false,
             },
         );
         let own = lax.tiles.iter().find(|t| t.root == cmp).expect("cmp tile");
@@ -6954,6 +7203,7 @@ mod tests {
         let opts = SelectOptions {
             require_encodable: false,
             fold_loads: true,
+            frame_homed: false,
         };
         let s = select_block(&f.graph, &f.block, None, &opts);
         assert!(
@@ -6972,6 +7222,7 @@ mod tests {
         let opts = SelectOptions {
             require_encodable: false,
             fold_loads: true,
+            frame_homed: false,
         };
         let s = select_block(&f.graph, &f.block, None, &opts);
         let t = s.tiles.iter().find(|t| t.root == f.add).expect("add tile");
@@ -7180,6 +7431,7 @@ mod tests {
             &SelectOptions {
                 require_encodable: false,
                 fold_loads: false,
+                frame_homed: false,
             },
         );
         assert_eq!(
@@ -7288,6 +7540,71 @@ mod tests {
         assert_eq!(sel(&gpr_imm(Op::Cmp, Ty::I32, RAX, 7)), vec![0x83, 0xF8, 0x07]);
     }
 
+    /// `lea_r32_m` reproduces the three byte literals `emit_imul_const` emits.
+    ///
+    /// `Rule::Lea` fired **zero** times on 850 real Spring Boot compiles
+    /// because `tile_lea` refused every `Ty::I32` root — Java arithmetic is
+    /// 32-bit and the table had only the REX.W form. This is the anchor for the
+    /// row that unblocked it: `x64/arith.rs:790`, `:797`, `:804` already write
+    /// exactly these bytes for `imul` by 3, 5 and 9.
+    ///
+    /// The exact edit that trips it: set `rex_w: true` on the row, or change
+    /// `RexMode::OnDemand` to `RexMode::Always`. Either adds a `0x48` and the
+    /// row stops being the literal it claims.
+    #[test]
+    fn the_32bit_lea_row_reproduces_the_imul_const_byte_literals() {
+        for (scale, want) in [
+            (2u8, vec![0x8Du8, 0x04, 0x40]),
+            (4, vec![0x8D, 0x04, 0x80]),
+            (8, vec![0x8D, 0x04, 0xC0]),
+        ] {
+            let mem = Mem {
+                base: RAX,
+                index: Some(Index { reg: RAX, scale }),
+                disp: 0,
+                force_disp32: false,
+            };
+            let got = sel(&Req::new(
+                Op::Lea,
+                Ty::I32,
+                Operand::Gpr(RAX),
+                Operand::Mem(mem),
+            ));
+            assert_eq!(got, want, "LEA EAX, [RAX + RAX*{scale}]");
+        }
+    }
+
+    /// An `int` add/shift/multiply tree becomes one `LEA`, which is the whole
+    /// point of the row above: before it, `tile_lea` returned `None` for every
+    /// `IrType::Int` root and the rule was dead on real code.
+    #[test]
+    fn an_int_address_tree_now_tiles_as_a_lea() {
+        let mut graph = g();
+        let p = graph.add(IrOp::Param(0), IrType::Int, vec![], None);
+        let q = graph.add(IrOp::Param(1), IrType::Int, vec![], None);
+        let k = konst_i32(&mut graph, 2);
+        let shl = graph.add(IrOp::Shl, IrType::Int, vec![q, k], None);
+        let add = graph.add(IrOp::Add, IrType::Int, vec![p, shl], None);
+        let block = vec![k, shl, add];
+        let s = select_block(&graph, &block, None, &SelectOptions::default());
+        assert!(s.covers(&block), "coverage: {s:?}");
+        let root = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(root.rule, Rule::Lea, "an int address tree must fold");
+        match root.insts.as_slice() {
+            [MInst::Lea { ty, addr, .. }] => {
+                assert_eq!(*ty, Ty::I32, "an int root must select the 32-bit form");
+                assert_eq!(addr.scale, 4);
+            }
+            other => panic!("expected one LEA, got {other:?}"),
+        }
+        // And the tile the selector produced is one the table can encode —
+        // a rule that fires but cannot encode is discarded by
+        // `require_encodable` and reads as "fired zero times" all over again.
+        for i in &root.insts {
+            i.probe().unwrap_or_else(|e| panic!("{i:?}: {e:?}"));
+        }
+    }
+
     /// The new rows are reachable through `MInst::probe`, not merely present.
     ///
     /// A row the table has but `pattern_name` cannot name is a row
@@ -7344,11 +7661,6 @@ mod tests {
                 dst: 0,
                 cc: CmpOp::Eq,
             },
-            MInst::Lea {
-                dst: 0,
-                ty: Ty::I32,
-                addr: IrAddr::empty(),
-            },
             MInst::AluRI {
                 op: Op::Xor,
                 ty: Ty::I64,
@@ -7364,8 +7676,8 @@ mod tests {
         .collect();
         assert_eq!(
             missing.len(),
-            5,
-            "these five instruction shapes have no PATTERNS row; see \
+            4,
+            "these four instruction shapes have no PATTERNS row; see \
              docs/jit/instruction-selection.md"
         );
         // And the ones that DO have rows really resolve to a row.
@@ -7389,6 +7701,16 @@ mod tests {
                     base: Some(1),
                     index: None,
                     scale: 1,
+                    disp: 0,
+                },
+            },
+            MInst::Lea {
+                dst: 0,
+                ty: Ty::I32,
+                addr: IrAddr {
+                    base: Some(1),
+                    index: Some(1),
+                    scale: 2,
                     disp: 0,
                 },
             },

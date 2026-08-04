@@ -383,7 +383,7 @@ fn watch_service_surface_has_a_single_owner_in_native_io() {
 ///   the pre-fix `field 0 = None` shape. Every Spring Boot test going
 ///   through `ModifiedClassPathClassLoader` (Aether resolving
 ///   `@ClassPathOverrides` coordinates over HTTPS) failed on it. See
-///   `docs/internal/fixed-suite-bugs/springboot/`
+///   `fixed-suite-bugs/springboot/`
 ///   `sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 ///
 /// So this pins the *surviving owner site*, not merely the count: a duplicate
@@ -443,8 +443,21 @@ fn ssl_entry_points_keep_their_documented_owning_registration() {
         // so the LAST row is the one that owns the slot (`register` is
         // last-write-wins on the exact triple).
         let owner = rows[rows.len() - 1];
+        // `registered_by` comes from `Location::caller()`, whose `file()` uses
+        // the HOST path separator — so on Windows every row reads
+        // `native-builtins\src\...` and no comparison against a `/`-spelled
+        // expectation can ever match. This guard was therefore red on Windows
+        // for reasons having nothing to do with what it guards: it reported
+        // "owned by ...ssl_security.rs:1521, not by ...ssl_security.rs" —
+        // the same file, spelled two ways — while the invariant it exists to
+        // protect (registered exactly once, by that file) was intact.
+        //
+        // Normalize both sides. A guard that cannot pass on a platform is not
+        // a guard there; it is a permanently-red test that trains people to
+        // ignore this suite, which is exactly what it was written to prevent.
+        let norm = |s: &str| s.replace('\\', "/");
         assert!(
-            owner.starts_with(owner_file),
+            norm(owner).starts_with(&norm(owner_file)),
             "{class}.{method}{descriptor} is owned by {owner}, not by {owner_file}. \
              It is registered {n} time(s), by {rows:?}. Registration order alone \
              decides the winner, so a new or moved registration silently replaced \
@@ -513,4 +526,83 @@ fn no_native_mints_a_field_less_ssl_socket_factory_carrier() {
          (use t27_tls::default_ssl_socket_factory_obj):\n  {}",
         violations.join("\n  ")
     );
+}
+
+/// Phase 61 must not take ownership of any `java.nio.file.Path` native away
+/// from phase 57.
+///
+/// `NativeMethodRegistry::register` overwrites the slot in place, so the LAST
+/// registration of a triple is the one that runs, and
+/// `register_synthetic_overrides` calls phase 57 and then phase 61.
+/// `register_p61_files_path` used to re-register six Path methods that phase 57
+/// already owned; the `resolve` pair among them joined with
+/// `std::path::Path::join` and stored the result without going through
+/// `p57_alloc_path`, so they skipped the normalize-at-construction step and
+/// silently re-introduced the trailing-separator defect from
+/// `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
+///
+/// The assertion compares the WINNING registration site against the site that
+/// wins when phase 57 registers alone, rather than asserting a registration
+/// merely exists — a presence check passes just as happily when a later phase
+/// has displaced the good implementation. Line numbers are compared between two
+/// runtime observations, so ordinary edits to the file do not move the goalposts.
+///
+/// Gated on the feature because `register_synthetic_overrides` — the only
+/// caller that puts phase 61 after phase 57, and therefore the only place the
+/// displacement can happen — does not exist without it. Ungated, this whole
+/// test TARGET fails to compile in the default configuration
+/// (`cargo test -p cratonvm-native-builtins`), taking every other contract in
+/// this file down with it. The guard therefore runs in the
+/// `experimental-features` job, which is also the only place the code it
+/// guards is reachable: real-JDK mode reaches phase 57 straight from
+/// `vm_init.rs` and never calls phase 61.
+#[cfg(feature = "synthetic-jdk")]
+#[test]
+fn p61_does_not_displace_phase57_path_natives() {
+    fn winner(registry: &NativeMethodRegistry, name: &str, descriptor: &str) -> Option<String> {
+        // `census()` is sorted by (class, name, descriptor) with a stable sort,
+        // so duplicate triples stay in registration order: the last row is the
+        // live owner.
+        registry
+            .census()
+            .into_iter()
+            .filter(|e| e.class == "java/nio/file/Path" && e.name == name && e.descriptor == descriptor)
+            .next_back()
+            .and_then(|e| e.registered_by)
+    }
+
+    // These six are the ones phase 61 used to duplicate. `getParent` and
+    // `getNameCount` had already been hand-synced to their phase-57 twins,
+    // which is exactly the drift hazard this test removes.
+    let surface = [
+        ("getFileName", "()Ljava/nio/file/Path;"),
+        ("getParent", "()Ljava/nio/file/Path;"),
+        ("toAbsolutePath", "()Ljava/nio/file/Path;"),
+        ("resolve", "(Ljava/lang/String;)Ljava/nio/file/Path;"),
+        ("resolve", "(Ljava/nio/file/Path;)Ljava/nio/file/Path;"),
+        ("getNameCount", "()I"),
+    ];
+
+    let mut phase57_only = NativeMethodRegistry::new();
+    cratonvm_native_builtins::phases_late::register_phase57_nio_file(&mut phase57_only);
+
+    let mut full = NativeMethodRegistry::new();
+    cratonvm_native_builtins::register_synthetic_overrides(&mut full);
+
+    for (name, descriptor) in surface {
+        let expected = winner(&phase57_only, name, descriptor);
+        assert!(
+            expected.is_some(),
+            "phase 57 no longer registers java/nio/file/Path.{name}{descriptor} — \
+             this test has nothing left to guard and would pass vacuously"
+        );
+        assert_eq!(
+            winner(&full, name, descriptor),
+            expected,
+            "java/nio/file/Path.{name}{descriptor} is owned by a LATER registration \
+             than phase 57's. A duplicate registration of a Path native silently \
+             replaces the phase-57 implementation (last write wins); delete it \
+             instead of keeping a copy in sync."
+        );
+    }
 }

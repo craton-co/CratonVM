@@ -1185,6 +1185,25 @@ impl VmHeap {
         }
     }
 
+    /// `(used, free-list bytes, largest free block, capacity)` for the young
+    /// from-space, for diagnostics only.
+    ///
+    /// SB-LOADER-ZIPCONTENT (2026-08-04). `live_bytes_estimate` reports
+    /// `young.used - young.free_list` summed with old, which cannot distinguish
+    /// "young is genuinely full of live objects" from "young was bumped to the
+    /// top once and is now a free list nobody can carve an 8 KB array out of".
+    /// Those two want opposite fixes, and the second is what a run of
+    /// non-moving young sweeps produces — so the number that tells them apart
+    /// belongs next to the overhead-limit numbers that motivated the question.
+    ///
+    /// Non-generational backends have no young from-space; they report zeros.
+    pub fn young_occupancy(&self) -> (usize, usize, usize, usize) {
+        match self {
+            VmHeap::Generational(h) => h.young_from_occupancy(),
+            _ => (0, 0, 0, 0),
+        }
+    }
+
     /// Run a garbage collection cycle.
     ///
     /// The `stw` parameter is type-level proof that the caller is in a

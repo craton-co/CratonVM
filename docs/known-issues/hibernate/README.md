@@ -157,10 +157,21 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
   **Correction (2026-08-04):** a fresh 50-class residual run
   (`run-20260804-113511-custom`) shows these two classes have diverged.
-  `BatchTest` no longer belongs in this bullet at all — today it fails 100%
-  of the time with a genuine, JIT-only `ConstraintViolationException` (a
-  unique-index collision), not a timeout; see
-  [`batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`](batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md).
+  `BatchTest` no longer belongs in this bullet at all — it failed 100% of the
+  time with a genuine, JIT-only `ConstraintViolationException` (a unique-index
+  collision), not a timeout. **That defect is now FIXED** (same day): the root
+  cause was CratonVM injecting `Unsafe.ARRAY_*_BASE_OFFSET` — `long` fields in
+  JDK 25 — as a 32-bit value, which the interpreter tolerated and JIT-compiled
+  code read as garbage, making `Arrays.equals(long[],long[])` return `true` for
+  arrays that differ. Write-up and evidence:
+  `../../internal/fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
+  `BatchTest` is now `ok=3 failed=1` under JIT with zero unique-index
+  violations; the remaining failure is `testBatchInsertUpdate` (`N=5000`) on
+  this cluster's own 120s throughput margin — which that doc measures at 273s
+  solo on a quiet box against a 5.6s HotSpot control, i.e. ~2.6x worse than the
+  101-107s recorded for the same method on 2026-07-17. **That regression is
+  unattributed and still open**, and is the only part of `BatchTest` this
+  bullet still covers.
   `DynamicBatchFetchTest` still trips the same internal 120s `TimeoutException`
   as before, but its log now shows 8-9 `[moving-young] fallback` events during
   `testMultiLoad` where the 07-30/31 table above recorded **zero** `[GC]`
@@ -211,6 +222,19 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   to this; read the write-up's "What is and is not proven" before citing it.
   Full write-up: `fixed-suite-bugs/hibernate/hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md`.
 
+- **`Type.getTypeName()` dispatched on `java/lang/Integer` during a SessionFactory rebuild
+  cascade** — CLOSED 2026-08-04, no longer reproduces. The single witness (2026-07-31) showed a
+  `Class` mirror resolving as the class it DESCRIBES; the doc's own 61 reproduction attempts were
+  already clean before this closure. A fresh 2026-08-04 hunt (~166 forced-cascade runs, ~10 000+
+  SessionFactory bootstraps, across the local Windows box and the Azure Linux shared host, tracer
+  armed throughout) also found zero occurrences. No fix landed under this investigation; strong
+  circumstantial evidence points at the dense cluster of GC-root-correctness fixes
+  (`0b18f15eb`, `638bd1190`, and five siblings) that landed within ~20 hours of the witness,
+  covering exactly this bug's territory (roots — including class-mirror rooting — not correctly
+  published across a moving-young GC cycle). Root cause was never conclusively pinned to one
+  commit; closed on absence of any live reproduction, not on a confirmed fix.
+  Full write-up: `fixed-suite-bugs/hibernate/gettypename-wrong-receiver-sessionfactory-rebuild-cascade-20260804-FIXED.md`.
+
 ## Open
 
 - [`InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT](hib-inpredicate-dispatch-heavy-jit-timeout-20260707-REOPENED-20260804.md)
@@ -224,21 +248,6 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   freshly re-confirmed this session (the original dispatch-heavy JIT tier-up
   analysis is the leading hypothesis, not re-proven); the real fix it points
   at (lock-free per-hit tier-up dispatch) was never landed.
-- [`Type.getTypeName()` dispatches on `java/lang/Integer` during a SessionFactory rebuild cascade](gettypename-wrong-receiver-in-sessionfactory-rebuild-cascade-20260801.md)
-  (OPEN, **not reproduced**; rewritten 2026-08-01 after re-reading the witness logs line by line —
-  its first version's causal story was wrong) — a `Class` mirror resolving as the class it
-  DESCRIBES, in `JavaTypeRegistry.addBaselineDescriptor`'s inlined `getTypeName()` call. The
-  cascade is not the consequence of a JUnit timeout: an affected run dies inside
-  `testNumericExpressionReturnTypes` at ~11% of the class, rebuilds, and from the SIXTH bootstrap
-  on **every** rebuild fails at priming before reaching the connection pool — 16 attempts, 2
-  warnings each, zero completed builds, until the wall cap. So it is self-feeding and **permanent**,
-  which rules out a transient race and points at state nothing invalidates. Ruled out by
-  measurement: the `getJavaType()` accessor (810k checks), `getTypeName()` over 30 mirrors (1.8M),
-  `VIRTUAL_TARGET_CACHE` recycling, 35 000 primings (fresh VM and post-suite), and 61 completed runs
-  of the class across dev, the lambda-fix commit and the witness's own era — including forced
-  `CRATONVM_NO_MOVING_YOUNG=1`. The witness era no longer reproduces even its own 103/106 baseline
-  on this host, which is the honest reason for the null result. Next: explain why
-  `testNumericExpressionReturnTypes` stopped — the earliest divergence, and nothing records it.
 
 - ~~Old-generation header corruption kills `DefaultCatalogAndSchemaTest` under `--nojit`~~
   — `HIB-MAPRESIZE-STALE.1`, **FIXED 2026-08-03**, retired to

@@ -2659,7 +2659,7 @@ pub fn execute(
                         &helpers,
                         scan.non_escaping_new.clone(), // escape analysis results
                         std::collections::HashMap::new(), // inline_sites
-                        std::collections::HashMap::new(), // inline_guard_class_ids (PGO-02, no guarded plan from this scan-based fast path)
+                        std::collections::HashMap::new(), // inline_guard_variants (PGO-02, no guarded plan from this scan-based fast path)
                         None, // string_layout — String intrinsics land in a later wave
                         &[],  // param_jvm_slots — legacy "arg index == slot" layout
                         0,    // param_slot_span — legacy layout
@@ -7879,10 +7879,16 @@ fn alloc_multi_array(
         } else {
             ArrayElementType::Reference
         };
+        // SB-LOADER-ZIPCONTENT (2026-08-04): `_full`, not the young-only
+        // variant. `alloc_multi_array` holds already-allocated dimension arrays
+        // in Rust locals across the recursion, so it deliberately never forces
+        // a GC — which leaves it with no second chance at all. Spilling into
+        // old gen is that second chance, and it relocates nothing (see
+        // `try_alloc_array_humongous`), so it is safe from exactly here.
         let arr = shared
             .mem
             .heap
-            .try_alloc_array(level_class_id, element_type, length)
+            .try_alloc_array_full(level_class_id, element_type, length)
             .ok_or_else(|| {
                 MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                     message: format!(
@@ -7894,10 +7900,11 @@ fn alloc_multi_array(
         Ok(arr)
     } else {
         // Intermediate dimensions: always Reference (array of arrays)
+        // `_full` for the same reason as the leaf dimension above.
         let arr = shared
             .mem
             .heap
-            .try_alloc_array(level_class_id, ArrayElementType::Reference, length)
+            .try_alloc_array_full(level_class_id, ArrayElementType::Reference, length)
             .ok_or_else(|| {
                 MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                     message: format!(
