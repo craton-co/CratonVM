@@ -4241,6 +4241,30 @@ fn execute_frame_from_index(
     // cannot be freed and recycled by a different method while `quick` is
     // `Some`. When `quick` is `None` a recycled address can only mislabel
     // another method as un-quickened -- a pessimisation, never a miscompare.
+    // ARCH-2026-08-04 A4b — hoisted out of the dispatch loop.
+    //
+    // `VmConfig` is immutable after `SharedVm::new`: `with_skip_verification` /
+    // `with_xverify_mode` are `mut self -> Self` builders that run before
+    // construction, so this is loop-invariant for the whole `execute()` call
+    // (indeed for the process). It was re-read once per bytecode as a
+    // `shared -> config -> bool` pointer chase.
+    //
+    // What it selects, and why it is a whole-mode switch rather than a
+    // per-opcode one: the fast-path local-access handlers (`lload`/`dload`,
+    // `istore`/`fstore`, `astore`, `lstore`/`dstore`, and the
+    // `get_local_compact_unchecked` / `set_local_compact_unchecked` helpers the
+    // `iload`/`iadd` fusions use) index `frame.locals` with the raw bytecode
+    // operand, relying on the verifier having proven `operand < max_locals`.
+    // Under `-noverify` / `-Xverify:none` that proof is gone. Note the indexing
+    // is ordinary Rust `Vec` indexing, so the failure is a *panic*, not memory
+    // unsafety — but a panic is still not an acceptable answer to a valid
+    // command line, hence the fallback to the bounds-checked decoded path.
+    //
+    // That fallback is what makes `--noverify` select a different
+    // implementation for all 122 fast-path arms at once, which is why
+    // `difftest`'s `interp-decoded` axis has to run (it did not until A4b; see
+    // `difftest/src/main.rs`).
+    let use_fast_path = !shared.config.skip_verification;
     let mut quick: Option<Arc<cratonvm_reader::QuickenedCode>> = None;
     let mut quick_code_ptr: *const u8 = std::ptr::null();
     // (The former `quick_hint` local is gone: `QuickenedCode` now resolves any
@@ -4401,22 +4425,12 @@ fn execute_frame_from_index(
         // throughput. Unsupported opcodes and guarded edge cases still fall
         // through to the shared decoded handler below.
         //
-        // H7: the fast-path local-access handlers (lload/dload, istore/fstore,
-        // astore, lstore/dstore — and the `_unchecked` get/set helpers used by
-        // the iload/iadd/etc. fusions) index `frame.locals` with the raw
-        // bytecode operand WITHOUT a bounds check, relying entirely on the
-        // bytecode verifier having proven the operand `< max_locals`. When
-        // verification is globally disabled (`-noverify` / `-Xverify:none`)
-        // that invariant no longer holds, so an out-of-range operand would
-        // index out of bounds. Disable the unchecked fast path entirely in
-        // that mode and fall back to the bounds-checked slow path; the
-        // per-site checks below are a second line of defence (e.g. for
-        // per-class `skip_verification` generated classes that this cheap
-        // global flag does not cover). `skip_verification` is a single bool
-        // load — no per-instruction RwLock acquire.
+        // H7: `use_fast_path` is hoisted above the loop (ARCH-2026-08-04 A4b)
+        // — see the note at its binding for what it selects and why the
+        // per-class `skip_verification` case still relies on the per-site
+        // checks below as a second line of defence.
         // SAFETY (every `hot_fp` deref below): see the hoist note above —
         // reads only, no push, no `&mut` reborrow of the stack in between.
-        let use_fast_path = !shared.config.skip_verification;
         // Explicit `&` on the place expression: calling `.len()` directly on
         // `(*hot_fp).code` autorefs through the raw pointer, which the
         // `dangerous_implicit_autorefs` lint denies. The borrow is confined to
