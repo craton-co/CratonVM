@@ -41298,33 +41298,6 @@ fn chm_seg_get(
     }
     drop(read_guard); // critical section ends — comparisons run lock-free
 
-    if chm_trace() {
-        eprintln!(
-            "[chm] seg_get seg={:p} hash={hash:#x} cap={cap} idx={idx} chain={:?}",
-            seg.as_ptr(),
-            chain
-                .iter()
-                .map(|(h, k, v)| (
-                    format!("{h:#x}"),
-                    match k {
-                        Value::Object(Some(o)) => ctx.read_string(*o),
-                        other => Some(format!("{other:?}")),
-                    },
-                    format!("{v:?}")
-                ))
-                .collect::<Vec<_>>()
-        );
-        let raw0 = ctx.get_array_element(buckets, idx);
-        if let Value::Object(Some(n)) = raw0 {
-            eprintln!(
-                "[chm]   node slots: 0={:?} 1={:?} 2={:?} 3={:?}",
-                ctx.get_field(n, 0),
-                ctx.get_field(n, 1),
-                ctx.get_field(n, 2),
-                ctx.get_field(n, 3)
-            );
-        }
-    }
     let chain_pins: Vec<(usize, usize)> = chain
         .iter()
         .map(|(_, key, value)| (pin_value(ctx, *key), pin_value(ctx, *value)))
@@ -41362,28 +41335,6 @@ fn chm_seg_get(
                     return Ok(None);
                 }
             };
-            if chm_trace() {
-                eprintln!(
-                    "[chm]   cmp key={:p}({:?}) node_key={:p}({:?}) strings_equal={:?} unbox=({:?},{:?}) cid=({:?},{:?}) eq={:?}",
-                    key.as_ptr(),
-                    ctx.read_string(key),
-                    node_key.as_ptr(),
-                    ctx.read_string(node_key),
-                    ctx.java_strings_equal(key, node_key),
-                    unbox_wrapper(ctx, key),
-                    unbox_wrapper(ctx, node_key),
-                    ctx.class_id_of_object(key),
-                    ctx.class_id_of_object(node_key),
-                    map_keys_equal(ctx, key, node_key)
-                );
-                eprintln!(
-                    "[chm]   key slots 0={:?} 1={:?} | node_key slots 0={:?} 1={:?}",
-                    ctx.get_field(key, 0),
-                    ctx.get_field(key, 1),
-                    ctx.get_field(node_key, 0),
-                    ctx.get_field(node_key, 1),
-                );
-            }
             if map_keys_equal(ctx, key, node_key)? {
                 let node_value = read_pinned_elem(ctx, node_value_pin, node_value);
                 // CHM-mapper-deadlock fix (2026-07-21): reservation markers
@@ -41502,14 +41453,6 @@ fn native_chm_get_string_fast(
     }
     let raw_hash = ctx.java_string_hash_code(key)?;
     let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
-    if chm_trace() {
-        eprintln!(
-            "[chm] getfast this={:p} key={:?} raw={raw_hash:#x} hash={hash:#x} seg={:?}",
-            this.as_ptr(),
-            ctx.read_string(key),
-            chm_segment_for(ctx, this, hash).map(|s| s.as_ptr())
-        );
-    }
     let seg = chm_segment_for(ctx, this, hash)?;
     let seg_id = ctx.identity_hash_code(seg);
     let before_mutation = chm_seg_mutation_snapshot(seg_id);
@@ -41562,9 +41505,6 @@ pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     chm_reject_null_key(&key)?;
     if let Value::Object(Some(key_object)) = key {
         if let Some(value) = native_chm_get_string_fast(ctx, this, key_object) {
-            if chm_trace() {
-                eprintln!("[chm] get fast-path -> {value:?}");
-            }
             return Ok(Some(value));
         }
     }
@@ -41574,18 +41514,6 @@ pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let hash = chm_key_hash(ctx, &key)?;
     let this = ctx.read_native_pin(this_pin, this);
     let key = read_pinned_elem(ctx, key_pin, key);
-    if chm_trace() {
-        let text = match key {
-            Value::Object(Some(k)) => ctx.read_string(k),
-            _ => None,
-        };
-        eprintln!(
-            "[chm] get slow this={:p} key={:?} hash={hash:#x} seg={:?}",
-            this.as_ptr(),
-            text,
-            chm_segment_for(ctx, this, hash).map(|s| s.as_ptr())
-        );
-    }
     let result = match chm_segment_for(ctx, this, hash) {
         Some(seg) => Ok(Some(
             chm_seg_get(ctx, seg, key)?.unwrap_or(Value::Object(None)),
@@ -41704,12 +41632,6 @@ fn native_chm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 // --- Core write operations (per-segment locking) ---
 
-/// TEMPORARY diagnostic switch for the CHM in-process get-miss investigation.
-fn chm_trace() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_CHM_TRACE").is_some())
-}
-
 fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -41734,18 +41656,6 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         let key = read_pinned_elem(ctx, key_pin, key);
         let hash = chm_key_hash(ctx, &key)?;
         let this = ctx.read_native_pin(this_pin, this);
-        if chm_trace() {
-            let text = match key {
-                Value::Object(Some(k)) => ctx.read_string(k),
-                _ => None,
-            };
-            eprintln!(
-                "[chm] put this={:p} key={:?} hash={hash:#x} seg={:?}",
-                this.as_ptr(),
-                text,
-                chm_segment_for(ctx, this, hash).map(|s| s.as_ptr())
-            );
-        }
         match chm_segment_for(ctx, this, hash) {
             Some(seg) => {
                 let _resize_flag = ChmResizeLockGuard::enter();

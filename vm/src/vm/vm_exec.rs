@@ -23852,6 +23852,55 @@ mod tests {
         }
     }
 
+    /// Two distinct `java.lang.String` objects with the same characters must
+    /// compare EQUAL through the native-context fast path, whatever layout
+    /// this VM's `java/lang/String` happens to use.
+    ///
+    /// `VmConfig::default()` boots the fabricated `java/lang/String`, which is
+    /// `char[]`-backed and has no `coder` field. The positional reader used to
+    /// read its slot 1 (the cached hash) as a coder, reject the value, and
+    /// return a hard `false` — which `ConcurrentHashMap.get` believed, so a
+    /// String-keyed CHM missed every key it held
+    /// (`docs/known-issues/vm/chm-get-misses-stored-key-in-process-20260803.md`).
+    #[test]
+    fn equal_strings_compare_equal_in_the_embedded_string_layout() {
+        let shared = test_shared();
+        let a = super::create_java_string_uninterned(&shared, "k0");
+        let b = super::create_java_string_uninterned(&shared, "k0");
+        assert_ne!(a.as_ptr(), b.as_ptr(), "the probe needs two distinct objects");
+        assert_eq!(compact_java_strings_equal(&shared, a, b), Some(true));
+        // "k0" == 'k' * 31 + '0' == 3365, the value String.hashCode() returns.
+        assert_eq!(compact_java_string_hash(&shared, a), Some(3365));
+        assert_eq!(
+            compact_java_string_hash(&shared, a),
+            compact_java_string_hash(&shared, b)
+        );
+    }
+
+    /// Different characters still compare unequal — the fix must not make
+    /// every comparison "unknown".
+    #[test]
+    fn different_strings_compare_unequal_in_the_embedded_string_layout() {
+        let shared = test_shared();
+        let a = super::create_java_string_uninterned(&shared, "k0");
+        let b = super::create_java_string_uninterned(&shared, "k1");
+        assert_eq!(compact_java_strings_equal(&shared, a, b), Some(false));
+    }
+
+    /// A String whose character storage cannot be located answers `None`
+    /// ("not compared"), never `Some(false)`. This is the whole contract: a
+    /// caller reading `false` stops looking, and that is how a present key
+    /// becomes an absent one.
+    #[test]
+    fn unreadable_string_storage_is_unknown_not_unequal() {
+        let shared = test_shared();
+        let a = super::create_java_string_uninterned(&shared, "k0");
+        let b = super::create_java_string_uninterned(&shared, "k0");
+        shared.mem.heap.set_field(b, 0, Value::Object(None));
+        assert_eq!(compact_java_strings_equal(&shared, a, b), None);
+        assert_eq!(compact_java_string_hash(&shared, b), None);
+    }
+
     /// A virtual thread parked across a MOVING collection must resume with
     /// remapped frame slots.
     ///
