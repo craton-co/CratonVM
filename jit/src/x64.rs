@@ -180,6 +180,11 @@ pub use null_check_elim::*;
 // declared visibility, so nothing here became more public than it was.
 mod escape_analysis;
 pub use escape_analysis::*;
+
+// PERF-01: the enumeration of what the single-pass backend can do that the
+// optimizing tier cannot. The admission chain consults it.
+mod single_pass_only;
+pub use single_pass_only::*;
 // ---------------------------------------------------------------------------
 // Integer-arithmetic LICM
 // ---------------------------------------------------------------------------
@@ -1467,7 +1472,7 @@ mod deopt_snapshot_tests {
 
     use super::{
         classify_local_kinds, code_uses_long_float_double, opcode_touches_long_float_double,
-        refine_ambiguous_local_kinds,
+        refine_ambiguous_local_kinds, wide_local_high_halves,
         typed_local_frame_value, LocalKind,
     };
 
@@ -1633,6 +1638,51 @@ mod deopt_snapshot_tests {
         let kinds = classify_local_kinds(&code, code.len(), 2);
         assert_eq!(kinds[0], LocalKind::Long);
         assert_eq!(kinds[1], LocalKind::Ambiguous);
+    }
+
+    /// REGRESSION (`arrays-sort-long-osr-miscompile`): the OSR publication
+    /// strips register homes from cat-2 high-half slots so the trampoline
+    /// cannot seed a dead half over a live local sharing its register. That
+    /// strip must NOT touch a slot which is also a real local in a disjoint
+    /// live range.
+    ///
+    /// `java.util.DualPivotQuicksort.mixedInsertionSort` is the shape: slot 7
+    /// is `long ai`'s high half in the method's first region and the `int i`
+    /// loop counter in the other two. Stripping it made the trampoline seed
+    /// only its frame slot while the compiled body read its register, so an OSR
+    /// entry ran with a garbage `i` and `Arrays.sort(long[])` threw an
+    /// `ArrayIndexOutOfBoundsException` with an index in the hundreds of
+    /// millions.
+    ///
+    /// The classifier already draws the distinction; this pins the predicate
+    /// the OSR publication filters on, which is where the bug was.
+    #[test]
+    fn only_pure_high_halves_may_lose_their_osr_register_home() {
+        // slot 0: long (so slot 1 would be its high half, untouched otherwise)
+        // slot 2: long (so slot 3 would be its high half) — but slot 3 is also
+        //         loaded as an int, exactly the reuse `mixedInsertionSort` has.
+        let code = [
+            0x37, 0x00, // lstore 0  -> Long@0, HighHalf@1
+            0x37, 0x02, // lstore 2  -> Long@2, would-be HighHalf@3
+            0x15, 0x03, // iload  3  -> Int@3, so @3 is Ambiguous, not HighHalf
+            0xb1, // return
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 4);
+        assert_eq!(kinds[1], LocalKind::HighHalf, "untouched high half");
+        assert_eq!(kinds[3], LocalKind::Ambiguous, "high half reused as an int");
+
+        // `wide_local_high_halves` names BOTH — it is a whole-method scan with
+        // no notion of reuse, which is why the publication must filter it.
+        let halves = wide_local_high_halves(&code, code.len());
+        assert!(halves.contains(&1) && halves.contains(&3));
+
+        // The filter the OSR publication applies: strip 1, keep 3.
+        let stripped: Vec<usize> = halves
+            .iter()
+            .copied()
+            .filter(|&hh| matches!(kinds.get(hh), Some(LocalKind::HighHalf)))
+            .collect();
+        assert_eq!(stripped, vec![1], "a reused high half must keep its home");
     }
 
     #[test]

@@ -1919,10 +1919,15 @@ pub fn execute(
                         let class = cm_lock.get_class(class_id)?;
                         for &(pc, cp_idx) in &scan.typecheck_ops {
                             let class_name = class.constant_pool.get_class_name(cp_idx)?;
-                            let boxed: Box<str> = class_name.to_string().into_boxed_str();
-                            let ptr = boxed.as_ptr();
-                            let len = boxed.len();
-                            owned_jit_strings.push(boxed);
+                            // Interned for the life of the process rather than
+                            // owned by this compilation: `jit_checkcast` /
+                            // `jit_instanceof` memoize on the `(ptr, len)` pair
+                            // in thread-locals that outlive the compiled
+                            // method, so a recycled address would answer for
+                            // the class that used to live there. See
+                            // `cratonvm_jit::intern_typecheck_class_name`.
+                            let (ptr, len) =
+                                cratonvm_jit::intern_typecheck_class_name(class_name);
                             typecheck_info.push((pc, ptr, len));
                         }
                     }

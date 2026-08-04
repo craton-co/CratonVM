@@ -6847,7 +6847,10 @@ mod linear_scan_tests {
                 class_id: 0,
                 num_fields: 0,
             },
-            Op::NewArray { element_type: 0 },
+            Op::NewArray {
+                element_type: 0,
+                component_class_id: 0,
+            },
             Op::LambdaIntToDouble,
             // `jit_frem` / `jit_drem`.
             Op::Rem,

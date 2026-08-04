@@ -1537,16 +1537,17 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // field 0 at all, throwing `IllegalStateException("SSLSocketFactory
             // has no owning SSLContext")` instead of connecting — a real-JDK
             // A/B confirmed CratonVM-only failure.
-            let ssl_ctx = crate::t27_tls::get_runtime_default_ssl_context().unwrap_or_else(|| {
-                let new_ctx = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
-                let name = ctx.create_string("TLS");
-                ctx.set_field(new_ctx, 0, Value::Object(Some(name)));
-                ctx.set_field(new_ctx, 1, Value::Int(1));
-                crate::t27_tls::set_runtime_default_ssl_context(new_ctx);
-                new_ctx
-            });
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
-            ctx.set_field(obj, 0, Value::Object(Some(ssl_ctx)));
+            //
+            // REGRESSION 2026-08-04: the fix below was correct and still
+            // present, but `net_phase_e::register_re6_ssl_context` carried a
+            // SECOND registration of this same triple that ran later and won
+            // by last-registration-wins, handing back a factory whose field 0
+            // was `None`. That duplicate is deleted; this is the single owner
+            // (asserted by `registry_contracts.rs`). The body moved into
+            // `t27_tls::default_ssl_socket_factory_obj` so the
+            // `HttpsURLConnection` factory getters — which also used to mint
+            // bare carriers — share one implementation.
+            let obj = crate::t27_tls::default_ssl_socket_factory_obj(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1779,13 +1780,34 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
+            // A factory with no reachable owning `SSLContext` used to be a
+            // hard `IllegalStateException` here. That is not a JDK-faithful
+            // failure mode — no real `SSLSocketFactory` exists without a
+            // context; `getDefault()` and every `SSLContext.getSocketFactory()`
+            // carry one — so an empty field 0 always means one of OUR
+            // synthetic carriers lost it, and the honest answer is the
+            // process default context, which is what the real
+            // `SSLSocketFactory.getDefault()` would have supplied anyway.
+            //
+            // Twice now a single mis-wired carrier has converted into an
+            // exception thrown before any network I/O, taking out a whole
+            // test family (2026-07-23 the bare 0-field `getDefault()`;
+            // 2026-08-04 the duplicate registration that clobbered its fix).
+            // Falling back cannot weaken trust: caller-supplied anchors are
+            // resolved below by factory identity (`p68_factory_trust_roots`),
+            // not through this context, and the default context validates
+            // against the platform trust store — strictly stricter than a
+            // permissive caller-installed TrustManager, never laxer.
             let ssl_context = match ctx.get_field(factory, 0) {
                 Value::Object(Some(context)) => context,
                 _ => {
-                    return Err(RuntimeError::IllegalStateException {
-                        message: "SSLSocketFactory has no owning SSLContext".into(),
+                    if crate::nbflags().dbg_tls_auth_ok {
+                        eprintln!(
+                            "[dbg-tls-auth] createSocket(layered): factory has no field-0 \
+                             SSLContext, falling back to the process default"
+                        );
                     }
-                    .into())
+                    crate::t27_tls::default_ssl_context_or_create(ctx)
                 }
             };
             // Same trust-anchor/TrustManager resolution `new13_do_create_socket`

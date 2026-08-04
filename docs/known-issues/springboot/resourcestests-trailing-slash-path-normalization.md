@@ -1,6 +1,13 @@
-# ResourcesTests: Windows trailing-separator path normalization
+# ResourcesTests: trailing-separator path normalization not applied to `java.nio.file.Path`
 
-**Status: RESOLVED 2026-07-18**
+**Status: OPEN.** Originally filed 2026-07-18 as "RESOLVED", but every
+re-run since (2026-07-23, 2026-07-28, and now 2026-08-04 — see below) shows
+the same test still failing; the header was never corrected to match. Moved
+from `docs/internal/fixed-suite-bugs/` to `docs/known-issues/` on 2026-08-04
+to stop it being read as closed. The title has also been broadened: the
+2026-08-04 rerun reproduces the identical failure on **Linux**, confirming
+the bug is in CratonVM's `java.nio.file.Path`/`Files` layer generally, not a
+Windows-only path-separator quirk.
 
 > **Confirmed still failing 2026-07-23** — `ResourcesTests.whenAddDirectoryAndResourceAlreadyExistsThenIllegalStateExceptionIsThrown`
 > reproduces the *exact* original symptom in the `craton-rerun-20260723`
@@ -47,6 +54,48 @@
 > build or test execution performed) — the "confirming next step" above
 > (tracing `Path`/`Files` construction rather than `File`) remains
 > un-attempted.
+
+## Confirmed still failing 2026-08-04 (Linux — cross-platform confirmation)
+
+Residual rerun `craton-residual32-20260804-s4`, same class, same method,
+same setup call and failing line as every prior recurrence
+(`Resources.addResource(Resources.java:114)`), but this time on a **Linux**
+host, with the platform-appropriate errno instead of Windows'
+`ERROR_DIRECTORY`/267:
+
+```
+=> java.lang.IllegalStateException: IOException: Is a directory (os error 21)
+   org.springframework.boot.testsupport.classpath.resources.Resources.addResource(Resources.java:114)
+   org.springframework.boot.testsupport.classpath.resources.ResourcesTests.whenAddDirectoryAndResourceAlreadyExistsThenIllegalStateExceptionIsThrown(ResourcesTests.java:146)
+```
+
+Log:
+`apps/spring-boot-suite-runner/.suite/results/craton-residual32-20260804-s4/all-jit/logs/test-support_spring-boot-test-support.org.springframework.boot.testsupport.classpath.resources.ResourcesTests.{out,err}.log`
+
+Test source (`ResourcesTests.java:145-147`, matches every prior recurrence):
+
+```java
+void whenAddDirectoryAndResourceAlreadyExistsThenIllegalStateExceptionIsThrown() {
+    this.resources.addResource("one/two/three/", "content", true);
+    assertThatIllegalStateException().isThrownBy(() -> this.resources.addDirectory("one/two/three"));
+}
+```
+
+`Resources.addResource` (`Resources.java:103-118`) does
+`Path resourcePath = this.root.resolve(name)` (name still carries the
+trailing `/`) then `Files.writeString(resourcePath, ...)`. On Linux this
+throws `EISDIR` ("Is a directory", errno 21) for the same underlying reason
+the Windows recurrences hit `ERROR_DIRECTORY` (267): CratonVM's synthetic
+`Path`/NIO layer keeps the literal trailing separator on an ordinary
+non-root path, so the write bridge receives a directory-shaped path instead
+of a file path — this is OS-errno-portable evidence for the exact root
+cause already suspected in the 2026-07-23 note above (the fix only ever
+touched `java.io.File.getAbsolutePath()`/`getAbsoluteFile()` in
+`native-builtins/src/phases_late.rs`, never the `java.nio.file.Path`/
+`Files` path this test actually exercises). The "confirming next step" from
+2026-07-23 — trace whatever backs `Path` construction/`resolve()` for the
+NIO API and apply the same trailing-separator strip there — is still the
+right next step and is still un-attempted.
 
 `ResourcesTests.whenAddDirectoryAndResourceAlreadyExistsThenIllegalStateExceptionIsThrown`
 previously failed during its setup call:
