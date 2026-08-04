@@ -144,9 +144,11 @@ not new ones.
 
 **This table is revision-stamped and expected to go stale.** It is measured at
 `50218df9b`, which has `cov-02` and not `cov-01`; `cov-01` landed immediately
-after and takes the `0x12 ldc` row with it. Every remaining `cov-*` lane will
-move a row here the day it lands — that is the point of them. Do not patch a
-cell: re-take the whole column, which is one command per phase
+after and takes the `0x12 ldc` row with it. **`cov-04` landed after that and
+takes the `ir.rs:5329` row** — the candidate's 4 non-elidable-`<init>` refusals
+are now zero, and the site itself no longer exists at that line. Every remaining
+`cov-*` lane will move a row here the day it lands — that is the point of them.
+Do not patch a cell: re-take the whole column, which is one command per phase
 (`regression-suite/perf/c2-reach.sh`), and re-stamp the revision. A table with
 one fresh row and six stale ones is the failure this directory's own rules
 already name twice.
