@@ -2,9 +2,17 @@
 
 **Slug:** `architecture-review-a1-a9`
 **Date:** 2026-08-04
-**Status:** LANDED for A1, A3, A4a, A6, A7, A8. **A5 WITHDRAWN** (the finding
-was wrong; see §A5). **A2 and A4b NOT DONE** — scoped below with the specific
-blocking detail each needs, deliberately not half-landed. **A9 advisory.**
+**Status:** LANDED for A1, A3, A4a, A6, A7, A8. **A5 WITHDRAWN** and **A2
+DOWNGRADED** — both rested on claims that measurement did not support (§A5,
+§A2). **A4b NOT DONE** — scoped below, deliberately not half-landed. **A9
+advisory.**
+
+Three of the nine findings were wrong in whole or in part, and all three errors
+share a shape: a conclusion drawn from the *storage* or from a grep, without
+reading the consumer. A5 counted `fn` lines in a file and attributed them to a
+type that has no `impl` block there. A2 asserted a runtime tag load that the
+emitter has never performed. A9 asserted tests do not run that CI does run.
+They are corrected in place below rather than quietly dropped.
 
 ## Tree basis
 
@@ -32,15 +40,15 @@ Files changed:
 | | Finding | Status |
 |---|---|---|
 | A1 | JIT bakes a `repr(Rust)` enum layout; the comment justifying it is false | **LANDED** |
-| A2 | Statics use 16-byte `Value` cells while instance fields are tagless | **NOT DONE** — §A2 |
+| A2 | "Statics cost a runtime tag load" | **DOWNGRADED — half wrong**; footprint-only residual, unmeasured |
 | A3 | 13 diagnostic gates inline on the native-call funnel | **LANDED** |
 | A4a | Two byte-identical exception-unwind copies in the dispatch loop | **LANDED** |
-| A4b | Dual interpreter dispatch; per-bytecode safepoint poll | **NOT DONE** — §A4b |
+| A4b | 122 opcodes with two implementations; per-bytecode safepoint poll | **NOT DONE** — §A4b |
 | A5 | "`SharedVm` has 458 methods" | **WITHDRAWN — wrong** |
 | A6 | Lock hierarchy has 0% adoption in `native-builtins` | **LANDED** (gate + first 2) |
 | A7 | Dead resolution tiers kept alive by their own tests | **LANDED** |
 | A8 | Second-tier invoke cache is one process-wide lock | **LANDED** |
-| A9 | 45% of the tree is inline test code | Advisory — §A9 |
+| A9 | 45% of the tree is inline test code | Advisory — §A9; the "tests don't run" half was wrong |
 
 Three CI gates were added, all injection-tested rather than inspected:
 `no_test_only_public_api` (A7), `lock_discipline_ratchet` (A6), and the
@@ -124,45 +132,63 @@ leaving `Int` at 0 while moving `Object` would still miscompile.
 
 ---
 
-# A2 — Statics still use 16-byte `Value` cells — NOT DONE
+# A2 — DOWNGRADED: the tag-load justification was wrong; only footprint remains
 
-## The finding stands
+## What the review claimed
 
-Instance fields got the compact tagless treatment (`CompactLayout`, 1/2/4/8-byte
-cells plus a precise `ref_offsets` GC map). Statics did not: `StaticsBlock` is
-an array of 16-byte `Value` (`vm/src/vm/realms/class_realm.rs:43`).
+> Statics did not [get the compact treatment] … That is 2× the cache footprint
+> of the equivalent instance field, and **every JIT'd `getstatic` must load a
+> tag word it structurally cannot need** — the field's declared type is known at
+> compile time.
 
-That is 2× the cache footprint of the equivalent instance field, and every
-JIT'd `getstatic` loads a tag word it structurally cannot need — the field's
-declared type is known at compile time. The doc trail records static reads at
-~35 ns against HotSpot's ~1, with the helper CALL since deleted; this is part
-of what remains.
+**The second half is false.** `try_emit_inline_getstatic`
+(`jit/src/x64/objects.rs:281`) emits exactly three instructions and reads no tag:
 
-## Why it is not landed, and the specific blocker
+```
+MOV RAX, imm64(base_cell)                 ; baked base-POINTER cell address
+MOV RAX, [RAX]                            ; deref -> the statics block
+MOV RAX/EAX, [RAX + idx*16 + 4 or 8]      ; payload only
+```
 
-It is a real project, not a patch: ~30 read/write sites in `vm`, two JIT
-emitters (`x64/bytecode_walk.rs:3774` `try_emit_inline_getstatic` and
-`ir_lower.rs:4326`), the GC's statics root scan (`vm/src/memory/roots.rs:1067`),
-and the `putstatic` helper path.
+The `match type_tag` at `objects.rs:301` is a **compile-time** switch on the
+descriptor selecting the load width and sign-extension; it emits no runtime tag
+check. Compiled `getstatic` has never read the discriminant word. The claim was
+made from the *storage* type without reading the emitter.
 
-The blocking design detail, which is worth writing down because it is not
-obvious from the call sites:
+## What is actually left
 
-> With `Value` cells the offset is `field_index * SLOT_SIZE` — a **uniform
-> stride** the JIT computes from the index alone, with no knowledge of the
-> class. Under a compact layout the offset is per-field and depends on the
-> class's static layout, so the compile-time resolver must return
-> `(base_cell_addr, byte_offset, width)` instead of just a base.
+Footprint, and only footprint: `SLOT_SIZE` is 16, so a statics block is
+`n_fields * 16` bytes where a packed layout would be the sum of 1/2/4/8-byte
+cells. One block per loaded class, sized by that class's static count.
 
-That is a straightforward extension of the existing `set_static_base_resolver`
-seam — the resolver already runs at compile time inside the backend and already
-declines classes it cannot serve — but it changes the emitted shape for every
-inline `getstatic`, and a wrong width or offset is a **silent wrong value**, not
-a crash. It needs its own change with its own differential run against HotSpot.
+**This was not measured**, and it should be before anyone spends the change on
+it. The population is statics only — far smaller than instance fields or arrays,
+which already carry the compact layout.
 
-**A1 was its prerequisite and is now done**: the cell layout the emitters read
-is a language guarantee rather than an observation, so the compact work starts
-from a pinned baseline.
+## Why it is now assessed as not worth doing as stated
+
+The trade is worse than the review implied, because the read cost does not
+change:
+
+- **Benefit:** a smaller statics footprint. Real, bounded, unmeasured.
+- **Cost:** `cell_off` stops being `field_index * SLOT_SIZE` — a **uniform
+  stride the backend computes from the index alone, with no knowledge of the
+  class** — and becomes a per-class per-field byte offset. The compile-time
+  resolver (`set_static_base_resolver`) would have to return
+  `(base_cell_addr, byte_offset, width)` rather than just a base, and every
+  inline `getstatic` emission site changes shape. A wrong width or offset is a
+  **silent wrong value**, not a crash.
+- **No read-path win at all:** the emitted sequence stays one baked immediate,
+  one dependent deref, one payload load, whatever the cell width is.
+
+So this buys memory, not speed, at the price of a new miscompile risk class in
+the backend. That may still be worth it if the footprint turns out to be large —
+but the review presented it as a speed fix, and it is not one.
+
+**Recommendation:** measure the aggregate statics-block bytes on a real workload
+first. If the number is small, close this. `A1` is landed either way and was the
+genuine prerequisite: the cell layout the emitters read is now a language
+guarantee rather than an observation.
 
 ---
 
@@ -280,19 +306,22 @@ Verified: `exception_tests` 11 passed, `exception_edge_tests` 19 passed,
 
 # A4b — The dual interpreter dispatch — NOT DONE
 
-## The finding stands
+## The finding stands, with one number sharpened
 
-`vm/src/runtime/interpreter.rs` has a raw-byte fast path and a decoded fallback
-path, and `--noverify` switches which one runs
-(`let use_fast_path = !shared.config.skip_verification`). Two implementations of
-overlapping opcode sets means every opcode fix must land twice, and a divergence
-is a bug that appears under one flag only. The project's own architecture doc
-records a prior instance of this shape causing both a 2.7× throughput cliff and
-different semantics.
+The review said "two implementations of overlapping opcode sets". Measured: the
+raw-byte fast-path `match` carries **122 opcode arms**, and the decoded path is
+complete (~200). So this is a fast-path/slow-path split, not two whole
+interpreters — but 122 opcodes genuinely do have two implementations, and
+`--noverify` (`let use_fast_path = !shared.config.skip_verification`) switches
+which one runs for all of them at once. Every fix to those 122 must land twice,
+and a divergence is a bug that appears under one flag only. The project's own
+architecture doc records a prior instance of this shape causing both a 2.7×
+throughput cliff and different semantics.
 
-The per-bytecode prologue also still contains an `Acquire` load of
-`stw_requested` on every instruction, and re-derives `code_ptr` / `code_len` /
-the frame pointer each iteration.
+The per-bytecode `Acquire` load of `stw_requested` is confirmed present in the
+dispatch loop (`interpreter.rs:4306`, inside the loop that opens at 4251);
+method entry has its own polls at 3416 and 3680. The loop also re-derives
+`code_ptr` / `code_len` / the frame pointer each iteration.
 
 ## Why it is not landed
 
@@ -312,8 +341,30 @@ Two notes for whoever takes it, both learned while scoping A4a:
    buys two loads from an already-hot cache line at the cost of a correctness
    hazard. It was deliberately dropped from A4a for this reason.
 2. **The safepoint poll's ordering is load-bearing.** The `Acquire` is what
-   orders the reads that follow it. Moving the poll is safe; relaxing it in
-   place is not.
+   orders the reads that follow it. Relaxing it in place is not an option.
+
+## The safepoint poll was deliberately left alone
+
+Moving it off the per-bytecode path is the obvious separable win — JVMS only
+requires safepoints at back edges, calls and allocations, all of which are
+already polled, and HotSpot makes the common case free by swapping the dispatch
+table. It was **not** done here, for a reason worth recording rather than
+rediscovering:
+
+- The per-bytecode poll was added deliberately. The comment above it states the
+  case it covers: *"A newly-started or long straight-line frame may not hit an
+  allocation or backward-branch poll before another thread requests STW."*
+- Poll frequency feeds GC quiescence, and this collector does not merely stop
+  the world — each moving cycle must carry a **per-cycle root-coverage proof**
+  (`divert_for_incomplete_moving_coverage`, driven by
+  `refresh_moving_young_coverage_for_collection`). Changing when threads reach
+  safepoints changes which frames are certifiable at census time, and the
+  failure mode is not a crash but a silent rise in `coverage_fallbacks` — a
+  collector quietly diverting to the non-moving sweep.
+
+That is a change that must be made with the GC decision report
+(`gc_metrics::collector_decision_report()`) in hand across a real workload,
+not alongside nine other findings.
 
 ---
 
