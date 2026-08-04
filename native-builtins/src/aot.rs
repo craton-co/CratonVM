@@ -16,6 +16,7 @@ use cratonvm_types::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
 
 use crate::{native_noop, native_noop_with_this};
 
@@ -946,8 +947,29 @@ static AOT_ENABLED: AtomicBool = AtomicBool::new(false);
 static AOT_TRAINING: AtomicBool = AtomicBool::new(false);
 static AOT_PRODUCTION: AtomicBool = AtomicBool::new(false);
 
-static AOT_CACHE_INPUT_PATH: Mutex<Option<String>> = Mutex::new(None);
-static AOT_CACHE_OUTPUT_PATH: Mutex<Option<String>> = Mutex::new(None);
+// ARCH-2026-08-04 A6 — the first two locks in this crate to carry a LockLevel.
+//
+// `native-builtins` had 440 raw lock constructions and zero ordered ones, in
+// the crate that re-enters the VM. These two are the pattern for working that
+// number down: a level is a *claim*, so it is only stamped on a lock whose
+// every acquisition site has actually been read.
+//
+// `Scratch` (L0, the leaf level) is correct here because no lock is ever taken
+// while one of these is held. Every production site — `init_aot_runtime`,
+// `reset_aot_globals`, the training-flush path, and the two
+// `leyden_get_aot_cache_*_path` natives — acquires, `.clone()`s the
+// `Option<String>`, and drops the guard *before* touching `ctx`. The two
+// natives call `ctx.create_string` only after that clone, so the guard is never
+// held across a re-entry into the VM. That is exactly what the level asserts,
+// and it is why these two were converted first: it is checkable by reading six
+// call sites.
+//
+// See `native-builtins/tests/lock_discipline_ratchet.rs` for the ratchet and
+// `arch-2026-08-04/architecture-review-a1-a9.md` §A6 for the remaining backlog.
+static AOT_CACHE_INPUT_PATH: OrderedPlMutex<Option<String>> =
+    OrderedPlMutex::new(None, LockLevel::Scratch);
+static AOT_CACHE_OUTPUT_PATH: OrderedPlMutex<Option<String>> =
+    OrderedPlMutex::new(None, LockLevel::Scratch);
 
 /// Global training recorder — accumulates profile data during training runs.
 static AOT_TRAINING_RECORDER: Mutex<Option<TrainingRunRecorder>> = Mutex::new(None);
@@ -987,9 +1009,7 @@ pub fn init_aot_runtime(
 
     if let Some(p) = cache_input {
         let sanitized = sanitize_aot_path(p).unwrap_or_default();
-        *AOT_CACHE_INPUT_PATH
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = if sanitized.is_empty() {
+        *AOT_CACHE_INPUT_PATH.lock() = if sanitized.is_empty() {
             None
         } else {
             Some(sanitized)
@@ -997,9 +1017,7 @@ pub fn init_aot_runtime(
     }
     if let Some(p) = cache_output {
         let sanitized = sanitize_aot_path(p).unwrap_or_default();
-        *AOT_CACHE_OUTPUT_PATH
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = if sanitized.is_empty() {
+        *AOT_CACHE_OUTPUT_PATH.lock() = if sanitized.is_empty() {
             None
         } else {
             Some(sanitized)
@@ -1104,9 +1122,7 @@ pub fn aot_flush_training_data() -> usize {
     if !AOT_TRAINING.load(Ordering::Relaxed) {
         return 0;
     }
-    let output_path = AOT_CACHE_OUTPUT_PATH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let output_path = AOT_CACHE_OUTPUT_PATH.lock()
         .clone();
     let Some(output_path) = output_path else {
         return 0;
@@ -1238,8 +1254,8 @@ fn reset_aot_globals() {
     AOT_ENABLED.store(false, Ordering::Relaxed);
     AOT_TRAINING.store(false, Ordering::Relaxed);
     AOT_PRODUCTION.store(false, Ordering::Relaxed);
-    *AOT_CACHE_INPUT_PATH.lock().unwrap() = None;
-    *AOT_CACHE_OUTPUT_PATH.lock().unwrap() = None;
+    *AOT_CACHE_INPUT_PATH.lock() = None;
+    *AOT_CACHE_OUTPUT_PATH.lock() = None;
     *AOT_TRAINING_RECORDER.lock().unwrap() = None;
     *AOT_CACHE_GLOBAL.lock().unwrap() = None;
     *AOT_PRELINKER_CACHE.lock().unwrap() = None;
@@ -1267,9 +1283,7 @@ fn leyden_get_aot_cache_input_path(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let path = AOT_CACHE_INPUT_PATH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let path = AOT_CACHE_INPUT_PATH.lock()
         .clone();
     match path {
         Some(p) => {
@@ -1284,9 +1298,7 @@ fn leyden_get_aot_cache_output_path(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let path = AOT_CACHE_OUTPUT_PATH
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let path = AOT_CACHE_OUTPUT_PATH.lock()
         .clone();
     match path {
         Some(p) => {
@@ -2052,7 +2064,7 @@ mod aot_tests {
         assert!(is_aot_training());
         assert!(!is_aot_production());
         assert_eq!(
-            AOT_CACHE_OUTPUT_PATH.lock().unwrap().as_deref(),
+            AOT_CACHE_OUTPUT_PATH.lock().as_deref(),
             Some("/tmp/test_cache.aot")
         );
         assert!(AOT_TRAINING_RECORDER.lock().unwrap().is_some());
@@ -2070,7 +2082,7 @@ mod aot_tests {
         assert!(!is_aot_training());
         assert!(is_aot_production());
         assert_eq!(
-            AOT_CACHE_INPUT_PATH.lock().unwrap().as_deref(),
+            AOT_CACHE_INPUT_PATH.lock().as_deref(),
             Some("/nonexistent/cache.aot")
         );
         // Cache should be None since file doesn't exist
