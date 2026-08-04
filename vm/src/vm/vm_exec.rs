@@ -8990,6 +8990,37 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     #[track_caller]
     fn array_length(&self, obj: ObjectRef) -> usize {
+        // KINDOF-SENTINEL: `obj` reaches this native accessor from callers
+        // (e.g. `native-collections`' `map_state`, which validates a bucket
+        // array via `heap_kind_of` and then calls this several lines later)
+        // that treat an earlier validation as still good at the point of
+        // use. Observed once with `obj` as the all-ones sentinel
+        // `0xFFFFFFFFFFFFFFFF` — not a stale-but-plausible address, and not
+        // reachable through any conservative-root-scan path (those all
+        // filter through `is_object_address`, which this call chain does
+        // not). `load_and_forward`'s very first read (`header.is_forwarded()`)
+        // dereferences the raw pointer unconditionally, so an invalid `obj`
+        // here is a hard crash rather than a wrong answer. Validate before
+        // touching memory at all, and fall back to the same "not an array"
+        // diagnostic path already used below for a live-but-wrong-kind object.
+        if self
+            .shared
+            .mem
+            .heap
+            .is_object_address(obj.as_ptr() as usize)
+            .is_none()
+        {
+            if crate::runtime::env_cache::dbg_arrlen() {
+                let loc = std::panic::Location::caller();
+                eprintln!(
+                    "[ARRAY-LEN-GUARD] obj is not a valid heap address rust-caller={}:{} obj={:?}",
+                    loc.file(),
+                    loc.line(),
+                    obj
+                );
+            }
+            return 0;
+        }
         let obj = self.shared.mem.heap.load_and_forward(obj);
         let kind = self.shared.mem.heap.kind_of(obj);
         if kind != ObjectKind::Array {
@@ -23224,6 +23255,43 @@ mod tests {
             new,
             "monitor_on_exit must be forwarded, or the implicit monitorexit \
              releases a vacated address"
+        );
+    }
+
+    /// KINDOF-SENTINEL (2026-08-03): `NativeHeapAccess::array_length` used to
+    /// dereference `obj` unconditionally via `load_and_forward` before ever
+    /// checking it pointed at real heap memory. Observed once in the wild as
+    /// a `native-collections::map_state` bucket-array reference that had
+    /// gone from a validated `ObjectKind::Array` to the all-ones sentinel
+    /// `0xFFFFFFFFFFFFFFFF` by the time this accessor read it — an
+    /// `EXCEPTION_ACCESS_VIOLATION` reading exactly that address. Whatever
+    /// corrupted the value upstream, `array_length` itself must not crash on
+    /// an invalid pointer: it has an established "not an array" fallback
+    /// (returns 0) for a *live* non-array object, and an invalid address
+    /// must take that same safe path rather than a hard fault.
+    #[test]
+    fn array_length_rejects_an_invalid_object_pointer_instead_of_faulting() {
+        let shared = test_shared();
+        let tid = ThreadId(0x7603);
+        let mut thread = JvmThread::new(tid, "kindof-sentinel-test");
+
+        let ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        // SAFETY: deliberately constructing an invalid ObjectRef to prove
+        // `array_length` validates before dereferencing — never dereferenced
+        // as a real pointer if the fix holds. 8-byte aligned (unlike the
+        // observed all-ones sentinel) only to clear `ObjectRef::from_raw`'s
+        // `debug_assert_aligned`, which is compiled out in the release build
+        // where the real crash was observed; `is_object_address` rejects
+        // this for being outside every heap region, the same rejection path
+        // an unaligned address takes.
+        let sentinel = unsafe { ObjectRef::from_raw(0xFFFF_FFFF_FFFF_FFF8u64 as *mut u8) };
+        assert_eq!(
+            ctx.array_length(sentinel),
+            0,
+            "an invalid pointer must fall back to 0, not fault"
         );
     }
 
