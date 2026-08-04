@@ -2,7 +2,7 @@
 
 **Landed 2026-08-03 with `cov-02`. Found 2026-08-04. Fixed the same day.**
 The brief this closes is
-[`docs/known-issues/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`](../known-issues/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md).
+[`docs/known-issues/c2/archive/perf-01-sieve-ir-body-6x-slower-than-c1.md`](../known-issues/c2/archive/perf-01-sieve-ir-body-6x-slower-than-c1.md).
 
 ## What happened
 
@@ -74,11 +74,35 @@ without anyone reading this document:
 |---|---|
 | `sieve` reach | 2 req / 1 admitted / 1 body → 2 req / **0 admitted** / 0 bodies |
 | `sieve` speed, interleaved vs the pre-`cov-02` control and HotSpot 25 | fixed ≈ control ≈ HotSpot; the regressed binary stays 5–6x slower |
-| every other CratonBench phase's reach | unchanged — no phase lost a body |
-| `CratonBenchC2`'s three phases | unchanged/higher — the veto costs nothing there |
+| blast radius (below) | **exactly one method** |
 | `cargo test -p cratonvm-jit --lib` | 1880 passed, 0 failed |
 | HotSpot-diffed regression suite | 22 passed, 0 failed |
 | the new unit test | `single_pass_bulk_byte_veto_fires_on_the_cratonbench_sieve` |
+
+### Blast radius, measured the only way worth measuring
+
+The declared off-switch makes this exact rather than argued: **one binary, the
+flag on and off**, all ten phases. Anything else — comparing against an older
+binary, or against another tree — confounds the veto with everything else that
+landed.
+
+| phase | veto ON (default) | veto OFF |
+|---|---|---|
+| `cb:arithmetic` | 0 / 0 / 0 | 0 / 0 / 0 |
+| `cb:fib` | 1 / 1 / 1 | 1 / 1 / 1 |
+| **`cb:sieve`** | **2 / 0 / 0** | **2 / 1 / 1** |
+| `cb:matrix` | 1 / 0 / 0 | 1 / 0 / 0 |
+| `cb:hashmap` | 0 / 0 / 0 | 0 / 0 / 0 |
+| `cb:stringregex` | 1 / 0 / 0 | 1 / 0 / 0 |
+| `cb:bintrees` | 3 / 1 / 1 | 3 / 1 / 1 |
+| `c2c:dispatch` | 16 / 9 / 7 | 16 / 9 / 7 |
+| `c2c:bind` | 9 / 5 / 5 | 9 / 5 / 5 |
+| `c2c:pipeline` | 14 / 7 / 5 | 14 / 7 / 5 |
+
+One row differs. The veto costs exactly one IR body across both benchmark
+suites — the one that was 6.4x slower than the code it displaced — and the
+framework-shaped candidate, which is the workload that actually exercises the
+optimizing tier, is untouched to the cell.
 
 The unit test asserts the veto fires on the exact javac bytecode of
 `CratonBench.sieve`, that it agrees with what the emission path found, and that
