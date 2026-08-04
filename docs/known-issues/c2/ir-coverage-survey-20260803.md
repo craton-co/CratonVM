@@ -95,6 +95,15 @@ reference field read is most of what object-oriented Java does."* The `putfield`
 arm twenty lines below it was not given the same treatment, and a reference
 field **write** is most of what object-oriented Java does too.
 
+> **Both `cov-03` rows closed 2026-08-03.** The numbers above are left as
+> measured — this file is a dated record and rewriting it would destroy the
+> before-half of every later comparison. On a re-run of
+> `ConditionalOnPropertyTests` alone, `ir.rs:5085` went 33 → 0 and `ir.rs:5041`
+> 5 → 0, and bodies went 410 → 445. The `cov-04` rows rose by 4–5 in the same
+> runs, which is the expected shape: methods that used to die at `cov-03`'s
+> sites now reach the invoke arms. Details in
+> `docs/internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md`.
+
 ## The whole-method refusals, before the builder runs
 
 583 events, from `ir_compatible` (`jit/src/ir.rs:6066`). These methods never

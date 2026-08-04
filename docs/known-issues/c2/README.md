@@ -64,7 +64,7 @@ read each lane's "first increment".
 |---|---|---:|---|
 | [`cov-01`](cov-01-constants-and-statics.md) | `ir.rs` arms `0x12`/`0x13`/`0xb2` | 189 | largest opcode bucket; the caller already supplies every table it needs |
 | [`cov-02`](cov-02-array-element-access.md) | `ir.rs` arms `0x2e`/`0x32`/`0x33`/`0x34`/`0x54`/`0x5a`/`0xbe` | 77 | `arraylength` alone is 43 and is the cheapest thing in this directory |
-| [`cov-03`](cov-03-field-stores-and-wide-fields.md) | `ir.rs` arms `0xb4`/`0xb5` | 43 | `getfield` learned about references; `putfield` twenty lines below did not |
+| ~~`cov-03`~~ **closed 2026-08-03** | `ir.rs` arms `0xb4`/`0xb5` | 43 → **0** | Both sites measured to zero on `ConditionalOnPropertyTests`; bodies 410 → 445. The asymmetry was the **write barrier** and only that — a reference LOAD needs none, so the change that taught `getfield` about references had nothing to say about the arm twenty lines below it. Both arms now share ONE tag classifier, so a future divergence trips a test. Wide `J`/`F`/`D` fields landed too. → [`RETIRED`](../../internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md) |
 | [`cov-04`](cov-04-the-invoke-arms.md) | `ir.rs` invoke arms + `<init>` elision | 69 | **cannot be sized from the survey** — first increment is a grouping, not code |
 | [`cov-05`](cov-05-checkcast-and-instanceof.md) | one `ir_compatible` conjunct | 306 | biggest refusal anywhere; `instanceof` first, `checkcast` needs `cov-07`'s answer |
 | [`cov-06`](cov-06-array-allocation.md) | two `ir_compatible` conjuncts + `0xbc`/`0xbd`/`0xc5` | 141 | the conjunct exists *because* the arm is missing — one piece of work, not two |
@@ -98,6 +98,8 @@ restores the nine original briefs.
 | `osr-02` | the exit-state differential (its forcing lever, `CRATONVM_OSR_EXIT_AFTER=N`, already exists) | `docs/feature-designs/jit-osr-exit-and-recompile.md` | nobody |
 | `loop-01` | unswitching, interchange, fusion — but the binding constraint is now the loop band and structural admission (`no_candidate_loop` is 94%+ of eligible compiles), not the gates `loop-02` retired | `loop-01-peeling-and-versioning.md` | nobody |
 | `verify-01` | still stands as the harness every lane above wants | `docs/internal/verify-01-differential-harness-RETIRED-20260803.md` | nobody |
+| `cov-03` | no barrier-free fast path for a C2 reference store (every one is a helper CALL; the single-pass backend has an opt-in inline route that proves four premises this tier cannot yet prove), and no inline route for a wide field read | `docs/internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md` | nobody |
+| `cov-03` | **whether an optimizing body is FASTER than the single-pass one it replaces.** Every `cov-*` lane moves methods onto a tier whose default configuration keeps integers in frame slots (`ir-linear-scan` is default-OFF), and the survey these lanes are sized from is a COUNT. A coverage win is not a performance win, and no lane owns tier code quality | `docs/internal/performance/`, `reference_c2_tier_slower_because_fields_take_the_helper` | nobody |
 
 
 ## The five review lanes, as the review framed them

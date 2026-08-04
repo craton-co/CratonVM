@@ -1,17 +1,20 @@
 # The original lane briefs, recovered
 
-These nine files are the lane docs this directory shipped with. Each was
+These files are the lane docs this directory shipped with. The first nine were
 **deleted by the commit that implemented its first increment**, so the brief
 went away at the moment the work stopped being hypothetical — and with it the
-list of what the lane had *not* done.
+list of what the lane had *not* done. That is the failure this directory exists
+to fix, so a `cov-*` lane now MOVES its brief here instead of deleting it, and
+writes its residuals into a `docs/internal/*-RETIRED-*.md` of its own.
 
-They are restored here unchanged. Nothing in this directory should be planned
-from them without checking the parent `README.md` first: their "Current state"
-sections describe 2026-08-01, and at least one lane discovered its subject
+They are here unchanged. Nothing in this directory should be planned from them
+without checking the parent `README.md` first: their "Current state" sections
+describe 2026-08-01 to 2026-08-03, and at least one lane discovered its subject
 already existed.
 
 | file | retired by | what is genuinely finished | what is not |
 |---|---|---|---|
+| `cov-03-field-stores-and-wide-fields.md` | moved, not deleted (2026-08-03) | both its sites measured to zero — reference `putfield` and `J`/`F`/`D` on both arms. The brief's open question ("which of the two candidate reasons is the real one?") is answered: the **write barrier**, and the compact-layout candidate was not a reason at all | no barrier-free fast path for a C2 reference store, no inline route for a wide read, and — the one that outlives this lane — no measurement that an optimizing body is FASTER than the single-pass one it replaces. `docs/internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md` |
 | `seam-01-x64-backend-split.md` | `60e297ec9` | all of it — `x64.rs` 40,588 → 2,539 lines | — |
 | `seam-02-invoke-dispatch-split.md` | `44aabd78b` | all of it — the interpreter's two files 26,775 → 8,158 and 24,817 → 3,941 | — |
 | `hir-01-lowering-contract.md` | `a628e18cb` | the contract is settled; four levels, not three | — |
