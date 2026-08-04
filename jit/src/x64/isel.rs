@@ -3877,30 +3877,9 @@ const FRAME_LOAD_COST: SeqCost = SeqCost {
 
 impl Tile {
     fn new(root: NodeId, covered: Vec<NodeId>, insts: Vec<MInst>, rule: Rule) -> Tile {
-        Tile::new_with_extra(root, covered, insts, rule, SeqCost::default())
-    }
-
-    /// As [`Tile::new`], plus a cost the *instructions* do not carry.
-    ///
-    /// One caller, and it is not a fudge factor: under
-    /// [`SelectOptions::frame_homed`] an operand that stays a register is an
-    /// operand the consumer has to load out of its frame word, and
-    /// [`MInst::cost`] prices instructions rather than operands. Without this
-    /// the register form of `x + 7` costs two bytes and the immediate form
-    /// three, so the immediate form loses — while actually emitting four bytes
-    /// *fewer*, because it drops the load that materialises the constant into
-    /// a register.
-    fn new_with_extra(
-        root: NodeId,
-        covered: Vec<NodeId>,
-        insts: Vec<MInst>,
-        rule: Rule,
-        extra: SeqCost,
-    ) -> Tile {
         let cost = insts
             .iter()
-            .fold(SeqCost::default(), |acc, i| acc.then(i.cost()))
-            .then(extra);
+            .fold(SeqCost::default(), |acc, i| acc.then(i.cost()));
         Tile {
             root,
             covered,
@@ -3944,6 +3923,66 @@ impl Tile {
             i64::from(self.cost.bytes) - i64::from(b.bytes),
             i64::from(self.cost.latency) - i64::from(b.latency),
         )
+    }
+
+    /// This tile's cost, re-priced for a frame-homed allocation.
+    ///
+    /// [`MInst::cost`] prices instructions. Under
+    /// [`SelectOptions::frame_homed`] an operand that stays a register is also
+    /// a `MOV r64, [RBP - disp]` the consumer has to emit to bring it in, and
+    /// two candidates for one node can need a *different number* of those:
+    /// `ADD EAX, ECX` loads two values where `ADD EAX, 7` loads one. Pricing
+    /// only the instruction hides four bytes and a micro-op, and hands the node
+    /// to the register form every time.
+    ///
+    /// Every tile loads at least one operand — the value it computes from — so
+    /// the first is free here and only the extras are charged. That keeps this
+    /// a *comparison between candidates for one node* rather than an absolute
+    /// figure competing with [`GENERIC_COST`].
+    ///
+    /// The operand set is a set: `x + x` selects an `LEA [x + x]` that loads
+    /// `x` once, and counting edges rather than values would charge it twice.
+    fn frame_homed(mut self) -> Tile {
+        let mut operands: Vec<NodeId> = Vec::new();
+        for inst in &self.insts {
+            let mut note = |id: NodeId| {
+                if !operands.contains(&id) {
+                    operands.push(id);
+                }
+            };
+            match *inst {
+                MInst::Imm { .. } | MInst::Generic { .. } | MInst::Jcc { .. } => {}
+                MInst::Move { src, .. } => note(src),
+                MInst::Lea { addr, .. } => {
+                    if let Some(b) = addr.base {
+                        note(b);
+                    }
+                    if let Some(i) = addr.index {
+                        note(i);
+                    }
+                }
+                MInst::AluRR { lhs, rhs, .. } => {
+                    note(lhs);
+                    note(rhs);
+                }
+                MInst::AluRI { lhs, .. } => note(lhs),
+                // A folded load's address is the memory node's own, which the
+                // lowering computes; only the kept operand is a frame word.
+                MInst::AluRM { lhs, .. } => note(lhs),
+                MInst::CmpRR { lhs, rhs, .. } => {
+                    note(lhs);
+                    note(rhs);
+                }
+                MInst::CmpRI { lhs, .. } => note(lhs),
+                MInst::TestRR { reg, .. } => note(reg),
+                // `SETcc` reads flags, not a frame word.
+                MInst::SetCc { .. } => {}
+            }
+        }
+        for _ in 1..operands.len() {
+            self.cost = self.cost.then(FRAME_LOAD_COST);
+        }
+        self
     }
 
     /// The fall-back tile: one node, lowered the old way.
@@ -4304,24 +4343,7 @@ fn tiles_alu(
         lhs,
         rhs,
     });
-    // Under frame homing the right operand has to be loaded out of its frame
-    // word before this instruction can name it, and the immediate form above
-    // does not pay that. Both forms load the LEFT operand, so only the delta
-    // belongs here. Charged to the tile rather than to `MInst::cost` because it
-    // is a property of the ALLOCATION, not of the instruction — the same
-    // register form costs nothing extra once operands live in registers.
-    let extra = if opts.frame_homed {
-        FRAME_LOAD_COST
-    } else {
-        SeqCost::default()
-    };
-    out.push(Tile::new_with_extra(
-        root,
-        vec![root],
-        insts,
-        Rule::AluReg,
-        extra,
-    ));
+    out.push(Tile::new(root, vec![root], insts, Rule::AluReg));
     out
 }
 
@@ -4616,6 +4638,11 @@ fn mark_claims(t: &Tile, claimed: &mut [bool]) {
 /// back to the generic lowering instead of being selected into an instruction
 /// nobody can emit.
 fn admit(t: Tile, opts: &SelectOptions, notes: &mut Vec<Note>) -> Option<Tile> {
+    // The allocation the consumer will encode against changes what a tile
+    // costs, and it changes it differently for different candidates. Applied
+    // here rather than in each rule so that every candidate for a node is
+    // priced the same way — a rule that forgot would look cheap.
+    let t = if opts.frame_homed { t.frame_homed() } else { t };
     if !opts.require_encodable {
         return Some(t);
     }
@@ -6827,9 +6854,11 @@ mod tests {
             let p = param(&mut graph, 0);
             let k = konst(&mut graph, 7);
             let add = bin(&mut graph, IrOp::Add, p, k);
-            // A second consumer, so the constant is not absorbable and both
-            // candidate tiles cover exactly the add.
-            let _other = bin(&mut graph, IrOp::Sub, p, k);
+            // A second consumer for the CONSTANT only, so it is not absorbable
+            // and both candidates cover exactly the add — and so the left
+            // operand stays single-use, which keeps the two-address copy out of
+            // the comparison. This is a test about operand loads, not copies.
+            let _other = second_use(&mut graph, k);
             (graph, add)
         };
 
