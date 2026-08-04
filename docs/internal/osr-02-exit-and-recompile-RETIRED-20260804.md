@@ -1,6 +1,8 @@
 # OSR-02 — retired 2026-08-04: the exit state is checkable, and it was checked
 
-Branch `fix/c2-osr02-exit-differential-20260804`, merged to `dev` and pushed.
+Branches `fix/c2-osr02-exit-differential-20260804` and — for §8, the literal
+frame comparison — `fix/c2-osr02-frame-comparator-20260804`. Both merged to
+`dev` and pushed.
 Retires `docs/known-issues/c2/archive/osr-02-exit-and-recompile.md` and closes
 `docs/feature-designs/jit-osr-exit-and-recompile.md`.
 
@@ -23,6 +25,7 @@ deliberately injected instance of the exact defect the lane exists for**.
 | 4 — cross-check `osr_exit_points` against observed exits | **Landed here**, and it needed a correction the brief did not anticipate. §3. |
 | "What to refuse": an exit whose resume bci has more than one native image, or none | **Landed here**, at *admission* rather than at exit, and **narrowed by a measurement**. §4. |
 | The counters "have not been read end to end from a live run" | **Closed.** §5. |
+| 2, taken **literally** — the resumed frame diffed against the un-compiled run's, slot for slot | **Landed 2026-08-04** on `fix/c2-osr02-frame-comparator-20260804`, closing §6's first residual. §8. |
 
 ---
 
@@ -226,7 +229,7 @@ requests are refused or declined, and the other rows say which.
 
 ## 6. What is NOT closed
 
-* **The differential is a Java-level oracle, not a frame comparator.** It
+* ~~**The differential is a Java-level oracle, not a frame comparator.** It
   observes the resumed frame through the program's behaviour — per-execution
   side effects and a per-iteration digest of the loop-carried state — not by
   reading the interpreter's slots and diffing them against a recorded
@@ -234,7 +237,7 @@ requests are refused or declined, and the other rows say which.
   remainder of the loop never reads would not be seen. It is also why the
   injection test matters, and the injection *was* of exactly that kind (drop
   every local write) and was caught, because a loop's live locals are by
-  definition read by the loop.
+  definition read by the loop.~~ **CLOSED 2026-08-04**, §8.
 * **`osr_exit_off_loop_boundary` has not been observed non-zero.** Every exit in
   every arm here landed on a true loop boundary. The row exists because the indy
   trap can produce one; nothing in this lane drove one.
@@ -261,3 +264,97 @@ requests are refused or declined, and the other rows say which.
 | `vm/src/runtime/interpreter/jit_bridge.rs` | classify + count every exit that arrives with a frame |
 | `probes/OsrExitDifferentialProbe.java` | new |
 | `regression-suite/perf/osr-exit-differential.sh` | new |
+| `vm/src/runtime/interpreter/osr_frame_trace.rs` | new — §8 |
+| `regression-suite/perf/osr-frame-comparator.py` | new — §8 |
+| `regression-suite/perf/osr-frame-differential.sh` | new — §8 |
+
+---
+
+## 8. The frame comparator — the item taken literally
+
+Branch `fix/c2-osr02-frame-comparator-20260804`. §6's first residual, closed the
+same day it was written, because "delivered in substance" is not the same claim
+as the brief's:
+
+> compares the resumed frame against the frame an un-compiled run would have had
+> at the same iteration count
+
+§2's oracle is behavioural. This one reads the frames.
+
+### The trace
+
+`CRATONVM_DBG_OSR_FRAME_TRACE=<class-substring>` emits three record kinds in one
+format, so a checker compares them without knowing which produced which:
+
+| | |
+|---|---|
+| `A` | a back-edge **arrival**, with its per-`(method, bci)` index |
+| `E` | the frame an OSR **entry** was taken with |
+| `X` | the frame an OSR **exit** transferred into the live frame |
+
+Locals go through the same `get_local_raw` / `get_local_tag` pair the OSR entry
+contract reads, so what is compared is what OSR itself acts on rather than a
+re-derived view. The stack comes from `ValueStack::snapshot_raw`. Both render as
+`tag:word`, hex, in slot order.
+
+Two placements are load-bearing:
+
+* **The arrival hook is in `try_osr_with_backoff`, ahead of every early return.**
+  That function is the one funnel all fourteen back-edge sites go through, and
+  the ground-truth arm runs `--nojit`, where the virtual-thread test, the
+  `CRATONVM_JIT_OSR` gate and the backoff schedule each decline. A hook after any
+  of them would emit in one arm and not the other, and the comparison would be
+  between two different things rather than two runs of one.
+* **The exit hook is after the write, and reads the frame, not `rframe`.** They
+  differ: an `Unsupported` source slot is deliberately left at the live frame's
+  current value, so a record built from the reconstruction would describe a
+  frame that never exists.
+
+### The two assertions, and why one was not enough
+
+For each `(key, bci)` site, `osr-frame-comparator.py` maps every record of the
+run under test to its index in the un-compiled run's sequence by **exact frame
+equality**, and requires:
+
+1. **the index sequence to increase strictly** — a frame matching nothing is a
+   state the program cannot be in (the case §2's oracle misses when the slot is
+   never read again); an index that repeats is an iteration executing twice;
+2. **`index(X) - index(E) >= --min-advance`** — how far the compiled body got,
+   measured on the un-compiled run's own trajectory rather than taken from
+   anything the JIT claims.
+
+**Assertion 2 exists because a hand-built fixture walked straight through
+assertion 1.** Compiled iterations produce no arrival records, so the historical
+defect — entered at frame 5, ran to 12, resumed at 5 — and "entered at 5 and
+advanced nothing" are the *same* index sequence: 0…4, then 5, then 6, 7, 8…
+Strictly increasing, and wrong. Only the `E` record separates them. Zero advance
+is *correct* for the unconditional-at-header trigger, where reject and transfer
+coincide, so the floor is a parameter rather than a constant.
+
+A **gap** between an exit and the next arrival is not an error at all. That gap
+is the OSR; its size is reported, not judged.
+
+### The checker is itself guarded
+
+`--selftest` builds six transcript pairs with known verdicts — `clean`,
+`replay`, `corrupt-local`, `backwards`, `no-exit`, `no-truth` — and the
+differential script runs it **before** the real comparison, so a comparator that
+has stopped catching anything cannot report a green run. Two of the six are
+vacuity cases rather than defects: an empty ground truth (the class filter
+matched nothing) and a run under test with no exits (no OSR happened, so nothing
+about OSR was tested). Both must be red.
+
+### What it still does not cover
+
+* **Only frames at a loop header.** The trace records arrivals at back edges and
+  the resume point, which is where OSR entry and exit happen. A divergence
+  introduced and repaired *within* one iteration is invisible to both halves of
+  this differential.
+* **The index is ambiguous on a site whose frames repeat.** A loop whose header
+  state is not monotone has several candidate indices; the comparator takes the
+  smallest one that makes progress and **marks the site `ok*`**, because
+  "strictly increasing" is a weaker claim there. Reported, not hidden.
+* **Volume.** One line per back edge means the ground-truth arm is large; the
+  driver lowers the trip count and `CRATONVM_TIER_OSR_BACKEDGE` together so a
+  few thousand trips still produce many entries and exits, and per-site records
+  are capped with the truncation announced.
