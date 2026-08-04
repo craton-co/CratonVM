@@ -23499,27 +23499,35 @@ mod native_diag_tests {
         let _serialise = RING_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let was = cratonvm_native_api::native_ring::is_enabled();
 
+        // Keep the window in which the process-global is flipped as short as
+        // physically possible — sample both masks, restore, and only THEN
+        // assert. libtest runs the rest of the suite on parallel threads and
+        // `RING.lock()` is process-wide; asserting inside the window would
+        // hold the ring on across panic/formatting machinery and perturb
+        // timing-sensitive neighbours.
         cratonvm_native_api::native_ring::enable(true);
+        let on_mask = native_diag_mask();
+        cratonvm_native_api::native_ring::enable(false);
+        let off_mask = native_diag_mask();
+        let track_on = cratonvm_native_api::native_ring::any_recording_enabled();
+        cratonvm_native_api::native_ring::enable(was);
+
         assert_ne!(
-            native_diag_mask() & native_diag::RING,
+            on_mask & native_diag::RING,
             0,
             "enabling the ring must set RING in the mask; if it does not, the \
              funnel will skip record_enter/record_exit and the watchdog's \
              STILL-IN-NATIVE breadcrumb is lost"
         );
-
-        cratonvm_native_api::native_ring::enable(false);
-        // `any_recording_enabled` also covers CRATONVM_TRACK_NATIVE, which is a
+        // `any_recording_enabled` also covers CRATONVM_TRACK_NATIVE, a
         // separate env gate — only assert the bit clears when that is off too.
-        if !cratonvm_native_api::native_ring::any_recording_enabled() {
+        if !track_on {
             assert_eq!(
-                native_diag_mask() & native_diag::RING,
+                off_mask & native_diag::RING,
                 0,
                 "disabling the ring must clear RING in the mask"
             );
         }
-
-        cratonvm_native_api::native_ring::enable(was);
     }
 
     /// Every bit is distinct.
@@ -23577,9 +23585,15 @@ mod native_diag_tests {
         assert!(st.vm_state_name.is_none(), "mask 0 must not name the callee");
 
         // RING alone: a token, and nothing else.
-        let _serialise = RING_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let was = cratonvm_native_api::native_ring::is_enabled();
-        cratonvm_native_api::native_ring::enable(true);
+        //
+        // Deliberately does NOT enable the ring. `record_enter` returns its
+        // `DISABLED_TOKEN` when recording is off, so `ring_idx` is still
+        // `Some(..)` and the assertion still proves the bit reached
+        // `record_enter` — which is the entire claim. Enabling it would flip a
+        // *process-global* that libtest's other threads observe, and
+        // `RING.lock()` is process-wide, so this test would perturb every
+        // timing-sensitive test running beside it. `record_exit` on the
+        // disabled token is an explicit no-op.
         let st = native_diag_pre_call(native_diag::RING, &mut thread, cb);
         assert!(
             st.ring_idx.is_some(),
@@ -23590,7 +23604,6 @@ mod native_diag_tests {
         if let Some(idx) = st.ring_idx {
             cratonvm_native_api::native_ring::record_exit(idx);
         }
-        cratonvm_native_api::native_ring::enable(was);
 
         // STRAYSTACK alone: a push, and nothing else. Pop it back.
         let st = native_diag_pre_call(native_diag::STRAYSTACK, &mut thread, cb);
