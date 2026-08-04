@@ -171,8 +171,38 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     hunter does not report it**: `overlay_write_is_destructive` only flags
     `Object(Some(_))` over a primitive, so a null write is invisible. The
     census is a floor for that reason too.
-  * **Both built-in class loaders take `Int` writes over four reference slots
-    each.** Whatever those slots hold on the real classes, they are not integers.
+  * **Both built-in class loaders — root cause found 2026-08-04, and it is a
+    different KIND of defect from the two fixed above.** `alloc_classloader`
+    writes CratonVM's seven-slot loader model onto the object, and four of those
+    slots are `Int`:
+
+    | slot | synthetic meaning | real `ClassLoaders$AppClassLoader` |
+    |---:|---|---|
+    | 0 | `CL_LOADER_TYPE` | a reference |
+    | 3 | `CL_CLASSES_LOADED` | a reference |
+    | 4 | `CL_IS_PARALLEL_CAPABLE` | a reference |
+    | 6 | `CL_LOADER_ID` | a reference |
+
+    Reached from `Thread.currentThread()` → `current_thread_object` →
+    `get_or_create_system_cl` while initialising `contextClassLoader`, which is
+    why the Java stack said `BufferedWriter.initialBufferSize()` and why
+    grepping found nothing. Named by `CRATONVM_DBG=overlay-bt`, which exists
+    because of this site.
+
+    **`resolve_field_index_by_class_id` cannot fix these.** `loadFactor` on a
+    `Properties` has a real counterpart to resolve to; `CL_LOADER_TYPE` and
+    `CL_LOADER_ID` are VM-internal bookkeeping with **no real JDK field at
+    all**. There is nowhere correct to put them in a real loader's layout, so
+    on a real image they must not be in the object: they belong in a side table
+    keyed by the loader, exactly as `vh_meta_put` does for `VarHandle`. Note the
+    same function already writes `name`/`parent` twice — once by index, once by
+    name — with a comment explaining that the real natives read the real slots,
+    so the by-name half of this lesson was already learned here and the
+    VM-internal half was not.
+
+    Size: 9 / 6 / 10 / 16 read-and-write sites for the four constants. Not a
+    one-line change, and it is the reason this row is diagnosed rather than
+    fixed.
   * `URI` and `Properties` each mismatch in both directions, which rules out a
     single off-by-one against one layout.
 
