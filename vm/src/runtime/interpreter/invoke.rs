@@ -2748,12 +2748,22 @@ pub(super) fn try_stackless_invoke(
         && method_name == "invoke"
         && descriptor == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
     {
-        if let Some(callback) =
-            shared
-                .natives
-                .native_methods
-                .find("java/lang/reflect/Method", method_name, descriptor)
-        {
+        // ONE STATIC, ONE TRIPLE — see the discipline note in
+        // `dispatch_virtual.rs`. A `NativeCallSite` is keyed on the registry
+        // generation alone and does not re-verify the triple on a warm hit, so
+        // a cell must be unreachable with a second triple. The `if` above has
+        // already proven all three components by exact equality, so this cell
+        // sees exactly one. It is its own cell rather than a share of
+        // `dispatch_virtual`'s identically-keyed `NCS_METHOD_INVOKE`, matching
+        // that module's rule that no cell is reachable from more than one call.
+        static NCS_METHOD_INVOKE: cratonvm_native_api::NativeCallSite =
+            cratonvm_native_api::NativeCallSite::new();
+        if let Some(callback) = NCS_METHOD_INVOKE.callback(
+            &shared.natives.native_methods,
+            "java/lang/reflect/Method",
+            method_name,
+            descriptor,
+        ) {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
                 push_invoke_return_value(
@@ -2772,7 +2782,11 @@ pub(super) fn try_stackless_invoke(
         && method_name == "newInstance"
         && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;"
     {
-        if let Some(callback) = shared.natives.native_methods.find(
+        // ONE STATIC, ONE TRIPLE — as above; the guard proves the triple.
+        static NCS_CONSTRUCTOR_NEW_INSTANCE: cratonvm_native_api::NativeCallSite =
+            cratonvm_native_api::NativeCallSite::new();
+        if let Some(callback) = NCS_CONSTRUCTOR_NEW_INSTANCE.callback(
+            &shared.natives.native_methods,
             "java/lang/reflect/Constructor",
             method_name,
             descriptor,
