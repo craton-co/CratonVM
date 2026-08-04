@@ -20,12 +20,27 @@
 //! Every counter in this module is therefore permanently **zero at runtime**.
 //!
 //! The consequence for anyone reaching for it: an optimisation gated on
-//! [`CallSiteProfile::inline_benefit_score`], [`MethodProfile::get_inline_candidates`],
-//! [`ReceiverTypeProfile::is_monomorphic`] or [`InliningPolicy::should_inline`]
-//! will silently see "no candidates / not hot / not monomorphic" for every
-//! call site in the VM, and its effect will be indistinguishable from being
-//! turned off. That failure mode — a capability that reads as landed but never
-//! runs — is exactly what `docs/flag-census.md` tracks.
+//! [`ReceiverTypeProfile::shape`] or any predicate built on it will silently
+//! see "not monomorphic" for every call site in the VM, and its effect will be
+//! indistinguishable from being turned off. That failure mode — a capability
+//! that reads as landed but never runs — is exactly what
+//! `docs/flag-census.md` tracks.
+//!
+//! # There is exactly ONE inlining policy, and it is not here
+//!
+//! This module used to carry a second one: `InliningPolicy::should_inline`,
+//! `InlineCandidate`, `InlineDecision`, `MethodProfile::get_inline_candidates`,
+//! `CallSiteProfile::inline_benefit_score`, and a set of receiver-shape
+//! predicates with their own thresholds. They disagreed with the live policy
+//! in every dimension that matters — an exact type count instead of a dominant
+//! SHARE, no minimum-observation floor, a megamorphic ceiling of four types
+//! instead of eight — and this module is explicitly a sketch awaiting a
+//! recorder, so the moment it got one the divergence would ship. They are
+//! gone. The policy is `crate::plan_inline` / `crate::classify_receiver_shape`
+//! (`docs/feature-designs/profile-guided-inlining.md`), and
+//! [`ReceiverTypeProfile::shape`] is a VIEW onto it rather than a rival to it.
+//! Anything this module still needs from a policy — the devirtualisation
+//! frequency floor — is passed in as a number.
 //!
 //! **The live profile is [`crate::profile`]**, which the interpreter really
 //! does feed (`ProfileStore::record_branch_borrowed` / `record_backedge_borrowed`
@@ -50,8 +65,10 @@
 //! monomorphic?") is answerable only together with "and was the table full when
 //! you asked?" — a site that overflowed its slots is not monomorphic, it is
 //! *unknown*, and conflating the two is a wrong-code bug the moment anything
-//! speculates on the answer. Every predicate below is therefore truncation-aware
-//! and fails closed; see [`ReceiverTypeProfile::is_truncated`].
+//! speculates on the answer. This is the one thing the live policy has no
+//! notion of, so [`ReceiverTypeProfile::shape`] layers it ON TOP: a truncated
+//! profile reports megamorphic, which refuses. See
+//! [`ReceiverTypeProfile::is_truncated`].
 
 use rustc_hash::FxHashMap;
 
@@ -237,36 +254,69 @@ impl ReceiverTypeProfile {
             .map(|e| e.class_id)
     }
 
-    /// True iff exactly one concrete type has been observed **and the profile
-    /// recorded every call it counted**.
+    /// This profile's shape, decided by **the** inlining policy —
+    /// [`crate::classify_receiver_shape`] — rather than by a second set of
+    /// thresholds living here.
     ///
-    /// The second clause is the whole point. Without it, a site whose table
-    /// filled and overflowed reports the shape of its surviving entries, and a
-    /// caller that speculates on the answer emits a guard for a class that may
-    /// be a minority of real receivers. Today `MAX_ENTRIES` is 8, so a
-    /// one-entry table cannot itself have overflowed and the clause is a no-op;
-    /// it becomes load-bearing the moment the cap is lowered towards HotSpot's
-    /// `TypeProfileWidth = 2`, which is precisely when nobody would think to
-    /// revisit this predicate.
+    /// This module used to answer the shape question with its own rules
+    /// (exactly one entry / exactly two / more than four). Those rules
+    /// disagreed with the live policy in every dimension that matters: the
+    /// live one requires a dominant SHARE (90% / 92% combined) rather than an
+    /// exact type count, refuses a site under
+    /// `INLINE_MIN_SPECULATION_OBSERVATIONS` observations as unproven rather
+    /// than monomorphic, and puts the megamorphic ceiling at eight types, not
+    /// four. Two policies that answer "is this site monomorphic?" differently
+    /// are one wiring change away from a wrong speculation, and this module is
+    /// explicitly a sketch awaiting a recorder — the moment it gets one, the
+    /// divergence ships. So there is one policy now, and this is a view onto
+    /// it.
+    ///
+    /// Truncation is layered ON TOP, because it is the one thing the live
+    /// policy has no notion of: `crate::profile` never caps its type table, so
+    /// `classify_receiver_shape` can assume the counts name every type it saw.
+    /// This profile DOES cap ([`Self::MAX_ENTRIES`]) and silently drops the
+    /// rest, so a truncated profile is not a description of the call site at
+    /// all — the classes it does not name may collectively outweigh the ones
+    /// it does. It reports [`crate::ReceiverShape::Megamorphic`] with the true
+    /// observation total, which refuses.
+    pub fn shape(&self) -> crate::ReceiverShape {
+        if self.is_truncated() {
+            return crate::ReceiverShape::Megamorphic {
+                types: self.entries.len().saturating_add(1),
+                observations: self.total_calls.min(u64::from(u32::MAX)) as u32,
+            };
+        }
+        let counts: crate::profile::ReceiverCounts = self
+            .entries
+            .iter()
+            .map(|e| (e.class_id, e.count.min(u64::from(u32::MAX)) as u32))
+            .collect();
+        crate::classify_receiver_shape(Some(&counts))
+    }
+
+    /// True iff [`Self::shape`] is monomorphic.
+    ///
+    /// Fail-closed under truncation by construction: [`Self::shape`] reports a
+    /// truncated profile as megamorphic. Today `MAX_ENTRIES` is 8, so a
+    /// one-entry table cannot itself have overflowed; that stops being true the
+    /// moment the cap is lowered towards HotSpot's `TypeProfileWidth = 2`,
+    /// which is precisely when nobody would think to revisit this predicate.
     pub fn is_monomorphic(&self) -> bool {
-        self.entries.len() == 1 && !self.is_truncated()
+        matches!(self.shape(), crate::ReceiverShape::Monomorphic { .. })
     }
 
-    /// True iff exactly two concrete types have been observed and nothing was
-    /// dropped. Same fail-closed rule as [`Self::is_monomorphic`].
+    /// True iff [`Self::shape`] is bimorphic. Same fail-closed rule.
     pub fn is_bimorphic(&self) -> bool {
-        self.entries.len() == 2 && !self.is_truncated()
+        matches!(self.shape(), crate::ReceiverShape::Bimorphic { .. })
     }
 
-    /// True iff more than four concrete types have been observed, **or** the
-    /// profile is truncated.
+    /// True iff [`Self::shape`] is megamorphic — too many types, no dominant
+    /// one, a saturated counter, **or** a truncated table.
     ///
-    /// Truncation implies "at least one more type than we could record", so a
-    /// truncated site is at least as polymorphic as it looks. Erring towards
-    /// megamorphic costs a devirtualisation opportunity; erring the other way
-    /// costs a wrong speculation.
+    /// Erring towards megamorphic costs a devirtualisation opportunity; erring
+    /// the other way costs a wrong speculation.
     pub fn is_megamorphic(&self) -> bool {
-        self.entries.len() > 4 || self.is_truncated()
+        matches!(self.shape(), crate::ReceiverShape::Megamorphic { .. })
     }
 
     /// Number of distinct types **recorded** so far.
@@ -315,20 +365,6 @@ impl CallSiteProfile {
             .map(|(&id, _)| id)
     }
 
-    /// Inline benefit score: (call_count × dominance_ratio) / (callee_size + 1).
-    pub fn inline_benefit_score(&self, callee_size: usize) -> f64 {
-        if self.call_count == 0 {
-            return 0.0;
-        }
-        let dominance_ratio = match self.most_common_callee() {
-            Some(id) => {
-                let top = *self.callee_distribution.get(&id).unwrap_or(&0);
-                top as f64 / self.call_count as f64
-            }
-            None => 0.0,
-        };
-        (self.call_count as f64 * dominance_ratio) / (callee_size + 1) as f64
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -537,38 +573,6 @@ impl MethodProfile {
             .backedge_count += 1;
     }
 
-    /// Return inline candidates derived from call-site profiles, sorted by
-    /// descending benefit, limited to `budget` candidates.
-    pub fn get_inline_candidates(&self, budget: usize) -> Vec<InlineCandidate> {
-        let mut candidates: Vec<InlineCandidate> = self
-            .call_sites
-            .values()
-            .filter_map(|cs| {
-                let callee_id = cs.most_common_callee()?;
-                let score = cs.inline_benefit_score(0); // size unknown here
-                let tp = self.type_profiles.get(&cs.bci);
-                Some(InlineCandidate {
-                    call_site_bci: cs.bci,
-                    callee_method_id: callee_id,
-                    callee_class: tp
-                        .and_then(|t| t.entries.first())
-                        .map(|_| String::new())
-                        .unwrap_or_default(),
-                    callee_name: String::new(),
-                    estimated_benefit: score,
-                    callee_size: 0,
-                })
-            })
-            .collect();
-        candidates.sort_by(|a, b| {
-            b.estimated_benefit
-                .partial_cmp(&a.estimated_benefit)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        candidates.truncate(budget);
-        candidates
-    }
-
     /// BCIs of loop headers whose back-edge count exceeds `threshold`.
     pub fn get_hot_loops(&self, threshold: u64) -> Vec<u32> {
         let mut bcis: Vec<u32> = self
@@ -579,120 +583,6 @@ impl MethodProfile {
             .collect();
         bcis.sort_unstable();
         bcis
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Inlining Budget & Decisions
-// ---------------------------------------------------------------------------
-
-/// A candidate call site that the JIT is considering inlining.
-#[derive(Debug, Clone)]
-pub struct InlineCandidate {
-    pub call_site_bci: u32,
-    pub callee_method_id: u64,
-    pub callee_class: String,
-    pub callee_name: String,
-    pub estimated_benefit: f64,
-    pub callee_size: usize,
-}
-
-/// Outcome of an inlining decision.
-#[derive(Debug, Clone, PartialEq)]
-pub enum InlineDecision {
-    /// The call site should be inlined.
-    Inline,
-    /// The callee is too large to inline.
-    TooLarge { size: usize, max: usize },
-    /// The call site is not invoked often enough.
-    TooRare { count: u64, min: u64 },
-    /// The inlining budget for this compilation unit is exhausted.
-    BudgetExhausted,
-    /// The call site is megamorphic; inlining is not profitable.
-    Megamorphic,
-}
-
-/// Policy parameters governing inlining decisions.
-#[derive(Debug, Clone)]
-pub struct InliningPolicy {
-    /// Maximum callee bytecode size eligible for inlining (default 35).
-    pub max_inline_size: usize,
-    /// Maximum total inlined bytecodes per compilation unit (default 250).
-    pub max_total_budget: usize,
-    /// Minimum call count required for a site to be inlined (default 100).
-    pub min_call_count: u64,
-    /// Budget multiplier for monomorphic sites (default 2.0).
-    pub monomorphic_boost: f64,
-}
-
-impl Default for InliningPolicy {
-    fn default() -> Self {
-        Self {
-            max_inline_size: 35,
-            max_total_budget: 250,
-            min_call_count: 100,
-            monomorphic_boost: 2.0,
-        }
-    }
-}
-
-impl InliningPolicy {
-    /// Decide whether to inline `candidate` given the method's profile.
-    /// `profile` is used to check type-profile morphism at the call site.
-    pub fn should_inline(
-        &self,
-        candidate: &InlineCandidate,
-        profile: &MethodProfile,
-    ) -> InlineDecision {
-        // Check for megamorphic call site.
-        if let Some(tp) = profile.type_profiles.get(&candidate.call_site_bci) {
-            if tp.is_megamorphic() {
-                return InlineDecision::Megamorphic;
-            }
-        }
-
-        // Determine effective size limit (boost monomorphic sites).
-        let effective_max = if profile
-            .type_profiles
-            .get(&candidate.call_site_bci)
-            .map(|t| t.is_monomorphic())
-            .unwrap_or(false)
-        {
-            (self.max_inline_size as f64 * self.monomorphic_boost) as usize
-        } else {
-            self.max_inline_size
-        };
-
-        if candidate.callee_size > effective_max {
-            return InlineDecision::TooLarge {
-                size: candidate.callee_size,
-                max: effective_max,
-            };
-        }
-
-        // Check call frequency.
-        let call_count = profile
-            .call_sites
-            .get(&candidate.call_site_bci)
-            .map(|cs| cs.call_count)
-            .unwrap_or(0);
-        if call_count < self.min_call_count {
-            return InlineDecision::TooRare {
-                count: call_count,
-                min: self.min_call_count,
-            };
-        }
-
-        InlineDecision::Inline
-    }
-
-    /// Sort candidates descending by estimated benefit (in-place).
-    pub fn rank_candidates(&self, candidates: &mut Vec<InlineCandidate>) {
-        candidates.sort_by(|a, b| {
-            b.estimated_benefit
-                .partial_cmp(&a.estimated_benefit)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
     }
 }
 
@@ -924,7 +814,14 @@ pub struct DevirtualizationAnalyzer;
 
 impl DevirtualizationAnalyzer {
     /// Analyse all virtual call sites in `profile` and return decisions.
-    pub fn analyze(&self, profile: &MethodProfile, policy: &InliningPolicy) -> Vec<DevirtDecision> {
+    /// `min_call_count` is the frequency floor above which a monomorphic site
+    /// is worth splicing rather than merely binding directly. It used to come
+    /// from `InliningPolicy`, a second inlining policy that lived in this
+    /// module and disagreed with the live one; that type is gone (the shape
+    /// question is now `crate::classify_receiver_shape`, via
+    /// `ReceiverTypeProfile::shape`), so the one number this analysis still
+    /// needs is passed in.
+    pub fn analyze(&self, profile: &MethodProfile, min_call_count: u64) -> Vec<DevirtDecision> {
         let mut decisions = Vec::new();
 
         for (bci, tp) in &profile.type_profiles {
@@ -947,7 +844,7 @@ impl DevirtualizationAnalyzer {
                     .get(bci)
                     .map(|cs| cs.call_count)
                     .unwrap_or(0);
-                let strategy = if cs_count >= policy.min_call_count {
+                let strategy = if cs_count >= min_call_count {
                     DevirtStrategy::Inline(entry.method_id)
                 } else {
                     DevirtStrategy::DirectCall(entry.method_id)
@@ -1313,6 +1210,12 @@ impl ProfileSerializer {
 
 #[cfg(test)]
 mod tests {
+    /// The frequency floor `DevirtualizationAnalyzer::analyze` takes. It used
+    /// to arrive as `InliningPolicy::default().min_call_count`; that type is
+    /// gone (it was a second inlining policy that disagreed with the live one
+    /// — see `ReceiverTypeProfile::shape`), so the tests name the number.
+    const DEVIRT_MIN_CALLS: u64 = 100;
+
     use super::*;
 
     // ---- BranchProfile -------------------------------------------------------
@@ -1419,10 +1322,15 @@ mod tests {
         assert!(tp.dominant_type().is_none());
     }
 
+    /// Counts are `crate::INLINE_MIN_SPECULATION_OBSERVATIONS`-scale on
+    /// purpose. The shape predicates delegate to the LIVE policy, which refuses
+    /// to call a barely-executed site monomorphic — a site seen ten times with
+    /// one receiver is unproven, not settled, and the old local thresholds said
+    /// otherwise.
     #[test]
     fn type_profile_monomorphic() {
         let mut tp = ReceiverTypeProfile::new(0);
-        for _ in 0..10 {
+        for _ in 0..1000 {
             tp.add_receiver(42, 1001);
         }
         assert!(tp.is_monomorphic());
@@ -1434,10 +1342,10 @@ mod tests {
     #[test]
     fn type_profile_bimorphic() {
         let mut tp = ReceiverTypeProfile::new(0);
-        for _ in 0..5 {
+        for _ in 0..500 {
             tp.add_receiver(1, 100);
         }
-        for _ in 0..5 {
+        for _ in 0..500 {
             tp.add_receiver(2, 200);
         }
         assert!(tp.is_bimorphic());
@@ -1447,11 +1355,38 @@ mod tests {
 
     #[test]
     fn type_profile_megamorphic() {
+        // Five types with no dominant one: under the live policy's eight-type
+        // ceiling but nowhere near its 90% / 92% share thresholds, so it is
+        // reported megamorphic for want of a dominant receiver rather than for
+        // sheer type count. Either way it refuses.
         let mut tp = ReceiverTypeProfile::new(0);
-        for i in 0..5 {
-            tp.add_receiver(i, i as u64 * 100);
+        for i in 0..5u32 {
+            for _ in 0..200 {
+                tp.add_receiver(i, u64::from(i) * 100);
+            }
         }
         assert!(tp.is_megamorphic());
+        assert!(!tp.is_monomorphic());
+        assert!(!tp.is_bimorphic());
+    }
+
+    /// A settled receiver with too few observations is UNPROVEN, not
+    /// monomorphic. This is the single sharpest disagreement between the local
+    /// thresholds this module used to carry and the policy it now delegates
+    /// to, and speculating on it is what
+    /// `crate::INLINE_MIN_SPECULATION_OBSERVATIONS` exists to prevent.
+    #[test]
+    fn a_settled_but_barely_executed_site_is_not_monomorphic() {
+        let mut tp = ReceiverTypeProfile::new(0);
+        for _ in 0..10 {
+            tp.add_receiver(42, 1001);
+        }
+        assert!(!tp.is_truncated(), "nothing was dropped");
+        assert!(
+            !tp.is_monomorphic(),
+            "ten observations is not evidence, whatever the shape looks like"
+        );
+        assert!(matches!(tp.shape(), crate::ReceiverShape::Cold { .. }));
     }
 
     #[test]
@@ -1564,7 +1499,7 @@ mod tests {
     #[test]
     fn untruncated_profile_accounts_for_every_call() {
         let mut tp = ReceiverTypeProfile::new(0);
-        for _ in 0..10 {
+        for _ in 0..1000 {
             tp.add_receiver(42, 1001);
         }
         assert_eq!(tp.recorded_calls(), tp.total_calls);
@@ -1632,42 +1567,6 @@ mod tests {
         assert!(tp.is_megamorphic());
     }
 
-    /// A truncated site is refused by the policy rather than inlined on the
-    /// strength of the entries that happened to fit.
-    #[test]
-    fn inlining_policy_refuses_a_truncated_site() {
-        let policy = InliningPolicy::default();
-        let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..500 {
-            mp.record_call(0, 1);
-        }
-        mp.type_profiles.insert(
-            0,
-            ReceiverTypeProfile {
-                call_site_bci: 0,
-                entries: vec![TypeProfileEntry {
-                    class_id: 7,
-                    method_id: 1,
-                    count: 100,
-                    ratio: 1.0,
-                }],
-                total_calls: 5_000,
-            },
-        );
-        let cand = InlineCandidate {
-            call_site_bci: 0,
-            callee_method_id: 1,
-            callee_class: "B".into(),
-            callee_name: "n".into(),
-            estimated_benefit: 100.0,
-            callee_size: 4,
-        };
-        assert_eq!(
-            policy.should_inline(&cand, &mp),
-            InlineDecision::Megamorphic,
-            "a site whose profile lost observations is not an inline candidate"
-        );
-    }
 
     #[test]
     fn type_profile_ratios_sum_to_at_most_one() {
@@ -1692,36 +1591,8 @@ mod tests {
         assert_eq!(cs.most_common_callee(), Some(10));
     }
 
-    #[test]
-    fn call_site_benefit_score_empty() {
-        let cs = CallSiteProfile::new(0);
-        assert_eq!(cs.inline_benefit_score(10), 0.0);
-    }
 
-    #[test]
-    fn call_site_benefit_score_single_callee() {
-        let mut cs = CallSiteProfile::new(0);
-        for _ in 0..100 {
-            cs.record_call(42);
-        }
-        // dominance_ratio = 1.0, callee_size = 9 => score = 100 / 10
-        let score = cs.inline_benefit_score(9);
-        assert!((score - 10.0).abs() < 1e-9);
-    }
 
-    #[test]
-    fn call_site_benefit_score_split_callee() {
-        let mut cs = CallSiteProfile::new(0);
-        for _ in 0..50 {
-            cs.record_call(1);
-        }
-        for _ in 0..50 {
-            cs.record_call(2);
-        }
-        // dominance_ratio = 0.5, callee_size = 9 => score = 100 * 0.5 / 10 = 5.0
-        let score = cs.inline_benefit_score(9);
-        assert!((score - 5.0).abs() < 1e-9);
-    }
 
     // ---- DeoptProfile -------------------------------------------------------
 
@@ -1835,8 +1706,11 @@ mod tests {
     #[test]
     fn method_profile_record_receiver() {
         let mut mp = MethodProfile::new(1, "Foo", "bar", "()V");
-        mp.record_receiver(20, 99, 1001);
+        for _ in 0..1000 {
+            mp.record_receiver(20, 99, 1001);
+        }
         let tp = mp.type_profiles.get(&20).unwrap();
+        assert_eq!(tp.total_calls, 1000);
         assert!(tp.is_monomorphic());
     }
 
@@ -1871,152 +1745,14 @@ mod tests {
         assert!(!hot.contains(&20));
     }
 
-    #[test]
-    fn method_profile_get_inline_candidates() {
-        let mut mp = MethodProfile::new(1, "Foo", "bar", "()V");
-        for _ in 0..500 {
-            mp.record_call(5, 99);
-        }
-        let cands = mp.get_inline_candidates(10);
-        assert!(!cands.is_empty());
-        assert_eq!(cands[0].call_site_bci, 5);
-    }
 
     // ---- InliningPolicy -----------------------------------------------------
 
-    #[test]
-    fn inlining_policy_defaults() {
-        let p = InliningPolicy::default();
-        assert_eq!(p.max_inline_size, 35);
-        assert_eq!(p.max_total_budget, 250);
-        assert_eq!(p.min_call_count, 100);
-    }
 
-    #[test]
-    fn inlining_policy_too_rare() {
-        let policy = InliningPolicy::default();
-        let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..50 {
-            mp.record_call(0, 1);
-        } // only 50, need 100
-        let cand = InlineCandidate {
-            call_site_bci: 0,
-            callee_method_id: 1,
-            callee_class: "B".into(),
-            callee_name: "n".into(),
-            estimated_benefit: 1.0,
-            callee_size: 10,
-        };
-        assert_eq!(
-            policy.should_inline(&cand, &mp),
-            InlineDecision::TooRare {
-                count: 50,
-                min: 100
-            }
-        );
-    }
 
-    #[test]
-    fn inlining_policy_too_large() {
-        let policy = InliningPolicy::default();
-        let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..200 {
-            mp.record_call(0, 1);
-        }
-        let cand = InlineCandidate {
-            call_site_bci: 0,
-            callee_method_id: 1,
-            callee_class: "B".into(),
-            callee_name: "n".into(),
-            estimated_benefit: 100.0,
-            callee_size: 50, // > 35
-        };
-        match policy.should_inline(&cand, &mp) {
-            InlineDecision::TooLarge { size, max } => {
-                assert_eq!(size, 50);
-                assert_eq!(max, 35);
-            }
-            other => panic!("expected TooLarge, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn inlining_policy_monomorphic_boost_allows_larger() {
-        let policy = InliningPolicy::default(); // boost = 2.0, max = 35 => effective 70
-        let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..200 {
-            mp.record_call(0, 1);
-        }
-        mp.record_receiver(0, 7, 1); // monomorphic
-        let cand = InlineCandidate {
-            call_site_bci: 0,
-            callee_method_id: 1,
-            callee_class: "B".into(),
-            callee_name: "n".into(),
-            estimated_benefit: 100.0,
-            callee_size: 60, // > 35 but < 70
-        };
-        assert_eq!(policy.should_inline(&cand, &mp), InlineDecision::Inline);
-    }
 
-    #[test]
-    fn inlining_policy_megamorphic_rejected() {
-        let policy = InliningPolicy::default();
-        let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..500 {
-            mp.record_call(0, 1);
-        }
-        for i in 0..5u32 {
-            mp.record_receiver(0, i, i as u64);
-        }
-        let cand = InlineCandidate {
-            call_site_bci: 0,
-            callee_method_id: 1,
-            callee_class: "B".into(),
-            callee_name: "n".into(),
-            estimated_benefit: 100.0,
-            callee_size: 10,
-        };
-        assert_eq!(
-            policy.should_inline(&cand, &mp),
-            InlineDecision::Megamorphic
-        );
-    }
 
-    #[test]
-    fn inlining_policy_rank_candidates() {
-        let policy = InliningPolicy::default();
-        let mut cands = vec![
-            InlineCandidate {
-                call_site_bci: 0,
-                callee_method_id: 1,
-                callee_class: "".into(),
-                callee_name: "".into(),
-                estimated_benefit: 3.0,
-                callee_size: 10,
-            },
-            InlineCandidate {
-                call_site_bci: 1,
-                callee_method_id: 2,
-                callee_class: "".into(),
-                callee_name: "".into(),
-                estimated_benefit: 7.0,
-                callee_size: 10,
-            },
-            InlineCandidate {
-                call_site_bci: 2,
-                callee_method_id: 3,
-                callee_class: "".into(),
-                callee_name: "".into(),
-                estimated_benefit: 1.0,
-                callee_size: 10,
-            },
-        ];
-        policy.rank_candidates(&mut cands);
-        assert_eq!(cands[0].estimated_benefit, 7.0);
-        assert_eq!(cands[1].estimated_benefit, 3.0);
-        assert_eq!(cands[2].estimated_benefit, 1.0);
-    }
 
     // ---- PgoRepository ------------------------------------------------------
 
@@ -2126,10 +1862,13 @@ mod tests {
         for _ in 0..200 {
             mp.record_call(10, 99);
         }
-        mp.record_receiver(10, 5, 99);
+        // Past the live policy's speculation floor: a single observation reads
+        // as Cold, which is a refusal, not a devirtualisation decision.
+        for _ in 0..1000 {
+            mp.record_receiver(10, 5, 99);
+        }
         let analyzer = DevirtualizationAnalyzer;
-        let policy = InliningPolicy::default();
-        let decisions = analyzer.analyze(&mp, &policy);
+        let decisions = analyzer.analyze(&mp, DEVIRT_MIN_CALLS);
         let d = decisions.iter().find(|d| d.call_site_bci == 10).unwrap();
         assert_eq!(d.strategy, DevirtStrategy::Inline(99));
         assert!(d.confidence > 0.9);
@@ -2138,15 +1877,14 @@ mod tests {
     #[test]
     fn devirt_bimorphic_if_then_else() {
         let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..5 {
+        for _ in 0..500 {
             mp.record_receiver(20, 1, 101);
         }
-        for _ in 0..5 {
+        for _ in 0..500 {
             mp.record_receiver(20, 2, 202);
         }
         let analyzer = DevirtualizationAnalyzer;
-        let policy = InliningPolicy::default();
-        let decisions = analyzer.analyze(&mp, &policy);
+        let decisions = analyzer.analyze(&mp, DEVIRT_MIN_CALLS);
         let d = decisions.iter().find(|d| d.call_site_bci == 20).unwrap();
         match &d.strategy {
             DevirtStrategy::IfThenElse(a, b) => {
@@ -2162,11 +1900,12 @@ mod tests {
     fn devirt_megamorphic() {
         let mut mp = MethodProfile::new(1, "A", "m", "()V");
         for i in 0..5u32 {
-            mp.record_receiver(30, i, i as u64 + 100);
+            for _ in 0..200 {
+                mp.record_receiver(30, i, u64::from(i) + 100);
+            }
         }
         let analyzer = DevirtualizationAnalyzer;
-        let policy = InliningPolicy::default();
-        let decisions = analyzer.analyze(&mp, &policy);
+        let decisions = analyzer.analyze(&mp, DEVIRT_MIN_CALLS);
         let d = decisions.iter().find(|d| d.call_site_bci == 30).unwrap();
         assert_eq!(d.strategy, DevirtStrategy::Megamorphic);
     }
@@ -2180,8 +1919,7 @@ mod tests {
         }
         mp.record_receiver(40, 9, 77);
         let analyzer = DevirtualizationAnalyzer;
-        let policy = InliningPolicy::default(); // min_call_count = 100
-        let decisions = analyzer.analyze(&mp, &policy);
+        let decisions = analyzer.analyze(&mp, DEVIRT_MIN_CALLS);
         let d = decisions.iter().find(|d| d.call_site_bci == 40).unwrap();
         assert_eq!(d.strategy, DevirtStrategy::DirectCall(77));
     }

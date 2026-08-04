@@ -699,15 +699,39 @@ day-to-day variance for this load-dependent cluster, not itself news. But the
 section above, and one specific claim in that section (a load-bearing part of
 its "moving-young explicitly ruled out" argument) no longer holds as stated:
 
-- **`BatchTest` is not a timeout at all today.** All 4 methods fail with a
-  genuine `org.hibernate.exception.ConstraintViolationException` (a unique-index
-  collision on `DataPoint(xval,yval)`), confirmed JIT-only (0/3 reproduce
-  under `--nojit` on the small methods) and 100% reproducible under JIT. This
-  is a real, distinct CratonVM defect, not a recurrence of this cluster's
-  generic throughput margin. Full write-up:
-  `../../../known-issues/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
-  **`BatchTest` should be considered graduated out of this cluster** — track
-  it at the new doc, not here, going forward.
+- **`BatchTest`'s constraint violation was a distinct defect, and is FIXED.**
+  All 4 methods failed with a genuine
+  `org.hibernate.exception.ConstraintViolationException` (a unique-index
+  collision on `DataPoint(xval,yval)`), JIT-only and 100% reproducible. Root
+  cause, found and fixed the same day: CratonVM's post-`<clinit>` fixup injected
+  `Unsafe.ARRAY_*_BASE_OFFSET` — declared `long` in JDK 25 — as a 32-bit value.
+  The interpreter widened it on read; JIT-compiled code read the 64-bit slot and
+  got garbage, so `Arrays.equals`/`mismatch`/`compare` answered wrongly for
+  `int[]`/`long[]`/`short[]`/`double[]` and H2's index comparisons went
+  incoherent. Full write-up:
+  [`batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`](batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md).
+
+  **What comes back to this cluster.** With that fixed, `BatchTest` is
+  `ok=3 failed=1` under JIT and the one remaining failure is exactly this
+  cluster's subject: `testBatchInsertUpdate` (`N=5000`) tripping the internal
+  120s `@Timeout`. Fresh solo measurements on a quiet box, which this cluster
+  should absorb:
+
+  | Arm | `testBatchInsertUpdate` |
+  |---|---|
+  | HotSpot | 5.6 s |
+  | CratonVM (2026-08-04 dev + the fix) | 273.0 s |
+  | CratonVM pre-fix binary + `CRATONVM_JIT=deny=ArraysSupport.mismatch` | 382.7 s |
+
+  The fix is *faster*, so it is not the cause — but 273 s is **~2.6x the
+  101-107 s this same method recorded solo on 2026-07-17** (see the
+  2026-07-17 follow-up section above) and 49x the HotSpot control. Something in
+  this workload's throughput has regressed on `dev` since July, on a quiet box,
+  independently of the constraint-violation bug. **Unattributed and open.**
+  Note the July numbers were themselves measured on a VM whose
+  `Arrays.equals`/`mismatch` could terminate early with a wrong answer, so they
+  may never have been a fair baseline — a fresh bisect, not a comparison
+  against them, is the way in.
 - **`DynamicBatchFetchTest` is still the same `TimeoutException` shape**
   (`testMultiLoad` trips the internal 120s `@Timeout`, `found=2 ok=1
   failed=1`), so the throughput-margin classification is not overturned. But
