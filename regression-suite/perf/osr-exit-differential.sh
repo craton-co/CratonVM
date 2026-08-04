@@ -108,8 +108,9 @@ if [[ ! -x "$JAVAC" ]]; then
   echo "osr-exit-differential.sh: $JAVAC is not executable" >&2
   exit 2
 fi
-# No LC_ALL=C here: it breaks javac's source encoding
-# (`docs/known-issues/...lc-all-c...`), and this file is UTF-8.
+# No LC_ALL=C here. Exporting it breaks javac's SOURCE encoding — the trap the
+# CratonBench gate hit, where the gate could not compile its own benchmark
+# (`meas-02-bench-suite-c2-reach-RETIRED-20260803.md`) — and this file is UTF-8.
 if ! "$JAVAC" -d "$CLASSES" "$SRC" > "$WORK/javac.log" 2>&1; then
   echo "osr-exit-differential.sh: probe failed to compile" >&2
   cat "$WORK/javac.log" >&2
