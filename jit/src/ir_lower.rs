@@ -1746,8 +1746,23 @@ fn reloc_emit_enabled() -> bool {
         if !crate::x64::inline_getstatic_enabled() {
             return false;
         }
-        let is_ref = matches!(type_tag, b'L' | b'[');
-        if !is_ref && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+        // Three widths, and they are the single-pass arm's three, in the same
+        // order and with the same constants:
+        //
+        //   `J`/`D`/`L`/`[`  64-bit MOV of the 64-bit payload
+        //   `F`              32-bit MOV of the 32-bit payload — a float's bit
+        //                    pattern, so ZERO-extended. `MOVSXD` here would
+        //                    sign-extend any float whose bit 31 is set (i.e.
+        //                    every negative one) into garbage in the high half,
+        //                    and the home word is what `publish_fp_from_slot`
+        //                    and every deopt frame read.
+        //   int-category     `MOVSXD` of the 32-bit payload
+        //
+        // A tag outside those is a builder bug — its 0xb2 arm admits exactly
+        // these — so take the helper rather than emit a plausible-looking width.
+        let wide = matches!(type_tag, b'L' | b'[' | b'J' | b'D');
+        let is_float = type_tag == b'F';
+        if !wide && !is_float && !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
             return false;
         }
         let Some(base_cell) = crate::x64::resolve_static_base(class_id, field_index as usize) else {
@@ -1759,7 +1774,7 @@ fn reloc_emit_enabled() -> bool {
         let Ok(cell_off) = i32::try_from((field_index as usize).saturating_mul(SLOT_SIZE)) else {
             return false;
         };
-        let payload = if is_ref {
+        let payload = if wide {
             FIELD_CELL_PAYLOAD64_OFFSET as i32
         } else {
             FIELD_CELL_PAYLOAD32_OFFSET as i32
@@ -1772,8 +1787,10 @@ fn reloc_emit_enabled() -> bool {
         self.emit_mov_reg_imm64(RAX, base_cell as u64);
         self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX + disp32]
         self.buf.emit(&0i32.to_le_bytes());
-        if is_ref {
+        if wide {
             self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX + disp32]
+        } else if is_float {
+            self.buf.emit(&[0x8B, 0x80]); // MOV EAX, [RAX + disp32] (zero-extends)
         } else {
             self.buf.emit(&[0x48, 0x63, 0x80]); // MOVSXD RAX, [RAX + disp32]
         }
@@ -1782,6 +1799,12 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
         }
         self.store_rax(slot);
+        // An FP result was computed in RAX and is now in its home word — the
+        // `Op::ConstF` shape exactly, so it publishes the same way. A no-op when
+        // the allocator gave this value no register.
+        if matches!(type_tag, b'F' | b'D') {
+            self.publish_fp_from_slot(id, slot, type_tag == b'D');
+        }
         true
     }
 
@@ -4114,24 +4137,39 @@ fn reloc_emit_enabled() -> bool {
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[2], u64::from(field_index));
                 self.emit_mov_reg_imm64(RAX, self.getstatic as u64);
                 self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
-                self.emit_post_call_frame_record();
-                self.emit_shadow_reload();
-                // `i64::MIN` = the helper published a pending Java exception
-                // (a failed `<clinit>`) instead of a value. The IR builder
-                // admits only int-category and reference statics, for neither
-                // of which `i64::MIN` is a legitimate result, so a plain
-                // compare-and-bail is unambiguous — the same reasoning the
-                // `Op::Load` arm's sentinel check rests on.
-                self.emit_mov_reg_imm64(R10, i64::MIN as u64);
-                self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
-                self.buf.emit(&[0x0F, 0x84]); // JE rel32 → shared bail stub
-                let exc_patch = self.buf.pos();
-                self.buf.emit(&[0; 4]);
-                self.call_exc_patches.push(exc_patch);
                 if is_volatile {
+                    // The JMM acquire. Emitted here rather than after the
+                    // sentinel check because the check may CALL `dispatch_threw`
+                    // for a wide value, and a fence is only meaningful between
+                    // the load and the value's first use — both positions
+                    // satisfy that, and this one is before any branch, so the
+                    // fence is on every path out of the load. `MFENCE` touches
+                    // neither RAX nor the flags the check is about to set.
                     self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
                 }
-                self.store_rax(slot);
+                // `i64::MIN` = the helper published a pending Java exception (a
+                // failed `<clinit>`) instead of a value — but for a `J`/`D`/`F`
+                // static a legitimate `Long.MIN_VALUE` is bit-identical to it,
+                // so the sentinel alone is ambiguous. `emit_call_return_check`
+                // is exactly that protocol: plain compare-and-bail for the
+                // unambiguous widths, and for a wide value the cold-path peek at
+                // `jit_dispatch_threw` that distinguishes a real signal from a
+                // real value.
+                //
+                // It is the SAME helper and the SAME disambiguation the
+                // single-pass `0xb2` arm has used for wide statics all along —
+                // its `emit_post_invoke_exception_check(type_tag)` takes the
+                // `J`/`D`/`F` branch — so this is matching that arm's behaviour
+                // rather than inventing one. It also folds in the post-call
+                // frame republish and shadow reload this arm was open-coding.
+                self.emit_call_return_check(slot, node.ty);
+                // An FP result arrives as bits in RAX and has just been stored
+                // to its home word by the line above; publish it to its register
+                // the way `Op::ConstF` does. A no-op when the allocator gave
+                // this value no register.
+                if matches!(type_tag, b'F' | b'D') {
+                    self.publish_fp_from_slot(id, slot, type_tag == b'D');
+                }
             }
             // ── FP value tier (inc 30) ───────────────────────────────────
             // A float/double constant is just its IEEE bit pattern written to
@@ -7455,6 +7493,20 @@ pub(crate) fn lower_inner_with_scopes(
                 .iter()
                 .any(|n| matches!(n.op, Op::LoadStatic { .. })),
             "getstatic",
+        ),
+        // A WIDE static's helper route peeks `jit_dispatch_threw` to tell a
+        // legitimate `Long.MIN_VALUE` from the exception sentinel, so that
+        // helper is load-bearing for exactly the `J`/`D`/`F` tags and for
+        // nothing else. `Op::Call` reaches the same peek and does not guard it
+        // — its wide-return sites are gated elsewhere — but a wide static
+        // arrives here through a table, so state the requirement rather than
+        // inherit an assumption.
+        (
+            helpers.dispatch_threw,
+            graph.nodes.iter().any(|n| {
+                matches!(n.op, Op::LoadStatic { type_tag, .. } if matches!(type_tag, b'J' | b'D' | b'F'))
+            }),
+            "dispatch_threw (needed by a J/D/F getstatic)",
         ),
     ] {
         if helper == 0 && present {
