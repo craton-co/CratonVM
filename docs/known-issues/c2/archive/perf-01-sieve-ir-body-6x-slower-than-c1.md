@@ -2,7 +2,7 @@
 
 **Status: FIXED 2026-08-04**, same day it was found. Closeout, with the
 verification and the limitation the fix leaves behind:
-[`docs/internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`](../../../internal/perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md).
+`perf-01-sieve-ir-body-slower-than-c1-FIXED-20260804.md`.
 The brief is kept because its reasoning — and the policy question in its "first
 increment", which is **still open** — is what a reader needs, not because
 anything in the measurement below is still current.
@@ -101,7 +101,7 @@ budget, and it measures 15,680 ms.
    stride loop, plus the `for (i = 0; i <= limit; i++) composite[i] = false`
    clear. Compare the two bodies' emitted code; a 6.4x gap on a store-only loop
    is a bounds check, a write barrier, or a helper call per element, not a
-   register-allocation difference. `docs/internal/performance/` already records
+   register-allocation difference. `performance/` already records
    one case of exactly this shape (`reference_c2_tier_slower_because_fields_take_the_helper`).
 2. **Then decide the policy question this raises**, which is bigger than the
    defect: the optimizing tier currently replaces a C1 body with an IR body

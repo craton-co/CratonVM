@@ -5,7 +5,7 @@
 | **Status** | OPEN — root cause identified; there is no AQS-specific defect |
 | **Severity** | high — AQS is a VM-wide primitive, but the fix is not in AQS |
 | **Discovered** | 2026-08-03, root-causing `TestAsyncMessagesPerformance` SEQ2 |
-| **Owns** | the residue of the retired [`websocket-async-send-interframe-latency`](../../internal/fixed-suite-bugs/tomcat/websocket-async-send-interframe-latency-CLOSED-20260803.md) doc |
+| **Owns** | the residue of the retired `websocket-async-send-interframe-latency` doc |
 | **Real owner of the fix** | the per-call dispatch floor — see *Where this actually belongs* |
 
 > **CORRECTED TWICE. Read

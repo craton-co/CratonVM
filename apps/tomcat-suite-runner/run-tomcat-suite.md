@@ -96,7 +96,7 @@ bigger `-Xmx` than the flat default) rather than CratonVM bugs - these fail
 identically under real JDK 25 in the same fixture. Always run the `hotspot`
 mode over the same class list first (or alongside) and diff: only classes
 that **PASS on hotspot but FAIL/HANG/NOSUMMARY/CRASH on craton** are candidate
-regressions. See `docs/internal/tomcat-suite-bugs/16-full-suite-6shard-rerun-20260721.md`
+regressions. See `tomcat-suite-bugs/16-full-suite-6shard-rerun-20260721.md`
 for a worked example (646-class run, 23 confirmed regressions out of 196
 initial non-PASS classes; the other 172 failed on HotSpot too).
 
@@ -149,4 +149,4 @@ Eight classes (`TestSSLValve`, `TestJNDIRealm`, `TestPersistentManager`,
 `TestLoadBalancerDrainingValve`, `TestRequest`, `TestTldScanner`) are therefore
 permanently red in a HotSpot control run and green under CratonVM — expected,
 not a regression. Details:
-`docs/internal/fixed-suite-bugs/tomcat/bouncycastle-easymock-classpath-fixture-gap-FIXED.md`.
+`fixed-suite-bugs/tomcat/bouncycastle-easymock-classpath-fixture-gap-FIXED.md`.

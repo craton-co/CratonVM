@@ -277,7 +277,7 @@ first and evaluates `ACTIVE_JIT_EXECUTIONS.is_zero()` with the guard held, and
 described here is closed.
 
 **The obligation that replaced it** (2026-08-03,
-`docs/internal/jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`)
+`jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`)
 is not about ordering at all, and it is the one to check when touching this
 area:
 

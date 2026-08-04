@@ -497,7 +497,7 @@ fn live_monitor_ops_execute_direct_runtime_stubs() {
 }
 
 // -----------------------------------------------------------------------
-// Regression: docs/internal/fixed-suite-bugs/app-jvm-bugs/
+// Regression: fixed-suite-bugs/app-jvm-bugs/
 //             moving-young-gen-drops-jit-held-oops-FIXED.md
 // -----------------------------------------------------------------------
 //
@@ -575,7 +575,7 @@ fn self_recursive_reference_return_is_published_as_an_oop() {
         !map.frame_slot_offsets.is_empty(),
         "the first call's result is a live reference on the operand stack across \
          the second call; leaving it untagged is the measured bt18 moving-young \
-         heap corruption (docs/internal/fixed-suite-bugs/app-jvm-bugs/             moving-young-gen-drops-jit-held-oops-FIXED.md)",
+         heap corruption (fixed-suite-bugs/app-jvm-bugs/             moving-young-gen-drops-jit-held-oops-FIXED.md)",
     );
 }
 
@@ -10979,7 +10979,7 @@ fn compile_probe_method(
 /// Shape transcribed from `Rbc6FieldProbe.getfieldRefHandlerLocal`'s
 /// handler — `catch (NPE e) { return scratch + (seen == null ? 0 : 1); }`
 /// — whose ternary is the branch in question. See
-/// `docs/internal/singlepass-codegen-refuses-handler-body-merge-FIXED-20260803.md`.
+/// `singlepass-codegen-refuses-handler-body-merge-FIXED-20260803.md`.
 #[test]
 fn a_dead_region_with_an_internal_branch_does_not_refuse_the_method() {
     //  0: iload_0
@@ -11051,7 +11051,7 @@ fn a_flag_refusal_names_the_site_that_raised_it() {
 /// rejected the whole method with `branch-target-not-an-instruction-boundary`
 /// — a reason that blames malformed bytecode for what is ordinary javac
 /// output. See
-/// `docs/internal/jit-tailcall-swallows-shared-return-FIXED-20260803.md`.
+/// `jit-tailcall-swallows-shared-return-FIXED-20260803.md`.
 ///
 ///     0: iload_0
 ///     1: ifeq 8

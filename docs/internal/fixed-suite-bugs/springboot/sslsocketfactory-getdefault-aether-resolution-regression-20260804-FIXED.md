@@ -1,17 +1,12 @@
 # `SSLSocketFactory.getDefault()` "no owning SSLContext" breaks Aether/Maven artifact resolution for `ModifiedClassPathClassLoader` tests — FIXED
 
+**Status: OPEN — REGRESSED 2026-08-04.** Previously fixed and closed
+2026-07-26 (see `spring-boot-core39-residual-clusters-20260723.md`,
 **Status: FIXED 2026-08-04** — see "STATUS 2026-08-04: FIXED AND CLOSED" at the
 end of this page for the runtime confirmation, the fix, the two residuals it
 also closed, the five additional affected classes a cold-cache rerun found, and
 the guards. Everything above that section is the original investigation, left
 as written.
-
-Previously OPEN — REGRESSED 2026-08-04. Previously fixed and closed
-2026-07-26 (see `docs/internal/spring-boot-core39-residual-clusters-20260723.md`,
-"Cluster C" item 1, under "STATUS 2026-07-26: all four clusters closed").
-The exact same exception, with the exact same mechanism, reappeared in a
-2026-08-04 residual rerun across 3 classes in 3 different modules.
-
 ## Symptom
 
 Any test that uses Spring Boot test-support's `@ClassPathExclusions`/

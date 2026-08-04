@@ -167,7 +167,7 @@ Item 8 left this table on 2026-08-04:
 [the real-protected-stub allow-lists](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md)
 are one predicate now.
 
-Retired item 6: [cached invoke targets retain and revalidate `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md)
+Retired item 6: cached invoke targets retain and revalidate `NativeKind`
 was fixed on 2026-08-01. The interpreter invoke cache now carries the id and
 kind, re-applies central policy, and counts both static and virtual warm hits.
 The JIT MIC/PIC-slot half remains independently tracked by item 11 §1.
@@ -270,4 +270,4 @@ the whole tree. Do not size anything here from a `rg` count.
   "retag JMX" is working from a stale report. `Function$Identity` has a
   *successor* defect instead — see item 1.
 * `docs/known-issues/` holds **unfixed** issues only. A record moves to
-  `docs/internal/` when it is fixed, not when it is planned.
+  `` when it is fixed, not when it is planned.

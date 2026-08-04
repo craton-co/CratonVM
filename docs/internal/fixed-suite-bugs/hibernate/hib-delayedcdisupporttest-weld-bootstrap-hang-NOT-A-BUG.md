@@ -62,6 +62,21 @@ noted in the original doc are confirmed harmless (as the original doc already
 suspected) — they still print identically on every passing run and are not
 correlated with any actual failure.
 
+## 2026-08-04 cross-reference — different symptom, do not conflate
+
+`DelayedCdiSupportTest` fails again on fresh `dev` (2026-08-04 residual run),
+but **not** a hang — it now fails fast and deterministically (~3.8s) with
+`java.util.concurrent.RejectedExecutionException` out of
+`WeldStartup.startInitialization` → `ConcurrentBeanDeployer.addClasses` →
+`ForkJoinPool.invokeAll`, shared with the other 13 classes in the CDI
+cluster. This is unrelated to the shared-host-load false-hang mechanism this
+doc refutes; it's caused by `CRATONVM_REAL_FORKJOINPOOL` becoming
+default-on after this doc was written (`16ec5d7ad`, 2026-07-30), which
+exposed an uncovered `ForkJoinPool.invokeAll` overload in the real-FJP
+bridge allow-list. This doc's refutation of the *hang* claim stands — see
+[`docs/known-issues/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-20260804.md`](../../../known-issues/hibernate/cdi-cluster-forkjoinpool-invokeall-rejectedexecution-20260804.md)
+for the current (different) failure.
+
 ## Lesson
 
 Before deep-diving into VM-side root-causing of a "hangs even in isolation"

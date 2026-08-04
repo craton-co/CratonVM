@@ -10,7 +10,7 @@
 //!
 //! [`HEADER_SIZE`] is 32 today. It is written symbolically here on purpose:
 //! a shrink to 24 is mapped out in
-//! `docs/internal/arch-2026-07-26/header-shrink.md`, and a baked "32" in a doc
+//! `arch-2026-07-26/header-shrink.md`, and a baked "32" in a doc
 //! comment is exactly the kind of staleness that document's §6.9 catalogues.
 //!
 //! Field cell width depends on the field's type:
@@ -1552,7 +1552,7 @@ unsafe fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
 /// tear-free (e.g. `ReentrantReadWriteLock$Sync`'s plain `firstReader`/
 /// `firstReaderHoldCount`, published via a nearby `volatile`/CAS write to
 /// `state` — see
-/// docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+/// fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
 /// #3). Delegates to the same already-proven `read_value_atomic` helper.
 ///
 /// # Safety

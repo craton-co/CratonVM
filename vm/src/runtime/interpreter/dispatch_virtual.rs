@@ -252,8 +252,8 @@ pub(super) fn execute_invokevirtual_vtable_fast(
     // (`class_id_of`/`kind_of` used to pick the dispatch target) are
     // exactly the class-resolution step implicated in the TestUpgrade
     // RootReference residual — refresh defensively before trusting it for
-    // dispatch. See docs/known-issues/h2/
-    // bug-h2-suite-residual-fail-triage.md.
+    // dispatch. See fixed-suite-bugs/h2-suite-bugs/
+    // bug-h2-suite-residual-fail-triage-FIXED.md.
     let receiver_obj = shared.mem.heap.load_and_forward(receiver_obj);
 
     // Arrays go through java/lang/Object — don't dispatch via the
@@ -807,7 +807,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
     // The prior pop_unchecked()/to_value() dropped the high bits of a
     // category-2 long arg whose NaN-box bit pattern collides with a tagged
     // sub-tag (BC safegcd 0xFFFC_… accumulators). See
-    // docs/bc-ec-mod-mododdinverse-investigation.md.
+    // gaps/bc-ec-mod-mododdinverse-investigation.md.
     let arg_desc_byte = |i: usize| -> u8 {
         if i == 0 {
             b'L'
@@ -1564,8 +1564,8 @@ pub(super) fn execute_invokevirtual_cached(
                     // Refresh via the same GC-forwarding barrier as invoke
                     // args (`refresh_stale_object_args`) — this receiver
                     // came from a bare `peek_at`, not a `pop`. See
-                    // docs/known-issues/h2/
-                    // bug-h2-suite-residual-fail-triage.md.
+                    // fixed-suite-bugs/h2-suite-bugs/
+                    // bug-h2-suite-residual-fail-triage-FIXED.md.
                     let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
                     // JVMS §4.4.1: an array type inherits its method table
                     // from `java.lang.Object`, but an array's header stores
@@ -1703,7 +1703,7 @@ pub(super) fn execute_invokevirtual_cached(
                     // Decode args bit-exact via parameter descriptors (receiver
                     // = 'L'); pop_unchecked()/to_value() dropped the high bits
                     // of collision-pattern long args. See
-                    // docs/bc-ec-mod-mododdinverse-investigation.md.
+                    // gaps/bc-ec-mod-mododdinverse-investigation.md.
                     let arg_desc_byte = |i: usize| -> u8 {
                         if i == 0 {
                             b'L'
@@ -1911,8 +1911,8 @@ pub(super) fn execute_invokevirtual_cached(
                     // doesn't faithfully reproduce, reintroducing the exact
                     // always-null symptom the native override exists to fix, but
                     // ONLY under JIT (this tier-up is JIT-only) and ONLY once
-                    // warm — see docs/known-issues/springboot/
-                    // core-spring-boot-test-config-data-and-classpath-scan-cluster.md
+                    // warm — see fixed-suite-bugs/springboot/
+                    // core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md
                     // Cluster C "Residual 5". Site A3 of
                     // `native-dispatch-memoization.md` §3 Step 2: reusing this
                     // entry's `NativeCallSite` (already warm from the
@@ -2158,8 +2158,8 @@ pub(super) fn execute_invokevirtual_cached(
                     // Refresh via the same GC-forwarding barrier as invoke
                     // args (`refresh_stale_object_args`) — this receiver
                     // came from a bare `peek_at`, not a `pop`. See
-                    // docs/known-issues/h2/
-                    // bug-h2-suite-residual-fail-triage.md.
+                    // fixed-suite-bugs/h2-suite-bugs/
+                    // bug-h2-suite-residual-fail-triage-FIXED.md.
                     let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
                     // JVMS §4.4.1: an array type inherits its method table
                     // from `java.lang.Object`, but an array's header stores
@@ -2341,8 +2341,8 @@ pub(super) fn execute_invokevirtual_cached(
                         // Refresh via the same GC-forwarding barrier as
                         // invoke args (`refresh_stale_object_args`) — this
                         // receiver came from a bare `peek_at`, not a `pop`.
-                        // See docs/known-issues/h2/
-                        // bug-h2-suite-residual-fail-triage.md.
+                        // See fixed-suite-bugs/h2-suite-bugs/
+                        // bug-h2-suite-residual-fail-triage-FIXED.md.
                         let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
                         // JVMS §4.4.1: an array type inherits its method table
                         // from `java.lang.Object`, but an array's header stores
@@ -2474,7 +2474,7 @@ pub(super) fn execute_invokevirtual_cached(
             const MAX_INLINE_ARGS: usize = 16;
             // Decode args bit-exact via parameter descriptors (receiver = 'L');
             // pop_unchecked()/to_value() dropped the high bits of collision-
-            // pattern long args. See docs/bc-ec-mod-mododdinverse-investigation.md.
+            // pattern long args. See gaps/bc-ec-mod-mododdinverse-investigation.md.
             let arg_desc_byte = |i: usize| -> u8 {
                 if i == 0 {
                     b'L'
@@ -3061,7 +3061,7 @@ pub(super) fn populate_virtual_invoke_cache(
         // path below cache `VirtualBytecode`, whose dispatch-time
         // `intercept_force_registered_native` check re-validates the
         // ACTUAL receiver on every hit (not just at population time). See
-        // docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
+        // fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
         let is_real_tpe_execute = lookup_name == "java/util/concurrent/ThreadPoolExecutor"
             && method_name.as_ref() == "execute"
             && descriptor.as_ref() == "(Ljava/lang/Runnable;)V"
@@ -3368,7 +3368,7 @@ pub(super) fn populate_virtual_invoke_cache(
         // bypassing those receiver checks entirely, is what actually poisons
         // this call site's inline cache with `VirtualNative` for a
         // genuinely real ThreadPoolExecutor. Exempt it the same way as the
-        // other call sites. See docs/internal/fixed-suite-bugs/
+        // other call sites. See fixed-suite-bugs/
         // threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md.
         let is_real_tpe_execute_force = declaring_name == "java/util/concurrent/ThreadPoolExecutor"
             && method_name.as_ref() == "execute"

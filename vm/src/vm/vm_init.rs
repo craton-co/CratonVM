@@ -798,7 +798,7 @@ impl SharedVm {
         //
         // Both cells are one-shot and lock-free; see the `VM diagnostic
         // snapshot` section in `runtime::crash_handler` and
-        // `docs/internal/arch-2026-07-26/jdk-mode-determinism.md` §6.1.
+        // `arch-2026-07-26/jdk-mode-determinism.md` §6.1.
         crate::runtime::crash_handler::publish_jdk_mode(
             config.jdk_mode(),
             config.java_home.as_deref(),
@@ -905,7 +905,7 @@ impl SharedVm {
         // all: the only way to find out where `SharedVm::new` spent its time
         // was to add `Instant::now()` by hand and rebuild. The three phases
         // below are the ones measurement showed actually matter (see
-        // `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §2):
+        // `arch-2026-07-26/startup-and-diagnostics.md` §2):
         //
         //   1. classpath ingestion — `ClassManager::new` constructs the
         //      bootstrap/extension/application `ClassPath`s, and `load_jmod`
@@ -1315,7 +1315,7 @@ impl SharedVm {
         // genuine ~250 MiB direct-buffer working set (chunk writer thread)
         // threw OutOfMemoryError at a ceiling HotSpot doesn't impose at the
         // same heap size. See
-        // docs/known-issues/h2/bug-h2-largeblob-direct-memory-oom.md.
+        // fixed-suite-bugs/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
         let direct_memory_cap = config
             .max_direct_memory_size
             .unwrap_or(config.max_heap_size);
@@ -1507,7 +1507,7 @@ impl SharedVm {
                 // `CRATONVM_NO_STUBS`, "because some apps currently limp on
                 // these fakes and dropping them surfaces real gaps as clear
                 // errors." Leave it opt-in; do not force it on here. See
-                // docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md's
+                // fixed-suite-bugs/wildfly/wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md's
                 // 2026-07-14 addendum for the WildFly-boot regression this
                 // caused and how it was found (git bisect).
                 //
@@ -1552,7 +1552,7 @@ impl SharedVm {
                 // real FileHandler() bytecode instead (which throws
                 // NoSuchFileException trying to actually lock a real log
                 // file). Register just the FileHandler natives directly here.
-                // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+                // See fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
                 cratonvm_native_builtins::phases_late::register_p61_file_handler(
                     &mut native_methods,
                 );
@@ -2031,7 +2031,7 @@ impl SharedVm {
             // real FileHandler() bytecode instead (which throws
             // NoSuchFileException trying to actually lock a real log
             // file). Register just the FileHandler natives directly here.
-            // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+            // See fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
             cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
             // See the twin above.
             cratonvm_native_builtins::servlet::register_url_classloader_close_bridge(
@@ -2137,7 +2137,7 @@ impl SharedVm {
             // TomcatBaseTest.tearDown. The real STPE constructor bytecode runs
             // correctly on CratonVM once the synthetic STPE natives are gone (the
             // native-collections copy is now gated behind synthetic-jdk). See
-            // docs/known-issues/tomcat-suite-bugs/11-stpe-mainlock-npe-teardown-regression.md.
+            // fixed-suite-bugs/tomcat/11-stpe-mainlock-npe-teardown-regression.md.
             native_methods.register(
                 "java/util/concurrent/CopyOnWriteArrayList",
                 "addIfAbsent",
@@ -3115,7 +3115,7 @@ impl SharedVm {
         // whichever arm of the two mode `cfg` blocks was compiled in. That
         // count is the honest answer to "is real-JDK mode really ~300
         // natives?" (it is not — see
-        // `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §2.5).
+        // `arch-2026-07-26/startup-and-diagnostics.md` §2.5).
         // Note the registry pre-sizes four maps to 4,096 entries
         // unconditionally (`NativeMethodRegistry::new`), i.e. independently of
         // mode; that is one bounded allocation, not per-native work.
@@ -7277,7 +7277,7 @@ impl Vm {
         // report for the thread most crashes happen on. Worker threads need
         // the equivalent publication at their own registration sites; see the
         // cross-owner request in
-        // `docs/internal/arch-2026-07-26/startup-and-diagnostics.md`.
+        // `arch-2026-07-26/startup-and-diagnostics.md`.
         crate::runtime::crash_handler::publish_primordial_frame_trace(
             main_thread.frame_trace.clone(),
         );

@@ -3810,7 +3810,7 @@ std::thread_local! {
     /// with the *primordial* thread's frames or none at all — and the two crash
     /// classes that most need a Java stack (virtual-thread resume heap
     /// corruption, STW-takeover deadlock) both fault on workers. See
-    /// `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §6.3.
+    /// `arch-2026-07-26/startup-and-diagnostics.md` §6.3.
     ///
     /// Thread-local rather than a shared registry, deliberately: the crash
     /// handler runs *on the faulting thread* (Rust panic hook, Windows vectored

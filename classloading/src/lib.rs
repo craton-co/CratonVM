@@ -90,7 +90,7 @@ pub use class_manager::{
     // `CRATONVM_LOADER_AWARE_RESOLUTION` gate. `vm::runtime::env_cache` and
     // `native-builtins::classloader` both delegate to this instead of
     // keeping their own `OnceLock`-cached env-var copy — see
-    // `docs/internal/loader-identity.md`.
+    // `fixed-suite-bugs/loader-identity.md`.
     loader_aware_resolution,
     register_builtin_classloaders,
     set_current_thread_id,
@@ -104,7 +104,7 @@ pub use class_manager::{
     // "nobody has this name" apart from "several loaders each have their own
     // class under it". Every `Option`-returning lookup collapses the two, and a
     // caller that reads the collapse as "absent" loads a second copy — see
-    // `docs/known-issues/c2/classloading-identity-audit.md`.
+    // `docs/feature-designs/classloading-identity-audit.md`.
     NameResolution,
     RedefineOptions,
     ResolutionInvalidateHook,

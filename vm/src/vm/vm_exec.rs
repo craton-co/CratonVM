@@ -3025,7 +3025,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         .threads
         .thread_registry
         .set_tlab_addr(tid, &thread.tlab as *const cratonvm_gc::Tlab as usize);
-    // REMOUNT FIXUP (2026-07-26, `docs/internal/arch-2026-07-26/vt-resume-gc-fixup.md`).
+    // REMOUNT FIXUP (2026-07-26, `arch-2026-07-26/vt-resume-gc-fixup.md`).
     //
     // This used to be a bare
     //     gc_block_state.in_blocked_region.store(false, Release)
@@ -8086,7 +8086,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
             // warmup concurrently with the main thread's own bean/class
             // initialization, and making this heavier path the hot path
             // for every virtual call from both threads deadlocked them
-            // (see docs/internal/springboot/embedded-tomcat-loopback-self-connect-silent-hang-FIXED.md).
+            // (see fixed-suite-bugs/springboot/embedded-tomcat-loopback-self-connect-silent-hang-FIXED.md).
             // Keep it scoped to the two cases that actually need it: the
             // original loader-identity divergence this mechanism was built
             // for, and the specific anonymous-`toString()` shape the
@@ -8850,7 +8850,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // allocation sites). Any per-object identity-keyed side table built
         // on the old, address-derived value would silently stop finding its
         // own entries after the first GC move — see
-        // `docs/internal/fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`
+        // `fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`
         // for the bug this produced in `keystore.rs`'s `store_id_by_identity`.
         //
         // What remains here is now just a last-resort guard against a 0
@@ -10307,7 +10307,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // STW-TAKEOVER-FIX (2026-07-13) follow-up: this reasoning IS the
         // root cause of the WildFly `parallel-extension-add` STW-barrier
         // deadlock (see
-        // `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-stw-jit-takeover-hang.md`)
+        // `fixed-suite-bugs/wildfly/wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md`)
         // for the one call site proven live via gdb to hit it
         // (`CountDownLatch`'s polling loop). An earlier version of this fix
         // switched THIS method wholesale to `monitor_enter_blocking`, but a
@@ -10319,7 +10319,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // GC-pausable wait at once would trade one hang for a batch of new,
         // unaudited stale-`ObjectRef`-across-GC bugs (this codebase's most
         // recurring defect class, see
-        // `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`).
+        // `fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md`).
         // `monitor_enter` therefore stays on this original, non-GC-blocked
         // path for everyone; `monitor_enter_gc_safe` (below) is the narrow,
         // opt-in escape hatch for the one call site with live evidence.
@@ -11424,7 +11424,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         let Some(tid) = tid else {
             return Vec::new();
         };
-        // CR-CLO-1 (`docs/internal/arch-2026-07-26/cross-owner-closeout.md` §6).
+        // CR-CLO-1 (`arch-2026-07-26/cross-owner-closeout.md` §6).
         //
         // Two stale comments used to sit here. The first claimed line numbers
         // were resolved "now that we hold the ClassStore" — and then called the
@@ -12132,7 +12132,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // pool was disjoint from the real carriers, so the release freed no
         // carrier (this OS thread stays blocked in `park_interruptible`
         // either way — see §7.2 of
-        // `docs/internal/arch-2026-07-26/virtual-threads.md`), while the
+        // `arch-2026-07-26/virtual-threads.md`), while the
         // post-park `acquire()` was a live hang risk. Nothing else in the tree
         // acquires from that pool, so with more concurrently-parked virtual
         // threads than `carrier_count`, the surplus acquirers blocked on a
@@ -13047,7 +13047,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // ensure_synthetic_class` hands back a distinctly-named, correctly
         // sized `cratonvm/synthetic/AmbiguousName$…` stand-in instead of a
         // stub filed under the ambiguous name — see its doc comment, and
-        // `docs/known-issues/c2/synthetic-class-fallibility.md` for the migration
+        // `docs/feature-designs/synthetic-class-fallibility.md` for the migration
         // that removes this method's callers.
         self.shared
             .classes
@@ -14641,7 +14641,7 @@ pub fn invoke_or_native(
     // run its own real `execute()` bytecode here too, or calling `.execute()`
     // on it from native code (via `ctx.invoke_virtual`) recurses back into
     // this same native forever (a real stack overflow, confirmed via gdb).
-    // See docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
+    // See fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
     //
     // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check, COPY 1
     // OF 8. See `THREADPOOL_EXECUTE_RECEIVER_SHAPE_SITES` in
@@ -15481,7 +15481,7 @@ fn invoke_special_shared_impl(
 /// `invoke_virtual_bytecode_only(this, "shutdown", ...)` call resolved the
 /// declaring class from the STPE receiver's DYNAMIC class -- re-finding
 /// STPE's own overriding shutdown() and looping forever. See
-/// docs/internal/threadpoolexecutor-shutdown-super-call-self-recursion-FIXED.md.
+/// fixed-suite-bugs/threadpoolexecutor-shutdown-super-call-self-recursion-FIXED.md.
 pub fn invoke_special_bytecode_only_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -18466,7 +18466,7 @@ fn invoke_on_class_shared_inner(
     // ACTUAL RECEIVER is one of our synthetic Path values. Check the
     // receiver's real class directly, independent of the resolved
     // `class_name`. Same family as
-    // `docs/internal/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`
+    // `fixed-suite-bugs/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`
     // (which covered this exact call shape) — this hunk went missing from
     // `invoke_on_class_shared_inner` somewhere between that fix landing
     // (a6ce01fe2, 2026-07-19) and dev tip; re-added 2026-07-21 after
@@ -21350,7 +21350,7 @@ fn invoke_on_class_shared_inner(
                         // bookkeeping in an identity-hash side table
                         // (jul_file_handler_state_table, logging_shims.rs)
                         // rather than real instance field slots -- see
-                        // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+                        // fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
                         // Without this override, real FileHandler bytecode
                         // (loaded from java.base) is concrete/non-abstract,
                         // so the default rule above ran its REAL
@@ -22555,7 +22555,7 @@ fn invoke_on_class_shared_inner(
         // path from `invoke_or_native` (e.g. reached from the interpreter's
         // reflection/initial-invoke routes) that independently consults
         // `should_force_registered_native_over_bytecode`, so it needs its own
-        // copy of the receiver check. See docs/internal/fixed-suite-bugs/
+        // copy of the receiver check. See fixed-suite-bugs/
         // threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md.
         //
         // JDK-ONLY-WAVE2: `ThreadPoolExecutor.execute` receiver-shape check,
@@ -25122,7 +25122,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // CR-CLO-1 — `thread_stack_trace`'s cross-thread arm
-    // (`docs/internal/arch-2026-07-26/vm-exec-closeout.md` §1)
+    // (`arch-2026-07-26/vm-exec-closeout.md` §1)
     // -----------------------------------------------------------------------
 
     fn line_less_entry(class_id: ClassId, method: &str, bci: i32) -> StackTraceEntry {

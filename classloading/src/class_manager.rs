@@ -493,8 +493,8 @@ mod loader_lookup_tests {
 /// linking, verifier hierarchy lookup) by default even though the
 /// interpreter half of the same fix was live — a production desync between
 /// three independently-read env-var copies. See
-/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`
-/// and `docs/internal/loader-identity.md` for the consolidation. Flip on
+/// `fixed-suite-bugs/hibernate/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`
+/// and `fixed-suite-bugs/loader-identity.md` for the consolidation. Flip on
 /// links an enhanced subclass to its same-loader (enhanced) supertype copy
 /// rather than the un-enhanced global one returned by `get_loaded_class_id`.
 ///
@@ -1737,7 +1737,7 @@ pub struct DefineClassOptions {
     /// by the application loader), so the resulting `$ProxyN` type-checks
     /// (`interfaceClass.isInstance(proxy)`) and `Method.invoke` against the
     /// requested interface both fail — see "Residual issue B" in
-    /// `docs/known-issues/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md`
+    /// `fixed-suite-bugs/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md`
     /// (found via annotation-proxy work but is a general `CRATONVM_REAL_PROXY`
     /// bug, reproducible with a plain `Proxy.newProxyInstance` + custom
     /// `ClassLoader`, independent of annotations).
@@ -3382,7 +3382,7 @@ impl ClassManager {
     ///    classes, so a stand-in filed under `(Bootstrap, name)` would shadow
     ///    all of them. `LinkageError::IncompatibleClassChangeError`, in **both**
     ///    modes. See [`Self::classify_loaded_name`] and
-    ///    `docs/known-issues/c2/synthetic-class-fallibility.md`.
+    ///    `docs/feature-designs/synthetic-class-fallibility.md`.
     ///
     /// The two are deliberately different error shapes: a caller retrying with
     /// an initiating loader (the right response to 2) must not confuse it with
@@ -3621,7 +3621,7 @@ impl ClassManager {
         // one this lane deliberately does not answer.
         //
         // NOT covered, and tracked in
-        // `docs/known-issues/c2/synthetic-class-fallibility.md`: when a built-in
+        // `docs/feature-designs/synthetic-class-fallibility.md`: when a built-in
         // loader *also* has a class under the name, `get_loaded_class_id`
         // returns that copy from the early return above and never reaches this
         // gate. That is the pre-existing built-in-first delegation answer every
@@ -5370,7 +5370,7 @@ impl ClassManager {
                 // exposed via reflection. `RuntimeInvisibleAnnotations` carry
                 // @Retention(CLASS) types which JVMS requires NOT be visible
                 // through Class.getAnnotation / isAnnotationPresent — see
-                // docs/gaps/gap-annotation-retention-policy.md.
+                // gaps/gap-annotation-retention-policy.md.
                 Some(Attribute::RuntimeVisibleAnnotations(anns)) => {
                     annotations.extend(anns.iter().cloned());
                 }
@@ -7849,7 +7849,7 @@ impl ClassManager {
     /// advisory only (no `deny(warnings)` anywhere in the workspace, so this
     /// cannot break the centrally-run build) — it exists to surface the ~50
     /// remaining external call sites for follow-up migration. See
-    /// `docs/internal/loader-identity.md` for the current per-file tally.
+    /// `fixed-suite-bugs/loader-identity.md` for the current per-file tally.
     ///
     /// **Round 4 audit fix (HIGH):** the prior fallback scanned every
     /// entry in `loaded_classes` linearly for each key (O(n · keys)).
@@ -7999,7 +7999,7 @@ impl ClassManager {
     /// falls through to `ClassLoader.loadClass` via
     /// `native-builtins::classloader::defining_loader_for` when this kind
     /// of lookup misses) rather than expecting this crate to resolve it.
-    /// See `docs/internal/loader-identity.md`.
+    /// See `fixed-suite-bugs/loader-identity.md`.
     pub fn find_class_by_name_for_loader(
         &self,
         name: &str,
@@ -9336,7 +9336,7 @@ impl ClassManager {
         // report a duplicate-define `LinkageError` where it currently mints a
         // second copy. That is arguably the JVMS-correct outcome, but it is a
         // behaviour change on the hottest path in the VM and is out of scope
-        // here — see `docs/known-issues/c2/classloading-identity-audit.md`.
+        // here — see `docs/feature-designs/classloading-identity-audit.md`.
         if let (Some(previous_loader_id), Some(registered_name)) =
             (previous_loader_id, registered_name)
         {
@@ -18383,7 +18383,7 @@ mod tests {
     /// descendant's INHERITED descriptor at the freshly-rebuilt slot.
     ///
     /// Regression test for
-    /// `docs/internal/mockito-spy-outer-invokeinterface-call-not-recorded-
+    /// `mockito-spy-outer-invokeinterface-call-not-recorded-
     /// FIXED-20260801.md`: the descendant's vec is a copy of the
     /// ancestor's, so leaving it stale let a descendant redefined LATER in the
     /// same `retransformClasses` batch rebuild from the pre-redefinition

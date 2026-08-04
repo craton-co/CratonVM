@@ -91,7 +91,7 @@ array **appended at the TAIL**, since `CLASS_ID_OFFSETS` / `ENTRY_PTR_OFFSETS` /
 `NEEDS_CONTEXT_OFFSETS` / `MEGA_*_OFFSET` are all emitted-code immediates.
 
 Fix this together with
-[cached invoke targets retain and revalidate the `NativeKind`](../../internal/cached-invoke-targets-drop-the-nativekind-FIXED-20260801.md).
+cached invoke targets retain and revalidate the `NativeKind`.
 A `NativeKind` stored in `CachedInvokeTarget` that is dropped again when the JIT
 installs an MIC slot buys nothing.
 
@@ -510,15 +510,15 @@ are kept here so nobody re-opens them from a stale report.
 ## 13. Stale documentation paths in load-bearing code comments — three paths, five occurrences
 
 Several dispatch sites cite known-issue docs that have since been fixed and moved
-to `docs/internal/fixed-suite-bugs/` with a `-FIXED` suffix. The cited paths no
+to `fixed-suite-bugs/` with a `-FIXED` suffix. The cited paths no
 longer resolve. The original filing listed three rows; the re-verification found
 **five occurrences** of those three paths:
 
 | Cited in code as | Occurrences | Actually at |
 |---|---|---|
-| `docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md` | `native-collections/src/lib.rs:24522` | `docs/internal/fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md` |
-| `docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md` | `vm/src/vm/vm_exec.rs:13501`, `vm/src/runtime/interpreter/invoke.rs:9998`, `:10149` | `docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md` |
-| `docs/known-issues/threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md` | `vm/src/runtime/interpreter/invoke.rs:23059` | `docs/internal/fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md` |
+| `docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md` | `native-collections/src/lib.rs:24522` | `fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md` |
+| `docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md` | `vm/src/vm/vm_exec.rs:13501`, `vm/src/runtime/interpreter/invoke.rs:9998`, `:10149` | `fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md` |
+| `docs/known-issues/threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md` | `vm/src/runtime/interpreter/invoke.rs:23059` | `fixed-suite-bugs/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md` |
 
 Note that the `StringJoiner` path is *also* cited inside `invoke.rs`'s
 `real_protected_stub_class` comment, in a wrapped form

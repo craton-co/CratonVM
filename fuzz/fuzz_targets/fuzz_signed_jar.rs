@@ -38,7 +38,7 @@
 //! examines only the first `SignerInfo` in the SET (`:476-481`, documented
 //! at `:110` and `:353`). That is not a crash and not a fail-open against a
 //! zero-anchor store, so no amount of fuzzing here reaches it. It needs an
-//! ordering-invariance test — see `docs/known-issues/c2/fuzzing-state.md`.
+//! ordering-invariance test — see `docs/feature-designs/fuzzing-state.md`.
 //!   * `cratonvm_classloading::ManifestInfo::parse`
 //!     (`classloading/src/class_path.rs:711`) — the manifest reader the
 //!     class path itself uses.

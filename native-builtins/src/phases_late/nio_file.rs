@@ -28,7 +28,7 @@ pub(crate) fn register_phase57_natives(registry: &mut NativeMethodRegistry) {
     // `this.fd` null (length()=0/read()=-1). Both crates must skip together — each
     // shadows the real ctor via native-override priority. Opt back into synthetic
     // with CRATONVM_SYNTHETIC_RAF=1. (SEGV/Cleaner crashes that once gated this are
-    // fixed: docs/internal/app-jvm-bugs/real-raf-segv-root-cause.md.)
+    // fixed: app-jvm-bugs/real-raf-segv-root-cause.md.)
     if crate::vmflags().io.synthetic_raf_forced {
         register_phase57_random_access_file(registry);
     }
@@ -1069,7 +1069,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // later native then operated on an object with none of the expected
     // slots — `Path.register` reported "service is closed or unknown" and
     // `WatchService.close` wrote past the receiver's layout. See
-    // `docs/internal/springboot/filewatcher-watchservice-surface-FIXED-20260801.md`.
+    // `springboot/filewatcher-watchservice-surface-FIXED-20260801.md`.
 
     r.register(
         fs_class,
@@ -4915,7 +4915,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // saw the FileAlreadyExistsException it catches to translate into
             // DbException(FILE_RENAME_FAILED_2), letting
             // TestFileSystem.testMoveTo's move-onto-existing-file case
-            // through instead of rejecting it (docs/known-issues/h2-suite-bugs/
+            // through instead of rejecting it (
             // bug-h2-files-setposixfilepermissions-FIXED.md residual chain).
             // ATOMIC_MOVE also implies replacement: it is specified as a single
             // filesystem operation, which on every platform CratonVM targets is
@@ -5727,7 +5727,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
     r.register(fc_cls, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // See docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
+        // See docs/known-issues/h2/!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
         // this native is registered on the literal "java/nio/channels/FileChannel"
         // class to service a synthetic single-field FileChannel, but native
         // overrides shadow ALL dispatch for that class name -- including a real
@@ -6574,7 +6574,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
 
     // --- WinNTFileSystem / UnixFileSystem native methods ---
+    //
     // These are JNI natives in the real JDK. We implement them using std::fs.
+    //
+    // EVERY operation is registered under BOTH spellings — the bare pre-JDK-22
+    // name and the `0`-suffixed JDK-22+ name — because the two JDK generations
+    // put the native in different places and only one of them is ever called
+    // on a given JDK. See the `fs_boolean_attributes0` banner in this file for
+    // why registering only the bare name silently registers a method nothing
+    // calls on a modern JDK.
     for fs_cls in &["java/io/WinNTFileSystem", "java/io/UnixFileSystem"] {
         r.register(
             fs_cls,
@@ -6594,42 +6602,36 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
         // getBooleanAttributes returns a bitmask:
         // BA_EXISTS=0x01, BA_REGULAR=0x02, BA_DIRECTORY=0x04, BA_HIDDEN=0x08
+        //
+        // `getBooleanAttributes0` is the raw JNI native (JDK 22+) and
+        // `getBooleanAttributes` the pre-22 spelling / public wrapper; they
+        // differ only in BA_HIDDEN, which is why they get different bodies.
+        r.register(
+            fs_cls,
+            "getBooleanAttributes0",
+            "(Ljava/io/File;)I",
+            |ctx, args| {
+                let file_ref = obj_arg(args, 1)?;
+                let path = file_read_path(ctx, file_ref);
+                Ok(Some(Value::Int(fs_boolean_attributes0(&path))))
+            },
+        );
         r.register(
             fs_cls,
             "getBooleanAttributes",
             "(Ljava/io/File;)I",
             |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
-                let path_str = match ctx.get_field(file_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let p = std::path::Path::new(&path_str);
-                let mut attrs = 0i32;
-                if let Ok(md) = std::fs::metadata(p) {
-                    attrs |= 0x01; // BA_EXISTS
-                    if md.is_file() {
-                        attrs |= 0x02;
-                    } // BA_REGULAR
-                    if md.is_dir() {
-                        attrs |= 0x04;
-                    } // BA_DIRECTORY
-                }
-                Ok(Some(Value::Int(attrs)))
+                let path = file_read_path(ctx, file_ref);
+                Ok(Some(Value::Int(fs_boolean_attributes(&path))))
             },
         );
 
-        r.register(
-            fs_cls,
-            "getLastModifiedTime",
-            "(Ljava/io/File;)J",
-            |ctx, args| {
+        for name in ["getLastModifiedTime", "getLastModifiedTime0"] {
+            r.register(fs_cls, name, "(Ljava/io/File;)J", |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
-                let path_str = match ctx.get_field(file_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let millis = std::fs::metadata(&path_str)
+                let path = file_read_path(ctx, file_ref);
+                let millis = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .map(|t| {
                         t.duration_since(std::time::UNIX_EPOCH)
@@ -6638,62 +6640,64 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     })
                     .unwrap_or(0);
                 Ok(Some(Value::Long(millis)))
-            },
-        );
+            });
+        }
 
-        r.register(fs_cls, "getLength", "(Ljava/io/File;)J", |ctx, args| {
-            let file_ref = obj_arg(args, 1)?;
-            let path_str = match ctx.get_field(file_ref, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let len = std::fs::metadata(&path_str)
-                .map(|m| m.len() as i64)
-                .unwrap_or(0);
-            Ok(Some(Value::Long(len)))
-        });
-
-        r.register(
-            fs_cls,
-            "list",
-            "(Ljava/io/File;)[Ljava/lang/String;",
-            |ctx, args| {
+        for name in ["getLength", "getLength0"] {
+            r.register(fs_cls, name, "(Ljava/io/File;)J", |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
-                let path_str = match ctx.get_field(file_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let entries: Vec<String> = match std::fs::read_dir(&path_str) {
-                    Ok(rd) => rd
-                        .filter_map(|e| e.ok())
-                        .map(|e| e.file_name().to_string_lossy().to_string())
-                        .collect(),
-                    Err(_) => vec![],
-                };
-                use cratonvm_types::ArrayElementType;
-                let arr = ctx.new_array(ArrayElementType::Reference, entries.len());
-                for (i, name) in entries.iter().enumerate() {
-                    let s = ctx.create_string(name);
-                    ctx.set_array_element(arr, i, Value::Object(Some(s)));
-                }
-                Ok(Some(Value::Object(Some(arr))))
-            },
-        );
+                let path = file_read_path(ctx, file_ref);
+                let len = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
+                Ok(Some(Value::Long(len)))
+            });
+        }
 
-        r.register(
-            fs_cls,
-            "createDirectory",
-            "(Ljava/io/File;)Z",
-            |ctx, args| {
+        for name in ["list", "list0"] {
+            r.register(
+                fs_cls,
+                name,
+                "(Ljava/io/File;)[Ljava/lang/String;",
+                |ctx, args| {
+                    let file_ref = obj_arg(args, 1)?;
+                    let path = file_read_path(ctx, file_ref);
+                    // `null`, not an empty array, when the path is not a
+                    // readable directory — `File.list()` documents the
+                    // difference and callers branch on it.
+                    let entries = match fs_list_dir(&path) {
+                        Some(e) => e,
+                        None => return Ok(Some(Value::Object(None))),
+                    };
+                    // A `String[]`, not the untyped `Object[]` that
+                    // `new_array(ArrayElementType::Reference, ..)` produces:
+                    // the descriptor is `[Ljava/lang/String;` and
+                    // `File.normalizedList()` assigns the result straight to a
+                    // `String[]` local, which is a checkcast.
+                    let string_class = string_class_id(ctx);
+                    let arr = ctx.new_ref_array(string_class, entries.len());
+                    // Pin across the `create_string` calls below — a moving
+                    // young GC there relocates the fresh array (the native
+                    // stale-local family), same as `java/io/File.list()`.
+                    let arr_pin = ctx.pin_native_root(arr);
+                    for (i, name) in entries.iter().enumerate() {
+                        let s = ctx.create_string(name);
+                        let arr = ctx.read_native_pin(arr_pin, arr);
+                        ctx.set_array_element(arr, i, Value::Object(Some(s)));
+                    }
+                    let arr = ctx.read_native_pin(arr_pin, arr);
+                    ctx.unpin_native_roots(arr_pin);
+                    Ok(Some(Value::Object(Some(arr))))
+                },
+            );
+        }
+
+        for name in ["createDirectory", "createDirectory0"] {
+            r.register(fs_cls, name, "(Ljava/io/File;)Z", |ctx, args| {
                 let file_ref = obj_arg(args, 1)?;
-                let path_str = match ctx.get_field(file_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let ok = std::fs::create_dir(&path_str).is_ok();
+                let path = file_read_path(ctx, file_ref);
+                let ok = std::fs::create_dir(&path).is_ok();
                 Ok(Some(Value::Int(if ok { 1 } else { 0 })))
-            },
-        );
+            });
+        }
 
         r.register(
             fs_cls,
@@ -6702,14 +6706,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             |ctx, args| {
                 let from_ref = obj_arg(args, 1)?;
                 let to_ref = obj_arg(args, 2)?;
-                let from = match ctx.get_field(from_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let to = match ctx.get_field(to_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
+                let from = file_read_path(ctx, from_ref);
+                let to = file_read_path(ctx, to_ref);
                 let ok = std::fs::rename(&from, &to).is_ok();
                 Ok(Some(Value::Int(if ok { 1 } else { 0 })))
             },
@@ -6717,21 +6715,38 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
         r.register(fs_cls, "delete0", "(Ljava/io/File;)Z", |ctx, args| {
             let file_ref = obj_arg(args, 1)?;
-            let path_str = match ctx.get_field(file_ref, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let ok = std::fs::remove_file(&path_str)
-                .or_else(|_| std::fs::remove_dir(&path_str))
+            let path = file_read_path(ctx, file_ref);
+            let ok = std::fs::remove_file(&path)
+                .or_else(|_| std::fs::remove_dir(&path))
+                .is_ok();
+            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        });
+        // `WinNTFileSystem.delete0` takes a second `allowDeleteReadOnlyFiles`
+        // argument (`java.io.File.allowDeleteReadOnlyFiles`, default false)
+        // that `UnixFileSystem.delete0` does not have — a different method,
+        // not a different spelling, so it needs its own registration or
+        // `File.delete()` is an `UnsatisfiedLinkError` on Windows.
+        r.register(fs_cls, "delete0", "(Ljava/io/File;Z)Z", |ctx, args| {
+            let file_ref = obj_arg(args, 1)?;
+            let allow_read_only = matches!(args.get(2), Some(v) if v.as_int().unwrap_or(0) != 0);
+            let path = file_read_path(ctx, file_ref);
+            if allow_read_only {
+                if let Ok(md) = std::fs::metadata(&path) {
+                    let mut perms = md.permissions();
+                    if perms.readonly() {
+                        perms.set_readonly(false);
+                        let _ = std::fs::set_permissions(&path, perms);
+                    }
+                }
+            }
+            let ok = std::fs::remove_file(&path)
+                .or_else(|_| std::fs::remove_dir(&path))
                 .is_ok();
             Ok(Some(Value::Int(if ok { 1 } else { 0 })))
         });
 
-        r.register(
-            fs_cls,
-            "setLastModifiedTime",
-            "(Ljava/io/File;J)Z",
-            |ctx, args| {
+        for name in ["setLastModifiedTime", "setLastModifiedTime0"] {
+            r.register(fs_cls, name, "(Ljava/io/File;J)Z", |ctx, args| {
                 // Real-JDK `File.setLastModified(long)` bytecode delegates here.
                 // This used to be a stub that claimed success without touching
                 // the file, so any caller that reached the bytecode path (rather
@@ -6740,12 +6755,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 // so both entry points behave identically for files AND
                 // directories.
                 let file_ref = obj_arg(args, 1)?;
-                // Same `path`-field read as the sibling `getLastModifiedTime` /
-                // `getLength` / `delete0` handlers in this loop.
-                let path = match ctx.get_field(file_ref, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
+                let path = file_read_path(ctx, file_ref);
                 let millis = match args.get(2) {
                     Some(Value::Long(v)) => *v,
                     _ => 0,
@@ -6755,26 +6765,68 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 } else {
                     0
                 })))
-            },
-        );
+            });
+        }
 
         // Was a hardcoded `true`: `File.setReadOnly()`'s real bytecode
         // delegates here, so a caller was told the file had been made
         // read-only while its permissions were untouched — and a follow-up
         // `canWrite()` (which IS a real permission query) then contradicted
         // it. Same body as the direct `java/io/File.setReadOnly()` native.
-        r.register(fs_cls, "setReadOnly", "(Ljava/io/File;)Z", |ctx, args| {
-            let file_ref = obj_arg(args, 1)?;
-            let path = file_read_path(ctx, file_ref);
-            let ok = std::fs::metadata(&path)
-                .and_then(|meta| {
-                    let mut perms = meta.permissions();
-                    perms.set_readonly(true);
-                    std::fs::set_permissions(&path, perms)
-                })
-                .is_ok();
-            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
-        });
+        for name in ["setReadOnly", "setReadOnly0"] {
+            r.register(fs_cls, name, "(Ljava/io/File;)Z", |ctx, args| {
+                let file_ref = obj_arg(args, 1)?;
+                let path = file_read_path(ctx, file_ref);
+                let ok = std::fs::metadata(&path)
+                    .and_then(|meta| {
+                        let mut perms = meta.permissions();
+                        perms.set_readonly(true);
+                        std::fs::set_permissions(&path, perms)
+                    })
+                    .is_ok();
+                Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+            });
+        }
+
+        // `File.setWritable`/`setReadable`/`setExecutable` bytecode lands here.
+        // Never registered before, so all three were an `UnsatisfiedLinkError`
+        // for any caller that reached the real `FileSystem` bytecode.
+        for name in ["setPermission", "setPermission0"] {
+            r.register(fs_cls, name, "(Ljava/io/File;IZZ)Z", |ctx, args| {
+                let file_ref = obj_arg(args, 1)?;
+                let path = file_read_path(ctx, file_ref);
+                let access = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+                let enable = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+                let owner_only = args.get(4).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+                let ok = fs_set_permission(&path, access, enable, owner_only);
+                Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+            });
+        }
+
+        // `File.createNewFile()` / `File.createTempFile(...)` bytecode. Same
+        // story as `setPermission`: never registered under either spelling.
+        for name in ["createFileExclusively", "createFileExclusively0"] {
+            r.register(fs_cls, name, "(Ljava/lang/String;)Z", |ctx, args| {
+                let path_ref = obj_arg(args, 1)?;
+                let path = ctx.read_string(path_ref).unwrap_or_default();
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(_) => Ok(Some(Value::Int(1))),
+                    // The JDK returns false only for "already exists"; every
+                    // other errno is an IOException the caller must see.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        Ok(Some(Value::Int(0)))
+                    }
+                    Err(e) => Err(RuntimeError::IOException {
+                        message: format!("{path}: {e}"),
+                    }
+                    .into()),
+                }
+            });
+        }
 
         // real-JDK `File.getTotalSpace()`/`getFreeSpace()`/`getUsableSpace()`
         // delegate to `FileSystem.getSpace(File, int)` (SPACE_TOTAL=0,
@@ -6788,37 +6840,50 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // mocked/real-File test class (e.g. `DiskSpaceHealthIndicatorTests`)
         // gets a correct answer for the mocked instances but a fake one for
         // real `File`s in the same JVM process.
-        r.register(fs_cls, "getSpace", "(Ljava/io/File;I)J", |ctx, args| {
-            let file_ref = obj_arg(args, 1)?;
-            let space_type = match args.get(2) {
-                Some(Value::Int(v)) => *v,
-                _ => 2,
-            };
-            let path = file_read_path(ctx, file_ref);
-            let value =
-                file_disk_space_bytes(&path).map_or(0, |(total, free, usable)| match space_type {
-                    0 => total,
-                    1 => free,
-                    _ => usable,
+        for name in ["getSpace", "getSpace0"] {
+            r.register(fs_cls, name, "(Ljava/io/File;I)J", |ctx, args| {
+                let file_ref = obj_arg(args, 1)?;
+                let space_type = match args.get(2) {
+                    Some(Value::Int(v)) => *v,
+                    _ => 2,
+                };
+                let path = file_read_path(ctx, file_ref);
+                let value = file_disk_space_bytes(&path).map_or(0, |(total, free, usable)| {
+                    match space_type {
+                        0 => total,
+                        1 => free,
+                        _ => usable,
+                    }
                 });
-            Ok(Some(Value::Long(value as i64)))
-        });
+                Ok(Some(Value::Long(value as i64)))
+            });
+        }
 
-        r.register(fs_cls, "checkAccess", "(Ljava/io/File;I)Z", |ctx, args| {
-            let file_ref = obj_arg(args, 1)?;
-            let path_str = match ctx.get_field(file_ref, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let exists = std::path::Path::new(&path_str).exists();
-            Ok(Some(Value::Int(if exists { 1 } else { 0 })))
-        });
+        // Was "does the path exist?" for every mode, so `canWrite()` said
+        // `true` for a file `setReadOnly()` had just locked down.
+        for name in ["checkAccess", "checkAccess0"] {
+            r.register(fs_cls, name, "(Ljava/io/File;I)Z", |ctx, args| {
+                let file_ref = obj_arg(args, 1)?;
+                let path = file_read_path(ctx, file_ref);
+                let access = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+                Ok(Some(Value::Int(if fs_check_access(&path, access) {
+                    1
+                } else {
+                    0
+                })))
+            });
+        }
 
         // Was a flat 255. Unix can answer this exactly the way the JDK's own
         // `UnixFileSystem.getNameMax0` does — `pathconf(_PC_NAME_MAX)` — and
         // that is not always 255 (an eCryptfs mount reports 143, and callers
         // like Lucene/H2 use the value to decide how long a generated file name
         // may be, so an over-long name fails at create time instead).
+        //
+        // The return type is NOT the same on both platforms: `long` on
+        // `UnixFileSystem`, `int` on `WinNTFileSystem`. Registering only the
+        // `I` form left the Unix native unresolved, since a native is looked
+        // up by descriptor as well as name.
         r.register(
             fs_cls,
             "getNameMax0",
@@ -6831,7 +6896,29 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Ok(Some(Value::Int(file_system_name_max(&path))))
             },
         );
+        r.register(
+            fs_cls,
+            "getNameMax0",
+            "(Ljava/lang/String;)J",
+            |ctx, args| {
+                let path = match args.get(1) {
+                    Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                Ok(Some(Value::Long(file_system_name_max(&path) as i64)))
+            },
+        );
 
+        // `WinNTFileSystem.canonicalize(String)` is
+        // `getFinalPath(canonicalize0(s))`, so this native's result IS what a
+        // caller reaching real `FileSystem` bytecode gets back. It used to
+        // return `std::fs::canonicalize`'s output verbatim, which on Windows
+        // carries the `\\?\` extended-length prefix that the real
+        // `GetFinalPathNameByHandleW`-based native strips: `canonicalize` came
+        // back as `\\?\C:\...\x.txt` where HotSpot returns `C:\...\x.txt`, so
+        // every `startsWith(canonicalBase)` containment check against a
+        // non-prefixed base failed. `strip_unc` is the same helper
+        // `file_canonicalize_path_uncached` already applies for this reason.
         r.register(
             fs_cls,
             "getFinalPath0",
@@ -6840,12 +6927,57 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let path_ref = obj_arg(args, 1)?;
                 let p = ctx.read_string(path_ref).unwrap_or_default();
                 let final_path = std::fs::canonicalize(&p)
-                    .map(|c| c.to_string_lossy().to_string())
+                    .map(|c| strip_unc(&c.to_string_lossy()))
                     .unwrap_or(p);
                 let s = ctx.create_string(&final_path);
                 Ok(Some(Value::Object(Some(s))))
             },
         );
+
+        // --- WinNTFileSystem-only natives ---
+        // Registered on both class names for symmetry with the loop; only the
+        // Windows class ever declares them, and a native is only reachable
+        // through a declared method.
+
+        // `File.listRoots()` -> a bitmask with bit 0 = `A:`.
+        r.register(fs_cls, "listRoots0", "()I", |_ctx, _args| {
+            Ok(Some(Value::Int(fs_list_roots_bitmask())))
+        });
+
+        // The per-drive working directory, minus its `X:` prefix — what
+        // `_wgetdcwd` gives the JDK. Reached only for drive-relative paths
+        // (`C:foo`), which `WinNTFileSystem.resolve` has to expand.
+        r.register(
+            fs_cls,
+            "getDriveDirectory",
+            "(I)Ljava/lang/String;",
+            |ctx, args| {
+                let drive = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+                if !(1..=26).contains(&drive) {
+                    return Ok(Some(Value::Object(None)));
+                }
+                let letter = (b'A' + (drive - 1) as u8) as char;
+                // Windows keeps each drive's working directory in a hidden
+                // `=X:` environment variable; that IS what `_wgetdcwd` reads.
+                let dir = std::env::var(format!("={letter}:"))
+                    .ok()
+                    .or_else(|| {
+                        let cwd = std::env::current_dir().ok()?;
+                        let cwd = cwd.to_string_lossy().to_string();
+                        cwd.starts_with(&format!("{letter}:")).then_some(cwd)
+                    })
+                    .unwrap_or_else(|| format!("{letter}:\\"));
+                // Strip the `X:` prefix the JDK's native also strips.
+                let stripped = dir.get(2..).unwrap_or("\\").to_string();
+                let s = ctx.create_string(&stripped);
+                Ok(Some(Value::Object(Some(s))))
+            },
+        );
+
+        // The real native caches jfieldIDs; there is nothing for us to cache,
+        // but the class's `<clinit>` calls it and an unregistered native there
+        // fails class initialisation outright.
+        r.register(fs_cls, "initIDs", "()V", |_ctx, _args| Ok(None));
     }
 
     // Round 24 — Files.write(Path, Iterable<? extends CharSequence>, OpenOption...)
@@ -6997,10 +7129,10 @@ pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) ->
     // This fallback's `invoke_virtual(path_obj, "toString", ...)` was written
     // assuming dispatch lands somewhere OTHER than back here — either the
     // (separate) dead-dispatch-to-Object.toString() bug fixed the same day in
-    // `docs/internal/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+    // `fixed-suite-bugs/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
     // or a genuine delegating wrapper's own real bytecode `toString()`. A
     // THIRD same-day fix
-    // (`docs/internal/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`,
+    // (`fixed-suite-bugs/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`,
     // `vm_exec.rs`'s `invoke_on_class_shared_inner`) made dispatch correctly
     // receiver-aware: ANY Path-subtype receiver's `toString()` now routes
     // straight back to this exact native (`p57_path_display_string` ->
@@ -7010,7 +7142,7 @@ pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) ->
     // EXCEPTION_STACK_OVERFLOW, not a Java StackOverflowError (native
     // recursion via `ctx.invoke_virtual` is invisible to every one of the
     // interpreter's counted recursion guards; see
-    // `docs/known-issues/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md`).
+    // `fixed-suite-bugs/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow-FIXED.md`).
     //
     // A thread-local re-entrancy flag breaks the cycle: the first call takes
     // the real dispatch as before (the common, legitimate delegating-wrapper
@@ -10961,6 +11093,252 @@ pub(crate) fn set_file_mtime_millis(path: &str, millis: i64) -> bool {
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(secs, nanos)).is_ok()
 }
 
+// ---------------------------------------------------------------------------
+// `java.io.FileSystem` native surface (UnixFileSystem / WinNTFileSystem)
+// ---------------------------------------------------------------------------
+//
+// JDK 22 moved almost every `FileSystem` JNI native behind a `0`-suffixed
+// private one with a plain-Java public wrapper in front of it:
+// `getBooleanAttributes0`, `checkAccess0`, `getLength0`, `getLastModifiedTime0`,
+// `list0`, `createDirectory0`, `setLastModifiedTime0`, `setReadOnly0`,
+// `setPermission0`, `createFileExclusively0`, `getSpace0`, `getNameMax0`.
+//
+// That matters here because the wrappers are *concrete bytecode* and neither
+// `java/io/UnixFileSystem` nor `java/io/WinNTFileSystem` appears in the
+// `check_override` allow-list in `vm_exec.rs::invoke_on_class_shared_inner`
+// — so a registered native under the bare pre-22 name is inert on a real
+// JDK 22+: the wrapper's bytecode runs and asks for the `0` native, which was
+// never registered. `File.exists()` then dies with
+//
+//     UnsatisfiedLinkError: java/io/UnixFileSystem.getBooleanAttributes0(Ljava/io/File;)I
+//
+// (docs/internal/fixed-suite-bugs/springboot/
+// unixfilesystem-getbooleanattributes0-missing-native-20260804-FIXED.md).
+// The `java/io/File` natives normally hide this, because `File.exists` /
+// `isFile` / `isDirectory` ARE forced overrides — but only until some test
+// redefines `java.io.File` (Mockito's inline mock maker does that
+// process-wide for `@Mock private File f`), after which the real `File`
+// bytecode runs for every instance and every one of these natives is reached.
+//
+// Both spellings are registered: the `0` one for JDK 22+, the bare one for
+// pre-22 JDKs and for CratonVM's synthetic `java.io.FileSystem`.
+
+/// `java.io.FileSystem.BA_EXISTS`.
+pub(crate) const FS_BA_EXISTS: i32 = 0x01;
+/// `java.io.FileSystem.BA_REGULAR`.
+pub(crate) const FS_BA_REGULAR: i32 = 0x02;
+/// `java.io.FileSystem.BA_DIRECTORY`.
+pub(crate) const FS_BA_DIRECTORY: i32 = 0x04;
+/// `java.io.FileSystem.BA_HIDDEN`.
+pub(crate) const FS_BA_HIDDEN: i32 = 0x08;
+
+/// `java.io.FileSystem.ACCESS_EXECUTE`.
+pub(crate) const FS_ACCESS_EXECUTE: i32 = 0x01;
+/// `java.io.FileSystem.ACCESS_WRITE`.
+pub(crate) const FS_ACCESS_WRITE: i32 = 0x02;
+/// `java.io.FileSystem.ACCESS_READ`.
+pub(crate) const FS_ACCESS_READ: i32 = 0x04;
+
+/// The bitmask the raw `getBooleanAttributes0` JNI native returns.
+///
+/// Note the platform split on `BA_HIDDEN`, which is NOT cosmetic:
+/// `UnixFileSystem.getBooleanAttributes0` never sets it (the public wrapper
+/// ORs in `isHidden(f)`, a leading-`.` check on the *name*), while
+/// `WinNTFileSystem.getBooleanAttributes0` does, straight out of
+/// `FILE_ATTRIBUTE_HIDDEN`, and its wrapper adds nothing. Getting this
+/// backwards makes `File.isHidden()` wrong on one platform or the other.
+pub(crate) fn fs_boolean_attributes0(path: &str) -> i32 {
+    let md = match std::fs::metadata(path) {
+        Ok(m) => m,
+        // Real JNI returns 0 for anything it cannot `stat`, including a
+        // permission error on a parent directory — not just ENOENT.
+        Err(_) => return 0,
+    };
+    let mut attrs = FS_BA_EXISTS;
+    if md.is_file() {
+        attrs |= FS_BA_REGULAR;
+    }
+    if md.is_dir() {
+        attrs |= FS_BA_DIRECTORY;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+        if md.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+            attrs |= FS_BA_HIDDEN;
+        }
+    }
+    attrs
+}
+
+/// The public `getBooleanAttributes` wrapper's result.
+///
+/// On Unix that is `getBooleanAttributes0(f) | isHidden(f)`, and `isHidden`
+/// is a pure name test that does not consult the filesystem — so a
+/// non-existent `.foo` reports `BA_HIDDEN` and nothing else, exactly as
+/// HotSpot does. On Windows the wrapper returns `getBooleanAttributes0`
+/// unchanged.
+pub(crate) fn fs_boolean_attributes(path: &str) -> i32 {
+    let attrs = fs_boolean_attributes0(path);
+    #[cfg(not(windows))]
+    {
+        let dot_hidden = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with('.'))
+            .unwrap_or(false);
+        if dot_hidden {
+            return attrs | FS_BA_HIDDEN;
+        }
+    }
+    attrs
+}
+
+/// `checkAccess0(File, int)` — one of `ACCESS_READ`/`WRITE`/`EXECUTE`.
+///
+/// This used to answer plain "does the path exist?" for every mode, so
+/// `File.canWrite()` on a file that `File.setReadOnly()` had just made
+/// read-only still said `true` whenever the real `FileSystem` bytecode was
+/// the caller.
+pub(crate) fn fs_check_access(path: &str, access: i32) -> bool {
+    #[cfg(unix)]
+    {
+        // `access(2)`, the same call the JDK's native makes — real uid/gid,
+        // not effective, and it honours ACLs and read-only mounts that a
+        // permission-bit test alone would miss.
+        let mode = match access {
+            FS_ACCESS_EXECUTE => libc::X_OK,
+            FS_ACCESS_WRITE => libc::W_OK,
+            FS_ACCESS_READ => libc::R_OK,
+            _ => libc::F_OK,
+        };
+        let c_path = match std::ffi::CString::new(path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        // SAFETY: `c_path` is a NUL-terminated C string that outlives the call,
+        // and `access(2)` only reads it.
+        unsafe { libc::access(c_path.as_ptr(), mode) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        // `WinNTFileSystem_checkAccess0`: any readable attribute set means
+        // readable and executable; only the READONLY attribute can deny write.
+        match std::fs::metadata(path) {
+            Err(_) => false,
+            Ok(md) => access != FS_ACCESS_WRITE || !md.permissions().readonly(),
+        }
+    }
+}
+
+/// `setPermission0(File, int access, boolean enable, boolean owneronly)`.
+pub(crate) fn fs_set_permission(path: &str, access: i32, enable: bool, owner_only: bool) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let md = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        let amode: u32 = match access {
+            FS_ACCESS_READ => {
+                if owner_only {
+                    0o400
+                } else {
+                    0o444
+                }
+            }
+            FS_ACCESS_WRITE => {
+                if owner_only {
+                    0o200
+                } else {
+                    0o222
+                }
+            }
+            FS_ACCESS_EXECUTE => {
+                if owner_only {
+                    0o100
+                } else {
+                    0o111
+                }
+            }
+            _ => return false,
+        };
+        let old = md.permissions().mode();
+        let new = if enable { old | amode } else { old & !amode };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(new)).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = owner_only;
+        let md = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        if access != FS_ACCESS_WRITE {
+            // Windows cannot revoke read or execute through this API; the JDK
+            // native reports failure for a disable and success for an enable.
+            return enable;
+        }
+        let mut perms = md.permissions();
+        perms.set_readonly(!enable);
+        std::fs::set_permissions(path, perms).is_ok()
+    }
+}
+
+/// `list0(File)` — `None` maps to a Java `null`, which is what the JDK returns
+/// for a path that is not a readable directory. Returning an empty array
+/// instead would make `File.list()` on a plain file look like an empty
+/// directory.
+pub(crate) fn fs_list_dir(path: &str) -> Option<Vec<String>> {
+    let entries = std::fs::read_dir(path).ok()?;
+    Some(
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect(),
+    )
+}
+
+/// The `ClassId` for `java/lang/String`, for allocating a genuinely typed
+/// `String[]` rather than the untyped `Object[]` that
+/// `new_array(ArrayElementType::Reference, ..)` hands back.
+pub(crate) fn string_class_id(ctx: &mut dyn NativeContext) -> ClassId {
+    ref_array_component_id(ctx, "java/lang/String")
+}
+
+/// The `ClassId` for `java/io/File`, for the `[Ljava/io/File;`-returning
+/// natives (`File.listFiles`, `File.listRoots`).
+pub(crate) fn file_class_id(ctx: &mut dyn NativeContext) -> ClassId {
+    ref_array_component_id(ctx, "java/io/File")
+}
+
+fn ref_array_component_id(ctx: &mut dyn NativeContext, name: &str) -> ClassId {
+    ctx.ensure_class_initialized(name)
+        .ok()
+        .or_else(|| ctx.class_id_by_name(name))
+        .unwrap_or_else(|| ClassId::new(0))
+}
+
+/// `listRoots0()` — the drive-letter bitmask (bit 0 = `A:`). Only Windows has
+/// a native for this; `UnixFileSystem.listRoots()` is plain Java returning
+/// `/`, so the Unix build never reaches here.
+pub(crate) fn fs_list_roots_bitmask() -> i32 {
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetLogicalDrives() -> u32;
+        }
+        // SAFETY: no arguments, no out-params — the call cannot observe or
+        // corrupt anything in this process.
+        (unsafe { GetLogicalDrives() }) as i32
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
 pub(crate) fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     // Prefer the real-JDK `getPath()` implementation when Available (correct
     // `prefixLength` + internal path for `java.io.File` loaded from modules).
@@ -12371,7 +12749,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().into_owned())
                     .collect();
-                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, names.len());
+                // A typed component class, not the untyped `Object[]` that
+                // `ArrayElementType::Reference` produces — the descriptor's array
+                // type is what the caller's assignment checkcasts against.
+                let component = string_class_id(ctx);
+                let arr = ctx.new_ref_array(component, names.len());
                 // Pin across the create_strings below — a moving young GC
                 // there would relocate the fresh array (native stale-local
                 // family).
@@ -12397,7 +12779,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .filter_map(|e| e.ok())
                     .map(|e| e.path().to_string_lossy().into_owned())
                     .collect();
-                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, paths.len());
+                // A typed component class, not the untyped `Object[]` that
+                // `ArrayElementType::Reference` produces — the descriptor's array
+                // type is what the caller's assignment checkcasts against.
+                let component = file_class_id(ctx);
+                let arr = ctx.new_ref_array(component, paths.len());
                 // Pin across the File allocs below — a moving young GC there
                 // would relocate the fresh array (native stale-local family).
                 let arr_pin = ctx.pin_native_root(arr);
@@ -12459,7 +12845,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     accepted.push((file_pin, file_obj));
                 }
             }
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
+            // A typed component class, not the untyped `Object[]` that
+            // `ArrayElementType::Reference` produces — the descriptor's array
+            // type is what the caller's assignment checkcasts against.
+            let component = file_class_id(ctx);
+            let arr = ctx.new_ref_array(component, accepted.len());
             for (i, (pin, orig)) in accepted.iter().enumerate() {
                 let f = ctx.read_native_pin(*pin, *orig);
                 ctx.set_array_element(arr, i, Value::Object(Some(f)));
@@ -12518,7 +12908,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     accepted.push((ctx.pin_native_root(f_obj), f_obj));
                 }
             }
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
+            // A typed component class, not the untyped `Object[]` that
+            // `ArrayElementType::Reference` produces — the descriptor's array
+            // type is what the caller's assignment checkcasts against.
+            let component = file_class_id(ctx);
+            let arr = ctx.new_ref_array(component, accepted.len());
             for (i, (pin, orig)) in accepted.iter().enumerate() {
                 let f = ctx.read_native_pin(*pin, *orig);
                 ctx.set_array_element(arr, i, Value::Object(Some(f)));
@@ -12570,7 +12964,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 }
             }
             ctx.unpin_native_roots(this_pin);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
+            // A typed component class, not the untyped `Object[]` that
+            // `ArrayElementType::Reference` produces — the descriptor's array
+            // type is what the caller's assignment checkcasts against.
+            let component = string_class_id(ctx);
+            let arr = ctx.new_ref_array(component, accepted.len());
             let arr_pin = ctx.pin_native_root(arr);
             for (i, name) in accepted.iter().enumerate() {
                 let s = ctx.create_string(name);
@@ -12750,7 +13148,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         };
         #[cfg(not(windows))]
         let roots: Vec<String> = vec!["/".to_string()];
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, roots.len());
+        // A typed component class, not the untyped `Object[]` that
+        // `ArrayElementType::Reference` produces — the descriptor's array
+        // type is what the caller's assignment checkcasts against.
+        let component = file_class_id(ctx);
+        let arr = ctx.new_ref_array(component, roots.len());
         // Pin across the File allocs below — a moving young GC there would
         // relocate the fresh array (native stale-local family).
         let arr_pin = ctx.pin_native_root(arr);
@@ -13319,7 +13721,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // close()V
     r.register(fc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // See docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
+        // See docs/known-issues/h2/!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
         // this native is registered on the literal "java/nio/channels/FileChannel"
         // class to service a synthetic single-field FileChannel, but native
         // overrides shadow ALL dispatch for that class name -- including a real

@@ -25,7 +25,7 @@ use crate::types::ObjectRef;
 // (`collect_all_root_snapshots`, `alive_count_and_os_tids`,
 // `alive_count_blocked_and_os_tids`). Investigating a CratonVM-specific
 // per-alive-thread VM overhead gap (Cluster B,
-// docs/known-issues/springboot/http-client-connector-teardown-hang-crash.md):
+// fixed-suite-bugs/http-client-connector-teardown-hang-crash-FIXED.md):
 // real HotSpot finishes a test class that briefly accumulates ~750 mostly-
 // idle threads in 6s; CratonVM takes 25-300+s for the identical thread
 // count. This measures which of these O(N) walkers actually dominates
@@ -149,7 +149,7 @@ struct ThreadEntry {
     /// lookups (getState/isAlive/interrupt/unpark) therefore prefer this
     /// key over pointer comparison; see `find_thread_id_by_java_tid` and
     /// the aliasing incident writeup in
-    /// docs/known-issues/tomcat-08-07/dohead-residual-http2-midrun-hang.md.
+    /// fixed-suite-bugs/tomcat/dohead-residual-http2-midrun-hang-FIXED.md.
     /// 0 = unknown (synthetic-layout mirror, or registered mid-construction
     /// before the ctor assigned `tid` — backfilled lazily on first lookup).
     java_tid: u64,
@@ -329,7 +329,7 @@ pub struct ThreadRegistry {
     /// collection relocates a mirror: the address the GC vacated. A running
     /// or blocked frame that resumed holding a not-yet-remapped copy of that
     /// OLD address (the frame/operand remap-coverage gap documented in
-    /// `docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md`)
+    /// `fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`)
     /// can then recover the live mirror instead of reading a zeroed object's
     /// null `holder` and NPEing in `Thread.getThreadGroup` (Tomcat
     /// `TestDigestAuthenticator` et al.). `.0` is the lookup map; `.1` is the
@@ -1550,7 +1550,7 @@ impl ThreadRegistry {
     /// in from `class_store`.
     ///
     /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-SW-2 of
-    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`). The published
+    /// `arch-2026-07-26/stackwalk-and-vtable.md`). The published
     /// snapshot is line-less because the *depositor* must stay lock-free; the
     /// *reader* usually does hold a `ClassStore` (cross-thread
     /// `Thread.getStackTrace()`, `dumpThreads()`, the JMX thread dump), so it

@@ -762,7 +762,7 @@ impl SharedResolutionState {
     /// interpreter's invoke paths).
     ///
     /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-LR-1 of
-    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`). This is the
+    /// `arch-2026-07-26/stackwalk-and-vtable.md`). This is the
     /// entry point the class-loader unload sweep in `vm/src/memory/gc.rs`
     /// wants: a conservative wholesale clear of the live cache, without
     /// asserting by implication that `global_methods` / `global_fields` are

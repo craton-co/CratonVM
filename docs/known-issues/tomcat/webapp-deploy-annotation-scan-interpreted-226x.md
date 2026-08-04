@@ -6,7 +6,7 @@
 | **Severity** | high — blocks `TestManagerWebapp.testDeploy` + `.testBug57700`; makes every deploy-heavy Tomcat class 15–65x slower |
 | **HotSpot** | PASS |
 | **CratonVM** | FAIL (timing only — no wrong results, no crash) |
-| **Discovered** | 2026-08-03, after fixing the `seek0`/`ExpandWar` defect that had been masking it (`docs/internal/fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md`) |
+| **Discovered** | 2026-08-03, after fixing the `seek0`/`ExpandWar` defect that had been masking it (`fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md`) |
 
 > **Update 2026-08-03 — two corrections, neither of which closes this doc.**
 >
@@ -218,7 +218,7 @@ measured on 2026-07-27 (it recorded 13–16 µs per byte for the identical
 `ByteReadCostProbe` reads 15.0 µs) and handed to
 `31-synchronized-code-never-jit-compiled-FIXED.md`. Doc 31's fix landed on
 2026-07-28 and did not move this path. It is also the residual that
-`docs/internal/fixed-suite-bugs/managerwebapp-deploy-bare-assertion-FIXED.md`
+`fixed-suite-bugs/managerwebapp-deploy-bare-assertion-FIXED.md`
 retired against in July, naming these same two test methods.
 
 The admission bans that plausibly own it are catalogued in the retired

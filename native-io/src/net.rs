@@ -2966,7 +2966,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // `ServerSocket.close()` (via `NioSocketImpl.close()` ->
     // `NativeDispatcher.preClose`). Companion gap to the `FileKey.init`
     // fix, see
-    // docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
+    // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
     r.register(
         "sun/nio/ch/UnixDispatcher",
         "close0",

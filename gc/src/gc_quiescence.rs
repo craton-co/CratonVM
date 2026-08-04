@@ -222,7 +222,7 @@ pub fn publish_moving_young_enabled(on: bool) {
 /// COMPLETE rewritable precise root map via the shadow stack and the
 /// conservative frame scan is suppressed (see the vm crate's
 /// `conservative_roots::moving_young_enabled` and
-/// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`).
+/// `arch-2026-07-26/moving-young-precise-roots.md`).
 ///
 /// Reads what the VM published from the codegen gate; before the first publish
 /// it falls back to `gc_flags().moving_young`. Never an independent policy
@@ -573,7 +573,7 @@ fn read_reason_counts() -> [usize; incomplete_reason::COUNT] {
 ///
 /// Paired with [`moving_young_cycle_count`] this is the whole runtime answer to
 /// "is the young generation a copying collector, and if not, what is stopping
-/// it?" — see `docs/internal/arch-2026-07-26/moving-young-corruption-rootcause.md`.
+/// it?" — see `arch-2026-07-26/moving-young-corruption-rootcause.md`.
 pub fn moving_young_fallback_reason_counts() -> [usize; incomplete_reason::COUNT] {
     read_reason_counts()
 }
@@ -703,7 +703,7 @@ pub fn moving_young_coverage_incomplete() -> bool {
 /// **Emits at `warn` level, ON BY DEFAULT.** A silent regression to the
 /// non-moving sweep is precisely how the moving young generation stayed
 /// switched off while the architecture docs advertised it (see
-/// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`): the only
+/// `arch-2026-07-26/moving-young-precise-roots.md`): the only
 /// signal was a `tracing::debug!` line reading "compaction deferred" and a
 /// counter behind `CRATONVM_MOVING_YOUNG_FALLBACKS`, which nobody set.
 /// Rate-limited (every occurrence up to 8, then powers of two) so a genuinely
@@ -1274,7 +1274,7 @@ pub fn pinned_jit_root_count() -> usize {
 // RandomizedContext.getPerThread()` returning null for its OWN WeakHashMap
 // key — the running suite thread's `java.lang.Thread` mirror — well after
 // the entry was legitimately created (see
-// docs/known-issues/elasticsearch-randomizedcontext-per-thread-null.md).
+// fixed-suite-bugs/elasticsearch-suite/elasticsearch-randomizedcontext-per-thread-null.md).
 //
 // Fix: the VM publishes the currently-registered Weak/Soft/Phantom referent
 // addresses here immediately before a collection (same thread that will run

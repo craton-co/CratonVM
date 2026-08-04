@@ -4,8 +4,8 @@
 //! `java/lang/Long` interpreter intrinsics.
 //!
 //! Group file for the interpreter intrinsic-dispatch fast path
-//! (see `docs/feature_roadmap_interpreter_intrinsic_table.md` and the shared
-//! contract `docs/internal/intrinsic_table_contract.md`).
+//! (see `gaps/feature_roadmap_interpreter_intrinsic_table.md` and the shared
+//! contract `intrinsic_table_contract.md`).
 //!
 //! Hard project rule (`feedback_no_synthetic_stubs`): NO synthetic stubs, NO
 //! fake behavior. Every handler here is byte-for-byte behavior-identical to the

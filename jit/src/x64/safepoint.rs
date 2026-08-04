@@ -84,7 +84,7 @@ impl Compiler {
         // only per-safepoint code size. Under moving-young it is NOT redundant:
         // it also rewrites `self.stack`, so the PRECISE map names those slots,
         // and a moving cycle has no conservative backstop to fall back on.
-        // See `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
+        // See `jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
         if moving_young_enabled() && scratch_flush_at_safepoint_enabled() {
             self.flush_scratch_registers();
         }

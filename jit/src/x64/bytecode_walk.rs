@@ -298,7 +298,7 @@ impl Compiler {
                     // `getstatic System.out` immediately followed by an
                     // `if`/`else`-computed `makeConcatWithConstants` arg —
                     // see
-                    // `docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`).
+                    // `fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`).
                     // `record_branch_target_depth` now captures the REAL
                     // marks live at this target the first time it's seen
                     // (mirroring how `expected_depth` itself is captured);
@@ -1796,7 +1796,7 @@ impl Compiler {
                     // this, a still-live reference overwritten by JIT code
                     // during concurrent marking would be silently dropped by
                     // the marker → use-after-free on the next mixed
-                    // evacuation (audit: docs/round7-gc.md §1).
+                    // evacuation (audit: history/round7-gc.md §1).
                     //
                     // Save RAX (array) / RCX (index) into argument registers
                     // first since `emit_ref_aload_regs` clobbers RAX with
@@ -3731,7 +3731,7 @@ impl Compiler {
                 // CratonVM called `jit_getstatic` for every static read
                 // instead, and that CALL — not the read — was the whole cost:
                 // ~35 ns against HotSpot's ~1. See
-                // `docs/internal/jit-getstatic-costs-a-helper-call-FIXED-20260803.md`.
+                // `jit-getstatic-costs-a-helper-call-FIXED-20260803.md`.
                 //
                 // MED-2 (round-2 JIT review) named three blockers for emitting
                 // the load. All three are gone:
@@ -4259,7 +4259,7 @@ impl Compiler {
                         // `push_from_rax` assigns, or it decodes as a plain
                         // `Int` (not `Object`) in the precise GC/deopt oop
                         // map — the root cause of the JDT `Parser`
-                        // stack-corruption bug (docs/known-issues/
+                        // stack-corruption bug (fixed-suite-bugs/
                         // jasper-jdt-parser-arrayindexoutofbounds.md): a
                         // `char[][]` field read this way, then used live
                         // across an always-deopting `System.arraycopy`
@@ -5402,7 +5402,7 @@ impl Compiler {
                         // reaching this call (e.g. a `stack[ptr--]` decrement
                         // already committed to the heap) — the mechanism
                         // behind the JDT `Parser` stack-corruption bug
-                        // (docs/known-issues/jasper-jdt-parser-arrayindexoutofbounds.md).
+                        // (fixed-suite-bugs/jasper-jdt-parser-arrayindexoutofbounds.md).
                         // `real_frame_deopt_resume_and_despeculate` already
                         // records this bci in the de-spec registry after
                         // `PER_BCI_DESPEC_LIMIT` deopts, exactly like the
@@ -5727,8 +5727,8 @@ impl Compiler {
                             // performed before reaching this call (e.g. a
                             // `stack[ptr--]` decrement already committed to
                             // the heap) — the mechanism behind the JDT
-                            // `Parser` stack-corruption bug (docs/
-                            // known-issues/jasper-jdt-parser-arrayindexoutofbounds.md).
+                            // `Parser` stack-corruption bug (fixed-suite-bugs/
+                            // jasper-jdt-parser-arrayindexoutofbounds.md).
                             // Falls back to the historical deopt trap only if
                             // the dispatch info wasn't registered (defensive;
                             // should not happen for this intrinsic).
@@ -6306,7 +6306,7 @@ impl Compiler {
                             // therefore handed the argument slots themselves. Remember
                             // the pre-pop top so such a reservation can be placed above
                             // them. See
-                            // docs/known-issues/jit-direct-call-arg1-clobbered-by-arg0.md.
+                            // fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md.
                             let args_frame_top = self.next_spill_offset;
                             let mut arg_slots = Vec::with_capacity(n);
                             for _ in 0..n {
@@ -6863,8 +6863,8 @@ impl Compiler {
                             // that MARKED entries have frame/register homes.
                             //
                             // That combination is the measured heap corruption
-                            // in `docs/known-issues/
-                            // moving-young-gen-drops-jit-held-oops.md`:
+                            // in `fixed-suite-bugs/app-jvm-bugs/
+                            // moving-young-gen-drops-jit-held-oops-FIXED.md`:
                             // `BinTreesClassic.bottomUpTree` keeps the result of
                             // its first recursive call — an entire subtree — on
                             // the operand stack across its second, and a moving
@@ -7969,7 +7969,7 @@ impl Compiler {
                         // intrinsics (Phase 4c). Both classes hold a single
                         // `private int crc` at instance field slot 0 — the
                         // running (uncomplemented) CRC state — see
-                        // docs/internal/crc_layout_contract.md. The four
+                        // gaps/crc_layout_contract.md. The four
                         // sentinels handled here:
                         //
                         //   Crc32cUpdateByte  : CRC32C.update(I)V
@@ -8324,7 +8324,7 @@ impl Compiler {
                             // therefore handed the argument slots themselves. Remember
                             // the pre-pop top so such a reservation can be placed above
                             // them. See
-                            // docs/known-issues/jit-direct-call-arg1-clobbered-by-arg0.md.
+                            // fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md.
                             let args_frame_top = self.next_spill_offset;
                             let mut arg_slots = Vec::with_capacity(n);
                             for _ in 0..n {
