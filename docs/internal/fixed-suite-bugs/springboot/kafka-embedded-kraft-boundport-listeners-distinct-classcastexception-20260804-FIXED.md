@@ -352,7 +352,8 @@ HotSpot control first, same host and JDK: `probes/LinkedHashMapNodeProbe.java`
 | HotSpot 25.0.3+9 | the control | PASS | PASS |
 | `cratonvm-lhment-base` | `origin/dev` @ `87d323bac`, unmodified | **FAIL** (JIT and `--nojit`) | PASS |
 | `cratonvm-lhment-r1` | + the class change alone | **FAIL** (6, the Set regression) | PASS |
-| `cratonvm-lhment-r2` | + the sentinel fix, as landed | PASS (JIT and `--nojit`) | PASS (JIT and `--nojit`) |
+| `cratonvm-lhment-r2` | + the sentinel fix | PASS (JIT and `--nojit`) | PASS (JIT and `--nojit`) |
+| `cratonvm-lhment-r3` | final merged state, as landed on `dev` | PASS (JIT and `--nojit`) | PASS (JIT and `--nojit`) |
 
 The baseline failure is the original divergence, identically on both arms:
 
@@ -404,9 +405,24 @@ is a busy neighbour. Every one of those runs took 150–218 s with host load at
 Spring Boot verdict means nothing. Re-run interleaved against `base` and `r1`
 on a quiet box, `r2` went 5/5.
 
-`regression-suite/run.sh` (it diffs CratonVM against HotSpot) against `r2`:
-**24 passed, 0 failed**, including `RCollections`, `RJdkCollections`,
-`RMapResizeGc`, `RMapGcStress`, `RSerial` and `RForNameGcStress`.
+`regression-suite/run.sh` (it diffs CratonVM against HotSpot): **24 passed, 0
+failed** against `r2` and again against `r3`, including `RCollections`,
+`RJdkCollections`, `RMapResizeGc`, `RMapGcStress`, `RSerial` and
+`RForNameGcStress`.
+
+Re-verified on the **merged state** (`r3`): both probes PASS under JIT and
+`--nojit`, regression suite 24/24, Kafka 2/3 JIT and 2/2 `--nojit`. A further
+interleaved `base`-vs-`r3` round landed in a second load storm and stratifies
+cleanly by wall time rather than by arm — every run that finished in 28–30 s
+passed on both arms, every run that took 219–511 s failed on both:
+
+```
+[base] PASS 29s   [r3] PASS  28s      <- load ~10
+[base] PASS 30s   [r3] PASS  30s
+[base] PASS 30s   [r3] FAIL 219s      <- load climbing past 85
+[base] FAIL  58s  [r3] FAIL 405s
+[base] FAIL 511s
+```
 
 `cratonvm-native-collections`: **94** lib tests plus **86** across every
 integration test (`abstract_collection_interception`, `gc_native_pins`,
