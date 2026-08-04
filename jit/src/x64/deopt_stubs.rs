@@ -79,6 +79,77 @@ impl Compiler {
         }
     }
 
+    /// Compute the per-bci operand-stack kinds from the resolved per-pc
+    /// metadata. See `x64::stack_kinds` for the analysis and its safety
+    /// argument; this is only the adapter that collects its inputs.
+    ///
+    /// Call arities are gathered from all three dispatch shapes, because the
+    /// analysis needs an arity at EVERY call site — one unmodelled call poisons
+    /// the rest of the method:
+    ///
+    ///   * `invoke_info` — the descriptor is present, so the arity is
+    ///     `indy_arg_type_tags(descriptor).len()`, which counts one entry per
+    ///     compact slot exactly like the abstract stack;
+    ///   * `direct_calls` — `num_params` is already compact slots and excludes
+    ///     the receiver (the opcode supplies that);
+    ///   * `indy_info` — carries `count_param_slots(descriptor)` directly.
+    ///
+    /// `invoke_info` is applied last so a site with both shapes takes the
+    /// descriptor-derived answer.
+    pub(super) fn analyze_stack_kinds(&mut self, code: &[u8], code_len: usize) {
+        use super::stack_kinds::{analyze, StackKindInputs};
+
+        let field_types: FxHashMap<usize, u8> =
+            self.field_info.iter().map(|&(pc, _, tag)| (pc, tag)).collect();
+        let static_types: FxHashMap<usize, u8> = self
+            .static_field_info
+            .iter()
+            .map(|&(pc, _, _, tag, _)| (pc, tag))
+            .collect();
+
+        let mut calls: FxHashMap<usize, (usize, u8)> = FxHashMap::default();
+        for &(pc, args, ret, _, _) in &self.indy_info {
+            calls.insert(pc, (args, ret));
+        }
+        for (pc, dc) in &self.direct_calls {
+            calls.insert(*pc, (dc.num_params, dc.return_type));
+        }
+        for &(pc, info) in &self.invoke_info {
+            if info.is_null() {
+                continue;
+            }
+            // SAFETY: `invoke_info` holds pointers to `JitInvokeInfo` boxes the
+            // caller keeps alive for the whole compile.
+            let (descriptor, ret) = unsafe { ((*info).descriptor, (*info).return_type) };
+            calls.insert(pc, (crate::indy_arg_type_tags(descriptor).len(), ret));
+        }
+
+        let ldc_refs: FxHashSet<usize> = self
+            .ldc_string_info
+            .iter()
+            .map(|&(pc, _, _)| pc)
+            .chain(self.ldc_class_info.iter().map(|&(pc, _, _)| pc))
+            .collect();
+
+        let inputs = StackKindInputs {
+            field_types,
+            static_types,
+            calls,
+            ldc_refs: &ldc_refs,
+        };
+        self.stack_kinds = analyze(code, code_len, &inputs);
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
+            eprintln!(
+                "[stack-kinds] {} answered {} of {code_len} pcs (calls={} fields={} statics={})",
+                self.method_key,
+                self.stack_kinds.answered(),
+                self.indy_info.len() + self.direct_calls.len() + self.invoke_info.len(),
+                self.field_info.len(),
+                self.static_field_info.len(),
+            );
+        }
+    }
+
     pub(super) fn snapshot_pre_intrinsic_call(&mut self, bci: usize, reason: crate::deopt::DeoptReason) {
         if self.deopt_box_ptr_by_bci.contains_key(&bci) {
             return;
@@ -353,6 +424,46 @@ impl Compiler {
                     })
             });
         let indy_arg_base = indy_arg_types.map(|tags| n.saturating_sub(tags.len()));
+        // The operand stack's width source (`x64::stack_kinds`), admitted only
+        // when it agrees with the emitter about this bci's live stack on two
+        // independent counts:
+        //
+        //   * DEPTH — the analysis derives it from the JVMS stack effects, the
+        //     emitter from running its own opcode handlers. A modelling error
+        //     that shifts the stack changes the depth, and a positional tag
+        //     vector applied at the wrong offset is exactly the truncated-long
+        //     corruption the coarse fallback exists to prevent.
+        //   * REF-NESS — every entry the analysis calls a reference must be one
+        //     the emitter's oop mark also calls a reference, and vice versa.
+        //     The marks are maintained for the GC, so this is a second opinion
+        //     with a different provenance, and it catches an off-by-one that
+        //     happens to preserve depth.
+        //
+        // Either disagreement discards the whole vector for this bci and leaves
+        // the pre-existing encoding in place.
+        let raw_kinds = self.stack_kinds.get(bci);
+        let stack_kinds = raw_kinds
+            .filter(|kinds| kinds.len() == n)
+            .filter(|kinds| {
+                kinds.iter().enumerate().all(|(i, k)| {
+                    let analysis_says_ref = *k == super::stack_kinds::StackKind::Ref;
+                    let unknown = *k == super::stack_kinds::StackKind::Unknown;
+                    unknown || self.stack_oop_marks[i] == analysis_says_ref
+                })
+            });
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
+            // Which of the three outcomes happened is the whole diagnosis when
+            // a snapshot stays `Unsupported`: no answer at this bci (the
+            // analysis poisoned upstream), an answer the emitter's depth or oop
+            // marks contradict (a modelling bug), or an accepted answer that is
+            // simply `Unknown` at the blocking index.
+            eprintln!(
+                "[stack-kinds] {} bci={bci} emitter_depth={n} analysis={:?} accepted={}",
+                self.method_key,
+                raw_kinds,
+                stack_kinds.is_some(),
+            );
+        }
         let mut stack = Vec::with_capacity(n);
         for i in 0..n {
             let is_oop = self.stack_oop_marks[i];
@@ -376,7 +487,27 @@ impl Compiler {
                     } else if indy_tag == Some(b'I') || !wide_fp {
                         FrameValue::StackSlot(-*off)
                     } else {
-                        FrameValue::Unsupported
+                        // Previously always `Unsupported`. The typed stack is
+                        // asked here and only here, so every encoding the old
+                        // code produced it still produces.
+                        match stack_kinds.and_then(|kinds| kinds.get(i)) {
+                            Some(super::stack_kinds::StackKind::Long) => {
+                                FrameValue::StackSlotLong(-*off)
+                            }
+                            Some(super::stack_kinds::StackKind::Double) => {
+                                FrameValue::StackSlotDouble(-*off)
+                            }
+                            Some(super::stack_kinds::StackKind::Float) => {
+                                FrameValue::StackSlotFloat(-*off)
+                            }
+                            Some(super::stack_kinds::StackKind::Int) => {
+                                FrameValue::StackSlot(-*off)
+                            }
+                            // `Ref` cannot reach here: `is_oop` handled it
+                            // above, and the ref-agreement filter guarantees
+                            // the two never disagree.
+                            _ => FrameValue::Unsupported,
+                        }
                     }
                 }
                 // A register-resident operand: a ref → `RegisterRef` (GC-tracked
@@ -396,7 +527,19 @@ impl Compiler {
                     } else if indy_tag == Some(b'I') || !wide_fp {
                         FrameValue::Register(*r)
                     } else {
-                        FrameValue::Unsupported
+                        // Same upgrade as the frame-slot arm above. A GPR-homed
+                        // `Float`/`Double` stays `Unsupported`: the FP tier
+                        // keeps those in an XMM or a spill slot, so a wide-FP
+                        // kind claiming a GPR home is a contradiction, not a
+                        // value to encode — the same judgement
+                        // `typed_local_frame_value` makes for locals.
+                        match stack_kinds.and_then(|kinds| kinds.get(i)) {
+                            Some(super::stack_kinds::StackKind::Long) => {
+                                FrameValue::RegisterLong(*r)
+                            }
+                            Some(super::stack_kinds::StackKind::Int) => FrameValue::Register(*r),
+                            _ => FrameValue::Unsupported,
+                        }
                     }
                 }
                 // An XMM-resident operand is FP, but float-vs-double is not

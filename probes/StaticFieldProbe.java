@@ -88,14 +88,18 @@ public final class StaticFieldProbe {
             "instance field",
         };
 
-        // 1200, not 200: a rung must be INVOKED past the tier-up threshold
-        // (c1_threshold=500) to run compiled from entry. At 200 the only route
-        // into compiled code is OSR, and OSR entry into these loops is refused
-        // today ("osr-entry-unresumable-exit", see this probe's doc in
-        // docs/internal/) — so every rung measured the interpreter and read
-        // ~90 ns/op flat, JIT and --nojit alike. Verify with
-        // `CRATONVM_DBG=jit-method-stats` (or simply: the control rung must
-        // land near HotSpot's ~1 ns/op, not near 90).
+        // 1200 invocations, not 200: past the tier-up threshold
+        // (c1_threshold=500) each rung runs compiled from entry, which is the
+        // tier this probe means to measure. Lowering it to 200 is the way to
+        // isolate OSR instead — below the threshold, an OSR entry at the loop
+        // header is the only route into compiled code.
+        //
+        // Both routes were dead until 2026-08-03: every OSR entry was refused
+        // `osr-entry-unresumable-exit`, so at 200 every rung silently measured
+        // the INTERPRETER at ~90 ns/op, identically under `--nojit`. See
+        // docs/internal/osr-entry-unresumable-exit-FIXED-20260803.md. The cheap
+        // check, either way: the control rung must land near HotSpot's ~1
+        // ns/op, not near 90.
         for (int w = 0; w < 1200; w++) {
             sink += control(2_000); sink += staticFinalRef(2_000);
             sink += staticFinalRefHoisted(2_000); sink += staticMutRef(2_000);

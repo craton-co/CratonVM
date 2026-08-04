@@ -161,6 +161,7 @@ pub use bytecode_compat::*;
 // declared visibility, so nothing here became more public than it was.
 mod licm;
 pub use licm::*;
+mod stack_kinds;
 // ---------------------------------------------------------------------------
 // HIGH-1 / Fix 1 — null-check elimination helper
 // ---------------------------------------------------------------------------
@@ -1091,6 +1092,16 @@ struct Compiler {
     /// arguments) instead of the coarse per-method `wide_fp` gate. See
     /// `indy_arg_type_tags`'s doc comment for the motivating bug.
     indy_stack_arg_types: FxHashMap<usize, Vec<u8>>,
+
+    /// Per-bci operand-stack KINDS — the width source the stack never had.
+    ///
+    /// Consulted by `build_and_record_deopt_point` exactly where it would
+    /// otherwise record `FrameValue::Unsupported`, and only when its depth and
+    /// ref-ness agree with the emitter's own live stack. Empty when the
+    /// analysis declined (an unmodelled construct poisons its successors), in
+    /// which case every snapshot keeps the pre-existing coarse encoding. See
+    /// `x64::stack_kinds`.
+    stack_kinds: stack_kinds::StackKindMap,
 
     /// The same thing for ORDINARY invokes (`invoke{virtual,special,static,
     /// interface}`), keyed by call-site bci and derived once from
@@ -2250,6 +2261,7 @@ impl Compiler {
             invoke_info_idx: FxHashMap::default(),
             indy_info_idx: FxHashMap::default(),
             indy_stack_arg_types: FxHashMap::default(),
+            stack_kinds: stack_kinds::StackKindMap::default(),
             invoke_stack_arg_types: FxHashMap::default(),
             direct_calls_idx: FxHashMap::default(),
             mic_slots_idx: FxHashMap::default(),

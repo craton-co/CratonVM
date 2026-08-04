@@ -134,6 +134,80 @@ test now drives `old_gen_gc(compact = true)` directly rather than through
 `major_gc`, so it keeps testing the downgrade rather than silently passing
 because nothing compacts.
 
+### The residual is NOT a mark-phase gap — measured at the moment of reclamation (2026-08-03)
+
+This page has spent three sessions asking *which mark source missed the edge*.
+That question now has an answer, and the answer is **none of them**.
+
+`CRATONVM_DBG_SWEEP_REFERRERS=1` word-scans, at the moment the in-place old
+sweep is about to free, for anything still pointing into the doomed set. It
+runs **after** `OldGen::close_live_set`, so the set it scans is the one that
+actually gets freed rather than the raw mark result the closure then rescues,
+and it CATEGORISES rather than printing the first N — the first sixteen words
+of an ascending scan are the sixteen lowest addresses, which was exactly how an
+earlier version of this scan reported `1_298_639` "referrer words" of which
+every printed one was `doomed → doomed`.
+
+Five in-place sweeps on `TestMVStoreCacheLoop`, `--Xmx 1g`,
+`CRATONVM_GC=-moving-young`, JIT on:
+
+```text
+doomed=34849   DEFECTS(live_old=0 young=0 root=0) benign(dead_old=901945 unowned=0)
+               scanned(old_bytes=536870912 young_bytes=50289344  roots=142261)
+doomed=129942  DEFECTS(live_old=0 young=0 root=0) benign(dead_old=855453 unowned=129)
+               scanned(old_bytes=536870912 young_bytes=268365920 roots=270692)
+doomed=209244  DEFECTS(live_old=0 young=0 root=0) benign(dead_old=966082 unowned=0)
+doomed=154356  DEFECTS(live_old=0 young=0 root=0) benign(dead_old=421166 unowned=3)
+doomed=70527   DEFECTS(live_old=0 young=0 root=0) benign(dead_old=945249 unowned=37)
+```
+
+The three defect columns are the three mark sources that could have missed an
+edge:
+
+* `live_old` — a **marked** old-gen object still points at a doomed block. Zero.
+  So the mark BFS did not drop an edge it was handed, and `close_live_set` is
+  not leaving anything behind either.
+* `young` — a word in the young space points at a doomed block, i.e.
+  `mark_young_to_old_refs` missed a young→old edge. Zero.
+* `root` — a root points straight at a doomed block. Zero.
+
+**Read the `scanned(...)` triple before believing the zeros.** It is there
+precisely so this cannot be an inert-lever reading: 512 MB of old-gen backing
+store, 50-268 MB of young space, and 142 000-270 000 roots were actually walked,
+and the scan demonstrably finds pointers — 0.4-1.0 M of them per sweep, all
+`doomed → doomed`, which is the whole-subgraph-condemned-together case the
+promotion-seed comment in `sweep_old_gen_non_moving` warns about.
+
+### What that leaves
+
+The blocks this sweep frees are unreachable from **everything the collector can
+see**: the whole old generation, the whole young space, and the entire root
+slice. Yet two independent fix-arm witnesses show such a block being read back
+later through a surviving reference.
+
+So the surviving reference is somewhere the collector never looks. In rough
+order of suspicion:
+
+1. **A peer thread's JIT spill slots.** These runs log
+   `[moving-young] fallback: reason=compiled-frame-oop-not-published` and
+   `reason=innermost-rbp-belongs-to-unguarded-callee` — the collector knows some
+   live JIT frames cannot publish a precise map. The non-moving fallback means
+   it does not have to *relocate* them; it still has to **mark** through them.
+   The next measurement is root COVERAGE, not mark completeness: per old-gen
+   sweep, how many threads were in JIT and how many of their frames contributed
+   roots.
+2. **A native/Rust side table.** `native-collections` keeps state in identity-keyed
+   overlays (`clone_lhm_overlay`, `properties_sidetable`) and `external_roots`
+   registers owners. `CRATONVM_DBG_OLDSWEEP_OWNERS=1` already reports when a
+   freed block **is** an overlay owner; nothing reports when a freed block is
+   **referenced by** one.
+3. **A thread whose snapshot was not folded into this cycle.**
+
+This is a genuine reframing: for three sessions the working hypothesis has been
+"a gap in the old-gen mark phase". The mark phase is now measured complete over
+every edge that exists in the heap. The defect is in **what the collector is
+told about**, not in what it does with it.
+
 ## Severity
 **HIGH** — silent. Before this session no guard fired: zero
 `gen_heap::set_field`/`get_field` out-of-bounds hits, zero

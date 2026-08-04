@@ -208,7 +208,7 @@ of the SLOW side still holds and was not re-derived: `probes/SdfOnlyProbe
 .java` runs `SimpleDateFormat.format` with pattern `"ss"`, reaches none of
 them, and cost 51 µs with `hot_but_stuck_in_interpreter=0` — 870× HotSpot's
 59 ns. The cost there is generic-dispatch round trips; see
-[30 § Adopted](fixed-suite-bugs/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32-and-where-they-went)
+[30 § Adopted](tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md#adopted-2026-07-31--two-residuals-from-the-retired-tomcat32-and-where-they-went)
 and [raw JIT-to-JIT](jit-raw-jit-to-jit-shadow-stack-overflow-FIXED-20260731.md),
 which carry that work. **Do not cite this doc as a lever for any
 date-formatting throughput test, on either side.**

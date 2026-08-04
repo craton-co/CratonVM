@@ -417,8 +417,48 @@ pub fn clear() {
 mod tests {
     use super::*;
 
+    /// Serialises this module's tests against each other. **Every test below
+    /// must hold it for its whole body.**
+    ///
+    /// The table these tests drive is process-global by design — it is the
+    /// VM-wide registry [`active_class_ids`] exposes to the GC root walk — so
+    /// there is no per-test state to hand out instead. `clear()` walks
+    /// `STATES` and zeroes *every* thread's slots, and `active_class_ids()`
+    /// reads *every* thread's slots. Cargo runs a module's tests in parallel
+    /// threads of one process, so without this lock every assertion here races
+    /// its siblings, in three separate ways:
+    ///
+    ///   * a sibling's `clear()` wipes an activation this test is about to
+    ///     assert on. That is the failure this lock was added for:
+    ///     `a_peer_threads_activations_are_visible` reported "a peer thread's
+    ///     compiled frame must root its defining loader" on roughly one run in
+    ///     eight (2/12 on 2026-08-03), because a sibling cleared class 11
+    ///     between the peer publishing it and the assertion reading it;
+    ///   * a sibling's *live* activation shows up in this test's
+    ///     `active_class_ids()`, which three tests compare by exact equality;
+    ///   * a sibling's `enter` can take the freed slot that
+    ///     `a_slot_is_reused_once_its_class_leaves` expects to be reused.
+    ///
+    /// Only the first had been observed, but all three are reachable, and the
+    /// second and third would read as far more alarming failures than a flake
+    /// — an exact-equality mismatch on the GC's root list looks like a
+    /// retention bug.
+    ///
+    /// This is not papering over an ordering defect in the code under test.
+    /// Publication is correctly ordered on both hops — `acquire_state` pushes
+    /// onto `STATES` with `Release` against `active_class_ids`' `Acquire`, and
+    /// `enter` publishes the slot's class id with `Release` against the same
+    /// `Acquire` — and the peer test's channel adds its own happens-before
+    /// edge on top. Isolated, the test does not fail.
+    ///
+    /// `parking_lot::Mutex`, not `std::sync::Mutex`: it does not poison, so
+    /// one test's genuine failure stays one failure instead of cascading into
+    /// four poisoning errors that bury which assertion actually broke.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn active_owner_counts_survive_nested_entries() {
+        let _serialised = TEST_LOCK.lock();
         clear();
         let outer = enter(7).expect("a real class id is tracked");
         let inner = enter(7).expect("a real class id is tracked");
@@ -433,6 +473,7 @@ mod tests {
 
     #[test]
     fn distinct_classes_get_distinct_slots() {
+        let _serialised = TEST_LOCK.lock();
         clear();
         let a = enter(3).expect("tracked");
         let b = enter(4).expect("tracked");
@@ -446,6 +487,7 @@ mod tests {
 
     #[test]
     fn more_live_classes_than_one_chunk_holds() {
+        let _serialised = TEST_LOCK.lock();
         clear();
         let n = SLOTS_PER_CHUNK + 5;
         let tokens: Vec<_> = (0..n).map(|cid| enter(cid).expect("tracked")).collect();
@@ -462,6 +504,7 @@ mod tests {
 
     #[test]
     fn a_slot_is_reused_once_its_class_leaves() {
+        let _serialised = TEST_LOCK.lock();
         clear();
         let first = enter(21).expect("tracked");
         exit(first);
@@ -474,6 +517,9 @@ mod tests {
 
     #[test]
     fn a_peer_threads_activations_are_visible() {
+        // Held across the peer's whole lifetime. The peer never takes this
+        // lock, so holding it while the peer runs cannot deadlock.
+        let _serialised = TEST_LOCK.lock();
         clear();
         let (marked_tx, marked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -492,5 +538,75 @@ mod tests {
         peer.join().expect("peer finishes");
         assert!(!active_class_ids().contains(&11));
         clear();
+    }
+
+    /// Every `#[test]` in this module must take [`TEST_LOCK`].
+    ///
+    /// A test added without it does not fail; it makes the *other* tests fail,
+    /// rarely, somewhere else. That is what this module already cost once:
+    /// isolated, `a_peer_threads_activations_are_visible` passed 100 runs out
+    /// of 100, while the suite failed 3 runs out of 25 — a shape that reads as
+    /// "flaky test" and hides that the assertion was right all along.
+    ///
+    /// Reads its own source through `file!()`, which is the compiler's answer
+    /// and therefore follows a rename or a move of this module to another
+    /// file. It fails loudly rather than vacuously when the file cannot be
+    /// read or when it finds no tests at all.
+    #[test]
+    fn every_test_in_this_module_serialises() {
+        let _serialised = TEST_LOCK.lock();
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the types crate directory has a parent")
+            .join(file!());
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read this module's own source at {} ({e}) — failing \
+                 rather than passing without having checked anything",
+                path.display()
+            )
+        });
+
+        // Assembled so this needle does not match the line that defines it.
+        let attr = format!("#[{}]", "test");
+        let takes_lock = format!("{}.lock()", "TEST_LOCK");
+
+        let lines: Vec<&str> = src.lines().collect();
+        let mut checked = 0usize;
+        let mut missing: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim() != attr {
+                continue;
+            }
+            checked += 1;
+            // The lock is the first statement of every test here; a dozen
+            // lines is slack for an attribute stack or a wrapped signature.
+            let body = lines[i + 1..lines.len().min(i + 13)].join("\n");
+            if !body.contains(&takes_lock) {
+                let name = lines[i + 1..lines.len().min(i + 5)]
+                    .iter()
+                    .find(|l| l.contains("fn "))
+                    .unwrap_or(&"<unknown>")
+                    .trim();
+                missing.push(format!("line {}: {name}", i + 1));
+            }
+        }
+
+        assert!(
+            checked >= 5,
+            "found only {checked} tests in {} — the scan is broken, and it was \
+             about to pass without checking anything",
+            path.display()
+        );
+        assert!(
+            missing.is_empty(),
+            "test(s) in this module do not take TEST_LOCK. Every test here \
+             drives ONE process-global table (see the lock's doc), so one that \
+             runs unserialised does not fail itself — it makes its siblings \
+             fail rarely and somewhere else. Add `let _serialised = \
+             TEST_LOCK.lock();` as the first statement:\n  {}",
+            missing.join("\n  ")
+        );
     }
 }

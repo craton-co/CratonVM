@@ -152,7 +152,7 @@ compiled", not "the compiler emits bad code".
 ## Prior art
 
 This is the same wall
-`docs/internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-CLOSED.md`
+`../../internal/tomcat/04-embedded-server-throughput-wall-CLOSED.md`
 measured on 2026-07-27 (it recorded 13–16 µs per byte for the identical
 `DataInputStream`/`BufferedInputStream` operation; today's
 `ByteReadCostProbe` reads 15.0 µs) and handed to

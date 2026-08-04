@@ -198,7 +198,7 @@ OSR-refuse StaticFieldProbe.staticMutInt(I)J entry_pc=4 JIT bailout
 
 Not specific to this probe — `VirtOnlyProbe`'s four rungs are refused the same
 way, 406 times each. Filed separately as
-`docs/known-issues/jit/osr-entry-unresumable-exit-refuses-hot-counted-loops-20260803.md`;
+`docs/internal/osr-entry-unresumable-exit-FIXED-20260803.md`;
 it is not a `getstatic` problem and this fix does not touch it.
 
 `probes/StaticFieldProbe.java` now warms up 1200 invocations per rung, so the

@@ -1653,6 +1653,21 @@ pub fn compile_with_param_slots(
         compiler.exception_ranges_dbg_len = exception_ranges.len();
     }
 
+    // The operand stack's width source. Placed HERE, immediately before the
+    // walk, because it reads per-pc metadata assigned across a long stretch of
+    // this function: field and static-field types, and call arities from all
+    // three of `indy_info` / `direct_calls` / `invoke_info`.
+    //
+    // Run it any earlier and the vectors it has not seen yet read as ABSENT,
+    // which the analysis treats as an unmodelled call site and poisons on — so
+    // the result is silently empty and every snapshot keeps the coarse
+    // encoding. That is exactly what the first attempt did (placed right after
+    // `invoke_info`, three of its five inputs were still empty): the suites
+    // stayed green and the refusal count did not move at all, which is the
+    // signature of an analysis that answered nothing rather than one that
+    // answered wrong.
+    compiler.analyze_stack_kinds(code, code_len);
+
     // Emit prologue
     compiler.emit_prologue();
     if compiler.failed {
