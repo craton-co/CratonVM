@@ -157,10 +157,21 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
   **Correction (2026-08-04):** a fresh 50-class residual run
   (`run-20260804-113511-custom`) shows these two classes have diverged.
-  `BatchTest` no longer belongs in this bullet at all — today it fails 100%
-  of the time with a genuine, JIT-only `ConstraintViolationException` (a
-  unique-index collision), not a timeout; see
-  [`batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`](batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md).
+  `BatchTest` no longer belongs in this bullet at all — it failed 100% of the
+  time with a genuine, JIT-only `ConstraintViolationException` (a unique-index
+  collision), not a timeout. **That defect is now FIXED** (same day): the root
+  cause was CratonVM injecting `Unsafe.ARRAY_*_BASE_OFFSET` — `long` fields in
+  JDK 25 — as a 32-bit value, which the interpreter tolerated and JIT-compiled
+  code read as garbage, making `Arrays.equals(long[],long[])` return `true` for
+  arrays that differ. Write-up and evidence:
+  `../../internal/fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
+  `BatchTest` is now `ok=3 failed=1` under JIT with zero unique-index
+  violations; the remaining failure is `testBatchInsertUpdate` (`N=5000`) on
+  this cluster's own 120s throughput margin — which that doc measures at 273s
+  solo on a quiet box against a 5.6s HotSpot control, i.e. ~2.6x worse than the
+  101-107s recorded for the same method on 2026-07-17. **That regression is
+  unattributed and still open**, and is the only part of `BatchTest` this
+  bullet still covers.
   `DynamicBatchFetchTest` still trips the same internal 120s `TimeoutException`
   as before, but its log now shows 8-9 `[moving-young] fallback` events during
   `testMultiLoad` where the 07-30/31 table above recorded **zero** `[GC]`

@@ -669,6 +669,14 @@ pub const INVENTORY: &[E] = &[
     // would work too but would mislabel the row as a default-ON knob, which is
     // the one thing this table is supposed to state unambiguously.
     E { group: Group::JIT, token: "ir-isel-shadow", on_key: Some("CRATONVM_JIT_IR_ISEL_SHADOW"), off_key: None, off_word: None },
+    // Increment 2 of the machine level. `ir-isel-emit` makes the selector's
+    // tiles the emitted bytes; `ir-isel-verify` builds the same machine list and
+    // checks it against the per-opcode arms byte for byte WITHOUT emitting it.
+    // Both default-OFF for the same reason as `ir-isel-shadow` above:
+    // `ir_lower::isel_emit_enabled` / `isel_verify_enabled` answer `false` for
+    // `Err(_)`, so unsetting the key is already the off state.
+    E { group: Group::JIT, token: "ir-isel-emit", on_key: Some("CRATONVM_JIT_IR_ISEL_EMIT"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "ir-isel-verify", on_key: Some("CRATONVM_JIT_IR_ISEL_VERIFY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "precise-field-ops", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_FIELD_OPS"), off_word: None },
     E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None },

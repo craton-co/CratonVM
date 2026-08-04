@@ -346,6 +346,21 @@ pub(crate) struct VecEmitRequest<'a> {
     pub host: HostVectorSupport,
     /// Whether vectorized emission is on.
     pub policy: VecEmitPolicy,
+    /// The XMM registers the caller guarantees are **dead across this whole
+    /// region**, in preference order.
+    ///
+    /// An argument rather than a constant, and that is the point. The obvious
+    /// six (`regalloc::xmm_roles::VECTOR_REGION_MAX`) are the only ones this
+    /// emitter can encode without a prologue save area — and they are also
+    /// `ir_lower`'s FP scratch pair and its entire linear-scan file. Which of
+    /// them is free is a fact about the surrounding method, so the surrounding
+    /// method is what has to state it.
+    ///
+    /// An empty slice is legal and refuses at the first allocation, which is
+    /// the right answer for a caller that has not done the analysis. Any
+    /// register `regalloc::xmm_roles::vector_pool_is_encodable` rejects refuses
+    /// the whole region.
+    pub vector_pool: &'a [u8],
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +510,15 @@ pub(crate) enum VecEmitRefusal {
     },
     /// The XMM pool ran out. This emitter does not spill.
     OutOfVectorRegisters,
+    /// The caller offered a register this emitter cannot use without a
+    /// prologue save area — XMM6..XMM15 are callee-saved on Windows. Refused
+    /// for the whole region rather than skipped, because a pool the caller
+    /// believes it handed over and this module quietly narrowed is a pool
+    /// nobody is reasoning about correctly.
+    UnusableVectorPool {
+        /// The offending register number.
+        reg: u8,
+    },
     /// An element address needs a displacement x86-64 cannot encode.
     DisplacementOutOfRange {
         /// The displacement asked for.
@@ -514,32 +538,48 @@ impl From<DispOutOfRange> for VecEmitRefusal {
 // The vector register pool
 // ---------------------------------------------------------------------------
 
-/// The XMM registers this emitter may use.
+/// The widest pool a caller may hand this emitter, and the set the tests drive
+/// it with.
 ///
 /// XMM0..XMM5 are caller-saved under both the SysV and the Windows x64 ABIs.
 /// XMM6..XMM15 are callee-saved on Windows, so touching them would owe a
 /// save/restore in the method prologue that this module does not emit — and
 /// getting that wrong corrupts a caller's floating-point state silently.
-pub(crate) const VEC_POOL: [u8; VEC_POOL_LEN] = [0, 1, 2, 3, 4, 5];
+///
+/// **Which of them is free is not this module's to assume.** These same six
+/// registers are `ir_lower`'s FP scratch pair and its entire linear-scan file
+/// (`regalloc::xmm_roles`), so a region that helps itself to all six destroys
+/// any scalar `double` living there. The set now arrives in
+/// [`VecEmitRequest::vector_pool`], from the party that knows what is live.
+pub(crate) const VEC_POOL: [u8; VEC_POOL_LEN] = crate::regalloc::xmm_roles::VECTOR_REGION_MAX;
 
-/// How many registers [`VEC_POOL`] holds.
+/// How many registers [`VEC_POOL`] holds, and the cap on any caller's pool.
 pub(crate) const VEC_POOL_LEN: usize = 6;
 
-/// Lowest-free-index allocation over [`VEC_POOL`], with no spilling.
-#[derive(Debug, Clone, Default)]
-struct VecRegPool {
+/// Lowest-free-index allocation over a **caller-supplied** register set, with
+/// no spilling.
+#[derive(Debug, Clone)]
+struct VecRegPool<'p> {
+    pool: &'p [u8],
     in_use: [bool; VEC_POOL_LEN],
     ever_used: [bool; VEC_POOL_LEN],
 }
 
-impl VecRegPool {
-    fn new() -> VecRegPool {
-        VecRegPool::default()
+impl<'p> VecRegPool<'p> {
+    /// An empty pool is a legal argument and a useful one: it refuses at the
+    /// first allocation, which is what a caller that has proved nothing about
+    /// its scalar FP values should get.
+    fn new(pool: &'p [u8]) -> VecRegPool<'p> {
+        VecRegPool {
+            pool,
+            in_use: [false; VEC_POOL_LEN],
+            ever_used: [false; VEC_POOL_LEN],
+        }
     }
 
     /// Take the lowest free register, or refuse.
     fn alloc(&mut self) -> Result<u8, VecEmitRefusal> {
-        for (slot, reg) in VEC_POOL.iter().enumerate() {
+        for (slot, reg) in self.pool.iter().enumerate().take(VEC_POOL_LEN) {
             match self.in_use.get(slot) {
                 Some(false) => {
                     if let Some(u) = self.in_use.get_mut(slot) {
@@ -559,7 +599,7 @@ impl VecRegPool {
     /// Return a register to the pool. Freeing a register that is not held is a
     /// no-op rather than a panic — this module never panics in production.
     fn free(&mut self, reg: u8) {
-        if let Some(slot) = VEC_POOL.iter().position(|r| *r == reg) {
+        if let Some(slot) = self.pool.iter().position(|r| *r == reg) {
             if let Some(u) = self.in_use.get_mut(slot) {
                 *u = false;
             }
@@ -568,9 +608,10 @@ impl VecRegPool {
 
     /// Every register the pool has handed out at least once.
     fn clobbered(&self) -> Vec<u8> {
-        VEC_POOL
+        self.pool
             .iter()
             .enumerate()
+            .take(VEC_POOL_LEN)
             .filter(|(slot, _)| matches!(self.ever_used.get(*slot), Some(true)))
             .map(|(_, reg)| *reg)
             .collect()
@@ -1100,6 +1141,15 @@ pub(crate) fn emit_vector_loop(req: &VecEmitRequest<'_>) -> Result<VecLoopCode, 
     if !req.host.has_avx2() {
         return Err(VecEmitRefusal::HostLacksAvx2);
     }
+    // The caller's pool, checked before anything is emitted. This module can
+    // only encode XMM0..XMM5 without a prologue save area, and a register
+    // outside that set would corrupt a caller's floating-point state on
+    // Windows and not on Linux — the worst shape a bug can have.
+    for &reg in req.vector_pool {
+        if !crate::regalloc::xmm_roles::vector_pool_is_encodable(reg) {
+            return Err(VecEmitRefusal::UnusableVectorPool { reg });
+        }
+    }
 
     let plan = req.plan;
     let shape = req.shape;
@@ -1180,7 +1230,7 @@ pub(crate) fn emit_vector_loop(req: &VecEmitRequest<'_>) -> Result<VecLoopCode, 
     let (load_enc, store_enc) = move_opcodes(plan.elem)?;
 
     let mut asm = Asm::new();
-    let mut pool = VecRegPool::new();
+    let mut pool = VecRegPool::new(req.vector_pool);
     let mut fallback_sites: Vec<usize> = Vec::new();
 
     // ---- guards, before any vector register is touched ---------------------
@@ -1354,7 +1404,7 @@ fn value_reg(regs: &[Option<u8>], v: VecValueId) -> Result<u8, VecEmitRefusal> {
 }
 
 fn release_if_dead(
-    pool: &mut VecRegPool,
+    pool: &mut VecRegPool<'_>,
     regs: &mut [Option<u8>],
     lives: &[ValueLife],
     v: VecValueId,
@@ -1545,6 +1595,7 @@ mod tests {
             guards,
             host: HostVectorSupport::for_test(true),
             policy: VecEmitPolicy::Enabled,
+            vector_pool: &VEC_POOL,
         }
     }
 
@@ -1590,6 +1641,7 @@ mod tests {
             guards: &[],
             host: HostVectorSupport::for_test(true),
             policy: VecEmitPolicy::Disabled,
+            vector_pool: &VEC_POOL,
         };
         assert_eq!(emit_vector_loop(&req), Err(VecEmitRefusal::Disabled));
     }
@@ -1604,6 +1656,7 @@ mod tests {
             guards: &[],
             host: HostVectorSupport::for_test(false),
             policy: VecEmitPolicy::Enabled,
+            vector_pool: &VEC_POOL,
         };
         assert_eq!(emit_vector_loop(&req), Err(VecEmitRefusal::HostLacksAvx2));
     }
@@ -2289,7 +2342,7 @@ mod tests {
 
     #[test]
     fn the_pool_allocates_lowest_first_and_refuses_rather_than_spills() {
-        let mut pool = VecRegPool::new();
+        let mut pool = VecRegPool::new(&VEC_POOL);
         let mut held = Vec::new();
         for _ in 0..VEC_POOL.len() {
             held.push(pool.alloc().expect("pool has room"));
@@ -2310,6 +2363,78 @@ mod tests {
         for reg in VEC_POOL {
             assert!(reg < 6, "xmm{reg} is callee-saved on Windows");
         }
+    }
+
+    /// The pool is the CALLER's to supply, and a pool this emitter cannot
+    /// encode refuses the whole region rather than being quietly narrowed.
+    ///
+    /// A narrowed pool is worse than a refusal: the caller goes on believing it
+    /// handed over eight registers, and the two parties disagree about which
+    /// ones are live.
+    ///
+    /// The exact edit that trips it: delete the `vector_pool_is_encodable` loop
+    /// at the top of `emit_vector_loop`.
+    #[test]
+    fn a_pool_naming_a_windows_callee_saved_register_refuses_the_region() {
+        let plan = plan_for(MemKind::Int, 8, Vec::new());
+        let shape = elementwise_shape();
+        let mut req = request(&plan, &shape, &[]);
+        let bad: [u8; 3] = [0, 1, 7];
+        req.vector_pool = &bad;
+        assert_eq!(
+            emit_vector_loop(&req),
+            Err(VecEmitRefusal::UnusableVectorPool { reg: 7 })
+        );
+    }
+
+    /// An EMPTY pool is legal, and refuses at the first allocation.
+    ///
+    /// This is the answer a caller that has proved nothing about its scalar FP
+    /// values must get. The alternative — falling back to the six registers
+    /// this module used to own privately — is exactly the silent clobber
+    /// `regalloc::xmm_roles` exists to make impossible: those six are
+    /// `ir_lower`'s FP scratch pair and its whole linear-scan file.
+    #[test]
+    fn an_empty_pool_refuses_instead_of_helping_itself_to_the_scalar_file() {
+        let plan = plan_for(MemKind::Int, 8, Vec::new());
+        let shape = elementwise_shape();
+        let mut req = request(&plan, &shape, &[]);
+        req.vector_pool = &[];
+        assert_eq!(
+            emit_vector_loop(&req),
+            Err(VecEmitRefusal::OutOfVectorRegisters)
+        );
+    }
+
+    /// The three XMM authorities, stated together.
+    ///
+    /// `ir_lower`'s scratch pair and its linear-scan file are disjoint — that
+    /// is why residency and the arithmetic arms coexist — and the vector pool
+    /// overlaps BOTH of them completely. That overlap is the hazard
+    /// `docs/jit/vectorization-emitter.md` calls the single highest-risk
+    /// prerequisite for wiring `emit_vector_loop`, and it cannot be removed
+    /// while `ir_lower::emit_prologue` saves no register: the only registers
+    /// that would make the pools disjoint are callee-saved on Windows.
+    ///
+    /// So the overlap is asserted, not wished away. When a prologue save area
+    /// lands and the pools are separated, this test fails and says so.
+    #[test]
+    fn the_three_xmm_authorities_are_stated_in_one_place() {
+        use crate::regalloc::xmm_roles::{IR_FP_SCRATCH, IR_LINEAR_SCAN, VECTOR_REGION_MAX};
+
+        for reg in IR_FP_SCRATCH {
+            assert!(
+                !IR_LINEAR_SCAN.contains(&reg),
+                "xmm{reg} is both `ir_lower` scratch and a linear-scan home"
+            );
+        }
+        for reg in IR_FP_SCRATCH.iter().chain(IR_LINEAR_SCAN.iter()) {
+            assert!(
+                VECTOR_REGION_MAX.contains(reg),
+                "xmm{reg} left the vector pool — if a prologue save area landed,                  update `regalloc::xmm_roles` and this test together"
+            );
+        }
+        assert_eq!(VEC_POOL.to_vec(), VECTOR_REGION_MAX.to_vec());
     }
 
     #[test]

@@ -790,6 +790,13 @@ pub(super) fn isolated_loader_class_not_found(
 /// the legacy global [`SharedVm::load_class_concurrent`]. The loader path can
 /// therefore only ever return a *more* correct answer, never a worse failure
 /// than the pre-gate behavior.
+///
+/// Contract §9 `requested_by`: the global fallbacks below go through
+/// [`SharedVm::load_class_concurrent_for`] with [`requesting_frame`], so a
+/// class fabricated to satisfy a constant-pool reference records *which method*
+/// referenced it. The loader-drive branches deliberately do not — a class
+/// resolved by running a user `loadClass` was produced by that loader, not
+/// fabricated, so there is no violation to attribute.
 pub(crate) fn resolve_class_loader_aware(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -1053,7 +1060,7 @@ pub(crate) fn resolve_class_loader_aware(
             }
             return Err(isolated_loader_class_not_found(shared, thread, name));
         }
-        let fallback = shared.load_class_concurrent(name);
+        let fallback = shared.load_class_concurrent_for(name, requesting_frame(thread));
         if dbg_trace {
             let owner = fallback
                 .as_ref()
@@ -1113,7 +1120,7 @@ pub(crate) fn resolve_class_loader_aware(
             return Ok(id);
         }
     }
-    match shared.load_class_concurrent(name) {
+    match shared.load_class_concurrent_for(name, requesting_frame(thread)) {
         Ok(id) => {
             if dbg_trace {
                 let cm = shared.classes.class_manager.read();
@@ -1143,7 +1150,7 @@ pub(crate) fn resolve_class_loader_aware(
                 if drive_defining_loader_load(shared, thread, referencing_class_id, component)
                     .is_some()
                 {
-                    if let Ok(id) = shared.load_class_concurrent(name) {
+                    if let Ok(id) = shared.load_class_concurrent_for(name, requesting_frame(thread)) {
                         return Ok(id);
                     }
                 }
@@ -1151,6 +1158,26 @@ pub(crate) fn resolve_class_loader_aware(
             Err(MethodCallFailed::from(e))
         }
     }
+}
+
+/// The `(owner, method, descriptor)` of the frame that is currently executing,
+/// for contract §9's `requested_by` attribution.
+///
+/// Three borrowed `&str`s, so a caller that resolves a class it never
+/// fabricates pays three pointer copies and no allocation; the requester is
+/// only formatted at the recording site, and only when a violation was actually
+/// produced. Call this at the load site rather than binding it early — the
+/// result borrows `thread`, and the resolution paths around it need `thread`
+/// mutably.
+///
+/// `None` on an empty frame stack, which is VM bootstrap: a fabrication there
+/// has no Java requester and the census says so rather than inventing one.
+#[inline]
+pub(crate) fn requesting_frame(thread: &JvmThread) -> Option<(&str, &str, &str)> {
+    thread
+        .frames
+        .last()
+        .map(|f| (f.class_name(), f.method_name(), f.method_descriptor()))
 }
 
 /// Resolve `name` by invoking the `loadClass` of the loader that DEFINED

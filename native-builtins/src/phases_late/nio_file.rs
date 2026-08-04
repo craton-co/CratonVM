@@ -7294,7 +7294,7 @@ pub(crate) fn p57_trim_path_trailing_separator(path: &str) -> String {
 /// directory-shaped path — `Files.writeString(root.resolve("one/two/three/"), ...)`
 /// failed with `EISDIR` ("Is a directory", errno 21) instead of creating the
 /// file (Windows reported the same defect as `ERROR_DIRECTORY`/267). See
-/// `docs/internal/fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization.md`.
+/// `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
 ///
 /// Virtual (jar/jrt) filesystem paths are excluded, exactly as in the Windows
 /// twin: their sentinel-encoded string carries an entry whose trailing `/` is
@@ -7715,7 +7715,7 @@ pub(crate) mod p57_posix_path_tests {
     //! POSIX (`sun.nio.fs.UnixPath`) construction / root / parent semantics.
     //! Pure-function tests (no VM); every expectation was cross-checked against
     //! the host JDK on Linux (`PathMatrix` repro) — see
-    //! `docs/internal/fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization.md`.
+    //! `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
     //! The Windows twin lives in `p57_win_path_tests`.
     use super::{
         jarfs_encode, p57_alloc_path, p57_parse_root, p57_posix_parent_of, p57_read_path,
@@ -15492,7 +15492,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
     // instead of going through `p57_alloc_path`, so they skipped the
     // normalize-at-construction step that `sun.nio.fs.UnixPath`/`WindowsPath`
     // perform — which is exactly the trailing-separator defect
-    // `docs/internal/fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization.md`
+    // `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`
     // was filed for, re-introduced one phase later. `getFileName` used
     // `jarfs_decode` (missing jrt) and dropped the root/null contract;
     // `getNameCount` and `getParent` had already been hand-synced to their
