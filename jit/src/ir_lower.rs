@@ -327,6 +327,17 @@ struct Lowerer<'a> {
     /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
     /// nodes use the same shared runtime-lowering stub as the baseline tier.
     new_object: usize,
+    /// cov-06 — `jit_newarray(vm, atype, length) -> array | 0`. The lowering
+    /// for a PRIMITIVE `Op::NewArray` (`element_type != 0`); zero-fill, GC
+    /// retry and the zero-on-failure convention (negative length OR OOM) are
+    /// the same as `new_object`'s, and this is the identical helper the
+    /// single-pass backend's 0xbc arm calls.
+    newarray: usize,
+    /// cov-06 — `jit_anewarray_object(vm, component_class_id, length) -> array
+    /// | 0`. The lowering for a REFERENCE `Op::NewArray` (`element_type ==
+    /// 0`) — same zero-on-failure convention, same helper the single-pass
+    /// backend's 0xbd arm calls.
+    anewarray_object: usize,
     monitor_enter: usize,
     monitor_exit: usize,
     /// cov-01. `jit_ldc_string(vm, bytes, len) -> ObjectRef` — the interning
@@ -768,6 +779,8 @@ impl<'a> Lowerer<'a> {
             putfield_float: helpers.putfield_float,
             putfield_double: helpers.putfield_double,
             new_object: helpers.new_object,
+            newarray: helpers.newarray,
+            anewarray_object: helpers.anewarray_object,
             monitor_enter: helpers.monitor_enter,
             monitor_exit: helpers.monitor_exit,
             ldc_string: helpers.ldc_string,
@@ -3417,6 +3430,78 @@ fn reloc_emit_enabled() -> bool {
                 Self::patch_or_bail(&mut self.buf, allocated_patch, rel);
                 self.store_rax(slot);
             }
+            // cov-06: array allocation. Inputs `[ctrl, mem, length]` — the
+            // shared allocation stub differs from `Op::New`'s only in that
+            // the third argument is a RUNTIME slot (the length) rather than
+            // an immediate, and the target/immediate pair is chosen by
+            // shape: `element_type != 0` is a `newarray` (the atype IS the
+            // immediate, `helpers.newarray`); `element_type == 0` is an
+            // `anewarray` of an already-loaded class (`component_class_id`
+            // is the immediate, `helpers.anewarray_object`). Same
+            // zero-on-failure convention as `Op::New` — `jit_newarray` /
+            // `jit_anewarray_object` return `0` after publishing a pending
+            // exception (OOM OR a negative length, both routed through the
+            // interpreter's `NegativeArraySizeException`/`OutOfMemoryError`
+            // machinery), converted to the JIT-wide `i64::MIN` sentinel
+            // exactly like `Op::New`'s failure path.
+            //
+            // `jit_newarray`/`jit_anewarray_object` can trigger a real
+            // collection (TLAB exhaustion), so — unlike `Op::New`'s arm,
+            // which has no operand of its own to protect — this allocation
+            // needs a fresh safepoint map published BEFORE it, exactly as
+            // `Op::MonitorEnter`/`Op::Call` do: without one, `sp_id_slot_off`
+            // keeps naming whichever EARLIER safepoint last wrote it (or none
+            // at all), so a collection during THIS call matches a map
+            // describing a different program point and relocates against it
+            // — `emit_safepoint_map`'s own doc names this exact hazard.
+            // Reached in practice: a hot method that `newarray`s in a tight
+            // loop and returns the array to an interpreter caller corrupted
+            // the returned reference under GC pressure before this map was
+            // added (`vm/tests/jit_cov06_array_allocation.rs`, `gcRootsOK`/
+            // the plain allocate-loop warm-up both reproduced it).
+            //
+            // Published BEFORE `alloc_slot(id)` too — `alloc_slot` marks this
+            // node's OWN result slot `defined_nodes[id] = true` immediately,
+            // and the result is not written until the call returns, so a map
+            // taken after `alloc_slot` would hand the collector an
+            // uninitialised word to treat as a live reference (the same
+            // ordering `emit_safepoint_map`'s doc requires).
+            Op::NewArray {
+                element_type,
+                component_class_id,
+            } => {
+                let sp_live_hi = self.spill_high_water;
+                self.emit_safepoint_map(sp_live_hi);
+                let slot = self.alloc_slot(id);
+                let length_slot = self.slot_of(node.inputs[2]);
+                let (target, immediate) = if *element_type != 0 {
+                    (self.newarray, u32::from(*element_type))
+                } else {
+                    (self.anewarray_object, *component_class_id)
+                };
+                crate::runtime_lowering::emit_new_array_stub(
+                    &mut self.buf,
+                    self.context_slot_off,
+                    target,
+                    immediate,
+                    length_slot,
+                    self.frame_record,
+                );
+
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+                self.buf.emit(&[0x0F, 0x85]); // JNZ allocated
+                let allocated_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+                self.buf.emit_byte(0xE9); // JMP shared exception epilogue
+                let exception_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.call_exc_patches.push(exception_patch);
+                let allocated = self.buf.pos();
+                let rel = allocated as i32 - (allocated_patch as i32 + 4);
+                Self::patch_or_bail(&mut self.buf, allocated_patch, rel);
+                self.store_rax(slot);
+            }
             Op::Neg => {
                 let slot = self.alloc_slot(id);
                 self.load_to_rax(self.slot_of(node.inputs[0]));
@@ -5748,6 +5833,11 @@ fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
         if matches!(n.op, Op::New { .. }) {
             needs_context = true;
         }
+        // cov-06: `emit_new_array_stub` loads the VM context into ARG0, same
+        // as `Op::New`'s `emit_new_object_stub`.
+        if matches!(n.op, Op::NewArray { .. }) {
+            needs_context = true;
+        }
         // cov-01: all three take the VM context pointer as their helper's arg0.
         // `Op::LoadStatic` needs it even on the direct route it usually takes,
         // because the route is chosen per SITE at compile time and a single
@@ -5983,6 +6073,7 @@ fn op_defines_result_slot(op: &Op) -> bool {
             | Op::ArrayStore(_)
             | Op::ArrayLength
             | Op::New { .. }
+            | Op::NewArray { .. }
             | Op::Call { .. }
             // cov-01: each defines a result slot — a `Ref` for the two `ldc`
             // constants, the field's value for `getstatic`.
@@ -7746,6 +7837,22 @@ pub(crate) fn lower_inner_with_scopes(
     {
         return None;
     }
+    // cov-06. Same reasoning, split per `Op::NewArray` shape: a PRIMITIVE
+    // array (`element_type != 0`) needs `helpers.newarray` wired; a
+    // REFERENCE array (`element_type == 0`) needs `helpers.anewarray_object`.
+    // Only a synthetic unit-test table leaves either at 0.
+    if graph.nodes.iter().any(|node| {
+        matches!(node.op, Op::NewArray { element_type, .. } if element_type != 0)
+    }) && helpers.newarray == 0
+    {
+        return None;
+    }
+    if graph.nodes.iter().any(|node| {
+        matches!(node.op, Op::NewArray { element_type, .. } if element_type == 0)
+    }) && helpers.anewarray_object == 0
+    {
+        return None;
+    }
     // cov-01. The same reasoning as the two guards above, for the three
     // constant-pool nodes: each lowers to a `CALL` through a helper address,
     // and a zero there is a call to address 0. Only a synthetic unit-test table
@@ -8527,6 +8634,188 @@ mod tests {
         assert_eq!(
             unsafe { compiled.try_call_with_context(1, &[]) },
             Ok(i64::MIN)
+        );
+    }
+
+    /// cov-06: a PRIMITIVE `Op::NewArray` (`element_type != 0`) lowers
+    /// through `emit_new_array_stub` to a call on `helpers.newarray`, with
+    /// the runtime length forwarded as the third ABI argument (not baked as
+    /// an immediate, unlike `Op::New`'s field count) — the same
+    /// `(vm, atype, length)` shape `jit_newarray` and the single-pass
+    /// backend's 0xbc arm share.
+    #[test]
+    fn live_newarray_uses_shared_allocation_stub_and_context_abi() {
+        extern "C" fn allocate(vm: i64, atype: i64, length: i64) -> i64 {
+            vm + atype * 100 + length
+        }
+
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let length = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let allocation = graph.add(
+            Op::NewArray {
+                element_type: 10, // T_INT
+                component_class_id: 0,
+            },
+            IrType::Ref,
+            vec![ctrl, mem, length],
+            Some(0),
+        );
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, allocation], Some(3));
+
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.newarray = allocate as *const () as usize;
+        let compiled =
+            lower(&graph, &schedule, 1, 1, &helpers).expect("live array allocation must lower");
+        assert!(compiled.needs_context);
+        // SAFETY: the synthetic helper treats the context/length as integers
+        // and the generated method takes one int argument (the length).
+        let result = unsafe {
+            compiled
+                .try_call_with_context(11, &[7])
+                .expect("allocation call")
+        };
+        assert_eq!(result, 11 + 10 * 100 + 7);
+    }
+
+    /// cov-06: a REFERENCE `Op::NewArray` (`element_type == 0`) lowers
+    /// through the SAME stub but calls `helpers.anewarray_object` with the
+    /// component class id as the immediate — the two helpers are chosen
+    /// per-node, not per-graph, so a method could in principle mix both
+    /// shapes (this test only needs one to prove the routing).
+    #[test]
+    fn live_anewarray_calls_the_reference_array_helper() {
+        extern "C" fn allocate(vm: i64, component_class_id: i64, length: i64) -> i64 {
+            vm + component_class_id * 1000 + length
+        }
+
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let length = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let allocation = graph.add(
+            Op::NewArray {
+                element_type: 0,
+                component_class_id: 42,
+            },
+            IrType::Ref,
+            vec![ctrl, mem, length],
+            Some(0),
+        );
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, allocation], Some(3));
+
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.anewarray_object = allocate as *const () as usize;
+        let compiled =
+            lower(&graph, &schedule, 1, 1, &helpers).expect("live array allocation must lower");
+        // SAFETY: the synthetic helper treats the context/length as integers.
+        let result = unsafe {
+            compiled
+                .try_call_with_context(11, &[5])
+                .expect("allocation call")
+        };
+        assert_eq!(result, 11 + 42 * 1000 + 5);
+    }
+
+    /// cov-06: `jit_newarray`/`jit_anewarray_object` return `0` for BOTH a
+    /// negative length (JLS `NegativeArraySizeException`) and OOM — the same
+    /// zero-on-failure convention `jit_new_object` uses. `Op::NewArray`'s
+    /// lowering must convert that to the JIT-wide `i64::MIN` sentinel exactly
+    /// like `Op::New`'s failure path, or a negative-length `anewarray` would
+    /// hand the caller a null pointer instead of routing through the pending
+    /// exception.
+    #[test]
+    fn live_newarray_converts_null_failure_to_jit_exception_sentinel() {
+        extern "C" fn fail(_: i64, _: i64, _: i64) -> i64 {
+            0
+        }
+
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let length = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let allocation = graph.add(
+            Op::NewArray {
+                element_type: 10,
+                component_class_id: 0,
+            },
+            IrType::Ref,
+            vec![ctrl, mem, length],
+            Some(0),
+        );
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, allocation], Some(3));
+
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.newarray = fail as *const () as usize;
+        let compiled = lower(&graph, &schedule, 1, 1, &helpers).expect("live allocation");
+        // SAFETY: helper ignores the synthetic context/length.
+        assert_eq!(
+            unsafe { compiled.try_call_with_context(1, &[-1]) },
+            Ok(i64::MIN)
+        );
+    }
+
+    /// cov-06: the same "refuse rather than call through address zero"
+    /// contract `Op::New`/`Op::MonitorEnter` already have. A graph containing
+    /// a live `Op::NewArray` with NO helper wired for its shape must be
+    /// REFUSED, never silently miscompiled into a call to `0`.
+    #[test]
+    fn a_newarray_graph_with_no_helper_is_refused() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let length = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let allocation = graph.add(
+            Op::NewArray {
+                element_type: 10,
+                component_class_id: 0,
+            },
+            IrType::Ref,
+            vec![ctrl, mem, length],
+            Some(0),
+        );
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, allocation], Some(3));
+        let schedule = ir_schedule::schedule(&graph);
+        assert!(
+            lower(&graph, &schedule, 1, 1, &no_helpers()).is_none(),
+            "a newarray graph with no `helpers.newarray` must be REFUSED, not \
+             lowered to a call through address zero"
         );
     }
 
@@ -12206,14 +12495,17 @@ mod tests {
         Unlowerable,
     }
 
-    /// The five variants with no lowering arm — the explicit list the catch-all
+    /// The variants with no lowering arm — the explicit list the catch-all
     /// used to leave implicit.
     ///
     /// Each is unreachable from a real compile today (see the catch-all's own
     /// comment for the evidence per op). This is a statement about the tree,
     /// not a permission: a variant added here is a variant the optimizing tier
     /// silently declines to compile, and the edit should be visible in review.
-    const UNLOWERABLE: [&str; 4] = ["I2B", "I2C", "I2S", "NewArray"];
+    ///
+    /// `NewArray` left this list in cov-06: it now has a real arm below (the
+    /// shared `emit_new_array_stub`, mirroring `Op::New`).
+    const UNLOWERABLE: [&str; 3] = ["I2B", "I2C", "I2S"];
 
     /// **Exhaustive on purpose — do not add a wildcard arm.**
     ///
@@ -12264,6 +12556,7 @@ mod tests {
             | Op::ArrayStore(_)
             | Op::ArrayLength
             | Op::New { .. }
+            | Op::NewArray { .. }
             | Op::Call { .. }
             | Op::ConstString { .. }
             | Op::ConstClass { .. }
@@ -12274,7 +12567,7 @@ mod tests {
             // Effects with an arm but no result slot.
             Op::Store(_) | Op::MonitorEnter | Op::MonitorExit | Op::Guard { .. } => LoweredEffect,
             // No arm. Keep in step with `UNLOWERABLE`; the tests check it.
-            Op::I2B | Op::I2C | Op::I2S | Op::NewArray { .. } => Unlowerable,
+            Op::I2B | Op::I2C | Op::I2S => Unlowerable,
         }
     }
 
@@ -12344,7 +12637,13 @@ mod tests {
                     num_fields: 0,
                 },
             ),
-            ("NewArray", Op::NewArray { element_type: 10 }),
+            (
+                "NewArray",
+                Op::NewArray {
+                    element_type: 10,
+                    component_class_id: 0,
+                },
+            ),
             ("Call", Op::Call { info_ptr: 0 }),
             ("ConstString", Op::ConstString { bytes: 0, len: 0 }),
             (
@@ -12595,11 +12894,22 @@ mod tests {
     /// reads its value. `ir::Op::MonitorEnter` was exactly that shape and this
     /// is the general form of the guard it got.
     ///
-    /// `Op::NewArray` is used because it is on `UNLOWERABLE` and produces a
-    /// value; the graph is hand-built so no optimizer pass can DCE it away
-    /// before the lowerer sees it. (It was `Op::ArrayLength` until COV-02 gave
-    /// that op a lowering arm — the witness has to be an op with NO arm, which
-    /// is exactly what the precondition assertion below enforces.)
+    /// `Op::I2B` is used because it is on `UNLOWERABLE` and produces a value;
+    /// the graph is hand-built so no optimizer pass can DCE it away before
+    /// the lowerer sees it. (It was `Op::ArrayLength` until COV-02 gave that
+    /// op a lowering arm, then `Op::NewArray` until cov-06 gave THAT op one —
+    /// the witness has to be an op with NO arm, which is exactly what the
+    /// precondition assertion below enforces. `I2B`/`I2C`/`I2S` stay on
+    /// `UNLOWERABLE` permanently: the builder decomposes 0x91/0x92/0x93 into
+    /// `Shl`/`Shr`/`And` instead of ever constructing one, so there is no
+    /// real arm to add.)
+    ///
+    /// Unlike `NewArray` (control-anchored: `[ctrl, mem, length]`), `I2B`
+    /// takes a single VALUE input and no control edge — but the scheduler
+    /// places every live non-control node into a block regardless of its
+    /// input shape or use count (`ir_schedule`'s block-placement loop
+    /// iterates `graph.nodes` unconditionally), so an unread `I2B` is
+    /// scheduled exactly as reliably as an unread `NewArray` was.
     ///
     /// **Anti-vacuity, executed rather than argued (2026-08-03).** A test that
     /// asserts `is_none()` passes for any refusal, including one that has
@@ -12620,23 +12930,17 @@ mod tests {
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
-        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
-        let len_arg = graph.add(Op::Param(0), IrType::Int, vec![start], None);
+        let int_arg = graph.add(Op::Param(0), IrType::Int, vec![start], None);
         // Scheduled, lowered, and read by nobody — the monitor's shape.
-        let _len = graph.add(
-            Op::NewArray { element_type: 10 },
-            IrType::Ref,
-            vec![ctrl, mem, len_arg],
-            None,
-        );
+        let _narrowed = graph.add(Op::I2B, IrType::Int, vec![int_arg], None);
         let zero = graph.add(Op::Const(0), IrType::Int, vec![], None);
         let ret = graph.add(Op::Return, IrType::Void, vec![ctrl, zero], None);
         graph.exit = ret;
 
         assert_eq!(
-            declared_lowering(&Op::NewArray { element_type: 10 }),
+            declared_lowering(&Op::I2B),
             OpLowering::Unlowerable,
-            "precondition: this test is only meaningful while `NewArray` has \
+            "precondition: this test is only meaningful while `I2B` has \
              no arm — if one was added, pick another `UNLOWERABLE` op"
         );
 
@@ -12645,7 +12949,7 @@ mod tests {
             schedule
                 .blocks
                 .iter()
-                .any(|b| b.nodes.contains(&_len)),
+                .any(|b| b.nodes.contains(&_narrowed)),
             "precondition: the unlowerable node must actually be scheduled, or \
              this test passes without exercising the catch-all"
         );
