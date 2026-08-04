@@ -217,19 +217,30 @@ early re-narrows the window it exists to widen.
 
 **The strengthening: "cannot", not "will be caught".** The brief asks for the
 two paths to be unable to *drift again*, and a counter asserted zero by a test
-is only the second of those. So `x64::compile_with_param_slots` (and the legacy
-`compile` wrapper) **take `&CompileAdmission`**, and the only way to obtain one
-is `compile_gate::admit`. A fourth door written without the gate does not
-compile.
+is only the second of those. So `x64::compile_with_param_slots` — the entry
+point all three doors use — **takes `&CompileAdmission`**, and the only way to
+obtain one is `compile_gate::admit`. A fourth door written without the gate does
+not compile.
 
-That leaves one hole, deliberately: the `jit` crate's own tests drive the
-backend with hand-built bytecode and no method identity to admit, and an
-integration test under `jit/tests/` is a separate crate, so `#[cfg(test)]`
-cannot serve them. `CompileAdmission::for_backend_test()` is the way in, and it
-is built not to hide anything — it does **not** open the thread scope, so an
-entry made under it is still counted by `ungated_backend_entries()`, which the
-VM asserts is zero over a real run. **The type system stops the accident; the
-counter stops the deliberate misuse; the name makes the latter greppable.**
+Two deliberate holes, both left visible rather than closed:
+
+* the `jit` crate's own tests drive the backend with hand-built bytecode and no
+  method identity to admit, and an integration test under `jit/tests/` is a
+  separate crate, so `#[cfg(test)]` cannot serve them.
+  `CompileAdmission::for_backend_test()` is their way in;
+* the legacy `x64::compile` wrapper keeps its signature and mints that token
+  itself. Its "arg index == JVM slot" assumption is wrong for any method with a
+  `long`/`double` parameter, so no production path can use it — gating it would
+  have meant editing **~140 unit-test call sites to protect a function
+  production cannot reach**. (That count is the finding: the first attempt did
+  add the parameter there, and 140 compile errors is what said the gate was in
+  the wrong place.)
+
+Neither hole hides anything: `for_backend_test` does **not** open the thread
+scope, so an entry made under it is still counted by
+`ungated_backend_entries()`, which the VM asserts is zero over a real run.
+**The type system stops the accident; the counter stops the deliberate misuse;
+the name makes the latter greppable.**
 
 Both layers are behaviour-named rather than source-scanning, because five checks
 in this repository named a *file* where they meant a module and died when that

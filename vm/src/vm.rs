@@ -74413,8 +74413,6 @@ public class SkippedTest {
 
         let helpers = crate::jit::helpers::build_helpers();
         let compiled = cratonvm_jit::x64::compile(
-            // Not a door: a hand-built lookupswitch with no method identity.
-            &cratonvm_jit::compile_gate::CompileAdmission::for_backend_test(),
             &code,
             code_len,
             1,
@@ -74497,8 +74495,6 @@ public class SkippedTest {
 
         let helpers = crate::jit::helpers::build_helpers();
         let compiled = cratonvm_jit::x64::compile(
-            // Not a door: a hand-built lookupswitch with no method identity.
-            &cratonvm_jit::compile_gate::CompileAdmission::for_backend_test(),
             &code,
             code_len,
             1,

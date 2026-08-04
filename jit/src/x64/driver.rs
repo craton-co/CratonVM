@@ -80,10 +80,6 @@ pub(crate) fn set_pending_exception_ranges(ranges: Vec<(usize, usize, usize)>) {
 /// Returns `Some(CompiledMethod)` on success, `None` if compilation fails.
 #[allow(clippy::too_many_arguments)]
 pub fn compile(
-    // Proof the caller passed the admission gate — see
-    // [`compile_with_param_slots`]'s first parameter. Test call sites use
-    // `CompileAdmission::for_backend_test()`.
-    admission: &crate::compile_gate::CompileAdmission,
     code: &[u8],
     code_len: usize,
     num_params: usize,
@@ -108,8 +104,22 @@ pub fn compile(
     inline_sites: HashMap<usize, crate::InlineSite>,
     string_layout: Option<crate::StringFieldLayout>,
 ) -> Option<CompiledMethod> {
+    // This wrapper does NOT take an admission token, and that is deliberate.
+    //
+    // It is the legacy test entry point — its "arg index == JVM slot"
+    // assumption is wrong for any method with a `long`/`double` parameter, so
+    // no production path can use it, and none does (the only callers outside
+    // this crate are two `#[cfg(test)]` fixtures in `vm/src/vm.rs`). Threading
+    // a token through it would have meant editing ~140 unit-test call sites to
+    // gate a function production cannot use.
+    //
+    // The escape it leaves is still visible: `for_backend_test` does not open
+    // the thread scope, so anything reaching the backend this way is counted by
+    // `compile_gate::ungated_backend_entries()`, which the VM asserts is zero
+    // over a real run. `compile_with_param_slots` — the entry point the three
+    // real doors use — is the one that requires the token.
     compile_with_param_slots(
-        admission,
+        &crate::compile_gate::CompileAdmission::for_backend_test(),
         code,
         code_len,
         num_params,

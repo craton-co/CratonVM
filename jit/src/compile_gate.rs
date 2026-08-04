@@ -69,11 +69,18 @@
 //!
 //! **The counter catches the deliberate bypass.** The `jit` crate's own tests
 //! drive the backend with hand-built bytecode and no method identity, so they
-//! need a way in: [`CompileAdmission::for_backend_test`]. That is a genuine
-//! hole, so it is built not to hide anything — it does not open the thread
-//! scope, so a backend entry made under it is still counted by
-//! [`ungated_backend_entries`], which the VM asserts is zero over a real run.
-//! Its name is what makes a production use greppable.
+//! need a way in: [`CompileAdmission::for_backend_test`], which the legacy
+//! `x64::compile` wrapper also uses on their behalf. That is a genuine hole, so
+//! it is built not to hide anything — it does not open the thread scope, so a
+//! backend entry made under it is still counted by [`ungated_backend_entries`],
+//! which the VM asserts is zero over a real run. Its name is what makes a
+//! production use greppable.
+//!
+//! Only `compile_with_param_slots` takes the token, not the `compile` wrapper
+//! above it: that wrapper's "arg index == JVM slot" assumption is wrong for any
+//! method with a `long`/`double` parameter, so no production path can use it,
+//! and gating it would have meant editing ~140 unit-test call sites to protect
+//! a function production cannot reach.
 //!
 //! Both layers are behaviour-named rather than source-scanning: a check that
 //! grepped for `compile_with_param_slots(` would have died the day `x64.rs`
