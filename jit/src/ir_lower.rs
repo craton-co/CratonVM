@@ -9709,6 +9709,30 @@ pub(crate) fn lower_inner_with_scopes(
     cm.sp_id_slot_off = sp_id_slot_off;
     cm.oop_maps = oop_maps;
     cm.osr_frame_size = frame_size;
+    // OSR and the save area, stated where the artifact is published.
+    //
+    // `osr_trampoline` builds the frame ITSELF — push rbp, sub
+    // `osr_frame_size`, spill the callee-saved sets at `osr_callee_saved_base`
+    // / `osr_xmm_saved_base` — and jumps to a native offset PAST
+    // `emit_prologue`. An OSR entry into a method with a save area would
+    // therefore never perform the save, while every exit would still perform
+    // the restore: the caller gets two words of uninitialised frame back as
+    // its XMM6/XMM7. A wrong `double` in a caller's register, on Windows only,
+    // with nothing downstream that inspects it.
+    //
+    // It cannot happen today — this backend publishes no `osr_pc_to_native`,
+    // so `osr_enter` refuses at its first `?` (`OSR_REFUSE_NO_ENTRY_TABLE`).
+    // Asserted rather than commented because the edit that breaks it is "wire
+    // OSR into the IR tier", which will not look like it touches the prologue.
+    // The fix then is to publish `osr_callee_saved_xmms` and
+    // `osr_xmm_saved_base` here so the trampoline saves what the epilogue
+    // restores — not to delete this assertion.
+    debug_assert!(
+        saved_xmm_bytes == 0 || cm.osr_pc_to_native.is_none(),
+        "this frame saves {saved_xmm_bytes} bytes of callee-saved XMM in its \
+         prologue but publishes an OSR entry table; the trampoline enters past \
+         the prologue and every exit would restore what was never saved",
+    );
     // Where the reader finds what the emission side published. Without these
     // three, `shadow_window_from_frame` cannot even locate the shadow stack —
     // it returns `None`, `published_shadow_values` yields the empty set, and
@@ -15035,6 +15059,26 @@ mod tests {
                 "xmm{reg} is saved at {off}, outside [{lo_off}, {hi_off}]",
             );
         }
+    }
+
+    /// A method with a save area publishes no OSR entry table.
+    ///
+    /// The trampoline enters *past* `emit_prologue` and builds the frame
+    /// itself, so an OSR-entered method would restore XMM6/XMM7 from words the
+    /// save never wrote. The `debug_assert!` at the publication site states the
+    /// invariant; this is the behavioural half, on a method compiled with the
+    /// linear-scan path on — because a `debug_assert` in a release build is a
+    /// comment, and this is the one place the two paths could be wired together
+    /// by someone who never reads either.
+    #[test]
+    fn an_ir_artifact_never_offers_an_osr_entry_the_save_area_would_break() {
+        let _flag = LsForce::on();
+        let cm = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
+        assert!(
+            cm.osr_pc_to_native.is_none(),
+            "the IR tier published an OSR entry table; `osr_callee_saved_xmms` \
+             and `osr_xmm_saved_base` must be published with it",
+        );
     }
 
     /// With the linear-scan path off — the default, and every production
