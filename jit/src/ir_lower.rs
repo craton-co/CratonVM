@@ -13281,7 +13281,8 @@ mod tests {
             .map(|b| {
                 let sel = select_block(&graph, &b.nodes, b.terminator, &opts);
                 format!(
-                    "notes={:?} ops={:?} tiles={:?}",
+                    "all={:?} notes={:?} ops={:?} tiles={:?}",
+                    graph.nodes.iter().enumerate().map(|(i, n)| (i, format!("{:?}", n.op), n.inputs.clone())).collect::<Vec<_>>(),
                     sel.notes,
                     b.nodes.iter().map(|n| (n, &graph.nodes[*n as usize].op, graph.nodes[*n as usize].ty)).collect::<Vec<_>>(),
                     sel.tiles
