@@ -132,6 +132,19 @@ unrelated to any defect — precisely how the earlier version of the loop
 rewriter's OSR test "passed for the wrong reason and then failed for the wrong
 reason" (`docs/jit/loop-rewriter-wiring.md`).
 
+**"Every set bit in the published dead mask names a local the frame has."**
+Checked and rejected 2026-08-04, because it is the closest thing to the brief's
+"the three vectors are index-compatible" that spans into local-index space, and
+a future reader will reach for it. It does **not** hold: `osr_local_assignments`
+is the allocator's own vector and is legitimately *longer* than `num_locals` —
+a category-2 high half pushes it past, which `osr_contract`'s
+`assignment_vectors_must_cover_every_seeded_local` already asserts is fine — so
+`resident`, and therefore the mask, can carry bits above `num_locals`. Those
+bits are inert (both `validate_osr_entry` and `osr_trampoline` iterate
+`0..num_locals` and never read them), so asserting it would drop OSR metadata on
+correct methods and buy nothing. Same trap as the paragraph above, one space
+over.
+
 ### Failing closed
 
 On a violation the publication site publishes **no** OSR metadata at all rather

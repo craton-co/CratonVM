@@ -27,7 +27,12 @@
 >    the same space — `osr_local_assignments` is indexed by *local index*, not
 >    by any pc. Length-compatibility is checked for the two that are bci-indexed
 >    and coverage for the third; the design doc's coordinate table is the
->    correction.
+>    correction. The one cross-space statement that *would* connect them —
+>    "every set bit in the dead mask names a local the frame has" — was checked
+>    and rejected: the assignment vector is legitimately longer than
+>    `num_locals` (a category-2 high half pushes it past), so the mask can carry
+>    inert high bits and asserting it would refuse correct methods. Reasoning in
+>    the design doc's "What is deliberately NOT checked".
 > 2. **"…and on which entries are refused."** The `-1` sentinel is enforced at
 >    publication (item 2), but there is deliberately no cross-vector
 >    *refused-set* assertion: the dead mask is filled from basic-block starts
