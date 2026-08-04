@@ -1,16 +1,18 @@
-# Embedded KRaft `KafkaAutoConfigurationIntegrationTests` — two `ClassCastException`s, both fixed
+# Embedded KRaft `KafkaAutoConfigurationIntegrationTests` — two `ClassCastException`s, and the invented node class behind one of them
 
-**Status: FIXED 2026-08-04.** Filed 2026-08-04 as a `ClassCastException:
-String cannot be cast to Number` inside `KafkaConfig.listeners`, root cause
-unknown. Triage found two independent defects, both now closed:
+**Status: FIXED 2026-08-04, residual closed 2026-08-04.** Filed 2026-08-04 as
+a `ClassCastException: String cannot be cast to Number` inside
+`KafkaConfig.listeners`, root cause unknown. Triage found two independent
+defects; closing them left one residual, which is now closed too:
 
 | # | Defect | Symptom in this test | Fix |
 |---|---|---|---|
 | 1 | `Map.remove(k,v)` / `replace(k,v)` / `replace(k,old,new)` were the only observable `Map` operations with no registered native | `ClassCastException: java.util.LinkedHashMap$Node cannot be cast to java.util.LinkedHashMap$Entry` → `IllegalStateException: Failed to shut down embedded Kafka cluster` (`containersFailed=1`) | `7696328fc` |
 | 2 | `checkcast`/`instanceof` target class names were owned by the `CompiledMethod`, while the JIT type-check memos key on their raw address | the originally reported `String cannot be cast to Number` | `69e7124bc` |
+| 3 | `java/util/LinkedHashMap$Node` is not a JDK class — the real nested node type is `java/util/LinkedHashMap$Entry`. Filed here as a residual "not reachable today"; it was reachable | the right-hand side of defect 1's cast message, and a `removeEldestEntry` override receiving an immutable copy instead of the live entry | `6ca262993` |
 
-Both are general VM defects that happen to be reachable through this test;
-neither is Kafka-specific.
+All three are general VM defects that happen to be reachable through this
+test; none is Kafka-specific.
 
 ---
 
@@ -226,27 +228,138 @@ integration tests except `gc_relocation_harness`, which does not compile on
 
 ---
 
-## Known residual risk (not reachable today)
+## Defect 3 — the node class itself was invented (residual, closed 2026-08-04)
 
-`lhm_alloc_node` binds LinkedHashMap nodes to
-`java/util/LinkedHashMap$Node`, a class the real JDK does not have — its real
-nested node type is `java/util/LinkedHashMap$Entry`. The field layout is
-already the real one (`hash@0, key@1, value@2, next@3, before@4, after@5`),
-so only the class *identity* differs.
+Filed here as "known residual risk (not reachable today)". It was reachable.
+Fixed by `6ca262993`.
 
-That mismatch is what turned defect 1 from silent state divergence into a
-loud `ClassCastException`, and it will do so again for any future real-JDK
-bytecode path that reaches a LinkedHashMap node. After this fix the known
-entry points are all intercepted (`put`/`get`/`remove`/`putAll`/`compute*`/
-`merge`/`putIfAbsent`/`getOrDefault`/`forEach`/`replaceAll`/`writeObject`/
-`readObject`/the three added here, plus natively-snapshotted views), so there
-is no live reproducer.
+`lhm_alloc_node` bound LinkedHashMap nodes to `java/util/LinkedHashMap$Node`,
+a class the real JDK does not have — its nested node type is
+`java/util/LinkedHashMap$Entry`:
 
-Switching the allocation to the real `java/util/LinkedHashMap$Entry` is the
-honest model and would degrade any future gap from a hard cast failure to
-(probably) correct field access. It changes the runtime class of every
-LinkedHashMap node in the process, so it wants its own validated pass across
-the collection suites rather than riding along here.
+```
+$ javap -p --module java.base 'java.util.LinkedHashMap$Entry'      # JDK 25.0.3+9
+class java.util.LinkedHashMap$Entry<K, V> extends java.util.HashMap$Node<K, V> {
+  java.util.LinkedHashMap$Entry<K, V> before;
+  java.util.LinkedHashMap$Entry<K, V> after;
+}
+$ javap -p --module java.base 'java.util.HashMap$Node'
+class java.util.HashMap$Node<K, V> implements java.util.Map$Entry<K, V> {
+  final int hash;  final K key;  V value;  java.util.HashMap$Node<K, V> next;
+  public final K getKey();            public final V getValue();
+  public final V setValue(V);         public final java.lang.String toString();
+  public final int hashCode();        public final boolean equals(Object);
+}
+```
+
+The field layout was already the real one (`hash@0, key@1, value@2, next@3,
+before@4, after@5`), and `compute_field_layout` lays superclass fields out
+first in declaration order, so the six `LHM_NODE_*` indices were already
+exactly right. Only the class *identity* was invented — but identity is what
+carries the six methods above, all declared on `HashMap$Node` and inherited by
+`Entry`. On the invented class there were none.
+
+That had two consequences; the residual note only saw the first.
+
+1. **The cast.** It is what turned defect 1 from silent state divergence into
+   a loud `ClassCastException`, and it would do so again for any future
+   real-JDK path reaching a node.
+2. **The missing methods — live, not hypothetical.** `native_lhm_put_evict`
+   could not hand the head node to a `removeEldestEntry` override, because
+   `eldest.getKey()` would have been a `NoSuchMethodError`. It copied the
+   head's key and value into an `AbstractMap$SimpleImmutableEntry` instead.
+   HotSpot's `afterNodeInsertion` passes the live `head`, so on the copy
+   `eldest.setValue(v)` threw `UnsupportedOperationException` where HotSpot
+   mutates the map, and the entry was never `==` the one in the map. That
+   reproduces on the unmodified `dev` binary — see the baseline row below.
+
+### Fix
+
+`lhm_alloc_node` allocates `java/util/LinkedHashMap$Entry`. `alloc_synthetic`
+resolves it to the real class (already in the tier-4b `view_classes` bootstrap
+list), and `alloc_object`'s clamp raises the requested slot count to the
+class's declared instance-field count — which is the same 6.
+
+With real nodes the eldest-entry copy is unnecessary, so the hook passes
+`head`. The pin discipline is unchanged in substance: the eldest key is still
+read and pinned **before** the dispatch, because an override may unlink the
+node reentrantly (Hibernate's `BoundedConcurrentHashMap.LRU` calls back into
+`this.remove` from its eviction listener), and the node itself is now pinned
+across the dispatch too.
+
+Nothing else needed changing. `typecheck.rs` already listed
+`java/util/LinkedHashMap$Entry` among the `Map$Entry` implementations (and
+never listed `$Node`); no native is registered on either node class name; and
+`getKey`/`getValue`/`setValue` resolve to the real inherited `HashMap$Node`
+bodies rather than to the `java/util/Map$Entry` **interface** natives, because
+native-override lookup keys on the declaring class of the *resolved* method.
+That last one was the live risk in this change — those interface natives read
+`key@0`/`value@1`, the synthetic `Map$Entry` layout, which on a real node is
+`hash`/`key`. Confirmed empirically rather than by reading: `eldest.getKey()`
+returns the key, not the boxed `hash` a slot-0 read would have produced.
+
+### Validation
+
+HotSpot control first, same host and JDK: `probes/LinkedHashMapNodeProbe.java`
+**PROBE PASS**, 54 assertions.
+
+| Binary | Contents | `LinkedHashMapNodeProbe` | `MapConditionalMutatorProbe` |
+|---|---|---|---|
+| HotSpot 25.0.3+9 | the control | PASS | PASS |
+| `cratonvm-lhment-base` | `origin/dev` @ `87d323bac`, unmodified | **FAIL** (JIT and `--nojit`) | PASS |
+| `cratonvm-lhment-r1` | + this fix | PASS (JIT and `--nojit`) | PASS (JIT and `--nojit`) |
+
+The baseline failure is the divergence itself, identically on both arms:
+
+```
+  FAIL eldest.getClass() expected=java.util.LinkedHashMap$Entry
+                         actual=java.util.AbstractMap$SimpleImmutableEntry
+Exception in thread "main" java/lang/UnsupportedOperationException
+        at java/util/AbstractMap$SimpleImmutableEntry.setValue(AbstractMap.java:800)
+        at LinkedHashMapNodeProbe$Observer.removeEldestEntry(...)
+```
+
+`KafkaAutoConfigurationIntegrationTests` on `r1`: **3/3 PASS** under JIT and
+**2/2 PASS** under `--nojit`, every run reporting `SBRUNNER_RESULT tests=3
+failed=0 aborted=0 skipped=0 containersFailed=0`.
+
+`regression-suite/run.sh` (it diffs CratonVM against HotSpot) against `r1`:
+**24 passed, 0 failed**, including `RCollections`, `RJdkCollections`,
+`RMapResizeGc`, `RMapGcStress`, `RSerial` and `RForNameGcStress`.
+
+`cratonvm-native-collections`: **94** lib tests plus **86** across every
+integration test (`abstract_collection_interception`, `gc_native_pins`,
+`gc_relocation_collection_stores`, `gc_side_table_root_audit`,
+`map_conditional_mutators`, `mock_arraylist`, `mock_concurrency`,
+`mock_hashmap`, `mock_lhm_access_order`, `mock_treemap`, and the new
+`lhm_node_class_identity`). `gc_relocation_harness` is excluded — it does not
+compile on `dev` either.
+
+SB_AB_PLACEHOLDER
+
+### Regression tests
+
+* `native-collections/tests/lhm_node_class_identity.rs` — the node allocator
+  asks for `java/util/LinkedHashMap$Entry` and never for the invented name;
+  the hook receives the live head node rather than a copy; the node carries
+  the real slot layout (`Int` in slot 0, `before`/`after` at 4/5); and a plain
+  `java/util/LinkedHashMap` still never dispatches the hook, so the three
+  above cannot pass vacuously. **Verified by injecting each violation
+  separately**: restoring the `$Node` name turns 3 of the 4 red, and restoring
+  the `SimpleImmutableEntry` copy on its own turns 2 red.
+* `probes/LinkedHashMapNodeProbe.java` — the end-to-end witness, runnable on
+  HotSpot as its own control: what the hook is handed and every method it can
+  call on it, `setValue` write-through, LRU eviction, the Hibernate reentrant
+  eviction shape under both verdicts, insertion order across head and tail
+  removal, `entrySet` `setValue`, access-order LRU, serialization round trip,
+  and 2000 entries across several resizes.
+
+### Left alone, deliberately
+
+`map_alloc_node`'s comment still says it allocates with `ClassId::new(0)`
+"rather than binding to the real `java/util/HashMap$Node` class"; the line
+below it has bound to the real class for some time. Stale comment, correct
+code, unrelated to this doc.
 
 ## Affected classes
 

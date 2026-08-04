@@ -30763,6 +30763,33 @@ fn native_lhm_put_evict(
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // A LinkedHashMap value is a REFERENCE: the node's value slot is
+    // `V value` -> `Ljava/lang/Object;` on the real `java/util/HashMap$Node`
+    // that `LinkedHashMap$Entry` extends. Now that `lhm_alloc_node` binds to
+    // that real class, the descriptor-aware `set_field` path coerces a
+    // primitive `Value` in that slot to NULL.
+    //
+    // Our own set layer writes a raw `Value::Int(1)` PRESENT sentinel there
+    // (`native_hs_add`), and `native_hs_add` / `native_hs_remove` decide "was
+    // it already in the set" purely from whether the previous value was null.
+    // Coerced to null, `LinkedHashSet.remove(x)` DELETED the element and still
+    // reported `false` — which broke Jersey's
+    // `Resource.Builder.onBuildMethod`, whose
+    // `checkState(methodBuilders.remove(builder))` then threw
+    // `IllegalStateException` and failed every test that starts the Jersey
+    // filter. `CopyOnWriteArraySet` shares the same backing and broke with it.
+    //
+    // Box it on the way in. A real Java caller can never arrive here with a
+    // primitive — `Map.put`'s descriptor is `(Object,Object)Object`, so the
+    // interpreter has already boxed — so this only ever fires for our own
+    // internal sentinels, and `Integer.valueOf(1)` hands back the JDK's cached
+    // instance rather than allocating. Boxing here, before the pins below, is
+    // deliberate: `box_primitive_result` dispatches `valueOf`, which can GC.
+    let value = match value {
+        Value::Object(_) => value,
+        primitive => box_primitive_result(ctx, primitive),
+    };
+
     // GC-SAFETY: `this` is a bare Rust local read from `args`, not itself a
     // GC root -- only a `pin_native_root`/`read_native_pin` handle survives a
     // moving GC. `map_hash_key` (key.hashCode()), `lhm_resize` (allocates a

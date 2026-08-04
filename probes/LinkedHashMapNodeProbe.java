@@ -273,6 +273,71 @@ public class LinkedHashMapNodeProbe {
         }
     }
 
+    /**
+     * A {@code Set} is a map whose values are a PRESENT marker, and CratonVM's
+     * set layer writes a raw {@code Int(1)} there. Once the node binds to the
+     * real JDK class, that slot is {@code V value -> Ljava/lang/Object;}, so
+     * the descriptor-aware write path coerces the marker to null — and
+     * {@code add}/{@code remove} both decide membership from "was the previous
+     * value null". Symptom: {@code remove(x)} deletes the element and returns
+     * {@code false}, which is what {@code Resource.Builder.onBuildMethod}'s
+     * {@code checkState(methodBuilders.remove(builder))} caught in Jersey.
+     *
+     * <p>{@code CopyOnWriteArraySet} shares the same LinkedHashMap backing;
+     * {@code HashSet} is here as the control that never broke.
+     */
+    private static void setMembershipIsReportedCorrectly() {
+        System.out.println("== Set add/remove report membership (PRESENT marker)");
+        List<Set<String>> sets = new ArrayList<>();
+        sets.add(new LinkedHashSet<>());
+        sets.add(new HashSet<>());
+        sets.add(new java.util.concurrent.CopyOnWriteArraySet<>());
+        for (Set<String> s : sets) {
+            String n = "  " + s.getClass().getSimpleName();
+            check(n + " add(new)", Boolean.TRUE, Boolean.valueOf(s.add("a")));
+            check(n + " add(dup)", Boolean.FALSE, Boolean.valueOf(s.add("a")));
+            check(n + " size", Integer.valueOf(1), Integer.valueOf(s.size()));
+            check(n + " contains", Boolean.TRUE, Boolean.valueOf(s.contains("a")));
+            check(n + " remove(present)", Boolean.TRUE, Boolean.valueOf(s.remove("a")));
+            check(n + " remove(again)", Boolean.FALSE, Boolean.valueOf(s.remove("a")));
+            check(n + " empty", Boolean.TRUE, Boolean.valueOf(s.isEmpty()));
+            // Identity-keyed elements, the Jersey shape: many adds, then remove
+            // each one and require every call to report true.
+            int reported = 0;
+            List<Object> objs = new ArrayList<>();
+            Set<Object> t = s.getClass() == HashSet.class
+                    ? new HashSet<>()
+                    : (s.getClass() == LinkedHashSet.class
+                            ? new LinkedHashSet<>()
+                            : new java.util.concurrent.CopyOnWriteArraySet<>());
+            for (int i = 0; i < 40; i++) {
+                Object o = new Object();
+                objs.add(o);
+                t.add(o);
+            }
+            for (Object o : objs) {
+                if (t.remove(o)) {
+                    reported++;
+                }
+            }
+            check(n + " 40 identity removes report true", Integer.valueOf(40),
+                    Integer.valueOf(reported));
+            check(n + " emptied", Boolean.TRUE, Boolean.valueOf(t.isEmpty()));
+        }
+        // The map value itself must survive the round trip unchanged.
+        Map<String, Object> m = new LinkedHashMap<>();
+        Object marker = new Object();
+        m.put("k", marker);
+        check("  LHM value identity preserved", Boolean.TRUE,
+                Boolean.valueOf(m.get("k") == marker));
+        check("  LHM remove returns the value", Boolean.TRUE,
+                Boolean.valueOf(m.remove("k") == marker));
+        m.put("n", null);
+        check("  LHM null value stays null", null, m.get("n"));
+        check("  LHM containsKey for null value", Boolean.TRUE,
+                Boolean.valueOf(m.containsKey("n")));
+    }
+
     private static void manyEntriesSurviveResize() {
         System.out.println("== 2000 entries across several resizes");
         LinkedHashMap<Integer, Integer> m = new LinkedHashMap<>();
@@ -310,6 +375,7 @@ public class LinkedHashMapNodeProbe {
         insertionOrderAndBasicOps();
         entrySetSetValueWritesThrough();
         accessOrderIsLru();
+        setMembershipIsReportedCorrectly();
         serializationRoundTrip();
         manyEntriesSurviveResize();
 
