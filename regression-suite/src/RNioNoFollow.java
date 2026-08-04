@@ -204,6 +204,29 @@ public class RNioNoFollow {
         check(createNew.equals("io"), "CREATE_NEW on an existing file: " + createNew);
         check(content(app).equals("one-two"), "a refused CREATE_NEW must not have written");
 
+        // The Files.write* statics now open through the fd table and write via a
+        // buffered writer rather than a single std::fs::write. Assert the three
+        // things that can silently go wrong with that: a payload larger than any
+        // internal buffer must round-trip whole, a shorter write over a longer
+        // file must TRUNCATE rather than leave a tail, and the Iterable overload
+        // must still emit one newline-terminated line per element.
+        Path big = dir.resolve("big");
+        byte[] payload = new byte[4 * 1024 * 1024 + 7];
+        for (int i = 0; i < payload.length; i++) {
+            payload[i] = (byte) (i * 31 + 7);
+        }
+        Files.write(big, payload);
+        byte[] readBack = Files.readAllBytes(big);
+        check(readBack.length == payload.length,
+                "large write round-trip length: " + readBack.length + " != " + payload.length);
+        check(java.util.Arrays.equals(readBack, payload), "large write round-trip content");
+        Files.write(big, new byte[] { 'a', 'b', 'c' });
+        check(Files.size(big) == 3, "a shorter write must truncate, size=" + Files.size(big));
+
+        Path lines = dir.resolve("lines");
+        Files.write(lines, java.util.List.of("alpha", "beta"));
+        check(content(lines).equals("alpha\nbeta\n"), "Iterable write: " + content(lines));
+
         System.out.println("CK RNioNoFollow checks=" + checks);
         System.out.println("CK RNioNoFollow refusals=" + writeString + "," + dangling + ","
                 + outStream + "," + inStream + "," + byteChannel + "," + fileChannel + ","
