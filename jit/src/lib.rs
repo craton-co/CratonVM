@@ -3775,6 +3775,27 @@ impl CompiledMethod {
 /// method's own parameter (`String[] args`, local 0) is dead at the loop head.
 /// A once-invoked method with its hot loop inline has no other route into
 /// compiled code.
+/// `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` — make the OSR trampoline write every
+/// seeded local to its frame slot as well as its register home, instead of
+/// eliding the store for register-resident locals.
+///
+/// Diagnosis lever for the `mixedInsertionSort` OSR miscompile
+/// (`docs/known-issues/jit/arrays-sort-long-osr-miscompile-20260803.md`). The
+/// elision assumes the compiled body re-establishes a local's frame slot
+/// before any operation that needs a memory operand; if that is not true on
+/// every path reachable from an OSR entry, the slot holds whatever the
+/// trampoline's own frame left there.
+fn osr_always_seed_frame_slot() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_SEED_FRAME_SLOTS") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"),
+            Err(_) => false,
+        },
+    )
+}
+
 /// `CRATONVM_JIT_OSR_SINGLE_PC` — see [`CompiledMethod::osr_compiled_entry_pc`].
 fn osr_single_pc_entry_only() -> bool {
     use std::sync::OnceLock;
@@ -4150,7 +4171,7 @@ unsafe fn emit_osr_trampoline(
             None
         };
         let has_register_home = dst_reg_opt.is_some() || xmm_opt.is_some();
-        if !has_register_home {
+        if !has_register_home || osr_always_seed_frame_slot() {
             let frame_neg_off = -((i as i32 + 1) * 8);
             tramp.emit(&[0x48, 0x89, 0x85]);
             tramp.emit(&frame_neg_off.to_le_bytes());
