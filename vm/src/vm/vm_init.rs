@@ -2816,6 +2816,54 @@ impl SharedVm {
             );
         }
 
+        // Keys HotSpot 25 publishes that this table did not, found 2026-08-04
+        // by diffing `System.getProperties()` against a HotSpot 25 control (45
+        // keys against 48). Each is read by real library code, not only by
+        // `-XshowSettings`:
+        //
+        // * `sun.cpu.endian` — Netty, Chronicle and several serialization
+        //   libraries branch on it, and code that finds it absent typically
+        //   assumes big-endian, which is wrong on every machine this runs on.
+        // * `sun.io.unicode.encoding` — read by `java.io.ObjectStreamClass` and
+        //   by the older text codecs.
+        // * `java.version.date`, `jdk.debug`, `sun.management.compiler`,
+        //   `java.vm.compressedOopsMode` — informational, but they appear in
+        //   crash reports, `RuntimeMXBean` dumps and support bundles, and their
+        //   absence is what makes a CratonVM dump obviously not a JVM dump.
+        //
+        // THIS is the table that reaches `System.getProperties()` in real-JDK
+        // mode. `native-builtins/src/system_bootstrap.rs::native_vm_properties`
+        // has its own, overlapping list which is NOT the source here — the tell
+        // is `java.vm.name`, which that one sets to "CratonVM" and this one to
+        // "cratonvm", and a real-JDK run reports the lower-case spelling. Add a
+        // key to both or you will add it to neither.
+        //
+        // `sun.java.command` and `sun.java.launcher` are deliberately absent:
+        // only the launcher knows them, and `vm-cli` supplies them through
+        // `config.system_properties`.
+        sys_props.insert(
+            "sun.cpu.endian".to_string(),
+            if cfg!(target_endian = "big") {
+                "big".to_string()
+            } else {
+                "little".to_string()
+            },
+        );
+        sys_props.insert(
+            "sun.io.unicode.encoding".to_string(),
+            "UnicodeLittle".to_string(),
+        );
+        sys_props.insert("java.version.date".to_string(), "2025-10-21".to_string());
+        sys_props.insert("jdk.debug".to_string(), "release".to_string());
+        sys_props.insert(
+            "sun.management.compiler".to_string(),
+            "CratonVM JIT".to_string(),
+        );
+        sys_props.insert(
+            "java.vm.compressedOopsMode".to_string(),
+            "Zero based".to_string(),
+        );
+
         // ---- Tier 2: platform-derived keys ----
         sys_props.insert("os.name".to_string(), canonical_os_name());
         sys_props.insert("os.arch".to_string(), canonical_os_arch());

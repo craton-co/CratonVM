@@ -292,6 +292,13 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     //
     // `sun.java.command` and `sun.java.launcher` are deliberately NOT here:
     // only the launcher knows them, and it sets them (`vm-cli`).
+    //
+    // NOTE, and it cost a build to find out: this table is **not** the one that
+    // reaches `System.getProperties()` in real-JDK mode. `SharedVm::new`'s
+    // `sys_props` in `vm/src/vm/vm_init.rs` is, and the two overlap without
+    // agreeing — the tell is `java.vm.name`, "CratonVM" here and "cratonvm"
+    // there, and a real-JDK run reports the lower-case one. The six keys below
+    // are in both. **Add a key to both or you will add it to neither.**
     props.push((
         "sun.cpu.endian",
         if cfg!(target_endian = "big") {
