@@ -85,6 +85,20 @@ fn maybe_dump_shutdown_reports() {
                  arm_bytes={arm_bytes} enc_bytes={enc_bytes}"
             );
         }
+        // Increment 2's verdict tally. Printed on its own line and with the
+        // three states kept apart on purpose: `verified` methods with a zero
+        // `values` total and `nothing_to_cover` methods look identical in any
+        // collapsed "ok" count, and only the first is evidence. `rejected` is
+        // not a ratio — any non-zero value is a compiler bug.
+        let (verified, values, vacuous, indescribable, rejected) =
+            cratonvm_jit::ir_lower::mir_totals::read_alloc();
+        if verified + vacuous + indescribable + rejected != 0 {
+            eprintln!(
+                "[ir-isel] MIR ALLOC verified={verified} values={values} \
+                 nothing_to_cover={vacuous} indescribable={indescribable} \
+                 rejected={rejected}"
+            );
+        }
     }
 
     if cratonvm_types::flags().jit.method_stats {

@@ -7858,6 +7858,66 @@ pub mod mir_totals {
     static SHADOW_TILES: AtomicU64 = AtomicU64::new(0);
     static ARM_BYTES: AtomicU64 = AtomicU64::new(0);
     static ENC_BYTES: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_VERIFIED: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_VALUES: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_UNLOCATED_ROOTS: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_VACUOUS: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_INDESCRIBABLE: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one method's [`super::MirAllocVerdict`], keeping the three states
+    /// apart.
+    ///
+    /// Collapsing them is the specific failure this counter set exists to
+    /// prevent: a corpus where every method came back `NothingToCover` and one
+    /// where every method verified thousands of values are indistinguishable in
+    /// a single "ok" tally, and the first proves nothing at all.
+    pub(super) fn record_alloc(verdict: super::MirAllocVerdict) {
+        match verdict {
+            super::MirAllocVerdict::Verified {
+                located,
+                unlocated_tile_roots,
+            } => {
+                ALLOC_VERIFIED.fetch_add(1, Relaxed);
+                ALLOC_VALUES.fetch_add(located as u64, Relaxed);
+                ALLOC_UNLOCATED_ROOTS.fetch_add(unlocated_tile_roots as u64, Relaxed);
+            }
+            super::MirAllocVerdict::NothingToCover => {
+                ALLOC_VACUOUS.fetch_add(1, Relaxed);
+            }
+            super::MirAllocVerdict::Indescribable(_) => {
+                ALLOC_INDESCRIBABLE.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    /// One method whose allocation `verify_allocation` REJECTED. A compiler
+    /// bug, and non-zero is a stop-and-look number, not a ratio to watch.
+    pub(super) fn record_alloc_rejected() {
+        ALLOC_REJECTED.fetch_add(1, Relaxed);
+    }
+
+    /// `(verified, values, nothing_to_cover, indescribable, rejected)` — the
+    /// increment-2 allocation verdicts since process start.
+    pub fn read_alloc() -> (u64, u64, u64, u64, u64) {
+        (
+            ALLOC_VERIFIED.load(Relaxed),
+            ALLOC_VALUES.load(Relaxed),
+            ALLOC_VACUOUS.load(Relaxed),
+            ALLOC_INDESCRIBABLE.load(Relaxed),
+            ALLOC_REJECTED.load(Relaxed),
+        )
+    }
+
+    /// Tile roots the allocation could give no home word, summed over every
+    /// verified method.
+    ///
+    /// Increment 3's sizing, taken from real compiles instead of from a
+    /// synthetic shape count: every one of these is a value that must live in a
+    /// register because there is no memory for it to live in.
+    pub fn read_unlocated_tile_roots() -> u64 {
+        ALLOC_UNLOCATED_ROOTS.load(Relaxed)
+    }
 
     pub(super) fn record(
         tiles: usize,
@@ -7908,6 +7968,12 @@ pub mod mir_totals {
             &SHADOW_TILES,
             &ARM_BYTES,
             &ENC_BYTES,
+            &ALLOC_VERIFIED,
+            &ALLOC_VALUES,
+            &ALLOC_UNLOCATED_ROOTS,
+            &ALLOC_VACUOUS,
+            &ALLOC_INDESCRIBABLE,
+            &ALLOC_REJECTED,
         ] {
             c.store(0, Relaxed);
         }
@@ -7985,6 +8051,200 @@ fn build_mir_plan(graph: &Graph, schedule: &Schedule) -> Option<MirPlan> {
         blocks.push(sel);
     }
     Some(MirPlan { blocks, tile_of })
+}
+
+/// What [`verify_mir_allocation`] concluded — the three-valued shape the
+/// design doc requires, not an `Option`.
+///
+/// `emit_safepoint_map` already refuses to conflate "nothing to cover" with
+/// "could not describe it" (an oop-free safepoint publishes
+/// `moving_young_coverage_complete: true`; an indescribable slot publishes
+/// `false` and diverts the cycle). A level-2 form owes the same distinction,
+/// because the two have opposite consequences: one is a healthy compile, the
+/// other is a compile whose allocation nothing proved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MirAllocVerdict {
+    /// An allocation was built over the tile list and `verify_allocation`
+    /// accepted it.
+    Verified {
+        /// Values the allocation gives a location to.
+        located: usize,
+        /// Tiles whose root the allocation gives NO location.
+        ///
+        /// Legal, and worth counting rather than refusing: `plan_slots` gives
+        /// no home word to a value nothing reads from memory — the last value
+        /// in `(a + b) * a` is returned straight out of RAX — while
+        /// `select_block` still roots a tile at it, because a tile is about
+        /// *computing* the value, not about storing it. The encoder already
+        /// declines such a tile (`frame_destination(dst)?`) and the per-opcode
+        /// arm emits it instead.
+        ///
+        /// It is a number rather than a silence because it is exactly the
+        /// gap increment 3 closes: a value with no home is a value that MUST
+        /// stay in a register, so this count is the size of the register file's
+        /// first real customer.
+        unlocated_tile_roots: usize,
+    },
+    /// The tile list defines no value that needs a location. Vacuous, and
+    /// counted separately so a run of these cannot be read as coverage.
+    NothingToCover,
+    /// The allocation could not be *described*, before any verifier ran: the
+    /// liveness model did not converge, or it disagrees with `plan_slots` about
+    /// which values want a location.
+    ///
+    /// Not a failure. `plan_register_residency` treats exactly the same
+    /// disagreement as "decline to promote and keep the colourer's answer",
+    /// and the reasoning carries: the colourer's layout is correct on its own
+    /// terms and is the one the frame was built from. What this must not do is
+    /// report itself as `Verified`.
+    Indescribable(&'static str),
+}
+
+/// Build an allocation over the machine list and put it through the **existing**
+/// [`crate::regalloc::verify_allocation`].
+///
+/// This is increment 2 of
+/// `docs/feature-designs/jit-machine-level-and-instruction-selection.md`: "an
+/// allocation over it, verified by `verify_allocation`". Deliberately not a new
+/// verifier — the value of the increment is that the level-2 artifact is
+/// checkable by the allocator's *own* checker, and a second checker written for
+/// it would be a second model to keep in step.
+///
+/// # What the allocation says
+///
+/// Every value lives in its frame home for its entire live range, with an empty
+/// register file. That is not a placeholder: it is exactly what
+/// [`Lowerer::encode_tile_frame_homed`] emits, so the allocation being verified
+/// is the one the encoder actually implements. The register file is empty
+/// rather than XMM-shaped because the MIR encoder holds nothing in a long-lived
+/// register — RAX is reloaded per tile.
+///
+/// # What that buys, given nothing is in a register
+///
+/// The register rules go quiet; four others do not, and they are the ones that
+/// bite a memory-only backend:
+///
+///   * **the timeline covers the live range** — a value the tile list reads
+///     after its recorded death, or defines without a location, is refused
+///     here instead of `?`-ing out silently inside the encoder;
+///   * **no two simultaneously live values share a home word** — checked
+///     against `build_live_model`'s ranges, which are computed *independently*
+///     of `plan_slots`'. Two implementations of one liveness model drifting
+///     apart is precisely how a backend comes to alias two live values, and
+///     the tile list is a third consumer of that model;
+///   * **home pools stay separated** — a word holding a `Ref` for one value and
+///     a pinned primitive for another is the shape a moving collector
+///     misreads;
+///   * **no reference is register-resident at a safepoint** — vacuous today
+///     and the whole point tomorrow: increment 3 swaps the empty `RegFile` for
+///     a real one at this exact call site, and this check is what makes that
+///     swap reviewable rather than an act of faith.
+///
+/// # Failure policy
+///
+/// `Err` only from `verify_allocation`, and only that. A model disagreement is
+/// [`MirAllocVerdict::Indescribable`], not an error, for the reason
+/// `plan_register_residency` gives. The caller decides what an `Err` costs:
+/// `MirMode::Verify` changes no emitted byte and records it, `MirMode::Emit`
+/// refuses the compile, because emitting against an allocation nothing proved
+/// is the trade that has produced silent heap corruption in this VM before.
+fn verify_mir_allocation(
+    graph: &Graph,
+    schedule: &Schedule,
+    plan: &SlotPlan,
+    mir: &MirPlan,
+) -> CompileResult<MirAllocVerdict> {
+    use crate::regalloc::{
+        build_live_model, verify_allocation, Allocation, RegFile, Segment, RegSpec,
+    };
+
+    let live = build_live_model(graph, schedule);
+    if !live.converged {
+        return Ok(MirAllocVerdict::Indescribable("liveness did not converge"));
+    }
+    // The same agreement check `plan_register_residency` runs, and for the same
+    // reason: `build_live_model` re-implements `plan_slots`' position model
+    // rather than calling it, so the two are only interchangeable while they
+    // agree. Checked before either is used.
+    let expected_positions: usize = schedule
+        .blocks
+        .iter()
+        .map(|b| b.nodes.len() + usize::from(b.terminator.is_some()) + 1)
+        .sum();
+    if live.total_positions != expected_positions {
+        return Ok(MirAllocVerdict::Indescribable("position models disagree"));
+    }
+    if live.wants_loc.len() != plan.node_color.len()
+        || live
+            .wants_loc
+            .iter()
+            .zip(plan.node_color.iter())
+            .any(|(wants, color)| *wants != color.is_some())
+    {
+        return Ok(MirAllocVerdict::Indescribable(
+            "liveness and the colourer disagree about which values want a location",
+        ));
+    }
+
+    let n = graph.nodes.len();
+    let mut segments: Vec<Vec<Segment>> = vec![Vec::new(); n];
+    let mut located = 0usize;
+    for id in 0..n {
+        if !live.wants_loc.get(id).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(range) = live.range.get(id).copied().flatten() else {
+            // `wants_loc` without a range is the model contradicting itself.
+            // Describing it would mean inventing a range, so say so instead.
+            return Ok(MirAllocVerdict::Indescribable(
+                "a value wants a location but has no live range",
+            ));
+        };
+        segments[id].push(Segment { range, reg: None });
+        located += 1;
+    }
+    if located == 0 {
+        return Ok(MirAllocVerdict::NothingToCover);
+    }
+
+    // How many tiles the allocation cannot back. Counted, not refused — see
+    // `MirAllocVerdict::Verified::unlocated_tile_roots` for why a tile rooted
+    // at a homeless value is the normal case rather than a defect.
+    let unlocated_tile_roots = mir
+        .tile_of
+        .iter()
+        .enumerate()
+        .filter(|(id, cell)| {
+            cell.is_some() && segments.get(*id).is_none_or(|s| s.is_empty())
+        })
+        .count();
+
+    let alloc = Allocation {
+        segments,
+        // `Allocation::stack_slot`'s own contract: "a drop-in replacement for
+        // `ir_lower`'s `SlotPlan::node_color` — same numbering, same
+        // Ref/Prim/pinned pool separation". Passing the colourer's answer
+        // rather than a re-derived one is what makes the home-aliasing check
+        // above a check of the *frame the encoder addresses*, not of a
+        // parallel invention.
+        stack_slot: plan.node_color.clone(),
+        stack_slots: plan.slots,
+        spills: 0,
+        reloads: 0,
+        remats: 0,
+        reg_moves: 0,
+        splits: 0,
+        promoted: 0,
+        events: Vec::new(),
+        peak_live: live.peak_live,
+    };
+    let empty_file = RegFile::from_specs(std::iter::empty::<RegSpec>());
+    let model = ir_lower_machine_model(graph, schedule, &live, empty_file);
+    verify_allocation(graph, &live, &model, &alloc)?;
+    Ok(MirAllocVerdict::Verified {
+        located,
+        unlocated_tile_roots,
+    })
 }
 
 /// `CRATONVM_JIT_IR_LINEAR_SCAN=1` — run the linear-scan allocator and use its
@@ -9135,7 +9395,29 @@ pub(crate) fn lower_inner_with_scopes(
     };
     if let Some(mode) = mir_mode {
         match build_mir_plan(graph, schedule) {
-            Some(plan) => lowerer.set_mir(plan, mode),
+            Some(plan) => {
+                // Increment 2: the machine list gets an allocation, and the
+                // allocation gets `verify_allocation`. Runs BEFORE `set_mir`,
+                // so a plan the verifier rejects is never installed and the
+                // encoder never sees it.
+                match verify_mir_allocation(graph, schedule, &slot_plan, &plan) {
+                    Ok(verdict) => mir_totals::record_alloc(verdict),
+                    Err(bailout) => {
+                        mir_totals::record_alloc_rejected();
+                        // `Verify` mode's contract is that it changes no
+                        // emitted byte, so it must not change which methods
+                        // compile either: record the rejection, report it with
+                        // `CRATONVM_DBG=ir-isel`, and leave the per-opcode arms
+                        // to emit exactly what they always did. `Emit` mode has
+                        // no such licence — its bytes ARE the allocation's, so
+                        // an allocation nothing proved is refused outright.
+                        if mode == MirMode::Emit {
+                            return refuse(bailout);
+                        }
+                    }
+                }
+                lowerer.set_mir(plan, mode)
+            }
             None => {
                 return refuse(Bailout::new(BailoutReason::Internal(
                     "ir_lower: instruction selection did not cover a block",
@@ -13499,6 +13781,16 @@ mod tests {
     #[cfg(test)]
     const MIR_ALU_CODE: [u8; 8] = [0x1a, 0x1b, 0x60, 0x1a, 0x68, 0xac, 0, 0];
 
+    /// [`MIR_ALU_CODE`] as a graph and a schedule, for the tests that work on
+    /// the machine list directly instead of on the emitted bytes.
+    #[cfg(test)]
+    fn mir_alu_graph() -> (Graph, Schedule) {
+        let builder = IrBuilder::new(2, 2);
+        let graph = builder.build(&MIR_ALU_CODE, 6).expect("build");
+        let schedule = ir_schedule::schedule(&graph);
+        (graph, schedule)
+    }
+
     #[cfg(test)]
     fn mir_emitted_bytes(mode: Option<MirMode>) -> Vec<u8> {
         let _force = mode.map(MirForce::set);
@@ -13540,6 +13832,132 @@ mod tests {
             "`(a + b) * a` has two AluReg roots; the encoder took {tiles}"
         );
         assert_eq!(mismatches, 0);
+    }
+
+    // ── Increment 2: the allocation over the tile list ───────────────
+
+    /// The machine list gets an allocation, and `verify_allocation` accepts it.
+    ///
+    /// The point of the increment is *which* verifier: the allocator's own,
+    /// unmodified. A second checker written for the level-2 form would be a
+    /// second model of the same program, and the whole reason the frame-homed
+    /// allocation is describable at all is that `Allocation` already has a
+    /// shape for "everything in its home word".
+    ///
+    /// Not vacuous by construction — `located` is asserted non-zero, which is
+    /// the difference between "verified" and "there was nothing to verify".
+    #[test]
+    fn the_machine_list_carries_an_allocation_that_verify_allocation_accepts() {
+        let (graph, schedule) = mir_alu_graph();
+        let plan = plan_slots(&graph, &schedule, None);
+        let mir = build_mir_plan(&graph, &schedule).expect("selection covers every block");
+
+        let verdict =
+            verify_mir_allocation(&graph, &schedule, &plan, &mir).expect("the allocation verifies");
+        match verdict {
+            MirAllocVerdict::Verified { located, .. } => assert!(
+                located >= 3,
+                "`(a + b) * a` has two params and two results; the allocation \
+                 located only {located} values, so this test is close to vacuous"
+            ),
+            other => panic!("expected a verified allocation, got {other:?}"),
+        }
+    }
+
+    /// The verifier is REACHED, and it can say no.
+    ///
+    /// A verification step nothing can fail is indistinguishable from no
+    /// verification step. This one runs over an allocation whose every segment
+    /// is `reg: None` — the arm where most of `verify_allocation`'s rules go
+    /// quiet — so what gets injected against is the rule that does *not* go
+    /// quiet: two values whose live ranges overlap, pointed at one home word.
+    ///
+    /// The violation is planted in the `SlotPlan`, UPSTREAM of
+    /// `verify_mir_allocation`, so the whole path is under test rather than
+    /// `verify_allocation` in isolation. Only the colour's *value* changes,
+    /// never its `Some`-ness, so the liveness-agreement precheck still passes
+    /// and the rejection can only have come from the verifier.
+    ///
+    /// The exact edit that trips it: drop the `verify_allocation` call from
+    /// `verify_mir_allocation`.
+    #[test]
+    fn an_aliased_home_word_is_rejected_by_the_allocation_verifier() {
+        use crate::regalloc::build_live_model;
+
+        let (graph, schedule) = mir_alu_graph();
+        let plan = plan_slots(&graph, &schedule, None);
+        let mir = build_mir_plan(&graph, &schedule).expect("selection covers every block");
+        // Precondition: unaliased, this graph verifies. Without it a broken
+        // fixture would make the rejection below meaningless.
+        assert!(
+            matches!(
+                verify_mir_allocation(&graph, &schedule, &plan, &mir),
+                Ok(MirAllocVerdict::Verified { .. })
+            ),
+            "the fixture must verify BEFORE the injection"
+        );
+
+        // Two values genuinely live at the same position, so the rejection is
+        // the aliasing rule and not some other one.
+        let live = build_live_model(&graph, &schedule);
+        let located: Vec<usize> = (0..graph.nodes.len())
+            .filter(|&id| plan.node_color.get(id).copied().flatten().is_some())
+            .filter(|&id| live.range.get(id).copied().flatten().is_some())
+            .collect();
+        let mut pair = None;
+        'outer: for (i, &a) in located.iter().enumerate() {
+            let ra = live.range[a].expect("located");
+            for &b in &located[i + 1..] {
+                let rb = live.range[b].expect("located");
+                if ra.lo <= rb.hi && rb.lo <= ra.hi {
+                    pair = Some((a, b));
+                    break 'outer;
+                }
+            }
+        }
+        let (a, b) = pair.expect("this graph has two simultaneously live values");
+
+        let mut aliased = plan_slots(&graph, &schedule, None);
+        aliased.node_color[b] = aliased.node_color[a];
+        let err = verify_mir_allocation(&graph, &schedule, &aliased, &mir)
+            .expect_err("two values live together in one home word");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("home word") || text.contains("slot pools"),
+            "rejected for the wrong reason: {text}"
+        );
+    }
+
+    /// Emit mode refuses a compile whose allocation the verifier rejected;
+    /// verify mode does not.
+    ///
+    /// Asserted as a property of the two modes rather than by forcing a
+    /// rejection, because the only way to force one on a real graph is to
+    /// introduce the compiler bug it exists to catch. What is checkable without
+    /// that is the ASYMMETRY, and the asymmetry is the whole policy: verify
+    /// mode's contract is that it changes no emitted byte, which it would break
+    /// by also changing which methods compile.
+    #[test]
+    fn verify_mode_records_the_allocation_and_emit_mode_stakes_the_compile_on_it() {
+        let _guard = mir_totals::TEST_LOCK.lock();
+
+        for mode in [MirMode::Verify, MirMode::Emit] {
+            mir_totals::reset();
+            let bytes = mir_emitted_bytes(Some(mode));
+            assert!(!bytes.is_empty(), "{mode:?} must still produce a body");
+            let (verified, values, vacuous, indescribable, rejected) = mir_totals::read_alloc();
+            assert_eq!(rejected, 0, "{mode:?}: the allocation was rejected");
+            assert_eq!(
+                verified, 1,
+                "{mode:?}: one method, one verdict — got verified={verified} \
+                 nothing_to_cover={vacuous} indescribable={indescribable}"
+            );
+            assert!(
+                values > 0,
+                "{mode:?}: the verdict was `Verified` over zero values, which \
+                 is `NothingToCover` wearing the wrong label"
+            );
+        }
     }
 
     /// Verify mode is the same oracle without the risk: the per-opcode arms
