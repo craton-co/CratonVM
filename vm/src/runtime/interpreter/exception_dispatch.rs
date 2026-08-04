@@ -23,6 +23,93 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
+// Interpreter-loop exception unwind
+// ---------------------------------------------------------------------------
+
+/// Search for a handler for `exc`, popping frames until one is found or the
+/// exception escapes `initial_frame_idx`.
+///
+/// Returns `Ok(())` once a handler is installed — the caller resumes at the
+/// handler pc. Returns `Err` when the exception escaped the method this
+/// `execute()` invocation owns, or when installing the handler failed.
+/// `frame_idx` is updated in place as frames are popped.
+///
+/// ## Why this is a function (ARCH-2026-08-04 A4a)
+///
+/// The interpreter's dispatch loop carried **two byte-identical copies** of
+/// this walk — one draining `pending_java_exception`, one draining
+/// `pending_runtime_error` after `throw_runtime_error` produced a throwable.
+/// Both sat in the loop *prologue*, ahead of the opcode fetch, so their ~40
+/// lines each were in the hot loop's instruction footprint on every bytecode
+/// even though they run only when an exception is in flight.
+///
+/// Duplication was also the more expensive problem. The pin below is subtle and
+/// load-bearing, and a fix applied to one copy and not the other is a
+/// use-after-free that only reproduces on one of the two throw paths.
+///
+/// ## The pin is not optional
+///
+/// This loop can pop MANY frames while searching (unwinding out of the method
+/// entirely if no handler exists), and `find_exception_handler` ->
+/// `find_exception_handler_impl` lazily loads an unresolved catch-type class on
+/// a cache miss (`load_class_concurrent`, which runs `<clinit>` and can
+/// allocate, hence collect). Once a frame is popped it no longer roots the
+/// propagating exception, and nothing else does until a handler is found (which
+/// pushes it onto a frame's stack) or the method returns it as an `Err`. So it
+/// is pinned in `native_pin_roots` for the whole walk, and re-read from there
+/// on every iteration — a moving collector rewrites the pin slot in place, so
+/// the local copy taken before a GC is stale.
+pub(super) fn unwind_to_handler(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: &mut usize,
+    initial_frame_idx: usize,
+    exc: ObjectRef,
+    invoke_pc: usize,
+) -> Result<(), MethodCallFailed> {
+    let mut exc_pc = invoke_pc;
+    let pin_base = thread.native_pin_roots.len();
+    thread.native_pin_roots.push(exc);
+    loop {
+        // Re-read through the pin: a collection during the previous iteration's
+        // lazy class load may have relocated the throwable.
+        let current_exc = thread.native_pin_roots[pin_base];
+        match find_exception_handler(shared, &thread.frames[*frame_idx], exc_pc, current_exc) {
+            Some((handler_pc, exc_ref)) => {
+                thread.frames[*frame_idx].stack.clear();
+                let push = thread.frames[*frame_idx]
+                    .stack
+                    .push(Value::Object(Some(exc_ref)));
+                if let Err(e) = push {
+                    thread.native_pin_roots.truncate(pin_base);
+                    return Err(MethodCallFailed::InternalError(VmError::Runtime(e)));
+                }
+                thread.frames[*frame_idx].pc = handler_pc;
+                fire_jvmti_exception_catch(
+                    shared.vm_identity,
+                    &thread.frames[*frame_idx],
+                    handler_pc,
+                );
+                thread.native_pin_roots.truncate(pin_base);
+                return Ok(());
+            }
+            None => {
+                if *frame_idx > initial_frame_idx {
+                    // T17.Δ — exception-unwind.
+                    pop_and_recycle_frame_with_reason(shared, thread, true);
+                    *frame_idx -= 1;
+                    exc_pc = thread.frames[*frame_idx].last_instr_pc;
+                } else {
+                    let current_exc = thread.native_pin_roots[pin_base];
+                    thread.native_pin_roots.truncate(pin_base);
+                    return Err(MethodCallFailed::ExceptionThrown(current_exc));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // JVMTI event delivery
 // ---------------------------------------------------------------------------
 //

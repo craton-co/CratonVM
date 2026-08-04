@@ -4255,51 +4255,18 @@ fn execute_frame_from_index(
         // yet. Polling first can let STW reclaim the Throwable before a caller
         // catch handler stores it.
         if let Some((exc, invoke_pc)) = pending_java_exception.take() {
-            let mut exc_pc = invoke_pc;
-            // GC-root gap: this loop can pop MANY frames while searching for a
-            // handler (unwinding all the way out of the method if none is
-            // found), and `find_exception_handler` -> `find_exception_handler_impl`
-            // lazily loads an unresolved catch-type class on a cache miss
-            // (`load_class_concurrent`, which runs <clinit> and can allocate/
-            // trigger a GC). Once a frame is popped it no longer roots the
-            // propagating exception, and nothing else does until a handler is
-            // found (pushed onto a frame's stack) or the method returns it as
-            // an Err - pin it in `native_pin_roots` for the whole walk so a GC
-            // mid-unwind can't reclaim it.
-            let pin_base = thread.native_pin_roots.len();
-            thread.native_pin_roots.push(exc);
-            loop {
-                let current_exc = thread.native_pin_roots[pin_base];
-                match find_exception_handler(shared, &thread.frames[frame_idx], exc_pc, current_exc)
-                {
-                    Some((handler_pc, exc_ref)) => {
-                        thread.frames[frame_idx].stack.clear();
-                        thread.frames[frame_idx]
-                            .stack
-                            .push(Value::Object(Some(exc_ref)))
-                            .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
-                        thread.frames[frame_idx].pc = handler_pc;
-                        fire_jvmti_exception_catch(
-                            shared.vm_identity,
-                            &thread.frames[frame_idx],
-                            handler_pc,
-                        );
-                        thread.native_pin_roots.truncate(pin_base);
-                        break;
-                    }
-                    None => {
-                        if frame_idx > initial_frame_idx {
-                            pop_and_recycle_frame_with_reason(shared, thread, true);
-                            frame_idx -= 1;
-                            exc_pc = thread.frames[frame_idx].last_instr_pc;
-                        } else {
-                            let current_exc = thread.native_pin_roots[pin_base];
-                            thread.native_pin_roots.truncate(pin_base);
-                            return Err(MethodCallFailed::ExceptionThrown(current_exc));
-                        }
-                    }
-                }
-            }
+            // The handler walk and its GC pin live in
+            // `exception_dispatch::unwind_to_handler` — shared with the
+            // `pending_runtime_error` arm below, which used to carry a
+            // byte-identical copy (ARCH-2026-08-04 A4a).
+            unwind_to_handler(
+                shared,
+                thread,
+                &mut frame_idx,
+                initial_frame_idx,
+                exc,
+                invoke_pc,
+            )?;
             continue;
         }
 
@@ -4360,59 +4327,20 @@ fn execute_frame_from_index(
             let exc_result = super::exceptions::throw_runtime_error(shared, thread, re);
             match exc_result {
                 MethodCallFailed::ExceptionThrown(exc) => {
-                    let mut exc_pc = invoke_pc;
-                    // GC-root gap: see the identical pin in the
-                    // `pending_java_exception` arm above — this loop has the
-                    // same unpinned-across-frame-pops-and-lazy-class-load hazard.
-                    let pin_base = thread.native_pin_roots.len();
-                    thread.native_pin_roots.push(exc);
-                    loop {
-                        let current_exc = thread.native_pin_roots[pin_base];
-                        match find_exception_handler(
-                            shared,
-                            &thread.frames[frame_idx],
-                            exc_pc,
-                            current_exc,
-                        ) {
-                            Some((handler_pc, exc_ref)) => {
-                                thread.frames[frame_idx].stack.clear();
-                                thread.frames[frame_idx]
-                                    .stack
-                                    .push(Value::Object(Some(exc_ref)))
-                                    .map_err(|e| {
-                                        MethodCallFailed::InternalError(VmError::Runtime(e))
-                                    })?;
-                                thread.frames[frame_idx].pc = handler_pc;
-                                fire_jvmti_exception_catch(
-                                    shared.vm_identity,
-                                    &thread.frames[frame_idx],
-                                    handler_pc,
-                                );
-                                thread.native_pin_roots.truncate(pin_base);
-                                break;
-                            }
-                            None => {
-                                if frame_idx > initial_frame_idx {
-                                    // T17.Δ — exception-unwind.
-                                    pop_and_recycle_frame_with_reason(shared, thread, true);
-                                    frame_idx -= 1;
-                                    exc_pc = thread.frames[frame_idx].last_instr_pc;
-                                } else {
-                                    // Perf: the previous `exc_class` / `caller` /
-                                    // `mname` bindings here each took a
-                                    // `class_manager.read()` RwLock + `to_string()`
-                                    // allocation on every top-frame exception
-                                    // unwind, but their values were never used
-                                    // (no trace site consumed them). Dropped —
-                                    // behaviour is identical (pure, discarded
-                                    // computations).
-                                    let current_exc = thread.native_pin_roots[pin_base];
-                                    thread.native_pin_roots.truncate(pin_base);
-                                    return Err(MethodCallFailed::ExceptionThrown(current_exc));
-                                }
-                            }
-                        }
-                    }
+                    // Same walk as the `pending_java_exception` arm above, and
+                    // now literally the same code (ARCH-2026-08-04 A4a). The
+                    // two copies had already drifted in comments only, but the
+                    // GC pin they share is subtle enough that a fix landing in
+                    // one and not the other is a use-after-free reproducing on
+                    // just one of the two throw paths.
+                    unwind_to_handler(
+                        shared,
+                        thread,
+                        &mut frame_idx,
+                        initial_frame_idx,
+                        exc,
+                        invoke_pc,
+                    )?;
                     continue;
                 }
                 other => return Err(other),
