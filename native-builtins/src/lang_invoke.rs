@@ -668,14 +668,77 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(empty))))
         }
     });
+    // `MethodType.toString()` is specified as `(P1,P2,…)R` using each type's
+    // SIMPLE name — `(Bean)int`, not `MethodType(1 params)`, which is what this
+    // returned until 2026-08-04 and which no JDK ever prints.
+    //
+    // It matters beyond cosmetics: this string is what `WrongMethodTypeException`
+    // and every `MethodHandle` linkage error carry as their message, so a
+    // placeholder here turns a diagnosable "expected (Bean)int, found (int)int"
+    // into two identical strings.
+    //
+    // The receiver may have either layout, so read the two fields by shape.
+    // Synthetic `MethodType` is the 2-field `(returnType, parameterArray)` this
+    // file mints; the real JDK class names them `rtype` / `ptypes` and has
+    // several more fields behind them. Falling back to the placeholder when
+    // neither read works keeps this total — a `toString` that raises would be a
+    // worse failure than a vague one.
     r.register(mt, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let pc = if let Value::Object(Some(arr)) = ctx.get_field(this, 1) {
-            ctx.array_length(arr)
+        let synthetic = ctx.object_num_fields(this) <= 2;
+        let rtype = if synthetic {
+            ctx.get_field(this, 0)
         } else {
-            0
+            ctx.get_field_by_name(this, "rtype")
         };
-        let s = ctx.create_string(&format!("MethodType({pc} params)"));
+        let ptypes = if synthetic {
+            ctx.get_field(this, 1)
+        } else {
+            ctx.get_field_by_name(this, "ptypes")
+        };
+
+        // `int` / `java.lang.String` -> `int` / `String`, which is what
+        // `Class.getSimpleName()` yields and what the JDK's own `toString`
+        // uses. Nested classes render after the last `$`, matching it.
+        fn simple_name(ctx: &dyn cratonvm_native_api::NativeContext, mirror: Value) -> String {
+            let Value::Object(Some(m)) = mirror else {
+                return "?".to_string();
+            };
+            match resolve_class_name_robust(ctx, m) {
+                Some(name) => {
+                    let name = name.replace('/', ".");
+                    let tail = name.rsplit(['.', '$']).next().unwrap_or(&name);
+                    tail.to_string()
+                }
+                None => "?".to_string(),
+            }
+        }
+
+        let mut out = String::from("(");
+        // Tracked as a flag, not inferred from the rendered string: `()void` is
+        // a perfectly good `MethodType`, so an empty parameter list must not be
+        // read as "the field could not be read".
+        let mut ptypes_ok = false;
+        let mut param_count = 0usize;
+        if let Value::Object(Some(arr)) = ptypes {
+            ptypes_ok = true;
+            param_count = ctx.array_length(arr);
+            for i in 0..param_count {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&simple_name(ctx, ctx.get_array_element(arr, i)));
+            }
+        }
+        out.push(')');
+        let ret = simple_name(ctx, rtype);
+        let s = if !ptypes_ok || ret == "?" {
+            // A field could not be read — do not invent a signature.
+            ctx.create_string(&format!("MethodType({param_count} params)"))
+        } else {
+            out.push_str(&ret);
+            ctx.create_string(&out)
+        };
         Ok(Some(Value::Object(Some(s))))
     });
 

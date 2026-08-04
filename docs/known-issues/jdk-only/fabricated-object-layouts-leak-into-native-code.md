@@ -11,6 +11,110 @@ silent wrong-field read or write, never an exception.**
 > names **six** drift families, not five, and the marker table's per-file
 > verdict split was slightly off.
 
+## What changed on 2026-08-04 — step 2 of four
+
+*What specifically must change* lists four steps. Step 2 — **adjudicate the two
+`unknown` verdicts in `vm/src/vm/vm_object.rs`** — is now partly answered, with
+evidence rather than an argument.
+
+Both are **overlays**, not mis-numbered slots: a VM-internal `Int` deliberately
+written on top of `java.lang.Class`'s instance field 0, which JDK 25 declares as
+`Constructor<T> cachedConstructor` — a *reference* slot. The question was never
+"is this the right slot" but "does writing an `Int` where the image declares a
+reference corrupt anything". The marker listed three checks. Two are run,
+against a real JDK 21 image, and both are clean:
+
+1. Three rounds of `getDeclaredConstructor()` on a nested class, interleaved
+   with `String.class.getConstructor(String.class)` — so the second and third
+   take the real bytecode's `cachedConstructor != null` fast path — all returned
+   the right `Constructor`. Nothing raised, and no `expected object reference,
+   got int(N)`.
+2. The same run under `CRATONVM_DBG=overlay`, whose hunter
+   (`overlay_write_is_destructive`) exists precisely to report a primitive
+   written to a reference slot, reported nothing.
+
+So the verdict stays `unknown` but **drops from ranked-HIGH**: the two checks
+that would have shown live harm did not.
+
+The third check — does anything still *depend* on the overlay — is the one whose
+answer removes code rather than reassuring about it, and nothing in the tree
+could answer it. `mirror_class_id` (`native-builtins/src/lang_class.rs`) is the
+overlay's only reader outside the VM, a fallback behind the reverse map, and it
+now reports its first hit under the same flag. **One broad real-JDK run makes
+the verdict decidable.** A ten-class probe does not: silence over a small
+workload is not silence over Spring Boot, and the marker says so rather than
+inviting a deletion on thin evidence.
+
+The primitive-mirror sibling (`Int(-1)` over the same slot) rides on that
+finding: it is the easier of the two to retire if check 3 comes back zero,
+because a primitive mirror has no legitimate `cachedConstructor` reader at all.
+
+## What is still open — steps 1, 3 and 4, which are the bulk
+
+* **Step 1, the sweep — it has a measured work list now (2026-08-04).** The
+  sweep was scoped as "read four crates for index-based field access". It does
+  not need reading first: **the runtime detector for exactly this defect already
+  exists** and had never been run broadly. `CRATONVM_DBG_OVERLAY=1` reports a
+  native writing a primitive to a reference slot *or* a reference to a primitive
+  slot on a class loaded from real JDK bytes. Add `CRATONVM_DBG_OVERLAY_ALL=1`
+  or the `java.util.Map` suppression hides the dominant family.
+
+  Three probes, both modes, JDK 25. **The results are identical under
+  `--real-jdk` and `--jdk-only`**, so this is a `Compatible`-mode defect too.
+  Distinct `(class, slot, value kind, real descriptor)` sites:
+
+  | class | slot | writes | real desc | n |
+  |---|---:|---|---|---:|
+  | `java/util/HashMap` | 1 | `Int` | `L` | 4,395 |
+  | `java/util/HashMap$Node` | 2 | `Int` | `L` | 2,108 |
+  | `java/lang/invoke/VarHandle` | 1 | `Object` | `Z` | 52 |
+  | `java/lang/invoke/VarHandle` | 0 | `Int` | `L` | 52 |
+  | `java/util/HashMap` | 2 | `Int` | `[` | 32 |
+  | `java/lang/invoke/MemberName` | 4 | `Int` | `L` | 14 |
+  | `java/util/Properties` | 7 | `Float` | `L` | 6 |
+  | `java/util/Properties` | 6, 5 | `Int` | `L` | 6 each |
+  | `java/util/Properties` | 2 | `Object` | `I` | 6 |
+  | `ClassLoaders$PlatformClassLoader` | 0, 3, 4, 6 | `Int` | `L` | 4 each |
+  | `ClassLoaders$AppClassLoader` | 0, 3, 4, 6 | `Int` | `L` | 4 each |
+  | `java/util/Scanner` | 3, 4 | `Int` | `L` | 2 each |
+  | `java/net/URI` | 5 | `Object` | `I` | 2 |
+  | `java/net/URI` | 2 | `Int` | `L` | 2 |
+  | `java/net/Proxy` | 0 | `Int` | `L` | 2 |
+
+  **13 classes, 24 distinct slots**, from three small probes. Reading it:
+
+  * The **`HashMap` family is the known-benign case** the hunter suppresses by
+    default — coercion-to-null lands the real bytecode in the null-initialised
+    state it expects. It dominates by volume and says nothing.
+  * **`VarHandle` is the one to look at first.** It mismatches in *both*
+    directions on adjacent slots (`Int` over a reference at 0, an `Object` over
+    a `boolean` at 1), it is not a `Map`, and the benign argument says nothing
+    about it.
+  * **`Properties` writing a `Float` over a reference slot** is in the group
+    item 1 calls the highest-risk in `native-collections`, and it is on the
+    bootstrap path.
+  * **Both built-in class loaders take `Int` writes over four reference slots
+    each.** Whatever those slots hold on the real classes, they are not integers.
+  * `URI` and `Properties` each mismatch in both directions, which rules out a
+    single off-by-one against one layout.
+
+  Two limits, so nobody reads this as complete. The detector covers
+  `NativeContextImpl::set_field` only: **reads are uninstrumented, and a
+  same-kind wrong-slot write is invisible** — an `Int` into the wrong `Int` slot
+  passes silently, and that is half the defect this record describes. And three
+  probes is not Spring Boot. Treat the table as a floor and re-run under H2 or
+  Spring Boot before calling the sweep done.
+
+  Adjudicating and fixing the 24 sites is untouched.
+* **Step 3**, replacing the two `breaks-under-strict` sites in `vm_util.rs`.
+  Note the `ValueLayout` one cannot be converted at all — the marker is explicit
+  that there are no real fields to name, so it is a
+  `CompatibilityClassRequested` violation, not a slot-numbering bug, and fixing
+  it means letting the real `ValueLayout.<clinit>` run.
+* **Step 4**, making `safe` verdicts checkable rather than asserted. They are
+  claims about JDK 25 that nothing in the build re-checks; a JDK upgrade should
+  fail a test, not corrupt an object.
+
 ## What is wrong
 
 A large amount of CratonVM native and VM-internal code reaches into Java objects
@@ -161,7 +265,7 @@ finding, not a general rule.
 * `docs/known-issues/jdk-only/README.md` — index.
 * The `StringJoiner` divergence between the two real-protected-stub allow-lists
   is a *separate* consequence of the same class's layout drift; see
-  [real-protected-stub allow-lists diverge](real-protected-stub-allowlists-diverge.md).
+  [real-protected-stub allow-lists diverge](../../internal/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md) (reconciled 2026-08-04).
 * [`docs/jdk-only-object-layout-audit.md`](../../jdk-only-object-layout-audit.md)
   — the companion audit. The original filing recorded that this file did not
   exist; **it does now**, and it is the right starting point for the sweep in
