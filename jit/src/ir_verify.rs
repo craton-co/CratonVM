@@ -685,6 +685,8 @@ fn expected_arity(op: &Op) -> (usize, usize) {
         Op::Guard { .. } => (2, 2),
         // [ctrl, mem, obj]
         Op::MonitorEnter | Op::MonitorExit => (3, 3),
+        // cov-05 — [ctrl, mem, obj], same shape as `MonitorEnter` above.
+        Op::InstanceOf { .. } | Op::CheckCast { .. } => (3, 3),
         Op::Dead => (0, 0),
     }
 }
