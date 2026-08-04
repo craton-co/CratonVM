@@ -268,6 +268,52 @@ pub fn ensure_system_stdin_object(
 // Free functions: class initialization
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Nesting depth of `<clinit>` frames currently executing on this
+    /// (OS) thread, including nested/re-entrant `<clinit>` calls one
+    /// static initializer transitively triggers. See `in_clinit_shared`.
+    static CLINIT_NESTING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// True while this thread is executing inside some class's `<clinit>`.
+///
+/// Reflective code paths (e.g. building `java.lang.reflect.Method`
+/// mirrors) must consult this before forcing an UNRELATED class's full
+/// initialization as a side effect of merely exposing its return/parameter
+/// type. JVMS §5.5 triggers initialization only via `new`/`getstatic`/
+/// `putstatic`/`invokestatic` on that exact class, never as a side effect
+/// of reflection over a *different*, currently-initializing class. Forcing
+/// it anyway lets the newly-initialized class observe the in-progress
+/// class's static fields at their pre-assignment default (usually `null`)
+/// instead of failing to resolve at all -- see
+/// `docs/known-issues/springboot/netty-compositebytebuf-clinit-reads-unpooled-empty-buffer-null-20260731.md`
+/// for the concrete repro (Netty's `Unpooled.<clinit>` -> `UnpooledByteBufAllocator`
+/// superclass init -> `ResourceLeakDetector.addExclusions` ->
+/// `Class.getDeclaredMethods()` on `AbstractByteBufAllocator`, whose declared
+/// `compositeBuffer()` return type `CompositeByteBuf` was being force-initialized
+/// mid-way through `Unpooled.<clinit>`, before `EMPTY_BUFFER` was assigned).
+pub fn in_clinit_shared() -> bool {
+    CLINIT_NESTING_DEPTH.with(|d| d.get() > 0)
+}
+
+/// RAII depth counter paired with `in_clinit_shared`. Increment on
+/// `<clinit>` entry, decrement on every exit (including panics unwinding
+/// through the guarded scope).
+struct ClinitDepthGuard;
+
+impl ClinitDepthGuard {
+    fn enter() -> Self {
+        CLINIT_NESTING_DEPTH.with(|d| d.set(d.get() + 1));
+        ClinitDepthGuard
+    }
+}
+
+impl Drop for ClinitDepthGuard {
+    fn drop(&mut self) {
+        CLINIT_NESTING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Ensure a class is fully initialized (JVM spec В§5.5).
 ///
 /// Handles three cases:
@@ -806,6 +852,18 @@ fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassSta
     }
     if matches!(new_state, ClassState::Initialized) {
         super::vm_object::pre_init_wrapper_type_field_for_class(shared, class_id);
+        // Authoritative, monotonic "this class is initialized" event. The JIT's
+        // lock-free init memo used to be written ONLY by `jit_getstatic`, i.e.
+        // only after a compiled static read had already taken the slow path
+        // once. That is too late for the compiler, which must decide whether a
+        // `getstatic` may become a direct load (no helper, so no init check)
+        // BEFORE the method's first compiled execution. Marking it here makes
+        // the memo a general lock-free predicate with no extra bookkeeping:
+        // this is exactly the point at which `<clinit>` has completed
+        // successfully, which is the only condition the memo is allowed to
+        // record (a failed `<clinit>` finalizes as `InitializationError` and is
+        // deliberately not marked).
+        crate::jit::helpers::note_class_initialized(shared, class_id);
     }
     // Remove waiter and notify all blocked threads.
     let removed = shared.classes.class_init_waiters.lock().remove(&class_id);
@@ -1158,6 +1216,7 @@ fn initialize_class_shared(
     }
     if has_clinit {
         tracing::debug!(class = %class_name_for_jfr, "running <clinit>");
+        let _clinit_depth_guard = ClinitDepthGuard::enter();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             super::invoke_on_class_shared(shared, thread, class_id, "<clinit>", "()V", &[])
         }));
@@ -2142,6 +2201,19 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
         }
         (class.name.to_string(), info)
     };
+
+    // Compiled `getstatic` needs a lock-free answer to "is this the class whose
+    // statics the `System.out`/`err`/`in` bootstrap intercept services?" before
+    // it may emit a direct load. Preparation is the earliest point the name is
+    // known, and it always precedes initialization — which the inline path also
+    // requires — so the id is always recorded before any inline decision about
+    // this class can be taken. See `ClassRealm::system_class_id`.
+    if class_name == "java/lang/System" {
+        shared
+            .classes
+            .system_class_id
+            .store(class_id.as_u32(), std::sync::atomic::Ordering::Relaxed);
+    }
 
     // Allocate static field slots with default values, then overlay any
     // resolved ConstantValue. String constants are allocated through the

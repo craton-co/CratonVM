@@ -314,7 +314,7 @@ diagnosis is complete for this class: nothing else in it carries the shape.
 * `../h2/bug-h2-testmultithread-concurrent-update-timeout.md` — the same class's
   throughput problem, which this now hides: the class cannot reach
   `testConcurrentUpdate` at all on an affected binary.
-* `sigsegv-in-unmapped-code-buffer-20260801.md`, `jit-ir-tier-code-buffer-*` —
+* `jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`, `jit-ir-tier-code-buffer-*` —
   the code-buffer sizing work this fell out of.
 
 </details>

@@ -147,9 +147,231 @@ fn object_ref_at(addr: usize) -> ObjectRef {
     unsafe { ObjectRef::from_raw(addr as *mut u8) }
 }
 
+/// The workspace census of address-keyed `ObjectRef` tables.
+///
+/// `docs/threading/objectref-concurrency-contract.md` §7.3 records the gap this
+/// closes. `ObjectRef`'s `Hash`/`Eq` are addresses, so every
+/// `HashMap<ObjectRef, _>` in the tree needs a GC disposition — and "**Nothing
+/// enumerates the tables that need it.**" A table added without one breaks
+/// nothing at review time; it just starts answering a lookup for a new object
+/// with a dead object's value once the allocator reuses the address.
+///
+/// This is that enumeration, and
+/// `the_address_keyed_table_census_is_complete` enforces it.
+#[cfg(test)]
+mod census {
+    /// One audited source file: its workspace-relative path, how many
+    /// address-keyed declarations it contains, and the GC disposition each of
+    /// its tables states in its own source.
+    pub(super) struct AuditedFile {
+        pub path: &'static str,
+        /// Lines declaring `HashMap<ObjectRef` / `HashSet<ObjectRef`, comments
+        /// excluded. A table is usually two (the accessor signature and the
+        /// `static` behind it), so this is a count of declarations, not of
+        /// tables. It is here to make ADDING a table to an
+        /// already-audited file fail too, not just adding a new file.
+        pub declarations: usize,
+        pub disposition: &'static str,
+    }
+
+    pub(super) const AUDITED: &[AuditedFile] = &[
+        AuditedFile {
+            path: "gc/src/heap.rs",
+            declarations: 1,
+            disposition: "gpu_pinned_refs: PINNED — membership is exactly what \
+                          forbids relocation, so no key in it can go stale.",
+        },
+        AuditedFile {
+            path: "vm/src/vm/realms/class_realm.rs",
+            declarations: 1,
+            disposition: "class_mirrors_reverse: REMAPPED — rebuilt inside the \
+                          collection by vm/src/memory/gc.rs, ahead of \
+                          update_all_roots' own mirror step.",
+        },
+        AuditedFile {
+            path: "vm/src/runtime/offload.rs",
+            declarations: 3,
+            disposition: "input_cache: REMAPPED + SWEPT — \
+                          offload::input_cache::remap_and_sweep, which routes \
+                          through this module and is driven from \
+                          vm/src/memory/gc.rs.",
+        },
+        AuditedFile {
+            path: "native-builtins/src/net_phase_e.rs",
+            declarations: 4,
+            disposition: "inet_addr_side_table and ds_side_table: SCANNED + \
+                          REMAPPED — gc_scan_inet_addr_roots / \
+                          gc_update_inet_addr_refs and the re10 handler-root \
+                          pair in the same module.",
+        },
+        AuditedFile {
+            path: "native-builtins/src/locale_bootstrap.rs",
+            declarations: 2,
+            disposition: "synthetic_locale_data: SCANNED + REMAPPED — \
+                          gc_scan_locale_roots and its remap companion.",
+        },
+        AuditedFile {
+            path: "native-builtins/src/lib.rs",
+            declarations: 2,
+            disposition: "locale_data: SCANNED + REMAPPED — covered by \
+                          gc_scan_locale_roots alongside the bootstrap table.",
+        },
+        AuditedFile {
+            path: "native-builtins/src/classloader.rs",
+            declarations: 2,
+            disposition: "class_data_store: TOLERATED UNDER A STATED CONDITION \
+                          — effectively write-only (get_class_data has no \
+                          production caller). The source names the \
+                          re-key-by-identity-hash migration required before a \
+                          reader may be added.",
+        },
+        AuditedFile {
+            path: "native-builtins/src/wildfly_core.rs",
+            declarations: 2,
+            disposition: "EQE_PENDING: TOLERATED UNDER A STATED CONDITION — the \
+                          queued Runnables are rooted by identity hash; a stale \
+                          KEY only splits one EQE's tasks across two buckets, \
+                          and drain_all_pending_runnables drains every bucket \
+                          unconditionally, so no task is lost or misdispatched.",
+        },
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Walk every workspace source tree and require each address-keyed
+    /// `ObjectRef` declaration to be accounted for in [`census::AUDITED`].
+    ///
+    /// Scans DIRECTORIES rather than a list of file names on purpose: a module
+    /// split renames files, and a gate keyed on file names goes quietly
+    /// fail-open at exactly the moment the code it guards was reorganised. For
+    /// the same reason it fails loudly — rather than passing vacuously — when
+    /// it cannot find the workspace root, when the walk turns up implausibly
+    /// few files, or when the pattern matches nothing at all.
+    #[test]
+    fn the_address_keyed_table_census_is_complete() {
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    collect_rs(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the vm crate directory must have a parent")
+            .to_path_buf();
+        assert!(
+            workspace.join("Cargo.toml").is_file(),
+            "workspace root not found at {} — failing rather than scanning nothing",
+            workspace.display()
+        );
+
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&workspace).expect("workspace root is readable") {
+            let src = entry.expect("readable directory entry").path().join("src");
+            if src.is_dir() {
+                collect_rs(&src, &mut files);
+            }
+        }
+        assert!(
+            files.len() > 100,
+            "only {} source files found under {} — the directory walk is broken",
+            files.len(),
+            workspace.display()
+        );
+
+        // Declarations, not mentions: the pattern inside a doc comment or a
+        // prose note is not a table. Everything from the first `//` is prose.
+        let declarations_in = |text: &str| {
+            text.lines()
+                .filter(|line| {
+                    let code = line.split("//").next().unwrap_or("");
+                    code.contains("HashMap<ObjectRef") || code.contains("HashSet<ObjectRef")
+                })
+                .count()
+        };
+
+        let mut findings: Vec<String> = Vec::new();
+        let mut total_declarations = 0usize;
+        let mut seen: Vec<&str> = Vec::new();
+        for file in &files {
+            let rel = file
+                .strip_prefix(&workspace)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            // This module is the fixup machinery and `value.rs` is where the
+            // contract itself is argued; neither owns a table.
+            if rel.ends_with("vm/src/memory/addr_keyed.rs") || rel.ends_with("types/src/value.rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            let count = declarations_in(&text);
+            if count == 0 {
+                continue;
+            }
+            total_declarations += count;
+            match super::census::AUDITED.iter().find(|a| rel.ends_with(a.path)) {
+                None => findings.push(format!(
+                    "{rel}: {count} address-keyed declaration(s), NOT in the census"
+                )),
+                Some(audited) => {
+                    seen.push(audited.path);
+                    if audited.declarations != count {
+                        findings.push(format!(
+                            "{rel}: census says {} declaration(s), found {count} — a \
+                             table was added or removed here, so re-audit it and \
+                             update the entry",
+                            audited.declarations
+                        ));
+                    }
+                }
+            }
+        }
+        for audited in super::census::AUDITED {
+            if !seen.contains(&audited.path) {
+                findings.push(format!(
+                    "{}: in the census but no longer declares an address-keyed \
+                     table — drop the entry (or fix the path if the file moved)",
+                    audited.path
+                ));
+            }
+        }
+
+        assert!(
+            total_declarations > 0,
+            "the census matched no declarations at all — the pattern stopped \
+             matching, so this test was about to pass vacuously"
+        );
+        assert!(
+            findings.is_empty(),
+            "address-keyed `ObjectRef` table census is out of date.\n\
+             `ObjectRef`'s Hash/Eq are addresses: a moving collection strands \
+             live entries, and a DEAD entry collides with whatever object the \
+             allocator next places on that address — a silent wrong answer, not \
+             a miss (docs/threading/objectref-concurrency-contract.md §7.3).\n\
+             Give the table a scan+remap pair (see \
+             `net_phase_e::gc_scan_inet_addr_roots`), route it through \
+             `addr_keyed::remap_and_sweep`, or state why it is safe — then \
+             record it in `census::AUDITED`.\n  {}",
+            findings.join("\n  ")
+        );
+    }
 
     const A: usize = 0x1_0000;
     const B: usize = 0x2_0000;

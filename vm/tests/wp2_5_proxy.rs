@@ -356,9 +356,32 @@ fn proxy_lambda_dispatch_preserves_diagnostic_counters() {
     let _ = stats::dispatches();
     let _ = stats::instances_created();
     // Bump and verify monotonic.
+    //
+    // `>=`, not `==`. `PROXY_DISPATCHES` is a process-global `AtomicUsize` and
+    // this thread is not its only writer:
+    // `proxy_lambda_handler_dispatches_single_iface` runs `ProxyProbe.main`
+    // through an IN-PROCESS `Vm` in a sibling test thread, and every proxy
+    // dispatch it performs calls `inc_dispatches()` on the same counter.
+    // `load; inc; load == b + 1` is a read-modify-read race against that, and
+    // an exact delta is not a property this thread can own.
+    //
+    // Observed 2026-08-03 failing 2 of 3 full `cargo test -p cratonvm-vm` runs
+    // (`left: 2, right: 1`) while passing 3 of 3 when the binary is run on its
+    // own — the giveaway that it is scheduling, not behaviour. Anything that
+    // shifts timing changes how often the race loses; what surfaced it was
+    // cov-01 moving more methods to the optimizing tier, so the probe VM ran
+    // at a different speed.
+    //
+    // What this thread CAN prove is what is asserted below: the counter is
+    // monotonic and its own increment is included in the result.
     let b = stats::dispatches();
     stats::inc_dispatches();
-    assert_eq!(stats::dispatches(), b + 1);
+    let after = stats::dispatches();
+    assert!(
+        after >= b + 1,
+        "the dispatch counter must be monotonic and include this thread's \
+         increment: before={b} after={after}"
+    );
 }
 
 #[test]
@@ -495,6 +518,26 @@ fn ensure_probe_compiled() -> bool {
         // javac RAN and rejected the fixture: skipping here would make this
         // test a permanent vacuous pass.
         Ok(o) => {
+            // javac REJECTED THE ARGUMENTS, not the source: an unsupported `--release`
+            // means this javac is older than the level this probe compiles at, so it never
+            // opened the file. That is a missing-toolchain condition — the same one the
+            // `Err(e)` arm above skips for — not a broken probe. Reporting it as "fix the
+            // source" sends the next reader to edit a correct `.java` file.
+            //
+            // Narrowly keyed on javac's own wording for an unsupported release, so a
+            // genuine source error still reaches the assertion below and still fails loudly
+            // (see `probe_compile_guard.rs` for why that must never become a skip).
+            if !o.status.success() {
+                let stderr_probe = String::from_utf8_lossy(&o.stderr);
+                if stderr_probe.contains("release version") && stderr_probe.contains("not supported") {
+                    eprintln!(
+                        "[wp2_5_proxy] javac cannot target --release 21 ({}); skipping. Point \
+                         JAVA_HOME or CRATONVM_JAVA_HOME at a JDK 21+ install.",
+                        stderr_probe.lines().next().unwrap_or("").trim()
+                    );
+                    return false;
+                }
+            }
             assert!(
                 o.status.success(),
                 "[wp2_5_proxy] the checked-in probe fixture failed to compile — fix \

@@ -19154,20 +19154,29 @@ pub fn register_essential_natives_with_shims(
     }
 
     fn timezone_default_ref(ctx: &mut dyn NativeContext) -> cratonvm_types::Value {
+        // Fallback id when `TimeZone.setDefault(...)` has never run this
+        // process: honour the embedder's `user.timezone` system property
+        // (set at VM init from `-Duser.timezone`/the environment) instead of
+        // hardcoding "UTC", so a configured startup zone is visible before
+        // any Java code calls `setDefault`.
+        let fallback_id = cratonvm_types::flags::runtime_var("user.timezone")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "UTC".to_string());
         if let Some(class_id) = ctx.class_id_by_name("java/util/TimeZone") {
             if let Some(field_index) = ctx.static_field_index_by_name(class_id, "defaultTimeZone") {
                 let current = ctx.get_static_field(class_id, field_index);
                 if matches!(current, Value::Object(Some(_))) {
                     return current;
                 }
-                let fallback = alloc_synth_timezone(ctx, "UTC");
+                let fallback = alloc_synth_timezone(ctx, &fallback_id);
                 if matches!(fallback, Value::Object(Some(_))) {
                     ctx.set_static_field(class_id, field_index, fallback);
                 }
                 return fallback;
             }
         }
-        alloc_synth_timezone(ctx, "UTC")
+        alloc_synth_timezone(ctx, &fallback_id)
     }
 
     /// Localized display name for a synthetic TimeZone, honouring its `ID` and
@@ -19528,25 +19537,35 @@ pub fn register_essential_natives_with_shims(
         },
     );
 
-    // `TimeZone.getDefault()` — the VM runs on UTC unless the embedder says
-    // otherwise (`user.timezone`), and returning null here made every
-    // `TimeZone.getDefault().getID()` NPE.
-    registry.register(
-        "java/util/TimeZone",
-        "getDefault",
-        "()Ljava/util/TimeZone;",
-        |ctx, _args| {
-            let id = cratonvm_types::flags::runtime_var("user.timezone")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "UTC".to_string());
-            let tz = alloc_concurrent_synthetic(ctx, "java/util/TimeZone", 1);
-            let s = ctx.create_string(&id);
-            ctx.set_field(tz, 0, Value::Object(Some(s)));
-            let _ = ctx.set_field_by_name(tz, "ID", Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(tz))))
-        },
-    );
+    // `TimeZone.getDefault()` is intentionally NOT re-registered here.
+    //
+    // REGRESSION 2026-08-03: this spot used to carry a second
+    // `registry.register("java/util/TimeZone", "getDefault", ...)` (added
+    // 2026-07-31, `98878a6dd`) that allocated a fresh synthetic TimeZone from
+    // the `user.timezone` system property on every call. `register()` is
+    // documented last-registration-wins on the exact (class, method,
+    // descriptor) triple (see `NativeMethodRegistry::register`), and the real
+    // implementation — `timezone_default_ref` above, registered earlier in
+    // this same function at the `"getDefault"` site next to `getDefaultRef`
+    // — reads the actual `TimeZone.defaultTimeZone` static field, which is
+    // what `TimeZone.setDefault(...)`'s real bytecode writes. The later
+    // registration silently shadowed it, so every `TimeZone.getDefault()`
+    // call after a `setDefault(...)` (and everything built on it —
+    // `ZoneId.systemDefault()` above, every JDBC/native path that consults
+    // the JVM default zone) went back to reporting the VM's *startup* zone
+    // instead of whatever the running program had set. Hibernate's
+    // `Timezones.withDefaultTimeZone()`-based temporal tests
+    // (confirmed on `OffsetDateTimeTest`: `failed=0` -> `failed=60`,
+    // identically under the JIT and `--nojit`) went back to reporting
+    // timezone-offset-sized value corruption — this is native-registration
+    // shadowing, not a JIT or GC defect. `timezone_default_ref` now also
+    // honours `user.timezone` as its
+    // own fallback (used only before the first `setDefault` call), so the
+    // duplicate's one legitimate feature is preserved without reintroducing
+    // the shadow. Lesson: "this native looks wrong / returns null" is never
+    // grounds for a fresh `register()` call on a triple without first
+    // grepping whether an earlier one already owns it — the earlier one may
+    // be the correct implementation, and the later call always wins silently.
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
         "getZoneInfo",
@@ -24870,7 +24889,14 @@ fn locale_default() -> &'static parking_lot::Mutex<Option<ObjectRef>> {
 }
 
 /// Side-table mapping a CratonVM-synthesised `java/util/Locale` ObjectRef to
-/// its `(language, country, variant)` strings.
+/// its `(language, script, country, variant)` strings.
+///
+/// The `script` slot is what makes `Locale.forLanguageTag("zh-hant-CN")`
+/// round-trip: `Locale` keeps the script as a first-class subtag (its
+/// `toString()` renders it as the `_#Hant` suffix), and a table that only held
+/// language/country/variant had nowhere to put it, so every script-bearing
+/// tag collapsed onto the script-less locale — Tomcat's
+/// `TestAcceptLanguage.bug56848`, "expected:<zh_CN_#Hant> but was:<zh_CN>".
 ///
 /// CRITICAL: `java.util.Locale` is a real bootstrap class whose instance
 /// fields are `baseLocale` (a `sun.util.locale.BaseLocale`) and
@@ -24889,21 +24915,39 @@ fn locale_default() -> &'static parking_lot::Mutex<Option<ObjectRef>> {
 /// spec-correct "no extensions" shape). The language/country/variant data
 /// lives here instead, keyed by ObjectRef, and every Locale accessor native
 /// reads from this table.
-fn locale_data(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<ObjectRef, (String, String, String)>> {
+fn locale_data() -> &'static parking_lot::Mutex<
+    std::collections::HashMap<ObjectRef, (String, String, String, String)>,
+> {
     use std::sync::OnceLock;
     static DATA: OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<ObjectRef, (String, String, String)>>,
+        parking_lot::Mutex<std::collections::HashMap<ObjectRef, (String, String, String, String)>>,
     > = OnceLock::new();
     DATA.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Record a synthetic Locale's `(language, country, variant)` in the side
-/// table. See [`locale_data`] for why instance fields must not be used.
+/// table, with no script subtag. See [`locale_data`] for why instance fields
+/// must not be used, and [`locale_data_set_full`] for the script-bearing form.
 pub(crate) fn locale_data_set(obj: ObjectRef, lang: &str, country: &str, variant: &str) {
+    locale_data_set_full(obj, lang, "", country, variant);
+}
+
+/// Record a synthetic Locale's full `(language, script, country, variant)`.
+pub(crate) fn locale_data_set_full(
+    obj: ObjectRef,
+    lang: &str,
+    script: &str,
+    country: &str,
+    variant: &str,
+) {
     locale_data().lock().insert(
         obj,
-        (lang.to_string(), country.to_string(), variant.to_string()),
+        (
+            lang.to_string(),
+            script.to_string(),
+            country.to_string(),
+            variant.to_string(),
+        ),
     );
 }
 
@@ -24911,6 +24955,12 @@ pub(crate) fn locale_data_set(obj: ObjectRef, lang: &str, country: &str, variant
 /// table. Returns empty strings for a Locale we never recorded (e.g. a
 /// real-JDK-constructed Locale) — callers treat that as the root locale.
 pub(crate) fn locale_data_get(obj: ObjectRef) -> (String, String, String) {
+    let (l, _, c, v) = locale_data_get_full(obj);
+    (l, c, v)
+}
+
+/// Read a synthetic Locale's full `(language, script, country, variant)`.
+pub(crate) fn locale_data_get_full(obj: ObjectRef) -> (String, String, String, String) {
     locale_data().lock().get(&obj).cloned().unwrap_or_default()
 }
 
@@ -34226,9 +34276,19 @@ fn register_locale_natives(_registry: &mut NativeMethodRegistry) {
 // side table instead. See `locale_data()` for the full rationale.
 
 pub(crate) fn locale_alloc(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> ObjectRef {
+    locale_alloc_full(ctx, lang, "", country, "")
+}
+
+/// [`locale_alloc`] with the full subtag set, including the BCP-47 script.
+pub(crate) fn locale_alloc_full(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    script: &str,
+    country: &str,
+    variant: &str,
+) -> ObjectRef {
     let loc = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-    locale_populate(ctx, loc, lang, country, "");
-    loc
+    locale_populate_full(ctx, loc, lang, script, country, variant)
 }
 
 /// Record a synthetic Locale's `(language, country, variant)` in the side
@@ -34255,8 +34315,27 @@ pub(crate) fn locale_populate(
     lang: &str,
     country: &str,
     variant: &str,
-) {
-    locale_data_set(loc, lang, country, variant);
+) -> ObjectRef {
+    locale_populate_full(ctx, loc, lang, "", country, variant)
+}
+
+/// [`locale_populate`] with the BCP-47 script subtag as well.
+///
+/// Returns `loc`'s CURRENT reference: the `BaseLocale` build below allocates
+/// (five objects), so a moving young GC in the middle relocates `loc` out from
+/// under the caller's raw `ObjectRef` — the Family-1 stale-native-local shape.
+/// `loc` is rooted in a handle scope for the duration and read back at the end.
+pub(crate) fn locale_populate_full(
+    ctx: &mut dyn NativeContext,
+    loc: ObjectRef,
+    lang: &str,
+    script: &str,
+    country: &str,
+    variant: &str,
+) -> ObjectRef {
+    locale_data_set_full(loc, lang, script, country, variant);
+    let mut scope = NativeHandleScope::new(ctx);
+    let loc_h = scope.root(loc);
     // Build the real-JDK `sun.util.locale.BaseLocale` backing object.
     // BaseLocale's instance fields are `language`, `script`, `region`,
     // `variant` (all `String`) plus a lazily-computed `int hash`. We set
@@ -34264,19 +34343,30 @@ pub(crate) fn locale_populate(
     // it lazily). `BaseLocale.equals` compares the four Strings, so using
     // interned Strings (the default for `create_string`) keeps its
     // identity (`==`) comparisons correct across separately-built Locales.
-    match ctx.ensure_class_initialized("sun/util/locale/BaseLocale") {
+    match scope.ensure_class_initialized("sun/util/locale/BaseLocale") {
         Ok(base_cid) => {
-            let nfields = ctx.class_num_total_fields(base_cid).max(5);
-            let base = ctx.alloc_object(base_cid, nfields);
-            let lang_s = ctx.create_string(lang);
-            let script_s = ctx.create_string("");
-            let region_s = ctx.create_string(country);
-            let variant_s = ctx.create_string(variant);
-            ctx.set_field_by_name(base, "language", Value::Object(Some(lang_s)));
-            ctx.set_field_by_name(base, "script", Value::Object(Some(script_s)));
-            ctx.set_field_by_name(base, "region", Value::Object(Some(region_s)));
-            ctx.set_field_by_name(base, "variant", Value::Object(Some(variant_s)));
-            ctx.set_field_by_name(loc, "baseLocale", Value::Object(Some(base)));
+            let nfields = scope.class_num_total_fields(base_cid).max(5);
+            let base = scope.alloc_object(base_cid, nfields);
+            let base_h = scope.root(base);
+            let lang_s = scope.create_string(lang);
+            let lang_h = scope.root(lang_s);
+            let script_s = scope.create_string(script);
+            let script_h = scope.root(script_s);
+            let region_s = scope.create_string(country);
+            let region_h = scope.root(region_s);
+            let variant_s = scope.create_string(variant);
+            let base = scope.get(&base_h);
+            let (lang_s, script_s, region_s) = (
+                scope.get(&lang_h),
+                scope.get(&script_h),
+                scope.get(&region_h),
+            );
+            scope.set_field_by_name(base, "language", Value::Object(Some(lang_s)));
+            scope.set_field_by_name(base, "script", Value::Object(Some(script_s)));
+            scope.set_field_by_name(base, "region", Value::Object(Some(region_s)));
+            scope.set_field_by_name(base, "variant", Value::Object(Some(variant_s)));
+            let loc_now = scope.get(&loc_h);
+            scope.set_field_by_name(loc_now, "baseLocale", Value::Object(Some(base)));
         }
         Err(e) => {
             // KNOWN GAP (2026-07-14): if `sun/util/locale/BaseLocale`'s own
@@ -34299,6 +34389,7 @@ pub(crate) fn locale_populate(
     }
     // `localeExtensions` is intentionally left null (the "no extensions"
     // shape that real-JDK `Locale.equals`/`hashCode` expect).
+    scope.get(&loc_h)
 }
 
 /// Read a Locale arg's `(language, country, variant)` — side table first,

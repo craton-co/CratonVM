@@ -1088,8 +1088,11 @@ impl SharedVm {
         let iterator_id = class_manager
             .load_class("java/util/Iterator")
             .expect("java/util/Iterator must be loadable");
+        // Through `set_superclass`, not a raw `cls.superclass =` write: the
+        // store's direct-subclass index has to see the new edge, or
+        // `recompute_subclass_layouts` goes blind to this class.
+        class_manager.set_superclass(enum_impl_id, Some(object_id));
         if let Some(cls) = class_manager.get_class_mut(enum_impl_id) {
-            cls.superclass = Some(object_id);
             if !cls.interfaces.contains(&enumeration_id) {
                 cls.interfaces.push(enumeration_id);
             }
@@ -1108,8 +1111,8 @@ impl SharedVm {
         let comparator_id = class_manager
             .load_class("java/util/Comparator")
             .expect("java/util/Comparator must be loadable");
+        class_manager.set_superclass(cmp_native_id, Some(object_id));
         if let Some(cls) = class_manager.get_class_mut(cmp_native_id) {
-            cls.superclass = Some(object_id);
             if !cls.interfaces.contains(&comparator_id) {
                 cls.interfaces.push(comparator_id);
             }
@@ -1222,8 +1225,8 @@ impl SharedVm {
             ];
             for (name, ifaces) in unmod_specs {
                 let cid = class_manager.ensure_synthetic_class(name, 1);
+                class_manager.set_superclass(cid, Some(object_id));
                 if let Some(cls) = class_manager.get_class_mut(cid) {
-                    cls.superclass = Some(object_id);
                     for iface in ifaces {
                         if !cls.interfaces.contains(iface) {
                             cls.interfaces.push(*iface);
@@ -3110,6 +3113,10 @@ impl SharedVm {
                 anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
                 statics: RwLock::new(FxHashMap::default()),
                 statics_index: crate::vm::realms::class_realm::StaticsIndex::new(),
+                // u32::MAX = "java/lang/System not prepared yet"; a real
+                // ClassId can never be u32::MAX (see AUTOBOX_CLASS_ID's
+                // reserved-range note in `types`).
+                system_class_id: AtomicU32::new(u32::MAX),
                 resolution_cache: RwLock::new(ResolutionCache::new()),
                 // Round 8 audit fix (CRIT #2): reflective lookup cache.
                 link_resolver: LinkResolver::new(),
@@ -3376,7 +3383,11 @@ impl SharedVm {
         // in the VM's VtableManager too.
         {
             let cm = vm.classes.class_manager.read();
-            let store_len = cm.class_store.len() as u32;
+            // `slot_count()`, not `len()` — the latter is the live count and
+            // under-runs the id space as soon as anything has been unloaded
+            // (see `ClassStore::slot_count`). `vtable_descriptors_of` returns
+            // `None` for tombstoned ids, so the extra slots cost nothing.
+            let store_len = cm.class_store.slot_count() as u32;
             for cid in 0..store_len {
                 let cid = crate::classloading::ClassId::new(cid);
                 if let Some(entries) = cm.vtable_descriptors_of(cid) {

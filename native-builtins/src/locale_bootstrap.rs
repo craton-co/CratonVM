@@ -303,20 +303,28 @@ fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // See `locale_language`: the `locale_populate` side table is what the
         // constructors and constants fill, and a synthetic Locale has no
         // `baseLocale` for the fallback below to read.
-        let (l, c, v) = crate::locale_data_get(*this);
-        if !l.is_empty() || !c.is_empty() {
+        let (l, sc, c, v) = crate::locale_data_get_full(*this);
+        if !l.is_empty() || !c.is_empty() || !sc.is_empty() {
             let mut tag = if l.is_empty() {
                 "und".to_string()
             } else {
                 l.to_ascii_lowercase()
             };
+            // BCP-47 orders the subtags language-Script-REGION-variant.
+            if !sc.is_empty() {
+                tag.push('-');
+                tag.push_str(&sc);
+            }
             if !c.is_empty() {
                 tag.push('-');
                 tag.push_str(&c.to_ascii_uppercase());
             }
             if !v.is_empty() {
-                tag.push('-');
-                tag.push_str(&v);
+                // `Locale` stores multiple variants "_"-joined; BCP-47 uses "-".
+                for sub in v.split('_').filter(|s| !s.is_empty()) {
+                    tag.push('-');
+                    tag.push_str(sub);
+                }
             }
             return Ok(Some(Value::Object(Some(ctx.create_string(&tag)))));
         }
@@ -435,11 +443,224 @@ fn locale_get_extension(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn locale_script(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
+        // Same three-shape lookup as `locale_language`: the `locale_populate`
+        // side table first (it is the only place a synthetic Locale's script
+        // survives when `sun.util.locale.BaseLocale` is unavailable — the
+        // synthetic-JDK build has no such class), then the real object's
+        // `baseLocale`.
+        let (_, script, _, _) = crate::locale_data_get_full(*this);
+        if !script.is_empty() {
+            return Ok(Some(Value::Object(Some(ctx.create_string(&script)))));
+        }
         if let Some(s) = base_locale_field(ctx, *this, "script") {
             return Ok(Some(Value::Object(Some(s))));
         }
     }
     Ok(Some(Value::Object(Some(ctx.create_string("")))))
+}
+
+/// Build a `Locale` from a BCP-47 language tag by running the REAL JDK's
+/// `Locale.forLanguageTag` body — `LanguageTag.parse` →
+/// `InternalLocaleBuilder` → `Locale.getInstance` — instead of
+/// re-implementing BCP-47 in Rust.
+///
+/// Returns `None` when any step is unreachable, which is exactly the
+/// synthetic-JDK build (no `sun.util.locale` package at all); the caller then
+/// falls back to [`split_language_tag`].
+///
+/// Why delegate rather than extend the Rust parser: the Rust split had no
+/// slot for the script subtag (`zh-hant-CN` came out as plain `zh_CN`, the
+/// `TestAcceptLanguage.bug56848` failure) and mistook a BCP-47 singleton for a
+/// variant (`en-US-u-ca-japanese` came out with variant `"u"`,
+/// `zh-Hant-TW-x-java` with variant `"x"`). Each of those is a separate corner
+/// of a grammar the JDK already implements — and the JDK's implementation is
+/// plain bytecode that CratonVM runs correctly, as
+/// `Locale.Builder.setLanguageTag` (which shares this exact chain) already
+/// demonstrated. `LanguageTag.parse` is called with `lenient = true` and a
+/// fresh `ParsePosition(0)` that is never inspected — exactly what
+/// `forLanguageTag` passes, so an ill-formed trailing subtag is dropped
+/// rather than thrown on.
+fn locale_from_language_tag_real(ctx: &mut dyn NativeContext, tag: &str) -> Option<ObjectRef> {
+    ctx.ensure_class_initialized("sun/util/locale/LanguageTag")
+        .ok()?;
+    ctx.ensure_class_initialized("sun/util/locale/InternalLocaleBuilder")
+        .ok()?;
+
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let tag_s = scope.create_string(tag);
+    let tag_h = scope.root(tag_s);
+
+    // NOTE the descriptor: JDK 25 spells this `parse(String, ParsePosition,
+    // boolean)`. The older `parse(String, ParseStatus)` shape resolves to
+    // nothing here — `sun.util.locale.ParseStatus` no longer exists — and a
+    // failed resolution is indistinguishable from "synthetic JDK", so the
+    // whole delegation silently degraded to the Rust fallback.
+    let pp = match scope.new_object_initialized("java/text/ParsePosition", "(I)V", &[Value::Int(0)])
+    {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let pp_h = scope.root(pp);
+
+    let parse_args = [
+        Value::Object(Some(scope.get(&tag_h))),
+        Value::Object(Some(scope.get(&pp_h))),
+        Value::Int(1),
+    ];
+    let lt = match scope.invoke(
+        "sun/util/locale/LanguageTag",
+        "parse",
+        "(Ljava/lang/String;Ljava/text/ParsePosition;Z)Lsun/util/locale/LanguageTag;",
+        &parse_args,
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let lt_h = scope.root(lt);
+
+    let bldr =
+        match scope.new_object_initialized("sun/util/locale/InternalLocaleBuilder", "()V", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+    let bldr_h = scope.root(bldr);
+
+    let (recv, arg) = (scope.get(&bldr_h), scope.get(&lt_h));
+    scope
+        .invoke_virtual(
+            recv,
+            "setLanguageTag",
+            "(Lsun/util/locale/LanguageTag;)Lsun/util/locale/InternalLocaleBuilder;",
+            &[Value::Object(Some(arg))],
+        )
+        .ok()?;
+
+    let recv = scope.get(&bldr_h);
+    let base =
+        match scope.invoke_virtual(recv, "getBaseLocale", "()Lsun/util/locale/BaseLocale;", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+    let base_h = scope.root(base);
+
+    let recv = scope.get(&bldr_h);
+    let exts = match scope.invoke_virtual(
+        recv,
+        "getLocaleExtensions",
+        "()Lsun/util/locale/LocaleExtensions;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(o))) => o,
+        _ => return None,
+    };
+    let exts_h = exts.map(|e| scope.root(e));
+
+    // `forLanguageTag`'s last step: a tag whose only extension information is
+    // carried by a legacy variant (`ja-JP-x-lvariant-JP`) gets the matching
+    // calendar/numbering extension synthesised back. Best-effort — if the
+    // package-private helper is not callable the locale is still correct for
+    // every tag that does not use that legacy spelling.
+    let exts_h = match exts_h {
+        Some(h) => Some(h),
+        None => {
+            let base_now = scope.get(&base_h);
+            let variant_empty = match scope.get_field_by_name(base_now, "variant") {
+                Value::Object(Some(s)) => scope.read_string(s).unwrap_or_default().is_empty(),
+                _ => true,
+            };
+            if variant_empty {
+                None
+            } else {
+                let base_now = scope.get(&base_h);
+                let compat_args = [
+                    scope.get_field_by_name(base_now, "language"),
+                    scope.get_field_by_name(base_now, "script"),
+                    scope.get_field_by_name(base_now, "region"),
+                    scope.get_field_by_name(base_now, "variant"),
+                ];
+                match scope.invoke(
+                    "java/util/Locale",
+                    "getCompatibilityExtensions",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)\
+                     Lsun/util/locale/LocaleExtensions;",
+                    &compat_args,
+                ) {
+                    Ok(Some(Value::Object(Some(e)))) => Some(scope.root(e)),
+                    _ => None,
+                }
+            }
+        }
+    };
+
+    let get_args = [
+        Value::Object(Some(scope.get(&base_h))),
+        Value::Object(exts_h.as_ref().map(|h| scope.get(h))),
+    ];
+    match scope.invoke(
+        "java/util/Locale",
+        "getInstance",
+        "(Lsun/util/locale/BaseLocale;Lsun/util/locale/LocaleExtensions;)Ljava/util/Locale;",
+        &get_args,
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => Some(o),
+        _ => None,
+    }
+}
+
+/// Split a BCP-47 language tag into `(language, script, region, variant)`.
+///
+/// The synthetic-JDK fallback for [`locale_from_language_tag_real`]; it models
+/// only the subtags the Rust side table can hold, so BCP-47 extensions are
+/// dropped rather than mis-filed as a variant.
+pub(crate) fn split_language_tag(tag: &str) -> (String, String, String, String) {
+    let mut parts = tag.split(['-', '_']).filter(|p| !p.is_empty());
+    let mut language = parts.next().unwrap_or("").to_ascii_lowercase();
+    // `und` is BCP-47 for "undetermined", which `Locale` represents as an
+    // EMPTY language: on HotSpot `forLanguageTag("und-DE").getLanguage()` is
+    // `""` and its `toString()` is `_DE`, not `und_DE`.
+    if language == "und" {
+        language.clear();
+    }
+    let mut script = String::new();
+    let mut region = String::new();
+    let mut variants: Vec<String> = Vec::new();
+    for p in parts {
+        // A single-character subtag is an extension/private-use singleton;
+        // everything after it belongs to that extension. The side table has no
+        // slot for extensions, so stop here rather than filing `u` or `x` as a
+        // variant (which is what the previous parser did).
+        if p.len() == 1 {
+            break;
+        }
+        let alpha = p.chars().all(|c| c.is_ascii_alphabetic());
+        if script.is_empty() && region.is_empty() && variants.is_empty() && p.len() == 4 && alpha {
+            script = p.to_ascii_lowercase();
+            if let Some(first) = script.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            continue;
+        }
+        if region.is_empty()
+            && variants.is_empty()
+            && ((p.len() == 2 && alpha) || (p.len() == 3 && p.chars().all(|c| c.is_ascii_digit())))
+        {
+            region = p.to_ascii_uppercase();
+            continue;
+        }
+        // A well-formed variant is 5-8 alphanumerics, or exactly 4 characters
+        // the first of which is a digit. Anything else is ill-formed, and
+        // `LanguageTag.parse` stops at the first ill-formed subtag.
+        let alnum = p.chars().all(|c| c.is_ascii_alphanumeric());
+        let well_formed = alnum
+            && ((5..=8).contains(&p.len())
+                || (p.len() == 4 && p.starts_with(|c: char| c.is_ascii_digit())));
+        if !well_formed {
+            break;
+        }
+        variants.push(p.to_string());
+    }
+    // `Locale` joins multiple variant subtags with `_`.
+    (language, script, region, variants.join("_"))
 }
 
 fn locale_variant(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -808,11 +1029,49 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         locale_tag,
     );
+    // `stripExtensions` used to be an identity stub, which was harmless only
+    // while no CratonVM `Locale` could carry extensions in the first place.
+    // Now that `forLanguageTag` runs the real BCP-47 parser, `zh-Hant-TW-x-java`
+    // does have a `localeExtensions`, and the identity stub answered
+    // `zh_TW_#Hant_x-java` where HotSpot answers `zh_TW_#Hant`.
     registry.register(
         "java/util/Locale",
         "stripExtensions",
         "()Ljava/util/Locale;",
-        |_ctx, args| Ok(args.first().copied()),
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                other => return Ok(other.copied()),
+            };
+            // `hasExtensions()` is `localeExtensions != null`. A Locale
+            // without extensions — every synthetic one — strips to itself.
+            if !matches!(
+                ctx.get_field_by_name(this, "localeExtensions"),
+                Value::Object(Some(_))
+            ) {
+                return Ok(Some(Value::Object(Some(this))));
+            }
+            let base = match ctx.get_field_by_name(this, "baseLocale") {
+                Value::Object(Some(b)) => b,
+                _ => return Ok(Some(Value::Object(Some(this)))),
+            };
+            let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let base_h = scope.root(base);
+            let args = [
+                Value::Object(Some(scope.get(&base_h))),
+                Value::Object(None),
+            ];
+            match scope.invoke(
+                "java/util/Locale",
+                "getInstance",
+                "(Lsun/util/locale/BaseLocale;Lsun/util/locale/LocaleExtensions;)Ljava/util/Locale;",
+                &args,
+            ) {
+                Ok(Some(Value::Object(Some(o)))) => Ok(Some(Value::Object(Some(o)))),
+                _ => Ok(Some(Value::Object(Some(scope.get(&this_h))))),
+            }
+        },
     );
     registry.register(
         "java/util/Locale",
@@ -1017,14 +1276,26 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             let variant = read(ctx, v);
             let v = subtag(ctx, "getScript")?;
             let script = read(ctx, v);
+            // BCP-47 extensions, e.g. `-u-ca-japanese` / `-x-java`.
+            // `LocaleExtensions.id` already holds the canonical, lower-cased
+            // sequence real `toString()` appends; a Locale with no extensions
+            // has a null `localeExtensions`, so this reads as empty.
+            let ext = match ctx.get_field_by_name(this, "localeExtensions") {
+                Value::Object(Some(le)) => match ctx.get_field_by_name(le, "id") {
+                    Value::Object(Some(id_s)) => ctx.read_string(id_s).unwrap_or_default(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
 
             // Same condition set as `java.util.Locale.toString`: the region
             // separator appears when there IS a region, or when a language is
-            // followed by a variant/script that needs the empty region slot to
-            // keep its position.
+            // followed by a variant/script/extension that needs the empty
+            // region slot to keep its position.
             let mut s = lang.clone();
             if !country.is_empty()
-                || (!lang.is_empty() && (!variant.is_empty() || !script.is_empty()))
+                || (!lang.is_empty()
+                    && (!variant.is_empty() || !script.is_empty() || !ext.is_empty()))
             {
                 s.push('_');
                 s.push_str(&country);
@@ -1037,13 +1308,28 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 s.push_str("_#");
                 s.push_str(&script);
             }
+            // The extension sequence follows the script, sharing its `#`
+            // marker when a script is present (`zh_TW_#Hant_x-java`) and
+            // introducing its own when it is not (`en_US_#u-ca-japanese`).
+            if !ext.is_empty() && (!lang.is_empty() || !country.is_empty()) {
+                s.push('_');
+                if script.is_empty() {
+                    s.push('#');
+                }
+                s.push_str(&ext);
+            }
             Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
         },
     );
 
-    // BCP-47 `language-Script-REGION-variant`. Only the language and region
-    // subtags feed the side table, which is all the accessors above read; a
-    // script subtag is recognised so it is not mistaken for the region.
+    // BCP-47 `language-Script-REGION-variant-extensions`.
+    //
+    // The real JDK's own parser is used whenever it is reachable (see
+    // [`locale_from_language_tag_real`]) — it is the only thing that gets
+    // script subtags, multi-subtag variants, and `-u-`/`-x-` extensions right,
+    // and its output is bit-for-bit what HotSpot produces. The hand-rolled
+    // Rust split below is the synthetic-JDK fallback, where `sun.util.locale`
+    // does not exist at all.
     registry.register(
         "java/util/Locale",
         "forLanguageTag",
@@ -1053,27 +1339,21 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let mut parts = tag.split(['-', '_']).filter(|p| !p.is_empty());
-            let lang = parts.next().unwrap_or("").to_ascii_lowercase();
-            let mut country = String::new();
-            let mut variant = String::new();
-            for p in parts {
-                // A 4-letter subtag is a script (e.g. `Hant`); skip it.
-                if p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()) {
-                    continue;
-                }
-                if country.is_empty()
-                    && (p.len() == 2 || (p.len() == 3 && p.chars().all(|c| c.is_ascii_digit())))
-                {
-                    country = p.to_ascii_uppercase();
-                } else if variant.is_empty() {
-                    variant = p.to_string();
-                }
+            if let Some(loc) = locale_from_language_tag_real(ctx, &tag) {
+                return Ok(Some(Value::Object(Some(loc))));
             }
-            let loc = crate::locale_alloc(ctx, &lang, &country);
-            if !variant.is_empty() {
-                crate::locale_populate(ctx, loc, &lang, &country, &variant);
-            }
+            // Reaching here in real-JDK mode means one of the delegation's
+            // class/method resolutions moved. That degrades silently — the
+            // fallback answers plausibly for simple tags and only loses
+            // extensions — so say so rather than leave the next reader to
+            // rediscover it from a failing assertion.
+            tracing::debug!(
+                tag = %tag,
+                "Locale.forLanguageTag: real-JDK BCP-47 chain unavailable, \
+                 using the Rust subtag split (extensions will be dropped)"
+            );
+            let (lang, script, country, variant) = split_language_tag(&tag);
+            let loc = crate::locale_alloc_full(ctx, &lang, &script, &country, &variant);
             Ok(Some(Value::Object(Some(loc))))
         },
     );
@@ -1122,7 +1402,115 @@ pub fn register(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_posix_locale;
+    use super::{parse_posix_locale, split_language_tag};
+
+    fn split(tag: &str) -> (String, String, String, String) {
+        split_language_tag(tag)
+    }
+
+    /// The script subtag survives, title-cased, and does not eat the region.
+    ///
+    /// `zh-hant-CN` used to come back as `("zh", "", "CN", "")` — the parser
+    /// recognised the 4-letter script only well enough to *skip* it — so
+    /// `Locale.toString()` rendered `zh_CN` where HotSpot renders
+    /// `zh_CN_#Hant` (`TestAcceptLanguage.bug56848`).
+    #[test]
+    fn script_subtag_is_kept_and_title_cased() {
+        assert_eq!(
+            split("zh-hant-CN"),
+            ("zh".into(), "Hant".into(), "CN".into(), String::new())
+        );
+        assert_eq!(
+            split("zh-hans-TW"),
+            ("zh".into(), "Hans".into(), "TW".into(), String::new())
+        );
+        // No region at all.
+        assert_eq!(
+            split("az-Cyrl"),
+            ("az".into(), "Cyrl".into(), String::new(), String::new())
+        );
+        // Already title-cased input is left alone.
+        assert_eq!(
+            split("sr-Latn-RS"),
+            ("sr".into(), "Latn".into(), "RS".into(), String::new())
+        );
+    }
+
+    /// `und` is BCP-47 for "undetermined"; `Locale` renders it as an EMPTY
+    /// language, so `forLanguageTag("und-DE").toString()` is `_DE` — not
+    /// `und_DE`, which is what treating `und` as a language produced.
+    #[test]
+    fn undetermined_language_is_empty() {
+        assert_eq!(
+            split("und-DE"),
+            (String::new(), String::new(), "DE".into(), String::new())
+        );
+    }
+
+    /// A single-character subtag opens a BCP-47 extension (`-u-`, `-x-`).
+    /// The side table cannot hold extensions, so parsing stops there; the old
+    /// parser filed the singleton itself as the variant, producing locales
+    /// whose variant was literally `"u"` or `"x"`.
+    #[test]
+    fn extension_singleton_is_not_a_variant() {
+        assert_eq!(
+            split("en-US-u-ca-japanese"),
+            ("en".into(), String::new(), "US".into(), String::new())
+        );
+        assert_eq!(
+            split("zh-Hant-TW-x-java"),
+            ("zh".into(), "Hant".into(), "TW".into(), String::new())
+        );
+    }
+
+    /// Variants are 5-8 alphanumerics, or 4 characters starting with a digit,
+    /// and several may be present (`Locale` joins them with `_`).
+    #[test]
+    fn variants_follow_the_bcp47_shape() {
+        assert_eq!(
+            split("de-DE-1996"),
+            ("de".into(), String::new(), "DE".into(), "1996".into())
+        );
+        assert_eq!(
+            split("de-DE-POSIX"),
+            ("de".into(), String::new(), "DE".into(), "POSIX".into())
+        );
+        assert_eq!(
+            split("sl-IT-nedis-rozaj"),
+            (
+                "sl".into(),
+                String::new(),
+                "IT".into(),
+                "nedis_rozaj".into()
+            )
+        );
+        // A 3-digit region is legal (UN M.49); a 3-letter one is not.
+        assert_eq!(
+            split("es-419"),
+            ("es".into(), String::new(), "419".into(), String::new())
+        );
+    }
+
+    /// Plain tags, and the `_` separator CratonVM callers sometimes pass.
+    #[test]
+    fn simple_tags_are_unchanged() {
+        assert_eq!(
+            split("en"),
+            ("en".into(), String::new(), String::new(), String::new())
+        );
+        assert_eq!(
+            split("en-gb"),
+            ("en".into(), String::new(), "GB".into(), String::new())
+        );
+        assert_eq!(
+            split("fr_FR"),
+            ("fr".into(), String::new(), "FR".into(), String::new())
+        );
+        assert_eq!(
+            split(""),
+            (String::new(), String::new(), String::new(), String::new())
+        );
+    }
 
     /// The POSIX `C`/`POSIX` locales, and no locale at all, are English/US.
     ///

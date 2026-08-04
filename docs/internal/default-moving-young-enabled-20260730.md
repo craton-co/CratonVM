@@ -292,7 +292,7 @@ The mirror image of the same class was found the day before, on 2026-07-31:
 three root-visibility mechanisms (full-GPR safepoint spill, scratch flush,
 shadow publication) were live *only* because this default is on, so
 `CRATONVM_NO_MOVING_YOUNG=1` withdrew all three at once and faulted within
-seconds (`known-issues/jit/jit-no-moving-young-opt-out-unpublishes-roots.md`).
+seconds (`internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`).
 Both directions, two days apart, same root shape: a fix keyed on this flag for
 correlation rather than for meaning.
 

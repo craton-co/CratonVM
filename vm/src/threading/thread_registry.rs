@@ -1289,6 +1289,21 @@ impl ThreadRegistry {
         }
     }
 
+    /// The monitor `thread_id` is currently blocked in `Object.wait()` on, if
+    /// any — without consuming it or closing the JMX wait-time accounting.
+    ///
+    /// Used by `Thread.interrupt()` to wake a target parked in `Object.wait()`.
+    /// The slot is written just before the park and taken just after it, so a
+    /// `Some` here means the target is (or was a moment ago) in the wait, and a
+    /// wake sent to a target that has already left is harmless: `wait()` is
+    /// specified to permit spurious wakeups, and the surrounding Java `while`
+    /// loop re-checks and re-parks.
+    pub fn peek_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
+        let threads = self.threads.read();
+        let monitor = *threads.get(&thread_id)?.jmx_waiting_monitor.lock();
+        monitor
+    }
+
     pub fn take_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
         let threads = self.threads.read();
         let entry = threads.get(&thread_id)?;

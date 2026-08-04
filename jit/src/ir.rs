@@ -261,6 +261,64 @@ pub enum Op {
     /// Float / double constant stored as raw bits (no inputs).
     ConstF(u64),
 
+    // ── Constant-pool constants that are NOT immediates (cov-01) ─────
+    //
+    // These three are constants in the bytecode's sense and runtime calls in
+    // the machine's. Each names a constant-pool SITE and materialises its value
+    // on every execution through the same helper the single-pass backend uses,
+    // and each therefore carries `[ctrl, mem]` and the `MemAccess::Opaque`
+    // memory shape `Op::Call` has: a safepoint, an allocation, and a barrier
+    // nothing reorders across.
+    //
+    // Re-materialising rather than baking is not a missed optimisation — it is
+    // the correctness requirement. An `ObjectRef` baked at compile time is
+    // stale the moment a relocating collector moves it, and `<clinit>` is a
+    // side effect the constant owes on first touch. See each variant.
+    /// `ldc <String>` — the interned literal at (`bytes`, `len`). Inputs
+    /// `[ctrl, mem]`, result `Ref`.
+    ///
+    /// Lowered as a call to `helpers.ldc_string`, which consults the VM string
+    /// pool. The bytes live in the compiling artifact (`_jit_strings`), so the
+    /// baked address outlives the code; the *object* is fetched fresh every
+    /// execution, because the pool is rewritten after a moving collection.
+    ConstString {
+        bytes: usize,
+        len: usize,
+    },
+
+    /// `ldc <Class>` — the mirror of the class named at `cp_idx` in
+    /// `holder_class_id`'s constant pool. Inputs `[ctrl, mem]`, result `Ref`.
+    ///
+    /// Lowered as a call to `helpers.ldc_class_cp`. CP-indexed rather than
+    /// class-id-indexed for the two reasons `JitLdcConstant::ClassMirror`
+    /// records: the target may not be loaded yet, and loading it is a user
+    /// `ClassLoader.loadClass` that must not run inside the compiler. A `0`
+    /// return is a published pending exception, not a value.
+    ConstClass {
+        holder_class_id: u32,
+        cp_idx: u16,
+    },
+
+    /// `getstatic` — read the static field at `field_index` of `class_id`.
+    /// Inputs `[ctrl, mem]`; result typed from `type_tag`.
+    ///
+    /// Two lowerings, chosen exactly as the single-pass backend's `0xb2` arm
+    /// chooses: a direct load through the class's baked base-POINTER cell when
+    /// `x64::resolve_static_base` accepts the site (which it does only for a
+    /// class already initialised at compile time), and `helpers.getstatic`
+    /// otherwise — that helper runs `<clinit>` on first touch and reports a
+    /// failure as the `i64::MIN` deopt sentinel with a pending Java exception.
+    ///
+    /// `putstatic` has no counterpart here on purpose: a static reference WRITE
+    /// owes an SATB pre-barrier that no collector `set_field` barrier covers,
+    /// which is why the single-pass backend keeps writes on their helpers.
+    LoadStatic {
+        class_id: u32,
+        field_index: u32,
+        type_tag: u8,
+        is_volatile: bool,
+    },
+
     // ── Parameters ───────────────────────────────────────────────────
     /// Method parameter at index `i` (no inputs — defined at Start).
     Param(u16),
@@ -2755,6 +2813,14 @@ impl Op {
             Op::New { .. } => (2, MemAccess::Allocate), // [ctrl, mem]
             Op::NewArray { .. } => (3, MemAccess::Allocate), // [ctrl, mem, length]
             Op::Call { .. } => (2, MemAccess::Opaque), // [ctrl, mem, args…]
+            // cov-01. Each is a call to a runtime helper that can intern, load
+            // a class, or run `<clinit>` — i.e. arbitrary Java. `Opaque` is the
+            // top of the effect lattice (reads Any, writes Any, safepoint,
+            // allocates), which is the same classification `Op::Call` gets and
+            // the only defensible one for a node whose callee is a class
+            // initialiser.
+            Op::ConstString { .. } | Op::ConstClass { .. } => (2, MemAccess::Opaque), // [ctrl, mem]
+            Op::LoadStatic { .. } => (2, MemAccess::Opaque), // [ctrl, mem]
             Op::LambdaIntToDouble => (4, MemAccess::Opaque), // [ctrl, mem, lambda, index]
             Op::MonitorEnter => (3, MemAccess::MonitorEnter), // [ctrl, mem, obj]
             Op::MonitorExit => (3, MemAccess::MonitorExit), // [ctrl, mem, obj]
@@ -3519,12 +3585,72 @@ pub struct IrBuilder {
     /// live across the call — found by the conservative GC scan of the spilled
     /// frame, sound because GC is non-moving while a JIT frame is active).
     invoke_info: HashMap<usize, (usize, usize, u8)>,
+    /// Diagnostic-only: `pc → "0xNN cn.mn desc"` for every invoke site in the
+    /// method. Populated by `lib.rs` **only** when [`ir_bail_reporting`] is on,
+    /// and read **only** by [`Self::bail_invoke`]. Never consulted by lowering,
+    /// so an absent or stale entry cannot change a compile.
+    ///
+    /// It exists because the invoke bails below report a line number and a
+    /// pc, and the question every one of them raises — *which callee* — was
+    /// otherwise a `javap` away for each event. `cov-04`'s whole first
+    /// increment was "group the 53 by callee"; this is what makes that a grep.
+    invoke_labels: HashMap<usize, Box<str>>,
+    /// Diagnostic-only companion to [`Self::invoke_labels`]: the compiling
+    /// method's own `cn.mn desc`. Without it the caller has to be recovered by
+    /// pairing a bail line with the nearest preceding `[ir] invoke-plan` line,
+    /// which is an *assumption about log interleaving* rather than a fact —
+    /// exactly the kind of inferred join this directory's rule 6 says not to
+    /// trust. Same lifetime and same flag as `invoke_labels`.
+    method_label: Option<Box<str>>,
     pub tdigest_scalar_kernel: bool,
     /// inc 26/35: resolved `ldc2_w` (0x14) constant values (`pc → (bits, is_double)`).
     /// Set by [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to
     /// single-pass. `is_double` selects the lowering: a `long` constant becomes
     /// `Op::Const(Long)` (`lconst`), a `double` constant `Op::ConstF` (`dconst`).
     ldc2w_info: HashMap<usize, (i64, bool)>,
+    /// COV-03: may a `getfield`/`putfield` of a `J` (long) field build?
+    ///
+    /// A wide field access is the one way a category-2 VALUE can enter the
+    /// graph without a category-2 OPCODE appearing in the body — `getfield J;
+    /// invokestatic (J)V` contains neither. The admission gate in `lib.rs`
+    /// keys on opcodes and the descriptor, so it would admit that method with
+    /// the long tier OFF and the builder would then produce `IrType::Long`
+    /// nodes the tier does not support. Gate the arm on the same flag the
+    /// admission chain uses (`ir_emit_long`) instead of relying on a premise
+    /// the arm itself breaks. Default `false` ⇒ a `J` field bails, exactly as
+    /// before this lane.
+    wide_field_long: bool,
+    /// COV-03: may a `getfield`/`putfield` of an `F`/`D` field build? Same
+    /// reasoning as [`Self::wide_field_long`], for `ir_emit_fp`.
+    wide_field_fp: bool,
+    /// cov-01: resolved `ldc` / `ldc_w` (0x12 / 0x13) IMMEDIATE constants
+    /// (`pc → (bits, is_float)`). Set by [`Self::set_ldc_info`]; a pc not
+    /// present bails to single-pass, which is what every String / Class /
+    /// `MethodHandle` / condy site does — those are not immediates and the
+    /// builder must not invent one for them.
+    ///
+    /// `is_float` selects the node exactly as `ldc2w_info`'s `is_double` does:
+    /// an `int` constant becomes `Op::Const`/`Int` (`iconst`), a `float`
+    /// constant `Op::ConstF`/`Float` (`fconst`). The caller only inserts a
+    /// float entry when the FP tier is on.
+    ldc_info: HashMap<usize, (i64, bool)>,
+    /// cov-01 increment 2: resolved `ldc <String>` sites (`pc → (bytes, len)`),
+    /// the ADDRESS and length of the literal's UTF-8, not a reference. Set by
+    /// [`Self::set_ldc_string_info`]. The caller owns the bytes for the
+    /// artifact's lifetime; see [`Op::ConstString`] for why the object itself
+    /// is re-fetched on every execution instead.
+    ldc_string_info: HashMap<usize, (usize, usize)>,
+    /// cov-01 increment 3: resolved `ldc <Class>` sites
+    /// (`pc → (holder_class_id, cp_idx)`). Set by
+    /// [`Self::set_ldc_class_info`]; a site whose helper is unwired is simply
+    /// absent, so the arm bails. See [`Op::ConstClass`].
+    ldc_class_info: HashMap<usize, (u32, u16)>,
+    /// cov-01 increment 4: resolved `getstatic` (0xb2) sites
+    /// (`pc → (class_id, field_index, type_tag, is_volatile)`) — the same tuple
+    /// the single-pass backend's `static_field_info` carries. Set by
+    /// [`Self::set_static_field_info`]; an unresolvable site is absent and the
+    /// arm bails the method. See [`Op::LoadStatic`].
+    static_field_info: HashMap<usize, (u32, usize, u8, bool)>,
 }
 
 impl IrBuilder {
@@ -3571,8 +3697,16 @@ impl IrBuilder {
             new_info: HashMap::new(),
             trivial_init_pcs: HashSet::new(),
             invoke_info: HashMap::new(),
+            invoke_labels: HashMap::new(),
+            method_label: None,
             tdigest_scalar_kernel: false,
             ldc2w_info: HashMap::new(),
+            wide_field_long: false,
+            wide_field_fp: false,
+            ldc_info: HashMap::new(),
+            ldc_string_info: HashMap::new(),
+            ldc_class_info: HashMap::new(),
+            static_field_info: HashMap::new(),
         }
     }
 
@@ -3580,6 +3714,63 @@ impl IrBuilder {
     /// be called before [`Self::build`]; an `ldc2_w` pc not present bails.
     pub fn set_ldc2w_info(&mut self, info: HashMap<usize, (i64, bool)>) {
         self.ldc2w_info = info;
+    }
+
+    /// COV-03: admit `J` / `F`+`D` instance-field accesses, from the same two
+    /// flags the `lib.rs` admission chain evaluates (`ir_emit_long`,
+    /// `ir_emit_fp`). Must be called before [`Self::build`]; both default off,
+    /// which is the pre-lane behaviour (every wide field bails to single-pass).
+    pub fn set_wide_field_gates(&mut self, long: bool, fp: bool) {
+        self.wide_field_long = long;
+        self.wide_field_fp = fp;
+    }
+
+    /// The `IrType` a field of descriptor tag `type_tag` loads/stores as, or
+    /// `None` when this builder must refuse the access.
+    ///
+    /// One place decides it for both the `getfield` (0xb4) and `putfield`
+    /// (0xb5) arms. COV-03 exists because those two arms disagreed: `getfield`
+    /// learned about reference fields and `putfield`, twenty lines below it,
+    /// did not — a fix applied to one of two sites. Sharing the classifier is
+    /// what stops that recurring.
+    fn field_access_type(&self, type_tag: u8) -> Option<IrType> {
+        match type_tag {
+            b'I' | b'Z' | b'B' | b'C' | b'S' => Some(IrType::Int),
+            b'L' | b'[' => Some(IrType::Ref),
+            b'J' if self.wide_field_long => Some(IrType::Long),
+            b'F' if self.wide_field_fp => Some(IrType::Float),
+            b'D' if self.wide_field_fp => Some(IrType::Double),
+            _ => None,
+        }
+    }
+
+    /// cov-01: supply resolved `ldc` / `ldc_w` IMMEDIATE constants
+    /// (`pc → (bits, is_float)`). Must be called before [`Self::build`]; a pc
+    /// not present makes that `ldc` bail the method to single-pass.
+    pub fn set_ldc_info(&mut self, info: HashMap<usize, (i64, bool)>) {
+        self.ldc_info = info;
+    }
+
+    /// cov-01 increment 2: supply resolved `ldc <String>` sites
+    /// (`pc → (bytes, len)`). The caller must keep the bytes alive for the
+    /// artifact's lifetime — the lowered body bakes their address.
+    pub fn set_ldc_string_info(&mut self, info: HashMap<usize, (usize, usize)>) {
+        self.ldc_string_info = info;
+    }
+
+    /// cov-01 increment 3: supply resolved `ldc <Class>` sites
+    /// (`pc → (holder_class_id, cp_idx)`). Only sites whose
+    /// `helpers.ldc_class_cp` is wired may be supplied.
+    pub fn set_ldc_class_info(&mut self, info: HashMap<usize, (u32, u16)>) {
+        self.ldc_class_info = info;
+    }
+
+    /// cov-01 increment 4: supply resolved `getstatic` sites
+    /// (`pc → (class_id, field_index, type_tag, is_volatile)`). Must be called
+    /// before [`Self::build`]; an absent pc bails that `getstatic` to
+    /// single-pass.
+    pub fn set_static_field_info(&mut self, info: HashMap<usize, (u32, usize, u8, bool)>) {
+        self.static_field_info = info;
     }
 
     /// The data type for a merge / loop-carried `Op::Phi`, derived from its
@@ -3717,6 +3908,37 @@ impl IrBuilder {
     /// to single-pass. `ret_type` is the JVM return-type byte (see the field doc).
     pub fn set_invoke_info(&mut self, info: HashMap<usize, (usize, usize, u8)>) {
         self.invoke_info = info;
+    }
+
+    /// Diagnostic-only: supply `pc → "0xNN cn.mn desc"` for the invoke sites, so
+    /// the three invoke bails can name the callee they refused. Never read by
+    /// lowering; `lib.rs` only calls this when `CRATONVM_DBG=ir-compiles` (or
+    /// `jitc`) is on, so the default path never builds the strings.
+    pub fn set_invoke_labels(&mut self, labels: HashMap<usize, Box<str>>, method: Box<str>) {
+        self.invoke_labels = labels;
+        self.method_label = Some(method);
+    }
+
+    /// [`ir_build_bail`] for the invoke arms, which — given the diagnostic map
+    /// above — know the one thing the bare pc does not: *which callee*.
+    ///
+    /// Falls back to the plain report when the map is empty (no flag, a
+    /// hand-built graph, or a resolver that declined the CP index), so the
+    /// `ir.rs:NNNN` line the survey greps for is emitted either way.
+    #[cold]
+    #[inline(never)]
+    fn bail_invoke<T>(&self, site: u32, pc: usize) -> Option<T> {
+        if ir_bail_reporting() {
+            if let Some(label) = self.invoke_labels.get(&pc) {
+                eprintln!(
+                    "[ir] IrBuilder::build refused at ir.rs:{site} (bytecode pc {pc}) \
+                     in {} callee {label}",
+                    self.method_label.as_deref().unwrap_or("<unknown>"),
+                );
+                return None;
+            }
+        }
+        ir_build_bail(site, pc)
     }
 
     // ── Stack operations ─────────────────────────────────────────────
@@ -4979,19 +5201,144 @@ impl IrBuilder {
                     self.mem = store;
                     pc += 1;
                 }
+
+                // ── COV-02: the integral and reference array element access ──
+                //
+                // `faload`/`daload`/`fastore`/`dastore` above are the arms an FP
+                // benchmark kernel needed. Nobody decided that a `float[]`
+                // element should be lowerable and an `int[]` element should
+                // not; the survey in `docs/known-issues/c2/` measured 77 events
+                // on the missing arms, second-largest opcode bucket, and the
+                // *shape* is the argument rather than the number. These arms
+                // are the same node with a different [`MemKind`]: one element
+                // width, one sign/zero-extension rule, the same JVMS null +
+                // bounds guards, the same memory token.
+                //
+                // iaload / laload / aaload / baload / caload / saload.
+                // (`baload` covers `boolean[]` too — one byte either way.)
+                //
+                // `aaload` is a REFERENCE load: the node is typed
+                // `IrType::Ref`, so `ir_lower::emit_safepoint_map`'s scan
+                // publishes its spill slot as a rewritable root at every later
+                // safepoint. Typing it `Int` would compile — and lose the
+                // element across the first relocating collection.
+                //
+                // `aastore` is deliberately NOT here (see the store arm below).
+                0x2e | 0x2f | 0x32 | 0x33 | 0x34 | 0x35 => {
+                    let (kind, ty) = match op {
+                        0x2e => (MemKind::Int, IrType::Int),
+                        0x2f => (MemKind::Long, IrType::Long),
+                        0x32 => (MemKind::Ref, IrType::Ref),
+                        0x33 => (MemKind::Byte, IrType::Int),
+                        0x34 => (MemKind::Char, IrType::Int),
+                        // 0x35 saload
+                        _ => (MemKind::Short, IrType::Int),
+                    };
+                    let index = self.pop();
+                    let array = self.pop();
+                    let load = self.graph.add(
+                        Op::ArrayLoad(kind),
+                        ty,
+                        vec![self.ctrl, self.mem, array, index],
+                        Some(pc),
+                    );
+                    self.mem = load;
+                    self.push(load);
+                    pc += 1;
+                }
+                // iastore / lastore / bastore / castore / sastore.
+                //
+                // `aastore` (0x53) is OUT OF SCOPE and stays out, stated here
+                // rather than left for the next reader to infer from an absence:
+                // a reference element store needs the SATB pre-write barrier and
+                // the card-mark write barrier the single-pass backend emits
+                // around `emit_ref_astore_regs`, and a missing barrier is
+                // invisible until a concurrent collection drops the only path to
+                // an overwritten-but-live target. Refusing the method is the
+                // cheap answer; emitting the store without the barriers is a
+                // use-after-free that surfaces somewhere else entirely.
+                0x4f | 0x50 | 0x54 | 0x55 | 0x56 => {
+                    let kind = match op {
+                        0x4f => MemKind::Int,
+                        0x50 => MemKind::Long,
+                        0x54 => MemKind::Byte,
+                        0x55 => MemKind::Char,
+                        // 0x56 sastore
+                        _ => MemKind::Short,
+                    };
+                    let value = self.pop();
+                    let index = self.pop();
+                    let array = self.pop();
+                    let store = self.graph.add(
+                        Op::ArrayStore(kind),
+                        IrType::Memory,
+                        vec![self.ctrl, self.mem, array, index, value],
+                        Some(pc),
+                    );
+                    self.mem = store;
+                    pc += 1;
+                }
+                // arraylength — the array's immutable length word.
+                //
+                // The cheapest thing in this lane: one 32-bit load at a fixed
+                // header offset behind a null check. No element type, no bounds
+                // check, no barrier.
+                //
+                // It does NOT advance the memory token. Nothing in the JVM
+                // writes an array's length, so `AliasClass::ArrayLength` can
+                // never conflict with a write (`Graph::may_alias`), and putting
+                // a pure read in the token chain would serialise every store
+                // around it for nothing. The token is still an *input*, which is
+                // what pins the node behind the writes that produced the array.
+                0xbe => {
+                    let array = self.pop();
+                    let len = self.graph.add(
+                        Op::ArrayLength,
+                        IrType::Int,
+                        vec![self.ctrl, self.mem, array],
+                        Some(pc),
+                    );
+                    self.push(len);
+                    pc += 1;
+                }
+                // dup_x1 — insert a copy of the top value below the second.
+                //
+                // A stack shuffle rather than an access; it is in this lane only
+                // because it appears in the same method bodies (six events).
+                // The abstract stack holds one entry per VALUE, so the shuffle
+                // is three pushes — but only if BOTH operands are category 1,
+                // which is what JVMS §dup_x1 requires. A category-2 operand
+                // would mean this builder's one-entry-per-value stack and the
+                // verifier's two-slot stack disagree about what "the value
+                // below" names, so refuse rather than shuffle the wrong entry.
+                0x5a => {
+                    let (Some(v1), Some(v2)) = (self.pop_opt(), self.pop_opt()) else {
+                        return ir_build_bail(line!(), pc);
+                    };
+                    let is_cat2 = |ty: IrType| matches!(ty, IrType::Long | IrType::Double);
+                    if is_cat2(self.graph.nodes[v1 as usize].ty)
+                        || is_cat2(self.graph.nodes[v2 as usize].ty)
+                    {
+                        return ir_build_bail(line!(), pc);
+                    }
+                    self.push(v1);
+                    self.push(v2);
+                    self.push(v1);
+                    pc += 1;
+                }
                 // getfield — read an instance field as an `Op::Load`.
                 //
-                // Slice 1 (read-only) of the field/call IR frontier: only
-                // int-category fields (`I`/`Z`/`B`/`C`/`S`) are lowered. They
-                // all read the 32-bit `Value::Int` payload sign-extended — the
-                // exact ABI the single-pass backend's inline getfield emits
-                // (`MOVSXD` from `HEADER_SIZE + field_index*SLOT_SIZE +
-                // FIELD_CELL_PAYLOAD32_OFFSET`). The cell-offset operand is a
-                // `Const(field_index)`; the lowerer derives the byte
-                // displacement. Float/long/double/reference fields and any pc
-                // without resolved layout bail (`None` → single-pass), as does
-                // every `putfield` (no IR `Op::Store` lowering yet — writes
-                // need scheduler memory ordering, a separate slice).
+                // Slice 1 (read-only) of the field/call IR frontier. An
+                // int-category field (`I`/`Z`/`B`/`C`/`S`) reads the 32-bit
+                // `Value::Int` payload sign-extended — the exact ABI the
+                // single-pass backend's inline getfield emits (`MOVSXD` from
+                // `HEADER_SIZE + field_index*SLOT_SIZE +
+                // FIELD_CELL_PAYLOAD32_OFFSET`). A reference field reads the raw
+                // pointer, and (COV-03) a `J`/`F`/`D` field the long payload or
+                // the FP bit pattern, both through the checked helper. The
+                // cell-offset operand is a `Const(field_index)`; the lowerer
+                // derives the byte displacement. A pc without resolved layout
+                // bails (`None` → single-pass).
                 0xb4 => {
                     // Compact reference-field layout packs field offsets (refs
                     // to 8 bytes), so the `HEADER_SIZE + field_index*SLOT_SIZE`
@@ -5036,16 +5383,26 @@ impl IrBuilder {
                     // real workload (66 of 141 on a Hibernate class): a
                     // reference field read is most of what object-oriented Java
                     // does.
-                    let is_ref_field = matches!(type_tag, b'L' | b'[');
-                    if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') && !is_ref_field {
+                    // COV-03 (wide fields): a `J`/`F`/`D` field reads through
+                    // the SAME helper — it already returns the long payload or
+                    // the float/double BITS — so the only thing that differs is
+                    // the node type and, for `J`/`D`, the `i64::MIN`-sentinel
+                    // collision the lowerer must disambiguate through
+                    // `jit_dispatch_threw` (the identical problem, and the
+                    // identical answer, as a `J`/`D` `Op::Call` return). The
+                    // inline compact fast path refuses these tags on its own, so
+                    // a wide field simply takes the helper arm.
+                    let Some(ty) = self.field_access_type(type_tag) else {
                         return ir_build_bail(line!(), pc);
-                    }
+                    };
                     let base = self.pop();
                     let offset = self.iconst(field_index as i64);
-                    let (mem_kind, ty) = if is_ref_field {
-                        (MemKind::Ref, IrType::Ref)
-                    } else {
-                        (MemKind::Int, IrType::Int)
+                    let mem_kind = match ty {
+                        IrType::Ref => MemKind::Ref,
+                        IrType::Long => MemKind::Long,
+                        IrType::Float => MemKind::Float,
+                        IrType::Double => MemKind::Double,
+                        _ => MemKind::Int,
                     };
                     let load = self.graph.add(
                         Op::Load(mem_kind),
@@ -5064,31 +5421,55 @@ impl IrBuilder {
                 }
                 // putfield — write an instance field as an `Op::Store`.
                 //
-                // Slice 2 (read/write) of the field/call IR frontier: only
-                // int-category fields lower. The store consumes the current
-                // memory token and produces a new one (the store node itself),
-                // so the scheduler serialises it after every prior memory op and
-                // before every later one (RAW/WAR/WAW all preserved by the
-                // input-edge topological sort). Non-int fields and any pc without
-                // resolved layout bail (`None` → single-pass).
+                // Slice 2 (read/write) of the field/call IR frontier. The store
+                // consumes the current memory token and produces a new one (the
+                // store node itself), so the scheduler serialises it after every
+                // prior memory op and before every later one (RAW/WAR/WAW all
+                // preserved by the input-edge topological sort). Any pc without
+                // resolved layout bails (`None` → single-pass).
                 0xb5 => {
-                    // See the getfield (0xb4) note. `Op::Store` likewise has a
-                    // layout-naive inline lowering and a compact-aware helper
-                    // lowering (`jit_putfield_int`); `ir_lower::lower_inner`
-                    // picks between them and refuses only when compact layout is
-                    // on and no helper address is available.
+                    // See the getfield (0xb4) note. This arm accepts exactly the
+                    // tags that arm accepts — one classifier, two call sites —
+                    // and the DIFFERENCE between a read and a write is carried
+                    // entirely by `MemKind`, which selects the lowering:
+                    //
+                    //   * `Int`  → the inline store, or `jit_putfield_int` when
+                    //     compact layout is on (an int cell has no barrier).
+                    //   * `Ref`  → ALWAYS `jit_putfield_object`, which is the
+                    //     single-pass backend's own full-barrier route: SATB
+                    //     pre-barrier on the OLD reference, then the collector's
+                    //     post-write barrier (G1's remembered-set edge included).
+                    //     This — not the compact layout — is the reason the
+                    //     reference case was missing here while `getfield` had
+                    //     it: a reference LOAD needs no barrier, so the fix that
+                    //     added it there had nothing to say about this arm.
+                    //     `jit_putfield_object` is compact-aware in its own
+                    //     right, so there is no separate compact refusal to make.
+                    //   * `Long`/`Float`/`Double` → the matching
+                    //     `jit_putfield_{long,float,double}` helper, gated on the
+                    //     same long/FP flags the read arm uses.
+                    //
+                    // `ir_lower::lower_inner` refuses the graph when the helper a
+                    // given kind needs is absent (the unit-test stub table).
                     let (field_index, type_tag) = match self.field_info.get(&pc) {
                         Some(&fi) => fi,
                         None => return ir_build_bail(line!(), pc),
                     };
-                    if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+                    let Some(ty) = self.field_access_type(type_tag) else {
                         return ir_build_bail(line!(), pc);
-                    }
+                    };
+                    let mem_kind = match ty {
+                        IrType::Ref => MemKind::Ref,
+                        IrType::Long => MemKind::Long,
+                        IrType::Float => MemKind::Float,
+                        IrType::Double => MemKind::Double,
+                        _ => MemKind::Int,
+                    };
                     let value = self.pop();
                     let base = self.pop();
                     let offset = self.iconst(field_index as i64);
                     let store = self.graph.add(
-                        Op::Store(MemKind::Int),
+                        Op::Store(mem_kind),
                         IrType::Memory,
                         vec![self.ctrl, self.mem, base, offset, value],
                         Some(pc),
@@ -5140,28 +5521,80 @@ impl IrBuilder {
                     self.push(newobj);
                     pc += 3;
                 }
-                // invokespecial — only a trivial `<init>()V` on a fresh object
-                // is handled, by ELISION: pop the receiver (the `dup`'d new
-                // object) and emit nothing. Sound only because the caller
-                // admits the pc to `trivial_init_pcs` exclusively when the
-                // object is a non-escaping `new` whose class has no primitive
-                // field initialisers (its fields are zero-initialised and set
-                // by the visible `putfield`s — the constructor adds nothing the
-                // scalar-replaced slots don't already model). Any other
-                // `invokespecial` bails to single-pass.
+                // invokespecial — two lowerings, tried in this order:
+                //
+                //  1. ELISION of a trivial `<init>()V` on a fresh object: pop
+                //     the `dup`'d receiver and emit nothing. Sound only because
+                //     the caller admits the pc to `trivial_init_pcs` exclusively
+                //     when the object is a `new` whose class has no primitive
+                //     field initialisers (its fields are zero-initialised and
+                //     set by the visible `putfield`s — the constructor adds
+                //     nothing the scalar-replaced slots don't already model),
+                //     AND because the receiver is a fresh `Op::New` this pass
+                //     emitted. Preferred when it applies: it is the whole point
+                //     of scalar replacement, and a call here would pin the
+                //     allocation (`Op::Call` arg-escapes its reference inputs).
+                //
+                //  2. an ordinary statically-bound CALL — a `super.m()`, a
+                //     private method, or (cov-04) a real constructor: a
+                //     `super(...)`/`this(...)` chain call, or the `<init>` of a
+                //     `new` the elision analysis declined.
+                //
+                // cov-04 measured this arm on the three Spring Boot workloads
+                // that carry 1,947 of the survey's 1,954 compile requests, at
+                // `48fba3a31` — **every** refusal here was an `<init>`, and
+                // **none** was a non-`<init>` `invokespecial` the arm had no
+                // path for. 29 of 52 were a `super(...)`/`this(...)` chain call
+                // in a compiled constructor (receiver `this`, no `new` in the
+                // method at all) and 23 were a `new X(args)` site. So the
+                // ordering above is not a preference between two common cases —
+                // case 1 is rare (`is_elidable_construction` admits only a
+                // 5-byte `aload_0; invokespecial Object.<init>()V; return`
+                // body) and case 2 is the arm's real work.
+                //
+                // The COUNTS are baseline-relative and should not be quoted
+                // without their tree: the same measurement re-run after `cov-01`
+                // and `cov-02` landed reads 106, not 52, because a method
+                // blocked on `ldc` never reached its `invokespecial`. The
+                // *shape* — all of them `<init>` — held at every baseline.
+                //
+                // Calling an `<init>` runs every side effect the elision path
+                // was allowed to skip, which is the safe direction: the hazard
+                // named at the elision site is the other one.
                 0xb7 => {
-                    // inc 24 (Gap B): a resolved non-`<init>` `invokespecial`
+                    // Defence in depth on the elision: only elide when the
+                    // receiver (top of stack for a no-arg `<init>`) is a fresh
+                    // `Op::New` we emitted. Eliding a `<init>` whose receiver is
+                    // `this` or a parameter would skip a real superclass
+                    // constructor (and hide any escape it performs) — and that
+                    // is exactly what a `super()` chain call looks like, which
+                    // the census found 29 of. Such a site now falls through to
+                    // the call path below instead of bailing the method.
+                    let elide = self.trivial_init_pcs.contains(&pc)
+                        && matches!(
+                            self.peek_opt().and_then(|r| self.graph.node_opt(r)),
+                            Some(Node {
+                                op: Op::New { .. },
+                                ..
+                            })
+                        );
+                    if elide {
+                        self.pop();
+                        pc += 3;
+                    }
+                    // inc 24 (Gap B) + cov-04: a resolved `invokespecial`
                     // lowered to `Op::Call` — identical to the `invokestatic`
                     // arm except the receiver is arg0 (the caller's
                     // `invoke_info` entry already counts it in `num_args`, and
                     // the leaked `JitInvokeInfo` carries `invoke_kind == 1` so
                     // `invoke_dispatch` does the non-virtual dispatch to the
-                    // statically-resolved target). GC-safe by the same
-                    // conservative IR-frame scan that roots reference args
-                    // (inc 22). Only populated when the special-call gate is on;
-                    // otherwise `invoke_info` has no entry for this pc and we
-                    // fall through to the elidable-`<init>` path below.
-                    if let Some(&(info_ptr, num_args, ret_type)) = self.invoke_info.get(&pc) {
+                    // statically-resolved target — the same route the
+                    // single-pass backend gives every non-elided `<init>`).
+                    // GC-safe by the same conservative IR-frame scan that roots
+                    // reference args (inc 22). Only populated when the
+                    // special-call gate is on; otherwise `invoke_info` has no
+                    // entry for this pc and the method bails to single-pass.
+                    else if let Some(&(info_ptr, num_args, ret_type)) = self.invoke_info.get(&pc) {
                         let mut args = Vec::with_capacity(num_args);
                         for _ in 0..num_args {
                             args.push(self.pop());
@@ -5198,28 +5631,13 @@ impl IrBuilder {
                         }
                         pc += 3;
                     } else {
-                        // Elidable-`<init>` path (scalar-new): elide a trivial
-                        // `<init>()V` on a fresh object.
-                        if !self.trivial_init_pcs.contains(&pc) {
-                            return ir_build_bail(line!(), pc);
-                        }
-                        // Defence in depth: only elide when the receiver (top of
-                        // stack for a no-arg `<init>`) is a fresh `Op::New` we
-                        // emitted. Eliding a `<init>` whose receiver is `this` or
-                        // a parameter would skip a real superclass constructor
-                        // (and hide any escape it performs).
-                        let recv_is_new = matches!(
-                            self.peek_opt().and_then(|r| self.graph.node_opt(r)),
-                            Some(Node {
-                                op: Op::New { .. },
-                                ..
-                            })
-                        );
-                        if !recv_is_new {
-                            return ir_build_bail(line!(), pc);
-                        }
-                        self.pop();
-                        pc += 3;
+                        // Neither lowering applies: no `invoke_info` entry for
+                        // this pc (the special-call gate is off, or one
+                        // non-emittable invoke elsewhere in the method
+                        // discarded the whole map) and the site is not an
+                        // elidable `<init>` on a fresh `Op::New`. Refuse the
+                        // method — never guess a callee identity.
+                        return self.bail_invoke(line!(), pc);
                     }
                 }
                 // invokestatic (0xb8) and invokevirtual (0xb6) — lower a resolved
@@ -5261,7 +5679,7 @@ impl IrBuilder {
                     }
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
-                        None => return ir_build_bail(line!(), pc),
+                        None => return self.bail_invoke(line!(), pc),
                     };
                     // Pop args (deepest-first on the abstract stack) and restore
                     // source order so inputs are [ctrl, mem, arg0, arg1, …].
@@ -5311,7 +5729,7 @@ impl IrBuilder {
                 0xb9 => {
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
-                        None => return ir_build_bail(line!(), pc),
+                        None => return self.bail_invoke(line!(), pc),
                     };
                     let mut args = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
@@ -5606,6 +6024,149 @@ impl IrBuilder {
                         self.lconst(val)
                     };
                     self.push(c);
+                    pc += 3;
+                }
+                // ldc (0x12, 1-byte CP index) / ldc_w (0x13, 2-byte CP index) —
+                // cov-01 increment 1, the IMMEDIATE case.
+                //
+                // `ldc` + `ldc_w` + `getstatic` was 189 of the 273 opcode-gap
+                // events measured on 2026-08-03 — 69% of every opcode
+                // `IrBuilder::build` had no arm for at all
+                // (`docs/known-issues/c2/ir-coverage-survey-20260803.md`).
+                //
+                // A resolved `int` / `float` constant is a constant node and
+                // nothing else — no memory edge, no safepoint, no GC
+                // interaction — so it is typed and pushed exactly the way the
+                // `ldc2_w` arm above types its `long` / `double`. `is_float`
+                // comes from the resolver rather than from the opcode because
+                // `ldc` is polymorphic and `is_float_opcode` does NOT list it:
+                // a method whose only FP is `ldc 1.5f` is admitted through the
+                // int clause, so the builder cannot infer the width from
+                // admission either. See `JitLdcConstant::Immediate`.
+                //
+                // Increments 2 and 3 add the two REFERENCE constants — a String
+                // literal and a Class mirror. Neither is an immediate: each
+                // names a constant-pool site whose value is materialised on
+                // every execution by the same runtime helper the single-pass
+                // backend calls, because an `ObjectRef` baked at compile time is
+                // stale the moment a relocating collector moves it. Both are
+                // therefore `[ctrl, mem]` safepoint nodes, not constants — see
+                // `Op::ConstString` / `Op::ConstClass`.
+                //
+                // Everything still absent from all three tables — `MethodHandle`,
+                // `MethodType`, condy, a site whose helper is unwired, a float
+                // with the FP gate off — bails the method to single-pass, which
+                // DOES compile all of them. That is the fail-closed half of this
+                // arm and it is the point: a constant materialised without its
+                // resolution side effects (interning, class loading, `<clinit>`)
+                // is a wrong-code bug, not a missing optimisation.
+                0x12 | 0x13 => {
+                    let width = if op == 0x12 { 2 } else { 3 };
+                    if let Some(&(bits, is_float)) = self.ldc_info.get(&pc) {
+                        let c = if is_float {
+                            self.fconst(f32::from_bits(bits as u32))
+                        } else {
+                            self.iconst(bits)
+                        };
+                        self.push(c);
+                        pc += width;
+                    } else if let Some(&(bytes, len)) = self.ldc_string_info.get(&pc) {
+                        let s = self.graph.add(
+                            Op::ConstString { bytes, len },
+                            IrType::Ref,
+                            vec![self.ctrl, self.mem],
+                            Some(pc),
+                        );
+                        // The node IS the new memory token, exactly as
+                        // `Op::Call` is: interning can allocate, and a
+                        // collection may run inside the helper, so nothing may
+                        // be reordered across it.
+                        self.mem = s;
+                        self.push(s);
+                        pc += width;
+                    } else if let Some(&(holder_class_id, cp_idx)) = self.ldc_class_info.get(&pc) {
+                        let c = self.graph.add(
+                            Op::ConstClass {
+                                holder_class_id,
+                                cp_idx,
+                            },
+                            IrType::Ref,
+                            vec![self.ctrl, self.mem],
+                            Some(pc),
+                        );
+                        self.mem = c;
+                        self.push(c);
+                        pc += width;
+                    } else {
+                        return ir_build_bail(line!(), pc);
+                    }
+                }
+                // getstatic — cov-01 increment 4, and the single largest opcode
+                // in the survey (92 of 273 events).
+                //
+                // A load from a statics base plus the ref/non-ref split, exactly
+                // as the lane brief frames it. `static_field_info` names the
+                // offset and the type tag; this arm's job is to match the
+                // single-pass `0xb2` arm's behaviour, not to invent one, so the
+                // class-initialisation question is answered where that arm
+                // answers it — in the lowering, which picks between the direct
+                // load (only for a class the resolver reports already
+                // initialised) and `helpers.getstatic` (which runs `<clinit>`
+                // and can throw).
+                //
+                // Every JVM field type lowers. `J`/`D`/`F` were refused when this
+                // arm landed, on the grounds that admitting one would put a
+                // `Long`/`Double`/`Float` node in a graph whose admission clause
+                // may have been the int one. That is a real hazard and the
+                // refusal was in the wrong PLACE: `getstatic` is polymorphic and
+                // is listed by neither `is_category2_opcode` nor
+                // `is_float_opcode`, so the builder cannot see the width — but
+                // the CALLER can, because it resolved the type tag in order to
+                // build this table at all. So the gate moved to the feed in
+                // `try_compile`, which admits a `J` entry only under
+                // `ir_emit_long` and a `D`/`F` entry only under `ir_emit_fp`,
+                // exactly as it already does for a float `ldc` and as the
+                // `ldc2_w` feed does for its `(bits, is_double)`.
+                //
+                // A tag absent from this map is therefore either unresolvable or
+                // gated off, and both bail — the same fail-closed answer, now
+                // decided by the one party that has the information.
+                0xb2 => {
+                    let (class_id, field_index, type_tag, is_volatile) =
+                        match self.static_field_info.get(&pc) {
+                            Some(&si) => si,
+                            None => return ir_build_bail(line!(), pc),
+                        };
+                    let ty = match type_tag {
+                        b'I' | b'Z' | b'B' | b'C' | b'S' => IrType::Int,
+                        b'L' | b'[' => IrType::Ref,
+                        b'J' => IrType::Long,
+                        b'D' => IrType::Double,
+                        b'F' => IrType::Float,
+                        _ => return ir_build_bail(line!(), pc),
+                    };
+                    // A `field_index` past `u32` cannot be encoded in the baked
+                    // displacement; refuse rather than truncate.
+                    let Ok(field_index) = u32::try_from(field_index) else {
+                        return ir_build_bail(line!(), pc);
+                    };
+                    let load = self.graph.add(
+                        Op::LoadStatic {
+                            class_id,
+                            field_index,
+                            type_tag,
+                            is_volatile,
+                        },
+                        ty,
+                        vec![self.ctrl, self.mem],
+                        Some(pc),
+                    );
+                    // Both lowerings can reach the runtime (the helper one runs
+                    // `<clinit>`), and a volatile read is a JMM acquire, so the
+                    // node advances the memory token like every other
+                    // `MemAccess::Opaque` node.
+                    self.mem = load;
+                    self.push(load);
                     pc += 3;
                 }
 
@@ -6566,11 +7127,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ir_getfield_still_bails_on_a_wide_field() {
-        // `J`/`D`/`F` fields have no IR load lowering: the helper returns the
-        // int payload, and a category-2 value additionally needs the wide
-        // operand-stack shape. Still refused, and refused HERE rather than
-        // deeper in the pipeline.
+    fn test_ir_getfield_still_bails_on_a_wide_field_with_the_gates_off() {
+        // `J`/`D`/`F` fields build only when the long / FP tier is on — the
+        // gate `lib.rs` passes down from the same `ir_emit_long` /
+        // `ir_emit_fp` its admission chain evaluates. With both off (the
+        // builder default, and what a hand-built graph gets) they are still
+        // refused HERE rather than deeper in the pipeline.
         for tag in [b'J', b'D', b'F'] {
             let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
             let mut builder = IrBuilder::new(1, 1);
@@ -6579,7 +7141,136 @@ mod tests {
             builder.set_field_info(fi);
             assert!(
                 builder.build(&code, 5).is_none(),
-                "field tag {} must not build",
+                "field tag {} must not build with the wide-field gates off",
+                tag as char
+            );
+        }
+    }
+
+    /// COV-03. `getfield` learned about reference fields; `putfield` twenty
+    /// lines below it did not — 37 refusals on `ir.rs:5085`, the second-largest
+    /// structural refusal in the coverage survey, for a fix that had simply
+    /// been applied to one of two sites.
+    ///
+    /// The node TYPE is the load-bearing assertion, exactly as it is for the
+    /// read: `MemKind::Ref` is what selects `jit_putfield_object` in
+    /// `ir_lower`, and that helper is what carries the SATB pre-barrier and the
+    /// collector's post-write barrier. An `Int`-kinded reference store would
+    /// lower to a raw 16-byte int-cell write with no barrier at all.
+    #[test]
+    fn test_ir_putfield_builds_a_ref_kinded_store_for_a_reference_field() {
+        for tag in [b'L', b'['] {
+            // aload_0; aload_1; putfield #2; return
+            let code = [0x2a, 0x2b, 0xb5, 0x00, 0x02, 0xb1, 0, 0];
+            let mut builder = IrBuilder::new(2, 2);
+            let mut fi = HashMap::new();
+            fi.insert(2usize, (0usize, tag));
+            builder.set_field_info(fi);
+            let graph = builder
+                .build(&code, 6)
+                .unwrap_or_else(|| panic!("a {} field putfield must build", tag as char));
+            assert!(
+                graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, Op::Store(MemKind::Ref))),
+                "a {} field must lower to Op::Store(MemKind::Ref), not Int",
+                tag as char
+            );
+        }
+    }
+
+    /// The two arms must accept the SAME tag set. This is the regression the
+    /// lane exists for: a tag one arm admits and the other refuses is how the
+    /// asymmetry arose, and it is invisible in any test that exercises one arm.
+    #[test]
+    fn test_ir_getfield_and_putfield_admit_the_same_field_tags() {
+        for &(long_gate, fp_gate) in &[(false, false), (true, false), (false, true), (true, true)] {
+            for tag in [b'I', b'Z', b'B', b'C', b'S', b'L', b'[', b'J', b'F', b'D', b'V'] {
+                // aload_0; getfield #2; return — the read side only needs to
+                // build; leaving the value on the abstract stack at the return
+                // is fine for a straight-line translation.
+                let get = [0x2a, 0xb4, 0x00, 0x02, 0xb1, 0, 0];
+                let mut gb = IrBuilder::new(1, 1);
+                let mut gfi = HashMap::new();
+                gfi.insert(1usize, (0usize, tag));
+                gb.set_field_info(gfi);
+                gb.set_wide_field_gates(long_gate, fp_gate);
+                let get_builds = gb.build(&get, 5).is_some();
+
+                // aload_0; aload_1; putfield #2; return
+                let put = [0x2a, 0x2b, 0xb5, 0x00, 0x02, 0xb1, 0, 0];
+                let mut pb = IrBuilder::new(2, 2);
+                let mut pfi = HashMap::new();
+                pfi.insert(2usize, (0usize, tag));
+                pb.set_field_info(pfi);
+                pb.set_wide_field_gates(long_gate, fp_gate);
+                let put_builds = pb.build(&put, 6).is_some();
+
+                assert_eq!(
+                    get_builds, put_builds,
+                    "tag {} (long_gate={long_gate} fp_gate={fp_gate}): getfield builds={get_builds} \
+                     but putfield builds={put_builds} — the two arms have drifted apart again",
+                    tag as char
+                );
+            }
+        }
+    }
+
+    /// With the matching gate on, a wide field builds a wide-KINDED access on
+    /// both arms. The kind is what picks `jit_putfield_{long,float,double}` and
+    /// what tells the lowerer a `J`/`D` read needs the `dispatch_threw`
+    /// disambiguation (`Long.MIN_VALUE` and `-0.0` are bit-identical to the
+    /// helper's deopt sentinel).
+    #[test]
+    fn test_ir_wide_fields_build_wide_kinded_accesses_when_gated() {
+        for (tag, kind, ty, load_op, ret) in [
+            (b'J', MemKind::Long, IrType::Long, 0x16u8, 0xadu8),
+            (b'F', MemKind::Float, IrType::Float, 0x17, 0xae),
+            (b'D', MemKind::Double, IrType::Double, 0x18, 0xaf),
+        ] {
+            // aload_0; getfield #2; <x>return
+            let get = [0x2a, 0xb4, 0x00, 0x02, ret, 0, 0];
+            let mut gb = IrBuilder::new(1, 1);
+            let mut gfi = HashMap::new();
+            gfi.insert(1usize, (0usize, tag));
+            gb.set_field_info(gfi);
+            gb.set_wide_field_gates(true, true);
+            let graph = gb
+                .build(&get, 5)
+                .unwrap_or_else(|| panic!("a gated {} field getfield must build", tag as char));
+            let load = graph
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, Op::Load(k) if k == kind))
+                .unwrap_or_else(|| panic!("{} must lower to Op::Load({kind:?})", tag as char));
+            assert_eq!(load.ty, ty, "{} load node type", tag as char);
+
+            // aload_0; <x>load_1; putfield #2; return — `this` at slot 0, the
+            // wide value at slot 1 (occupying slots 1-2 for `J`/`D`).
+            let put = [0x2a, load_op, 0x01, 0xb5, 0x00, 0x02, 0xb1, 0, 0];
+            let mut pb = IrBuilder::new(2, 4);
+            pb.set_param_types(&[IrType::Ref, ty]);
+            let mut pfi = HashMap::new();
+            pfi.insert(3usize, (0usize, tag));
+            pb.set_field_info(pfi);
+            pb.set_wide_field_gates(true, true);
+            let graph = pb
+                .build(&put, 7)
+                .unwrap_or_else(|| panic!("a gated {} field putfield must build", tag as char));
+            let store = graph
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, Op::Store(k) if k == kind))
+                .unwrap_or_else(|| panic!("{} must lower to Op::Store({kind:?})", tag as char));
+            // The VALUE operand must carry the wide type too — the lowerer
+            // reads its frame slot as raw bits and hands them to the width's
+            // helper, and an `Int`-typed producer would mean the slot was never
+            // written as one.
+            assert_eq!(
+                graph.nodes[store.inputs[4] as usize].ty,
+                ty,
+                "{} store value operand type",
                 tag as char
             );
         }
@@ -8293,6 +8984,27 @@ mod tests {
             ),
             (Op::NewArray { element_type: 10 }, 3, MemAccess::Allocate),
             (Op::Call { info_ptr: 0 }, 2, MemAccess::Opaque),
+            // cov-01 — the same classification `Op::Call` has, for the same
+            // reason: the helper each lowers to can run arbitrary Java.
+            (Op::ConstString { bytes: 0, len: 0 }, 2, MemAccess::Opaque),
+            (
+                Op::ConstClass {
+                    holder_class_id: 0,
+                    cp_idx: 0,
+                },
+                2,
+                MemAccess::Opaque,
+            ),
+            (
+                Op::LoadStatic {
+                    class_id: 0,
+                    field_index: 0,
+                    type_tag: b'I',
+                    is_volatile: false,
+                },
+                2,
+                MemAccess::Opaque,
+            ),
             (Op::LambdaIntToDouble, 4, MemAccess::Opaque),
             (Op::MonitorEnter, 3, MemAccess::MonitorEnter),
             (Op::MonitorExit, 3, MemAccess::MonitorExit),

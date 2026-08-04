@@ -41,7 +41,14 @@ CLASS_TO="${CLASS_TO:-300}"          # per-class timeout seconds
 MAX_HEAP="${MAX_HEAP:-1g}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
-log() { echo "[$(date +%H:%M:%S)] $*"; }
+# stderr, not stdout: log() output must never land in a command-substitution
+# capture (list_for_category()'s callers do `listf="$(list_for_category)"`,
+# and list_for_category calls ensure_idx -> discover on a fresh checkout,
+# whose log() lines used to get captured into $listf right along with the
+# real path, silently corrupting it into "nothing to run" on any worktree
+# that hasn't run discover() yet - found while validating VERIFY-01 on a
+# fresh worktree 2026-08-03).
+log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
 now_ms() { date +%s%3N; }
 
@@ -59,6 +66,22 @@ safe_name() { printf '%s' "$1" | sed 's/[^A-Za-z0-9_.-]/_/g'; }
 
 ensure_paths() {
   [ -d "$H2_TEST_SRC" ] || die "H2 test source tree not found: $H2_TEST_SRC (set H2_ROOT)"
+}
+
+# Fixture precondition check (VERIFY-01, docs/known-issues/c2/verify-01-differential-harness.md):
+# a swept or never-built target/{classes,test-classes} makes every class fail
+# the same way (NoClassDefFoundError before the test itself even starts), which
+# reads exactly like a real regression sweep. Fail loudly once, up front,
+# instead of producing 218 identical wrong results. Called from run_mode(),
+# not from discover/categorize (which only need H2_TEST_SRC).
+ensure_built() {
+  local missing=()
+  { [ -d "$H2_ROOT/target/classes" ] && [ -n "$(ls -A "$H2_ROOT/target/classes" 2>/dev/null)" ]; } || missing+=("$H2_ROOT/target/classes")
+  { [ -d "$H2_ROOT/target/test-classes" ] && [ -n "$(ls -A "$H2_ROOT/target/test-classes" 2>/dev/null)" ]; } || missing+=("$H2_ROOT/target/test-classes")
+  [ -s "$CP_FILE" ] || missing+=("$CP_FILE (classpath file)")
+  if [ "${#missing[@]}" -gt 0 ]; then
+    die "H2 fixture not built (or was swept) - missing/empty: ${missing[*]}. Run: $0 setup"
+  fi
 }
 
 # --- discovery ---------------------------------------------------------
@@ -207,6 +230,7 @@ run_one_class() {
 run_mode() {
   local mode="$1" listfile="$2" start="$3" count="$4" outdir="$5"
   ensure_paths
+  ensure_built
   mkdir -p "$outdir/logs" "$outdir/workdirs"
   local RES="$outdir/results.tsv" RUN="$outdir/run.log"
   : > "$RES"; : > "$RUN"; : > "$outdir/timing.tsv"

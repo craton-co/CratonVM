@@ -450,6 +450,11 @@ impl VmHeap {
     }
 
     pub fn class_id_of(&self, obj: ObjectRef) -> ClassId {
+        // KINDOF-SENTINEL: see `kind_of` below — same idiom, same observed
+        // sentinel (`0xFFFFFFFFFFFFFFFF`) reaching this dispatch unchecked.
+        if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            return ClassId::new(0);
+        }
         dispatch!(self, class_id_of(obj))
     }
 
@@ -649,6 +654,20 @@ impl VmHeap {
     /// gate the alternate decode path on the appropriate cfg).
     #[inline]
     pub fn load_and_forward(&self, obj: ObjectRef) -> ObjectRef {
+        // KINDOF-SENTINEL: `obj` itself has been observed already invalid
+        // here (not merely forwarded-to-garbage — see the forwarding-target
+        // check below) when the caller's own value was reconstructed across
+        // a JIT bail-to-interpreter boundary with a live JIT frame the
+        // collector couldn't get a precise root map for. There is no valid
+        // object to hand back in that case; returning `obj` unchanged is a
+        // no-op, not a fix, but it at least avoids adding a SECOND
+        // dereference on top of the one about to fail below, and every
+        // reproduced crash site downstream (`kind_of`, `class_id_of`,
+        // `element_type_of`, `identity_hash_code`) now validates its own
+        // input independently — see those methods below.
+        if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            return obj;
+        }
         // SAFETY: the caller guarantees `obj` is a live root. Every
         // current backend lays out `ObjectHeader` at offset 0 of the
         // ObjectRef pointer with `forwarding_ptr` at the documented
@@ -665,6 +684,21 @@ impl VmHeap {
             // anticipate). Returning the original pointer is always
             // safe because the original object still exists in memory
             // until the evacuation epoch ends.
+            return obj;
+        }
+        // KINDOF-SENTINEL: `header` itself may be corrupted (the same
+        // implausible-header family `old_gen::scan_region` guards against —
+        // see `validate_header_tags_or_desync`), and unlike `kind_tag`/
+        // `elem_tag`, the forwarding-pointer word was never validated
+        // before this call trusted it outright. A corrupted header can set
+        // the forwarded bit and hand back a garbage `forwarding_address()`
+        // — observed as the all-ones sentinel `0xFFFFFFFFFFFFFFFF` — which
+        // every caller of this read barrier then dereferences unchecked
+        // (`kind_of`, `get_field`, `array_length`, ...). Validate the
+        // extracted address is actually a live object in this heap before
+        // trusting it; an implausible target falls back to the original
+        // pointer, exactly like the null-address case above.
+        if self.is_object_address(addr as usize).is_none() {
             return obj;
         }
         // SAFETY: the forwarding pointer was installed by the GC and
@@ -699,15 +733,46 @@ impl VmHeap {
         crate::compact_header::CompactHeader::from_raw(raw)
     }
 
+    // KINDOF-SENTINEL (2026-08-04): `kind_of`/`element_type_of`/
+    // `identity_hash_code` are the innermost dispatch point for the whole
+    // `#[repr(u8)]`-header-validation family this file's `old_gen`/
+    // `gen_heap` siblings already guard on the GC-internal walk side (see
+    // `validate_header_tags_or_desync`). Those fixes hardened the
+    // COLLECTOR's own scan of old-gen; they never touched this VM-level
+    // read barrier, which every MUTATOR path (interpreter dispatch, JIT
+    // helpers, native array/field accessors) funnels through with a bare
+    // `ObjectRef` and no independent check of its own. Reproduced: a JIT
+    // bail-to-interpreter transition on a thread whose innermost frame
+    // belonged to an unguarded/unregistered JIT callee (no precise root
+    // map for that root-gathering pass) handed one of these a receiver
+    // that read back as the all-ones sentinel `0xFFFFFFFFFFFFFFFF` —
+    // `EXCEPTION_ACCESS_VIOLATION` reading exactly that address, at three
+    // distinct call sites (`kind_of` itself via
+    // `dispatch_virtual::execute_invokevirtual_cached`, `class_id_of` via
+    // `NativeHeapAccess::get_field`, and `load_and_forward` via a fourth).
+    // `load_and_forward` (above) now validates the forwarding target it
+    // hands back, but a corrupted header can also be reached directly
+    // without ever going through that barrier, so each of these validates
+    // independently rather than trusting an already-validated caller.
     pub fn kind_of(&self, obj: ObjectRef) -> ObjectKind {
+        if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            return ObjectKind::Object;
+        }
         dispatch!(self, kind_of(obj))
     }
 
     pub fn element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
+        if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            return ArrayElementType::Reference;
+        }
         dispatch!(self, element_type_of(obj))
     }
 
     pub fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
+        // KINDOF-SENTINEL: see `kind_of` above.
+        if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            return 0;
+        }
         dispatch!(self, identity_hash_code(obj))
     }
 
@@ -1895,6 +1960,42 @@ impl VmHeap {
                 eprintln!("[GC] oldgen_coalesce: calls={calls} blocks_merged={merged}");
             }
         }
+        // H2-CID0 — the conservative-root and free-list invariants. Printed
+        // unconditionally when non-zero so a soak log answers "did the workload
+        // actually enter the regime this fix is about?" without a debug flag.
+        //
+        // `interior_root_pins` non-zero means conservative roots really are
+        // interior words of live old-gen objects in this workload, i.e. the hole
+        // the pin closes was live. `freed_interior_pinned` is ZERO BY
+        // CONSTRUCTION unless `CRATONVM_GC_NO_OLD_INTERIOR_PINS` disabled the
+        // pin — it is the negative control, and a non-zero value on an ordinary
+        // run would mean the pin has regressed. `free_list_overlaps` non-zero
+        // means an old-gen span was freed twice.
+        {
+            use std::sync::atomic::Ordering as O;
+            let pins = crate::gen_heap::OLDMARK_INTERIOR_ROOT_PINS.load(O::Relaxed);
+            let freed = crate::gen_heap::OLD_SWEEP_FREED_INTERIOR_PINNED.load(O::Relaxed);
+            let overlaps = crate::gen_heap::OLD_FREE_LIST_OVERLAPS.load(O::Relaxed);
+            if pins | freed | overlaps != 0 {
+                eprintln!(
+                    "[GC] oldgen_conservative: interior_root_pins={pins} \
+                     freed_interior_pinned={freed} free_list_overlaps={overlaps}"
+                );
+            }
+            // The compacting arm's half of the same question, and the cost of
+            // the answer. `dropped_interior_root` is zero by construction once
+            // the downgrade is in; `downgraded` against `major=N` above says how
+            // often compaction had to give way to the in-place sweep.
+            let c_watched = crate::gen_heap::COMPACT_DROPPED_WATCHED.load(O::Relaxed);
+            let c_interior = crate::gen_heap::COMPACT_DROPPED_INTERIOR_ROOT.load(O::Relaxed);
+            let c_down = crate::gen_heap::COMPACT_DOWNGRADED_INTERIOR_ROOT.load(O::Relaxed);
+            if c_watched | c_interior | c_down != 0 {
+                eprintln!(
+                    "[GC] oldgen_compact: dropped_watched_referents={c_watched} \
+                     dropped_interior_root={c_interior} downgraded_to_inplace={c_down}"
+                );
+            }
+        }
         // What the collector actually did on the last cycle and why. This is
         // the line that settles the `docs/GC.md` ("young collections run
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`
@@ -2839,6 +2940,56 @@ mod concurrent_mark_controller_tests {
         assert!(
             after <= before,
             "free-MB estimate rose from {before} to {after} while allocating"
+        );
+    }
+
+    /// KINDOF-SENTINEL (2026-08-04): `kind_of`/`element_type_of`/
+    /// `identity_hash_code`/`class_id_of`/`load_and_forward` all used to
+    /// dereference `obj` unconditionally, trusting the caller. Reproduced in
+    /// the wild as the all-ones sentinel `0xFFFFFFFFFFFFFFFF` reaching each
+    /// of these from a JIT bail-to-interpreter transition — a hard
+    /// `EXCEPTION_ACCESS_VIOLATION`, not a wrong answer. Every one of these
+    /// accessors must now fall back to a safe default instead of faulting.
+    #[test]
+    fn heap_accessors_reject_an_invalid_object_pointer_instead_of_faulting() {
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        // 8-byte aligned so only the region-bounds check (not the alignment
+        // check) is exercised — the observed all-ones sentinel fails both,
+        // and either failure mode must be rejected the same way.
+        let sentinel = unsafe { ObjectRef::from_raw_nonnull(
+            std::ptr::NonNull::new(0xFFFF_FFFF_FFFF_FFF8u64 as *mut u8).unwrap(),
+        ) };
+
+        assert_eq!(heap.kind_of(sentinel), ObjectKind::Object);
+        assert_eq!(heap.element_type_of(sentinel), ArrayElementType::Reference);
+        assert_eq!(heap.identity_hash_code(sentinel), 0);
+        assert_eq!(heap.class_id_of(sentinel), cratonvm_types::ClassId::new(0));
+        assert_eq!(
+            heap.load_and_forward(sentinel).as_ptr(),
+            sentinel.as_ptr(),
+            "an invalid obj has nothing valid to forward to; must return unchanged, not fault"
+        );
+    }
+
+    /// The forwarding-target half of the same fix: a live, validly-addressed
+    /// object whose header bytes are corrupted can have its `forwarded` bit
+    /// spuriously set with a garbage `forwarding_ptr` — `load_and_forward`
+    /// must not hand that garbage address back to the caller.
+    #[test]
+    fn load_and_forward_rejects_a_forwarding_target_outside_every_region() {
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.try_alloc_object(cratonvm_types::ClassId::new(0), 8).unwrap();
+        // SAFETY: test-only corruption of a live header to simulate the
+        // observed implausible-header family (see `old_gen::scan_region`'s
+        // `validate_header_tags_or_desync`) reaching the forwarding word.
+        unsafe {
+            let header = &mut *(obj.as_ptr() as *mut ObjectHeader);
+            header.forwarding_ptr = 0xFFFF_FFFF_FFFF_FFF8u64 as *mut u8;
+        }
+        assert_eq!(
+            heap.load_and_forward(obj).as_ptr(),
+            obj.as_ptr(),
+            "an implausible forwarding target must fall back to the original pointer"
         );
     }
 }

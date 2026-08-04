@@ -12,7 +12,7 @@ closed:
 
 One residual is **handed over, not closed**: a single `SIGSEGV` in those 330
 runs, with a different signature from this report's (see below). It is handed to
-`docs/known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`.
+`docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
 
 The `Chunk N not found` failures this report already attributed to upstream H2
 fault-injection flakiness are confirmed again: stock HotSpot JDK 25 hit them in
@@ -88,7 +88,7 @@ zero words — an **all-zero object header**, the premature-reclamation shape.
 Not root-caused: it is one unreproduced sample, and 203 further runs armed with
 `CRATONVM_DBG_SWEEP_ZERO=1` (the reclaimed-live-object ring, which self-diagnoses
 on a hit) produced no second occurrence and no ring hit. Recorded in
-`bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`, which owns that
+`bug-h2-classid0-stale-address-family.md`, which owns that
 family; `TestDiskFull` at ~73 s per run may be a cheaper handle on it than
 `TestMVStoreCachePerformance` at 12–40 min, if the rate holds up.
 

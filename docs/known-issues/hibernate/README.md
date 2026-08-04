@@ -40,14 +40,18 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   `overrides=N (loaded)`) — retired to
   `../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`.
   **Three real VM defects were found and fixed here**, and the class reached
-  `132/132 failed=0` three runs for three against base `32f9db9a2` — but it is
-  **not green on the `dev` tip**, and neither is any other collector arm. A
-  fourth, older fault remains: the class is
-  [intermittently unstable in every arm](defaultcatalogandschema-late-phase-instability-20260801.md),
-  including on `dev` with no local changes at all. Running it to completion for
-  the first time disproved the inherited "clean but slow, just needs a bigger
-  timeout" premise: HotSpot does it in 119.7 s on the same `-Xmx1500m`, while
-  CratonVM failed in both modes, for reasons now tracked on their own.
+  `132/132 failed=0` three runs for three against base `32f9db9a2` — but it was
+  **not green on the `dev` tip**, and neither was any other collector arm. A
+  fourth, older fault — the class was
+  [intermittently unstable in every arm](../../internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md),
+  including on `dev` with no local changes at all — was **FIXED 2026-08-03**:
+  nine distinct GC old-gen mark/sweep/compact defects (one family — trusting
+  `ObjectHeader` fields before validating them), found via `CRATONVM_SYMBOLIZE`
+  + `llvm-objdump` disassembly and closed one at a time with empirical
+  re-verification after each. Running it to completion for the first time
+  disproved the inherited "clean but slow, just needs a bigger timeout"
+  premise: HotSpot does it in 119.7 s on the same `-Xmx1500m`, while CratonVM
+  failed in both modes, for reasons now tracked on their own.
 
   ⚠️ **Do not use this class to re-check any of those fixes.** It has stopped
   discriminating: it also passes `132/132` on a `dev` tip that still carries the
@@ -79,20 +83,12 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
     HotSpot's 120 s. That part *is* the
     [moving-young-inert-under-JIT](moving-young-inert-under-jit-throughput-tax-20260730.md)
     throughput tax, and it stays there.
-  - `--nojit` — [the collector leaves reference fields UN-FORWARDED](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md).
-    The SIGSEGV is **fixed** (the class now completes, `rc=0` @ 5110 s, where it
-    crashed at 2103–2611 s), but it still does not match HotSpot: `found=99` vs
-    `132`, with JUnit `TestPlan` losing identifiers. That doc's original
-    `map_resize_inner` attribution is RETRACTED. A second corrupt writer in
-    the same runs (`HIB-WEAKREF-RECYCLE.1`, post-GC weak/phantom referent
-    restore) was root-caused and **fixed** on the same branch.
-
-    Worth a re-measure on this branch before further investigation: "`found=N`
-    below 132, with `TestPlan` losing identifiers" is *exactly* the face the JIT
-    lane showed (`found=121`), and there it turned out to be one symptom of a
-    stale reference in a frame, cured by the movable-JIT-root bound above. The
-    `--nojit` lane runs the same non-moving sweep and the same selective
-    promotion, so the fix applies to it too and this number predates it.
+  - `--nojit` — **FIXED 2026-08-03**, retired to
+    [`../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md).
+    The `map_resize_inner` attribution below was RETRACTED early in that doc's
+    life; the actual writer turned out to be `OldGen::compact` (the sliding
+    old-gen compactor), which is now disabled by default. The class completes
+    at exact HotSpot parity, `found=132`, on three independent runs.
 
   The class's `MutableBigInteger` AIOOBE quarantine (`41cdfdf94`) is untouched
   and not in question.
@@ -196,22 +192,16 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   on this host, which is the honest reason for the null result. Next: explain why
   `testNumericExpressionReturnTypes` stopped — the earliest divergence, and nothing records it.
 
-- [Old-generation header corruption kills `DefaultCatalogAndSchemaTest` under `--nojit`](map-resize-unpinned-chain-cursors-nojit-segv-20260731.md)
-  (NARROWED, still OPEN) — `HIB-MAPRESIZE-STALE.1`. **The `map_resize_inner` attribution
-  this entry used to carry is retracted**: a reference-typed store is not a GC point at
-  all (`gen_heap::write_barrier` never allocates from the Java heap), which is why the
-  pin refactor that premise called for landed and changed nothing. Three defects were
-  tangled here. Two are fixed — a whole class of collection natives holding heap refs
-  across their own allocations and Java callbacks (`fix/hib-mapresize-put-stale-20260731`,
-  ~40 sites behind a new `rooted_across` helper, caught deterministically in ~90 s by the
-  new `RMapGcStress`), and the corrupt-header diagnostic that `Debug`-formatted an invalid
-  `ObjectKind` and walked a wild pointer in `core::fmt` (`22107d512`). The residual is
-  what makes an old-gen header garbage in the first place: arm C logs 48 rejected headers
-  with `kind=0x3a` (ASCII `':'` — text written over a header) and then SIGSEGVs on a heap
-  address. Crash time has moved 2103 s → 2312 s → 2611 s across the three arms. The one
-  lead is a `CRATONVM_DBG_STALE_OBJREF` hit in a native reached from
-  `ClassLoaderServiceImpl.classForName` — the same bug shape, in the class-loading
-  natives.
+- ~~Old-generation header corruption kills `DefaultCatalogAndSchemaTest` under `--nojit`~~
+  — `HIB-MAPRESIZE-STALE.1`, **FIXED 2026-08-03**, retired to
+  [`../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md).
+  Four tangled defects, three fixed earlier; the residual corruption's actual writer
+  was `OldGen::compact` (the sliding old-gen compactor), found by bisection after code
+  review of its own Phase 1-3 came up empty. Disabled by default
+  (`CRATONVM_OLDGEN_COMPACT=1` to re-enable); the class now completes at exact HotSpot
+  parity (`found=132`) on three independent runs, `cratonvm-gc`'s full suite and the
+  fast regression suite are green, and 400 real Hibernate classes (200 `--nojit` + 200
+  JIT-on) all pass unchanged.
 
 - ~~Spurious `OutOfMemoryError` with 570 MB free~~ — `HIB-GCOVERHEAD-HALFFULL.1`,
   **FIXED 2026-07-31**, retired to

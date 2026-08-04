@@ -495,6 +495,9 @@ fn control_input_indices(node: &Node) -> Vec<usize> {
         | Op::New { .. }
         | Op::NewArray { .. }
         | Op::Call { .. }
+        | Op::ConstString { .. }
+        | Op::ConstClass { .. }
+        | Op::LoadStatic { .. }
         | Op::LambdaIntToDouble => {
             if node.inputs.is_empty() {
                 Vec::new()
@@ -671,6 +674,11 @@ fn expected_arity(op: &Op) -> (usize, usize) {
         Op::NewArray { .. } => (3, 3),
         // [ctrl, mem, args…]
         Op::Call { .. } => (2, ANY),
+        // cov-01 — [ctrl, mem]. Every operand is baked (the literal's address,
+        // the CP index, the field's class and index), so there is no value edge
+        // at all; what the two edges carry is the position in the control and
+        // memory chains a helper call has to keep.
+        Op::ConstString { .. } | Op::ConstClass { .. } | Op::LoadStatic { .. } => (2, 2),
         // [ctrl, mem, lambda, index]
         Op::LambdaIntToDouble => (4, 4),
         // [ctrl, cond]

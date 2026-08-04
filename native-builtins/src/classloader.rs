@@ -140,6 +140,7 @@ pub fn reset_loader_singletons() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    clear_all_defining_loader_bits();
     ANY_DEFINING_LOADER_REGISTERED.store(false, Ordering::Release);
     loader_namespace_id_store()
         .lock()
@@ -282,6 +283,9 @@ pub fn gc_reconcile_defining_loaders(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(*_class_id);
+            // Keep the lock-free key-set mirror in step with the removal, so a
+            // retired class stops paying the `Mutex` on every lookup again.
+            clear_defining_loader_bit(*_class_id);
             dead_class_ids.push(*_class_id);
             return false;
         }
@@ -452,6 +456,92 @@ pub(crate) fn is_defining_loader_orphaned(class_id: u32) -> bool {
 /// then empty except via the same reset that clears this flag.
 static ANY_DEFINING_LOADER_REGISTERED: AtomicBool = AtomicBool::new(false);
 
+/// Highest `class_id` the [`defining_loader_bits`] mirror can answer for. Ids
+/// at or above it fall back to the map (correct, just not lock-free); 1M is
+/// far past what any real workload reaches, so the fallback is dead code in
+/// practice rather than a second hot path.
+const DEFINING_LOADER_BITS_CAP: u32 = 1 << 20;
+
+/// Lock-free per-`ClassId` mirror of [`defining_loader_store`]'s KEY SET.
+///
+/// [`ANY_DEFINING_LOADER_REGISTERED`] answers the same question for the whole
+/// PROCESS, and that is precisely why it stops paying. It latches true the
+/// instant any user-defined loader defines any class — which in a servlet
+/// container, an OSGi runtime, or anything using ByteBuddy/cglib/Groovy
+/// happens once, early, and then never goes back — after which every caller
+/// takes the store's `Mutex` on every lookup, forever, for the bootstrap and
+/// app-loader classes that are the overwhelming majority of all lookups.
+///
+/// Measured (2026-08-03, `probes/LoaderStepCostProbe.java`): BCEL-parsing 156
+/// class files costs 448 ms on a fresh VM and **830 ms after a single class is
+/// defined through a `URLClassLoader`** — a permanent 1.8x on work that has
+/// nothing to do with that loader. `new` is the amplifier: it is resolved from
+/// scratch on every execution (`opcodes.rs`'s `Instruction::New` →
+/// `resolve_class_loader_aware`), and a constant-pool parse constructs one
+/// object per entry. That is the Tomcat webapp-deploy wall's degradation term:
+/// successive deploys in one JVM ran 104 s, 162 s, 260 s, 298 s.
+///
+/// Keyed by `class_id`, so a class the map has no entry for is answered
+/// without touching the `Mutex` no matter how many other loaders exist.
+///
+/// **Maintenance — three writers, matching the map's own three:**
+/// [`register_defining_loader`] sets a bit, [`gc_reconcile_defining_loaders`]
+/// clears the bits of entries it retires, and [`reset_loader_singletons`]
+/// clears everything. Each writes the bit while the map lock is held (or, for
+/// registration, after the insert), so a reader that observes a bit SET and
+/// then takes the lock either finds the entry or finds it concurrently
+/// removed — both already-legal outcomes. A reader that observes a bit CLEAR
+/// returns `None`, which is the same race the process-wide latch already had
+/// against a concurrent first registration.
+///
+/// Allocated lazily (128 KiB) on the first registration, so a run that never
+/// uses a custom loader never pays for it.
+fn defining_loader_bits() -> &'static [AtomicU64] {
+    static INSTANCE: OnceLock<Box<[AtomicU64]>> = OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        (0..(DEFINING_LOADER_BITS_CAP as usize / 64))
+            .map(|_| AtomicU64::new(0))
+            .collect()
+    })
+}
+
+/// Could `class_id` have a registered defining loader? `false` is exact — the
+/// caller may skip the map entirely. `true` means "consult the map", which may
+/// still answer `None`.
+#[inline]
+fn class_may_have_defining_loader(class_id: u32) -> bool {
+    if !ANY_DEFINING_LOADER_REGISTERED.load(Ordering::Acquire) {
+        return false;
+    }
+    if class_id >= DEFINING_LOADER_BITS_CAP {
+        return true;
+    }
+    let word = &defining_loader_bits()[(class_id / 64) as usize];
+    word.load(Ordering::Acquire) & (1u64 << (class_id % 64)) != 0
+}
+
+fn set_defining_loader_bit(class_id: u32) {
+    if class_id >= DEFINING_LOADER_BITS_CAP {
+        return;
+    }
+    defining_loader_bits()[(class_id / 64) as usize]
+        .fetch_or(1u64 << (class_id % 64), Ordering::Release);
+}
+
+fn clear_defining_loader_bit(class_id: u32) {
+    if class_id >= DEFINING_LOADER_BITS_CAP {
+        return;
+    }
+    defining_loader_bits()[(class_id / 64) as usize]
+        .fetch_and(!(1u64 << (class_id % 64)), Ordering::Release);
+}
+
+fn clear_all_defining_loader_bits() {
+    for word in defining_loader_bits() {
+        word.store(0, Ordering::Release);
+    }
+}
+
 /// Record the user-defined `ClassLoader` object that defined `class_id`, so
 /// `Class.getClassLoader()` returns the exact instance instead of the app-loader
 /// fallback.
@@ -460,6 +550,9 @@ pub fn register_defining_loader(class_id: u32, loader: ObjectRef) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(class_id, loader);
+    // Bit AFTER the insert, latch after the bit: a reader that sees either
+    // signal set then finds the entry already in the map.
+    set_defining_loader_bit(class_id);
     ANY_DEFINING_LOADER_REGISTERED.store(true, Ordering::Release);
     // HIB-CV-24: mirror into the loader-pin registry the GC marker consults so a
     // live instance of this class keeps its defining loader alive (the
@@ -469,7 +562,7 @@ pub fn register_defining_loader(class_id: u32, loader: ObjectRef) {
 
 /// Look up the user-defined `ClassLoader` object that defined `class_id`.
 pub fn defining_loader_for(class_id: u32) -> Option<ObjectRef> {
-    if !ANY_DEFINING_LOADER_REGISTERED.load(Ordering::Acquire) {
+    if !class_may_have_defining_loader(class_id) {
         return None;
     }
     defining_loader_store()

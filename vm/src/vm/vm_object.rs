@@ -1283,8 +1283,14 @@ fn statics_index_counters_on() -> bool {
 }
 
 /// Is the lock-free statics read path switched off? (`CRATONVM_NO_STATICS_INDEX=1`)
+///
+/// `pub` (re-exported as `crate::vm::statics_index_disabled`, like the
+/// hit/miss counters beside it) because the JIT's compile-time static-slot
+/// resolver honours the same switch: with the index off, compiled code must not
+/// bake a direct load either, or the switch would silently stop being an A/B of
+/// the lock-free path once methods tier up.
 #[inline]
-fn statics_index_disabled() -> bool {
+pub fn statics_index_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_NO_STATICS_INDEX").is_some()
@@ -1672,8 +1678,13 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
     let mut missing = Vec::new();
 
     let cm = shared.classes.class_manager.read();
-    // Iterate over all loaded classes in the ClassStore
-    for class_id_u32 in 0..cm.class_store.len() as u32 {
+    // Iterate over all loaded classes in the ClassStore.
+    //
+    // `slot_count()`, not `len()`: `len()` is the LIVE class count, so after
+    // any class unload the tombstone makes it smaller than the id upper bound
+    // and this census silently stopped short of the highest-id classes — the
+    // most recently loaded ones. `get` already skips tombstones below.
+    for class_id_u32 in 0..cm.class_store.slot_count() as u32 {
         let class_id = ClassId::new(class_id_u32);
         let class = match cm.class_store.get(class_id) {
             Some(c) => c,
