@@ -883,39 +883,15 @@ pub fn compile_with_param_slots(
         }
         ewise
     };
-    let bulk_zero_byte_fill_loops: Vec<BulkZeroByteFillLoop> = if bulk_byte_loops_enabled() {
-        loops
-            .iter()
-            .filter_map(|&(header, back_edge)| {
-                detect_bulk_zero_byte_fill_loop(code, code_len, header, back_edge)
-            })
-            .filter(|fill| !bypassable_headers.contains(&fill.header_pc))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let bulk_set_byte_stride_loops: Vec<BulkSetByteStrideLoop> = if bulk_byte_loops_enabled() {
-        loops
-            .iter()
-            .filter_map(|&(header, back_edge)| {
-                detect_bulk_set_byte_stride_loop(code, code_len, header, back_edge)
-            })
-            .filter(|fill| !bypassable_headers.contains(&fill.header_pc))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let byte_sieve_loops: Vec<ByteSieveLoop> = if bulk_byte_loops_enabled() {
-        loops
-            .iter()
-            .filter_map(|&(header, back_edge)| {
-                detect_byte_sieve_loop(code, code_len, header, back_edge)
-            })
-            .filter(|sieve| !bypassable_headers.contains(&sieve.header_pc))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // One call, not three inlined copies: the optimizing tier's admission
+    // chain asks the same question through
+    // `single_pass_has_bulk_byte_lowering`, and it has to get the same answer
+    // this does or it will hand the IR tier a method this backend vectorises.
+    let BulkByteLoops {
+        zero_fill: bulk_zero_byte_fill_loops,
+        set_stride: bulk_set_byte_stride_loops,
+        sieve: byte_sieve_loops,
+    } = detect_bulk_byte_loops(code, code_len, &loops, &bypassable_headers);
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
         && !(bulk_zero_byte_fill_loops.is_empty()
             && bulk_set_byte_stride_loops.is_empty()
