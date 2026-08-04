@@ -37,19 +37,29 @@
 //! than remembered: `vm/tests/no_test_only_public_api.rs` fails the build on a
 //! `pub` item in this crate whose only references are inside `#[cfg(test)]`.
 //!
-//! ## "Lock-free" is a misnomer — keep it in mind before relying on it
+//! ## "Lock-free" is still a misnomer — sharded, not lock-free
 //!
-//! Nothing here is lock-free in the technical sense, and the live path in
-//! particular is not. `get_promoted_invoke` takes a `parking_lot::RwLock`
-//! **read** guard on a single process-wide map: acquiring it is an atomic
-//! read-modify-write on one shared word, so every dispatching thread writes
-//! the same cache line on every consult. That is much cheaper than the
-//! `ClassManager` write lock it replaces — which is the real and worthwhile
-//! win, and it is genuine — but it is contention, not its absence. The claim
-//! that this "eliminates lock contention on the common case" was overstated;
-//! it *relocates* it off the class-manager lock.
+//! Nothing here is lock-free in the technical sense. `get_promoted_invoke`
+//! takes a `parking_lot::RwLock` **read** guard, and acquiring one is an atomic
+//! read-modify-write on the lock word — the file name has always overstated
+//! this and still does.
 //!
-//! (This is the same class of overstatement a sibling pass found on
+//! What ARCH-2026-08-04 A8 changed is *which* word. Until then there was one
+//! process-wide map, so every dispatching thread RMW'd the same lock word on
+//! every consult, plus a second shared line for the `promoted_hits` counter
+//! incremented on every hit. That is invisible on a single-threaded benchmark
+//! and a scaling ceiling on a loaded one, and because this tier is only reached
+//! on a `JvmThread::invoke_cache` miss it does not even present as lock
+//! *contention* in a profile — it presents as cache-line traffic.
+//!
+//! The cache is now [`PROMOTED_SHARDS`] independently-locked shards, each
+//! `repr(align(64))` so it owns its cache line, with the hit/insert counters
+//! moved *inside* the shard. Threads working different call sites no longer
+//! touch a common line at all. The residual truth stands: this relocates and
+//! divides contention, it does not eliminate it.
+//!
+//! (The pre-A8 header made the weaker version of this point after a sibling
+//! pass found the same class of overstatement on
 //! `class_manager.rs::class_loading_locks`, which claimed to "allow concurrent
 //! loading of different classes to proceed without contention" while
 //! `load_class_concurrent` still ran under the L10 write lock. Verify against
@@ -201,6 +211,26 @@ use std::hash::{Hash, Hasher};
 type CachedInvokeTarget = GenericCachedInvokeTarget<cratonvm_jit::RetainedCode>;
 
 
+/// Per-shard entry cap, so the total across all shards is [`shared_cache_cap`].
+///
+/// Rounds **up** (`ceil`), which means the true global bound is at most
+/// `shared_cache_cap() + PROMOTED_SHARDS - 1` entries — 15 over 65,536 at the
+/// default. That direction is chosen deliberately: rounding down would let a
+/// cap of 1 (the documented minimum, which `parse_shared_cache_cap` enforces so
+/// a freshly-inserted entry always survives) become a per-shard cap of 0, and
+/// `evict_to_fit` with `cap == 0` would evict the entry it was called to make
+/// room for. The `max(1)` below is what actually holds that invariant; the
+/// ceiling keeps the aggregate honest for every larger value.
+///
+/// Note this makes the bound per-shard rather than global: a workload whose
+/// minted keys all hash to one shard is capped at `per_shard_cap()`, not
+/// `shared_cache_cap()`. That is a *tighter* bound, never a looser one, so the
+/// DoS property the cap exists for is preserved.
+#[inline]
+fn per_shard_cap() -> usize {
+    shared_cache_cap().div_ceil(PROMOTED_SHARDS).max(1)
+}
+
 // ---------------------------------------------------------------------------
 // SharedResolutionState
 // ---------------------------------------------------------------------------
@@ -213,11 +243,88 @@ type CachedInvokeTarget = GenericCachedInvokeTarget<cratonvm_jit::RetainedCode>;
 /// that two receiver classes sharing the same call site do not collide.
 pub type PromotedInvokeKey = (ClassId, u16, bool, Option<ClassId>);
 
+/// Number of independent shards the promoted-invoke cache is split across.
+///
+/// ARCH-2026-08-04 A8. Must be a power of two — [`shard_of`] masks rather than
+/// divides.
+///
+/// 16 is sized against the machines this VM is benchmarked on (8-32 hardware
+/// threads): enough that a fully-loaded box rarely has two threads on one
+/// shard, small enough that the whole array is 16 cache lines of lock state and
+/// the O(SHARDS) housekeeping operations — `invalidate_promoted`,
+/// `promoted_invoke_count` — stay trivial. Raising it costs a cache line each
+/// and buys nothing past core count.
+const PROMOTED_SHARDS: usize = 16;
+
+/// One shard of the promoted-invoke cache, padded to its own cache line.
+///
+/// **The padding is the point, not a micro-optimisation.** Sharding a map
+/// without separating the shards leaves every lock word and counter on the same
+/// one or two lines, so the cores still ping-pong exactly as they did before
+/// and the split buys nothing measurable. `align(64)` gives each shard its own
+/// line on x86-64 and AArch64.
+///
+/// The hit/insert counters live *inside* the shard for the same reason. They
+/// were process-global `AtomicU64`s incremented on every cache hit — which is
+/// to say, a read-modify-write on one shared line on the hottest path this
+/// type has. Sharding the map while leaving those behind would have relocated
+/// the contention rather than removed it, which is precisely the mistake this
+/// module's own header calls out about the pre-A8 design.
+#[repr(align(64))]
+struct PromotedShard {
+    map: RwLock<FxHashMap<PromotedInvokeKey, CachedInvokeTarget>>,
+    /// T10.4 observability — successful read-lock hits on this shard.
+    hits: AtomicU64,
+    /// T10.4 observability — write-lock inserts into this shard.
+    inserts: AtomicU64,
+}
+
+impl PromotedShard {
+    fn new() -> Self {
+        Self {
+            map: RwLock::new(fx_hashmap()),
+            hits: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Which shard owns `key`.
+///
+/// Hashes the whole key, not just `caller_class`. Sharding on the caller alone
+/// would put every call site of one hot class — exactly the class whose sites
+/// are being consulted in a tight loop — on a single shard, reproducing the
+/// original contention under a different name.
+#[inline]
+fn shard_of(key: &PromotedInvokeKey) -> usize {
+    let mut h = FxHasher::default();
+    key.hash(&mut h);
+    // Fold the high bits down: FxHasher's low bits are its weakest, and
+    // `PROMOTED_SHARDS` masks off everything else.
+    let v = h.finish();
+    ((v ^ (v >> 32)) as usize) & (PROMOTED_SHARDS - 1)
+}
+
 /// Read-optimised shared resolution state accessible from any thread.
 ///
-/// Reads take a `RwLock` read-guard (concurrent readers never block each
-/// other).  Writes take the write-guard and are expected to be infrequent
-/// (only on first resolution of a given target).
+/// Reads take a `RwLock` read-guard on one shard (concurrent readers never
+/// block each other). Writes take that shard's write-guard and are expected to
+/// be infrequent (only on first resolution of a given target).
+///
+/// ## Why this is sharded (ARCH-2026-08-04 A8)
+///
+/// This was a single process-wide `RwLock<FxHashMap<..>>`. A `parking_lot` read
+/// acquire is an atomic read-modify-write on the lock word, so *every*
+/// dispatching thread wrote the same cache line on every consult, plus a second
+/// shared line for the hit counter. That is invisible on a single-threaded
+/// benchmark and a hard scaling ceiling on a loaded one — and it is second-tier
+/// (only reached on a `JvmThread::invoke_cache` miss), so it does not even show
+/// up as lock *contention* in a profile; it shows up as cache-line traffic.
+///
+/// The module header has said since 2026-07-26 that "lock-free" was a misnomer
+/// and that the design *relocated* contention off the class-manager lock rather
+/// than removing it. This spreads what remains across [`PROMOTED_SHARDS`]
+/// independently-locked, separately-cache-lined shards.
 pub struct SharedResolutionState {
     /// T10.4 — cross-thread promoted cache of fully-built invoke targets.
     ///
@@ -225,23 +332,14 @@ pub struct SharedResolutionState {
     /// before falling through to the slow `class_manager` walk.  When a thread
     /// completes the slow path it promotes the resulting `CachedInvokeTarget`
     /// here so sibling threads skip the walk on their first call.
-    promoted_invokes: RwLock<FxHashMap<PromotedInvokeKey, CachedInvokeTarget>>,
-    /// T10.4 observability — number of successful read-lock hits on
-    /// `promoted_invokes` since VM start.  Tests assert this counter to prove
-    /// the shared read path bypassed the class-manager write lock.
-    promoted_hits: AtomicU64,
-    /// T10.4 observability — number of write-lock inserts into
-    /// `promoted_invokes`.
-    promoted_inserts: AtomicU64,
+    shards: Box<[PromotedShard; PROMOTED_SHARDS]>,
 }
 
 impl SharedResolutionState {
     /// Create an empty shared state.
     pub fn new() -> Self {
         Self {
-            promoted_invokes: RwLock::new(fx_hashmap()),
-            promoted_hits: AtomicU64::new(0),
-            promoted_inserts: AtomicU64::new(0),
+            shards: Box::new(std::array::from_fn(|_| PromotedShard::new())),
         }
     }
 
@@ -258,18 +356,19 @@ impl SharedResolutionState {
     /// `None` and fall through to the slow re-resolution which will
     /// promote a fresh entry.
     pub fn get_promoted_invoke(&self, key: &PromotedInvokeKey) -> Option<CachedInvokeTarget> {
-        let guard = self.promoted_invokes.read();
+        let shard = &self.shards[shard_of(key)];
+        let guard = shard.map.read();
         let hit = guard.get(key).cloned();
         drop(guard);
         match hit {
             Some(t) if !t.is_stale() => {
-                self.promoted_hits.fetch_add(1, Ordering::Relaxed);
+                shard.hits.fetch_add(1, Ordering::Relaxed);
                 Some(t)
             }
             Some(_stale) => {
                 // Evict on detection — sibling threads would otherwise keep
                 // re-promoting the same stale entry until somebody noticed.
-                let mut guard = self.promoted_invokes.write();
+                let mut guard = shard.map.write();
                 if let Some(existing) = guard.get(key) {
                     if existing.is_stale() {
                         guard.remove(key);
@@ -289,29 +388,46 @@ impl SharedResolutionState {
     /// minting unbounded distinct `(caller, cp_index, receiver)` keys cannot
     /// grow this map without limit. Re-promoting an already-present call site
     /// never evicts.
+    ///
+    /// The cap is per-shard ([`per_shard_cap`]) so the total bound across all
+    /// shards stays at `shared_cache_cap()`, rounded up by at most
+    /// `PROMOTED_SHARDS - 1` entries. A key-minting adversary is still held to a
+    /// bounded footprint; see `per_shard_cap` for why the rounding direction is
+    /// the safe one.
     pub fn insert_promoted_invoke(&self, key: PromotedInvokeKey, target: CachedInvokeTarget) {
-        let mut guard = self.promoted_invokes.write();
+        let shard = &self.shards[shard_of(&key)];
+        let mut guard = shard.map.write();
         if !guard.contains_key(&key) {
-            evict_to_fit(&mut guard, shared_cache_cap());
+            evict_to_fit(&mut guard, per_shard_cap());
         }
         guard.insert(key, target);
-        self.promoted_inserts.fetch_add(1, Ordering::Relaxed);
+        shard.inserts.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Snapshot of the promoted-invoke hit counter (tests / diagnostics).
+    ///
+    /// Sums the per-shard counters. Not a consistent snapshot across shards —
+    /// concurrent hits may land either side of the walk — which is the same
+    /// guarantee the single relaxed counter gave before A8 sharded it.
     pub fn promoted_hit_count(&self) -> u64 {
-        self.promoted_hits.load(Ordering::Relaxed)
+        self.shards
+            .iter()
+            .map(|s| s.hits.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Snapshot of the promoted-invoke insert counter (tests / diagnostics).
     pub fn promoted_insert_count(&self) -> u64 {
-        self.promoted_inserts.load(Ordering::Relaxed)
+        self.shards
+            .iter()
+            .map(|s| s.inserts.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Number of distinct call sites currently cached in the promoted-invoke
-    /// map (tests / diagnostics).  Acquires a read-lock.
+    /// map (tests / diagnostics).  Acquires each shard's read-lock in turn.
     pub fn promoted_invoke_count(&self) -> usize {
-        self.promoted_invokes.read().len()
+        self.shards.iter().map(|s| s.map.read().len()).sum()
     }
 
     // -- housekeeping -----------------------------------------------------
@@ -330,14 +446,21 @@ impl SharedResolutionState {
     /// caller — `vm/src/memory/gc.rs` — already called this method and carried
     /// a comment explaining why it avoided the three-lock variant.
     pub fn invalidate_promoted(&self) {
-        self.promoted_invokes.write().clear();
+        for shard in self.shards.iter() {
+            shard.map.write().clear();
+        }
     }
 
     /// Clear promoted invoke entries whose caller class or receiver class
     /// matches `class_id` — used by CHA invalidation / class redefinition.
+    ///
+    /// Sweeps every shard: the key's shard is a hash of the *whole* key, so a
+    /// class's entries are deliberately spread across all of them.
     pub fn invalidate_promoted_for_class(&self, class_id: ClassId) {
-        let mut guard = self.promoted_invokes.write();
-        guard.retain(|(caller, _, _, rcv), _| *caller != class_id && *rcv != Some(class_id));
+        for shard in self.shards.iter() {
+            let mut guard = shard.map.write();
+            guard.retain(|(caller, _, _, rcv), _| *caller != class_id && *rcv != Some(class_id));
+        }
     }
 }
 
@@ -722,5 +845,139 @@ mod tests {
             },
         );
         assert!(via_promoted.get_promoted_invoke(&key).is_some());
+    }
+
+    // -- ARCH-2026-08-04 A8: sharding ------------------------------------
+
+    /// Call sites of one caller class must spread across shards.
+    ///
+    /// This is the whole point of hashing the full key instead of just
+    /// `caller_class`. Sharding on the caller alone would put every call site
+    /// of one hot class — exactly the class being consulted in a tight loop —
+    /// on a single shard, reproducing the contention A8 removed under a new
+    /// name. A pre-A8 single map is the degenerate case of this test with one
+    /// bucket, so it would fail here.
+    #[test]
+    fn one_caller_class_spreads_across_shards() {
+        let mut seen = std::collections::HashSet::new();
+        for cp in 0..256u16 {
+            let key: PromotedInvokeKey = (ClassId::new(1), cp, false, Some(ClassId::new(2)));
+            seen.insert(shard_of(&key));
+        }
+        assert_eq!(
+            seen.len(),
+            PROMOTED_SHARDS,
+            "256 call sites of one caller landed on {} of {} shards — the shard \
+             function is not spreading a hot class's sites",
+            seen.len(),
+            PROMOTED_SHARDS
+        );
+    }
+
+    /// The shard of a key never moves.
+    ///
+    /// `get_promoted_invoke` and `insert_promoted_invoke` compute the shard
+    /// independently; if `shard_of` were not a pure function of the key, an
+    /// insert and its lookup could land on different shards and every promotion
+    /// would silently miss — a pure slowdown with no visible symptom.
+    #[test]
+    fn shard_of_is_stable_for_a_key() {
+        let key: PromotedInvokeKey = (ClassId::new(7), 42, true, Some(ClassId::new(9)));
+        let first = shard_of(&key);
+        for _ in 0..1000 {
+            assert_eq!(shard_of(&key), first);
+        }
+        assert!(first < PROMOTED_SHARDS);
+    }
+
+    /// The DoS bound survives sharding.
+    ///
+    /// `shared_cache_cap` exists so a workload minting unbounded distinct keys
+    /// (a class emitting fresh lambda / proxy / hidden-class names per call)
+    /// cannot grow the cache until the process dies. Splitting one capped map
+    /// into 16 uncapped ones would have quietly deleted that property, so this
+    /// mints far more keys than the cap allows and checks the total.
+    #[test]
+    fn the_shared_cap_still_bounds_the_total_across_shards() {
+        let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
+        let _override = CapOverride::set(64);
+
+        let state = SharedResolutionState::new();
+        for cp in 0..4096u16 {
+            state.insert_promoted_invoke(
+                (ClassId::new(1), cp, false, Some(ClassId::new(2))),
+                CachedInvokeTarget::VirtualBytecode {
+                    receiver_class_id: ClassId::new(2),
+                    cached: sample_bytecode_method(2),
+                    gate: crate::classloading::resolution::RedefineGate::never_stale(),
+                },
+            );
+        }
+
+        // Per-shard cap is ceil(64/16) = 4, so the aggregate ceiling is 64.
+        let total = state.promoted_invoke_count();
+        assert!(
+            total <= per_shard_cap() * PROMOTED_SHARDS,
+            "4096 minted keys grew the cache to {total}, above the \
+             {} the per-shard cap allows",
+            per_shard_cap() * PROMOTED_SHARDS
+        );
+        assert!(
+            total > 0,
+            "the cap evicted everything — a freshly-inserted entry must survive"
+        );
+    }
+
+    /// A cap of 1 must not evict the entry it was making room for.
+    ///
+    /// `parse_shared_cache_cap` enforces a floor of 1 precisely so a fresh
+    /// insert survives. Dividing that by `PROMOTED_SHARDS` without the `max(1)`
+    /// in `per_shard_cap` yields 0, and `evict_to_fit` with `cap == 0` evicts
+    /// unconditionally — the cache would then hold nothing at all, turning a
+    /// tuning knob into a silent total disable.
+    #[test]
+    fn a_cap_of_one_still_admits_an_entry() {
+        let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
+        let _override = CapOverride::set(1);
+
+        assert_eq!(per_shard_cap(), 1, "per-shard cap must never round to 0");
+
+        let state = SharedResolutionState::new();
+        let key: PromotedInvokeKey = (ClassId::new(1), 0, false, Some(ClassId::new(2)));
+        state.insert_promoted_invoke(
+            key,
+            CachedInvokeTarget::VirtualBytecode {
+                receiver_class_id: ClassId::new(2),
+                cached: sample_bytecode_method(2),
+                gate: crate::classloading::resolution::RedefineGate::never_stale(),
+            },
+        );
+        assert!(
+            state.get_promoted_invoke(&key).is_some(),
+            "a cap of 1 must still admit one entry per shard"
+        );
+    }
+
+    /// Each shard occupies its own cache line.
+    ///
+    /// The padding is what makes sharding worth anything: without it every
+    /// shard's lock word and counters share one or two lines and the cores
+    /// ping-pong exactly as they did with a single lock. A future edit that
+    /// drops `repr(align(64))` — or adds a field pushing the shard over a line
+    /// — would leave a correct cache that scales no better than the one A8
+    /// replaced, with nothing to show for it.
+    #[test]
+    fn shards_do_not_share_a_cache_line() {
+        assert_eq!(
+            std::mem::align_of::<PromotedShard>(),
+            64,
+            "PromotedShard must be cache-line aligned"
+        );
+        assert_eq!(
+            std::mem::size_of::<PromotedShard>() % 64,
+            0,
+            "PromotedShard must be a whole number of cache lines so shard N+1 \
+             does not start inside shard N's line"
+        );
     }
 }
