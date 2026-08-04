@@ -2163,6 +2163,15 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
                 Op::Return
                     | Op::Store(_)
                     | Op::Call { .. }
+                    // cov-01: all three are observable side effects whose value
+                    // may have no consumer. `ldc <Class>` and `getstatic` can
+                    // run `<clinit>` and throw; `ldc <String>` interns, which
+                    // is observable through `==` on a later literal. Deleting
+                    // one because nothing reads its result would drop the
+                    // class initialisation Java owes at that bytecode.
+                    | Op::ConstString { .. }
+                    | Op::ConstClass { .. }
+                    | Op::LoadStatic { .. }
                     | Op::ArrayLoad(_)
                     | Op::ArrayStore(_)
                     | Op::ArrayLength
@@ -2647,6 +2656,12 @@ fn unroll(graph: &mut Graph) -> bool {
                 op,
                 Op::Store(_)
                     | Op::Call { .. }
+                    // cov-01: a helper call that may allocate, intern or run
+                    // `<clinit>` is a side effect this pass does not model, so
+                    // a loop containing one is not unrolled.
+                    | Op::ConstString { .. }
+                    | Op::ConstClass { .. }
+                    | Op::LoadStatic { .. }
                     | Op::New { .. }
                     | Op::NewArray { .. }
                     | Op::ArrayLength

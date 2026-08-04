@@ -210,6 +210,21 @@ static CLASS_LAYOUT_VERSIONS: LazyLock<
     parking_lot::RwLock<rustc_hash::FxHashMap<(u32, u32), Arc<CompactLayout>>>,
 > = LazyLock::new(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()));
 
+/// Reverse index over [`CLASS_LAYOUT_VERSIONS`]: `class_id -> its field
+/// counts`. Exists solely so [`unregister_class_layout`] can drop one class's
+/// versions without a full-map `retain`.
+///
+/// A `retain` is `O(all registered versions)` and class unloading walks every
+/// class of a dying loader, so the sweep was quadratic in the number of loaded
+/// classes — the same "linear scan where an index belongs" shape the registry
+/// above was rewritten to remove. Held under the *same* lock discipline: both
+/// maps are only ever mutated inside [`register_class_layout`] /
+/// [`unregister_class_layout`], and the versions lock is taken first in both,
+/// so the pair cannot deadlock or diverge.
+static CLASS_LAYOUT_VERSION_KEYS: LazyLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<u32, Vec<u32>>>,
+> = LazyLock::new(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()));
+
 /// Maximum slot count for the dense layout registry.
 ///
 /// Class IDs are expected to be allocator-issued and dense. A sparse or corrupt
@@ -285,7 +300,16 @@ pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
         .expect("compact field count exceeds u32");
     {
         let mut versions = CLASS_LAYOUT_VERSIONS.write();
-        versions.insert((class_id, field_count), Arc::clone(&layout));
+        if versions
+            .insert((class_id, field_count), Arc::clone(&layout))
+            .is_none()
+        {
+            // First time this class has been registered at this field count —
+            // record the key so `unregister_class_layout` can find it without
+            // scanning the whole version map.
+            let mut keys = CLASS_LAYOUT_VERSION_KEYS.write();
+            keys.entry(class_id).or_default().push(field_count);
+        }
     }
     let mut v = CLASS_LAYOUTS.write().unwrap();
     if idx >= v.len() {
@@ -315,9 +339,17 @@ pub fn unregister_class_layout(class_id: u32) {
     let Ok(index) = usize::try_from(class_id) else {
         return;
     };
-    CLASS_LAYOUT_VERSIONS
-        .write()
-        .retain(|(id, _), _| *id != class_id);
+    {
+        // O(this class's versions), not O(every registered version): see
+        // `CLASS_LAYOUT_VERSION_KEYS`. Versions lock first, matching
+        // `register_class_layout`.
+        let mut versions = CLASS_LAYOUT_VERSIONS.write();
+        if let Some(field_counts) = CLASS_LAYOUT_VERSION_KEYS.write().remove(&class_id) {
+            for fc in field_counts {
+                versions.remove(&(class_id, fc));
+            }
+        }
+    }
     let mut layouts = CLASS_LAYOUTS.write().unwrap();
     if let Some(slot) = layouts.get_mut(index) {
         if slot.take().is_some() {
@@ -901,6 +933,7 @@ pub unsafe fn write_compact_field(
 pub fn clear_class_layouts() {
     CLASS_LAYOUTS.write().unwrap().clear();
     CLASS_LAYOUT_VERSIONS.write().clear();
+    CLASS_LAYOUT_VERSION_KEYS.write().clear();
     // The per-thread `class_layout_for_fields` cache is validated against
     // `layout_generation()`, so bump it here: without this, a test that clears
     // the registry and re-registers could be served a pre-clear entry from
