@@ -533,6 +533,17 @@ fn no_native_mints_a_field_less_ssl_socket_factory_carrier() {
 /// merely exists — a presence check passes just as happily when a later phase
 /// has displaced the good implementation. Line numbers are compared between two
 /// runtime observations, so ordinary edits to the file do not move the goalposts.
+///
+/// Gated on the feature because `register_synthetic_overrides` — the only
+/// caller that puts phase 61 after phase 57, and therefore the only place the
+/// displacement can happen — does not exist without it. Ungated, this whole
+/// test TARGET fails to compile in the default configuration
+/// (`cargo test -p cratonvm-native-builtins`), taking every other contract in
+/// this file down with it. The guard therefore runs in the
+/// `experimental-features` job, which is also the only place the code it
+/// guards is reachable: real-JDK mode reaches phase 57 straight from
+/// `vm_init.rs` and never calls phase 61.
+#[cfg(feature = "synthetic-jdk")]
 #[test]
 fn p61_does_not_displace_phase57_path_natives() {
     fn winner(registry: &NativeMethodRegistry, name: &str, descriptor: &str) -> Option<String> {
