@@ -92,6 +92,25 @@ and **`cov-02` gave `sieve` a body** by lowering the `0x54 bastore` it used to
 die on. A `cov-*` lane moving the bench suite's own reach is exactly the
 movement the per-phase record exists to make visible.
 
+## The first thing the coverage lanes cost
+
+**`cov-02` made `CratonBench`'s `sieve` phase 6.4x slower** — 2,462 ms →
+15,823 ms, interleaved A/B of the two builds either side of it, checksums
+identical. One method: `CratonBench.sieve([ZI)I` was admitted to the optimizing
+pipeline on both builds, but only the newer one produces a body for it, and
+that body is 6.4x slower than the single-pass one it replaced. CratonVM was
+*faster than HotSpot* on this phase before the change.
+
+That is not an argument against `cov-02` — lowering integral array access is
+right, and its own closeout measured what it set out to. It is the other half
+of the trade, which the survey below had already written down: *"it does not
+say lowering these opcodes makes anything faster."* Every lane in the table
+below widens the set of methods this can happen to, and nothing today compares
+an IR body against the C1 body it replaces before keeping it.
+
+[`perf-01`](perf-01-sieve-ir-body-6x-slower-than-c1.md) — open, unowned,
+and it raises a policy question bigger than the defect.
+
 ## The coverage lanes
 
 Nine parallel-actionable lanes, each sized from the survey, each with disjoint
