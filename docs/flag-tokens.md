@@ -1,8 +1,11 @@
 # CratonVM — complete `CRATONVM_*` token reference
 
 *Generated from `types/src/flag_groups.rs::INVENTORY`. Regenerate with
-`tools/flag-census/render-tokens.sh`; `types/tests/flag_surface.rs` fails the
-build if this table and the code disagree about which variables exist.*
+`tools/flag-census/render-tokens.sh`; `types/tests/flag_docs_generated.rs`
+fails the build if this table and the code disagree about which tokens exist.
+(That claim used to name `flag_surface.rs`, which only ever compared
+`INVENTORY` against `flag-surface.txt` and never read this file — which is how
+this table came to be three rows wrong.)*
 
 Every knob in the VM is a token in one of **ten** environment variables. This
 file lists all of them. [`docs/CONFIG.md`](CONFIG.md) documents the handful you
