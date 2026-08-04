@@ -319,6 +319,63 @@ pub enum Op {
         is_volatile: bool,
     },
 
+    // ── cov-05 ────────────────────────────────────────────────────
+    /// `instanceof` (0xc1) against a class already resolved and loaded at
+    /// compile time. Inputs `[ctrl, mem, obj]`, result `Int` (0 or 1).
+    ///
+    /// Lowered as a call to `helpers.instanceof_check` — the SAME helper the
+    /// single-pass backend's 0xc1 arm calls, with the identical
+    /// `(vm_ptr, obj_ptr, name_ptr, name_len)` ABI, so this node reuses the
+    /// single-pass backend's subtype answer (including the strict-vs-lenient
+    /// array rule and every recorded typecheck defect fix) rather than
+    /// re-deriving one. `Opaque` because the helper's fast path can still
+    /// allocate a `java/lang/Class` mirror on first touch (a GC-triggering
+    /// safepoint) even though the *target* class is already loaded — see
+    /// `Op::ConstString` for why re-materialising through the shared helper,
+    /// not baking a value, is the correctness requirement here too.
+    ///
+    /// The name is resolved and its target confirmed loaded once, at compile
+    /// time (`(name_ptr, name_len)` baked from the artifact's own owned
+    /// string table, kept alive on `CompiledMethod::_jit_strings`) — an
+    /// `instanceof` whose target is not yet loaded is refused per-site by the
+    /// caller (`lib.rs`'s `instanceof_info` construction), never reaching
+    /// this node, because the not-yet-loaded resolution path can run a user
+    /// classloader. Never throws and has no control-flow consequence, unlike
+    /// its sibling `checkcast` (0xc0) below. See
+    /// `docs/internal/cov-05-checkcast-and-instanceof-RETIRED-*.md`.
+    InstanceOf {
+        name_ptr: usize,
+        name_len: usize,
+    },
+
+    /// `checkcast` (0xc0) against a class already resolved and loaded at
+    /// compile time — `instanceof`'s throwing sibling. Inputs
+    /// `[ctrl, mem, obj]`, result `Ref` (the same reference, or `null`).
+    ///
+    /// Lowered as a call to `helpers.checkcast` — same helper, same ABI, same
+    /// loaded-only admission gate as `Op::InstanceOf` above, and the same
+    /// reason (`lib.rs`'s `checkcast_info` construction: the not-yet-loaded
+    /// resolution path can run a user classloader).
+    ///
+    /// Unlike `instanceof`, a definitive refusal THROWS
+    /// `ClassCastException` — the helper stashes it and returns the
+    /// `i64::MIN` sentinel, exactly the protocol `helpers.ldc_class_cp`
+    /// (`Op::ConstClass`) already uses for a resolution failure. This is
+    /// **not** the same machinery `athrow` (0xbf) needs: it is the generic
+    /// "helper failed, drain the pending exception through the shared
+    /// epilogue" protocol every fallible `Opaque` call in this tier already
+    /// has (`Lowerer::emit_call_return_check`), not a jump into a LOCAL
+    /// exception-table handler inside this compiled frame — the whole-method
+    /// `precise_exception_frames` admission term already excludes the one
+    /// case (a handler reading a non-parameter local) where that distinction
+    /// would matter, independently of which opcode throws. `checkcast` and
+    /// `athrow` are independent lanes; see the cov-05 retirement doc for the
+    /// full reasoning.
+    CheckCast {
+        name_ptr: usize,
+        name_len: usize,
+    },
+
     // ── Parameters ───────────────────────────────────────────────────
     /// Method parameter at index `i` (no inputs — defined at Start).
     Param(u16),
@@ -2821,6 +2878,12 @@ impl Op {
             // initialiser.
             Op::ConstString { .. } | Op::ConstClass { .. } => (2, MemAccess::Opaque), // [ctrl, mem]
             Op::LoadStatic { .. } => (2, MemAccess::Opaque), // [ctrl, mem]
+            // cov-05: same Opaque classification as the three above, for the
+            // same reason — the helper it calls can allocate a Class mirror.
+            Op::InstanceOf { .. } => (3, MemAccess::Opaque), // [ctrl, mem, obj]
+            // cov-05: same reasoning, plus the helper can stash a pending
+            // ClassCastException and return the deopt/exception sentinel.
+            Op::CheckCast { .. } => (3, MemAccess::Opaque), // [ctrl, mem, obj]
             Op::LambdaIntToDouble => (4, MemAccess::Opaque), // [ctrl, mem, lambda, index]
             Op::MonitorEnter => (3, MemAccess::MonitorEnter), // [ctrl, mem, obj]
             Op::MonitorExit => (3, MemAccess::MonitorExit), // [ctrl, mem, obj]
@@ -3651,6 +3714,19 @@ pub struct IrBuilder {
     /// [`Self::set_static_field_info`]; an unresolvable site is absent and the
     /// arm bails the method. See [`Op::LoadStatic`].
     static_field_info: HashMap<usize, (u32, usize, u8, bool)>,
+    /// cov-05 increment 1: resolved `instanceof` (0xc1) sites whose target
+    /// class is already loaded (`pc → (name_ptr, name_len)`), the same
+    /// (address, length) shape [`Self::ldc_string_info`] carries. Set by
+    /// [`Self::set_instanceof_info`]; a pc not present — target not yet
+    /// loaded, or no resolver supplied — bails that `instanceof` to
+    /// single-pass. See [`Op::InstanceOf`].
+    instanceof_info: HashMap<usize, (usize, usize)>,
+    /// cov-05: resolved `checkcast` (0xc0) sites whose target class is
+    /// already loaded, same `(name_ptr, name_len)` shape as
+    /// [`Self::instanceof_info`]. Set by [`Self::set_checkcast_info`]; a pc
+    /// not present bails that `checkcast` to single-pass. See
+    /// [`Op::CheckCast`].
+    checkcast_info: HashMap<usize, (usize, usize)>,
 }
 
 impl IrBuilder {
@@ -3707,6 +3783,8 @@ impl IrBuilder {
             ldc_string_info: HashMap::new(),
             ldc_class_info: HashMap::new(),
             static_field_info: HashMap::new(),
+            instanceof_info: HashMap::new(),
+            checkcast_info: HashMap::new(),
         }
     }
 
@@ -3771,6 +3849,24 @@ impl IrBuilder {
     /// single-pass.
     pub fn set_static_field_info(&mut self, info: HashMap<usize, (u32, usize, u8, bool)>) {
         self.static_field_info = info;
+    }
+
+    /// cov-05 increment 1: supply resolved `instanceof` sites whose target
+    /// class is already loaded (`pc → (name_ptr, name_len)`). Must be called
+    /// before [`Self::build`]; an absent pc bails that `instanceof` to
+    /// single-pass — including every not-yet-loaded target, which the caller
+    /// must not insert here (see [`Op::InstanceOf`]).
+    pub fn set_instanceof_info(&mut self, info: HashMap<usize, (usize, usize)>) {
+        self.instanceof_info = info;
+    }
+
+    /// cov-05: supply resolved `checkcast` sites whose target class is
+    /// already loaded (`pc → (name_ptr, name_len)`). Must be called before
+    /// [`Self::build`]; an absent pc bails that `checkcast` to single-pass —
+    /// including every not-yet-loaded target, which the caller must not
+    /// insert here (see [`Op::CheckCast`]).
+    pub fn set_checkcast_info(&mut self, info: HashMap<usize, (usize, usize)>) {
+        self.checkcast_info = info;
     }
 
     /// The data type for a merge / loop-carried `Op::Phi`, derived from its
@@ -5301,6 +5397,58 @@ impl IrBuilder {
                     self.push(len);
                     pc += 1;
                 }
+                // checkcast / instanceof — cov-05. Both admitted ONLY for a
+                // site whose target class is already resolved and loaded at
+                // compile time: `checkcast_info`/`instanceof_info` are
+                // populated in `lib.rs`'s `try_compile_inner` (reusing
+                // `cp_new_resolver`, the same CONSTANT_Class resolver
+                // `new`/`anewarray` already use, to answer "is it loaded" —
+                // see that call site). A pc absent from the map — not yet
+                // loaded, an unresolvable CP entry, or no resolver supplied at
+                // all — bails this site (and so this whole method, same as
+                // every other per-pc bail in this builder) to single-pass,
+                // which resolves lazily via `jit_typecheck_resolve`'s
+                // not-yet-loaded slow path — a path that can run a user
+                // classloader's `loadClass`/`findClass`, arbitrary Java this
+                // tier does not host inside a helper call.
+                0xc0 => {
+                    let (name_ptr, name_len) = match self.checkcast_info.get(&pc) {
+                        Some(&info) => info,
+                        None => return ir_build_bail(line!(), pc),
+                    };
+                    let obj = self.pop();
+                    let result = self.graph.add(
+                        Op::CheckCast { name_ptr, name_len },
+                        IrType::Ref,
+                        vec![self.ctrl, self.mem, obj],
+                        Some(pc),
+                    );
+                    // Opaque: same reasoning as `instanceof` below, plus a
+                    // definitive refusal stashes a pending ClassCastException
+                    // and returns the deopt sentinel — see `Op::CheckCast`.
+                    self.mem = result;
+                    self.push(result);
+                    pc += 3;
+                }
+                0xc1 => {
+                    let (name_ptr, name_len) = match self.instanceof_info.get(&pc) {
+                        Some(&info) => info,
+                        None => return ir_build_bail(line!(), pc),
+                    };
+                    let obj = self.pop();
+                    let result = self.graph.add(
+                        Op::InstanceOf { name_ptr, name_len },
+                        IrType::Int,
+                        vec![self.ctrl, self.mem, obj],
+                        Some(pc),
+                    );
+                    // Opaque: the helper can still allocate a `java/lang/Class`
+                    // mirror on first touch even though the target class is
+                    // already loaded — see `Op::InstanceOf`'s doc comment.
+                    self.mem = result;
+                    self.push(result);
+                    pc += 3;
+                }
                 // dup_x1 — insert a copy of the top value below the second.
                 //
                 // A stack shuffle rather than an access; it is in this lane only
@@ -6726,19 +6874,34 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     //    reported "open" (docs/internal/jit-ir-relocation-map-contract.md). A
     //    method the builder will refuse must be refused HERE, cheaply and with
     //    a reason, not after a full graph build.
-    //  * `checkcast` / `instanceof` — the runtime type check needs its own
-    //    guard shape (class-id compare plus a subtype-check helper fallback)
-    //    which the IR lowerer does not emit. The inline caches added for
-    //    virtual/interface DISPATCH do not help: they cache a call target, not
-    //    a subtype answer.
+    //  * `checkcast` / `instanceof` — NEITHER is refused here as of cov-05.
+    //    `instanceof` produces an `int`, cannot throw, and has no
+    //    control-flow consequence. `checkcast` (0xc0) CAN throw
+    //    `ClassCastException` on a definitive refusal, but that is the same
+    //    generic "helper stashed a pending exception, drain it through the
+    //    shared epilogue" protocol every other fallible `Opaque` call in this
+    //    tier already has (`Op::ConstClass`'s resolution failure is the
+    //    existing precedent) — not a jump into a LOCAL exception-table
+    //    handler inside this compiled frame, which is what `scan.has_athrow`
+    //    above and `precise_exception_frames` (checked by this function's
+    //    caller) actually guard against. See
+    //    `docs/internal/cov-05-checkcast-and-instanceof-RETIRED-*.md` for the
+    //    full reasoning distinguishing this from `athrow`'s gap.
+    //
+    //    `IrBuilder::build`'s 0xc0/0xc1 arms additionally require the target
+    //    class to be resolved-and-loaded at compile time (via
+    //    `checkcast_info`/`instanceof_info`, populated in `lib.rs`'s
+    //    `try_compile_inner`); a site whose target is not yet loaded is
+    //    simply absent from that map, so *that* method bails at the builder
+    //    instead of here — the not-yet-loaded slow path in
+    //    `jit_typecheck_resolve` can run a user classloader's
+    //    `loadClass`/`findClass`, arbitrary Java this tier does not host
+    //    inside a helper call.
     if !scan.anewarray_ops.is_empty() {
         return ir_reject("!scan.anewarray_ops.is_empty() (no IR lowering for 0xbd)");
     }
     if !scan.multianewarray_ops.is_empty() {
         return ir_reject("!scan.multianewarray_ops.is_empty()");
-    }
-    if !scan.typecheck_ops.is_empty() {
-        return ir_reject("!scan.typecheck_ops.is_empty()");
     }
 
     true
@@ -7374,6 +7537,7 @@ mod tests {
             multianewarray_ops: vec![],
             field_ops: vec![],
             typecheck_ops: vec![],
+            checkcast_ops: vec![],
             static_field_ops: vec![],
             invoke_ops: vec![],
             new_ops: vec![],
@@ -7398,6 +7562,7 @@ mod tests {
             multianewarray_ops: vec![],
             field_ops: vec![(0, 1), (3, 2)],
             typecheck_ops: vec![],
+            checkcast_ops: vec![],
             static_field_ops: vec![(6, 3)],
             invoke_ops: vec![(9, 4, 0xb8), (12, 5, 0xb6)],
             new_ops: vec![(15, 6)],
@@ -7422,6 +7587,7 @@ mod tests {
             multianewarray_ops: vec![],
             field_ops: vec![],
             typecheck_ops: vec![],
+            checkcast_ops: vec![],
             static_field_ops: vec![],
             invoke_ops: vec![],
             new_ops: vec![],
@@ -7489,11 +7655,27 @@ mod tests {
         scan.anewarray_ops.clear();
 
         // ── Surviving exclusions (NOT budgets) ──────────────────────
-        // checkcast/instanceof still rejected outright: the inline caches added
-        // for virtual DISPATCH cache a call target, not a subtype answer.
+        // cov-05: neither `instanceof` (0xc1) nor `checkcast` (0xc0) refuses
+        // the whole method here any more — both are admitted structurally,
+        // with the loaded-target-only gate applied per-site by
+        // `IrBuilder::build`'s 0xc0/0xc1 arms (fed from `lib.rs`), not by
+        // this whole-method predicate.
         scan.typecheck_ops = vec![(0, 1)];
-        assert!(!ir_compatible(&scan));
+        assert!(
+            ir_compatible(&scan),
+            "instanceof-only (no checkcast) must be admitted"
+        );
         scan.typecheck_ops.clear();
+        scan.typecheck_ops = vec![(0, 1)];
+        scan.checkcast_ops = vec![(0, 1)];
+        assert!(
+            ir_compatible(&scan),
+            "cov-05: checkcast no longer refuses the whole method — its \
+             throw routes through the same generic sentinel-drain protocol \
+             Op::ConstClass already uses, independent of athrow's gap"
+        );
+        scan.typecheck_ops.clear();
+        scan.checkcast_ops.clear();
         // athrow: no IR lowering exists.
         scan.has_athrow = true;
         assert!(!ir_compatible(&scan));
@@ -7515,6 +7697,7 @@ mod tests {
             multianewarray_ops: vec![],
             field_ops: vec![],
             typecheck_ops: vec![],
+            checkcast_ops: vec![],
             static_field_ops: vec![],
             invoke_ops: vec![],
             new_ops: vec![],
@@ -7551,6 +7734,7 @@ mod tests {
             multianewarray_ops: vec![],
             field_ops: vec![],
             typecheck_ops: vec![],
+            checkcast_ops: vec![],
             static_field_ops: vec![],
             invoke_ops: vec![],
             new_ops: vec![],
