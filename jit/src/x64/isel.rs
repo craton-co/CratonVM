@@ -1433,6 +1433,38 @@ pub static PATTERNS: &[Pattern] = &[
         cost: Cost::new(3, 1, 1),
         ..Pattern::BASE
     },
+    // 32-bit `LEA`, the form real Java `int` arithmetic asks for.
+    //
+    // Anchored: `x64.rs`'s small-multiply fast path already emits exactly this
+    // row's bytes — `emit_imul_const` (`x64/arith.rs:790`, `:797`, `:804`)
+    // writes `8D 04 40` / `8D 04 80` / `8D 04 C0`, i.e. `LEA EAX, [RAX+RAX*n]`
+    // with no REX prefix. `rex_w: false` plus `RexMode::IfNeeded` reproduces
+    // that byte-for-byte for registers 0-7 and adds REX only where the encoding
+    // requires it.
+    //
+    // Correct for `int` for the same reason `ADD EAX, ECX` is: a 32-bit `LEA`
+    // computes the effective address in 64 bits, truncates to 32 and
+    // zero-extends into the destination, and address arithmetic is congruent
+    // mod 2^32 — so the low half is Java's wrapping result whatever the
+    // operands' widths. The high half it leaves is the *same* high half the
+    // majority of `ir_lower`'s `Int` arms already leave.
+    Pattern {
+        name: "lea_r32_m",
+        emitter: "x64/arith.rs emit_imul_const `[0x8D, 0x04, 0x40|0x80|0xC0]`",
+        op: Op::Lea,
+        ty: Ty::I32,
+        src: OpKind::Mem,
+        enc: Enc {
+            opcode: Opcode::One(0x8D),
+            reg: RegF::Dst,
+            rm: RmF::Mem,
+            ..Enc::BASE
+        },
+        disp: DispPolicy::Smallest,
+        // LEA reads no memory: it computes the effective address only.
+        cost: Cost::new(3, 1, 1),
+        ..Pattern::BASE
+    },
     Pattern {
         name: "lea_r64_m_disp32",
         emitter: "emit_lea_r64_mem_disp32",
@@ -3611,6 +3643,7 @@ impl MInst {
             MInst::Move { ty: Ty::I64, .. } => Some("mov_r64_r64"),
             MInst::Move { .. } => None,
             MInst::Lea { ty: Ty::I64, .. } => Some("lea_r64_m"),
+            MInst::Lea { ty: Ty::I32, .. } => Some("lea_r32_m"),
             MInst::Lea { .. } => None,
             MInst::AluRR { op, ty, .. } => match (op, ty) {
                 (Op::Add, Ty::I64) => Some("add_r64_r64"),
@@ -4036,15 +4069,14 @@ fn needs_copy(ctx: &SelCtx, lhs: NodeId) -> bool {
 
 /// `LEA` for an add / shift / multiply tree.
 fn tile_lea(ctx: &SelCtx, root: NodeId, claimed: &[bool], notes: &mut Vec<Note>) -> Option<Tile> {
-    // 32-bit `LEA` (`8D /r` with REX.W clear) is correct for `int` arithmetic —
-    // it truncates to 32 bits, which is exactly Java's wrap — but the table has
-    // no row for it, and emitting the 64-bit form instead would leave garbage in
-    // the high half of a slot that `Op::Return` copies out whole. Refuse rather
-    // than guess; see the doc's "still unvalidated" section.
+    // 32-bit `LEA` (`8D /r` with REX.W clear) is correct for `int` arithmetic:
+    // it truncates to 32 bits, which is exactly Java's wrap, and zero-extends
+    // into the destination — the same high half `ADD EAX, ECX` leaves, which is
+    // what `ir_lower`'s `Op::Add`/`Op::Mul` `Int` arms already emit. The row it
+    // encodes through (`lea_r32_m`) is anchored to `emit_imul_const`'s
+    // `8D 04 40` / `8D 04 80` / `8D 04 C0`. Nothing wider than `I64` gets here:
+    // `int_ty` maps only `Int`/`Long`/`Ref`.
     let ty = ctx.int_ty(root)?;
-    if ty != Ty::I64 {
-        return None;
-    }
     let m = match match_address(ctx, root) {
         Ok(m) => m,
         // `NotAnAddress` only means "this rule does not apply to this node",
@@ -7288,6 +7320,71 @@ mod tests {
         assert_eq!(sel(&gpr_imm(Op::Cmp, Ty::I32, RAX, 7)), vec![0x83, 0xF8, 0x07]);
     }
 
+    /// `lea_r32_m` reproduces the three byte literals `emit_imul_const` emits.
+    ///
+    /// `Rule::Lea` fired **zero** times on 850 real Spring Boot compiles
+    /// because `tile_lea` refused every `Ty::I32` root — Java arithmetic is
+    /// 32-bit and the table had only the REX.W form. This is the anchor for the
+    /// row that unblocked it: `x64/arith.rs:790`, `:797`, `:804` already write
+    /// exactly these bytes for `imul` by 3, 5 and 9.
+    ///
+    /// The exact edit that trips it: set `rex_w: true` on the row, or change
+    /// `RexMode::OnDemand` to `RexMode::Always`. Either adds a `0x48` and the
+    /// row stops being the literal it claims.
+    #[test]
+    fn the_32bit_lea_row_reproduces_the_imul_const_byte_literals() {
+        for (scale, want) in [
+            (2u8, vec![0x8Du8, 0x04, 0x40]),
+            (4, vec![0x8D, 0x04, 0x80]),
+            (8, vec![0x8D, 0x04, 0xC0]),
+        ] {
+            let mem = Mem {
+                base: RAX,
+                index: Some(Index { reg: RAX, scale }),
+                disp: 0,
+                force_disp32: false,
+            };
+            let got = sel(&Req::new(
+                Op::Lea,
+                Ty::I32,
+                Operand::Gpr(RAX),
+                Operand::Mem(mem),
+            ));
+            assert_eq!(got, want, "LEA EAX, [RAX + RAX*{scale}]");
+        }
+    }
+
+    /// An `int` add/shift/multiply tree becomes one `LEA`, which is the whole
+    /// point of the row above: before it, `tile_lea` returned `None` for every
+    /// `IrType::Int` root and the rule was dead on real code.
+    #[test]
+    fn an_int_address_tree_now_tiles_as_a_lea() {
+        let mut graph = g();
+        let p = graph.add(IrOp::Param(0), IrType::Int, vec![], None);
+        let q = graph.add(IrOp::Param(1), IrType::Int, vec![], None);
+        let k = konst_i32(&mut graph, 2);
+        let shl = graph.add(IrOp::Shl, IrType::Int, vec![q, k], None);
+        let add = graph.add(IrOp::Add, IrType::Int, vec![p, shl], None);
+        let block = vec![k, shl, add];
+        let s = select_block(&graph, &block, None, &SelectOptions::default());
+        assert!(s.covers(&block), "coverage: {s:?}");
+        let root = s.tiles.iter().find(|t| t.root == add).expect("root");
+        assert_eq!(root.rule, Rule::Lea, "an int address tree must fold");
+        match root.insts.as_slice() {
+            [MInst::Lea { ty, addr, .. }] => {
+                assert_eq!(*ty, Ty::I32, "an int root must select the 32-bit form");
+                assert_eq!(addr.scale, 4);
+            }
+            other => panic!("expected one LEA, got {other:?}"),
+        }
+        // And the tile the selector produced is one the table can encode —
+        // a rule that fires but cannot encode is discarded by
+        // `require_encodable` and reads as "fired zero times" all over again.
+        for i in &root.insts {
+            i.probe().unwrap_or_else(|e| panic!("{i:?}: {e:?}"));
+        }
+    }
+
     /// The new rows are reachable through `MInst::probe`, not merely present.
     ///
     /// A row the table has but `pattern_name` cannot name is a row
@@ -7344,11 +7441,6 @@ mod tests {
                 dst: 0,
                 cc: CmpOp::Eq,
             },
-            MInst::Lea {
-                dst: 0,
-                ty: Ty::I32,
-                addr: IrAddr::empty(),
-            },
             MInst::AluRI {
                 op: Op::Xor,
                 ty: Ty::I64,
@@ -7364,8 +7456,8 @@ mod tests {
         .collect();
         assert_eq!(
             missing.len(),
-            5,
-            "these five instruction shapes have no PATTERNS row; see \
+            4,
+            "these four instruction shapes have no PATTERNS row; see \
              docs/jit/instruction-selection.md"
         );
         // And the ones that DO have rows really resolve to a row.
@@ -7389,6 +7481,16 @@ mod tests {
                     base: Some(1),
                     index: None,
                     scale: 1,
+                    disp: 0,
+                },
+            },
+            MInst::Lea {
+                dst: 0,
+                ty: Ty::I32,
+                addr: IrAddr {
+                    base: Some(1),
+                    index: Some(1),
+                    scale: 2,
                     disp: 0,
                 },
             },
