@@ -1,6 +1,33 @@
-# `SSLSocketFactory.getDefault()` "no owning SSLContext" breaks Aether/Maven artifact resolution for `ModifiedClassPathClassLoader` tests — REGRESSED
+# `SSLSocketFactory.getDefault()` "no owning SSLContext" breaks Aether/Maven artifact resolution for `ModifiedClassPathClassLoader` tests — FIXED
 
-**Status: OPEN — REGRESSED 2026-08-04.** Previously fixed and closed
+**Status: FIXED 2026-08-04.** The duplicate registration diagnosed below
+(`net_phase_e.rs`'s stale twin of the triple) is deleted, so
+`ssl_security.rs`'s already-correct registration is now the live one. Verified
+by direct A/B against a `getDefault()` → layered `createSocket` probe:
+
+| build | result |
+|---|---|
+| HotSpot 25 (reference) | PASS — returns `sun.security.ssl.SSLSocketImpl` |
+| CratonVM `dev` before the fix | **`IllegalStateException: SSLSocketFactory has no owning SSLContext`** |
+| CratonVM `dev` + the fix | PASS — returns `javax.net.ssl.SSLSocket` |
+
+The probe reaches the failing field-0 read against a plain local listener, so
+it needs no TLS peer and no network — the exception fired *before* any I/O.
+Pinned against regression by
+`ssl_socket_factory_get_default_is_registered_exactly_once` in
+`native-builtins/tests/registry_contracts.rs`, which counts the triple in
+`dump_registrations()` (`find()` cannot see a duplicate — it returns the
+winner). `org.apache.tomcat.util.net.TestSsl` is unchanged at 21 tests / 1
+pre-existing by-design failure before and after.
+
+The affected Spring Boot classes listed at the bottom were NOT re-run — they
+need the Azure Linux fixture. The mechanism is settled and the VM-level repro
+is closed; confirming those classes is the remaining step.
+
+<details>
+<summary>Original diagnosis (kept — it is what identified the mechanism)</summary>
+
+**Status when filed: OPEN — REGRESSED 2026-08-04.** Previously fixed and closed
 2026-07-26 (see `spring-boot-core39-residual-clusters-20260723.md`,
 "Cluster C" item 1, under "STATUS 2026-07-26: all four clusters closed").
 The exact same exception, with the exact same mechanism, reappeared in a
@@ -172,13 +199,28 @@ Logs:
 - `apps/spring-boot-suite-runner/.suite/results/craton-residual32-20260804-s1/all-jit/logs/module_spring-boot-jdbc.org.springframework.boot.jdbc.autoconfigure.HikariDataSourceConfigurationTests.{out,err}.log`
 - `apps/spring-boot-suite-runner/.suite/results/craton-residual32-20260804-s4/all-jit/logs/module_spring-boot-liquibase.org.springframework.boot.liquibase.autoconfigure.Liquibase423AutoConfigurationTests.{out,err}.log`
 
-### Fix direction (not applied — investigation/doc only; source not modified)
+### Fix direction — APPLIED 2026-08-04
 
 Delete or align the `native-builtins/src/net_phase_e.rs:12067-12074`
 `SSLSocketFactory.getDefault()` registration so it matches
 `ssl_security.rs`'s (populate field 0 with the runtime default `SSLContext`,
 or simply remove the duplicate and let `register_p68_ssl`'s registration —
 which already runs first and already carries the fix — stand alone).
+
+**Taken: the delete.** Two registrations that agree today are two that can
+disagree after the next edit to either, and this bug is exactly that failure
+mode — so removing the duplicate outright is worth more than making the twin
+agree. A comment now sits where it was, naming the ordering and the symptom, so
+it is not reintroduced. Note the sibling `SSLContext.getDefault()` in the same
+function IS an intentional duplicate that relies on winning via
+last-registration-wins; the ordering there is load-bearing and was left alone.
+
+One caveat on scope: the production registry contains **678** triples
+registered more than once. The overwhelming majority are deliberate layering
+(`alias_class`, interface copy-down, phase overrides like the `SSLContext` one
+above), so a blanket "no duplicates" gate would be wrong and was not added.
+Only this triple is pinned. If another present-but-dead fix is ever suspected,
+`dump_registrations()` is the tool — `find()` structurally cannot show it.
 
 ## More affected classes (2026-08-04, third pass — test-support itself)
 
@@ -203,7 +245,13 @@ No new investigation performed here — this is the same duplicate
 mechanism, same fix direction), just two more instances found while
 triaging the 2026-08-04 residual rerun.
 
+</details>
+
 ## Affected classes
+
+(Listed as of the diagnosis. Not re-run — see the status block at the top:
+these need the Azure Linux fixture, and the fix was verified at the VM level
+instead.)
 
 - `module/spring-boot-gson` — `org.springframework.boot.gson.autoconfigure.Gson210AutoConfigurationTests`
 - `core/spring-boot` — `org.springframework.boot.diagnostics.analyzer.NoSuchMethodFailureAnalyzerTests`

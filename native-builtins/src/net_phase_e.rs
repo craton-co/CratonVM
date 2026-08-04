@@ -12066,16 +12066,41 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    r.register(
-        sf,
-        "getDefault",
-        "()Ljavax/net/SocketFactory;",
-        |ctx, _args| {
-            let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
-            ctx.set_field(f, 0, Value::Object(None));
-            Ok(Some(Value::Object(Some(f))))
-        },
-    );
+    // `SSLSocketFactory.getDefault()` is deliberately NOT registered here.
+    //
+    // It used to be, immediately below this comment, and it was the stale twin
+    // of `phases_late::ssl_security`'s registration of the identical
+    // `(class, method, descriptor)` triple: it allocated the 1-field factory
+    // and then set field 0 to `Value::Object(None)` instead of to the owning
+    // `SSLContext`. Because `register_p68_ssl` runs at `lib.rs:17505` and
+    // `register_phase_e_networking` (→ here) at `:17528`, and the registry is
+    // last-registration-wins for a repeat key (`native-api/src/registry.rs`,
+    // `register`: a repeat updates the existing slot in place), this one
+    // overwrote the good one on every boot.
+    //
+    // The effect was that the 2026-07-23 fix in `ssl_security.rs` — which
+    // resolves the runtime default context and stores it at field 0 — was
+    // present, correct, and dead. Every caller of the static `getDefault()`
+    // still got a factory whose field 0 was `None`, so the layered
+    // `createSocket(Socket,String,int,boolean)` overload's
+    // `ctx.get_field(factory, 0)` hit its `_` arm and threw
+    // `IllegalStateException("SSLSocketFactory has no owning SSLContext")`.
+    // That is the whole mechanism behind the Aether/Maven resolution failures
+    // in `docs/known-issues/springboot/
+    // sslsocketfactory-getdefault-aether-resolution-regression-20260804.md`,
+    // which is why a fix that "looked present and correct" on re-reading the
+    // source did not take effect at run time.
+    //
+    // Deleted rather than corrected in place: two registrations that agree
+    // today are two registrations that can disagree again after the next edit
+    // to either one, and this bug is precisely that failure mode. Note the
+    // sibling `SSLContext.getDefault()` above IS an intentional duplicate that
+    // relies on winning here — so the ordering itself is load-bearing and must
+    // not be "cleaned up"; it is only this triple that had no business being
+    // registered twice.
+    //
+    // Pinned by `ssl_socket_factory_get_default_is_registered_exactly_once`
+    // in `native-builtins/tests/registry_contracts.rs`.
 }
 
 // ===========================================================================
