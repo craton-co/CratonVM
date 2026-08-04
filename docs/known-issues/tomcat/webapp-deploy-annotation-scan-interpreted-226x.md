@@ -91,6 +91,45 @@ So the JAR/zip/inflate path is fine (`probes/JarEntryReadCostProbe.java`: 30.5
 vs 62.7 MiB/s entry reads, raw `Inflater` 938 vs 1254 MiB/s — both under 2x).
 The cost is the per-byte class-file parse.
 
+## Where the cost is, decomposed (2026-08-04)
+
+> This section supersedes § Root cause below on the question of *what* is slow.
+> That section's shape — "this code never got compiled" — survives, but it
+> names the wrong code, and the difference decides which fix is worth building.
+
+`probes/AnnotationScanSplitProbe.java` runs five stages over the **same
+in-memory class bytes**, each loop inlined into a named static method (never a
+lambda — see the harness note in that file). 156 classes, 328 KiB,
+steady-state round, ns/byte:
+
+| stage | what it does | HotSpot | CratonVM |
+|---|---|---|---|
+| `parseMem` | `ClassParser.parse()` — construction + I/O chain | 4.8 | **982** |
+| `readBytes` | `DataInputStream.readUnsignedByte()` per byte, **constructing nothing** | 0.3 | **971** |
+| `readRaw` | `ByteArrayInputStream.read()` per byte — one layer less | 0.5 | **376** |
+
+**`readBytes` alone is ~99% of `parseMem`.** Reading the bytes one at a time,
+allocating nothing and parsing nothing, costs essentially the whole scan. So:
+
+* it is **not** object construction, and not the constructor-compilation story
+  the § below builds on;
+* it is **not** class resolution or `new` — a per-call-site class-resolution
+  cache was scoped and then dropped on the strength of this measurement;
+* it is **not** the jar/inflate layer — `parseMem` (from a `byte[]`) matches
+  `parse` (from the jar entry stream) to within noise.
+
+It is the **per-byte I/O call chain**: ~376 ns for one
+`ByteArrayInputStream.read()` (a one-line `synchronized` method) and ~600 ns
+more for the `DataInputStream.readUnsignedByte()` wrapper, against HotSpot's
+~0.5 ns. That is exactly the frame the stack dump named all along, and it puts
+this doc in
+`../../internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`'s
+territory plus the VM-wide per-call floor — not in admission-gate territory.
+
+⚠️ The same probe **SIGSEGVs on CratonVM** in its `arrayRead` stage on the real
+Tomcat classpath — a separate, deterministic JIT miscompile:
+[`../jit/annotation-scan-arrayread-sigsegv.md`](../jit/annotation-scan-arrayread-sigsegv.md).
+
 ## Root cause: the parse is never compiled
 
 `--nojit` costs the **same** as the default — on both the original build and
