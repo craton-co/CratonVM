@@ -2,9 +2,13 @@
 
 **Slug:** `perf-advisory-assessment`
 **Date:** 2026-08-04
-**Status:** ASSESSED. Of eleven distinct claims: **five already implemented**,
-**three refuted or stale as written** (one of them actively dangerous to
-follow), **two partly done**, **one genuinely open and correctly diagnosed**.
+**Status:** ASSESSED, and item 1 then **acted on**. Of eleven distinct claims:
+**five already implemented**, **three refuted or stale as written** (one of them
+actively dangerous to follow), **two partly done**, and **one — native dispatch
+— whose mechanism was real but whose impact both the advisory and this
+assessment overstated**: the steady-state path was already memoized, and what
+remained was a single duplicated registry probe, now fixed. One item (interpreter
+dispatch) remains genuinely open and is tracked as A4b in the sibling review.
 
 Every verdict below was reached by reading the consumer — the emitter, the call
 site, the wiring — not by grepping for a name. That discipline is here because
@@ -31,10 +35,12 @@ other way (see `architecture-review-a1-a9.md`).
 
 ---
 
-## 1. Native dispatch — OPEN, and the advisory is right
+## 1. Native dispatch — mechanism real, impact overstated; the redundancy is fixed
 
-This is the one action item worth doing as written, and it is correctly
-identified as the highest-priority one.
+This was assessed as the one action item worth doing as written. Taking it on
+showed the mechanism is real and the sizing — the advisory's *and* mine — was
+not. The original assessment is kept below unedited, with the correction after
+it, because the way it was wrong is the useful part.
 
 `NativeMethodRegistry::find` → `find_with_kind` → `slot_for_exact`
 (`native-api/src/registry.rs:5922`) does, on **every** call:
