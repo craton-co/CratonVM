@@ -24,7 +24,7 @@ own refusal list.
 | Increment 1 — the 32-bit immediate rows | Landed 2026-08-03 (eight rows), before this branch. |
 | Increment 1b — `Rule::Lea` at `Ty::I32` | **Landed.** One anchored row. `Lea` fires **26 tiles** on the C2 corpus, against **zero** before. |
 | "The first increment": a tile list, an allocation over it, an encoder | **Landed** as `MirPlan` + the frame plan + the allocation, encoded through `isel::select`. |
-| "Prove equivalence rather than asserting it … compare emitted bytes" | **Landed** as `ir-isel-verify`, and it ran: 39 tiles, 19 methods, **0 mismatches**, checksums identical in all three modes. |
+| "Prove equivalence rather than asserting it … compare emitted bytes" | **Landed** as `ir-isel-verify`, and it ran: 27 tiles, 19 methods, **0 mismatches**, checksums identical in all four modes. |
 | Hazard 1 — safepoints | Discharged **structurally**: the emitted bytes are identical to the per-opcode arms', so no reference changes residency and `OopMapEntry` is untouched. |
 | Hazard 2 — the vector register pool | **Landed** as `regalloc::xmm_roles` plus a caller-supplied `VecEmitRequest::vector_pool`. The overlap itself cannot be removed here; §5. |
 | Increment 3 — registers | **Not built, on purpose.** §6. |
@@ -106,12 +106,24 @@ pair — and the shadow pass measures with `SelectOptions::default()`, i.e.
 | | dispatch | bind | pipeline |
 |---|---:|---:|---:|
 | methods through the machine list | 9 | 5 | 5 |
-| tiles the encoder emitted | 17 | 6 | 16 |
+| tiles the encoder emitted | 12 | 6 | 9 |
 | **byte mismatches** | **0** | **0** | **0** |
+| tiles it could encode but may not emit | 5 | 0 | 7 |
+| …bytes the per-opcode arms wrote for them | 115 | — | 150 |
+| …bytes the encoder would have written | **85** | — | **114** |
 
-Every phase produced a **bit-identical checksum** in all three modes (off,
-verify, emit): `2893201123071733440`, `-1727289071355132288`,
+Every phase produced a **bit-identical checksum** in all four modes (off,
+shadow, verify, emit): `2893201123071733440`, `-1727289071355132288`,
 `97968176938830464`.
+
+The last three rows are increment 2b's price tag, and they are the reason to
+keep the machine level rather than delete it: **265 bytes → 199 over 12 nodes,
+a quarter smaller**, on rules increment 2's oracle cannot cover. That is a
+number, not an argument, and it is what the next lane should be sized from.
+
+They also explain why the emitted-tile count *fell* from 39 to 27 when the
+operand pricing landed: those twelve nodes were only `Rule::AluReg` because the
+cost model could not see the load. Fewer tiles emitted, and a truer tiling.
 
 ---
 
@@ -216,8 +228,8 @@ answer a performance question by construction.
 ## 7. Verification
 
 * `cargo test -p cratonvm-jit --lib` — **1906 passed, 0 failed** (Azure Linux).
-* CratonBenchC2 × 3 phases × 3 modes: identical checksums, 0 mismatches, 0
-  `covers()` violations (§3).
+* CratonBenchC2 × 3 phases × 4 modes (off / shadow / verify / emit): identical
+  checksums, 0 mismatches, 0 `covers()` violations (§3).
 * New tests that can actually fail, each with its trip condition written down:
   * `the_machine_level_emits_the_same_bytes_as_the_per_opcode_arms` — the
     oracle at unit scale, plus a non-vacuity assertion on the tile count.
@@ -264,7 +276,8 @@ rather than here:
   the byte-equality oracle by construction — dropping a frame load is the
   point, so the bytes differ. They need a differential-execution oracle, which
   is `verify-01`'s harness, and a decision about whether the saving is worth
-  it. Verify mode already reports the size of the prize (`shadow_tiles`,
-  `arm_bytes`, `enc_bytes` on the `[ir-isel] MIR TOTALS` line).
+  it — and verify mode has already priced it: **265 bytes → 199 over 12 nodes**
+  on this corpus (`shadow_tiles`, `arm_bytes`, `enc_bytes` on the
+  `[ir-isel] MIR TOTALS` line).
 * **Increment 3**, on the terms in §6.
 * **The XMM overlap**, which increment 3's prologue would remove (§5).
