@@ -42,7 +42,8 @@ gating and not tiering. Three findings shape the `cov-*` lanes:
 > **The opcode half of that sentence is no longer true.** `cov-01` and `cov-02`
 > both closed 2026-08-03. On `ConditionalOnPropertyTests` the opcode gap went
 > from 196 events to **10** and bodies from 410 to **538 (+31%)**; what is left
-> is `cov-04` (82), `cov-03` (43) and the `ir_compatible` conjuncts. Read the
+> was `cov-04` (82), `cov-03` (43) and the `ir_compatible` conjuncts; both of
+> those have since closed too, leaving only the conjuncts. Read the
 > combined re-measurement in
 > [`ir-coverage-survey-20260803.md`](ir-coverage-survey-20260803.md) before
 > sizing anything from the table below.
@@ -101,7 +102,7 @@ read each lane's "first increment".
 |---|---|---:|---|
 | ~~`cov-01`~~ | ~~`ir.rs` arms `0x12`/`0x13`/`0xb2`~~ | ~~189~~ | **CLOSED 2026-08-03** — all three at zero, **+116 bodies (+20%)**. [Closeout](../../internal/cov-01-constants-and-statics-RETIRED-20260803.md) |
 | ~~`cov-02`~~ | ~~`ir.rs` arms `0x2e`/`0x32`/`0x33`/`0x34`/`0x54`/`0x5a`/`0xbe`~~ | ~~77~~ | **CLOSED 2026-08-03** — all seven at zero. [Closeout](../../internal/cov-02-array-element-access-RETIRED-20260803.md) · [brief](archive/cov-02-array-element-access.md) |
-| [`cov-03`](cov-03-field-stores-and-wide-fields.md) | `ir.rs` arms `0xb4`/`0xb5` | 43 | `getfield` learned about references; `putfield` twenty lines below did not |
+| ~~`cov-03`~~ | ~~`ir.rs` arms `0xb4`/`0xb5`~~ | ~~43~~ | **CLOSED 2026-08-03** — both sites at zero, bodies 536 → 575 measured on top of `cov-01`+`cov-02`. The asymmetry was the **write barrier** and only that: a reference LOAD needs none, so the change that taught `getfield` about references had nothing to say about the arm twenty lines below it. Both arms now share ONE tag classifier. Wide `J`/`F`/`D` fields landed too. [Closeout](../../internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md) · [brief](archive/cov-03-field-stores-and-wide-fields.md) |
 | ~~`cov-04`~~ | ~~`ir.rs` invoke arms + `<init>` elision~~ | ~~69 → 81~~ | **CLOSED 2026-08-03** — all three invoke sites at zero. Every one was an `<init>`. [Closeout](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md) |
 | [`cov-05`](cov-05-checkcast-and-instanceof.md) | one `ir_compatible` conjunct | 306 | biggest refusal anywhere; `instanceof` first, `checkcast` needs `cov-07`'s answer |
 | [`cov-06`](cov-06-array-allocation.md) | two `ir_compatible` conjuncts + `0xbc`/`0xbd`/`0xc5` | 141 | the conjunct exists *because* the arm is missing — one piece of work, not two |
@@ -155,10 +156,14 @@ Three things to carry into the neighbouring lanes:
    read and had been true when written. Rule 1 applies to a term's *comment*
    just as much as to a report's claim.
 
-**With `cov-01`, `cov-02` and `cov-04` closed, `cov-03` is the whole remaining
-builder story** — 78 of 85 refusals — and the opcode gap is down to **13 events
-across the entire corpus**. Everything else left is in `ir_compatible`
-(`cov-05`/`cov-06`/`cov-07`).
+**With `cov-01`, `cov-02` and `cov-04` closed, `cov-03` was the whole remaining
+builder story** — 78 of 85 refusals — and the opcode gap was down to **13 events
+across the entire corpus**. **`cov-03` then closed too** (2026-08-03), so as of
+now the builder's structural refusals are effectively gone and everything left
+is in `ir_compatible` (`cov-05`/`cov-06`/`cov-07`). `cov-03`'s own numbers were
+taken on `cov-01`+`cov-02` and therefore do NOT include `cov-04`; on that tree
+its two sites were 38+5 and the run above puts the `putfield` site at 78 on a
+tree that has `cov-04`. **Re-survey before quoting either.**
 
 **Re-run the survey after any of `cov-05`/`cov-06`/`cov-07` lands.** Lifting a
 whole-method conjunct admits methods that were hiding behind it, and they fail
@@ -177,6 +182,11 @@ other's ranking:
 * `cov-01` removed 155 opcode-gap events and produced only 91 bodies; the
   difference surfaced in `cov-04`, whose largest refusal doubled from 36 to 71
   without anyone touching it.
+* `cov-03` removed 43 builder refusals (38 reference `putfield` + 5 wide
+  `getfield`) for a net 38, because `cov-04`'s `invokespecial` site absorbed the
+  other 5 — the same shape a third time. Bodies **536 → 575**. Measured on
+  `cov-01`+`cov-02`, so it does not include `cov-04`, which landed while it was
+  in flight.
 
 So: **re-run the survey after ANY lane lands**, not only the three conjunct
 ones. And a caveat that follows from those two landing in parallel — **neither
@@ -215,6 +225,9 @@ restores the nine original briefs.
 | `cov-01` | `putstatic` (`0xb3`) has no IR lowering; 1 measured event, deliberately out of scope (the SATB pre-barrier) | same | nobody |
 | `cov-01` | the "fails to rewrite" half of the reference-root test is unreachable until `JIT_PUBLISHES_RELOCATION_CONTRACT` flips | same | nobody |
 | `cov-01` | guarded virtual inlining (`pgo-02`, default-off) no longer reaches a `getstatic; invokevirtual` method — that shape is C2's now | `docs/feature-designs/profile-guided-inlining.md` §8 | nobody |
+| `cov-03` | no barrier-free fast path for a C2 reference store — every one is a helper CALL. The single-pass backend has an opt-in inline route that proves four premises (mapped, genuinely compact, YOUNG receiver, old field null) this tier cannot yet prove | `docs/internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md` | nobody |
+| `cov-03` | no inline route for a wide field READ — `emit_inline_compact_getfield` refuses `J`/`F`/`D`, so every one is a helper call plus the sentinel cold branch | same | nobody |
+| `cov-03` | **whether an optimizing body is FASTER than the single-pass one it replaces.** Every `cov-*` lane moves methods onto a tier that keeps integers in frame slots by default (`ir-linear-scan` is default-OFF), and the survey these lanes are sized from is a COUNT. `cov-03`'s own n=17 A/B could not resolve a difference either way. A coverage win is not a performance win, and no lane owns tier code quality | `docs/internal/performance/`, `reference_c2_tier_slower_because_fields_take_the_helper` | nobody |
 
 
 ## The five review lanes, as the review framed them

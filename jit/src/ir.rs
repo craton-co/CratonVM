@@ -3608,6 +3608,21 @@ pub struct IrBuilder {
     /// single-pass. `is_double` selects the lowering: a `long` constant becomes
     /// `Op::Const(Long)` (`lconst`), a `double` constant `Op::ConstF` (`dconst`).
     ldc2w_info: HashMap<usize, (i64, bool)>,
+    /// COV-03: may a `getfield`/`putfield` of a `J` (long) field build?
+    ///
+    /// A wide field access is the one way a category-2 VALUE can enter the
+    /// graph without a category-2 OPCODE appearing in the body — `getfield J;
+    /// invokestatic (J)V` contains neither. The admission gate in `lib.rs`
+    /// keys on opcodes and the descriptor, so it would admit that method with
+    /// the long tier OFF and the builder would then produce `IrType::Long`
+    /// nodes the tier does not support. Gate the arm on the same flag the
+    /// admission chain uses (`ir_emit_long`) instead of relying on a premise
+    /// the arm itself breaks. Default `false` ⇒ a `J` field bails, exactly as
+    /// before this lane.
+    wide_field_long: bool,
+    /// COV-03: may a `getfield`/`putfield` of an `F`/`D` field build? Same
+    /// reasoning as [`Self::wide_field_long`], for `ir_emit_fp`.
+    wide_field_fp: bool,
     /// cov-01: resolved `ldc` / `ldc_w` (0x12 / 0x13) IMMEDIATE constants
     /// (`pc → (bits, is_float)`). Set by [`Self::set_ldc_info`]; a pc not
     /// present bails to single-pass, which is what every String / Class /
@@ -3686,6 +3701,8 @@ impl IrBuilder {
             method_label: None,
             tdigest_scalar_kernel: false,
             ldc2w_info: HashMap::new(),
+            wide_field_long: false,
+            wide_field_fp: false,
             ldc_info: HashMap::new(),
             ldc_string_info: HashMap::new(),
             ldc_class_info: HashMap::new(),
@@ -3697,6 +3714,34 @@ impl IrBuilder {
     /// be called before [`Self::build`]; an `ldc2_w` pc not present bails.
     pub fn set_ldc2w_info(&mut self, info: HashMap<usize, (i64, bool)>) {
         self.ldc2w_info = info;
+    }
+
+    /// COV-03: admit `J` / `F`+`D` instance-field accesses, from the same two
+    /// flags the `lib.rs` admission chain evaluates (`ir_emit_long`,
+    /// `ir_emit_fp`). Must be called before [`Self::build`]; both default off,
+    /// which is the pre-lane behaviour (every wide field bails to single-pass).
+    pub fn set_wide_field_gates(&mut self, long: bool, fp: bool) {
+        self.wide_field_long = long;
+        self.wide_field_fp = fp;
+    }
+
+    /// The `IrType` a field of descriptor tag `type_tag` loads/stores as, or
+    /// `None` when this builder must refuse the access.
+    ///
+    /// One place decides it for both the `getfield` (0xb4) and `putfield`
+    /// (0xb5) arms. COV-03 exists because those two arms disagreed: `getfield`
+    /// learned about reference fields and `putfield`, twenty lines below it,
+    /// did not — a fix applied to one of two sites. Sharing the classifier is
+    /// what stops that recurring.
+    fn field_access_type(&self, type_tag: u8) -> Option<IrType> {
+        match type_tag {
+            b'I' | b'Z' | b'B' | b'C' | b'S' => Some(IrType::Int),
+            b'L' | b'[' => Some(IrType::Ref),
+            b'J' if self.wide_field_long => Some(IrType::Long),
+            b'F' if self.wide_field_fp => Some(IrType::Float),
+            b'D' if self.wide_field_fp => Some(IrType::Double),
+            _ => None,
+        }
     }
 
     /// cov-01: supply resolved `ldc` / `ldc_w` IMMEDIATE constants
@@ -5283,17 +5328,17 @@ impl IrBuilder {
                 }
                 // getfield — read an instance field as an `Op::Load`.
                 //
-                // Slice 1 (read-only) of the field/call IR frontier: only
-                // int-category fields (`I`/`Z`/`B`/`C`/`S`) are lowered. They
-                // all read the 32-bit `Value::Int` payload sign-extended — the
-                // exact ABI the single-pass backend's inline getfield emits
-                // (`MOVSXD` from `HEADER_SIZE + field_index*SLOT_SIZE +
-                // FIELD_CELL_PAYLOAD32_OFFSET`). The cell-offset operand is a
-                // `Const(field_index)`; the lowerer derives the byte
-                // displacement. Float/long/double/reference fields and any pc
-                // without resolved layout bail (`None` → single-pass), as does
-                // every `putfield` (no IR `Op::Store` lowering yet — writes
-                // need scheduler memory ordering, a separate slice).
+                // Slice 1 (read-only) of the field/call IR frontier. An
+                // int-category field (`I`/`Z`/`B`/`C`/`S`) reads the 32-bit
+                // `Value::Int` payload sign-extended — the exact ABI the
+                // single-pass backend's inline getfield emits (`MOVSXD` from
+                // `HEADER_SIZE + field_index*SLOT_SIZE +
+                // FIELD_CELL_PAYLOAD32_OFFSET`). A reference field reads the raw
+                // pointer, and (COV-03) a `J`/`F`/`D` field the long payload or
+                // the FP bit pattern, both through the checked helper. The
+                // cell-offset operand is a `Const(field_index)`; the lowerer
+                // derives the byte displacement. A pc without resolved layout
+                // bails (`None` → single-pass).
                 0xb4 => {
                     // Compact reference-field layout packs field offsets (refs
                     // to 8 bytes), so the `HEADER_SIZE + field_index*SLOT_SIZE`
@@ -5338,16 +5383,26 @@ impl IrBuilder {
                     // real workload (66 of 141 on a Hibernate class): a
                     // reference field read is most of what object-oriented Java
                     // does.
-                    let is_ref_field = matches!(type_tag, b'L' | b'[');
-                    if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') && !is_ref_field {
+                    // COV-03 (wide fields): a `J`/`F`/`D` field reads through
+                    // the SAME helper — it already returns the long payload or
+                    // the float/double BITS — so the only thing that differs is
+                    // the node type and, for `J`/`D`, the `i64::MIN`-sentinel
+                    // collision the lowerer must disambiguate through
+                    // `jit_dispatch_threw` (the identical problem, and the
+                    // identical answer, as a `J`/`D` `Op::Call` return). The
+                    // inline compact fast path refuses these tags on its own, so
+                    // a wide field simply takes the helper arm.
+                    let Some(ty) = self.field_access_type(type_tag) else {
                         return ir_build_bail(line!(), pc);
-                    }
+                    };
                     let base = self.pop();
                     let offset = self.iconst(field_index as i64);
-                    let (mem_kind, ty) = if is_ref_field {
-                        (MemKind::Ref, IrType::Ref)
-                    } else {
-                        (MemKind::Int, IrType::Int)
+                    let mem_kind = match ty {
+                        IrType::Ref => MemKind::Ref,
+                        IrType::Long => MemKind::Long,
+                        IrType::Float => MemKind::Float,
+                        IrType::Double => MemKind::Double,
+                        _ => MemKind::Int,
                     };
                     let load = self.graph.add(
                         Op::Load(mem_kind),
@@ -5366,31 +5421,55 @@ impl IrBuilder {
                 }
                 // putfield — write an instance field as an `Op::Store`.
                 //
-                // Slice 2 (read/write) of the field/call IR frontier: only
-                // int-category fields lower. The store consumes the current
-                // memory token and produces a new one (the store node itself),
-                // so the scheduler serialises it after every prior memory op and
-                // before every later one (RAW/WAR/WAW all preserved by the
-                // input-edge topological sort). Non-int fields and any pc without
-                // resolved layout bail (`None` → single-pass).
+                // Slice 2 (read/write) of the field/call IR frontier. The store
+                // consumes the current memory token and produces a new one (the
+                // store node itself), so the scheduler serialises it after every
+                // prior memory op and before every later one (RAW/WAR/WAW all
+                // preserved by the input-edge topological sort). Any pc without
+                // resolved layout bails (`None` → single-pass).
                 0xb5 => {
-                    // See the getfield (0xb4) note. `Op::Store` likewise has a
-                    // layout-naive inline lowering and a compact-aware helper
-                    // lowering (`jit_putfield_int`); `ir_lower::lower_inner`
-                    // picks between them and refuses only when compact layout is
-                    // on and no helper address is available.
+                    // See the getfield (0xb4) note. This arm accepts exactly the
+                    // tags that arm accepts — one classifier, two call sites —
+                    // and the DIFFERENCE between a read and a write is carried
+                    // entirely by `MemKind`, which selects the lowering:
+                    //
+                    //   * `Int`  → the inline store, or `jit_putfield_int` when
+                    //     compact layout is on (an int cell has no barrier).
+                    //   * `Ref`  → ALWAYS `jit_putfield_object`, which is the
+                    //     single-pass backend's own full-barrier route: SATB
+                    //     pre-barrier on the OLD reference, then the collector's
+                    //     post-write barrier (G1's remembered-set edge included).
+                    //     This — not the compact layout — is the reason the
+                    //     reference case was missing here while `getfield` had
+                    //     it: a reference LOAD needs no barrier, so the fix that
+                    //     added it there had nothing to say about this arm.
+                    //     `jit_putfield_object` is compact-aware in its own
+                    //     right, so there is no separate compact refusal to make.
+                    //   * `Long`/`Float`/`Double` → the matching
+                    //     `jit_putfield_{long,float,double}` helper, gated on the
+                    //     same long/FP flags the read arm uses.
+                    //
+                    // `ir_lower::lower_inner` refuses the graph when the helper a
+                    // given kind needs is absent (the unit-test stub table).
                     let (field_index, type_tag) = match self.field_info.get(&pc) {
                         Some(&fi) => fi,
                         None => return ir_build_bail(line!(), pc),
                     };
-                    if !matches!(type_tag, b'I' | b'Z' | b'B' | b'C' | b'S') {
+                    let Some(ty) = self.field_access_type(type_tag) else {
                         return ir_build_bail(line!(), pc);
-                    }
+                    };
+                    let mem_kind = match ty {
+                        IrType::Ref => MemKind::Ref,
+                        IrType::Long => MemKind::Long,
+                        IrType::Float => MemKind::Float,
+                        IrType::Double => MemKind::Double,
+                        _ => MemKind::Int,
+                    };
                     let value = self.pop();
                     let base = self.pop();
                     let offset = self.iconst(field_index as i64);
                     let store = self.graph.add(
-                        Op::Store(MemKind::Int),
+                        Op::Store(mem_kind),
                         IrType::Memory,
                         vec![self.ctrl, self.mem, base, offset, value],
                         Some(pc),
@@ -7048,11 +7127,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ir_getfield_still_bails_on_a_wide_field() {
-        // `J`/`D`/`F` fields have no IR load lowering: the helper returns the
-        // int payload, and a category-2 value additionally needs the wide
-        // operand-stack shape. Still refused, and refused HERE rather than
-        // deeper in the pipeline.
+    fn test_ir_getfield_still_bails_on_a_wide_field_with_the_gates_off() {
+        // `J`/`D`/`F` fields build only when the long / FP tier is on — the
+        // gate `lib.rs` passes down from the same `ir_emit_long` /
+        // `ir_emit_fp` its admission chain evaluates. With both off (the
+        // builder default, and what a hand-built graph gets) they are still
+        // refused HERE rather than deeper in the pipeline.
         for tag in [b'J', b'D', b'F'] {
             let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
             let mut builder = IrBuilder::new(1, 1);
@@ -7061,7 +7141,136 @@ mod tests {
             builder.set_field_info(fi);
             assert!(
                 builder.build(&code, 5).is_none(),
-                "field tag {} must not build",
+                "field tag {} must not build with the wide-field gates off",
+                tag as char
+            );
+        }
+    }
+
+    /// COV-03. `getfield` learned about reference fields; `putfield` twenty
+    /// lines below it did not — 37 refusals on `ir.rs:5085`, the second-largest
+    /// structural refusal in the coverage survey, for a fix that had simply
+    /// been applied to one of two sites.
+    ///
+    /// The node TYPE is the load-bearing assertion, exactly as it is for the
+    /// read: `MemKind::Ref` is what selects `jit_putfield_object` in
+    /// `ir_lower`, and that helper is what carries the SATB pre-barrier and the
+    /// collector's post-write barrier. An `Int`-kinded reference store would
+    /// lower to a raw 16-byte int-cell write with no barrier at all.
+    #[test]
+    fn test_ir_putfield_builds_a_ref_kinded_store_for_a_reference_field() {
+        for tag in [b'L', b'['] {
+            // aload_0; aload_1; putfield #2; return
+            let code = [0x2a, 0x2b, 0xb5, 0x00, 0x02, 0xb1, 0, 0];
+            let mut builder = IrBuilder::new(2, 2);
+            let mut fi = HashMap::new();
+            fi.insert(2usize, (0usize, tag));
+            builder.set_field_info(fi);
+            let graph = builder
+                .build(&code, 6)
+                .unwrap_or_else(|| panic!("a {} field putfield must build", tag as char));
+            assert!(
+                graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, Op::Store(MemKind::Ref))),
+                "a {} field must lower to Op::Store(MemKind::Ref), not Int",
+                tag as char
+            );
+        }
+    }
+
+    /// The two arms must accept the SAME tag set. This is the regression the
+    /// lane exists for: a tag one arm admits and the other refuses is how the
+    /// asymmetry arose, and it is invisible in any test that exercises one arm.
+    #[test]
+    fn test_ir_getfield_and_putfield_admit_the_same_field_tags() {
+        for &(long_gate, fp_gate) in &[(false, false), (true, false), (false, true), (true, true)] {
+            for tag in [b'I', b'Z', b'B', b'C', b'S', b'L', b'[', b'J', b'F', b'D', b'V'] {
+                // aload_0; getfield #2; return — the read side only needs to
+                // build; leaving the value on the abstract stack at the return
+                // is fine for a straight-line translation.
+                let get = [0x2a, 0xb4, 0x00, 0x02, 0xb1, 0, 0];
+                let mut gb = IrBuilder::new(1, 1);
+                let mut gfi = HashMap::new();
+                gfi.insert(1usize, (0usize, tag));
+                gb.set_field_info(gfi);
+                gb.set_wide_field_gates(long_gate, fp_gate);
+                let get_builds = gb.build(&get, 5).is_some();
+
+                // aload_0; aload_1; putfield #2; return
+                let put = [0x2a, 0x2b, 0xb5, 0x00, 0x02, 0xb1, 0, 0];
+                let mut pb = IrBuilder::new(2, 2);
+                let mut pfi = HashMap::new();
+                pfi.insert(2usize, (0usize, tag));
+                pb.set_field_info(pfi);
+                pb.set_wide_field_gates(long_gate, fp_gate);
+                let put_builds = pb.build(&put, 6).is_some();
+
+                assert_eq!(
+                    get_builds, put_builds,
+                    "tag {} (long_gate={long_gate} fp_gate={fp_gate}): getfield builds={get_builds} \
+                     but putfield builds={put_builds} — the two arms have drifted apart again",
+                    tag as char
+                );
+            }
+        }
+    }
+
+    /// With the matching gate on, a wide field builds a wide-KINDED access on
+    /// both arms. The kind is what picks `jit_putfield_{long,float,double}` and
+    /// what tells the lowerer a `J`/`D` read needs the `dispatch_threw`
+    /// disambiguation (`Long.MIN_VALUE` and `-0.0` are bit-identical to the
+    /// helper's deopt sentinel).
+    #[test]
+    fn test_ir_wide_fields_build_wide_kinded_accesses_when_gated() {
+        for (tag, kind, ty, load_op, ret) in [
+            (b'J', MemKind::Long, IrType::Long, 0x16u8, 0xadu8),
+            (b'F', MemKind::Float, IrType::Float, 0x17, 0xae),
+            (b'D', MemKind::Double, IrType::Double, 0x18, 0xaf),
+        ] {
+            // aload_0; getfield #2; <x>return
+            let get = [0x2a, 0xb4, 0x00, 0x02, ret, 0, 0];
+            let mut gb = IrBuilder::new(1, 1);
+            let mut gfi = HashMap::new();
+            gfi.insert(1usize, (0usize, tag));
+            gb.set_field_info(gfi);
+            gb.set_wide_field_gates(true, true);
+            let graph = gb
+                .build(&get, 5)
+                .unwrap_or_else(|| panic!("a gated {} field getfield must build", tag as char));
+            let load = graph
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, Op::Load(k) if k == kind))
+                .unwrap_or_else(|| panic!("{} must lower to Op::Load({kind:?})", tag as char));
+            assert_eq!(load.ty, ty, "{} load node type", tag as char);
+
+            // aload_0; <x>load_1; putfield #2; return — `this` at slot 0, the
+            // wide value at slot 1 (occupying slots 1-2 for `J`/`D`).
+            let put = [0x2a, load_op, 0x01, 0xb5, 0x00, 0x02, 0xb1, 0, 0];
+            let mut pb = IrBuilder::new(2, 4);
+            pb.set_param_types(&[IrType::Ref, ty]);
+            let mut pfi = HashMap::new();
+            pfi.insert(3usize, (0usize, tag));
+            pb.set_field_info(pfi);
+            pb.set_wide_field_gates(true, true);
+            let graph = pb
+                .build(&put, 7)
+                .unwrap_or_else(|| panic!("a gated {} field putfield must build", tag as char));
+            let store = graph
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, Op::Store(k) if k == kind))
+                .unwrap_or_else(|| panic!("{} must lower to Op::Store({kind:?})", tag as char));
+            // The VALUE operand must carry the wide type too — the lowerer
+            // reads its frame slot as raw bits and hands them to the width's
+            // helper, and an `Int`-typed producer would mean the slot was never
+            // written as one.
+            assert_eq!(
+                graph.nodes[store.inputs[4] as usize].ty,
+                ty,
+                "{} store value operand type",
                 tag as char
             );
         }

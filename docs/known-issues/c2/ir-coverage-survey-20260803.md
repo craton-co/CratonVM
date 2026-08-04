@@ -224,7 +224,8 @@ reads like an opcode-shaped gap can be neither.
 > whose site is `JitNewSite::Deferred` **3**. `cov-03` therefore owns 78 of the
 > 85 and is the whole remaining builder story. The methods that were hiding
 > behind the invoke terms are constructors, and constructors write reference
-> fields.
+> fields. **`cov-03` closed 2026-08-03 as well**, so those 82 rows are gone too
+> and the `Deferred`-`new` row is what is left.
 
 **These line numbers are pre-`cov-02`.** Adding the array arms pushed the whole
 match statement down; re-derived after it landed, `5204` is now **5329** and
@@ -239,6 +240,27 @@ builder refusal measured on a real workload (66 of 141 on a Hibernate class): a
 reference field read is most of what object-oriented Java does."* The `putfield`
 arm twenty lines below it was not given the same treatment, and a reference
 field **write** is most of what object-oriented Java does too.
+
+> **Both `cov-03` rows closed 2026-08-03.** The numbers above are left as
+> measured — this file is a dated record and rewriting it would destroy the
+> before-half of every later comparison.
+>
+> Re-measured twice on `ConditionalOnPropertyTests`, two rounds per arm with the
+> order reversed. **In isolation**, against `dev` before `cov-01`/`cov-02`: the
+> `putfield` site 33 → 0, the wide `getfield` site 5 → 0, bodies 410 → 445.
+> **On top of `cov-01`+`cov-02`**: 38 → 0 and 5 → 0, bodies **536 → 575**. In
+> both, the `cov-04` invoke rows rose by 4–5 — methods that used to die at
+> `cov-03`'s sites now reach the invoke arms.
+>
+> Neither includes `cov-04`, which closed while this lane was in flight, and the
+> run that put the `putfield` row at **78** was taken on a tree that does. Every
+> one of these numbers names the tree it was taken on because **none of them is
+> comparable to the others**.
+>
+> The brief asked which of two candidate reasons the asymmetry actually was.
+> It is **the write barrier**, and the compact-layout candidate was not a reason
+> at all. Details in
+> `docs/internal/cov-03-field-stores-and-wide-fields-RETIRED-20260803.md`.
 
 ## The whole-method refusals, before the builder runs
 

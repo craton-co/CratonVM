@@ -13440,6 +13440,16 @@ fn try_compile_inner(
         // unconditionally rather than only under the long gate.
         let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
         builder.set_param_types(&ptypes);
+        // COV-03: admit `J` / `F`+`D` INSTANCE FIELD accesses from the same two
+        // flags this admission chain evaluates. A wide field is the one way a
+        // category-2 or FP value can enter the graph with no category-2/FP
+        // OPCODE in the body (`getfield J; invokestatic (J)V` has neither), so
+        // `method_uses_category2` / `method_uses_fp` would admit such a method
+        // with the long/FP tier off and the builder would then produce
+        // `IrType::Long`/`Double` nodes it does not support. Telling the builder
+        // directly keeps the premise those gates rest on true rather than
+        // assuming it.
+        builder.set_wide_field_gates(ir_emit_long, ir_emit_fp);
         if ir_emit_long || ir_emit_fp {
             // inc 26 (long) / inc 35 (double): resolve `ldc2_w` constants to
             // `(pc → (bits, is_double))` so the builder lowers a `long` to
