@@ -3131,7 +3131,16 @@ pub(crate) fn alloc_object_shared(
             },
         )));
     }
-    if let Some(obj) = shared.mem.heap.try_alloc_object(class_id, num_fields) {
+    // SB-LOADER-ZIPCONTENT (2026-08-04): the post-GC retries use the
+    // old-gen-spilling `try_alloc_object_full`, for the same reason
+    // `gc_alloc_array` gives on the array side — once a non-moving JIT-safe
+    // young sweep has fragmented the young free list, a young-only retry
+    // reports OOM while the old generation still holds most of the heap. (The
+    // first attempt above stays young-only: it is the fast path, and spilling
+    // before a GC has even been attempted would promote ordinary short-lived
+    // objects straight into old gen.) `gc_alloc_array`'s doc comment already
+    // claimed this path behaved that way; it did not.
+    if let Some(obj) = shared.mem.heap.try_alloc_object_full(class_id, num_fields) {
         shared
             .mem
             .bytes_allocated_total
@@ -3145,7 +3154,7 @@ pub(crate) fn alloc_object_shared(
     shared
         .mem
         .heap
-        .try_alloc_object(class_id, num_fields)
+        .try_alloc_object_full(class_id, num_fields)
         .map(|obj| {
             shared
                 .mem

@@ -3226,13 +3226,37 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // `java/lang/OutOfMemoryError` exactly as the interpreter's
     // `gc_alloc_array` does, instead of the old non-fallible `alloc_array`
     // (which would abort the process on a real OOM).
-    let obj_ref = match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+    //
+    // SB-LOADER-ZIPCONTENT (2026-08-04): these two retries MUST use the
+    // old-gen-spilling `try_alloc_array_full`, not the young-only
+    // `try_alloc_array`. `gc_alloc_array` states the reason for the
+    // interpreter's identical arm — "once a non-moving JIT-safe sweep has left
+    // the young generation fragmented it can spill the request into old space
+    // ... retrying young-only here used to report OOM for a tiny array while
+    // most of the heap was available as old-generation headroom" — and this
+    // helper was the one primitive-array path that never got the same
+    // treatment (`jit_anewarray_object` already calls `try_alloc_array_full`
+    // and `jit_new_object` already calls `try_alloc_object_full`; see the
+    // `jit_alloc_oom` doc comment, which lists the asymmetry as fact).
+    //
+    // That gap is exactly how `ZipContentTests.nestedZip64CanBeRead` died:
+    // moving-young had fallen back to the non-moving sweep
+    // (`reason=unregistered-jit-frame-on-stack`), the young free list could no
+    // longer serve the compiled `byte[8192]` that assertj's `assertHasContent`
+    // allocates once per ZIP entry, and this arm reported
+    // `OutOfMemoryError: Java heap space (alloc_array length 8192)` with a
+    // 134 MB live set, a 1.5 GiB heap, and **1042 MB of old-generation
+    // headroom** (`CRATONVM_DBG=gc-overhead`: `old_gen_wedged=false`, so the
+    // overhead limit correctly never fired — the heap was not full, the
+    // allocator just refused to look at the free gigabyte). The same class
+    // passed 29/29 under `--nojit`, where every array runs `gc_alloc_array`.
+    let obj_ref = match heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
         Some(o) => o,
         None => {
             if !jit_g1_last_ditch_full_cycle(vm) {
                 return jit_newarray_oom(vm, length as usize);
             }
-            match heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+            match heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
                 Some(o) => o,
                 None => return jit_newarray_oom(vm, length as usize),
             }
@@ -3291,9 +3315,9 @@ fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
     }
 }
 
-/// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`
-/// (via `try_alloc_array`), `jit_anewarray_object` (via `try_alloc_array_full`),
-/// and `jit_new_object` (via `try_alloc_object_full`). On heap exhaustion the
+/// Shared OOM signal for the fallible JIT allocation helpers — `jit_newarray`,
+/// `jit_anewarray_object` (both via `try_alloc_array_full`), and
+/// `jit_new_object` (via `try_alloc_object_full`). On heap exhaustion the
 /// helper stashes a `java/lang/OutOfMemoryError` in `JIT_PENDING_EXCEPTION` and
 /// returns the `0`/null sentinel; the alloc codegen site null-checks the result
 /// and bails to the shared exception stub (`emit_post_alloc_oom_check` in
