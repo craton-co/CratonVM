@@ -6661,8 +6661,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         Some(e) => e,
                         None => return Ok(Some(Value::Object(None))),
                     };
-                    use cratonvm_types::ArrayElementType;
-                    let arr = ctx.new_array(ArrayElementType::Reference, entries.len());
+                    // A `String[]`, not the untyped `Object[]` that
+                    // `new_array(ArrayElementType::Reference, ..)` produces:
+                    // the descriptor is `[Ljava/lang/String;` and
+                    // `File.normalizedList()` assigns the result straight to a
+                    // `String[]` local, which is a checkcast.
+                    let string_class = string_class_id(ctx);
+                    let arr = ctx.new_ref_array(string_class, entries.len());
                     // Pin across the `create_string` calls below — a moving
                     // young GC there relocates the fresh array (the native
                     // stale-local family), same as `java/io/File.list()`.
@@ -11076,6 +11081,16 @@ pub(crate) fn fs_list_dir(path: &str) -> Option<Vec<String>> {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect(),
     )
+}
+
+/// The `ClassId` for `java/lang/String`, for allocating a genuinely typed
+/// `String[]` rather than the untyped `Object[]` that
+/// `new_array(ArrayElementType::Reference, ..)` hands back.
+pub(crate) fn string_class_id(ctx: &mut dyn NativeContext) -> ClassId {
+    ctx.ensure_class_initialized("java/lang/String")
+        .ok()
+        .or_else(|| ctx.class_id_by_name("java/lang/String"))
+        .unwrap_or_else(|| ClassId::new(0))
 }
 
 /// `listRoots0()` — the drive-letter bitmask (bit 0 = `A:`). Only Windows has

@@ -80,10 +80,18 @@ public class FsNativeSurfaceProbe {
         // --- list0 ---
         Object listed = call("list", new Class<?>[] { File.class }, dir);
         p("LIST_dir", sortedJoin(listed));
+        // The descriptor says `[Ljava/lang/String;`, so the array's runtime
+        // class has to be `String[]` — an `Object[]` would fail the implicit
+        // checkcast in `File.normalizedList()`.
+        p("LIST_dir_array_class", arrayClass(listed));
         p("LIST_missing", call("list", new Class<?>[] { File.class }, missing));
         // `null`, not an empty array — `File.list()` on a plain file must not
         // look like an empty directory.
         p("LIST_on_regular_file", call("list", new Class<?>[] { File.class }, regular));
+        // The same question for the two `java.io.File` entry points, which
+        // CratonVM answers with its own natives rather than this FileSystem.
+        p("FILE_list_array_class", arrayClass(dir.list()));
+        p("FILE_listFiles_array_class", arrayClass(dir.listFiles()));
 
         // --- createDirectory0 ---
         File newDir = new File(dir, "made");
@@ -207,6 +215,10 @@ public class FsNativeSurfaceProbe {
 
     private static Object positiveInt(Object v) {
         return (v instanceof Integer) ? Boolean.valueOf((Integer) v > 0) : v;
+    }
+
+    private static String arrayClass(Object arr) {
+        return arr == null ? "null" : arr.getClass().getName();
     }
 
     private static String sortedJoin(Object arr) {
