@@ -74,9 +74,51 @@ record this, and the refusal is counted. The branch is reached only on an
 inline-cache **miss**, which already takes two mutexes, so `Compatible` is
 untouched.
 
-**Why it is still open.** The refusal is a tax, not a fix: every inline-cached
-native call site in a `--jdk-only` run permanently takes the slow dispatch path.
-And the missing kind still makes the census incomplete in `Compatible` mode. The
+### The "tax" is zero — measured 2026-08-04, and it re-ranks this item
+
+The original text below said the refusal "costs `JdkOnly` runs every
+inline-cached native call". That is a claim about a rate; the counter for it
+already existed (`--jdk-only-report`'s `refusals.jit_inline_cache_natives`) and
+nobody had read it. Measured on JDK 25 under `--jdk-only`, three workloads
+including a deliberately JIT-hot one (`probes/JdkOnlyIcHotProbe.java` — 400k
+iterations across monomorphic, polymorphic, megamorphic-interface and `String`
+sites, 3.4 s):
+
+| workload | `jit_inline_cache_natives` | `jit_direct_native_binds` | `jit_fastpath_admissions` | `interpreter_bytecode_preferred` |
+|---|---:|---:|---:|---:|
+| `JdkOnlyIcHotProbe` | **0** | 0 | 0 | 3,344 |
+| `JdkOnlyCensusLoadProbe` | **0** | 0 | 0 | 3,254 |
+| `JdkOnlyBreadthProbe` | **0** | 0 | 0 | 532 |
+
+**The refusal never fires**, and `vm/src/jit/helpers.rs` says why: *every*
+MIC/PIC publication path takes its entry from `try_jit_compile_callee` — a
+JIT-compiled Java callee, which has a live owner and therefore hits
+`jit_entry_publishable`'s `owner.is_some()` early return before the strict
+branch. That covers both `mic.update` sites, both `pic.install` sites, and
+`publish_mic_rust_cached_entry`, which additionally requires `pin_jit_entry` to
+succeed — i.e. a JIT entry. A native trampoline never reaches the refusal from
+these sites, so there is nothing for it to refuse.
+
+What this changes:
+
+* **This is not a performance defect and does not belong in the wave-2 critical
+  path.** What remains is real but narrower — the missing kind leaves the census
+  incomplete, in `Compatible` mode as much as strict. A completeness gap, not a
+  tax.
+* **`jit_direct_native_binds` and `jit_fastpath_admissions` are also zero.** Ask
+  the same question of §4's seven direct-call ladders before rewriting them.
+* **`interpreter_bytecode_preferred` is the column that is not zero** — 3,344
+  shadowing natives yielding to real bytecode in one 3.4-second run. That is §7
+  step 3, the hottest jdk-only path in the VM by three orders of magnitude, and
+  it is where the
+  [thread-start defect](../../internal/jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md)
+  lived. Effort spent here is worth more than effort spent on any of the zeroes.
+
+Fourth measurement in a row to contradict one of these records, and the first to
+contradict a claim about *cost* rather than *size*.
+
+**Why it is still open.** The missing kind leaves the census incomplete in
+`Compatible` mode. The
 MIC doc explains why storing it was rejected for wave 1 and exactly what wave 2
 must do:
 

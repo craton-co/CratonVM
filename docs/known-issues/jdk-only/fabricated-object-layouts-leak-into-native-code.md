@@ -51,10 +51,61 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
 
 ## What is still open — steps 1, 3 and 4, which are the bulk
 
-* **Step 1, the sweep.** `native-builtins`, `native-collections`, `native-io`
-  and `vm/src/native/` are still unswept, and until they are the 10 markers
-  understate the problem by an unknown factor. This is the largest remaining
-  piece of the item and nothing above touches it.
+* **Step 1, the sweep — it has a measured work list now (2026-08-04).** The
+  sweep was scoped as "read four crates for index-based field access". It does
+  not need reading first: **the runtime detector for exactly this defect already
+  exists** and had never been run broadly. `CRATONVM_DBG_OVERLAY=1` reports a
+  native writing a primitive to a reference slot *or* a reference to a primitive
+  slot on a class loaded from real JDK bytes. Add `CRATONVM_DBG_OVERLAY_ALL=1`
+  or the `java.util.Map` suppression hides the dominant family.
+
+  Three probes, both modes, JDK 25. **The results are identical under
+  `--real-jdk` and `--jdk-only`**, so this is a `Compatible`-mode defect too.
+  Distinct `(class, slot, value kind, real descriptor)` sites:
+
+  | class | slot | writes | real desc | n |
+  |---|---:|---|---|---:|
+  | `java/util/HashMap` | 1 | `Int` | `L` | 4,395 |
+  | `java/util/HashMap$Node` | 2 | `Int` | `L` | 2,108 |
+  | `java/lang/invoke/VarHandle` | 1 | `Object` | `Z` | 52 |
+  | `java/lang/invoke/VarHandle` | 0 | `Int` | `L` | 52 |
+  | `java/util/HashMap` | 2 | `Int` | `[` | 32 |
+  | `java/lang/invoke/MemberName` | 4 | `Int` | `L` | 14 |
+  | `java/util/Properties` | 7 | `Float` | `L` | 6 |
+  | `java/util/Properties` | 6, 5 | `Int` | `L` | 6 each |
+  | `java/util/Properties` | 2 | `Object` | `I` | 6 |
+  | `ClassLoaders$PlatformClassLoader` | 0, 3, 4, 6 | `Int` | `L` | 4 each |
+  | `ClassLoaders$AppClassLoader` | 0, 3, 4, 6 | `Int` | `L` | 4 each |
+  | `java/util/Scanner` | 3, 4 | `Int` | `L` | 2 each |
+  | `java/net/URI` | 5 | `Object` | `I` | 2 |
+  | `java/net/URI` | 2 | `Int` | `L` | 2 |
+  | `java/net/Proxy` | 0 | `Int` | `L` | 2 |
+
+  **13 classes, 24 distinct slots**, from three small probes. Reading it:
+
+  * The **`HashMap` family is the known-benign case** the hunter suppresses by
+    default — coercion-to-null lands the real bytecode in the null-initialised
+    state it expects. It dominates by volume and says nothing.
+  * **`VarHandle` is the one to look at first.** It mismatches in *both*
+    directions on adjacent slots (`Int` over a reference at 0, an `Object` over
+    a `boolean` at 1), it is not a `Map`, and the benign argument says nothing
+    about it.
+  * **`Properties` writing a `Float` over a reference slot** is in the group
+    item 1 calls the highest-risk in `native-collections`, and it is on the
+    bootstrap path.
+  * **Both built-in class loaders take `Int` writes over four reference slots
+    each.** Whatever those slots hold on the real classes, they are not integers.
+  * `URI` and `Properties` each mismatch in both directions, which rules out a
+    single off-by-one against one layout.
+
+  Two limits, so nobody reads this as complete. The detector covers
+  `NativeContextImpl::set_field` only: **reads are uninstrumented, and a
+  same-kind wrong-slot write is invisible** — an `Int` into the wrong `Int` slot
+  passes silently, and that is half the defect this record describes. And three
+  probes is not Spring Boot. Treat the table as a floor and re-run under H2 or
+  Spring Boot before calling the sweep done.
+
+  Adjudicating and fixing the 24 sites is untouched.
 * **Step 3**, replacing the two `breaks-under-strict` sites in `vm_util.rs`.
   Note the `ValueLayout` one cannot be converted at all — the marker is explicit
   that there are no real fields to name, so it is a
