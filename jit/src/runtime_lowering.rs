@@ -184,6 +184,33 @@ pub(crate) fn emit_new_object_stub(
     emit_post_call_frame_republish(buf, frame_record);
 }
 
+/// cov-06: emit the array-allocation runtime stub shared by both JIT tiers.
+///
+/// Same ABI shape as [`emit_new_object_stub`] with one difference: the THIRD
+/// argument (the length) is a RUNTIME value read from a frame slot, not an
+/// immediate — an array's element count is a JVM operand-stack value, unlike
+/// `new`'s field count, which is fixed by the class. `element_type_or_class_id`
+/// is the immediate second argument and is a compile-time constant either
+/// way: the JVM `newarray` atype tag for a primitive array, or the loaded
+/// component class id for an `anewarray`. Matches `jit_newarray(vm, atype,
+/// length)` / `jit_anewarray_object(vm, component_class_id, length)`, and the
+/// same zero-on-failure convention (`0` = pending exception stashed) as
+/// `emit_new_object_stub`'s target.
+pub(crate) fn emit_new_array_stub(
+    buf: &mut ExecutableBuffer,
+    context_offset: i32,
+    target: usize,
+    element_type_or_class_id: u32,
+    length_offset: i32,
+    frame_record: usize,
+) {
+    emit_load_frame(buf, ENTRY_ABI_REGS[0], context_offset);
+    emit_mov_imm64(buf, ENTRY_ABI_REGS[1], u64::from(element_type_or_class_id));
+    emit_load_frame(buf, ENTRY_ABI_REGS[2], length_offset);
+    emit_call_absolute(buf, target);
+    emit_post_call_frame_republish(buf, frame_record);
+}
+
 /// Emit the CONSTANT-POOL-INDEXED object-allocation stub.
 ///
 /// Identical ABI shape to [`emit_new_object_stub`], but the immediates name a

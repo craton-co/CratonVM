@@ -122,29 +122,104 @@ The transform is opt-in and off by default, so no shipped configuration is
 affected, and both failure modes are worse codegen rather than wrong codegen.
 Re-derive it if that transform ever becomes default-on.
 
-## What this does NOT fix
+## The general form, taken on the same day
 
-This is a special case of a general problem, and the general problem is open:
+Fixing one method was a special case. The problem behind it is:
 
-> **The optimizing tier replaces a C1 body with an IR body whenever it *can*,
-> with no evidence that the replacement is faster.**
+> **The optimizing tier installs its body whenever it *can*, and nothing checks
+> that the body it installs is faster than the one the single-pass backend
+> would have installed.**
 
-Every `cov-*` lane widens the set of methods that happens to. `cov-02` widened
-it onto a method where the single-pass backend had a vectoriser; the next lane
-may widen it onto one where the single-pass backend has some other advantage
-nobody has enumerated, and there will be no detector to ask.
+The set of things that backend can do and the IR tier cannot is finite and
+knowable. It is now enumerated, in `jit/src/x64/single_pass_only.rs`, and the
+admission chain consults the enumeration rather than the one-off predicate this
+fix started as. Seven classes, each consumed by a single-pass emitter at a loop
+header, each with no counterpart in `ir_optimize`/`ir_lower`:
 
-The survey said this before any of it happened:
+| class | what the single-pass backend emits |
+|---|---|
+| `BulkZeroByteFill` | `REP STOSB` over a `byte[]`/`boolean[]` clear |
+| `BulkSetByteStride` | a bulk `a[iv] = 1; iv += step` store |
+| `ByteSieve` | the whole sieve nest in registers |
+| `SimdIntArraySum` | AVX2 `int[]` reduction |
+| `SimdFpArraySum` | AVX2 floating-point reduction |
+| `SimdArrayElementWise` | AVX2 `out[i] = a[i] OP b[i]` |
+| `MatrixDot` | the matrix dot-product nest |
 
-> It does not say lowering these opcodes makes anything **faster**. It says the
-> optimizing tier declines to compile 41% of what it admits. Whether an
-> optimized body beats the single-pass one for a given method is a separate
-> measurement.
+The verdict now names which one it protected, so a reader of a results
+directory sees the reason and not just the refusal.
 
-A general answer would be to compare the two bodies once and keep the faster —
-cheap in principle, since both backends already run for any method the
-optimizing tier declines. Nothing like it exists. Until it does, the
-`ir_reach_<phase>` record in every gate run is the tripwire, and the gate now
-runs (`MEAS-02` fixed the `javac` defect that had stopped it): `sieve`'s
-baseline is 2,700 ms with a 5% budget, and the regressed build measured
-15,680 ms, so the gate would have failed it outright on the day it landed.
+### Three things the audit turned up
+
+**1. The IR tier has no vectoriser at all.** Every SIMD family above is a
+lowering it cannot match. `cov-02` hitting one of them was not bad luck — there
+were four more of exactly that shape waiting for the next lane.
+
+**2. Loop unswitching was in the first draft of the list and is not in it
+now.** It is detected and an emitter consumes it, which is what put it there.
+Reading what that emitter *emits* is what took it out:
+`emit_loop_unswitch_preheader`'s own contract says the sequence "is
+*additive* — it reads `invariant_local` and sets flags but never writes back to
+any local … Removing the emission yields identical final state." It does not
+duplicate the body or hoist the branch, so there is no advantage to protect.
+Vetoing on it would have declined IR bodies for every loop with an invariant
+branch — a common shape — in exchange for nothing. **Do not add a class because
+a detector and an emitter exist. Read what the emitter emits.**
+
+**3. `ir_optimize`'s unroll and LICM are default-ON**, and the comments beside
+them saying "Default-OFF … while it soaks" were stale; they are corrected in
+the same commit. Those two are precisely why the single-pass native unroller
+and the `aaload`/FP hoists are *not* on the veto list, so a reader who believed
+the comments would have added two more classes that cost a large population of
+IR bodies for nothing.
+
+### Blast radius of the widened veto
+
+Same binary, flag on and off, all ten phases — the seven-class registry still
+costs **exactly one** IR body, the same one:
+
+| phase | veto ON | veto OFF |
+|---|---|---|
+| **`cb:sieve`** | **2 / 0 / 0** | **2 / 1 / 1** |
+| *all nine others* | *identical* | *identical* |
+
+`c2c:dispatch` first appeared to differ (7 bodies against 8). It does not: the
+veto's verdict string never appears in that phase's log at all, and four
+repeats put ON above OFF twice, below once, equal once — that phase's request
+count swings 15–18 run to run on its own. **A one-body difference on a phase
+that noisy is not a result**, which is why the check that settled it was the
+verdict string and not the count.
+
+## What this still does NOT fix
+
+The enumeration catches an advantage somebody has written down. It cannot catch
+one nobody has.
+
+Two things narrow that and neither closes it. Every `match` in the module is
+exhaustive, so a new class cannot be half-added — it will not compile until it
+is classified, and `all_variants_are_registered` fails until `ALL` carries it.
+And the audit that produced the seven is reproducible: read every list the
+single-pass emitters consult at a loop header, ask whether `ir_optimize` or
+`ir_lower` has a counterpart, then read what the emitter actually emits. But
+nothing forces the next person to run it.
+
+**The mechanism that would close it is a backend-parity harness**: compile a
+corpus with both backends and flag any method whose single-pass body contains
+VEX-prefixed or `REP`-string bytes that its IR body does not. That is
+capability-*agnostic* — it would catch a vectorising specialisation nobody
+registered, because it reads emitted bytes rather than asking a detector.
+
+It is not built here, and the reason is structural rather than effort: the two
+backends cannot currently be driven independently over the same method. The
+single-pass call site sits about 2,000 lines below the IR one inside
+`try_compile_inner`, behind local state built in between, so "compile it both
+ways" means either restructuring that function or duplicating a 19-argument
+call. That is a real increment, and it is written up as one because a parity
+check that only *looks* general is worse than one whose limits are on the
+label.
+
+Until it exists, the `ir_reach_<phase>` record in every gate run is the
+tripwire, and the gate now runs (`MEAS-02` fixed the `javac` defect that had
+stopped it): `sieve`'s baseline is 2,700 ms with a 5% budget and the regressed
+build measured 15,680 ms, so the gate would have failed it outright on the day
+it landed.
