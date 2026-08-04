@@ -1075,6 +1075,32 @@ struct MethodPromotionSnapshot {
 /// (should not happen in the normal VM binary, but keeps this safe to call
 /// unconditionally from an exit hook).
 pub fn dump_method_stats_to_stderr() {
+    // The OSR lifecycle, first and BEFORE the `DIAG_CORE` early return, so a
+    // run with no tiered manager still reports it.
+    //
+    // The `osr-02` lane ungated these counters precisely because *a silent OSR
+    // exit is indistinguishable from never having entered* — and then nothing
+    // printed them, which its own design doc records as the reason they "have
+    // not been read end to end from a live run". A differential that cannot
+    // show its OSR arms actually ENTERED and EXITED is a test of the
+    // interpreter, so the harness this lane adds needs this line to not be
+    // vacuous.
+    //
+    // How to read it: never `osr_exited` alone. Against `osr_entered` it is the
+    // livelock shape (every entry paying for a trampoline and a local seed,
+    // then leaving); `osr_entered` at zero under a hot loop means requests are
+    // being refused or declined, and `osr_refused_entry` /
+    // `osr_compile_declined` say which. The four `osr_exit_*` rows partition
+    // the exits that arrived with a reconstructed frame, and two of them —
+    // `osr_exit_map_missing`, `osr_exit_bci_unrecorded` — must read zero.
+    eprintln!(
+        "[cratonvm] OSR lifecycle: {}",
+        crate::metrics::osr_counts()
+            .iter()
+            .map(|(n, c)| format!("{n}={c}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     let Some(core) = DIAG_CORE.get() else {
         return;
     };

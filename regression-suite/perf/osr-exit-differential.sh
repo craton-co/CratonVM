@@ -118,6 +118,24 @@ fi
 
 declare -a ARM_NAMES=()
 declare -a ARM_FILES=()
+declare -a ARM_OSR=()
+
+# The OSR lifecycle counters, from the arm's stderr. Empty for HotSpot.
+#
+# This is what keeps the whole harness from passing vacuously. Every arm here
+# computes the right answer in the INTERPRETER too, so "byte-identical to
+# HotSpot" is a claim about the OSR exit path only if the OSR exit path
+# actually ran — a differential that never asserts an entry was taken is a test
+# of the interpreter. `CRATONVM_DBG_JIT_METHOD_STATS=1` is passed to every
+# CratonVM arm so the configuration is uniform across them; it writes to stderr,
+# which the comparison does not read.
+osr_line() {
+  sed -n 's/^\[cratonvm\] OSR lifecycle: //p' "$1" | tail -1
+}
+osr_field() {
+  # $1 = the lifecycle line, $2 = row name. Empty when the row is absent.
+  echo "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | tail -1
+}
 
 run_arm() {
   local name="$1"; shift
@@ -130,6 +148,7 @@ run_arm() {
     tail -20 "$WORK/$name.err" >&2
     ARM_NAMES+=("$name(FAILED rc=$rc)")
     ARM_FILES+=("$out")
+    ARM_OSR+=("")
     return
   fi
   # An arm that produced no accumulator line ran something other than the
@@ -139,27 +158,32 @@ run_arm() {
     tail -20 "$WORK/$name.err" >&2
     ARM_NAMES+=("$name(NO-OUTPUT)")
     ARM_FILES+=("$out")
+    ARM_OSR+=("")
     return
   fi
   ARM_NAMES+=("$name")
   ARM_FILES+=("$out")
+  ARM_OSR+=("$(osr_line "$WORK/$name.err")")
 }
 
 echo "osr-exit differential — n=$N, work dir $WORK" >&2
 
+STATS=CRATONVM_DBG_JIT_METHOD_STATS=1
+
 run_arm hotspot "$JAVA" -cp "$CLASSES" OsrExitDifferentialProbe "$N"
-run_arm nojit "$EXE" --nojit -cp "$CLASSES" OsrExitDifferentialProbe "$N"
-run_arm default "$EXE" -cp "$CLASSES" OsrExitDifferentialProbe "$N"
-run_arm exit-test CRATONVM_OSR_EXIT_TEST=1 "$EXE" -cp "$CLASSES" OsrExitDifferentialProbe "$N"
+run_arm nojit "$STATS" "$EXE" --nojit -cp "$CLASSES" OsrExitDifferentialProbe "$N"
+run_arm default "$STATS" "$EXE" -cp "$CLASSES" OsrExitDifferentialProbe "$N"
+run_arm exit-test "$STATS" CRATONVM_OSR_EXIT_TEST=1 "$EXE" -cp "$CLASSES" \
+    OsrExitDifferentialProbe "$N"
 for a in $AFTERS; do
-  run_arm "exit-after-$a" "CRATONVM_OSR_EXIT_AFTER=$a" "$EXE" -cp "$CLASSES" \
+  run_arm "exit-after-$a" "$STATS" "CRATONVM_OSR_EXIT_AFTER=$a" "$EXE" -cp "$CLASSES" \
       OsrExitDifferentialProbe "$N"
 done
 if [[ "$LOOP_XFORM" == "1" ]]; then
-  run_arm loop-xform CRATONVM_JIT_BYTECODE_LOOP_XFORM=1 "$EXE" -cp "$CLASSES" \
+  run_arm loop-xform "$STATS" CRATONVM_JIT_BYTECODE_LOOP_XFORM=1 "$EXE" -cp "$CLASSES" \
       OsrExitDifferentialProbe "$N"
   for a in $AFTERS; do
-    run_arm "loop-xform-after-$a" CRATONVM_JIT_BYTECODE_LOOP_XFORM=1 \
+    run_arm "loop-xform-after-$a" "$STATS" CRATONVM_JIT_BYTECODE_LOOP_XFORM=1 \
         "CRATONVM_OSR_EXIT_AFTER=$a" "$EXE" -cp "$CLASSES" \
         OsrExitDifferentialProbe "$N"
   done
@@ -172,31 +196,68 @@ fi
 REF="${ARM_FILES[0]}"
 fail=0
 echo
-printf '%-24s %-8s %s\n' arm verdict "acc"
+printf '%-22s %-9s %-22s %-9s %-8s %s\n' \
+    arm verdict acc entered exited "exit sites (boundary/off/missing/unrecorded)"
 for i in "${!ARM_NAMES[@]}"; do
   name="${ARM_NAMES[$i]}"
   file="${ARM_FILES[$i]}"
+  osr="${ARM_OSR[$i]}"
   acc="$(grep -m1 '^OsrExitDifferentialProbe acc=' "$file" 2>/dev/null | sed 's/.*acc=//')"
   if [[ "$name" == *FAILED* || "$name" == *NO-OUTPUT* ]]; then
-    printf '%-24s %-8s %s\n' "$name" "ERROR" "-"
+    printf '%-22s %-9s %s\n' "$name" "ERROR" "-"
     fail=1
     continue
   fi
-  if diff -q "$REF" "$file" > /dev/null 2>&1; then
-    printf '%-24s %-8s %s\n' "$name" "ok" "$acc"
-  else
-    printf '%-24s %-8s %s\n' "$name" "DIVERGED" "$acc"
+  entered="$(osr_field "$osr" osr_entered)"; entered="${entered:--}"
+  exited="$(osr_field "$osr" osr_exited)"; exited="${exited:--}"
+  b="$(osr_field "$osr" osr_exit_at_loop_boundary)"; b="${b:--}"
+  o="$(osr_field "$osr" osr_exit_off_loop_boundary)"; o="${o:--}"
+  m="$(osr_field "$osr" osr_exit_map_missing)"; m="${m:--}"
+  u="$(osr_field "$osr" osr_exit_bci_unrecorded)"; u="${u:--}"
+  verdict=ok
+  if ! diff -q "$REF" "$file" > /dev/null 2>&1; then
+    verdict=DIVERGED
     fail=1
+  fi
+  # The two rows that are a defect wherever they appear. Both are cross-checks
+  # between metadata the same function writes, not classifications.
+  if [[ "$m" != "-" && "$m" != "0" ]] || [[ "$u" != "-" && "$u" != "0" ]]; then
+    verdict=BAD-EXIT
+    fail=1
+  fi
+  printf '%-22s %-9s %-22s %-9s %-8s %s/%s/%s/%s\n' \
+      "$name" "$verdict" "$acc" "$entered" "$exited" "$b" "$o" "$m" "$u"
+  if [[ "$verdict" == "DIVERGED" ]]; then
     echo "    first differing lines:"
     diff "$REF" "$file" | head -12 | sed 's/^/      /'
   fi
 done
 
+# The vacuity check, stated as loudly as the comparison. Every shape here
+# computes the right answer in the interpreter, so a green table proves nothing
+# about the OSR exit path unless that path ran. A forced-exit arm that took no
+# entry, or took entries and no exits, is measuring the interpreter.
+for i in "${!ARM_NAMES[@]}"; do
+  name="${ARM_NAMES[$i]}"
+  [[ "$name" == exit-after-* || "$name" == exit-test || "$name" == loop-xform-after-* ]] || continue
+  entered="$(osr_field "${ARM_OSR[$i]}" osr_entered)"
+  exited="$(osr_field "${ARM_OSR[$i]}" osr_exited)"
+  if [[ -z "$entered" || "$entered" == 0 ]]; then
+    echo "VACUOUS: arm '$name' took no OSR entry — it measured the interpreter." >&2
+    fail=1
+  elif [[ -z "$exited" || "$exited" == 0 ]]; then
+    echo "VACUOUS: arm '$name' entered $entered time(s) and never exited — the" >&2
+    echo "  forced-exit trigger did not fire, so no exit state was compared." >&2
+    fail=1
+  fi
+done
+
 echo
 if [[ $fail -eq 0 ]]; then
-  echo "OSR exit differential: every arm byte-identical to HotSpot."
+  echo "OSR exit differential: every arm byte-identical to HotSpot, with the forced-exit"
+  echo "arms taking real entries and real exits."
 else
-  echo "OSR exit differential: DIVERGENCE — see the arm table above." >&2
+  echo "OSR exit differential: FAILED — see the arm table above." >&2
 fi
 [[ -n "$KEEP" ]] || echo "(transcripts in $WORK)" >&2
 exit $fail
