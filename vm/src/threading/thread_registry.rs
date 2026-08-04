@@ -700,6 +700,7 @@ impl ThreadRegistry {
             roots: usize,
             state: String,
             top: String,
+            full_frames: Vec<String>,
         }
         let mut rows: Vec<SummaryRow> = threads
             .iter()
@@ -726,6 +727,29 @@ impl ThreadRegistry {
                 if top.is_empty() {
                     top.push_str("<no-frame-trace>");
                 }
+                // 2026-08-03 (onclasscondition-join-never-returns) — the
+                // one-line `top` above caps at 3 frames, which is enough to
+                // name a wait site but not to tell "this thread is a live
+                // participant mid-call-chain" from "this is a stale dead
+                // entry that happens to share a wait site with hundreds of
+                // others from earlier per-test JVM reboots". Every alive
+                // thread's COMPLETE deposited chain, oldest frame first (same
+                // order `dump_current_thread_frames` uses), so a hang repro
+                // can be told apart from the accumulated dead-thread noise
+                // without a second run.
+                let full_frames = if e.alive.load(std::sync::atomic::Ordering::Acquire) {
+                    trace
+                        .iter()
+                        .map(|frame| {
+                            format!(
+                                "{}.{}@{}",
+                                frame.class_name, frame.method_name, frame.byte_code_index
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 SummaryRow {
                     tid: tid.0,
                     os_tid: e.os_tid.load(std::sync::atomic::Ordering::Acquire) as u64,
@@ -739,11 +763,12 @@ impl ThreadRegistry {
                     roots: e.root_snapshot.lock().len(),
                     state,
                     top,
+                    full_frames,
                 }
             })
             .collect();
         rows.sort_by_key(|r| r.tid);
-        for row in rows {
+        for row in &rows {
             let _ = writeln!(
                 h,
                 "  tid={} os_tid={} name={:?} alive={} daemon={} blocked={} roots={} state={:?} top={}",
@@ -757,6 +782,33 @@ impl ThreadRegistry {
                 row.state,
                 row.top
             );
+        }
+        // Full frame chains, split out from the one-line-per-thread summary
+        // above so that table stays scannable. Restricted to `alive` threads
+        // — the registry retains every thread it has ever seen for the life
+        // of the process, so a long-running multi-class suite run can carry
+        // hundreds of dead entries whose frame chains are pure noise here.
+        let live_with_frames: Vec<&SummaryRow> = rows
+            .iter()
+            .filter(|r| r.alive && !r.full_frames.is_empty())
+            .collect();
+        let _ = writeln!(
+            h,
+            "--- T19.H1 full frame chains: {} alive thread(s) with a deposited snapshot ---",
+            live_with_frames.len()
+        );
+        for row in live_with_frames {
+            let _ = writeln!(
+                h,
+                "  tid={} os_tid={} name={:?} ({} frame(s), oldest first):",
+                row.tid,
+                row.os_tid,
+                row.name,
+                row.full_frames.len()
+            );
+            for (depth, frame) in row.full_frames.iter().enumerate() {
+                let _ = writeln!(h, "    [{depth}] {frame}");
+            }
         }
         let _ = writeln!(h, "--- T19.H1 end thread summary ---");
         let _ = h.flush();
@@ -1235,6 +1287,21 @@ impl ThreadRegistry {
             *entry.jmx_waiting_monitor.lock() = Some(monitor);
             *entry.jmx_wait_started.lock() = Some(Instant::now());
         }
+    }
+
+    /// The monitor `thread_id` is currently blocked in `Object.wait()` on, if
+    /// any — without consuming it or closing the JMX wait-time accounting.
+    ///
+    /// Used by `Thread.interrupt()` to wake a target parked in `Object.wait()`.
+    /// The slot is written just before the park and taken just after it, so a
+    /// `Some` here means the target is (or was a moment ago) in the wait, and a
+    /// wake sent to a target that has already left is harmless: `wait()` is
+    /// specified to permit spurious wakeups, and the surrounding Java `while`
+    /// loop re-checks and re-parks.
+    pub fn peek_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
+        let threads = self.threads.read();
+        let monitor = *threads.get(&thread_id)?.jmx_waiting_monitor.lock();
+        monitor
     }
 
     pub fn take_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {

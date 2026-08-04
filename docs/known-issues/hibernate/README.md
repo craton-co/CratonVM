@@ -40,14 +40,18 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   `overrides=N (loaded)`) — retired to
   `../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`.
   **Three real VM defects were found and fixed here**, and the class reached
-  `132/132 failed=0` three runs for three against base `32f9db9a2` — but it is
-  **not green on the `dev` tip**, and neither is any other collector arm. A
-  fourth, older fault remains: the class is
-  [intermittently unstable in every arm](defaultcatalogandschema-late-phase-instability-20260801.md),
-  including on `dev` with no local changes at all. Running it to completion for
-  the first time disproved the inherited "clean but slow, just needs a bigger
-  timeout" premise: HotSpot does it in 119.7 s on the same `-Xmx1500m`, while
-  CratonVM failed in both modes, for reasons now tracked on their own.
+  `132/132 failed=0` three runs for three against base `32f9db9a2` — but it was
+  **not green on the `dev` tip**, and neither was any other collector arm. A
+  fourth, older fault — the class was
+  [intermittently unstable in every arm](../../internal/fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md),
+  including on `dev` with no local changes at all — was **FIXED 2026-08-03**:
+  nine distinct GC old-gen mark/sweep/compact defects (one family — trusting
+  `ObjectHeader` fields before validating them), found via `CRATONVM_SYMBOLIZE`
+  + `llvm-objdump` disassembly and closed one at a time with empirical
+  re-verification after each. Running it to completion for the first time
+  disproved the inherited "clean but slow, just needs a bigger timeout"
+  premise: HotSpot does it in 119.7 s on the same `-Xmx1500m`, while CratonVM
+  failed in both modes, for reasons now tracked on their own.
 
   ⚠️ **Do not use this class to re-check any of those fixes.** It has stopped
   discriminating: it also passes `132/132` on a `dev` tip that still carries the

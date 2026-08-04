@@ -4,7 +4,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Isolates the mechanism behind
- * the retired bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep write-up
+ * the retired bug-h2-classid0-stale-address-family write-up
  * without needing H2.
  *
  * The failing read there is `FileStore.readPageFromCache`:

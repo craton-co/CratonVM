@@ -167,7 +167,7 @@ suspicion, so those runs never exercised the sweep the failing run used. A
 > Any `CRATONVM_DBG_SWEEP_ZERO` / `DBG_A2` / `DBG_SWEEP_CENSUS` /
 > `DBG_WATCHREF` run is testing a DIFFERENT young sweep. Reproduce first with no
 > flags; only then instrument. This is also a live candidate for why
-> `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md` went from ~40%
+> `bug-h2-classid0-stale-address-family.md` went from ~40%
 > reproduction to 0/18 "the next day on current dev + instrumentation" and
 > concluded the host had changed.
 
@@ -189,7 +189,7 @@ The residual belongs to the array-receiver dispatch family tracked on
 not to this page's throughput subject — it was only ever noted here in passing.
 If it recurs, the most likely home is the open premature-reclamation bug in the
 non-moving young sweep
-(`docs/known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`),
+(`docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`),
 whose signature — a live object's header reading back as something else — is the
 same family. **Reproduce it with no flags first**; the diagnostic that page
 recommends is the one that voided round 1 here.
@@ -237,9 +237,9 @@ for it to block. See
    `bug-h2-testmultithread-concurrent-update-timeout.md`.
 2. ~~**`NoSuchMethodError: java/lang/Object.next()`**~~ — reproduced with a
    receiver dump, promoted to its own page:
-   `bug-h2-blocked-frame-classid0-dispatch-miss.md`. It is the ambiguous
+   `bug-h2-classid0-stale-address-family.md`. It is the ambiguous
    `ClassId(0)` face, same family as
-   `bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`.
+   `bug-h2-classid0-stale-address-family.md`.
 3. **The flat ~25-30x constant factor** — still open, and still the biggest
    number here. See the profile section for the clusters worth attacking first;
    the 25-thread UPDATE profile on the successor page adds a contended

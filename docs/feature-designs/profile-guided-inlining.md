@@ -394,3 +394,25 @@ through the metrics/JFR surface.
    untested (§6) — the same deopt-metadata gap as item 2 blocks a real test
    of it, since there is no frame to describe the inlined scope if execution
    needs to resume the interpreter mid-callee.
+8. **This whole capability is single-pass-only, and the population it can
+   reach is shrinking** (recorded 2026-08-03, by `cov-01`). Guarded inlining
+   is planned by `x64`'s inliner and reported through
+   `CompiledMethod::inline_tally`; the optimizing (IR) backend serves a
+   virtual site from a MIC/PIC cascade and records no tally. So a method that
+   the optimizing tier starts accepting leaves this feature's reach entirely.
+
+   `cov-01` demonstrated it by accident. `getstatic <A>; invokevirtual tag` —
+   the single most ordinary virtual-call shape there is, and the exact shape
+   of every entry point in `vm/tests/resources/cratonvm/PgoGuardedVirtualInline.java`
+   — was refused by the IR builder only because it had no `0xb2` arm. The
+   moment `getstatic` lowered, `callA` was compiled by C2 on its next
+   promotion, its `inline_tally` was empty, and `check_guard_hit` failed with
+   `speculative_sites == 0`. The test now pins the tier with
+   `CRATONVM_JIT_IR_CALL_VIRTUAL=0` and asserts `!used_ir_backend` first, so
+   the dependency is stated rather than relied on.
+
+   Nothing in the product regressed — the flag is default-off, and the IR
+   tier's inline cache is a MIC/PIC cascade rather than nothing. But this is
+   the question to answer before item 1 or item 2 is worth building: as the
+   `cov-*` lanes land, which methods will still be compiled by the backend
+   this lowering lives in?

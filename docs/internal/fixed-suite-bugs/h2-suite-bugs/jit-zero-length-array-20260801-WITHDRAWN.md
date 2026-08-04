@@ -113,7 +113,7 @@ probably *real* — but "real once, under that load" is not "deterministic", and
 the page asserted the stronger claim from the same three runs. A length-0 array
 is also the array face of the all-zero header the collector leaves over a
 reclaimed span, which is a live open defect
-(`../../../known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md` and
+(`../../../known-issues/h2/bug-h2-classid0-stale-address-family.md` and
 its sibling) whose rate is exactly the kind that rises with load.
 
 Rule this adds to the pile: **N=3 buys "it happened", never "it is
@@ -124,5 +124,5 @@ would have taken to say either way.
 
 * `bug-h2-testmultithread-concurrent-insert-throughput-RESOLVED-20260801.md` —
   the investigation this fell out of; its ban A/B is withdrawn above.
-* `../../../known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md` —
+* `../../../known-issues/h2/bug-h2-classid0-stale-address-family.md` —
   the all-zero-header defect that is real, reproduced, and still open.

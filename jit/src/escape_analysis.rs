@@ -2463,7 +2463,8 @@ pub fn is_partial_escape(cg: &ConnectionGraph, graph: &Graph, alloc: NodeId) -> 
             continue;
         }
         match &graph.nodes[use_id].op {
-            Op::Return | Op::Call => has_escaping_use = true,
+            // cov-07: a thrown reference escapes exactly like a returned one.
+            Op::Return | Op::Throw | Op::Call => has_escaping_use = true,
             Op::Store(_) | Op::Load(_) | Op::MonitorEnter | Op::MonitorExit => has_local_use = true,
             Op::Phi => {
                 // Phi merges paths -- check if any successor escapes.
@@ -2502,7 +2503,7 @@ pub fn find_materialization_points(
         if use_id >= graph.nodes.len() {
             continue;
         }
-        let is_escape_point = matches!(graph.nodes[use_id].op, Op::Return | Op::Call);
+        let is_escape_point = matches!(graph.nodes[use_id].op, Op::Return | Op::Throw | Op::Call);
         if !is_escape_point {
             if let Op::Phi = &graph.nodes[use_id].op {
                 if cg.get_escape(use_id) >= EscapeState::ArgEscape {

@@ -611,6 +611,36 @@ impl ExecutableBuffer {
         Ok(())
     }
 
+    /// Patch a `rel8` branch displacement, or discard the compile.
+    ///
+    /// The one rule this enforces is that a displacement which does not fit in
+    /// an `i8` must NEVER be written truncated. `rel as u8` is not a near-miss:
+    /// it turns an out-of-range forward branch into a backward one, and on x86
+    /// the landing site is normally the middle of an earlier instruction. The
+    /// inline-PIC cascade shipped exactly that — `JNE -128` into the body of
+    /// the pre-call spill/shadow-push run, which then ran as an unguarded
+    /// infinite push loop (`docs/internal/jit-raw-jit-to-jit-shadow-stack-
+    /// overflow-FIXED-20260731.md`), and the same wrap reappeared as a
+    /// deterministic SIGILL in the `CRATONVM_NO_MOVING_YOUNG=1` lane, whose
+    /// larger slot bodies pushed the same branch past 127 bytes.
+    ///
+    /// Marking the buffer overflowed makes the driver's
+    /// `if buf.overflowed() { return None; }` discard the half-emitted method
+    /// and fall back to the interpreter, which is always valid. Every emitter
+    /// that patches a short branch goes through here — `jit`'s only remaining
+    /// `try_patch_byte(.., .. as u8)` is the one inside this function, which
+    /// `rel8_displacement_patches_all_go_through_the_range_checked_helper`
+    /// pins.
+    pub fn patch_rel8_or_bail(&mut self, patch: usize, rel: i64) {
+        match i8::try_from(rel) {
+            // Cast: rel8 displacement, range-checked immediately above.
+            Ok(v) => {
+                self.try_patch_byte(patch, v as u8).ok();
+            }
+            Err(_) => self.mark_overflowed(),
+        }
+    }
+
     // task #44: the deprecated panicking `patch_i32` / `patch_byte` shims
     // have been removed. Every internal codegen site was migrated to the
     // `try_patch_*` variants in task #20 (commit acd57f2). A workspace grep
@@ -6245,7 +6275,18 @@ mod inline_selection_tests {
 /// `ObjectRef`: the latter can relocate between compiled invocations.
 #[derive(Clone, Debug)]
 pub enum JitLdcConstant {
-    Immediate(i64),
+    /// A `CONSTANT_Integer` or `CONSTANT_Float` entry, already reduced to the
+    /// machine word both backends push.
+    ///
+    /// `is_float` (cov-01) records which of the two it was. The single-pass
+    /// backend does not read it — it pushes `bits` with `MOV imm64` and lets
+    /// the CONSUMING opcode pick the width, exactly as it does for `ldc2_w`.
+    /// The IR builder has no consuming opcode to ask: it must type the node it
+    /// creates, and an `Op::Const`/`Int` holding a float bit pattern is a
+    /// mistyped φ and a mistyped deopt slot. So this flag is the same shape
+    /// `cp_ldc2w_resolver`'s `(bits, is_double)` already has, for the same
+    /// reason.
+    Immediate { bits: i64, is_float: bool },
     String(String),
     /// A `CONSTANT_Class` entry: `ldc <Class>` pushes that class's mirror.
     ///
@@ -10274,13 +10315,20 @@ fn ir_call_is_identity_hash(node: &ir::Node, info_ptr: usize) -> bool {
 // gate, both of which need monitors to exist before they can decide anything.
 // Wire them in the same change as the variants, not before.
 //
-// `athrow` ⇒ `EaOp::Throw` cannot be wired at all: `ir::Op` has no throw and
-// `ir::IrBuilder` rejects the whole method when `scan.has_athrow` (there is no
-// athrow lowering — see the `ir_reject("scan.has_athrow")` gate). So no IR
-// graph reaching this bridge contains a throw, and `EaOp::Throw` stays
-// producerless until handler bodies are compiled. Note for whoever does that:
-// `escape_analysis::program_order_proves_dominance` explicitly assumes the
-// absence of exception control flow and must gain a `may_throw` term then.
+// `athrow` ⇒ `EaOp::Throw` — WIRED, cov-07. `ir::Op::Throw` now exists
+// (`IrBuilder::build`'s `0xbf` arm) and maps below with NO operand
+// re-packing: its `[ctrl, mem, exc]` layout is forwarded verbatim by the
+// second pass's default arm, exactly like `Op::Return`'s `[ctrl, val]` — the
+// escape rule at `escape_analysis::Op::Return | Op::Throw` iterates every
+// input and filters by `is_ref_producer`, so the extra non-ref `ctrl`/`mem`
+// inputs are harmless.
+//
+// `escape_analysis::program_order_proves_dominance` was NOT given a
+// `may_throw` term, and does not need one: `Op::Throw` always LEAVES the
+// frame (the compiled body never branches to an in-method handler — see
+// `Op::Throw`'s own doc comment in `ir.rs`), so it cannot create a control
+// edge back to a lower-id load, which is the only thing that predicate
+// guards against. See `docs/internal/cov-07-athrow-RETIRED-*.md`.
 
 /// Map a single `ir::Op` variant to its `escape_analysis::Op` counterpart.
 fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
@@ -10304,6 +10352,8 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
         // attribute the monitor to the memory token.
         ir::Op::MonitorEnter => EaOp::MonitorEnter,
         ir::Op::MonitorExit => EaOp::MonitorExit,
+        // cov-07. No re-packing needed — see the section comment above.
+        ir::Op::Throw => EaOp::Throw,
         ir::Op::New {
             class_id,
             num_fields,
@@ -10315,6 +10365,19 @@ fn ir_op_to_ea_op(op: &ir::Op) -> escape_analysis::Op {
             element_type: *element_type,
         },
         ir::Op::Call { .. } => EaOp::Call,
+        // cov-01. `EaOp::Call` is the conservative mapping and the honest one:
+        // all three lower to a runtime helper that can run arbitrary Java, and
+        // their memory shape in `ir::Op::memory_shape` is already
+        // `MemAccess::Opaque` for that reason — the two classifications must
+        // not disagree. None of the three has a reference INPUT, so the
+        // arg-escape half of the `Call` rule is a no-op; what matters is that
+        // the reference each PRODUCES is treated like a call result rather than
+        // like a fresh allocation, because none of them is one. An interned
+        // literal, a class mirror and a static field's referent are all
+        // pre-existing objects that other threads can already see.
+        ir::Op::ConstString { .. } | ir::Op::ConstClass { .. } | ir::Op::LoadStatic { .. } => {
+            EaOp::Call
+        }
         ir::Op::ArrayLength => EaOp::ArrayLength,
         // Array element access escapes its array reference (conservative): map to
         // `EaOp::Call`, whose handling marks every reference input `ArgEscape`.
@@ -10377,6 +10440,7 @@ fn ea_control_preds(node: &ir::Node) -> &[ir::NodeId] {
         ir::Op::Merge | ir::Op::Region => node.inputs.as_slice(),
         // Everything else pins control at input 0 (when it has one at all).
         ir::Op::Return
+        | ir::Op::Throw
         | ir::Op::If
         | ir::Op::Proj(_)
         | ir::Op::Guard { .. }
@@ -10387,6 +10451,9 @@ fn ea_control_preds(node: &ir::Node) -> &[ir::NodeId] {
         | ir::Op::New { .. }
         | ir::Op::NewArray { .. }
         | ir::Op::Call { .. }
+        | ir::Op::ConstString { .. }
+        | ir::Op::ConstClass { .. }
+        | ir::Op::LoadStatic { .. }
         | ir::Op::LambdaIntToDouble => &node.inputs[..node.inputs.len().min(1)],
         // Start, and every floating pure node (Const, Add, Cmp, Phi, …). A node
         // with no control input has no fixed position, so it is never cold.
@@ -11514,6 +11581,59 @@ fn jit_bisect_only_filter() -> Option<&'static Vec<String>> {
         .as_ref()
 }
 
+/// Do the bisect levers force `class_name`.`method_name` to stay interpreted?
+///
+/// **Call this at EVERY codegen entry point, not just [`try_compile`].** Both
+/// levers used to be checked only inside `try_compile`, and two paths reach the
+/// backend without going through it — `execute`'s eager first-call single-pass
+/// compile, and `compile_osr_artifact`, which says so in its own comment
+/// ("This path calls the backend directly instead of going through
+/// `try_compile`"). An entire class of compiled body was therefore invisible to
+/// both levers.
+///
+/// That is worse than a missing feature, because it makes the levers *lie*.
+/// Isolating a miscompile with them is a proof by elimination, and "deny this
+/// package and the crash goes away" only means something if the deny actually
+/// stopped a compile. Measured 2026-08-04 against
+/// `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`:
+/// `CRATONVM_JIT=bisect-only=zzzNoSuchPrefix` — a prefix matching nothing, so
+/// nothing should compile at all — still left **11 methods compiled** and the
+/// crash still reproduced. Every bisect step read "no effect", which reads as
+/// an exoneration and was really a silent no-op.
+///
+/// The levers are otherwise unchanged: `CRATONVM_JIT_DENY` is a
+/// comma-separated list of substrings matched against `Class.method`, and
+/// `CRATONVM_JIT_BISECT_ONLY` is the inverse allowlist of class-name prefixes.
+/// Both are no-ops unless set, and the `format!` is reached only when the deny
+/// lever is actually configured.
+pub fn jit_force_interpret(class_name: &str, method_name: &str) -> bool {
+    force_interpret_matches(
+        jit_deny_filter().map(|v| v.as_slice()),
+        jit_bisect_only_filter().map(|v| v.as_slice()),
+        class_name,
+        method_name,
+    )
+}
+
+/// The matching rule behind [`jit_force_interpret`], with the two parsed
+/// filters passed in rather than read from the process-wide `OnceLock`s — so
+/// it is unit-testable without racing every other test in this binary for the
+/// one-shot env read.
+fn force_interpret_matches(
+    deny: Option<&[String]>,
+    bisect_only: Option<&[String]>,
+    class_name: &str,
+    method_name: &str,
+) -> bool {
+    if let Some(filter) = deny {
+        let sig = format!("{class_name}.{method_name}");
+        if filter.iter().any(|f| sig.contains(f.as_str())) {
+            return true;
+        }
+    }
+    bisect_only.is_some_and(|prefixes| !prefixes.iter().any(|p| class_name.starts_with(p.as_str())))
+}
+
 /// Diagnostic: number of `try_compile` calls short-circuited because
 /// the method was already bail-listed.  Each short-circuit saves the
 /// ~50µs we'd otherwise have spent re-running scan/IR/lowering only to
@@ -12282,18 +12402,13 @@ pub fn try_compile_with_invokespecial_resolver(
     // JIT-compiled) so a single suspect compiled method can be isolated
     // from the rest of a workload's JIT-compiled code, without disabling
     // JIT wholesale. No-op unless the env var is set.
-    if jit_deny_filter().is_some_and(|filter| {
-        let sig = format!("{}.{}", cached.class_name, cached.method_name);
-        filter.iter().any(|f| sig.contains(f.as_str()))
-    }) {
-        return None;
-    }
-
-    // `CRATONVM_JIT_BISECT_ONLY` — the inverse: only the listed class-name
-    // prefixes stay JIT-eligible. No-op unless set.
-    if jit_bisect_only_filter()
-        .is_some_and(|prefixes| !prefixes.iter().any(|p| cached.class_name.starts_with(p.as_str())))
-    {
+    //
+    // `CRATONVM_JIT_BISECT_ONLY` is the inverse: only the listed class-name
+    // prefixes stay JIT-eligible. Both now live in `jit_force_interpret`, so
+    // the eager first-call and OSR codegen paths — which do NOT come through
+    // this function — can apply the identical predicate. See that function for
+    // why sharing it matters.
+    if jit_force_interpret(&cached.class_name, &cached.method_name) {
         return None;
     }
 
@@ -13420,6 +13535,16 @@ fn try_compile_inner(
         // unconditionally rather than only under the long gate.
         let ptypes = ir_param_types(&cached.method_descriptor, cached.is_static);
         builder.set_param_types(&ptypes);
+        // COV-03: admit `J` / `F`+`D` INSTANCE FIELD accesses from the same two
+        // flags this admission chain evaluates. A wide field is the one way a
+        // category-2 or FP value can enter the graph with no category-2/FP
+        // OPCODE in the body (`getfield J; invokestatic (J)V` has neither), so
+        // `method_uses_category2` / `method_uses_fp` would admit such a method
+        // with the long/FP tier off and the builder would then produce
+        // `IrType::Long`/`Double` nodes it does not support. Telling the builder
+        // directly keeps the premise those gates rest on true rather than
+        // assuming it.
+        builder.set_wide_field_gates(ir_emit_long, ir_emit_fp);
         if ir_emit_long || ir_emit_fp {
             // inc 26 (long) / inc 35 (double): resolve `ldc2_w` constants to
             // `(pc → (bits, is_double))` so the builder lowers a `long` to
@@ -13439,6 +13564,154 @@ fn try_compile_inner(
                     builder.set_ldc2w_info(lm);
                 }
             }
+        }
+        // cov-01 increment 1: resolve `ldc`/`ldc_w` (0x12/0x13) constants for
+        // the IR builder. `getstatic` + `ldc`/`ldc_w` was 189 of the 273
+        // opcode-gap events measured on 2026-08-03 — 69% of every opcode the
+        // optimizing builder had no arm for
+        // (`docs/known-issues/c2/ir-coverage-survey-20260803.md`).
+        //
+        // Three site kinds, three tables, all fed from the SAME resolver the
+        // single-pass backend uses — this lane consumes a table the caller
+        // already computes, it does not resolve a constant pool:
+        //
+        //   * `Immediate` → `(bits, is_float)`. A constant node and nothing
+        //     else: no memory edge, no safepoint, no GC interaction. An `int`
+        //     constant is admitted unconditionally; a `float` constant only
+        //     under `ir_emit_fp`, mirroring the `ldc2_w` gate directly above —
+        //     the builder would otherwise emit an `Op::ConstF`/`Float` into a
+        //     graph the FP tier is switched off for.
+        //   * `String` → the interned-literal SITE (`bytes`, `len`), not a
+        //     reference: the value is materialised by `helpers.ldc_string` on
+        //     every execution, because an `ObjectRef` baked at compile time can
+        //     relocate between two runs of the body.
+        //   * `ClassMirror` → the CP-indexed site, served by
+        //     `helpers.ldc_class_cp` for the same reason plus one more:
+        //     resolution can load a class, which runs arbitrary Java.
+        //
+        // A pc absent from all three (no resolver, a `MethodHandle` /
+        // `MethodType` / condy entry, an unwired class helper, or a float with
+        // the FP gate off) makes the builder's 0x12/0x13 arm bail that method
+        // to single-pass — the pre-existing behaviour, only narrower.
+        //
+        // Keep-alive for the string-literal bytes whose ADDRESS the lowered
+        // body bakes as an imm64. Moved onto the finished `CompiledMethod`
+        // below, next to the `Op::Call` info boxes, so the pointer cannot
+        // outlive its pointee.
+        let mut ir_ldc_strings: Vec<Box<str>> = Vec::new();
+        // cov-05: keep-alive for `instanceof`/`checkcast` target class-name
+        // bytes, same obligation as `ir_ldc_strings` immediately above (the
+        // lowered body bakes the ADDRESS as an imm64 argument to
+        // `helpers.instanceof_check`/`helpers.checkcast`). Populated below,
+        // near the `new_info` / `anewarray_info` construction they share a
+        // resolver with.
+        let mut ir_instanceof_strings: Vec<Box<str>> = Vec::new();
+        let mut ir_checkcast_strings: Vec<Box<str>> = Vec::new();
+        // cov-05: `jit_checkcast`'s definitive-refusal path constructs a
+        // `ClassCastException` through `jit_thread_mut()` (the JIT_THREAD
+        // TLS), same requirement `jit_getstatic`'s `<clinit>` has — the
+        // `!has_dispatch` fast entry never sets that TLS. Set below, near
+        // where the `getstatic` lane sets the same flag for the same reason.
+        let mut ir_needs_dispatch_for_checkcast = false;
+        if !scan.ldc_ops.is_empty() {
+            if let Some(resolver) = cp_ldc_resolver {
+                let mut imm: std::collections::HashMap<usize, (i64, bool)> =
+                    std::collections::HashMap::new();
+                let mut strs: std::collections::HashMap<usize, (usize, usize)> =
+                    std::collections::HashMap::new();
+                let mut classes: std::collections::HashMap<usize, (u32, u16)> =
+                    std::collections::HashMap::new();
+                for &(pc, cp_idx) in &scan.ldc_ops {
+                    match resolver(cp_idx) {
+                        Some(JitLdcConstant::Immediate { bits, is_float }) => {
+                            if !is_float || ir_emit_fp {
+                                imm.insert(pc, (bits, is_float));
+                            }
+                        }
+                        Some(JitLdcConstant::String(text)) => {
+                            let boxed: Box<str> = text.into_boxed_str();
+                            strs.insert(pc, (boxed.as_ptr() as usize, boxed.len()));
+                            ir_ldc_strings.push(boxed);
+                        }
+                        Some(JitLdcConstant::ClassMirror {
+                            holder_class_id,
+                            cp_idx,
+                        }) => {
+                            // `ldc_class_cp` is an OptionalPtr — a hand-built
+                            // test helper table leaves it 0. Omit the site
+                            // rather than plan a CALL to address 0; the builder
+                            // then bails the method, exactly as the single-pass
+                            // arm does for the same condition.
+                            if helpers.ldc_class_cp != 0 {
+                                classes.insert(pc, (holder_class_id, cp_idx));
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                builder.set_ldc_info(imm);
+                builder.set_ldc_string_info(strs);
+                builder.set_ldc_class_info(classes);
+            }
+        }
+        // cov-01 increment 4: resolve `getstatic` (0xb2) sites for the IR
+        // builder — the largest single opcode in the survey (92 events). Same
+        // resolver and same `(class_id, field_index, type_tag, is_volatile)`
+        // tuple the single-pass backend's 0xb2 arm consumes; an unresolvable
+        // site is omitted and the builder bails that method.
+        //
+        // `putstatic` (0xb3) is deliberately NOT fed. The single-pass backend
+        // keeps it on `jit_putstatic_*` because a static reference WRITE owes
+        // an SATB pre-barrier that no collector `set_field` barrier covers —
+        // statics live in a Rust-side table, not the heap — and a missed one is
+        // a hidden-pointer SATB hole. This lane owns the read arm only.
+        //
+        // The class ids this collects are ALSO recorded on the finished
+        // artifact (`static_init_classes`, below), because compiled code reads
+        // static storage directly and the interpreter's compiled-entry path is
+        // what ensure-initializes the declaring classes once per artifact.
+        //
+        // The VALUE TIER is gated here and not in the builder, because this is
+        // the only place that knows the width. `getstatic` is polymorphic: it
+        // is listed by neither `is_category2_opcode` nor `is_float_opcode`, so
+        // a method whose only wide or floating-point content is a static read
+        // has `method_uses_category2() == false` and `fp_in_body() == false`,
+        // and is admitted to the optimizing pipeline through the INT clause.
+        // Feeding it a `J` site with `ir_emit_long` off would then put a `Long`
+        // node in a graph the long tier is switched off for, and a `D`/`F` site
+        // an FP node with the FP tier off.
+        //
+        // Same shape as the float half of the `ldc` feed above, and as the
+        // `ldc2_w` feed's `if ir_emit_long || ir_emit_fp`: the party that
+        // resolved the width is the party that decides. A gated-off site is
+        // simply absent, so the builder's 0xb2 arm bails that method to
+        // single-pass, which compiles every width.
+        let mut ir_static_init_classes: Vec<u32> = Vec::new();
+        if !scan.static_field_ops.is_empty() {
+            if let Some(resolver) = cp_static_field_resolver {
+                let mut sm = std::collections::HashMap::with_capacity(scan.static_field_ops.len());
+                for &(pc, cp_idx) in &scan.static_field_ops {
+                    if let Some((class_id, field_index, type_tag, is_volatile)) = resolver(cp_idx) {
+                        let admitted_by_value_tier = match type_tag {
+                            b'J' => ir_emit_long,
+                            b'D' | b'F' => ir_emit_fp,
+                            _ => true,
+                        };
+                        if admitted_by_value_tier {
+                            sm.insert(pc, (class_id, field_index, type_tag, is_volatile));
+                        }
+                        // Recorded regardless of the value tier: this list is
+                        // the ensure-init obligation, which the declaring class
+                        // owes whether or not the IR lowers the read. It also
+                        // matches the single-pass artifact, which records every
+                        // static site including every `putstatic`.
+                        ir_static_init_classes.push(class_id);
+                    }
+                }
+                builder.set_static_field_info(sm);
+            }
+            ir_static_init_classes.sort_unstable();
+            ir_static_init_classes.dedup();
         }
         // Thread the resolved instance-field layout (pc → (field_index,
         // type_tag)) into the builder so it can lower an int-category
@@ -13505,6 +13778,65 @@ fn try_compile_inner(
                 builder.set_new_info(new_info_map, trivial_init_pcs);
             }
         }
+        // cov-05: resolve `checkcast` (0xc0) / `instanceof` (0xc1) sites for
+        // the IR builder — 306 events, the largest single whole-method
+        // refusal in the survey, more than every opcode gap combined:
+        // `docs/known-issues/c2/cov-05-checkcast-and-instanceof.md`.
+        //
+        // Admits a site ONLY when its target class is already resolved and
+        // loaded at compile time. `cp_new_resolver` already answers exactly
+        // that question for `new`/`anewarray` — `Resolved` means the
+        // CONSTANT_Class entry's target is loaded, `Deferred`/`None` means it
+        // is not (or the entry is malformed) — and a checkcast/instanceof CP
+        // entry is the identical CONSTANT_Class shape, so this reuses that
+        // resolver rather than adding a new one. `num_fields`/the two init
+        // flags `Resolved` also carries are irrelevant here and discarded;
+        // only "loaded or not" is read.
+        //
+        // A site that resolves `Deferred` (or has no resolver at all) is
+        // simply omitted from `checkcast_info`/`instanceof_info`, so the
+        // builder's 0xc0/0xc1 arm bails THAT site — and so the method — to
+        // single-pass, which resolves lazily via `jit_typecheck_resolve`'s
+        // not-yet-loaded slow path. That path can run a user classloader's
+        // `loadClass`/`findClass`, arbitrary Java this tier does not host
+        // inside a helper call — see the admission comment in `ir.rs`.
+        //
+        // `scan.typecheck_ops` is `checkcast_ops ∪ instanceof_ops`; a pc is
+        // routed to `checkcast_info` iff it is also in `scan.checkcast_ops`,
+        // else to `instanceof_info` — the two are no longer mutually
+        // exclusive at the whole-method level as of cov-05 (a method may
+        // contain both), unlike the pre-cov-05 shape where `checkcast_ops`
+        // non-empty refused the whole method upstream.
+        if !scan.typecheck_ops.is_empty() {
+            if let (Some(new_resolver), Some(name_resolver)) =
+                (cp_new_resolver, cp_class_name_resolver)
+            {
+                let checkcast_pcs: std::collections::HashSet<usize> =
+                    scan.checkcast_ops.iter().map(|&(pc, _)| pc).collect();
+                let mut cc_im = std::collections::HashMap::new();
+                let mut io_im = std::collections::HashMap::new();
+                for &(pc, cp_idx) in &scan.typecheck_ops {
+                    if matches!(new_resolver(cp_idx), Some(JitNewSite::Resolved { .. })) {
+                        if let Some(name) = name_resolver(cp_idx) {
+                            let boxed: Box<str> = name.into_boxed_str();
+                            let entry = (boxed.as_ptr() as usize, boxed.len());
+                            if checkcast_pcs.contains(&pc) {
+                                cc_im.insert(pc, entry);
+                                ir_checkcast_strings.push(boxed);
+                            } else {
+                                io_im.insert(pc, entry);
+                                ir_instanceof_strings.push(boxed);
+                            }
+                        }
+                    }
+                }
+                if !cc_im.is_empty() {
+                    ir_needs_dispatch_for_checkcast = true;
+                }
+                builder.set_checkcast_info(cc_im);
+                builder.set_instanceof_info(io_im);
+            }
+        }
         // Gap B / inc 22: invokestatic → `Op::Call`. Only when the IR-call gate
         // is on AND the method has no `new`/array allocation (a surviving `New`
         // would need the allocation path the lowerer lacks; array ops bail the
@@ -13546,14 +13878,93 @@ fn try_compile_inner(
         // ON; it can no longer force it off. See the design doc for the matching
         // `vm/src/runtime/env_cache.rs` cleanup.
         let ir_emit_virtual_calls = ir_virtual_calls_enabled(ir_emit_virtual_calls);
+        // cov-04 census. The invoke bails in `IrBuilder::build` report a line
+        // number and a bytecode pc; neither says *which callee*, and the whole
+        // first increment of
+        // `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`
+        // was "group them by callee before writing code". Under
+        // `CRATONVM_DBG=ir-compiles` (or `jitc`) hand the builder a
+        // diagnostic-only `pc → "0xNN cn.mn desc"` map so each bail names its
+        // callee, and print the method-level facts that decide whether
+        // `invoke_info` is populated at all. Costs nothing when the flag is off:
+        // the resolver is not called and no string is built.
+        if ir_stage_reporting() && !scan.invoke_ops.is_empty() {
+            if let Some(resolver) = cp_invoke_resolver {
+                let mut labels: std::collections::HashMap<usize, Box<str>> =
+                    std::collections::HashMap::with_capacity(scan.invoke_ops.len());
+                for &(pc, cp_idx, opcode) in &scan.invoke_ops {
+                    if let Some((cn, mn, desc)) = resolver(cp_idx) {
+                        labels.insert(
+                            pc,
+                            format!("{opcode:#04x} {cn}.{mn}{desc}").into_boxed_str(),
+                        );
+                    }
+                }
+                builder.set_invoke_labels(
+                    labels,
+                    format!(
+                        "{}.{}{}",
+                        cached.class_name, cached.method_name, cached.method_descriptor
+                    )
+                    .into_boxed_str(),
+                );
+            }
+            eprintln!(
+                "[ir] invoke-plan {}.{}{}: sites={} new_ops={} anewarray_ops={} \
+                 gates(static={ir_emit_calls} special={ir_emit_special_calls} \
+                 virtual={ir_emit_virtual_calls}) call_eligible={}",
+                cached.class_name,
+                cached.method_name,
+                cached.method_descriptor,
+                scan.invoke_ops.len(),
+                scan.new_ops.len(),
+                // `new_ops` is reported but is NOT part of `call_eligible` any
+                // more (cov-04 increment 2). It stays in the line because it is
+                // what the pre-fix measurement keyed on, so the two runs remain
+                // comparable — but this field must keep matching the predicate
+                // below, or the census reports a gate that is not the gate.
+                scan.anewarray_ops.len(),
+                scan.anewarray_ops.is_empty(),
+            );
+        }
         if (ir_emit_calls || ir_emit_special_calls || ir_emit_virtual_calls)
             && !scan.invoke_ops.is_empty()
         {
             if let Some(resolver) = cp_invoke_resolver {
-                let call_eligible = scan.new_ops.is_empty() && scan.anewarray_ops.is_empty();
+                // cov-04. This used to also require `scan.new_ops.is_empty()`,
+                // on the premise that "a surviving `New` would need the
+                // allocation path the lowerer lacks". `ir_lower` grew that path
+                // — its `Op::New` arm goes through the shared
+                // compact-layout/TLAB-aware `jit_new_object` stub, the same
+                // helper the single-pass backend's `0xbb` uses, and it already
+                // refuses (`helpers.new_object == 0`) rather than emitting a
+                // call through address zero. So the term outlived its reason,
+                // and it was the single largest cause of an invoke refusal
+                // measured: 79 compiles lost `invoke_info` to it, producing 39
+                // of the 68 invoke bails — including all 13 at the `0xb6`/`0xb8`
+                // arm and both at `0xb9`, whose callees are ordinary
+                // perfectly-resolvable methods that were never the problem.
+                //
+                // `anewarray` stays: `IrBuilder::build` has no `0xbd` arm at
+                // all, and `ir_compatible` refuses such methods one stage
+                // earlier anyway (that conjunct is `cov-06`'s, not this lane's).
+                //
+                // An allocation that reaches an `Op::Call` as an argument is
+                // arg-escaped by the escape analysis, so it is really allocated
+                // rather than scalar-replaced — see `build_connection_graph`'s
+                // `Op::Call` arm.
+                let call_eligible = scan.anewarray_ops.is_empty();
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     let mut all_emittable = true;
+                    // cov-04 census: which site, and which of the five
+                    // conditions below, turned `all_emittable` off. Only built
+                    // under the debug flag; `all_emittable` is the real state.
+                    // The distinction matters because a single non-emittable
+                    // site discards `invoke_info` for the WHOLE method, so the
+                    // builder then bails on whichever invoke comes FIRST — which
+                    // is rarely the site that caused it.
+                    let mut nonemittable: Option<String> = None;
                     // Follow-up to the fib44 fix: when
                     // `CRATONVM_JIT_IR_SELFREC_DIRECT` is on, an eligible
                     // self-recursive static call is emitted as a DIRECT self-call
@@ -13583,29 +13994,67 @@ fn try_compile_inner(
                             || ((is_virtual || is_interface) && ir_emit_virtual_calls))
                         {
                             all_emittable = false;
+                            if ir_stage_reporting() {
+                                nonemittable =
+                                    Some(format!("pc={pc}: gate off for opcode {opcode:#04x}"));
+                            }
                             break;
                         }
                         let (cn, mn, desc) = match resolver(cp_idx) {
                             Some(t) => t,
                             None => {
                                 all_emittable = false;
+                                if ir_stage_reporting() {
+                                    nonemittable = Some(format!(
+                                        "pc={pc}: cp_invoke_resolver declined cp_idx={cp_idx}"
+                                    ));
+                                }
                                 break;
                             }
                         };
-                        // A `<init>` `invokespecial` is never a real `Op::Call`
-                        // here: a constructor is only ever handled by the
-                        // scalar-new elision path (`trivial_init_pcs`), and
-                        // eliding vs. calling a ctor are different transforms.
-                        // (Belt-and-braces — a `<init>`-bearing method also has
-                        // a `new`, so `call_eligible` is already false.)
-                        if is_special && mn == "<init>" {
-                            all_emittable = false;
-                            break;
-                        }
+                        // cov-04. This used to read
+                        //
+                        //     if is_special && mn == "<init>" { all_emittable = false; break; }
+                        //
+                        // on the premise that "a constructor is only ever
+                        // handled by the scalar-new elision path, and a
+                        // `<init>`-bearing method also has a `new`, so
+                        // `call_eligible` is already false". The second half of
+                        // that is simply not true, and the measurement says so:
+                        // 35 of the compiles this term disabled had **no `new`
+                        // at all** — they were compiled CONSTRUCTORS, whose
+                        // `super(...)` / `this(...)` chain call is an
+                        // `invokespecial` to `<init>` on `this`. Eliding one is
+                        // never an option (the receiver is a parameter, not a
+                        // fresh `Op::New`), so this term was not choosing
+                        // between two transforms; it was refusing the only one.
+                        //
+                        // A `<init>` now takes the ordinary statically-bound
+                        // `invoke_kind == 1` route, which is exactly what the
+                        // single-pass backend already emits for every
+                        // non-elidable constructor call (see the
+                        // `cp_elidable_init_resolver` rewrite below, whose
+                        // `else` arm is this same dispatch). The builder still
+                        // prefers ELISION whenever the pc is elidable and the
+                        // receiver is a fresh `Op::New`, so scalar replacement
+                        // is unaffected — see `IrBuilder::build`'s `0xb7` arm.
+                        //
+                        // What a `<init>` may NOT do is take the direct-call
+                        // path below: `direct_target` bakes an entry this
+                        // compile resolved by running `callee_compiler`, and
+                        // making every constructor site compile its callee is a
+                        // compile-time and recursion-cycle change this lane did
+                        // not measure. Constructors keep helper dispatch.
+                        let is_ctor = is_special && mn == "<init>";
                         let (desc_args, ret) = match static_call_shape(&desc) {
                             Some(t) => t,
                             None => {
                                 all_emittable = false;
+                                if ir_stage_reporting() {
+                                    nonemittable = Some(format!(
+                                        "pc={pc}: static_call_shape refused {cn}.{mn}{desc}"
+                                    ));
+                                }
                                 break;
                             }
                         };
@@ -13641,6 +14090,11 @@ fn try_compile_inner(
                             // it on the IR path with a direct self-call instead
                             // (invoke_kind 4 below).
                             all_emittable = false;
+                            if ir_stage_reporting() {
+                                nonemittable = Some(format!(
+                                    "pc={pc}: self-recursive wide return {cn}.{mn}{desc}"
+                                ));
+                            }
                             break;
                         }
                         // Every kind except `invokestatic` marshals the receiver
@@ -13693,7 +14147,7 @@ fn try_compile_inner(
                         //    `callee_compiler` call). Without this a super call
                         //    could be bound to the wrong method body.
                         let mut direct_target: Option<(usize, bool)> = None;
-                        if ir_direct && (is_static || is_special) && !is_self_recursive {
+                        if ir_direct && (is_static || is_special) && !is_ctor && !is_self_recursive {
                             let special_owner: Option<String> = if is_special {
                                 cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx))
                             } else {
@@ -13846,7 +14300,27 @@ fn try_compile_inner(
                         ir_ic_slots.clear();
                         ir_mic_boxes.clear();
                         ir_pic_boxes.clear();
+                        if ir_stage_reporting() {
+                            eprintln!(
+                                "[ir] invoke-plan {}.{}{}: NO invoke_info — {}",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                nonemittable
+                                    .as_deref()
+                                    .unwrap_or("no emittable invoke site found"),
+                            );
+                        }
                     }
+                } else if ir_stage_reporting() {
+                    eprintln!(
+                        "[ir] invoke-plan {}.{}{}: NO invoke_info — call_eligible=false \
+                         (anewarray_ops={})",
+                        cached.class_name,
+                        cached.method_name,
+                        cached.method_descriptor,
+                        scan.anewarray_ops.len(),
+                    );
                 }
             }
         }
@@ -14216,6 +14690,54 @@ fn try_compile_inner(
                             compiled._jit_strings = ir_call_strings;
                             compiled.has_dispatch = true;
                         }
+                        // cov-01: the same keep-alive obligation for an
+                        // `ldc <String>` site, whose UTF-8 bytes' ADDRESS is
+                        // baked into the body as an imm64 argument to
+                        // `helpers.ldc_string`. `append`, never assign — the
+                        // call strings may already be installed above, and
+                        // dropping either list frees memory the emitted code
+                        // still names.
+                        compiled._jit_strings.append(&mut ir_ldc_strings);
+                        // cov-05: the same keep-alive obligation for an
+                        // `instanceof`/`checkcast` target class-name site,
+                        // whose UTF-8 bytes' ADDRESS is baked into the body as
+                        // an imm64 argument to `helpers.instanceof_check` /
+                        // `helpers.checkcast`.
+                        compiled._jit_strings.append(&mut ir_instanceof_strings);
+                        compiled._jit_strings.append(&mut ir_checkcast_strings);
+                        // cov-05: see `ir_needs_dispatch_for_checkcast`'s
+                        // declaration above for why.
+                        if ir_needs_dispatch_for_checkcast {
+                            compiled.has_dispatch = true;
+                        }
+                        // cov-01 / RBC.5: compiled code reads static storage
+                        // directly, bypassing the interpreter's
+                        // `ensure_class_initialized_shared`, so the declaring
+                        // class of every static site must be initialized before
+                        // this body first runs. `x64::compile` records exactly
+                        // this list for the single-pass artifact; an IR
+                        // artifact that lowers `getstatic` owes it too, and
+                        // without it the direct (helper-free) load reads a
+                        // block whose `<clinit>` has not run.
+                        //
+                        // `append` + re-dedup for the same reason as the
+                        // callee-entry list below: assigning would discard
+                        // anything already recorded on the artifact.
+                        if !ir_static_init_classes.is_empty() {
+                            compiled
+                                .static_init_classes
+                                .append(&mut ir_static_init_classes);
+                            compiled.static_init_classes.sort_unstable();
+                            compiled.static_init_classes.dedup();
+                            // `jit_getstatic` resolves `&mut JvmThread` through
+                            // `jit_thread_mut()` to run `<clinit>`, and the
+                            // `!has_dispatch` fast entry never sets that TLS —
+                            // the `jit-clinit-gap-has-dispatch` defect, whose
+                            // single-pass fix is the
+                            // `!compiler.static_field_info.is_empty()` clause in
+                            // `x64/driver.rs`. Same helper, same requirement.
+                            compiled.has_dispatch = true;
+                        }
                         // IR direct-call lowering: record every raw JIT-to-JIT
                         // callee entry baked into this body. `_direct_callee_roots`
                         // (computed at publication) keeps the callee's executable
@@ -14511,7 +15033,10 @@ fn try_compile_inner(
         if let Some(resolver) = cp_ldc_resolver {
             for &(pc, cp_idx) in &scan.ldc_ops {
                 match resolver(cp_idx) {
-                    Some(JitLdcConstant::Immediate(v)) => ldc_info.push((pc, v)),
+                    // The single-pass backend ignores `is_float`: it pushes the
+                    // bits and the consuming opcode picks the width. See the
+                    // variant's doc for why the IR builder cannot.
+                    Some(JitLdcConstant::Immediate { bits, .. }) => ldc_info.push((pc, bits)),
                     Some(JitLdcConstant::ClassMirror {
                         holder_class_id,
                         cp_idx,
@@ -23370,7 +23895,29 @@ mod layout_constant_inventory {
         // address (`HEADER_SIZE + packed_body_offset`) — a disp32 site, so it
         // does not share the disp8 backwards-addressing hazard, but it does
         // bake the header size into machine code.
-        ("ir_lower.rs", [8, 3, 4, 0, 0, 0, 3, 0]),
+        //
+        // COV-02 added two more of each of the first two. `HEADER_SIZE`
+        // 8 -> 10: `emit_gpr_array_elem_load` and `emit_gpr_array_elem_store`,
+        // one shared displacement apiece covering every integral/reference
+        // element width (int, long, byte, char, short, ref — wide and narrow).
+        // That is deliberately ONE site per emitter rather than one per width;
+        // the header shrink has fewer places to visit, and both go through
+        // `disp::disp8_const`, so an oversized header is a build failure rather
+        // than a read before the object. `ARRAY_LENGTH_OFFSET` 3 -> 4: the
+        // `arraylength` lowering's own length load, alongside the bounds
+        // check's.
+        //
+        // cov-01 added one site on top of that, `emit_inline_getstatic`, which
+        // accounts for the fifth `SLOT_SIZE`, the fourth
+        // `FIELD_CELL_PAYLOAD32_OFFSET` and both `FIELD_CELL_PAYLOAD64_OFFSET`s
+        // (the `use` list and the site). It addresses a STATICS block, which
+        // has no object header — hence no new `HEADER_SIZE` — and reaches the
+        // cell as `field_index * SLOT_SIZE + payload_offset` from the block
+        // base, the same 16-byte `Value` cell shape
+        // `field_cell_layout_matches_value_enum` pins. It is a disp32 site
+        // (`48 8B 80 disp32` / `48 63 80 disp32`), so it does not share the
+        // disp8 backwards-addressing hazard the three array sites have.
+        ("ir_lower.rs", [10, 4, 5, 0, 0, 0, 4, 2]),
     ];
 
     fn source(file: &str) -> &'static str {
@@ -23877,5 +24424,73 @@ mod code_cache_lifetime_tests {
     fn pinning_an_unmapped_address_yields_none() {
         assert!(pin_jit_code_range_owner(0).is_none());
         assert!(pin_jit_code_range_owner(0x10).is_none());
+    }
+
+    /// The bisect levers' matching rule. Pinned as a pure function because the
+    /// live predicate reads two `OnceLock`s seeded from the environment once
+    /// per process, which no test can set reproducibly.
+    ///
+    /// The load-bearing case is the last one. `CRATONVM_DBG=jit-bisect-only`
+    /// with a prefix matching NOTHING must force EVERY method interpreted —
+    /// that is what makes "allow only X, does the crash survive?" a valid
+    /// bisect step. See `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`:
+    /// the OSR path did not consult this predicate at all, so 21 OSR bodies
+    /// compiled under exactly that setting and every bisect row read a
+    /// meaningless "no effect".
+    #[test]
+    fn bisect_levers_match_deny_by_substring_and_allow_only_by_prefix() {
+        let deny = vec!["org/h2/mvstore/MVStore.commit".to_string()];
+        assert!(force_interpret_matches(
+            Some(&deny),
+            None,
+            "org/h2/mvstore/MVStore",
+            "commit"
+        ));
+        assert!(!force_interpret_matches(
+            Some(&deny),
+            None,
+            "org/h2/mvstore/MVStore",
+            "rollback"
+        ));
+
+        // A bare package entry pins everything under it.
+        let pkg = vec!["org/keycloak/".to_string()];
+        assert!(force_interpret_matches(
+            Some(&pkg),
+            None,
+            "org/keycloak/Foo",
+            "bar"
+        ));
+
+        // Allowlist: listed prefix stays eligible, everything else does not.
+        let only = vec!["org/apache/tomcat".to_string()];
+        assert!(!force_interpret_matches(
+            None,
+            Some(&only),
+            "org/apache/tomcat/util/bcel/classfile/ConstantPool",
+            "getConstant"
+        ));
+        assert!(force_interpret_matches(
+            None,
+            Some(&only),
+            "java/io/BufferedInputStream",
+            "read"
+        ));
+
+        // Neither lever set: nothing is forced interpreted.
+        assert!(!force_interpret_matches(None, None, "any/Class", "any"));
+
+        // A prefix that matches nothing forces EVERY method interpreted.
+        let nothing = vec!["zzzNoSuchPrefix".to_string()];
+        for (c, m) in [
+            ("java/io/BufferedInputStream", "read"),
+            ("org/apache/tomcat/util/bcel/classfile/ConstantPool", "getConstant"),
+            ("AnnotationScanSplitProbe", "readBytes"),
+        ] {
+            assert!(
+                force_interpret_matches(None, Some(&nothing), c, m),
+                "bisect-only with an unmatched prefix must force {c}.{m} interpreted"
+            );
+        }
     }
 }

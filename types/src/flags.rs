@@ -563,7 +563,7 @@ pub enum BlockedAccessMode {
 ///   ROOT-VISIBILITY mechanisms, none of them moving-specific — were live only
 ///   because this default is on, so `CRATONVM_NO_MOVING_YOUNG=1` withdrew all
 ///   three at once and the opt-out lane faulted on a zeroed heap slot within
-///   seconds. See `docs/known-issues/jit/jit-no-moving-young-opt-out-unpublishes-roots.md`.
+///   seconds. See `docs/internal/jit-no-moving-young-opt-out-unpublishes-roots-CLOSED-20260803.md`.
 /// * **on, but nominally.** For two days after the flip the constant was `true`
 ///   while every cycle still diverted to the non-moving sweep
 ///   (`cycles=0 coverage_fallbacks=66`). Anything keyed on the FLAG changed

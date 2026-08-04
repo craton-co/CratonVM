@@ -121,6 +121,17 @@ pub(super) fn compile_osr_artifact(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
+    // Same reasoning one gate down, for the BISECT levers.
+    // `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY` were applied only inside
+    // `cratonvm_jit::try_compile`, and this function reaches
+    // `x64::compile_with_param_slots` directly (see the "calls the backend
+    // directly instead of going through `try_compile`" note further down), so
+    // an OSR body could be force-interpreted by neither lever. A bisect step
+    // that cannot actually stop the compile reads as an exoneration — see
+    // `cratonvm_jit::jit_force_interpret`.
+    if cratonvm_jit::jit_force_interpret(&class_name, &method_name) {
+        return None;
+    }
     // A compiled entry has no ACC_SYNCHRONIZED monitor prologue/epilogue.
     // Keep synchronized methods out of OSR until that monitor contract is
     // implemented for compiled frames.
@@ -2885,10 +2896,16 @@ pub(super) fn try_jit_upgrade_with_gate(
         let class = cm.get_class(class_id)?;
         match class.constant_pool.get(cp_idx)? {
             ConstantPoolEntry::Integer(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+                Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: *v as i64,
+    is_float: false,
+})
             }
             ConstantPoolEntry::Float(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+                Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: v.to_bits() as i64,
+    is_float: true,
+})
             }
             ConstantPoolEntry::StringReference { string_index }
                 if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
@@ -3317,10 +3334,16 @@ pub(super) fn try_jit_upgrade_with_gate(
                 let class = cm.get_class(callee_cid)?;
                 match class.constant_pool.get(cp_idx)? {
                     ConstantPoolEntry::Integer(v) => {
-                        Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+                        Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: *v as i64,
+    is_float: false,
+})
                     }
                     ConstantPoolEntry::Float(v) => {
-                        Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+                        Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: v.to_bits() as i64,
+    is_float: true,
+})
                     }
                     ConstantPoolEntry::StringReference { string_index }
                         if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
@@ -4363,10 +4386,16 @@ pub(super) fn try_jit_compile_callee_slow(
         let class = cm.get_class(cid)?;
         match class.constant_pool.get(cp_idx)? {
             ConstantPoolEntry::Integer(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate(*v as i64))
+                Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: *v as i64,
+    is_float: false,
+})
             }
             ConstantPoolEntry::Float(v) => {
-                Some(cratonvm_jit::JitLdcConstant::Immediate(v.to_bits() as i64))
+                Some(cratonvm_jit::JitLdcConstant::Immediate {
+    bits: v.to_bits() as i64,
+    is_float: true,
+})
             }
             ConstantPoolEntry::StringReference { string_index }
                 if class.constant_pool.get_utf8_wide(*string_index).is_none() =>

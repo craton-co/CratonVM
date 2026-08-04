@@ -1150,6 +1150,7 @@ mod imp {
         let mut newly = 0usize;
         let mut examined = 0usize;
         let mut unclassified = 0usize;
+        let mut roots_this_pass = 0usize;
         for tid in list_thread_tids() {
             if tid == self_tid || taken.contains(tid) {
                 continue;
@@ -1173,6 +1174,7 @@ mod imp {
                     taken.handles.push(0);
                     taken.tids.push(tid);
                     newly += 1;
+                    roots_this_pass += found;
                     XT_THREADS_TAKEN_OVER.fetch_add(1, Ordering::Relaxed);
                     XT_ROOTS_FOUND.fetch_add(found as u64, Ordering::Relaxed);
                     // See the Windows arm: a frozen peer's conservatively
@@ -1205,6 +1207,15 @@ mod imp {
         if unclassified > 0 {
             XT_CYCLES_WITH_UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
         }
+        // Publish this cycle's coverage where the SWEEP can read it. A looping
+        // reproduction never reaches the shutdown summary these counters were
+        // previously only visible in, and the question "did this sweep mark
+        // from a complete root set?" has to be answerable per sweep.
+        cratonvm_gc::gc_quiescence::publish_xt_pass(
+            newly as u64,
+            unclassified as u64,
+            roots_this_pass as u64,
+        );
         if taken.tids.is_empty() {
             ACTIVE.store(false, Ordering::Release);
             RANGES_LEN.store(0, Ordering::Release);
@@ -1328,6 +1339,7 @@ mod imp {
                 cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
             );
         }
+        cratonvm_gc::gc_quiescence::publish_xt_helper_window(windows as u64, found_total as u64);
         if dbg() {
             eprintln!(
                 "[xt-jit-roots] linux helper-window pass: examined {examined} blocked peer(s), {windows} window(s), {found_total} conservative root(s)"

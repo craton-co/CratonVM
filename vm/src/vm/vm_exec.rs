@@ -3514,7 +3514,7 @@ impl<'a> NativeContextImpl<'a> {
     /// only for those. A process-wide probe budget bounds a workload that
     /// really does park with `Object` locals.
     ///
-    /// See `docs/known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md`.
+    /// See `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
     fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
         static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         const PROBE_BUDGET: u64 = 200_000;
@@ -9140,6 +9140,37 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     #[track_caller]
     fn array_length(&self, obj: ObjectRef) -> usize {
+        // KINDOF-SENTINEL: `obj` reaches this native accessor from callers
+        // (e.g. `native-collections`' `map_state`, which validates a bucket
+        // array via `heap_kind_of` and then calls this several lines later)
+        // that treat an earlier validation as still good at the point of
+        // use. Observed once with `obj` as the all-ones sentinel
+        // `0xFFFFFFFFFFFFFFFF` — not a stale-but-plausible address, and not
+        // reachable through any conservative-root-scan path (those all
+        // filter through `is_object_address`, which this call chain does
+        // not). `load_and_forward`'s very first read (`header.is_forwarded()`)
+        // dereferences the raw pointer unconditionally, so an invalid `obj`
+        // here is a hard crash rather than a wrong answer. Validate before
+        // touching memory at all, and fall back to the same "not an array"
+        // diagnostic path already used below for a live-but-wrong-kind object.
+        if self
+            .shared
+            .mem
+            .heap
+            .is_object_address(obj.as_ptr() as usize)
+            .is_none()
+        {
+            if crate::runtime::env_cache::dbg_arrlen() {
+                let loc = std::panic::Location::caller();
+                eprintln!(
+                    "[ARRAY-LEN-GUARD] obj is not a valid heap address rust-caller={}:{} obj={:?}",
+                    loc.file(),
+                    loc.line(),
+                    obj
+                );
+            }
+            return 0;
+        }
         let obj = self.shared.mem.heap.load_and_forward(obj);
         let kind = self.shared.mem.heap.kind_of(obj);
         if kind != ObjectKind::Array {
@@ -11721,6 +11752,31 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                 .threads
                 .thread_registry
                 .set_interrupted(tid, true);
+            // Wake a target parked in `Object.wait()`, for the same reason the
+            // `LockSupport.park` unpark below exists: `interrupt()` only sets a
+            // flag, and `Monitor::wait` can observe it no sooner than its next
+            // 5 ms poll slice. `Object.wait()` was the one blocking primitive
+            // left without a prompt wake — a thread interrupted while waiting
+            // sat in the condvar for up to a full slice before throwing
+            // `InterruptedException`, and an untimed wait had nothing but that
+            // poll to end it.
+            //
+            // The registry already records which monitor a thread is parked on
+            // (written for JMX right before the park, taken right after), so the
+            // target is identified without a new side table. The wake consumes
+            // no pending notification, and a `Some` that has already gone stale
+            // costs one spurious wakeup, which `Object.wait()` permits.
+            if let Some(monitor_obj) = self
+                .shared
+                .threads
+                .thread_registry
+                .peek_jmx_waiting_monitor(tid)
+            {
+                self.shared
+                    .threads
+                    .monitors
+                    .wake_waiters_for_interrupt(monitor_obj);
+            }
         }
         // Match HotSpot `Thread.interrupt0`: wake the target if it is parked in
         // `LockSupport.park` (e.g. AQS `ConditionObject.await`). Without this the
@@ -22250,7 +22306,7 @@ fn invoke_on_class_shared_inner(
                 // `TestMultiThread.testConcurrentUpdate @pc=252` — the
                 // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
                 // docs/known-issues/h2/
-                // bug-h2-blocked-frame-classid0-dispatch-miss.md.
+                // bug-h2-classid0-stale-address-family.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
                     crate::memory::reclaim_guard::report_reclaimed_receiver(
                         shared,
@@ -23374,6 +23430,43 @@ mod tests {
             new,
             "monitor_on_exit must be forwarded, or the implicit monitorexit \
              releases a vacated address"
+        );
+    }
+
+    /// KINDOF-SENTINEL (2026-08-03): `NativeHeapAccess::array_length` used to
+    /// dereference `obj` unconditionally via `load_and_forward` before ever
+    /// checking it pointed at real heap memory. Observed once in the wild as
+    /// a `native-collections::map_state` bucket-array reference that had
+    /// gone from a validated `ObjectKind::Array` to the all-ones sentinel
+    /// `0xFFFFFFFFFFFFFFFF` by the time this accessor read it — an
+    /// `EXCEPTION_ACCESS_VIOLATION` reading exactly that address. Whatever
+    /// corrupted the value upstream, `array_length` itself must not crash on
+    /// an invalid pointer: it has an established "not an array" fallback
+    /// (returns 0) for a *live* non-array object, and an invalid address
+    /// must take that same safe path rather than a hard fault.
+    #[test]
+    fn array_length_rejects_an_invalid_object_pointer_instead_of_faulting() {
+        let shared = test_shared();
+        let tid = ThreadId(0x7603);
+        let mut thread = JvmThread::new(tid, "kindof-sentinel-test");
+
+        let ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        // SAFETY: deliberately constructing an invalid ObjectRef to prove
+        // `array_length` validates before dereferencing — never dereferenced
+        // as a real pointer if the fix holds. 8-byte aligned (unlike the
+        // observed all-ones sentinel) only to clear `ObjectRef::from_raw`'s
+        // `debug_assert_aligned`, which is compiled out in the release build
+        // where the real crash was observed; `is_object_address` rejects
+        // this for being outside every heap region, the same rejection path
+        // an unaligned address takes.
+        let sentinel = unsafe { ObjectRef::from_raw(0xFFFF_FFFF_FFFF_FFF8u64 as *mut u8) };
+        assert_eq!(
+            ctx.array_length(sentinel),
+            0,
+            "an invalid pointer must fall back to 0, not fault"
         );
     }
 

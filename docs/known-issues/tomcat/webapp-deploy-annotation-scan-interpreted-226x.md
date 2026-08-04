@@ -8,6 +8,27 @@
 | **CratonVM** | FAIL (timing only — no wrong results, no crash) |
 | **Discovered** | 2026-08-03, after fixing the `seek0`/`ExpandWar` defect that had been masking it (`docs/internal/fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md`) |
 
+> **Update 2026-08-03 — two corrections, neither of which closes this doc.**
+>
+> 1. **The compiled-method census below is stale.** Re-run on merged `dev`
+>    `5e1f7d6e3` over the same `AnnotationScanCostProbe` scan,
+>    `CRATONVM_DBG=jit-compiled` lists **21 methods, two of them `<init>`**
+>    (`ConstantUtf8.<init>`, `ConstantClass.<init>`), not "eight, zero
+>    `<init>`". `Constant.readConstant`, `ConstantUtf8.getInstance` and
+>    `Utility.getClassName` compile now too. So **"the parse is never compiled"
+>    and "zero constructors" are both out of date**, and § Root cause — which
+>    argues from them — must be re-derived before it is planned against. What
+>    is still absent is exactly the frame `--stack-dump-on-timeout` puts on
+>    top: `BufferedInputStream.read`, `DataInputStream.readUnsignedByte`,
+>    `ClassParser.parse`, `ConstantPool.<init>` — i.e. the `synchronized` /
+>    lock-bearing bodies, which is doc 31's subject, not an admission ban.
+> 2. **A separate degradation term was found and fixed**, and it is not in this
+>    doc's model at all: the cost is not flat, it *rises* within one process.
+>    See [loader-latch-degrades-every-deploy.md](loader-latch-degrades-every-deploy.md).
+>    Defining one class through any user-defined loader used to make the whole
+>    VM ~1.8x slower permanently. Fixed; worth 3.5x on the probe and **nothing
+>    measurable on the test classes**, which is why this doc stays OPEN.
+
 ## Symptom
 
 `org.apache.catalina.manager.TestManagerWebapp` fails 2 of its 3 methods on
@@ -69,6 +90,45 @@ the three rounds because the whole parse is only ~2 ms there.
 So the JAR/zip/inflate path is fine (`probes/JarEntryReadCostProbe.java`: 30.5
 vs 62.7 MiB/s entry reads, raw `Inflater` 938 vs 1254 MiB/s — both under 2x).
 The cost is the per-byte class-file parse.
+
+## Where the cost is, decomposed (2026-08-04)
+
+> This section supersedes § Root cause below on the question of *what* is slow.
+> That section's shape — "this code never got compiled" — survives, but it
+> names the wrong code, and the difference decides which fix is worth building.
+
+`probes/AnnotationScanSplitProbe.java` runs five stages over the **same
+in-memory class bytes**, each loop inlined into a named static method (never a
+lambda — see the harness note in that file). 156 classes, 328 KiB,
+steady-state round, ns/byte:
+
+| stage | what it does | HotSpot | CratonVM |
+|---|---|---|---|
+| `parseMem` | `ClassParser.parse()` — construction + I/O chain | 4.8 | **982** |
+| `readBytes` | `DataInputStream.readUnsignedByte()` per byte, **constructing nothing** | 0.3 | **971** |
+| `readRaw` | `ByteArrayInputStream.read()` per byte — one layer less | 0.5 | **376** |
+
+**`readBytes` alone is ~99% of `parseMem`.** Reading the bytes one at a time,
+allocating nothing and parsing nothing, costs essentially the whole scan. So:
+
+* it is **not** object construction, and not the constructor-compilation story
+  the § below builds on;
+* it is **not** class resolution or `new` — a per-call-site class-resolution
+  cache was scoped and then dropped on the strength of this measurement;
+* it is **not** the jar/inflate layer — `parseMem` (from a `byte[]`) matches
+  `parse` (from the jar entry stream) to within noise.
+
+It is the **per-byte I/O call chain**: ~376 ns for one
+`ByteArrayInputStream.read()` (a one-line `synchronized` method) and ~600 ns
+more for the `DataInputStream.readUnsignedByte()` wrapper, against HotSpot's
+~0.5 ns. That is exactly the frame the stack dump named all along, and it puts
+this doc in
+`../../internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`'s
+territory plus the VM-wide per-call floor — not in admission-gate territory.
+
+⚠️ The same probe **SIGSEGVs on CratonVM** in its `arrayRead` stage on the real
+Tomcat classpath — a separate, deterministic JIT miscompile:
+[`../jit/annotation-scan-arrayread-sigsegv.md`](../jit/annotation-scan-arrayread-sigsegv.md).
 
 ## Root cause: the parse is never compiled
 
@@ -152,7 +212,7 @@ compiled", not "the compiler emits bad code".
 ## Prior art
 
 This is the same wall
-`docs/internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-CLOSED.md`
+`../../internal/tomcat/04-embedded-server-throughput-wall-CLOSED.md`
 measured on 2026-07-27 (it recorded 13–16 µs per byte for the identical
 `DataInputStream`/`BufferedInputStream` operation; today's
 `ByteReadCostProbe` reads 15.0 µs) and handed to

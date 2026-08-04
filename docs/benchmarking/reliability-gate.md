@@ -37,7 +37,7 @@ bash regression-suite/perf/reliability-gate.sh check-baseline \
 
 # Judge an existing results directory after the fact.
 bash regression-suite/perf/reliability-gate.sh postflight \
-    --results regression-suite/perf/results/v1/<run-id> \
+    --results regression-suite/perf/results/v2/<run-id> \
     --baseline regression-suite/perf/cratonbench-baseline-azure-epyc.tsv
 ```
 

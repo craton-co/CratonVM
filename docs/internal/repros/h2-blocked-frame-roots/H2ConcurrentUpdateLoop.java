@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Looping standalone model of org.h2.test.db.TestMultiThread.testConcurrentUpdate,
  * for the ClassId(0) blocked-frame family
- * (docs/known-issues/h2/bug-h2-blocked-frame-classid0-dispatch-miss.md).
+ * (docs/known-issues/h2/bug-h2-classid0-stale-address-family.md).
  *
  * The real class costs ~450 s per attempt and runs ten other methods first.
  * This keeps everything the family's evidence points at and drops the rest:

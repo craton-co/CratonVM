@@ -1478,15 +1478,14 @@ impl Compiler {
         // overflowed (the driver's `if buf.overflowed() { return None; }`
         // discards the half-emitted method and falls back to the interpreter)
         // instead of asserting. The intervening block is fixed-size and small,
-        // so this can only fire on a genuine codegen bug.
-        if !(-128..=127).contains(&rel1) || !(-128..=127).contains(&rel2) {
-            self.buf.mark_overflowed();
+        // so this can only fire on a genuine codegen bug. The range check is
+        // `patch_rel8_or_bail`'s (which marks the buffer on a miss), not a
+        // second hand-rolled copy of it.
+        Self::patch_rel8_or_bail(&mut self.buf, jne1_patch, rel1);
+        Self::patch_rel8_or_bail(&mut self.buf, jne2_patch, rel2);
+        if self.buf.overflowed() {
             return;
         }
-        // Truncation: i64 -> u8 (short (rel8) branch displacement, range-checked)
-        self.buf.try_patch_byte(jne1_patch, rel1 as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
-                                                              // Truncation: i64 -> u8 (short (rel8) branch displacement, range-checked)
-        self.buf.try_patch_byte(jne2_patch, rel2 as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
 
         // Sign-extend RAX → RDX:RAX (or EAX → EDX:EAX), then IDIV.
         if is_64bit {
@@ -1523,12 +1522,7 @@ impl Compiler {
         // No-panic bail (see JNE patch checks above): a rel8 that does not fit in
         // an i8 would silently miscompile, so mark the buffer overflowed and let
         // the driver discard the method instead of asserting.
-        if !(-128..=127).contains(&rel_jmp) {
-            self.buf.mark_overflowed();
-            return;
-        }
-        // Truncation: i64 -> u8 (short (rel8) branch displacement, range-checked)
-        self.buf.try_patch_byte(jmp_after_patch, rel_jmp as u8).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+        Self::patch_rel8_or_bail(&mut self.buf, jmp_after_patch, rel_jmp);
     }
 
     // -----------------------------------------------------------------------

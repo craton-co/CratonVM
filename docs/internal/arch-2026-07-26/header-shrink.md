@@ -343,6 +343,14 @@ audit the shrink was planned from:
 - `ir_lower.rs:1186` (added 2026-07-31) — `(HEADER_SIZE + packed_body_offset) as i32`,
   the guarded inline compact `getfield` cell address (disp32, so no disp8 hazard;
   it is here because it bakes the header size into emitted machine code)
+- `ir_lower.rs::emit_inline_getstatic` (added 2026-08-03, cov-01) — the direct
+  `getstatic` read: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`
+  as a disp32, from the class's **statics block** base. It bakes the field-cell
+  arithmetic but **no** `HEADER_SIZE` term — a statics block has no object
+  header — so it is unaffected by the shrink at either target. Listed because
+  the cell shape it assumes is the same one
+  `types::heap_types::field_cell_layout_matches_value_enum` pins for instance
+  fields.
 
 Plus `jit/src/lib.rs:3210`, `:3236` (was `:3186`, `:3226` — the two closures were
 rewritten by BUG-STRING-CODER-COMPACT-20260726) —
@@ -352,6 +360,23 @@ All are value-safe at `HEADER_SIZE = 24` (24 fits signed disp8, `ARRAY_LENGTH_OF
 does not move), so **§6.6 needs no edit for the 24-byte target** — but it must be in the
 inventory before anyone attempts 16. This session added
 `ir_lower_header_offset_sites_are_inventoried_too` to `x64.rs` to close the blind spot.
+
+**2026-08-03, COV-02.** `ir_lower.rs` gained the integral and reference array
+element access it never had
+(`docs/internal/cov-02-array-element-access-RETIRED-20260803.md`), which is three more
+emission sites — and none of them is a raw narrowing cast:
+
+- `emit_gpr_array_elem_load` / `emit_gpr_array_elem_store` — one
+  `disp::disp8_const(HEADER_SIZE as i64)` per emitter, shared across every
+  element width (`int`/`long`/`byte`/`char`/`short`/`ref`, wide and narrow oops)
+- the `Op::ArrayLength` lowering arm —
+  `disp::disp8_const(ARRAY_LENGTH_OFFSET as i64)`, `MOV EAX,[RAX+12]`
+
+`disp8_const` is a `const fn` that fails the BUILD above 127, so these three are
+the first sites in this file for which "the shrink went the wrong way" is not
+representable. The eleven distinct instruction encodings deliberately share two
+displacement expressions; keep it that way, or the 16-byte attempt inherits
+eleven places to check instead of two.
 
 ### 6.7 `gc/src/tlab.rs` — the GAP_FILLER sub-header aliasing
 

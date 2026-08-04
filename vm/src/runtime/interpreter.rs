@@ -1645,8 +1645,21 @@ pub fn execute(
         // virtual thread must not enter machine code that may cross a yield.
         // This is a per-thread execution gate; platform threads still compile
         // and use the shared artifacts normally.
+        //
+        // The BISECT levers ride along here for the same reason. This block's
+        // eager first-call `x64::compile_with_param_slots` (further down)
+        // reaches the backend WITHOUT going through `cratonvm_jit::try_compile`,
+        // which is where `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY` used
+        // to be applied — so the single-pass tier was force-interpretable by
+        // neither lever, and a bisect that could not stop the compile read as
+        // an exoneration. Folded into `env_disable_jit` rather than into the
+        // static-reason group below on purpose: that group SEALS the method
+        // into `jit_skip_set`, and these are process-wide diagnostic flags, not
+        // per-method facts about the bytecode. See
+        // `cratonvm_jit::jit_force_interpret`.
         let env_disable_jit = crate::runtime::env_cache::disable_jit()
-            || matches!(thread.kind, crate::threading::ThreadKind::Virtual);
+            || matches!(thread.kind, crate::threading::ThreadKind::Virtual)
+            || cratonvm_jit::jit_force_interpret(&class_name_str, method_name);
         // Redefinition does NOT permanently bar a class from compiling.
         //
         // This used to be `class_was_redefined(shared, class_id)`. The
