@@ -1,3 +1,13 @@
+> Point-in-time dump of one suite run's non-passing classes. Rows are NOT
+> re-verified when a fix lands, so treat every entry as "was failing when this
+> was captured", not as current status.
+>
+> Known stale as of 2026-08-04:
+> `loader/spring-boot-jarmode-tools` `ExtractCommandTests` (22/22) and
+> `ExtractLayersCommandTests` (6/6) now PASS with JIT and `--nojit` — see
+> `docs/internal/fixed-suite-bugs/springboot/jarmode-tools-extract-timestamp-preservation-FIXED.md`.
+> The other four `jarmode-tools` rows below are still red and untriaged.
+
 1 CRASH
 Module	Class	Seconds
 module/spring-boot-jetty	SslServerCustomizerTests	1.4

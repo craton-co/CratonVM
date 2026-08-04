@@ -1,11 +1,12 @@
-# `SSLSocketFactory.getDefault()` "no owning SSLContext" breaks Aether/Maven artifact resolution for `ModifiedClassPathClassLoader` tests — REGRESSED
+# `SSLSocketFactory.getDefault()` "no owning SSLContext" breaks Aether/Maven artifact resolution for `ModifiedClassPathClassLoader` tests — FIXED
 
 **Status: OPEN — REGRESSED 2026-08-04.** Previously fixed and closed
 2026-07-26 (see `spring-boot-core39-residual-clusters-20260723.md`,
-"Cluster C" item 1, under "STATUS 2026-07-26: all four clusters closed").
-The exact same exception, with the exact same mechanism, reappeared in a
-2026-08-04 residual rerun across 3 classes in 3 different modules.
-
+**Status: FIXED 2026-08-04** — see "STATUS 2026-08-04: FIXED AND CLOSED" at the
+end of this page for the runtime confirmation, the fix, the two residuals it
+also closed, the five additional affected classes a cold-cache rerun found, and
+the guards. Everything above that section is the original investigation, left
+as written.
 ## Symptom
 
 Any test that uses Spring Boot test-support's `@ClassPathExclusions`/
@@ -216,3 +217,156 @@ triaging the 2026-08-04 residual rerun.
 
 (Likely affects every other `ModifiedClassPathClassLoader`-based test across
 every module, per the original fix's "VM-wide" scope claim.)
+
+---
+
+## STATUS 2026-08-04: FIXED AND CLOSED
+
+Fixed on `fix/ssf-getdefault-dup-registration-20260804`, merged to `dev`.
+The "Root cause found (second pass)" section above is correct in full — this
+section records the runtime confirmation, the fix, the two residuals it also
+closes, one finding that materially changes the blast radius, and the
+verification.
+
+### Runtime confirmation of the duplicate
+
+Read from the source, the duplicate is only a strong inference; the registry
+census proves it. `--dump-native-registry` emits one row per *registration*
+(not per slot), in registration order, each with its `#[track_caller]` site,
+so the surviving owner of a triple is the last row.
+
+Baseline (`origin/dev`, commit `c7c63d8818`):
+
+```
+javax/net/ssl/SSLSocketFactory getDefault ()Ljavax/net/SocketFactory;
+    by=native-builtins/src/phases_late/ssl_security.rs:1521  overwrote=None
+javax/net/ssl/SSLSocketFactory getDefault ()Ljavax/net/SocketFactory;
+    by=native-builtins/src/net_phase_e.rs:12069              overwrote=bridge
+```
+
+After the fix, one row, owned by `ssl_security.rs:1521`. The
+`overwrote=bridge` on the second row is the registry telling us, in the
+artefact we already emit, that a working implementation was replaced.
+
+### The fix
+
+1. **`net_phase_e.rs`** — the stale duplicate registration is deleted, with a
+   comment explaining why the *sibling* `SSLContext.getDefault()` duplicate a
+   few lines above is intentional and stays. Same bug shape as the
+   `TimeZone.getDefault()` duplicate removed 2026-08-03.
+2. **`t27_tls.rs`** — `default_ssl_context_or_create` and
+   `default_ssl_socket_factory_obj`. Three natives were each minting a
+   "default `SSLSocketFactory`" independently, which is three chances to get
+   field 0 wrong; the idiom is converted rather than the sites.
+3. **`t27_tls.rs`** — the two residuals this doc flagged for "the next pass"
+   are closed. `HttpsURLConnection.getDefaultSSLSocketFactory` (unset-default
+   fallback) and `HttpsURLConnection.getSSLSocketFactory` both minted bare
+   0-field carriers and so threw the identical exception; both now return the
+   wired carrier. Confirmed independently by `probes/SsfSurfaceProbe.java`,
+   which fails **all three** entry points on the baseline binary and passes
+   all three on the fixed one.
+4. **`ssl_security.rs`** — the layered
+   `createSocket(Socket,String,int,boolean)` overload no longer converts a
+   lost field 0 into a hard `IllegalStateException`. There is no such thing
+   as a contextless `SSLSocketFactory` in the JDK, so an empty field 0 always
+   means one of our synthetic carriers lost it, and the JDK-faithful answer is
+   the process default context — which `getDefault()` would have supplied
+   anyway. It cannot weaken trust: caller anchors are resolved by factory
+   identity (`p68_factory_trust_roots`), not through this context, and the
+   default context validates against the platform store, which is strictly
+   stricter than a permissive caller-installed `TrustManager`, never laxer.
+   This is the third time one mis-wired carrier has been converted into an
+   exception thrown before any network I/O, taking out a whole test family.
+
+### The blast radius is Maven-cache-dependent — this is why it looked arbitrary
+
+The single most useful finding of this pass, and the reason the affected-class
+list above is **incomplete**.
+
+`ModifiedClassPathClassLoader` resolves coordinates through Aether against
+`System.getProperty("user.home") + "/.m2/repository"` first, and only reaches
+the network on a miss. So an affected test **passes** whenever its coordinates
+happen to already be in the local repository, and fails only on a cold one.
+Nothing about the class distinguishes the two cases.
+
+That has two consequences worth remembering:
+
+* The 2026-08-04 residual rerun's 8 classes were not "the affected set" — they
+  were the subset whose coordinates that host had not cached. On a fresh host
+  the set is larger; on a fully warm one the bug is invisible.
+* **A warm-cache A/B is worthless here, and silently so.** During this pass a
+  83-class comparison came back `base: 83 PASS / fixed: 83 PASS`, which reads
+  as "no bug" — only because the *fixed* arm, run an hour earlier, had
+  downloaded the artifacts into the shared `~/.m2` that the baseline arm then
+  hit. Every arm must get its own cold repository (`-Duser.home=<fresh dir>`)
+  or the comparison measures download history, not the VM.
+
+Re-running the full `@ClassPathOverrides`/`@ClassPathExclusions`/
+`@ForkedClassPath` population (83 classes, found by grepping the Spring Boot
+checkout for those annotations) with a **cold repository per arm** gives the
+real picture:
+
+| arm | result |
+|---|---|
+| baseline (`origin/dev`) | **13 FAIL**, 70 PASS |
+| fixed | **83 PASS**, 0 FAIL |
+
+All 13 baseline failures carry the exact
+`IllegalStateException: SSLSocketFactory has no owning SSLContext`, and all 13
+pass on the fixed binary. Five were never listed in this doc:
+
+| Module | Class | Tests fixed |
+|---|---|---|
+| `core/spring-boot` | `org.springframework.boot.logging.log4j2.Log4J2LoggingSystemTests` | 61/61 |
+| `core/spring-boot` | `org.springframework.boot.logging.log4j2.SpringProfileArbiterTests` | 7/7 |
+| `core/spring-boot` | `org.springframework.boot.logging.logback.LogbackLoggingSystemTests` | 2/86 |
+| `core/spring-boot-autoconfigure` | `org.springframework.boot.autoconfigure.condition.ConditionalOnCheckpointRestoreTests` | 1/2 |
+| `core/spring-boot-test` | `org.springframework.boot.test.json.DuplicateJsonObjectContextCustomizerFactoryTests` | 1/1 |
+
+`SpringProfileArbiterTests` is worth calling out: the 2026-07-23 fix in
+`ssl_security.rs` is *named after it*
+(`springprofilearbitertests-ssf-getdefault-no-context`). It failing on the
+baseline binary is direct proof that the named fix had been inert since the day
+the duplicate registration was authored — not that it regressed later.
+
+### Verification
+
+| Check | Baseline (`origin/dev`) | Fixed | Control |
+|---|---|---|---|
+| `probes/SsfDefaultProbe.java` (getDefault → layered createSocket → HTTPS GET) | `FAIL-NO-OWNING-CONTEXT` | PASS, TLS13_AES_256_GCM_SHA384, HTTP 200, 9787 body bytes | real JDK 21: PASS, same 9787 bytes |
+| `probes/SsfSurfaceProbe.java` (7 checks over every factory-acquisition path) | 4 pass / **3 fail** | **7 pass / 0 fail** | real JDK 21: 7 pass / 0 fail |
+| the 8 classes listed in this doc | 8 FAIL, all with the SSF signature | **8 PASS** | HotSpot: 8 PASS, test-for-test identical |
+| all 83 `ModifiedClassPathClassLoader` classes, cold repo per arm | 13 FAIL / 70 PASS | **83 PASS** | — |
+| 177 TLS/HTTP-adjacent Spring Boot classes | 171 PASS / 1 FAIL / 5 EMPTY | identical | — |
+| `cargo test -p cratonvm-native-builtins -p cratonvm-native-api` | — | 3250 + 270 + 60 pass, 0 fail | — |
+
+The one class that moved in the 177-class slice
+(`NettyReactiveWebServerFactoryTests`, FAIL in both arms, failed 1 → 2) is a
+load-induced flake in `whenARequestIsActiveAfterGracefulShutdownEndsThen
+StopWillComplete`, not an SSL failure: three interleaved A/B repeats give
+`failed=1` on both binaries every time. Its one real failure,
+`whenSslBundleIsUpdatedThenSslIsReloaded`, is identical in both arms and is a
+separate pre-existing endpoint-identification issue.
+
+### Guards
+
+Both in `native-builtins/tests/registry_contracts.rs`, and both verified
+non-vacuous by injecting the defect and watching them fail:
+
+* `ssl_entry_points_keep_their_documented_owning_registration` — pins the
+  *surviving owner site* (not a registration count) for the three duplicated
+  `javax.net.ssl` entry points, so a deliberately-intentional duplicate stays
+  legal while a silent change of winner does not. Re-injecting the deleted
+  registration fails it, naming both competing sites.
+* `no_native_mints_a_field_less_ssl_socket_factory_carrier` — scans the four
+  TLS source files for 0-field `SSLSocketFactory` allocations, with a
+  found-count floor so a rename or a file split cannot make it pass vacuously.
+  Injecting a 0-field allocation fails it.
+
+### Note for the next duplicate-registration bug
+
+`--dump-native-registry` already answers "who owns this triple, and did they
+overwrite someone" for all ~11,900 registrations. Reading a file and finding
+the fix present proves nothing about which registration wins at runtime; the
+census does. That is the check to run first the next time a closed fix's
+symptom returns unchanged.

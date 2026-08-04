@@ -180,6 +180,11 @@ pub use null_check_elim::*;
 // declared visibility, so nothing here became more public than it was.
 mod escape_analysis;
 pub use escape_analysis::*;
+
+// PERF-01: the enumeration of what the single-pass backend can do that the
+// optimizing tier cannot. The admission chain consults it.
+mod single_pass_only;
+pub use single_pass_only::*;
 // ---------------------------------------------------------------------------
 // Integer-arithmetic LICM
 // ---------------------------------------------------------------------------

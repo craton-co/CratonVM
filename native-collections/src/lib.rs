@@ -7120,6 +7120,10 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/BiFunction;)V",
         native_map_replace_all,
     );
+    // `Map`'s three conditional mutators. `HashMap` overrides all of them with
+    // bucket-walking bodies, so without these the JDK bytecode runs over our
+    // natively-allocated nodes — see `register_map_conditional_mutators`.
+    register_map_conditional_mutators(r, c);
     r.set_category(__prev_cat);
 }
 
@@ -8787,6 +8791,241 @@ fn native_map_remove_pinned(
     }
 
     Ok(Some(Value::Object(None)))
+}
+
+// ---------------------------------------------------------------------------
+// `Map`'s three conditional mutators: remove(k,v) / replace(k,v) / replace(k,o,n)
+// ---------------------------------------------------------------------------
+//
+// `native_map_init`'s header states the premise this whole layer rests on:
+// "every observable Map method is registered as a native, so JDK bytecode for
+// `HashMap.<method>` does not run". These three were the exception. They are
+// `java.util.Map` *default* methods that `HashMap` and `Hashtable` override
+// with implementations that walk the bucket array directly, so every call ran
+// REAL JDK bytecode over a table whose nodes this native layer allocates —
+// while `ConcurrentHashMap` had all three registered (see the
+// "ConcurrentHashMap-specific methods" block in `register_chm_natives`; they
+// are not CHM-specific at all).
+//
+// On a `LinkedHashMap` that bytecode path is
+// `HashMap.remove(k,v)` -> `HashMap.removeNode` -> `LinkedHashMap.afterNodeRemoval`,
+// whose first statement is `(LinkedHashMap.Entry<K,V>) e`. Our nodes are
+// `java/util/LinkedHashMap$Node` (see `lhm_alloc_node`), so it threw
+// `ClassCastException: java.util.LinkedHashMap$Node cannot be cast to
+// java.util.LinkedHashMap$Entry`. Kafka's
+// `MetadataLoader.removeAndClosePublisher` calls exactly
+// `publishers.remove(name, publisher)` on a `LinkedHashMap` field, which failed
+// embedded-broker shutdown ("Failed to shut down embedded Kafka cluster") in
+// Spring Boot's `KafkaAutoConfigurationIntegrationTests`.
+//
+// The cast is only the loudest symptom. Even where no cast is involved (a plain
+// `HashMap`), the JDK bytecode mutates the real bucket array and `size` field
+// behind the native bookkeeping — `map_state`'s size, the LHM overlay's
+// `size`/`head`/`tail`, the integer fast-path overlay — desyncing the map.
+//
+// Each is implemented exactly as `java.util.Map`'s default: in terms of
+// `get` / `containsKey` / `put` / `remove`, which are registered and which do
+// the receiver routing (LinkedHashMap / TreeMap / ConcurrentHashMap /
+// Hashtable) themselves.
+
+/// `Hashtable` (and `Properties`) reject a null value in all three of these
+/// methods (`Objects.requireNonNull(value)` is the first statement of each);
+/// `HashMap`/`LinkedHashMap` accept null values throughout. One helper so the
+/// three natives below stay a faithful mirror of whichever override the
+/// receiver actually has.
+fn map_kv_reject_null_for_hashtable(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    value: &Value,
+    method: &str,
+) -> Result<(), MethodCallFailed> {
+    if matches!(value, Value::Object(None)) && is_hashtable_receiver(ctx, this) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(format!("Hashtable.{method}: null value")),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// `Map.remove(Object key, Object value)` — remove only if currently mapped to
+/// `value`. Mirrors the JDK default:
+/// ```text
+/// Object cur = get(key);
+/// if (!Objects.equals(cur, value) || (cur == null && !containsKey(key))) return false;
+/// remove(key);
+/// return true;
+/// ```
+fn native_map_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let expected = args.get(2).copied().unwrap_or(Value::Object(None));
+    map_kv_reject_null_for_hashtable(ctx, this, &expected, "remove")?;
+    // GC-safety: `get`/`containsKey`/`remove` each dispatch the key's
+    // `hashCode()`/`equals()` — arbitrary Java that can complete a moving young
+    // GC — so every receiver/key/value local is re-read from its pin after each
+    // call, the same discipline `native_chm_remove_kv` follows.
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let expected_pin = pin_value(ctx, expected);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let current =
+            native_map_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+        let current_pin = pin_value(ctx, current);
+        let current = read_pinned_elem(ctx, current_pin, current);
+        let expected = read_pinned_elem(ctx, expected_pin, expected);
+        if !values_equal_deep(ctx, &current, &expected)? {
+            return Ok(Some(Value::Int(0)));
+        }
+        // `get` cannot distinguish "absent" from "mapped to null"; only the
+        // null case needs the extra probe.
+        if matches!(current, Value::Object(None)) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let present = matches!(
+                native_map_contains_key(ctx, &[Value::Object(Some(this)), key])?,
+                Some(Value::Int(1))
+            );
+            if !present {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
+        Ok(Some(Value::Int(1)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// `Map.replace(K key, V value)` — replace only if the key is currently mapped,
+/// returning the previous value (or `null` when absent). Mirrors the JDK
+/// default: `if (get(key) != null || containsKey(key)) cur = put(key, value);`
+fn native_map_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let new_pin = pin_value(ctx, new_val);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let current =
+            native_map_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+        let current_pin = pin_value(ctx, current);
+        let current = read_pinned_elem(ctx, current_pin, current);
+        if matches!(current, Value::Object(None)) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let present = matches!(
+                native_map_contains_key(ctx, &[Value::Object(Some(this)), key])?,
+                Some(Value::Int(1))
+            );
+            if !present {
+                return Ok(Some(Value::Object(None)));
+            }
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let new_val = read_pinned_elem(ctx, new_pin, new_val);
+        let old = native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?
+            .unwrap_or(Value::Object(None));
+        Ok(Some(old))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// `Map.replace(K key, V oldValue, V newValue)` — compare-and-set. Mirrors the
+/// JDK default:
+/// ```text
+/// Object cur = get(key);
+/// if (!Objects.equals(cur, oldValue) || (cur == null && !containsKey(key))) return false;
+/// put(key, newValue);
+/// return true;
+/// ```
+fn native_map_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
+    map_kv_reject_null_for_hashtable(ctx, this, &old_val, "replace")?;
+    map_kv_reject_null_for_hashtable(ctx, this, &new_val, "replace")?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key);
+    let old_pin = pin_value(ctx, old_val);
+    let new_pin = pin_value(ctx, new_val);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let current =
+            native_map_get(ctx, &[Value::Object(Some(this)), key])?.unwrap_or(Value::Object(None));
+        let current_pin = pin_value(ctx, current);
+        let current = read_pinned_elem(ctx, current_pin, current);
+        let old_val = read_pinned_elem(ctx, old_pin, old_val);
+        if !values_equal_deep(ctx, &current, &old_val)? {
+            return Ok(Some(Value::Int(0)));
+        }
+        if matches!(current, Value::Object(None)) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let present = matches!(
+                native_map_contains_key(ctx, &[Value::Object(Some(this)), key])?,
+                Some(Value::Int(1))
+            );
+            if !present {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let new_val = read_pinned_elem(ctx, new_pin, new_val);
+        native_map_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+        Ok(Some(Value::Int(1)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// Register `remove(k,v)` / `replace(k,v)` / `replace(k,old,new)` on one
+/// map class. Called for every map family whose JDK class overrides them with
+/// a bucket-walking body (`HashMap`, `LinkedHashMap`, `Hashtable`);
+/// `ConcurrentHashMap` has its own segment-locked versions and `TreeMap` does
+/// not override them at all (its inherited `Map` defaults call the registered
+/// `get`/`containsKey`/`put`/`remove` natives, which is already correct).
+fn register_map_conditional_mutators(r: &mut NativeMethodRegistry, c: &str) {
+    r.register(
+        c,
+        "remove",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_map_remove_kv,
+    );
+    r.register(
+        c,
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_map_replace,
+    );
+    r.register(
+        c,
+        "replace",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_map_replace_kv,
+    );
 }
 
 fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -30199,6 +30438,11 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
         native_lhm_compute_if_absent,
     );
+    // `LinkedHashMap` inherits `HashMap`'s bucket-walking overrides of the
+    // three conditional mutators, and `HashMap.removeNode` calls
+    // `LinkedHashMap.afterNodeRemoval`, which casts the node to
+    // `LinkedHashMap$Entry` — see `register_map_conditional_mutators`.
+    register_map_conditional_mutators(registry, c);
     registry.set_category(__prev_cat);
 }
 
@@ -42941,6 +43185,13 @@ fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     registry.register(ht, "entrySet", "()Ljava/util/Set;", native_map_entry_set);
     registry.register(ht, "toString", "()Ljava/lang/String;", native_map_to_string);
     registry.register(ht, "putAll", "(Ljava/util/Map;)V", native_map_put_all);
+    // `Hashtable` (and `Properties`, which overrides them again) declare their
+    // own bucket-walking `remove(k,v)` / `replace(k,v)` / `replace(k,old,new)`.
+    // Same gap, same fix — see `register_map_conditional_mutators`. The null
+    // rejection those overrides open with is honoured by
+    // `map_kv_reject_null_for_hashtable`.
+    register_map_conditional_mutators(registry, ht);
+    register_map_conditional_mutators(registry, p);
     // Note: `keys()` / `elements()` are registered by
     // `cratonvm-native-builtins::deprecated_io_util::register_*_natives`,
     // which runs AFTER us in `vm_init`'s real-JDK arm. The force-native

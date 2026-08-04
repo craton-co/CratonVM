@@ -6353,6 +6353,86 @@ fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
 }
 
 // ---------------------------------------------------------------------------
+// cov-06: `newarray` (0xbc) IR-vs-single-pass differential.
+// ---------------------------------------------------------------------------
+
+/// Backs `helpers.newarray` with a REAL (leaked, test-only) buffer laid out
+/// exactly the way `Op::ArrayLoad`/`Op::ArrayStore`'s inline codegen expects:
+/// the length at `ARRAY_LENGTH_OFFSET` and int elements packed at
+/// `HEADER_SIZE + index*4` — see `ir_lower::emit_array_null_bounds_guards`
+/// and `emit_gpr_array_elem_load`/`_store`. This is what makes "allocate,
+/// store, read back, return" a REAL round trip through both backends' array
+/// element codegen, not just a check that the allocator was called.
+///
+/// Negative-length handling is intentionally OUT of scope here: `jit_newarray`
+/// routes a negative length through the pending-Java-exception channel, which
+/// this synthetic-helper harness has no VM/interpreter to drain — see
+/// `vm/tests/jit_cov06_array_allocation.rs` for the real (heap + exception +
+/// GC) end-to-end coverage the doc's "How to verify" section also asks for.
+///
+/// # Safety
+/// `atype` is always `10` (`T_INT`) in this file's corpus; `length` is
+/// non-negative in every case exercised. The leaked buffer outlives the test
+/// process, which is acceptable for a one-shot test binary.
+unsafe extern "C" fn synthetic_newarray(_vm: i64, _atype: i64, length: i64) -> i64 {
+    let len = length as usize;
+    let total = HEADER_SIZE + len * 4;
+    let buf = vec![0u8; total].into_boxed_slice();
+    let ptr = Box::into_raw(buf) as *mut u8;
+    std::ptr::write_unaligned(ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32, length as i32);
+    ptr as i64
+}
+
+/// `static int f(int n, int idx, int val) { int[] a = new int[n]; a[idx] =
+/// val; return a[idx]; }` — allocate, store, read back, return, through BOTH
+/// backends, with the real `Op::ArrayLoad`/`Op::ArrayStore` element codegen
+/// (cov-02) reading the exact buffer `synthetic_newarray` laid out above.
+#[test]
+fn ir_vs_singlepass_newarray_allocate_store_load() {
+    // iload_0 (n); newarray T_INT; astore_3 (a);
+    // aload_3; iload_1 (idx); iload_2 (val); iastore;
+    // aload_3; iload_1 (idx); iaload; ireturn
+    let code = vec![
+        0x1a, 0xbc, 0x0a, 0x4e, 0x2d, 0x1b, 0x1c, 0x4f, 0x2d, 0x1b, 0x2e, 0xac,
+    ];
+    let mut helpers = dummy_helpers();
+    helpers.newarray = synthetic_newarray as *const () as usize;
+    let cm = cached("newarrayRoundTrip", "(III)I", code, 4, 3);
+    let ir = compile_opt(&cm, &helpers, true)
+        .expect("newarrayRoundTrip: optimize=true (IR pipeline) failed to compile");
+    let sp = compile_opt(&cm, &helpers, false)
+        .expect("newarrayRoundTrip: optimize=false (single-pass) failed to compile");
+    assert!(
+        ir.used_ir_backend,
+        "this test is about the IR arm — a silent single-pass fallback would make it vacuous"
+    );
+
+    let dummy_vm = [0u8; 64];
+    for (n, idx, val) in [(5i64, 2i64, 42i64), (1, 0, -7), (8, 7, i32::MAX as i64)] {
+        // SAFETY: both bodies were produced by the JIT from valid bytecode;
+        // `synthetic_newarray` hands back a real, correctly-laid-out buffer
+        // for the allocation each call performs (a fresh one per call, so
+        // the two backends never share or race over one buffer).
+        let r_sp = unsafe { sp.try_call_with_context(dummy_vm.as_ptr() as i64, &[n, idx, val]) }
+            .unwrap_or_else(|e| panic!("newarrayRoundTrip: single-pass ({n},{idx},{val}): {e:?}"));
+        let r_ir = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[n, idx, val]) }
+            .unwrap_or_else(|e| panic!("newarrayRoundTrip: IR ({n},{idx},{val}): {e:?}"));
+        assert_eq!(
+            r_ir as i32, r_sp as i32,
+            "newarrayRoundTrip: IR vs single-pass DIVERGE for ({n},{idx},{val}): IR={}, \
+             single-pass={}",
+            r_ir as i32, r_sp as i32,
+        );
+        assert_eq!(
+            r_ir as i32, val as i32,
+            "newarrayRoundTrip: both backends agree but disagree with the expected \
+             allocate/store/load round trip for ({n},{idx},{val}): got {}",
+            r_ir as i32,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // cov-05 increment 1 — `instanceof` (0xc1) against an already-loaded target
 //
 // `cov-05-checkcast-and-instanceof-RETIRED-20260804.md`. The largest
