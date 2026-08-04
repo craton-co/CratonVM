@@ -56,20 +56,28 @@
 //! 6. **Clears the one-shot bail-site record** so a bail can only ever report
 //!    its own cause.
 //!
-//! # How a future drift is caught
+//! # How a future drift is stopped, and then caught
 //!
-//! [`CompileAdmission`] is an RAII token, and `x64::compile_with_param_slots`
-//! calls [`note_backend_entry`], which counts every backend entry taken with no
-//! token open on the thread. A fourth door added without the gate does not
-//! merely miss the checks — it moves [`ungated_backend_entries`], which the
-//! VM's own test asserts is zero after driving all three doors. That is a
-//! witness rather than a source scan: it names the *behaviour*, so it survives
-//! the file being split, which five checks in this repository did not.
+//! Two layers, because they fail differently.
 //!
-//! Test compiles inside the `jit` crate reach the backend with no token by
-//! design (they are not doors), so a non-zero count is only meaningful in the
-//! VM. The counter is per-process and relaxed, like every other diagnostic
-//! counter here.
+//! **The type system stops the accident.**
+//! `x64::compile_with_param_slots` takes `&CompileAdmission`, and the only way
+//! to get one is [`admit`]. A fourth door written without the gate does not
+//! compile. The brief this closes asked for the two paths to be unable to
+//! "drift again", and a counter asserted zero by a test is *will be caught*,
+//! not *cannot*; this is the *cannot* half.
+//!
+//! **The counter catches the deliberate bypass.** The `jit` crate's own tests
+//! drive the backend with hand-built bytecode and no method identity, so they
+//! need a way in: [`CompileAdmission::for_backend_test`]. That is a genuine
+//! hole, so it is built not to hide anything — it does not open the thread
+//! scope, so a backend entry made under it is still counted by
+//! [`ungated_backend_entries`], which the VM asserts is zero over a real run.
+//! Its name is what makes a production use greppable.
+//!
+//! Both layers are behaviour-named rather than source-scanning: a check that
+//! grepped for `compile_with_param_slots(` would have died the day `x64.rs`
+//! was split, as five checks in this repository did.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -185,6 +193,10 @@ pub struct CompileAdmission {
     // Dropped after the counter below, which is what makes "an admission is
     // open" and "the epoch witness is open" the same interval.
     _epoch: crate::CompileEpochWitness,
+    /// Whether this token incremented the thread scope. `false` only for
+    /// [`CompileAdmission::for_backend_test`], whose whole point is that it
+    /// does not — see there.
+    opened_scope: bool,
 }
 
 impl CompileAdmission {
@@ -192,11 +204,37 @@ impl CompileAdmission {
     pub fn door(&self) -> CompileDoor {
         self.door
     }
+
+    /// A token for a **test** that drives the backend directly.
+    ///
+    /// `x64::compile_with_param_slots` takes `&CompileAdmission`, which is what
+    /// makes a door that skips the gate a *compile error* rather than a red
+    /// test. The `jit` crate's own tests are not doors — they hand the backend
+    /// hand-built bytecode with no method identity to admit — so they need a
+    /// way in, and an integration test under `jit/tests/` is a separate crate,
+    /// so `#[cfg(test)]` cannot provide it.
+    ///
+    /// This is therefore a real bypass, and it is built so that using it in
+    /// production is still caught: it does **not** open the thread scope, so a
+    /// backend entry made under it is still counted by
+    /// [`ungated_backend_entries`], which the VM asserts is zero. The type
+    /// system stops the accident; the counter stops the deliberate misuse. The
+    /// name is what makes the second one greppable.
+    #[doc(hidden)]
+    pub fn for_backend_test() -> Self {
+        Self {
+            door: CompileDoor::MethodEntry,
+            _epoch: crate::open_compile_epoch_witness(),
+            opened_scope: false,
+        }
+    }
 }
 
 impl Drop for CompileAdmission {
     fn drop(&mut self) {
-        OPEN_ADMISSIONS.with(|c| c.set(c.get().saturating_sub(1)));
+        if self.opened_scope {
+            OPEN_ADMISSIONS.with(|c| c.set(c.get().saturating_sub(1)));
+        }
     }
 }
 
@@ -273,6 +311,7 @@ pub fn admit(
     Ok(CompileAdmission {
         door,
         _epoch: epoch,
+        opened_scope: true,
     })
 }
 
@@ -413,6 +452,31 @@ mod tests {
             before + 1,
             "a backend entry under an admission must not be counted"
         );
+    }
+
+    /// The escape hatch must not launder a backend entry.
+    ///
+    /// `for_backend_test` exists because an integration test under `jit/tests/`
+    /// is a separate crate and cannot reach a `#[cfg(test)]` constructor. That
+    /// makes it a real bypass of the type-level gate, so the *runtime* witness
+    /// has to keep seeing through it — otherwise a production caller could
+    /// reach for it and both layers would go quiet at once.
+    #[test]
+    fn the_backend_test_token_is_still_counted_as_ungated() {
+        let before = ungated_backend_entries();
+        let t = CompileAdmission::for_backend_test();
+        assert!(
+            !admission_is_open(),
+            "the test token must not open the thread scope"
+        );
+        note_backend_entry();
+        assert_eq!(
+            ungated_backend_entries(),
+            before + 1,
+            "a backend entry under the test token must still be counted"
+        );
+        drop(t);
+        assert!(!admission_is_open());
     }
 
     #[test]

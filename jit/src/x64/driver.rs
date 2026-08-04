@@ -80,6 +80,10 @@ pub(crate) fn set_pending_exception_ranges(ranges: Vec<(usize, usize, usize)>) {
 /// Returns `Some(CompiledMethod)` on success, `None` if compilation fails.
 #[allow(clippy::too_many_arguments)]
 pub fn compile(
+    // Proof the caller passed the admission gate — see
+    // [`compile_with_param_slots`]'s first parameter. Test call sites use
+    // `CompileAdmission::for_backend_test()`.
+    admission: &crate::compile_gate::CompileAdmission,
     code: &[u8],
     code_len: usize,
     num_params: usize,
@@ -105,6 +109,7 @@ pub fn compile(
     string_layout: Option<crate::StringFieldLayout>,
 ) -> Option<CompiledMethod> {
     compile_with_param_slots(
+        admission,
         code,
         code_len,
         num_params,
@@ -243,6 +248,24 @@ pub(super) fn gc_inert_selfrec_candidate(
 /// "arg index == slot" behavior (see the [`compile`] wrapper).
 #[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
+    // ── The admission gate, enforced by the type system ───────────────
+    //
+    // Proof that the caller passed `compile_gate::admit` — the kill switch,
+    // the permanent bail-list, the bisect levers, the code-cache cap, and the
+    // compile-epoch witness opened BEFORE any constant-pool read. There are
+    // three doors into this function and for a long time only one of them
+    // asked all of that; the other two carried hand-copied subsets, each added
+    // after its own bug. `osr-01`'s brief asked for the paths to be unable to
+    // "drift again", and this parameter is what makes a fourth door written
+    // without the gate a *compile error* rather than a red test.
+    //
+    // The `jit` crate's own tests are not doors — they hand this function
+    // hand-built bytecode with no method identity to admit — and they use
+    // `CompileAdmission::for_backend_test()`, which is deliberately still
+    // visible to `compile_gate::ungated_backend_entries()`.
+    //
+    // Unused in the body on purpose: it is a capability, not data.
+    admission: &crate::compile_gate::CompileAdmission,
     code: &[u8],
     code_len: usize,
     num_params: usize,
@@ -348,6 +371,13 @@ pub fn compile_with_param_slots(
     // Non-zero inside this crate's own tests is expected and meaningless — a
     // unit test calling the backend is not a door. The assertion that matters
     // lives in the VM.
+    //
+    // Kept even though `admission` is now required by the signature: the two
+    // layers fail differently. The parameter stops a door written *without*
+    // the gate; this counter stops a door written *with*
+    // `CompileAdmission::for_backend_test()`, which the type system cannot
+    // tell apart from a real one.
+    let _ = admission;
     crate::compile_gate::note_backend_entry();
     // A class-`ldc` calls a helper that takes the VM context as its first
     // argument, exactly like a string-`ldc`, so it forces the context form of

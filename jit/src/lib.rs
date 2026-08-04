@@ -13049,6 +13049,7 @@ pub fn try_compile_with_invokespecial_resolver(
         receiver_inline_resolver,
         &mut backend_attempted,
         self_call_identity_stable,
+        &_admission,
     );
 
     if result.is_none() && backend_attempted {
@@ -13599,6 +13600,10 @@ fn try_compile_inner(
     // present — worth retrying later).
     backend_attempted: &mut bool,
     self_call_identity_stable: bool,
+    // The caller's admission token, threaded through so the single-pass
+    // backend call at the end of this function can require it. See
+    // `x64::compile_with_param_slots`'s first parameter.
+    admission: &compile_gate::CompileAdmission,
 ) -> Option<CompiledMethod> {
     // C2-review P0 "Measure compilation quality": one structured
     // `metrics::CompilationReport` per compilation, published when this handle
@@ -17025,6 +17030,7 @@ fn try_compile_inner(
     // the `?` below: a backend bail is a compilation that spent this time.
     let metrics_single_pass = metrics.phase(metrics::Phase::SinglePass);
     let mut compiled = x64::compile_with_param_slots(
+        admission,
         code,
         code_len,
         param_slots,

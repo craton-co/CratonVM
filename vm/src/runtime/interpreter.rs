@@ -2654,6 +2654,7 @@ pub fn execute(
                         0
                     };
                     let mut cm = crate::jit::x64::compile_with_param_slots(
+                        &_admission,
                         &padded,
                         code_len,
                         param_slots,

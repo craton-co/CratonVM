@@ -1227,6 +1227,7 @@ pub(super) fn compile_osr_artifact(
             // landed while the resolvers ran produced a body the install
             // barrier could not tell from a current one.
             let mut cm = crate::jit::x64::compile_with_param_slots(
+                &_admission,
                 &code,
                 code_len,
                 param_slots,
