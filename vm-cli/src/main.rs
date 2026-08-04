@@ -58,6 +58,35 @@ fn maybe_dump_shutdown_reports() {
         return;
     }
 
+    // `CRATONVM_DBG=ir-isel` — the instruction selector's process totals.
+    //
+    // Its own switch, not `jit.method_stats`: these are two different
+    // measurements and a run that wants one rarely wants the other. At exit
+    // rather than per compile because the population is every method the
+    // optimizing tier produced a body for — 850 of them across the two Spring
+    // Boot classes this was first measured over — and summing that many stderr
+    // lines by hand is how a coverage figure gets mis-transcribed.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_ISEL").is_some() {
+        let (methods, stats) = cratonvm_jit::x64::isel::shadow_totals();
+        if methods != 0 {
+            eprintln!("[ir-isel] TOTALS methods={methods} {}", stats.summary_line());
+        }
+        let (mir_methods, tiles, mismatches) = cratonvm_jit::ir_lower::mir_totals::read();
+        if mir_methods != 0 {
+            // `shadow_tiles` / `arm_bytes` / `enc_bytes` are verify mode's
+            // sizing of the increment byte equality cannot cover: what the
+            // encoder would have written for the tiles it is not allowed to
+            // emit, against what the per-opcode arms did write.
+            let (shadow, arm_bytes, enc_bytes) =
+                cratonvm_jit::ir_lower::mir_totals::read_shadow();
+            eprintln!(
+                "[ir-isel] MIR TOTALS methods={mir_methods} tiles={tiles} \
+                 mismatches={mismatches} shadow_tiles={shadow} \
+                 arm_bytes={arm_bytes} enc_bytes={enc_bytes}"
+            );
+        }
+    }
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The bytecode loop rewriter's admission tally, on the same switch and
