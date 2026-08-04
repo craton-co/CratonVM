@@ -12943,7 +12943,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // backend already permanently bailed on.  Avoids ~50µs of wasted
     // scan/IR/lowering work per re-attempt (every 2000 invocations
     // under the default interpreter warmup gate).
-    let _admission = match compile_gate::admit(
+    let admission = match compile_gate::admit(
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -13049,7 +13049,7 @@ pub fn try_compile_with_invokespecial_resolver(
         receiver_inline_resolver,
         &mut backend_attempted,
         self_call_identity_stable,
-        &_admission,
+        &admission,
     );
 
     if result.is_none() && backend_attempted {

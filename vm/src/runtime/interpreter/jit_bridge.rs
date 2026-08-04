@@ -266,7 +266,7 @@ pub(super) fn compile_osr_artifact(
             // a redefinition landing in that window produced a body stamped
             // with the CURRENT epoch, which the install barrier then accepted.
             // Holding the token from here is what closes it.
-            let _admission = cratonvm_jit::compile_gate::admit(
+            let admission = cratonvm_jit::compile_gate::admit(
                 &class_name,
                 &method_name,
                 &method_descriptor,
@@ -1227,7 +1227,7 @@ pub(super) fn compile_osr_artifact(
             // landed while the resolvers ran produced a body the install
             // barrier could not tell from a current one.
             let mut cm = crate::jit::x64::compile_with_param_slots(
-                &_admission,
+                &admission,
                 &code,
                 code_len,
                 param_slots,

@@ -1879,7 +1879,7 @@ pub fn execute(
                     // from before the first constant-pool read.
                     // `compile_gate::admit` asks all of them; the token owns
                     // the epoch witness and must outlive the resolution below.
-                    let _admission = cratonvm_jit::compile_gate::admit(
+                    let admission = cratonvm_jit::compile_gate::admit(
                         &class_name_str,
                         method_name,
                         method_descriptor,
@@ -2654,7 +2654,7 @@ pub fn execute(
                         0
                     };
                     let mut cm = crate::jit::x64::compile_with_param_slots(
-                        &_admission,
+                        &admission,
                         &padded,
                         code_len,
                         param_slots,
