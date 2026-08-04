@@ -187,6 +187,23 @@ baseline file is per-host). For a new bench host, generate
 `perf/cratonbench-baseline-<host>.tsv` with `--calibrate` and pass it via
 `--baseline`.
 
+**What the gate is evidence about.** Every run records the optimizing tier's
+per-phase reach — `ir_requests` / `ir_admitted` / `ir_bodies` in
+`samples.tsv`, one `ir_reach_<phase>` line in `manifest.tsv`, and a summary
+line on the console. Across all seven phases the optimizing (C2/IR) tier
+produces **three** bodies, so the gate measures the **single-pass** backend, and
+a CratonBench delta is not evidence about C2 in either direction — including
+"the C2 change did no harm". Note `compiles_c2` is a *different* column and is
+not a substitute: it counts compiles whose requested tier was C2, including
+every one the optimizing pipeline declined and handed back to the single-pass
+backend.
+
+Anchoring a workload whose reach has not been measured, and quoting a
+CratonBench delta as a C2 result, are the two things `docs/known-issues/c2/`
+says to refuse. `perf/c2-reach.sh` measures any workload's reach in one run;
+`bench/CratonBenchC2.java` is a characterised candidate that does reach the
+tier, deliberately **not** a gate phase and with no baseline.
+
 > Note (2026-07-24): the bintrees anchor deliberately FAILS on current `dev` —
 > an open ~4x bt18 regression (post-`cf3a44e2a`) is being bisected. That is
 > the gate doing its job; do not re-anchor the baseline to absorb it.

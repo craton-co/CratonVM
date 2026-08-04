@@ -47,14 +47,23 @@
 #   --require-freq-data  Treat unreadable cpufreq sysfs as a failure rather
 #                    than a warning.
 #   --results-dir D  Where to write this run's results (default:
-#                    <script dir>/results/v1/<utc>-<host>-<rev>).
+#                    <script dir>/results/v2/<utc>-<host>-<rev>).
 #   --run-timeout S  Kill one measurement after S seconds (default 1800) and
 #                    record it as a failed run. A hung VM must never be
 #                    recorded as a merely slow one.
-#   --no-vm-stats    Do not ask the VM for its shutdown JIT/GC summaries.
-#                    (Both knobs are shutdown-only, so they do not perturb
-#                    the measurement; this exists for strict A/B parity with
-#                    an older result set that lacks them.)
+#   --no-vm-stats    Do not ask the VM for its shutdown JIT/GC summaries, and
+#                    do not record the optimizing tier's per-phase reach.
+#                    The GC and JIT summaries are shutdown-only. The reach
+#                    (`ir-compiles`) is NOT: it prints one line per compile
+#                    REQUEST, on the compile path. That path is entered a
+#                    single-digit number of times per phase — which is the
+#                    whole point of MEAS-02 — and the whole extra output was
+#                    counted at 0-4 lines / 0-419 bytes per phase, against a
+#                    shortest phase of 165 ms. See
+#                    docs/internal/meas-02-bench-suite-c2-reach-RETIRED-20260803.md
+#                    §6. Keep the flag for strict parity with an older result
+#                    set, and re-count if a phase ever starts issuing compile
+#                    requests in bulk.
 #   --skip-reliability  Measure without the reliability gate. The manifest
 #                    records reliability_gate=skipped and compare.py REFUSES
 #                    to render a verdict from such a run. Debugging only.
@@ -81,7 +90,14 @@ export LC_ALL=C
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RELIABILITY_GATE="$SCRIPT_DIR/reliability-gate.sh"
-RESULTS_SCHEMA=1
+# Schema 2 (2026-08-03, MEAS-02): samples/summary gained the optimizing
+# tier's per-phase reach — ir_requests / ir_admitted / ir_bodies — and the
+# manifest gained an `ir_reach_<phase>` line per phase. Every existing column
+# kept its name; every consumer resolves columns BY NAME, so a v1 reader
+# reads a v2 directory correctly and simply sees no reach. The version moved
+# anyway because "this directory records C2 reach" is exactly the kind of
+# fact a reader must not have to infer from a column's presence.
+RESULTS_SCHEMA=2
 VM_FLAGS="-Xmx8g"
 EXE=""
 CPU=13
@@ -144,7 +160,23 @@ awk -v l="$LOAD1" -v m="$MAX_LOAD" 'BEGIN { exit !(l > m) }' && {
 CLASSES=$(mktemp -d)
 WORK=$(mktemp -d)
 trap 'rm -rf "$CLASSES" "$WORK"' EXIT
-javac -d "$CLASSES" "$ROOT/bench/CratonBench.java" || { echo "FATAL: bench compile failed" >&2; exit 2; }
+# `-encoding UTF-8`, explicitly, and not because anybody prefers it.
+#
+# `export LC_ALL=C` above is right for the awk arithmetic and wrong for javac:
+# on a JDK whose javac derives its default SOURCE encoding from the platform
+# charset (17 here — JEP 400 moved `file.encoding`, not this), `C` means
+# US-ASCII, and `bench/CratonBench.java` contains em-dashes in its header
+# comment. The gate then died at setup with 30 `unmappable character (0xE2)`
+# errors and `FATAL: bench compile failed`, before measuring anything.
+#
+# Measured on the Azure bench host 2026-08-03: the mandatory perf gate could
+# not compile its own benchmark. The ambient locale there is `C.UTF-8`, so
+# the failure appears only INSIDE the gate — running the same javac by hand
+# in the same shell succeeds, which is why it survived. Pinning the encoding
+# is also the same argument that pinned the locale: one fewer thing that
+# differs between two runs being compared.
+javac -encoding UTF-8 -d "$CLASSES" "$ROOT/bench/CratonBench.java" \
+    || { echo "FATAL: bench compile failed" >&2; exit 2; }
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -186,6 +218,115 @@ dash() {
     v=${v//$'\r'/ }
     v=${v//$'\t'/ }
     if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' '-'; fi
+}
+
+# MEAS-02: one manifest line per phase saying how far into the optimizing
+# tier that phase actually got. It goes in the MANIFEST, not only in the
+# summary, because the manifest is what a reader opens to find out what a
+# results directory is — and "these numbers were taken on a workload that
+# never reached the tier they are being quoted about" belongs there, next to
+# the CPU model and the binary hash, rather than in a column somebody has to
+# already suspect exists.
+REACH_REQ_TOTAL=0
+REACH_ADM_TOTAL=0
+REACH_BOD_TOTAL=0
+REACH_MEASURED=0
+REACH_BROKEN=0
+record_reach() {  # record_reach <phase> <requests> <admitted> <bodies> <c1> <c2> <osr>
+    case "$2$3$4" in
+        *-*)
+            printf 'ir_reach_%s\tNOT RECORDED (phase produced no usable run)\n' "$1" >> "$MANIFEST"
+            return 0
+            ;;
+    esac
+
+    # The reach is scraped from two `[ir] …` lines the VM prints under
+    # `CRATONVM_DBG=ir-compiles`. A scrape fails OPEN: reword either line and
+    # every phase records a confident zero, which reads exactly like the
+    # finding this record exists to carry. Two independent checks close it.
+    #
+    # 1. Monotonicity. Every body came from an admitted method and every
+    #    admitted method came from a request, so requests >= admitted >=
+    #    bodies is a property of the pipeline, not of this run.
+    # 2. More non-OSR compiles than requests. `compiles_c1`/`compiles_c2`/
+    #    `compiles_osr` come from a DIFFERENT line, emitted by a different
+    #    module (the tier manager's shutdown summary), and a non-OSR compile
+    #    cannot happen without passing the chain — the C1 ones report
+    #    `optimize=false` there and are counted in `requests` too. So
+    #    `c1 + c2 - osr > requests` is not a workload fact; it is this scrape
+    #    reading a log that no longer says what it expects.
+    #
+    #    OSR is subtracted, and that correction is measured rather than
+    #    assumed. An OSR compile goes through `compile_osr_artifact`, which
+    #    calls the backend directly — a second compile door that does not
+    #    pass this chain — but the tier manager still counts it under the
+    #    TIER it was requested at, so a C2-tier OSR compile lands in `c2=`.
+    #    On the Azure bench host 2026-08-03 the `arithmetic` phase reports
+    #    `c1=0 c2=1 osr=1` with zero admission lines: that single C2 compile
+    #    IS the OSR one. Without the subtraction this check called that
+    #    phase's genuine reach of zero a broken scrape — which is what a
+    #    phase that is one long loop inside one method looks like, and that
+    #    is most of CratonBench.
+    _c1=${5:--}; _c2=${6:--}; _osr=${7:--}
+    [ "$_c1" = "-" ] && _c1=0
+    [ "$_c2" = "-" ] && _c2=0
+    [ "$_osr" = "-" ] && _osr=0
+    _nonosr=$(( _c1 + _c2 - _osr ))
+    [ "$_nonosr" -lt 0 ] && _nonosr=0
+    _suffix=""
+    if [ "$2" -lt "$3" ] || [ "$3" -lt "$4" ]; then
+        echo "  $1: REACH SCRAPE BROKEN — requests=$2 admitted=$3 bodies=$4 is not monotone." >&2
+        _suffix=" SCRAPE-BROKEN (not monotone)"
+        REACH_BROKEN=$((REACH_BROKEN + 1))
+    elif [ "$_nonosr" -gt "$2" ]; then
+        echo "  $1: REACH SCRAPE BROKEN — the tier manager reports c1=$_c1 c2=$_c2 osr=$_osr" >&2
+        echo "      ($_nonosr non-OSR compiles) but only $2 request(s) reached the admission" >&2
+        echo "      chain. The '[ir] admission' line in jit/src/lib.rs has moved or been" >&2
+        echo "      reworded; this run's reach must not be read as measured." >&2
+        _suffix=" SCRAPE-BROKEN ($_nonosr non-OSR compiles vs $2 requests; NOT measured)"
+        REACH_BROKEN=$((REACH_BROKEN + 1))
+    fi
+
+    # The caveat goes on the PHASE's own line, not only in a run-level tally.
+    # A broken scrape's per-phase reading is `requests=0 admitted=0 bodies=0`,
+    # which is character-for-character what the expected finding looks like —
+    # so a reader who greps one phase out of the manifest has to be told
+    # there, or they will not be told at all.
+    printf 'ir_reach_%s\trequests=%s admitted=%s bodies=%s%s\n' \
+        "$1" "$2" "$3" "$4" "$_suffix" >> "$MANIFEST"
+
+    REACH_REQ_TOTAL=$(( REACH_REQ_TOTAL + $2 ))
+    REACH_ADM_TOTAL=$(( REACH_ADM_TOTAL + $3 ))
+    REACH_BOD_TOTAL=$(( REACH_BOD_TOTAL + $4 ))
+    REACH_MEASURED=$(( REACH_MEASURED + 1 ))
+}
+
+# The reach, said out loud at the end of a run rather than left in a TSV.
+# The message a reader needs is not the counts; it is what the counts license
+# them to conclude, so it says that instead of making them work it out.
+print_reach_note() {
+    if [ "$VM_STATS" != 1 ]; then
+        echo "optimizing-tier reach: NOT RECORDED (--no-vm-stats)."
+        echo "         This run cannot support any claim about the C2 tier."
+        return 0
+    fi
+    echo "optimizing-tier reach (MEAS-02): requests=$REACH_REQ_TOTAL admitted=$REACH_ADM_TOTAL bodies=$REACH_BOD_TOTAL across $REACH_MEASURED phase(s)"
+    if [ "$REACH_BROKEN" -gt 0 ]; then
+        echo "         NOT TRUSTWORTHY: $REACH_BROKEN phase(s) failed the scrape's own"
+        echo "         consistency checks (see the REACH SCRAPE BROKEN lines above). Fix the"
+        echo "         scrape before reading any reach number from this run — a broken scrape"
+        echo "         reports zeros, and zero is the answer this record is usually expected"
+        echo "         to give, so it is the one value nobody double-checks."
+        return 0
+    fi
+    if [ "$REACH_BOD_TOTAL" -eq 0 ]; then
+        echo "         The optimizing backend produced NO bodies in this run. Every"
+        echo "         number above measures the single-pass backend, and none of"
+        echo "         them is evidence about C2 in either direction."
+    else
+        echo "         Per phase: manifest.tsv 'ir_reach_<phase>'. A delta on a phase"
+        echo "         whose bodies=0 says nothing about the optimizing tier."
+    fi
 }
 
 sha256_of() {
@@ -339,8 +480,8 @@ run_reliability preflight --cpu "$CPU" --reps "$REPS" || exit $?
 # ---------------------------------------------------------------------------
 SAMPLES="$RESULTS/samples.tsv"
 SUMMARY="$RESULTS/summary.tsv"
-printf '#phase\trep\tms\tchecksum\tcpu_pinned\tcpu_observed\tload1\tthrottle_delta\tkhz_min\tkhz_max\tpeak_rss_kb\tcompiles_c1\tcompiles_c2\tcompiles_osr\tdeopts\tcompile_ms\tgc_young_count\tgc_young_p50_us\tgc_young_p99_us\tgc_young_max_us\tgc_minor\tgc_major\texit_code\n' > "$SAMPLES"
-printf '#phase\tn\tmin_ms\tp50_ms\tp90_ms\tp99_ms\tmax_ms\tmean_ms\tstddev_ms\tcv_pct\tchecksum\tbaseline_ms\tbaseline_status\tbudget_ms\tverdict\tpeak_rss_kb_max\tcompiles_c1_max\tcompiles_c2_max\tgc_young_count_max\tgc_young_p50_us_max\tgc_young_p99_us_max\tgc_young_max_us_max\n' > "$SUMMARY"
+printf '#phase\trep\tms\tchecksum\tcpu_pinned\tcpu_observed\tload1\tthrottle_delta\tkhz_min\tkhz_max\tpeak_rss_kb\tcompiles_c1\tcompiles_c2\tcompiles_osr\tdeopts\tcompile_ms\tgc_young_count\tgc_young_p50_us\tgc_young_p99_us\tgc_young_max_us\tgc_minor\tgc_major\texit_code\tir_requests\tir_admitted\tir_bodies\n' > "$SAMPLES"
+printf '#phase\tn\tmin_ms\tp50_ms\tp90_ms\tp99_ms\tmax_ms\tmean_ms\tstddev_ms\tcv_pct\tchecksum\tbaseline_ms\tbaseline_status\tbudget_ms\tverdict\tpeak_rss_kb_max\tcompiles_c1_max\tcompiles_c2_max\tgc_young_count_max\tgc_young_p50_us_max\tgc_young_p99_us_max\tgc_young_max_us_max\tir_requests_max\tir_admitted_max\tir_bodies_max\n' > "$SUMMARY"
 
 # One isolated, pinned, instrumented measurement. Sets RUN_MS, RUN_SUM,
 # RUN_EXIT and the per-run environment fields. The process is started in the
@@ -360,7 +501,12 @@ run_one() {
     thr0=$(read_throttle)
 
     if [ "$VM_STATS" = 1 ]; then
-        env CRATONVM_GC_STATS=1 CRATONVM_DBG_JIT_METHOD_STATS=1 \
+        # Grouped spelling. The per-flag names (CRATONVM_GC_STATS=1,
+        # CRATONVM_DBG_JIT_METHOD_STATS=1) still work, but every run made the
+        # VM print a deprecation line as the FIRST line of the stderr this
+        # script then parses — and a harness whose stderr opens with a
+        # configuration warning is one nobody reads twice.
+        env CRATONVM_DBG='gc-stats,jit-method-stats,ir-compiles' \
             taskset -c "$CPU" "$EXE" $VM_FLAGS -cp "$CLASSES" CratonBench "$phase" \
             >"$out" 2>"$err" </dev/null &
     else
@@ -452,6 +598,40 @@ run_one() {
     RUN_GCMAX=$(printf '%s' "$gcline" | grep -oE ' max_us=[0-9]+' | head -1 | grep -oE '[0-9]+$')
     RUN_MINOR=$(grep -oE 'generational: minor=[0-9]+' "$err" | head -1 | grep -oE '[0-9]+$')
     RUN_MAJOR=$(grep -oE 'major=[0-9]+' "$err" | head -1 | grep -oE '[0-9]+$')
+
+    # MEAS-02: the OPTIMIZING tier's reach, per phase.
+    #
+    # `compiles_c2` above is not this number and must never be read as it.
+    # `TieredCompiler`'s `c2_compilations` counts a successful compile whose
+    # requested TIER was C2 — including every one that entered the optimizing
+    # pipeline, was declined by it, and had its body produced by the
+    # single-pass backend instead. A phase can therefore report `c2=5` while
+    # the optimizing backend emitted nothing at all, which is precisely the
+    # inference MEAS-02 exists to stop.
+    #
+    # Three counts, from the three points a request can die at:
+    #   requests — reached the admission chain at all (C1 requests included:
+    #              `optimize=false` is the commonest verdict and is normal
+    #              tiering, not a gap)
+    #   admitted — the chain's verdict was "admitted to the optimizing
+    #              pipeline"
+    #   bodies   — the optimizing backend actually produced one
+    # `admitted - bodies` is the pipeline admitting a method it then cannot
+    # lower; `requests - admitted` is the admission chain declining up front.
+    #
+    # `grep -c` is deliberate over `grep | wc -l`: an empty match is 0 with a
+    # non-zero exit, which `dash()` must NOT turn into "-" here. A phase that
+    # reaches the tier zero times is a measured zero, not an unrecorded field
+    # — telling those two apart is the whole deliverable.
+    if [ "$VM_STATS" = 1 ]; then
+        RUN_IRREQ=$(grep -c '^\[ir\] admission ' "$err" 2>/dev/null)
+        RUN_IRADM=$(grep -c ': admitted to the optimizing pipeline$' "$err" 2>/dev/null)
+        RUN_IRBOD=$(grep -c '^\[ir\] optimizing backend produced a body ' "$err" 2>/dev/null)
+        RUN_IRREQ=${RUN_IRREQ:-0}; RUN_IRADM=${RUN_IRADM:-0}; RUN_IRBOD=${RUN_IRBOD:-0}
+    else
+        RUN_IRREQ="-"; RUN_IRADM="-"; RUN_IRBOD="-"
+    fi
+
     cp "$err" "$RESULTS/stderr-$phase-last.txt" 2>/dev/null
 }
 
@@ -478,14 +658,15 @@ while IFS=$'\t' read -r phase base_ms want_sum status _evidence; do
         # for a run that crashed or timed out. A results directory that
         # silently drops the runs that went wrong is how a bad series comes
         # to look like a clean one.
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$phase" "$rep" "$(dash "$RUN_MS")" "$(dash "$RUN_SUM")" \
             "$CPU" "$(dash "$RUN_CPUS")" "$(dash "$RUN_LOAD")" "$(dash "$RUN_THROTTLE")" \
             "$(dash "$RUN_KMIN")" "$(dash "$RUN_KMAX")" "$(dash "$RUN_RSS")" \
             "$(dash "$RUN_C1")" "$(dash "$RUN_C2")" "$(dash "$RUN_OSR")" "$(dash "$RUN_DEOPT")" \
             "$(dash "$RUN_CTIME")" "$(dash "$RUN_GCN")" "$(dash "$RUN_GCP50")" \
             "$(dash "$RUN_GCP99")" "$(dash "$RUN_GCMAX")" "$(dash "$RUN_MINOR")" \
-            "$(dash "$RUN_MAJOR")" "$RUN_EXIT" >> "$SAMPLES"
+            "$(dash "$RUN_MAJOR")" "$RUN_EXIT" \
+            "$(dash "$RUN_IRREQ")" "$(dash "$RUN_IRADM")" "$(dash "$RUN_IRBOD")" >> "$SAMPLES"
 
         if [ "$RUN_EXIT" != 0 ] || [ -z "$RUN_MS" ] || [ -z "$RUN_SUM" ]; then
             if [ "$RUN_EXIT" = 124 ]; then
@@ -501,7 +682,13 @@ while IFS=$'\t' read -r phase base_ms want_sum status _evidence; do
         fi
         times+=("$RUN_MS")
     done
-    [ "$phase_broken" = 1 ] && continue
+    if [ "$phase_broken" = 1 ]; then
+        # A broken phase has no reach, as opposed to a reach of zero. Say so
+        # rather than leaving the key out: an absent key reads as "the gate
+        # predates this record", which is the wrong conclusion here.
+        record_reach "$phase" - - -
+        continue
+    fi
 
     med=$(median "${times[@]}")
     read -r d_min d_p50 d_p90 d_p99 d_max d_mean d_sd d_cv <<EOD
@@ -509,24 +696,46 @@ $(dist "${times[@]}")
 EOD
     # Per-phase maxima of the VM-reported counters. "-" when the VM reported
     # nothing (e.g. the generational collector keeps no pause history).
-    read -r a_rss a_c1 a_c2 a_gcn a_gcp50 a_gcp99 a_gcmax <<EOD
-$(awk -F'\t' -v p="$phase" '
-    function v(i) { return (i in m) ? m[i] : "-" }
-    !/^#/ && $1 == p {
-        split("11 12 13 17 18 19 20", cols, " ")
-        for (k in cols) { i = cols[k]; if ($i != "-" && $i + 0 > (i in m ? m[i] : -1)) m[i] = $i + 0 }
+    #
+    # Columns are resolved from the header row BY NAME. They used to be a
+    # hardcoded index list (`split("11 12 13 17 18 19 20", ...)`) sitting a
+    # hundred lines away from the `printf` that decides what column 11 is —
+    # so adding one column in the middle of the sample row would have
+    # silently re-pointed every maximum at its neighbour, with no error and
+    # no obviously wrong number.
+    read -r a_rss a_c1 a_c2 a_osr a_gcn a_gcp50 a_gcp99 a_gcmax a_irreq a_iradm a_irbod <<EOD
+$(awk -F'\t' -v p="$phase" \
+    -v want="peak_rss_kb compiles_c1 compiles_c2 compiles_osr gc_young_count gc_young_p50_us gc_young_p99_us gc_young_max_us ir_requests ir_admitted ir_bodies" '
+    BEGIN { nw = split(want, wname, " ") }
+    /^#/ && NR == 1 {
+        for (i = 1; i <= NF; i++) { h = $i; sub(/^#/, "", h); idx[h] = i }
+        for (k = 1; k <= nw; k++) if (!(wname[k] in idx)) missing = missing " " wname[k]
+        if (missing != "") { printf "samples.tsv header has no column(s):%s\n", missing > "/dev/stderr" }
+        next
     }
-    END { printf "%s %s %s %s %s %s %s\n", v(11), v(12), v(13), v(17), v(18), v(19), v(20) }
+    /^#/ { next }
+    $1 == p {
+        for (k = 1; k <= nw; k++) {
+            i = idx[wname[k]]
+            if (i == "" || $i == "-" || $i == "") continue
+            if (!(k in m) || $i + 0 > m[k]) m[k] = $i + 0
+        }
+    }
+    END {
+        for (k = 1; k <= nw; k++) printf "%s%s", (k in m) ? m[k] "" : "-", (k < nw ? " " : "\n")
+    }
 ' "$SAMPLES")
 EOD
 
     if [ "$CALIBRATE" = 1 ]; then
         CAL_OUT="$CAL_OUT$phase\t$med\t$want_sum\tprovisional\tcalibrated $(date +%F) on $(hostname), n=${#times[@]} p50=${d_p50} p99=${d_p99} cv=${d_cv}%\n"
         echo "  $phase: median ${med}ms  p90 ${d_p90}ms  p99 ${d_p99}ms  CV ${d_cv}%  (runs: ${times[*]})"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$phase" "${#times[@]}" "$d_min" "$d_p50" "$d_p90" "$d_p99" "$d_max" "$d_mean" "$d_sd" "$d_cv" \
             "$want_sum" "$base_ms" "$status" "-" "calibrate" \
-            "$a_rss" "$a_c1" "$a_c2" "$a_gcn" "$a_gcp50" "$a_gcp99" "$a_gcmax" >> "$SUMMARY"
+            "$a_rss" "$a_c1" "$a_c2" "$a_gcn" "$a_gcp50" "$a_gcp99" "$a_gcmax" \
+            "$a_irreq" "$a_iradm" "$a_irbod" >> "$SUMMARY"
+        record_reach "$phase" "$a_irreq" "$a_iradm" "$a_irbod" "$a_c1" "$a_c2" "$a_osr"
         continue
     fi
 
@@ -544,10 +753,12 @@ EOD
         echo "  $phase: PASS median ${med}ms <= ${budget}ms$note"
         echo "         p90 ${d_p90}ms  p99 ${d_p99}ms  min ${d_min}ms  max ${d_max}ms  CV ${d_cv}%  n=${#times[@]}"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$phase" "${#times[@]}" "$d_min" "$d_p50" "$d_p90" "$d_p99" "$d_max" "$d_mean" "$d_sd" "$d_cv" \
         "$want_sum" "$base_ms" "$status" "$budget" "$verdict" \
-        "$a_rss" "$a_c1" "$a_c2" "$a_gcn" "$a_gcp50" "$a_gcp99" "$a_gcmax" >> "$SUMMARY"
+        "$a_rss" "$a_c1" "$a_c2" "$a_gcn" "$a_gcp50" "$a_gcp99" "$a_gcmax" \
+        "$a_irreq" "$a_iradm" "$a_irbod" >> "$SUMMARY"
+    record_reach "$phase" "$a_irreq" "$a_iradm" "$a_irbod" "$a_c1" "$a_c2" "$a_osr"
 done <<EOF
 $BASELINE_BODY
 EOF
@@ -558,6 +769,14 @@ EOF
 printf 'load1_end\t%s\n' "$(read_load1)" >> "$MANIFEST"
 printf 'finished_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$MANIFEST"
 printf 'perf_failures\t%s\n' "$FAILURES" >> "$MANIFEST"
+if [ "$VM_STATS" = 1 ]; then
+    printf 'ir_reach_recorded\tyes\n' >> "$MANIFEST"
+else
+    printf 'ir_reach_recorded\tno (--no-vm-stats)\n' >> "$MANIFEST"
+fi
+printf 'ir_reach_total\trequests=%s admitted=%s bodies=%s over %s phase(s)\n' \
+    "$REACH_REQ_TOTAL" "$REACH_ADM_TOTAL" "$REACH_BOD_TOTAL" "$REACH_MEASURED" >> "$MANIFEST"
+printf 'ir_reach_scrape_broken\t%s\n' "$REACH_BROKEN" >> "$MANIFEST"
 
 tsv_to_json "$SAMPLES" "$RESULTS/samples.json" samples
 tsv_to_json "$SUMMARY" "$RESULTS/summary.json" phases
@@ -581,6 +800,11 @@ run_reliability postflight || RELIABILITY_RC=$?
 if [ "$CALIBRATE" = 1 ]; then
     echo; echo "# calibrated baseline body:"; printf "$CAL_OUT"
     echo "# full distributions: $RESULTS/summary.tsv (+ .json); raw samples: $RESULTS/samples.tsv"
+    # Calibration is the moment the reach matters most: a baseline is a
+    # commitment that future deltas against it will be read as meaning
+    # something, and this says what they will be able to mean.
+    echo
+    print_reach_note
     if [ "$RELIABILITY_RC" != 0 ]; then
         echo "REFUSED: the reliability gate rejected this calibration run (exit $RELIABILITY_RC)." >&2
         echo "         Do NOT record these numbers as a baseline — see" >&2
@@ -592,6 +816,7 @@ fi
 echo "---------------------------------------------"
 echo "results: $RESULTS"
 echo "         manifest.tsv/.json  samples.tsv/.json  summary.tsv/.json  reliability.json"
+print_reach_note
 # A refused run's PASS is worth exactly as much as its FAIL, so the
 # reliability verdict is reported first and wins the exit code.
 if [ "$RELIABILITY_RC" != 0 ]; then
