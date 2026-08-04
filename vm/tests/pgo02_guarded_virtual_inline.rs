@@ -208,7 +208,7 @@ fn check_bimorphic(vm: &mut Vm) -> Result<(), String> {
             ));
         }
     }
-    let tally = compiled_tally(vm, "callBimorphic")?;
+    let tally = compiled_tally(vm, "callBimorphic", &[Value::Int(1), Value::Int(0)])?;
     if tally.speculative_sites == 0 {
         return Err(format!(
             "check_bimorphic: callBimorphic compiled but speculative_sites == 0 (tally={tally:?})"
@@ -267,7 +267,7 @@ fn check_uncaught_from_inlined_frame(vm: &mut Vm) -> Result<(), String> {
             ));
         }
     }
-    let tally = compiled_tally(vm, "callDivider")?;
+    let tally = compiled_tally(vm, "callDivider", &[Value::Int(1)])?;
 
     // Now the same division raises, from inside whatever the compiled body is.
     invoke_void(vm, "setDivisor", &[Value::Int(0)]);
@@ -330,7 +330,7 @@ fn check_override_receiver(vm: &mut Vm) -> Result<(), String> {
     }
     // The results above come from the interpreter unless this holds, and the
     // interpreter was never the thing at risk.
-    let tally = compiled_tally(vm, "callOverride")?;
+    let tally = compiled_tally(vm, "callOverride", &[Value::Int(1)])?;
     if tally.speculative_sites == 0 {
         return Err(format!(
             "check_override_receiver: callOverride compiled but speculative_sites == 0              (tally={tally:?}) — the guarded path never ran, so a wrong spliced body              would not have been observable"
@@ -355,7 +355,7 @@ fn check_interface_site(vm: &mut Vm) -> Result<(), String> {
             ));
         }
     }
-    let tally = compiled_tally(vm, "callIface")?;
+    let tally = compiled_tally(vm, "callIface", &[Value::Int(1)])?;
     if tally.speculative_sites == 0 {
         return Err(format!(
             "check_interface_site: callIface compiled but speculative_sites == 0 (tally={tally:?}) \
@@ -392,33 +392,70 @@ fn describe_failure(vm: &Vm, failure: &cratonvm_vm::error::MethodCallFailed) -> 
 /// The `inline_tally` of a compiled entry point, with the tier dependency
 /// stated rather than relied on (an IR artifact leaves the tally zeroed, which
 /// is the opposite conclusion from "the guard did not fire").
-fn compiled_tally(vm: &Vm, method: &str) -> Result<cratonvm_jit::InlineDecisionTally, String> {
-    let class_id = vm
-        .shared
-        .classes
-        .class_manager
-        .read()
-        .get_loaded_class_id("cratonvm/PgoGuardedVirtualInline")
-        .ok_or_else(|| "class must be loaded after invoke".to_string())?;
-    let compiled = vm
-        .shared
-        .jit
-        .jit_cache
-        .read()
-        .get(
+fn compiled_tally(
+    vm: &mut Vm,
+    method: &str,
+    warm_args: &[Value],
+) -> Result<cratonvm_jit::InlineDecisionTally, String> {
+    // Compilation is ASYNCHRONOUS. `CRATONVM_DBG_JITC=1` shows it as
+    // `bg-compile … bg=true`: crossing the invocation threshold enqueues the
+    // method, and a background worker installs the artifact some time later.
+    // A release build runs this file's 700-call warm-up in ~80 ms, which is
+    // routinely faster than the worker — so reading the cache once and
+    // declaring "never JIT-compiled" is a race, not a result. It passed on
+    // Windows/debug (a slow enough interpreter that the worker always won)
+    // and failed on Linux/release inside the full suite.
+    //
+    // Keep calling the method while waiting. That gives the worker both the
+    // trigger and the time, and it is what a real caller would be doing
+    // anyway. The bound is generous because a loaded CI host is exactly when
+    // the worker is slowest; exceeding it is still a failure, because
+    // "eventually compiles" is the claim under test.
+    const ATTEMPTS: usize = 400;
+    const CALLS_PER_ATTEMPT: i32 = 50;
+
+    for attempt in 0..ATTEMPTS {
+        let class_id = vm
+            .shared
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id("cratonvm/PgoGuardedVirtualInline")
+            .ok_or_else(|| "class must be loaded after invoke".to_string())?;
+        let found = vm.shared.jit.jit_cache.read().get(
             "cratonvm/PgoGuardedVirtualInline",
             method,
             method_descriptor(method),
             class_id,
-        )
-        .ok_or_else(|| format!("{method} never JIT-compiled"))?;
-    if compiled.used_ir_backend {
-        return Err(format!(
-            "{method} was compiled by the OPTIMIZING (IR) backend, which plans no guarded \
-             inlines and records no inline_tally — the tier pin did not take"
-        ));
+        );
+        if let Some(compiled) = found {
+            // State the tier dependency instead of relying on it.
+            // `inline_tally` is a single-pass artifact's record; an IR
+            // artifact leaves it zeroed, so without this rung "the guard did
+            // not fire" and "a different backend compiled the method" are
+            // indistinguishable — and they are opposite conclusions.
+            if compiled.used_ir_backend {
+                return Err(format!(
+                    "{method} was compiled by the OPTIMIZING (IR) backend, which plans no \
+                     guarded inlines and records no inline_tally — the tier pin did not take"
+                ));
+            }
+            return Ok(compiled.inline_tally.clone());
+        }
+        if attempt + 1 == ATTEMPTS {
+            break;
+        }
+        for i in 0..CALLS_PER_ATTEMPT {
+            let _ = invoke_int(vm, method, warm_args);
+            let _ = i;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    Ok(compiled.inline_tally.clone())
+    Err(format!(
+        "{method} never JIT-compiled, after {} further calls and ~{} ms of waiting",
+        ATTEMPTS as i32 * CALLS_PER_ATTEMPT,
+        ATTEMPTS * 5
+    ))
 }
 
 /// Positive control: a fixed monomorphic-A call site, called past the
@@ -499,7 +536,7 @@ fn check_guard_miss(vm: &mut Vm) -> Result<(), String> {
     // Without this the phases below run interpreted and the check is empty:
     // "a mismatched guard falls back to dispatch" is only a claim about
     // COMPILED code.
-    let tally = compiled_tally(vm, "callCurrent")?;
+    let tally = compiled_tally(vm, "callCurrent", &[Value::Int(1)])?;
     if tally.speculative_sites == 0 {
         return Err(format!(
             "check_guard_miss: callCurrent compiled but speculative_sites == 0              (tally={tally:?}) — no guard was baked in, so switching the receiver              tests nothing"
