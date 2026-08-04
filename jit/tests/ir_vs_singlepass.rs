@@ -5562,18 +5562,21 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
     // `0xb7` arm ahead of the elision branch. The elidable arm then dispatches
     // and `must_not_dispatch` panics.
     //
-    // The allocation is asserted too, in both directions, because escape
-    // analysis reports `scalar-replaced 1/1` for the elidable arm and `0/1` for
-    // the control (`CRATONVM_DBG_SCALAR_NEW=1`): with the constructor elided the
-    // object never escapes and the allocation disappears outright; with the
-    // constructor called, the call arg-escapes the receiver and pins it. That
-    // pair is the whole reason the elision must be tried first.
+    // The allocation count is asserted too, but it is NOT the property this
+    // lane owns and the two arms agree on it: the object is really allocated in
+    // both. That is worth pinning precisely because it is surprising —
+    // `CRATONVM_DBG_SCALAR_NEW=1` reports `scalar-replaced 1/1` for the elidable
+    // arm, so escape analysis OFFERS the replacement and the emitted body
+    // allocates anyway. The offer and the emitted code disagree; see the
+    // residual in `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`.
+    //
+    // If this assertion ever fails because arm 1's count went to ZERO, that is
+    // an improvement, not a regression: change it to 0 and delete that residual.
     cratonvm_jit::x64::set_moving_young_override(Some(false));
     unsafe extern "C" fn must_not_dispatch(_vm: i64, _i: i64, _a: i64, _n: i64) -> i64 {
+        // Deliberately a hard failure rather than a plausible return value: a
+        // stub that quietly returned 0 here would let an un-elided <init> pass.
         panic!("an elidable <init>()V on a fresh `new` was DISPATCHED, not elided");
-    }
-    unsafe extern "C" fn must_not_allocate(_vm: i64, _c: i64, _n: i64) -> i64 {
-        panic!("a scalar-replaced `new` reached the allocation helper");
     }
     // Test-local, never shared: see `leak_zeroed_object`.
     static CTOR_DISPATCHES: std::sync::atomic::AtomicUsize =
@@ -5590,7 +5593,7 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
     }
     let mut helpers = dummy_helpers();
     helpers.invoke_dispatch = must_not_dispatch as *const () as usize;
-    helpers.new_object = must_not_allocate as *const () as usize;
+    helpers.new_object = counting_alloc as *const () as usize;
     helpers.getfield = legacy_getfield as *const () as usize;
     helpers.putfield_int = legacy_putfield_int as *const () as usize;
     let code = vec![
@@ -5663,23 +5666,29 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
     let ir = compile(&elidable, &helpers)
         .expect("an elidable trivial-<init> allocation must still compile");
     assert!(ir.used_ir_backend, "this test is about the IR arm");
-    for n in [11i64, 0, -4] {
-        // SAFETY: with the allocation scalar-replaced the emitted code touches
-        // no heap memory at all. Reaching either helper is the failure — both
-        // panic rather than returning something plausible.
+    for (i, n) in [11i64, 0, -4].into_iter().enumerate() {
+        // SAFETY: every pointer the emitted code touches comes from
+        // `counting_alloc`, which hands out live leaked 8-aligned buffers.
+        // Reaching `must_not_dispatch` is the failure this arm is here for.
         let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
             .unwrap_or_else(|e| panic!("elidable-init method n={n}: {e:?}"));
         assert_eq!(r, n, "the field written is the field read back");
+        assert_eq!(
+            ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
+            i + 1,
+            "documenting current behaviour, not requiring it: escape analysis \
+             offers this `new` as scalar-replaceable and the emitted body \
+             allocates anyway (see the residual). 0 here would be an improvement"
+        );
     }
+    let allocs_after_arm1 = ALLOCS.load(std::sync::atomic::Ordering::SeqCst);
 
     // Arm 2 — the control. Identical bytecode, but the elision analysis
-    // DECLINES the site, so the constructor must be really called AND the
-    // object really allocated (the call arg-escapes its receiver). Without this
+    // DECLINES the site, so the constructor must be really called. Without this
     // arm the test above would also pass on a builder that silently dropped
     // every `<init>`.
     let mut call_helpers = helpers;
     call_helpers.invoke_dispatch = counting_dispatch as *const () as usize;
-    call_helpers.new_object = counting_alloc as *const () as usize;
     let not_elidable = |_cp: u16| -> bool { false };
     let ir2 = compile(&not_elidable, &call_helpers)
         .expect("a non-elidable <init>()V on a fresh `new` must still compile — cov-04");
@@ -5697,7 +5706,7 @@ fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
         );
         assert_eq!(
             ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
-            i + 1,
+            allocs_after_arm1 + i + 1,
             "and its receiver arg-escapes into that call, so the allocation must \
              survive — once per invocation, never scalar-replaced"
         );

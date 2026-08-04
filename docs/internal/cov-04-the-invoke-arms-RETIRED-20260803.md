@@ -236,12 +236,11 @@ Unit coverage, `jit/tests/ir_vs_singlepass.rs`:
   reads it back, and the allocation counter must advance once per invocation.
 * `ir_elidable_trivial_init_on_fresh_new_is_still_elided` — the transform the
   lane must not lose, as a two-armed comparison over identical bytecode. With
-  the site elidable, neither the dispatch helper nor the allocation helper may
-  run (escape analysis scalar-replaces the object outright — both helpers
-  `panic!` rather than returning something plausible). With the site declined by
-  the elision analysis, both must run exactly once per invocation. The second
-  arm exists because the first alone would also pass on a builder that silently
-  dropped every `<init>`.
+  the site elidable the dispatch helper must never run (it `panic!`s rather than
+  returning something plausible, so an un-elided `<init>` cannot slip past);
+  with the identical bytecode declined by the elision analysis it must run
+  exactly once per invocation. The second arm exists because the first alone
+  would also pass on a builder that silently dropped every `<init>`.
 
 Each test names the exact edit that trips it, per this directory's rule 5. On
 the merged tree `cargo test --release -p cratonvm-jit --lib` is 1,868 / 0 and
@@ -285,25 +284,37 @@ direction that has nothing to do with moving code.
   never fires, but it is why the two terms this lane removed cost 106 events
   rather than being confined to the sites that caused them.
 
-### A residual that turned out not to exist
+### The one residual this lane found, and the two wrong answers on the way
 
-An earlier draft of this document recorded, as a finding for the escape-analysis
-owner, that *"a `new` whose only uses are its own field ops is still
-allocated"* — the elision test's allocation counter moved when it should not
-have. That was wrong, and the way it was wrong is the useful part.
+**Escape analysis offers a scalar replacement that the emitted body does not
+take.** For `Corpus c = new Corpus(); c.f0 = n; return c.f0` with an elidable
+`<init>`, `CRATONVM_DBG_SCALAR_NEW=1` reports **`scalar-replaced 1/1`** — and
+the emitted code still calls `jit_new_object` once per invocation. The control
+arm, with the constructor declined and therefore really called, reports `0/1`
+and also allocates, which is correct. So the discrepancy is not in
+`analyze_escapes`' *analysis*; it is between what it offers and what survives to
+the emitted body. Not this lane's to fix — recorded here with an exact repro
+(`ir_elidable_trivial_init_on_fresh_new_is_still_elided`, arm 1, which asserts
+the current count and says in the assertion message that 0 would be an
+improvement).
 
-`CRATONVM_DBG_SCALAR_NEW=1` reports **`scalar-replaced 1/1`** for the elidable
-arm and **`0/1`** for the control. Escape analysis is doing exactly the right
-thing in both. The counter moved because it was a **single `static` shared by
-two `#[test]` functions, which `cargo test` runs on concurrent threads** — the
-other test's allocations were being counted against this one's expectation. A
-flaky assertion, which rule 5 rates worse than no assertion, dressed up as a
-compiler defect and nearly shipped as one.
+Getting there took two wrong answers, both worth naming:
+
+1. The counter that produced the first report was **a single `static` shared by
+   two `#[test]` functions, which `cargo test` runs on concurrent threads** —
+   the other test's allocations were being counted against this one. Flaky,
+   which rule 5 rates worse than no assertion.
+2. Having found that, the obvious conclusion — *"so the residual was an
+   artefact"* — was **also wrong**, and `scalar-replaced 1/1` looked like proof
+   of it. It is not: that line reports what the analysis *offered*. Replacing
+   the stub with one that `panic!`s if it is ever reached settled it in one run;
+   the allocation is real.
 
 Both tests now own their counter and their `extern "C"` wrapper, declared inside
-the test body, and the elision test asserts the allocation behaviour in **both**
-directions — gone when the constructor is elided, present once per invocation
-when it is called. Ask the diagnostic before writing the residual.
+the test body. And the general lesson is the one already in
+`reference_compare_what_the_consumer_reads_not_the_value`: a diagnostic that
+reports a decision is not evidence about the code that was emitted. Assert
+against the observable, not against the log line.
 
 ## Reproducing
 
