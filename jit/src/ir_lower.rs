@@ -10043,7 +10043,8 @@ mod tests {
     /// property is asserted where it is actually decided.
     ///
     /// **The edit that trips this**: change `0x32`'s arm in `ir.rs` to build
-    /// `(MemKind::Ref, IrType::Int)`.
+    /// `(MemKind::Ref, IrType::Int)`. That flips the `IrType` assertion AND
+    /// moves the element into the primitive pool, so both halves fire.
     #[test]
     fn an_aaload_result_is_reference_typed_and_takes_a_reference_slot() {
         use crate::ir::{IrBuilder, MemKind};
@@ -10077,14 +10078,38 @@ mod tests {
              root at every later safepoint"
         );
 
+        // …and no primitive may ever inherit the word it lands in, because
+        // `emit_safepoint_map` will name that word as a root.
+        //
+        // Asserted as an ALIASING property rather than as `class ==
+        // SlotClass::Ref`, which is what this test tried first and which is
+        // wrong: in a method this short the element is still on the operand
+        // stack at the `areturn` bci, so a safepoint snapshot names it and
+        // `plan_slots` pins it (`SlotClass::Pinned` — shares with nothing at
+        // all, strictly stronger than the reference pool). Which of the two it
+        // gets depends on where the value dies, i.e. on the fixture. What must
+        // hold for every fixture is that no `Prim` sits on its colour.
         let schedule = ir_schedule::schedule(&graph);
         let plan = plan_slots(&graph, &schedule, None);
-        assert_eq!(
-            plan.class[load as usize],
-            Some(SlotClass::Ref),
-            "the element's frame word must come from the reference pool, so no \
-             primitive can ever inherit a word an oop map names"
+        let class = plan.class[load as usize].expect("the element must get a frame word");
+        assert_ne!(
+            class,
+            SlotClass::Prim,
+            "an `aaload` result took a word from the PRIMITIVE pool; the \
+             collector would then follow whatever int recycled it as an object \
+             pointer"
         );
+        let color = plan.node_color[load as usize].expect("a coloured element");
+        for (id, other) in plan.node_color.iter().enumerate() {
+            if id == load as usize || *other != Some(color) {
+                continue;
+            }
+            assert_ne!(
+                plan.class[id],
+                Some(SlotClass::Prim),
+                "n{id} is a primitive sharing the `aaload` element's frame word",
+            );
+        }
     }
 
     /// Every value a deopt frame names keeps a dedicated slot: the deopt
