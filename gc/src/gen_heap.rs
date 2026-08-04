@@ -13380,15 +13380,23 @@ fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative
     total >= HEADER_SIZE && old_gen.contains(unsafe { ptr.add(total - 1) })
 }
 
-/// `CRATONVM_DBG_COMPACT_REFERRERS=1` — word-scan the heap for referrers of
-/// every block an old-gen compaction is about to drop. Off by default: the scan
-/// is O(heap / 8) per compaction.
+/// `CRATONVM_DBG=sweep-referrers` (legacy `CRATONVM_DBG_SWEEP_REFERRERS=1`) —
+/// word-scan the heap for referrers of every block an old-gen reclamation is
+/// about to drop, on BOTH arms: the in-place sweep and the compactor. Off by
+/// default: the scan is O(heap / 8) per cycle.
+///
+/// This used to be two names OR'd together, `CRATONVM_DBG_SWEEP_REFERRERS` and
+/// `CRATONVM_DBG_COMPACT_REFERRERS` — one switch spelled twice, which is the
+/// exact duplication `flag_groups` exists to undo. Neither was declared, so
+/// neither was reachable through `CRATONVM_DBG=` or arrangeable by
+/// `flags::with_thread_overrides`, and the second spelling appeared nowhere
+/// outside this function. Collapsed to the one name a known-issue repro
+/// already uses (`known-issues/h2/bug-h2-mvstore-readpagefromcache-classid0-nonmoving-sweep.md`).
 fn doomed_referrers_dbg() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SWEEP_REFERRERS").is_some()
-        || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_REFERRERS").is_some()
 }
 
-/// See [`compact_referrers_dbg`]. Reports the first few (victim, referrer)
+/// See [`doomed_referrers_dbg`]. Reports the first few (victim, referrer)
 /// pairs with enough context to name the mark source that missed the edge.
 fn report_doomed_referrers(
     label: &str,

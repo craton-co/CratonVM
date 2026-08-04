@@ -189,12 +189,10 @@ that caught the three new variants missing from `op_representatives`.
 
 The brief's "what to refuse" section, as implemented:
 
-* **`J` / `D` / `F` statics** — refused in the **builder**, because the refusal
-  is about the value tier and not about the load. Admitting one would put a
-  `Long`/`Double`/`Float` node in a graph whose admission clause may have been
-  the int one, and a static field carries no equivalent of the `ir_emit_long` /
-  `ir_emit_fp` signal the `ldc2_w` arm consults. **Residual**: giving statics
-  that signal is a real follow-up and is not hard; nobody owns it.
+* ~~**`J` / `D` / `F` statics** — refused in the **builder**~~ **Closed
+  2026-08-04**; see the section above. The refusal was right about the hazard
+  and wrong about the place: the gate belongs in the feed, which is the only
+  party that knows the width.
 * **`putstatic`** — not fed to the builder at all. A static reference WRITE owes
   an SATB pre-barrier that no collector `set_field` barrier covers (statics live
   in a Rust-side table, not the heap), which is exactly why the single-pass
@@ -306,11 +304,106 @@ land, every single-pass-only capability loses population.**
 `getstatic; invokevirtual` is the most ordinary virtual-call shape there is,
 and one lane took the whole shape away from PGO-02.
 
+## The `J` / `D` / `F` residual, closed 2026-08-04
+
+The lane shipped with wide and floating-point statics refused, and the reason
+given was that admitting one would put a `Long`/`Double`/`Float` node in a graph
+whose admission clause may have been the int one. The hazard was real. **The
+refusal was in the wrong place**, and that is the whole finding.
+
+`getstatic` is polymorphic and appears in neither `is_category2_opcode` nor
+`is_float_opcode` — the same property that forced `JitLdcConstant::Immediate` to
+grow an `is_float` flag. So a method whose only wide content is a static read
+has `method_uses_category2() == false` and `fp_in_body() == false` and is
+admitted through the INT clause; the builder genuinely cannot see the width. But
+`try_compile` resolved the type tag in order to build the table at all. The gate
+therefore belongs in the **feed**, keyed on `ir_emit_long` / `ir_emit_fp`,
+exactly as the float half of the `ldc` feed and the `ldc2_w` feed already are:
+the party that resolves the width is the party that decides.
+
+Three things the widths needed beyond the builder's type match:
+
+* the DIRECT route gets a third case — `J`/`D` at the 64-bit payload like a
+  reference, `F` at the 32-bit payload with `MOV r32` and **not** `MOVSXD`
+  (sign-extending a negative float's bit pattern fills the high half of the home
+  word with garbage). Same three cases, same constants, same order as
+  `try_emit_inline_getstatic`.
+* the HELPER route's sentinel check became `emit_call_return_check` — the
+  protocol rather than a second copy of it. For a wide value a legitimate
+  `Long.MIN_VALUE` is bit-identical to the failed-`<clinit>` sentinel, so it
+  peeks `jit_dispatch_threw` on that branch. The single-pass `0xb2` arm has
+  routed wide statics through that same peek all along via
+  `emit_post_invoke_exception_check`, so this is matching that arm rather than
+  inventing anything.
+* an FP result publishes to its register the way `Op::ConstF` does.
+
+### What it is worth: nothing measurable, and that is the answer
+
+| `ConditionalOnPropertyTests`, interleaved | before | after |
+|---|---:|---:|
+| bodies | 535–536 | 536–537 |
+| `build returned None` | 137 | 135–137 |
+| the wide-static refusal (`ir.rs:5969`) | **0** | — |
+
+Within run-to-run noise. The refusal fired **zero** times on the workload this
+lane was sized from, before and after, so there was never anything for it to
+admit — which was established *before* the work by counting that bail site, not
+discovered after.
+
+The reason is a property of the Java language rather than of this workload: a
+`static final` primitive with a constant initializer is a **compile-time
+constant**, so javac emits `ldc2_w`, not `getstatic`. A wide static READ only
+survives compilation when the field is non-final or not constant-initialised.
+`probes/Cov01WideStaticProbe.java` has to declare every field non-final for
+exactly this reason, and `javap` on it is the check that the probe tests the
+opcode it claims to.
+
+So this is a completeness and correctness change, not a throughput one, and it
+should not be quoted as bodies gained.
+
+### Evidence
+
+`probes/Cov01WideStaticProbe.java`, 300,000 iterations, default configuration,
+green — and the control is exact. On the **pre-change** binary only the `int`
+reader gets an optimizing body and the five wide readers are refused six times
+at `ir.rs:5969`, the type-tag bail:
+
+```
+--- IR bodies (CONTROL):    [ir] … produced a body for Cov01WideStaticProbe.readI()I
+--- builder refusals:       6 refused at ir.rs:5969 (bytecode pc 0)
+```
+
+After, all six compile and the refusal is gone. The probe passes on both, which
+is the point: single-pass always compiled these, so this moves *which tier*
+serves them.
+
+Four differential cases, and **the two that carry the weight were verified by
+breaking what they guard** — which is how both turned out to be unable to fail
+as first written:
+
+* `long_min_value_static_is_a_value_not_a_sentinel` returns the static **plus
+  one**. Without the `+ 1`, "kept the value" and "propagated the sentinel" both
+  produce `Long.MIN_VALUE`, and the test passed against a deliberately broken
+  lowering.
+* the direct-load float rung compares the two backends on the **full 64-bit
+  word**. A float return only defines the low 32, so the first draft masked —
+  discarding exactly the bits the `MOVSXD`/`MOV EAX` choice decides — and it too
+  passed against a deliberately wrong width. The host comparison still uses the
+  ABI-defined bits; the backend-vs-backend one does not.
+
+One harness lesson worth carrying: the wide direct-load rungs are rungs of the
+**existing** direct-load test, not a sibling. `set_static_base_resolver` latches
+its context for the life of the process, so a second registration with its own
+block poisons the resolver and every direct site silently reverts to the helper
+— which is what a separate test did, making the original rung return the marker
+value. Widening that one resolver's accepted range also turned its
+declined-site control into a resolved site; the control moved from field 5 to
+field 0.
+
 ## Residuals
 
 | Residual | Where | Owner |
 |---|---|---|
-| `J` / `D` / `F` statics are refused; statics have no `ir_emit_long`/`ir_emit_fp` equivalent | `IrBuilder::build`'s `0xb2` arm | nobody |
 | `putstatic` (`0xb3`) has no IR lowering — 1 measured event, deliberately out of scope (the SATB pre-barrier) | `ir.rs`, `ir_lower.rs` | nobody |
 | the "fails to rewrite" half of the root test is unreachable until `JIT_PUBLISHES_RELOCATION_CONTRACT` flips | `types/src/flags.rs` | nobody |
 | `cov-04`'s `invokespecial` refusal is now 71, double what the survey measured | [`cov-04`](../known-issues/c2/cov-04-the-invoke-arms.md) | `cov-04` |

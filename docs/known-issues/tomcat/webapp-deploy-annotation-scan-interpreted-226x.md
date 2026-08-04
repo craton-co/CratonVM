@@ -8,6 +8,27 @@
 | **CratonVM** | FAIL (timing only — no wrong results, no crash) |
 | **Discovered** | 2026-08-03, after fixing the `seek0`/`ExpandWar` defect that had been masking it (`docs/internal/fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md`) |
 
+> **Update 2026-08-03 — two corrections, neither of which closes this doc.**
+>
+> 1. **The compiled-method census below is stale.** Re-run on merged `dev`
+>    `5e1f7d6e3` over the same `AnnotationScanCostProbe` scan,
+>    `CRATONVM_DBG=jit-compiled` lists **21 methods, two of them `<init>`**
+>    (`ConstantUtf8.<init>`, `ConstantClass.<init>`), not "eight, zero
+>    `<init>`". `Constant.readConstant`, `ConstantUtf8.getInstance` and
+>    `Utility.getClassName` compile now too. So **"the parse is never compiled"
+>    and "zero constructors" are both out of date**, and § Root cause — which
+>    argues from them — must be re-derived before it is planned against. What
+>    is still absent is exactly the frame `--stack-dump-on-timeout` puts on
+>    top: `BufferedInputStream.read`, `DataInputStream.readUnsignedByte`,
+>    `ClassParser.parse`, `ConstantPool.<init>` — i.e. the `synchronized` /
+>    lock-bearing bodies, which is doc 31's subject, not an admission ban.
+> 2. **A separate degradation term was found and fixed**, and it is not in this
+>    doc's model at all: the cost is not flat, it *rises* within one process.
+>    See [loader-latch-degrades-every-deploy.md](loader-latch-degrades-every-deploy.md).
+>    Defining one class through any user-defined loader used to make the whole
+>    VM ~1.8x slower permanently. Fixed; worth 3.5x on the probe and **nothing
+>    measurable on the test classes**, which is why this doc stays OPEN.
+
 ## Symptom
 
 `org.apache.catalina.manager.TestManagerWebapp` fails 2 of its 3 methods on
