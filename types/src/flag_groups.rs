@@ -426,6 +426,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "oom-bt", on_key: Some("CRATONVM_DBG_OOM_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "oop-span-probe", on_key: Some("CRATONVM_OOP_SPAN_PROBE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr", on_key: Some("CRATONVM_DBG_OSR"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "owner-filter", on_key: Some("CRATONVM_DBG_OWNER_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-exit-after", on_key: Some("CRATONVM_OSR_EXIT_AFTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-exit-test", on_key: Some("CRATONVM_OSR_EXIT_TEST"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-meta", on_key: Some("CRATONVM_DBG_OSR_META"), off_key: None, off_word: None },
@@ -526,6 +527,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "surefire-ipc-dbg", on_key: Some("CRATONVM_SUREFIRE_IPC_DBG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-census", on_key: Some("CRATONVM_DBG_SWEEP_CENSUS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-edges", on_key: Some("CRATONVM_DBG_SWEEP_EDGES"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "sweep-referrers", on_key: Some("CRATONVM_DBG_SWEEP_REFERRERS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-zero", on_key: Some("CRATONVM_DBG_SWEEP_ZERO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "symbolize", on_key: Some("CRATONVM_SYMBOLIZE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "symbolize-dbg", on_key: Some("CRATONVM_SYMBOLIZE_DBG"), off_key: None, off_word: None },
@@ -841,8 +843,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "mirror-pin-young-defer", on_key: None, off_key: Some("CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER"), off_word: None },
     E { group: Group::GC, token: "moving-young", on_key: Some("CRATONVM_MOVING_YOUNG"), off_key: Some("CRATONVM_NO_MOVING_YOUNG"), off_word: None },
     E { group: Group::GC, token: "moving-young-jit-frames", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_JIT"), off_word: None },
+    E { group: Group::GC, token: "old-interior-pins", on_key: None, off_key: Some("CRATONVM_GC_NO_OLD_INTERIOR_PINS"), off_word: None },
     E { group: Group::GC, token: "oldgen-coalesce", on_key: None, off_key: Some("CRATONVM_NO_OLDGEN_COALESCE"), off_word: None },
+    E { group: Group::GC, token: "oldgen-compact", on_key: Some("CRATONVM_OLDGEN_COMPACT"), off_key: None, off_word: None },
     E { group: Group::GC, token: "overhead-limit", on_key: Some("CRATONVM_GC_OVERHEAD_LIMIT"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "owner-class-filter", on_key: Some("CRATONVM_OWNER_CLASS_FILTER"), off_key: None, off_word: None },
     E { group: Group::GC, token: "par-min-bytes", on_key: Some("CRATONVM_GC_PAR_MIN_BYTES"), off_key: None, off_word: None },
     E { group: Group::GC, token: "par-threads", on_key: Some("CRATONVM_GC_PAR_THREADS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None },
@@ -2061,6 +2066,54 @@ mod tests {
             Some(OsString::from("1"))
         );
         assert_eq!(r.get("CRATONVM_JIT_IR_LINEAR_SCAN"), None);
+    }
+
+    /// The six GC/native-collections knobs brought inside the boundary on
+    /// 2026-08-04 are reachable BOTH ways, which is the whole point of
+    /// declaring them.
+    ///
+    /// `flag_declaration_guard` only asks whether a name appears in
+    /// [`INVENTORY`]; it cannot tell a token that resolves from one that was
+    /// merely listed. Until this landed, all six were served by a live
+    /// `getenv`, so `CRATONVM_GC=…` could not reach them and
+    /// `flags::with_thread_overrides` could not arrange them in a test — which
+    /// is exactly how a flag-dependent test ends up measuring the developer's
+    /// ambient environment instead of what it claims to check.
+    #[test]
+    fn the_gc_diagnostic_knobs_resolve_from_their_grouped_token() {
+        // (group variable, token, the legacy key it must set)
+        let on: &[(&str, &str, &str)] = &[
+            ("CRATONVM_DBG", "sweep-referrers", "CRATONVM_DBG_SWEEP_REFERRERS"),
+            ("CRATONVM_DBG", "owner-filter", "CRATONVM_DBG_OWNER_FILTER"),
+            ("CRATONVM_GC", "oldgen-compact", "CRATONVM_OLDGEN_COMPACT"),
+            ("CRATONVM_GC", "owner-class-filter", "CRATONVM_OWNER_CLASS_FILTER"),
+        ];
+        for &(var, token, key) in on {
+            let c = case(&[(var, token)]);
+            assert_eq!(
+                c.resolve().get(key),
+                Some(OsString::from("1")),
+                "{var}={token} must set {key}"
+            );
+        }
+
+        // `old-interior-pins` is a default-ON capability whose only spelling
+        // was ever the opt-out, so the token is stated positively and it is
+        // `-old-interior-pins` that sets the `NO_` key. Both directions are
+        // asserted: a token that silently did nothing would otherwise look
+        // exactly like one that worked.
+        let off = case(&[("CRATONVM_GC", "-old-interior-pins")]);
+        assert_eq!(
+            off.resolve().get("CRATONVM_GC_NO_OLD_INTERIOR_PINS"),
+            Some(OsString::from("1")),
+            "-old-interior-pins must set the NO_ key"
+        );
+        let on = case(&[("CRATONVM_GC", "old-interior-pins")]);
+        assert_eq!(
+            on.resolve().get("CRATONVM_GC_NO_OLD_INTERIOR_PINS"),
+            None,
+            "the positive token must leave the pins on, i.e. the NO_ key unset"
+        );
     }
 
     #[test]
