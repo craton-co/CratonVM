@@ -93,32 +93,46 @@ for the absence of a helper it never calls.
 
 ### Coverage — `CRATONVM_DBG=ir-compiles`, `ConditionalOnPropertyTests`
 
-Two rounds, both arms per round, arm order reversed in round 2.
+Two rounds, both arms per round, arm order reversed in round 2. **Measured
+twice**, because `cov-01` and `cov-02` merged into `dev` while this lane was in
+flight and neither of their post-measurements includes this one either. The
+second table is the one that describes `dev` today.
+
+**(a) In isolation, against `dev` before `cov-01`/`cov-02`:**
 
 | arm | admitted | bodies | builder refusals |
 |---|---:|---:|---:|
-| base r1 | 693 | 410 | 83 |
-| base r2 | 695 | 410 | 83 |
-| **fix r1** | 696 | **445** | **50** |
-| **fix r2** | 694 | **444** | **49** |
+| base | 693 / 695 | 410 / 410 | 83 / 83 |
+| **fix** | 696 / 694 | **445 / 444** | **50 / 49** |
 
-Refusal sites, per run (`ir.rs` line numbers shift with the edit; the mapping is
-by arm):
+**(b) On top of `cov-01` + `cov-02`, which is where it landed:**
 
-| site (base) | what | base | site (fix) | fix |
+| arm | admitted | bodies | builder refusals |
+|---|---:|---:|---:|
+| dev base | 695 / 694 | 537 / 536 | 127 / 127 |
+| **merged** | 694 / 696 | **574 / 576** | **89 / 89** |
+
+Refusal sites for (b) (`ir.rs` line numbers shift by +79 with this edit; the
+mapping is by arm, and every surviving site maps 1:1):
+
+| site (dev) | what | dev | site (merged) | merged |
 |---|---|---:|---|---:|
-| `ir.rs:5085` | `putfield` tag not `I/Z/B/C/S` | **33** | `ir.rs:5157` | **0** |
-| `ir.rs:5041` | `getfield` of `long`/`float`/`double` | **5** | `ir.rs:5094` | **0** |
-| `ir.rs:5204` | `invokespecial` (`cov-04`) | 36 | `ir.rs:5283` | 40 |
-| `ir.rs:5264` | invoke with no `invoke_info` (`cov-04`) | 8 | `ir.rs:5343` | 9 |
-| `ir.rs:5219` | (`cov-04`) | 1 | `ir.rs:5298` | 1 |
+| `ir.rs:5337` | `putfield` tag not `I/Z/B/C/S` | **38** | `ir.rs:5416` | **0** |
+| `ir.rs:5293` | `getfield` of `long`/`float`/`double` | **5** | `ir.rs:5372` | **0** |
+| `ir.rs:5456` | `invokespecial` (`cov-04`) | 73 | `ir.rs:5535` | 78 |
+| `ir.rs:5516` | invoke with no `invoke_info` (`cov-04`) | 9 | `ir.rs:5595` | 9 |
+| `ir.rs:5471` | (`cov-04`) | 1 | `ir.rs:5550` | 1 |
+| `ir.rs:5381` | `getfield` with no resolved layout | 1 | `ir.rs:5460` | 1 |
 
-Both of the lane's sites are gone. Bodies rise by 34–35 against 38 refusals
-removed — the shortfall is methods that now get past the builder and fail
-somewhere later, which is the expected shape, not a regression. `cov-04`'s
-counts rise by 4–5 for the same reason: methods that used to die at this lane's
-sites now reach the invoke arms. Tests: 38/38 pass on both arms in all four
-runs.
+Both of the lane's sites are gone: **43 events removed, 38 net** (`cov-04`'s
+`invokespecial` absorbs 5), and bodies rise by **38.5**. Tests: 38/38 pass on
+every arm of every run.
+
+The reason 43 removed does not become 43 bodies is the same shape `cov-01` and
+`cov-02` both hit: a method that gets past this lane's site dies at the next gap
+it meets. That is not a shortfall to explain away — it is the survey's own
+prediction, and it is why the README says to re-run the survey after ANY lane
+lands.
 
 ### Wall clock — and the fake 1.7x regression on the way there
 
@@ -168,7 +182,9 @@ times any difference either statistic claims".
   identically on both (pre-existing — `BootJarTests` 43/43,
   `ModifiedClassPathExtension*`, `WebApplicationTypeIntegrationTests` 5/10, and
   the rest of the gradle-plugin group). No class changed status, test count,
-  or failure count in either direction.
+  or failure count in either direction. **Run twice** — once for the isolated
+  change and again for the merge on top of `cov-01`/`cov-02` — with the same
+  66/12 split both times.
 * `jit/tests/ir_vs_singlepass.rs` — the brief's second verification item.
   `ir_vs_singlepass_reference_putfield_then_getfield` stores a reference field,
   reads it back and returns it; `…_pure_write` stores and never reads. Both run
@@ -201,10 +217,12 @@ methods under test:
 
 | backend | cycles | old→young edges recorded | checks | missing | wrong type | corrupt |
 |---|---:|---:|---:|---:|---:|---:|
-| generational | 46 minor (2 of them MOVING young) | **76,042** | 16,000 | 0 | 0 | 0 |
+| generational | 46 minor (2 of them MOVING young) | **76,036** | 16,000 | 0 | 0 | 0 |
 | G1 | 15 young, all evacuating (`cset_young`, `cset_old=0`) | — | 16,000 | 0 | 0 | 0 |
 
-`old_to_young_edges=76042` is the number that makes the run non-vacuous: the
+(Re-run identically on the post-`cov-01`/`cov-02` merged binary: same counts.)
+
+`old_to_young_edges=76036` is the number that makes the run non-vacuous: the
 remembered set genuinely recorded the edges, so the barrier path was on the
 critical path rather than merely present.
 

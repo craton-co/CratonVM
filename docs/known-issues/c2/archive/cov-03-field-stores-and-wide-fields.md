@@ -5,6 +5,17 @@
 (`ir.rs:4995` and `ir.rs:5074` today), and their lowering in
 `jit/src/ir_lower.rs`. Not `ir_compatible`.
 
+> **Re-measure before quoting the survey's 43 — this lane is now much larger
+> than that.** `cov-01`, `cov-02` and `cov-04` all closed 2026-08-03, and
+> `cov-04`'s two removed terms admitted a population of **constructors** to the
+> builder, which is the code that writes reference fields. On the merged tree
+> the `putfield` row is **78** (was 37) and this lane owns **78 of the 85**
+> builder refusals that remain — every other structural refusal in the corpus
+> is gone, and the opcode gap is down to 13 events. `cov-03` is the whole
+> remaining builder story. Line numbers moved too (`0xb4` at `ir.rs:5343`,
+> `0xb5` at `ir.rs:5387` with all three lanes in); re-derive both. See
+> [`docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).
+
 ## The finding
 
 The `getfield` arm accepts an int-family tag **or a reference**:

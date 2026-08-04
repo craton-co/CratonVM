@@ -552,6 +552,15 @@ mod tests {
     /// and therefore follows a rename or a move of this module to another
     /// file. It fails loudly rather than vacuously when the file cannot be
     /// read or when it finds no tests at all.
+    ///
+    /// The scan itself is [`tests_missing_lock`], which is a pure function so
+    /// that [`the_serialisation_guard_catches_a_test_that_omits_the_lock`] can
+    /// prove it is not vacuous. It was: the first version searched a FIXED
+    /// twelve-line window after each `#[test]`, so a short unserialised test
+    /// followed by a serialised one was satisfied by *its neighbour's* lock.
+    /// Injecting a deliberately unlocked three-line test into this module and
+    /// running the guard passed, on 2026-08-04. Every test here is short, so
+    /// that was the normal case, not a corner.
     #[test]
     fn every_test_in_this_module_serialises() {
         let _serialised = TEST_LOCK.lock();
@@ -568,30 +577,7 @@ mod tests {
             )
         });
 
-        // Assembled so this needle does not match the line that defines it.
-        let attr = format!("#[{}]", "test");
-        let takes_lock = format!("{}.lock()", "TEST_LOCK");
-
-        let lines: Vec<&str> = src.lines().collect();
-        let mut checked = 0usize;
-        let mut missing: Vec<String> = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if line.trim() != attr {
-                continue;
-            }
-            checked += 1;
-            // The lock is the first statement of every test here; a dozen
-            // lines is slack for an attribute stack or a wrapped signature.
-            let body = lines[i + 1..lines.len().min(i + 13)].join("\n");
-            if !body.contains(&takes_lock) {
-                let name = lines[i + 1..lines.len().min(i + 5)]
-                    .iter()
-                    .find(|l| l.contains("fn "))
-                    .unwrap_or(&"<unknown>")
-                    .trim();
-                missing.push(format!("line {}: {name}", i + 1));
-            }
-        }
+        let (checked, missing) = tests_missing_lock(&src);
 
         assert!(
             checked >= 5,
@@ -608,5 +594,115 @@ mod tests {
              TEST_LOCK.lock();` as the first statement:\n  {}",
             missing.join("\n  ")
         );
+    }
+
+    /// `(tests seen, one description per test that never takes [`TEST_LOCK`])`.
+    ///
+    /// Each test's window ends at that test's own closing brace — the first
+    /// `    }` at module-item indentation — or at the next `#[test]`,
+    /// whichever comes first. Never at a fixed line count. A fixed window is
+    /// what made the first version of this guard vacuous: it ran past the end
+    /// of a short test and found the lock belonging to the following one. The
+    /// closing-brace bound additionally stops a *helper* defined below a test
+    /// from vouching for it.
+    ///
+    /// Erring is one-directional by construction: a window that ends too early
+    /// reports a lock it did not see (loud, and wrong in the safe direction),
+    /// never the reverse.
+    ///
+    /// Pure, and takes the source as an argument, so the guard's own behaviour
+    /// is testable on synthetic input instead of only on the file that is
+    /// currently correct — a source scan that silently matches nothing passes
+    /// exactly as happily as one that matches everything.
+    fn tests_missing_lock(src: &str) -> (usize, Vec<String>) {
+        // Assembled so these needles do not match the lines that define them.
+        let attr = format!("#[{}]", "test");
+        let takes_lock = format!("{}.lock()", "TEST_LOCK");
+
+        let lines: Vec<&str> = src.lines().collect();
+        let starts: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim() == attr)
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut missing = Vec::new();
+        for (n, &i) in starts.iter().enumerate() {
+            let next_attr = starts.get(n + 1).copied().unwrap_or(lines.len());
+            // A fn body's own lines are indented at least 8 spaces inside
+            // `mod tests`, so the first 4-space `}` is this test's closer.
+            let closer = lines[i + 1..next_attr]
+                .iter()
+                .position(|l| *l == "    }")
+                .map(|p| i + 1 + p + 1)
+                .unwrap_or(next_attr);
+            let end = closer.min(next_attr);
+            let body = lines[i + 1..end].join("\n");
+            if !body.contains(&takes_lock) {
+                let name = lines[i + 1..end.min(i + 5)]
+                    .iter()
+                    .find(|l| l.contains("fn "))
+                    .unwrap_or(&"<unknown>")
+                    .trim();
+                missing.push(format!("line {}: {name}", i + 1));
+            }
+        }
+        (starts.len(), missing)
+    }
+
+    /// The guard has to fail on the shape that actually gets written: someone
+    /// adds a short test, forgets the lock, and the next test down has one.
+    ///
+    /// This is the case the fixed-window version passed. Asserting it here —
+    /// on synthetic source, so it cannot be quietly satisfied by whatever the
+    /// real module happens to look like today — is the difference between a
+    /// tripwire and a comment claiming there is one.
+    #[test]
+    fn the_serialisation_guard_catches_a_test_that_omits_the_lock() {
+        let _serialised = TEST_LOCK.lock();
+
+        // Built rather than written literally: a `#[test]` in a string in this
+        // file would be counted by the guard scanning its own source.
+        let attr = format!("#[{}]", "test");
+        let lock = format!("        let _s = {}.lock();", "TEST_LOCK");
+        let synthetic = format!(
+            "{attr}\n    fn forgot_the_lock() {{\n        clear();\n    }}\n\n\
+             {attr}\n    fn took_the_lock() {{\n{lock}\n        clear();\n    }}\n"
+        );
+
+        let (checked, missing) = tests_missing_lock(&synthetic);
+        assert_eq!(checked, 2, "both tests must be seen");
+        assert_eq!(
+            missing.len(),
+            1,
+            "exactly the unserialised test must be reported, not its neighbour \
+             — got {missing:?}"
+        );
+        assert!(
+            missing[0].contains("forgot_the_lock"),
+            "the report must name the offender: {missing:?}"
+        );
+
+        // A helper defined BELOW a test must not vouch for it either — that is
+        // the same borrowed-lock mistake with a non-test neighbour.
+        let with_helper = format!(
+            "{attr}\n    fn forgot_the_lock() {{\n        clear();\n    }}\n\n\
+                 fn helper() {{\n{lock}\n    }}\n"
+        );
+        let (checked, missing) = tests_missing_lock(&with_helper);
+        assert_eq!(checked, 1);
+        assert_eq!(
+            missing.len(),
+            1,
+            "a helper's lock, below the test, must not satisfy it: {missing:?}"
+        );
+
+        // ...and it must not cry wolf on a module that is correct.
+        let (checked, missing) = tests_missing_lock(&format!(
+            "{attr}\n    fn a() {{\n{lock}\n    }}\n\n{attr}\n    fn b() {{\n{lock}\n    }}\n"
+        ));
+        assert_eq!(checked, 2);
+        assert!(missing.is_empty(), "no false positives: {missing:?}");
     }
 }

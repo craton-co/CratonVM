@@ -13561,13 +13561,41 @@ fn try_compile_inner(
         // artifact (`static_init_classes`, below), because compiled code reads
         // static storage directly and the interpreter's compiled-entry path is
         // what ensure-initializes the declaring classes once per artifact.
+        //
+        // The VALUE TIER is gated here and not in the builder, because this is
+        // the only place that knows the width. `getstatic` is polymorphic: it
+        // is listed by neither `is_category2_opcode` nor `is_float_opcode`, so
+        // a method whose only wide or floating-point content is a static read
+        // has `method_uses_category2() == false` and `fp_in_body() == false`,
+        // and is admitted to the optimizing pipeline through the INT clause.
+        // Feeding it a `J` site with `ir_emit_long` off would then put a `Long`
+        // node in a graph the long tier is switched off for, and a `D`/`F` site
+        // an FP node with the FP tier off.
+        //
+        // Same shape as the float half of the `ldc` feed above, and as the
+        // `ldc2_w` feed's `if ir_emit_long || ir_emit_fp`: the party that
+        // resolved the width is the party that decides. A gated-off site is
+        // simply absent, so the builder's 0xb2 arm bails that method to
+        // single-pass, which compiles every width.
         let mut ir_static_init_classes: Vec<u32> = Vec::new();
         if !scan.static_field_ops.is_empty() {
             if let Some(resolver) = cp_static_field_resolver {
                 let mut sm = std::collections::HashMap::with_capacity(scan.static_field_ops.len());
                 for &(pc, cp_idx) in &scan.static_field_ops {
                     if let Some((class_id, field_index, type_tag, is_volatile)) = resolver(cp_idx) {
-                        sm.insert(pc, (class_id, field_index, type_tag, is_volatile));
+                        let admitted_by_value_tier = match type_tag {
+                            b'J' => ir_emit_long,
+                            b'D' | b'F' => ir_emit_fp,
+                            _ => true,
+                        };
+                        if admitted_by_value_tier {
+                            sm.insert(pc, (class_id, field_index, type_tag, is_volatile));
+                        }
+                        // Recorded regardless of the value tier: this list is
+                        // the ensure-init obligation, which the declaring class
+                        // owes whether or not the IR lowers the read. It also
+                        // matches the single-pass artifact, which records every
+                        // static site including every `putstatic`.
                         ir_static_init_classes.push(class_id);
                     }
                 }
@@ -13682,14 +13710,93 @@ fn try_compile_inner(
         // ON; it can no longer force it off. See the design doc for the matching
         // `vm/src/runtime/env_cache.rs` cleanup.
         let ir_emit_virtual_calls = ir_virtual_calls_enabled(ir_emit_virtual_calls);
+        // cov-04 census. The invoke bails in `IrBuilder::build` report a line
+        // number and a bytecode pc; neither says *which callee*, and the whole
+        // first increment of
+        // `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`
+        // was "group them by callee before writing code". Under
+        // `CRATONVM_DBG=ir-compiles` (or `jitc`) hand the builder a
+        // diagnostic-only `pc → "0xNN cn.mn desc"` map so each bail names its
+        // callee, and print the method-level facts that decide whether
+        // `invoke_info` is populated at all. Costs nothing when the flag is off:
+        // the resolver is not called and no string is built.
+        if ir_stage_reporting() && !scan.invoke_ops.is_empty() {
+            if let Some(resolver) = cp_invoke_resolver {
+                let mut labels: std::collections::HashMap<usize, Box<str>> =
+                    std::collections::HashMap::with_capacity(scan.invoke_ops.len());
+                for &(pc, cp_idx, opcode) in &scan.invoke_ops {
+                    if let Some((cn, mn, desc)) = resolver(cp_idx) {
+                        labels.insert(
+                            pc,
+                            format!("{opcode:#04x} {cn}.{mn}{desc}").into_boxed_str(),
+                        );
+                    }
+                }
+                builder.set_invoke_labels(
+                    labels,
+                    format!(
+                        "{}.{}{}",
+                        cached.class_name, cached.method_name, cached.method_descriptor
+                    )
+                    .into_boxed_str(),
+                );
+            }
+            eprintln!(
+                "[ir] invoke-plan {}.{}{}: sites={} new_ops={} anewarray_ops={} \
+                 gates(static={ir_emit_calls} special={ir_emit_special_calls} \
+                 virtual={ir_emit_virtual_calls}) call_eligible={}",
+                cached.class_name,
+                cached.method_name,
+                cached.method_descriptor,
+                scan.invoke_ops.len(),
+                scan.new_ops.len(),
+                // `new_ops` is reported but is NOT part of `call_eligible` any
+                // more (cov-04 increment 2). It stays in the line because it is
+                // what the pre-fix measurement keyed on, so the two runs remain
+                // comparable — but this field must keep matching the predicate
+                // below, or the census reports a gate that is not the gate.
+                scan.anewarray_ops.len(),
+                scan.anewarray_ops.is_empty(),
+            );
+        }
         if (ir_emit_calls || ir_emit_special_calls || ir_emit_virtual_calls)
             && !scan.invoke_ops.is_empty()
         {
             if let Some(resolver) = cp_invoke_resolver {
-                let call_eligible = scan.new_ops.is_empty() && scan.anewarray_ops.is_empty();
+                // cov-04. This used to also require `scan.new_ops.is_empty()`,
+                // on the premise that "a surviving `New` would need the
+                // allocation path the lowerer lacks". `ir_lower` grew that path
+                // — its `Op::New` arm goes through the shared
+                // compact-layout/TLAB-aware `jit_new_object` stub, the same
+                // helper the single-pass backend's `0xbb` uses, and it already
+                // refuses (`helpers.new_object == 0`) rather than emitting a
+                // call through address zero. So the term outlived its reason,
+                // and it was the single largest cause of an invoke refusal
+                // measured: 79 compiles lost `invoke_info` to it, producing 39
+                // of the 68 invoke bails — including all 13 at the `0xb6`/`0xb8`
+                // arm and both at `0xb9`, whose callees are ordinary
+                // perfectly-resolvable methods that were never the problem.
+                //
+                // `anewarray` stays: `IrBuilder::build` has no `0xbd` arm at
+                // all, and `ir_compatible` refuses such methods one stage
+                // earlier anyway (that conjunct is `cov-06`'s, not this lane's).
+                //
+                // An allocation that reaches an `Op::Call` as an argument is
+                // arg-escaped by the escape analysis, so it is really allocated
+                // rather than scalar-replaced — see `build_connection_graph`'s
+                // `Op::Call` arm.
+                let call_eligible = scan.anewarray_ops.is_empty();
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     let mut all_emittable = true;
+                    // cov-04 census: which site, and which of the five
+                    // conditions below, turned `all_emittable` off. Only built
+                    // under the debug flag; `all_emittable` is the real state.
+                    // The distinction matters because a single non-emittable
+                    // site discards `invoke_info` for the WHOLE method, so the
+                    // builder then bails on whichever invoke comes FIRST — which
+                    // is rarely the site that caused it.
+                    let mut nonemittable: Option<String> = None;
                     // Follow-up to the fib44 fix: when
                     // `CRATONVM_JIT_IR_SELFREC_DIRECT` is on, an eligible
                     // self-recursive static call is emitted as a DIRECT self-call
@@ -13719,29 +13826,67 @@ fn try_compile_inner(
                             || ((is_virtual || is_interface) && ir_emit_virtual_calls))
                         {
                             all_emittable = false;
+                            if ir_stage_reporting() {
+                                nonemittable =
+                                    Some(format!("pc={pc}: gate off for opcode {opcode:#04x}"));
+                            }
                             break;
                         }
                         let (cn, mn, desc) = match resolver(cp_idx) {
                             Some(t) => t,
                             None => {
                                 all_emittable = false;
+                                if ir_stage_reporting() {
+                                    nonemittable = Some(format!(
+                                        "pc={pc}: cp_invoke_resolver declined cp_idx={cp_idx}"
+                                    ));
+                                }
                                 break;
                             }
                         };
-                        // A `<init>` `invokespecial` is never a real `Op::Call`
-                        // here: a constructor is only ever handled by the
-                        // scalar-new elision path (`trivial_init_pcs`), and
-                        // eliding vs. calling a ctor are different transforms.
-                        // (Belt-and-braces — a `<init>`-bearing method also has
-                        // a `new`, so `call_eligible` is already false.)
-                        if is_special && mn == "<init>" {
-                            all_emittable = false;
-                            break;
-                        }
+                        // cov-04. This used to read
+                        //
+                        //     if is_special && mn == "<init>" { all_emittable = false; break; }
+                        //
+                        // on the premise that "a constructor is only ever
+                        // handled by the scalar-new elision path, and a
+                        // `<init>`-bearing method also has a `new`, so
+                        // `call_eligible` is already false". The second half of
+                        // that is simply not true, and the measurement says so:
+                        // 35 of the compiles this term disabled had **no `new`
+                        // at all** — they were compiled CONSTRUCTORS, whose
+                        // `super(...)` / `this(...)` chain call is an
+                        // `invokespecial` to `<init>` on `this`. Eliding one is
+                        // never an option (the receiver is a parameter, not a
+                        // fresh `Op::New`), so this term was not choosing
+                        // between two transforms; it was refusing the only one.
+                        //
+                        // A `<init>` now takes the ordinary statically-bound
+                        // `invoke_kind == 1` route, which is exactly what the
+                        // single-pass backend already emits for every
+                        // non-elidable constructor call (see the
+                        // `cp_elidable_init_resolver` rewrite below, whose
+                        // `else` arm is this same dispatch). The builder still
+                        // prefers ELISION whenever the pc is elidable and the
+                        // receiver is a fresh `Op::New`, so scalar replacement
+                        // is unaffected — see `IrBuilder::build`'s `0xb7` arm.
+                        //
+                        // What a `<init>` may NOT do is take the direct-call
+                        // path below: `direct_target` bakes an entry this
+                        // compile resolved by running `callee_compiler`, and
+                        // making every constructor site compile its callee is a
+                        // compile-time and recursion-cycle change this lane did
+                        // not measure. Constructors keep helper dispatch.
+                        let is_ctor = is_special && mn == "<init>";
                         let (desc_args, ret) = match static_call_shape(&desc) {
                             Some(t) => t,
                             None => {
                                 all_emittable = false;
+                                if ir_stage_reporting() {
+                                    nonemittable = Some(format!(
+                                        "pc={pc}: static_call_shape refused {cn}.{mn}{desc}"
+                                    ));
+                                }
                                 break;
                             }
                         };
@@ -13777,6 +13922,11 @@ fn try_compile_inner(
                             // it on the IR path with a direct self-call instead
                             // (invoke_kind 4 below).
                             all_emittable = false;
+                            if ir_stage_reporting() {
+                                nonemittable = Some(format!(
+                                    "pc={pc}: self-recursive wide return {cn}.{mn}{desc}"
+                                ));
+                            }
                             break;
                         }
                         // Every kind except `invokestatic` marshals the receiver
@@ -13829,7 +13979,7 @@ fn try_compile_inner(
                         //    `callee_compiler` call). Without this a super call
                         //    could be bound to the wrong method body.
                         let mut direct_target: Option<(usize, bool)> = None;
-                        if ir_direct && (is_static || is_special) && !is_self_recursive {
+                        if ir_direct && (is_static || is_special) && !is_ctor && !is_self_recursive {
                             let special_owner: Option<String> = if is_special {
                                 cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx))
                             } else {
@@ -13982,7 +14132,27 @@ fn try_compile_inner(
                         ir_ic_slots.clear();
                         ir_mic_boxes.clear();
                         ir_pic_boxes.clear();
+                        if ir_stage_reporting() {
+                            eprintln!(
+                                "[ir] invoke-plan {}.{}{}: NO invoke_info — {}",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                nonemittable
+                                    .as_deref()
+                                    .unwrap_or("no emittable invoke site found"),
+                            );
+                        }
                     }
+                } else if ir_stage_reporting() {
+                    eprintln!(
+                        "[ir] invoke-plan {}.{}{}: NO invoke_info — call_eligible=false \
+                         (anewarray_ops={})",
+                        cached.class_name,
+                        cached.method_name,
+                        cached.method_descriptor,
+                        scan.anewarray_ops.len(),
+                    );
                 }
             }
         }

@@ -178,35 +178,68 @@ and the scan demonstrably finds pointers — 0.4-1.0 M of them per sweep, all
 `doomed → doomed`, which is the whole-subgraph-condemned-together case the
 promotion-seed comment in `sweep_old_gen_non_moving` warns about.
 
-### What that leaves
+### Root coverage per sweep (2026-08-03)
 
-The blocks this sweep frees are unreachable from **everything the collector can
-see**: the whole old generation, the whole young space, and the entire root
-slice. Yet two independent fix-arm witnesses show such a block being read back
-later through a surviving reference.
+The follow-on from the referrer scan: if nothing in the heap or the root slice
+points at the freed block, was the root slice itself complete? The same summary
+line now carries this cycle's cross-thread peer-scan coverage. Five in-place
+sweeps:
 
-So the surviving reference is somewhere the collector never looks. In rough
-order of suspicion:
+```text
+xt(passes=0 taken_over=0 UNCLASSIFIED=0 xt_roots=0 hw_windows=0 hw_roots=0)   x2
+xt(passes=1 taken_over=0 UNCLASSIFIED=0 xt_roots=0 hw_windows=0 hw_roots=0)   x1
+xt(passes=1 taken_over=0 UNCLASSIFIED=0 xt_roots=0 hw_windows=3 hw_roots=182) x1
+xt(passes=1 taken_over=0 UNCLASSIFIED=0 xt_roots=0 hw_windows=3 hw_roots=189) x1
+```
 
-1. **A peer thread's JIT spill slots.** These runs log
-   `[moving-young] fallback: reason=compiled-frame-oop-not-published` and
-   `reason=innermost-rbp-belongs-to-unguarded-callee` — the collector knows some
-   live JIT frames cannot publish a precise map. The non-moving fallback means
-   it does not have to *relocate* them; it still has to **mark** through them.
-   The next measurement is root COVERAGE, not mark completeness: per old-gen
-   sweep, how many threads were in JIT and how many of their frames contributed
-   roots.
-2. **A native/Rust side table.** `native-collections` keeps state in identity-keyed
-   overlays (`clone_lhm_overlay`, `properties_sidetable`) and `external_roots`
-   registers owners. `CRATONVM_DBG_OLDSWEEP_OWNERS=1` already reports when a
-   freed block **is** an overlay owner; nothing reports when a freed block is
-   **referenced by** one.
-3. **A thread whose snapshot was not folded into this cycle.**
+`UNCLASSIFIED` is the one that matters, and it is **zero on all five**. On Linux
+a peer is taken over by signalling it and waiting for it to park in the handler;
+`STATE_CANCELLED` — no answer within the deadline — means the peer is **still
+running JIT code**, and `xt_root_scan`'s own comment says its "JIT-frame oops
+are in no root set". A sweep with `UNCLASSIFIED > 0` would have decided liveness
+from a root set that provably omitted a running thread's registers and stack —
+exactly the root no heap-side scan can see. It has not been observed non-zero.
 
-This is a genuine reframing: for three sessions the working hypothesis has been
-"a gap in the old-gen mark phase". The mark phase is now measured complete over
-every edge that exists in the heap. The defect is in **what the collector is
-told about**, not in what it does with it.
+`passes` exists because without it the rest is unreadable.
+`stw_takeover_should_scan` gates round 0 on the cheap `any_thread_in_jit()` hint
+and the take-over loop exits as soon as the barrier is satisfied, so a fully
+cooperative pause legitimately runs **zero** passes — and then
+`taken_over=0 UNCLASSIFIED=0` means "never looked", not "looked and found
+nothing". Both readings occur above and they point at opposite conclusions.
+
+`hw_windows` is the post-barrier helper-window pass: a *blocked* peer, excluded
+from the barrier, whose native stack still holds JIT frames that its
+`deposit_root_snapshot` never covers. It reported **3 windows and ~185
+conservative roots on two of the five cycles**, which is what makes the
+`hw_windows=0` readings meaningful rather than vacuous — the pass demonstrably
+runs and demonstrably reports when there is something to find.
+
+### Where that leaves the residual
+
+On every cycle measured, *both* halves come back clean:
+
+* the heap says nothing live points into the condemned set (`live_old=0
+  young=0 root=0`, against 512 MB of old gen, 5-268 MB of young and
+  142 000-355 000 roots actually walked, with 0.4-1.0 M `doomed → doomed`
+  pointers found so the scan is demonstrably working);
+* the collector's own accounting says the root set was complete
+  (`UNCLASSIFIED=0`, with the helper-window pass active).
+
+And the family still reproduces. Two possibilities remain, and they are
+distinguishable:
+
+1. **The bad cycle has not been caught with the instrument armed.** The events
+   are rare (~1 per several worker-hours) and only five sweeps carry the full
+   instrument. The instrument is cheap enough to leave on for a long soak; the
+   decisive run is one that ends in a `cannot be cast` with these lines above
+   it.
+2. **The surviving reference is held somewhere neither instrument looks.** The
+   remaining candidate is a native identity-keyed side table:
+   `native-collections` keeps state in overlays (`clone_lhm_overlay`,
+   `properties_sidetable`) and `external_roots` registers owners.
+   `CRATONVM_DBG_OLDSWEEP_OWNERS=1` already reports when a freed block **is** an
+   overlay owner; nothing reports when a freed block is **referenced by** one,
+   and that is the next instrument to write.
 
 ## Severity
 **HIGH** — silent. Before this session no guard fired: zero

@@ -5395,8 +5395,16 @@ fn ir_vs_singlepass_getstatic_direct_load() {
     use std::sync::atomic::AtomicPtr;
 
     /// Stands in for `jit_resolve_static_base`; `ctx` IS the base-pointer cell.
+    ///
+    /// **One registration for this whole binary.** A second
+    /// `set_static_base_resolver` with a different context does not replace this
+    /// one — it POISONS the resolver, and every direct site silently reverts to
+    /// the helper. (Learned the expensive way: a separate wide-static test with
+    /// its own block made this one's rung 1 return the marker value.) So the
+    /// wide and floating-point widths are rungs of THIS test, sharing this
+    /// block, rather than a sibling with a block of its own.
     unsafe extern "C" fn test_resolver(ctx: i64, class_id: i64, field_index: i64) -> i64 {
-        if class_id == 0x1CE && (field_index == 1 || field_index == 2) {
+        if class_id == 0x1CE && (1..=5).contains(&field_index) {
             ctx
         } else {
             0
@@ -5409,12 +5417,16 @@ fn ir_vs_singlepass_getstatic_direct_load() {
         // an `AtomicPtr` cell naming it. Slot 1 is the int-category case; slot 2
         // is read back through the 64-bit payload offset the reference encoding
         // uses, so a bias mixed up between the two arms shows up as a wrong
-        // number rather than as nothing.
+        // number rather than as nothing. Slots 3-5 are the wide and
+        // floating-point widths.
         let block: &'static mut [Value] = Box::leak(
             vec![
                 Value::Int(0),
                 Value::Int(-7),
                 Value::Long(0x0BAD_F00D_1234_5678),
+                Value::Long(0x0123_4567_89AB_CDEF),
+                Value::Double(-2.5f64),
+                Value::Float(-2.5f32),
             ]
             .into_boxed_slice(),
         );
@@ -5454,16 +5466,22 @@ fn ir_vs_singlepass_getstatic_direct_load() {
     //    getstatic works at all.
     {
         let code = vec![0xb2, 0x00, 0x01, 0xac];
+        // Field 0, which `test_resolver` declines. This control used to use
+        // field 5; when rung 4 widened the resolver's accepted range to `1..=5`
+        // it silently became a RESOLVED site and started reading slot 5 (a
+        // float) as an int. Index 0 is both outside the accepted range and a
+        // real slot, so a resolver that wrongly accepted it would read a valid
+        // word rather than off the end of the block.
         let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
             match cp {
-                1 => Some((0x1CEu32, 5usize, b'I', false)),
+                1 => Some((0x1CEu32, 0usize, b'I', false)),
                 _ => None,
             }
         };
         let cm = cached("gsdf", "()I", code, 1, 0);
         let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR fallback getstatic");
         let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
-        let expected = 424_242 + 0x1CE + 5;
+        let expected = 424_242 + 0x1CE;
         assert_eq!(call_with_dummy_context(&ir, &[]) as i32, expected);
         assert_eq!(call_with_dummy_context(&sp, &[]) as i32, expected);
     }
@@ -5494,42 +5512,60 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             0x0BAD_F00D_1234_5678u64 as i64
         );
     }
-}
 
-#[test]
-fn wide_and_fp_statics_stay_on_single_pass() {
-    // The fail-closed rung for `getstatic`. `J`, `D` and `F` are refused by the
-    // builder, not by the lowering, because the refusal is about the VALUE tier:
-    // admitting one would put a `Long`/`Double`/`Float` node in a graph whose
-    // admission clause may have been the int one, and a static field carries no
-    // equivalent of the `ir_emit_long` / `ir_emit_fp` signal the `ldc2_w` arm
-    // consults.
-    //
-    // The edit that trips it: widen the `type_tag` match in `IrBuilder`'s 0xb2
-    // arm to accept `J`/`D`/`F`.
-    let mut helpers = dummy_helpers();
-    helpers.getstatic = marker_getstatic as *const () as usize;
-    for (tag, desc, ret) in [
-        (b'J', "()J", 0xadu8),
-        (b'D', "()D", 0xafu8),
-        (b'F', "()F", 0xaeu8),
+    // 4. The wide and floating-point widths, on the same block and the same one
+    //    registration. This is where the payload OFFSET and the load WIDTH are
+    //    both tag-dependent: `J`/`D` read the 64-bit payload, `F` the 32-bit
+    //    one, and `F` must be ZERO-extended — `MOVSXD` on a NEGATIVE float's bit
+    //    pattern (bit 31 set, which is why the value is -2.5 and not 2.5) fills
+    //    the high half of the home word with garbage, and the home word is what
+    //    every deopt frame and `publish_fp_from_slot` read.
+    for (slot_idx, tag, desc, ret, want) in [
+        (3usize, b'J', "()J", 0xadu8, 0x0123_4567_89AB_CDEFi64),
+        (4, b'D', "()D", 0xaf, (-2.5f64).to_bits() as i64),
+        (5, b'F', "()F", 0xae, (-2.5f32).to_bits() as u32 as i64),
     ] {
         let code = vec![0xb2, 0x00, 0x01, ret];
         let statics = move |cp: u16| -> Option<(u32, usize, u8, bool)> {
             match cp {
-                1 => Some((0x22u32, 0usize, tag, false)),
+                1 => Some((0x1CEu32, slot_idx, tag, false)),
                 _ => None,
             }
         };
-        let cm = cached("gsw", desc, code, 2, 0);
-        match compile_getstatic(&cm, &helpers, true, &statics) {
-            None => { /* refused outright — also acceptable, and fail-closed. */ }
-            Some(compiled) => assert!(
-                !compiled.used_ir_backend,
-                "cov-01: a `{}` static must bail the optimizing builder",
-                tag as char
-            ),
-        }
+        let cm = cached("gsdw", desc, code, 2, 0);
+        let ir = compile_wide_getstatic(&cm, &helpers, true, &statics)
+            .unwrap_or_else(|| panic!("IR direct `{}` static", tag as char));
+        let sp = compile_wide_getstatic(&cm, &helpers, false, &statics)
+            .unwrap_or_else(|| panic!("single-pass direct `{}` static", tag as char));
+        assert!(
+            ir.used_ir_backend,
+            "cov-01: a `{}` static must reach the optimizing backend under its \
+             value-tier gate",
+            tag as char
+        );
+        let r_ir = call_with_dummy_context(&ir, &[]);
+        let r_sp = call_with_dummy_context(&sp, &[]);
+        // The two backends are compared on the FULL 64-bit word, deliberately.
+        // A `float` return only defines the low 32 bits, so the high half is
+        // ABI-undefined — but it is not backend-undefined: the single-pass arm
+        // zero-extends (`MOV r32`) and this is the assertion that catches the
+        // IR arm sign-extending instead. Masking here would discard exactly the
+        // bits the `MOVSXD`-vs-`MOV EAX` choice decides, which is what the first
+        // draft of this rung did, and it passed against a deliberately wrong
+        // width.
+        assert_eq!(
+            r_ir, r_sp,
+            "`{}` direct static: IR vs single-pass diverge",
+            tag as char
+        );
+        // Against the host, only the bits the ABI defines.
+        let masked = if tag == b'F' { r_ir as u32 as i64 } else { r_ir };
+        assert_eq!(
+            masked, want,
+            "`{}` direct static: wrong bits — the marker value would mean it \
+             took the helper instead",
+            tag as char
+        );
     }
 }
 
@@ -5556,4 +5592,762 @@ fn a_volatile_static_agrees_on_both_backends() {
     let expected = 424_242 + 0x33 + 2;
     assert_eq!(call_with_dummy_context(&ir, &[]) as i32, expected);
     assert_eq!(call_with_dummy_context(&sp, &[]) as i32, expected);
+}
+
+// ── cov-01 residual: `J` / `D` / `F` statics ─────────────────────────────
+//
+// When `getstatic` first lowered, these three tags were refused in the BUILDER
+// on the grounds that admitting one would put a `Long`/`Double`/`Float` node in
+// a graph whose admission clause may have been the int one. The hazard was
+// real; the refusal was in the wrong place. `getstatic` is polymorphic and
+// appears in neither `is_category2_opcode` nor `is_float_opcode`, so the builder
+// genuinely cannot see the width — but `try_compile` resolved the type tag in
+// order to build the table at all, so the gate belongs there, keyed on
+// `ir_emit_long` / `ir_emit_fp` exactly as the float `ldc` and `ldc2_w` feeds
+// already are.
+
+/// `jit_dispatch_threw` stand-in that reports **no** pending signal.
+///
+/// Reached only on the cold `RAX == i64::MIN` branch of a wide static's helper
+/// route. Returning 0 is the "that was a real value, keep it" answer, which is
+/// the case `long_min_value_static_is_a_value_not_a_sentinel` exists to drive.
+unsafe extern "C" fn no_signal_pending() -> i64 {
+    0
+}
+
+/// `jit_dispatch_threw` stand-in that reports a pending signal — the other half
+/// of the same branch, used to prove the peek is consulted rather than ignored.
+unsafe extern "C" fn signal_pending() -> i64 {
+    1
+}
+
+/// `jit_getstatic` stand-in whose value is chosen by `field_index`.
+///
+/// The first draft of these tests shared one `AtomicI64` that each test stored
+/// into before calling. They run in parallel threads, so they raced and three of
+/// the four failed — while passing under `--test-threads=1`. Keying on an
+/// ARGUMENT removes the shared mutable state rather than serialising around it,
+/// which is the same fix `proxy_lambda_dispatch_preserves_diagnostic_counters`
+/// needed for the same reason.
+unsafe extern "C" fn wide_value_getstatic(_vm: i64, _class_id: i64, field_index: i64) -> i64 {
+    match field_index {
+        0 => 0x0123_4567_89AB_CDEF,
+        1 => (-2.5f64).to_bits() as i64,
+        2 => (-2.5f32).to_bits() as i64,
+        _ => 7,
+    }
+}
+
+/// `jit_getstatic` stand-in that always returns the value bit-identical to the
+/// failed-`<clinit>` sentinel. Its own function, so nothing else can perturb it.
+unsafe extern "C" fn long_min_getstatic(_vm: i64, _class_id: i64, _field_index: i64) -> i64 {
+    i64::MIN
+}
+
+/// [`compile_getstatic`] with the long and FP value tiers on, which is what a
+/// `J` / `D` / `F` static needs to be fed to the builder at all.
+fn compile_wide_getstatic(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    statics: &dyn Fn(u16) -> Option<(u32, usize, u8, bool)>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        Some(statics),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        optimize,
+        false,
+        false,
+        true, // ir_emit_long
+        false,
+        true, // ir_emit_fp
+        None,
+    )
+}
+
+#[test]
+fn ir_vs_singlepass_wide_and_fp_statics_through_the_helper() {
+    // `long f() { return H.J; }`, `double f() { return H.D; }`,
+    // `float f() { return H.F; }` — getstatic #1 ; {lreturn,dreturn,freturn}.
+    //
+    // The helper route (no VM registered for this class id, so
+    // `resolve_static_base` declines). Both backends must return the same bits.
+    let mut helpers = dummy_helpers();
+    helpers.getstatic = wide_value_getstatic as *const () as usize;
+    helpers.dispatch_threw = no_signal_pending as *const () as usize;
+
+    // `field_index` selects the value `wide_value_getstatic` returns, so no two
+    // parallel tests share a cell.
+    for (slot_idx, tag, desc, ret, bits) in [
+        (0usize, b'J', "()J", 0xadu8, 0x0123_4567_89AB_CDEFu64 as i64),
+        (1, b'D', "()D", 0xafu8, (-2.5f64).to_bits() as i64),
+        // A NEGATIVE float, so bit 31 is set: the inline arm's `MOV EAX` vs
+        // `MOVSXD` distinction is invisible for a positive one.
+        (2, b'F', "()F", 0xaeu8, (-2.5f32).to_bits() as i64),
+    ] {
+        let code = vec![0xb2, 0x00, 0x01, ret];
+        let statics = move |cp: u16| -> Option<(u32, usize, u8, bool)> {
+            match cp {
+                1 => Some((0x44u32, slot_idx, tag, false)),
+                _ => None,
+            }
+        };
+        let cm = cached("gsw", desc, code, 2, 0);
+        let ir = compile_wide_getstatic(&cm, &helpers, true, &statics)
+            .unwrap_or_else(|| panic!("IR `{}` static", tag as char));
+        let sp = compile_wide_getstatic(&cm, &helpers, false, &statics)
+            .unwrap_or_else(|| panic!("single-pass `{}` static", tag as char));
+        assert!(
+            ir.used_ir_backend,
+            "cov-01: a `{}` static must reach the optimizing backend under its \
+             value-tier gate",
+            tag as char
+        );
+        let r_ir = call_with_dummy_context(&ir, &[]);
+        let r_sp = call_with_dummy_context(&sp, &[]);
+        // Full 64 bits between the two backends — see the direct-load rung for
+        // why masking here would hide a width bug — and the ABI-defined bits
+        // against the host.
+        assert_eq!(
+            r_ir, r_sp,
+            "`{}` static: IR vs single-pass diverge",
+            tag as char
+        );
+        let (masked, want) = if tag == b'F' {
+            (r_ir as u32 as i64, bits as u32 as i64)
+        } else {
+            (r_ir, bits)
+        };
+        assert_eq!(masked, want, "`{}` static: wrong bits", tag as char);
+    }
+}
+
+#[test]
+fn long_min_value_static_is_a_value_not_a_sentinel() {
+    // The case wide statics exist to get wrong. `jit_getstatic` reports a failed
+    // `<clinit>` by returning `i64::MIN`, and `Long.MIN_VALUE` is bit-identical
+    // to it — so a plain compare-and-bail would turn
+    //
+    //     static final long L = Long.MIN_VALUE;
+    //
+    // into a spurious exception on every read. The helper route peeks
+    // `jit_dispatch_threw` on that branch to tell the two apart.
+    //
+    // The edit that trips it: replace `emit_call_return_check(slot, node.ty)` in
+    // the `Op::LoadStatic` arm with the unconditional `CMP RAX, i64::MIN ; JE
+    // bail` it used to have. **Verified to fail.**
+    //
+    // The body is `return H.L + 1;`, not `return H.L;`, and that is the whole
+    // reason this test can fail at all. On the bail path the shared epilogue
+    // returns `i64::MIN` unchanged — so a method that merely returned the static
+    // would produce `i64::MIN` whether the value was KEPT or the sentinel was
+    // PROPAGATED, and the assertion would hold against a backend that got it
+    // exactly wrong. Adding one makes the two answers different bit patterns:
+    // `MIN + 1` if the value survived, `MIN` if it was mistaken for a signal.
+    // (The first draft of this test omitted the `+ 1` and passed against a
+    // deliberately broken lowering.)
+    let mut helpers = dummy_helpers();
+    helpers.getstatic = long_min_getstatic as *const () as usize;
+    helpers.dispatch_threw = no_signal_pending as *const () as usize;
+
+    let code = vec![
+        0xb2, 0x00, 0x01, // getstatic #1   (Long.MIN_VALUE)
+        0x0a, // lconst_1
+        0x61, // ladd
+        0xad, // lreturn
+    ];
+    let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
+        match cp {
+            1 => Some((0x55u32, 0usize, b'J', false)),
+            _ => None,
+        }
+    };
+    let cm = cached("gsmin", "()J", code, 4, 0);
+    let ir = compile_wide_getstatic(&cm, &helpers, true, &statics).expect("IR Long.MIN static");
+    let sp = compile_wide_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
+    assert!(ir.used_ir_backend, "must be the optimizing body");
+    let kept = i64::MIN.wrapping_add(1);
+    assert_eq!(
+        call_with_dummy_context(&ir, &[]),
+        kept,
+        "a static holding Long.MIN_VALUE must READ BACK as Long.MIN_VALUE, not \
+         be mistaken for the failed-<clinit> sentinel (getting i64::MIN here \
+         means the read bailed to the exception epilogue)"
+    );
+    assert_eq!(call_with_dummy_context(&sp, &[]), kept);
+
+    // The other half of the same branch: with a signal genuinely pending, the
+    // identical bits must propagate the sentinel instead — and now that is
+    // observable, because the `+ 1` never runs. Without this rung the assertion
+    // above passes just as well against a lowering that never checks at all.
+    helpers.dispatch_threw = signal_pending as *const () as usize;
+    let ir2 = compile_wide_getstatic(&cm, &helpers, true, &statics).expect("IR");
+    assert_eq!(
+        call_with_dummy_context(&ir2, &[]),
+        i64::MIN,
+        "with a signal pending the same bits must propagate the sentinel and \
+         skip the rest of the method"
+    );
+}
+
+#[test]
+fn wide_statics_stay_on_single_pass_with_their_value_tier_off() {
+    // The fail-closed rung, and the reason the gate lives in `try_compile`
+    // rather than in the builder.
+    //
+    // The body is `sink(H.WIDE);` — `getstatic #1 ; invokestatic #2 ; return`.
+    // That is the ONLY shape in which a wide or floating-point static appears
+    // in a method containing no category-2 or FP OPCODE, and it is also what
+    // ordinary Java looks like. Every other consumer of a `long` is itself
+    // category-2 (`lstore`, `lreturn`, `ladd`, `l2i`, `lcmp`), which would make
+    // the admission gate refuse the method and the test pass vacuously; the one
+    // non-category-2 discard, `pop2`, is implemented by neither backend.
+    //
+    // So `method_uses_category2("()V")` is false, `fp_in_body` is false, and
+    // the method is ADMITTED to the optimizing pipeline through the int clause
+    // — at which point only the feed knows that `H.WIDE` is 64 bits wide.
+    //
+    // The edit that trips it: delete the `admitted_by_value_tier` match in
+    // `try_compile`'s cov-01 static-field feed.
+    let mut helpers = dummy_helpers();
+    // `field_index` 3 ⇒ the value 7; the site below uses it.
+    helpers.getstatic = wide_value_getstatic as *const () as usize;
+    helpers.dispatch_threw = no_signal_pending as *const () as usize;
+
+    for (tag, sink_desc, long_gate, fp_gate) in [
+        (b'J', "(J)V", true, false),
+        (b'D', "(D)V", false, true),
+        (b'F', "(F)V", false, true),
+    ] {
+        let code = vec![
+            0xb2, 0x00, 0x01, // getstatic #1  (the wide static)
+            0xb8, 0x00, 0x02, // invokestatic #2  sink(<tag>)V
+            0xb1, // return
+        ];
+        let statics = move |cp: u16| -> Option<(u32, usize, u8, bool)> {
+            match cp {
+                1 => Some((0x66u32, 3usize, tag, false)),
+                _ => None,
+            }
+        };
+        let invokes = move |cp: u16| -> Option<(String, String, String)> {
+            match cp {
+                2 => Some((
+                    "Corpus".to_string(),
+                    "sink".to_string(),
+                    sink_desc.to_string(),
+                )),
+                _ => None,
+            }
+        };
+        // Never CALLED — `invoke_dispatch` is the harness's panicking stub. This
+        // rung is about which BACKEND produced the body; the value paths are
+        // driven by the two tests above.
+        let compile = |cm: &CachedBytecodeMethod, long: bool, fp: bool| {
+            try_compile(
+                cm,
+                None,
+                None,
+                Some(&statics),
+                Some(&invokes),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &helpers,
+                None,
+                None,
+                None,
+                None,
+                true,  // optimize
+                true,  // ir_emit_calls — the invokestatic must lower either way,
+                false, //   so the value-tier gate is the only difference
+                long,
+                false,
+                fp,
+                None,
+            )
+        };
+        let cm = cached("gsoff", "()V", code, 2, 0);
+
+        // Gate OFF for this tag ⇒ the builder must bail to single-pass.
+        let off = compile(&cm, false, false)
+            .expect("the method still compiles — on the single-pass backend");
+        assert!(
+            !off.used_ir_backend,
+            "cov-01: a `{}` static with its value tier off must bail the \
+             optimizing builder",
+            tag as char
+        );
+
+        // Gate ON ⇒ the same body IS lowered. Without this control, "the gate
+        // refused it" and "the builder cannot lower this shape at all" are
+        // indistinguishable and the assertion above proves nothing.
+        let on = compile(&cm, long_gate, fp_gate).expect("IR body under the value-tier gate");
+        assert!(
+            on.used_ir_backend,
+            "cov-01: the same `{}` body must reach the optimizing backend with \
+             its value tier on",
+            tag as char
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cov-04 — the invoke arms: a real `<init>` CALL, and the elision that outranks it
+//
+// `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`. The census on the three
+// Spring Boot workloads found that EVERY refusal in the `0xb7` arm was an
+// `<init>` — 29 a `super(...)`/`this(...)` chain call in a compiled
+// constructor, 23 a `new X(args)` site — and none was a non-`<init>`
+// `invokespecial` with no lowering. One test per shape, plus the guard on the
+// transform the lane must not lose.
+// ---------------------------------------------------------------------------
+
+/// Stands in for the VM heap so a live (escaping) `Op::New` has something to
+/// return. `jit_new_object`'s ABI: `(vm_ptr, class_id, num_fields) -> oop`,
+/// `0` on failure. Zero-initialised, 8-aligned and above the
+/// `TEST_REGION_BOUNDS` floor exactly like [`make_object`]'s buffers, and
+/// deliberately leaked — JIT-emitted code holds the raw address.
+///
+/// Each test that counts allocations owns its **own** counter and its own
+/// `extern "C"` wrapper around this, declared inside the test body. A single
+/// shared counter is wrong here and was wrong once: `cargo test` runs these
+/// tests on concurrent threads, so a global would have the two allocating tests
+/// incrementing each other's expected values. That is a flaky test, which this
+/// directory's rule 5 rates worse than no test — and it cost a real diagnosis,
+/// because the interference looked exactly like "escape analysis failed to
+/// scalar-replace" until `CRATONVM_DBG_SCALAR_NEW=1` said `1/1`.
+fn leak_zeroed_object(num_fields: i64) -> i64 {
+    let words = (HEADER_SIZE + num_fields as usize * SLOT_SIZE)
+        .div_ceil(8)
+        .max(1);
+    let buf: Vec<u64> = vec![0u64; words];
+    let ptr = buf.as_ptr() as i64;
+    std::mem::forget(buf);
+    ptr
+}
+
+/// [`compile_with_dispatch`] plus the two resolvers the `new` / `<init>` path
+/// needs: `cp_new_resolver` (allocation layout) and `cp_elidable_init_resolver`
+/// (which `<init>()V` calls may be elided rather than emitted).
+fn compile_with_dispatch_and_new(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    invoke_resolver: &dyn Fn(u16) -> Option<(String, String, String)>,
+    new_resolver: &dyn Fn(u16) -> Option<cratonvm_jit::JitNewSite>,
+    elidable_init_resolver: &dyn Fn(u16) -> bool,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        None,
+        Some(invoke_resolver),
+        None,
+        Some(new_resolver),
+        None,
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        Some(elidable_init_resolver),
+        true,  // optimize (C2 / IR pipeline)
+        true,  // ir_emit_calls
+        true,  // ir_emit_special_calls
+        true,  // ir_emit_long
+        true,  // ir_emit_virtual_calls
+        false, // ir_emit_fp
+        None,
+    )
+}
+
+#[test]
+fn ir_invokespecial_super_constructor_chain_is_called() {
+    // cov-04 group A — 29 of the 68 events measured at `48fba3a31`, and the
+    // whole of the 35 compiles the `is_special && mn == "<init>"` term used to
+    // discard. (Counts are baseline-relative; the shape is not. See the
+    // closeout.) A compiled CONSTRUCTOR's `super(...)` / `this(...)` chain
+    // call: the receiver is `this` — a parameter, never a fresh `Op::New` — so
+    // the elision path is structurally inapplicable and the only correct
+    // lowering is a real call.
+    //
+    //   int <init>(Corpus this, int n) { super(n); return this.f0; }
+    //   aload_0; iload_1; invokespecial #2 <init>(I)V; aload_0; getfield #4; ireturn
+    //
+    // The dispatch stub WRITES `n * 3` into the receiver's field 0, which the
+    // method reads back and returns. Exact edits that trip this test: restore
+    // the `is_special && mn == "<init>"` bulk-disable (compile returns None),
+    // or drop the call emission (returns 0), or swap receiver and argument
+    // (writes to the wrong address).
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
+    unsafe extern "C" fn ctor_dispatch(_vm: i64, _info: i64, args_ptr: i64, num_args: i64) -> i64 {
+        assert_eq!(num_args, 2, "<init>(I)V takes (receiver, int)");
+        let p = args_ptr as *const i64;
+        let recv = *p;
+        let n = *p.add(1) as i32;
+        let off = HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET;
+        std::ptr::write_unaligned((recv as *mut u8).add(off) as *mut i32, n * 3);
+        0 // `<init>` returns void
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = ctor_dispatch as *const () as usize;
+    helpers.getfield = legacy_getfield as *const () as usize;
+    let code = vec![
+        0x2a, 0x1b, 0xb7, 0x00, 0x02, // aload_0; iload_1; invokespecial #2
+        0x2a, 0xb4, 0x00, 0x04, 0xac, // aload_0; getfield #4; ireturn
+    ];
+    let cm = cached("<init>", "(Lpkg/Corpus;I)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Super".into(), "<init>".into(), "(I)V".into()))
+        } else {
+            None
+        }
+    };
+    let field_resolver = |cp: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
+        if cp == 4 {
+            Some((0, b'I', None))
+        } else {
+            None
+        }
+    };
+    let ir = try_compile(
+        &cm,
+        None,
+        Some(&field_resolver),
+        None,
+        Some(&resolver),
+        None,
+        None,
+        None,
+        None,
+        None,
+        &helpers,
+        None,
+        None,
+        None,
+        None,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        None,
+    )
+    .expect(
+        "a constructor's super(...) chain call must lower through the optimizing \
+         tier — cov-04 group A",
+    );
+    assert!(
+        ir.used_ir_backend,
+        "the point of this test is the IR arm; a single-pass fallback proves nothing",
+    );
+    let dummy_vm = [0u8; 64];
+    for n in [7i64, -3, 0, 5] {
+        let mut obj = make_object(&[0]);
+        let args = [obj.as_mut_ptr() as i64, n];
+        // SAFETY: `obj` is a live 8-aligned synthetic object with one int field;
+        // the stub writes only that field and `getfield #4` reads only it.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &args) }
+            .unwrap_or_else(|e| panic!("super-ctor chain call n={n}: {e:?}"));
+        assert_eq!(
+            r,
+            n * 3,
+            "the super constructor must actually RUN: 0 means the call was never \
+             emitted, anything else means the receiver/arg pair is wrong"
+        );
+        drop(obj);
+    }
+}
+
+#[test]
+fn ir_elidable_trivial_init_on_fresh_new_is_still_elided() {
+    // The transform cov-04 must not lose. Once a `<init>` can take an
+    // `invoke_info` entry, an elidable `<init>()V` on a fresh `Op::New` has TWO
+    // available lowerings, and the builder must keep choosing ELISION — a call
+    // here arg-escapes the allocation and defeats scalar replacement.
+    //
+    //   int f(int n) { Corpus c = new Corpus(); c.f0 = n; return c.f0; }
+    //   new #3; dup; invokespecial #2 <init>()V; astore_1;
+    //   aload_1; iload_0; putfield #4; aload_1; getfield #4; ireturn
+    //
+    // The SAME bytecode is compiled twice — once with the site elidable, once
+    // not — so the assertion is a comparison rather than a claim about one run:
+    //
+    //   elidable  → the dispatch helper must NOT be reached (elision chosen)
+    //   !elidable → the dispatch helper MUST be reached exactly once per call
+    //
+    // Exact edit that trips this test: put the `invoke_info` branch of the
+    // `0xb7` arm ahead of the elision branch. The elidable arm then dispatches
+    // and `must_not_dispatch` panics.
+    //
+    // The allocation count is asserted too, but it is NOT the property this
+    // lane owns and the two arms agree on it: the object is really allocated in
+    // both. That is worth pinning precisely because it is surprising —
+    // `CRATONVM_DBG_SCALAR_NEW=1` reports `scalar-replaced 1/1` for the elidable
+    // arm, so escape analysis OFFERS the replacement and the emitted body
+    // allocates anyway. The offer and the emitted code disagree; see the
+    // residual in `docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`.
+    //
+    // If this assertion ever fails because arm 1's count went to ZERO, that is
+    // an improvement, not a regression: change it to 0 and delete that residual.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
+    unsafe extern "C" fn must_not_dispatch(_vm: i64, _i: i64, _a: i64, _n: i64) -> i64 {
+        // Deliberately a hard failure rather than a plausible return value: a
+        // stub that quietly returned 0 here would let an un-elided <init> pass.
+        panic!("an elidable <init>()V on a fresh `new` was DISPATCHED, not elided");
+    }
+    // Test-local, never shared: see `leak_zeroed_object`.
+    static CTOR_DISPATCHES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static ALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    unsafe extern "C" fn counting_dispatch(_vm: i64, _i: i64, _a: i64, num_args: i64) -> i64 {
+        assert_eq!(num_args, 1, "<init>()V takes the receiver and nothing else");
+        CTOR_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        0
+    }
+    unsafe extern "C" fn counting_alloc(_vm: i64, _class_id: i64, num_fields: i64) -> i64 {
+        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        leak_zeroed_object(num_fields)
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = must_not_dispatch as *const () as usize;
+    helpers.new_object = counting_alloc as *const () as usize;
+    helpers.getfield = legacy_getfield as *const () as usize;
+    helpers.putfield_int = legacy_putfield_int as *const () as usize;
+    let code = vec![
+        0xbb, 0x00, 0x03, // new #3
+        0x59, // dup
+        0xb7, 0x00, 0x02, // invokespecial #2  <init>()V
+        0x4c, // astore_1
+        0x2b, 0x1a, 0xb5, 0x00, 0x04, // aload_1; iload_0; putfield #4
+        0x2b, 0xb4, 0x00, 0x04, // aload_1; getfield #4
+        0xac, // ireturn
+    ];
+    let cm = cached("f", "(I)I", code, 2, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Corpus".into(), "<init>".into(), "()V".into()))
+        } else {
+            None
+        }
+    };
+    let field_resolver = |cp: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
+        if cp == 4 {
+            Some((0, b'I', None))
+        } else {
+            None
+        }
+    };
+    let new_resolver = |cp: u16| -> Option<cratonvm_jit::JitNewSite> {
+        if cp == 3 {
+            Some(cratonvm_jit::JitNewSite::Resolved {
+                class_id: 7,
+                num_fields: 1,
+                has_prim_init: false,
+                has_finalizer: false,
+            })
+        } else {
+            None
+        }
+    };
+    let compile = |elidable: &dyn Fn(u16) -> bool, helpers: &JitRuntimeHelpers| {
+        try_compile(
+            &cm,
+            None,
+            Some(&field_resolver),
+            None,
+            Some(&resolver),
+            None,
+            Some(&new_resolver),
+            None,
+            None,
+            None,
+            helpers,
+            None,
+            None,
+            None,
+            Some(elidable),
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            None,
+        )
+    };
+    let dummy_vm = [0u8; 64];
+
+    // Arm 1 — the site IS elidable: elision must win over the (now available)
+    // call, so `must_not_dispatch` must never run.
+    let elidable = |cp: u16| -> bool { cp == 2 };
+    let ir = compile(&elidable, &helpers)
+        .expect("an elidable trivial-<init> allocation must still compile");
+    assert!(ir.used_ir_backend, "this test is about the IR arm");
+    for (i, n) in [11i64, 0, -4].into_iter().enumerate() {
+        // SAFETY: every pointer the emitted code touches comes from
+        // `counting_alloc`, which hands out live leaked 8-aligned buffers.
+        // Reaching `must_not_dispatch` is the failure this arm is here for.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
+            .unwrap_or_else(|e| panic!("elidable-init method n={n}: {e:?}"));
+        assert_eq!(r, n, "the field written is the field read back");
+        assert_eq!(
+            ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
+            i + 1,
+            "documenting current behaviour, not requiring it: escape analysis \
+             offers this `new` as scalar-replaceable and the emitted body \
+             allocates anyway (see the residual). 0 here would be an improvement"
+        );
+    }
+    let allocs_after_arm1 = ALLOCS.load(std::sync::atomic::Ordering::SeqCst);
+
+    // Arm 2 — the control. Identical bytecode, but the elision analysis
+    // DECLINES the site, so the constructor must be really called. Without this
+    // arm the test above would also pass on a builder that silently dropped
+    // every `<init>`.
+    let mut call_helpers = helpers;
+    call_helpers.invoke_dispatch = counting_dispatch as *const () as usize;
+    let not_elidable = |_cp: u16| -> bool { false };
+    let ir2 = compile(&not_elidable, &call_helpers)
+        .expect("a non-elidable <init>()V on a fresh `new` must still compile — cov-04");
+    assert!(ir2.used_ir_backend, "this test is about the IR arm");
+    for (i, n) in [11i64, 0, -4].into_iter().enumerate() {
+        // SAFETY: as above.
+        let r = unsafe { ir2.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
+            .unwrap_or_else(|e| panic!("non-elidable-init method n={n}: {e:?}"));
+        assert_eq!(r, n, "the field written is the field read back");
+        assert_eq!(
+            CTOR_DISPATCHES.load(std::sync::atomic::Ordering::SeqCst),
+            i + 1,
+            "a constructor the elision analysis declines must be CALLED, once \
+             per invocation"
+        );
+        assert_eq!(
+            ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
+            allocs_after_arm1 + i + 1,
+            "and its receiver arg-escapes into that call, so the allocation must \
+             survive — once per invocation, never scalar-replaced"
+        );
+    }
+}
+
+#[test]
+fn ir_new_with_non_elidable_constructor_allocates_and_calls_init() {
+    // cov-04 group B — 39 of the 68 events measured at `48fba3a31`: a method
+    // containing a
+    // `new` whose constructor the elision analysis declines. Two things had to
+    // change for this to compile — the `<init>` call itself, and
+    // `call_eligible`, which discarded `invoke_info` for the WHOLE method
+    // whenever `scan.new_ops` was non-empty, on the premise that the lowerer
+    // had no allocation path. It has one: `ir_lower`'s `Op::New` arm, through
+    // the shared TLAB-aware stub.
+    //
+    //   int f(int n) { return sink(new Corpus(n)); }
+    //   new #3; dup; iload_0; invokespecial #2 <init>(I)V; invokestatic #5; ireturn
+    //
+    // `<init>` writes `n * 5` into field 0; `sink` reads field 0 back. The
+    // assertion therefore covers the allocation, the constructor call, the
+    // argument marshalling, and the identity of the object handed on after it.
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
+    unsafe extern "C" fn ctor_or_sink(_vm: i64, _info: i64, args_ptr: i64, num_args: i64) -> i64 {
+        let p = args_ptr as *const i64;
+        let off = HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET;
+        match num_args {
+            // `<init>(I)V` — (receiver, int)
+            2 => {
+                let recv = *p;
+                let n = *p.add(1) as i32;
+                std::ptr::write_unaligned((recv as *mut u8).add(off) as *mut i32, n * 5);
+                0
+            }
+            // `sink(LCorpus;)I` — (object)
+            1 => {
+                let obj = *p;
+                std::ptr::read_unaligned((obj as *const u8).add(off) as *const i32) as i64
+            }
+            n => panic!("unexpected arg count {n}"),
+        }
+    }
+    // Test-local, never shared: see `leak_zeroed_object`.
+    static ALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    unsafe extern "C" fn counting_alloc(_vm: i64, _class_id: i64, num_fields: i64) -> i64 {
+        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        leak_zeroed_object(num_fields)
+    }
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = ctor_or_sink as *const () as usize;
+    helpers.new_object = counting_alloc as *const () as usize;
+    let code = vec![
+        0xbb, 0x00, 0x03, // new #3
+        0x59, // dup
+        0x1a, // iload_0
+        0xb7, 0x00, 0x02, // invokespecial #2  <init>(I)V
+        0xb8, 0x00, 0x05, // invokestatic #5   sink(LCorpus;)I
+        0xac, // ireturn
+    ];
+    let cm = cached("f", "(I)I", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        match cp {
+            2 => Some(("pkg/Corpus".into(), "<init>".into(), "(I)V".into())),
+            5 => Some((
+                "pkg/Helper".into(),
+                "sink".into(),
+                "(Lpkg/Corpus;)I".into(),
+            )),
+            _ => None,
+        }
+    };
+    let new_resolver = |cp: u16| -> Option<cratonvm_jit::JitNewSite> {
+        if cp == 3 {
+            Some(cratonvm_jit::JitNewSite::Resolved {
+                class_id: 7,
+                num_fields: 1,
+                has_prim_init: false,
+                has_finalizer: false,
+            })
+        } else {
+            None
+        }
+    };
+    // Nothing is elidable here: this is the case the elision analysis DECLINES.
+    let elidable = |_cp: u16| -> bool { false };
+    let ir = compile_with_dispatch_and_new(&cm, &helpers, &resolver, &new_resolver, &elidable)
+        .expect(
+            "a `new X(n)` with a non-elidable constructor must lower through the \
+             optimizing tier — cov-04 group B",
+        );
+    assert!(ir.used_ir_backend, "this test is about the IR arm");
+    let dummy_vm = [0u8; 64];
+    for (i, n) in [3i64, -2, 0, 9].into_iter().enumerate() {
+        // SAFETY: every pointer the emitted code touches comes from
+        // `counting_alloc`, which hands out live leaked 8-aligned buffers.
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
+            .unwrap_or_else(|e| panic!("new + non-elidable ctor n={n}: {e:?}"));
+        assert_eq!(r, n * 5, "constructor side effect must be visible to `sink`");
+        assert_eq!(
+            ALLOCS.load(std::sync::atomic::Ordering::SeqCst),
+            i + 1,
+            "an object passed to a call arg-escapes: it must be really allocated, \
+             once per invocation, not scalar-replaced",
+        );
+    }
 }
