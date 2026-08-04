@@ -6613,38 +6613,32 @@ pub(crate) fn cold_forced_native_string_name(method_name: &str) -> bool {
     )
 }
 
-/// JDK-ONLY-WAVE2: real-protected-stub class allow-list. This and
-/// [`real_protected_stub_class_cold`] are **deliberately not the same
-/// predicate**: `java/util/StringJoiner` is protected on the cold path and not
-/// here.
+/// JDK-ONLY-WAVE2: real-protected-stub class allow-list — **one predicate, both
+/// dispatch paths** as of 2026-08-04.
 ///
 /// It used to be two independently-maintained copies — this one and an inline
 /// `matches!` in `vm_exec::invoke_or_native` — which is how they came to
-/// differ, and how a reader who found one had no way to know the other said
-/// something else. There is now one list ([`real_protected_stub_class_common`])
-/// and one stated exception, asserted by
-/// `real_protected_stub_paths_diverge_on_exactly_stringjoiner`. Adding a class
-/// to the common list protects it on both paths; a class that belongs on only
-/// one has to say which, in code.
+/// differ: the cold copy listed `java/util/StringJoiner` and this one
+/// deliberately omitted it, so a `SyntheticStub` native's yield-to-real-bytecode
+/// verdict depended on how many times its call site had executed. The copies
+/// were first centralised into one list plus one stated exception
+/// (`real_protected_stub_class_cold`), and the exception was retired once the
+/// defect that forced it was measured not to reproduce — see
+/// [`real_protected_stub_class_common`] for that measurement.
 ///
-/// The asymmetry itself is untouched and load-bearing. Wave 2 must RECONCILE
-/// it — which means fixing the defect that forces it, not merging the lists.
-/// Both naive directions reintroduce a known bug; see
-/// [`real_protected_stub_class_cold`] for both of them.
-///
-/// What must replace both: `NativeKind` alone. Under `--jdk-only` a
-/// `SyntheticStub` never dispatches, so no class needs protecting from one and
-/// the entire list becomes dead.
+/// What must ultimately replace this list: `NativeKind` alone. Under
+/// `--jdk-only` a `SyntheticStub` never dispatches, so no class needs
+/// protecting from one and the entire list becomes dead.
 pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
     crate::runtime::env_cache::real_bytecode_selector().prefers_real(class_name)
         || real_protected_stub_class_common(class_name)
 }
 
-/// The ten classes **both** dispatch paths agree must yield to real bytecode.
+/// The eleven classes **both** dispatch paths yield to real bytecode.
 ///
 /// Kept as a `matches!` over string literals rather than a slice scan: this is
 /// on the native-dispatch path, and `matches!` compiles to a length-bucketed
-/// comparison chain rather than ten `str` equality calls.
+/// comparison chain rather than eleven `str` equality calls.
 #[inline]
 fn real_protected_stub_class_common(class_name: &str) -> bool {
     matches!(
@@ -6668,44 +6662,37 @@ fn real_protected_stub_class_common(class_name: &str) -> bool {
             | "java/lang/ref/Cleaner"
             | "java/lang/ref/Cleaner$Cleanable"
             | "java/lang/management/ManagementFactory"
+            // Protected on BOTH paths since 2026-08-04. It was cold-path-only
+            // from 2026-07-10, because yielding this class's SyntheticStub
+            // natives to real bytecode on the warm path once tripped a
+            // deterministic heap-reference-integrity defect: the
+            // `gen_heap::read_slot` "corrupt Value cell" / HIB-CV-32 guard
+            // fired reading `StringJoiner`'s own `size` / `elts` back after a
+            // `putfield`, from the SECOND `add()` onward. Re-measured
+            // 2026-08-04 with the merge applied — 40k `add()` calls under
+            // `-Xmx64m` with per-iteration allocation churn, seven intermediate
+            // consistency checks, against a HotSpot control — and it did not
+            // reproduce on either `--jdk-only` or `--real-jdk`.
+            //
+            // Dropping it from the cold path instead is the other half of the
+            // trap and is NOT an option: the synthetic `add()` writes a 5-field
+            // fake layout (`delim/prefix/suffix/elements-ArrayList/emptyValue`)
+            // over the real 7-field class
+            // (`prefix/delimiter/suffix/elts[]/size/len/emptyValue`), reads
+            // slot 3 — real `elts`, null — and no-ops, so `size` never moves
+            // and `toString()` renders just prefix+suffix. A silently empty
+            // join, not a crash. See
+            // `docs/internal/fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`.
+            | "java/util/StringJoiner"
     )
 }
 
-/// The class allowlist consulted by the **cold** path — `invoke_or_native`'s
-/// vtable-miss route in `vm/src/vm/vm_exec.rs`.
+/// Every class the allow-list protects, as a floor corpus for
+/// `every_allowlisted_class_is_protected`.
 ///
-/// [`real_protected_stub_class`] plus `java/util/StringJoiner`, and that one
-/// class is the whole documented divergence between the two dispatch paths.
-///
-/// NOT in the warm predicate (2026-07-10): yielding that class's SyntheticStub
-/// natives to real bytecode on the interpreter path exposes a deterministic
-/// heap-reference-integrity defect — the `gen_heap::read_slot` "corrupt Value
-/// cell" / HIB-CV-32 guard fires reading `StringJoiner`'s own `size` / `elts`
-/// fields back after a `putfield`, on the SECOND `add()` call onward. It does
-/// not reproduce for an equivalent user-defined class with the identical
-/// bytecode shape and field count/layout (ruled out via a standalone MicroProbe
-/// repro), so it is something specific to this being a natively-registered
-/// bootstrap class, not the bytecode pattern itself. See
-/// `docs/internal/fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`.
-///
-/// Protected *here* because the cold path has done so since long before that
-/// defect was found, and dropping it is the other half of the trap: the
-/// synthetic `add()` writes a 5-field fake layout
-/// (`delim/prefix/suffix/elements-ArrayList/emptyValue`) over the real 7-field
-/// class (`prefix/delimiter/suffix/elts[]/size/len/emptyValue`), reads slot 3 —
-/// real `elts`, null — and no-ops, so `size` never moves and `toString()`
-/// renders just prefix+suffix. A silently empty join, not a crash.
-#[inline]
-pub(crate) fn real_protected_stub_class_cold(class_name: &str) -> bool {
-    real_protected_stub_class(class_name) || class_name == "java/util/StringJoiner"
-}
-
-/// Every class named by either path, as a test corpus for
-/// `real_protected_stub_paths_diverge_on_exactly_stringjoiner`.
-///
-/// Not a dispatch input — the predicates above stay `matches!`. It exists so
-/// the divergence between the two paths is *asserted* rather than described in
-/// a comment, which is what let the two copies drift in the first place.
+/// Not a dispatch input — the predicate above stays a `matches!`. It exists so
+/// that deleting a class from the allow-list fails a test instead of silently
+/// handing that class's `SyntheticStub` natives back to a synthetic layout.
 #[cfg(test)]
 pub(crate) const REAL_PROTECTED_STUB_CORPUS: &[&str] = &[
     "java/util/concurrent/locks/ReentrantLock",
@@ -6725,50 +6712,37 @@ pub(crate) const REAL_PROTECTED_STUB_CORPUS: &[&str] = &[
 mod real_protected_stub_tests {
     use super::*;
 
-    /// The two dispatch paths disagree about **exactly one** class, and this
-    /// test is what makes that a decision rather than an accident.
+    /// Every class the allow-list is supposed to protect is still protected.
     ///
-    /// It is deliberately *not* an "these two lists are equal" assertion: they
-    /// are not equal, on purpose, and freezing the disagreement is the point.
-    /// A wave-2 engineer who fixes the underlying `StringJoiner` heap-integrity
-    /// defect deletes the exception and this test tells them whether they
-    /// caught every path.
+    /// This replaces `real_protected_stub_paths_diverge_on_exactly_stringjoiner`
+    /// (2026-07-10 → 2026-08-04), which froze the one-class divergence between
+    /// the warm and cold dispatch paths. There is now a single predicate, so
+    /// there is nothing left to compare the paths against — an "the paths
+    /// agree" assertion over one function would be a guard that cannot fail.
+    /// What can still regress is a class silently leaving the list, so that is
+    /// what is asserted, with a floor on the corpus size so that emptying the
+    /// corpus does not make the test vacuous either.
     ///
-    /// It does not cover the `CRATONVM_REAL` env selection, which both
-    /// predicates OR in identically from the same
-    /// `real_bytecode_selector()` — a divergence cannot enter through there.
+    /// It does not cover the `CRATONVM_REAL` env selection, which the predicate
+    /// ORs in from `real_bytecode_selector()`; that widens the list, never
+    /// narrows it.
     #[test]
-    fn real_protected_stub_paths_diverge_on_exactly_stringjoiner() {
-        let diverging: Vec<&str> = REAL_PROTECTED_STUB_CORPUS
-            .iter()
-            .copied()
-            .filter(|c| real_protected_stub_class(c) != real_protected_stub_class_cold(c))
-            .collect();
-        assert_eq!(
-            diverging,
-            vec!["java/util/StringJoiner"],
-            "the cold (vtable-miss) and warm (cached/stackless) dispatch paths must \
-             disagree about exactly `java/util/StringJoiner`, and about nothing else. \
-             Adding a class to one path only makes a `SyntheticStub` native's \
-             yield-to-real-bytecode verdict depend on how many times its call site has \
-             executed — the JIT-state-dependent divergence contract §7 centralisation \
-             exists to prevent. See `real_protected_stub_class_cold`."
+    fn every_allowlisted_class_is_protected() {
+        assert!(
+            REAL_PROTECTED_STUB_CORPUS.len() >= 11,
+            "the corpus shrank to {} entries; a class was removed from the \
+             real-protected-stub allow-list. That hands its `SyntheticStub` natives \
+             back to a synthetic field layout over the real JDK class — for \
+             `StringJoiner` that was a silently empty join, not a crash. If the \
+             removal is intended, lower this floor deliberately and say why.",
+            REAL_PROTECTED_STUB_CORPUS.len()
         );
-    }
-
-    /// Every class in the corpus is protected on at least one path — i.e. the
-    /// corpus is a list of the allowlists' members, not a wish list.
-    ///
-    /// Without this, deleting a class from `real_protected_stub_class_common`
-    /// and forgetting to delete it from the corpus would leave the divergence
-    /// test passing while it silently checked a name neither path mentions.
-    #[test]
-    fn every_corpus_class_is_protected_on_some_path() {
         for class in REAL_PROTECTED_STUB_CORPUS {
             assert!(
-                real_protected_stub_class_cold(class),
-                "{class} is in REAL_PROTECTED_STUB_CORPUS but no path protects it; \
-                 remove it from the corpus or restore it to the allowlist"
+                real_protected_stub_class(class),
+                "{class} is in REAL_PROTECTED_STUB_CORPUS but the allow-list no longer \
+                 protects it; restore it to `real_protected_stub_class_common` or \
+                 remove it from the corpus and lower the floor above"
             );
         }
     }

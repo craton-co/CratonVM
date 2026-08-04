@@ -14707,25 +14707,20 @@ pub fn invoke_or_native(
         // This was an inline `matches!` maintained by hand alongside a second
         // copy in `real_protected_stub_class`, and the two had drifted: this
         // one listed `java/util/StringJoiner`, the other deliberately omitted
-        // it. Both predicates now come from one list plus one *stated*
-        // exception in `native_override.rs`, asserted by
-        // `real_protected_stub_paths_diverge_on_exactly_stringjoiner`, so the
-        // divergence is a decision a reader can find rather than a difference
-        // between two files.
+        // it — so a `SyntheticStub` native's yield-to-real-bytecode verdict
+        // depended on how many times its call site had executed. The copies
+        // were centralised into one list plus one stated exception, and the
+        // exception was retired on 2026-08-04 once the defect that forced it
+        // was measured not to reproduce. Both paths now call the one predicate.
         //
-        // `_cold` is the right one HERE: this is `invoke_or_native`, the
-        // vtable-miss route, and `StringJoiner` is protected on this path and
-        // not on the warm one. Do not "simplify" it to the warm predicate —
-        // that hands `StringJoiner.add()` back to a 5-field synthetic layout
-        // over a 7-field real class, which makes it a silent no-op.
+        // Do NOT re-inline a copy here. The divergence this replaced is exactly
+        // what the contract §7 centralisation exists to prevent.
         //
-        // Wave 2 must RECONCILE the two, not merge them; both naive directions
-        // reintroduce a known defect. What must ultimately replace both:
-        // `NativeKind` alone — under `--jdk-only` a `SyntheticStub` never
-        // dispatches, so no class needs "protecting" from one and the whole
-        // allow-list becomes dead.
+        // What must ultimately replace the list: `NativeKind` alone — under
+        // `--jdk-only` a `SyntheticStub` never dispatches, so no class needs
+        // "protecting" from one and the whole allow-list becomes dead.
         let real_protected_stub = synthetic_stub_native
-            && crate::runtime::interpreter::real_protected_stub_class_cold(effective_class);
+            && crate::runtime::interpreter::real_protected_stub_class(effective_class);
         let has_real = real_protected_stub && {
             let cm = shared.classes.class_manager.read();
             cm.get_loaded_class_id(effective_class)
