@@ -245,14 +245,19 @@ answer a performance question by construction.
     `an_empty_pool_refuses_instead_of_helping_itself_to_the_scalar_file`,
     `the_three_xmm_authorities_are_stated_in_one_place`.
 
-`regression-suite/run.sh` was run on the same host and is **not usable as a
-verdict**: another session's Spring Boot suite held the 16-core box at load
-51–242 throughout, and three of the four CratonVM failures are `rc=124`
-timeouts, with a fourth (`RMapResizeGc`) reported as "output differs from
-HotSpot" while the HotSpot section is **empty** — the oracle timed out, and
-CratonVM's own line says `PASS`. The two non-timeout failures were baselined
-the cheap way and are JIT-independent: `RSerial` and `RFileTimes` fail
-**identically under `--nojit`**, which excludes every change on this branch.
+`regression-suite/run.sh` — **17 passed, 7 failed**, and it is *not* usable as
+a verdict: another session's Spring Boot suite held the 16-core box at load
+51–242 throughout. Every one of the seven was accounted for, none by this
+branch. The cheap discriminator is `--nojit`: it removes every change here, so
+a failure that survives it is not this branch's.
+
+| failure | why it is not this branch |
+|---|---|
+| `RSerial` | fails **identically under `--nojit`** |
+| `RFileTimes` | fails **identically under `--nojit`** |
+| `RNioNoFollow` | prints `PASS RNioNoFollow`, then hangs at exit — under `--nojit` too. A shutdown hang, not a wrong answer |
+| `RChannelInterrupt`, `RAtomicArray`, `RDirectBufferElem` | `rc=124`, i.e. the 180 s timeout, at load 51–242 |
+| `RMapResizeGc` | "output differs from HotSpot" with the **HotSpot section empty** — the oracle timed out. CratonVM's own line says `PASS RMapResizeGc (120006 checks)` |
 
 The load-insensitive evidence is what this section rests on instead: 1 906 unit
 tests, and three checksummed workloads compared across four modes.
