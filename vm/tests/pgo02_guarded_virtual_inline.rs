@@ -208,7 +208,7 @@ fn check_uncaught_from_inlined_frame(vm: &mut Vm) -> Result<(), String> {
         &[Value::Int(9)],
     );
     let interpreted = match interpreted {
-        Err(e) => format!("{e:?}"),
+        Err(e) => describe_failure(vm, &e),
         Ok(v) => {
             return Err(format!(
                 "check_uncaught_from_inlined_frame: interpreted callDivider(9) with divisor 0 \
@@ -239,7 +239,7 @@ fn check_uncaught_from_inlined_frame(vm: &mut Vm) -> Result<(), String> {
         &[Value::Int(9)],
     );
     let compiled = match compiled {
-        Err(e) => format!("{e:?}"),
+        Err(e) => describe_failure(vm, &e),
         Ok(v) => {
             return Err(format!(
                 "check_uncaught_from_inlined_frame: compiled callDivider(9) with divisor 0 \
@@ -325,6 +325,29 @@ fn check_interface_site(vm: &mut Vm) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Name a failed call by what ESCAPED, not by the heap address it escaped in.
+///
+/// Comparing the raw `ObjectRef` compares two allocations of the same
+/// exception and always differs; the question this file asks is whether the
+/// compiled path and the interpreter throw the same THING.
+fn describe_failure(vm: &Vm, failure: &cratonvm_vm::error::MethodCallFailed) -> String {
+    match failure {
+        cratonvm_vm::error::MethodCallFailed::ExceptionThrown(exc) => {
+            let class_id = vm.shared.mem.heap.class_id_of(*exc);
+            let class_name = vm
+                .shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|class| class.name.to_string())
+                .unwrap_or_else(|| format!("<unknown class {class_id:?}>"));
+            format!("ExceptionThrown({class_name})")
+        }
+        other => format!("{other:?}"),
+    }
 }
 
 /// The `inline_tally` of a compiled entry point, with the tier dependency
