@@ -462,7 +462,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-143 tokens.
+148 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -474,6 +474,7 @@ export inherited from a parent shell.
 | `bg-compile` | `CRATONVM_BG_COMPILE` |
 | `bytecode-loop-xform` | `CRATONVM_JIT_BYTECODE_LOOP_XFORM` |
 | `bulk-byte-loops` | `CRATONVM_JIT_BULK_BYTE_LOOPS` |
+| `c1-vector-veto` | `CRATONVM_JIT_C1_VECTOR_VETO` |
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |
@@ -516,6 +517,8 @@ export inherited from a parent shell.
 | `ir-buffer-estimate` | `CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE` |
 | `ir-fp` | `CRATONVM_JIT_IR_FP` |
 | `ir-isel-shadow` | `CRATONVM_JIT_IR_ISEL_SHADOW` |
+| `ir-isel-emit` | `CRATONVM_JIT_IR_ISEL_EMIT` |
+| `ir-isel-verify` | `CRATONVM_JIT_IR_ISEL_VERIFY` |
 | `precise-field-ops` | `CRATONVM_JIT_NO_PRECISE_FIELD_OPS` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
@@ -549,6 +552,8 @@ export inherited from a parent shell.
 | `osr-dead-locals` | `CRATONVM_JIT_OSR_DEAD_LOCALS` |
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
+| `osr-seed-frame-slots` | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` |
+| `osr-single-pc` | `CRATONVM_JIT_OSR_SINGLE_PC` |
 | `poison-free` | `CRATONVM_JIT_POISON_FREE` |
 | `precise-coverage-pin` | `CRATONVM_PRECISE_COVERAGE_PIN` |
 | `callee-handler-precise-frame` | `CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME` |
