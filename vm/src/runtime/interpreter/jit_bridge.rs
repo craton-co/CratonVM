@@ -121,6 +121,17 @@ pub(super) fn compile_osr_artifact(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
+    // Same reasoning one gate down, for the BISECT levers.
+    // `CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_ONLY` were applied only inside
+    // `cratonvm_jit::try_compile`, and this function reaches
+    // `x64::compile_with_param_slots` directly (see the "calls the backend
+    // directly instead of going through `try_compile`" note further down), so
+    // an OSR body could be force-interpreted by neither lever. A bisect step
+    // that cannot actually stop the compile reads as an exoneration — see
+    // `cratonvm_jit::jit_force_interpret`.
+    if cratonvm_jit::jit_force_interpret(&class_name, &method_name) {
+        return None;
+    }
     // A compiled entry has no ACC_SYNCHRONIZED monitor prologue/epilogue.
     // Keep synchronized methods out of OSR until that monitor contract is
     // implemented for compiled frames.

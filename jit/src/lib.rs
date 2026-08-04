@@ -11534,6 +11534,59 @@ fn jit_bisect_only_filter() -> Option<&'static Vec<String>> {
         .as_ref()
 }
 
+/// Do the bisect levers force `class_name`.`method_name` to stay interpreted?
+///
+/// **Call this at EVERY codegen entry point, not just [`try_compile`].** Both
+/// levers used to be checked only inside `try_compile`, and two paths reach the
+/// backend without going through it — `execute`'s eager first-call single-pass
+/// compile, and `compile_osr_artifact`, which says so in its own comment
+/// ("This path calls the backend directly instead of going through
+/// `try_compile`"). An entire class of compiled body was therefore invisible to
+/// both levers.
+///
+/// That is worse than a missing feature, because it makes the levers *lie*.
+/// Isolating a miscompile with them is a proof by elimination, and "deny this
+/// package and the crash goes away" only means something if the deny actually
+/// stopped a compile. Measured 2026-08-04 against
+/// `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`:
+/// `CRATONVM_JIT=bisect-only=zzzNoSuchPrefix` — a prefix matching nothing, so
+/// nothing should compile at all — still left **11 methods compiled** and the
+/// crash still reproduced. Every bisect step read "no effect", which reads as
+/// an exoneration and was really a silent no-op.
+///
+/// The levers are otherwise unchanged: `CRATONVM_JIT_DENY` is a
+/// comma-separated list of substrings matched against `Class.method`, and
+/// `CRATONVM_JIT_BISECT_ONLY` is the inverse allowlist of class-name prefixes.
+/// Both are no-ops unless set, and the `format!` is reached only when the deny
+/// lever is actually configured.
+pub fn jit_force_interpret(class_name: &str, method_name: &str) -> bool {
+    force_interpret_matches(
+        jit_deny_filter().map(|v| v.as_slice()),
+        jit_bisect_only_filter().map(|v| v.as_slice()),
+        class_name,
+        method_name,
+    )
+}
+
+/// The matching rule behind [`jit_force_interpret`], with the two parsed
+/// filters passed in rather than read from the process-wide `OnceLock`s — so
+/// it is unit-testable without racing every other test in this binary for the
+/// one-shot env read.
+fn force_interpret_matches(
+    deny: Option<&[String]>,
+    bisect_only: Option<&[String]>,
+    class_name: &str,
+    method_name: &str,
+) -> bool {
+    if let Some(filter) = deny {
+        let sig = format!("{class_name}.{method_name}");
+        if filter.iter().any(|f| sig.contains(f.as_str())) {
+            return true;
+        }
+    }
+    bisect_only.is_some_and(|prefixes| !prefixes.iter().any(|p| class_name.starts_with(p.as_str())))
+}
+
 /// Diagnostic: number of `try_compile` calls short-circuited because
 /// the method was already bail-listed.  Each short-circuit saves the
 /// ~50µs we'd otherwise have spent re-running scan/IR/lowering only to
@@ -12302,18 +12355,13 @@ pub fn try_compile_with_invokespecial_resolver(
     // JIT-compiled) so a single suspect compiled method can be isolated
     // from the rest of a workload's JIT-compiled code, without disabling
     // JIT wholesale. No-op unless the env var is set.
-    if jit_deny_filter().is_some_and(|filter| {
-        let sig = format!("{}.{}", cached.class_name, cached.method_name);
-        filter.iter().any(|f| sig.contains(f.as_str()))
-    }) {
-        return None;
-    }
-
-    // `CRATONVM_JIT_BISECT_ONLY` — the inverse: only the listed class-name
-    // prefixes stay JIT-eligible. No-op unless set.
-    if jit_bisect_only_filter()
-        .is_some_and(|prefixes| !prefixes.iter().any(|p| cached.class_name.starts_with(p.as_str())))
-    {
+    //
+    // `CRATONVM_JIT_BISECT_ONLY` is the inverse: only the listed class-name
+    // prefixes stay JIT-eligible. Both now live in `jit_force_interpret`, so
+    // the eager first-call and OSR codegen paths — which do NOT come through
+    // this function — can apply the identical predicate. See that function for
+    // why sharing it matters.
+    if jit_force_interpret(&cached.class_name, &cached.method_name) {
         return None;
     }
 
@@ -24244,5 +24292,73 @@ mod code_cache_lifetime_tests {
     fn pinning_an_unmapped_address_yields_none() {
         assert!(pin_jit_code_range_owner(0).is_none());
         assert!(pin_jit_code_range_owner(0x10).is_none());
+    }
+
+    /// The bisect levers' matching rule. Pinned as a pure function because the
+    /// live predicate reads two `OnceLock`s seeded from the environment once
+    /// per process, which no test can set reproducibly.
+    ///
+    /// The load-bearing case is the last one. `CRATONVM_DBG=jit-bisect-only`
+    /// with a prefix matching NOTHING must force EVERY method interpreted —
+    /// that is what makes "allow only X, does the crash survive?" a valid
+    /// bisect step. See `docs/known-issues/jit/annotation-scan-arrayread-sigsegv.md`:
+    /// the OSR path did not consult this predicate at all, so 21 OSR bodies
+    /// compiled under exactly that setting and every bisect row read a
+    /// meaningless "no effect".
+    #[test]
+    fn bisect_levers_match_deny_by_substring_and_allow_only_by_prefix() {
+        let deny = vec!["org/h2/mvstore/MVStore.commit".to_string()];
+        assert!(force_interpret_matches(
+            Some(&deny),
+            None,
+            "org/h2/mvstore/MVStore",
+            "commit"
+        ));
+        assert!(!force_interpret_matches(
+            Some(&deny),
+            None,
+            "org/h2/mvstore/MVStore",
+            "rollback"
+        ));
+
+        // A bare package entry pins everything under it.
+        let pkg = vec!["org/keycloak/".to_string()];
+        assert!(force_interpret_matches(
+            Some(&pkg),
+            None,
+            "org/keycloak/Foo",
+            "bar"
+        ));
+
+        // Allowlist: listed prefix stays eligible, everything else does not.
+        let only = vec!["org/apache/tomcat".to_string()];
+        assert!(!force_interpret_matches(
+            None,
+            Some(&only),
+            "org/apache/tomcat/util/bcel/classfile/ConstantPool",
+            "getConstant"
+        ));
+        assert!(force_interpret_matches(
+            None,
+            Some(&only),
+            "java/io/BufferedInputStream",
+            "read"
+        ));
+
+        // Neither lever set: nothing is forced interpreted.
+        assert!(!force_interpret_matches(None, None, "any/Class", "any"));
+
+        // A prefix that matches nothing forces EVERY method interpreted.
+        let nothing = vec!["zzzNoSuchPrefix".to_string()];
+        for (c, m) in [
+            ("java/io/BufferedInputStream", "read"),
+            ("org/apache/tomcat/util/bcel/classfile/ConstantPool", "getConstant"),
+            ("AnnotationScanSplitProbe", "readBytes"),
+        ] {
+            assert!(
+                force_interpret_matches(None, Some(&nothing), c, m),
+                "bisect-only with an unmatched prefix must force {c}.{m} interpreted"
+            );
+        }
     }
 }
