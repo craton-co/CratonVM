@@ -17,7 +17,7 @@ other way (see `architecture-review-a1-a9.md`).
 
 | # | Advisory claim | Verdict |
 |---|---|---|
-| 1 | Migrate `NativeMethodRegistry::find` sites to memoized `NativeCallSite` | **OPEN — correctly diagnosed** |
+| 1 | Migrate `NativeMethodRegistry::find` sites to memoized `NativeCallSite` | **MECHANISM RIGHT, IMPACT OVERSTATED — hot path was already migrated; one real redundancy fixed** |
 | 2 | "Fix young-GC activation; remove the unconditional guard that ignores `CRATONVM_MOVING_YOUNG`" | **REFUTED — already removed; following this now would reintroduce heap corruption** |
 | 3 | "Layout-registry lookup is 50% of runtime; add a HashMap cache" | **REFUTED as written — the file does not exist; the real one is already better than proposed** |
 | 4 | Interpreter: table-driven / computed-goto dispatch | **OPEN — this is A4b; measured, scoped** |
@@ -53,9 +53,64 @@ It is well-engineered, and it is still string hashing per call.
 advisory proposes — a single `AtomicU64` memo cell with a generation check,
 `const fn new()` so it can be a `static` at the call site.
 
-**Adoption is the gap: 10 `NativeCallSite::new()` sites against 44
-`native_methods.find(` sites in `vm/src`.** The mechanism exists and is proven;
-the migration is unfinished. Effort medium, risk low, as the advisory says.
+### Update after taking it on (2026-08-04)
+
+The mechanism is real and the description of `slot_for_exact` above is
+accurate. The **sizing was not**, and both of my numbers were wrong.
+
+**"10 `NativeCallSite` sites vs 44 `find(` sites" was wrong twice over.**
+
+- It missed the adoption that matters. `CachedBytecodeMethod` carries a
+  **per-method** `NativeCallSite` (`native_call_site()` / `native_dispatch()`,
+  `jit-api/src/lib.rs:317`), so **steady-state cached dispatch already does no
+  string hashing at all**. Counting only `static NativeCallSite::new()`
+  declarations missed the entire hot path. (`native_id.rs`'s own rationale still
+  describes that field as an `OnceLock<Option<NativeCallback>>` with a stale-
+  negative bug — that is out of date; it is already a `NativeCallSite`.)
+- "44" counted test code. The production figure is **123**, once both
+  `#[cfg(test)]` *and* `#[cfg(all(test, feature = ...))]` regions are excluded —
+  `vm.rs` alone contributed 38 false positives, because its 76K-line test module
+  uses the second spelling.
+
+**Of those 123, almost none are migratable or hot:**
+
+- 34 are `vm_init` bootstrap registration — cold by construction.
+- Most of the interpreter ones are *guarded interception* paths
+  (`intercept_force_registered_native_cached`, the SSL/Spring-loader arms) whose
+  triples are **variable**. A `NativeCallSite` is keyed on the registry
+  generation alone and never re-verifies the triple on a warm hit, so one cell
+  **structurally cannot** serve them. Two of those arms are constrained to 3 and
+  4 possible triples respectively — they would need one cell per arm, and one is
+  already preceded by a `class_manager.read()` that dwarfs the lookup.
+
+**What was actually worth doing, and was done:**
+
+1. `dispatch_static.rs` ran `find(..).is_some()` then `kind_of(..)` on the
+   **same triple**, back to back — two full `slot_for_exact` passes where
+   `find_with_kind` gives both facts in one. Fixed.
+   Safe because the two forms differ only on the cold descriptor-quirk path
+   (`kind_of` → `None`, `find_with_kind` → `Bridge`), and neither equals
+   `SyntheticStub`, which is this site's only consumer.
+2. The two constant-triple reflection sites in `invoke.rs` migrated to their own
+   `static` cells, mirroring `dispatch_virtual.rs`.
+
+**Measured, not assumed:**
+
+- The `dispatch_static` path is per-call-**site** resolution, not per-invoke —
+  `execute_invokestatic_cached` skips it once warm. A counter compiled into a
+  release binary showed **fewer than 5,000 hits per run** on `HelloWorld`,
+  `DistinctEquals`, `MapEqRepro` and `StringNativeAllocationChurn`. Hundreds,
+  not millions: a warm-up win.
+- The two `invoke.rs` sites are **cold**. An `eprintln` probe recorded **zero**
+  hits across `wp2_2_method_invoke_matrix`, `wp2_1_reflect`, `wp2_5_proxy` and
+  `wp2_7_annotation_proxy`. They are migrated for consistency, and no gain is
+  claimed for them.
+
+**Revised verdict:** the advisory correctly identified a real mechanism and a
+real (if small) redundancy, but its premise — that native dispatch pays a string
+hash *per call* — does not hold: that cost was already removed from the
+steady-state path. "Effort medium, risk low" was right; "could improve Java
+library performance significantly" was not.
 
 ## 2. Young-GC activation — REFUTED, and dangerous to act on
 
