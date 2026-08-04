@@ -462,7 +462,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-148 tokens.
+149 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -565,6 +565,7 @@ export inherited from a parent shell.
 | `range-bce` | `CRATONVM_JIT_RANGE_BCE` |
 | `range-scan-legacy` | `CRATONVM_JIT_RANGE_SCAN_LEGACY` |
 | `reassoc` | `CRATONVM_JIT_REASSOC` |
+| `retpc-validate` | `CRATONVM_JIT_NO_RETPC_VALIDATE` |
 | `rootsnap-cache` | `CRATONVM_ROOTSNAP_CACHE` |
 | `rootsnap-cache-survive-gc` | `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC` |
 | `safepoint-polls` | `CRATONVM_JIT_SAFEPOINT_POLLS` |
@@ -617,7 +618,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-33 tokens.
+34 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -627,6 +628,7 @@ export inherited from a parent shell.
 | `compressed-oops` | `CRATONVM_COMPRESSED_OOPS` |
 | `default-heap-ergonomics` | `CRATONVM_DEFAULT_HEAP_ERGONOMICS` |
 | `default-heap-max-mb` | `CRATONVM_DEFAULT_HEAP_MAX_MB` |
+| `defrag-promote` | `CRATONVM_NO_DEFRAG_PROMOTE` |
 | `exact-refproc-survival` | `CRATONVM_NO_EXACT_REFPROC_SURVIVAL` |
 | `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
