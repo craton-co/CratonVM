@@ -2605,7 +2605,7 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// dispatching `String.equals`. An implementation must never report `false`
     /// for a pair it did not actually read: doing so silently turned every
     /// `ConcurrentHashMap.get` on a String key into a miss (see
-    /// `docs/known-issues/vm/chm-get-misses-stored-key-in-process-20260803.md`).
+    /// `docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
     fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
         Some(self.read_string(a)? == self.read_string(b)?)
     }

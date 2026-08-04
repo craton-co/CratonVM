@@ -5420,7 +5420,7 @@ const STRING_STORAGE_CHARS: u8 = 2;
 /// as a coder is what made `compact_java_strings_equal` answer "not equal" for
 /// two identical Strings, which in turn made `ConcurrentHashMap.get` miss
 /// every String key the same map had just stored
-/// (`docs/known-issues/vm/chm-get-misses-stored-key-in-process-20260803.md`).
+/// (`docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
 /// So when the positional probe does not describe a String, resolve `value`
 /// and `coder` by NAME off the receiver's own class before giving up.
 fn java_string_storage(shared: &SharedVm, object: ObjectRef) -> Option<(ObjectRef, u8)> {
@@ -23861,7 +23861,7 @@ mod tests {
     /// read its slot 1 (the cached hash) as a coder, reject the value, and
     /// return a hard `false` — which `ConcurrentHashMap.get` believed, so a
     /// String-keyed CHM missed every key it held
-    /// (`docs/known-issues/vm/chm-get-misses-stored-key-in-process-20260803.md`).
+    /// (`docs/internal/chm-get-misses-stored-key-in-process-RETIRED-20260804.md`).
     #[test]
     fn equal_strings_compare_equal_in_the_embedded_string_layout() {
         let shared = test_shared();
