@@ -28,22 +28,37 @@ INPUT.  Two `CRATONVM_DBG_OSR_FRAME_TRACE=<substring>` transcripts:
 Records (both arms, one format, see `vm/.../osr_frame_trace.rs`):
 
     [osr-frame] A key=<m> bci=<n> n=<i> L=<tag:word,...> S=<tag:word,...>
+    [osr-frame] E key=<m> bci=<n> n=-   L=...            S=...
     [osr-frame] X key=<m> bci=<n> n=-   L=...            S=...
 
-THE ASSERTION.  For each `(key, bci)` site, map every record of the run under
-test — arrivals AND resumed frames alike — to its index in the ground-truth
-sequence by EXACT frame equality, and require that index sequence to be
-strictly increasing. One property, and it is the brief's assertion and the
-lane's defect together:
+TWO ASSERTIONS, because one is not enough.
+
+(1) MONOTONICITY.  For each `(key, bci)` site, map every record of the run under
+test to its index in the ground-truth sequence by EXACT frame equality, and
+require that index sequence to be strictly increasing.
 
   * a frame matching NO ground-truth frame is a state the program can never be
     in — a corrupted local, however dead, since the comparison does not care
     whether anything reads it;
   * an index that repeats or goes backwards is an iteration executing a second
-    time, which is `jit-osr-bail-reruns-loop-iterations`;
-  * a GAP is not an error. Compiled code legitimately runs the iterations
-    between an entry and its exit without producing arrival records — that gap
-    is the OSR, and its size is reported rather than judged.
+    time.
+
+(2) ADVANCE.  For each entry/exit pair, `index(X) - index(E)` is how many
+iterations the compiled body committed, derived from the un-compiled run's own
+trajectory rather than from anything the JIT claims. `--min-advance` is the
+floor it must meet.
+
+Assertion (2) exists because a synthetic fixture walked straight through (1).
+Compiled iterations produce no arrival records, so "entered at frame 5, ran to
+12, resumed at 5" — the historical `jit-osr-bail-reruns-loop-iterations` defect
+— and "entered at 5 and advanced nothing" are the same index sequence, both
+strictly increasing. Only the entry record separates them.
+
+`--min-advance 0` is correct for the unconditional-at-header trigger
+(`CRATONVM_OSR_EXIT_TEST`), which bails at iteration 0 where "reject" and
+"transfer" coincide. Under `CRATONVM_OSR_EXIT_AFTER=N` with `N >= 2` it must be
+at least 1. A GAP between an exit and the next arrival is not an error at all —
+that gap IS the OSR.
 
 AMBIGUITY, stated rather than hidden.  The index is well defined only when
 frames at a site are distinct, which holds for any loop with a monotone
@@ -54,7 +69,8 @@ ambiguous, because on such a site "strictly increasing" is a weaker claim than
 it looks.
 
 Usage:
-    osr-frame-comparator.py <ground-truth.err> <under-test.err> [--verbose]
+    osr-frame-comparator.py <ground-truth.err> <under-test.err>
+                            [--min-advance N] [--verbose]
 """
 
 import collections
@@ -68,7 +84,7 @@ def parse(path):
     than a parsed one is deliberate, so a change in how a slot is rendered
     cannot silently make two different frames compare equal.
     """
-    sites = collections.defaultdict(lambda: {"A": [], "X": [], "seq": []})
+    sites = collections.defaultdict(lambda: {"A": [], "E": [], "X": [], "seq": []})
     truncated = set()
     for line in open(path, encoding="utf-8", errors="replace"):
         if "[osr-frame]" not in line:
@@ -79,7 +95,7 @@ def parse(path):
             truncated.add((fields.get("key"), fields.get("bci")))
             continue
         kind, rest = body.split(" ", 1)
-        if kind not in ("A", "X"):
+        if kind not in ("A", "E", "X"):
             continue
         fields = {}
         for part in ("key", "bci", "n"):
@@ -96,8 +112,14 @@ def parse(path):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    verbose = "--verbose" in sys.argv
+    argv = sys.argv[1:]
+    min_advance = 1
+    if "--min-advance" in argv:
+        i = argv.index("--min-advance")
+        min_advance = int(argv[i + 1])
+        del argv[i:i + 2]
+    args = [a for a in argv if not a.startswith("--")]
+    verbose = "--verbose" in argv
     if len(args) != 2:
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
         return 2
@@ -126,7 +148,8 @@ def main():
 
     failures = []
     ambiguous_sites = []
-    print(f"{'site':<52} {'truth':>7} {'test':>6} {'exits':>6} {'gap':>6}  verdict")
+    print(f"{'site':<52} {'truth':>7} {'test':>6} {'exits':>6} {'gap':>6} "
+          f"{'advance':>9}  verdict")
     for site in sorted(test_sites):
         key, bci = site
         truth = truth_sites.get(site, {}).get("A", [])
@@ -134,7 +157,8 @@ def main():
         n_exits = len(test_sites[site]["X"])
         if not truth:
             failures.append(f"{key} bci={bci}: no ground-truth arrivals for this site")
-            print(f"{key+' bci='+bci:<52} {0:>7} {len(seq):>6} {n_exits:>6} {'-':>6}  NO-TRUTH")
+            print(f"{key+' bci='+bci:<52} {0:>7} {len(seq):>6} {n_exits:>6} "
+                  f"{'-':>6} {'-':>9}  NO-TRUTH")
             continue
 
         # index -> the positions in `truth` that hold that exact frame
@@ -148,6 +172,9 @@ def main():
         prev = -1
         gaps = 0
         site_failed = False
+        # index(E) of the entry whose exit has not arrived yet.
+        open_entry = None
+        advances = []
         for pos, (kind, frame) in enumerate(seq):
             cands = [i for i in where.get(frame, []) if i > prev]
             if not cands:
@@ -168,10 +195,31 @@ def main():
             i = cands[0]
             if i > prev + 1:
                 gaps += i - prev - 1
+            # ASSERTION 2. index(X) - index(E) is how far compiled code got,
+            # measured on the un-compiled run's trajectory. A replay drives it
+            # to zero and slips past assertion 1 entirely.
+            if kind == "E":
+                open_entry = i
+            elif kind == "X" and open_entry is not None:
+                advance = i - open_entry
+                advances.append(advance)
+                if advance < min_advance:
+                    failures.append(
+                        f"{key} bci={bci}: record {pos} — the body entered at "
+                        f"ground-truth index {open_entry} and resumed at {i}, an "
+                        f"advance of {advance} (< --min-advance {min_advance}). The "
+                        f"compiled body ran and the resume did not account for it: "
+                        f"every iteration it committed will execute a second time"
+                    )
+                    site_failed = True
+                open_entry = None
             prev = i
         verdict = "FAIL" if site_failed else ("ok*" if ambiguous else "ok")
+        adv = "-" if not advances else (
+            f"{min(advances)}..{max(advances)}" if min(advances) != max(advances)
+            else str(advances[0]))
         print(f"{key+' bci='+bci:<52} {len(truth):>7} {len(seq):>6} "
-              f"{n_exits:>6} {gaps:>6}  {verdict}")
+              f"{n_exits:>6} {gaps:>6} {adv:>9}  {verdict}")
         if verbose and not site_failed:
             print(f"      {gaps} iteration(s) ran in compiled code and produced no arrival")
 
@@ -197,5 +245,90 @@ def main():
     return 0
 
 
+def selftest():
+    """Does this checker actually catch the defects it claims to?
+
+    A comparator is a guard, and a guard that has never been shown to fire is
+    an assumption. Every case below is a hand-built pair of transcripts with a
+    KNOWN verdict, and one of them earned its place: `replay` — the historical
+    `jit-osr-bail-reruns-loop-iterations` shape — walked straight through an
+    earlier version of this file, which is why the `E` record exists at all.
+
+    The loop modelled is `for (i = 0; i < 20; i++) acc = i*i`, so the frames at
+    the header are distinct and the index is unambiguous.
+    """
+    import os
+    import tempfile
+
+    K = "P.loop:(I)J"
+
+    def rec(kind, n, i, acc):
+        ns = str(n) if kind == "A" else "-"
+        return f"[osr-frame] {kind} key={K} bci=8 n={ns} L=1:{i:016x},2:{acc:016x} S=\n"
+
+    def arrivals(lo, hi):
+        return "".join(rec("A", i, i, i * i) for i in range(lo, hi))
+
+    truth = arrivals(0, 20)
+    cases = {
+        # Entered at 5, compiled ran to 12, resumed at 12. The correct shape.
+        "clean": (arrivals(0, 5) + rec("E", 0, 5, 25) + rec("X", 0, 12, 144)
+                  + arrivals(13, 20), 0),
+        # Entered at 5, compiled ran to 12, resumed at 5: every iteration since
+        # entry executes a second time.
+        "replay": (arrivals(0, 5) + rec("E", 0, 5, 25) + rec("X", 0, 5, 25)
+                   + arrivals(6, 20), 1),
+        # Right iteration, wrong accumulator — a state the program cannot be
+        # in. This is the case the BEHAVIOURAL differential cannot see when the
+        # slot is never read again.
+        "corrupt-local": (arrivals(0, 5) + rec("E", 0, 5, 25)
+                          + rec("X", 0, 12, 0xDEADBEEF) + arrivals(13, 20), 1),
+        # A later arrival repeats an earlier frame.
+        "backwards": (arrivals(0, 5) + rec("E", 0, 5, 25) + rec("X", 0, 12, 144)
+                      + rec("A", 3, 3, 9), 1),
+        # No OSR happened at all: the run tested nothing and must not be green.
+        "no-exit": (truth, 1),
+        # The ground truth itself is empty — the filter matched nothing.
+        "no-truth": (arrivals(0, 5) + rec("E", 0, 5, 25) + rec("X", 0, 12, 144), 1),
+    }
+
+    d = tempfile.mkdtemp(prefix="osr-frame-selftest-")
+    tp = os.path.join(d, "truth.err")
+    with open(tp, "w", encoding="utf-8", newline="") as f:
+        f.write(truth)
+    empty = os.path.join(d, "empty.err")
+    open(empty, "w").close()
+
+    ok = True
+    for name, (text, want) in cases.items():
+        p = os.path.join(d, name + ".err")
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        argv = sys.argv
+        try:
+            sys.argv = ["x", empty if name == "no-truth" else tp, p]
+            import io as _io
+            buf, err = _io.StringIO(), _io.StringIO()
+            so, se = sys.stdout, sys.stderr
+            sys.stdout, sys.stderr = buf, err
+            try:
+                got = main()
+            finally:
+                sys.stdout, sys.stderr = so, se
+        finally:
+            sys.argv = argv
+        verdict = "ok" if got == want else "SELFTEST FAILED"
+        if got != want:
+            ok = False
+        print(f"  {name:<16} want rc={want} got rc={got}   {verdict}")
+        if got != want:
+            print("    " + err.getvalue().replace("\n", "\n    "))
+    print()
+    print("comparator selftest: PASS" if ok else "comparator selftest: FAILED")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     sys.exit(main())

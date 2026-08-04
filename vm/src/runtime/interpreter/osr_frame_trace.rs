@@ -17,13 +17,14 @@
 //!
 //! # Two records, one format
 //!
-//! Under `CRATONVM_DBG_OSR_FRAME_TRACE=<class-substring>` the VM emits two
+//! Under `CRATONVM_DBG_OSR_FRAME_TRACE=<class-substring>` the VM emits three
 //! kinds of line to stderr, and they are deliberately the same shape so a
 //! checker can compare them without knowing which produced which:
 //!
 //! ```text
 //! [osr-frame] A key=Probe.loop:(I)J bci=8 n=417 L=3:0000000000000000,1:00000000000001a1 S=
-//! [osr-frame] X key=Probe.loop:(I)J bci=8 n=- L=3:0000000000000000,1:00000000000001a1 S=
+//! [osr-frame] E key=Probe.loop:(I)J bci=8 n=- L=3:0000000000000000,1:00000000000001a1 S=
+//! [osr-frame] X key=Probe.loop:(I)J bci=8 n=- L=3:0000000000000000,1:0000000000000209 S=
 //! ```
 //!
 //! * **`A`** — a back-edge **arrival**, taken at the one funnel every one of the
@@ -31,10 +32,33 @@
 //!   any of its early returns, so the record does not depend on whether OSR is
 //!   enabled, whether the thread is virtual, or where the backoff schedule is.
 //!   `n` is the arrival index for this `(key, bci)`, counted by this module.
+//! * **`E`** — the frame an OSR **entry** was taken with: the state compiled
+//!   code starts from.
 //! * **`X`** — the frame an OSR **exit** transferred into the live frame,
 //!   emitted from `transfer_osr_exit_into_live_frame_checked` *after* the write
 //!   and therefore describing what the interpreter will actually resume on.
-//!   It carries no `n`: what index it *should* be is exactly the question.
+//!   Neither carries an `n`: what index each *should* be is the question.
+//!
+//! # Why `E` exists — a hole a synthetic fixture found
+//!
+//! Without it the checker's rule ("map every record to its ground-truth index
+//! and require the index to increase strictly") **does not catch a replay**,
+//! and a hand-written fixture modelling the historical defect passed. The
+//! reason is structural: compiled iterations produce no arrival records, so
+//! "entered at frame 5, ran to frame 12, resumed at frame 5" and "entered at
+//! frame 5 and resumed at frame 5 having advanced nothing" are the same
+//! sequence. Both then continue 6, 7, 8… — strictly increasing, and wrong.
+//!
+//! Recording the ENTRY frame makes the advance measurable:
+//! `index(X) - index(E)` is how many iterations the compiled body committed,
+//! derived from the un-compiled run's own trajectory rather than from anything
+//! the JIT claims. Under `CRATONVM_OSR_EXIT_AFTER=N` with `N >= 2` that
+//! difference must be non-zero, and a replay drives it to zero.
+//!
+//! Zero is *correct* for the unconditional-at-header trigger
+//! (`CRATONVM_OSR_EXIT_TEST`), which bails at iteration 0 where "reject" and
+//! "transfer" coincide — so the floor is the checker's parameter, not a
+//! constant.
 //!
 //! Each slot is `tag:word`, both hex, in JVM slot order — the same
 //! `get_local_raw` / `get_local_tag` pair the OSR entry contract reads, so a
@@ -191,6 +215,24 @@ pub(crate) fn record_arrival(frame: &Frame, bci: usize) {
     }
     let (l, s) = render(frame);
     eprintln!("[osr-frame] A key={key} bci={bci} n={n} L={l} S={s}");
+}
+
+/// Record the frame an OSR **entry** is about to be taken with.
+///
+/// Emitted after the entry validates and before the trampoline runs, so it is
+/// the state compiled code actually starts from. Paired with the next `X` at
+/// the same site, it makes the compiled body's advance measurable — see the
+/// module note for the replay a fixture slipped past without it.
+pub(crate) fn record_entry(frame: &Frame, bci: usize) {
+    let Some(f) = filter() else { return };
+    if !frame.class_name().contains(f) {
+        return;
+    }
+    let (l, s) = render(frame);
+    eprintln!(
+        "[osr-frame] E key={} bci={bci} n=- L={l} S={s}",
+        key_of(frame)
+    );
 }
 
 /// Record the frame an OSR **exit** transferred into the live frame.

@@ -108,8 +108,23 @@ if ! diff -q "$WORK/truth.out" "$WORK/test.out" > /dev/null 2>&1; then
   fail=1
 fi
 
+# The checker is a guard, and a guard that has never been shown to fire is an
+# assumption. Its self-test builds transcripts with known verdicts — including
+# the replay shape that walked past an earlier version of it — and runs first,
+# so a comparator that has stopped catching anything cannot report a green run.
 echo
-python3 "$HERE/osr-frame-comparator.py" "$WORK/truth.err" "$WORK/test.err" || fail=1
+if ! python3 "$HERE/osr-frame-comparator.py" --selftest; then
+  echo "osr-frame-differential.sh: the comparator's own self-test failed; its" >&2
+  echo "  verdict on the real transcripts below cannot be trusted." >&2
+  fail=1
+fi
+
+echo
+# `--min-advance 1`: the run under test uses CRATONVM_OSR_EXIT_AFTER=$AFTER, so
+# the compiled body is meant to advance the frame before bailing. Zero would be
+# correct only for the unconditional-at-header trigger.
+python3 "$HERE/osr-frame-comparator.py" --min-advance 1 \
+    "$WORK/truth.err" "$WORK/test.err" || fail=1
 
 echo
 if [[ $fail -eq 0 ]]; then
