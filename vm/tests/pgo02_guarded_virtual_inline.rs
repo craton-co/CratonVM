@@ -476,37 +476,12 @@ fn check_guard_hit(vm: &mut Vm) -> Result<(), String> {
     // happened to be correct (which normal dispatch alone would also give):
     // callA must have compiled, and its own inline_tally must show at least
     // one speculative (guarded) site admitted.
-    let class_id = vm
-        .shared
-        .classes
-        .class_manager
-        .read()
-        .get_loaded_class_id("cratonvm/PgoGuardedVirtualInline")
-        .expect("class must be loaded after invoke");
-    let compiled = vm
-        .shared
-        .jit
-        .jit_cache
-        .read()
-        .get("cratonvm/PgoGuardedVirtualInline", "callA", "(I)I", class_id)
-        .ok_or_else(|| "check_guard_hit: callA never JIT-compiled".to_string())?;
-    // State the tier dependency instead of relying on it. `inline_tally` is a
-    // single-pass artifact's record; an IR artifact leaves it zeroed, so
-    // without this rung the assertion below cannot tell "the guard did not
-    // fire" from "a different backend compiled the method and was never asked
-    // to plan an inline". Those are opposite conclusions.
-    if compiled.used_ir_backend {
-        return Err(
-            "check_guard_hit: callA was compiled by the OPTIMIZING (IR) backend, which \
-             plans no guarded inlines and records no inline_tally — the pin in \
-             `test_pgo02_guarded_virtual_inline` did not take"
-                .to_string(),
-        );
-    }
-    if compiled.inline_tally.speculative_sites == 0 {
+    let tally = compiled_tally(vm, "callA", &[Value::Int(1)])?;
+    if tally.speculative_sites == 0 {
         return Err(format!(
-            "check_guard_hit: callA compiled but speculative_sites == 0              (tally={:?}) — the guard never actually fired, correctness above              only proves normal dispatch works",
-            compiled.inline_tally
+            "check_guard_hit: callA compiled but speculative_sites == 0 (tally={tally:?}) \
+             — the guard never actually fired, so the correctness above only proves \
+             normal dispatch works"
         ));
     }
     Ok(())
