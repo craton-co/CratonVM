@@ -94,3 +94,9 @@ than leaving the next reader to infer it from an absence.
 
 Shares `jit/src/ir.rs`'s opcode match with `cov-01`, `cov-03` and `cov-04`.
 Disjoint arms, one 365 KB file — rebase daily, land increments.
+
+Both this lane and `cov-04` **closed 2026-08-03**, in that order. Measured on
+the merged tree every row this lane owns is **zero**; in the window between the
+two landings `cov-04` had moved two of them (`aaload` 18 → 19, `dup_x1` 6 → 7),
+which is now moot. Details in
+[`docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`](../../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).

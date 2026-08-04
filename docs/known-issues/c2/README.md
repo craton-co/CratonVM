@@ -102,7 +102,7 @@ read each lane's "first increment".
 | ~~`cov-01`~~ | ~~`ir.rs` arms `0x12`/`0x13`/`0xb2`~~ | ~~189~~ | **CLOSED 2026-08-03** — all three at zero, **+116 bodies (+20%)**. [Closeout](../../internal/cov-01-constants-and-statics-RETIRED-20260803.md) |
 | ~~`cov-02`~~ | ~~`ir.rs` arms `0x2e`/`0x32`/`0x33`/`0x34`/`0x54`/`0x5a`/`0xbe`~~ | ~~77~~ | **CLOSED 2026-08-03** — all seven at zero. [Closeout](../../internal/cov-02-array-element-access-RETIRED-20260803.md) · [brief](archive/cov-02-array-element-access.md) |
 | [`cov-03`](cov-03-field-stores-and-wide-fields.md) | `ir.rs` arms `0xb4`/`0xb5` | 43 | `getfield` learned about references; `putfield` twenty lines below did not |
-| [`cov-04`](cov-04-the-invoke-arms.md) | `ir.rs` invoke arms + `<init>` elision | 69 → **81** | **now the largest refusal of any kind.** Its `invokespecial` site doubled, 36 → 71, when `cov-01` landed. Still **cannot be sized from the survey** — first increment is a grouping, not code |
+| ~~`cov-04`~~ | ~~`ir.rs` invoke arms + `<init>` elision~~ | ~~69 → 81~~ | **CLOSED 2026-08-03** — all three invoke sites at zero. Every one was an `<init>`. [Closeout](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md) |
 | [`cov-05`](cov-05-checkcast-and-instanceof.md) | one `ir_compatible` conjunct | 306 | biggest refusal anywhere; `instanceof` first, `checkcast` needs `cov-07`'s answer |
 | [`cov-06`](cov-06-array-allocation.md) | two `ir_compatible` conjuncts + `0xbc`/`0xbd`/`0xc5` | 141 | the conjunct exists *because* the arm is missing — one piece of work, not two |
 | [`cov-07`](cov-07-athrow.md) | one `ir_compatible` conjunct | 89 | framed as a question; **"keep the refusal" is a legitimate outcome** |
@@ -114,6 +114,51 @@ conjunct from `ir_compatible`, which is one small function. Four of them
 365 KB file. That is as disjoint as this subject gets: rebase daily, land
 increments rather than lanes, and do not touch a neighbour's conjunct while you
 are in the same function.
+
+**`cov-04` closed 2026-08-03** →
+[`docs/internal/cov-04-the-invoke-arms-RETIRED-20260803.md`](../../internal/cov-04-the-invoke-arms-RETIRED-20260803.md).
+It was the one lane whose brief refused to size itself, and the grouping it
+demanded first contradicted both cases it had offered. **Every invoke bail was
+an `<init>`** — none was the "superclass or private `invokespecial` the arm has
+no path for" the brief led with, which inc 24 had already handled. They split
+29 / 39 between a compiled constructor's `super(...)`/`this(...)` chain call
+(refused by a term whose comment claimed such a method "also has a `new`", which
+35 of them did not) and a method containing a `new` (refused by a
+`call_eligible` term whose stated reason — that the lowerer has no allocation
+path — expired when `ir_lower` grew one). Both terms are gone.
+
+Measured against `origin/dev` at `95152daea`, **with `cov-01` and `cov-02`
+already in it**: invoke refusals **106 → 0**, bodies **778 → 849 (+9%)**, and
+`cov-03`'s `putfield` row grew 45 → **78**, which is now **78 of the 85**
+builder refusals that remain. Correctness: the 79-class Spring Boot regression
+list, both arms interleaved, run once per baseline — **no class changes state in
+either direction** that survives repetition. (Sweep 2 threw one mismatch, in the
+*flattering* direction: a devtools class that failed on base and passed on fix.
+6/6 PASS on re-run, both arms — a known bean-attribute flake. Re-run a mismatch
+that favours you before it becomes a claim.)
+
+Three things to carry into the neighbouring lanes:
+
+1. **Every neighbour that lands makes the next lane bigger.** A method blocked
+   on `ldc` never reached its `invokespecial`, so `cov-01`'s landing roughly
+   doubled the `0xb7` site. This lane removed 69, then 69, then **106** invoke
+   refusals across three baselines — same code, same corpus, different
+   neighbours. Do not quote a lane's size without naming the tree it was
+   measured on.
+2. `ir.rs:5264`'s 13 events were **not** "the site was never resolved at compile
+   time". Their callees are `StringBuilder.append` and `Class.getName`; they
+   were collateral from a whole-method discard triggered by a constructor
+   elsewhere in the same method. A bail site names the *first* thing the builder
+   could not lower, which is rarely the thing that caused it — so read a
+   structural-refusal row as "where the method died", never as "why".
+3. Both removed terms carried a comment stating a premise that was false when
+   read and had been true when written. Rule 1 applies to a term's *comment*
+   just as much as to a report's claim.
+
+**With `cov-01`, `cov-02` and `cov-04` closed, `cov-03` is the whole remaining
+builder story** — 78 of 85 refusals — and the opcode gap is down to **13 events
+across the entire corpus**. Everything else left is in `ir_compatible`
+(`cov-05`/`cov-06`/`cov-07`).
 
 **Re-run the survey after any of `cov-05`/`cov-06`/`cov-07` lands.** Lifting a
 whole-method conjunct admits methods that were hiding behind it, and they fail
