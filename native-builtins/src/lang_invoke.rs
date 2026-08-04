@@ -1187,6 +1187,53 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
 // VarHandle operation implementations
 // ---------------------------------------------------------------------------
 
+/// JDK-ONLY-LAYOUT: does this `VarHandle` object actually have OUR six-slot
+/// layout, or is it a real `java.lang.invoke.VarHandle`?
+///
+/// `alloc_concurrent_synthetic` asks for `VH_FIELD_COUNT` slots, but when the
+/// real class is loaded the object it returns has the **real** layout —
+/// `vform` (a `VarForm` reference) at 0 and `exact` (a `boolean`) at 1 on
+/// JDK 21+. Writing our `VH_KIND` `Int` to slot 0 is then coerced to `null`,
+/// **destroying `vform`**, and writing our `VH_CLASS` `String` to slot 1 is
+/// coerced to a number, corrupting `exact`.
+///
+/// Measured 2026-08-04 with `CRATONVM_DBG_OVERLAY=1`: 52 hits on each of those
+/// two slots from `MhUtil.findVarHandle`, reached from the `<clinit>` of
+/// `java.util.concurrent.atomic.AtomicBoolean`, `AtomicReference` and
+/// `java.io.ObjectInputFilter$Config`. Those are real JDK classes whose
+/// `static final VarHandle` fields real bytecode uses — so a null `vform` is
+/// handed straight back to the JDK. It does not fault today only because our
+/// natives intercept every `VarHandle` operation and read the side table
+/// instead; the moment §7 step 3 hands one of those calls to real bytecode,
+/// `vform.getMethodHandle(...)` is an NPE.
+///
+/// The metadata is not lost by skipping the writes: `vh_meta_put` is called on
+/// every allocation path and every reader consults it first (see
+/// [`vh_field_desc`]). The slot writes are the fallback for VarHandles
+/// allocated outside our path, which by definition do not have our layout
+/// either.
+/// **Ask by NAME, not by field count.** The first version of this predicate was
+/// `object_num_fields(vh) >= VH_FIELD_COUNT` and was completely inert: an A/B
+/// against the pre-fix binary counted the same 8 overlay writes with and
+/// without it. `alloc_concurrent_synthetic` returns an object with at least the
+/// requested slot count either way, so a count test cannot tell the two layouts
+/// apart — it only looks as though it can.
+///
+/// A real `java.lang.invoke.VarHandle` declares an instance field literally
+/// named `vform`; a VM-fabricated stub has generated placeholder fields and
+/// does not. That is the difference, so that is what is tested.
+///
+/// If a future JDK renames `vform`, this reverts to today's behaviour (writing
+/// the slots) rather than to something new, and `CRATONVM_DBG_OVERLAY=1` still
+/// reports it — a loud failure mode, not a silent one.
+fn vh_has_synthetic_layout(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(vh);
+    !ctx
+        .declared_fields(class_id)
+        .iter()
+        .any(|f| !f.is_static && f.name == "vform")
+}
+
 /// Allocate a VarHandle for an instance field.
 pub(crate) fn alloc_instance_var_handle(
     ctx: &mut dyn NativeContext,
@@ -1197,15 +1244,19 @@ pub(crate) fn alloc_instance_var_handle(
     class_id: cratonvm_types::ClassId,
 ) -> ObjectRef {
     let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
-    ctx.set_field(vh, VH_KIND, Value::Int(VH_KIND_INSTANCE));
-    let cls_s = ctx.create_string(class_name);
-    ctx.set_field(vh, VH_CLASS, Value::Object(Some(cls_s)));
-    let fld_s = ctx.create_string(field_name);
-    ctx.set_field(vh, VH_FIELD, Value::Object(Some(fld_s)));
-    let desc_s = ctx.create_string(field_desc);
-    ctx.set_field(vh, VH_FIELD_DESC, Value::Object(Some(desc_s)));
-    ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(field_index as i32));
-    ctx.set_field(vh, VH_CLASS_ID, Value::Int(class_id.as_u32() as i32));
+    // Only on OUR layout — see `vh_has_synthetic_layout`. On a real
+    // `VarHandle` these six writes null `vform` and corrupt `exact`.
+    if vh_has_synthetic_layout(ctx, vh) {
+        ctx.set_field(vh, VH_KIND, Value::Int(VH_KIND_INSTANCE));
+        let cls_s = ctx.create_string(class_name);
+        ctx.set_field(vh, VH_CLASS, Value::Object(Some(cls_s)));
+        let fld_s = ctx.create_string(field_name);
+        ctx.set_field(vh, VH_FIELD, Value::Object(Some(fld_s)));
+        let desc_s = ctx.create_string(field_desc);
+        ctx.set_field(vh, VH_FIELD_DESC, Value::Object(Some(desc_s)));
+        ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(field_index as i32));
+        ctx.set_field(vh, VH_CLASS_ID, Value::Int(class_id.as_u32() as i32));
+    }
     // WP4.2: also stash in the side table so the descriptor-aware setter
     // on real-JDK VarHandle layout doesn't drop our metadata.
     vh_meta_put(
@@ -1231,15 +1282,18 @@ pub(crate) fn alloc_static_var_handle(
     field_desc: &str,
 ) -> ObjectRef {
     let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
-    ctx.set_field(vh, VH_KIND, Value::Int(VH_KIND_STATIC));
-    let cls_s = ctx.create_string(class_name);
-    ctx.set_field(vh, VH_CLASS, Value::Object(Some(cls_s)));
-    let fld_s = ctx.create_string(field_name);
-    ctx.set_field(vh, VH_FIELD, Value::Object(Some(fld_s)));
-    let desc_s = ctx.create_string(field_desc);
-    ctx.set_field(vh, VH_FIELD_DESC, Value::Object(Some(desc_s)));
-    ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(-1)); // resolved lazily
-    ctx.set_field(vh, VH_CLASS_ID, Value::Int(0));
+    // Only on OUR layout — see `vh_has_synthetic_layout`.
+    if vh_has_synthetic_layout(ctx, vh) {
+        ctx.set_field(vh, VH_KIND, Value::Int(VH_KIND_STATIC));
+        let cls_s = ctx.create_string(class_name);
+        ctx.set_field(vh, VH_CLASS, Value::Object(Some(cls_s)));
+        let fld_s = ctx.create_string(field_name);
+        ctx.set_field(vh, VH_FIELD, Value::Object(Some(fld_s)));
+        let desc_s = ctx.create_string(field_desc);
+        ctx.set_field(vh, VH_FIELD_DESC, Value::Object(Some(desc_s)));
+        ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(-1)); // resolved lazily
+        ctx.set_field(vh, VH_CLASS_ID, Value::Int(0));
+    }
     // WP4.2: side table for descriptor-aware-coercion-safe metadata access.
     vh_meta_put(
         ctx,

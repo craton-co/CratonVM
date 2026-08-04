@@ -20,7 +20,7 @@ Increment 2 is therefore built and measured rather than argued about: the
 selector has a production caller (`CRATONVM_JIT=ir-isel-emit`, default off,
 fail-closed) and a byte-equality oracle that ran over a real workload and found
 **zero** disagreements. See
-`docs/internal/hir-02-mir-regalloc-handoff-RETIRED-20260804.md`.
+`hir-02-mir-regalloc-handoff-RETIRED-20260804.md` in the internal tree.
 
 Consolidates the `hir-01` and `hir-02` lanes of
 `docs/known-issues/c2/deep-research-vm-c2.md`, which asked for an HIR/LIR/MIR
