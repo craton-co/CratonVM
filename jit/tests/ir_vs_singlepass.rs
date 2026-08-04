@@ -5208,8 +5208,16 @@ fn ir_vs_singlepass_getstatic_direct_load() {
     use std::sync::atomic::AtomicPtr;
 
     /// Stands in for `jit_resolve_static_base`; `ctx` IS the base-pointer cell.
+    ///
+    /// **One registration for this whole binary.** A second
+    /// `set_static_base_resolver` with a different context does not replace this
+    /// one — it POISONS the resolver, and every direct site silently reverts to
+    /// the helper. (Learned the expensive way: a separate wide-static test with
+    /// its own block made this one's rung 1 return the marker value.) So the
+    /// wide and floating-point widths are rungs of THIS test, sharing this
+    /// block, rather than a sibling with a block of its own.
     unsafe extern "C" fn test_resolver(ctx: i64, class_id: i64, field_index: i64) -> i64 {
-        if class_id == 0x1CE && (field_index == 1 || field_index == 2) {
+        if class_id == 0x1CE && (1..=5).contains(&field_index) {
             ctx
         } else {
             0
@@ -5222,12 +5230,16 @@ fn ir_vs_singlepass_getstatic_direct_load() {
         // an `AtomicPtr` cell naming it. Slot 1 is the int-category case; slot 2
         // is read back through the 64-bit payload offset the reference encoding
         // uses, so a bias mixed up between the two arms shows up as a wrong
-        // number rather than as nothing.
+        // number rather than as nothing. Slots 3-5 are the wide and
+        // floating-point widths.
         let block: &'static mut [Value] = Box::leak(
             vec![
                 Value::Int(0),
                 Value::Int(-7),
                 Value::Long(0x0BAD_F00D_1234_5678),
+                Value::Long(0x0123_4567_89AB_CDEF),
+                Value::Double(-2.5f64),
+                Value::Float(-2.5f32),
             ]
             .into_boxed_slice(),
         );
@@ -5267,16 +5279,22 @@ fn ir_vs_singlepass_getstatic_direct_load() {
     //    getstatic works at all.
     {
         let code = vec![0xb2, 0x00, 0x01, 0xac];
+        // Field 0, which `test_resolver` declines. This control used to use
+        // field 5; when rung 4 widened the resolver's accepted range to `1..=5`
+        // it silently became a RESOLVED site and started reading slot 5 (a
+        // float) as an int. Index 0 is both outside the accepted range and a
+        // real slot, so a resolver that wrongly accepted it would read a valid
+        // word rather than off the end of the block.
         let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
             match cp {
-                1 => Some((0x1CEu32, 5usize, b'I', false)),
+                1 => Some((0x1CEu32, 0usize, b'I', false)),
                 _ => None,
             }
         };
         let cm = cached("gsdf", "()I", code, 1, 0);
         let ir = compile_getstatic(&cm, &helpers, true, &statics).expect("IR fallback getstatic");
         let sp = compile_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
-        let expected = 424_242 + 0x1CE + 5;
+        let expected = 424_242 + 0x1CE;
         assert_eq!(call_with_dummy_context(&ir, &[]) as i32, expected);
         assert_eq!(call_with_dummy_context(&sp, &[]) as i32, expected);
     }
@@ -5307,42 +5325,60 @@ fn ir_vs_singlepass_getstatic_direct_load() {
             0x0BAD_F00D_1234_5678u64 as i64
         );
     }
-}
 
-#[test]
-fn wide_and_fp_statics_stay_on_single_pass() {
-    // The fail-closed rung for `getstatic`. `J`, `D` and `F` are refused by the
-    // builder, not by the lowering, because the refusal is about the VALUE tier:
-    // admitting one would put a `Long`/`Double`/`Float` node in a graph whose
-    // admission clause may have been the int one, and a static field carries no
-    // equivalent of the `ir_emit_long` / `ir_emit_fp` signal the `ldc2_w` arm
-    // consults.
-    //
-    // The edit that trips it: widen the `type_tag` match in `IrBuilder`'s 0xb2
-    // arm to accept `J`/`D`/`F`.
-    let mut helpers = dummy_helpers();
-    helpers.getstatic = marker_getstatic as *const () as usize;
-    for (tag, desc, ret) in [
-        (b'J', "()J", 0xadu8),
-        (b'D', "()D", 0xafu8),
-        (b'F', "()F", 0xaeu8),
+    // 4. The wide and floating-point widths, on the same block and the same one
+    //    registration. This is where the payload OFFSET and the load WIDTH are
+    //    both tag-dependent: `J`/`D` read the 64-bit payload, `F` the 32-bit
+    //    one, and `F` must be ZERO-extended — `MOVSXD` on a NEGATIVE float's bit
+    //    pattern (bit 31 set, which is why the value is -2.5 and not 2.5) fills
+    //    the high half of the home word with garbage, and the home word is what
+    //    every deopt frame and `publish_fp_from_slot` read.
+    for (slot_idx, tag, desc, ret, want) in [
+        (3usize, b'J', "()J", 0xadu8, 0x0123_4567_89AB_CDEFi64),
+        (4, b'D', "()D", 0xaf, (-2.5f64).to_bits() as i64),
+        (5, b'F', "()F", 0xae, (-2.5f32).to_bits() as u32 as i64),
     ] {
         let code = vec![0xb2, 0x00, 0x01, ret];
         let statics = move |cp: u16| -> Option<(u32, usize, u8, bool)> {
             match cp {
-                1 => Some((0x22u32, 0usize, tag, false)),
+                1 => Some((0x1CEu32, slot_idx, tag, false)),
                 _ => None,
             }
         };
-        let cm = cached("gsw", desc, code, 2, 0);
-        match compile_getstatic(&cm, &helpers, true, &statics) {
-            None => { /* refused outright — also acceptable, and fail-closed. */ }
-            Some(compiled) => assert!(
-                !compiled.used_ir_backend,
-                "cov-01: a `{}` static must bail the optimizing builder",
-                tag as char
-            ),
-        }
+        let cm = cached("gsdw", desc, code, 2, 0);
+        let ir = compile_wide_getstatic(&cm, &helpers, true, &statics)
+            .unwrap_or_else(|| panic!("IR direct `{}` static", tag as char));
+        let sp = compile_wide_getstatic(&cm, &helpers, false, &statics)
+            .unwrap_or_else(|| panic!("single-pass direct `{}` static", tag as char));
+        assert!(
+            ir.used_ir_backend,
+            "cov-01: a `{}` static must reach the optimizing backend under its \
+             value-tier gate",
+            tag as char
+        );
+        let r_ir = call_with_dummy_context(&ir, &[]);
+        let r_sp = call_with_dummy_context(&sp, &[]);
+        // The two backends are compared on the FULL 64-bit word, deliberately.
+        // A `float` return only defines the low 32 bits, so the high half is
+        // ABI-undefined — but it is not backend-undefined: the single-pass arm
+        // zero-extends (`MOV r32`) and this is the assertion that catches the
+        // IR arm sign-extending instead. Masking here would discard exactly the
+        // bits the `MOVSXD`-vs-`MOV EAX` choice decides, which is what the first
+        // draft of this rung did, and it passed against a deliberately wrong
+        // width.
+        assert_eq!(
+            r_ir, r_sp,
+            "`{}` direct static: IR vs single-pass diverge",
+            tag as char
+        );
+        // Against the host, only the bits the ABI defines.
+        let masked = if tag == b'F' { r_ir as u32 as i64 } else { r_ir };
+        assert_eq!(
+            masked, want,
+            "`{}` direct static: wrong bits — the marker value would mean it \
+             took the helper instead",
+            tag as char
+        );
     }
 }
 
@@ -5369,6 +5405,319 @@ fn a_volatile_static_agrees_on_both_backends() {
     let expected = 424_242 + 0x33 + 2;
     assert_eq!(call_with_dummy_context(&ir, &[]) as i32, expected);
     assert_eq!(call_with_dummy_context(&sp, &[]) as i32, expected);
+}
+
+// ── cov-01 residual: `J` / `D` / `F` statics ─────────────────────────────
+//
+// When `getstatic` first lowered, these three tags were refused in the BUILDER
+// on the grounds that admitting one would put a `Long`/`Double`/`Float` node in
+// a graph whose admission clause may have been the int one. The hazard was
+// real; the refusal was in the wrong place. `getstatic` is polymorphic and
+// appears in neither `is_category2_opcode` nor `is_float_opcode`, so the builder
+// genuinely cannot see the width — but `try_compile` resolved the type tag in
+// order to build the table at all, so the gate belongs there, keyed on
+// `ir_emit_long` / `ir_emit_fp` exactly as the float `ldc` and `ldc2_w` feeds
+// already are.
+
+/// `jit_dispatch_threw` stand-in that reports **no** pending signal.
+///
+/// Reached only on the cold `RAX == i64::MIN` branch of a wide static's helper
+/// route. Returning 0 is the "that was a real value, keep it" answer, which is
+/// the case `long_min_value_static_is_a_value_not_a_sentinel` exists to drive.
+unsafe extern "C" fn no_signal_pending() -> i64 {
+    0
+}
+
+/// `jit_dispatch_threw` stand-in that reports a pending signal — the other half
+/// of the same branch, used to prove the peek is consulted rather than ignored.
+unsafe extern "C" fn signal_pending() -> i64 {
+    1
+}
+
+/// `jit_getstatic` stand-in whose value is chosen by `field_index`.
+///
+/// The first draft of these tests shared one `AtomicI64` that each test stored
+/// into before calling. They run in parallel threads, so they raced and three of
+/// the four failed — while passing under `--test-threads=1`. Keying on an
+/// ARGUMENT removes the shared mutable state rather than serialising around it,
+/// which is the same fix `proxy_lambda_dispatch_preserves_diagnostic_counters`
+/// needed for the same reason.
+unsafe extern "C" fn wide_value_getstatic(_vm: i64, _class_id: i64, field_index: i64) -> i64 {
+    match field_index {
+        0 => 0x0123_4567_89AB_CDEF,
+        1 => (-2.5f64).to_bits() as i64,
+        2 => (-2.5f32).to_bits() as i64,
+        _ => 7,
+    }
+}
+
+/// `jit_getstatic` stand-in that always returns the value bit-identical to the
+/// failed-`<clinit>` sentinel. Its own function, so nothing else can perturb it.
+unsafe extern "C" fn long_min_getstatic(_vm: i64, _class_id: i64, _field_index: i64) -> i64 {
+    i64::MIN
+}
+
+/// [`compile_getstatic`] with the long and FP value tiers on, which is what a
+/// `J` / `D` / `F` static needs to be fed to the builder at all.
+fn compile_wide_getstatic(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    statics: &dyn Fn(u16) -> Option<(u32, usize, u8, bool)>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        Some(statics),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        optimize,
+        false,
+        false,
+        true, // ir_emit_long
+        false,
+        true, // ir_emit_fp
+        None,
+    )
+}
+
+#[test]
+fn ir_vs_singlepass_wide_and_fp_statics_through_the_helper() {
+    // `long f() { return H.J; }`, `double f() { return H.D; }`,
+    // `float f() { return H.F; }` — getstatic #1 ; {lreturn,dreturn,freturn}.
+    //
+    // The helper route (no VM registered for this class id, so
+    // `resolve_static_base` declines). Both backends must return the same bits.
+    let mut helpers = dummy_helpers();
+    helpers.getstatic = wide_value_getstatic as *const () as usize;
+    helpers.dispatch_threw = no_signal_pending as *const () as usize;
+
+    // `field_index` selects the value `wide_value_getstatic` returns, so no two
+    // parallel tests share a cell.
+    for (slot_idx, tag, desc, ret, bits) in [
+        (0usize, b'J', "()J", 0xadu8, 0x0123_4567_89AB_CDEFu64 as i64),
+        (1, b'D', "()D", 0xafu8, (-2.5f64).to_bits() as i64),
+        // A NEGATIVE float, so bit 31 is set: the inline arm's `MOV EAX` vs
+        // `MOVSXD` distinction is invisible for a positive one.
+        (2, b'F', "()F", 0xaeu8, (-2.5f32).to_bits() as i64),
+    ] {
+        let code = vec![0xb2, 0x00, 0x01, ret];
+        let statics = move |cp: u16| -> Option<(u32, usize, u8, bool)> {
+            match cp {
+                1 => Some((0x44u32, slot_idx, tag, false)),
+                _ => None,
+            }
+        };
+        let cm = cached("gsw", desc, code, 2, 0);
+        let ir = compile_wide_getstatic(&cm, &helpers, true, &statics)
+            .unwrap_or_else(|| panic!("IR `{}` static", tag as char));
+        let sp = compile_wide_getstatic(&cm, &helpers, false, &statics)
+            .unwrap_or_else(|| panic!("single-pass `{}` static", tag as char));
+        assert!(
+            ir.used_ir_backend,
+            "cov-01: a `{}` static must reach the optimizing backend under its \
+             value-tier gate",
+            tag as char
+        );
+        let r_ir = call_with_dummy_context(&ir, &[]);
+        let r_sp = call_with_dummy_context(&sp, &[]);
+        // Full 64 bits between the two backends — see the direct-load rung for
+        // why masking here would hide a width bug — and the ABI-defined bits
+        // against the host.
+        assert_eq!(
+            r_ir, r_sp,
+            "`{}` static: IR vs single-pass diverge",
+            tag as char
+        );
+        let (masked, want) = if tag == b'F' {
+            (r_ir as u32 as i64, bits as u32 as i64)
+        } else {
+            (r_ir, bits)
+        };
+        assert_eq!(masked, want, "`{}` static: wrong bits", tag as char);
+    }
+}
+
+#[test]
+fn long_min_value_static_is_a_value_not_a_sentinel() {
+    // The case wide statics exist to get wrong. `jit_getstatic` reports a failed
+    // `<clinit>` by returning `i64::MIN`, and `Long.MIN_VALUE` is bit-identical
+    // to it — so a plain compare-and-bail would turn
+    //
+    //     static final long L = Long.MIN_VALUE;
+    //
+    // into a spurious exception on every read. The helper route peeks
+    // `jit_dispatch_threw` on that branch to tell the two apart.
+    //
+    // The edit that trips it: replace `emit_call_return_check(slot, node.ty)` in
+    // the `Op::LoadStatic` arm with the unconditional `CMP RAX, i64::MIN ; JE
+    // bail` it used to have. **Verified to fail.**
+    //
+    // The body is `return H.L + 1;`, not `return H.L;`, and that is the whole
+    // reason this test can fail at all. On the bail path the shared epilogue
+    // returns `i64::MIN` unchanged — so a method that merely returned the static
+    // would produce `i64::MIN` whether the value was KEPT or the sentinel was
+    // PROPAGATED, and the assertion would hold against a backend that got it
+    // exactly wrong. Adding one makes the two answers different bit patterns:
+    // `MIN + 1` if the value survived, `MIN` if it was mistaken for a signal.
+    // (The first draft of this test omitted the `+ 1` and passed against a
+    // deliberately broken lowering.)
+    let mut helpers = dummy_helpers();
+    helpers.getstatic = long_min_getstatic as *const () as usize;
+    helpers.dispatch_threw = no_signal_pending as *const () as usize;
+
+    let code = vec![
+        0xb2, 0x00, 0x01, // getstatic #1   (Long.MIN_VALUE)
+        0x0a, // lconst_1
+        0x61, // ladd
+        0xad, // lreturn
+    ];
+    let statics = |cp: u16| -> Option<(u32, usize, u8, bool)> {
+        match cp {
+            1 => Some((0x55u32, 0usize, b'J', false)),
+            _ => None,
+        }
+    };
+    let cm = cached("gsmin", "()J", code, 4, 0);
+    let ir = compile_wide_getstatic(&cm, &helpers, true, &statics).expect("IR Long.MIN static");
+    let sp = compile_wide_getstatic(&cm, &helpers, false, &statics).expect("single-pass");
+    assert!(ir.used_ir_backend, "must be the optimizing body");
+    let kept = i64::MIN.wrapping_add(1);
+    assert_eq!(
+        call_with_dummy_context(&ir, &[]),
+        kept,
+        "a static holding Long.MIN_VALUE must READ BACK as Long.MIN_VALUE, not \
+         be mistaken for the failed-<clinit> sentinel (getting i64::MIN here \
+         means the read bailed to the exception epilogue)"
+    );
+    assert_eq!(call_with_dummy_context(&sp, &[]), kept);
+
+    // The other half of the same branch: with a signal genuinely pending, the
+    // identical bits must propagate the sentinel instead — and now that is
+    // observable, because the `+ 1` never runs. Without this rung the assertion
+    // above passes just as well against a lowering that never checks at all.
+    helpers.dispatch_threw = signal_pending as *const () as usize;
+    let ir2 = compile_wide_getstatic(&cm, &helpers, true, &statics).expect("IR");
+    assert_eq!(
+        call_with_dummy_context(&ir2, &[]),
+        i64::MIN,
+        "with a signal pending the same bits must propagate the sentinel and \
+         skip the rest of the method"
+    );
+}
+
+#[test]
+fn wide_statics_stay_on_single_pass_with_their_value_tier_off() {
+    // The fail-closed rung, and the reason the gate lives in `try_compile`
+    // rather than in the builder.
+    //
+    // The body is `sink(H.WIDE);` — `getstatic #1 ; invokestatic #2 ; return`.
+    // That is the ONLY shape in which a wide or floating-point static appears
+    // in a method containing no category-2 or FP OPCODE, and it is also what
+    // ordinary Java looks like. Every other consumer of a `long` is itself
+    // category-2 (`lstore`, `lreturn`, `ladd`, `l2i`, `lcmp`), which would make
+    // the admission gate refuse the method and the test pass vacuously; the one
+    // non-category-2 discard, `pop2`, is implemented by neither backend.
+    //
+    // So `method_uses_category2("()V")` is false, `fp_in_body` is false, and
+    // the method is ADMITTED to the optimizing pipeline through the int clause
+    // — at which point only the feed knows that `H.WIDE` is 64 bits wide.
+    //
+    // The edit that trips it: delete the `admitted_by_value_tier` match in
+    // `try_compile`'s cov-01 static-field feed.
+    let mut helpers = dummy_helpers();
+    // `field_index` 3 ⇒ the value 7; the site below uses it.
+    helpers.getstatic = wide_value_getstatic as *const () as usize;
+    helpers.dispatch_threw = no_signal_pending as *const () as usize;
+
+    for (tag, sink_desc, long_gate, fp_gate) in [
+        (b'J', "(J)V", true, false),
+        (b'D', "(D)V", false, true),
+        (b'F', "(F)V", false, true),
+    ] {
+        let code = vec![
+            0xb2, 0x00, 0x01, // getstatic #1  (the wide static)
+            0xb8, 0x00, 0x02, // invokestatic #2  sink(<tag>)V
+            0xb1, // return
+        ];
+        let statics = move |cp: u16| -> Option<(u32, usize, u8, bool)> {
+            match cp {
+                1 => Some((0x66u32, 3usize, tag, false)),
+                _ => None,
+            }
+        };
+        let invokes = move |cp: u16| -> Option<(String, String, String)> {
+            match cp {
+                2 => Some((
+                    "Corpus".to_string(),
+                    "sink".to_string(),
+                    sink_desc.to_string(),
+                )),
+                _ => None,
+            }
+        };
+        // Never CALLED — `invoke_dispatch` is the harness's panicking stub. This
+        // rung is about which BACKEND produced the body; the value paths are
+        // driven by the two tests above.
+        let compile = |cm: &CachedBytecodeMethod, long: bool, fp: bool| {
+            try_compile(
+                cm,
+                None,
+                None,
+                Some(&statics),
+                Some(&invokes),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &helpers,
+                None,
+                None,
+                None,
+                None,
+                true,  // optimize
+                true,  // ir_emit_calls — the invokestatic must lower either way,
+                false, //   so the value-tier gate is the only difference
+                long,
+                false,
+                fp,
+                None,
+            )
+        };
+        let cm = cached("gsoff", "()V", code, 2, 0);
+
+        // Gate OFF for this tag ⇒ the builder must bail to single-pass.
+        let off = compile(&cm, false, false)
+            .expect("the method still compiles — on the single-pass backend");
+        assert!(
+            !off.used_ir_backend,
+            "cov-01: a `{}` static with its value tier off must bail the \
+             optimizing builder",
+            tag as char
+        );
+
+        // Gate ON ⇒ the same body IS lowered. Without this control, "the gate
+        // refused it" and "the builder cannot lower this shape at all" are
+        // indistinguishable and the assertion above proves nothing.
+        let on = compile(&cm, long_gate, fp_gate).expect("IR body under the value-tier gate");
+        assert!(
+            on.used_ir_backend,
+            "cov-01: the same `{}` body must reach the optimizing backend with \
+             its value tier on",
+            tag as char
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

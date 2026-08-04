@@ -13551,13 +13551,41 @@ fn try_compile_inner(
         // artifact (`static_init_classes`, below), because compiled code reads
         // static storage directly and the interpreter's compiled-entry path is
         // what ensure-initializes the declaring classes once per artifact.
+        //
+        // The VALUE TIER is gated here and not in the builder, because this is
+        // the only place that knows the width. `getstatic` is polymorphic: it
+        // is listed by neither `is_category2_opcode` nor `is_float_opcode`, so
+        // a method whose only wide or floating-point content is a static read
+        // has `method_uses_category2() == false` and `fp_in_body() == false`,
+        // and is admitted to the optimizing pipeline through the INT clause.
+        // Feeding it a `J` site with `ir_emit_long` off would then put a `Long`
+        // node in a graph the long tier is switched off for, and a `D`/`F` site
+        // an FP node with the FP tier off.
+        //
+        // Same shape as the float half of the `ldc` feed above, and as the
+        // `ldc2_w` feed's `if ir_emit_long || ir_emit_fp`: the party that
+        // resolved the width is the party that decides. A gated-off site is
+        // simply absent, so the builder's 0xb2 arm bails that method to
+        // single-pass, which compiles every width.
         let mut ir_static_init_classes: Vec<u32> = Vec::new();
         if !scan.static_field_ops.is_empty() {
             if let Some(resolver) = cp_static_field_resolver {
                 let mut sm = std::collections::HashMap::with_capacity(scan.static_field_ops.len());
                 for &(pc, cp_idx) in &scan.static_field_ops {
                     if let Some((class_id, field_index, type_tag, is_volatile)) = resolver(cp_idx) {
-                        sm.insert(pc, (class_id, field_index, type_tag, is_volatile));
+                        let admitted_by_value_tier = match type_tag {
+                            b'J' => ir_emit_long,
+                            b'D' | b'F' => ir_emit_fp,
+                            _ => true,
+                        };
+                        if admitted_by_value_tier {
+                            sm.insert(pc, (class_id, field_index, type_tag, is_volatile));
+                        }
+                        // Recorded regardless of the value tier: this list is
+                        // the ensure-init obligation, which the declaring class
+                        // owes whether or not the IR lowers the read. It also
+                        // matches the single-pass artifact, which records every
+                        // static site including every `putstatic`.
                         ir_static_init_classes.push(class_id);
                     }
                 }

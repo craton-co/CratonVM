@@ -6035,15 +6035,23 @@ impl IrBuilder {
                 // initialised) and `helpers.getstatic` (which runs `<clinit>`
                 // and can throw).
                 //
-                // Three type tags are refused here rather than in the lowering,
-                // because the refusal is about the VALUE tier and not about the
-                // load: `J`/`D` are category-2 and `F` is FP, and admitting one
-                // would put a `Long`/`Double`/`Float` node in a graph whose
-                // admission clause may have been the int one. The gates the
-                // caller already threads (`ir_emit_long`, `ir_emit_fp`) decide
-                // that for `ldc2_w`; a static field has no equivalent signal at
-                // this point, so the conservative answer is the one that keeps
-                // the method compiling on the other backend.
+                // Every JVM field type lowers. `J`/`D`/`F` were refused when this
+                // arm landed, on the grounds that admitting one would put a
+                // `Long`/`Double`/`Float` node in a graph whose admission clause
+                // may have been the int one. That is a real hazard and the
+                // refusal was in the wrong PLACE: `getstatic` is polymorphic and
+                // is listed by neither `is_category2_opcode` nor
+                // `is_float_opcode`, so the builder cannot see the width — but
+                // the CALLER can, because it resolved the type tag in order to
+                // build this table at all. So the gate moved to the feed in
+                // `try_compile`, which admits a `J` entry only under
+                // `ir_emit_long` and a `D`/`F` entry only under `ir_emit_fp`,
+                // exactly as it already does for a float `ldc` and as the
+                // `ldc2_w` feed does for its `(bits, is_double)`.
+                //
+                // A tag absent from this map is therefore either unresolvable or
+                // gated off, and both bail — the same fail-closed answer, now
+                // decided by the one party that has the information.
                 0xb2 => {
                     let (class_id, field_index, type_tag, is_volatile) =
                         match self.static_field_info.get(&pc) {
@@ -6053,6 +6061,9 @@ impl IrBuilder {
                     let ty = match type_tag {
                         b'I' | b'Z' | b'B' | b'C' | b'S' => IrType::Int,
                         b'L' | b'[' => IrType::Ref,
+                        b'J' => IrType::Long,
+                        b'D' => IrType::Double,
+                        b'F' => IrType::Float,
                         _ => return ir_build_bail(line!(), pc),
                     };
                     // A `field_index` past `u32` cannot be encoded in the baked

@@ -211,7 +211,7 @@ restores the nine original briefs.
 | `osr-02` | the exit-state differential (its forcing lever, `CRATONVM_OSR_EXIT_AFTER=N`, already exists) | `docs/feature-designs/jit-osr-exit-and-recompile.md` | nobody |
 | `loop-01` | unswitching, interchange, fusion — but the binding constraint is now the loop band and structural admission (`no_candidate_loop` is 94%+ of eligible compiles), not the gates `loop-02` retired | `archive/loop-01-peeling-and-versioning.md` | nobody |
 | `verify-01` | still stands as the harness every lane above wants | `docs/internal/verify-01-differential-harness-RETIRED-20260803.md` | nobody |
-| `cov-01` | `J`/`D`/`F` statics are refused — statics have no `ir_emit_long`/`ir_emit_fp` equivalent | `docs/internal/cov-01-constants-and-statics-RETIRED-20260803.md` | nobody |
+| ~~`cov-01`~~ | ~~`J`/`D`/`F` statics are refused~~ **CLOSED 2026-08-04** — the gate moved to the feed, which is the only party that knows the width. Worth **nothing measurable** (the refusal fired 0 times on the surveyed workload) because a `static final` primitive with a constant initializer emits `ldc2_w`, not `getstatic` | `docs/internal/cov-01-constants-and-statics-RETIRED-20260803.md` | — |
 | `cov-01` | `putstatic` (`0xb3`) has no IR lowering; 1 measured event, deliberately out of scope (the SATB pre-barrier) | same | nobody |
 | `cov-01` | the "fails to rewrite" half of the reference-root test is unreachable until `JIT_PUBLISHES_RELOCATION_CONTRACT` flips | same | nobody |
 | `cov-01` | guarded virtual inlining (`pgo-02`, default-off) no longer reaches a `getstatic; invokevirtual` method — that shape is C2's now | `docs/feature-designs/profile-guided-inlining.md` §8 | nobody |
