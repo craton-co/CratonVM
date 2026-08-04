@@ -462,7 +462,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-143 tokens.
+144 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -560,6 +560,7 @@ export inherited from a parent shell.
 | `range-bce` | `CRATONVM_JIT_RANGE_BCE` |
 | `range-scan-legacy` | `CRATONVM_JIT_RANGE_SCAN_LEGACY` |
 | `reassoc` | `CRATONVM_JIT_REASSOC` |
+| `retpc-validate` | `CRATONVM_JIT_NO_RETPC_VALIDATE` |
 | `rootsnap-cache` | `CRATONVM_ROOTSNAP_CACHE` |
 | `rootsnap-cache-survive-gc` | `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC` |
 | `safepoint-polls` | `CRATONVM_JIT_SAFEPOINT_POLLS` |
